@@ -1693,31 +1693,26 @@ fn a_sqlite_store_inside_the_storage_dir_still_hydrates() {
 /// success while neither field ever reaches the destination, and an upgraded
 /// installation's incremental exports quietly differ from a fresh one's.
 fn an_upgraded_database_delivers_the_new_event_columns() {
-    use ai_hist::delivery::{
-        create_job, DeliveryJobConfig, DeliveryLimits, ExportSelection, SUPPORTED_KINDS,
-    };
+    use ai_hist::export::capture;
 
     let root = temp_root("upgraded-capture");
     let db_path = root.join("history.db");
     let stripped = {
         let conn = open_db(&db_path).unwrap();
-        create_job(
-            &conn,
-            &DeliveryJobConfig {
-                destination_id: "fixture".into(),
-                instance_id: "upgrade".into(),
-                account_id: "account".into(),
-                mapping_version: "1".into(),
-                selection: ExportSelection {
-                    all_sources: true,
-                    kinds: SUPPORTED_KINDS.iter().map(|kind| (*kind).into()).collect(),
-                    ..ExportSelection::default()
-                },
-                limits: DeliveryLimits::default(),
+        let tx = conn.unchecked_transaction().unwrap();
+        capture::save_subscription(
+            &tx,
+            &capture::Subscription {
+                id: "fixture",
+                session: None,
+                cursor: 0,
+                kind: 0,
+                rowid: 0,
+                complete: true,
             },
-            0,
         )
         .unwrap();
+        tx.commit().unwrap();
 
         // Rewind the store to what an installation from before this PR has on
         // disk: `session_events` without the two new columns, and capture

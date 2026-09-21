@@ -14,7 +14,8 @@ already available to send.
 
 ## Decision
 
-The generic delivery core owns normalized session membership. One destination
+The probe-owned delivery engine owns normalized session membership (see the
+[ownership ADR](2026-09-21-probe-owns-uploads.md)). One destination
 job retains its immutable configuration and account/instance generation. Each
 member has a distinct snapshot identity, cutoff revision, historical bounds,
 bootstrap position and indexed journal cursor. Inclusion adds that snapshot;
@@ -26,8 +27,10 @@ rows and retained preimages are sought by source, session and rowid before any
 payload is read. Ownership-changing updates preserve OLD evidence even when the
 NEW identity belongs to another member. An indexed readiness queue is woken
 transactionally by capture; idle members do not scan unrelated journal entries.
+A persisted round-robin position advances between ready members so a continuously
+busy session cannot starve the others, including across worker restarts.
 Compaction respects the lowest cursor among members with unread work. Normal
-job transport, immutable batches, claims, acknowledgments, retry states and
+probe job transport, immutable batches, claims, acknowledgments, retry states and
 leases remain shared. Consent is checked on prepare, claim and immediately
 before dispatch. A member's fresh cutoff excludes stale queued work from a
 previous inclusion; an already transmitted request cannot be recalled.
@@ -39,7 +42,7 @@ remain authoritative and cannot be cleared while an affected active destination
 could have skipped evidence.
 
 The probe persists a durable change intent under its existing control locks.
-Ordinary selected-mode mutations call the generic membership API, retain the
+Ordinary selected-mode mutations call the probe membership API, retain the
 same job, and update the compatibility manifest. All/new modes and explicit mode
 transitions retain their generation/exclusion semantics. Selected setup skips
 full-history capture. Selected delivery drains committed evidence first and
@@ -75,8 +78,8 @@ intent safely completes each changed member before restarting delivery.
   by an earlier cursor.
 - Recreate the old job during upgrade: can discard unacknowledged tombstones or
   deleted-row evidence no longer available in live tables.
-- Duplicate delivery SQL or provider parsing in the probe: breaks the repository's
-  single sourcing and delivery ownership boundary.
+- Duplicate provider parsing or evidence traversal in the probe: breaks the
+  repository's single sourcing boundary. Upload SQL belongs to the probe.
 
 ## Consequences and limits
 

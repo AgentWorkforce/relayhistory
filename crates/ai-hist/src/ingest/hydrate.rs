@@ -4485,14 +4485,10 @@ mod tests {
     /// is a persisted index into `TABLES`, so putting a row anywhere but the
     /// end would silently re-point every in-flight job's bootstrap cursor at a
     /// different table.
-    #[cfg(feature = "delivery")]
+    #[cfg(feature = "export")]
     #[test]
     fn a_hydrated_grok_marker_reaches_a_delivery_export() {
-        use crate::delivery::{
-            acknowledge, claim_batch, create_job, prepare_batch, store_prepared_payload,
-            AcceptanceLevel, DeliveryAcknowledgment, DeliveryJobConfig, DeliveryLimits,
-            ExportSelection,
-        };
+        use crate::export::{create_export, export_page, ExportLimits, ExportSelection};
 
         let dir = tempfile::tempdir().unwrap();
         let chat = grok_fixture_home(dir.path(), "events-session");
@@ -4516,64 +4512,24 @@ mod tests {
             .unwrap();
         assert!(markers > 0, "the fixture has to write markers to test this");
 
-        let job = create_job(
+        let snapshot = create_export(
             &conn,
-            &DeliveryJobConfig {
-                destination_id: "fixture".into(),
-                instance_id: "grok".into(),
-                account_id: "account".into(),
-                mapping_version: "1".into(),
-                selection: ExportSelection {
-                    all_sources: true,
-                    kinds: vec!["session_marker".into(), "session_event".into()],
-                    ..ExportSelection::default()
-                },
-                limits: DeliveryLimits::default(),
+            &ExportSelection {
+                all_sources: true,
+                kinds: vec!["session_marker".into(), "session_event".into()],
+                ..Default::default()
             },
-            0,
+            &ExportLimits::default(),
+            60_000,
+            now_ms(),
         )
         .unwrap();
-
         let mut kinds = Vec::new();
-        for step in 0..200 {
-            let now = step * 10;
-            let prepared = prepare_batch(&conn, &job.job_id, now).unwrap();
-            if prepared.batch_id.is_none() {
-                if prepared.bootstrap_complete && prepared.scanned_records == 0 {
-                    break;
-                }
-                continue;
-            }
-            let claim = claim_batch(&conn, &job.job_id, "worker", 1000, &|| now)
-                .unwrap()
-                .expect("a prepared batch is claimable");
-            store_prepared_payload(
-                &conn,
-                &claim.lease,
-                &claim.batch.mapping_version,
-                "application/json",
-                &serde_json::to_string(&claim.batch).unwrap(),
-                &|| now,
-            )
-            .unwrap();
-            acknowledge(
-                &conn,
-                &claim.lease,
-                &DeliveryAcknowledgment {
-                    batch_id: claim.batch.batch_id.clone(),
-                    accepted_revision_ids: claim
-                        .batch
-                        .records
-                        .iter()
-                        .map(|record| record.revision_id.clone())
-                        .collect(),
-                    unsupported_revision_ids: vec![],
-                    acceptance_level: AcceptanceLevel::Durable,
-                },
-                &|| now,
-            )
-            .unwrap();
-            kinds.extend(claim.batch.records.into_iter().map(|record| record.kind));
+        let mut cursor = Some(snapshot.cursor);
+        while let Some(value) = cursor {
+            let page = export_page(&conn, &value, now_ms()).unwrap();
+            kinds.extend(page.records.into_iter().map(|r| r.kind));
+            cursor = page.next_cursor;
         }
 
         let delivered = |kind: &str| kinds.iter().filter(|seen| *seen == kind).count();

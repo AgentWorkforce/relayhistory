@@ -17,7 +17,9 @@ path = "src/lib.rs"
 
 [features]
 default = []
-delivery = []
+# Legacy feature alias; upload APIs now belong to relayhistory-plugin.
+delivery = ["export"]
+export = []
 opencode-backup = ["dep:tempfile", "rusqlite/backup"]
 git-hooks = ["dep:url"]
 unstable-internal = []
@@ -49,18 +51,6 @@ name = "fixture_corpus"
 required-features = ["unstable-internal"]
 
 [[test]]
-name = "delivery_worker"
-required-features = ["delivery", "unstable-internal"]
-
-[[test]]
-name = "durable_delivery"
-required-features = ["delivery", "unstable-internal"]
-
-[[test]]
-name = "delivery_capture"
-required-features = ["delivery", "unstable-internal"]
-
-[[test]]
 name = "local_history_boundary"
 required-features = ["unstable-internal"]
 
@@ -70,7 +60,7 @@ required-features = ["unstable-internal"]
 
 [[test]]
 name = "opencode_parity"
-required-features = ["delivery", "unstable-internal"]
+required-features = ["export", "unstable-internal"]
 
 [[test]]
 name = "session_continuity"
@@ -95,10 +85,6 @@ required-features = ["unstable-internal"]
 [[test]]
 name = "project_identity_discovery"
 required-features = ["unstable-internal"]
-
-[[test]]
-name = "project_key_delivery"
-required-features = ["delivery", "unstable-internal"]
 
 [[test]]
 name = "source_intake"

@@ -8,9 +8,9 @@ Node.js, npm, NAPI addon or separately installed Agent Relay CLI.
 ## Source ownership
 
 Keep the binary in `plugins/relayhistory/rust/src/probe/` in this repository. It
-links the existing `ai-hist` capture engine, `ai-hist` delivery queue
-and optional `relayhistory-plugin` transport. A separate repository would need to
-coordinate versions of these same components without adding a runtime boundary.
+links the existing `ai-hist` evidence engine and owns its upload queue, worker,
+sharing policy and transport within `relayhistory-plugin`. Moving the probe to
+relay-desktop is a separate follow-up; provider acquisition remains here.
 The core local SDK remains independent of the Cloud package.
 
 This binary is separate from `relayhistory-plugin`, whose JSON bridge, package
@@ -86,8 +86,8 @@ No Cloud bearer credential is persisted by the probe. Tokens are never command
 arguments, and provider errors, response bodies and session content are not logged.
 The device approval URL is intentionally displayed in the interactive terminal.
 
-Each cycle delivers through the shared core delivery worker — the same bounded
-drain the SDK uses — carrying the RelayHistory receiver. The worker owns
+Each cycle delivers through the probe-owned Rust worker. The plugin helper
+uses that same bounded drain and RelayHistory receiver. The worker owns
 immutable batches, leases and their keepalive, prepared-byte persistence, the
 eligibility recheck immediately before dispatch, retry/backoff, acknowledgment
 and compaction; the receiver owns only the consent and destination guards and
@@ -163,7 +163,7 @@ installer. The CI job builds and tests on macOS/Linux but publishes nothing.
 ```sh
 cargo test --manifest-path plugins/relayhistory/rust/Cargo.toml --bin agent-relay-probe --locked
 cargo test --manifest-path plugins/relayhistory/rust/Cargo.toml --lib cloud:: --locked
-cargo test -p ai-hist --features delivery identity_pages --locked
+cargo test -p ai-hist --features export identity_pages --locked
 ```
 
 Regression tests cover Cloud's `201 Created` device grant, authorization polling,

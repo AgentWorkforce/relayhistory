@@ -1,6 +1,6 @@
 //! Exercise the real stop command while the collector is writing a large source.
-use ai_hist::delivery::{self, DeliveryJobConfig, ExportSelection};
 use fs2::FileExt;
+use relayhistory_plugin::delivery::{self, DeliveryJobConfig, ExportSelection};
 use relayhistory_plugin::destination;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -56,7 +56,7 @@ fn stop_command_interrupts_active_capture_and_preserves_committed_history() {
     let directory = home.path().join(".agentworkforce/probe").join(key);
     fs::create_dir_all(&directory).unwrap();
     let db = directory.join("history.db");
-    let conn = ai_hist::open_db(&db).unwrap();
+    let conn = delivery::open_db(&db).unwrap();
     let job = delivery::create_job(
         &conn,
         &DeliveryJobConfig {

@@ -275,7 +275,7 @@ pub fn drain(
         1,
         3_600_000,
     )?;
-    let keepalive = crate::open_db(db_path)?;
+    let keepalive = super::open_db(db_path)?;
     // The shared busy policy retries for about thirty seconds, which is right
     // for a sync that must not give up and exactly wrong for a keepalive: a
     // renewal that waits thirty seconds to protect a lease shorter than that
@@ -286,7 +286,7 @@ pub fn drain(
         options.lease_ms,
     )))?;
     let mut worker = Worker {
-        conn: crate::open_db(db_path)?,
+        conn: super::open_db(db_path)?,
         keepalive: Mutex::new(keepalive),
         receivers,
         options,

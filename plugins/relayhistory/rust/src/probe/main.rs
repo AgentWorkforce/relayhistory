@@ -410,23 +410,23 @@ fn install(options: Install) -> Result<()> {
         humanln!("Preparing local session capture…");
         collector::capture(&directory, &history_url)?;
     }
-    let conn = ai_hist::open_db(&db_path)?;
+    let conn = relayhistory_plugin::delivery::open_db(&db_path)?;
     let config = match existing {
         Some(mut config) => {
             config.acknowledge_uninspected_schedules = options.acknowledge_uninspected_schedules;
             save_json(&directory.join("config.json"), &config)?;
-            let job = ai_hist::delivery::status(&conn, &config.job_id)?;
+            let job = relayhistory_plugin::delivery::status(&conn, &config.job_id)?;
             ensure!(
                 job.config.account_id == account,
                 "invalid saved delivery account"
             );
             if job.state == "blocked" && options.force_login {
-                ai_hist::delivery::retry_job(&conn, &config.job_id)?;
+                relayhistory_plugin::delivery::retry_job(&conn, &config.job_id)?;
             }
             config
         }
         None => {
-            let job_config = ai_hist::delivery::DeliveryJobConfig {
+            let job_config = relayhistory_plugin::delivery::DeliveryJobConfig {
                 destination_id: "relayhistory".into(),
                 instance_id: "teams-probe".into(),
                 account_id: account.clone(),
@@ -437,7 +437,7 @@ fn install(options: Install) -> Result<()> {
             // A generation outlives an interrupted setup: create_job commits
             // before config.json is written. Adopt that job instead of recording
             // a second baseline behind a generation nothing can reach.
-            let adopted = ai_hist::delivery::list_jobs(&conn)?
+            let adopted = relayhistory_plugin::delivery::list_jobs(&conn)?
                 .into_iter()
                 .find(|job| {
                     job.state != "cancelled"
@@ -462,11 +462,20 @@ fn install(options: Install) -> Result<()> {
                     // No generation to inherit a baseline from, so the exclusion
                     // table has to be brought in line with this choice first.
                     if sharing_mode == bridge::SharingMode::Selected {
-                        ai_hist::delivery::create_session_job(&conn, &job_config, collector::now())?
-                            .job_id
+                        relayhistory_plugin::delivery::create_session_job(
+                            &conn,
+                            &job_config,
+                            collector::now(),
+                        )?
+                        .job_id
                     } else {
                         collector::record_baseline(&conn, include_existing)?;
-                        ai_hist::delivery::create_job(&conn, &job_config, collector::now())?.job_id
+                        relayhistory_plugin::delivery::create_job(
+                            &conn,
+                            &job_config,
+                            collector::now(),
+                        )?
+                        .job_id
                     }
                 }
             };

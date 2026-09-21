@@ -62,11 +62,11 @@ pub use tool_result_facts::{
 };
 
 fn is_delivery_retention_limit(error: &anyhow::Error) -> bool {
-    #[cfg(feature = "delivery")]
+    #[cfg(feature = "export")]
     {
-        crate::delivery::is_retention_limit(error)
+        crate::export::is_retention_limit(error)
     }
-    #[cfg(not(feature = "delivery"))]
+    #[cfg(not(feature = "export"))]
     {
         let _ = error;
         false

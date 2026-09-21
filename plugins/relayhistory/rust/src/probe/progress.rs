@@ -1,6 +1,6 @@
 //! Content-free, best-effort progress. A slow/offline status endpoint never blocks capture.
-use ai_hist::delivery;
 use relayhistory_plugin::cloud;
+use relayhistory_plugin::delivery;
 use serde::Serialize;
 use std::{
     path::Path,

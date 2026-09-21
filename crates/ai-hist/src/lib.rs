@@ -40,11 +40,6 @@ mod session_store;
 mod session_usage;
 mod usage;
 
-#[cfg(all(feature = "delivery", feature = "unstable-internal"))]
-pub mod delivery;
-#[cfg(all(feature = "delivery", not(feature = "unstable-internal")))]
-pub(crate) mod delivery;
-
 #[cfg(all(feature = "git-hooks", feature = "unstable-internal"))]
 pub mod git_helpers;
 #[cfg(all(feature = "git-hooks", not(feature = "unstable-internal")))]
@@ -117,3 +112,6 @@ pub mod internal {
     pub use crate::store::*;
     pub use crate::usage::*;
 }
+
+#[cfg(feature = "export")]
+pub mod export;

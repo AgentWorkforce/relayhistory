@@ -11,7 +11,7 @@ name = "ai-hist"
 path = "src/main.rs"
 
 [dependencies]
-ai-hist = { path = "../ai-hist", features = ["delivery", "opencode-backup", "git-hooks", "unstable-internal"] }
+ai-hist = { path = "../ai-hist", features = ["export", "opencode-backup", "git-hooks", "unstable-internal"] }
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive", "env"] }

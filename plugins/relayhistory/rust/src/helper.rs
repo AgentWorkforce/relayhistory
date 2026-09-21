@@ -1,6 +1,6 @@
 //! Versioned one-request bridge. Errors never serialize remote bodies or credentials.
+use crate::delivery::worker::{Receiver, ReceiverContext, ReceiverFailure};
 use crate::{cloud, replay};
-use ai_hist::delivery::worker::{Receiver, ReceiverContext, ReceiverFailure};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -17,12 +17,14 @@ pub struct Request {
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Arguments {
+    pub delivery_request: Option<Value>,
+    pub drain_options: Option<crate::delivery::rpc::DrainRequest>,
     pub connector_id: Option<String>,
     pub connector_instance: Option<String>,
     pub state: Option<serde_json::Map<String, Value>>,
     pub read_options: Option<crate::destination::ReadOptions>,
-    pub batch: Option<ai_hist::delivery::HistoryExportBatch>,
-    pub prepared: Option<ai_hist::delivery::PreparedPayload>,
+    pub batch: Option<crate::delivery::HistoryExportBatch>,
+    pub prepared: Option<crate::delivery::PreparedPayload>,
     pub expected_account: Option<String>,
     pub instance_id: Option<String>,
     pub acknowledge_uninspected_schedules: Option<bool>,
@@ -87,6 +89,30 @@ fn execute(request: Request) -> Result<Value> {
                 .context("state required; preserve the previous relay cursor map")?;
             let inserted = crate::relaycast::sync_relaycast(&conn, &mut state)?;
             json!({"inserted":inserted,"state":state,"capability":"legacy-incremental-history"})
+        }
+        "probeDelivery" => crate::delivery::rpc::request(
+            Path::new(a.db_path.as_deref().context("dbPath required")?),
+            a.delivery_request.context("deliveryRequest required")?,
+        )?,
+        "probeDeliveryDrain" => {
+            let instance = a.instance_id.context("instanceId required")?;
+            let receiver = crate::destination::RelayHistoryReceiver {
+                base_url: a.base_url,
+                expected_account: Some(a.expected_account.context("expectedAccount required")?),
+                instance_id: Some(instance.clone()),
+                acknowledge_uninspected_schedules: a
+                    .acknowledge_uninspected_schedules
+                    .unwrap_or(false),
+            };
+            let receivers =
+                crate::delivery::worker::SingleReceiver::new("relayhistory", instance, &receiver);
+            serde_json::to_value(crate::delivery::worker::drain(
+                Path::new(a.db_path.as_deref().context("dbPath required")?),
+                &receivers,
+                &a.drain_options.unwrap_or_default().options(),
+                &crate::delivery::worker::system_clock,
+                &|| false,
+            )?)?
         }
         "deliveryMigrationStatus" => serde_json::to_value(crate::migration::status())?,
         "deliveryRead" => serde_json::to_value(crate::destination::read_page(

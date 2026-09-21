@@ -223,12 +223,12 @@ pub fn latest_history_for_session(
 /// uncatalogued sessions so an export exclusion cannot miss partially read data.
 /// Continue with the last returned identity; hold a read transaction when a
 /// consistent multi-page baseline is required.
-#[cfg(feature = "delivery")]
+#[cfg(feature = "export")]
 pub fn session_identities_after(
     conn: &Connection,
-    after: Option<&crate::delivery::SessionIdentity>,
+    after: Option<&crate::export::SessionIdentity>,
     limit: usize,
-) -> Result<Vec<crate::delivery::SessionIdentity>> {
+) -> Result<Vec<crate::export::SessionIdentity>> {
     let mut query = conn.prepare(
         "SELECT source, session_id FROM (
             SELECT source, session_id FROM sessions
@@ -244,7 +244,7 @@ pub fn session_identities_after(
             bounded(limit)
         ],
         |row| {
-            Ok(crate::delivery::SessionIdentity {
+            Ok(crate::export::SessionIdentity {
                 source: row.get(0)?,
                 session_id: row.get(1)?,
             })
@@ -253,7 +253,7 @@ pub fn session_identities_after(
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-#[cfg(all(test, feature = "delivery"))]
+#[cfg(all(test, feature = "export"))]
 mod identity_tests {
     use super::*;
     #[test]
