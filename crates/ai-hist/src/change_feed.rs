@@ -282,7 +282,8 @@ impl ChangeQuery {
 /// The drain [`SessionStore::changes_since`] hands back.
 ///
 /// Yields every change with `from < revision <= head()`, oldest first, paging
-/// through the store in `batch`-sized indexed reads as it goes. `position()`
+/// through the store in `batch`-sized indexed reads as it goes; at most one
+/// page of typed rows is resident at a time. `position()`
 /// follows the last change yielded, and reaches `head()` once the drain is
 /// exhausted. Nothing written after the drain was opened is included — a
 /// row re-stamped past the head while the drain runs is simply absent from
@@ -356,24 +357,32 @@ impl Changes {
             self.position = self.head;
             return Ok(());
         }
-        let mut rows: Vec<Change> = Vec::new();
+        // Two passes, so no more than one page of typed rows is ever
+        // resident. The first reads only revisions -- a covering read of each
+        // revision index, `batch` integers per stream at most -- and finds the
+        // cut: the `batch`-th smallest revision across every stream. Any row a
+        // stream did not return sits above every row it did, and therefore
+        // above the cut. The second pass fetches the rows in `(lo, cut]`,
+        // which is exactly the page, because revisions are unique per write.
+        let Some(cut) = page_cut(&self.conn, &self.kinds, lo, hi, self.batch)? else {
+            self.exhausted = true;
+            self.position = self.head;
+            return Ok(());
+        };
+        let mut rows: Vec<Change> = Vec::with_capacity(self.batch);
         for kind in &self.kinds {
-            rows.extend(read_upserts(&self.conn, *kind, lo, hi, self.batch)?);
+            rows.extend(read_upserts(&self.conn, *kind, lo, cut, self.batch)?);
         }
         rows.extend(read_tombstones(
             &self.conn,
             &self.kinds,
             lo,
-            hi,
+            cut,
             self.batch,
         )?);
         rows.sort_by(|a, b| {
             (a.revision, a.kind, &a.record_key).cmp(&(b.revision, b.kind, &b.record_key))
         });
-        // Each per-kind read returned its `batch` lowest revisions, so the
-        // `batch` lowest of the union are exactly the next page: any row not
-        // read sits above every row its kind did return, and therefore above
-        // the cut.
         rows.truncate(self.batch);
         if rows.is_empty() {
             self.exhausted = true;
@@ -471,20 +480,14 @@ impl SessionStore {
             0 => DEFAULT_CHANGE_BATCH,
             batch => batch.min(MAX_CHANGE_BATCH),
         };
-        let head = read_head(&conn).map_err(Error::from_anyhow)?;
-        let start = if from == Watermark::CONSUMER {
-            let Some(name) = &query.consumer else {
-                return Err(Error::new(
-                    ErrorKind::Other,
-                    "changes_since: Watermark::CONSUMER needs ChangeQuery::consumer to name the cursor",
-                ));
-            };
-            read_cursor(&conn, name)
-                .map_err(Error::from_anyhow)?
-                .unwrap_or(Watermark::START)
-        } else {
-            from
-        };
+        if from == Watermark::CONSUMER && query.consumer.is_none() {
+            return Err(Error::new(
+                ErrorKind::Other,
+                "changes_since: Watermark::CONSUMER needs ChangeQuery::consumer to name the cursor",
+            ));
+        }
+        let (start, head) = resolve_start_and_head(&conn, from, query.consumer.as_deref())
+            .map_err(Error::from_anyhow)?;
         if start > head {
             return Err(Error::new(
                 ErrorKind::WatermarkAheadOfStore,
@@ -512,10 +515,106 @@ impl SessionStore {
 
 /// The head revision of the database at `db_path`, through a read-only
 /// handle. A database from before the feed existed answers `START`: nothing
-/// in it is stamped, so nothing in it is reported yet.
+/// in it is stamped, so nothing in it is reported yet -- and its
+/// `observation_clock`, which predates the feed, is not a feed position.
 pub(crate) fn head_revision_at(db_path: &Path) -> Result<Watermark, Error> {
     let conn = open_db_readonly(db_path)?;
+    if !schema_is_current(&conn).map_err(Error::from_anyhow)? {
+        return Ok(Watermark::START);
+    }
     read_head(&conn).map_err(Error::from_anyhow)
+}
+
+/// Resolve where a drain starts and where it is bounded, from one snapshot.
+///
+/// The two reads share a read transaction, so a writer advancing the store
+/// and a sibling drain committing the resulting cursor between them cannot
+/// make a valid cursor look ahead of the head. The cursor is also read first:
+/// even without the snapshot, a cursor that moved after being read can only
+/// cause a safe replay, never a false reset.
+fn resolve_start_and_head(
+    conn: &Connection,
+    from: Watermark,
+    consumer: Option<&str>,
+) -> Result<(Watermark, Watermark)> {
+    let snapshot = conn.unchecked_transaction()?;
+    let start = match (from == Watermark::CONSUMER, consumer) {
+        (true, Some(name)) => read_cursor(&snapshot, name)?.unwrap_or(Watermark::START),
+        (true, None) => anyhow::bail!("Watermark::CONSUMER needs a consumer name"),
+        (false, _) => from,
+    };
+    let head = read_head(&snapshot)?;
+    snapshot.commit()?;
+    Ok((start, head))
+}
+
+/// The revision-only page query for one kind: a covering read of the
+/// revision index.
+fn upsert_key_sql(kind: ChangeKind) -> String {
+    format!(
+        "SELECT {REVISION_COLUMN} FROM {name} \
+         WHERE {REVISION_COLUMN} > ?1 AND {REVISION_COLUMN} <= ?2 \
+         ORDER BY {REVISION_COLUMN} ASC LIMIT ?3",
+        name = kind.table().name,
+    )
+}
+
+fn tombstone_key_sql() -> String {
+    format!(
+        "SELECT {REVISION_COLUMN} FROM evidence_tombstones \
+         WHERE kind = ?1 AND {REVISION_COLUMN} > ?2 AND {REVISION_COLUMN} <= ?3 \
+         ORDER BY {REVISION_COLUMN} ASC LIMIT ?4"
+    )
+}
+
+/// The highest revision of the next page: the `batch`-th smallest revision
+/// in `(lo, hi]` across every stream, or `hi` when fewer remain, or `None`
+/// when nothing does. Reads revisions only.
+fn page_cut(
+    conn: &Connection,
+    kinds: &[ChangeKind],
+    lo: u64,
+    hi: u64,
+    batch: usize,
+) -> Result<Option<u64>> {
+    let mut revisions: Vec<u64> = Vec::new();
+    let mut collect = |statement: &mut rusqlite::CachedStatement<'_>,
+                       values: &[rusqlite::types::Value]|
+     -> Result<()> {
+        let rows = statement.query_map(rusqlite::params_from_iter(values), |row| {
+            row.get::<_, i64>(0)
+        })?;
+        for row in rows {
+            revisions.push(row?.max(0) as u64);
+        }
+        Ok(())
+    };
+    let range: [rusqlite::types::Value; 3] = [
+        (lo as i64).into(),
+        (hi as i64).into(),
+        (batch as i64).into(),
+    ];
+    for kind in kinds {
+        let mut statement = conn.prepare_cached(&upsert_key_sql(*kind))?;
+        collect(&mut statement, &range)?;
+    }
+    let mut tombstones = conn.prepare_cached(&tombstone_key_sql())?;
+    for kind in kinds {
+        let mut values: Vec<rusqlite::types::Value> = vec![kind.as_str().to_string().into()];
+        values.extend(range.iter().cloned());
+        collect(&mut tombstones, &values)?;
+    }
+    if revisions.is_empty() {
+        return Ok(None);
+    }
+    revisions.sort_unstable();
+    Ok(Some(
+        revisions
+            .get(batch.saturating_sub(1))
+            .copied()
+            .unwrap_or(hi)
+            .min(hi),
+    ))
 }
 
 fn read_head(conn: &Connection) -> Result<Watermark> {
@@ -1519,8 +1618,18 @@ mod tests {
             plans.push((kind.table().name, upsert_sql(*kind), page.clone()));
         }
         let mut tombstone_page = vec![rusqlite::types::Value::from("session_event".to_string())];
-        tombstone_page.extend(page);
-        plans.push(("evidence_tombstones", tombstone_sql(), tombstone_page));
+        tombstone_page.extend(page.iter().cloned());
+        plans.push((
+            "evidence_tombstones",
+            tombstone_sql(),
+            tombstone_page.clone(),
+        ));
+        // The revision-only first pass must be a covering read of the same
+        // index, with no table access at all.
+        for kind in ChangeKind::ALL {
+            plans.push((kind.table().name, upsert_key_sql(*kind), page.clone()));
+        }
+        plans.push(("evidence_tombstones", tombstone_key_sql(), tombstone_page));
         for (table, sql, values) in plans {
             let details: Vec<String> = conn
                 .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
@@ -1533,12 +1642,211 @@ mod tests {
                 .unwrap();
             let plan = details.join("\n");
             assert!(
-                plan.contains(&format!("USING INDEX idx_{table}_")),
+                plan.contains(&format!("INDEX idx_{table}_")),
                 "{table}: {plan}"
             );
             assert!(!plan.contains(&format!("SCAN {table}")), "{table}: {plan}");
             assert!(!plan.contains("TEMP B-TREE"), "{table}: {plan}");
+            if sql.starts_with(&format!("SELECT {REVISION_COLUMN} FROM")) {
+                assert!(plan.contains("COVERING INDEX"), "{table}: {plan}");
+            }
         }
+    }
+
+    /// One page holds exactly `batch` typed rows however many streams feed
+    /// it: the first pass reads revisions only and the second fetches just
+    /// the rows below the cut, so six tables and their tombstones cannot
+    /// multiply what is resident.
+    #[test]
+    fn a_page_over_many_kinds_materialises_exactly_batch_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, conn) = store(dir.path());
+        for index in 0..4 {
+            conn.execute(
+                "INSERT INTO sessions (session_id, source) VALUES (?, 'claude')",
+                [format!("s{index}")],
+            )
+            .unwrap();
+            insert_event(&conn, "s0", &format!("e{index}"), "x");
+            conn.execute(
+                "INSERT INTO tool_calls (source, session_id, tool_use_id, name) \
+                 VALUES ('claude', 's0', ?, 'Bash')",
+                [format!("t{index}")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO file_edits (source, session_id, tool_use_id, file_path, tool_name) \
+                 VALUES ('claude', 's0', ?, '/p', 'Edit')",
+                [format!("f{index}")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session_markers (source, session_id, marker_uid, kind) \
+                 VALUES ('claude', 's0', ?, 'compaction')",
+                [format!("m{index}")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session_relationships (source, parent_session_id, \
+                 relationship_uid, relationship, identity_status, evidence_kind, \
+                 created_ms, updated_ms) \
+                 VALUES ('claude', 's0', ?, 'delegated', 'unlinked', 'sidecar', 1, 1)",
+                [format!("r{index}")],
+            )
+            .unwrap();
+            conn.execute(
+                "DELETE FROM session_markers WHERE marker_uid = ?",
+                [format!("m{index}")],
+            )
+            .unwrap();
+        }
+        let head = store.head_revision().unwrap().revision;
+        assert_eq!(head, 28, "24 upserts and 4 tombstone writes");
+
+        // The cut is the batch-th smallest revision across all streams. Each
+        // round wrote revisions 7k+1..7k+7, and the marker at 7k+5 is gone
+        // (its tombstone sits at 7k+7), so the fifth smallest is 6.
+        assert_eq!(
+            page_cut(&conn, ChangeKind::ALL, 0, head, 5).unwrap(),
+            Some(6)
+        );
+        assert_eq!(
+            page_cut(&conn, ChangeKind::ALL, 20, head, 100).unwrap(),
+            Some(head),
+            "fewer than a page left: the cut is the head"
+        );
+        assert_eq!(
+            page_cut(&conn, ChangeKind::ALL, head, head, 5).unwrap(),
+            None
+        );
+        // Only the rows below the cut are fetched, across every kind.
+        let fetched: usize = ChangeKind::ALL
+            .iter()
+            .map(|kind| read_upserts(&conn, *kind, 0, 6, 5).unwrap().len())
+            .sum::<usize>()
+            + read_tombstones(&conn, ChangeKind::ALL, 0, 6, 5)
+                .unwrap()
+                .len();
+        assert_eq!(fetched, 5);
+
+        let mut changes = store
+            .changes_since(Watermark::START, ChangeQuery::default().batch(5))
+            .unwrap();
+        let first = changes.next().unwrap().unwrap();
+        assert_eq!(first.revision, 1);
+        assert_eq!(
+            changes.buffer.len(),
+            4,
+            "the page held exactly `batch` rows, not `batch` per stream"
+        );
+        let mut revisions = vec![first.revision];
+        for _ in 0..4 {
+            revisions.push(changes.next().unwrap().unwrap().revision);
+        }
+        assert_eq!(revisions, vec![1, 2, 3, 4, 6]);
+        assert_eq!(changes.position().revision, 6);
+        assert!(changes.buffer.is_empty());
+        // The rest arrives in later pages, in order, tombstones included:
+        // 20 surviving upserts and 4 tombstones, less the 5 already seen.
+        let rest = drain(changes);
+        assert_eq!(rest.len(), 19);
+        assert_eq!(rest.iter().filter(|c| c.op == ChangeOp::Delete).count(), 4);
+        assert!(rest
+            .windows(2)
+            .all(|pair| pair[0].revision < pair[1].revision));
+    }
+
+    /// A drain that resolves its cursor while a sibling advances it must not
+    /// mistake the advance for a store reset. The cursor and the head come
+    /// from one snapshot, so a commit landing between the two reads is
+    /// either wholly visible or wholly not.
+    #[test]
+    fn a_cursor_advanced_during_open_is_not_a_reset() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ai-history.db");
+        let (_store, writer) = store(dir.path());
+        for index in 0..10 {
+            insert_event(&writer, "s1", &format!("e{index}"), "x");
+        }
+        commit_cursor(&writer, "burn", Watermark { revision: 10 }).unwrap();
+
+        // The drain's own connection, with a hook that lets a second
+        // process's work land in the middle of resolving the start.
+        let reader = open_db_readonly(&db).unwrap();
+        let fired = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&fired);
+        let db_for_hook = db.clone();
+        reader.progress_handler(
+            1,
+            Some(move || {
+                if !flag.swap(true, Ordering::SeqCst) {
+                    let other = open_db(&db_for_hook).unwrap();
+                    insert_event(&other, "s1", "e10", "late");
+                    commit_cursor(&other, "burn", Watermark { revision: 11 }).unwrap();
+                }
+                false
+            }),
+        );
+        let (start, head) =
+            resolve_start_and_head(&reader, Watermark::CONSUMER, Some("burn")).unwrap();
+        reader.progress_handler(0, None::<fn() -> bool>);
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "the interleaving must have happened"
+        );
+        assert!(
+            start <= head,
+            "cursor {} must not look ahead of head {}",
+            start.revision,
+            head.revision
+        );
+        // Both values come from one snapshot: either before the sibling's
+        // commit or after it, never one of each.
+        assert!(
+            (start.revision, head.revision) == (10, 10)
+                || (start.revision, head.revision) == (11, 11),
+            "start {} head {}",
+            start.revision,
+            head.revision
+        );
+    }
+
+    /// A database from before the feed carries an `observation_clock` that
+    /// says nothing about feed state. A read-only handle over it answers
+    /// `START`, not that clock.
+    #[test]
+    fn a_legacy_store_reports_start_not_its_observation_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.db");
+        {
+            let conn = open_db(&db).unwrap();
+            insert_event(&conn, "s1", "e1", "x");
+            conn.execute_batch(
+                "DELETE FROM schema_migrations WHERE name = 'change_feed_v1'; \
+                 UPDATE observation_clock SET version = 42;",
+            )
+            .unwrap();
+        }
+        let read_only = SessionStore::open(StoreOptions {
+            db_path: Some(db.clone()),
+            read_only: true,
+            ..StoreOptions::default()
+        })
+        .unwrap();
+        assert_eq!(read_only.head_revision().unwrap(), Watermark::START);
+        assert!(read_only
+            .changes_since(Watermark::START, ChangeQuery::default())
+            .is_err());
+        // Once migrated, the head is the real one again.
+        let writable = SessionStore::open(StoreOptions {
+            db_path: Some(db),
+            ..StoreOptions::default()
+        })
+        .unwrap();
+        assert!(writable.head_revision().unwrap().revision >= 42);
     }
 
     /// A database from before the feed existed is stamped once on migration,

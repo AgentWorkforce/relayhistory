@@ -147,7 +147,11 @@ Notable changes to the native `ai-hist` CLI are documented here.
   commit, and the cursor only moves forward, so a stale commit from an older
   drain cannot rewind it (`commit` returns the cursor as stored). A presence
   arriving or leaving re-stamps its catalog row, since the row's `locations`
-  is derived from `session_presences`. `SessionStore::head_revision()` and `SyncReport::head_revision`
+  is derived from `session_presences`. A page is read revision-first, so at
+  most one page of typed rows is resident however many kinds are fed; a
+  drain's start and head come from one read snapshot; and a read-only handle
+  over an unmigrated database reports `Watermark::START` rather than its
+  pre-feed `observation_clock`. `SessionStore::head_revision()` and `SyncReport::head_revision`
   report the head; a stored watermark beyond it (the database was reset)
   fails with `ErrorKind::WatermarkAheadOfStore`, read through the new
   `Error::kind()`. A re-parse re-stamps every row it upserts, so a consumer

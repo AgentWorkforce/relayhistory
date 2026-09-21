@@ -357,6 +357,16 @@ row's `locations` is derived from `session_presences`, so a presence arriving
 or leaving re-stamps its `sessions` row too: a consumer sees the row replaced
 even though nothing wrote `sessions` itself.
 
+Each page is read in two passes: a covering read of each stream's revision
+index finds the page's cut (the `batch`-th smallest revision across streams),
+and only the rows below it are then fetched, so at most one page of typed rows
+is resident however many kinds are fed. The drain's start and its head are
+resolved from one read snapshot, so a sibling drain committing the cursor while
+this one opens can never make a valid cursor look ahead of the head. A
+read-only handle over a database the feed has not migrated reports
+`Watermark::START` as its head; its pre-feed `observation_clock` is not a feed
+position.
+
 `changes_since(from, ChangeQuery { kinds, consumer, batch })` yields
 `Change { kind, source, session_id, record_key, revision, op }` in
 `(revision, kind, record_key)` order, where `op` is `Upsert(EvidenceRow)` —
