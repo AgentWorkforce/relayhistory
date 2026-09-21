@@ -34,6 +34,12 @@ use ai_hist::{
     MAX_CHILDREN_PAGE_LIMIT, MAX_TREE_MAX_DEPTH, MAX_TREE_MAX_NODES,
     SESSION_EVIDENCE_CONTRACT_VERSION, SESSION_RELATIONSHIP_CONTRACT_VERSION,
 };
+use ai_hist::{
+    schema_is_usage_read_current, session_requests_page as core_session_requests_page,
+    session_usage_summary as core_session_usage_summary, NormalizedUsage as CoreNormalizedUsage,
+    SessionRequest as CoreSessionRequest, SessionRequestCursor as CoreRequestCursor,
+    SessionUsageSummary as CoreSessionUsageSummary, SESSION_USAGE_CONTRACT_VERSION,
+};
 use napi_derive::napi;
 
 /// Bump whenever native object shapes or semantics require an SDK change.
@@ -45,10 +51,10 @@ use napi_derive::napi;
 /// work and the project-identity work were developed in parallel and both
 /// claimed 16; a merged addon carries both, so it cannot answer with a
 /// number either side already published.
-/// 18 adds the upstream `provider` field to session events; the per-message
-/// raw facts landed alongside contract 16 without changing its published
-/// value, so this is the first combined contract that advertises them all.
-pub const NATIVE_CONTRACT_VERSION: u32 = 18;
+/// 18 was claimed independently by the upstream `provider` field and the
+/// per-request usage surface. The merged addon exposes both shapes, so it is
+/// 19 rather than identifying itself as either incompatible contract 18.
+pub const NATIVE_CONTRACT_VERSION: u32 = 19;
 const DEFAULT_LIMIT: i64 = 50;
 const DEFAULT_EVENT_LIMIT: i64 = 200;
 
@@ -557,6 +563,262 @@ pub struct SessionFileEditsPage {
     pub next_cursor: Option<EvidenceCursor>,
 }
 
+/// Normalized usage for one request or one session.
+///
+/// The optional fields stay optional across the boundary: `null` means the
+/// provider did not report that counter, which is a different fact from a
+/// reported zero and the only thing that makes `coverage` interpretable.
+#[napi(object)]
+pub struct NativeNormalizedUsage {
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub reasoning_tokens: Option<i64>,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    #[napi(js_name = "cacheWrite5mTokens")]
+    pub cache_write5m_tokens: Option<i64>,
+    #[napi(js_name = "cacheWrite1hTokens")]
+    pub cache_write1h_tokens: Option<i64>,
+    pub provider_total_tokens: Option<i64>,
+    pub reported_cost_usd: Option<f64>,
+    /// `per-request`, `per-message`, `cumulative-delta`, `context-proxy`, or
+    /// `mixed` on a summary spanning more than one.
+    pub accounting: String,
+    pub has_input_tokens: bool,
+    pub has_output_tokens: bool,
+    pub has_reasoning_tokens: bool,
+    pub has_cache_read_tokens: bool,
+    pub has_cache_write_tokens: bool,
+}
+
+/// The largest integer a JavaScript number represents exactly
+/// (`Number.MAX_SAFE_INTEGER`).
+///
+/// This, not `i64::MAX`, is the real ceiling of the boundary: above it a
+/// `number` silently stops being the value it was given, so a count that does
+/// not fit cannot be handed over at all.
+pub(crate) const MAX_JS_SAFE_COUNT: u64 = 9_007_199_254_740_991;
+
+/// Stable code for a count that JavaScript cannot represent exactly.
+const COUNT_NOT_REPRESENTABLE: &str = "USAGE_COUNT_NOT_REPRESENTABLE";
+const COUNT_NOT_REPRESENTABLE_DIAGNOSTIC: &str = "count-not-representable";
+
+/// A token count as a JavaScript-safe integer, or `None` when it is not one.
+///
+/// Core accepts every counter up to `u64::MAX`; this boundary accepts only
+/// what survives the crossing. Saturating to `i64::MAX` would hand JavaScript
+/// a plausible number that is neither the stored value nor representable —
+/// the exact shape of failure this crate refuses everywhere else.
+pub(crate) fn js_count(value: u64) -> Option<i64> {
+    (value <= MAX_JS_SAFE_COUNT).then_some(value as i64)
+}
+
+/// `None` stays `None`; a reported count that is not representable makes the
+/// whole record unrepresentable rather than quietly dropping one field.
+fn js_count_optional(value: Option<u64>) -> Option<Option<i64>> {
+    match value {
+        None => Some(None),
+        Some(value) => js_count(value).map(Some),
+    }
+}
+
+impl NativeNormalizedUsage {
+    /// Convert a normalized record, or `None` when any count it carries
+    /// cannot cross the boundary intact.
+    pub(crate) fn from_core(usage: &CoreNormalizedUsage, accounting: String) -> Option<Self> {
+        Some(Self {
+            input_tokens: js_count(usage.input_tokens)?,
+            output_tokens: js_count(usage.output_tokens)?,
+            reasoning_tokens: js_count_optional(usage.reasoning_tokens)?,
+            cache_read_tokens: js_count(usage.cache_read_tokens)?,
+            cache_write_tokens: js_count(usage.cache_write_tokens)?,
+            cache_write5m_tokens: js_count_optional(usage.cache_write_5m_tokens)?,
+            cache_write1h_tokens: js_count_optional(usage.cache_write_1h_tokens)?,
+            provider_total_tokens: js_count_optional(usage.provider_total_tokens)?,
+            reported_cost_usd: usage.reported_cost_usd,
+            accounting,
+            has_input_tokens: usage.coverage.has_input_tokens,
+            has_output_tokens: usage.coverage.has_output_tokens,
+            has_reasoning_tokens: usage.coverage.has_reasoning_tokens,
+            has_cache_read_tokens: usage.coverage.has_cache_read_tokens,
+            has_cache_write_tokens: usage.coverage.has_cache_write_tokens,
+        })
+    }
+}
+
+#[napi(object)]
+pub struct NativeSessionRequest {
+    pub id: i64,
+    pub source: String,
+    pub session_id: String,
+    pub request_key: String,
+    /// `request-id`, `provider-message-id`, `request-span` or `record-id`.
+    pub request_key_source: String,
+    pub message_ids: Vec<String>,
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub first_ts_ms: i64,
+    pub last_ts_ms: i64,
+    /// Absent when the request carried no usage evidence, or when the
+    /// evidence could not be trusted — `diagnostics` says which.
+    pub usage: Option<NativeNormalizedUsage>,
+    pub usage_error: Option<String>,
+    pub tool_use_ids: Vec<String>,
+    pub has_thinking: bool,
+    pub event_count: i64,
+    pub diagnostics: Vec<String>,
+}
+
+impl From<CoreSessionRequest> for NativeSessionRequest {
+    fn from(request: CoreSessionRequest) -> Self {
+        let mut diagnostics: Vec<String> = request
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.as_str().to_string())
+            .collect();
+        let mut usage_error = request.usage_error;
+        let usage = request.usage.as_ref().and_then(|usage| {
+            let accounting = usage.accounting.as_str().to_string();
+            let converted = NativeNormalizedUsage::from_core(usage, accounting);
+            if converted.is_none() {
+                // The row normalized; it just cannot be expressed here. Say
+                // so rather than serve a rounded number.
+                usage_error = Some(COUNT_NOT_REPRESENTABLE.to_string());
+                diagnostics.push(COUNT_NOT_REPRESENTABLE_DIAGNOSTIC.to_string());
+            }
+            converted
+        });
+        Self {
+            id: request.id,
+            source: request.source,
+            session_id: request.session_id,
+            request_key: request.request_key,
+            request_key_source: request.request_key_source.as_str().to_string(),
+            message_ids: request.message_ids,
+            model: request.model,
+            provider: request.provider,
+            first_ts_ms: request.first_ts_ms,
+            last_ts_ms: request.last_ts_ms,
+            usage,
+            usage_error,
+            tool_use_ids: request.tool_use_ids,
+            has_thinking: request.has_thinking,
+            event_count: request.event_count,
+            diagnostics,
+        }
+    }
+}
+
+#[napi(object)]
+pub struct RequestCursor {
+    pub ts_ms: i64,
+    pub id: i64,
+}
+
+#[napi(object)]
+pub struct RequestPageOptions {
+    pub db_path: Option<String>,
+    pub limit: Option<i64>,
+    pub after: Option<RequestCursor>,
+}
+
+#[napi(object)]
+pub struct SessionRequestsPage {
+    pub contract_version: u32,
+    pub source: String,
+    pub session_id: String,
+    pub requests: Vec<NativeSessionRequest>,
+    pub next_cursor: Option<RequestCursor>,
+}
+
+#[napi(object)]
+pub struct SessionUsageOptions {
+    pub db_path: Option<String>,
+}
+
+/// One session's usage rollup. `usage` is absent when the session has no
+/// usage evidence at all — not zeroed, because zero is a claim.
+#[napi(object)]
+pub struct SessionUsage {
+    pub contract_version: u32,
+    pub source: String,
+    pub session_id: String,
+    pub usage: Option<NativeNormalizedUsage>,
+    /// Requests that contributed to `usage`.
+    pub request_count: i64,
+    /// Requests seen, including ones with no usage.
+    pub total_request_count: i64,
+    /// Every accounting mode present. More than one means the totals mix
+    /// units and should be read per mode.
+    pub accounting: Vec<String>,
+    pub models: Vec<String>,
+    pub first_ts_ms: Option<i64>,
+    pub last_ts_ms: Option<i64>,
+    pub diagnostics: Vec<String>,
+    /// The totals exceeded what can be represented and must not be used.
+    pub overflowed: bool,
+}
+
+fn session_usage(
+    source: String,
+    session_id: String,
+    summary: Option<CoreSessionUsageSummary>,
+) -> SessionUsage {
+    let Some(summary) = summary else {
+        return SessionUsage {
+            contract_version: SESSION_USAGE_CONTRACT_VERSION,
+            source,
+            session_id,
+            usage: None,
+            request_count: 0,
+            total_request_count: 0,
+            accounting: Vec::new(),
+            models: Vec::new(),
+            first_ts_ms: None,
+            last_ts_ms: None,
+            diagnostics: Vec::new(),
+            overflowed: false,
+        };
+    };
+    let mut diagnostics: Vec<String> = summary
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.as_str().to_string())
+        .collect();
+    // A summary's mode list can be plural; the single-mode field carries a
+    // real mode only when there is exactly one, so a session that mixes units
+    // cannot be read as if it had one.
+    let accounting = match summary.accounting.as_slice() {
+        [mode] => mode.as_str().to_string(),
+        _ => "mixed".to_string(),
+    };
+    let usage = summary.usage.as_ref().and_then(|usage| {
+        let converted = NativeNormalizedUsage::from_core(usage, accounting);
+        if converted.is_none() {
+            diagnostics.push(COUNT_NOT_REPRESENTABLE_DIAGNOSTIC.to_string());
+        }
+        converted
+    });
+    SessionUsage {
+        contract_version: SESSION_USAGE_CONTRACT_VERSION,
+        source,
+        session_id,
+        usage,
+        request_count: js_count(summary.request_count).unwrap_or(i64::MAX),
+        total_request_count: js_count(summary.total_request_count).unwrap_or(i64::MAX),
+        accounting: summary
+            .accounting
+            .iter()
+            .map(|mode| mode.as_str().to_string())
+            .collect(),
+        models: summary.models,
+        first_ts_ms: Some(summary.first_ts_ms),
+        last_ts_ms: Some(summary.last_ts_ms),
+        diagnostics,
+        overflowed: summary.overflowed,
+    }
+}
+
 #[napi(object)]
 pub struct SourceCount {
     pub source: String,
@@ -900,6 +1162,75 @@ pub async fn get_session_file_edits_page(
             .collect(),
         next_cursor: page.next_cursor.map(evidence_cursor),
     })
+}
+
+/// One bounded page of a session's model requests, oldest first.
+///
+/// Both halves of the identity are required for the same reason the evidence
+/// pages require them: provider session ids collide across providers.
+#[napi]
+pub async fn get_session_requests_page(
+    source: String,
+    session_id: String,
+    options: Option<RequestPageOptions>,
+) -> napi::Result<SessionRequestsPage> {
+    let options = options.unwrap_or(RequestPageOptions {
+        db_path: None,
+        limit: None,
+        after: None,
+    });
+    let source = validate_identity(source, "source")?;
+    let session_id = validate_identity(session_id, "sessionId")?;
+    let limit = validate_limit(options.limit, DEFAULT_EVENT_LIMIT, 1_000)?;
+    let path = db_path(options.db_path);
+    let after = options.after.map(|cursor| CoreRequestCursor {
+        ts_ms: cursor.ts_ms,
+        id: cursor.id,
+    });
+    let (page_source, page_session_id) = (source.clone(), session_id.clone());
+    read_database_with_schema(
+        path,
+        ai_hist::SessionRequestPage {
+            requests: Vec::new(),
+            next_cursor: None,
+        },
+        schema_is_usage_read_current,
+        move |conn| core_session_requests_page(conn, &source, &session_id, limit, after.as_ref()),
+    )
+    .await
+    .map(|page| SessionRequestsPage {
+        contract_version: SESSION_USAGE_CONTRACT_VERSION,
+        source: page_source,
+        session_id: page_session_id,
+        requests: page
+            .requests
+            .into_iter()
+            .map(NativeSessionRequest::from)
+            .collect(),
+        next_cursor: page.next_cursor.map(|cursor| RequestCursor {
+            ts_ms: cursor.ts_ms,
+            id: cursor.id,
+        }),
+    })
+}
+
+/// Provider-neutral usage rollup for one session.
+#[napi]
+pub async fn get_session_usage(
+    source: String,
+    session_id: String,
+    options: Option<SessionUsageOptions>,
+) -> napi::Result<SessionUsage> {
+    let options = options.unwrap_or(SessionUsageOptions { db_path: None });
+    let source = validate_identity(source, "source")?;
+    let session_id = validate_identity(session_id, "sessionId")?;
+    let path = db_path(options.db_path);
+    let (summary_source, summary_session_id) = (source.clone(), session_id.clone());
+    read_database_with_schema(path, None, schema_is_usage_read_current, move |conn| {
+        core_session_usage_summary(conn, &source, &session_id)
+    })
+    .await
+    .map(|summary| session_usage(summary_source, summary_session_id, summary))
 }
 
 /// Database statistics over already-indexed data.
@@ -1873,4 +2204,33 @@ pub async fn link_git_commit(options_json: String) -> napi::Result<String> {
     .await
     .map_err(worker_error)?
     .map_err(|error: anyhow::Error| native_error("GIT_LINK_FAILED", format!("{error:#}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{js_count, MAX_JS_SAFE_COUNT};
+
+    /// The boundary is `Number.MAX_SAFE_INTEGER`, not `i64::MAX`: beyond it a
+    /// JavaScript number is no longer the value it was handed.
+    #[test]
+    fn a_count_javascript_cannot_represent_is_refused_not_rounded() {
+        assert_eq!(js_count(0), Some(0));
+        assert_eq!(js_count(43), Some(43));
+        assert_eq!(
+            js_count(MAX_JS_SAFE_COUNT),
+            Some(9_007_199_254_740_991_i64),
+            "the largest exactly representable integer still crosses"
+        );
+        assert_eq!(js_count(MAX_JS_SAFE_COUNT + 1), None);
+        assert_eq!(js_count(u64::MAX), None);
+    }
+
+    /// The regression this replaced: `i64::try_from(u64::MAX)` saturating to
+    /// `i64::MAX` handed JavaScript a number that is neither the stored value
+    /// nor representable.
+    #[test]
+    fn the_old_i64_ceiling_is_not_the_boundary() {
+        assert!(i64::try_from(u64::MAX).is_err());
+        assert_eq!(js_count(i64::MAX as u64), None);
+    }
 }

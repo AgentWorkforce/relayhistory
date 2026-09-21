@@ -1,0 +1,115 @@
+{
+  "corpus_files": [
+    "claude/multi-record-bad-copy.jsonl"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "claude/multi-record-bad-copy",
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "which copy is real",
+      "session_id": "22222222-2222-2222-2222-222222222222",
+      "source": "claude",
+      "timestamp_ms": 1776643200000
+    }
+  ],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "22222222-2222-2222-2222-222222222222",
+      "source": "claude",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "ClaudeTranscript",
+  "notes": [],
+  "origin": "relayhistory",
+  "quirk": "one request has a readable usage copy and an unreadable sibling, so its measurement is disputed",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-user-1:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-user-1",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "22222222-2222-2222-2222-222222222222",
+      "source": "claude",
+      "text": "which copy is real",
+      "token_json": null,
+      "ts_ms": 1776643200000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-1a:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-asst-1a",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-user-1",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "22222222-2222-2222-2222-222222222222",
+      "source": "claude",
+      "text": "Working on it.",
+      "token_json": "{\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":7,\"output_tokens\":40}",
+      "ts_ms": 1776643201000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-1b:0",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "u-asst-1b",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-asst-1a",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "22222222-2222-2222-2222-222222222222",
+      "source": "claude",
+      "text": "Bash true",
+      "token_json": "{\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":7,\"output_tokens\":-40}",
+      "ts_ms": 1776643201000
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": "2.1.96",
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776643200000,
+      "first_prompt": "which copy is real",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776643201000,
+      "last_assistant_text": "Working on it.",
+      "models_json": "[\"claude-sonnet-4-6\"]",
+      "originator": null,
+      "raw_path": "<home>/.claude/projects/corpus/multi-record-bad-copy.jsonl",
+      "repo_url": null,
+      "session_id": "22222222-2222-2222-2222-222222222222",
+      "source": "claude",
+      "source_stamp": "<n>:1503",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "claude",
+  "tool_calls": [
+    {
+      "args_json": "{\"command\":\"true\"}",
+      "is_error": null,
+      "message_id": "u-asst-1b",
+      "name": "Bash",
+      "session_id": "22222222-2222-2222-2222-222222222222",
+      "source": "claude",
+      "target": "true",
+      "tool_use_id": "toolu_badcopy_1",
+      "ts_ms": 1776643201000
+    }
+  ]
+}

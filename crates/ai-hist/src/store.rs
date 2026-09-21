@@ -209,12 +209,14 @@ CREATE TABLE IF NOT EXISTS session_events (
     subagent_session_id TEXT,
     agent_id TEXT,
     request_id TEXT,
+    provider_message_id TEXT,
     -- Why the turn ended, as the harness itself reported it.
     stop_reason TEXT,
     agent_version TEXT,
     is_sidechain INTEGER,
     is_meta INTEGER,
     turn_id TEXT,
+    request_span TEXT,
     raw_facts_version INTEGER,
     UNIQUE(source, session_id, event_uid)
 );
@@ -591,11 +593,21 @@ const REQUIRED_SESSION_EVENT_COLUMNS: &[(&str, &str)] = &[
     ("project_key_method", "TEXT"),
     ("provider", "TEXT"),
     ("request_id", "TEXT"),
+    ("provider_message_id", "TEXT"),
     ("stop_reason", "TEXT"),
     ("agent_version", "TEXT"),
     ("is_sidechain", "INTEGER"),
     ("is_meta", "INTEGER"),
     ("turn_id", "TEXT"),
+    // Which API request a row belongs to, for a provider that delimits its
+    // requests without naming them. Codex reports cumulative `token_count`
+    // snapshots; one snapshot ends one request, and every assistant row since
+    // the previous snapshot belongs to it. The parser numbers those spans per
+    // session, because the boundary is knowable only while reading the
+    // rollout in order -- a reader cannot recover it from the stored rows
+    // without scanning the session. Null for providers that name their
+    // requests, which group on `request_id` instead.
+    ("request_span", "TEXT"),
     // Not a provider fact: the generation of raw-fact parsing the local parser
     // wrote the row with. It is the only field stamped on every event the
     // parser writes, whatever the provider recorded, which is what lets a
@@ -777,6 +789,13 @@ pub fn schema_is_evidence_read_current(conn: &Connection) -> Result<bool> {
     schema_has_required_indexes(conn, REQUIRED_EVIDENCE_READ_INDEXES)
 }
 
+/// Whether per-request usage reads can be served: the `session_requests` view
+/// has to exist, and the grouped scan behind it rides the same session-scoped
+/// event indexes as the event page.
+pub fn schema_is_usage_read_current(conn: &Connection) -> Result<bool> {
+    schema_has_required_indexes(conn, REQUIRED_EVENT_READ_INDEXES)
+}
+
 fn schema_has_required_indexes(conn: &Connection, required_indexes: &[&str]) -> Result<bool> {
     let mut table = conn.prepare("SELECT 1 FROM sqlite_master WHERE name = ? LIMIT 1")?;
     for name in REQUIRED_TABLES
@@ -791,6 +810,12 @@ fn schema_has_required_indexes(conn: &Connection, required_indexes: &[&str]) -> 
         if !table.exists([name])? {
             return Ok(false);
         }
+    }
+    // A view is a query shape, not a row set: it can be present and still be
+    // derived from a column set the table no longer has, which is why this
+    // asks whether it is *current* rather than whether it exists.
+    if !crate::session_usage::session_requests_view_is_current(conn)? {
+        return Ok(false);
     }
     let mut migration = conn.prepare("SELECT 1 FROM schema_migrations WHERE name = ? LIMIT 1")?;
     for name in REQUIRED_SCHEMA_MIGRATIONS
@@ -1375,6 +1400,10 @@ VALUES ('session_presences_local_backfill_v1');
         "CREATE INDEX IF NOT EXISTS idx_session_commit_links_repo ON session_commit_links(repo, branch)",
         [],
     )?;
+    // Derived from `session_events`, so it must come after the DDL and the
+    // column migrations above, and needs no backfill: the first query over an
+    // upgraded database already sees every request its events describe.
+    crate::session_usage::ensure_session_requests_view(conn)?;
     crate::observations::init_schema(conn)?;
     init_delivery_schema(conn)?;
     Ok(())
@@ -2087,12 +2116,25 @@ pub struct SessionEvent {
     pub agent_id: Option<String>,
     /// Verbatim provider envelope facts; see [`REQUIRED_SESSION_EVENT_COLUMNS`].
     pub request_id: Option<String>,
+    /// The provider's own message id — Claude's `message.id` — verbatim.
+    /// Together with `request_id`, this preserves a stable request identity
+    /// when one Claude response spans multiple JSONL records.
+    pub provider_message_id: Option<String>,
     /// Why the turn ended, as the harness reported it.
     pub stop_reason: Option<String>,
     pub agent_version: Option<String>,
     pub is_sidechain: Option<i64>,
     pub is_meta: Option<i64>,
     pub turn_id: Option<String>,
+    /// Which API request this row belongs to, when the provider delimits its
+    /// requests without naming them — see `request_span` in
+    /// `REQUIRED_SESSION_EVENT_COLUMNS`.
+    ///
+    /// On the struct, not only in the table, so a connector supplying
+    /// normalized events preserves the grouping: without it a remotely
+    /// hydrated Codex session arrives with null spans and reads as one request
+    /// per row, which is the defect this column exists to prevent.
+    pub request_span: Option<String>,
 }
 
 /// Stable continuation for normalized session events.
@@ -2185,8 +2227,8 @@ const SESSION_EVENT_COLUMNS: &str =
     "id, source, session_id, project, project_key, cwd, git_branch, message_id, parent_id, \
      ts_ms, role, kind, text, model, token_json, provider, event_uid, tool_use_id, payload_bytes, \
      payload_truncated, payload_hash, call_index, event_index, result_status, event_source, \
-     error_signal, subagent_session_id, agent_id, request_id, stop_reason, \
-     agent_version, is_sidechain, is_meta, turn_id";
+     error_signal, subagent_session_id, agent_id, request_id, provider_message_id, \
+     stop_reason, agent_version, is_sidechain, is_meta, turn_id, request_span";
 
 fn row_to_session_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionEvent> {
     Ok(SessionEvent {
@@ -2219,11 +2261,13 @@ fn row_to_session_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionEven
         subagent_session_id: row.get(26)?,
         agent_id: row.get(27)?,
         request_id: row.get(28)?,
-        stop_reason: row.get(29)?,
-        agent_version: row.get(30)?,
-        is_sidechain: row.get(31)?,
-        is_meta: row.get(32)?,
-        turn_id: row.get(33)?,
+        provider_message_id: row.get(29)?,
+        stop_reason: row.get(30)?,
+        agent_version: row.get(31)?,
+        is_sidechain: row.get(32)?,
+        is_meta: row.get(33)?,
+        turn_id: row.get(34)?,
+        request_span: row.get(35)?,
     })
 }
 
@@ -6406,6 +6450,12 @@ mod tests {
     /// never referenced them either; SQLite refuses to drop a column a trigger
     /// still names.
     fn drop_session_event_capture_triggers(conn: &Connection) {
+        // A pre-usage database also predates the derived request view. Current
+        // SQLite correctly refuses to drop one of its source columns while
+        // that view still references it, so remove the view while recreating
+        // the legacy shape this helper models.
+        conn.execute_batch("DROP VIEW IF EXISTS session_requests;")
+            .unwrap();
         let names = conn
             .prepare(
                 "SELECT name FROM sqlite_master \

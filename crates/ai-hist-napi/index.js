@@ -310,7 +310,7 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { historyDelivery, historyDeliveryDrain, getSourceObservation, applySourceObservations, applySourceEvidence, nativeContractVersion, nativeBuildProfile, search, recent, getSession, getSessionEventsPage, getSessionToolCallsPage, getSessionUserTurnsPage, getSessionFileEditsPage, stats, listSessionCatalogPage, listSessionCatalog, discoverSessions, hydrateSession, getSessionRelationships, getSessionTree, getSessionChildrenPage, sync, syncLocal, installGitHooks, linkGitCommit } = nativeBinding
+const { historyDelivery, historyDeliveryDrain, getSourceObservation, applySourceObservations, applySourceEvidence, nativeContractVersion, nativeBuildProfile, search, recent, getSession, getSessionEventsPage, getSessionToolCallsPage, getSessionUserTurnsPage, getSessionFileEditsPage, getSessionRequestsPage, getSessionUsage, stats, listSessionCatalogPage, listSessionCatalog, discoverSessions, hydrateSession, getSessionRelationships, getSessionTree, getSessionChildrenPage, sync, syncLocal, installGitHooks, linkGitCommit } = nativeBinding
 
 module.exports.historyDelivery = historyDelivery
 module.exports.historyDeliveryDrain = historyDeliveryDrain
@@ -326,6 +326,8 @@ module.exports.getSessionEventsPage = getSessionEventsPage
 module.exports.getSessionToolCallsPage = getSessionToolCallsPage
 module.exports.getSessionUserTurnsPage = getSessionUserTurnsPage
 module.exports.getSessionFileEditsPage = getSessionFileEditsPage
+module.exports.getSessionRequestsPage = getSessionRequestsPage
+module.exports.getSessionUsage = getSessionUsage
 module.exports.stats = stats
 module.exports.listSessionCatalogPage = listSessionCatalogPage
 module.exports.listSessionCatalog = listSessionCatalog

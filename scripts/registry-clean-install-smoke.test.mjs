@@ -2,9 +2,25 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  coreSmokeManifest,
   REGISTRY_RELEASE_PACKAGES,
   waitForRegistryPackages,
 } from './registry-clean-install-smoke.mjs';
+import { hostInstallArgs } from './npm-host-install.mjs';
+
+test('core smoke project depends on ai-hist and ai-hist-mcp at the release version', () => {
+  assert.deepEqual(coreSmokeManifest('0.21.1').dependencies, {
+    'ai-hist': '0.21.1',
+    'ai-hist-mcp': '0.21.1',
+  });
+});
+
+test('core smoke install tells npm the helper libc family', () => {
+  assert.deepEqual(
+    hostInstallArgs('/tmp/smoke', 'glibc'),
+    ['--prefix', '/tmp/smoke', '--libc=glibc'],
+  );
+});
 
 test('release package list covers the public npm family', () => {
   assert.ok(REGISTRY_RELEASE_PACKAGES.includes('ai-hist'));

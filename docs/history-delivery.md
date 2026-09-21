@@ -3,7 +3,7 @@
 History can stay local, be exported as NDJSON, or be delivered to an explicitly
 enabled destination. Export and delivery share versioned Rust evidence records.
 Delivery adds a durable queue, immutable mapped payloads, acknowledgments, retry
-times, and fenced worker leases. Native contract 15 is required.
+times, and fenced worker leases. Native contract 16 is required.
 
 ## Export a snapshot
 

@@ -1465,17 +1465,19 @@ Each connector presence stores a `source_stamp` —
 | claude, codex, cursor | `{mtime nanoseconds}:{file length}` |
 | grok | the chat file's marker, `\|`, the `summary.json` marker, `\|`, the `updates.jsonl` marker, `\|x:`, a digest over `signals.json`, `prompt_context.json` and the sorted entries of `compaction_checkpoints/` and `subagents/` |
 | opencode (SQLite) | `{database identity}:{schema version}:{time_created}:{time_updated}` |
-| opencode (JSON tree) | `{total bytes}:{file count}:{newest mtime nanoseconds}` over the session file, its messages and their parts |
+| opencode (JSON tree) | `{total bytes}:{file count}:{newest mtime nanoseconds}:{digest}` over the session file, its messages and their parts |
 | relay | `{newest synced timestamp}:{synced row count}` |
 
 The OpenCode JSON-tree marker is an aggregate for a reason: the provider
 appends a turn by writing *new* files under `message/` and `part/` and does
 not touch the session JSON, so a marker over that file alone reports an active
-session as unchanged forever. All three components earn their place —
+session as unchanged forever. All four components earn their place —
 modification time because a birth time cannot see an in-place rewrite, the
 file count because a coarse filesystem clock can give an appended turn the
 same mtime as the read before it, and the byte total because an in-place edit
-can preserve the count. Discovery and hydration compute it with the same
+can preserve the count. The digest folds each file's name, length and mtime
+together with the contents of recently modified files, catching same-length
+rewrites that land in the same filesystem clock tick. Discovery and hydration compute it with the same
 function, so the catalog and the checkpoint cannot disagree about whether a
 session has moved.
 

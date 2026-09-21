@@ -296,13 +296,18 @@ fn opencode_reaches_event_level_parity_across_both_storage_layouts() {
     an_unindexed_store_is_not_read_once_per_session();
     a_sqlite_store_inside_the_storage_dir_still_hydrates();
     an_upgraded_database_delivers_the_new_event_columns();
-    an_unreadable_part_does_not_checkpoint_a_session_without_it();
-    an_unreadable_part_does_not_catalog_a_session_without_it();
+    #[cfg(unix)]
+    {
+        an_unreadable_part_does_not_checkpoint_a_session_without_it();
+        an_unreadable_part_does_not_catalog_a_session_without_it();
+    }
     a_same_length_rewrite_in_one_tick_re_hydrates();
+    #[cfg(unix)]
     one_unreadable_session_does_not_take_the_tree_down_with_it();
     a_removed_tool_output_stops_being_served();
     a_directory_named_by_opencode_db_is_read_as_the_legacy_tree();
     a_limit_is_not_spent_on_a_file_that_is_not_a_session();
+    #[cfg(unix)]
     a_scope_that_cannot_be_walked_is_reported_not_omitted();
     a_failed_session_query_does_not_checkpoint_an_empty_session();
     one_unreadable_session_does_not_end_the_sqlite_sweep();

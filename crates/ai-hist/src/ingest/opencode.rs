@@ -23,7 +23,7 @@
 
 use super::{
     insert_session_event_with_provenance, insert_tool_call, upsert_file_edit_from_call,
-    upsert_session, RawMessageFacts, OPENCODE_MARKER_COMPACTION_BOUNDARY,
+    upsert_session, RawMessageFacts, RequestIdentity, OPENCODE_MARKER_COMPACTION_BOUNDARY,
 };
 use crate::relationship_capture::{
     record_relationship_replacing_child_model, ObservedRelationship,
@@ -1342,6 +1342,7 @@ fn normalize_session(
                     None,
                     None,
                     None,
+                    RequestIdentity::none(),
                     &event_uid,
                     None,
                     RawMessageFacts::default(),
@@ -1403,6 +1404,7 @@ fn normalize_session(
                     token_json.as_deref(),
                     message.provider_id.as_deref(),
                     stop_reason.as_deref(),
+                    RequestIdentity::none(),
                     &event_uid,
                     None,
                     RawMessageFacts::default(),
@@ -1455,6 +1457,7 @@ fn normalize_session(
                 token_json.as_deref(),
                 message.provider_id.as_deref(),
                 stop_reason.as_deref(),
+                RequestIdentity::none(),
                 &format!("tool_use:{}", tool.call_id),
                 None,
                 RawMessageFacts::default(),
@@ -1516,6 +1519,7 @@ fn normalize_session(
                         token_json.as_deref(),
                         message.provider_id.as_deref(),
                         stop_reason.as_deref(),
+                        RequestIdentity::none(),
                         &format!("tool_result:{}", tool.call_id),
                         None,
                         RawMessageFacts::default(),
