@@ -155,8 +155,13 @@ Notable changes to the native `ai-hist` CLI are documented here.
   answer to a slash command is charged to the human prompt before it rather
   than to the command's output row. `session_user_turns_page` leaves control
   rows out too, so a Codex context wrapper is not a turn and a split reminder
-  is not one of its prompt's blocks; the relayhistory plugin skips them when
-  publishing conversation turns. For Claude the full-transcript metadata fold
+  is not one of its prompt's blocks; the relayhistory plugin does not publish
+  them as conversation turns, and pads a session's published tail with one
+  empty `system` turn per control row so a session an earlier release
+  published with its control rows as user turns is rewritten index for index
+  on the server, which upserts by `turnIndex` and never trims. Source-evidence
+  validation refuses a `control_kind` outside the vocabulary or on anything
+  but a user text row. For Claude the full-transcript metadata fold
   now settles `sessions.first_prompt` on every sync or hydration, null
   included, so a title an earlier release took from a row that is control now
   (a bare `/resume <id>`, a task notification) is replaced on the one-time

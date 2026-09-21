@@ -99,6 +99,12 @@ harness writes into the user role that is not a human prompt keeps
 | `meta`                     | claude | `isMeta: true` and nothing above applies                                                   |
 | `resume_marker`            | claude | a bare `/resume <id>` or `/continue <id>`                                                  |
 
+A `control_kind` is only ever set on a `role = "user"`, `kind = "text"` row,
+and only to one of the spellings above; the source-evidence validation a
+connector's rows pass through rejects any other spelling and any control kind
+on an assistant, thinking, tool-use or tool-result row, because every reader
+treats a non-null value as authoritative.
+
 `null` is a genuine prompt, or model output. `history`, `sessions.first_prompt`,
 `session_user_turns_page` and `attribute_usage_to_prompts` all derive from the
 same classification (`crates/ai-hist/src/ingest/control.rs`), so a control row

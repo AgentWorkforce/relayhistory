@@ -145,8 +145,7 @@ fn build_turns_batch_in_snapshot(
     // Which sessions have anything new, oldest change first so the backlog drains in a
     // predictable order rather than jumping around. One extra session identifies
     // the first event this batch cannot acknowledge.
-    let mut pending =
-        ai_hist::storage::pending_event_sessions(conn, session_event_id, lookahead)?;
+    let mut pending = ai_hist::storage::pending_event_sessions(conn, session_event_id, lookahead)?;
 
     if pending.is_empty() {
         return Ok(TurnsBatch {
@@ -172,23 +171,26 @@ fn build_turns_batch_in_snapshot(
         let rows = ai_hist::session_events(conn, &session_id, Some(&source))?;
 
         let mut turns: Vec<ConversationTurn> = Vec::new();
+        // Control rows, held back until the conversation's own turns are
+        // numbered. See the padding below.
+        let mut control: Vec<ai_hist::SessionEvent> = Vec::new();
         for event in rows {
             watermark = watermark.max(event.id);
 
-            // A control row -- a Codex context wrapper, a Claude slash-command
-            // record, a system reminder -- is the harness's, not a turn of the
-            // conversation. Skip it the same way, after the watermark has
-            // moved past it, so it neither uploads as a user turn nor shifts
-            // the indices of the turns that follow.
-            if event.control_kind.is_some() {
-                continue;
-            }
             // An event with no text carries nothing a reader can use. Skip it, but only
             // after the watermark has moved past it.
             let content = match event.text.as_deref().map(str::trim) {
                 Some(text) if !text.is_empty() => text.to_string(),
                 _ => continue,
             };
+            // A control row -- a Codex context wrapper, a Claude slash-command
+            // record, a system reminder -- is the harness's, not a turn of the
+            // conversation, so it is not published as one and does not take an
+            // index from the turns that follow.
+            if event.control_kind.is_some() {
+                control.push(event);
+                continue;
+            }
 
             let index = turns.len() as i64;
             turns.push(ConversationTurn {
@@ -208,6 +210,35 @@ fn build_turns_batch_in_snapshot(
                 ts: epoch_ms_to_iso(event.ts_ms),
             });
             let _ = event.session_id;
+        }
+        // `turnIndex` is the server's conflict key and the server only ever
+        // upserts by it: a session published with N turns and republished
+        // with fewer keeps its old tail at the indices nobody rewrote, and
+        // there is no call that trims it. Before control rows were typed
+        // every one of them was published as a user turn, so a session that
+        // carried them was published wider than its conversation is now.
+        // Padding the tail with one empty `system` turn per control row keeps
+        // the published index space at least as wide as any earlier parser's,
+        // so every index that was ever written is written again -- the
+        // control text itself is blanked rather than republished -- and the
+        // conversation's own turns stay dense from zero, which is what a
+        // reader taking the lowest index as the opening prompt depends on.
+        for event in control {
+            let index = turns.len() as i64;
+            turns.push(ConversationTurn {
+                session_owner: event.source.clone(),
+                turn_index: index,
+                role: "system".to_string(),
+                content: String::new(),
+                actor_name: format!("{}:control", event.source),
+                actor_role: "owner".to_string(),
+                metadata: serde_json::json!({
+                    "kind": "control",
+                    "sourceRole": event.role,
+                    "controlKind": event.control_kind,
+                }),
+                ts: epoch_ms_to_iso(event.ts_ms),
+            });
         }
 
         if incognito.contains(&session_id) || turns.is_empty() {
@@ -388,11 +419,12 @@ mod tests {
         assert_eq!(chunks[1][0].turn_index, MAX_TURNS_PER_REQUEST as i64);
     }
 
-
+    /// A user text row typed as control, in the same `claude` source the
+    /// other helper writes so it belongs to the same session.
     fn insert_control(conn: &Connection, session: &str, ts: i64, text: &str, control_kind: &str) {
         conn.execute(
             "INSERT INTO session_events (source, session_id, ts_ms, role, kind, text, event_uid, control_kind)
-             VALUES ('codex', ?1, ?2, 'user', 'text', ?3, ?4, ?5)",
+             VALUES ('claude', ?1, ?2, 'user', 'text', ?3, ?4, ?5)",
             rusqlite::params![session, ts, text, format!("{session}-{ts}-control"), control_kind],
         )
         .unwrap();
@@ -400,11 +432,12 @@ mod tests {
 
     /// A Codex context wrapper, a Claude slash-command record, a system
     /// reminder: user-role rows the harness wrote, typed by `control_kind`.
-    /// None is a turn of the conversation, so none is uploaded and none
-    /// shifts the index of the turns around it -- but each still advances the
-    /// watermark, exactly as an empty row does.
+    /// None is a turn of the conversation, so none is published as content
+    /// and none takes an index from the turns around it; the conversation's
+    /// own turns stay dense from zero. Each still advances the watermark,
+    /// exactly as an empty row does.
     #[test]
-    fn control_rows_are_skipped_but_still_advance_the_watermark() {
+    fn control_rows_are_not_published_as_turns_but_still_advance_the_watermark() {
         let conn = db();
         insert_control(
             &conn,
@@ -425,30 +458,112 @@ mod tests {
 
         let batch = build_turns_batch(&conn, 0, 10, &HashSet::new()).unwrap();
         let turns = &batch.sessions[0].chunks[0];
+        let conversation: Vec<_> = turns
+            .iter()
+            .filter(|turn| turn.metadata["kind"] != "control")
+            .map(|turn| (turn.turn_index, turn.role.as_str(), turn.content.as_str()))
+            .collect();
         assert_eq!(
+            conversation,
+            vec![(0, "user", "fix the importer"), (1, "assistant", "done")],
+        );
+        assert!(
             turns
                 .iter()
-                .map(|turn| (turn.turn_index, turn.role.as_str(), turn.content.as_str()))
-                .collect::<Vec<_>>(),
-            vec![(0, "user", "fix the importer"), (1, "assistant", "done")],
+                .all(|turn| !turn.content.contains("environment_context")
+                    && !turn.content.contains("task-notification")),
+            "control text is never published: {turns:?}"
         );
         assert_eq!(
             batch.session_event_id, 4,
-            "watermark must pass the skipped control row"
+            "watermark must pass the control rows"
         );
+    }
 
-        // A session of nothing but control rows uploads nothing and stalls
-        // nothing.
+    /// The server upserts by `turnIndex` and never deletes. Before control
+    /// rows were typed, a session's slash-command records were published as
+    /// user turns, so an upgraded install's next publish of that session --
+    /// with fewer conversation turns -- would rewrite the head and leave the
+    /// old tail standing, a duplicate of the turns now numbered lower. The
+    /// tail is padded with one empty `system` turn per control row instead:
+    /// every index the earlier publish wrote is written again, the control
+    /// text is blanked, and the conversation stays dense from zero.
+    #[test]
+    fn a_session_published_before_control_rows_were_typed_is_rewritten_index_for_index() {
+        let conn = db();
+        insert(&conn, "s1", 1000, "user", "text", "hi");
+        // What an earlier parser stored as three ordinary user text rows and
+        // published as turns 1, 2 and 3.
+        insert_control(
+            &conn,
+            "s1",
+            2000,
+            "Caveat: The messages below were generated by the user while running local commands.",
+            "slash_command_caveat",
+        );
+        insert_control(
+            &conn,
+            "s1",
+            3000,
+            "<command-name>/review</command-name>",
+            "slash_command_invocation",
+        );
+        insert_control(
+            &conn,
+            "s1",
+            4000,
+            "<local-command-stdout>ok</local-command-stdout>",
+            "slash_command_output",
+        );
+        insert(&conn, "s1", 5000, "assistant", "text", "Reviewed.");
+        let previously_published = 5;
+
+        let batch = build_turns_batch(&conn, 0, 10, &HashSet::new()).unwrap();
+        let turns = &batch.sessions[0].chunks[0];
+        assert_eq!(
+            turns.len(),
+            previously_published,
+            "every index the earlier publish wrote is written again: {turns:?}"
+        );
+        assert_eq!(
+            turns.iter().map(|turn| turn.turn_index).collect::<Vec<_>>(),
+            [0, 1, 2, 3, 4],
+            "indices are dense, so the server's row set is rewritten whole"
+        );
+        assert_eq!(turns[0].content, "hi");
+        assert_eq!(turns[1].content, "Reviewed.");
+        for (offset, kind) in [
+            "slash_command_caveat",
+            "slash_command_invocation",
+            "slash_command_output",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let padding = &turns[2 + offset];
+            assert_eq!(padding.role, "system");
+            assert_eq!(padding.content, "");
+            assert_eq!(padding.metadata["kind"], "control");
+            assert_eq!(padding.metadata["controlKind"], *kind);
+            assert_eq!(padding.metadata["sourceRole"], "user");
+        }
+
+        // A session of nothing but control rows was published as one user
+        // turn before; it is rewritten as one blank rather than left as it
+        // was.
         insert_control(
             &conn,
             "s2",
-            5000,
-            "<environment_context>cwd=/tmp/other</environment_context>",
-            "codex_context_wrapper",
+            6000,
+            "/resume 11111111-1111-1111-1111-111111111111",
+            "resume_marker",
         );
-        let batch = build_turns_batch(&conn, 4, 10, &HashSet::new()).unwrap();
-        assert!(batch.sessions.is_empty());
-        assert_eq!(batch.session_event_id, 5);
+        let batch = build_turns_batch(&conn, 5, 10, &HashSet::new()).unwrap();
+        assert_eq!(batch.sessions.len(), 1);
+        let turns = &batch.sessions[0].chunks[0];
+        assert_eq!(turns.len(), 1);
+        assert_eq!((turns[0].turn_index, turns[0].content.as_str()), (0, ""));
+        assert_eq!(batch.session_event_id, 6);
     }
 
     #[test]

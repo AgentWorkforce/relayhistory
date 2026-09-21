@@ -61,6 +61,31 @@ pub(crate) enum ControlKind {
 }
 
 impl ControlKind {
+    /// Every kind, in declaration order: the closed vocabulary a stored or
+    /// contributed `control_kind` must come from.
+    pub(crate) const ALL: &'static [ControlKind] = &[
+        ControlKind::SlashCommandCaveat,
+        ControlKind::SlashCommandInvocation,
+        ControlKind::SlashCommandOutput,
+        ControlKind::TaskNotification,
+        ControlKind::HookOutput,
+        ControlKind::BashPassthroughInput,
+        ControlKind::BashPassthroughOutput,
+        ControlKind::SystemReminder,
+        ControlKind::CodexContextWrapper,
+        ControlKind::Meta,
+        ControlKind::ResumeMarker,
+    ];
+
+    /// The inverse of [`Self::as_str`]: `None` for any spelling not in the
+    /// vocabulary, which is what source-evidence validation refuses.
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|kind| kind.as_str() == value)
+    }
+
     /// The `session_events.control_kind` spelling.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
@@ -526,22 +551,7 @@ mod tests {
     /// it and as the column documentation names it.
     #[test]
     fn the_stored_spellings_are_the_documented_vocabulary() {
-        let spellings: Vec<&str> = [
-            ControlKind::SlashCommandCaveat,
-            ControlKind::SlashCommandInvocation,
-            ControlKind::SlashCommandOutput,
-            ControlKind::TaskNotification,
-            ControlKind::HookOutput,
-            ControlKind::BashPassthroughInput,
-            ControlKind::BashPassthroughOutput,
-            ControlKind::SystemReminder,
-            ControlKind::CodexContextWrapper,
-            ControlKind::Meta,
-            ControlKind::ResumeMarker,
-        ]
-        .iter()
-        .map(|kind| kind.as_str())
-        .collect();
+        let spellings: Vec<&str> = ControlKind::ALL.iter().map(|kind| kind.as_str()).collect();
         assert_eq!(
             spellings,
             [
@@ -558,6 +568,11 @@ mod tests {
                 "resume_marker",
             ]
         );
+        for kind in ControlKind::ALL {
+            assert_eq!(ControlKind::parse(kind.as_str()), Some(*kind));
+        }
+        assert_eq!(ControlKind::parse("prompt"), None);
+        assert_eq!(ControlKind::parse("Meta"), None);
     }
 
     #[test]
