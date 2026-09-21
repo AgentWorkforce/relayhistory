@@ -1879,18 +1879,22 @@ impl ShallowSessionProvider for OpencodeProvider {
         {
             scan.note_query();
             let model = {
-                // Match `OpencodeSession::first_model`: the earliest assistant
-                // message, not a user message carrying the requested model.
-                // Older stores may lack the optional timestamp column, so the
-                // stable message id is the fallback ordering key.
-                let order_by = match (
-                    snapshot.message_columns.contains("time_created"),
-                    snapshot.message_columns.contains("id"),
-                ) {
-                    (true, true) => "ORDER BY time_created ASC, id ASC",
-                    (true, false) => "ORDER BY time_created ASC",
-                    (false, true) => "ORDER BY id ASC",
-                    (false, false) => "",
+                // Match `parse_message` and `OpencodeSession::first_model`:
+                // payload time wins, the relational column is its fallback,
+                // and a message with neither is not parseable. Checking for a
+                // JSON integer mirrors `Value::as_i64`; a string that merely
+                // looks numeric must not take precedence here.
+                let payload_created = "CASE WHEN json_type(data, '$.time.created') = 'integer' \
+                                       THEN json_extract(data, '$.time.created') END";
+                let created = if snapshot.message_columns.contains("time_created") {
+                    format!("COALESCE({payload_created}, time_created)")
+                } else {
+                    payload_created.to_string()
+                };
+                let order_by = if snapshot.message_columns.contains("id") {
+                    format!("ORDER BY {created} ASC, id ASC")
+                } else {
+                    format!("ORDER BY {created} ASC")
                 };
                 let sql = format!(
                     "SELECT json_extract(data, '$.providerID'), \
@@ -1898,6 +1902,7 @@ impl ShallowSessionProvider for OpencodeProvider {
                                      json_extract(data, '$.model.modelID')) \
                      FROM message WHERE session_id = ? AND json_valid(data) \
                      AND json_extract(data, '$.role') = 'assistant' \
+                     AND {created} IS NOT NULL \
                      AND (NULLIF(json_extract(data, '$.providerID'), '') IS NOT NULL \
                           OR NULLIF(COALESCE(json_extract(data, '$.modelID'), \
                                              json_extract(data, '$.model.modelID')), '') IS NOT NULL) \

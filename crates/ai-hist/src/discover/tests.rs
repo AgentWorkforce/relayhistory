@@ -1538,7 +1538,8 @@ fn opencode_sessions_come_from_the_session_table_with_a_first_prompt() {
         home.path(),
         r#"INSERT INTO session VALUES ('oc-1', '/work/oc', 1750000600000, 1750000700000);
            INSERT INTO message VALUES ('m1', 'oc-1', 1750000600000, '{"role":"user","providerID":"openai","modelID":"gpt-5"}');
-           INSERT INTO message VALUES ('m2', 'oc-1', 1750000601000, '{"role":"assistant","providerID":"anthropic","modelID":"claude-sonnet"}');
+           INSERT INTO message VALUES ('m2', 'oc-1', NULL, '{"role":"assistant","time":{"created":200},"providerID":"anthropic","modelID":"claude-opus"}');
+           INSERT INTO message VALUES ('m3', 'oc-1', 100, '{"role":"assistant","time":{"created":100},"providerID":"anthropic","modelID":"claude-sonnet"}');
            INSERT INTO part VALUES ('p1', 'm1', 'oc-1', 1750000600000, '{"type":"text","text":"port the parser"}');"#,
     );
 
@@ -1635,9 +1636,9 @@ fn empty_and_minimal_opencode_schemas_are_tolerated() {
          CREATE INDEX message_session_id_idx ON message(session_id, id); \
          INSERT INTO session VALUES ('ses_legacy_message'); \
          INSERT INTO message VALUES ('m1', 'ses_legacy_message', \
-             '{\"role\":\"user\",\"providerID\":\"openai\",\"modelID\":\"gpt-5\"}'); \
+             '{\"role\":\"user\",\"time\":{\"created\":1},\"providerID\":\"openai\",\"modelID\":\"gpt-5\"}'); \
          INSERT INTO message VALUES ('m2', 'ses_legacy_message', \
-             '{\"role\":\"assistant\",\"providerID\":\"anthropic\",\"modelID\":\"claude-sonnet\"}');",
+             '{\"role\":\"assistant\",\"time\":{\"created\":2},\"providerID\":\"anthropic\",\"modelID\":\"claude-sonnet\"}');",
     )
     .unwrap();
     drop(db);
@@ -1824,10 +1825,21 @@ fn opencode_selected_session_queries_use_provider_indexes() {
                 COALESCE(json_extract(data, '$.modelID'), json_extract(data, '$.model.modelID'))
          FROM message WHERE session_id = 'selected' AND json_valid(data)
          AND json_extract(data, '$.role') = 'assistant'
+         AND COALESCE(
+               CASE WHEN json_type(data, '$.time.created') = 'integer'
+                    THEN json_extract(data, '$.time.created') END,
+               time_created
+             ) IS NOT NULL
          AND (NULLIF(json_extract(data, '$.providerID'), '') IS NOT NULL
               OR NULLIF(COALESCE(json_extract(data, '$.modelID'),
                                  json_extract(data, '$.model.modelID')), '') IS NOT NULL)
-         ORDER BY time_created ASC, id ASC LIMIT 1",
+         ORDER BY COALESCE(
+                    CASE WHEN json_type(data, '$.time.created') = 'integer'
+                         THEN json_extract(data, '$.time.created') END,
+                    time_created
+                  ) ASC,
+                  id ASC
+         LIMIT 1",
         [],
     );
     assert!(
