@@ -20,7 +20,9 @@ default = []
 # Legacy feature alias; upload APIs now belong to relayhistory-plugin.
 delivery = ["export"]
 export = []
-# Filesystem events remain optional; without them watch falls back to polling.
+# Filesystem-event driver for the live-capture watch loop. Optional so the
+# crate still builds with --no-default-features on a host with no watcher
+# backend; without it `watch` falls back to polling.
 fs-events = ["dep:notify"]
 opencode-backup = ["dep:tempfile", "rusqlite/backup"]
 git-hooks = ["dep:url"]
