@@ -1053,3 +1053,192 @@ fn a_panicking_receiver_is_a_transient_failure_and_releases_the_keepalive() {
     assert_eq!(result.statuses[0].acknowledged_records, 0);
     assert_eq!(result.statuses[0].pending_records, 3);
 }
+
+#[test]
+fn orderly_stops_release_claims_without_failure_or_backoff_and_resume_immediately() {
+    for (during_send, completed_send) in [(false, false), (true, false), (true, true)] {
+        let fixture = fixture();
+        let job = create_job(&fixture.conn, &config("one"), 0).unwrap();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let receiver = Fake {
+            prepare: {
+                let stopped = stopped.clone();
+                Box::new(move |batch| {
+                    if !during_send {
+                        stopped.store(true, SeqCst);
+                    }
+                    Ok(body(batch))
+                })
+            },
+            send: {
+                let stopped = stopped.clone();
+                Box::new(move |_, batch| {
+                    assert!(during_send, "stop before send must prevent transport");
+                    stopped.store(true, SeqCst);
+                    if completed_send {
+                        Ok(ack(batch))
+                    } else {
+                        Err(DeliveryFailure::Transient.into())
+                    }
+                })
+            },
+            ..Fake::default()
+        };
+        for _ in 0..3 {
+            stopped.store(false, SeqCst);
+            let result = drain(
+                &fixture.path(),
+                &one(&receiver),
+                &options(),
+                &system_clock,
+                &|| stopped.load(SeqCst),
+            )
+            .unwrap();
+            assert!(stopped.load(SeqCst));
+            assert!(result.issues.is_empty());
+            let status = &result.statuses[0];
+            assert_eq!(status.failure, None);
+            assert_eq!(status.next_attempt_ms, 0);
+            assert_eq!(status.acknowledged_records, 0);
+            assert_eq!(status.pending_records, 3);
+            let attempts: i64 = fixture
+                .conn
+                .query_row(
+                    "SELECT attempts FROM delivery_jobs WHERE id=?",
+                    [&job.job_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(attempts, 0, "stops must not accumulate exponential retries");
+        }
+        let receiver = Fake {
+            prepare: Box::new(move |batch| {
+                assert!(
+                    !during_send,
+                    "reuse the already persisted body after interrupted transport"
+                );
+                Ok(body(batch))
+            }),
+            ..Fake::default()
+        };
+        let resumed = run(&fixture.path(), &one(&receiver), &options());
+        assert!(resumed.issues.is_empty());
+        assert_eq!(resumed.statuses[0].acknowledged_records, 3);
+    }
+}
+
+#[test]
+fn host_stop_does_not_overwrite_a_new_workers_claim() {
+    let fixture = fixture();
+    let job = create_job(&fixture.conn, &config("one"), 0).unwrap();
+    let stopped = Arc::new(AtomicBool::new(false));
+    let replacement = Arc::new(Mutex::new(None));
+    let receiver = Fake {
+        prepare: {
+            let (path, job_id) = (fixture.path(), job.job_id.clone());
+            let (stopped, replacement) = (stopped.clone(), replacement.clone());
+            Box::new(move |batch| {
+                let conn = open_db(&path).unwrap();
+                conn.execute(
+                    "UPDATE delivery_jobs SET lease_until_ms=0 WHERE id=?",
+                    [&job_id],
+                )
+                .unwrap();
+                *replacement.lock().unwrap() = Some(
+                    claim_batch(&conn, &job_id, "replacement", 60_000, &system_clock)
+                        .unwrap()
+                        .unwrap(),
+                );
+                stopped.store(true, SeqCst);
+                Ok(body(batch))
+            })
+        },
+        send: Box::new(|_, _| panic!("fenced worker must not send")),
+        ..Fake::default()
+    };
+    let result = drain(
+        &fixture.path(),
+        &one(&receiver),
+        &options(),
+        &system_clock,
+        &|| stopped.load(SeqCst),
+    )
+    .unwrap();
+    assert_eq!(result.issues[0].code, DrainIssueCode::DeliveryStateFailed);
+    let replacement = replacement.lock().unwrap();
+    let claim = replacement.as_ref().unwrap();
+    // Still owns the live lease: stale cancellation must not change its fence,
+    // state, retry count or prepared body.
+    renew_lease(&fixture.conn, &claim.lease, 60_000, &system_clock).unwrap();
+    let attempts: i64 = fixture
+        .conn
+        .query_row(
+            "SELECT attempts FROM delivery_jobs WHERE id=?",
+            [&job.job_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(attempts, 2);
+    assert_eq!(result.statuses[0].failure, None);
+}
+
+#[test]
+fn host_stop_preserves_explicit_receiver_retry_after() {
+    let fixture = fixture();
+    create_job(&fixture.conn, &config("one"), 0).unwrap();
+    let stopped = Arc::new(AtomicBool::new(false));
+    let retry_at = system_clock() + 60_000;
+    let receiver = Fake {
+        send: {
+            let stopped = stopped.clone();
+            Box::new(move |_, _| {
+                stopped.store(true, SeqCst);
+                Err(ReceiverFailure {
+                    failure: DeliveryFailure::RateLimited,
+                    retry_after_ms: Some(retry_at),
+                })
+            })
+        },
+        ..Fake::default()
+    };
+    let result = drain(
+        &fixture.path(),
+        &one(&receiver),
+        &options(),
+        &system_clock,
+        &|| stopped.load(SeqCst),
+    )
+    .unwrap();
+    assert_eq!(result.statuses[0].failure.as_deref(), Some("rate_limited"));
+    assert!(result.statuses[0].next_attempt_ms >= retry_at);
+}
+
+#[test]
+fn a_stop_after_the_outcome_decision_does_not_turn_success_into_failure() {
+    let fixture = fixture();
+    create_job(&fixture.conn, &config("one"), 0).unwrap();
+    let sent = Arc::new(AtomicBool::new(false));
+    let polls_after_send = AtomicUsize::new(0);
+    let receiver = Fake {
+        send: {
+            let sent = sent.clone();
+            Box::new(move |_, batch| {
+                sent.store(true, SeqCst);
+                Ok(ack(batch))
+            })
+        },
+        ..Fake::default()
+    };
+    let result = drain(
+        &fixture.path(),
+        &one(&receiver),
+        &options(),
+        &system_clock,
+        &|| sent.load(SeqCst) && polls_after_send.fetch_add(1, SeqCst) > 0,
+    )
+    .unwrap();
+    assert!(result.issues.is_empty());
+    assert_eq!(result.statuses[0].acknowledged_records, 3);
+    assert_eq!(result.statuses[0].failure, None);
+    assert_eq!(result.statuses[0].next_attempt_ms, 0);
+}

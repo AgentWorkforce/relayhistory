@@ -235,6 +235,7 @@ pub(crate) fn scan_claude_transcript_resumed(
     let start_offset = reader.start_offset();
     let mut line = String::new();
     loop {
+        crate::ingest::check_capture_cancelled()?;
         let Some(kind) = reader.next_line(&mut line)? else {
             break;
         };
