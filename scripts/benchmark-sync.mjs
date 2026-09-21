@@ -250,11 +250,12 @@ export function failureFooter(verdict, profile) {
   const band = warnings.find((warning) => warning.kind === "calibration-band");
   const machineClass = profile?.measuredOn?.machineClass ?? "another machine class";
   if (unknown) {
-    // Say it only if it happened: the widening is off when the calibration is
-    // `applied`, and a bound only moves when something widened it.
-    const anyWidened = (verdict.checks ?? [])
-      .some((check) => check.effectiveBound !== undefined && check.effectiveBound !== check.bound);
-    const widened = anyWidened
+    // Say it only of the checks it is true of. A failure on peak RSS, or a
+    // phase that produced no measurement at all, did not survive any widening
+    // — pointing at the hardware there sends the reader somewhere else.
+    const survivedWidening = (verdict.checks ?? []).some((check) => !check.ok
+      && check.effectiveBound !== undefined && check.effectiveBound !== check.bound);
+    const widened = survivedWidening
       ? "\nThe bounds above were already widened for that — see the off-class line — and the\n"
         + "failures survived the widening, so re-measuring the baselines on this machine\n"
         + "class is the answer if the numbers are simply what this hardware costs.\n"
@@ -277,6 +278,28 @@ export function failureFooter(verdict, profile) {
       + "apart.\n";
   }
   return "";
+}
+
+/**
+ * The paragraph that explains an off-class widening, or "" when there was none.
+ *
+ * It is keyed on bounds that actually moved, not on the CPU alone. With
+ * `policy.calibration: "applied"` the run is still off class and the widening
+ * is deliberately disabled, and a banner there would contradict the very check
+ * lines printed under it.
+ */
+export function offClassBanner(verdict) {
+  if (!verdict.offClass) return "";
+  const widened = (verdict.checks ?? [])
+    .some((check) => check.effectiveBound !== undefined && check.effectiveBound !== check.bound);
+  if (!widened) return "";
+  const cap = verdict.offClassCap.toFixed(2);
+  return "off-class: this CPU is not one the baselines were measured on, so the bounds below "
+    + `are widened, never tightened, and never past ${cap}x. A bound derived from a stored `
+    + `baseline is widened ${verdict.offClassScale.toFixed(2)}x, the calibration ratio clamped `
+    + "to that cap; an elapsed ceiling that comes from a noise floor instead is widened the "
+    + `full ${cap}x and a breach inside that widening is advisory. Peak RSS is not widened at `
+    + "all. Each bound below prints raw -> widened.";
 }
 
 /**
@@ -516,17 +539,8 @@ async function main(argv) {
   for (const warning of verdict.warnings ?? []) {
     process.stdout.write(`warning [${warning.kind}]: ${warning.message}\n\n`);
   }
-  if (verdict.offClass) {
-    process.stdout.write(
-      `off-class: this CPU is not one the baselines were measured on, so the bounds below `
-      + `are widened, never tightened, and never past ${verdict.offClassCap.toFixed(2)}x. `
-      + `A bound derived from a stored baseline is widened ${verdict.offClassScale.toFixed(2)}x, `
-      + "the calibration ratio clamped to that cap; an elapsed ceiling that comes from a "
-      + `noise floor instead is widened the full ${verdict.offClassCap.toFixed(2)}x and a `
-      + "breach inside that widening is advisory. Peak RSS is not widened at all. Each "
-      + "bound below prints raw -> widened.\n\n",
-    );
-  }
+  const banner = offClassBanner(verdict);
+  if (banner) process.stdout.write(`${banner}\n\n`);
   for (const check of verdict.checks) process.stdout.write(`${renderCheck(check)}\n`);
   for (const advisory of verdict.advisories ?? []) {
     process.stdout.write(`\nadvisory: ${advisory}\n`);

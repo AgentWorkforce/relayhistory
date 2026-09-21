@@ -19,8 +19,8 @@ import {
 } from "./benchmark-sync-lib.mjs";
 import { generateStore, opencodeAvailable } from "./gen-synthetic-history.mjs";
 import {
-  CALIBRATION_PHASE, PHASE_ORDER, failureFooter, findHarnessExecutable, renderCheck,
-  updatedProfile,
+  CALIBRATION_PHASE, PHASE_ORDER, failureFooter, findHarnessExecutable, offClassBanner,
+  renderCheck, updatedProfile,
 } from "./benchmark-sync.mjs";
 
 const warningText = (verdict) => (verdict.warnings ?? []).map((w) => w.message).join("\n");
@@ -617,6 +617,70 @@ test("a widened bound is printed next to the raw one, on the line and in the fai
   const footer = failureFooter(failed, thresholds.profiles["ci-debug"]);
   assert.match(footer, /AMD EPYC 7763/);
   assert.match(footer, /already widened/);
+});
+
+test("the off-class diagnostics describe what actually happened, and no more", () => {
+  const run = offClassRuns["#199 run 35543305734"];
+
+  // A failure on a check nothing widened -- peak RSS here -- must not be
+  // explained away by a widening that was applied to other checks.
+  const bloated = {
+    ...run,
+    phases: run.phases.map((phase) => (
+      phase.phase === "cold_sync" ? { ...phase, peakRssBytes: 200_000_000 } : phase
+    )),
+  };
+  const rssOnly = evaluateGate(bloated, thresholds, "ci-debug");
+  assert.equal(rssOnly.ok, false);
+  assert.ok(rssOnly.checks.some((entry) => entry.effectiveBound !== entry.bound),
+    "other checks were widened, which is exactly the trap");
+  const rssFooter = failureFooter(rssOnly, thresholds.profiles["ci-debug"]);
+  assert.match(rssFooter, /AMD EPYC 7763/, "the unfamiliar-CPU paragraph still applies");
+  assert.doesNotMatch(rssFooter, /already widened/,
+    "this failure did not survive a widening; nothing widened it");
+
+  // A failure that is not a bound at all gets the same treatment.
+  const missing = { ...run, phases: run.phases.filter((p) => p.phase !== "hydrate_cold") };
+  const gone = evaluateGate(missing, thresholds, "ci-debug");
+  assert.equal(gone.ok, false);
+  assert.doesNotMatch(
+    failureFooter(gone, thresholds.profiles["ci-debug"]), /already widened/,
+  );
+
+  // A failure on a check that was widened does get the sentence.
+  const blown = {
+    ...run,
+    phases: run.phases.map((phase) => (
+      phase.phase === "unchanged_sync" ? { ...phase, elapsedMs: 1020 } : phase
+    )),
+  };
+  assert.match(
+    failureFooter(evaluateGate(blown, thresholds, "ci-debug"), thresholds.profiles["ci-debug"]),
+    /already widened/,
+  );
+});
+
+test("the off-class banner is not printed when nothing was widened", () => {
+  const run = offClassRuns["#199 run 35543305734"];
+  assert.match(offClassBanner(evaluateGate(run, thresholds, "ci-debug")), /^off-class: /);
+
+  // `policy.calibration: "applied"` normalizes the measurements instead, and
+  // deliberately disables the widening. Saying both happened would make the
+  // diagnostics contradict the checks printed under them.
+  const applied = { ...thresholds, policy: { ...thresholds.policy, calibration: "applied" } };
+  const verdict = evaluateGate(run, applied, "ci-debug");
+  assert.equal(verdict.offClass, true, "it is still an unfamiliar CPU");
+  for (const entry of verdict.checks) {
+    assert.equal(entry.effectiveBound, entry.bound, `${entry.phase}.${entry.metric}`);
+  }
+  assert.equal(offClassBanner(verdict), "");
+  // And on the baseline class there is no banner either way.
+  assert.equal(
+    offClassBanner(evaluateGate(
+      { ...run, machine: { cpu: "Intel(R) Xeon(R) 6973P-C" } }, thresholds, "ci-debug",
+    )),
+    "",
+  );
 });
 
 test("memory bounds are not widened off class", () => {
