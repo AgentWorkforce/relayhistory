@@ -311,28 +311,45 @@ fn run_capture_cycle(
 fn capture_selected(directory: &Path, config: &Config, cancelled: &Arc<AtomicBool>) -> Result<()> {
     let conn = relayhistory_plugin::delivery::open_db(&directory.join("history.db"))?;
     let members = delivery::job_sessions(&conn, &config.job_id)?;
+    capture_members(
+        directory,
+        members,
+        || stopping(cancelled),
+        |member| {
+            // Core hydration owns observation locks, parsers and checkpoints.
+            // It never enumerates an unrelated provider.
+            let stop = cancelled.clone();
+            ai_hist::hydrate_session_at_cancellable(
+                &directory.join("history.db"),
+                &ai_hist::HydrateSessionOptions {
+                    source: member.source,
+                    session_id: member.session_id,
+                    scope: ai_hist::SessionScope::Local,
+                    include_related: false,
+                },
+                move || stopping(&stop),
+            )
+            .map(|_| ())
+        },
+    )
+}
+
+fn capture_members(
+    directory: &Path,
+    members: Vec<delivery::SessionIdentity>,
+    stopped: impl Fn() -> bool,
+    hydrate: impl Fn(delivery::SessionIdentity) -> Result<()>,
+) -> Result<()> {
     let started = Instant::now();
     let mut captured = 0;
     let mut failed = 0;
+    let mut first_error = None;
     for member in members {
-        if stopping(cancelled) {
+        if stopped() {
             break;
         }
-        // Core hydration owns observation locks, provider resolution, parser,
-        // evidence and checkpoints. It never enumerates an unrelated provider.
-        let stop = cancelled.clone();
-        let result = ai_hist::hydrate_session_at_cancellable(
-            &directory.join("history.db"),
-            &ai_hist::HydrateSessionOptions {
-                source: member.source,
-                session_id: member.session_id,
-                scope: ai_hist::SessionScope::Local,
-                include_related: false,
-            },
-            move || stopping(&stop),
-        );
-        match result {
-            Ok(_) => captured += 1,
+        match hydrate(member) {
+            Ok(()) => captured += 1,
             Err(error) => {
                 failed += 1;
                 capture_diagnostic(
@@ -343,16 +360,18 @@ fn capture_selected(directory: &Path, config: &Config, cancelled: &Arc<AtomicBoo
                     failed,
                     Some(&error),
                 )?;
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
             }
         }
     }
-    if failed == 0 {
-        capture_diagnostic(directory, "targeted_hydration", started, captured, 0, None)?;
+    if let Some(error) = first_error {
+        // Keep the typed cause for the safe cycle/desktop classifier. Replacing
+        // it with a generic aggregate turns a full journal into "offline" again.
+        return Err(error.context("selected session capture incomplete"));
     }
-    ensure!(
-        failed == 0,
-        "selected session capture incomplete; see redacted capture-diagnostic.json"
-    );
+    capture_diagnostic(directory, "targeted_hydration", started, captured, 0, None)?;
     Ok(())
 }
 
@@ -1186,6 +1205,40 @@ mod tests {
         for forbidden in ["secret", "prompt", "private", "https", "example"] {
             assert!(!value.contains(forbidden));
         }
+    }
+
+    #[test]
+    fn targeted_storage_failure_keeps_its_class_and_other_members_still_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let captured = std::cell::Cell::new(0);
+        let members = ["full", "healthy"]
+            .iter()
+            .map(|id| delivery::SessionIdentity {
+                source: "codex".into(),
+                session_id: (*id).into(),
+            })
+            .collect();
+        let result = capture_members(
+            dir.path(),
+            members,
+            || false,
+            |member| {
+                if member.session_id == "full" {
+                    Err(anyhow::Error::new(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER),
+                        Some("delivery retention limit exceeded; secret transcript".into()),
+                    )))
+                } else {
+                    captured.set(captured.get() + 1);
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(captured.get(), 1);
+        let report = cycle_report(&result);
+        assert_eq!(report["error_class"], "retention_limit");
+        assert!(!report.to_string().contains("secret"));
+        assert!(!report["message"].as_str().unwrap().contains("offline"));
     }
 
     #[test]
