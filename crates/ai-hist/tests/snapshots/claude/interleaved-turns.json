@@ -35,6 +35,7 @@
   "quirk": "two assistant messages interleave their blocks instead of arriving contiguously",
   "session_events": [
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-user-1:0",
       "git_branch": null,
@@ -51,6 +52,7 @@
       "ts_ms": 1776643200000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-asst-1:0",
       "git_branch": null,
@@ -67,6 +69,7 @@
       "ts_ms": 1776643201000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-user-2:0",
       "git_branch": null,
@@ -83,6 +86,7 @@
       "ts_ms": 1776643202000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-asst-2:0",
       "git_branch": null,
@@ -99,6 +103,7 @@
       "ts_ms": 1776643203000
     }
   ],
+  "session_markers": [],
   "session_relationships": [],
   "sessions": [
     {

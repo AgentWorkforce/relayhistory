@@ -173,6 +173,69 @@ Notable changes to the native `ai-hist` CLI are documented here.
   it is this database's bookkeeping, not a fact about the record.
   `ShallowSession` and `SessionRelationship` are re-exported on the default
   feature set as the rows a catalog or relationship change carries.
+- Type the rows a harness writes into the user role that are not prompts.
+  `session_events` gains `control_kind`, null for a genuine prompt and for
+  model output, and otherwise one of `slash_command_caveat`,
+  `slash_command_invocation`, `slash_command_output`, `task_notification`,
+  `hook_output`, `bash_passthrough_input`, `bash_passthrough_output`,
+  `system_reminder`, `codex_context_wrapper`, `meta`, `resume_marker`. The
+  row keeps its role, kind and verbatim text; the column is what a consumer
+  building human turns, prompt roots or an overhead breakdown filters on.
+  Claude reads `origin.kind` and `attachment.{type, commandMode}` for task
+  notifications, and a slash command's caveat → invocation → output records,
+  chained by `parentUuid`, are grouped into one `session_markers` row of
+  `kind = "slash_command"` whose payload carries `command_name`,
+  `command_message`, `command_args`, `command_mode`, `origin_kind`, the three
+  rows' event uids and `stdout_bytes` — the whole of what an activity
+  classifier reads, with no raw JSON. The pending triad travels in the
+  transcript cursor, so a command split across two hydration passes is still
+  one marker. A `<system-reminder>` block inside a prompt becomes a
+  `system_reminder` row sharing the prompt's `message_id`
+  (`<uid>:reminder:<n>`), recreated from the current text on every re-read so
+  a record rewritten with fewer reminders, or without the block that carried
+  them, loses the rows it no longer has, and
+  the prompt row and `history` carry only the human's text. Codex's `<environment_context>` and sibling wrappers are
+  stored as `codex_context_wrapper` rows instead of falling to an `unknown`
+  marker. `history`, `sessions.first_prompt` and `attribute_usage_to_prompts`
+  all derive from that one classification (`ingest::control`), which
+  replaced the `CLAUDE_CONTROL_PREFIXES` list: a task notification or a bare
+  `/resume <id>` is no longer a `history` row or a first prompt, and the
+  answer to a slash command is charged to the human prompt before it rather
+  than to the command's output row. `session_user_turns_page` leaves control
+  rows out too, so a Codex context wrapper is not a turn and a split reminder
+  is not one of its prompt's blocks; the relayhistory plugin does not publish
+  them as conversation turns, and pads a session's published tail with one
+  empty `system` turn per control row so a session an earlier release
+  published with its control rows as user turns is rewritten index for index
+  on the server, which upserts by `turnIndex` and never trims. Source-evidence
+  validation refuses a `control_kind` outside the vocabulary or on anything
+  but a user text row. `SESSION_EVIDENCE_CONTRACT_VERSION` 2 -> 3 on both the
+  Rust and TypeScript sides, since the session-event row shape changed; the
+  TypeScript `SessionEvent` exposes it as `controlKind` (a `ControlKind`
+  union or null) and the native addon carries it, with no native contract
+  bump because the field is additive. For Claude the full-transcript metadata
+  fold now settles `sessions.first_prompt` on every sync or hydration, null
+  included -- never from a fold superseded by a rewrite under it, which the
+  next pass rescans -- so a title an earlier release took from a row that is control now
+  (a bare `/resume <id>`, a task notification) is replaced on the one-time
+  re-read; `SHALLOW_SCANNER_VERSION` 5 -> 6 sends cached discovery rows
+  through the current classifier once as well. A standalone reminder row the
+  previous parser stored untyped under the block's own uid, and the `unknown`
+  marker it left for a Codex wrapper, are retired by the re-read rather than
+  kept beside the typed rows. `SessionEvent` gains `control_kind`,
+  returned by `session_events` and `session_events_page` and carried by the
+  source-evidence row contract. `HYDRATION_PARSER_VERSION` 10 -> 11 and the
+  raw-facts generation 2 -> 3, so an existing install re-stamps every row
+  once on the next hydration or plain `sync`. That re-read also retires what
+  the previous parser wrote for a record it now stores differently: the
+  `history` row it wrote from the record's whole text (a reminder folded into
+  the prompt, a task notification as a prompt), keyed on this session, the
+  record's timestamp and that text; a row another session's human prompt
+  shares under `history`'s `(source, timestamp, prompt)` key is handed to
+  that session rather than deleted. Continuity reads a `/resume` through the
+  same reminder stripping, so a reminder ahead of the wrapper no longer hides
+  the resume. The fixture corpus snapshots now include `control_kind` and a
+  `session_markers` dump. napi/TS/MCP exposure is not included.
 - Stop dropping the record types neither parser could normalize. A new
   `session_markers` table records compaction and summary boundaries, provider
   `system` rows, non-text content blocks (`image`, `document`,

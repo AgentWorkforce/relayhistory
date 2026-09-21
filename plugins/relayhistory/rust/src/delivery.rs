@@ -1,4 +1,4 @@
-//! Service-independent, opt-in durable delivery. No transport or credential I/O.
+//! Probe-owned upload jobs and durable delivery state.
 //!
 //! Jobs bootstrap a historical snapshot in bounded pages, retaining preimages
 //! for rows changed before their page is read. SQLite triggers capture later
@@ -19,53 +19,25 @@
 //! that supports them. Presence is its own revisioned provenance evidence kind.
 
 mod schema;
-mod snapshot;
-pub mod worker;
-pub use snapshot::{
-    close_export, create_export, expire_exports, export_page, ExportHandle, HistoryExportPage,
+mod sessions;
+pub use sessions::{
+    adopt_session_job, create_session_job, include_job_session, is_session_job,
+    job_session_included, job_sessions, set_job_session,
 };
-
+pub mod rpc;
+pub mod worker;
+pub use ai_hist::export::{close_export, expire_exports, export_page};
 use anyhow::{ensure, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
-pub(crate) use schema::{init_schema, journal_migrated_rows, schema_is_current, shadow_preimages};
-pub const EXPORT_SCHEMA_VERSION: u32 = 1;
-pub const DEFAULT_RETENTION_LIMIT_BYTES: i64 = 256 * 1_048_576;
-pub const SUPPORTED_KINDS: &[&str] = &[
-    "history",
-    "session_event",
-    "tool_call",
-    "file_edit",
-    "session",
-    "presence",
-    "relationship",
-    "commit_link",
-    "trajectory",
-    "source_observation",
-    "observation_evidence",
-    "session_marker",
-];
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct SessionIdentity {
-    pub source: String,
-    pub session_id: String,
-}
-
-/// A nonempty explicit selection. Sources and sessions form a union. Empty
-/// lists select nothing unless all_sources is true; kinds must be explicit.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ExportSelection {
-    pub all_sources: bool,
-    pub sources: Vec<String>,
-    pub sessions: Vec<SessionIdentity>,
-    pub kinds: Vec<String>,
-    pub excluded_sessions: Vec<SessionIdentity>,
-}
-
+use ai_hist::export::capture::{self, make_record, snapshot_record, RawRecord};
+pub use ai_hist::export::{
+    ExportSelection, HistoryExportRecord, SessionIdentity, DEFAULT_RETENTION_LIMIT_BYTES,
+    EXPORT_SCHEMA_VERSION, SUPPORTED_KINDS,
+};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeliveryLimits {
     pub max_batch_records: usize,
@@ -96,22 +68,6 @@ pub struct DeliveryJobConfig {
     pub mapping_version: String,
     pub selection: ExportSelection,
     pub limits: DeliveryLimits,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct HistoryExportRecord {
-    pub schema_version: u32,
-    pub origin_id: String,
-    pub record_id: String,
-    pub revision_id: String,
-    pub revision: i64,
-    pub kind: String,
-    pub source: String,
-    pub session_id: Option<String>,
-    pub operation: String,
-    /// Original stored field names, timestamps and raw JSON strings are kept.
-    /// A tombstone has a null payload and retains its logical record identity.
-    pub payload: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -328,11 +284,24 @@ pub fn create_job(
     config: &DeliveryJobConfig,
     now_ms: i64,
 ) -> Result<DeliveryStatus> {
+    create_job_inner(conn, config, now_ms, false)
+}
+
+fn create_job_inner(
+    conn: &Connection,
+    config: &DeliveryJobConfig,
+    now_ms: i64,
+    scoped: bool,
+) -> Result<DeliveryStatus> {
     validate(config)?;
     ensure!(now_ms >= 0, "invalid clock");
     let tx = write_transaction(conn)?;
     let existing: Option<String> = tx.query_row("SELECT id FROM delivery_jobs WHERE destination_id=? AND instance_id=? AND account_id=? AND state <> 'cancelled'", params![config.destination_id,config.instance_id,config.account_id], |row| row.get(0)).optional()?;
     if let Some(id) = existing {
+        ensure!(
+            is_session_job(&tx, &id)? == scoped,
+            "delivery selection mode changed; cancel the old generation first"
+        );
         ensure!(job(&tx,&id)?.config == *config, "delivery configuration changed; explicitly cancel the old generation before creating a new one");
         tx.commit()?;
         return status(conn, &id);
@@ -347,22 +316,33 @@ pub fn create_job(
     let generation: i64 = tx.query_row("SELECT COALESCE(MAX(generation),0)+1 FROM delivery_jobs WHERE destination_id=? AND instance_id=? AND account_id=?", params![config.destination_id,config.instance_id,config.account_id], |row| row.get(0))?;
     // Reserve a fresh revision for this snapshot, even after a period with
     // capture disabled. The same revision ID must never name changed payloads.
-    tx.execute("INSERT INTO delivery_journal(kind,source,record_key,operation,payload) VALUES ('__cutoff','','','checkpoint','null')", [])?;
-    let cutoff = tx.last_insert_rowid();
+    let cutoff = capture::reserve_revision(&tx)?;
     tx.execute("INSERT INTO delivery_jobs(id,destination_id,instance_id,account_id,generation,config_json,state,created_ms,cutoff,journal_cursor) VALUES (?,?,?,?,?,?,'active',?,?,?)", params![id,config.destination_id,config.instance_id,config.account_id,generation,serde_json::to_string(config)?,now_ms,cutoff,cutoff])?;
-    for table in schema::TABLES {
-        tx.execute(&format!("INSERT INTO delivery_bootstrap_bounds(job_id,kind,max_rowid) SELECT ?,?,COALESCE(MAX(rowid),0) FROM {}",table.name), params![id,table.kind])?;
+    if scoped {
+        tx.execute(
+            "INSERT INTO delivery_session_jobs(job_id) VALUES (?)",
+            [&id],
+        )?;
+        tx.execute(
+            "UPDATE delivery_jobs SET bootstrap_done=1 WHERE id=?",
+            [&id],
+        )?;
     }
+    capture::snapshot_bounds(&tx, &id)?;
+    update_root_subscription(&tx, &id)?;
     tx.commit()?;
     status(conn, &id)
 }
 
 pub fn status(conn: &Connection, job_id: &str) -> Result<DeliveryStatus> {
-    let job = job(conn, job_id)?;
+    let mut job = job(conn, job_id)?;
+    if is_session_job(conn, job_id)? {
+        job.bootstrap_done = !conn.query_row("SELECT EXISTS(SELECT 1 FROM delivery_session_members WHERE job_id=? AND bootstrap_done=0)", [job_id], |r| r.get::<_, bool>(0))?;
+    }
     let (pending_records,pending_bytes,oldest_pending_ms): (i64,i64,Option<i64>) = conn.query_row("SELECT COALESCE(SUM(records),0),COALESCE(SUM(bytes+COALESCE(length(CAST(prepared AS BLOB)),0)),0),MIN(created_ms) FROM delivery_batches WHERE job_id=? AND state IN ('pending','leased','retry_wait','blocked')", [job_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
     let unqueued_changes: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM delivery_journal WHERE seq>?",
-        [job.cursor],
+        if is_session_job(conn, job_id)? { "SELECT count(*) FROM delivery_session_members m CROSS JOIN delivery_journal j INDEXED BY delivery_journal_session WHERE m.job_id=?2 AND m.ready=1 AND j.source=m.source AND j.session_id=m.session_id AND j.seq>m.cursor" } else { "SELECT COUNT(*) FROM delivery_journal WHERE seq>?1 AND ?2 IS NOT NULL" },
+        params![job.cursor, job_id],
         |row| row.get(0),
     )?;
     conn.query_row("SELECT acknowledged_cursor,next_attempt_ms,last_attempt_ms,last_acknowledged_ms,acceptance_level,failure,suppressed_records,acknowledged_records FROM delivery_jobs WHERE id=?", [job_id], |row| Ok(DeliveryStatus {
@@ -423,22 +403,50 @@ pub fn set_session_excluded(
     value: bool,
 ) -> Result<()> {
     let tx = write_transaction(conn)?;
+    set_session_excluded_in_transaction(&tx, session, value, None)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn set_session_excluded_in_transaction(
+    conn: &Connection,
+    session: &SessionIdentity,
+    value: bool,
+    fresh_session_job: Option<&str>,
+) -> Result<()> {
+    let current: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM delivery_exclusions WHERE source=? AND session_id=?)",
+        params![session.source, session.session_id],
+        |r| r.get(0),
+    )?;
+    if current == value {
+        return Ok(());
+    }
     if value {
-        tx.execute(
+        conn.execute(
             "INSERT OR IGNORE INTO delivery_exclusions(source,session_id) VALUES (?,?)",
             params![session.source, session.session_id],
         )?;
     } else {
-        if tx.query_row(
+        if conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM delivery_exclusions WHERE source=? AND session_id=?)",
             params![session.source, session.session_id],
             |row| row.get::<_, bool>(0),
         )? {
-            let mut statement =
-                tx.prepare("SELECT config_json FROM delivery_jobs WHERE state <> 'cancelled'")?;
-            let configs = statement.query_map([], |row| row.get::<_, String>(0))?;
+            let mut statement = conn
+                .prepare("SELECT id,config_json FROM delivery_jobs WHERE state <> 'cancelled'")?;
+            let configs = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
             for config in configs {
-                let config: DeliveryJobConfig = serde_json::from_str(&config?)?;
+                let (id, config) = config?;
+                // The caller establishes a fresh member cutoff in this same
+                // transaction. Every other affected job must still be guarded.
+                if fresh_session_job == Some(id.as_str()) {
+                    continue;
+                }
+                let config: DeliveryJobConfig = serde_json::from_str(&config)?;
+                if is_session_job(conn,&id)? && !conn.query_row("SELECT EXISTS(SELECT 1 FROM delivery_session_members WHERE job_id=? AND source=? AND (session_id=? OR ?))",params![id,session.source,session.session_id,config.selection.kinds.iter().any(|k|k=="relationship")],|r|r.get::<_,bool>(0))? { continue; }
                 let selection = &config.selection;
                 // A child exclusion also suppresses relationship records selected
                 // through a parent. Conservatively include same-source parent
@@ -455,46 +463,20 @@ pub fn set_session_excluded(
                 ensure!(!affected, "DELIVERY_GENERATION_REQUIRED: cancel affected delivery jobs before removing an exclusion, then create new jobs to backfill skipped history");
             }
         }
-        tx.execute(
+        conn.execute(
             "DELETE FROM delivery_exclusions WHERE source=? AND session_id=?",
             params![session.source, session.session_id],
         )?;
     }
     // Fence all active claims. A worker must re-claim and recheck before dispatch.
-    tx.execute("UPDATE delivery_jobs SET fence=fence+1,worker_id=NULL,lease_until_ms=NULL WHERE state <> 'cancelled'", [])?;
-    tx.execute(
+    conn.execute("UPDATE delivery_jobs SET fence=fence+1,worker_id=NULL,lease_until_ms=NULL WHERE state <> 'cancelled'", [])?;
+    conn.execute(
         "UPDATE delivery_batches SET state='pending' WHERE state='leased'",
         [],
     )?;
-    tx.commit()?;
     Ok(())
 }
 
-#[derive(Debug)]
-struct RawRecord {
-    position: i64,
-    kind: String,
-    source: String,
-    session: Option<String>,
-    key: String,
-    operation: String,
-    payload: String,
-}
-fn make_record(origin: &str, revision: i64, raw: &RawRecord) -> Result<HistoryExportRecord> {
-    let record_id = hash(&raw.key);
-    Ok(HistoryExportRecord {
-        schema_version: EXPORT_SCHEMA_VERSION,
-        origin_id: origin.into(),
-        revision_id: hash(format!("{origin}:{record_id}:{revision}")),
-        record_id,
-        revision,
-        kind: raw.kind.clone(),
-        source: raw.source.clone(),
-        session_id: raw.session.clone(),
-        operation: raw.operation.clone(),
-        payload: serde_json::from_str(&raw.payload)?,
-    })
-}
 fn batch_template(conn: &Connection, job: &Job) -> Result<HistoryExportBatch> {
     let (origin_id, batch_id) = conn.query_row(
         "SELECT origin_id,lower(hex(randomblob(16))) FROM delivery_state WHERE singleton=1",
@@ -532,6 +514,11 @@ pub fn prepare_batch(conn: &Connection, job_id: &str, now_ms: i64) -> Result<Pre
     let tx = write_transaction(conn)?;
     let mut job = job(&tx, job_id)?;
     ensure!(job.state == "active", "delivery job is not active");
+    if is_session_job(&tx, job_id)? {
+        let result = sessions::prepare(&tx, &job, now_ms)?;
+        tx.commit()?;
+        return Ok(result);
+    }
     let existing: Option<String> = tx.query_row("SELECT id FROM delivery_batches WHERE job_id=? AND state IN ('pending','leased','retry_wait','blocked')",[job_id],|row| row.get(0)).optional()?;
     if existing.is_some() {
         return Ok(PrepareResult {
@@ -547,7 +534,7 @@ pub fn prepare_batch(conn: &Connection, job_id: &str, now_ms: i64) -> Result<Pre
         && batch.records.len() < job.config.limits.max_batch_records
     {
         let raw = if !job.bootstrap_done {
-            if job.bootstrap_kind >= schema::TABLES.len() {
+            if job.bootstrap_kind >= capture::kind_count() {
                 job.bootstrap_done = true;
                 continue;
             }
@@ -559,7 +546,7 @@ pub fn prepare_batch(conn: &Connection, job_id: &str, now_ms: i64) -> Result<Pre
             };
             raw
         } else {
-            let value = tx.query_row("SELECT seq,kind,source,session_id,record_key,operation,payload FROM delivery_journal WHERE seq>? ORDER BY seq LIMIT 1",[job.cursor],|row| Ok(RawRecord {position:row.get(0)?,kind:row.get(1)?,source:row.get(2)?,session:row.get(3)?,key:row.get(4)?,operation:row.get(5)?,payload:row.get(6)?})).optional()?;
+            let value = capture::next_change(&tx, job.cursor, None)?;
             let Some(raw) = value else { break };
             raw
         };
@@ -597,13 +584,11 @@ pub fn prepare_batch(conn: &Connection, job_id: &str, now_ms: i64) -> Result<Pre
             job.cursor = raw.position;
         } else {
             job.bootstrap_rowid = raw.position;
-            tx.execute(
-                "DELETE FROM delivery_shadow WHERE job_id=? AND kind=? AND row_id<=?",
-                params![job_id, raw.kind, raw.position],
-            )?;
+            capture::discard_read_preimages(&tx, job_id, &raw.kind, raw.position)?;
         }
     }
     tx.execute("UPDATE delivery_jobs SET bootstrap_kind=?,bootstrap_rowid=?,bootstrap_done=?,journal_cursor=?,suppressed_records=suppressed_records+? WHERE id=?",params![job.bootstrap_kind as i64,job.bootstrap_rowid,job.bootstrap_done,job.cursor,suppressed,job_id])?;
+    update_root_subscription(&tx, job_id)?;
     let batch_id = if batch.records.is_empty() {
         None
     } else {
@@ -746,7 +731,9 @@ pub fn claim_batch(
     };
     let mut allowed = Vec::new();
     for record in &batch.records {
-        if !record_excluded(&tx, &job.config.selection, record)? {
+        if !record_excluded(&tx, &job.config.selection, record)?
+            && sessions::record_allowed(&tx, &job.id, record)?
+        {
             allowed.push(record.clone());
         }
     }
@@ -883,7 +870,8 @@ pub fn store_prepared_payload(
         pending_batch(&tx, &lease.job_id)?.context("delivery batch missing")?;
     for record in &batch.records {
         ensure!(
-            !record_excluded(&tx, &job.config.selection, record)?,
+            !record_excluded(&tx, &job.config.selection, record)?
+                && sessions::record_allowed(&tx, &job.id, record)?,
             "delivery batch is now excluded"
         );
     }
@@ -1113,11 +1101,8 @@ pub fn cancel_job(conn: &Connection, job_id: &str) -> Result<DeliveryStatus> {
     job(&tx, job_id)?;
     tx.execute("UPDATE delivery_jobs SET state='cancelled',fence=fence+1,worker_id=NULL,lease_until_ms=NULL WHERE id=?",[job_id])?;
     tx.execute("UPDATE delivery_batches SET state='cancelled',payload=NULL,prepared=NULL WHERE job_id=? AND state IN ('pending','leased','retry_wait','blocked')",[job_id])?;
-    tx.execute("DELETE FROM delivery_shadow WHERE job_id=?", [job_id])?;
-    tx.execute(
-        "DELETE FROM delivery_bootstrap_bounds WHERE job_id=?",
-        [job_id],
-    )?;
+    sessions::cancel(&tx, job_id)?;
+    capture::release_subscription(&tx, job_id)?;
     tx.commit()?;
     status(conn, job_id)
 }
@@ -1154,64 +1139,7 @@ pub fn retained_bytes(conn: &Connection) -> Result<(i64, i64)> {
 /// Acknowledged batch bodies are released at acknowledgment; small receipts
 /// and job generations remain for audit and safe generation numbering.
 pub fn compact_journal(conn: &Connection, limit: usize) -> Result<usize> {
-    ensure!((1..=10_000).contains(&limit), "invalid compaction limit");
-    let tx = write_transaction(conn)?;
-    let floor:i64=tx.query_row("SELECT COALESCE((SELECT MIN(journal_cursor) FROM delivery_jobs WHERE state <> 'cancelled'),(SELECT COALESCE(MAX(seq),0) FROM delivery_journal))",[],|row|row.get(0))?;
-    let removed=tx.execute("DELETE FROM delivery_journal WHERE seq IN (SELECT seq FROM delivery_journal WHERE seq<=? ORDER BY seq LIMIT ?)",params![floor,limit as i64])?;
-    tx.commit()?;
-    Ok(removed)
-}
-
-fn snapshot_record(
-    conn: &Connection,
-    id: &str,
-    kind_index: usize,
-    after: i64,
-) -> Result<Option<RawRecord>> {
-    let table = &schema::TABLES[kind_index];
-    let maximum: i64 = conn.query_row(
-        "SELECT max_rowid FROM delivery_bootstrap_bounds WHERE job_id=? AND kind=?",
-        params![id, table.kind],
-        |row| row.get(0),
-    )?;
-    let sql = format!(
-        r#"
-WITH ids AS (
- SELECT rowid AS row_id FROM {table} WHERE rowid>?1 AND rowid<=?2
- UNION SELECT row_id FROM delivery_shadow WHERE job_id=?3 AND kind=?4 AND row_id>?1 AND row_id<=?2
-), candidate AS (SELECT row_id FROM ids ORDER BY row_id LIMIT 1)
-SELECT c.row_id, CASE WHEN s.row_id IS NOT NULL THEN s.source ELSE {source} END,
- CASE WHEN s.row_id IS NOT NULL THEN s.session_id ELSE r.{session} END,
- CASE WHEN s.row_id IS NOT NULL THEN s.record_key ELSE {key} END,
- CASE WHEN s.row_id IS NOT NULL THEN s.payload ELSE {payload} END
-FROM candidate c LEFT JOIN {table} r ON r.rowid=c.row_id
-LEFT JOIN delivery_shadow s ON s.job_id=?3 AND s.kind=?4 AND s.row_id=c.row_id
-"#,
-        table = table.name,
-        source = table.source("r"),
-        session = table.session,
-        key = table.key("r"),
-        payload = table.payload(conn, "r")?
-    );
-    Ok(conn
-        .query_row(&sql, params![after, maximum, id, table.kind], |row| {
-            let payload: Option<String> = row.get(4)?;
-            Ok(RawRecord {
-                position: row.get(0)?,
-                kind: table.kind.into(),
-                source: row.get(1)?,
-                session: row.get(2)?,
-                key: row.get(3)?,
-                operation: if payload.is_none() {
-                    "absent"
-                } else {
-                    "upsert"
-                }
-                .into(),
-                payload: payload.unwrap_or_else(|| "null".into()),
-            })
-        })
-        .optional()?)
+    ai_hist::export::compact_journal(conn, limit)
 }
 
 /// Recheck immediately before dispatch, after async mapping or lease renewal.
@@ -1232,7 +1160,8 @@ pub fn validate_dispatch(
         pending_batch(&tx, &lease.job_id)?.context("delivery batch missing")?;
     for record in &batch.records {
         ensure!(
-            !record_excluded(&tx, &job.config.selection, record)?,
+            !record_excluded(&tx, &job.config.selection, record)?
+                && sessions::record_allowed(&tx, &job.id, record)?,
             "delivery batch is now excluded"
         );
     }
@@ -1295,4 +1224,55 @@ pub fn compact_receipts(conn: &Connection, limit: usize) -> Result<usize> {
 /// compact_journal/compact_receipts or an explicit set_retention_limit action.
 pub fn is_retention_limit(error: &anyhow::Error) -> bool {
     error.chain().any(|cause|matches!(cause.downcast_ref::<rusqlite::Error>(),Some(rusqlite::Error::SqliteFailure(_,Some(message))) if message.starts_with("delivery retention limit exceeded;")))
+}
+
+/// Open evidence and upload state. Ordinary ai-hist opens never initialize jobs.
+pub fn open_db(path: &std::path::Path) -> Result<Connection> {
+    let conn = ai_hist::open_db(path)?;
+    init_db(&conn)?;
+    Ok(conn)
+}
+pub fn init_db(conn: &Connection) -> Result<()> {
+    ai_hist::init_db(conn)?;
+    if schema::is_current(conn)? {
+        return Ok(());
+    }
+    let tx = write_transaction(conn)?;
+    schema::init_schema(&tx)?;
+    tx.commit()?;
+    Ok(())
+}
+pub fn create_export(
+    conn: &Connection,
+    selection: &ExportSelection,
+    limits: &DeliveryLimits,
+    ttl: i64,
+    now: i64,
+) -> Result<ai_hist::export::ExportHandle> {
+    ai_hist::export::create_export(
+        conn,
+        selection,
+        &ai_hist::export::ExportLimits {
+            max_batch_records: limits.max_batch_records,
+            max_batch_bytes: limits.max_batch_bytes,
+            max_scan_records: limits.max_scan_records,
+        },
+        ttl,
+        now,
+    )
+}
+
+fn update_root_subscription(conn: &Connection, id: &str) -> Result<()> {
+    let root = job(conn, id)?;
+    capture::save_subscription(
+        conn,
+        &capture::Subscription {
+            id,
+            session: None,
+            cursor: root.cursor,
+            kind: root.bootstrap_kind,
+            rowid: root.bootstrap_rowid,
+            complete: root.bootstrap_done,
+        },
+    )
 }

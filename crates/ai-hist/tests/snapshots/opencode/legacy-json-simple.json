@@ -20,6 +20,7 @@
   "quirk": "legacy `storage/{session,message,part}` JSON layout: one session, three parts",
   "session_events": [
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "text:prt_simple_2",
       "git_branch": null,
@@ -36,6 +37,7 @@
       "ts_ms": 1776988802000
     }
   ],
+  "session_markers": [],
   "session_relationships": [],
   "sessions": [
     {

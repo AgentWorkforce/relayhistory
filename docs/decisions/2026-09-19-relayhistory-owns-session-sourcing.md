@@ -144,7 +144,7 @@ of `sessions list`. It is listed for completeness; every session-evidence row is
 | Tool-result fidelity (identity, bytes, truncation, hash, ordering) | ✓      | ✓     | —      | ✗    | ✗        | ✗     | —          | [#171](https://github.com/AgentWorkforce/relayhistory/issues/171)                                                                                                                                                                                                             |
 | File edits (`file_edits`)                                          | ✓      | ✓     | ✓      | ✗    | ✓        | ✗     | —          | [#166](https://github.com/AgentWorkforce/relayhistory/issues/166) / [#167](https://github.com/AgentWorkforce/relayhistory/issues/167) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                     |
 | Compaction / summary markers                                       | ✗      | ✗     | ✗      | ✗    | ✓        | ✗     | —          | [#165](https://github.com/AgentWorkforce/relayhistory/issues/165) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                                                                                          |
-| Control / lifecycle rows                                           | ✗      | ✗     | ✗      | ✗    | ✗        | ✗     | —          | [#165](https://github.com/AgentWorkforce/relayhistory/issues/165), [#180](https://github.com/AgentWorkforce/relayhistory/issues/180)                                                                                                                                          |
+| Control / lifecycle rows                                           | ✓      | ✓     | ✗      | ✗    | ✗        | ✗     | —          | [#165](https://github.com/AgentWorkforce/relayhistory/issues/165), [#180](https://github.com/AgentWorkforce/relayhistory/issues/180)                                                                                                                                          |
 | Relationship — delegated                                           | ◐      | ✓     | —      | —    | ✓        | —     | —          | [#170](https://github.com/AgentWorkforce/relayhistory/issues/170) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                                                                                          |
 | Relationship — fork / resume / continuation                        | ✗      | ✗     | ✗      | ✗    | ✗        | ✗     | —          | [#170](https://github.com/AgentWorkforce/relayhistory/issues/170)                                                                                                                                                                                                             |
 | Session metadata (cwd, branch, versions)                           | ◐      | ✓     | ◐      | ◐    | ◐        | ✗     | —          | [#164](https://github.com/AgentWorkforce/relayhistory/issues/164), [#177](https://github.com/AgentWorkforce/relayhistory/issues/177)                                                                                                                                          |
@@ -226,6 +226,18 @@ and are skipped before the block loop is reached. The Codex arms end in
 rest of the lifecycle vanish. `is_claude_control_prompt` removes slash-command
 wrappers from `history` and leaves no record that the command was issued. There
 is no `session_markers` table.
+
+_Since [#165](https://github.com/AgentWorkforce/relayhistory/issues/165) and
+[#180](https://github.com/AgentWorkforce/relayhistory/issues/180):_
+`session_markers` holds the lifecycle records, and every user-role row that is
+not a prompt — slash-command triads, task notifications, hook output, bash
+pass-through, `<system-reminder>` blocks, `isMeta` bookkeeping, bare `/resume`
+markers, Codex context wrappers — is stored with `session_events.control_kind`
+and kept out of `history`, `first_prompt` and prompt attribution by that one
+classification (`src/ingest/control.rs`, which replaced the prefix list). A
+slash-command triad is grouped into one `slash_command` marker carrying the
+parsed command and the three rows' uids. Cursor, grok and opencode write no
+control rows of these shapes, so their cells stay as they were.
 
 **Relationships.** Only two relationship values are ever written:
 `delegated` and `materialized_local` (the latter is the remote↔local identity

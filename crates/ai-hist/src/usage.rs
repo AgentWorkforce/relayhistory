@@ -605,6 +605,11 @@ struct UsageMessage {
     /// The API request this record belongs to. Several records can share one
     /// — see [`request_key`].
     request: String,
+    /// A user-role record every row of which carries a `control_kind`: a
+    /// slash-command wrapper, a task notification, Codex context. Not a
+    /// prompt, so never an owner; the walk to the owning prompt steps over
+    /// it.
+    control: bool,
 }
 
 /// What one record contributes to its request.
@@ -692,14 +697,18 @@ pub fn attribute_usage_to_prompts(
                 }
                 Some(_) => RecordUsage::Unreadable,
             };
+            // A `<system-reminder>` row shares its prompt's record id and is
+            // not the human's text; leaving it out is what keeps this key
+            // equal to the `history` prompt the row was stored beside.
             let text = rows
                 .iter()
-                .filter(|r| r.kind == "text")
+                .filter(|r| r.kind == "text" && r.control_kind.is_none())
                 .filter_map(|r| r.text.as_deref())
                 .map(str::trim)
                 .filter(|text| !text.is_empty())
                 .collect::<Vec<_>>()
                 .join("\n");
+            let control = first.role == "user" && rows.iter().all(|r| r.control_kind.is_some());
             Some((
                 id.to_string(),
                 UsageMessage {
@@ -710,19 +719,26 @@ pub fn attribute_usage_to_prompts(
                     text,
                     usage,
                     request,
+                    control,
                 },
             ))
         })
         .collect();
     // Keep even unidentifiable user events as boundaries; dropping one would
-    // incorrectly charge its answer to the preceding identifiable prompt.
-    let mut boundaries: Vec<_> = events.iter().filter(|e| e.role == "user").collect();
+    // incorrectly charge its answer to the preceding identifiable prompt. A
+    // control row is the one user row that is *not* a boundary: Codex
+    // prepends its context wrapper to the human's turn, and treating it as a
+    // turn of its own would hand the answer to the wrapper.
+    let mut boundaries: Vec<_> = events
+        .iter()
+        .filter(|e| e.role == "user" && e.control_kind.is_none())
+        .collect();
     boundaries.sort_by_key(|e| e.ts_ms);
     // Parsers use zero when time is missing. Such a turn could fall anywhere,
     // so timestamp-only ownership is unsafe for the session.
     let timestamps_known = boundaries.iter().all(|e| e.ts_ms > 0);
     let mut prompt_counts = HashMap::new();
-    for user in messages.values().filter(|m| m.role == "user") {
+    for user in messages.values().filter(|m| m.role == "user" && !m.control) {
         *prompt_counts
             .entry((user.ts, user.text.clone()))
             .or_insert(0) += 1;
@@ -897,7 +913,10 @@ fn parent_prompt<'a>(
     let mut current = message;
     let mut visited = HashSet::new();
     while visited.insert(current.id.as_str()) {
-        if current.role == "user" {
+        // A slash command's rows sit between the answer and the prompt that
+        // caused it. They are chained like any record, and they are not the
+        // owner, so the walk continues through them to the prompt.
+        if current.role == "user" && !current.control {
             return Some(current);
         }
         current = messages.get(current.parent.as_deref()?)?;
@@ -1364,6 +1383,7 @@ mod tests {
             is_meta: None,
             turn_id: None,
             request_span: None,
+            control_kind: None,
             raw_kind: None,
         }
     }

@@ -17,7 +17,9 @@ path = "src/lib.rs"
 
 [features]
 default = []
-delivery = []
+# Legacy feature alias; upload APIs now belong to relayhistory-plugin.
+delivery = ["export"]
+export = []
 # Filesystem-event driver for the live-capture watch loop. Optional so the
 # crate still builds with --no-default-features on a host with no watcher
 # backend; without it `watch` falls back to polling.
@@ -63,18 +65,6 @@ required-features = ["unstable-internal"]
 libc = "0.2"
 
 [[test]]
-name = "delivery_worker"
-required-features = ["delivery", "unstable-internal"]
-
-[[test]]
-name = "durable_delivery"
-required-features = ["delivery", "unstable-internal"]
-
-[[test]]
-name = "delivery_capture"
-required-features = ["delivery", "unstable-internal"]
-
-[[test]]
 name = "live_capture"
 required-features = ["unstable-internal"]
 
@@ -92,7 +82,7 @@ required-features = ["unstable-internal"]
 
 [[test]]
 name = "opencode_parity"
-required-features = ["delivery", "unstable-internal"]
+required-features = ["export", "unstable-internal"]
 
 [[test]]
 name = "session_continuity"
@@ -117,10 +107,6 @@ required-features = ["unstable-internal"]
 [[test]]
 name = "project_identity_discovery"
 required-features = ["unstable-internal"]
-
-[[test]]
-name = "project_key_delivery"
-required-features = ["delivery", "unstable-internal"]
 
 [[test]]
 name = "source_intake"

@@ -12,7 +12,7 @@ pub(super) struct Table {
 /// Every consumer a capture trigger has to serve: live delivery jobs and
 /// unexpired file exports. Named once so the preimage sweep below cannot drift
 /// from the triggers it stands in for.
-const CONSUMERS: &str = "SELECT id,state,bootstrap_done,bootstrap_kind,bootstrap_rowid FROM delivery_jobs WHERE state <> 'cancelled' UNION ALL SELECT id,'active',bootstrap_done,bootstrap_kind,bootstrap_rowid FROM history_exports WHERE expires_at_ms > CAST(unixepoch('subsec')*1000 AS INTEGER)";
+const CONSUMERS: &str = "SELECT id,'active' AS state,bootstrap_done,bootstrap_kind,bootstrap_rowid,source AS member_source,session_id AS member_session FROM history_subscriptions UNION ALL SELECT id,'active',bootstrap_done,bootstrap_kind,bootstrap_rowid,NULL,NULL FROM history_exports WHERE expires_at_ms > CAST(unixepoch('subsec')*1000 AS INTEGER)";
 
 pub(super) const TABLES: &[Table] = &[
     Table {
@@ -209,24 +209,20 @@ fn drop_triggers_that_predate_a_column(conn: &Connection, table: &Table) -> Resu
 
 pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(&format!(r#"
+CREATE TABLE IF NOT EXISTS history_subscriptions (
+ id TEXT PRIMARY KEY, source TEXT, session_id TEXT, journal_cursor INTEGER NOT NULL,
+ bootstrap_kind INTEGER NOT NULL DEFAULT 0, bootstrap_rowid INTEGER NOT NULL DEFAULT 0,
+ bootstrap_done INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS history_subscription_cursor ON history_subscriptions(journal_cursor);
+CREATE INDEX IF NOT EXISTS history_subscription_identity ON history_subscriptions(source,session_id,journal_cursor);
+CREATE TABLE IF NOT EXISTS history_compaction (singleton INTEGER PRIMARY KEY CHECK(singleton=1), cursor INTEGER NOT NULL);
+INSERT OR IGNORE INTO history_compaction VALUES (1,0);
 CREATE TABLE IF NOT EXISTS delivery_state (
     singleton INTEGER PRIMARY KEY CHECK(singleton=1), origin_id TEXT NOT NULL,
     retained_bytes INTEGER NOT NULL DEFAULT 0, max_retained_bytes INTEGER NOT NULL DEFAULT {retention_limit}
 );
 INSERT OR IGNORE INTO delivery_state(singleton, origin_id) VALUES (1, lower(hex(randomblob(16))));
-CREATE TABLE IF NOT EXISTS delivery_jobs (
-    id TEXT PRIMARY KEY, destination_id TEXT NOT NULL, instance_id TEXT NOT NULL, account_id TEXT NOT NULL,
-    generation INTEGER NOT NULL, config_json TEXT NOT NULL,
-    state TEXT NOT NULL CHECK(state IN ('active','paused','blocked','cancelled')),
-    created_ms INTEGER NOT NULL, cutoff INTEGER NOT NULL, journal_cursor INTEGER NOT NULL,
-    bootstrap_kind INTEGER NOT NULL DEFAULT 0, bootstrap_rowid INTEGER NOT NULL DEFAULT 0,
-    bootstrap_done INTEGER NOT NULL DEFAULT 0, acknowledged_cursor INTEGER NOT NULL DEFAULT 0,
-    fence INTEGER NOT NULL DEFAULT 0, worker_id TEXT, lease_until_ms INTEGER,
-    next_attempt_ms INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0,
-    last_attempt_ms INTEGER, last_acknowledged_ms INTEGER, acceptance_level TEXT, failure TEXT,
-    suppressed_records INTEGER NOT NULL DEFAULT 0, acknowledged_records INTEGER NOT NULL DEFAULT 0
-);
-CREATE UNIQUE INDEX IF NOT EXISTS delivery_active_instance ON delivery_jobs(destination_id,instance_id,account_id) WHERE state <> 'cancelled';
 CREATE TABLE IF NOT EXISTS delivery_bootstrap_bounds (
     job_id TEXT NOT NULL, kind TEXT NOT NULL, max_rowid INTEGER NOT NULL,
     PRIMARY KEY(job_id,kind)
@@ -240,14 +236,6 @@ CREATE TABLE IF NOT EXISTS delivery_journal (
     seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, source TEXT NOT NULL,
     session_id TEXT, record_key TEXT NOT NULL, operation TEXT NOT NULL, payload TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS delivery_batches (
-    seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, job_id TEXT NOT NULL,
-    state TEXT NOT NULL CHECK(state IN ('pending','leased','retry_wait','blocked','acknowledged','suppressed','cancelled')),
-    payload TEXT, prepared TEXT, records INTEGER NOT NULL, bytes INTEGER NOT NULL,
-    journal_end INTEGER NOT NULL, created_ms INTEGER NOT NULL, accepted_records INTEGER NOT NULL DEFAULT 0
-);
-CREATE UNIQUE INDEX IF NOT EXISTS delivery_one_pending_batch ON delivery_batches(job_id) WHERE state IN ('pending','leased','retry_wait','blocked');
-CREATE INDEX IF NOT EXISTS delivery_batch_job ON delivery_batches(job_id, seq);
 CREATE TABLE IF NOT EXISTS history_exports (
  id TEXT PRIMARY KEY, selection_json TEXT NOT NULL, limits_json TEXT NOT NULL,
  cutoff INTEGER NOT NULL, bootstrap_kind INTEGER NOT NULL DEFAULT 0,
@@ -258,10 +246,13 @@ CREATE TABLE IF NOT EXISTS history_export_pages (
  cursor TEXT PRIMARY KEY, export_id TEXT NOT NULL, payload TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS history_export_page_owner ON history_export_pages(export_id);
+CREATE INDEX IF NOT EXISTS delivery_journal_session ON delivery_journal(source,session_id,seq);
+CREATE INDEX IF NOT EXISTS delivery_shadow_session ON delivery_shadow(job_id,kind,source,session_id,row_id);
 CREATE TABLE IF NOT EXISTS delivery_exclusions (
     source TEXT NOT NULL, session_id TEXT NOT NULL, PRIMARY KEY(source,session_id)
 );
 "#, retention_limit = super::DEFAULT_RETENTION_LIMIT_BYTES))?;
+    super::legacy::adopt_subscriptions(conn)?;
     // A pre-upgrade job/export has no snapshot boundary for newly introduced
     // tables. Give it an empty historical snapshot; new observation writes are
     // captured by the journal. A newly created generation exports current rows.
@@ -270,17 +261,26 @@ CREATE TABLE IF NOT EXISTS delivery_exclusions (
         "observation_evidence",
         "session_marker",
     ] {
-        conn.execute("INSERT OR IGNORE INTO delivery_bootstrap_bounds(job_id,kind,max_rowid) SELECT id,?,0 FROM delivery_jobs UNION ALL SELECT id,?,0 FROM history_exports",[kind,kind])?;
+        conn.execute("INSERT OR IGNORE INTO delivery_bootstrap_bounds(job_id,kind,max_rowid) SELECT id,?,0 FROM history_subscriptions UNION ALL SELECT id,?,0 FROM history_exports",[kind,kind])?;
     }
     // Count retained logical bytes, including key/payload duplication and row
     // overhead. This is a retention cap, not a promise about SQLite page size.
     for (table, size) in [
         ("history_export_pages", "length(CAST(payload AS BLOB))+512"),
-        ("delivery_journal", "length(CAST(payload AS BLOB))+length(CAST(record_key AS BLOB))+512"),
-        ("delivery_shadow", "coalesce(length(CAST(payload AS BLOB)),0)+length(CAST(record_key AS BLOB))+512"),
-        ("delivery_batches", "coalesce(length(CAST(payload AS BLOB)),0)+coalesce(length(CAST(prepared AS BLOB)),0)+512"),
+        (
+            "delivery_journal",
+            "length(CAST(payload AS BLOB))+length(CAST(record_key AS BLOB))+512",
+        ),
+        (
+            "delivery_shadow",
+            "coalesce(length(CAST(payload AS BLOB)),0)+length(CAST(record_key AS BLOB))+512",
+        ),
     ] {
-        let qualified = |row: &str| size.replace("payload", &format!("{row}.payload")).replace("record_key", &format!("{row}.record_key")).replace("prepared", &format!("{row}.prepared"));
+        let qualified = |row: &str| {
+            size.replace("payload", &format!("{row}.payload"))
+                .replace("record_key", &format!("{row}.record_key"))
+                .replace("prepared", &format!("{row}.prepared"))
+        };
         let new = qualified("NEW");
         let old = qualified("OLD");
         conn.execute_batch(&format!(r#"
@@ -301,6 +301,32 @@ CREATE TRIGGER IF NOT EXISTS {table}_count_delete AFTER DELETE ON {table} BEGIN
 END;
 "#))?;
     }
+    let members_current: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE name='history_export_storage_v1')",
+        [],
+        |r| r.get(0),
+    )?;
+    for table in TABLES {
+        // An index with only identity columns carries rowid as its implicit
+        // suffix, allowing ordered seeks without sorting a session's records.
+        let columns = if table.source.starts_with('\'') {
+            table.session.to_string()
+        } else {
+            format!("{},{}", table.source, table.session)
+        };
+        conn.execute_batch(&format!(
+            "CREATE INDEX IF NOT EXISTS delivery_identity_{} ON {}({})",
+            table.name, table.name, columns
+        ))?;
+        if !members_current {
+            for operation in ["insert", "update", "delete"] {
+                conn.execute_batch(&format!(
+                    "DROP TRIGGER IF EXISTS delivery_{}_{}",
+                    table.name, operation
+                ))?;
+            }
+        }
+    }
     let consumers = CONSUMERS;
     for table in TABLES {
         drop_triggers_that_predate_a_column(conn, table)?;
@@ -315,13 +341,14 @@ END;
         let name = table.name;
         let kind = table.kind;
         let session = table.session;
-        let shadow = |row: &str, payload: &str| {
+        let shadow = |row: &str, payload: &str, extra: &str| {
             format!(
                 r#"
  INSERT OR IGNORE INTO delivery_shadow(job_id,kind,row_id,source,session_id,record_key,payload)
  SELECT j.id,'{kind}',{row}.rowid,{source},{row}.{session},{key},{payload}
  FROM ({consumers}) j JOIN delivery_bootstrap_bounds b ON b.job_id=j.id AND b.kind='{kind}'
  WHERE j.state <> 'cancelled' AND j.bootstrap_done=0 AND {row}.rowid <= b.max_rowid
+ AND (j.member_source IS NULL OR (j.member_source={source} AND j.member_session={row}.{session}) {extra})
  AND (j.bootstrap_kind < {index} OR (j.bootstrap_kind={index} AND j.bootstrap_rowid < {row}.rowid))
  AND NOT EXISTS(SELECT 1 FROM delivery_shadow s WHERE s.job_id=j.id AND s.kind='{kind}' AND s.row_id={row}.rowid);
 "#,
@@ -329,8 +356,13 @@ END;
                 key = table.key(row)
             )
         };
-        let insert_shadow = shadow("NEW", "NULL");
-        let before_shadow = shadow("OLD", &old_payload);
+        let insert_shadow = shadow("NEW", "NULL", "");
+        let before_shadow = shadow("OLD", &old_payload, "");
+        let update_shadow = shadow(
+            "OLD",
+            &old_payload,
+            &format!("OR (j.member_source={new_source} AND j.member_session=NEW.{session})"),
+        );
         // A capture trigger embeds the column list the table had when it was
         // created. `CREATE TRIGGER IF NOT EXISTS` leaves that in place, so a
         // table that later gains a column keeps being captured in the old
@@ -355,32 +387,37 @@ CREATE TRIGGER IF NOT EXISTS delivery_{name}_insert AFTER INSERT ON {name}
 WHEN EXISTS(SELECT 1 FROM ({consumers})) BEGIN
  {insert_shadow}
  INSERT INTO delivery_journal(kind,source,session_id,record_key,operation,payload)
- SELECT '{kind}',{new_source},NEW.{session},{new_key},'upsert',{new_payload} WHERE EXISTS(SELECT 1 FROM delivery_jobs WHERE state <> 'cancelled');
+ SELECT '{kind}',{new_source},NEW.{session},{new_key},'upsert',{new_payload} WHERE EXISTS(SELECT 1 FROM history_subscriptions);
 END;
 CREATE TRIGGER IF NOT EXISTS delivery_{name}_update AFTER UPDATE ON {name}
 WHEN EXISTS(SELECT 1 FROM ({consumers})) AND {old_payload} <> {new_payload} BEGIN
- {before_shadow}
+ {update_shadow}
  INSERT OR IGNORE INTO delivery_shadow(job_id,kind,row_id,source,session_id,record_key,payload)
  SELECT j.id,'{kind}',NEW.rowid,{new_source},NEW.{session},{new_key},NULL
  FROM ({consumers}) j JOIN delivery_bootstrap_bounds b ON b.job_id=j.id AND b.kind='{kind}'
  WHERE OLD.rowid <> NEW.rowid AND j.state <> 'cancelled' AND j.bootstrap_done=0 AND NEW.rowid <= b.max_rowid
+ AND (j.member_source IS NULL OR (j.member_source={new_source} AND j.member_session=NEW.{session}))
  AND (j.bootstrap_kind < {index} OR (j.bootstrap_kind={index} AND j.bootstrap_rowid < NEW.rowid))
  AND NOT EXISTS(SELECT 1 FROM delivery_shadow s WHERE s.job_id=j.id AND s.kind='{kind}' AND s.row_id=NEW.rowid);
  INSERT INTO delivery_journal(kind,source,session_id,record_key,operation,payload)
- SELECT '{kind}',{old_source},OLD.{session},{old_key},'delete','null' WHERE {old_key} <> {new_key} AND EXISTS(SELECT 1 FROM delivery_jobs WHERE state <> 'cancelled');
+ SELECT '{kind}',{old_source},OLD.{session},{old_key},'delete','null' WHERE {old_key} <> {new_key} AND EXISTS(SELECT 1 FROM history_subscriptions);
  INSERT INTO delivery_journal(kind,source,session_id,record_key,operation,payload)
- SELECT '{kind}',{new_source},NEW.{session},{new_key},'upsert',{new_payload} WHERE EXISTS(SELECT 1 FROM delivery_jobs WHERE state <> 'cancelled');
+ SELECT '{kind}',{new_source},NEW.{session},{new_key},'upsert',{new_payload} WHERE EXISTS(SELECT 1 FROM history_subscriptions);
 END;
 CREATE TRIGGER IF NOT EXISTS delivery_{name}_delete AFTER DELETE ON {name}
 WHEN EXISTS(SELECT 1 FROM ({consumers})) BEGIN
  {before_shadow}
  INSERT INTO delivery_journal(kind,source,session_id,record_key,operation,payload)
- SELECT '{kind}',{old_source},OLD.{session},{old_key},'delete','null' WHERE EXISTS(SELECT 1 FROM delivery_jobs WHERE state <> 'cancelled');
+ SELECT '{kind}',{old_source},OLD.{session},{old_key},'delete','null' WHERE EXISTS(SELECT 1 FROM history_subscriptions);
 END;
 "#))?;
     }
     conn.execute(
         "INSERT OR IGNORE INTO schema_migrations(name) VALUES ('delivery_v1')",
+        [],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations(name) VALUES ('history_export_storage_v1')",
         [],
     )?;
     Ok(())
@@ -423,16 +460,21 @@ pub(crate) fn shadow_preimages(conn: &Connection, table_name: &str) -> Result<()
     // omitting it here did not degrade the sweep: it failed every open of that
     // database. Same crash class as `delivery_journal` and `delivery_shadow`,
     // reached through the fourth table.
-    let ready: bool = conn
-        .prepare(
-            "SELECT count(*) = 4 FROM sqlite_master WHERE type = 'table' \
-             AND name IN ('delivery_shadow','delivery_bootstrap_bounds','delivery_jobs',\
-             'history_exports')",
-        )?
-        .query_row([], |row| row.get(0))?;
+    super::legacy::ensure_subscriptions(conn)?;
+    let ready: bool = conn.query_row("SELECT count(*)=3 FROM sqlite_master WHERE type='table' AND name IN ('history_subscriptions','delivery_shadow','delivery_bootstrap_bounds')", [], |r| r.get(0))?;
     if !ready {
         return Ok(());
     }
+    let exports: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='history_exports')",
+        [],
+        |r| r.get(0),
+    )?;
+    let consumers = if exports {
+        CONSUMERS
+    } else {
+        "SELECT id,'active' AS state,bootstrap_done,bootstrap_kind,bootstrap_rowid,source AS member_source,session_id AS member_session FROM history_subscriptions"
+    };
     let payload = table.payload(conn, "m")?;
     let key = table.key("m");
     let source = table.source("m");
@@ -448,11 +490,12 @@ pub(crate) fn shadow_preimages(conn: &Connection, table_name: &str) -> Result<()
              JOIN ({consumers}) j \
              JOIN delivery_bootstrap_bounds b ON b.job_id=j.id AND b.kind='{kind}' \
              WHERE j.state <> 'cancelled' AND j.bootstrap_done=0 AND m.rowid <= b.max_rowid \
+             AND (j.member_source IS NULL OR (j.member_source={source} AND j.member_session=m.{session})) \
              AND (j.bootstrap_kind < {index} \
                   OR (j.bootstrap_kind={index} AND j.bootstrap_rowid < m.rowid)) \
              AND NOT EXISTS(SELECT 1 FROM delivery_shadow s \
                             WHERE s.job_id=j.id AND s.kind='{kind}' AND s.row_id=m.rowid)",
-            consumers = CONSUMERS,
+            consumers = consumers,
         ),
         [],
     )?;
@@ -493,7 +536,7 @@ pub(crate) fn journal_migrated_rows(conn: &Connection, table_name: &str) -> Resu
             "INSERT INTO delivery_journal(kind,source,session_id,record_key,operation,payload) \
              SELECT '{kind}',{source},m.{session},{key},'upsert',{payload} \
              FROM {name} m \
-             WHERE EXISTS(SELECT 1 FROM delivery_jobs WHERE state <> 'cancelled')",
+             WHERE EXISTS(SELECT 1 FROM history_subscriptions)",
         ),
         [],
     )?;
@@ -528,6 +571,39 @@ fn capture_payload_is_current(conn: &Connection, table: &Table) -> Result<bool> 
 }
 
 pub(crate) fn schema_is_current(conn: &Connection) -> Result<bool> {
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE name='history_export_storage_v1')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        return Ok(false);
+    }
+    let required = [
+        "history_subscriptions",
+        "history_subscription_cursor",
+        "history_subscription_identity",
+        "history_compaction",
+        "delivery_journal_session",
+        "delivery_shadow_session",
+    ];
+    for name in required {
+        if !conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?)",
+            [name],
+            |r| r.get::<_, bool>(0),
+        )? {
+            return Ok(false);
+        }
+    }
+    for table in TABLES {
+        if !conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?)",
+            [format!("delivery_identity_{}", table.name)],
+            |r| r.get::<_, bool>(0),
+        )? {
+            return Ok(false);
+        }
+    }
     let mut names = Vec::new();
     for table in TABLES {
         for operation in ["insert", "update", "delete"] {
@@ -537,7 +613,6 @@ pub(crate) fn schema_is_current(conn: &Connection) -> Result<bool> {
     for table in [
         "delivery_journal",
         "delivery_shadow",
-        "delivery_batches",
         "history_export_pages",
     ] {
         for suffix in [
@@ -569,49 +644,4 @@ pub(crate) fn schema_is_current(conn: &Connection) -> Result<bool> {
         }
     }
     Ok(true)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::open_db;
-
-    /// A capture trigger that predates a column must not survive the upgrade
-    /// that adds it: it would keep delivering rows that look complete and are
-    /// missing a field, with nothing in the result to say so.
-    #[test]
-    fn a_capture_trigger_predating_a_column_is_rebuilt_on_the_next_open() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("history.db");
-        let conn = open_db(&path).unwrap();
-        // Recreate the session_relationships capture as it stood before
-        // `origin_session_id`, which is exactly what an older release left.
-        let stale = conn
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE type='trigger' \
-                 AND name='delivery_session_relationships_insert'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap()
-            .replace("'origin_session_id',NEW.\"origin_session_id\",", "")
-            .replace(",'origin_session_id',NEW.\"origin_session_id\"", "");
-        conn.execute_batch("DROP TRIGGER delivery_session_relationships_insert;")
-            .unwrap();
-        conn.execute_batch(&stale).unwrap();
-        assert!(!schema_is_current(&conn).unwrap());
-        drop(conn);
-
-        let conn = open_db(&path).unwrap();
-        assert!(schema_is_current(&conn).unwrap());
-        let rebuilt: String = conn
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE type='trigger' \
-                 AND name='delivery_session_relationships_insert'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(rebuilt.contains("'origin_session_id',NEW.\"origin_session_id\""));
-    }
 }

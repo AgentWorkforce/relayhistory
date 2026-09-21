@@ -3,6 +3,7 @@
 pub mod cloud;
 pub mod compat;
 pub mod convergence;
+pub mod delivery;
 pub mod destination;
 pub mod helper;
 pub mod legacy_cli;

@@ -1,10 +1,9 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { gunzipSync } from 'node:zlib';
 
 import { usesCancellation } from './cli.js';
 
@@ -63,8 +62,8 @@ test('the bin claims the process signals only for the commands that read them', 
   // `main` asks this before installing a handler, so it has to agree with the
   // dispatch it precedes: every command that is handed `options.signal` and no
   // other.
-  assert.equal(usesCancellation(['delivery', 'run', '--config', 'x']), true);
-  assert.equal(usesCancellation(['delivery', 'drain', '--config', 'x']), true);
+  assert.equal(usesCancellation(['delivery', 'run', '--config', 'x']), false);
+  assert.equal(usesCancellation(['delivery', 'drain', '--config', 'x']), false);
   assert.equal(usesCancellation(['sessions', 'list']), false);
   assert.equal(usesCancellation(['sync']), false);
   assert.equal(usesCancellation(['search', 'delivery', 'run']), false,
@@ -91,26 +90,4 @@ test('Ctrl-C ends a command that does not read the cancellation signal', async (
   const ended = await interrupt(['plugin', 'block', '--config', configPath]);
   assert.equal(ended.signal, 'SIGINT',
     `one Ctrl-C must end an ordinary command; it ended with code ${ended.code}/${ended.signal}`);
-});
-
-test('Ctrl-C still stops the delivery loop the handler exists for', async (t) => {
-  // The other half of the fix: the delivery path genuinely consumes the signal,
-  // so it must keep its handler and shut down gracefully rather than be
-  // terminated by the default disposition.
-  const root = await mkdtemp(join(tmpdir(), 'relayhistory-signals-delivery-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
-  const db = join(root, 'history.db');
-  await writeFile(db, gunzipSync(await readFile(new URL('../fixtures/offline-history.db.gz', import.meta.url))));
-
-  const configPath = await pluginConfig(t, `
-    export function createHistoryPlugin() {
-      process.stdout.write('ready\\n');
-      return {};
-    }
-  `);
-
-  const ended = await interrupt(['delivery', 'run', '--db', db, '--config', configPath, '--poll-ms', '10']);
-  assert.equal(ended.signal, null,
-    `delivery run must stop itself on SIGINT, not be terminated by it: ${ended.stderr}`);
-  assert.equal(ended.code, 0, ended.stderr);
 });

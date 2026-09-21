@@ -1,6 +1,6 @@
 //! Exercise the real stop command while the collector is writing a large source.
-use ai_hist::delivery::{self, DeliveryJobConfig, ExportSelection};
 use fs2::FileExt;
+use relayhistory_plugin::delivery::{self, DeliveryJobConfig, ExportSelection};
 use relayhistory_plugin::destination;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -56,7 +56,7 @@ fn stop_command_interrupts_active_capture_and_preserves_committed_history() {
     let directory = home.path().join(".agentworkforce/probe").join(key);
     fs::create_dir_all(&directory).unwrap();
     let db = directory.join("history.db");
-    let conn = ai_hist::open_db(&db).unwrap();
+    let conn = delivery::open_db(&db).unwrap();
     let job = delivery::create_job(
         &conn,
         &DeliveryJobConfig {
@@ -165,4 +165,99 @@ fn stop_command_interrupts_active_capture_and_preserves_committed_history() {
     let checkpoint: Value =
         serde_json::from_slice(&fs::read(directory.join(".sync-state.json")).unwrap()).unwrap();
     assert!(checkpoint["claude"]["offset"].as_u64().unwrap() > 0);
+}
+
+/// A failed status write must leave the real background loop alive to recover on its next retry.
+#[test]
+fn cycle_status_write_failure_retries_and_recovers_without_restart() {
+    let home = tempfile::tempdir().unwrap();
+    let directory = home.path().join("probe");
+    fs::create_dir(&directory).unwrap();
+    let conn = delivery::open_db(&directory.join("history.db")).unwrap();
+    let job = delivery::create_job(
+        &conn,
+        &DeliveryJobConfig {
+            destination_id: "relayhistory".into(),
+            instance_id: "teams-probe".into(),
+            account_id: destination::account_id("org", Some("workspace")),
+            mapping_version: destination::MAPPING_VERSION.into(),
+            selection: ExportSelection {
+                all_sources: true,
+                kinds: vec!["session".into()],
+                ..Default::default()
+            },
+            limits: Default::default(),
+        },
+        0,
+    )
+    .unwrap();
+    delivery::pause_job(&conn, &job.job_id).unwrap();
+    fs::write(
+        directory.join("config.json"),
+        serde_json::to_vec(&json!({
+            "version":1,"site_url":"https://agentrelay.com","account_id":"account","org_id":"org",
+            "workspace_id":"workspace","history_url":"https://history.agentrelay.com",
+            "delivery_account":job.config.account_id,"job_id":job.job_id,"include_existing":true,
+            "sharing_mode":null,"acknowledge_uninspected_schedules":false
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    // Replacing a directory with the atomic status file fails deterministically
+    // on every platform without filling the host disk or depending on chmod.
+    let cycle = directory.join("cycle.json");
+    fs::create_dir(&cycle).unwrap();
+    let log = directory.join("test-stderr.log");
+    let mut collector = Running(
+        command(home.path())
+            .args(["run", "--directory"])
+            .arg(&directory)
+            .args(["--startup-id", "status-retry-test"])
+            .stderr(fs::File::create(&log).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    let start = Instant::now();
+    loop {
+        assert!(
+            collector.0.try_wait().unwrap().is_none(),
+            "status write failure stopped collector"
+        );
+        if fs::read_to_string(&log)
+            .unwrap()
+            .contains("Sync status could not be saved")
+        {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "first cycle never completed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    fs::remove_dir(&cycle).unwrap();
+    let retry = Instant::now();
+    while !cycle.is_file() {
+        assert!(
+            collector.0.try_wait().unwrap().is_none(),
+            "collector exited instead of retrying"
+        );
+        assert!(
+            retry.elapsed() < Duration::from_secs(30),
+            "status was not retried"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let report: Value = serde_json::from_slice(&fs::read(&cycle).unwrap()).unwrap();
+    assert_eq!(report["ok"], true);
+    assert_eq!(
+        delivery::status(&conn, &job.job_id).unwrap().state,
+        "paused"
+    );
+    fs::write(
+        directory.join("stop.json"),
+        serde_json::to_vec(&json!({"startup_id":"status-retry-test"})).unwrap(),
+    )
+    .unwrap();
+    assert!(wait(&mut collector, Duration::from_secs(3)).success());
 }

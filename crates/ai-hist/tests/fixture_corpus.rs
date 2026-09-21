@@ -363,6 +363,22 @@ const CORPUS: &[Fixture] = &[
     },
     Fixture {
         source: "claude",
+        name: "system-reminder",
+        layout: Layout::ClaudeTranscript,
+        origin: Origin::RelayHistory,
+        files: &["claude/system-reminder.jsonl"],
+        quirk: "`<system-reminder>` blocks injected into user content, as a block of their own, inline in a string prompt, and alone on an `isMeta` record",
+    },
+    Fixture {
+        source: "claude",
+        name: "hook-and-passthrough",
+        layout: Layout::ClaudeTranscript,
+        origin: Origin::RelayHistory,
+        files: &["claude/hook-and-passthrough.jsonl"],
+        quirk: "a `<user-prompt-submit-hook>` row flagged `isMeta`, a `<bash-input>` / `<bash-stdout>` pass-through pair, and a bare `isMeta` bookkeeping row between two prompts",
+    },
+    Fixture {
+        source: "claude",
         name: "sidecar-subagent",
         layout: Layout::HomeTree,
         origin: Origin::RelayHistory,
@@ -554,6 +570,14 @@ const CORPUS: &[Fixture] = &[
         origin: Origin::RelayHistory,
         files: &["codex/recovered-span-covers-two-turns.jsonl"],
         quirk: "a readable snapshot recovers a span an unreadable one left open, so its delta measures both turns as one request",
+    },
+    Fixture {
+        source: "codex",
+        name: "context-wrapper",
+        layout: Layout::CodexRollout,
+        origin: Origin::RelayHistory,
+        files: &["codex/context-wrapper.jsonl"],
+        quirk: "an `<environment_context>` wrapper the app injects as a user `response_item` ahead of the human's mirrored turn",
     },
     Fixture {
         source: "codex",
@@ -914,6 +938,7 @@ fn capture(fixture: &Fixture, home: &Path) -> Value {
         "tool_calls": dump(&conn, TOOL_CALLS_SQL),
         "file_edits": dump(&conn, FILE_EDITS_SQL),
         "session_relationships": dump(&conn, SESSION_RELATIONSHIPS_SQL),
+        "session_markers": dump(&conn, SESSION_MARKERS_SQL),
         "history": dump(&conn, HISTORY_SQL),
     });
     redact(snapshot, home)
@@ -930,8 +955,13 @@ const SESSIONS_SQL: &str = "SELECT source, session_id, cwd, git_branch, first_ac
      discovery_state FROM sessions ORDER BY source, session_id";
 const SESSION_EVENTS_SQL: &str =
     "SELECT source, session_id, project, cwd, git_branch, message_id, \
-     parent_id, ts_ms, role, kind, text, model, token_json, event_uid FROM session_events \
-     ORDER BY source, session_id, ts_ms, event_uid";
+     parent_id, ts_ms, role, kind, text, model, token_json, event_uid, control_kind \
+     FROM session_events ORDER BY source, session_id, ts_ms, event_uid";
+/// `marker_uid` is derived from the provider record, not from insertion
+/// order, so it is a stable key to select and sort by.
+const SESSION_MARKERS_SQL: &str = "SELECT source, session_id, marker_uid, ts_ms, message_id, \
+     parent_id, turn_id, kind, subkind, text, payload_json FROM session_markers \
+     ORDER BY source, session_id, ts_ms IS NULL, ts_ms, marker_uid";
 const TOOL_CALLS_SQL: &str = "SELECT source, session_id, message_id, tool_use_id, name, target, \
      args_json, is_error, ts_ms FROM tool_calls ORDER BY source, session_id, ts_ms, tool_use_id";
 const FILE_EDITS_SQL: &str = "SELECT source, session_id, message_id, tool_use_id, file_path, \
@@ -1719,6 +1749,264 @@ fn opencode_sqlite_store_is_read() {
 // Each of these is un-ignored by the issue named in its attribute, which also
 // regenerates the snapshots the change moves.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Control rows as typed evidence (#180). Every row a harness writes into the
+// user role that is not a prompt carries `control_kind`, is absent from
+// `history`, and a slash-command triad is grouped into one marker whose
+// payload is all a consumer needs -- no raw JSON.
+// ---------------------------------------------------------------------------
+
+/// `(event_uid, control_kind)` for every user-role event of a fixture.
+fn user_rows(key: &str) -> Vec<(String, Option<String>)> {
+    rows(key, "session_events")
+        .iter()
+        .filter(|event| text(event, "role") == "user")
+        .map(|event| {
+            (
+                text(event, "event_uid").to_string(),
+                field(event, "control_kind").as_str().map(str::to_string),
+            )
+        })
+        .collect()
+}
+
+fn control_kind_of(key: &str, event_uid: &str) -> Option<String> {
+    user_rows(key)
+        .into_iter()
+        .find(|(uid, _)| uid == event_uid)
+        .unwrap_or_else(|| panic!("{key} has no user row {event_uid}"))
+        .1
+}
+
+fn history_prompts(key: &str) -> Vec<String> {
+    rows(key, "history")
+        .iter()
+        .map(|row| text(row, "prompt").to_string())
+        .collect()
+}
+
+fn slash_command_markers(key: &str) -> Vec<Value> {
+    rows(key, "session_markers")
+        .iter()
+        .filter(|marker| text(marker, "kind") == "slash_command")
+        .map(|marker| {
+            let payload = text(marker, "payload_json");
+            let mut parsed: Value = serde_json::from_str(payload).expect("payload is JSON");
+            parsed["marker_uid"] = json!(text(marker, "marker_uid"));
+            parsed["message_id"] = json!(text(marker, "message_id"));
+            parsed["parent_id"] = field(marker, "parent_id").clone();
+            parsed["ts_ms"] = field(marker, "ts_ms").clone();
+            parsed
+        })
+        .collect()
+}
+
+/// burn: `slash_triads` collapses caveat -> invocation -> output, chained by
+/// `parentUuid`, into one synthetic activity. Here that is one marker per
+/// command, and the three rows keep their own typed kind.
+#[test]
+fn claude_slash_command_triad_is_typed_grouped_and_kept_out_of_history() {
+    let key = "claude/slash-command-triad";
+    for (uid, kind) in [
+        ("u-prompt-1:0", None),
+        ("u-cav-1:0", Some("slash_command_caveat")),
+        ("u-inv-1:0", Some("slash_command_invocation")),
+        ("u-out-1:0", Some("slash_command_output")),
+        ("u-cav-2:0", Some("slash_command_caveat")),
+        ("u-inv-2:0", Some("slash_command_invocation")),
+        ("u-out-2:0", Some("slash_command_output")),
+    ] {
+        assert_eq!(control_kind_of(key, uid).as_deref(), kind, "{uid}");
+    }
+    assert_eq!(history_prompts(key), vec!["hi"]);
+
+    let markers = slash_command_markers(key);
+    assert_eq!(markers.len(), 2, "{markers:?}");
+    let review = &markers[0];
+    assert_eq!(review["marker_uid"], "u-inv-1:slash_command");
+    assert_eq!(review["message_id"], "u-inv-1");
+    assert_eq!(review["parent_id"], "u-cav-1");
+    assert_eq!(review["command_name"], "/review");
+    assert_eq!(review["command_message"], "review is running…");
+    assert_eq!(review["caveat_event_uid"], "u-cav-1:0");
+    assert_eq!(review["invocation_event_uid"], "u-inv-1:0");
+    assert_eq!(review["output_event_uid"], "u-out-1:0");
+    assert_eq!(review["stdout_bytes"], "review summary: no issues".len());
+    // The fixture's commands took no arguments and named no mode, and the
+    // payload says so by omission rather than by a fabricated value.
+    assert!(review.get("command_args").is_none());
+    assert!(review.get("command_mode").is_none());
+    let init = &markers[1];
+    assert_eq!(init["command_name"], "/init");
+    assert_eq!(init["output_event_uid"], "u-out-2:0");
+    assert_eq!(init["stdout_bytes"], "initialization complete".len());
+}
+
+/// burn's three-clause task-notification detector, on `origin.kind`,
+/// `attachment.commandMode` and the wrapper text. The fixture carries one
+/// row of each of the first two; both are typed and neither is a prompt.
+#[test]
+fn claude_task_notifications_are_control_rows_not_prompts() {
+    let key = "claude/task-notification";
+    assert_eq!(
+        control_kind_of(key, "u-tn-1:0").as_deref(),
+        Some("task_notification")
+    );
+    assert_eq!(
+        control_kind_of(key, "u-tn-2:0").as_deref(),
+        Some("task_notification")
+    );
+    assert_eq!(control_kind_of(key, "u-user-1:0"), None);
+    assert_eq!(control_kind_of(key, "u-user-2:0"), None);
+    assert_eq!(
+        history_prompts(key),
+        vec!["please fix the build", "thanks, also add a changelog entry"]
+    );
+    assert!(slash_command_markers(key).is_empty());
+}
+
+/// A `<system-reminder>` in user content is stored as its own row, sharing
+/// the prompt's `message_id`, and the prompt row and `history` carry only
+/// the human's text -- whether the reminder was its own content block, inline
+/// in a string, or the whole of a meta record.
+#[test]
+fn claude_system_reminders_are_rows_of_their_own_beside_the_prompt() {
+    let key = "claude/system-reminder";
+    let events = rows(key, "session_events");
+    let by_uid = |uid: &str| {
+        events
+            .iter()
+            .find(|event| text(event, "event_uid") == uid)
+            .unwrap_or_else(|| panic!("no event {uid}"))
+    };
+    // A reminder block beside a prompt block.
+    let reminder = by_uid("u-rem-1:0:reminder:0");
+    assert_eq!(text(reminder, "control_kind"), "system_reminder");
+    assert_eq!(text(reminder, "message_id"), "u-rem-1");
+    assert!(text(reminder, "text").starts_with("<system-reminder>"));
+    let prompt = by_uid("u-rem-1:1");
+    assert!(field(prompt, "control_kind").is_null());
+    assert_eq!(text(prompt, "message_id"), "u-rem-1");
+    assert_eq!(text(prompt, "text"), "tighten the retry loop");
+    // A reminder inline in a string prompt: the prompt row keeps the
+    // human's text, the reminder row the harness's.
+    assert_eq!(text(by_uid("u-rem-2:0"), "text"), "now add a test for it");
+    assert!(field(by_uid("u-rem-2:0"), "control_kind").is_null());
+    assert_eq!(
+        text(by_uid("u-rem-2:0:reminder:0"), "control_kind"),
+        "system_reminder"
+    );
+    // A meta record that is nothing but a reminder is a reminder row.
+    assert_eq!(
+        text(by_uid("u-rem-3:0:reminder:0"), "control_kind"),
+        "system_reminder"
+    );
+    assert_eq!(
+        history_prompts(key),
+        vec!["tighten the retry loop", "now add a test for it"]
+    );
+    let sessions = rows(key, "sessions");
+    assert_eq!(text(&sessions[0], "first_prompt"), "tighten the retry loop");
+}
+
+#[test]
+fn claude_hook_passthrough_and_meta_rows_are_typed() {
+    let key = "claude/hook-and-passthrough";
+    for (uid, kind) in [
+        ("u-hp-1:0", None),
+        // Flagged `isMeta` too; the hook wrapper is the more specific fact.
+        ("u-hook-1:0", Some("hook_output")),
+        ("u-bash-in:0", Some("bash_passthrough_input")),
+        ("u-bash-out:0", Some("bash_passthrough_output")),
+        ("u-meta-1:0", Some("meta")),
+        ("u-hp-2:0", None),
+    ] {
+        assert_eq!(control_kind_of(key, uid).as_deref(), kind, "{uid}");
+    }
+    assert_eq!(
+        history_prompts(key),
+        vec!["check the working tree", "commit it"]
+    );
+}
+
+/// The bare `/resume <id>` form is a marker naming the prior session, not a
+/// prompt: it is typed, and no longer the session's first prompt.
+#[test]
+fn claude_bare_resume_marker_is_a_control_row() {
+    let key = "claude/resume-marker";
+    assert_eq!(
+        control_kind_of(key, "u-resume-1:0").as_deref(),
+        Some("resume_marker")
+    );
+    assert!(history_prompts(key).is_empty());
+    assert!(field(&rows(key, "sessions")[0], "first_prompt").is_null());
+}
+
+/// Codex's `<environment_context>` wrapper is stored as a typed row rather
+/// than dropped, is not a prompt, and does not become the first prompt.
+#[test]
+fn codex_context_wrapper_is_typed_kept_and_not_a_prompt() {
+    let key = "codex/context-wrapper";
+    let rows = user_rows(key);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(
+        rows[0],
+        (
+            "4:response_item_user_message".to_string(),
+            Some("codex_context_wrapper".to_string())
+        )
+    );
+    assert_eq!(rows[1], ("5:response_item_user_message".to_string(), None));
+    assert_eq!(history_prompts(key), vec!["fix the importer"]);
+    assert_eq!(
+        text(&rows_sessions(key)[0], "first_prompt"),
+        "fix the importer"
+    );
+    // The wrapper line wrote a row, so it is not also an `unknown` marker.
+    assert!(
+        rows_markers(key)
+            .iter()
+            .all(|marker| text(marker, "kind") != "unknown"),
+        "{:?}",
+        rows_markers(key)
+    );
+}
+
+fn rows_sessions(key: &str) -> &[Value] {
+    rows(key, "sessions")
+}
+
+fn rows_markers(key: &str) -> &[Value] {
+    rows(key, "session_markers")
+}
+
+/// The invariant across the whole corpus: `history` is derived from the
+/// same classification as `control_kind`, so no control row's text is a
+/// prompt anywhere, and every untyped user text row of a local Claude or
+/// Codex session is.
+#[test]
+fn history_and_control_kind_agree_in_every_fixture() {
+    for fixture in CORPUS.iter().filter(|fixture| {
+        matches!(fixture.source, "claude" | "codex") && fixture.layout != Layout::Reference
+    }) {
+        let key = snapshot_key(fixture);
+        let prompts = history_prompts(&key);
+        for event in rows(&key, "session_events") {
+            if text(event, "role") != "user" || text(event, "kind") != "text" {
+                continue;
+            }
+            let body = text(event, "text").trim();
+            if !field(event, "control_kind").is_null() {
+                assert!(
+                    !prompts.iter().any(|prompt| prompt == body),
+                    "{key}: control row {} is in history",
+                    text(event, "event_uid")
+                );
+            }
+        }
+    }
+}
 
 /// burn: `simple_turn_parses` — `requestId` and `stop_reason` are raw fields
 /// on every complete Claude assistant record.

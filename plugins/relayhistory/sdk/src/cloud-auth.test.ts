@@ -212,8 +212,9 @@ test('fetchImpl handles thread retries while stored-session refresh uses native 
         accessTokenExpiresAt: FUTURE, orgId: 'org-test' }));
     } else if (req.url === '/v1/auth/token/refresh') {
       assert.deepEqual(JSON.parse(raw), { refreshToken: 'rth_rt_old' });
+      // The service reports tenancy on refresh; Rust adopts it (`cloud::reported_tenancy`).
       res.end(JSON.stringify({ accessToken: 'rth_at_new', refreshToken: 'rth_rt_new',
-        accessTokenExpiresAt: FUTURE }));
+        accessTokenExpiresAt: FUTURE, orgId: 'org-reported' }));
     } else {
       res.statusCode = 500;
       res.end('{}');
@@ -245,7 +246,7 @@ test('fetchImpl handles thread retries while stored-session refresh uses native 
     const auth = await main.loadStoredRelayhistoryAuth(baseUrl);
     assert.equal(auth?.accessToken, 'rth_at_new');
     assert.equal(auth?.refreshToken, 'rth_rt_new');
-    assert.equal(auth?.orgId, 'org-test');
+    assert.equal(auth?.orgId, 'org-reported', 'the org the refresh reported replaces the one login stored');
     assert.ok(auth);
 
     // A caller-managed resolution does not enable native refresh, even when the

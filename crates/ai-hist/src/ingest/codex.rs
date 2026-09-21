@@ -17,6 +17,10 @@ pub(crate) struct HumanMessage {
     pub text: String,
     pub format: HumanMessageFormat,
     pub message_id: Option<String>,
+    /// `Some` when the text is context the app injected rather than a turn
+    /// the human typed. Such a message is stored as a `session_events` row
+    /// carrying this kind, and kept out of `history` and `first_prompt`.
+    pub control: Option<super::control::ControlKind>,
 }
 
 /// Extract one substantive human turn from either supported Codex shape.
@@ -24,8 +28,18 @@ pub(crate) struct HumanMessage {
 /// Multiple `input_text` parts are kept in provider order and separated by a
 /// newline, matching the way other multipart Codex text is materialized.
 /// Application-injected control wrappers are rejected here so every caller
-/// applies the same human-message classification.
+/// applies the same human-message classification; [`user_message`] is the
+/// read that keeps them, for the walk that stores them as control rows.
 pub(crate) fn human_message(value: &Value) -> Option<HumanMessage> {
+    user_message(value).filter(|message| message.control.is_none())
+}
+
+/// Every user-role message in either shape, control wrappers included.
+///
+/// The one place both readers classify a user record, so the row the rollout
+/// walk stores as `codex_context_wrapper` is exactly the row shallow
+/// discovery refuses as a prompt.
+pub(crate) fn user_message(value: &Value) -> Option<HumanMessage> {
     let payload = value.get("payload")?.as_object()?;
     let (text, format) = match (
         value.get("type").and_then(Value::as_str),
@@ -53,12 +67,13 @@ pub(crate) fn human_message(value: &Value) -> Option<HumanMessage> {
         _ => return None,
     };
     let text = text.trim();
-    if text.is_empty() || is_control_context(text) {
+    if text.is_empty() {
         return None;
     }
     Some(HumanMessage {
         text: text.to_string(),
         format,
+        control: super::control::codex_text_control_kind(text),
         message_id: payload
             .get("id")
             .and_then(Value::as_str)
@@ -107,8 +122,10 @@ pub(crate) enum HumanMessageOutcome {
     Stored(HumanMessage),
     /// The mirrored encoding of the turn just stored; its twin wrote the row.
     Suppressed,
-    /// Not a storable human turn: no text part, a control wrapper, or not a
-    /// user message at all. Nothing wrote a row on its behalf.
+    /// Not a storable user turn: no text part, or not a user message at all.
+    /// Nothing wrote a row on its behalf. A control wrapper is *not* rejected:
+    /// it comes back `Stored` with `HumanMessage::control` set, because it is
+    /// a row the ledger keeps, just not a prompt.
     Rejected,
 }
 
@@ -139,7 +156,7 @@ impl HumanMessageDeduper {
     }
 
     pub(crate) fn observe(&mut self, value: &Value) -> HumanMessageOutcome {
-        let current = human_message(value);
+        let current = user_message(value);
         let Some(current) = current else {
             self.previous = None;
             return HumanMessageOutcome::Rejected;
@@ -207,6 +224,38 @@ mod tests {
             ]}
         });
         assert!(human_message(&context).is_none());
+        // The same record is still a user message the walk stores, typed.
+        let stored = user_message(&context).expect("a control wrapper is a stored row");
+        assert_eq!(
+            stored.control,
+            Some(super::super::control::ControlKind::CodexContextWrapper)
+        );
+        assert_eq!(
+            stored.text,
+            "<environment_context>injected</environment_context>"
+        );
+    }
+
+    /// The app writes its context wrapper in both shapes too, so the mirror
+    /// pair is collapsed exactly as a human turn's is.
+    #[test]
+    fn a_mirrored_control_wrapper_is_stored_once() {
+        let response = json!({
+            "type": "response_item",
+            "payload": {"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "<environment_context>injected</environment_context>"}
+            ]}
+        });
+        let event = json!({
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "<environment_context>injected</environment_context>"}
+        });
+        let mut deduper = HumanMessageDeduper::default();
+        match deduper.observe(&response) {
+            HumanMessageOutcome::Stored(message) => assert!(message.control.is_some()),
+            other => panic!("expected a stored control row, got {other:?}"),
+        }
+        assert_eq!(deduper.observe(&event), HumanMessageOutcome::Suppressed);
     }
 
     #[test]

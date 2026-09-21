@@ -35,6 +35,7 @@
   "quirk": "a `system` record with `subtype: compact_boundary` splits the transcript",
   "session_events": [
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-user-1:0",
       "git_branch": null,
@@ -51,6 +52,7 @@
       "ts_ms": 1776643200000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-asst-1:0",
       "git_branch": null,
@@ -67,6 +69,7 @@
       "ts_ms": 1776643201000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-user-2:0",
       "git_branch": null,
@@ -83,6 +86,7 @@
       "ts_ms": 1776643203000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-asst-2:0",
       "git_branch": null,
@@ -97,6 +101,21 @@
       "text": "ok",
       "token_json": "{\"cache_creation\":{\"ephemeral_1h_input_tokens\":0,\"ephemeral_5m_input_tokens\":100},\"cache_creation_input_tokens\":100,\"cache_read_input_tokens\":300,\"input_tokens\":20,\"output_tokens\":5}",
       "ts_ms": 1776643204000
+    }
+  ],
+  "session_markers": [
+    {
+      "kind": "compaction_boundary",
+      "marker_uid": "s-compact-1:marker",
+      "message_id": "s-compact-1",
+      "parent_id": null,
+      "payload_json": "{\"tokens_before_compact\":9000}",
+      "session_id": "compact-session",
+      "source": "claude",
+      "subkind": "compact_boundary",
+      "text": null,
+      "ts_ms": 1776643202000,
+      "turn_id": null
     }
   ],
   "session_relationships": [],

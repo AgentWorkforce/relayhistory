@@ -19,18 +19,14 @@ import {
   ConnectorFailureError,
 } from './sdk-common.js';
 
-export const NATIVE_CONTRACT_VERSION = 19;
+export const NATIVE_CONTRACT_VERSION = 20;
 type UnknownRecord = Record<string, unknown>;
 
 interface NativeBinding {
   getSourceObservation(requestJson:string):Promise<string>;
   applySourceObservations(requestJson:string):Promise<string>;
   applySourceEvidence(requestJson:string):Promise<string>;
-  historyDelivery(requestJson: string, dbPath?: string): Promise<string>;
-  historyDeliveryDrain(optionsJson: string, dbPath: string | undefined,
-    prepare: (argumentJson: string) => Promise<string>,
-    send: (argumentJson: string) => Promise<string>,
-    cancelled: () => Promise<boolean>): Promise<string>;
+  historyExport(requestJson: string, dbPath?: string): Promise<string>;
   installGitHooks(optionsJson: string, node: string, sdkUrl: string): Promise<string>;
   linkGitCommit(optionsJson: string): Promise<string>;
   nativeContractVersion(): number;

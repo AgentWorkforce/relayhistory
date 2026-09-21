@@ -123,8 +123,11 @@ impl EvidenceKind {
         // contract is what `read_session` reads back and what a snapshot is
         // compared against, and a column missing here is rejected outright as
         // an unsupported column when it appears in a payload. It stays out of
-        // `required` because it is optional for every source.
-        Self::SessionEvent=>Spec{table:"session_events",columns:"source,session_id,project,project_key,project_key_method,cwd,git_branch,message_id,parent_id,ts_ms,role,kind,text,model,token_json,provider,event_uid,tool_use_id,payload_bytes,payload_truncated,payload_hash,call_index,event_index,result_status,event_source,error_signal,subagent_session_id,agent_id,request_id,provider_message_id,stop_reason,agent_version,is_sidechain,is_meta,turn_id,request_span,raw_kind",required:"source,session_id,ts_ms,role,kind,event_uid",key:"source,session_id,event_uid",derived:"project_key,project_key_method"},
+        // `required` because it is optional for every source. `control_kind`
+        // travels for the same reason: a connector that classified a row is
+        // reporting a fact about it, and a snapshot without the column would
+        // read every control row back as a prompt.
+        Self::SessionEvent=>Spec{table:"session_events",columns:"source,session_id,project,project_key,project_key_method,cwd,git_branch,message_id,parent_id,ts_ms,role,kind,text,model,token_json,provider,event_uid,tool_use_id,payload_bytes,payload_truncated,payload_hash,call_index,event_index,result_status,event_source,error_signal,subagent_session_id,agent_id,request_id,provider_message_id,stop_reason,agent_version,is_sidechain,is_meta,turn_id,request_span,raw_kind,control_kind",required:"source,session_id,ts_ms,role,kind,event_uid",key:"source,session_id,event_uid",derived:"project_key,project_key_method"},
         Self::ToolCall=>Spec{table:"tool_calls",columns:"source,session_id,message_id,tool_use_id,name,target,args_json,is_error,ts_ms",required:"source,session_id,tool_use_id,name",key:"source,session_id,tool_use_id",derived:""},
         Self::FileEdit=>Spec{table:"file_edits",columns:"source,session_id,message_id,tool_use_id,file_path,tool_name,lines_added,lines_removed,structured_patch_json,user_modified,ts_ms,git_branch,cwd",required:"source,session_id,tool_use_id,file_path,tool_name",key:"source,session_id,tool_use_id",derived:""},
         Self::Relationship=>Spec{table:"session_relationships",columns:"source,parent_session_id,relationship_uid,child_session_id,relationship,identity_status,child_agent_type,child_agent_name,child_model,spawn_depth,evidence_kind,evidence_locator,evidence_ref,child_has_events,spawned_at_ms,created_ms,updated_ms,origin_session_id",required:"source,parent_session_id,relationship_uid,relationship,identity_status,evidence_kind,created_ms,updated_ms",key:"source,parent_session_id,relationship_uid",derived:""},
@@ -289,6 +292,25 @@ pub fn validate_records(
                         .contains(&record.payload["kind"].as_str().unwrap_or_default()),
                 "INVALID_ARGUMENT: invalid event role or kind"
             );
+            // `control_kind` is a closed vocabulary, and every reader -- the
+            // user-turn page, prompt attribution, the plugin's turn export --
+            // treats any non-null value as authoritative without rechecking
+            // it. A spelling nobody classifies, or a kind on a row the
+            // contract says can never carry one, would silently hide real
+            // evidence, so it is refused here rather than stored.
+            if let Some(value) = record.payload.get("control_kind").filter(|v| !v.is_null()) {
+                ensure!(
+                    value
+                        .as_str()
+                        .is_some_and(|value| crate::ingest::control::ControlKind::parse(value).is_some()),
+                    "INVALID_ARGUMENT: unsupported control_kind value"
+                );
+                ensure!(
+                    record.payload["role"].as_str() == Some("user")
+                        && record.payload["kind"].as_str() == Some("text"),
+                    "INVALID_ARGUMENT: control_kind is only valid on a user text event"
+                );
+            }
             let tool_result = record.payload["kind"].as_str() == Some("tool_result");
             for field in TOOL_RESULT_FIELDS {
                 let Some(value) = record.payload.get(*field).filter(|v| !v.is_null()) else {
@@ -662,6 +684,78 @@ mod tests {
                 "{field}: {error}"
             );
         }
+    }
+
+    /// A user text event as a connector contributes it, with the one field
+    /// each control-kind test below varies.
+    fn user_text_event(control_kind: Value) -> EvidenceRecord {
+        EvidenceRecord {
+            kind: EvidenceKind::SessionEvent,
+            payload: json!({
+                "source": "claude",
+                "session_id": "s1",
+                "ts_ms": 1,
+                "role": "user",
+                "kind": "text",
+                "text": "<task-notification>done</task-notification>",
+                "event_uid": "e1",
+                "control_kind": control_kind,
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            record_id: None,
+            revision_id: None,
+        }
+    }
+
+    #[test]
+    fn a_control_kind_from_the_vocabulary_is_accepted_on_a_user_text_event() {
+        validate(user_text_event(json!("task_notification")))
+            .expect("a documented control kind on a user text row is the contract");
+        validate(user_text_event(Value::Null)).expect("null is a genuine prompt");
+    }
+
+    #[test]
+    fn an_unknown_control_kind_spelling_is_rejected() {
+        for value in [json!("meta_row"), json!("Meta"), json!("")] {
+            let error = validate(user_text_event(value.clone()))
+                .expect_err("a spelling no classifier produces must be refused");
+            assert!(
+                error.to_string().contains("unsupported control_kind value"),
+                "{value}: {error}"
+            );
+        }
+        // A non-string is refused by the column's type check before the
+        // vocabulary is consulted; either way it never reaches the table.
+        assert!(validate(user_text_event(json!(7))).is_err());
+    }
+
+    /// The example from review: an assistant text event with
+    /// `control_kind: "meta"` passed validation and was then dropped from
+    /// turn publishing and attribution as if it were the harness's.
+    #[test]
+    fn a_control_kind_on_an_assistant_or_tool_result_event_is_rejected() {
+        let mut assistant = user_text_event(json!("meta"));
+        assistant.payload.insert("role".into(), json!("assistant"));
+        let error = validate(assistant).expect_err("assistant rows never carry a control kind");
+        assert!(
+            error.to_string().contains("only valid on a user text event"),
+            "{error}"
+        );
+
+        let error = validate(with("control_kind", json!("codex_context_wrapper")))
+            .expect_err("tool results never carry a control kind");
+        assert!(
+            error.to_string().contains("only valid on a user text event"),
+            "{error}"
+        );
+
+        // A user row that is not text either: the classification is about
+        // what the human's turn is, not about a tool result on it.
+        let mut user_tool_result = user_text_event(json!("meta"));
+        user_tool_result.payload.insert("kind".into(), json!("tool_result"));
+        assert!(validate(user_tool_result).is_err());
     }
 
     #[test]

@@ -42,8 +42,7 @@ export function assertPublishedContract(
     `Published peer minimum must implement native contract ${requiredContract}`,
   );
   for (const method of [
-    "historyDelivery",
-    "historyDeliveryDrain",
+    "historyExport",
     "applySourceEvidence",
     "getSourceObservation",
   ]) {
@@ -55,10 +54,10 @@ export function assertPublishedContract(
   }
   for (const method of [
     "HistoryPluginRegistry",
-    "createHistoryDelivery",
-    "historyDeliveryStatus",
-    "drainHistoryDelivery",
-    "controlHistoryDelivery",
+    "beginHistoryExport",
+    "readHistoryExportPage",
+    "exportHistory",
+    "closeHistoryExport",
     "discoverSourcePlugins",
     "hydrateSourcePlugin",
     "getSourceObservation",
@@ -149,7 +148,7 @@ const require = createRequire(import.meta.url);
 const native = createRequire(require.resolve('ai-hist'))('ai-hist-native');
 const manifest = JSON.parse(await readFile(new URL('./node_modules/ai-hist/package.json', import.meta.url), 'utf8'));
 assertPublishedContract(sdk, native, manifest.version, ${JSON.stringify(version)});
-assert.deepEqual(await sdk.historyDeliveryStatus(undefined, {dbPath:${JSON.stringify(join(project, "fixture.db"))}}), []);
+assert.deepEqual(await sdk.listSessionCatalog({dbPath:${JSON.stringify(join(project, "fixture.db"))}}), []);
 `,
       );
       run([probe]);
