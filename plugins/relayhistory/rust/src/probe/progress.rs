@@ -3,19 +3,20 @@ use ai_hist::delivery;
 use relayhistory_plugin::cloud;
 use serde::Serialize;
 use std::{
-    path::Path,
-    sync::{mpsc, Arc, Mutex},
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{mpsc, Arc, Mutex, OnceLock},
     thread,
     time::{Duration, Instant},
 };
 
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(3);
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(2);
-// In-flight heartbeat + final token renewal/report + local bookkeeping margin.
+// In-flight renewal/report + final renewal/report + local bookkeeping margin.
 pub const COMPLETION_TIMEOUT: Duration =
-    Duration::from_secs(HEARTBEAT_TIMEOUT.as_secs() * 2 + REFRESH_TIMEOUT.as_secs() + 1);
+    Duration::from_secs((HEARTBEAT_TIMEOUT.as_secs() + REFRESH_TIMEOUT.as_secs()) * 2 + 1);
 
-#[derive(Clone, Default, Serialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Progress {
     pub phase: String,
@@ -98,19 +99,128 @@ impl Progress {
     }
 }
 
+// Shared across the short-lived capture/delivery monitors in a collector process.
+// Otherwise every empty background cycle would reset the idle heartbeat deadline.
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(3);
+const RETRY_INTERVAL: Duration = Duration::from_secs(30);
+
+#[derive(Default)]
+struct HeartbeatSchedule {
+    last_sent: Option<(Progress, Instant)>,
+    last_attempt: Option<(Progress, Instant, bool)>,
+    idle_interval: Duration,
+}
+impl HeartbeatSchedule {
+    fn new() -> Self {
+        // RandomState provides a per-instance random seed without a new dependency.
+        use std::hash::{BuildHasher, Hasher};
+        let jitter = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish()
+            % 61;
+        Self {
+            idle_interval: Duration::from_secs(270 + jitter),
+            ..Self::default()
+        }
+    }
+
+    fn comparable(progress: &Progress) -> Progress {
+        let mut p = progress.clone();
+        if p.phase != "scanning" && p.phase != "capture_paused" {
+            // Capture's per-source counters reset when delivery starts.
+            p.source.clear();
+            p.processed_files = 0;
+            p.total_files = None;
+        }
+        p
+    }
+
+    fn report(
+        &mut self,
+        progress: &Progress,
+        elapsed: Duration,
+        force: bool,
+        now: Instant,
+        send: impl FnOnce() -> bool,
+    ) -> bool {
+        let p = Self::comparable(progress);
+        let changed = self.last_sent.as_ref().is_none_or(|(last, _)| last != &p);
+        let terminal = matches!(p.phase.as_str(), "watching" | "paused" | "capture_paused");
+        let new_terminal = terminal
+            && changed
+            && self
+                .last_attempt
+                .as_ref()
+                .is_none_or(|(last, _, _)| last != &p);
+        let due = self
+            .last_sent
+            .as_ref()
+            .is_none_or(|(_, at)| now.duration_since(*at) >= self.idle_interval);
+        let can_retry = self.last_attempt.as_ref().is_none_or(|(_, at, ok)| {
+            now.duration_since(*at)
+                >= if *ok {
+                    PROGRESS_INTERVAL
+                } else {
+                    RETRY_INTERVAL
+                }
+        });
+        // A quick periodic scan should not turn an idle connection into an
+        // upload on every cycle. Initial onboarding still reports immediately.
+        let brief_scan =
+            p.phase == "scanning" && self.last_sent.is_some() && elapsed < PROGRESS_INTERVAL;
+        if !force && (brief_scan || !(new_terminal || (can_retry && (changed || due)))) {
+            return self.last_sent.is_some();
+        }
+        let ok = send();
+        self.last_attempt = Some((p.clone(), now, ok));
+        if ok {
+            self.last_sent = Some((p, now));
+        }
+        ok
+    }
+}
+
+type ScheduleKey = (PathBuf, String);
+fn heartbeat_schedule(directory: &Path, url: &str) -> Arc<Mutex<HeartbeatSchedule>> {
+    static SCHEDULES: OnceLock<Mutex<HashMap<ScheduleKey, Arc<Mutex<HeartbeatSchedule>>>>> =
+        OnceLock::new();
+    SCHEDULES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .entry((directory.to_owned(), url.to_owned()))
+        .or_insert_with(|| Arc::new(Mutex::new(HeartbeatSchedule::new())))
+        .clone()
+}
+
 pub struct Monitor {
     snapshot: Arc<Mutex<Progress>>,
     stop: Option<mpsc::Sender<bool>>,
     completion: mpsc::Receiver<bool>,
 }
 impl Monitor {
-    pub fn start(directory: &Path, history_url: &str, job: Option<&str>) -> Self {
+    pub fn start(
+        directory: &Path,
+        history_url: &str,
+        job: Option<&str>,
+        confirm_completion: bool,
+    ) -> Self {
         let url = history_url.to_owned();
+        let schedule = heartbeat_schedule(directory, history_url);
+        let started = Instant::now();
         Self::start_with_report(
             directory,
             job,
             !super::bridge::json_mode(),
-            move |progress, finished| heartbeat(&url, progress, finished),
+            move |progress, finished| {
+                schedule.lock().unwrap().report(
+                    progress,
+                    started.elapsed(),
+                    finished && confirm_completion,
+                    Instant::now(),
+                    || heartbeat(&url, progress),
+                )
+            },
         )
     }
     fn start_with_report(
@@ -163,7 +273,7 @@ impl Monitor {
                 if finish.is_some() {
                     break;
                 }
-                match receive.recv_timeout(Duration::from_secs(3)) {
+                match receive.recv_timeout(PROGRESS_INTERVAL) {
                     Ok(success) => finish = Some(success),
                     Err(mpsc::RecvTimeoutError::Disconnected) => finish = Some(false),
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -211,10 +321,11 @@ impl Drop for Monitor {
         self.stop.take();
     }
 }
-fn heartbeat(url: &str, progress: &Progress, finished: bool) -> bool {
-    // Periodic capture updates only read cached credentials. A final upload
-    // update may renew an idle token, without waiting for the refresh lock.
-    let token = if finished && progress.phase != "capture_paused" {
+fn heartbeat(url: &str, progress: &Progress) -> bool {
+    // Capture updates only read cached credentials. Every actual delivery or idle
+    // report may renew a token: the closing report can now be suppressed. Renewal
+    // is bounded and never waits for another transport's refresh lock.
+    let token = if progress.phase != "scanning" && progress.phase != "capture_paused" {
         match cloud::try_progress_access_token(url, REFRESH_TIMEOUT) {
             Ok(Some(token)) => token,
             _ => return false,
@@ -256,6 +367,239 @@ fn heartbeat(url: &str, progress: &Progress, finished: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn watching() -> Progress {
+        Progress {
+            phase: "watching".into(),
+            backlog_complete: true,
+            records_uploaded: 100,
+            sessions_captured: 2,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn idle_heartbeat_renews_expired_credentials_without_a_closing_report() {
+        // Run in a child test process so synthetic credentials cannot race other
+        // tests or touch the user's selected auth store.
+        if std::env::var("PROBE_HEARTBEAT_TEST_CHILD").as_deref() != Ok("1") {
+            let directory = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "progress::tests::idle_heartbeat_renews_expired_credentials_without_a_closing_report"])
+                .env("PROBE_HEARTBEAT_TEST_CHILD", "1")
+                .env("RELAYHISTORY_HOME", directory.path())
+                .status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        cloud::save_auth(&cloud::StoredAuth {
+            base_url: url.clone(),
+            access_token: "rth_at_expired".into(),
+            refresh_token: Some("rth_rt_test".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let server = thread::spawn(move || {
+            for path in ["/v1/auth/token/refresh", "/v1/onboarding/heartbeat"] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert!(line.starts_with(&format!("POST {path} ")));
+                let mut length = 0;
+                let mut authorized = false;
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                    authorized |=
+                        line.to_ascii_lowercase().trim() == "authorization: bearer rth_at_fresh";
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                if path.ends_with("heartbeat") {
+                    assert!(authorized);
+                    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(body["progress"]["phase"], "watching");
+                }
+                let body = if path.ends_with("refresh") {
+                    serde_json::json!({"accessToken":"rth_at_fresh", "refreshToken":"rth_rt_fresh",
+                        "accessTokenExpiresAt": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()}).to_string()
+                } else {
+                    "{}".into()
+                };
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            }
+        });
+        let mut schedule = HeartbeatSchedule::new();
+        let now = Instant::now();
+        assert!(
+            schedule.report(&watching(), Duration::ZERO, false, now, || heartbeat(
+                &url,
+                &watching()
+            ))
+        );
+        schedule.report(&watching(), Duration::ZERO, false, now, || {
+            panic!("duplicate closing report")
+        });
+        server.join().unwrap();
+        assert_eq!(
+            cloud::load_selected_auth(Some(&url))
+                .unwrap()
+                .unwrap()
+                .access_token,
+            "rth_at_fresh"
+        );
+    }
+
+    #[test]
+    fn idle_cycles_share_a_deadline_and_send_about_twelve_reports_per_hour() {
+        let directory = tempfile::tempdir().unwrap();
+        let schedule = heartbeat_schedule(directory.path(), "http://history.test");
+        assert!(Arc::ptr_eq(
+            &schedule,
+            &heartbeat_schedule(directory.path(), "http://history.test")
+        ));
+        assert!(!Arc::ptr_eq(
+            &schedule,
+            &heartbeat_schedule(directory.path(), "http://other.test")
+        ));
+        let mut state = schedule.lock().unwrap();
+        assert!((270..=330).contains(&state.idle_interval.as_secs()));
+        let start = Instant::now();
+        let mut sent = 0;
+        for seconds in (0..3600).step_by(20) {
+            let now = start + Duration::from_secs(seconds);
+            if seconds > 0 && seconds % 60 == 0 {
+                let scan = Progress {
+                    phase: "scanning".into(),
+                    ..Default::default()
+                };
+                state.report(&scan, Duration::ZERO, false, now, || {
+                    sent += 1;
+                    true
+                });
+            }
+            // Every monitor sends both an opening and closing snapshot.
+            for _ in 0..2 {
+                state.report(&watching(), Duration::ZERO, false, now, || {
+                    sent += 1;
+                    true
+                });
+            }
+        }
+        assert!((11..=14).contains(&sent), "sent {sent} idle requests");
+    }
+
+    #[test]
+    fn changed_progress_is_throttled_but_completion_and_failure_are_immediate() {
+        let mut state = HeartbeatSchedule::new();
+        let start = Instant::now();
+        let mut p = Progress {
+            phase: "uploading".into(),
+            ..Default::default()
+        };
+        let mut sent = 0;
+        for seconds in 0..10 {
+            p.records_uploaded = seconds;
+            state.report(
+                &p,
+                Duration::from_secs(seconds as u64),
+                false,
+                start + Duration::from_secs(seconds as u64),
+                || {
+                    sent += 1;
+                    true
+                },
+            );
+        }
+        assert_eq!(sent, 4); // 0, 3, 6, 9
+        state.report(
+            &watching(),
+            Duration::ZERO,
+            false,
+            start + Duration::from_secs(9),
+            || {
+                sent += 1;
+                true
+            },
+        );
+        p.phase = "capture_paused".into();
+        state.report(
+            &p,
+            Duration::ZERO,
+            false,
+            start + Duration::from_secs(9),
+            || {
+                sent += 1;
+                true
+            },
+        );
+        assert_eq!(sent, 6);
+        state.report(
+            &p,
+            Duration::ZERO,
+            false,
+            start + Duration::from_secs(20),
+            || panic!("unchanged failure"),
+        );
+    }
+
+    #[test]
+    fn unchanged_active_progress_is_suppressed_and_failed_reports_retry() {
+        let mut state = HeartbeatSchedule::new();
+        let start = Instant::now();
+        let p = Progress {
+            phase: "uploading".into(),
+            ..Default::default()
+        };
+        assert!(!state.report(&p, Duration::ZERO, false, start, || false));
+        state.report(
+            &p,
+            Duration::ZERO,
+            false,
+            start + Duration::from_secs(3),
+            || panic!("retry storm"),
+        );
+        let mut retried = false;
+        assert!(
+            state.report(&p, Duration::ZERO, false, start + RETRY_INTERVAL, || {
+                retried = true;
+                true
+            })
+        );
+        assert!(retried);
+        state.report(
+            &p,
+            Duration::ZERO,
+            false,
+            start + Duration::from_secs(60),
+            || panic!("unchanged active progress"),
+        );
+        let mut confirmed = false;
+        assert!(state.report(
+            &p,
+            Duration::ZERO,
+            true,
+            start + Duration::from_secs(60),
+            || {
+                confirmed = true;
+                true
+            }
+        ));
+        assert!(confirmed); // --once/setup must still prove final connectivity.
+    }
+
     #[test]
     fn finish_and_drop_do_not_wait_for_a_slow_reporter() {
         for success in [None, Some(false), Some(true)] {

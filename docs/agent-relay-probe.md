@@ -97,9 +97,14 @@ job waits out its own backoff, which is normal operation rather than a fault.
 Transport credentials refresh through the existing RelayHistory auth
 implementation.
 
-The probe sends the onboarding heartbeat only after a successful capture and
-delivery cycle. Cloud determines whether session data has actually arrived. A
-running process alone does not mark the dashboard's data step complete.
+The probe reports initial capture immediately, then changed progress at most every
+three seconds. Completion and failure transitions report immediately. Unchanged
+progress uses a jittered 270–330 second presence heartbeat shared across capture
+and delivery monitors; empty background cycles and short repeat scans do not
+produce extra requests. Failed reports retry no faster than every 30 seconds,
+except for a new terminal transition or explicit setup/one-shot confirmation.
+Cloud determines whether session data has actually arrived. A running process
+alone does not mark the dashboard's data step complete.
 
 An OS file lock permits one collector per destination directory. Stop requests
 carry the startup identity, so an old stop file cannot stop a new run. There is
