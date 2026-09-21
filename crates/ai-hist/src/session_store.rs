@@ -29,6 +29,11 @@ pub enum ErrorKind {
     /// the database was reset or replaced under a consumer that kept its
     /// cursor elsewhere. See [`SessionStore::changes_since`].
     WatermarkAheadOfStore,
+    /// A named change-feed cursor was asked to serve, or be moved by, a drain
+    /// over a different kind set than it was committed for. A cursor is a
+    /// position in one kind set's stream; use another consumer name for
+    /// another filter. See [`SessionStore::changes_since`].
+    ConsumerKindsMismatch,
 }
 
 /// Recoverable failure from [`SessionStore`].

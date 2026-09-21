@@ -360,7 +360,11 @@ even though nothing wrote `sessions` itself.
 Each page is read in two passes: a covering read of each stream's revision
 index finds the page's cut (the `batch`-th smallest revision across streams),
 and only the rows below it are then fetched, so at most one page of typed rows
-is resident however many kinds are fed. The drain's start and its head are
+is resident however many kinds are fed. Both passes read one snapshot, so a
+writer re-stamping or deleting the page's rows between them cannot empty the
+window the cut describes; and an empty window steps the position forward rather
+than declaring the head, so exhaustion is only ever what the key pass proved.
+The drain's start and its head are
 resolved from one read snapshot, so a sibling drain committing the cursor while
 this one opens can never make a valid cursor look ahead of the head. A
 read-only handle over a database the feed has not migrated reports
@@ -395,6 +399,14 @@ Three rules a consumer must hold:
   replay from an explicit watermark under a name that has moved past it —
   leaves the cursor where it is; a consumer that wants to reprocess drains from
   an explicit `from` and does not commit. Two consumers advance independently.
+- **A consumer name is scoped to one kind set.** A cursor is a position in a
+  stream, and a stream is defined by its kinds: a drain over events alone that
+  reaches the head and commits has accounted for no relationship, marker or
+  catalog row on the way. So `consumer_cursors` records the normalized kind
+  set a cursor was committed for, and a `Watermark::CONSUMER` drain or a
+  `commit()` under a different kind set fails with
+  `ErrorKind::ConsumerKindsMismatch` rather than silently skipping the other
+  kinds. Use another consumer name for another filter.
 - **A watermark ahead of the head is a reset.** `SessionStore::head_revision`
   and `SyncReport::head_revision` report the head; a stored watermark beyond it
   fails with `ErrorKind::WatermarkAheadOfStore`, and the recovery is a full

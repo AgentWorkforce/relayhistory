@@ -62,6 +62,57 @@ pub const DEFAULT_CHANGE_BATCH: usize = 1_000;
 
 const MIGRATION: &str = "change_feed_v1";
 
+/// The column a named cursor records its kind set in.
+const KINDS_COLUMN: &str = "kinds";
+
+/// The kind set a drain reports, normalized so two drains asking for the
+/// same kinds in any order or with repeats spell it the same way.
+///
+/// A named cursor is bound to one of these. A cursor is a position in a
+/// stream, and a stream is defined by its kinds: a drain over events alone
+/// that reaches the head and commits has accounted for no relationship,
+/// marker or catalog row on the way, so letting an all-kinds drain resume
+/// from that position would skip every one of them for good. A consumer
+/// that wants two filters keeps two names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KindSet {
+    kinds: Vec<ChangeKind>,
+}
+
+impl KindSet {
+    fn normalize(kinds: Option<Vec<ChangeKind>>) -> Self {
+        let mut kinds = kinds.unwrap_or_else(|| ChangeKind::ALL.to_vec());
+        kinds.sort();
+        kinds.dedup();
+        Self { kinds }
+    }
+
+    /// How the set is stored: `*` for every kind, else the wire names in
+    /// enum order, comma-separated.
+    fn stored(&self) -> String {
+        if self.kinds == ChangeKind::ALL {
+            "*".to_string()
+        } else {
+            self.kinds
+                .iter()
+                .map(|kind| kind.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+    }
+}
+
+fn kinds_mismatch(name: &str, stored: &str, offered: &str) -> Error {
+    Error::new(
+        ErrorKind::ConsumerKindsMismatch,
+        format!(
+            "changes_since: consumer {name:?} is bound to kinds [{stored}] but this drain reports \
+             [{offered}]; a cursor is a position in one kind set's stream, use another consumer \
+             name for another filter"
+        ),
+    )
+}
+
 /// A position in the feed: the revision of the last change accounted for.
 ///
 /// Revisions are unique per row write, so a watermark is a complete position
@@ -330,8 +381,11 @@ impl Changes {
     /// watermark under a name that has already moved past it — leaves the
     /// cursor where it is, so the returned watermark can exceed
     /// [`Changes::position`]; a consumer that wants to reprocess drains from
-    /// an explicit `from` and does not commit. Fails on a read-only store and
-    /// when no consumer was named.
+    /// an explicit `from` and does not commit. A named cursor is bound to the
+    /// kind set it was first committed for: a drain over other kinds cannot
+    /// resume it or move it ([`ErrorKind::ConsumerKindsMismatch`]), because
+    /// its position accounts for nothing outside its own kinds. Fails on a
+    /// read-only store and when no consumer was named.
     pub fn commit(&self) -> Result<Watermark, Error> {
         let Some(name) = &self.consumer else {
             return Err(Error::new(
@@ -346,50 +400,72 @@ impl Changes {
             ));
         }
         let conn = open_db(&self.db_path)?;
-        commit_cursor(&conn, name, self.position).map_err(Error::from_anyhow)
+        commit_cursor(
+            &conn,
+            name,
+            self.position,
+            &KindSet {
+                kinds: self.kinds.clone(),
+            },
+        )
     }
 
     fn fill(&mut self) -> Result<()> {
-        let lo = self.position.revision;
         let hi = self.head.revision;
-        if lo >= hi {
-            self.exhausted = true;
-            self.position = self.head;
-            return Ok(());
+        // Both passes of a page read one snapshot. Without that, a writer
+        // re-stamping or deleting the rows between the key pass and the row
+        // pass could empty the window the cut describes, and an empty window
+        // read as "nothing left" would jump the position to the head over
+        // changes still below it -- which a later commit then skips for good.
+        let snapshot = self.conn.unchecked_transaction()?;
+        loop {
+            let lo = self.position.revision;
+            if lo >= hi {
+                self.exhausted = true;
+                self.position = self.head;
+                break;
+            }
+            // Two passes, so no more than one page of typed rows is ever
+            // resident. The first reads only revisions -- a covering read of
+            // each revision index, `batch` integers per stream at most -- and
+            // finds the cut: the `batch`-th smallest revision across every
+            // stream. Any row a stream did not return sits above every row it
+            // did, and therefore above the cut. The second pass fetches the
+            // rows in `(lo, cut]`, which is exactly the page, because
+            // revisions are unique per write.
+            let Some(cut) = page_cut(&snapshot, &self.kinds, lo, hi, self.batch)? else {
+                // The key pass itself found nothing left: that, and only
+                // that, is exhaustion.
+                self.exhausted = true;
+                self.position = self.head;
+                break;
+            };
+            let mut rows: Vec<Change> = Vec::with_capacity(self.batch);
+            for kind in &self.kinds {
+                rows.extend(read_upserts(&snapshot, *kind, lo, cut, self.batch)?);
+            }
+            rows.extend(read_tombstones(
+                &snapshot,
+                &self.kinds,
+                lo,
+                cut,
+                self.batch,
+            )?);
+            rows.sort_by(|a, b| {
+                (a.revision, a.kind, &a.record_key).cmp(&(b.revision, b.kind, &b.record_key))
+            });
+            rows.truncate(self.batch);
+            if rows.is_empty() {
+                // Cannot happen within one snapshot; defended anyway: the
+                // window is known empty, so step past it and let the key
+                // pass decide what remains rather than declaring the head.
+                self.position = Watermark { revision: cut };
+                continue;
+            }
+            self.buffer.extend(rows);
+            break;
         }
-        // Two passes, so no more than one page of typed rows is ever
-        // resident. The first reads only revisions -- a covering read of each
-        // revision index, `batch` integers per stream at most -- and finds the
-        // cut: the `batch`-th smallest revision across every stream. Any row a
-        // stream did not return sits above every row it did, and therefore
-        // above the cut. The second pass fetches the rows in `(lo, cut]`,
-        // which is exactly the page, because revisions are unique per write.
-        let Some(cut) = page_cut(&self.conn, &self.kinds, lo, hi, self.batch)? else {
-            self.exhausted = true;
-            self.position = self.head;
-            return Ok(());
-        };
-        let mut rows: Vec<Change> = Vec::with_capacity(self.batch);
-        for kind in &self.kinds {
-            rows.extend(read_upserts(&self.conn, *kind, lo, cut, self.batch)?);
-        }
-        rows.extend(read_tombstones(
-            &self.conn,
-            &self.kinds,
-            lo,
-            cut,
-            self.batch,
-        )?);
-        rows.sort_by(|a, b| {
-            (a.revision, a.kind, &a.record_key).cmp(&(b.revision, b.kind, &b.record_key))
-        });
-        rows.truncate(self.batch);
-        if rows.is_empty() {
-            self.exhausted = true;
-            self.position = self.head;
-            return Ok(());
-        }
-        self.buffer.extend(rows);
+        snapshot.commit()?;
         Ok(())
     }
 }
@@ -467,15 +543,7 @@ impl SessionStore {
                 ),
             ));
         }
-        let kinds = match query.kinds {
-            None => ChangeKind::ALL.to_vec(),
-            Some(kinds) => {
-                let mut kinds = kinds;
-                kinds.sort();
-                kinds.dedup();
-                kinds
-            }
-        };
+        let kind_set = KindSet::normalize(query.kinds);
         let batch = match query.batch {
             0 => DEFAULT_CHANGE_BATCH,
             batch => batch.min(MAX_CHANGE_BATCH),
@@ -486,8 +554,8 @@ impl SessionStore {
                 "changes_since: Watermark::CONSUMER needs ChangeQuery::consumer to name the cursor",
             ));
         }
-        let (start, head) = resolve_start_and_head(&conn, from, query.consumer.as_deref())
-            .map_err(Error::from_anyhow)?;
+        let (start, head) =
+            resolve_start_and_head(&conn, from, query.consumer.as_deref(), &kind_set)?;
         if start > head {
             return Err(Error::new(
                 ErrorKind::WatermarkAheadOfStore,
@@ -502,7 +570,7 @@ impl SessionStore {
             db_path: self.db_path().to_path_buf(),
             read_only: self.is_read_only(),
             conn,
-            kinds,
+            kinds: kind_set.kinds,
             consumer: query.consumer,
             batch,
             head,
@@ -532,19 +600,36 @@ pub(crate) fn head_revision_at(db_path: &Path) -> Result<Watermark, Error> {
 /// make a valid cursor look ahead of the head. The cursor is also read first:
 /// even without the snapshot, a cursor that moved after being read can only
 /// cause a safe replay, never a false reset.
+///
+/// A named cursor is resumed only by a drain over the kind set it was
+/// committed for; see [`KindSet`].
 fn resolve_start_and_head(
     conn: &Connection,
     from: Watermark,
     consumer: Option<&str>,
-) -> Result<(Watermark, Watermark)> {
-    let snapshot = conn.unchecked_transaction()?;
-    let start = match (from == Watermark::CONSUMER, consumer) {
-        (true, Some(name)) => read_cursor(&snapshot, name)?.unwrap_or(Watermark::START),
-        (true, None) => anyhow::bail!("Watermark::CONSUMER needs a consumer name"),
-        (false, _) => from,
-    };
+    kinds: &KindSet,
+) -> Result<(Watermark, Watermark), Error> {
+    let snapshot = conn.unchecked_transaction().map_err(anyhow::Error::from)?;
+    let start =
+        match (from == Watermark::CONSUMER, consumer) {
+            (true, Some(name)) => match read_cursor(&snapshot, name)? {
+                Some((position, stored)) => {
+                    let offered = kinds.stored();
+                    if stored != offered {
+                        return Err(kinds_mismatch(name, &stored, &offered));
+                    }
+                    position
+                }
+                None => Watermark::START,
+            },
+            (true, None) => return Err(Error::new(
+                ErrorKind::Other,
+                "changes_since: Watermark::CONSUMER needs ChangeQuery::consumer to name the cursor",
+            )),
+            (false, _) => from,
+        };
     let head = read_head(&snapshot)?;
-    snapshot.commit()?;
+    snapshot.commit().map_err(anyhow::Error::from)?;
     Ok((start, head))
 }
 
@@ -631,34 +716,64 @@ fn read_head(conn: &Connection) -> Result<Watermark> {
     })
 }
 
-fn read_cursor(conn: &Connection, name: &str) -> Result<Option<Watermark>> {
-    let revision: Option<i64> = conn
+fn read_cursor(conn: &Connection, name: &str) -> Result<Option<(Watermark, String)>> {
+    let row: Option<(i64, String)> = conn
         .query_row(
-            "SELECT revision FROM consumer_cursors WHERE name = ?",
+            &format!("SELECT revision, {KINDS_COLUMN} FROM consumer_cursors WHERE name = ?"),
             [name],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    Ok(revision.map(|revision| Watermark {
-        revision: revision.max(0) as u64,
+    Ok(row.map(|(revision, kinds)| {
+        (
+            Watermark {
+                revision: revision.max(0) as u64,
+            },
+            kinds,
+        )
     }))
 }
 
 /// Monotonic: the stored cursor is the greater of what it holds and what is
 /// offered, so a stale commit cannot rewind a consumer behind a newer one.
-fn commit_cursor(conn: &Connection, name: &str, position: Watermark) -> Result<Watermark> {
-    let revision: i64 = conn.query_row(
-        "INSERT INTO consumer_cursors (name, revision, updated_ms) VALUES (?, ?, ?) \
-         ON CONFLICT(name) DO UPDATE SET \
-             revision = MAX(consumer_cursors.revision, excluded.revision), \
-             updated_ms = excluded.updated_ms \
-         RETURNING revision",
-        params![name, position.revision as i64, crate::now_ms()],
-        |row| row.get(0),
-    )?;
-    Ok(Watermark {
-        revision: revision.max(0) as u64,
-    })
+/// And bound: a cursor committed for one kind set is never moved by a drain
+/// over another. Both in one statement, so a sibling cannot slip between the
+/// check and the write.
+fn commit_cursor(
+    conn: &Connection,
+    name: &str,
+    position: Watermark,
+    kinds: &KindSet,
+) -> Result<Watermark, Error> {
+    let offered = kinds.stored();
+    let revision: Option<i64> = conn
+        .query_row(
+            &format!(
+                "INSERT INTO consumer_cursors (name, revision, updated_ms, {KINDS_COLUMN}) \
+                 VALUES (?, ?, ?, ?) \
+                 ON CONFLICT(name) DO UPDATE SET \
+                     revision = MAX(consumer_cursors.revision, excluded.revision), \
+                     updated_ms = excluded.updated_ms \
+                     WHERE consumer_cursors.{KINDS_COLUMN} = excluded.{KINDS_COLUMN} \
+                 RETURNING revision"
+            ),
+            params![name, position.revision as i64, crate::now_ms(), offered],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(anyhow::Error::from)?;
+    match revision {
+        Some(revision) => Ok(Watermark {
+            revision: revision.max(0) as u64,
+        }),
+        // The conflict clause declined: the row exists under another kind set.
+        None => {
+            let stored = read_cursor(conn, name)?
+                .map(|(_, stored)| stored)
+                .unwrap_or_default();
+            Err(kinds_mismatch(name, &stored, &offered))
+        }
+    }
 }
 
 fn parse_source(name: &str) -> Result<Source> {
@@ -882,6 +997,14 @@ pub(crate) fn schema_is_current(conn: &Connection) -> Result<bool> {
             return Ok(false);
         }
     }
+    let bound: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('consumer_cursors') WHERE name = ?)",
+        [KINDS_COLUMN],
+        |row| row.get(0),
+    )?;
+    if !bound {
+        return Ok(false);
+    }
     migration_applied(conn, MIGRATION)
 }
 
@@ -906,8 +1029,17 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
          CREATE TABLE IF NOT EXISTS consumer_cursors (
              name TEXT PRIMARY KEY,
              revision INTEGER NOT NULL,
-             updated_ms INTEGER NOT NULL
+             updated_ms INTEGER NOT NULL,
+             kinds TEXT NOT NULL DEFAULT '*'
          );",
+    )?;
+    // A cursor is a position in one kind set's stream; see `KindSet`. A
+    // database that created the table before the column existed gains it
+    // here, and both paths converge.
+    ensure_columns(
+        conn,
+        "consumer_cursors",
+        &[(KINDS_COLUMN, "TEXT NOT NULL DEFAULT '*'")],
     )?;
     let backfill = !migration_applied(conn, MIGRATION)?;
     for kind in ChangeKind::ALL {
@@ -1771,7 +1903,13 @@ mod tests {
         for index in 0..10 {
             insert_event(&writer, "s1", &format!("e{index}"), "x");
         }
-        commit_cursor(&writer, "burn", Watermark { revision: 10 }).unwrap();
+        commit_cursor(
+            &writer,
+            "burn",
+            Watermark { revision: 10 },
+            &KindSet::normalize(None),
+        )
+        .unwrap();
 
         // The drain's own connection, with a hook that lets a second
         // process's work land in the middle of resolving the start.
@@ -1785,13 +1923,24 @@ mod tests {
                 if !flag.swap(true, Ordering::SeqCst) {
                     let other = open_db(&db_for_hook).unwrap();
                     insert_event(&other, "s1", "e10", "late");
-                    commit_cursor(&other, "burn", Watermark { revision: 11 }).unwrap();
+                    commit_cursor(
+                        &other,
+                        "burn",
+                        Watermark { revision: 11 },
+                        &KindSet::normalize(None),
+                    )
+                    .unwrap();
                 }
                 false
             }),
         );
-        let (start, head) =
-            resolve_start_and_head(&reader, Watermark::CONSUMER, Some("burn")).unwrap();
+        let (start, head) = resolve_start_and_head(
+            &reader,
+            Watermark::CONSUMER,
+            Some("burn"),
+            &KindSet::normalize(None),
+        )
+        .unwrap();
         reader.progress_handler(0, None::<fn() -> bool>);
         assert!(
             fired.load(Ordering::SeqCst),
@@ -1812,6 +1961,201 @@ mod tests {
             start.revision,
             head.revision
         );
+    }
+
+    /// A writer that re-stamps or deletes the rows of the page being read,
+    /// between the key pass and the row pass, must not make the drain skip
+    /// what still sits below its head. The passes share a snapshot, so the
+    /// window the cut describes is the window the rows are read from; and
+    /// an empty window steps forward rather than declaring the head.
+    #[test]
+    fn a_window_emptied_between_the_passes_does_not_skip_later_changes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ai-history.db");
+        let (store, writer) = store(dir.path());
+        for index in 0..10 {
+            insert_event(&writer, "s1", &format!("e{index}"), "x");
+        }
+        let head = store.head_revision().unwrap();
+        assert_eq!(head.revision, 10);
+
+        // The drain's own connection, hooked so that while the first page's
+        // key pass runs, a second writer re-stamps the first page's rows
+        // (e0..e2 move to 11..13, past the head) and deletes e3 (tombstone
+        // at 14, also past the head).
+        let reader = open_db_readonly(&db).unwrap();
+        let fired = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&fired);
+        let db_for_hook = db.clone();
+        reader.progress_handler(
+            1,
+            Some(move || {
+                if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let other = open_db(&db_for_hook).unwrap();
+                    for index in 0..3 {
+                        insert_event(&other, "s1", &format!("e{index}"), "moved");
+                    }
+                    other
+                        .execute("DELETE FROM session_events WHERE event_uid = 'e3'", [])
+                        .unwrap();
+                }
+                false
+            }),
+        );
+        let mut changes = Changes {
+            db_path: db.clone(),
+            read_only: false,
+            conn: reader,
+            kinds: ChangeKind::ALL.to_vec(),
+            consumer: None,
+            batch: 3,
+            head,
+            position: Watermark::START,
+            buffer: VecDeque::new(),
+            exhausted: false,
+        };
+        let mut yielded = Vec::new();
+        let mut positions = Vec::new();
+        while let Some(change) = changes.next() {
+            yielded.push(change.unwrap().revision);
+            positions.push(changes.position().revision);
+        }
+        changes.conn.progress_handler(0, None::<fn() -> bool>);
+        assert!(
+            fired.load(Ordering::SeqCst) > 0,
+            "the interleaving must have happened"
+        );
+
+        // Whatever the snapshot saw of the concurrent write, everything that
+        // stayed below the head is yielded, in order, and the position never
+        // overshoots what was yielded until the drain is genuinely done.
+        assert!(
+            yielded.windows(2).all(|pair| pair[0] < pair[1]),
+            "{yielded:?}"
+        );
+        for revision in 5..=10 {
+            assert!(
+                yielded.contains(&revision),
+                "revision {revision} skipped: {yielded:?}"
+            );
+        }
+        assert!(
+            yielded.iter().all(|revision| *revision <= 10),
+            "{yielded:?}"
+        );
+        assert_eq!(positions, yielded);
+        assert_eq!(changes.position(), head);
+        // The moved rows are waiting past the head for the next drain.
+        let later = drain(store.changes_since(head, ChangeQuery::default()).unwrap());
+        let later: Vec<(u64, bool)> = later
+            .iter()
+            .map(|change| (change.revision, change.op == ChangeOp::Delete))
+            .collect();
+        assert_eq!(
+            later,
+            vec![(11, false), (12, false), (13, false), (14, true)]
+        );
+    }
+
+    /// A named cursor is a position in one kind set's stream. A drain over
+    /// events alone that reaches the head and commits has accounted for no
+    /// relationship on the way, so an all-kinds drain must not be allowed to
+    /// resume from it -- and a drain over other kinds must not move it.
+    #[test]
+    fn a_cursor_is_bound_to_the_kind_set_it_was_committed_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, conn) = store(dir.path());
+        insert_event(&conn, "s1", "e1", "x");
+        conn.execute(
+            "INSERT INTO session_relationships (source, parent_session_id, relationship_uid, \
+             relationship, identity_status, evidence_kind, created_ms, updated_ms) \
+             VALUES ('claude', 's1', 'r1', 'delegated', 'unlinked', 'sidecar', 1, 1)",
+            [],
+        )
+        .unwrap();
+        let events_only = || {
+            ChangeQuery::default()
+                .consumer("c")
+                .kinds([ChangeKind::SessionEvent])
+        };
+
+        // The filtered drain reaches the head and commits there.
+        let mut filtered = store
+            .changes_since(Watermark::CONSUMER, events_only())
+            .unwrap();
+        let seen: Vec<ChangeKind> = filtered
+            .by_ref()
+            .map(|change| change.unwrap().kind)
+            .collect();
+        assert_eq!(seen, vec![ChangeKind::SessionEvent]);
+        assert_eq!(filtered.commit().unwrap().revision, 2);
+
+        // An all-kinds drain cannot resume from a position that skipped the
+        // relationship at revision 2.
+        let error = store
+            .changes_since(Watermark::CONSUMER, ChangeQuery::default().consumer("c"))
+            .expect_err("a cursor bound to events must not serve an all-kinds drain");
+        assert_eq!(error.kind(), ErrorKind::ConsumerKindsMismatch);
+        assert!(error.to_string().contains("session_event"), "{error}");
+        // Nor can a drain over other kinds move it, whatever `from` it used.
+        let other = store
+            .changes_since(Watermark::START, ChangeQuery::default().consumer("c"))
+            .unwrap();
+        let error = other
+            .commit()
+            .expect_err("a commit under another kind set is refused");
+        assert_eq!(error.kind(), ErrorKind::ConsumerKindsMismatch);
+        let stored: (i64, String) = conn
+            .query_row(
+                "SELECT revision, kinds FROM consumer_cursors WHERE name = 'c'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, (2, "session_event".to_string()));
+
+        // The same filter, however spelled, resumes it; another name over
+        // every kind sees the relationship the filtered consumer never did.
+        let same = store
+            .changes_since(
+                Watermark::CONSUMER,
+                ChangeQuery::default()
+                    .consumer("c")
+                    .kinds([ChangeKind::SessionEvent, ChangeKind::SessionEvent]),
+            )
+            .unwrap();
+        assert_eq!(same.position().revision, 2);
+        assert!(drain(same).is_empty());
+        let everything = drain(
+            store
+                .changes_since(Watermark::CONSUMER, ChangeQuery::default().consumer("d"))
+                .unwrap(),
+        );
+        assert!(everything
+            .iter()
+            .any(|change| change.kind == ChangeKind::Relationship));
+        // An all-kinds cursor is stored as `*`, whichever way it was asked for.
+        let mut all = store
+            .changes_since(
+                Watermark::CONSUMER,
+                ChangeQuery::default()
+                    .consumer("d")
+                    .kinds(ChangeKind::ALL.iter().rev().copied()),
+            )
+            .unwrap();
+        while all.next().is_some() {}
+        all.commit().unwrap();
+        let stored: String = conn
+            .query_row(
+                "SELECT kinds FROM consumer_cursors WHERE name = 'd'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "*");
     }
 
     /// A database from before the feed carries an `observation_clock` that

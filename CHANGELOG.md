@@ -151,7 +151,14 @@ Notable changes to the native `ai-hist` CLI are documented here.
   most one page of typed rows is resident however many kinds are fed; a
   drain's start and head come from one read snapshot; and a read-only handle
   over an unmigrated database reports `Watermark::START` rather than its
-  pre-feed `observation_clock`. `SessionStore::head_revision()` and `SyncReport::head_revision`
+  pre-feed `observation_clock`. Both passes of a page share that snapshot
+  too, and an empty page window steps forward instead of declaring the head,
+  so a writer re-stamping the rows mid-page cannot make a drain skip what is
+  still below its head. A named cursor is bound to the kind set it was
+  committed for (`consumer_cursors.kinds`); resuming or committing it under
+  another filter fails with `ErrorKind::ConsumerKindsMismatch`, because a
+  position in an events-only stream has accounted for no relationship,
+  marker or catalog row. `SessionStore::head_revision()` and `SyncReport::head_revision`
   report the head; a stored watermark beyond it (the database was reset)
   fails with `ErrorKind::WatermarkAheadOfStore`, read through the new
   `Error::kind()`. A re-parse re-stamps every row it upserts, so a consumer
