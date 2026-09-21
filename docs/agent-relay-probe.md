@@ -218,9 +218,11 @@ human-readable install/status/stop commands remain available.
 
 - `installs --json`: discover configured probe directories.
 - `cloud install --json --include-existing|--new-sessions-only|--selected-sessions-only`:
-  emit NDJSON `approval`, `connected`, and `ready` events. The browser approves
-  the device; the probe stores Cloud and workspace RelayHistory credentials.
-  JSON setup requires one explicit sharing choice and runs in the background.
+  emit NDJSON `approval`, `authenticated`, `connected`, and `ready` events. The
+  browser approves the device; `authenticated` establishes the Agent Relay
+  login boundary before the probe provisions RelayHistory upload credentials.
+  `connected` confirms those upload credentials are stored. JSON setup requires
+  one explicit sharing choice and runs in the background.
 - `start`, `status`, `pause`, `resume`, `disconnect`: pass `--account ID`,
   `--workspace ID`, and optionally `--site-url URL`, plus `--json`.
 - `sessions list <target> --json --limit 500`: newest sessions with title,
