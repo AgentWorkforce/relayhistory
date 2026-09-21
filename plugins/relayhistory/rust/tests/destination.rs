@@ -61,12 +61,19 @@ fn auth(home: &Path, base: &str, org: &str) {
     .unwrap();
 }
 fn server(pages: Vec<(u16, Value)>) -> (String, thread::JoinHandle<Vec<(String, String)>>) {
+    server_with_hook(pages, |_, _| {}, |_| {})
+}
+fn server_with_hook(
+    pages: Vec<(u16, Value)>,
+    hook: impl Fn(usize, &mut std::net::TcpStream) + Send + 'static,
+    finished: impl FnOnce(&TcpListener) + Send + 'static,
+) -> (String, thread::JoinHandle<Vec<(String, String)>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     listener.set_nonblocking(true).unwrap();
     let handle = thread::spawn(move || {
         let mut requests = Vec::new();
-        for (status, body) in pages {
+        for (index, (status, body)) in pages.into_iter().enumerate() {
             let began = Instant::now();
             let mut stream = loop {
                 match listener.accept() {
@@ -99,12 +106,14 @@ fn server(pages: Vec<(u16, Value)>) -> (String, thread::JoinHandle<Vec<(String, 
             let mut bytes = vec![0; length];
             reader.read_exact(&mut bytes).unwrap();
             requests.push((headers, String::from_utf8(bytes).unwrap()));
+            hook(index, &mut stream);
             if status == 0 {
                 continue;
             }
             let body = body.to_string();
             write!(stream,"HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
         }
+        finished(&listener);
         requests
     });
     (base, handle)
@@ -320,4 +329,194 @@ fn preparation_matches_server_record_limit_before_persisting_invalid_payload() {
     extra.revision_id = "revision-100".into();
     batch.records.push(extra);
     assert!(prepare(batch).is_err());
+}
+
+#[test]
+fn receiver_deadlines_and_cancellation_cover_transport_refresh_and_lock_waits() {
+    // Isolate stored credentials and schedule discovery from other tests and
+    // from the host. All HTTP traffic goes to synthetic loopback receivers.
+    const CHILD: &str = "RELAY_TEST_RECEIVER_DEADLINE";
+    if std::env::var_os(CHILD).is_none() {
+        let home = tempfile::tempdir().unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "receiver_deadlines_and_cancellation_cover_transport_refresh_and_lock_waits",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("HOME", home.path())
+            .env("RELAYHISTORY_HOME", home.path())
+            .env_remove("RELAYHISTORY_BASE_URL")
+            .env_remove("AI_HIST_BASE_URL")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    use relayhistory_plugin::delivery::{
+        worker::{Receiver, ReceiverContext},
+        DeliveryFailure,
+    };
+    use relayhistory_plugin::destination::RelayHistoryReceiver;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    };
+    let home = std::env::var_os("RELAYHISTORY_HOME").unwrap();
+    let home = Path::new(&home);
+    let batch = batch();
+    let prepared = prepare(batch.clone()).unwrap();
+    let cancelled = ReceiverContext {
+        cancelled: &|| true,
+        timeout_ms: 60_000,
+        idempotency_key: &batch.batch_id,
+    };
+    let receiver = RelayHistoryReceiver::default();
+    assert_eq!(
+        receiver.prepare(&batch, &cancelled).unwrap_err().failure,
+        DeliveryFailure::Transient
+    );
+    assert_eq!(
+        receiver
+            .send(&prepared, &batch, &cancelled)
+            .unwrap_err()
+            .failure,
+        DeliveryFailure::Transient
+    );
+
+    for phase in [
+        "headers",
+        "body",
+        "refresh",
+        "lock",
+        "cancel-refresh",
+        "cancel-retry",
+        "success",
+    ] {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let server_cancelled = cancelled.clone();
+        let (entered, ready) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let pages = match phase {
+            "refresh" | "cancel-retry" => vec![
+                (401, json!({})),
+                (
+                    if phase == "refresh" { 0 } else { 200 },
+                    json!({"accessToken":"rth_at_rotated", "refreshToken":"rth_rt_rotated"}),
+                ),
+            ],
+            "lock" | "cancel-refresh" => vec![(401, json!({}))],
+            "success" => vec![(200, accepted(&batch))],
+            _ => vec![(0, json!({}))],
+        };
+        let (completed, completion) = mpsc::channel();
+        let (base, server) = server_with_hook(
+            pages,
+            move |index, stream| {
+                if phase == "cancel-refresh" || (phase == "cancel-retry" && index == 1) {
+                    server_cancelled.store(true, Ordering::SeqCst);
+                }
+                if phase == "body" {
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n").unwrap();
+                }
+                if matches!(phase, "headers" | "body") || (phase == "refresh" && index == 1) {
+                    entered.send(()).unwrap();
+                    released.recv_timeout(Duration::from_secs(10)).unwrap();
+                }
+                if phase == "success" {
+                    thread::sleep(Duration::from_millis(150));
+                }
+            },
+            move |listener| {
+                completion.recv_timeout(Duration::from_secs(10)).unwrap();
+                // Keep listening until the caller has returned: a forbidden refresh
+                // or retry would otherwise just get connection-refused and look transient.
+                assert!(
+                    matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+                    "{phase}: unexpected additional request"
+                );
+            },
+        );
+        auth(home, &base, "org-fixture");
+        let auth_path = home
+            .join("stages")
+            .join(format!("{}.auth.json", ai_hist::prompt_hash(&base)));
+        let mut stored: Value =
+            serde_json::from_slice(&std::fs::read(&auth_path).unwrap()).unwrap();
+        stored["refresh_token"] = json!("rth_rt_fixture");
+        std::fs::write(&auth_path, stored.to_string()).unwrap();
+        let lock = if phase == "lock" {
+            let path = auth_path.with_file_name(format!(
+                "{}.refresh.lock",
+                auth_path.file_name().unwrap().to_str().unwrap()
+            ));
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(path)
+                .unwrap();
+            fs2::FileExt::lock_exclusive(&file).unwrap();
+            Some(file)
+        } else {
+            None
+        };
+        let receiver = RelayHistoryReceiver {
+            base_url: Some(base),
+            acknowledge_uninspected_schedules: true,
+            ..Default::default()
+        };
+        let payload = prepared.clone();
+        let batch = batch.clone();
+        let (done, result) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let context = ReceiverContext {
+                cancelled: &|| cancelled.load(Ordering::SeqCst),
+                timeout_ms: if phase == "success" { 60_000 } else { 500 },
+                idempotency_key: &batch.batch_id,
+            };
+            done.send(receiver.send(&payload, &batch, &context))
+                .unwrap();
+        });
+        if matches!(phase, "headers" | "body" | "refresh") {
+            ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        let outcome = result.recv_timeout(Duration::from_secs(2));
+        // Always unblock fixtures before asserting so a regression cannot hang.
+        let _ = release.send(());
+        drop(lock);
+        worker.join().unwrap();
+        completed.send(()).unwrap();
+        let requests = server.join().unwrap();
+        let outcome =
+            outcome.unwrap_or_else(|_| panic!("{phase}: receiver exceeded the supplied budget"));
+        if phase == "success" {
+            assert!(outcome.is_ok());
+        } else {
+            assert_eq!(
+                outcome.unwrap_err().failure,
+                DeliveryFailure::Transient,
+                "{phase}"
+            );
+        }
+        assert_eq!(
+            requests.len(),
+            if matches!(phase, "refresh" | "cancel-retry") {
+                2
+            } else {
+                1
+            }
+        );
+        if phase == "cancel-retry" {
+            let rotated: Value =
+                serde_json::from_slice(&std::fs::read(&auth_path).unwrap()).unwrap();
+            assert_eq!(rotated["refresh_token"], "rth_rt_rotated");
+        }
+    }
 }
