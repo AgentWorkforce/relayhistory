@@ -20,6 +20,7 @@
 //! other JSON payload over its stable stringification (object keys sorted, so
 //! the hash does not depend on the provider's key order).
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use serde_json::{Map, Value};
@@ -194,12 +195,16 @@ impl ToolResultFacts {
 /// The counters are per-parse, and every provider parser in this crate
 /// re-reads its transcript from the start, so a re-sync reproduces exactly the
 /// same indexes rather than advancing them. [`ToolResultIndexer::resume_from`]
-/// exists for a future parser that resumes mid-file: the last index reached is
-/// persisted on the hydration checkpoint (`last_tool_result_index`) so the
-/// sequence can be continued rather than restarted.
-#[derive(Debug, Default)]
+/// exists for a parser that resumes mid-file from a hydration checkpoint's
+/// `last_tool_result_index` alone. The incremental reader carries the whole
+/// indexer on its cursor instead: `calls` counts results per `tool_use_id`,
+/// and a call whose results straddle a resume boundary would restart at zero
+/// if only the event index came back.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ToolResultIndexer {
+    #[serde(default)]
     next_event_index: i64,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     calls: HashMap<String, i64>,
 }
 

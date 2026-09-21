@@ -61,6 +61,18 @@ pub struct ObservationCheckpoint {
     pub records_parsed: i64,
     pub include_related: bool,
     pub updated_ms: i64,
+    /// The observed transcript's byte cursor, mirroring the one targeted
+    /// hydration writes to `session_hydration_checkpoints`. See
+    /// `ingest::cursor`: `parser_state_json` is the cursor document and the
+    /// other three are projections of it.
+    #[serde(default)]
+    pub committed_offset: i64,
+    #[serde(default)]
+    pub prefix_hash: Option<String>,
+    #[serde(default)]
+    pub dev_ino: Option<String>,
+    #[serde(default)]
+    pub parser_state_json: Option<String>,
 }
 
 pub(crate) fn schema_is_current(conn: &Connection) -> Result<bool> {
@@ -87,7 +99,7 @@ pub(crate) fn schema_is_current(conn: &Connection) -> Result<bool> {
     }
     for (table, required) in [
         ("session_observations", "source,session_id,location,connector_id,connector_instance,raw_locator,source_stamp,discovery_state,access_state,updated_ms"),
-        ("observation_hydration_checkpoints", "source,session_id,location,connector_id,connector_instance,source_stamp,parser_version,last_event_at_ms,source_bytes,records_parsed,include_related,updated_ms"),
+        ("observation_hydration_checkpoints", "source,session_id,location,connector_id,connector_instance,source_stamp,parser_version,last_event_at_ms,source_bytes,records_parsed,include_related,updated_ms,committed_offset,prefix_hash,dev_ino,parser_state_json"),
         ("observation_discovery_skips", "source,location,connector_id,connector_instance,locator,stamp,updated_ms"),
         ("observation_evidence", "source,session_id,location,connector_id,connector_instance,evidence_uid,payload_json"),
         ("canonical_evidence_protection", "source,session_id,record_identity"),
@@ -124,6 +136,7 @@ END;
 CREATE TABLE IF NOT EXISTS observation_hydration_checkpoints (
  source TEXT NOT NULL,session_id TEXT NOT NULL,location TEXT NOT NULL,connector_id TEXT NOT NULL,connector_instance TEXT NOT NULL,
  source_stamp TEXT,parser_version INTEGER NOT NULL,last_event_at_ms INTEGER,source_bytes INTEGER NOT NULL,records_parsed INTEGER NOT NULL,include_related INTEGER NOT NULL,updated_ms INTEGER NOT NULL,
+ committed_offset INTEGER NOT NULL DEFAULT 0,prefix_hash TEXT,dev_ino TEXT,parser_state_json TEXT,
  PRIMARY KEY(source,session_id,location,connector_id,connector_instance),
  FOREIGN KEY(source,session_id,location,connector_id,connector_instance) REFERENCES session_observations(source,session_id,location,connector_id,connector_instance) ON DELETE CASCADE
 );
@@ -157,6 +170,29 @@ INSERT OR IGNORE INTO observation_versions(source,session_id,location,connector_
 UPDATE observation_clock SET version=MAX(version,COALESCE((SELECT MAX(version) FROM observation_versions),0)) WHERE singleton=1;
 
 "#)?;
+    // The checkpoint's byte-cursor columns post-date the table, and
+    // `CREATE TABLE IF NOT EXISTS` is a no-op on a database that already has
+    // it, so an existing install gains them here. A fresh database gets the
+    // same shape from the DDL above and these are skipped.
+    let existing: Vec<String> = conn
+        .prepare("PRAGMA table_info(observation_hydration_checkpoints)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (column, declaration) in [
+        ("committed_offset", "INTEGER NOT NULL DEFAULT 0"),
+        ("prefix_hash", "TEXT"),
+        ("dev_ino", "TEXT"),
+        ("parser_state_json", "TEXT"),
+    ] {
+        if !existing.iter().any(|present| present == column) {
+            conn.execute(
+                &format!(
+                    "ALTER TABLE observation_hydration_checkpoints ADD COLUMN {column} {declaration}"
+                ),
+                [],
+            )?;
+        }
+    }
     ensure!(
         schema_is_current(conn)?,
         "incomplete connector observation schema"
@@ -250,7 +286,7 @@ pub fn checkpoint(
     conn: &Connection,
     key: &ObservationKey,
 ) -> Result<Option<ObservationCheckpoint>> {
-    Ok(conn.query_row("SELECT source_stamp,parser_version,last_event_at_ms,source_bytes,records_parsed,include_related,updated_ms FROM observation_hydration_checkpoints WHERE source=? AND session_id=? AND location=? AND connector_id=? AND connector_instance=?",params![key.source,key.session_id,key.location.as_str(),key.connector_id,key.connector_instance],|r|Ok(ObservationCheckpoint{source_stamp:r.get(0)?,parser_version:r.get(1)?,last_event_at_ms:r.get(2)?,source_bytes:r.get(3)?,records_parsed:r.get(4)?,include_related:r.get(5)?,updated_ms:r.get(6)?})).optional()?)
+    Ok(conn.query_row("SELECT source_stamp,parser_version,last_event_at_ms,source_bytes,records_parsed,include_related,updated_ms,committed_offset,prefix_hash,dev_ino,parser_state_json FROM observation_hydration_checkpoints WHERE source=? AND session_id=? AND location=? AND connector_id=? AND connector_instance=?",params![key.source,key.session_id,key.location.as_str(),key.connector_id,key.connector_instance],|r|Ok(ObservationCheckpoint{source_stamp:r.get(0)?,parser_version:r.get(1)?,last_event_at_ms:r.get(2)?,source_bytes:r.get(3)?,records_parsed:r.get(4)?,include_related:r.get(5)?,updated_ms:r.get(6)?,committed_offset:r.get(7)?,prefix_hash:r.get(8)?,dev_ino:r.get(9)?,parser_state_json:r.get(10)?})).optional()?)
 }
 
 pub fn write_checkpoint(
@@ -279,7 +315,7 @@ fn write_checkpoint_inner(
         get(conn, key)?.is_some(),
         "observation checkpoint requires an observation"
     );
-    conn.execute("INSERT INTO observation_hydration_checkpoints(source,session_id,location,connector_id,connector_instance,source_stamp,parser_version,last_event_at_ms,source_bytes,records_parsed,include_related,updated_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source,session_id,location,connector_id,connector_instance) DO UPDATE SET source_stamp=excluded.source_stamp,parser_version=excluded.parser_version,last_event_at_ms=excluded.last_event_at_ms,source_bytes=excluded.source_bytes,records_parsed=excluded.records_parsed,include_related=excluded.include_related,updated_ms=excluded.updated_ms",params![key.source,key.session_id,key.location.as_str(),key.connector_id,key.connector_instance,checkpoint.source_stamp,checkpoint.parser_version,checkpoint.last_event_at_ms,checkpoint.source_bytes,checkpoint.records_parsed,checkpoint.include_related,checkpoint.updated_ms])?;
+    conn.execute("INSERT INTO observation_hydration_checkpoints(source,session_id,location,connector_id,connector_instance,source_stamp,parser_version,last_event_at_ms,source_bytes,records_parsed,include_related,updated_ms,committed_offset,prefix_hash,dev_ino,parser_state_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source,session_id,location,connector_id,connector_instance) DO UPDATE SET source_stamp=excluded.source_stamp,parser_version=excluded.parser_version,last_event_at_ms=excluded.last_event_at_ms,source_bytes=excluded.source_bytes,records_parsed=excluded.records_parsed,include_related=excluded.include_related,updated_ms=excluded.updated_ms,committed_offset=excluded.committed_offset,prefix_hash=excluded.prefix_hash,dev_ino=excluded.dev_ino,parser_state_json=excluded.parser_state_json",params![key.source,key.session_id,key.location.as_str(),key.connector_id,key.connector_instance,checkpoint.source_stamp,checkpoint.parser_version,checkpoint.last_event_at_ms,checkpoint.source_bytes,checkpoint.records_parsed,checkpoint.include_related,checkpoint.updated_ms,checkpoint.committed_offset,checkpoint.prefix_hash,checkpoint.dev_ino,checkpoint.parser_state_json])?;
     bump_revision(conn, key)
 }
 
@@ -543,6 +579,10 @@ mod tests {
                     records_parsed: 1,
                     include_related: false,
                     updated_ms: 3,
+                    committed_offset: 0,
+                    prefix_hash: None,
+                    dev_ino: None,
+                    parser_state_json: None,
                 },
             )?;
             save_evidence(
@@ -677,6 +717,10 @@ mod tests {
                 records_parsed: 0,
                 include_related: false,
                 updated_ms: 1,
+                committed_offset: 0,
+                prefix_hash: None,
+                dev_ino: None,
+                parser_state_json: None,
             },
         )?;
         conn.execute(

@@ -5,7 +5,7 @@ use crate::{
     SessionLocation, SessionScope,
 };
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -19,9 +19,11 @@ pub(crate) mod codex;
 pub(crate) mod cursor;
 pub(crate) mod grok;
 pub(crate) mod hydrate;
+pub(crate) mod incremental;
 pub(crate) mod jsonl;
 pub(crate) mod opencode;
 pub(crate) mod tool_result_facts;
+pub(crate) mod transcript_cursor;
 
 /// `session_markers.kind` for the point a harness compacted its context. The
 /// turns either side of it are real, but the model's view of everything
@@ -2654,37 +2656,137 @@ pub(crate) fn codex_is_subagent(payload: Option<&Value>, session_id: &str) -> bo
 /// (`thread_source`, or the object form of `payload.source` *together with* an
 /// explicit parent) and excluded from session registration. A standalone
 /// guardian carries `source.subagent` without a parent and stays discoverable.
-pub(crate) fn read_codex_session_meta(path: &Path) -> Result<Option<CodexSessionMeta>> {
-    let first = fs::read_to_string(path)
-        .ok()
-        .and_then(|text| text.lines().next().map(str::to_string))
-        .unwrap_or_default();
-    if first.trim().is_empty() {
-        return Ok(None);
+/// How far into a file a bounded head read will look, however few records it
+/// has found. Callers set their own record limit; this one stops a file whose
+/// first record is enormous, or whose leading lines are all unparseable, from
+/// turning a bounded read back into a whole-file read.
+const LEADING_BYTE_LIMIT: u64 = 1024 * 1024;
+
+/// The first complete records of a JSONL file, and the bytes that cost.
+///
+/// For metadata that lives at the head of a transcript — a Codex
+/// `session_meta` line, the record that dates a Claude sidecar — reading the
+/// whole file to use its first line is the same defect as scanning a whole
+/// transcript to hydrate its tail, and it hides in the same place: the caller
+/// writes `.lines().next()` and looks bounded while the read is not. A
+/// trailing record with no newline counts, because the head of a one-record
+/// file is that record.
+fn read_leading_records(path: &Path, limit: usize) -> Result<(Vec<Value>, u64)> {
+    read_head_records(path, limit, true)
+}
+
+/// The **first physical record** of a file, and the bytes reading it cost.
+///
+/// Distinct from [`read_leading_records`], which walks past records it cannot
+/// parse until it finds one that it can. That is right for a caller looking
+/// for the first usable record and wrong for anything that defines identity by
+/// position: a rollout whose first line is corrupt, followed by a
+/// `session_meta` naming another session, was adopted under that other
+/// session's id. `None` here means "the first record is not one I can read",
+/// which is a different claim from "there is no such record in the file".
+fn read_first_record(path: &Path) -> Result<(Option<Value>, u64)> {
+    let (values, bytes_read) = read_head_records(path, 1, false)?;
+    Ok((values.into_iter().next(), bytes_read))
+}
+
+/// `skip_unparseable` decides what a record that does not parse means: skip
+/// past it and keep looking, or stop, having read it.
+fn read_head_records(
+    path: &Path,
+    limit: usize,
+    skip_unparseable: bool,
+) -> Result<(Vec<Value>, u64)> {
+    let file = fs::File::open(path)?;
+    // `take` is what enforces the ceiling. Checking `bytes_read` at the top of
+    // the loop only decided whether to start *another* line, and
+    // `read_until` appends until it finds a newline or reaches EOF — so a
+    // provider file whose first record is the whole file allocated the whole
+    // file, which is the unbounded read this helper exists to prevent,
+    // wearing a bound. With the limit on the reader, a record that would
+    // cross it comes back truncated, fails to parse, and is skipped.
+    let mut reader = BufReader::new(file).take(LEADING_BYTE_LIMIT);
+    let mut values = Vec::new();
+    let mut raw = Vec::new();
+    let mut bytes_read = 0u64;
+    while values.len() < limit {
+        raw.clear();
+        let read = reader.read_until(b'\n', &mut raw)?;
+        if read == 0 {
+            break;
+        }
+        bytes_read += read as u64;
+        match serde_json::from_slice::<Value>(trim_ascii_end(&raw)) {
+            Ok(value) => values.push(value),
+            Err(_) if skip_unparseable => continue,
+            // The bytes were read either way, so they are counted either way.
+            Err(_) => break,
+        }
     }
-    let value: Value = match serde_json::from_str(&first) {
-        Ok(value) => value,
-        Err(_) => return Ok(None),
+    Ok((values, bytes_read))
+}
+
+fn trim_ascii_end(raw: &[u8]) -> &[u8] {
+    let mut end = raw.len();
+    while end > 0 && raw[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    &raw[..end]
+}
+
+pub(crate) fn read_codex_session_meta(path: &Path) -> Result<Option<CodexSessionMeta>> {
+    Ok(read_codex_session_meta_counted(path)?.0)
+}
+
+/// Codex session metadata, and the bytes reading it cost.
+///
+/// A rollout's identity is its **first** record, so this reads one line rather
+/// than the file. It used to `read_to_string` a rollout that reaches hundreds
+/// of megabytes on a fleet machine and then take `lines().next()`, so a
+/// kilobyte appended to one still read all of it before the cursor reached the
+/// tail — the Codex twin of the whole-file Claude metadata scan, and invisible
+/// for the same reason: `bytes_read` counted the cursor's work, not this.
+fn read_codex_session_meta_counted(path: &Path) -> Result<(Option<CodexSessionMeta>, u64)> {
+    // A rollout that cannot be read is a rollout with no metadata, which is
+    // what the `read_to_string(path).ok()` this replaced already meant. The
+    // bounded reader propagates `File::open` failures, and every caller
+    // propagates them further, so one locked or deleted sibling rollout
+    // started failing a whole parent hydration or Codex sync — a file that
+    // could not be read taking down the files that could. The failure is
+    // reported rather than swallowed.
+    // The *first physical* record, not the first one that parses. Codex
+    // defines a rollout's identity by position, and skipping a corrupt opening
+    // line to reach a `session_meta` further down adopts the rollout under
+    // whatever session that record names.
+    let (value, bytes_read) = match read_first_record(path) {
+        Ok(read) => read,
+        Err(error) => {
+            sync_note!(
+                "  [codex] skipping unreadable rollout {}: {error}",
+                path.display()
+            );
+            return Ok((None, 0));
+        }
     };
+    let meta = value.as_ref().and_then(codex_session_meta_from_record);
+    Ok((meta, bytes_read))
+}
+
+/// Interpret one `session_meta` record. Pure, so the bounded reader above is
+/// the only thing that decides how much of the file is touched.
+fn codex_session_meta_from_record(value: &Value) -> Option<CodexSessionMeta> {
     if value.get("type").and_then(Value::as_str) != Some("session_meta") {
-        return Ok(None);
+        return None;
     }
     let payload_value = value.get("payload");
     let payload = payload_value.and_then(Value::as_object);
-    let Some(session_id) = payload
+    let session_id = payload
         .and_then(|p| p.get("id"))
         .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-    else {
-        return Ok(None);
-    };
-    let Some(cwd) = payload
+        .filter(|s| !s.is_empty())?;
+    let cwd = payload
         .and_then(|p| p.get("cwd"))
         .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-    else {
-        return Ok(None);
-    };
+        .filter(|s| !s.is_empty())?;
     let git_branch = payload
         .and_then(|p| p.get("git"))
         .and_then(Value::as_object)
@@ -2718,7 +2820,7 @@ pub(crate) fn read_codex_session_meta(path: &Path) -> Result<Option<CodexSession
         .get("timestamp")
         .and_then(Value::as_str)
         .and_then(parse_iso_ms);
-    Ok(Some(CodexSessionMeta {
+    Some(CodexSessionMeta {
         session_id: session_id.to_string(),
         cwd: cwd.to_string(),
         git_branch,
@@ -2727,7 +2829,7 @@ pub(crate) fn read_codex_session_meta(path: &Path) -> Result<Option<CodexSession
         parent_thread_id,
         subagent_label,
         meta_ts_ms,
-    }))
+    })
 }
 
 #[derive(Default)]
@@ -2749,8 +2851,8 @@ pub(crate) struct CodexIngestOutcome {
 /// differencing below then clamped the result back to a plausible
 /// non-negative delta. The stored JSON was valid, so nothing downstream could
 /// tell a corrupted snapshot from a reported zero.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-struct CodexTokenTotals {
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct CodexTokenTotals {
     input: u64,
     cached_input: u64,
     cache_write: u64,
@@ -3017,13 +3119,58 @@ pub(crate) fn ingest_codex_rollout(
     path: &Path,
     meta: &CodexSessionMeta,
 ) -> Result<CodexIngestOutcome> {
-    let file = fs::File::open(path)?;
+    let mut cursor = transcript_cursor::TranscriptCursorState::default();
+    Ok(ingest_codex_rollout_incremental(conn, path, meta, &mut cursor)?.0)
+}
+
+/// Index a Codex rollout from its cursor.
+///
+/// The committed position advances **only at a `task_complete` record**, which
+/// is where burn's `CommittedSnapshot` advances too. A Codex turn's token
+/// accounting is not final until the turn is: `token_count` carries cumulative
+/// totals, and the delta an assistant event is charged is measured against the
+/// baseline the previous snapshot left. Committing inside an open turn would
+/// freeze a baseline mid-turn and the next pass would attribute the turn's
+/// remaining spend against the wrong one.
+///
+/// Records of the open turn are still indexed as they are read — this is an
+/// evidence store, and a live session's events should be visible before its
+/// turn ends — but they are re-derived on the next pass from the last
+/// committed boundary, so the pass that sees the turn close is the one whose
+/// token attribution stands. Every insert on the path is an idempotent upsert
+/// keyed by provider-native identity, so re-reading that span rewrites the
+/// same rows.
+fn ingest_codex_rollout_incremental(
+    conn: &Connection,
+    path: &Path,
+    meta: &CodexSessionMeta,
+    cursor: &mut transcript_cursor::TranscriptCursorState,
+) -> Result<(CodexIngestOutcome, transcript_cursor::IncrementalPass)> {
     let session_id = meta.session_id.as_str();
     let cwd = Some(meta.cwd.as_str());
     let branch = meta.git_branch.as_deref();
     let mut outcome = CodexIngestOutcome::default();
-    let mut model: Option<String> = None;
-    let mut prev_totals: Option<CodexTokenTotals> = None;
+    // Codex keeps its existing rule for a trailing line with no newline: it
+    // is the half-written tail of a live rollout and the next pass re-reads
+    // it. Unlike Claude, no Codex writer leaves its last line unterminated.
+    let mut reader = transcript_cursor::TranscriptReader::open(path, cursor.file.as_ref(), None)?;
+    let mut pass = transcript_cursor::IncrementalPass {
+        rotated: reader.rotated,
+        ..Default::default()
+    };
+    let resume = if reader.start_offset() == 0 {
+        transcript_cursor::CodexCursorState::default()
+    } else {
+        cursor.codex.clone().unwrap_or_default()
+    };
+    let start_offset = reader.start_offset();
+    let mut model: Option<String> = resume.model.clone();
+    // The baseline the next delta is measured against, and the span and
+    // generation counters, continue across passes. The rest of the usage
+    // state below resolves inside a pass: the commit predicate refuses to
+    // advance past an open span run, pending usage or an unresolved refusal,
+    // so a resumed pass never inherits one.
+    let mut prev_totals: Option<CodexTokenTotals> = resume.prev_totals;
     let mut pending_usage: Option<PendingCodexUsage> = None;
     // Every snapshot that could not be differenced, in arrival order and never
     // rewritten, plus the baselines a delta was actually measured from. These
@@ -3034,7 +3181,7 @@ pub(crate) fn ingest_codex_rollout(
     let mut measured_generations: HashSet<u64> = HashSet::new();
     // Which baseline `prev_totals` currently holds. Bumped every time it is
     // replaced, so each fact above can name the baseline it belongs to.
-    let mut baseline_generation: u64 = 0;
+    let mut baseline_generation: u64 = resume.baseline_generation;
     // Which API request the rows being written belong to.
     //
     // Codex names no request — no request id, no message id — but it *ends*
@@ -3049,7 +3196,7 @@ pub(crate) fn ingest_codex_rollout(
     // calls as it made round trips. Grouping by `turn_id` would merge calls
     // with different measurements into one request and report no usage for
     // either.
-    let mut request_span: u64 = 0;
+    let mut request_span: u64 = resume.request_span;
     // The first span no measured delta has accounted for yet, and the spans a
     // single delta turned out to cover.
     //
@@ -3063,7 +3210,7 @@ pub(crate) fn ingest_codex_rollout(
     // Those spans are therefore one request: the unit the provider actually
     // measured. The merge is applied after the walk, because which spans a
     // delta covers is only known when it arrives.
-    let mut span_run_start: u64 = 0;
+    let mut span_run_start: u64 = resume.request_span;
     let mut span_merges: Vec<(u64, u64)> = Vec::new();
     // Set when a snapshot is unreadable while no baseline has been
     // established. A resumed rollout opens with the cumulative total it
@@ -3071,24 +3218,32 @@ pub(crate) fn ingest_codex_rollout(
     // baseline, and differencing the next good one against zero would charge
     // the session's entire carried-over history to one request.
     let mut baseline_unknown = false;
-    let mut untokened_assistant_uid: Option<String> = None;
+    let mut untokened_assistant_uid: Option<String> = resume.untokened_assistant_uid.clone();
     // The turn a record falls inside, stamped from the last `turn_context`
     // until the next one names a different turn. Codex writes it once per turn
     // rather than on every record, so carrying it forward is what makes turn
-    // boundaries recoverable downstream.
-    let mut turn_id: Option<String> = None;
-    let mut saw_model_output = false;
-    let mut human_messages = codex::HumanMessageDeduper::default();
+    // boundaries recoverable downstream — and carrying it *across passes* is
+    // why it is part of the resume state rather than a plain local.
+    let mut turn_id: Option<String> = resume.turn_id.clone();
+    let mut saw_model_output = resume.saw_model_output;
+    let mut human_messages =
+        codex::HumanMessageDeduper::restore(resume.previous_human_message.clone());
     // Codex reports how a call ended out of band — `exec_command_end`,
     // `patch_apply_end`, `mcp_tool_call_end` — and only guarantees they have
     // all arrived by `task_complete`. Results are recorded with an `unknown`
     // status and the turn's error signals are applied to them when it closes.
-    let mut indexer = tool_result_facts::ToolResultIndexer::default();
+    //
+    // These buffers need no resume state of their own: they are drained at
+    // `task_complete`, which is the only record the cursor commits at, so they
+    // are always empty at a committed offset.
+    let mut indexer = resume.tool_results.clone();
     let mut turn_error_signals: HashMap<String, &'static str> = HashMap::new();
     let mut pending_results: Vec<(String, String)> = Vec::new();
-    let mut reader = BufReader::new(file);
-    let mut raw = Vec::new();
-    let mut line_index = 0usize;
+    let mut line_index = resume.next_line_index;
+    // The committed shadow: the state as of the last `task_complete`, which is
+    // what is written back when the pass ends.
+    let mut committed = (reader.position(), resume.clone());
+    let mut line = String::new();
     // What to record if the line being processed turns out to write nothing,
     // and the row count to measure that against.
     //
@@ -3100,20 +3255,26 @@ pub(crate) fn ingest_codex_rollout(
     let mut changes_before_line = conn.total_changes();
     loop {
         check_capture_cancelled()?;
-        raw.clear();
-        if reader.read_until(b'\n', &mut raw)? == 0 {
-            break;
-        }
         // A line without its newline is the half-written tail of a live
-        // session; the next sync re-reads the whole file.
-        if raw.last() != Some(&b'\n') {
-            break;
+        // session; the next pass re-reads it.
+        match reader.next_line(&mut line)? {
+            Some(transcript_cursor::ReadRecord::Terminated) => {}
+            // Over the record ceiling. It was never held, and a terminated
+            // one is behind the reader, so the walk carries on past it.
+            Some(transcript_cursor::ReadRecord::Oversized { terminated: true }) => {
+                pass.oversized_records += 1;
+                line_index += 1;
+                continue;
+            }
+            Some(transcript_cursor::ReadRecord::Oversized { terminated: false }) => {
+                pass.oversized_records += 1;
+                break;
+            }
+            _ => break,
         }
         let index = line_index;
         line_index += 1;
-        let Ok(text) = std::str::from_utf8(&raw) else {
-            continue;
-        };
+        let text = line.as_str();
         let Ok(value) = serde_json::from_str::<Value>(text.trim()) else {
             continue;
         };
@@ -3447,6 +3608,38 @@ pub(crate) fn ingest_codex_rollout(
                         &mut turn_error_signals,
                         Settle::TurnComplete,
                     )?;
+                    // Committed only when the turn leaves nothing open. Usage
+                    // is resolved after the whole walk — `span_merges`
+                    // collapses a measured run onto its first span, and
+                    // `surviving_refusals` decides which unreadable snapshots
+                    // stand — so a pass that stopped mid-run would hand the
+                    // next one facts it could no longer resolve. Refusing the
+                    // commit instead means the next pass re-reads the open run
+                    // and resolves it whole; the cursor still advances at
+                    // every turn that closed cleanly, which is nearly all of
+                    // them.
+                    let usage_settled = pending_usage.is_none()
+                        && span_run_start == request_span
+                        && !baseline_unknown
+                        && surviving_refusals(&unreadable_snapshots, &measured_generations)
+                            .is_empty();
+                    if usage_settled {
+                        committed = (
+                            reader.position(),
+                            transcript_cursor::CodexCursorState {
+                                next_line_index: line_index,
+                                model: model.clone(),
+                                prev_totals,
+                                request_span,
+                                baseline_generation,
+                                untokened_assistant_uid: untokened_assistant_uid.clone(),
+                                tool_results: indexer.clone(),
+                                turn_id: turn_id.clone(),
+                                saw_model_output,
+                                previous_human_message: human_messages.remembered(),
+                            },
+                        );
+                    }
                 }
                 "thread_settings_applied" => {
                     if let Some(m) = payload
@@ -3735,7 +3928,8 @@ pub(crate) fn ingest_codex_rollout(
     // calls can still be written after the bytes this pass read. Failures
     // already observed are recorded; a result with no signal yet stays
     // `unknown`, because "not known to have failed" is not "succeeded". The
-    // next sync re-reads the file and settles it.
+    // next sync re-reads the file and settles it — the cursor does not advance
+    // past the open turn, so that re-read is guaranteed.
     resolve_codex_tool_results(
         conn,
         session_id,
@@ -3743,7 +3937,30 @@ pub(crate) fn ingest_codex_rollout(
         &mut turn_error_signals,
         Settle::EndOfFile,
     )?;
-    Ok(outcome)
+    let (offset, state) = committed;
+    // The tail `next_line` consumed was read, whether or not the position
+    // advanced over it. Leaving it out made an unterminated Codex tail
+    // invisible in the counter, which is the same omission this counter has
+    // had to be corrected for elsewhere.
+    pass.records = line_index.saturating_sub(resume.next_line_index) as i64;
+    // Rewritten under the pass: record nothing, and read the region again next
+    // time rather than blessing rows that came from bytes that are gone.
+    match reader.commit(offset)? {
+        transcript_cursor::CommitOutcome::Published(file) => {
+            cursor.file = Some(file);
+            cursor.codex = Some(state);
+        }
+        transcript_cursor::CommitOutcome::Superseded => pass.superseded = true,
+    }
+    // After the commit: validating the cursor is a provider read like any
+    // other, and the counter is every provider read this pass made.
+    pass.validation_bytes = reader.validation_bytes();
+    pass.bytes_read = reader
+        .position()
+        .saturating_sub(start_offset)
+        .saturating_add(reader.tail_bytes())
+        .saturating_add(pass.validation_bytes);
+    Ok((outcome, pass))
 }
 
 /// One Codex rollout line that has not yet been shown to write anything.
@@ -4023,117 +4240,168 @@ fn sync_claude_session_metadata(
     if !root.exists() {
         return Ok(());
     }
-    // The v4 key forces one full re-scan on upgrade so every transcript passes
-    // through the marker parser once. A marker exists nowhere but the
-    // transcript, and the skip below is satisfied by a matching stamp plus any
-    // pre-existing events, so carrying the v3 map forward would leave an
-    // upgraded install with no markers at all while every sync reported
-    // success. v3 is retired rather than seeded for exactly that reason.
-    // The earlier v3 pass cached exact remote/local ids for bounded
-    // post-discovery correlation; v2 healed sidechains attributed to a parent.
-    let mut session_state = state
-        .get("claude_sessions_v4")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    // These in-memory removes cannot reach disk on their own; RETIRED_SYNC_STATE_KEYS
-    // is what sweeps a superseded map.
-    state.remove("claude_sessions");
-    state.remove("claude_sessions_v2");
-    state.remove("claude_sessions_v3");
+    // The `claude_sessions*` path -> stamp maps are retired. They recorded only
+    // *that* a file had changed, which left one answer available — re-read all
+    // of it — and they grew a JSON entry per transcript inside a single state
+    // blob rewritten on every sync. Byte cursors in `transcript_cursors`
+    // replace them: same per-file skip, but a file that did change is now
+    // resumed rather than restarted.
+    //
+    // Dropping the keys here is the one-time migration. No cursor exists for
+    // any transcript on the first sync after upgrading, so every file is read
+    // once from offset 0 — exactly what a stamp-map generation bump did — and
+    // from the second sync on, each file is skipped on a stat or resumed from
+    // its cursor.
+    for retired in [
+        "claude_sessions",
+        "claude_sessions_v2",
+        "claude_sessions_v3",
+        "claude_sessions_v4",
+    ] {
+        state.remove(retired);
+    }
     let backfill_fidelity = fidelity_backfill_pending(state, CLAUDE_FIDELITY_GENERATION_KEY);
-    // The first read failure, returned once the in-memory state has been
-    // brought up to date. Continuing past it indexes the rest of the tree,
-    // but the run did omit a transcript it discovered, and a caller told the
-    // sync completed would treat an incomplete cache as current.
-    let mut read_error: Option<anyhow::Error> = None;
     let backfill_raw_facts = raw_facts_backfill_pending(state, CLAUDE_RAW_MESSAGE_FACTS_KEY);
+    // The first read failure, returned once everything else has been indexed.
+    // Continuing past it indexes the rest of the tree, but the run did omit a
+    // transcript it discovered, and a caller told the sync completed would
+    // treat an incomplete cache as current.
+    let mut read_error: Option<anyhow::Error> = None;
+    let transcripts = collect_matching_files(root, "", "jsonl")?;
     // Same question the codex walk asks of its roots, and asked the same way:
     // per path, because a project tree can be readable while part of it is
-    // not. A transcript the stamp map names that this run did not see has rows
-    // that are still there and still null, so it withholds the generation and
-    // loses the stamp this run can no longer vouch for.
-    let transcripts = collect_matching_files(root, "", "jsonl")?;
-    let missing = unobserved_known_paths(&session_state, root, &transcripts);
-    let mut walked_every_known_root =
-        forget_unobserved_paths(state, &mut session_state, "claude_sessions_v4", missing);
-    // Transcripts this run enumerated and then could not read. Only the ones
-    // the state already knew about count against the pass; one that was never
-    // indexed has no rows to backfill.
-    let mut unreadable: Vec<String> = Vec::new();
+    // not. Under cursors the set of files this install knows about is the
+    // cursor table rather than a stamp map, and forgetting one is a DELETE
+    // rather than an instruction for the checkpoint merge — the cursor lives
+    // in SQLite, so dropping it is durable the moment it happens.
+    let observed: HashSet<String> = transcripts
+        .iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect();
+    let mut walked_every_known_root = true;
+    for missing in transcript_cursor::known_locators(conn, "claude")?
+        .into_iter()
+        .filter(|locator| path_key_is_under(locator, root) && !observed.contains(locator))
+    {
+        // A cursor is a claim the file is unchanged since we read it. A file
+        // that vanished and came back is not something this process watched,
+        // and resuming from the stale cursor is exactly how its rows would
+        // keep null facts after the archive returns.
+        transcript_cursor::forget_locator(conn, "claude", &missing)?;
+        walked_every_known_root = false;
+    }
     let mut scanned = 0;
     let mut upserted = 0;
     for path in capture_files("claude", transcripts) {
         check_capture_cancelled()?;
-        let key = path.to_string_lossy().to_string();
-        let stamp = claude_sync_stamp(&path)?;
         let transcript_events = claude_transcript_events_exist(conn, &path)?;
-        if session_state.get(&key).and_then(Value::as_str) == Some(stamp.as_str())
-            && (transcript_events || claude_sidecar_evidence_exists(conn, &path)?)
-            // During the one-time backfill pass, an unchanged transcript
-            // whose rows predate either additive evidence shape is re-read to
-            // populate it. Outside those passes the stamp alone decides, so a
-            // row this transcript does not own cannot pin the file off the
-            // fast path.
-            && !(backfill_fidelity
-                && claude_transcript_lacks_tool_result_fidelity(conn, &path)?)
-            && !(backfill_raw_facts && claude_transcript_lacks_raw_facts(conn, &path)?)
-        {
+        let indexed = transcript_events || claude_sidecar_evidence_exists(conn, &path)?;
+        // During the one-time backfill passes, an unchanged transcript whose
+        // rows predate either additive evidence shape is re-read to populate
+        // it. Outside those passes the cursor alone decides, so a row this
+        // transcript does not own cannot pin the file off the fast path.
+        let backfill = (backfill_fidelity
+            && claude_transcript_lacks_tool_result_fidelity(conn, &path)?)
+            || (backfill_raw_facts && claude_transcript_lacks_raw_facts(conn, &path)?);
+        if indexed && !backfill && claude_transcript_unchanged(conn, &path)? {
             // A transcript registered as a session and indexed before
             // continuity existed still owes its evidence. Reading it here
-            // rather than falling through keeps the skip's promise:
-            // continuity is written to its own table and touches no indexed
-            // row, so the file is read without being re-ingested — the same
-            // shape as the subagent delegation backfill in the Codex walk.
-            // The capture writes a row for every readable transcript, so this
-            // clears after one pass and never reads again.
+            // rather than falling through keeps the skip's promise: continuity
+            // is written to its own table and touches no indexed row, so the
+            // file is read without being re-ingested. The capture writes a row
+            // for every readable transcript, so this clears after one pass.
             //
             // Gated on `transcript_events` because a subagent sidecar reaches
             // this skip through its delegation evidence instead, and a sidecar
-            // is not a session: it never reaches the capture on the ingest
-            // path either, so it has no row to owe and must not be re-read.
+            // is not a session: it has no row to owe and must not be re-read.
             if transcript_events && claude_transcript_lacks_continuity_evidence(conn, &path)? {
                 crate::continuity::capture_claude_transcript(conn, &path)?;
             }
             continue;
         }
-        // Asked before the parse, because `scan_claude_session_file` reads
-        // with `unwrap_or_default()` and an unreadable transcript is then
-        // indistinguishable from an empty one -- which would be stamped as
-        // seen on the next line.
+        // Only a file that would otherwise be *skipped* can hold the backfill
+        // pass open. A transcript with no cursor is reopened by the next walk
+        // whatever happens here, so a read failure on one is not a gap in this
+        // run's coverage — and treating it as one kept the per-session probes
+        // live for the life of the install.
+        let known_before = transcript_cursor::locator_cursor_exists(conn, "claude", &path)?;
+        // Asked before the reader opens it. A file that cannot be opened at
+        // all — a socket, a device, a mode this process does not have — is
+        // the "unavailable on this run" case, not a run-ending failure: the
+        // walk absorbs it, withholds the generation if this file was one it
+        // would otherwise have skipped, and drops the cursor so the next walk
+        // reads it again rather than skipping it on a position that no longer
+        // describes anything readable.
         if !transcript_is_readable(&path) {
-            unreadable.push(key);
+            walked_every_known_root &= !known_before;
+            if known_before {
+                transcript_cursor::forget_locator_cursor(conn, "claude", &path)?;
+            }
+            sync_note!(
+                "  [claude-sessions] could not open {} (skipped)",
+                path.display()
+            );
             continue;
         }
+        if !indexed || backfill {
+            // Either the cursor claims these bytes already produced rows and
+            // the rows are not there — a wiped database, or evidence a repair
+            // removed — or a backfill pass needs the whole file read again for
+            // columns the earlier parser never wrote. A resumed read of a file
+            // whose cursor sits at EOF reads nothing, so a backfill that left
+            // the cursor in place would retire its generation having written
+            // nothing at all.
+            transcript_cursor::forget_locator_cursor(conn, "claude", &path)?;
+        }
         scanned += 1;
-        // Read before stamping. The stamp is this walk's claim to have
-        // indexed the file; recording it first means a read that fails
+        // Resumed for the same reason hydration resumes it: a sync over a
+        // fleet machine's transcripts should read what arrived, not what is
+        // there.
+        //
+        // Read before the cursor is published. The cursor is this walk's claim
+        // to have indexed the file; recording it first means a read that fails
         // afterwards still looks done, and since a restored file keeps its
-        // length and mtime, the unchanged stamp would skip it forever.
-        let scanned_meta = match scan_claude_session_file(&path) {
-            Ok(meta) => meta,
-            Err(error) => {
-                if error.is::<CaptureCancelled>() {
-                    return Err(error);
-                }
-                // Only a file that would otherwise be skipped holds the pass
-                // open. An unstamped file, or one whose stamp has moved, is
-                // reopened by the next walk regardless -- and a pending
-                // generation keeps the per-session fidelity probe live, which
-                // drags any session carrying a contributed null row through a
-                // re-read on every sync.
-                if session_state.get(&key).and_then(Value::as_str) == Some(stamp.as_str()) {
-                    walked_every_known_root = false;
-                }
-                sync_note!(
-                    "  [claude-sessions] could not read {}: {error:#}",
-                    path.display()
-                );
-                read_error.get_or_insert(error);
-                continue;
-            }
+        // length and mtime, the unchanged cursor would skip it forever.
+        let locator = path.to_string_lossy().to_string();
+        let scan_key = transcript_cursor::CursorKey::Locator {
+            source: "claude",
+            locator: &locator,
         };
-        session_state.insert(key, json!(stamp));
+        let mut scan_cursor = transcript_cursor::load_cursor(conn, &scan_key)?;
+        let mut scan = scan_cursor.claude.clone().unwrap_or_default().scan;
+        let (scanned_meta, scanned_continuity, scan_superseded) =
+            match scan_claude_session_file_resumed(&path, &mut scan) {
+                Ok(scanned) if scanned.read_nothing_decodable() => {
+                    // Nothing in the file decoded. Publishing the cursor would
+                    // claim these bytes were read, and since a restored file keeps
+                    // its length and mtime, the transcript would be skipped for
+                    // good the moment it became readable again.
+                    walked_every_known_root &= !known_before;
+                    transcript_cursor::forget_locator_cursor(conn, "claude", &path)?;
+                    let error = anyhow::anyhow!(
+                        "could not read claude transcript {}: no record decoded",
+                        path.display()
+                    );
+                    sync_note!("  [claude-sessions] {error:#}");
+                    read_error.get_or_insert(error);
+                    continue;
+                }
+                Ok(scanned) => (scanned.meta, scanned.continuity, scanned.superseded),
+                Err(error) => {
+                    if error.is::<CaptureCancelled>() {
+                        return Err(error);
+                    }
+                    walked_every_known_root &= !known_before;
+                    sync_note!(
+                        "  [claude-sessions] could not read {}: {error:#}",
+                        path.display()
+                    );
+                    read_error.get_or_insert(error);
+                    continue;
+                }
+            };
+        scan_cursor.claude.get_or_insert_with(Default::default).scan = scan;
+        transcript_cursor::store_cursor(conn, &scan_key, &scan_cursor)?;
         if let Some(meta) = scanned_meta {
             // A subagent sidecar carries the parent's `sessionId` but is not
             // that session: registering it would overwrite the parent's
@@ -4147,7 +4415,9 @@ fn sync_claude_session_metadata(
                 // parent, so this walk reaches the same edge from the child's
                 // side, through the very code hydration uses: a named child
                 // is an observed row, an unnamed one is unlinked evidence.
-                let evidence = hydrate::claude_subagent_evidence(path.clone(), &meta);
+                // The sync walk reports its reads through its own counters, not
+                // through a hydration result, so the byte count is dropped here.
+                let (evidence, _) = hydrate::claude_subagent_evidence(path.clone(), &meta);
                 hydrate::ingest_claude_subagent(conn, &meta.session_id, &evidence)?;
                 continue;
             }
@@ -4162,26 +4432,28 @@ fn sync_claude_session_metadata(
                 meta.last_assistant_text.as_deref(),
                 Some(&path.to_string_lossy()),
             )?;
-            ingest_claude_transcript(conn, &path)?;
+            incremental::ingest_claude_transcript_at_locator(conn, &path, None)?;
             // Global sync is not scoped to one thread, so it indexes the
             // materialization edge like every other kind.
             record_claude_remote_relationship(conn, &meta, true)?;
             // Continuity is cross-file, so the evidence is banked here and
             // reconciled once the whole walk has indexed everything it can
             // reach; a branch read before its origin is resolved by the same
-            // pass rather than needing a second sync.
-            crate::continuity::capture_claude_transcript(conn, &path)?;
+            // pass rather than needing a second sync. Folded by the metadata
+            // walk above, so banking it reads nothing.
+            //
+            // A fold over bytes that were rewritten under the walk is not
+            // published: an absent row retracts continuity, so a partial fold
+            // would replace real topology rather than leave it alone.
+            // An absent row retracts continuity, so "said nothing" and "could
+            // not be trusted to have read it" must not look alike here.
+            if !scan_superseded {
+                crate::continuity::capture_folded(conn, &path, scanned_continuity)?;
+            }
             upserted += 1;
         }
     }
-    unreadable.retain(|key| session_state.contains_key(key));
-    if !forget_unobserved_paths(state, &mut session_state, "claude_sessions_v4", unreadable) {
-        walked_every_known_root = false;
-    }
-    state.insert(
-        "claude_sessions_v4".to_string(),
-        Value::Object(session_state),
-    );
+
     if walked_every_known_root {
         record_fidelity_backfill(state, CLAUDE_FIDELITY_GENERATION_KEY);
     }
@@ -4203,17 +4475,31 @@ fn sync_claude_session_metadata(
 /// A subagent sidecar's `agent-<agentId>.meta.json` is the only place the
 /// child's type, name, model and spawn depth are recorded, so metadata that
 /// changes beside an untouched transcript is still new evidence and has to
-/// reach `session_relationships`. Hydration stamps its source snapshot by the
-/// same rule.
-fn claude_sync_stamp(path: &Path) -> Result<String> {
-    let mut stamp = file_stamp(path)?;
-    let metadata = hydrate::claude_subagent_meta_path(path);
-    if metadata.is_file() {
-        stamp.push('|');
-        stamp.push_str(&file_stamp(&metadata)?);
+/// reach `session_relationships`. It carries its own whole-file cursor, so it
+/// is checked here rather than folded into the transcript's stamp.
+fn claude_transcript_unchanged(conn: &Connection, path: &Path) -> Result<bool> {
+    if !transcript_cursor::transcript_unchanged(conn, "claude", path)? {
+        return Ok(false);
     }
-    Ok(stamp)
+    let metadata = hydrate::claude_subagent_meta_path(path);
+    // A sidecar that was indexed and has since been deleted is a change, and
+    // it is the one change no amount of looking at the file will reveal. Its
+    // cursor is the record that it was once there; without this the transcript
+    // takes the fast path forever and the relationship keeps describing a
+    // child from a file nobody can read any more.
+    let indexed_metadata =
+        transcript_cursor::locator_cursor_exists(conn, CLAUDE_SUBAGENT_META_SOURCE, &metadata)?;
+    if (metadata.is_file() || indexed_metadata)
+        && !transcript_cursor::transcript_unchanged(conn, CLAUDE_SUBAGENT_META_SOURCE, &metadata)?
+    {
+        return Ok(false);
+    }
+    Ok(true)
 }
+
+/// The cursor namespace for `agent-*.meta.json` sidecars. Not a catalog
+/// source: these files never become sessions, they only describe one.
+pub(crate) const CLAUDE_SUBAGENT_META_SOURCE: &str = "claude-subagent-meta";
 
 /// Whether an unchanged subagent sidecar has already been ingested.
 ///
@@ -4494,52 +4780,94 @@ pub(crate) struct ClaudeSessionMeta {
     agent_id: Option<String>,
 }
 
-fn scan_claude_session_file(path: &Path) -> Result<Option<ClaudeSessionMeta>> {
-    // Propagated, not defaulted. An I/O or UTF-8 failure reduced to an empty
-    // string is indistinguishable here from a file that genuinely holds no
-    // session, and the caller would record it as successfully read.
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("reading claude transcript {}", path.display()))?;
-    let mut session_id = None;
-    let mut remote_session_id = None;
-    let mut cwd = None;
-    let mut git_branch = None;
-    let mut first_ts = None;
-    let mut last_ts = None;
-    let mut last_assistant_text = None;
-    let mut identified_records = 0usize;
-    let mut sidechain_records = 0usize;
-    let mut agent_id: Option<String> = None;
-    for line in text.lines() {
-        check_capture_cancelled()?;
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
+/// The running state of a walk over a Claude transcript's records, from which
+/// [`ClaudeSessionMeta`] is derived.
+///
+/// Split out of the walk so it can be **resumed**. Every field is either
+/// first-wins (set once, from the head of the file) or last-wins/accumulating
+/// (only the newly arrived records can change it), so folding the same
+/// records in the same order from a saved state gives the same answer as
+/// folding the whole file. That is what lets a 1 KiB append to a 200 MB
+/// transcript cost a 1 KiB read: identity and metadata used to be recovered by
+/// reading every byte before the incremental reader ran, which made the
+/// incremental reader's saving invisible in wall time and its `bytes_read`
+/// counter a report about the wrong thing.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct ClaudeMetaFold {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_ts: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_ts: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_assistant_text: Option<String>,
+    #[serde(default)]
+    pub identified_records: usize,
+    #[serde(default)]
+    pub sidechain_records: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// Continuity's fold, carried here rather than walked separately.
+    ///
+    /// Continuity asks different questions of the same records — where this
+    /// conversation came from rather than what it is — but it asks them of
+    /// *every* record, in file order, accumulating. That is this walk's
+    /// contract exactly, so a second resumable walk over the same bytes bought
+    /// nothing but a second read and a second cursor to keep honest.
+    #[serde(default)]
+    pub continuity: crate::continuity::ContinuityEvidence,
+    #[serde(default)]
+    pub continuity_first_user_seen: bool,
+    /// Whether any record folded in. Distinguishes a file that says nothing —
+    /// which retracts the edges it used to establish — from one that has not
+    /// grown since the last pass.
+    #[serde(default)]
+    pub continuity_any: bool,
+}
+
+impl ClaudeMetaFold {
+    /// Fold one record in. Must be called in file order, once per record.
+    pub(crate) fn observe(&mut self, value: &Value) {
+        if let Some(object) = value.as_object() {
+            self.continuity_any = true;
+            crate::continuity::fold_claude_record(
+                &mut self.continuity,
+                &mut self.continuity_first_user_seen,
+                object,
+            );
+        }
         if value
             .get("sessionId")
             .and_then(Value::as_str)
             .is_some_and(|id| !id.is_empty())
         {
-            identified_records += 1;
+            self.identified_records += 1;
             if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
-                sidechain_records += 1;
+                self.sidechain_records += 1;
             }
         }
-        if agent_id.is_none() {
-            agent_id = value
+        if self.agent_id.is_none() {
+            self.agent_id = value
                 .get("agentId")
                 .and_then(Value::as_str)
                 .filter(|id| !id.is_empty())
                 .map(str::to_string);
         }
-        if session_id.is_none() {
-            session_id = value
+        if self.session_id.is_none() {
+            self.session_id = value
                 .get("sessionId")
                 .and_then(Value::as_str)
                 .map(str::to_string);
         }
-        if remote_session_id.is_none() {
-            remote_session_id = [
+        if self.remote_session_id.is_none() {
+            self.remote_session_id = [
                 value.get("remoteSessionId"),
                 value.get("remote_session_id"),
                 value.pointer("/teleportedSessionInfo/sessionId"),
@@ -4551,25 +4879,25 @@ fn scan_claude_session_file(path: &Path) -> Result<Option<ClaudeSessionMeta>> {
             .find(|id| !id.is_empty())
             .map(str::to_string);
         }
-        if cwd.is_none() {
-            cwd = value.get("cwd").and_then(Value::as_str).map(str::to_string);
+        if self.cwd.is_none() {
+            self.cwd = value.get("cwd").and_then(Value::as_str).map(str::to_string);
         }
         if let Some(branch) = value.get("gitBranch").and_then(Value::as_str) {
-            git_branch = Some(branch.to_string());
+            self.git_branch = Some(branch.to_string());
         }
         if let Some(ts) = value
             .get("timestamp")
             .and_then(|v| v.as_str().and_then(parse_iso_ms).or_else(|| v.as_i64()))
         {
-            first_ts.get_or_insert(ts);
-            last_ts = Some(ts);
+            self.first_ts.get_or_insert(ts);
+            self.last_ts = Some(ts);
         }
         if value.get("type").and_then(Value::as_str) == Some("assistant")
             && value.get("isSidechain").and_then(Value::as_bool) != Some(true)
         {
             if let Some(content) = value.pointer("/message/content") {
                 if let Some(text) = content.as_str() {
-                    last_assistant_text = Some(text.chars().take(4096).collect());
+                    self.last_assistant_text = Some(text.chars().take(4096).collect());
                 } else if let Some(items) = content.as_array() {
                     let parts = items
                         .iter()
@@ -4577,27 +4905,153 @@ fn scan_claude_session_file(path: &Path) -> Result<Option<ClaudeSessionMeta>> {
                         .filter_map(|item| item.get("text").and_then(Value::as_str))
                         .collect::<Vec<_>>();
                     if !parts.is_empty() {
-                        last_assistant_text = Some(parts.join("\n").chars().take(4096).collect());
+                        self.last_assistant_text =
+                            Some(parts.join("\n").chars().take(4096).collect());
                     }
                 }
             }
         }
     }
-    let Some(session_id) = session_id else {
-        return Ok(None);
+
+    /// The session this transcript describes, or `None` when no record named
+    /// one.
+    pub(crate) fn finish(&self) -> Option<ClaudeSessionMeta> {
+        let session_id = self.session_id.clone()?;
+        let first = self.first_ts.unwrap_or(0);
+        Some(ClaudeSessionMeta {
+            session_id,
+            remote_session_id: self.remote_session_id.clone(),
+            cwd: self.cwd.clone(),
+            git_branch: self.git_branch.clone(),
+            first_ts: first,
+            last_ts: self.last_ts.unwrap_or(first),
+            last_assistant_text: self.last_assistant_text.clone(),
+            subagent: self.identified_records > 0
+                && self.sidechain_records == self.identified_records,
+            agent_id: self.agent_id.clone(),
+        })
+    }
+}
+
+/// Walk only the records that have arrived since `state` was written.
+///
+/// Returns the metadata and the bytes this call read. `state` is updated in
+/// place and must be persisted by the caller; a rejected or absent cursor
+/// reads the file from the start, which is the same answer at a higher price.
+/// What one resumable metadata walk found, cost, and whether it could record
+/// where it got to.
+pub(crate) struct ClaudeScanPass {
+    pub meta: Option<ClaudeSessionMeta>,
+    /// Records read, plus the bounded windows hashed to validate the cursor.
+    pub bytes_read: u64,
+    /// The validation part of `bytes_read`.
+    pub validation_bytes: u64,
+    /// The file was rewritten under the walk, so no position was recorded.
+    /// Reported for the same reason the record walk reports it: a transcript
+    /// that moved under a reader is news, and the walk that noticed is an
+    /// implementation detail.
+    pub superseded: bool,
+    /// Records this pass decoded as UTF-8, and records it could not. A pass
+    /// that decoded none of the records it read did not read the file.
+    pub decoded: u64,
+    pub undecodable: u64,
+    /// Continuity evidence folded by the same walk, ready to record.
+    pub continuity: Option<crate::continuity::ContinuityEvidence>,
+}
+
+impl ClaudeScanPass {
+    /// Whether this pass read records and could decode none of them.
+    ///
+    /// One undecodable record is a malformed record, skipped like any other.
+    /// A file that yielded nothing else is not a transcript holding no
+    /// session — it is a file the walk could not read, and stamping it as
+    /// seen would drop it for as long as its size and mtime stood still.
+    fn read_nothing_decodable(&self) -> bool {
+        self.decoded == 0 && self.undecodable > 0
+    }
+}
+
+pub(crate) fn scan_claude_session_file_resumed(
+    path: &Path,
+    state: &mut Option<transcript_cursor::ClaudeScanState>,
+) -> Result<ClaudeScanPass> {
+    let saved = state.clone().unwrap_or_default();
+    let mut reader =
+        transcript_cursor::TranscriptReader::open(path, saved.file.as_ref(), saved.resume_from)?;
+    let mut fold = if reader.start_offset() == 0 {
+        ClaudeMetaFold::default()
+    } else {
+        saved.fold.clone()
     };
-    let first = first_ts.unwrap_or(0);
-    Ok(Some(ClaudeSessionMeta {
-        session_id,
-        remote_session_id,
-        cwd,
-        git_branch,
-        first_ts: first,
-        last_ts: last_ts.unwrap_or(first),
-        last_assistant_text,
-        subagent: identified_records > 0 && sidechain_records == identified_records,
-        agent_id,
-    }))
+    let start_offset = reader.start_offset();
+    let mut resume_from = None;
+    let mut line = String::new();
+    loop {
+        check_capture_cancelled()?;
+        let line_start = reader.position();
+        let Some(kind) = reader.next_line(&mut line)? else {
+            break;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(line.trim_end()) else {
+            if kind == transcript_cursor::ReadRecord::Unterminated {
+                break;
+            }
+            continue;
+        };
+        fold.observe(&value);
+        if kind == transcript_cursor::ReadRecord::Unterminated {
+            // Counted, because it is a complete record as far as anything can
+            // tell; re-read next time in case the writer had more to say.
+            resume_from = Some(line_start);
+            break;
+        }
+    }
+    let committed = match resume_from {
+        Some(start) => start + reader.tail_bytes(),
+        None => reader.position(),
+    };
+    // The metadata walk keeps its own position in the same document, and the
+    // same rule applies to it: a fold over bytes that were rewritten during
+    // the walk is not a fold anyone should resume from.
+    let mut superseded = false;
+    match reader.commit(committed)? {
+        transcript_cursor::CommitOutcome::Published(file) => {
+            *state = Some(transcript_cursor::ClaudeScanState {
+                file: Some(file),
+                resume_from,
+                fold: fold.clone(),
+            });
+        }
+        transcript_cursor::CommitOutcome::Superseded => {
+            superseded = true;
+            // Forget the position *and* the fold. Leaving the previous state
+            // in place looked harmless — the next pass would resume from it —
+            // but the bytes that moved are behind that position, so resuming
+            // would never re-read them. Worse, the record walk goes on to
+            // publish a cursor over the new bytes, and both skip paths consult
+            // that cursor: the transcript would be skipped from then on with
+            // the stale fold standing. `None` is the honest state, and it is
+            // what makes the next pass fold the file again from zero.
+            *state = None;
+        }
+    }
+    let validation_bytes = reader.validation_bytes();
+    let bytes_read = reader
+        .position()
+        .saturating_sub(start_offset)
+        .saturating_add(reader.tail_bytes())
+        .saturating_add(validation_bytes);
+    let continuity =
+        crate::continuity::finish_claude_fold(fold.continuity.clone(), fold.continuity_any, path);
+    Ok(ClaudeScanPass {
+        meta: fold.finish(),
+        bytes_read,
+        validation_bytes,
+        superseded,
+        decoded: reader.decoded(),
+        undecodable: reader.undecodable(),
+        continuity,
+    })
 }
 
 pub(crate) fn reconcile_claude_remote_relationships(conn: &Connection) -> Result<()> {
@@ -5031,237 +5485,486 @@ fn ingest_claude_transcript_as(
     path: &Path,
     attributed_session_id: Option<&str>,
 ) -> Result<()> {
-    let text = fs::read_to_string(path)
+    // The session this file belongs to. Claude writes a conversation's summary
+    // as the *first* line and gives it `leafUuid` instead of `sessionId`, so a
+    // fallback that learned the id from earlier records would always be too
+    // late for the one record that needs it. Read ahead for it rather than
+    // holding the file: it is almost always the very first record.
+    let file_session_id = claude_file_session_id(path)?;
+    // Streamed a record at a time rather than read whole. A transcript is
+    // unbounded, and this is the reader a plain `sync` reaches for on every
+    // file it re-reads; holding one in memory is the cost incremental
+    // hydration exists to remove.
+    let file = fs::File::open(path)
         .with_context(|| format!("reading claude transcript {}", path.display()))?;
-    // A compaction boundary reports no size of its own. The context it
-    // replaced is the cache read of the assistant message immediately before
-    // it, which is the only place the provider states how much was in flight
-    // when compaction fired.
-    //
-    // Keyed by session, and never written from a sidechain record. One
-    // transcript file can carry more than one identity -- a subagent sidecar's
-    // records name the parent's `sessionId`, and a named child is re-attributed
-    // to its own -- so a single file-wide value would let a delegated agent's
-    // cache read become the number a later parent boundary reports. A
-    // confidently wrong token count is worse than none, so an assistant record
-    // whose usage omits the field clears the entry rather than leaving the
-    // previous message's value standing.
-    let mut last_assistant_cache_read: HashMap<String, i64> = HashMap::new();
+    let mut reader = BufReader::new(file);
+    let mut raw = Vec::new();
     // Ordering is assigned over the whole transcript, and this parser always
-    // re-reads the file from the start, so a re-sync reproduces the same
-    // indexes instead of advancing them.
+    // reads the file from the start, so a re-sync reproduces the same indexes
+    // instead of advancing them.
     let mut indexer = tool_result_facts::ToolResultIndexer::default();
-    // The session this file belongs to, found before the loop rather than as
-    // it goes. Claude writes a conversation's summary as the *first* line and
-    // gives it `leafUuid` instead of `sessionId`, so a fallback that learned
-    // the id from earlier records would always be too late for the one record
-    // that needs it.
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("session");
-    let file_session_id = text.lines().find_map(|line| {
-        serde_json::from_str::<Value>(line)
-            .ok()?
-            .get("sessionId")?
-            .as_str()
-            .filter(|id| !id.is_empty())
-            .map(str::to_string)
-    });
-    for line in text.lines() {
+    let mut cache_reads: HashMap<String, i64> = HashMap::new();
+    loop {
         check_capture_cancelled()?;
+        raw.clear();
+        if reader
+            .read_until(b'\n', &mut raw)
+            .with_context(|| format!("reading claude transcript {}", path.display()))?
+            == 0
+        {
+            break;
+        }
+        // The record's bytes exactly as `str::lines` would yield them: the
+        // fallback event identity is a hash of this string, so a trailing
+        // newline here would give one record two identities depending on which
+        // reader indexed it.
+        let Ok(line) = std::str::from_utf8(&raw) else {
+            continue;
+        };
+        let line = line.trim_end_matches(['\n', '\r']);
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
         let Some(obj) = value.as_object() else {
             continue;
         };
-        let record_session_id = match obj.get("sessionId").and_then(Value::as_str) {
-            Some(s) if !s.is_empty() => s,
-            // A record with no session of its own is still evidence about the
-            // transcript it sits in, and this guard runs before everything --
-            // so a summary, the one record type Claude writes without a
-            // `sessionId`, was dropped before the classifier ever saw it. That
-            // is the record type this table exists to keep, lost at the first
-            // gate.
-            //
-            // It is attributed to the file's own session, because a transcript
-            // has exactly one. Nothing else about such a record is ingested:
-            // it takes the marker path and then this iteration ends, so a
-            // future sessionless record type cannot become an event under a
-            // session it never named.
-            //
-            // A transcript that names no session anywhere has no answer, and
-            // inventing one would put the record on a session that does not
-            // exist. Those are still skipped.
-            _ => {
-                // `attributed_session_id` first, because that is the id the
-                // rest of this file is ingested under. A subagent sidecar
-                // carries the PARENT's `sessionId` on every row plus a
-                // per-child `agentId`, so reading the file's first
-                // `sessionId` would put the child's summary on the parent --
-                // the child losing it, and the parent gaining evidence from a
-                // conversation that is not its own. That is worse than the
-                // drop it replaced: a wrong attribution reads as a real one.
-                if let Some(session_id) = attributed_session_id.or(file_session_id.as_deref()) {
-                    insert_sessionless_record_marker(conn, session_id, obj, line, stem)?;
-                }
-                continue;
-            }
+        ingest_claude_record(
+            conn,
+            path,
+            attributed_session_id,
+            file_session_id.as_deref(),
+            line,
+            obj,
+            &mut indexer,
+            &mut cache_reads,
+        )?;
+    }
+    Ok(())
+}
+
+/// The first in-log session id a transcript carries.
+///
+/// Read ahead of the record walk, and bounded in the case that matters: the
+/// id is normally on the first record, and this stops at the first one that
+/// has it.
+fn claude_file_session_id(path: &Path) -> Result<Option<String>> {
+    let file = fs::File::open(path)
+        .with_context(|| format!("reading claude transcript {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut raw = Vec::new();
+    loop {
+        raw.clear();
+        if reader.read_until(b'\n', &mut raw)? == 0 {
+            return Ok(None);
+        }
+        let Ok(line) = std::str::from_utf8(&raw) else {
+            continue;
         };
-        let session_id = attributed_session_id.unwrap_or(record_session_id);
-        // Subagent sidecar transcripts share the parent's sessionId with
-        // isSidechain rows. The subagent's assistant output is real session
-        // activity (text and token spend), but its user-role rows are the
-        // parent agent's own prompts and tool results — ingesting those
-        // manufactures fake human turns.
-        let is_sidechain = obj.get("isSidechain").and_then(Value::as_bool);
-        let sidechain = is_sidechain.unwrap_or(false);
-        let skipped_sidechain = sidechain
-            && obj
-                .get("message")
-                .and_then(|m| m.get("role"))
-                .and_then(Value::as_str)
-                != Some("assistant");
-        let uuid = obj.get("uuid").and_then(Value::as_str);
-        let message = obj.get("message").and_then(Value::as_object);
-        // Records without provider identity fall back to a content hash, never
-        // the line index: compaction drops prefixes and inserts summary rows,
-        // so indexes shift and surviving rows would land on earlier rows'
-        // event uids, overwriting retained evidence through the conflict
-        // upsert instead of retaining it. The hash keeps a surviving row on
-        // its identity across a rewrite; a row whose bytes changed is a new
-        // identity whose predecessor stays retained. Byte-identical id-less
-        // rows share one identity. The `sha256:` namespace keeps hash
-        // identities disjoint from the legacy positional `{stem}:{digits}`
-        // namespace, so the legacy detector below can never select a row
-        // the new parser wrote (an all-decimal hash would otherwise match).
-        // Derived by `claude_record_identity`, shared with the sessionless
-        // path above. The same line reaches both -- a summary read locally
-        // carries no `sessionId`, and the same summary in a remote snapshot
-        // has one injected -- so a rule per path made one record into two rows
-        // the unique key could not collapse.
-        let fallback_uid = claude_record_identity(obj, line, stem);
-        // A pre-upgrade parse stored id-less records under a positional
-        // `{stem}:{line}` identity that no current parse emits. Heals remove
-        // exactly the current identity and never guess the historical one:
-        // after a prefix-dropping rewrite the live index no longer belongs
-        // to the same record, so a positional delete could drop another
-        // retained record while leaving the real predecessor behind. Stale
-        // positional leftovers are preserved by design — retention-safe
-        // duplication, bounded to id-less files — rather than healed by
-        // position.
-        let message_uuid = fallback_uid.as_str();
-        let id_less = uuid.is_none()
-            && message
-                .and_then(|m| m.get("id"))
-                .and_then(Value::as_str)
-                .is_none();
-        // ts_ms, role, model and token spend feed the legacy heal below;
-        // they only read the record.
-        let ts_ms = obj
-            .get("timestamp")
-            .and_then(|v| v.as_str().and_then(parse_iso_ms).or_else(|| v.as_i64()))
-            .unwrap_or(0);
-        let message_role = message
+        if let Some(id) = serde_json::from_str::<Value>(line.trim_end_matches(['\n', '\r']))
+            .ok()
+            .as_ref()
+            .and_then(|value| value.get("sessionId"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
+            return Ok(Some(id.to_string()));
+        }
+    }
+}
+
+/// Index one Claude transcript record.
+///
+/// Split out of the file walk so the whole-file and the incremental readers
+/// index a record identically: the only thing that may differ between them is
+/// which records they hand over, never what a record means.
+///
+/// `line` is the record's bytes as written, because a record carrying neither
+/// `uuid` nor `message.id` takes its identity from a hash of them.
+///
+/// `indexer` and `last_assistant_cache_read` are threaded in rather than owned
+/// here because both run across the whole transcript: tool-result ordering,
+/// and the cache read a compaction boundary reports as the context it
+/// replaced. A resumed pass restores both from the cursor.
+#[allow(clippy::too_many_arguments)]
+fn ingest_claude_record(
+    conn: &Connection,
+    path: &Path,
+    attributed_session_id: Option<&str>,
+    file_session_id: Option<&str>,
+    line: &str,
+    obj: &Map<String, Value>,
+    indexer: &mut tool_result_facts::ToolResultIndexer,
+    last_assistant_cache_read: &mut HashMap<String, i64>,
+) -> Result<()> {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("session");
+    let record_session_id = match obj.get("sessionId").and_then(Value::as_str) {
+        Some(s) if !s.is_empty() => s,
+        // A record with no session of its own is still evidence about the
+        // transcript it sits in, and this guard runs before everything --
+        // so a summary, the one record type Claude writes without a
+        // `sessionId`, was dropped before the classifier ever saw it. That
+        // is the record type this table exists to keep, lost at the first
+        // gate.
+        //
+        // It is attributed to the file's own session, because a transcript
+        // has exactly one. Nothing else about such a record is ingested:
+        // it takes the marker path and then this iteration ends, so a
+        // future sessionless record type cannot become an event under a
+        // session it never named.
+        //
+        // A transcript that names no session anywhere has no answer, and
+        // inventing one would put the record on a session that does not
+        // exist. Those are still skipped.
+        _ => {
+            // `attributed_session_id` first, because that is the id the
+            // rest of this file is ingested under. A subagent sidecar
+            // carries the PARENT's `sessionId` on every row plus a
+            // per-child `agentId`, so reading the file's first
+            // `sessionId` would put the child's summary on the parent --
+            // the child losing it, and the parent gaining evidence from a
+            // conversation that is not its own. That is worse than the
+            // drop it replaced: a wrong attribution reads as a real one.
+            if let Some(session_id) = attributed_session_id.or(file_session_id) {
+                insert_sessionless_record_marker(conn, session_id, obj, line, stem)?;
+            }
+            return Ok(());
+        }
+    };
+    let session_id = attributed_session_id.unwrap_or(record_session_id);
+    // Subagent sidecar transcripts share the parent's sessionId with
+    // isSidechain rows. The subagent's assistant output is real session
+    // activity (text and token spend), but its user-role rows are the
+    // parent agent's own prompts and tool results — ingesting those
+    // manufactures fake human turns.
+    let is_sidechain = obj.get("isSidechain").and_then(Value::as_bool);
+    let sidechain = is_sidechain.unwrap_or(false);
+    let skipped_sidechain = sidechain
+        && obj
+            .get("message")
             .and_then(|m| m.get("role"))
             .and_then(Value::as_str)
-            .or_else(|| obj.get("type").and_then(Value::as_str))
-            .unwrap_or("");
-        let model = message.and_then(|m| m.get("model")).and_then(Value::as_str);
-        let token_json = message
+            != Some("assistant");
+    let uuid = obj.get("uuid").and_then(Value::as_str);
+    let message = obj.get("message").and_then(Value::as_object);
+    // Records without provider identity fall back to a content hash, never
+    // the line index: compaction drops prefixes and inserts summary rows,
+    // so indexes shift and surviving rows would land on earlier rows'
+    // event uids, overwriting retained evidence through the conflict
+    // upsert instead of retaining it. The hash keeps a surviving row on
+    // its identity across a rewrite; a row whose bytes changed is a new
+    // identity whose predecessor stays retained. Byte-identical id-less
+    // rows share one identity. The `sha256:` namespace keeps hash
+    // identities disjoint from the legacy positional `{stem}:{digits}`
+    // namespace, so the legacy detector below can never select a row
+    // the new parser wrote (an all-decimal hash would otherwise match).
+    // Derived by `claude_record_identity`, shared with the sessionless
+    // path above. The same line reaches both -- a summary read locally
+    // carries no `sessionId`, and the same summary in a remote snapshot
+    // has one injected -- so a rule per path made one record into two rows
+    // the unique key could not collapse.
+    let fallback_uid = claude_record_identity(obj, line, stem);
+    // A pre-upgrade parse stored id-less records under a positional
+    // `{stem}:{line}` identity that no current parse emits. Heals remove
+    // exactly the current identity and never guess the historical one:
+    // after a prefix-dropping rewrite the live index no longer belongs
+    // to the same record, so a positional delete could drop another
+    // retained record while leaving the real predecessor behind. Stale
+    // positional leftovers are preserved by design — retention-safe
+    // duplication, bounded to id-less files — rather than healed by
+    // position.
+    let message_uuid = fallback_uid.as_str();
+    let id_less = uuid.is_none()
+        && message
+            .and_then(|m| m.get("id"))
+            .and_then(Value::as_str)
+            .is_none();
+    // ts_ms, role, model and token spend feed the legacy heal below;
+    // they only read the record.
+    let ts_ms = obj
+        .get("timestamp")
+        .and_then(|v| v.as_str().and_then(parse_iso_ms).or_else(|| v.as_i64()))
+        .unwrap_or(0);
+    let message_role = message
+        .and_then(|m| m.get("role"))
+        .and_then(Value::as_str)
+        .or_else(|| obj.get("type").and_then(Value::as_str))
+        .unwrap_or("");
+    let model = message.and_then(|m| m.get("model")).and_then(Value::as_str);
+    let token_json = message
+        .and_then(|m| m.get("usage"))
+        .and_then(|v| serde_json::to_string(v).ok());
+    // Read once per record: every row this record produces belongs to the
+    // same provider request, whatever `message_uuid` the block gets.
+    let identity = RequestIdentity::from_claude_record(obj, message);
+    let cwd = obj.get("cwd").and_then(Value::as_str);
+    let project = cwd;
+    let git_branch = obj.get("gitBranch").and_then(Value::as_str);
+    let parent_id = obj.get("parentUuid").and_then(Value::as_str);
+    let is_meta = obj.get("isMeta").and_then(Value::as_bool);
+    let raw_facts = RawMessageFacts {
+        request_id: obj
+            .get("requestId")
+            .or_else(|| obj.get("request_id"))
+            .and_then(Value::as_str),
+        stop_reason: message
+            .and_then(|m| m.get("stop_reason"))
+            .and_then(Value::as_str),
+        agent_version: obj
+            .get("version")
+            .or_else(|| obj.get("sourceVersion"))
+            .and_then(Value::as_str),
+        is_sidechain,
+        is_meta,
+        turn_id: None,
+        // Claude names its requests, so it groups on `request_id` and
+        // needs no span.
+        request_span: None,
+    };
+    if message_role == "assistant" && !sidechain {
+        match message
             .and_then(|m| m.get("usage"))
-            .and_then(|v| serde_json::to_string(v).ok());
-        // Read once per record: every row this record produces belongs to the
-        // same provider request, whatever `message_uuid` the block gets.
-        let identity = RequestIdentity::from_claude_record(obj, message);
-        let cwd = obj.get("cwd").and_then(Value::as_str);
-        let project = cwd;
-        let git_branch = obj.get("gitBranch").and_then(Value::as_str);
-        let parent_id = obj.get("parentUuid").and_then(Value::as_str);
-        let is_meta = obj.get("isMeta").and_then(Value::as_bool);
-        let raw_facts = RawMessageFacts {
-            request_id: obj
-                .get("requestId")
-                .or_else(|| obj.get("request_id"))
-                .and_then(Value::as_str),
-            stop_reason: message
-                .and_then(|m| m.get("stop_reason"))
-                .and_then(Value::as_str),
-            agent_version: obj
-                .get("version")
-                .or_else(|| obj.get("sourceVersion"))
-                .and_then(Value::as_str),
-            is_sidechain,
-            is_meta,
-            turn_id: None,
-            // Claude names its requests, so it groups on `request_id` and
-            // needs no span.
-            request_span: None,
-        };
-        if message_role == "assistant" && !sidechain {
-            match message
-                .and_then(|m| m.get("usage"))
-                .and_then(|usage| usage.get("cache_read_input_tokens"))
-                .and_then(Value::as_i64)
-            {
-                Some(cache_read) => {
-                    last_assistant_cache_read.insert(session_id.to_string(), cache_read);
-                }
-                None => {
-                    last_assistant_cache_read.remove(session_id);
-                }
+            .and_then(|usage| usage.get("cache_read_input_tokens"))
+            .and_then(Value::as_i64)
+        {
+            Some(cache_read) => {
+                last_assistant_cache_read.insert(session_id.to_string(), cache_read);
+            }
+            None => {
+                last_assistant_cache_read.remove(session_id);
             }
         }
-        // Heal what an earlier parser version wrote for this record: it
-        // attributed every sidechain row to the parent, and stored the rows
-        // this guard now skips. Re-reading the file removes the stale rows
-        // under the identity they were written with, so a re-parse moves them
-        // onto the child instead of duplicating them across both.
-        // Pre-upgrade positional leftovers match by full stored record,
-        // unique or preserved: the live index cannot identify them after a
-        // rewrite.
-        if session_id != record_session_id {
-            delete_claude_record_rows(conn, record_session_id, message_uuid)?;
-            if id_less {
-                heal_legacy_positional_record(
-                    conn,
-                    record_session_id,
-                    stem,
-                    ts_ms,
-                    message,
-                    message_role,
-                    model,
-                    token_json.as_deref(),
-                )?;
-            }
+    }
+    // Heal what an earlier parser version wrote for this record: it
+    // attributed every sidechain row to the parent, and stored the rows
+    // this guard now skips. Re-reading the file removes the stale rows
+    // under the identity they were written with, so a re-parse moves them
+    // onto the child instead of duplicating them across both.
+    // Pre-upgrade positional leftovers match by full stored record,
+    // unique or preserved: the live index cannot identify them after a
+    // rewrite.
+    if session_id != record_session_id {
+        delete_claude_record_rows(conn, record_session_id, message_uuid)?;
+        if id_less {
+            heal_legacy_positional_record(
+                conn,
+                record_session_id,
+                stem,
+                ts_ms,
+                message,
+                message_role,
+                model,
+                token_json.as_deref(),
+            )?;
         }
-        // How many rows this record produced, counted rather than predicted.
-        //
-        // Every record must leave at least one row behind, and the only
-        // trustworthy way to know whether it did is to count what was written.
-        // Predicting it from the shape of `content` needs a rule per emptiness
-        // -- absent, `null`, `""`, `[]`, blocks that are all blank -- and every
-        // rule that is missed is a record that silently disappears while the
-        // code looks correct.
-        let mut record_rows = 0usize;
-        // Classified here, before the handlers below start to `continue`: a
-        // system line that names no delegated child, and any record with no
-        // message body, are dropped further down, and a marker written after
-        // that point would never be reached for exactly the records this table
-        // exists to keep.
-        //
-        // A skipped sidechain record is deliberately excluded. Its rows are
-        // deleted rather than stored, so a marker would be the one trace left
-        // of a record the parser has decided not to keep.
-        let record_draft = if skipped_sidechain {
-            None
+    }
+    // How many rows this record produced, counted rather than predicted.
+    //
+    // Every record must leave at least one row behind, and the only
+    // trustworthy way to know whether it did is to count what was written.
+    // Predicting it from the shape of `content` needs a rule per emptiness
+    // -- absent, `null`, `""`, `[]`, blocks that are all blank -- and every
+    // rule that is missed is a record that silently disappears while the
+    // code looks correct.
+    let mut record_rows = 0usize;
+    // Classified here, before the handlers below start to `continue`: a
+    // system line that names no delegated child, and any record with no
+    // message body, are dropped further down, and a marker written after
+    // that point would never be reached for exactly the records this table
+    // exists to keep.
+    //
+    // A skipped sidechain record is deliberately excluded. Its rows are
+    // deleted rather than stored, so a marker would be the one trace left
+    // of a record the parser has decided not to keep.
+    let record_draft = if skipped_sidechain {
+        None
+    } else {
+        claude_marker_for_record(obj, last_assistant_cache_read.get(session_id).copied())
+    };
+    if let Some(draft) = &record_draft {
+        record_rows += 1;
+        let marker_uid = format!("{message_uuid}:marker");
+        insert_session_marker(
+            conn,
+            "claude",
+            session_id,
+            &NewSessionMarker {
+                marker_uid: &marker_uid,
+                ts_ms: (ts_ms != 0).then_some(ts_ms),
+                message_id: Some(message_uuid),
+                parent_id: draft.parent_id.as_deref().or(parent_id),
+                turn_id: draft.turn_id.as_deref(),
+                kind: draft.kind,
+                subkind: draft.subkind.as_deref(),
+                text: None,
+                payload_json: draft.payload_json.as_deref(),
+            },
+        )?;
+    }
+    // Claude reports a finished subagent as a `type: "system"` line with
+    // no message body, so the block walk below never sees it. It is the
+    // only record that ties a delegated child back to the Agent call that
+    // spawned it, which makes it a tool result in everything but shape.
+    //
+    // This runs before the sidechain guard, and has to. A system line
+    // carries no `message`, so `skipped_sidechain` is true for every one
+    // of them that is marked `isSidechain` -- and a nested Agent call
+    // writes its completion line inside the child's sidecar, where every
+    // record is a sidechain. Skipping those would drop the only record of
+    // the nested spawn while keeping the rows for the spawns that happen
+    // to sit on the parent transcript. The guard below still owns every
+    // other sidechain row; a system line that names no child falls
+    // through to it.
+    let system_record = obj.get("type").and_then(Value::as_str) == Some("system");
+    if system_record {
+        if let Some(tool_facts) = tool_result_facts::claude_subagent_notification_facts(obj) {
+            let tool_use_id = tool_facts.tool_use_id.clone().unwrap_or_default();
+            let (call_index, event_index) = indexer.next(&tool_use_id);
+            let tool_facts = tool_facts.with_ordering(call_index, event_index);
+            let notification_text = obj
+                .get("content")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty());
+            // `raw_kind` is what keeps this row apart from a real
+            // `tool_result` content block: both normalize to
+            // `kind = "tool_result"`, and the normalized vocabulary is
+            // deliberately not widened to carry the distinction.
+            insert_session_event_with_provenance(
+                conn,
+                "claude",
+                session_id,
+                project,
+                cwd,
+                git_branch,
+                message_uuid,
+                parent_id,
+                ts_ms,
+                "tool_result",
+                "tool_result",
+                notification_text,
+                None,
+                None,
+                // Claude records neither an inference provider nor a
+                // stop reason on this record.
+                None,
+                None,
+                identity,
+                &format!("{message_uuid}:subagent_notification"),
+                Some(&tool_facts),
+                raw_facts,
+                Some("system_subagent_notification"),
+            )?;
+            return Ok(());
+        }
+    }
+    if skipped_sidechain {
+        delete_claude_record_rows(conn, session_id, message_uuid)?;
+        if id_less {
+            heal_legacy_positional_record(
+                conn,
+                session_id,
+                stem,
+                ts_ms,
+                message,
+                message_role,
+                model,
+                token_json.as_deref(),
+            )?;
+        }
+        return Ok(());
+    }
+    // A system line that names no delegated child has nothing else this
+    // parser stores -- it carries no `message` body to walk -- and is
+    // dropped exactly as it was before the notification handler existed.
+    if system_record {
+        return Ok(());
+    }
+    let Some(content) = message.and_then(|m| m.get("content")) else {
+        // Nothing below can run for this record, so whether it left a row
+        // behind is already settled: it is the marker above, or nothing.
+        if record_rows == 0 {
+            insert_unknown_record_marker(
+                conn,
+                session_id,
+                message_uuid,
+                ts_ms,
+                parent_id,
+                obj.get("type").and_then(Value::as_str).unwrap_or(""),
+            )?;
+        }
+        return Ok(());
+    };
+    if !sidechain && message_role == "user" && is_meta != Some(true) {
+        let prompt = if let Some(text) = content.as_str() {
+            text.trim().to_string()
         } else {
-            claude_marker_for_record(obj, last_assistant_cache_read.get(session_id).copied())
+            content
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n")
         };
-        if let Some(draft) = &record_draft {
+        if !prompt.is_empty() && !discover::is_claude_control_prompt(&prompt) {
+            insert_history(
+                conn,
+                &HistoryEntry {
+                    id: 0,
+                    source: "claude".into(),
+                    session_id: Some(session_id.to_string()),
+                    project: project.map(str::to_string),
+                    prompt_hash: Some(prompt_hash(&prompt)),
+                    prompt,
+                    timestamp_ms: ts_ms,
+                },
+            )?;
+        }
+    }
+    if let Some(s) = content.as_str() {
+        if !s.trim().is_empty() {
+            let role = if message_role == "assistant" {
+                "assistant"
+            } else {
+                "user"
+            };
+            insert_session_event(
+                conn,
+                "claude",
+                session_id,
+                project,
+                cwd,
+                git_branch,
+                message_uuid,
+                parent_id,
+                ts_ms,
+                role,
+                "text",
+                Some(s),
+                model,
+                token_json.as_deref(),
+                identity,
+                &format!("{message_uuid}:0"),
+                None,
+                raw_facts,
+            )?;
             record_rows += 1;
-            let marker_uid = format!("{message_uuid}:marker");
+        }
+    }
+    for (block_index, block) in content.as_array().into_iter().flatten().enumerate() {
+        let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
+        let event_uid = format!("{message_uuid}:{block_index}");
+        // Everything the normalized event model cannot carry off this
+        // block — an unsupported block type, a thinking signature, tool
+        // replacement metadata, a delegated result's agent id — is
+        // recorded here, before the arms that handle what it can.
+        for (suffix, draft) in claude_markers_for_block(block_type, block) {
+            let marker_uid = format!("{event_uid}:{suffix}");
             insert_session_marker(
                 conn,
                 "claude",
@@ -5278,35 +5981,146 @@ fn ingest_claude_transcript_as(
                     payload_json: draft.payload_json.as_deref(),
                 },
             )?;
+            record_rows += 1;
         }
-        // Claude reports a finished subagent as a `type: "system"` line with
-        // no message body, so the block walk below never sees it. It is the
-        // only record that ties a delegated child back to the Agent call that
-        // spawned it, which makes it a tool result in everything but shape.
-        //
-        // This runs before the sidechain guard, and has to. A system line
-        // carries no `message`, so `skipped_sidechain` is true for every one
-        // of them that is marked `isSidechain` -- and a nested Agent call
-        // writes its completion line inside the child's sidecar, where every
-        // record is a sidechain. Skipping those would drop the only record of
-        // the nested spawn while keeping the rows for the spawns that happen
-        // to sit on the parent transcript. The guard below still owns every
-        // other sidechain row; a system line that names no child falls
-        // through to it.
-        let system_record = obj.get("type").and_then(Value::as_str) == Some("system");
-        if system_record {
-            if let Some(tool_facts) = tool_result_facts::claude_subagent_notification_facts(obj) {
-                let tool_use_id = tool_facts.tool_use_id.clone().unwrap_or_default();
-                let (call_index, event_index) = indexer.next(&tool_use_id);
-                let tool_facts = tool_facts.with_ordering(call_index, event_index);
-                let notification_text = obj
-                    .get("content")
+        match block_type {
+            "text" => {
+                if let Some(text) = block.get("text").and_then(Value::as_str) {
+                    if !text.trim().is_empty() {
+                        let role = if message_role == "assistant" {
+                            "assistant"
+                        } else {
+                            "user"
+                        };
+                        insert_session_event(
+                            conn,
+                            "claude",
+                            session_id,
+                            project,
+                            cwd,
+                            git_branch,
+                            message_uuid,
+                            parent_id,
+                            ts_ms,
+                            role,
+                            "text",
+                            Some(text),
+                            model,
+                            token_json.as_deref(),
+                            identity,
+                            &event_uid,
+                            None,
+                            raw_facts,
+                        )?;
+                        record_rows += 1;
+                    }
+                }
+            }
+            "thinking" => {
+                let text = block
+                    .get("thinking")
+                    .or_else(|| block.get("text"))
+                    .and_then(Value::as_str);
+                if text.is_some_and(|s| !s.trim().is_empty()) {
+                    insert_session_event(
+                        conn,
+                        "claude",
+                        session_id,
+                        project,
+                        cwd,
+                        git_branch,
+                        message_uuid,
+                        parent_id,
+                        ts_ms,
+                        "assistant",
+                        "thinking",
+                        text,
+                        model,
+                        token_json.as_deref(),
+                        identity,
+                        &event_uid,
+                        None,
+                        raw_facts,
+                    )?;
+                    record_rows += 1;
+                }
+            }
+            "tool_use" => {
+                let tool_use_id = block.get("id").and_then(Value::as_str).unwrap_or("");
+                let name = block.get("name").and_then(Value::as_str).unwrap_or("");
+                let args = block.get("input").unwrap_or(&Value::Null);
+                let target = pick_tool_target(name, args);
+                let event_text = format_tool_event_text(name, target.as_deref(), args);
+                insert_session_event(
+                    conn,
+                    "claude",
+                    session_id,
+                    project,
+                    cwd,
+                    git_branch,
+                    message_uuid,
+                    parent_id,
+                    ts_ms,
+                    "assistant",
+                    "tool_use",
+                    Some(&event_text),
+                    model,
+                    token_json.as_deref(),
+                    identity,
+                    &event_uid,
+                    None,
+                    raw_facts,
+                )?;
+                record_rows += 1;
+                if !tool_use_id.is_empty() && !name.is_empty() {
+                    let args_json =
+                        serde_json::to_string(args).unwrap_or_else(|_| "null".to_string());
+                    insert_tool_call(
+                        conn,
+                        "claude",
+                        session_id,
+                        message_uuid,
+                        tool_use_id,
+                        name,
+                        target.as_deref(),
+                        &args_json,
+                        None,
+                        ts_ms,
+                    )?;
+                    if is_file_edit_tool(name) {
+                        if let Some(file_path) = target.as_deref() {
+                            upsert_file_edit_from_call(
+                                conn,
+                                "claude",
+                                session_id,
+                                message_uuid,
+                                tool_use_id,
+                                file_path,
+                                name,
+                                ts_ms,
+                                git_branch,
+                                cwd,
+                            )?;
+                        }
+                    }
+                }
+            }
+            "tool_result" => {
+                let tool_use_id = block
+                    .get("tool_use_id")
+                    .or_else(|| block.get("toolUseId"))
                     .and_then(Value::as_str)
-                    .filter(|value| !value.trim().is_empty());
-                // `raw_kind` is what keeps this row apart from a real
-                // `tool_result` content block: both normalize to
-                // `kind = "tool_result"`, and the normalized vocabulary is
-                // deliberately not widened to carry the distinction.
+                    .unwrap_or("");
+                let content = block.get("content").unwrap_or(&Value::Null);
+                // Measured over the provider's raw content, before
+                // `materialize_tool_result_text` reshapes it: the whole
+                // point of `payload_bytes` is to say what the harness
+                // actually returned, which a post-processed string can no
+                // longer answer.
+                let (call_index, event_index) = indexer.next(tool_use_id);
+                let facts = tool_result_facts::claude_tool_result_facts(block)
+                    .with_ordering(call_index, event_index);
+                let text = materialize_tool_result_text(content);
                 insert_session_event_with_provenance(
                     conn,
                     "claude",
@@ -5319,345 +6133,54 @@ fn ingest_claude_transcript_as(
                     ts_ms,
                     "tool_result",
                     "tool_result",
-                    notification_text,
-                    None,
-                    None,
-                    // Claude records neither an inference provider nor a
-                    // stop reason on this record.
+                    text.as_deref(),
+                    model,
+                    token_json.as_deref(),
                     None,
                     None,
                     identity,
-                    &format!("{message_uuid}:subagent_notification"),
-                    Some(&tool_facts),
+                    &event_uid,
+                    Some(&facts),
                     raw_facts,
-                    Some("system_subagent_notification"),
-                )?;
-                continue;
-            }
-        }
-        if skipped_sidechain {
-            delete_claude_record_rows(conn, session_id, message_uuid)?;
-            if id_less {
-                heal_legacy_positional_record(
-                    conn,
-                    session_id,
-                    stem,
-                    ts_ms,
-                    message,
-                    message_role,
-                    model,
-                    token_json.as_deref(),
-                )?;
-            }
-            continue;
-        }
-        // A system line that names no delegated child has nothing else this
-        // parser stores -- it carries no `message` body to walk -- and is
-        // dropped exactly as it was before the notification handler existed.
-        if system_record {
-            continue;
-        }
-        let Some(content) = message.and_then(|m| m.get("content")) else {
-            // Nothing below can run for this record, so whether it left a row
-            // behind is already settled: it is the marker above, or nothing.
-            if record_rows == 0 {
-                insert_unknown_record_marker(
-                    conn,
-                    session_id,
-                    message_uuid,
-                    ts_ms,
-                    parent_id,
-                    obj.get("type").and_then(Value::as_str).unwrap_or(""),
-                )?;
-            }
-            continue;
-        };
-        if !sidechain && message_role == "user" && is_meta != Some(true) {
-            let prompt = if let Some(text) = content.as_str() {
-                text.trim().to_string()
-            } else {
-                content
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
-                    .filter_map(|block| block.get("text").and_then(Value::as_str))
-                    .map(str::trim)
-                    .filter(|text| !text.is_empty())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
-            if !prompt.is_empty() && !discover::is_claude_control_prompt(&prompt) {
-                insert_history(
-                    conn,
-                    &HistoryEntry {
-                        id: 0,
-                        source: "claude".into(),
-                        session_id: Some(session_id.to_string()),
-                        project: project.map(str::to_string),
-                        prompt_hash: Some(prompt_hash(&prompt)),
-                        prompt,
-                        timestamp_ms: ts_ms,
-                    },
-                )?;
-            }
-        }
-        if let Some(s) = content.as_str() {
-            if !s.trim().is_empty() {
-                let role = if message_role == "assistant" {
-                    "assistant"
-                } else {
-                    "user"
-                };
-                insert_session_event(
-                    conn,
-                    "claude",
-                    session_id,
-                    project,
-                    cwd,
-                    git_branch,
-                    message_uuid,
-                    parent_id,
-                    ts_ms,
-                    role,
-                    "text",
-                    Some(s),
-                    model,
-                    token_json.as_deref(),
-                    identity,
-                    &format!("{message_uuid}:0"),
-                    None,
-                    raw_facts,
+                    Some("tool_result_block"),
                 )?;
                 record_rows += 1;
-            }
-        }
-        for (block_index, block) in content.as_array().into_iter().flatten().enumerate() {
-            let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
-            let event_uid = format!("{message_uuid}:{block_index}");
-            // Everything the normalized event model cannot carry off this
-            // block — an unsupported block type, a thinking signature, tool
-            // replacement metadata, a delegated result's agent id — is
-            // recorded here, before the arms that handle what it can.
-            for (suffix, draft) in claude_markers_for_block(block_type, block) {
-                let marker_uid = format!("{event_uid}:{suffix}");
-                insert_session_marker(
-                    conn,
-                    "claude",
-                    session_id,
-                    &NewSessionMarker {
-                        marker_uid: &marker_uid,
-                        ts_ms: (ts_ms != 0).then_some(ts_ms),
-                        message_id: Some(message_uuid),
-                        parent_id: draft.parent_id.as_deref().or(parent_id),
-                        turn_id: draft.turn_id.as_deref(),
-                        kind: draft.kind,
-                        subkind: draft.subkind.as_deref(),
-                        text: None,
-                        payload_json: draft.payload_json.as_deref(),
-                    },
-                )?;
-                record_rows += 1;
-            }
-            match block_type {
-                "text" => {
-                    if let Some(text) = block.get("text").and_then(Value::as_str) {
-                        if !text.trim().is_empty() {
-                            let role = if message_role == "assistant" {
-                                "assistant"
-                            } else {
-                                "user"
-                            };
-                            insert_session_event(
-                                conn,
-                                "claude",
-                                session_id,
-                                project,
-                                cwd,
-                                git_branch,
-                                message_uuid,
-                                parent_id,
-                                ts_ms,
-                                role,
-                                "text",
-                                Some(text),
-                                model,
-                                token_json.as_deref(),
-                                identity,
-                                &event_uid,
-                                None,
-                                raw_facts,
-                            )?;
-                            record_rows += 1;
-                        }
+                let is_error = block.get("is_error").and_then(Value::as_bool);
+                if !tool_use_id.is_empty() {
+                    if let Some(err) = is_error {
+                        set_tool_call_error(conn, "claude", session_id, tool_use_id, err)?;
                     }
-                }
-                "thinking" => {
-                    let text = block
-                        .get("thinking")
-                        .or_else(|| block.get("text"))
-                        .and_then(Value::as_str);
-                    if text.is_some_and(|s| !s.trim().is_empty()) {
-                        insert_session_event(
-                            conn,
-                            "claude",
-                            session_id,
-                            project,
-                            cwd,
-                            git_branch,
-                            message_uuid,
-                            parent_id,
-                            ts_ms,
-                            "assistant",
-                            "thinking",
-                            text,
-                            model,
-                            token_json.as_deref(),
-                            identity,
-                            &event_uid,
-                            None,
-                            raw_facts,
-                        )?;
-                        record_rows += 1;
-                    }
-                }
-                "tool_use" => {
-                    let tool_use_id = block.get("id").and_then(Value::as_str).unwrap_or("");
-                    let name = block.get("name").and_then(Value::as_str).unwrap_or("");
-                    let args = block.get("input").unwrap_or(&Value::Null);
-                    let target = pick_tool_target(name, args);
-                    let event_text = format_tool_event_text(name, target.as_deref(), args);
-                    insert_session_event(
-                        conn,
-                        "claude",
-                        session_id,
-                        project,
-                        cwd,
-                        git_branch,
-                        message_uuid,
-                        parent_id,
-                        ts_ms,
-                        "assistant",
-                        "tool_use",
-                        Some(&event_text),
-                        model,
-                        token_json.as_deref(),
-                        identity,
-                        &event_uid,
-                        None,
-                        raw_facts,
-                    )?;
-                    record_rows += 1;
-                    if !tool_use_id.is_empty() && !name.is_empty() {
-                        let args_json =
-                            serde_json::to_string(args).unwrap_or_else(|_| "null".to_string());
-                        insert_tool_call(
+                    if let Some(result) = find_tool_use_result(block) {
+                        update_file_edit_from_tool_result(
                             conn,
                             "claude",
                             session_id,
                             message_uuid,
                             tool_use_id,
-                            name,
-                            target.as_deref(),
-                            &args_json,
-                            None,
+                            result,
                             ts_ms,
+                            git_branch,
+                            cwd,
                         )?;
-                        if is_file_edit_tool(name) {
-                            if let Some(file_path) = target.as_deref() {
-                                upsert_file_edit_from_call(
-                                    conn,
-                                    "claude",
-                                    session_id,
-                                    message_uuid,
-                                    tool_use_id,
-                                    file_path,
-                                    name,
-                                    ts_ms,
-                                    git_branch,
-                                    cwd,
-                                )?;
-                            }
-                        }
                     }
                 }
-                "tool_result" => {
-                    let tool_use_id = block
-                        .get("tool_use_id")
-                        .or_else(|| block.get("toolUseId"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    let content = block.get("content").unwrap_or(&Value::Null);
-                    // Measured over the provider's raw content, before
-                    // `materialize_tool_result_text` reshapes it: the whole
-                    // point of `payload_bytes` is to say what the harness
-                    // actually returned, which a post-processed string can no
-                    // longer answer.
-                    let (call_index, event_index) = indexer.next(tool_use_id);
-                    let facts = tool_result_facts::claude_tool_result_facts(block)
-                        .with_ordering(call_index, event_index);
-                    let text = materialize_tool_result_text(content);
-                    insert_session_event_with_provenance(
-                        conn,
-                        "claude",
-                        session_id,
-                        project,
-                        cwd,
-                        git_branch,
-                        message_uuid,
-                        parent_id,
-                        ts_ms,
-                        "tool_result",
-                        "tool_result",
-                        text.as_deref(),
-                        model,
-                        token_json.as_deref(),
-                        None,
-                        None,
-                        identity,
-                        &event_uid,
-                        Some(&facts),
-                        raw_facts,
-                        Some("tool_result_block"),
-                    )?;
-                    record_rows += 1;
-                    let is_error = block.get("is_error").and_then(Value::as_bool);
-                    if !tool_use_id.is_empty() {
-                        if let Some(err) = is_error {
-                            set_tool_call_error(conn, "claude", session_id, tool_use_id, err)?;
-                        }
-                        if let Some(result) = find_tool_use_result(block) {
-                            update_file_edit_from_tool_result(
-                                conn,
-                                "claude",
-                                session_id,
-                                message_uuid,
-                                tool_use_id,
-                                result,
-                                ts_ms,
-                                git_branch,
-                                cwd,
-                            )?;
-                        }
-                    }
-                }
-                _ => {}
             }
+            _ => {}
         }
-        // The invariant: every record leaves a row. A record whose content was
-        // present but empty -- `""`, `[]`, or blocks that are all blank --
-        // reaches none of the inserts above, and without this it would be
-        // absent from both tables with nothing to show it was ever there.
-        if record_rows == 0 {
-            insert_unknown_record_marker(
-                conn,
-                session_id,
-                message_uuid,
-                ts_ms,
-                parent_id,
-                obj.get("type").and_then(Value::as_str).unwrap_or(""),
-            )?;
-        }
+    }
+    // The invariant: every record leaves a row. A record whose content was
+    // present but empty -- `""`, `[]`, or blocks that are all blank --
+    // reaches none of the inserts above, and without this it would be
+    // absent from both tables with nothing to show it was ever there.
+    if record_rows == 0 {
+        insert_unknown_record_marker(
+            conn,
+            session_id,
+            message_uuid,
+            ts_ms,
+            parent_id,
+            obj.get("type").and_then(Value::as_str).unwrap_or(""),
+        )?;
     }
     Ok(())
 }
@@ -11695,12 +12218,10 @@ mod tests {
             ),
         )
         .unwrap();
-        let key = named.to_string_lossy().to_string();
-        state
-            .get_mut("claude_sessions_v4")
-            .and_then(Value::as_object_mut)
-            .unwrap()
-            .insert(key, json!(claude_sync_stamp(&named).unwrap()));
+        // Recording the rewritten sidecar as fully consumed is what the
+        // retired stamp map used to express; the cursor row says the same
+        // thing in the shape the walk now reads.
+        transcript_cursor::stamp_whole_file(&conn, "claude", &named).unwrap();
 
         let sentinel = |conn: &Connection| -> i64 {
             conn.query_row(
@@ -16020,6 +16541,15 @@ mod tests {
     /// reported failure needs the stamp to be identical before and after the
     /// unreadable window -- that is what makes the file invisible to the
     /// fast path once the generation has been retired.
+    /// Size and mtime, the pair the walk used to skip a file on before byte
+    /// cursors replaced it. The tests below still pin it, because a fixture
+    /// that changed length or mtime would be re-read for the ordinary reason
+    /// and prove nothing about the path under test.
+    fn stat_stamp(path: &std::path::Path) -> (u64, std::time::SystemTime) {
+        let meta = fs::metadata(path).unwrap();
+        (meta.len(), meta.modified().unwrap())
+    }
+
     fn restore_mtime(path: &std::path::Path, times: std::fs::FileTimes) {
         fs::OpenOptions::new()
             .write(true)
@@ -16080,7 +16610,7 @@ mod tests {
                 .set_accessed(meta.accessed().unwrap())
                 .set_modified(meta.modified().unwrap())
         };
-        let stamp_before = claude_sync_stamp(&unreadable).unwrap();
+        let stamp_before = stat_stamp(&unreadable);
 
         // The state an upgrade leaves behind.
         blank_tool_result_fidelity(&conn, "claude");
@@ -16092,7 +16622,7 @@ mod tests {
         // without proving anything.
         fs::write(&unreadable, vec![0xff_u8; good.len()]).unwrap();
         restore_mtime(&unreadable, pinned);
-        assert_eq!(claude_sync_stamp(&unreadable).unwrap(), stamp_before);
+        assert_eq!(stat_stamp(&unreadable), stamp_before);
 
         // The run reports the omission rather than claiming a clean sync.
         let error = sync_claude_session_metadata(&conn, &mut state, dir.path())
@@ -16123,7 +16653,7 @@ mod tests {
         // generation would have taken away.
         fs::write(&unreadable, &good).unwrap();
         restore_mtime(&unreadable, pinned);
-        assert_eq!(claude_sync_stamp(&unreadable).unwrap(), stamp_before);
+        assert_eq!(stat_stamp(&unreadable), stamp_before);
 
         sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
         assert_eq!(
@@ -17701,6 +18231,84 @@ mod tests {
         );
     }
 
+    /// A resumed Codex pass continues the request numbering rather than
+    /// restarting it.
+    ///
+    /// `request_span` groups the rows of one API call, and it is assigned
+    /// while walking the rollout in order. A pass that resumed from a cursor
+    /// and began again at zero would give a later call the number an earlier
+    /// one already holds, merging two requests into one. The span and the
+    /// baseline generation therefore live on the cursor.
+    ///
+    /// Driven through `ingest_codex_rollout_incremental` with a cursor that
+    /// persists, because that is the only caller that resumes: the global
+    /// sync walk hands it a throwaway cursor and reads every rollout from
+    /// zero.
+    #[test]
+    fn a_resumed_codex_pass_continues_the_request_numbering() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-resume.jsonl");
+        let turn = |n: u32, total: u32| {
+            format!(
+                concat!(
+                    r#"{{"timestamp":"2026-04-20T05:0{n}:01.000Z","type":"event_msg","payload":{{"type":"user_message","message":"run {n}"}}}}"#,
+                    "\n",
+                    r#"{{"timestamp":"2026-04-20T05:0{n}:02.000Z","type":"event_msg","payload":{{"type":"agent_message","message":"done {n}"}}}}"#,
+                    "\n",
+                    r#"{{"timestamp":"2026-04-20T05:0{n}:03.000Z","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{total},"cached_input_tokens":0,"output_tokens":10,"reasoning_output_tokens":0,"total_tokens":{total}}}}}}}}}"#,
+                    "\n",
+                    r#"{{"timestamp":"2026-04-20T05:0{n}:04.000Z","type":"event_msg","payload":{{"type":"task_complete","turn_id":"t{n}"}}}}"#,
+                    "\n",
+                ),
+                n = n,
+                total = total
+            )
+        };
+        let opening = concat!(
+            r#"{"timestamp":"2026-04-20T05:00:00.000Z","type":"session_meta","payload":{"id":"sess_resume","cwd":"/tmp/project"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-04-20T05:00:00.100Z","type":"turn_context","payload":{"turn_id":"t1","cwd":"/tmp/project","model":"gpt-5.4"}}"#,
+            "\n",
+        );
+        fs::write(&rollout, format!("{opening}{}", turn(1, 100))).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let meta = super::read_codex_session_meta(&rollout).unwrap().unwrap();
+        let mut cursor = transcript_cursor::TranscriptCursorState::default();
+
+        super::ingest_codex_rollout_incremental(&conn, &rollout, &meta, &mut cursor).unwrap();
+        let after_first = cursor.file.as_ref().map(|file| file.offset).unwrap_or(0);
+        assert!(after_first > 0, "the first turn published a cursor");
+
+        let mut file = fs::OpenOptions::new().append(true).open(&rollout).unwrap();
+        std::io::Write::write_all(&mut file, turn(2, 250).as_bytes()).unwrap();
+        drop(file);
+
+        super::ingest_codex_rollout_incremental(&conn, &rollout, &meta, &mut cursor).unwrap();
+        assert!(
+            cursor.file.as_ref().map(|file| file.offset).unwrap_or(0) > after_first,
+            "the resumed pass did not advance the cursor"
+        );
+
+        let mut statement = conn
+            .prepare(
+                "SELECT DISTINCT request_span FROM session_events \
+                 WHERE source='codex' AND request_span IS NOT NULL ORDER BY request_span",
+            )
+            .unwrap();
+        let spans = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            spans.len(),
+            2,
+            "a resumed pass restarted the numbering and merged two requests into one: {spans:?}"
+        );
+    }
+
     /// An install already at the recorded generation must still re-read its
     /// unchanged Codex rollouts once when a new fact is added.
     ///
@@ -17946,16 +18554,16 @@ mod tests {
             super::checkpoint_sync_state(&state_path, &state);
             super::load_sync_state(&state_path).unwrap()
         };
-        let stamped_paths = |state: &Map<String, Value>| -> Vec<String> {
-            state
-                .get("claude_sessions_v4")
-                .and_then(Value::as_object)
-                .map(|map| map.keys().cloned().collect())
-                .unwrap_or_default()
+        // The cursor table replaced the `path -> stamp` map, so it is what
+        // now answers "which transcripts does this install know about".
+        let stamped_paths = |conn: &Connection| -> Vec<String> {
+            let mut known = super::transcript_cursor::known_locators(conn, "claude").unwrap();
+            known.sort();
+            known
         };
 
         let state = sync(&conn);
-        assert_eq!(stamped_paths(&state).len(), 2);
+        assert_eq!(stamped_paths(&conn).len(), 2);
 
         let mut state = state;
         blank_raw_message_facts_state(&mut state);
@@ -17968,9 +18576,9 @@ mod tests {
             "the first run after the transcript vanished cannot know it is gone"
         );
         assert_eq!(
-            stamped_paths(&state),
+            stamped_paths(&conn),
             vec![kept.to_string_lossy().to_string()],
-            "the vanished transcript's stamp must not survive the checkpoint merge"
+            "the vanished transcript's cursor must not survive the walk that missed it"
         );
 
         let state = sync(&conn);
@@ -18088,7 +18696,7 @@ mod tests {
         let mut state = Map::new();
         sync_claude_session_metadata(&conn, &mut state, &root).unwrap();
         assert_eq!(request_id(&conn), Some("req_1".into()));
-        let stamp = claude_sync_stamp(&path).unwrap();
+        let stamp = stat_stamp(&path);
         let modified = path.metadata().unwrap().modified().unwrap();
 
         blank_raw_message_facts(&conn, "claude");
@@ -18103,7 +18711,7 @@ mod tests {
 
         restore_unchanged(&path, bytes, modified);
         assert_eq!(
-            claude_sync_stamp(&path).unwrap(),
+            stat_stamp(&path),
             stamp,
             "the restored transcript must carry its original stamp or this proves nothing"
         );
@@ -18316,12 +18924,10 @@ mod tests {
             ),
         )
         .unwrap();
-        let key = named.to_string_lossy().to_string();
-        state
-            .get_mut("claude_sessions_v4")
-            .and_then(Value::as_object_mut)
-            .unwrap()
-            .insert(key, json!(claude_sync_stamp(&named).unwrap()));
+        // Recording the rewritten sidecar as fully consumed is what the
+        // retired `claude_sessions_v3` stamp map used to express; the cursor
+        // row says the same thing in the shape the walk now reads.
+        transcript_cursor::stamp_whole_file(&conn, "claude", &named).unwrap();
 
         sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
         let rewritten = |conn: &Connection| -> i64 {
@@ -18344,6 +18950,356 @@ mod tests {
         .unwrap();
         sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
         assert_eq!(rewritten(&conn), 1);
+    }
+
+    /// A metadata sidecar that is deleted stops describing its child.
+    ///
+    /// Two things had to be true for the stale value to survive, and both were
+    /// the same mistake in different places. The transcript's fast path only
+    /// consulted the metadata cursor when the metadata file still existed, so
+    /// a deletion was the one change that could not be seen; and
+    /// `record_relationship` merges with COALESCE, so even a re-ingest read an
+    /// absent agent type as "nothing new to say" rather than as "that is no
+    /// longer true".
+    /// A global sync keeps the metadata walk's position across the record
+    /// walk that follows it.
+    ///
+    /// Both walks share one locator-keyed cursor row. The sync stored the
+    /// scan, then `ingest_claude_transcript_at_locator` reloaded that row and,
+    /// on any pass that started at offset zero, wrote a default over
+    /// `claude` — taking the scan with it. Hydration happened to put its scan
+    /// back afterwards; sync never did, so every sync re-derived a
+    /// transcript's identity from byte zero however little had arrived.
+    /// A bounded head read must bound the read, not just the loop around it.
+    ///
+    /// `read_until` appends until it finds a newline or reaches EOF, so
+    /// checking a byte budget between lines decided only whether to start
+    /// *another* line. One record the size of the file allocated the size of
+    /// the file — the unbounded read this helper exists to prevent, wearing a
+    /// bound.
+    #[test]
+    fn a_head_read_is_bounded_by_bytes_not_only_by_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("one-huge-line.jsonl");
+        // One record, no newline, far past the ceiling.
+        let huge = format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"x\",\"cwd\":\"/w\",\"pad\":\"{}\"}}}}",
+            "p".repeat(4 * 1024 * 1024)
+        );
+        fs::write(&path, &huge).unwrap();
+        assert!(huge.len() as u64 > 4 * super::LEADING_BYTE_LIMIT);
+
+        let (values, bytes_read) = super::read_leading_records(&path, 1).unwrap();
+        assert!(
+            bytes_read <= super::LEADING_BYTE_LIMIT,
+            "a head read took {bytes_read} bytes, over the {} byte ceiling",
+            super::LEADING_BYTE_LIMIT
+        );
+        // Truncated at the ceiling, so it is not valid JSON and is not
+        // mistaken for a record.
+        assert!(values.is_empty());
+
+        // Positive control: the same reader returns the record when it fits,
+        // so the bound is what stopped it rather than a reader that never
+        // reads anything.
+        let small = dir.path().join("small.jsonl");
+        fs::write(
+            &small,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"x\",\"cwd\":\"/w\"}}\n",
+        )
+        .unwrap();
+        let (values, _) = super::read_leading_records(&small, 1).unwrap();
+        assert_eq!(values.len(), 1);
+    }
+
+    /// One unreadable rollout must not take down the files that can be read.
+    #[test]
+    fn an_unreadable_rollout_is_skipped_rather_than_failing_the_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("rollout-gone.jsonl");
+        // Never created: `File::open` fails exactly as it would for a rollout
+        // deleted or locked between enumeration and reading.
+        let (meta, bytes_read) = super::read_codex_session_meta_counted(&missing).unwrap();
+        assert!(meta.is_none());
+        assert_eq!(bytes_read, 0);
+
+        // Positive control: a readable rollout beside it still yields its
+        // metadata, so "no metadata" is a fact about the unreadable file and
+        // not about the reader.
+        let good = dir.path().join("rollout-good.jsonl");
+        fs::write(
+            &good,
+            "{\"timestamp\":\"2026-08-31T10:00:00Z\",\"type\":\"session_meta\",\
+             \"payload\":{\"id\":\"good\",\"cwd\":\"/work/app\"}}\n",
+        )
+        .unwrap();
+        let (meta, _) = super::read_codex_session_meta_counted(&good).unwrap();
+        assert_eq!(meta.unwrap().session_id, "good");
+    }
+
+    /// A rollout's identity is its **first physical record**, not the first
+    /// record that happens to parse.
+    ///
+    /// The bounded head reader skips records it cannot parse until it finds
+    /// one, which is right for a caller looking for the first usable record
+    /// and wrong for Codex identity: a rollout whose first line is corrupt,
+    /// followed by a `session_meta` naming another session, was adopted under
+    /// that other session's id. The whole-file reader this replaced took
+    /// `lines().next()` and rejected the file, so the incremental rewrite
+    /// changed which session the rows landed under.
+    #[test]
+    fn a_malformed_first_record_does_not_hand_a_rollout_another_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta_line = "{\"timestamp\":\"2026-08-31T10:00:00Z\",\"type\":\"session_meta\",\
+                         \"payload\":{\"id\":\"session-b\",\"cwd\":\"/work/app\"}}\n";
+
+        let corrupt = dir.path().join("rollout-corrupt.jsonl");
+        fs::write(&corrupt, format!("not-json\n{meta_line}")).unwrap();
+        assert!(
+            super::read_codex_session_meta(&corrupt).unwrap().is_none(),
+            "a rollout whose first physical record is not a session_meta has no identity"
+        );
+
+        // Positive control: the same file without the corrupt line is read,
+        // so this is the first record being respected rather than the reader
+        // failing on the fixture.
+        let clean = dir.path().join("rollout-clean.jsonl");
+        fs::write(&clean, meta_line).unwrap();
+        assert_eq!(
+            super::read_codex_session_meta(&clean)
+                .unwrap()
+                .map(|meta| meta.session_id),
+            Some("session-b".to_string())
+        );
+    }
+
+    /// A rewrite that preserves size and mtime is still a rewrite.
+    #[test]
+    fn a_same_stat_rewrite_is_not_served_from_the_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess-rewrite.jsonl");
+        let original = "{\"type\":\"user\",\"uuid\":\"u1\",\"sessionId\":\"s-rw\",\
+                        \"cwd\":\"/tmp/proj\",\"timestamp\":\"2026-06-25T10:00:00.000Z\",\
+                        \"message\":{\"role\":\"user\",\"content\":\"aaaaa\"}}\n";
+        fs::write(&path, original).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        transcript_cursor::stamp_whole_file(&conn, "claude", &path).unwrap();
+        let stamped = fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(transcript_cursor::transcript_unchanged(&conn, "claude", &path).unwrap());
+
+        // Same length, different bytes, and the timestamp put back — which a
+        // writer that preserves mtime, or a coarse filesystem clock, produces
+        // for free.
+        let rewritten = original.replace("aaaaa", "bbbbb");
+        assert_eq!(rewritten.len(), original.len());
+        fs::write(&path, &rewritten).unwrap();
+        fs::File::open(&path)
+            .unwrap()
+            .set_modified(stamped)
+            .unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        assert_eq!(metadata.len() as usize, original.len());
+        assert_eq!(metadata.modified().unwrap(), stamped);
+
+        assert!(
+            !transcript_cursor::transcript_unchanged(&conn, "claude", &path).unwrap(),
+            "a same-size, same-mtime rewrite must not be served from the cursor"
+        );
+    }
+
+    /// An uncommitted record does not spend its line index.
+    ///
+    /// `ingest_claude_record` derives a fallback identity from the absolute
+    /// record index when a record carries neither `uuid` nor `message.id`.
+    /// Advancing the index past a half-written record that was never
+    /// committed gave that record a different identity once it completed than
+    /// a re-parse from zero would derive, so a later rotation wrote it a
+    /// second time under the other id.
+    #[test]
+    fn a_half_written_record_does_not_spend_its_line_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("indexless.jsonl");
+        // No `uuid` and no `message.id`: identity comes from the line index.
+        let first = "{\"sessionId\":\"s-idx\",\"cwd\":\"/w\",\"type\":\"user\",\
+                     \"message\":{\"role\":\"user\",\"content\":\"one\"}}\n";
+        fs::write(&path, first).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let mut state = transcript_cursor::TranscriptCursorState::default();
+        incremental::ingest_claude_transcript_incremental(&conn, &path, None, &mut state).unwrap();
+        assert_eq!(state.claude.as_ref().unwrap().next_line_index, 1);
+
+        // Half of the next record arrives.
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        use std::io::Write as _;
+        write!(file, "{{\"sessionId\":\"s-idx\",\"cw").unwrap();
+        drop(file);
+        incremental::ingest_claude_transcript_incremental(&conn, &path, None, &mut state).unwrap();
+        assert_eq!(
+            state.claude.as_ref().unwrap().next_line_index,
+            1,
+            "an uncommitted record must not advance the index"
+        );
+
+        // It completes. Its identity must be the one a full re-parse derives.
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(
+            file,
+            "d\":\"/w\",\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"two\"}}}}"
+        )
+        .unwrap();
+        drop(file);
+        incremental::ingest_claude_transcript_incremental(&conn, &path, None, &mut state).unwrap();
+
+        let incremental_uids = claude_event_uids(&conn, "s-idx");
+        assert_eq!(incremental_uids.len(), 2);
+
+        // Positive control: the same file parsed from zero into a fresh
+        // database produces the same identities, which is the property a
+        // shifted index breaks.
+        let fresh = Connection::open_in_memory().unwrap();
+        init_db(&fresh).unwrap();
+        let mut from_zero = transcript_cursor::TranscriptCursorState::default();
+        incremental::ingest_claude_transcript_incremental(&fresh, &path, None, &mut from_zero)
+            .unwrap();
+        assert_eq!(incremental_uids, claude_event_uids(&fresh, "s-idx"));
+    }
+
+    fn claude_event_uids(conn: &Connection, session_id: &str) -> Vec<String> {
+        conn.prepare(
+            "SELECT event_uid FROM session_events WHERE source='claude' AND session_id=? \
+             ORDER BY event_uid",
+        )
+        .unwrap()
+        .query_map([session_id], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+    }
+
+    #[test]
+    fn a_sync_keeps_the_metadata_walk_position_across_the_record_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess-scan.jsonl");
+        let body = "{\"type\":\"user\",\"uuid\":\"u1\",\"sessionId\":\"s-scan\",\
+                    \"cwd\":\"/tmp/proj\",\"timestamp\":\"2026-06-25T10:00:00.000Z\",\
+                    \"message\":{\"role\":\"user\",\"content\":\"first\"}}\n";
+        fs::write(&path, body).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+
+        let key = transcript_cursor::CursorKey::Locator {
+            source: "claude",
+            locator: &path.to_string_lossy(),
+        };
+        let scan = transcript_cursor::load_cursor(&conn, &key)
+            .unwrap()
+            .claude
+            .and_then(|claude| claude.scan)
+            .expect("the sync must leave the metadata walk's position behind");
+        assert_eq!(
+            scan.file.map(|file| file.offset),
+            Some(body.len() as u64),
+            "the metadata walk committed through the whole file"
+        );
+        // Positive control: the fold really did run and identify the session,
+        // so a surviving cursor is not an empty one.
+        assert_eq!(scan.fold.session_id.as_deref(), Some("s-scan"));
+
+        // A second sync over an appended file resumes rather than restarting.
+        let addition = "{\"type\":\"user\",\"uuid\":\"u2\",\"sessionId\":\"s-scan\",\
+                        \"cwd\":\"/tmp/proj\",\"timestamp\":\"2026-06-25T10:00:01.000Z\",\
+                        \"message\":{\"role\":\"user\",\"content\":\"second\"}}\n";
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        use std::io::Write as _;
+        write!(file, "{addition}").unwrap();
+        drop(file);
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+
+        let mut resumed = transcript_cursor::load_cursor(&conn, &key)
+            .unwrap()
+            .claude
+            .and_then(|claude| claude.scan)
+            .expect("the metadata walk position survives the second sync too");
+        assert_eq!(
+            resumed.file.as_ref().map(|file| file.offset),
+            Some((body.len() + addition.len()) as u64)
+        );
+
+        // And reading it again now costs only what a further append adds.
+        let tail = "{\"type\":\"user\",\"uuid\":\"u3\",\"sessionId\":\"s-scan\",\
+                    \"cwd\":\"/tmp/proj\",\"timestamp\":\"2026-06-25T10:00:02.000Z\",\
+                    \"message\":{\"role\":\"user\",\"content\":\"third\"}}\n";
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        write!(file, "{tail}").unwrap();
+        drop(file);
+        let mut state_holder = Some(resumed.clone());
+        let pass = scan_claude_session_file_resumed(&path, &mut state_holder).unwrap();
+        // Records read, with the cursor validation the pass also paid for
+        // reported separately rather than folded into the same figure.
+        assert_eq!(pass.bytes_read - pass.validation_bytes, tail.len() as u64);
+        // Positive control: the same call from no state reads the whole file,
+        // so the bounded figure is a fact about resumption.
+        resumed.file = None;
+        let mut from_zero = None;
+        let whole = scan_claude_session_file_resumed(&path, &mut from_zero).unwrap();
+        assert_eq!(
+            whole.bytes_read - whole.validation_bytes,
+            (body.len() + addition.len() + tail.len()) as u64
+        );
+    }
+
+    #[test]
+    fn a_deleted_metadata_sidecar_stops_describing_its_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, named, _) = write_claude_parent_with_subagents(dir.path());
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        let described = delegation_row(&conn, "claude_subagent_meta");
+        assert_eq!(described.agent_type.as_deref(), Some("Plan"));
+
+        // The provider removes the sidecar. The transcript does not move.
+        let metadata = named.with_extension("meta.json");
+        assert!(metadata.is_file());
+        fs::remove_file(&metadata).unwrap();
+
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        let after = delegation_row(&conn, "claude_subagent_meta");
+        assert_eq!(
+            after.agent_type, None,
+            "a deleted sidecar must not keep describing the child"
+        );
+        assert_eq!(after.agent_name, None);
+        assert_eq!(after.model, None);
+        assert_eq!(after.spawn_depth, None);
+
+        // The relationship itself is evidence from the transcript, not from
+        // the sidecar, so it survives with its child and its events.
+        let child_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE source='claude' AND session_id='abc'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(child_events > 0);
+
+        // The cursor for the deleted file is gone, so the transcript can take
+        // the fast path again rather than re-reading forever.
+        assert!(!transcript_cursor::locator_cursor_exists(
+            &conn,
+            CLAUDE_SUBAGENT_META_SOURCE,
+            &metadata
+        )
+        .unwrap());
+        assert!(claude_transcript_unchanged(&conn, &named).unwrap());
     }
 
     #[test]
@@ -18399,18 +19355,15 @@ mod tests {
             [super::RAW_MESSAGE_FACTS_VERSION],
         )
         .unwrap();
-        let mut claude_sessions = Map::new();
         for path in [&parent, &named, &nameless] {
-            claude_sessions.insert(
-                path.to_string_lossy().to_string(),
-                json!(claude_sync_stamp(path).unwrap()),
-            );
+            transcript_cursor::stamp_whole_file(&conn, "claude", path).unwrap();
+            let meta = hydrate::claude_subagent_meta_path(path);
+            if meta.is_file() {
+                transcript_cursor::stamp_whole_file(&conn, CLAUDE_SUBAGENT_META_SOURCE, &meta)
+                    .unwrap();
+            }
         }
         let mut state = Map::new();
-        state.insert(
-            "claude_sessions_v4".to_string(),
-            Value::Object(claude_sessions),
-        );
 
         sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
 
@@ -19026,13 +19979,20 @@ mod tests {
         )
         .unwrap();
 
-        let mut old_state = Map::new();
-        old_state.insert(
-            path.to_string_lossy().to_string(),
-            json!(claude_sync_stamp(&path).unwrap()),
-        );
+        // Seeded exactly as an upgraded install looks: a cursor written by the
+        // *previous* cursor version, which together with the events already in
+        // the database satisfies the skip. Written by hand rather than through
+        // `stamp_whole_file`, which stamps the current version and would
+        // therefore be a cursor this run is entitled to trust.
+        transcript_cursor::stamp_whole_file(&conn, "claude", &path).unwrap();
+        conn.execute(
+            "UPDATE transcript_cursors \
+             SET parser_state_json = replace(parser_state_json, '\"v\":3', '\"v\":2') \
+             WHERE source = 'claude' AND locator = ?",
+            params![path.to_string_lossy()],
+        )
+        .unwrap();
         let mut state = Map::new();
-        state.insert("claude_sessions_v3".to_string(), Value::Object(old_state));
 
         sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
 
@@ -19044,10 +20004,14 @@ mod tests {
         );
         assert_eq!(markers[0].0, "compaction_boundary");
 
-        // And the new generation is what is written, so the next run is fast
+        // And a current cursor is what is written, so the next run is fast
         // again rather than re-reading forever.
-        assert!(state.get("claude_sessions_v4").is_some());
-        assert!(state.get("claude_sessions_v3").is_none());
+        assert!(
+            !transcript_cursor::known_locators(&conn, "claude")
+                .unwrap()
+                .is_empty(),
+            "the re-read recorded a cursor at the current version"
+        );
         let before = markers_of(&conn, "claude", "upgrade-session");
         sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
         assert_eq!(
@@ -22235,12 +23199,13 @@ mod tests {
         let conn = open_db(&dir.path().join("history.db")).unwrap();
         let mut state = Map::new();
         sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
-        let generation = state
-            .get("claude_sessions_v4")
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap();
-        assert_eq!(generation.len(), 2, "both transcripts are stamped");
+        assert_eq!(
+            super::transcript_cursor::known_locators(&conn, "claude")
+                .unwrap()
+                .len(),
+            2,
+            "both transcripts carry a cursor"
+        );
 
         forget_continuity_evidence(&conn);
         conn.execute(
@@ -22271,12 +23236,11 @@ mod tests {
             .unwrap();
         assert_eq!(edge, ("origin".to_string(), Some("continued".to_string())));
         assert_eq!(
-            state
-                .get("claude_sessions_v4")
-                .and_then(Value::as_object)
-                .unwrap(),
-            &generation,
-            "the stamp map is untouched: this is a repair, not a generation reset"
+            super::transcript_cursor::known_locators(&conn, "claude")
+                .unwrap()
+                .len(),
+            2,
+            "the cursors are untouched: this is a repair, not a generation reset"
         );
 
         // The files are back on the fast path. A sentinel written into the
@@ -22933,17 +23897,21 @@ mod capture_progress_tests {
         )
         .unwrap_err();
         assert!(error.is::<CaptureCancelled>());
-        // The current Claude stamp map. This branch advanced the generation to
-        // v4 so an upgraded install re-reads each transcript once for markers;
-        // a test that names the retired key still compiles and then panics on
-        // the second index, which is how this one arrived here from main.
-        // Whoever advances it again has to come through this line.
-        let stamp_map = "claude_sessions_v4";
-        assert!(!state.contains_key(stamp_map));
+        // The cursor is this walk's claim to have read the file, and a
+        // cancelled pass has no such claim: publishing one would skip the
+        // transcript on every later sync with its records unindexed.
+        assert!(
+            transcript_cursor::known_locators(&conn, "claude")
+                .unwrap()
+                .is_empty(),
+            "a cancelled pass recorded a cursor"
+        );
         sync_claude_session_metadata(&conn, &mut state, &dir.path().join("projects")).unwrap();
-        assert!(state[stamp_map]
-            .get(path.to_string_lossy().as_ref())
-            .is_some());
+        assert_eq!(
+            transcript_cursor::known_locators(&conn, "claude").unwrap(),
+            vec![path.to_string_lossy().to_string()],
+            "the retry read the transcript and recorded its position"
+        );
         assert_eq!(
             conn.query_row(
                 "SELECT COUNT(*) FROM session_events WHERE source='claude'",

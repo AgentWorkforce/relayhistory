@@ -206,6 +206,19 @@ export interface HydrateSessionResult {
     relatedSessions: number;
   };
   /**
+   * Bytes read from provider files by this hydration. Zero for `unchanged`,
+   * and about the size of the append when a live transcript grew - the counter
+   * a watch loop reads to tell "the tail grew" from "the whole file was
+   * re-read".
+   *
+   * When a hydration draws on more than one source - the local reader plus one
+   * or more connectors - this is the **sum across every source that
+   * contributed**, not the figure from whichever one won the capability rank.
+   * A total that reported one source's bytes would let a caller watch a real
+   * read go by as a zero.
+   */
+  bytesRead: number;
+  /**
    * The evidence kinds this hydration could have indexed, in canonical order.
    * A zero count for a covered kind means the session has none of it; a kind
    * absent from this list means no parser on this path ever looked, and a

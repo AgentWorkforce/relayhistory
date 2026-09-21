@@ -225,6 +225,10 @@ export async function hydrateSourcePlugin(
     snapshot.records.length === 0
   )
     return {
+      // The hydration contract this SDK speaks. A literal here drifted from
+      // `SESSION_HYDRATION_CONTRACT_VERSION` the first time that constant was
+      // bumped, and the plugin path then reported a version the normalizer
+      // rejected; the constant is the single declaration.
       contract_version: SESSION_HYDRATION_CONTRACT_VERSION,
       source: identity.source,
       session_id: identity.sessionId,
@@ -234,6 +238,10 @@ export async function hydrateSourcePlugin(
       presence: connector.location,
       indexed_through: { source_stamp: null, last_event_at_ms: null },
       evidence: { prompts: 0, events: 0, tool_calls: 0, file_edits: 0, related_sessions: 0 },
+      // Required by contract version 3. `hydrateSourcePlugin` is public and
+      // hands this object straight back, so omitting it published a result
+      // that did not satisfy the type it claims to be.
+      bytes_read: 0,
       // A listing-only connector covers nothing; it is not a partial parse.
       coverage: [],
       related_session_ids: [],

@@ -1071,6 +1071,9 @@ function validateAcquisition(options: {
       'INVALID_ARGUMENT',
     );
 }
+/** Internals reachable from this package's own tests. Not public API. */
+export const __testing = { combineHydration };
+
 function validateSourceConnectors(value: unknown): string[] | undefined {
   if (value === undefined) return undefined;
   if (

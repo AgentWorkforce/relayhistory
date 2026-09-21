@@ -1614,6 +1614,294 @@ models and last assistant reply, and 5 qualifies OpenCode model IDs with their
 provider. Without these bumps, unchanged sources would keep serving the older
 cached shape forever. The cost is one re-read per source, once.
 
+### Transcript byte cursors
+
+Stamps answer *whether* a file changed. They cannot answer *where*, so any
+change meant re-reading the whole file — a live Claude session that appends two
+kilobytes made relayhistory re-parse every byte written before it, and a fleet
+machine's multi-hundred-megabyte transcript made that unaffordable.
+
+Every transcript now carries a **byte cursor**: the offset through which its
+database work has committed, the file generation that offset belongs to, and
+whatever per-source parser state a resumed pass cannot re-derive from the bytes
+it is about to read.
+
+| Where | Key | What it covers |
+|---|---|---|
+| `session_hydration_checkpoints` / `observation_hydration_checkpoints` | `(source, session_id, location)` | the session's own primary transcript |
+| `transcript_cursors` | `(source, locator)` | subagent sidecars, their `agent-*.meta.json`, child Codex rollouts, and the files the global sync walk meets |
+
+Both carry the same four columns. `parser_state_json` is the cursor document
+and the source of truth; `committed_offset`, `prefix_hash` and `dev_ino` are
+projections of it written in the same statement, so a cursor can be inspected
+without parsing JSON. A transcript reached from both directions — hydrated as a
+session and also walked by a global sync — holds two independent cursors over
+the same bytes. That is deliberate: each is one consumer's own committed
+position, and every insert on the path is an idempotent upsert keyed by
+provider-native identity, so a region read twice writes the same rows.
+
+A cursor is discarded and the file re-read from zero when
+
+```text
+inode changed || mtime < cursor.mtime || size < committed_offset
+  || prefix_hash mismatch
+```
+
+and the hydration result then carries a `HYDRATION_SOURCE_ROTATED` diagnostic.
+
+`prefix_hash` is **not** the hash of every byte before the offset. It is
+SHA-256 over a domain-separated header, the offset itself, the first 64 KiB of
+the file and the last 64 KiB before the offset. Hashing the whole prefix would
+be stronger, but it costs a read of the entire committed region on every open —
+a 200 MB read to discover that one kilobyte arrived, which is the cost cursors
+exist to remove. The window catches truncation and regrowth, replacement, a
+rewritten head and a rewritten tail. It does not catch an edit strictly between
+the two windows that preserves the total length and leaves mtime at or above
+the recorded one; no provider in this catalog rewrites a transcript's middle in
+place.
+
+### Messages that are still being written
+
+A Claude assistant message is written as several JSONL records over time, one
+per content block, and only the last carries a filled-in `stop_reason`. Records
+of a message whose `stop_reason` is present and `null` are **held and not
+indexed**, and the committed offset backs up to the first byte of the earliest
+held message, so the next pass reads it again and indexes it once, complete,
+with its usage. The held count is reported as `HYDRATION_IN_PROGRESS_MESSAGES`.
+
+A record with **no** `stop_reason` key at all is treated as finished, not as
+streaming: older record shapes and sidechain records omit the field, and
+deferring those would hold them back on every pass forever.
+
+Deferral is bounded — 8 MiB or 512 messages held — and past that the oldest
+held message is indexed as it stands, reported as
+`HYDRATION_IN_PROGRESS_OVERFLOW`. Memory stays bounded and the reader keeps
+making progress; the blocks that arrive later land as further rows under their
+own record identity rather than as corrections.
+
+Codex has no per-message completion marker, so its cursor follows the same rule
+burn's `CommittedSnapshot` does: the committed offset and parser state advance
+only at a `task_complete` record. A turn's token accounting is not final until
+the turn is, and committing inside an open turn would freeze a cumulative
+baseline mid-turn. The open turn's events are still indexed as they are read —
+this is an evidence store, and a live session should be visible before its turn
+ends — and re-derived on the next pass from the last committed boundary.
+
+### A record that never got its newline
+
+A transcript's last line may have no `\n`, and nothing in the bytes says
+whether that is a record the writer has finished or half of one it is still
+writing. The reader used to withhold every such line, which is right for the
+second case and silently drops the last record of a complete transcript in the
+first — the plugin SDK's 525-record fixture is built with `join('\n')` and
+indexed 524.
+
+The rule now: an unterminated trailing record is **indexed if it parses as
+complete JSON**, because a half-written line does not. The cursor still
+commits past it, so a file nobody has touched compares equal to its cursor and
+is skipped outright; `resume_from` in the cursor remembers where that record
+began, and if the file later grows the next pass rewinds there and reads it
+again rather than resuming after a record it only half saw. Re-reading is
+harmless — the row is an idempotent upsert under the same identity.
+
+Codex keeps the older rule and withholds an unterminated line: its rollouts are
+newline-terminated, and its cursor already advances only at `task_complete`.
+
+### A message the writer abandoned
+
+Holding a message back is a bet that the provider will finish it. If the file
+stops changing the bet has lost, and holding it again on every pass would turn
+"deferred" into "lost". A pass that finds the file still where its cursor
+left it — same size, same mtime, and a committed prefix that still hashes to
+what the cursor recorded — stops deferring and indexes what it held. The hash
+is not decoration: a matching size and mtime are not a claim that these are
+the same bytes, and a writer that restores timestamps produces a rewrite that
+passes the first test and fails the second. A session with records still held is never reported `unchanged`, which is
+what lets that pass run at all.
+
+### Identity and metadata resume too
+
+A Claude transcript is walked twice: once for identity and metadata
+(`ClaudeMetaFold`), once to index its records. Both resume from the same
+cursor document, under separate positions, because the record walk holds
+records back for a message still being written and the metadata walk has no
+reason to.
+
+They have to resume together. While the metadata walk read the whole file, a
+kilobyte appended to a 200 MB transcript still cost a 200 MB read, and
+`bytesRead` reported the kilobyte — the shape of a success, computed over one
+of the two walks. `bytesRead` is now the total across both.
+
+The same trap caught three more reads, all of them a whole file behind a call
+that looked bounded:
+
+| Read | Was | Is |
+|---|---|---|
+| Codex rollout identity | `read_to_string`, then `lines().next()` | one record from the head |
+| Claude sidecar enumeration | every sidecar scanned from byte zero, every hydration | each sidecar's metadata walk resumes from its own cursor |
+| A sidecar's first record | `read_to_string`, then `find_map` | a bounded head read |
+
+**Every provider read a hydration cannot avoid is in `bytesRead`.** A counter
+that omits one is worse than no counter: it reports the work that was
+optimised instead of the work that was done, and the omitted read is exactly
+the one nobody is watching. That includes the reads that *find* the related
+sessions — each Codex sibling rollout's head record during enumeration, and a
+Claude sidecar's head record and metadata document while its evidence is built.
+
+A bounded head read is bounded by a limit on the reader, not by a check
+between lines: `read_until` appends until a newline or EOF, so a budget
+consulted only before starting another line lets one record the size of the
+file allocate the size of the file.
+
+A record is read under a ceiling of its own. `read_until` extends its buffer
+until a newline or EOF, so any cap checked *around* the call — the 8 MiB
+deferral budget, for instance — can only ever notice an allocation that
+already happened. One record over `MAX_RECORD_BYTES` (16 MiB) is drained past
+in fixed-size chunks, never held, and reported as
+`HYDRATION_OVERSIZED_RECORDS`; a record that large is evidence of corruption
+rather than of a long turn.
+
+Record bytes are decoded strictly. `from_utf8_lossy` turns an invalid byte
+inside a JSON string into U+FFFD and leaves the syntax valid, so a corrupted
+record parsed cleanly and was indexed as though the replacement character were
+what the provider wrote. A record that is not valid UTF-8 now takes the same
+path as one that is not valid JSON: skipped.
+
+**Releasing deferred records waits out a grace window, not one observation.**
+A model pauses between streamed records constantly — thinking, running a tool,
+waiting on a network call — and those pauses are routinely longer than the
+interval between two hydrations. Releasing on the first pass that sees an
+unchanged file therefore fires during ordinary operation and publishes half a
+message that nothing will retract. The cursor carries `unchanged_since_ms`,
+and records are released only once the file has been still for
+`QUIESCENT_GRACE_MS` (two minutes). The asymmetry justifies erring long:
+releasing late costs latency on a genuinely abandoned message, releasing early
+publishes a partial one.
+
+A cheap "has this changed?" check that compares only size, mtime and inode is
+not enough to skip a file. A writer that restores timestamps, or a filesystem
+whose clock puts both writes in one tick, produces a rewrite with an identical
+stat; the bounded prefix window is validated before a file is skipped, which
+costs two seeks and at most 128 KiB and only on files that were about to be
+skipped anyway.
+
+A record the reader did not commit does not consume its line index either. The
+fallback identity for a record with neither `uuid` nor `message.id` is derived
+from that index, so advancing it past a half-written record gave the record a
+different identity once it completed than a re-parse from zero would derive —
+and the record then existed twice.
+
+### One deferral state machine
+
+Three separate defects turned out to be the same state machine seen from three
+sides, so it is written down once:
+
+- **A cursor at offset 0 is still a cursor.** It records the file's identity,
+  size and mtime, which is what says whether anything has been appended.
+  Reading "offset is zero" as "there is no cursor" meant a pass that held back
+  a file's *first* record could never see the file go quiet, and deferred the
+  same record forever.
+- **An unterminated trailing record goes through the same deferral decision as
+  any other record.** Indexing it because it parsed skipped deferral precisely
+  at the tail, where a file is most likely to be mid-write.
+- **Every transcript that defers gets a pass to release what it held.** The
+  session's own cursor is not the only one: each Claude sidecar keeps its
+  parser state in its own locator-keyed cursor, and the unchanged shortcut
+  consults all of them.
+
+A transcript's two walks share one cursor row, and the record walk never
+touches the metadata walk's state — including when the record walk restarts
+from zero, because rotation is something the metadata walk detects for
+itself.
+
+### What an existing install does on the first sync after upgrading
+
+`HYDRATION_PARSER_VERSION` is 3. A checkpoint written by an earlier generation
+has no cursor, and the `claude_sessions*` path → stamp maps that the global sync
+walk used are dropped from the sync state file. So the first sync or hydration
+after upgrading **reads every transcript once, in full, from offset 0** —
+exactly what a stamp-map generation bump always did. From the second pass on,
+each file is either skipped on a `stat` and one indexed point query, or resumed
+from its cursor.
+
+`codex_rollouts_v5` is deliberately **not** retired. It is the marker for the
+selective user-message repair, which is a statement about the parser rather
+than about file positions, and it keeps working unchanged beside the cursors.
+
+### `bytesRead`
+
+`hydrateSession` now returns `bytesRead`: what that call actually read from
+provider files, across every walk and every file it touched — and, when more
+than one source contributed, summed across them rather than taken from
+whichever one won the capability rank. About the size of the append for an
+incremental pass, the whole file when a cursor was rejected or the parser
+generation changed, and small but **not zero** for an `unchanged` one. It is
+the number a watch loop reads to tell "the tail grew" from "the whole file was
+re-read". `HydrateSessionResult`'s contract version is 3.
+
+Deciding a session is unchanged is not free and does not report as though it
+were. Building the stamp reads the Codex root's `session_meta`, one head record
+from every sibling rollout, and each Claude sidecar's head and metadata
+document; validating the cursors reads two bounded windows per file. Those
+bytes are in `bytesRead` on the unchanged path exactly as they are on every
+other. A counter that omits the reads a pass could not avoid reports the work
+that was optimised instead of the work that was done — and a well-formed zero
+is indistinguishable from a pass that really read nothing.
+
+### Skipping a file without reading it
+
+Two places skip a transcript on its stat: the sync walk's
+`transcript_unchanged` and targeted hydration's stamp shortcut. Both ask the
+same question through `committed_prefix_matches` — are the bytes behind the
+cursor still the bytes on disk? — because size, mtime and inode do not prove
+byte equality, and a writer that restores timestamps produced a rewrite that
+was skipped forever. Neither path advances parser state to answer it, and
+hydration pays the window only when the stamp was about to skip the file: a
+pass that is going to read the transcript anyway validates the same cursor
+inside `TranscriptReader::open`.
+
+### Validating costs provider reads, and they are counted
+
+A pass hashes bounded windows to satisfy itself that the file is the one its
+cursor describes: the saved cursor's window and the file's own at `open`, and
+the opened region again at `commit` (reused as the stored cursor's hash when
+the pass consumed exactly the file it opened). Those are provider reads, so
+they are in `bytesRead` like every other — counted inside the digest function,
+which is the only place they are spent, rather than added by hand at each call
+site. Internally a pass also reports `validation_bytes`, so "how much of this
+transcript did we read" and "what did checking it cost" are not one number
+hiding the other.
+
+The cost is **bounded by the window, not by the file**: a fixed handful of
+digests per walk, each at most 128 KiB, whatever the transcript's size. On the
+200 MB transcripts this work exists for it is noise; on a small transcript the
+windows can add up to more than the file, which is the accepted trade for a
+constant-cost check. A hydration of an unchanged 200 MB transcript reads
+kilobytes, not megabytes, and never the file.
+
+### The window is compared on every commit
+
+Not only when the stat moved. A rewrite that preserves length and restores
+mtime is exactly the rewrite a stat cannot see — the skip path already assumes
+writers do that — so gating the comparison on a moved stat left the one case
+nothing else catches free to publish a cursor over stale rows.
+
+### A transcript that moved under any walk is reported
+
+`HYDRATION_SOURCE_REWRITTEN` covers the session's own transcript, its sidecars,
+their metadata documents and Codex children, and it covers the metadata walk as
+well as the record walk. A pass that recorded no cursor is news; which of the
+two walks noticed is an implementation detail.
+
+### The quiescence clock
+
+`unchanged_since_ms` is stamped from the same instant as the size and mtime it
+is compared against. A pass stamps it at `open` and re-stats at `commit`, so a
+stat that moved during the walk restarts the clock: otherwise the grace window
+covered the walk as well, and a full re-parse of a large live transcript — on
+its own longer than the window — let the next pass treat a tail that settled
+seconds ago as abandoned and release a message that was still streaming.
+
 ---
 
 ## Concurrency

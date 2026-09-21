@@ -46,7 +46,7 @@ const REF_SOURCE_SESSION: &str = "sourceSessionId";
 /// Mirrors burn's `ClaudeRelationshipEvidence`, with `locator` and
 /// `session_id` added: relayhistory keys sessions by the in-log `sessionId`,
 /// and the file that carried it is the thing this row is about.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct ContinuityEvidence {
     pub source: String,
     /// The transcript this evidence was read from. The row's identity.
@@ -107,27 +107,116 @@ impl ContinuityEvidence {
     }
 }
 
+/// Read one newline-delimited record into `raw`; `false` at end of file.
+///
+/// Bounded by [`crate::ingest::transcript_cursor::MAX_RECORD_BYTES`]: a record that runs
+/// past the ceiling is walked to its newline in fixed-size chunks and `raw` is
+/// left empty, so one pathological line cannot cost this walk the file's size
+/// in memory. `raw` is reused across calls, so the buffer is grown once.
+/// Read one record; `None` at end of file, else the bytes it consumed.
+///
+/// The count is what the reader *spent*, not what `raw` ends up holding:
+/// `raw` loses the delimiter, and an oversized record is drained and dropped
+/// entirely. Measuring the buffer instead reported a 16 MiB record as zero
+/// bytes read, and every ordinary record one or two bytes short.
+fn next_record(
+    reader: &mut impl std::io::BufRead,
+    raw: &mut Vec<u8>,
+) -> std::io::Result<Option<u64>> {
+    use std::io::{BufRead, Read};
+    const CEILING: u64 = crate::ingest::transcript_cursor::MAX_RECORD_BYTES;
+    raw.clear();
+    // The cap is on the reader rather than a check around it: `read_until`
+    // extends `raw` until it finds a newline, so a budget consulted afterwards
+    // can only observe an allocation that already happened.
+    let mut consumed = reader.take(CEILING).read_until(b'\n', raw)? as u64;
+    if consumed == 0 {
+        return Ok(None);
+    }
+    let read = consumed;
+    // The limited read stops at the ceiling whether the record ends there or
+    // runs past it, so the ceiling alone cannot tell them apart. The same
+    // boundary rule as the ingest reader: one byte decides, and a record that
+    // ends exactly on the ceiling is an ordinary record.
+    if raw.last() != Some(&b'\n') && read == CEILING {
+        match reader.fill_buf()?.first().copied() {
+            // The file ends here: a complete tail, exactly on the ceiling.
+            None => return Ok(Some(consumed)),
+            Some(b'\n') => {
+                reader.consume(1);
+                return Ok(Some(consumed + 1));
+            }
+            Some(_) => {}
+        }
+    }
+    if raw.last() != Some(&b'\n') {
+        if read == CEILING {
+            // Over the ceiling. Drop what was read and walk to the newline
+            // through the buffer, consuming only up to it: anything after it
+            // is the next record and must still be there to read.
+            raw.clear();
+            loop {
+                let available = match reader.fill_buf() {
+                    Ok(bytes) => bytes,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error),
+                };
+                if available.is_empty() {
+                    break;
+                }
+                match available.iter().position(|byte| *byte == b'\n') {
+                    Some(at) => {
+                        reader.consume(at + 1);
+                        consumed += at as u64 + 1;
+                        break;
+                    }
+                    None => {
+                        let all = available.len();
+                        reader.consume(all);
+                        consumed += all as u64;
+                    }
+                }
+            }
+            return Ok(Some(consumed));
+        }
+        // A genuine tail: the file ends here, under the ceiling.
+        return Ok(Some(consumed));
+    }
+    raw.pop();
+    if raw.last() == Some(&b'\r') {
+        raw.pop();
+    }
+    Ok(Some(consumed))
+}
+
 /// Read one Claude transcript's continuity evidence in a single pass.
 ///
 /// Returns `None` for a transcript with no in-log session id: relayhistory has
 /// no identity to attach the evidence to, and inventing one from the file name
 /// is exactly what the delegation model already refuses to do.
+/// The metadata walk folds this as it goes, so hydration and the global sync
+/// never call it. It is the one-time backfill on the *skip* path: a transcript
+/// indexed before continuity existed owes its evidence, and no metadata walk
+/// runs for a file that is being skipped.
 pub fn scan_claude_transcript(path: &Path) -> Result<Option<ContinuityEvidence>> {
-    // Propagated, never collapsed into empty content. `Ok(None)` is what the
-    // caller retracts on, so a transient read failure returning it would have
-    // deleted real topology and reported a clean sync — the file still says
-    // what it said, and we simply failed to look.
-    let text = std::fs::read_to_string(path)
+    let file = std::fs::File::open(path)
         .with_context(|| format!("reading Claude transcript {}", path.display()))?;
-    let mut evidence = ContinuityEvidence {
-        source: "claude".to_string(),
-        locator: path.to_string_lossy().to_string(),
-        file_session_id: file_session_id_from_path(path),
-        ..ContinuityEvidence::default()
-    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut raw = Vec::new();
+    let mut evidence = ContinuityEvidence::default();
     let mut first_user_seen = false;
     let mut any = false;
-    for line in text.lines() {
+    while next_record(&mut reader, &mut raw)
+        .with_context(|| format!("reading Claude transcript {}", path.display()))?
+        .is_some()
+    {
+        crate::ingest::check_capture_cancelled()?;
+        // An oversized record is not buffered and an undecodable one is not
+        // repaired; both leave `raw` empty or unparseable and take the same
+        // skip any other malformed record takes.
+        let Ok(line) = std::str::from_utf8(&raw) else {
+            continue;
+        };
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
@@ -135,54 +224,93 @@ pub fn scan_claude_transcript(path: &Path) -> Result<Option<ContinuityEvidence>>
             continue;
         };
         any = true;
-        if let Some(explicit) = string_field(object, &["fileSessionId", "file_session_id"]) {
-            evidence.file_session_id = Some(explicit);
-        }
-        if let Some(session_id) = string_field(object, &["sessionId", "session_id"]) {
-            if !evidence.in_log_session_ids.contains(&session_id) {
-                evidence.in_log_session_ids.push(session_id);
-            }
-            if evidence.first_ts_ms.is_none() {
-                evidence.first_ts_ms = record_ts_ms(object);
-            }
-        }
-        if evidence.source_version.is_none() {
-            evidence.source_version = string_field(object, &["version", "source_version"]);
-        }
-        if let Some(target) =
-            string_field(object, &["continuedFromSessionId", "continued_from_session_id"])
-        {
-            push_unique(&mut evidence.explicit_continuation_targets, target);
-        }
-        if let Some(target) = string_field(object, &["forkSessionId", "fork_session_id"]) {
-            push_unique(&mut evidence.explicit_fork_targets, target);
-        }
-        if evidence.explicit_source_session_id.is_none() {
-            evidence.explicit_source_session_id =
-                string_field(object, &["sourceSessionId", "source_session_id"]);
-        }
-        let sidechain = object
-            .get("isSidechain")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let is_user = object.get("type").and_then(Value::as_str) == Some("user");
-        if is_user && !sidechain {
-            if !first_user_seen {
-                first_user_seen = true;
-                evidence.first_parent_uuid =
-                    string_field(object, &["parentUuid", "parent_uuid"]);
-            }
-            record_resume_marker(&mut evidence, object);
-        }
+        fold_claude_record(&mut evidence, &mut first_user_seen, object);
     }
+    Ok(finish_claude_fold(evidence, any, path))
+}
+
+/// Settle a folded evidence set into the row it should record, or `None`.
+///
+/// `any` is whether a record ever folded in: a file that says nothing retracts
+/// what it used to say, which is a different answer from a file that has
+/// simply not grown since the last pass.
+pub(crate) fn finish_claude_fold(
+    mut evidence: ContinuityEvidence,
+    any: bool,
+    path: &Path,
+) -> Option<ContinuityEvidence> {
     if !any {
-        return Ok(None);
+        return None;
     }
-    let Some(session_id) = evidence.in_log_session_ids.first().cloned() else {
-        return Ok(None);
-    };
-    evidence.session_id = session_id;
-    Ok(Some(evidence))
+    evidence.source = "claude".to_string();
+    evidence.locator = path.to_string_lossy().to_string();
+    // An explicit `fileSessionId` in the records wins; the file name is the
+    // fallback, which is why it is filled in here rather than seeded before
+    // the walk.
+    if evidence.file_session_id.is_none() {
+        evidence.file_session_id = file_session_id_from_path(path);
+    }
+    evidence.session_id = evidence.in_log_session_ids.first().cloned()?;
+    Some(evidence)
+}
+
+/// Record continuity evidence a walk has already folded, reading nothing.
+pub(crate) fn capture_folded(
+    conn: &Connection,
+    path: &Path,
+    evidence: Option<ContinuityEvidence>,
+) -> Result<()> {
+    capture(conn, "claude", path, evidence)
+}
+
+/// Fold one Claude record into the running continuity evidence.
+///
+/// Every field is first-wins, last-wins or accumulating, which is what makes
+/// the walk resumable: the same records in the same order give the same
+/// answer whether they arrive in one pass or several.
+pub(crate) fn fold_claude_record(
+    evidence: &mut ContinuityEvidence,
+    first_user_seen: &mut bool,
+    object: &serde_json::Map<String, Value>,
+) {
+    if let Some(explicit) = string_field(object, &["fileSessionId", "file_session_id"]) {
+        evidence.file_session_id = Some(explicit);
+    }
+    if let Some(session_id) = string_field(object, &["sessionId", "session_id"]) {
+        if !evidence.in_log_session_ids.contains(&session_id) {
+            evidence.in_log_session_ids.push(session_id);
+        }
+        if evidence.first_ts_ms.is_none() {
+            evidence.first_ts_ms = record_ts_ms(object);
+        }
+    }
+    if evidence.source_version.is_none() {
+        evidence.source_version = string_field(object, &["version", "source_version"]);
+    }
+    if let Some(target) =
+        string_field(object, &["continuedFromSessionId", "continued_from_session_id"])
+    {
+        push_unique(&mut evidence.explicit_continuation_targets, target);
+    }
+    if let Some(target) = string_field(object, &["forkSessionId", "fork_session_id"]) {
+        push_unique(&mut evidence.explicit_fork_targets, target);
+    }
+    if evidence.explicit_source_session_id.is_none() {
+        evidence.explicit_source_session_id =
+            string_field(object, &["sourceSessionId", "source_session_id"]);
+    }
+    let sidechain = object
+        .get("isSidechain")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let is_user = object.get("type").and_then(Value::as_str) == Some("user");
+    if is_user && !sidechain {
+        if !*first_user_seen {
+            *first_user_seen = true;
+            evidence.first_parent_uuid = string_field(object, &["parentUuid", "parent_uuid"]);
+        }
+        record_resume_marker(evidence, object);
+    }
 }
 
 /// Codex records continuity on the `session_meta` line that opens a rollout,
@@ -195,24 +323,43 @@ pub fn scan_claude_transcript(path: &Path) -> Result<Option<ContinuityEvidence>>
 /// records nothing when it does not — see
 /// `codex_resume_without_explicit_fields_records_no_continuity`.
 pub fn scan_codex_rollout(path: &Path) -> Result<Option<ContinuityEvidence>> {
+    Ok(scan_codex_rollout_counted(path)?.0)
+}
+
+/// The same scan, and the provider bytes it read.
+pub fn scan_codex_rollout_counted(path: &Path) -> Result<(Option<ContinuityEvidence>, u64)> {
     // As above: a read failure is an error, not an empty rollout.
-    let text = std::fs::read_to_string(path)
+    //
+    // One record, not the file. Everything below reads the opening
+    // `session_meta` line and nothing else, and a rollout reaches hundreds of
+    // megabytes — `read_to_string` here made every Codex hydration pay the
+    // file's size for a fact that lives in its first few hundred bytes.
+    let file = std::fs::File::open(path)
         .with_context(|| format!("reading Codex rollout {}", path.display()))?;
-    let first = text.lines().next().unwrap_or_default();
+    let mut reader = std::io::BufReader::new(file);
+    let mut raw = Vec::new();
+    let Some(bytes_read) = next_record(&mut reader, &mut raw)
+        .with_context(|| format!("reading Codex rollout {}", path.display()))?
+    else {
+        return Ok((None, 0));
+    };
+    let Ok(first) = std::str::from_utf8(&raw) else {
+        return Ok((None, bytes_read));
+    };
     if first.trim().is_empty() {
-        return Ok(None);
+        return Ok((None, bytes_read));
     }
     let Ok(value) = serde_json::from_str::<Value>(first) else {
-        return Ok(None);
+        return Ok((None, bytes_read));
     };
     if value.get("type").and_then(Value::as_str) != Some("session_meta") {
-        return Ok(None);
+        return Ok((None, bytes_read));
     }
     let Some(payload) = value.get("payload").and_then(Value::as_object) else {
-        return Ok(None);
+        return Ok((None, bytes_read));
     };
     let Some(session_id) = string_field(payload, &["id"]) else {
-        return Ok(None);
+        return Ok((None, bytes_read));
     };
     let mut evidence = ContinuityEvidence {
         source: "codex".to_string(),
@@ -246,7 +393,7 @@ pub fn scan_codex_rollout(path: &Path) -> Result<Option<ContinuityEvidence>> {
     // what tells a later sync this locator has already been read, and without
     // it every rollout that carries no continuity — which is nearly all of
     // them — would be re-read on every sync forever.
-    Ok(Some(evidence))
+    Ok((Some(evidence), bytes_read))
 }
 
 /// Persist one transcript's evidence, replacing whatever the last read of the
@@ -374,13 +521,20 @@ fn reopen_dependents(
 }
 
 /// Read one transcript's evidence and store it, in one call.
+///
+/// The backfill entry point: hydration and the global sync hand over evidence
+/// the metadata walk already folded, through [`capture_folded`].
 pub fn capture_claude_transcript(conn: &Connection, path: &Path) -> Result<()> {
-    capture(conn, "claude", path, scan_claude_transcript(path)?)
+    let evidence = scan_claude_transcript(path)?;
+    capture(conn, "claude", path, evidence)
 }
 
+
 /// Read one rollout's evidence and store it, in one call.
-pub fn capture_codex_rollout(conn: &Connection, path: &Path) -> Result<()> {
-    capture(conn, "codex", path, scan_codex_rollout(path)?)
+pub fn capture_codex_rollout(conn: &Connection, path: &Path) -> Result<u64> {
+    let (evidence, bytes_read) = scan_codex_rollout_counted(path)?;
+    capture(conn, "codex", path, evidence)?;
+    Ok(bytes_read)
 }
 
 /// Store what a file says now, or retract what it used to say.
@@ -2502,5 +2656,49 @@ mod tests {
         ingest(&conn, "fork-branch-a.jsonl");
         assert_eq!(held(&conn).len(), 4);
         assert_eq!(edges(&conn, SHARED_FORK).len(), 2);
+    }
+
+    /// A record the reader drained is counted, not reported as nothing read.
+    ///
+    /// `next_record` clears `raw` for a record over the ceiling and strips the
+    /// delimiter from every other, so measuring the buffer reported a 16 MiB
+    /// record as zero bytes and an ordinary one a byte or two short. The count
+    /// is what the reader spent.
+    #[test]
+    fn a_drained_record_is_counted_as_the_bytes_it_cost() {
+        use crate::ingest::transcript_cursor::MAX_RECORD_BYTES;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+
+        let ordinary = "{\"a\":1}\n";
+        std::fs::write(&path, ordinary).unwrap();
+        let mut reader = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
+        let mut raw = Vec::new();
+        assert_eq!(
+            super::next_record(&mut reader, &mut raw).unwrap(),
+            Some(ordinary.len() as u64),
+            "the delimiter was read, so it is counted"
+        );
+        assert_eq!(raw.len(), ordinary.len() - 1, "but it is not handed over");
+
+        // A record past the ceiling: drained and dropped, and every byte of it
+        // still cost a read.
+        let oversized_len = MAX_RECORD_BYTES as usize + 64;
+        let mut bytes = vec![b'x'; oversized_len];
+        bytes.push(b'\n');
+        std::fs::write(&path, &bytes).unwrap();
+        let mut reader = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
+        let mut raw = Vec::new();
+        assert_eq!(
+            super::next_record(&mut reader, &mut raw).unwrap(),
+            Some(bytes.len() as u64),
+            "a drained record reported the empty buffer instead of what it read"
+        );
+        assert!(raw.is_empty(), "an oversized record is not buffered");
+        assert_eq!(
+            super::next_record(&mut reader, &mut raw).unwrap(),
+            None,
+            "the drain stopped on the newline rather than overrunning"
+        );
     }
 }

@@ -338,6 +338,7 @@ test('a native full capability unsupported by its coverage is a contract mismatc
     capability: 'full', discoveryState: 'full', presence: 'local',
     indexedThrough: { sourceStamp: null, lastEventAtMs: null },
     evidence: { prompts: 1, events: 0, toolCalls: 0, fileEdits: 0, relatedSessions: 0 },
+    bytesRead: 0,
     relatedSessionIds: [], diagnostics: [],
   };
   // Exactly the defect contract 3 removes: a well-formed result asserting
@@ -424,6 +425,7 @@ function hydrationPart(
     evidence: {
       prompts: 0, events: 0, toolCalls: 0, fileEdits: 0, relatedSessions: 0, ...evidence,
     },
+    bytesRead: 0,
     coverage: [...coverage],
     relatedSessionIds: [],
     diagnostics: [

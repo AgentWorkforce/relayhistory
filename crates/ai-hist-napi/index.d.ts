@@ -531,6 +531,14 @@ export interface HydrateSessionResult {
   indexedThrough: HydrationIndexedThrough
   evidence: HydrationEvidence
   /**
+   * Bytes read from provider files by this hydration. About the size of
+   * the append when a live transcript grew, and small but **not zero** when
+   * the session was unchanged: deciding nothing changed means validating
+   * each cursor against a bounded window of the file it was written from.
+   * Zero is reserved for a pass that opened no provider file at all.
+   */
+  bytesRead: number
+  /**
    * Evidence kinds this hydration can have indexed, as wire names
    * (`history`, `session_event`, `tool_call`, `file_edit`,
    * `relationship`, `commit_link`).
