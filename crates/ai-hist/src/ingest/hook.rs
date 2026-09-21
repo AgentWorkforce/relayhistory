@@ -189,11 +189,30 @@ fn ingest_transcript_at_with_roots(
     let claude_snapshot = (source == "claude")
         .then(|| ClaudeTranscriptSnapshot::open(transcript))
         .transpose()?;
+    if claude_snapshot
+        .as_ref()
+        .is_some_and(ClaudeTranscriptSnapshot::is_subagent)
+    {
+        // A Claude sidecar carries its parent's sessionId, but it is evidence
+        // for a delegated child rather than a second transcript for the
+        // parent. Full-snapshot classification is authoritative here: bounded
+        // shallow discovery can miss the sidechain rows when they occur only
+        // in the middle and would otherwise register the parent at this path.
+        return Ok(TranscriptIngest::short(
+            source,
+            transcript,
+            TranscriptStatus::Unidentified,
+        ));
+    }
     let candidate = if let Some(snapshot) = claude_snapshot.as_ref() {
         Candidate {
             source: provider.source(),
             locator: transcript.to_string_lossy().into_owned(),
-            session_id: None,
+            // The complete immutable snapshot has already established this
+            // identity. Supplying it on the candidate prevents discovery from
+            // accepting a same-stamp row previously cached for this locator
+            // under Claude's filename fallback.
+            session_id: snapshot.session_id(),
             recency_hint_ms: snapshot.modified_ms,
             stamp: snapshot.stamp.clone(),
         }
@@ -270,6 +289,14 @@ fn ingest_transcript_at_with_roots(
             &[&single],
             |row: &ShallowSession| session_id = Some(row.session_id.clone()),
         )?;
+        if let Some(authoritative_session_id) = session_id.as_deref() {
+            remove_disproved_claude_filename_alias(
+                &conn,
+                source,
+                transcript,
+                authoritative_session_id,
+            )?;
+        }
     }
     let Some(session_id) = session_id else {
         return Ok(TranscriptIngest::short(
@@ -303,6 +330,37 @@ fn ingest_transcript_at_with_roots(
         status,
         hydration: Some(hydration),
     })
+}
+
+/// Remove the shallow filename fallback once a full Claude snapshot proves a
+/// different provider-native identity for the same path.
+///
+/// Only a still-shallow row is eligible. A fully hydrated historical session
+/// may legitimately have occupied a path before it was replaced, and its
+/// evidence must not be discarded merely because the current file differs.
+fn remove_disproved_claude_filename_alias(
+    conn: &Connection,
+    source: &str,
+    transcript: &Path,
+    authoritative_session_id: &str,
+) -> Result<()> {
+    if source != "claude" {
+        return Ok(());
+    }
+    let Some(filename_id) = transcript
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty() && *stem != authoritative_session_id)
+    else {
+        return Ok(());
+    };
+    conn.execute(
+        "DELETE FROM sessions \
+         WHERE source = 'claude' AND session_id = ? AND raw_path = ? \
+           AND discovery_state = 'shallow'",
+        params![filename_id, transcript.to_string_lossy()],
+    )?;
+    Ok(())
 }
 
 /// The one candidate a hook payload names, stamped the way that provider's own

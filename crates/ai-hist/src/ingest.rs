@@ -6296,6 +6296,10 @@ impl ClaudeTranscriptSnapshot {
         self.meta.clone()
     }
 
+    pub(crate) fn is_subagent(&self) -> bool {
+        self.meta.as_ref().is_some_and(|meta| meta.subagent)
+    }
+
     pub(crate) fn records(&self) -> i64 {
         jsonl::rows(&self.text)
             .filter(|row| {

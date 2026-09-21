@@ -2690,6 +2690,114 @@ fn a_hook_transcript_without_native_identity_creates_no_catalog_row() {
 }
 
 #[test]
+fn a_hook_ignores_a_cached_filename_identity_when_the_snapshot_proves_another() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let layout = HomeLayout::under(home.path());
+    let project = home.path().join(".claude/projects/proj");
+    std::fs::create_dir_all(&project).expect("create project");
+    let transcript = project.join("cached-name.jsonl");
+    let filler = r#"{"type":"progress","message":{"role":"progress","content":"padding padding padding padding padding padding padding padding"}}"#;
+    let mut text = String::new();
+    for _ in 0..5_000 {
+        text.push_str(filler);
+        text.push('\n');
+    }
+    text.push_str(
+        r#"{"sessionId":"native-id","uuid":"native","type":"user","timestamp":"2026-09-20T00:00:00.000Z","message":{"role":"user","content":"the real turn"}}"#,
+    );
+    text.push('\n');
+    for _ in 0..5_000 {
+        text.push_str(filler);
+        text.push('\n');
+    }
+    std::fs::write(&transcript, text).expect("write sparse transcript");
+    let db = home.path().join("history.db");
+
+    // Ordinary bounded discovery cannot see the middle identity and caches
+    // the filename fallback at this exact source stamp.
+    {
+        let conn = ai_hist::open_db(&db).expect("open db");
+        let env = DiscoveryEnv::with_all_roots(
+            &conn,
+            layout.home.clone(),
+            layout.claude.clone(),
+            layout.codex.clone(),
+            layout.grok.clone(),
+            layout.opencode_db.clone(),
+        );
+        ai_hist::discover::discover_sessions_with_env(
+            &env,
+            &ai_hist::discover::DiscoverOptions {
+                sources: vec!["claude".into()],
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .expect("seed shallow cache");
+    }
+    assert_eq!(catalog_session_count(&db, "claude", "cached-name"), 1);
+
+    let report = ai_hist::ingest_transcript_at_with_home(
+        &db,
+        home.path(),
+        "claude",
+        &transcript,
+        Some("native-id"),
+        true,
+    )
+    .expect("hook ingest must not reuse the filename identity");
+
+    assert_eq!(report.status, ai_hist::TranscriptStatus::Ingested);
+    assert_eq!(report.session_id.as_deref(), Some("native-id"));
+    assert_eq!(catalog_session_count(&db, "claude", "native-id"), 1);
+    assert_eq!(session_event_count(&db, "native-id"), 1);
+    assert_eq!(
+        catalog_session_count(&db, "claude", "cached-name"),
+        0,
+        "the disproved filename alias must not remain in the catalog"
+    );
+}
+
+#[test]
+fn a_hook_never_registers_a_sparse_subagent_sidecar_as_its_parent() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let sidecars = home.path().join(".claude/projects/proj/parent/subagents");
+    std::fs::create_dir_all(&sidecars).expect("create sidecar directory");
+    let transcript = sidecars.join("agent-child.jsonl");
+    let filler = r#"{"type":"progress","message":{"role":"progress","content":"padding padding padding padding padding padding padding padding"}}"#;
+    let mut text = String::new();
+    for _ in 0..5_000 {
+        text.push_str(filler);
+        text.push('\n');
+    }
+    text.push_str(
+        r#"{"sessionId":"parent","agentId":"child","isSidechain":true,"uuid":"sidechain","type":"assistant","timestamp":"2026-09-20T00:00:00.000Z","message":{"role":"assistant","content":"child output"}}"#,
+    );
+    text.push('\n');
+    for _ in 0..5_000 {
+        text.push_str(filler);
+        text.push('\n');
+    }
+    std::fs::write(&transcript, text).expect("write sparse sidecar");
+    let db = home.path().join("history.db");
+
+    let report = ai_hist::ingest_transcript_at_with_home(
+        &db,
+        home.path(),
+        "claude",
+        &transcript,
+        Some("parent"),
+        true,
+    )
+    .expect("sidecar hook classification");
+
+    assert_eq!(report.status, ai_hist::TranscriptStatus::Unidentified);
+    assert_eq!(report.session_id, None);
+    assert_eq!(catalog_session_count(&db, "claude", "parent"), 0);
+    assert_eq!(session_event_count(&db, "parent"), 0);
+}
+
+#[test]
 fn a_hook_transcript_with_conflicting_native_identities_is_rejected() {
     let home = tempfile::tempdir().expect("tempdir");
     let project = home.path().join(".claude/projects/proj");
