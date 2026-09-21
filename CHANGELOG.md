@@ -145,8 +145,9 @@ Notable changes to the native `ai-hist` CLI are documented here.
   transcript cursor, so a command split across two hydration passes is still
   one marker. A `<system-reminder>` block inside a prompt becomes a
   `system_reminder` row sharing the prompt's `message_id`
-  (`<uid>:reminder:<n>`), and the prompt row and `history` carry only the
-  human's text. Codex's `<environment_context>` and sibling wrappers are
+  (`<uid>:reminder:<n>`), recreated from the current text on every re-read so
+  a record rewritten with fewer reminders loses the rows it no longer has, and
+  the prompt row and `history` carry only the human's text. Codex's `<environment_context>` and sibling wrappers are
   stored as `codex_context_wrapper` rows instead of falling to an `unknown`
   marker. `history`, `sessions.first_prompt` and `attribute_usage_to_prompts`
   all derive from that one classification (`ingest::control`), which

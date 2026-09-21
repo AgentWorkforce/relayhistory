@@ -7563,6 +7563,24 @@ impl ClaudeTextRows<'_> {
             return write(text, event_uid, self.control);
         }
         let split = control::split_system_reminders(text);
+        // Reminder rows carry derived identities, `{event_uid}:reminder:{n}`,
+        // that the upsert can only add to or overwrite. A record Claude
+        // rewrites under the same uuid with fewer reminders -- or none --
+        // would keep the rows the earlier text produced, so the derived rows
+        // are cleared first and recreated from the current text. A bounded
+        // range on the unique index, so the clearing costs one index probe
+        // per prompt row rather than a scan; `;` is the character after `:`,
+        // which makes the range exactly the derived identities and nothing
+        // else.
+        conn.execute(
+            "DELETE FROM session_events \
+             WHERE source = 'claude' AND session_id = ?1 AND event_uid >= ?2 AND event_uid < ?3",
+            params![
+                self.session_id,
+                format!("{event_uid}:reminder:"),
+                format!("{event_uid}:reminder;")
+            ],
+        )?;
         if split.reminders.is_empty() {
             return write(text, event_uid, None);
         }
@@ -21548,6 +21566,69 @@ mod tests {
                 .all(|prompt| !prompt.contains("<system-reminder>")),
             "no reminder text is a prompt: {prompts:?}"
         );
+    }
+
+    /// Reminder rows have derived identities the upsert can only add to, so
+    /// a record Claude rewrites under the same uuid with fewer reminders has
+    /// to lose the rows the earlier text produced.
+    #[test]
+    fn a_rewritten_record_keeps_only_the_reminders_its_current_text_has() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rewritten.jsonl");
+        let record = |content: &str| {
+            format!(
+                "{{\"type\":\"user\",\"uuid\":\"u1\",\"sessionId\":\"rewrite-session\",\"cwd\":\"/tmp/project\",\"timestamp\":\"2026-04-21T00:00:00.000Z\",\"message\":{{\"role\":\"user\",\"content\":\"{content}\"}}}}\n"
+            )
+        };
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let rows = |conn: &Connection| typed_event_uids(conn, "rewrite-session", "u1");
+        let reminder = |n: usize| {
+            (
+                format!("u1:0:reminder:{n}"),
+                Some("system_reminder".to_string()),
+            )
+        };
+
+        fs::write(
+            &path,
+            record(
+                "<system-reminder>a</system-reminder>fix it<system-reminder>b</system-reminder>",
+            ),
+        )
+        .unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        assert_eq!(
+            rows(&conn),
+            vec![("u1:0".to_string(), None), reminder(0), reminder(1)]
+        );
+
+        fs::write(&path, record("<system-reminder>a</system-reminder>fix it")).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        assert_eq!(
+            rows(&conn),
+            vec![("u1:0".to_string(), None), reminder(0)],
+            "the second reminder is gone with the text that produced it"
+        );
+
+        fs::write(&path, record("fix it")).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        assert_eq!(
+            rows(&conn),
+            vec![("u1:0".to_string(), None)],
+            "no reminder in the text, no reminder row"
+        );
+
+        // And back up again: the derived rows are recreated from the text.
+        fs::write(
+            &path,
+            record(
+                "<system-reminder>a</system-reminder>fix it<system-reminder>b</system-reminder>",
+            ),
+        )
+        .unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        assert_eq!(rows(&conn).len(), 3);
     }
 
     /// The same shape for Codex: a context wrapper used to store nothing and
