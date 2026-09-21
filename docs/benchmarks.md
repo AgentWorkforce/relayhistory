@@ -193,7 +193,7 @@ once and written down.
 | Append to a sidecar | 2*n* for that sidecar; the parent is not read |
 | Append to a sidecar beside an unchanged parent | the sidecar's *n*, and nothing for the parent |
 | Deleted metadata sidecar | the transcript is re-read and the metadata it owned is cleared |
-| Nothing changed | 0 — the stamp short-circuit does not open the file |
+| Nothing changed | the bounded validation windows — two per cursor, at most 128 KiB each, and nothing else. Not zero: the stamp says the size and mtime have not moved, which is not the same claim as "these are the same bytes" |
 | Cursor rejected (truncated, replaced, rewritten head or tail) | the whole file, with a `HYDRATION_SOURCE_ROTATED` diagnostic |
 | First pass after a `HYDRATION_PARSER_VERSION` bump | the whole file, once |
 

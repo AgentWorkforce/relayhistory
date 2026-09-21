@@ -2027,7 +2027,23 @@ fn ingest_selected(
                     sync_opencode_session(conn, path, &options.session_id)?;
                 }
             }
-            Ok((IngestOutcome::default(), Vec::new(), None))
+            // The record count comes from the snapshot walk, as it does for
+            // every provider whose reader does not count for itself. Returning
+            // a default outcome dropped it: `records_parsed` is taken from the
+            // outcome now, so the zero reached `HYDRATION_METRICS` and the
+            // checkpoint, and every later `unchanged` pass read that zero back.
+            //
+            // Not `whole_file()`, which also reports the path's size as bytes
+            // read: OpenCode's locator can be a directory, whose length is not
+            // a count of anything.
+            Ok((
+                IngestOutcome {
+                    records,
+                    ..Default::default()
+                },
+                Vec::new(),
+                None,
+            ))
         }
         _ => Err(hydration_error(
             "HYDRATION_UNSUPPORTED",

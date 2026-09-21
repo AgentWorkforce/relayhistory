@@ -1595,9 +1595,12 @@ newline-terminated, and its cursor already advances only at `task_complete`.
 
 Holding a message back is a bet that the provider will finish it. If the file
 stops changing the bet has lost, and holding it again on every pass would turn
-"deferred" into "lost". A pass that finds the file byte-for-byte where its
-cursor left it — same size, same mtime — stops deferring and indexes what it
-held. A session with records still held is never reported `unchanged`, which is
+"deferred" into "lost". A pass that finds the file still where its cursor
+left it — same size, same mtime, and a committed prefix that still hashes to
+what the cursor recorded — stops deferring and indexes what it held. The hash
+is not decoration: a matching size and mtime are not a claim that these are
+the same bytes, and a writer that restores timestamps produces a rewrite that
+passes the first test and fails the second. A session with records still held is never reported `unchanged`, which is
 what lets that pass run at all.
 
 ### Identity and metadata resume too

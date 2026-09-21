@@ -79,6 +79,18 @@ struct DeferredMessage {
     /// The commit backs up to the earliest held message, so this is the state
     /// that belongs with the committed offset. Storing the end-of-pass state
     /// instead let every re-read of the held region claim fresh indexes.
+    ///
+    /// Known limit, in the one place it can bite: two messages can interleave,
+    /// and flushing the earlier one indexes its records wherever they fall —
+    /// including after the later one's offset, which is where the commit backs
+    /// up to. Those records are re-read on the next pass and renumbered, while
+    /// the same message's records *before* that offset keep the numbers they
+    /// already have, so one message's `event_index` values can stop being
+    /// monotonic. Rows are not duplicated — the conflict key is `event_uid` —
+    /// and the ordering converges once the file stops changing. Fixing it
+    /// properly means committing no further than the earliest record of any
+    /// message this pass flushed, which costs a re-read of every interleaved
+    /// span on every pass.
     tool_results: crate::ingest::tool_result_facts::ToolResultIndexer,
 }
 
