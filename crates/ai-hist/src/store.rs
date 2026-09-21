@@ -6736,6 +6736,136 @@ mod tests {
         assert!(preimage.get("payload_json").is_none(), "{preimage}");
     }
 
+    /// The preimage sweep must not crash on a database it cannot serve.
+    ///
+    /// `shadow_preimages` decides delivery is ready by looking for
+    /// `delivery_shadow`, `delivery_bootstrap_bounds` and `delivery_jobs` --
+    /// and then builds its statement around `CONSUMERS`, which also reads
+    /// `history_exports`. The three tables are created in the same batch as
+    /// the fourth today, so a database carrying them without it is an older
+    /// delivery-enabled install; and this runs from `init_db`, *before*
+    /// `init_schema` would put the missing table back.
+    ///
+    /// SQLite resolves table names when a statement is prepared, so the
+    /// missing table is not a degraded sweep -- it is a failed open, every
+    /// open, for as long as the database exists. Exactly the crash the probe
+    /// was added for, reached through the one table the probe forgot.
+    #[cfg(feature = "delivery")]
+    #[test]
+    fn a_delivery_database_missing_history_exports_still_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let v1 = |conn: &Connection| {
+            conn.execute_batch(
+                "DROP TRIGGER IF EXISTS delivery_session_markers_insert;
+                 DROP TRIGGER IF EXISTS delivery_session_markers_update;
+                 DROP TRIGGER IF EXISTS delivery_session_markers_delete;
+                 DROP TABLE session_markers;
+                 CREATE TABLE session_markers (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     source TEXT NOT NULL, session_id TEXT NOT NULL,
+                     marker_uid TEXT NOT NULL, kind TEXT NOT NULL,
+                     ts_ms INTEGER, text TEXT, detail_json TEXT,
+                     UNIQUE(source, session_id, marker_uid)
+                 );
+                 INSERT INTO session_markers
+                     (source, session_id, marker_uid, kind, ts_ms, text, detail_json)
+                 VALUES ('grok','old','c1','compaction_boundary',11,'compacted','{\"c\":1}');
+                 DELETE FROM schema_migrations WHERE name = 'session_markers_v2';",
+            )
+            .unwrap();
+        };
+
+        // An older delivery-enabled install: every delivery table this sweep
+        // probes for, and not the one it forgot to probe for.
+        let older = dir.path().join("older-delivery.db");
+        {
+            let conn = open_db(&older).unwrap();
+            v1(&conn);
+            // The table, and the capture triggers that name it -- an install
+            // from before `history_exports` existed had neither, and leaving
+            // the triggers behind would only prove that a trigger cannot read
+            // a table that is gone, which is not the claim under test.
+            let dependents: Vec<String> = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger' \
+                     AND sql LIKE '%history_exports%'",
+                )
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert!(
+                !dependents.is_empty(),
+                "the premise: some trigger does name it"
+            );
+            for trigger in dependents {
+                conn.execute_batch(&format!("DROP TRIGGER {trigger};"))
+                    .unwrap();
+            }
+            conn.execute_batch("DROP TABLE history_exports;").unwrap();
+            let probed: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN \
+                     ('delivery_shadow','delivery_bootstrap_bounds','delivery_jobs',\
+                      'history_exports')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                probed, 3,
+                "the premise: the three tables the probe asks about, and not the fourth"
+            );
+        }
+        let conn = open_db(&older).expect("a missing history_exports must not fail the open");
+        assert_eq!(
+            session_markers(&conn, "grok", "old").unwrap().len(),
+            1,
+            "and the migration must still have run"
+        );
+
+        // Positive control: the same database with all four tables and an
+        // in-flight export still takes the preimage, so this fixed the crash
+        // rather than switching the sweep off.
+        let whole = dir.path().join("whole-delivery.db");
+        {
+            let conn = open_db(&whole).unwrap();
+            v1(&conn);
+            init_delivery_schema(&conn).unwrap();
+            let rowid: i64 = conn
+                .query_row("SELECT rowid FROM session_markers", [], |row| row.get(0))
+                .unwrap();
+            conn.execute(
+                "INSERT INTO history_exports \
+                 (id, selection_json, limits_json, cutoff, bootstrap_kind, bootstrap_rowid, \
+                  bootstrap_done, expires_at_ms, cursor) \
+                 VALUES ('e1','{}','{}',0,0,0,0,?,'c1')",
+                params![now_ms() + 3_600_000],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO delivery_bootstrap_bounds(job_id, kind, max_rowid) \
+                 VALUES ('e1','session_marker',?)",
+                params![rowid],
+            )
+            .unwrap();
+        }
+        let conn = open_db(&whole).unwrap();
+        let preimage: Option<String> = conn
+            .query_row(
+                "SELECT payload FROM delivery_shadow \
+                 WHERE job_id = 'e1' AND kind = 'session_marker'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+            .flatten();
+        let preimage = preimage.expect("an unexpired export is still owed its preimage");
+        assert!(preimage.contains("detail_json"), "{preimage}");
+    }
+
     /// An export is a consumer too, and a build that cannot shadow must say so.
     ///
     /// `CONSUMERS` -- the set every capture trigger serves -- is live delivery

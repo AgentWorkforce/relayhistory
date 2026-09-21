@@ -403,10 +403,19 @@ pub(crate) fn shadow_preimages(conn: &Connection, table_name: &str) -> Result<()
     // A statement naming a missing table fails when it is prepared, so the
     // check has to come first. Absent means no consumer, which means nothing
     // is owed.
+    // `history_exports` is in the probe because `CONSUMERS` reads it. It is
+    // created in the same batch as the other three today, so a database
+    // carrying them without it is an older delivery-enabled install -- and
+    // this runs from `init_db`, before `init_schema` puts the table back. A
+    // statement naming a missing table fails when it is *prepared*, so
+    // omitting it here did not degrade the sweep: it failed every open of that
+    // database. Same crash class as `delivery_journal` and `delivery_shadow`,
+    // reached through the fourth table.
     let ready: bool = conn
         .prepare(
-            "SELECT count(*) = 3 FROM sqlite_master WHERE type = 'table' \
-             AND name IN ('delivery_shadow','delivery_bootstrap_bounds','delivery_jobs')",
+            "SELECT count(*) = 4 FROM sqlite_master WHERE type = 'table' \
+             AND name IN ('delivery_shadow','delivery_bootstrap_bounds','delivery_jobs',\
+             'history_exports')",
         )?
         .query_row([], |row| row.get(0))?;
     if !ready {

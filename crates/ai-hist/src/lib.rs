@@ -99,9 +99,9 @@ pub(crate) use session_usage::{session_requests_page, session_usage_summary};
 
 #[cfg(not(feature = "unstable-internal"))]
 pub use store::{
-    HistoryEntry, SessionEvent, SessionEventCursor, SessionFileEdit, SessionLocation,
-    SessionMarker, SessionScope, SessionToolCall, SessionUserTurn, SessionUserTurnBlock,
-    SessionUserTurnPage,
+    HistoryEntry, SessionEvent, SessionEventCursor, SessionEvidenceCursor, SessionFileEdit,
+    SessionLocation, SessionMarker, SessionMarkerPage, SessionScope, SessionToolCall,
+    SessionUserTurn, SessionUserTurnBlock, SessionUserTurnPage,
 };
 
 #[cfg(feature = "unstable-internal")]

@@ -4173,15 +4173,28 @@ fn claude_sync_stamp(path: &Path) -> Result<String> {
 /// re-reads the file.
 fn claude_sidecar_evidence_exists(conn: &Connection, path: &Path) -> Result<bool> {
     let locator = path.to_string_lossy();
+    // Markers count, for the same reason they count in the two session
+    // probes: a sidecar whose records the event model cannot carry -- a
+    // compaction boundary, a system row, a non-text block -- indexes markers
+    // and no events. Asking only about events reads that as "this file left
+    // nothing behind", so an unchanged sidecar is re-parsed on every sync
+    // forever while the sync reports itself perfectly normal.
     let exists: i64 = conn.query_row(
         "SELECT EXISTS(
             SELECT 1
             FROM session_relationships r
             WHERE r.source = 'claude' AND r.evidence_locator = ?
-              AND EXISTS(
-                SELECT 1 FROM session_events e
-                WHERE e.source = 'claude'
-                  AND e.session_id = COALESCE(r.child_session_id, r.parent_session_id)
+              AND (
+                EXISTS(
+                  SELECT 1 FROM session_events e
+                  WHERE e.source = 'claude'
+                    AND e.session_id = COALESCE(r.child_session_id, r.parent_session_id)
+                )
+                OR EXISTS(
+                  SELECT 1 FROM session_markers m
+                  WHERE m.source = 'claude'
+                    AND m.session_id = COALESCE(r.child_session_id, r.parent_session_id)
+                )
               )
             LIMIT 1
         )",
@@ -5676,7 +5689,13 @@ fn insert_sessionless_record_marker(
                 .or_else(|| value.as_i64())
         })
         .filter(|ts| *ts != 0);
-    let message_id = obj.get("uuid").and_then(Value::as_str);
+    // The *derived* identity, not the native `uuid`, because that is what the
+    // ordinary path stores -- and a summary, the record this path exists for,
+    // usually has no `uuid` at all. Reading the native field here left
+    // `message_id` null on exactly those records, so a later local pass erased
+    // the identity a remote snapshot had stored. Same column, same mechanism,
+    // one field further in.
+    let message_id = Some(identity.as_str());
     let parent_id = obj.get("parentUuid").and_then(Value::as_str);
     insert_session_marker(
         conn,
@@ -11486,11 +11505,13 @@ mod tests {
     #[test]
     fn a_sessionless_re_read_keeps_the_identity_the_record_carries() {
         let dir = tempfile::tempdir().unwrap();
+        // A summary as a remote snapshot carries it: `sessionId` injected, and
+        // -- like every real Claude summary -- no `uuid` of its own.
         let with_session = dir.path().join("remote.jsonl");
         fs::write(
             &with_session,
             concat!(
-                r#"{"type":"summary","summary":"s","leafUuid":"leaf-keep","uuid":"rec-keep","parentUuid":"par-1","sessionId":"keep-session","timestamp":"2026-09-14T00:00:00.000Z"}"#, "\n",
+                r#"{"type":"summary","summary":"s","leafUuid":"leaf-keep","parentUuid":"par-1","sessionId":"keep-session","timestamp":"2026-09-14T00:00:00.000Z"}"#, "\n",
                 r#"{"type":"user","uuid":"u0","sessionId":"keep-session","cwd":"/tmp/p","timestamp":"2026-09-14T00:00:01.000Z","message":{"role":"user","content":"hi"}}"#, "\n",
             ),
         )
@@ -11500,36 +11521,43 @@ mod tests {
         fs::write(
             &sessionless,
             concat!(
-                r#"{"type":"summary","summary":"s","leafUuid":"leaf-keep","uuid":"rec-keep","parentUuid":"par-1","timestamp":"2026-09-14T00:00:00.000Z"}"#, "\n",
+                r#"{"type":"summary","summary":"s","leafUuid":"leaf-keep","parentUuid":"par-1","timestamp":"2026-09-14T00:00:00.000Z"}"#, "\n",
                 r#"{"type":"user","uuid":"u0","sessionId":"keep-session","cwd":"/tmp/p","timestamp":"2026-09-14T00:00:01.000Z","message":{"role":"user","content":"hi"}}"#, "\n",
             ),
         )
         .unwrap();
 
+        let summary = |conn: &Connection| {
+            crate::session_markers_page(conn, "claude", "keep-session", 50, None)
+                .unwrap()
+                .markers
+                .into_iter()
+                .find(|m| m.kind == "summary")
+                .expect("the summary is recorded")
+        };
+
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         ingest_claude_transcript(&conn, &with_session).unwrap();
-        let before = crate::session_markers_page(&conn, "claude", "keep-session", 50, None)
-            .unwrap()
-            .markers;
-        let before = before.iter().find(|m| m.kind == "summary").unwrap().clone();
+        let before = summary(&conn);
         assert!(before.ts_ms.is_some(), "the premise: it starts populated");
-        assert_eq!(before.message_id.as_deref(), Some("rec-keep"));
+        assert_eq!(
+            before.message_id.as_deref(),
+            Some("leaf-keep"),
+            "the premise: the record path stores the derived identity"
+        );
 
         ingest_claude_transcript(&conn, &sessionless).unwrap();
-        let after = crate::session_markers_page(&conn, "claude", "keep-session", 50, None)
-            .unwrap()
-            .markers;
-        let after = after.iter().find(|m| m.kind == "summary").unwrap();
+        // The whole row, not three fields of it. Naming the columns that broke
+        // is how this was fixed twice already: `ts_ms`, `message_id` and
+        // `parent_id` the first time, `message_id`'s *value* the second. The
+        // next column added to the struct is covered here without anyone
+        // remembering to add it.
         assert_eq!(
-            after.ts_ms, before.ts_ms,
-            "a re-read must not blank the time"
+            summary(&conn),
+            before,
+            "a sessionless re-read must agree with the record path on every column"
         );
-        assert_eq!(
-            after.message_id, before.message_id,
-            "nor the message identity"
-        );
-        assert_eq!(after.parent_id, before.parent_id, "nor the parent");
         // Positive control: still one row, so this did not fix erasure by
         // reintroducing the duplicate.
         let rows: i64 = conn
@@ -11540,6 +11568,90 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows, 1);
+    }
+
+    /// A sidecar whose only evidence is markers is still evidence.
+    ///
+    /// The two session probes were taught to count `session_markers`; this
+    /// third one -- the sidecar's, which reaches its session through
+    /// `session_relationships` rather than the catalog -- was not. A sidecar
+    /// carrying only records the event model cannot hold indexes markers and
+    /// no events, so the fast path read it as having left nothing behind and
+    /// re-parsed it on every sync, forever, while reporting a normal sync.
+    #[test]
+    fn a_marker_only_sidecar_is_not_re_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, named, _) = write_claude_parent_with_subagents(dir.path());
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+
+        // Leave this sidecar's evidence as a marker and nothing else, which is
+        // the shape a compaction boundary or a system row produces.
+        conn.execute(
+            "DELETE FROM session_events WHERE source='claude' AND session_id='abc'",
+            [],
+        )
+        .unwrap();
+        crate::insert_session_marker(
+            &conn,
+            "claude",
+            "abc",
+            &crate::NewSessionMarker {
+                marker_uid: "side-b:marker",
+                ts_ms: Some(11),
+                message_id: Some("side-b"),
+                parent_id: None,
+                turn_id: None,
+                kind: "compaction_boundary",
+                subkind: Some("compact_boundary"),
+                text: None,
+                payload_json: None,
+            },
+        )
+        .unwrap();
+
+        // Rewrite the sidecar and record the rewritten file as already seen: a
+        // walk that cannot see the marker reads this as unindexed and ingests
+        // it despite the matching stamp.
+        fs::write(
+            &named,
+            concat!(
+                r#"{"sessionId":"claude-root","agentId":"abc","isSidechain":true,"uuid":"side-b","cwd":"/work/app","type":"assistant","message":{"role":"assistant","content":"later result"},"timestamp":"2026-08-31T11:00:06Z"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let key = named.to_string_lossy().to_string();
+        state
+            .get_mut("claude_sessions_v4")
+            .and_then(Value::as_object_mut)
+            .unwrap()
+            .insert(key, json!(claude_sync_stamp(&named).unwrap()));
+
+        let sentinel = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM session_events \
+                 WHERE source='claude' AND session_id='abc' AND event_uid='side-b:0'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(sentinel(&conn), 0, "a marker is evidence: do not re-read");
+
+        // Positive control: take the marker away and the same unchanged stamp
+        // reads the file again, so this skips a sidecar that left something
+        // rather than skipping every sidecar.
+        conn.execute(
+            "DELETE FROM session_markers WHERE source='claude' AND session_id='abc'",
+            [],
+        )
+        .unwrap();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(sentinel(&conn), 1);
     }
 
     /// Every sidecar read obeys the same three-way rule: absent is nothing,

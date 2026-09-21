@@ -57,7 +57,10 @@ Notable changes to the native `ai-hist` CLI are documented here.
   `signals` sidecar, a compaction checkpoint) the document is bounded whole,
   because enumerating their keys would silently drop whatever they add next. Read one bounded page with
   `session_markers_page(conn, source, session_id, limit, after)`, which uses
-  the same `(ts_ms IS NULL, ts_ms, id)` keyset as tool calls and file edits.
+  the same `(ts_ms IS NULL, ts_ms, id)` keyset as tool calls and file edits,
+  or, from an embedder on the crate's default features,
+  `SessionStore::session_markers_page` — a marker an embedder can sync and
+  cannot read back is a write-only table for everyone outside this workspace.
   `SessionEvent` gains `raw_kind`, the provider-native record or block type an
   event came from, returned by both `session_events` and `session_events_page`
   and carried by the normalized source-evidence row contract, so a
