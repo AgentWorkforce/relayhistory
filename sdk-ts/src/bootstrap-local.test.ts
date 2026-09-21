@@ -11,6 +11,8 @@ import { bootstrapLocal, InvalidArgumentError } from './index.js';
 const run = promisify(execFile);
 const cli = fileURLToPath(new URL('./cli.js', import.meta.url));
 const sdk = new URL('./index.js', import.meta.url).href;
+const sqlite = await import('node:sqlite').catch(() => null);
+const needsNodeSqlite = sqlite ? false : 'node:sqlite requires Node >= 22';
 
 test('bootstrap validates its work budget before loading native code', async () => {
   for (const limit of [0, -1, 1001, 1.5, NaN]) {
@@ -61,7 +63,7 @@ test('SDK bootstrap retries an empty home, indexes native evidence, and skips a 
 // capability limitation -- otherwise every Claude bootstrap would report the
 // provider as limited and land in `partial`. OpenCode is the remaining
 // prompt-only local parser; Cursor and Grok both write events now.
-test('bootstrap reports only the evidence the provider cannot produce, not what it declined', async () => {
+test('bootstrap reports only the evidence the provider cannot produce, not what it declined', { skip: needsNodeSqlite }, async () => {
   const home = await mkdtemp(join(tmpdir(), 'ai-hist-bootstrap-coverage-'));
   const env = { ...process.env, HOME: home, USERPROFILE: home, AI_HIST_DB: join(home, 'history.db') };
   const call = async () => JSON.parse((await run(process.execPath, ['--input-type=module', '-e',

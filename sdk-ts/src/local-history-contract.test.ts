@@ -10,6 +10,9 @@ import {
   type CatalogCursor, type CatalogSession, type EventCursor,
 } from './index.js';
 
+const sqlite = await import('node:sqlite').catch(() => null);
+const needsNodeSqlite = sqlite ? false : 'node:sqlite requires Node >= 22';
+
 // These fixtures exercise public SDK/native contracts before package moves.
 // Clear every provider/transport override used by these operations so neither
 // credentials nor history from the operator's environment enter the fixture.
@@ -169,7 +172,7 @@ async function opencodeSession(home: string, sessionId: string): Promise<void> {
 
 // The bug this replaced: a prompt-only provider reported `full`, so the SDK's
 // merge ranking preferred it over a presence that actually had the events.
-test('a prompt-only provider reports partial capability and names the evidence nobody parsed', async () => {
+test('a prompt-only provider reports partial capability and names the evidence nobody parsed', { skip: needsNodeSqlite }, async () => {
   await withFixture(async ({ home, dbPath }) => {
     await opencodeSession(home, 'oc-contract');
     await discoverSessions({ dbPath, scope: 'local', sources: ['opencode'] });
