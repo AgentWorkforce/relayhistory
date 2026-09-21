@@ -92,13 +92,15 @@ asked for a sweep and got none is told.
 
 `SyncReport { swept, changed }`: `swept` is false when the fingerprint matched
 and nothing was opened. `changed` lists the `SessionRef`s whose catalog row was
-created or changed while the sweep held the lock, derived from a per-row
-digest of the `sessions` table taken after the lock was acquired and again
-before it was released, not from the provider walk — so a row another process
-wrote while this call was still waiting for the lock is not counted. Another
-sync cannot land inside the window (it needs the same lock); a hydration
-writes the catalog outside it, so one that lands during the sweep is included,
-and per-row attribution to one writer is what #179's revision column is for. Every catalog
+created or changed while the call held the lock — swept or not — derived from
+a per-row digest of the `sessions` table taken after the lock was acquired and
+again before it was released, not from the provider walk. A row another
+process wrote while this call was still waiting for the lock is not counted;
+another sync cannot land inside the window (it needs the same lock); a
+hydration writes the catalog outside it, so one that lands inside the window is
+included even when the sweep itself opened nothing. `watch` reports a
+hydration between ticks once, on the next tick; per-row attribution to one
+writer is what #179's revision column is for. Every catalog
 column takes part except the two bounded text excerpts (`first_prompt`,
 `last_assistant_text`): a new session, new activity, a moved source stamp or
 discovery state, a re-resolved or inherited `project_key`, a metadata field the

@@ -645,12 +645,7 @@ impl SessionStore {
                 &self.roots,
                 force,
                 |conn| catalog_fingerprint(conn).map_err(anyhow::Error::from),
-                |conn, before, tick| {
-                    if !tick.swept {
-                        return Ok(Vec::new());
-                    }
-                    Ok(catalog_changes(&before, &catalog_fingerprint(conn)?))
-                },
+                |conn, before, _tick| Ok(changes_under_lock(conn, &before)?.1),
             )
             .map_err(Error::sync)?;
             if let Some(outcome) = outcome {
@@ -776,12 +771,12 @@ impl SessionStore {
                         Some(before) => Ok(before),
                         None => catalog_fingerprint(conn).map_err(anyhow::Error::from),
                     },
-                    |conn, before, tick| {
-                        let after = tick.swept.then(|| catalog_fingerprint(conn)).transpose()?;
-                        Ok((before, after))
+                    |conn, before, _tick| {
+                        let (after, changed) = changes_under_lock(conn, &before)?;
+                        Ok((after, changed))
                     },
                 )?;
-                Ok(outcome.map(|(tick, (before, after))| (tick, before, after)))
+                Ok(outcome.map(|(tick, (after, changed))| (tick, after, changed)))
             })?;
             *tick_pending.lock().expect("watch pending") = changed;
             Ok(outcome)
@@ -1021,13 +1016,33 @@ impl SessionStore {
     }
 }
 
-/// One watch tick's bookkeeping around a bracketed sweep: hand the sweep the
-/// rolling baseline, and roll it forward only when the sweep came back.
+/// The catalog digest at the end of a locked section, and what moved since
+/// `before` — taken on **every** locked tick, swept or not.
 ///
-/// `sweep` receives the previous swept tick's digest (or `None` for a fresh
-/// read under the lock) and answers with what it used as `before` and, when
-/// it swept, the `after` digest; `None` means the lock was held elsewhere.
-/// The baseline is *cloned* into the sweep rather than taken: a sweep that
+/// A hydration does not take the sync lock, so it can commit a catalog row
+/// while a sweep is deciding, from an unchanged source fingerprint, that
+/// there is nothing to do. Skipping the after-digest on such a tick would
+/// leave that row unreported for as long as the sources stay quiet; the
+/// digest costs one indexed scan of the catalog, which an unswept tick can
+/// afford.
+fn changes_under_lock(
+    conn: &Connection,
+    before: &CatalogFingerprint,
+) -> Result<(CatalogFingerprint, Vec<SessionRef>), Error> {
+    let after = catalog_fingerprint(conn)?;
+    let changed = catalog_changes(before, &after);
+    Ok((after, changed))
+}
+
+/// One watch tick's bookkeeping around a bracketed sweep: hand the sweep the
+/// rolling baseline, and roll it forward when the sweep came back.
+///
+/// `sweep` receives the previous tick's digest (or `None` for a fresh read
+/// under the lock) and answers with the `after` digest it took under the
+/// lock and what moved; `None` means the lock was held elsewhere. Every
+/// locked tick rolls the baseline forward, swept or not, so a catalog write
+/// between ticks is reported once by the next tick and never again. The
+/// baseline is *cloned* into the sweep rather than taken: a sweep that
 /// fails part-way has usually committed some of its rows already, and a
 /// baseline lost with it would make the next tick start afresh and never
 /// report them. On failure `base` is exactly what it was, so the next
@@ -1036,18 +1051,12 @@ fn rolling_tick(
     base: &mut Option<CatalogFingerprint>,
     sweep: impl FnOnce(
         Option<CatalogFingerprint>,
-    ) -> anyhow::Result<
-        Option<(SyncTick, CatalogFingerprint, Option<CatalogFingerprint>)>,
-    >,
+    ) -> anyhow::Result<Option<(SyncTick, CatalogFingerprint, Vec<SessionRef>)>>,
 ) -> anyhow::Result<(TickOutcome, Vec<SessionRef>)> {
     match sweep(base.clone())? {
         None => Ok((TickOutcome::from(SyncTick::default()), Vec::new())),
-        Some((tick, before, after)) => {
-            let changed = after
-                .as_ref()
-                .map(|after| catalog_changes(&before, after))
-                .unwrap_or_default();
-            *base = Some(after.unwrap_or(before));
+        Some((tick, after, changed)) => {
+            *base = Some(after);
             Ok((TickOutcome::from(tick), changed))
         }
     }
@@ -1107,11 +1116,12 @@ pub struct SyncOptions {
 #[non_exhaustive]
 pub struct SyncReport {
     /// A full walk ran. `false` when the stat-only source fingerprint matched
-    /// the previous sweep's and nothing was opened; `changed` is then empty
-    /// by construction.
+    /// the previous sweep's and nothing was opened. `changed` is still
+    /// compared on such a call: a hydration can write the catalog while the
+    /// fingerprint is being checked.
     pub swept: bool,
-    /// Sessions whose catalog row was created or changed while this sweep
-    /// held the `SyncRunLock`.
+    /// Sessions whose catalog row was created or changed while this call
+    /// held the `SyncRunLock`, whether or not it swept.
     ///
     /// Derived from a digest of the `sessions` table taken after the lock was
     /// acquired and again before it was released, not from the provider
@@ -1121,10 +1131,12 @@ pub struct SyncReport {
     /// or inherited `project_key`, and a metadata field the shallow read
     /// filled in are all changes here. Another process's sync cannot be
     /// counted — it holds the same lock — but a hydration writes the catalog
-    /// outside it, so a `hydrate` that lands during the sweep is included;
-    /// per-row attribution to one writer is what #179's `sessions.revision`
-    /// column is for. A session whose only change was inside a table the
-    /// catalog row does not summarise is not listed.
+    /// outside it, so a `hydrate` that lands inside the window is included
+    /// even on an unswept call; one that landed before the lock was taken
+    /// belongs to no `sync` report ([`SessionStore::watch`] reports it on
+    /// the next tick, and per-row attribution is what #179's
+    /// `sessions.revision` column is for). A session whose only change was
+    /// inside a table the catalog row does not summarise is not listed.
     pub changed: Vec<SessionRef>,
 }
 
@@ -1447,8 +1459,10 @@ pub struct TickReport {
     /// Another process held the sync lock; nothing was read. A forced tick
     /// that comes back this way is retried by the loop.
     pub contended: bool,
-    /// Sessions whose catalog row changed in this sweep; see
-    /// [`SyncReport::changed`]. Empty unless `swept`.
+    /// Sessions whose catalog row changed since the previous tick's report;
+    /// see [`SyncReport::changed`]. Compared on every tick that took the
+    /// lock, swept or not, so a hydration landing between ticks is reported
+    /// once by the tick that follows it. Empty on a `contended` tick.
     pub changed: Vec<SessionRef>,
 }
 
@@ -2712,6 +2726,111 @@ mod tests {
         );
     }
 
+    /// A catalog row a hydration writes while an unswept `sync` holds the
+    /// lock — after the baseline digest, before the after-digest — is that
+    /// call's change, though the sweep itself opened nothing.
+    #[test]
+    fn an_unswept_sync_reports_a_catalog_write_made_under_its_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ai-history.db");
+        let store = store_at(&db);
+        assert!(store.sync(SyncOptions::default()).unwrap().swept);
+
+        // The second call finds the fingerprint unchanged; the catalog write
+        // lands inside its locked window, the way a targeted hydration does.
+        let outcome = sync_facade_tick(
+            &db,
+            store.roots(),
+            false,
+            |conn| {
+                let before = catalog_fingerprint(conn)?;
+                conn.execute_batch(
+                    "INSERT INTO sessions (session_id, source, discovery_state) \
+                     VALUES ('hydrated-meanwhile', 'claude', 'full')",
+                )?;
+                Ok(before)
+            },
+            |conn, before, tick| {
+                assert!(!tick.swept, "the sources did not move");
+                Ok(changes_under_lock(conn, &before)?.1)
+            },
+        )
+        .unwrap()
+        .expect("the lock was free");
+        assert_eq!(
+            outcome.1,
+            vec![SessionRef::id(Source::Claude, "hydrated-meanwhile")]
+        );
+
+        // And the public call over the same store: unswept, nothing moved
+        // under its lock, nothing reported — the earlier write was before it.
+        let again = store.sync(SyncOptions::default()).unwrap();
+        assert!(!again.swept);
+        assert!(again.changed.is_empty());
+    }
+
+    /// A catalog write between watch ticks is reported once, by the next
+    /// tick that takes the lock, even though that tick opens no provider
+    /// file; the tick after it reports nothing.
+    #[test]
+    fn an_unswept_watch_tick_reports_a_hydration_between_ticks_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ai-history.db");
+        let store = store_at(&db);
+        let mut watch = store
+            .watch(WatchOptions {
+                use_fs_events: false,
+                poll_interval_ms: 100,
+                immediate: true,
+                ..WatchOptions::default()
+            })
+            .unwrap();
+        let first = watch
+            .next_timeout(Duration::from_secs(30))
+            .expect("startup tick")
+            .unwrap();
+        assert_eq!(first.trigger, TickTrigger::Startup);
+        assert!(first.changed.is_empty());
+
+        // A targeted hydration between ticks: a catalog write outside the
+        // sync lock while every source fingerprint stays where it was.
+        open_db(&db)
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO sessions (session_id, source, discovery_state) \
+                 VALUES ('hydrated-between-ticks', 'codex', 'full')",
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut reported = None;
+        while Instant::now() < deadline {
+            let tick = watch
+                .next_timeout(Duration::from_secs(5))
+                .expect("a poll tick")
+                .unwrap();
+            if !tick.changed.is_empty() {
+                reported = Some(tick);
+                break;
+            }
+        }
+        let reported = reported.expect("the write was reported");
+        assert!(!reported.swept, "no source moved; the tick was unswept");
+        assert_eq!(
+            reported.changed,
+            vec![SessionRef::id(Source::Codex, "hydrated-between-ticks")]
+        );
+        let following = watch
+            .next_timeout(Duration::from_secs(30))
+            .expect("the next poll tick")
+            .unwrap();
+        assert!(
+            following.changed.is_empty(),
+            "reported once, not on every unswept tick: {:?}",
+            following.changed
+        );
+        watch.stop();
+    }
+
     /// A tick that fails keeps the rolling baseline, so the rows it (or
     /// anyone) committed before the failure are reported by the next tick
     /// that succeeds, rather than silently folded into a fresh baseline.
@@ -2770,11 +2889,9 @@ mod tests {
         .unwrap();
         let after = catalog_fingerprint(&conn).unwrap();
         let (outcome, changed) = rolling_tick(&mut base, |previous| {
-            Ok(Some((
-                swept,
-                previous.expect("baseline kept"),
-                Some(after.clone()),
-            )))
+            let before = previous.expect("baseline kept");
+            let changed = catalog_changes(&before, &after);
+            Ok(Some((swept, after.clone(), changed)))
         })
         .unwrap();
         assert!(outcome.swept);
@@ -2791,13 +2908,15 @@ mod tests {
 
         // An unswept tick keeps the baseline where the last swept one left it.
         let (_, changed) = rolling_tick(&mut base, |previous| {
+            let before = previous.unwrap();
+            let (now, changed) = changes_under_lock(&conn, &before).unwrap();
             Ok(Some((
                 SyncTick {
                     attempted: true,
                     swept: false,
                 },
-                previous.unwrap(),
-                None,
+                now,
+                changed,
             )))
         })
         .unwrap();
