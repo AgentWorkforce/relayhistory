@@ -565,13 +565,7 @@ impl SessionStore {
         if self.read_only {
             return Err(Error::read_only("sync"));
         }
-        let before = catalog_fingerprint(&self.read_conn()?)?;
-        let tick = self.sync_tick(opts.force, opts.lock_timeout_ms)?;
-        let changed = if tick.swept {
-            catalog_changes(&before, &catalog_fingerprint(&self.read_conn()?)?)
-        } else {
-            Vec::new()
-        };
+        let (tick, changed) = self.sync_tick(opts.force, opts.lock_timeout_ms)?;
         Ok(SyncReport {
             swept: tick.swept,
             changed,
@@ -579,7 +573,16 @@ impl SessionStore {
     }
 
     /// Run the sweep, retrying a held lock until `lock_timeout_ms` is spent.
-    fn sync_tick(&self, force: bool, lock_timeout_ms: u64) -> Result<SyncTick, Error> {
+    ///
+    /// The catalog digest is taken and compared inside the locked section —
+    /// see [`sync_facade_tick`] — so `changed` is what the catalog gained
+    /// between this sweep taking the lock and releasing it, not since some
+    /// earlier read that another process's sync could have moved past.
+    fn sync_tick(
+        &self,
+        force: bool,
+        lock_timeout_ms: u64,
+    ) -> Result<(SyncTick, Vec<SessionRef>), Error> {
         let started = Instant::now();
         // Bounded where it enters, like every watch interval: `Instant +
         // Duration` panics when the sum is not representable, and a caller
@@ -588,9 +591,21 @@ impl SessionStore {
         // lock this crate holds.
         let deadline = started + Duration::from_millis(lock_timeout_ms.min(MAX_LOCK_WAIT_MS));
         loop {
-            let tick = sync_facade_tick(&self.db_path, &self.roots, force).map_err(Error::sync)?;
-            if tick.attempted {
-                return Ok(tick);
+            let outcome = sync_facade_tick(
+                &self.db_path,
+                &self.roots,
+                force,
+                |conn| catalog_fingerprint(conn).map_err(anyhow::Error::from),
+                |conn, before, tick| {
+                    if !tick.swept {
+                        return Ok(Vec::new());
+                    }
+                    Ok(catalog_changes(&before, &catalog_fingerprint(conn)?))
+                },
+            )
+            .map_err(Error::sync)?;
+            if let Some(outcome) = outcome {
+                return Ok(outcome);
             }
             let now = Instant::now();
             if now >= deadline {
@@ -636,12 +651,7 @@ impl SessionStore {
                 hydrate_report(*source, session_id.clone(), status, Some(result))
             }
             SessionRef::Path { source, path } => {
-                if !source.capabilities().hydrates_by_path {
-                    return Err(Error::HydrationUnsupported(format!(
-                        "{source} sessions cannot be hydrated by path; known harnesses: {}",
-                        HOOK_HARNESSES.join(", ")
-                    )));
-                }
+                path_names_one_session(*source)?;
                 let ingest = ingest_transcript_at_with_roots(
                     &self.db_path,
                     &self.roots,
@@ -697,20 +707,37 @@ impl SessionStore {
         let tick_baseline = baseline.clone();
         let tick_pending = pending.clone();
         let tick: crate::watch::TickFn = Arc::new(move |force| {
-            let conn = open_db_readonly(&db_path)?;
+            // Both reads happen under the sync lock, like `sync`'s. The
+            // baseline is the previous swept tick's `after` digest when there
+            // is one — nothing this loop reported has moved since, and a
+            // change another process made in between is a change since the
+            // last report either way — and a fresh read otherwise.
             let mut base = tick_baseline.lock().expect("watch baseline");
-            if base.is_none() {
-                *base = Some(catalog_fingerprint(&conn)?);
+            let outcome = sync_facade_tick(
+                &db_path,
+                &tick_roots,
+                force,
+                |conn| match base.take() {
+                    Some(before) => Ok(before),
+                    None => catalog_fingerprint(conn).map_err(anyhow::Error::from),
+                },
+                |conn, before, tick| {
+                    if !tick.swept {
+                        return Ok((before, Vec::new()));
+                    }
+                    let after = catalog_fingerprint(conn)?;
+                    let changed = catalog_changes(&before, &after);
+                    Ok((after, changed))
+                },
+            )?;
+            match outcome {
+                Some((tick, (digest, changed))) => {
+                    *base = Some(digest);
+                    *tick_pending.lock().expect("watch pending") = changed;
+                    Ok(TickOutcome::from(tick))
+                }
+                None => Ok(TickOutcome::from(SyncTick::default())),
             }
-            drop(conn);
-            let tick = sync_facade_tick(&db_path, &tick_roots, force)?;
-            if tick.swept {
-                let after = catalog_fingerprint(&open_db_readonly(&db_path)?)?;
-                let changed = catalog_changes(base.as_ref().expect("baseline set"), &after);
-                *base = Some(after);
-                *tick_pending.lock().expect("watch pending") = changed;
-            }
-            Ok(TickOutcome::from(tick))
         });
 
         let report_sink = reports.clone();
@@ -782,6 +809,10 @@ impl SessionStore {
     /// iterator promptly rather than holding it across a long-lived host
     /// loop. Each item is one row or the error that stopped the walk.
     pub fn sessions(&self, q: CatalogQuery) -> CatalogIter {
+        // `Some(vec![])` is an allowlist that admits nothing, which is not the
+        // same request as `None`; the internal filter spells "no filter" as
+        // an empty list, so the distinction has to be kept here.
+        let nothing_allowed = q.sources.as_ref().is_some_and(Vec::is_empty);
         let options = CatalogListOptions {
             scope: q.scope,
             sources: q
@@ -800,7 +831,7 @@ impl SessionStore {
             options,
             buffer: VecDeque::new(),
             cursor: None,
-            exhausted: false,
+            exhausted: nothing_allowed,
             snapshot_open: false,
         }
     }
@@ -831,6 +862,11 @@ impl SessionStore {
                 discover::catalog_row(&tx, name, session_id, include_text)
             }
             SessionRef::Path { path, .. } => {
+                // A path names one session only where the provider keeps one
+                // session per file. OpenCode's rows all carry the provider
+                // database as their locator, so a lookup by it would answer
+                // with whichever session sorts first — well-formed and wrong.
+                path_names_one_session(source)?;
                 discover::catalog_row_by_path(&tx, name, &path.to_string_lossy(), include_text)
             }
         }
@@ -938,6 +974,18 @@ impl SessionStore {
     }
 }
 
+/// Whether a [`SessionRef::Path`] can name exactly one session of `source`
+/// — the same rule for reading and for hydrating, with the same error.
+fn path_names_one_session(source: Source) -> Result<(), Error> {
+    if source.capabilities().hydrates_by_path {
+        return Ok(());
+    }
+    Err(Error::HydrationUnsupported(format!(
+        "{source} sessions cannot be named by path; known harnesses: {}",
+        HOOK_HARNESSES.join(", ")
+    )))
+}
+
 /// How often a held sync lock is re-tried while a caller's timeout runs.
 const SYNC_LOCK_RETRY: Duration = Duration::from_millis(100);
 
@@ -983,16 +1031,21 @@ pub struct SyncReport {
     /// the previous sweep's and nothing was opened; `changed` is then empty
     /// by construction.
     pub swept: bool,
-    /// Sessions whose catalog row was created or changed by this sweep.
+    /// Sessions whose catalog row was created or changed while this sweep
+    /// held the `SyncRunLock`.
     ///
-    /// Derived from the `sessions` table before and after the sweep, not
-    /// from the provider walk: every catalog column takes part except the
-    /// two bounded text excerpts (`first_prompt`, `last_assistant_text`), so
-    /// a new session, new activity, a moved source stamp or discovery state,
-    /// a re-resolved or inherited `project_key`, and a metadata field the
-    /// shallow read filled in are all changes here. A session whose only
-    /// change was inside a table the catalog row does not summarise is not
-    /// listed.
+    /// Derived from a digest of the `sessions` table taken after the lock was
+    /// acquired and again before it was released, not from the provider
+    /// walk: every catalog column takes part except the two bounded text
+    /// excerpts (`first_prompt`, `last_assistant_text`), so a new session,
+    /// new activity, a moved source stamp or discovery state, a re-resolved
+    /// or inherited `project_key`, and a metadata field the shallow read
+    /// filled in are all changes here. Another process's sync cannot be
+    /// counted — it holds the same lock — but a hydration writes the catalog
+    /// outside it, so a `hydrate` that lands during the sweep is included;
+    /// per-row attribution to one writer is what #179's `sessions.revision`
+    /// column is for. A session whose only change was inside a table the
+    /// catalog row does not summarise is not listed.
     pub changed: Vec<SessionRef>,
 }
 
@@ -1421,7 +1474,8 @@ pub struct CatalogQuery {
     /// Which presences to include. `Local` (the default) is what `ai-hist
     /// sessions list` shows; `All` adds sessions known only remotely.
     pub scope: SessionScope,
-    /// Restrict to these sources. `None` means every source.
+    /// Restrict to these sources. `None` means every source; `Some(vec![])`
+    /// is an allowlist that admits none and yields no rows.
     pub sources: Option<Vec<Source>>,
     /// Restrict to one canonical project identity, exactly as
     /// [`CatalogSession::project_key`] spells it.
@@ -2419,6 +2473,135 @@ mod tests {
             .unwrap();
         assert!(again.swept);
         assert!(again.changed.is_empty(), "{:?}", again.changed);
+    }
+
+    /// A catalog write that lands while `sync` is still waiting for another
+    /// holder's lock is not this sweep's change: the baseline is read after
+    /// the lock is taken.
+    #[cfg(unix)]
+    #[test]
+    fn changes_made_before_the_lock_was_taken_are_not_this_sweeps() {
+        use std::os::unix::io::AsRawFd;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ai-history.db");
+        let store = store_at(&db);
+        let holder = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.path().join("ai-history.db.sync.lock"))
+            .unwrap();
+        // SAFETY: `holder` owns the descriptor for the whole test.
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+        let waiting = std::thread::spawn({
+            let store = store.clone();
+            move || {
+                store.sync(SyncOptions {
+                    force: false,
+                    lock_timeout_ms: 10_000,
+                })
+            }
+        });
+        // While the sweep waits for the lock, another writer catalogs a
+        // session — a hydration, another host's discovery.
+        std::thread::sleep(Duration::from_millis(300));
+        open_db(&db)
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO sessions (session_id, source, discovery_state, last_activity_ms) \
+                 VALUES ('early', 'claude', 'full', 1)",
+            )
+            .unwrap();
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_UN) }, 0);
+        let report = waiting
+            .join()
+            .unwrap()
+            .expect("the lock was released in time");
+        assert!(report.swept);
+        assert!(
+            report.changed.is_empty(),
+            "a row written before this sweep held the lock is not its change: {:?}",
+            report.changed
+        );
+    }
+
+    /// A path names a session only for a source that keeps one session per
+    /// file; for the others the same reference is refused for reading as it
+    /// is for hydrating, rather than answering with whichever session shares
+    /// the locator.
+    #[test]
+    fn a_path_reference_is_refused_where_a_path_names_no_one_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ai-history.db");
+        let store = store_at(&db);
+        let opencode_db = dir.path().join("opencode.db");
+        open_db(&db)
+            .unwrap()
+            .execute(
+                "INSERT INTO sessions (session_id, source, discovery_state, raw_path) \
+                 VALUES ('a', 'opencode', 'full', ?1), ('b', 'opencode', 'full', ?1)",
+                [opencode_db.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+
+        let by_path = SessionRef::path(Source::OpenCode, &opencode_db);
+        let read = store
+            .session(&by_path, SessionQuery::default())
+            .unwrap_err();
+        assert_eq!(read.code(), "HYDRATION_UNSUPPORTED");
+        let hydrated = store
+            .hydrate(&by_path, HydrateOptions::default())
+            .unwrap_err();
+        assert_eq!(hydrated.code(), read.code(), "one rule, one error");
+        // Both sessions are still reachable the way the provider names them.
+        for id in ["a", "b"] {
+            assert!(store
+                .session(
+                    &SessionRef::id(Source::OpenCode, id),
+                    SessionQuery::default()
+                )
+                .unwrap()
+                .is_some());
+        }
+    }
+
+    /// `None` is every source; `Some(vec![])` is an allowlist that admits
+    /// none, and the two are not the same request.
+    #[test]
+    fn an_empty_source_allowlist_yields_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ai-history.db");
+        let store = store_at(&db);
+        open_db(&db)
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO sessions (session_id, source, discovery_state) \
+                 VALUES ('a', 'claude', 'full'), ('b', 'codex', 'full')",
+            )
+            .unwrap();
+        assert_eq!(store.sessions(CatalogQuery::default()).count(), 2);
+        assert_eq!(
+            store
+                .sessions(CatalogQuery {
+                    sources: Some(Vec::new()),
+                    ..CatalogQuery::default()
+                })
+                .count(),
+            0
+        );
+        assert_eq!(
+            store
+                .sessions(CatalogQuery {
+                    sources: Some(vec![Source::Codex]),
+                    ..CatalogQuery::default()
+                })
+                .count(),
+            1
+        );
     }
 
     /// `loaded` never names a kind the source cannot produce, whatever the

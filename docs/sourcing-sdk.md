@@ -92,8 +92,13 @@ asked for a sweep and got none is told.
 
 `SyncReport { swept, changed }`: `swept` is false when the fingerprint matched
 and nothing was opened. `changed` lists the `SessionRef`s whose catalog row was
-created or changed by the sweep, derived from a per-row digest of the
-`sessions` table before and after, not from the provider walk. Every catalog
+created or changed while the sweep held the lock, derived from a per-row
+digest of the `sessions` table taken after the lock was acquired and again
+before it was released, not from the provider walk — so a row another process
+wrote while this call was still waiting for the lock is not counted. Another
+sync cannot land inside the window (it needs the same lock); a hydration
+writes the catalog outside it, so one that lands during the sweep is included,
+and per-row attribution to one writer is what #179's revision column is for. Every catalog
 column takes part except the two bounded text excerpts (`first_prompt`,
 `last_assistant_text`): a new session, new activity, a moved source stamp or
 discovery state, a re-resolved or inherited `project_key`, a metadata field the
@@ -108,7 +113,11 @@ shallow read filled in. Once every catalog write stamps a revision
 `SessionRef::Path { source, path }` is the hook fast path: the transcript is
 read by locator before any catalog row exists, and it is accepted only for
 sources whose `SourceCapabilities::hydrates_by_path` is true (Claude Code
-today); the rest answer `Error::HydrationUnsupported`. `HydrateOptions {
+today); the rest answer `Error::HydrationUnsupported`. `session()` applies the
+same rule to a path reference: a path names one session only where the
+provider keeps one session per file, and OpenCode's rows all carry the provider
+database as their locator, so a lookup by it would answer with an arbitrary
+session rather than the one meant. `HydrateOptions {
 include_related }` (default `true`) also hydrates the bounded related
 transcripts beside the session — Claude subagent sidecars, Codex child rollouts
 — and never walks the rest of the provider root.
@@ -146,7 +155,8 @@ SQLite snapshot, taken at the first row and held until the iterator is dropped
 on separate snapshots would skip or repeat a session that moved across the
 cursor. A WAL reader blocks no writer but pins the WAL while it lives, so drain
 or drop the iterator promptly. `CatalogQuery { scope,
-sources, project_key, before_ms, page_size }`. `CatalogSession` is the typed
+sources, project_key, before_ms, page_size }` — `sources: None` is every
+source, `Some(vec![])` an allowlist that admits none and yields no rows. `CatalogSession` is the typed
 catalog row — `source: Source`, `project_key`, `discovery_state`, the
 provider-observed metadata — and `session_ref()` turns it into the reference
 `session` takes.

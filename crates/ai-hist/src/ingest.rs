@@ -236,22 +236,43 @@ fn capture_files(source: &'static str, files: Vec<PathBuf>) -> impl Iterator<Ite
 #[cfg(test)]
 pub(crate) fn sync_local_at_with_home(db_path: &Path, home: &Path) -> Result<bool> {
     let roots = crate::ProviderRoots::from_env(home.to_path_buf());
-    sync_facade_tick(db_path, &roots, false).map(|tick| tick.attempted)
+    SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
+    sync_exclusive_with_roots(db_path, &roots, false).map(|tick| tick.attempted)
 }
 
 /// One local sweep for [`crate::SessionStore`]: silent, against the store's
-/// resolved provider roots, forcing past the source fingerprint when asked.
+/// resolved provider roots, forcing past the source fingerprint when asked,
+/// with two reads bracketing the sweep **inside the locked section**.
 ///
-/// The facade reads the returned [`SyncTick`] rather than a boolean because
-/// it has to tell "another process holds the sync lock" apart from "nothing
-/// moved", and turn the former into an error instead of a silent no-op.
-pub(crate) fn sync_facade_tick(
+/// `before` runs once the `SyncRunLock` is held and before anything is
+/// written; `after` runs when the sweep has finished, on the same connection,
+/// still under the lock. That is what lets the facade say what *this* sweep
+/// changed: a baseline taken before the lock would also count whatever
+/// another sync wrote while this call waited for it. `None` means the lock
+/// was held elsewhere and nothing ran — the facade turns that into an error
+/// rather than a silent no-op.
+pub(crate) fn sync_facade_tick<B, R>(
     db_path: &Path,
     roots: &crate::ProviderRoots,
     force: bool,
-) -> Result<SyncTick> {
+    before: impl FnOnce(&Connection) -> Result<B>,
+    after: impl FnOnce(&Connection, B, SyncTick) -> Result<R>,
+) -> Result<Option<(SyncTick, R)>> {
     SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
-    sync_exclusive_with_roots(db_path, roots, force)
+    check_capture_cancelled()?;
+    let Some(_sync_lock) = try_acquire_sync_lock(db_path)? else {
+        return Ok(None);
+    };
+    let conn = open_db(db_path).map_err(|error| enrich_sync_error(db_path, error))?;
+    let baseline = before(&conn)?;
+    let swept = sync_basic(&conn, db_path, roots, force)
+        .map_err(|error| enrich_sync_error(db_path, error))?;
+    let tick = SyncTick {
+        attempted: true,
+        swept,
+    };
+    let outcome = after(&conn, baseline, tick)?;
+    Ok(Some((tick, outcome)))
 }
 
 /// One live-capture tick against an explicit provider home.
