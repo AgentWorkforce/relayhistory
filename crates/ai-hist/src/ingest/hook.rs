@@ -175,10 +175,6 @@ fn ingest_transcript_at_with_roots(
             return Err(error).with_context(|| format!("reading {}", transcript.display()))
         }
     }
-    // The payload comes from another process. Before the path is read as
-    // evidence it has to be inside the root that provider actually owns.
-    validate_provider_path(source, transcript, roots)?;
-
     let providers = shallow_providers();
     let provider = providers
         .iter()
@@ -186,24 +182,25 @@ fn ingest_transcript_at_with_roots(
         .find(|provider| provider.source() == source)
         .with_context(|| format!("INVALID_ARGUMENT: no local adapter for source '{source}'"))?;
 
-    let claude_snapshot = (source == "claude")
-        .then(|| ClaudeTranscriptSnapshot::open(transcript))
-        .transpose()?;
-    if claude_snapshot
-        .as_ref()
-        .is_some_and(ClaudeTranscriptSnapshot::is_subagent)
-    {
-        // A Claude sidecar carries its parent's sessionId, but it is evidence
-        // for a delegated child rather than a second transcript for the
-        // parent. Full-snapshot classification is authoritative here: bounded
-        // shallow discovery can miss the sidechain rows when they occur only
-        // in the middle and would otherwise register the parent at this path.
-        return Ok(TranscriptIngest::short(
-            source,
+    // The payload comes from another process. Claude binds validation to the
+    // already-opened handle before reading it, closing the path-replacement
+    // window between a canonical-path check and a later open. Providers that
+    // do not use the snapshot path keep the ordinary pre-read validation.
+    let claude_snapshot = if source == "claude" {
+        Some(ClaudeTranscriptSnapshot::open_checked(
             transcript,
-            TranscriptStatus::Unidentified,
-        ));
-    }
+            |opened| {
+                validate_provider_path(source, transcript, roots)?;
+                validate_opened_file_identity(transcript, opened)
+            },
+        )?)
+    } else {
+        validate_provider_path(source, transcript, roots)?;
+        None
+    };
+    let claude_sidecar = claude_snapshot
+        .as_ref()
+        .is_some_and(ClaudeTranscriptSnapshot::is_subagent);
     let candidate = if let Some(snapshot) = claude_snapshot.as_ref() {
         Candidate {
             source: provider.source(),
@@ -212,19 +209,30 @@ fn ingest_transcript_at_with_roots(
             // identity. Supplying it on the candidate prevents discovery from
             // accepting a same-stamp row previously cached for this locator
             // under Claude's filename fallback.
-            session_id: snapshot.session_id(),
+            session_id: (!claude_sidecar).then(|| snapshot.session_id()).flatten(),
             recency_hint_ms: snapshot.modified_ms,
             stamp: snapshot.stamp.clone(),
         }
     } else {
         candidate_for(provider.source(), transcript)?
     };
-    let mut preloaded = claude_snapshot
-        .as_ref()
-        .map(|snapshot| {
-            crate::discover::claude_shallow_session_from_bytes(&candidate, snapshot.text.as_bytes())
-        })
-        .transpose()?;
+    let mut preloaded = if claude_sidecar {
+        // Feed the full-snapshot classification through discovery rather than
+        // returning early: discovery records this exact stamp as a known
+        // non-session, so the next sweep cannot resurrect the sidecar through
+        // a bounded filename fallback.
+        Some(None)
+    } else {
+        claude_snapshot
+            .as_ref()
+            .map(|snapshot| {
+                crate::discover::claude_shallow_session_from_bytes(
+                    &candidate,
+                    snapshot.text.as_bytes(),
+                )
+            })
+            .transpose()?
+    };
     if let (Some(Some(session)), Some(snapshot)) = (&mut preloaded, claude_snapshot.as_ref()) {
         if let Some(session_id) = snapshot.session_id() {
             // Shallow discovery intentionally examines bounded head/tail
@@ -247,6 +255,29 @@ fn ingest_transcript_at_with_roots(
     {
         let conn = open_db(db_path)?;
         let env = DiscoveryEnv::with_provider_roots(&conn, roots.clone());
+        if claude_sidecar {
+            let authoritative_parent = claude_snapshot
+                .as_ref()
+                .and_then(ClaudeTranscriptSnapshot::session_id)
+                .expect("classified Claude sidecar has a parent identity");
+            remove_disproved_claude_filename_alias(
+                &conn,
+                source,
+                transcript,
+                &authoritative_parent,
+            )?;
+            discover_sessions_with_provider_refs(
+                &env,
+                &DiscoverOptions::default(),
+                &[&single],
+                |_| {},
+            )?;
+            return Ok(TranscriptIngest::short(
+                source,
+                transcript,
+                TranscriptStatus::Unidentified,
+            ));
+        }
         // Read before anything is written. The payload says which session
         // fired *and* which file holds it, and those are two claims: a
         // delayed or replayed hook can pair a live session id with a

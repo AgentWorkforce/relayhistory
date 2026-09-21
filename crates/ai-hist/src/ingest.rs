@@ -6266,7 +6266,16 @@ pub(crate) struct ClaudeTranscriptSnapshot {
 }
 
 impl ClaudeTranscriptSnapshot {
+    #[cfg(test)]
     pub(crate) fn open(path: &Path) -> Result<Self> {
+        Self::open_checked(path, |_| Ok(()))
+    }
+
+    /// Open once, validate that exact handle, and only then read its bytes.
+    pub(crate) fn open_checked(
+        path: &Path,
+        validate: impl FnOnce(&fs::Metadata) -> Result<()>,
+    ) -> Result<Self> {
         let mut file = fs::File::open(path)
             .with_context(|| format!("opening Claude transcript {}", path.display()))?;
         let metadata = file.metadata()?;
@@ -6275,6 +6284,7 @@ impl ClaudeTranscriptSnapshot {
             "{} is not a regular file",
             path.display()
         );
+        validate(&metadata)?;
         let mut text = String::with_capacity(metadata.len() as usize);
         file.read_to_string(&mut text)
             .with_context(|| format!("reading Claude transcript {}", path.display()))?;
@@ -6310,6 +6320,43 @@ impl ClaudeTranscriptSnapshot {
             })
             .count() as i64
     }
+}
+
+/// Confirm that a validated pathname still names the file handle already
+/// opened for a Claude snapshot.
+///
+/// The hook validates the path between `open` and `read`; matching filesystem
+/// identity binds that validation to the handle, so swapping a symlink or a
+/// directory entry cannot redirect the later read outside the provider root.
+pub(crate) fn validate_opened_file_identity(path: &Path, opened: &fs::Metadata) -> Result<()> {
+    let current = fs::metadata(path)
+        .with_context(|| format!("checking opened Claude transcript {}", path.display()))?;
+    anyhow::ensure!(
+        same_file_identity(opened, &current),
+        "Claude transcript changed while its provider path was validated: {}",
+        path.display()
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(windows)]
+fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    left.volume_serial_number() == right.volume_serial_number()
+        && left.file_index() == right.file_index()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.len() == right.len()
+        && left.modified().ok() == right.modified().ok()
+        && left.created().ok() == right.created().ok()
 }
 
 fn file_stamp(path: &Path) -> Result<String> {
@@ -8800,6 +8847,31 @@ mod tests {
         };
         assert!(count("opened") > 0);
         assert_eq!(count("replacement"), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_claude_snapshot_rejects_replacement_between_open_and_validation() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside.jsonl");
+        let allowed = dir.path().join("allowed.jsonl");
+        let link = dir.path().join("session.jsonl");
+        fs::write(&outside, r#"{"sessionId":"outside"}"#).unwrap();
+        fs::write(&allowed, r#"{"sessionId":"allowed"}"#).unwrap();
+        symlink(&outside, &link).unwrap();
+
+        let error = ClaudeTranscriptSnapshot::open_checked(&link, |opened| {
+            fs::remove_file(&link)?;
+            symlink(&allowed, &link)?;
+            validate_opened_file_identity(&link, opened)
+        })
+        .expect_err("a replacement after open must not redirect the validated handle");
+
+        assert!(error
+            .to_string()
+            .contains("changed while its provider path"));
     }
 
     /// `TRAJECTORY_ROOT=trajectory.json` is a legal setting, and a relative

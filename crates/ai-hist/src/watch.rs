@@ -351,6 +351,14 @@ impl WatchInner {
         self.wake_cv.notify_all();
     }
 
+    fn report_error(&self, error: &anyhow::Error) {
+        if let Some(sink) = &self.on_error {
+            sink(error);
+        } else {
+            eprintln!("ai-hist: watch failed: {error:#}");
+        }
+    }
+
     /// Block until a change signal arrives, `timeout` elapses, or the loop is
     /// stopped. A change signal is followed by the debounce window, so further
     /// events landing inside it roll into the same tick.
@@ -518,11 +526,7 @@ impl WatchInner {
                 forced && outcome.contended
             }
             Err(error) => {
-                if let Some(sink) = &self.on_error {
-                    sink(&error);
-                } else {
-                    eprintln!("ai-hist: watch tick failed: {error:#}");
-                }
+                self.report_error(&error);
                 // A sweep that failed covered nothing, exactly as a contended
                 // one covered nothing, and the change it was for is recorded
                 // nowhere else: the wake state was cleared when the debounce
@@ -705,10 +709,16 @@ impl WatchLoop {
         {
             let inner = self.inner.clone();
             let lost = self.inner.clone();
+            let failed = self.inner.clone();
             fs_events::attach(
                 &self.roots,
                 move || inner.signal_change(),
                 move || lost.signal_registration_lost(),
+                move |error| {
+                    failed.report_error(&anyhow::anyhow!(
+                        "filesystem watcher backend failed: {error}"
+                    ))
+                },
             )
             .ok()
         } else {
@@ -1035,6 +1045,29 @@ mod fs_events {
             .collect()
     }
 
+    pub(super) fn handle_backend_error(
+        error: anyhow::Error,
+        roots: &Mutex<Vec<WatchRoot>>,
+        stale: &Mutex<HashSet<PathBuf>>,
+        on_registration_lost: &dyn Fn(),
+        on_error: &dyn Fn(anyhow::Error),
+    ) {
+        let registration_keys = roots
+            .lock()
+            .expect("watch roots")
+            .iter()
+            .map(|root| root.registration_key().to_path_buf())
+            .collect::<Vec<_>>();
+        if !registration_keys.is_empty() {
+            stale
+                .lock()
+                .expect("stale roots")
+                .extend(registration_keys);
+            on_registration_lost();
+        }
+        on_error(error);
+    }
+
     /// Holds the OS-level watches open; dropping it stops them.
     ///
     /// Roots that did not exist at attach time stay in `pending` rather than
@@ -1235,6 +1268,7 @@ mod fs_events {
         roots: &[WatchRoot],
         on_change: impl Fn() + Send + 'static,
         on_registration_lost: impl Fn() + Send + 'static,
+        on_error: impl Fn(anyhow::Error) + Send + 'static,
     ) -> Result<FsWatch> {
         // The callback has to be able to see the roots to enforce their depth,
         // and `retry_pending` adds to that set later, so it is shared rather
@@ -1245,8 +1279,23 @@ mod fs_events {
         let stale: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
         let stale_for_events = stale.clone();
         let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-            let Ok(event) = event else {
-                return;
+            let event = match event {
+                Ok(event) => event,
+                Err(error) => {
+                    // A backend error means its coverage can no longer be
+                    // trusted, even when it cannot name the failed root. Mark
+                    // every registration stale and wake reconciliation; the
+                    // polling backstop remains active while reattachment is
+                    // attempted on the short recovery cadence.
+                    handle_backend_error(
+                        error.into(),
+                        &depth_for_events,
+                        &stale_for_events,
+                        &on_registration_lost,
+                        &on_error,
+                    );
+                    return;
+                }
             };
             // Metadata churn — an atime bump from a backup or an antivirus
             // scan — does not change the bytes a sweep would read. Filtering
@@ -1443,6 +1492,7 @@ mod fs_events {
         _roots: &[WatchRoot],
         _on_change: impl Fn() + Send + 'static,
         _on_registration_lost: impl Fn() + Send + 'static,
+        _on_error: impl Fn(anyhow::Error) + Send + 'static,
     ) -> Result<FsWatch> {
         anyhow::bail!("ai-hist was built without the fs-events feature")
     }
@@ -1497,6 +1547,43 @@ mod tests {
         ))
         .add_path(PathBuf::from("/home/u/unrelated"));
         assert!(!fs_events::event_matches_evidence(&outside, &roots));
+    }
+
+    #[cfg(feature = "fs-events")]
+    #[test]
+    fn a_backend_error_marks_every_registration_stale_and_reports_it() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let first = PathBuf::from("/home/u/.claude/projects");
+        let second = PathBuf::from("/home/u/.codex/sessions");
+        let roots = Mutex::new(vec![
+            WatchRoot::tree(first.clone()),
+            WatchRoot::tree(second.clone()),
+        ]);
+        let stale = Mutex::new(HashSet::new());
+        let lost = AtomicUsize::new(0);
+        let errors = Mutex::new(Vec::new());
+
+        fs_events::handle_backend_error(
+            anyhow::anyhow!("backend rescan lost"),
+            &roots,
+            &stale,
+            &|| {
+                lost.fetch_add(1, Ordering::SeqCst);
+            },
+            &|error| errors.lock().unwrap().push(error.to_string()),
+        );
+
+        assert_eq!(lost.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *stale.lock().unwrap(),
+            HashSet::from([first, second]),
+            "unknown backend coverage loss must make every root reconcile"
+        );
+        assert_eq!(
+            errors.lock().unwrap().as_slice(),
+            ["backend rescan lost"]
+        );
     }
 
     #[cfg(feature = "fs-events")]

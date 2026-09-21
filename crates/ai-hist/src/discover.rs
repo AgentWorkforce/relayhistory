@@ -981,6 +981,26 @@ fn keep_complete_lines(buffer: &mut Vec<u8>) {
     }
 }
 
+/// Keep newline-terminated records plus a parseable final object.
+///
+/// Used only for bytes already captured by a hook through one immutable file
+/// handle. A live bounded read still drops its trailing line because the
+/// harness may be writing it concurrently; once the snapshot is complete, a
+/// valid final JSON object is evidence even when the producer omitted `\n`.
+fn keep_snapshot_records(buffer: &mut Vec<u8>) {
+    if buffer.ends_with(b"\n") {
+        return;
+    }
+    let final_start = buffer
+        .iter()
+        .rposition(|&byte| byte == b'\n')
+        .map_or(0, |newline| newline + 1);
+    if parse_record(&buffer[final_start..]).is_some_and(|value| value.is_object()) {
+        return;
+    }
+    keep_complete_lines(buffer);
+}
+
 fn trimmed_record(line: &[u8]) -> Option<&[u8]> {
     let mut line = line;
     while let [rest @ .., last] = line {
@@ -1097,7 +1117,7 @@ fn read_bounded_jsonl(scan: &ScanEnv<'_>, path: &Path) -> Result<BoundedJsonl> {
 fn bounded_jsonl_from_bytes(bytes: &[u8]) -> BoundedJsonl {
     if bytes.len() as u64 <= HEAD_SCAN_MAX_BYTES {
         let mut head = bytes.to_vec();
-        keep_complete_lines(&mut head);
+        keep_snapshot_records(&mut head);
         return BoundedJsonl {
             head,
             tail: Vec::new(),
@@ -1113,7 +1133,7 @@ fn bounded_jsonl_from_bytes(bytes: &[u8]) -> BoundedJsonl {
     } else {
         tail.clear();
     }
-    keep_complete_lines(&mut tail);
+    keep_snapshot_records(&mut tail);
     BoundedJsonl { head, tail }
 }
 

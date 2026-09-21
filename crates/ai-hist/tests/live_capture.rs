@@ -2761,6 +2761,7 @@ fn a_hook_ignores_a_cached_filename_identity_when_the_snapshot_proves_another() 
 #[test]
 fn a_hook_never_registers_a_sparse_subagent_sidecar_as_its_parent() {
     let home = tempfile::tempdir().expect("tempdir");
+    let layout = HomeLayout::under(home.path());
     let sidecars = home.path().join(".claude/projects/proj/parent/subagents");
     std::fs::create_dir_all(&sidecars).expect("create sidecar directory");
     let transcript = sidecars.join("agent-child.jsonl");
@@ -2795,6 +2796,61 @@ fn a_hook_never_registers_a_sparse_subagent_sidecar_as_its_parent() {
     assert_eq!(report.session_id, None);
     assert_eq!(catalog_session_count(&db, "claude", "parent"), 0);
     assert_eq!(session_event_count(&db, "parent"), 0);
+
+    // The hook must also bank the full-scan classification as a discovery
+    // skip. Otherwise the next bounded pass sees neither the middle sidechain
+    // marker nor a cached non-session stamp and resurrects the filename as a
+    // real session.
+    {
+        let conn = ai_hist::open_db(&db).expect("open db");
+        let env = DiscoveryEnv::with_all_roots(
+            &conn,
+            layout.home.clone(),
+            layout.claude.clone(),
+            layout.codex.clone(),
+            layout.grok.clone(),
+            layout.opencode_db.clone(),
+        );
+        ai_hist::discover::discover_sessions_with_env(
+            &env,
+            &ai_hist::discover::DiscoverOptions {
+                sources: vec!["claude".into()],
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .expect("discover after sidecar hook");
+    }
+    assert_eq!(catalog_session_count(&db, "claude", "agent-child"), 0);
+    assert_eq!(catalog_session_count(&db, "claude", "parent"), 0);
+}
+
+#[test]
+fn a_hook_accepts_one_complete_claude_record_without_a_trailing_newline() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let project = home.path().join(".claude/projects/proj");
+    std::fs::create_dir_all(&project).expect("create project");
+    let transcript = project.join("unterminated.jsonl");
+    std::fs::write(
+        &transcript,
+        r#"{"sessionId":"no-newline","uuid":"one","type":"user","timestamp":"2026-09-20T00:00:00.000Z","message":{"role":"user","content":"complete JSON"}}"#,
+    )
+    .expect("write transcript");
+    let db = home.path().join("history.db");
+
+    let report = ai_hist::ingest_transcript_at_with_home(
+        &db,
+        home.path(),
+        "claude",
+        &transcript,
+        Some("no-newline"),
+        true,
+    )
+    .expect("hook ingest");
+
+    assert_eq!(report.status, ai_hist::TranscriptStatus::Ingested);
+    assert_eq!(report.session_id.as_deref(), Some("no-newline"));
+    assert_eq!(session_event_count(&db, "no-newline"), 1);
 }
 
 #[test]
