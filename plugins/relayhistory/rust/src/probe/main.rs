@@ -123,6 +123,7 @@ impl std::error::Error for UserError {}
 fn user_error(message: &'static str) -> anyhow::Error {
     UserError(message).into()
 }
+/// Dispatch probe commands and report only explicitly safe user-facing errors.
 fn main() {
     let cli = Cli::parse();
     bridge::set_json(cli.json);
@@ -131,6 +132,8 @@ fn main() {
         if let Some(safe) = error.downcast_ref::<UserError>() {
             eprintln!("{safe}");
         } else if let Some(safe) = error.downcast_ref::<cloud::CloudAuthError>() {
+            eprintln!("{safe}");
+        } else if let Some(safe) = collector::local_failure_message(&error) {
             eprintln!("{safe}");
         } else {
             eprintln!("Probe could not finish. Check your connection and run setup again. Credentials and session content were not logged.");
@@ -406,25 +409,27 @@ fn install(options: Install) -> Result<()> {
         );
     }
     let db_path = directory.join("history.db");
-    humanln!("Preparing local session capture…");
-    collector::capture(&directory, &history_url)?;
-    let conn = ai_hist::open_db(&db_path)?;
+    if sharing_mode != bridge::SharingMode::Selected {
+        humanln!("Preparing local session capture…");
+        collector::capture(&directory, &history_url)?;
+    }
+    let conn = relayhistory_plugin::delivery::open_db(&db_path)?;
     let config = match existing {
         Some(mut config) => {
             config.acknowledge_uninspected_schedules = options.acknowledge_uninspected_schedules;
             save_json(&directory.join("config.json"), &config)?;
-            let job = ai_hist::delivery::status(&conn, &config.job_id)?;
+            let job = relayhistory_plugin::delivery::status(&conn, &config.job_id)?;
             ensure!(
                 job.config.account_id == account,
                 "invalid saved delivery account"
             );
             if job.state == "blocked" && options.force_login {
-                ai_hist::delivery::retry_job(&conn, &config.job_id)?;
+                relayhistory_plugin::delivery::retry_job(&conn, &config.job_id)?;
             }
             config
         }
         None => {
-            let job_config = ai_hist::delivery::DeliveryJobConfig {
+            let job_config = relayhistory_plugin::delivery::DeliveryJobConfig {
                 destination_id: "relayhistory".into(),
                 instance_id: "teams-probe".into(),
                 account_id: account.clone(),
@@ -435,7 +440,7 @@ fn install(options: Install) -> Result<()> {
             // A generation outlives an interrupted setup: create_job commits
             // before config.json is written. Adopt that job instead of recording
             // a second baseline behind a generation nothing can reach.
-            let adopted = ai_hist::delivery::list_jobs(&conn)?
+            let adopted = relayhistory_plugin::delivery::list_jobs(&conn)?
                 .into_iter()
                 .find(|job| {
                     job.state != "cancelled"
@@ -459,8 +464,22 @@ fn install(options: Install) -> Result<()> {
                 None => {
                     // No generation to inherit a baseline from, so the exclusion
                     // table has to be brought in line with this choice first.
-                    collector::record_baseline(&conn, include_existing)?;
-                    ai_hist::delivery::create_job(&conn, &job_config, collector::now())?.job_id
+                    if sharing_mode == bridge::SharingMode::Selected {
+                        relayhistory_plugin::delivery::create_session_job(
+                            &conn,
+                            &job_config,
+                            collector::now(),
+                        )?
+                        .job_id
+                    } else {
+                        collector::record_baseline(&conn, include_existing)?;
+                        relayhistory_plugin::delivery::create_job(
+                            &conn,
+                            &job_config,
+                            collector::now(),
+                        )?
+                        .job_id
+                    }
                 }
             };
             let config = Config {
@@ -485,7 +504,7 @@ fn install(options: Install) -> Result<()> {
     // Desktop setup becomes ready after capture/credentials; the supervised
     // collector handles delivery and offline retries without blocking login.
     if options.once || !bridge::json_mode() {
-        collector::deliver_captured(&directory, &config, true)?;
+        collector::finish_setup(&directory, &config, options.once)?;
     }
     if options.once {
         humanln!("One capture/delivery cycle completed.");

@@ -12,7 +12,7 @@ path = "src/probe/main.rs"
 [workspace]
 
 [dependencies]
-ai-hist = { path = "../../../crates/ai-hist", features = ["delivery", "opencode-backup", "git-hooks", "unstable-internal"] }
+ai-hist = { path = "../../../crates/ai-hist", features = ["export", "opencode-backup", "git-hooks", "unstable-internal"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 atomicwrites = "0.4"
@@ -27,3 +27,6 @@ sha2 = "0.10"
 tempfile = "3"
 ureq = { version = "2", features = ["json"] }
 url = "2"
+
+[dev-dependencies]
+rusqlite = { version = "0.32", features = ["hooks"] }

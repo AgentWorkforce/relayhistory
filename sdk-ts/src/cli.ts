@@ -729,9 +729,8 @@ export const COMMANDS = new Map<string, CommandSpec>([
     retry: 'Clear a delivery job\'s failure and try it again.',
     cancel: 'Abandon a delivery job.',
   }) as Array<[string, string]>).map(([action, description]): [string, CommandSpec] => [`delivery ${action}`, {
-    name: `delivery ${action}`, description, surface: ['delivery', action],
+    name: `delivery ${action}`, description: `${description} Moved to agent-relay-probe / @relayhistory/capture.`, surface: ['delivery', action],
     positionals: [0, 0], allowed: ['db', 'config', 'job', 'poll-ms', 'timeout-ms'],
-    cancellable: true,
   }]),
   ['sessions list', { name: 'sessions list', description: 'List indexed sessions from the catalogue.',
     surface: ['list'], positionals: [0, 0], readsLocalStore: true,

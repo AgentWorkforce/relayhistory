@@ -1,6 +1,6 @@
 //! Versioned one-request bridge. Errors never serialize remote bodies or credentials.
+use crate::delivery::worker::{Receiver, ReceiverContext, ReceiverFailure};
 use crate::{cloud, replay};
-use ai_hist::delivery::worker::{Receiver, ReceiverContext, ReceiverFailure};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -17,12 +17,14 @@ pub struct Request {
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Arguments {
+    pub delivery_request: Option<Value>,
+    pub drain_options: Option<crate::delivery::rpc::DrainRequest>,
     pub connector_id: Option<String>,
     pub connector_instance: Option<String>,
     pub state: Option<serde_json::Map<String, Value>>,
     pub read_options: Option<crate::destination::ReadOptions>,
-    pub batch: Option<ai_hist::delivery::HistoryExportBatch>,
-    pub prepared: Option<ai_hist::delivery::PreparedPayload>,
+    pub batch: Option<crate::delivery::HistoryExportBatch>,
+    pub prepared: Option<crate::delivery::PreparedPayload>,
     pub expected_account: Option<String>,
     pub instance_id: Option<String>,
     pub acknowledge_uninspected_schedules: Option<bool>,
@@ -87,6 +89,44 @@ fn execute(request: Request) -> Result<Value> {
                 .context("state required; preserve the previous relay cursor map")?;
             let inserted = crate::relaycast::sync_relaycast(&conn, &mut state)?;
             json!({"inserted":inserted,"state":state,"capability":"legacy-incremental-history"})
+        }
+        "probeDelivery" => crate::delivery::rpc::request(
+            Path::new(
+                a.db_path
+                    .as_deref()
+                    .context("INVALID_ARGUMENT: dbPath required")?,
+            ),
+            a.delivery_request
+                .context("INVALID_ARGUMENT: deliveryRequest required")?,
+        )?,
+        "probeDeliveryDrain" => {
+            let instance = a
+                .instance_id
+                .context("INVALID_ARGUMENT: instanceId required")?;
+            let receiver = crate::destination::RelayHistoryReceiver {
+                base_url: a.base_url,
+                expected_account: Some(
+                    a.expected_account
+                        .context("INVALID_ARGUMENT: expectedAccount required")?,
+                ),
+                instance_id: Some(instance.clone()),
+                acknowledge_uninspected_schedules: a
+                    .acknowledge_uninspected_schedules
+                    .unwrap_or(false),
+            };
+            let receivers =
+                crate::delivery::worker::SingleReceiver::new("relayhistory", instance, &receiver);
+            serde_json::to_value(crate::delivery::worker::drain(
+                Path::new(
+                    a.db_path
+                        .as_deref()
+                        .context("INVALID_ARGUMENT: dbPath required")?,
+                ),
+                &receivers,
+                &a.drain_options.unwrap_or_default().options(),
+                &crate::delivery::worker::system_clock,
+                &|| false,
+            )?)?
         }
         "deliveryMigrationStatus" => serde_json::to_value(crate::migration::status())?,
         "deliveryRead" => serde_json::to_value(crate::destination::read_page(
@@ -203,6 +243,10 @@ pub fn handle(request: Request) -> Value {
     if request.version != 1 {
         return json!({"version":1,"ok":false,"error":{"code":"INVALID_ARGUMENT","message":"Unsupported helper protocol version"}});
     }
+    let probe_delivery = matches!(
+        request.operation.as_str(),
+        "probeDelivery" | "probeDeliveryDrain"
+    );
     let code = match request.operation.as_str() {
         "discover" | "relaycastSync" => "CONNECTOR_FAILURE",
         "accessToken" => "CLOUD_AUTH_FAILED",
@@ -221,8 +265,81 @@ pub fn handle(request: Request) -> Value {
             let code = error
                 .downcast_ref::<crate::destination::TransportFailure>()
                 .map(|error| error.code())
-                .unwrap_or(code);
+                .unwrap_or_else(|| {
+                    if probe_delivery {
+                        delivery_error_code(&error)
+                    } else {
+                        code
+                    }
+                });
             json!({"version":1,"ok":false,"error":{"code":code,"message":"RelayHistory operation failed; verify the selected stage, credentials and connectivity"}})
         }
+    }
+}
+
+// Classify only recognized categories; never serialize the underlying error.
+fn delivery_error_code(error: &anyhow::Error) -> &'static str {
+    if crate::delivery::is_retention_limit(error) {
+        "DELIVERY_RETENTION_LIMIT"
+    } else if error
+        .chain()
+        .any(|cause| cause.to_string().starts_with("INVALID_ARGUMENT:"))
+    {
+        "INVALID_ARGUMENT"
+    } else {
+        "DELIVERY_STATE_FAILED"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reply(operation: &str, args: Value) -> Value {
+        handle(
+            serde_json::from_value(json!({"version":1,"operation":operation,"args":args})).unwrap(),
+        )
+    }
+
+    #[test]
+    fn probe_delivery_errors_preserve_categories_without_private_details() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("private-session-path.db");
+        let malformed = reply(
+            "probeDelivery",
+            json!({"dbPath":path,"deliveryRequest":{"operation":"private-invalid-operation"}}),
+        );
+        assert_eq!(malformed["error"]["code"], "INVALID_ARGUMENT");
+        assert!(!malformed.to_string().contains("private-invalid-operation"));
+        assert_eq!(
+            reply("probeDelivery", json!({}))["error"]["code"],
+            "INVALID_ARGUMENT"
+        );
+        let state = reply(
+            "probeDelivery",
+            json!({"dbPath":path,"deliveryRequest":{"operation":"status","job_id":"private-session-id"}}),
+        );
+        assert_eq!(state["error"]["code"], "DELIVERY_STATE_FAILED");
+        assert!(!state.to_string().contains("private-session-id"));
+        let drain = json!({"dbPath":path,"instanceId":"fixture","expectedAccount":"fixture","drainOptions":{"leaseMs":0}});
+        assert_eq!(
+            reply("probeDeliveryDrain", drain)["error"]["code"],
+            "INVALID_ARGUMENT"
+        );
+        for operation in ["probeDelivery", "probeDeliveryDrain"] {
+            let args = json!({"dbPath":temp.path(),"instanceId":"fixture","expectedAccount":"fixture","deliveryRequest":{"operation":"list_jobs"}});
+            let result = reply(operation, args);
+            assert_eq!(result["error"]["code"], "DELIVERY_STATE_FAILED");
+            assert!(!result.to_string().contains(temp.path().to_str().unwrap()));
+        }
+        // An actual SQLite trigger error exercises the retention classifier through the helper.
+        let conn = crate::delivery::open_db(&path).unwrap();
+        conn.execute_batch("CREATE TRIGGER synthetic_retention BEFORE UPDATE ON delivery_state BEGIN SELECT RAISE(ABORT, 'delivery retention limit exceeded; private diagnostic'); END;").unwrap();
+        let result = reply(
+            "probeDelivery",
+            json!({"dbPath":path,"deliveryRequest":{"operation":"set_retention_limit","max_bytes":268435456}}),
+        );
+        assert_eq!(result["error"]["code"], "DELIVERY_RETENTION_LIMIT");
+        assert!(!result.to_string().contains("private diagnostic"));
     }
 }

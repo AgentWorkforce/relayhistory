@@ -13,6 +13,6 @@ fn main() -> Result<(), ai_hist::Error> {
 }
 ```
 
-Default features expose `SessionStore`, evidence structs, `Source`, and `Error`. Optional features: `delivery`, `opencode-backup`, `git-hooks`. Workspace crates enable `unstable-internal` for connection-level maintenance APIs.
+Default features expose `SessionStore`, evidence structs, `Source`, and `Error`. Optional features: `export` (consistent snapshots and change capture), `opencode-backup`, `git-hooks`. The legacy `delivery` feature aliases `export`; upload jobs and workers are owned by the probe package, `plugins/relayhistory/rust`. Workspace crates enable `unstable-internal` for connection-level maintenance APIs.
 
 See the [repository README](https://github.com/AgentWorkforce/relayhistory) for CLI and Node usage.

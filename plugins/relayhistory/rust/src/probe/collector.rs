@@ -1,6 +1,6 @@
 use super::{lock, read_config, save_json, user_error, Config};
-use ai_hist::delivery::{self, worker, ExportSelection};
 use anyhow::{ensure, Context, Result};
+use relayhistory_plugin::delivery::{self, worker, ExportSelection};
 use relayhistory_plugin::destination;
 use rusqlite::Connection;
 use serde_json::json;
@@ -193,47 +193,297 @@ fn capture_with_stop(
     history_url: &str,
     cancelled: Arc<AtomicBool>,
 ) -> Result<()> {
+    let started = Instant::now();
     let progress = super::progress::Monitor::start(directory, history_url, None, false);
+    let latest = Arc::new(std::sync::Mutex::new(ai_hist::CaptureProgress::default()));
+    let seen = latest.clone();
+    let observer = progress.observer();
     let result = ai_hist::sync_local_at_cancellable(
         &directory.join("history.db"),
-        progress.observer(),
+        move |value| {
+            if let Ok(mut last) = seen.lock() {
+                *last = value.clone();
+            }
+            observer(value);
+        },
         move || stopping(&cancelled),
     );
     progress.finish(matches!(result, Ok(true)));
+    capture_diagnostic(
+        directory,
+        "broad_capture",
+        started,
+        0,
+        usize::from(!matches!(result, Ok(true))),
+        result.as_ref().err(),
+    )?;
+    if let Err(error) = &result {
+        let last = latest.lock().ok();
+        let source = last
+            .as_ref()
+            .map(|v| v.source.as_str())
+            .filter(|s| ai_hist::SOURCE_CHOICES.contains(s))
+            .unwrap_or("unknown");
+        let value = json!({"operation":"capture","stage":"broad_capture","source":source,"processed_files":last.as_ref().map(|v|v.processed_files).unwrap_or(0),"elapsed_ms":started.elapsed().as_millis(),"error_class":capture_error_class(error)});
+        save_json(&directory.join("capture-diagnostic.json"), &value)?;
+        eprintln!("{value}");
+    }
+    if matches!(result, Ok(false)) {
+        save_json(
+            &directory.join("capture-diagnostic.json"),
+            &json!({"operation":"capture","stage":"broad_capture","elapsed_ms":started.elapsed().as_millis(),"outcome":"lock_contended","error_class":"capture_not_started"}),
+        )?;
+    }
     ensure!(result?, "capture not complete");
     Ok(())
 }
 
 #[cfg(test)]
 pub fn cycle(directory: &Path, config: &Config) -> Result<()> {
-    cycle_with_stop(directory, config, Arc::new(AtomicBool::new(false)))
+    cycle_with_stop(directory, config, Arc::new(AtomicBool::new(false)), false)
 }
 
-fn cycle_with_stop(directory: &Path, config: &Config, cancelled: Arc<AtomicBool>) -> Result<()> {
-    let paused = {
-        let conn = ai_hist::open_db(&directory.join("history.db"))?;
-        delivery::status(&conn, &config.job_id)?.state == "paused"
-    };
-    if paused {
-        // Another sync owns capture when this returns false. The paused
-        // collector can retry next cycle without reporting an offline error.
-        let stop = cancelled.clone();
-        ai_hist::sync_local_at_cancellable(
-            &directory.join("history.db"),
-            |_| {},
-            move || stopping(&stop),
-        )?;
-    } else {
-        ensure!(
-            destination::selected_account(Some(&config.history_url))? == config.delivery_account,
-            "wrong destination"
-        );
-        capture_with_stop(directory, &config.history_url, cancelled.clone())?;
-    }
-    if stopping(&cancelled) {
+fn cycle_with_stop(
+    directory: &Path,
+    config: &Config,
+    cancelled: Arc<AtomicBool>,
+    before_exit: bool,
+) -> Result<()> {
+    super::bridge::enforce_selection(directory, config)?;
+    let conn = relayhistory_plugin::delivery::open_db(&directory.join("history.db"))?;
+    let status = delivery::status(&conn, &config.job_id)?;
+    let selected = super::bridge::mode(config) == super::bridge::SharingMode::Selected;
+    if status.state == "paused" {
+        if !selected {
+            let stop = cancelled.clone();
+            ai_hist::sync_local_at_cancellable(
+                &directory.join("history.db"),
+                |_| {},
+                move || stopping(&stop),
+            )?;
+        }
         return Ok(());
     }
-    deliver_captured_with_stop(directory, config, false, &cancelled)
+    run_capture_cycle(
+        selected,
+        || deliver_captured_with_stop(directory, config, before_exit, &cancelled),
+        || ready_to_capture(&conn, &config.job_id),
+        || capture_selected(directory, config, &cancelled),
+        || capture_with_stop(directory, &config.history_url, cancelled.clone()),
+        || stopping(&cancelled),
+    )
+}
+
+fn ready_to_capture(conn: &Connection, job_id: &str) -> Result<bool> {
+    let status = delivery::status(conn, job_id)?;
+    // A retry deadline means delivery cannot progress yet. Keep capturing
+    // locally while offline rather than waiting for the remote queue to clear.
+    Ok(status.next_attempt_ms > now()
+        || (status.bootstrap_complete
+            && status.pending_records == 0
+            && status.unqueued_changes == 0))
+}
+
+// Tests inject a failing/blocked unrelated provider. Selected cycles never
+// enter it, and backlog gets priority over any further selected hydration.
+fn run_capture_cycle(
+    selected: bool,
+    deliver: impl Fn() -> Result<()>,
+    capture_ready: impl Fn() -> Result<bool>,
+    targeted: impl Fn() -> Result<()>,
+    broad: impl Fn() -> Result<()>,
+    stopped: impl Fn() -> bool,
+) -> Result<()> {
+    let delivered = deliver();
+    if stopped() || (delivered.is_ok() && selected && !capture_ready()?) {
+        return delivered;
+    }
+    // Delivery errors must remain visible, but must not prevent acquiring
+    // local evidence while credentials, transport or receiver state recover.
+    let capture = if selected { targeted() } else { broad() };
+    if stopped() {
+        return delivered.and(capture);
+    }
+    let drained = deliver();
+    delivered.and(capture).and(drained)
+}
+
+/// Hydrate only authorized members using core observation locks and cancellation.
+fn capture_selected(directory: &Path, config: &Config, cancelled: &Arc<AtomicBool>) -> Result<()> {
+    let conn = relayhistory_plugin::delivery::open_db(&directory.join("history.db"))?;
+    let members = delivery::job_sessions(&conn, &config.job_id)?;
+    capture_members(
+        directory,
+        members,
+        || stopping(cancelled),
+        |member| {
+            // Core hydration owns observation locks, parsers and checkpoints.
+            // It never enumerates an unrelated provider.
+            let stop = cancelled.clone();
+            ai_hist::hydrate_session_at_cancellable(
+                &directory.join("history.db"),
+                &ai_hist::HydrateSessionOptions {
+                    source: member.source,
+                    session_id: member.session_id,
+                    scope: ai_hist::SessionScope::Local,
+                    include_related: false,
+                },
+                move || stopping(&stop),
+            )
+            .map(|_| ())
+        },
+    )
+}
+
+/// Continue across member failures while retaining the first typed cause for safe reporting.
+fn capture_members(
+    directory: &Path,
+    members: Vec<delivery::SessionIdentity>,
+    stopped: impl Fn() -> bool,
+    hydrate: impl Fn(delivery::SessionIdentity) -> Result<()>,
+) -> Result<()> {
+    let started = Instant::now();
+    let mut captured = 0;
+    let mut failed = 0;
+    let mut first_error = None;
+    for member in members {
+        if stopped() {
+            break;
+        }
+        match hydrate(member) {
+            Ok(()) => captured += 1,
+            Err(error) => {
+                failed += 1;
+                capture_diagnostic(
+                    directory,
+                    "targeted_hydration",
+                    started,
+                    captured,
+                    failed,
+                    Some(&error),
+                )?;
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+    if let Some(error) = first_error {
+        // Keep the typed cause for the safe cycle/desktop classifier. Replacing
+        // it with a generic aggregate turns a full journal into "offline" again.
+        return Err(error.context("selected session capture incomplete"));
+    }
+    capture_diagnostic(directory, "targeted_hydration", started, captured, 0, None)?;
+    Ok(())
+}
+
+/// Classify typed causes into stable public labels without exposing raw error details.
+fn capture_error_class(error: &anyhow::Error) -> &'static str {
+    if error.downcast_ref::<ai_hist::CaptureCancelled>().is_some() {
+        return "cancelled";
+    }
+    if delivery::is_retention_limit(error) {
+        return "retention_limit";
+    }
+    for cause in error.chain() {
+        if let Some(sql) = cause.downcast_ref::<rusqlite::Error>() {
+            return match sql.sqlite_error_code() {
+                Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => {
+                    "database_busy"
+                }
+                Some(rusqlite::ErrorCode::DiskFull) => "disk_full",
+                Some(rusqlite::ErrorCode::ReadOnly | rusqlite::ErrorCode::PermissionDenied) => {
+                    "permission_denied"
+                }
+                Some(rusqlite::ErrorCode::CannotOpen) => "database_unavailable",
+                Some(rusqlite::ErrorCode::DatabaseCorrupt) => "database_corrupt",
+                _ => "database_error",
+            };
+        }
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            return match io.kind() {
+                std::io::ErrorKind::NotFound => "source_missing",
+                std::io::ErrorKind::PermissionDenied => "permission_denied",
+                std::io::ErrorKind::StorageFull => "disk_full",
+                _ => "io_error",
+            };
+        }
+        if cause.downcast_ref::<serde_json::Error>().is_some() {
+            return "invalid_source_json";
+        }
+    }
+    "capture_error"
+}
+
+/// Return actionable, allowlisted storage guidance suitable for desktop status and stderr.
+pub(super) fn local_failure_message(error: &anyhow::Error) -> Option<&'static str> {
+    match capture_error_class(error) {
+        "retention_limit" => Some("The local upload journal is full. Uploads will retry after consumed records can be compacted; queued sessions are preserved."),
+        "database_corrupt" => Some("The local history database needs repair. Preserve the database before recovery; reconnecting will not repair it."),
+        "disk_full" => Some("The local disk is full. Free disk space to resume session uploads."),
+        "database_busy" => Some("Local history is busy. Agent Relay will retry when the other operation finishes."),
+        "database_unavailable" => Some("Agent Relay cannot open local history. Check that its directory exists and local file permissions allow access."),
+        "permission_denied" => Some("Agent Relay cannot access local history. Check local file permissions."),
+        _ => None,
+    }
+}
+
+/// Build the advisory cycle status from typed errors without including provider data.
+fn cycle_report(result: &Result<()>) -> serde_json::Value {
+    let error = result.as_ref().err();
+    json!({
+        "at_ms": now(), "ok": result.is_ok(),
+        "error_class": error.map(capture_error_class),
+        "message": error.map(|error| local_failure_message(error).unwrap_or(
+            "Sync paused or offline. Retrying; local data remains queued."
+        )),
+    })
+}
+
+/// Persist advisory status without interrupting retries when either status or logs cannot be written.
+fn persist_cycle_report(directory: &Path, result: &Result<()>, mut diagnostics: impl Write) {
+    let report = cycle_report(result);
+    if let Err(error) = save_json(&directory.join("cycle.json"), &report) {
+        let message = local_failure_message(&error)
+            .unwrap_or("Sync status could not be saved. Retrying; local data remains queued.");
+        // collector.log may be on the same full disk. Logging must not panic
+        // or propagate another I/O error out of the retry loop either.
+        let _ = writeln!(diagnostics, "{message}");
+    }
+    if let Some(message) = report["message"].as_str() {
+        let _ = writeln!(diagnostics, "{message}");
+    }
+}
+
+fn capture_diagnostic(
+    directory: &Path,
+    stage: &str,
+    started: Instant,
+    captured: usize,
+    failed: usize,
+    error: Option<&anyhow::Error>,
+) -> Result<()> {
+    let diagnostic = json!({"operation":"capture","stage":stage,"elapsed_ms":started.elapsed().as_millis(),"sessions_captured":captured,"failures":failed,"error_class":error.map(capture_error_class)});
+    let filename = if stage == "shallow_inventory" {
+        "inventory-diagnostic.json"
+    } else {
+        "capture-diagnostic.json"
+    };
+    save_json(&directory.join(filename), &diagnostic)?;
+    if error.is_some() {
+        eprintln!("{diagnostic}");
+    }
+    Ok(())
+}
+
+/// All/new setup has already captured before creating its baseline. Selected
+/// setup stays shallow unless --once makes this the only capture opportunity.
+pub fn finish_setup(directory: &Path, config: &Config, once: bool) -> Result<()> {
+    if once && super::bridge::mode(config) == super::bridge::SharingMode::Selected {
+        cycle_with_stop(directory, config, Arc::new(AtomicBool::new(false)), true)
+    } else {
+        deliver_captured(directory, config, true)
+    }
 }
 
 pub fn deliver_captured(directory: &Path, config: &Config, before_exit: bool) -> Result<()> {
@@ -252,7 +502,7 @@ fn deliver_captured_with_stop(
     // a failed capture. Never reach the delivery worker with an unvetted row.
     super::bridge::enforce_selection(directory, config)?;
     {
-        let conn = ai_hist::open_db(&directory.join("history.db"))?;
+        let conn = relayhistory_plugin::delivery::open_db(&directory.join("history.db"))?;
         if delivery::status(&conn, &config.job_id)?.state == "paused" {
             return Ok(());
         }
@@ -266,7 +516,7 @@ fn deliver_captured_with_stop(
     // only once one exists. An idle generation pointed at another destination
     // must not look healthy, so the saved configuration is checked outright.
     {
-        let conn = ai_hist::open_db(&db_path)?;
+        let conn = relayhistory_plugin::delivery::open_db(&db_path)?;
         let job = delivery::status(&conn, &config.job_id)?;
         if job.state == "paused" {
             return Ok(());
@@ -378,6 +628,67 @@ pub(super) fn stop_requested(directory: &Path, startup_id: &str) -> bool {
 extern "C" fn stop_signal(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
+// Provider enumeration runs independently of selected delivery. The channel
+// wakes its idle wait on shutdown; an in-flight provider read never owns the
+// collector's control lock or blocks a delivery cycle waiting for a join.
+struct InventoryWorker(mpsc::Sender<()>);
+impl Drop for InventoryWorker {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+fn inventory_options() -> ai_hist::DiscoverOptions {
+    ai_hist::DiscoverOptions {
+        scope: ai_hist::SessionScope::Local,
+        sources: vec![],
+        // This independent worker builds the complete catalog. A recency cap
+        // would rediscover the same newest rows forever on selected installs.
+        limit: None,
+    }
+}
+
+fn start_inventory(directory: &Path, cancelled: Arc<AtomicBool>) -> InventoryWorker {
+    let directory = directory.to_path_buf();
+    let (finish, done) = mpsc::channel();
+    std::thread::spawn(move || {
+        // Give the first delivery pass priority over inventory initialization.
+        if done.recv_timeout(Duration::from_secs(1)).is_ok() {
+            return;
+        }
+        loop {
+            if stopping(&cancelled) {
+                break;
+            }
+            let started = Instant::now();
+            let result = (|| -> Result<usize> {
+                let conn = relayhistory_plugin::delivery::open_db(&directory.join("history.db"))?;
+                let mut count = 0;
+                let stop = cancelled.clone();
+                ai_hist::discover_sessions_cancellable(
+                    &conn,
+                    &inventory_options(),
+                    |_| count += 1,
+                    move || stopping(&stop),
+                )?;
+                Ok(count)
+            })();
+            let _ = capture_diagnostic(
+                &directory,
+                "shallow_inventory",
+                started,
+                result.as_ref().copied().unwrap_or(0),
+                usize::from(result.is_err()),
+                result.as_ref().err(),
+            );
+            if done.recv_timeout(Duration::from_secs(60)).is_ok() {
+                break;
+            }
+        }
+    });
+    InventoryWorker(finish)
+}
+
+/// Own the collector lock and retry capture/delivery until stopped; status writes are advisory.
 pub fn run_background(directory: &Path, startup_id: &str) -> Result<()> {
     let _lock = lock(directory)?;
     ensure!(
@@ -406,11 +717,16 @@ pub fn run_background(directory: &Path, startup_id: &str) -> Result<()> {
         &json!({"startup_id":startup_id,"pid":std::process::id(),"ready":true}),
     )?;
     let stop = StopWatch::start(directory, startup_id);
+    let _inventory = if super::bridge::mode(&config) == super::bridge::SharingMode::Selected {
+        Some(start_inventory(directory, stop.cancelled.clone()))
+    } else {
+        None
+    };
     let mut capture_due = Instant::now();
     while !stopping(&stop.cancelled) {
         let result = if Instant::now() >= capture_due {
             capture_due = Instant::now() + Duration::from_secs(60);
-            cycle_with_stop(directory, &config, stop.cancelled.clone())
+            cycle_with_stop(directory, &config, stop.cancelled.clone(), false)
         } else {
             deliver_captured_with_stop(directory, &config, false, &stop.cancelled)
         };
@@ -418,16 +734,7 @@ pub fn run_background(directory: &Path, startup_id: &str) -> Result<()> {
         if stopping(&stop.cancelled) {
             break;
         }
-        save_json(
-            &directory.join("cycle.json"),
-            &json!({
-                "at_ms":now(), "ok":result.is_ok(),
-                "message":if result.is_err() { Some("Sync paused or offline. Retrying; local data remains queued.") } else { None }
-            }),
-        )?;
-        if result.is_err() {
-            eprintln!("Sync paused or offline. Retrying; local data remains queued.");
-        }
+        persist_cycle_report(directory, &result, std::io::stderr());
         for _ in 0..200 {
             if stopping(&stop.cancelled) {
                 break;
@@ -514,6 +821,546 @@ pub fn start_background(directory: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use fs2::FileExt;
+    #[test]
+    fn selected_once_setup_hydrates_only_members_even_when_delivery_is_unavailable() {
+        // Hydration validates source paths against configured provider roots.
+        // Run alone in a subprocess so fixture roots cannot race other tests.
+        const CHILD: &str = "RELAYHISTORY_TEST_SELECTED_ONCE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "collector::tests::selected_once_setup_hydrates_only_members_even_when_delivery_is_unavailable", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", home.path());
+        std::env::set_var("USERPROFILE", home.path());
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path().join(".claude"));
+        let project = home.path().join(".claude/projects/synthetic");
+        fs::create_dir_all(&project).unwrap();
+        for session in ["selected", "private"] {
+            let record = json!({"sessionId":session,"uuid":format!("u-{session}"),"type":"user","message":{"role":"user","content":"synthetic"},"timestamp":"2026-09-01T01:00:00Z"});
+            fs::write(
+                project.join(format!("{session}.jsonl")),
+                format!("{record}\n"),
+            )
+            .unwrap();
+        }
+        let conn = relayhistory_plugin::delivery::open_db(&home.path().join("history.db")).unwrap();
+        let env = ai_hist::DiscoveryEnv::with_roots(
+            &conn,
+            home.path().to_path_buf(),
+            home.path().join("opencode.db"),
+        );
+        ai_hist::discover_sessions_with_env(&env, &inventory_options(), |_| {}).unwrap();
+        let job = delivery::create_session_job(&conn, &job_config(false), now()).unwrap();
+        delivery::set_job_session(
+            &conn,
+            &job.job_id,
+            &delivery::SessionIdentity {
+                source: "claude".into(),
+                session_id: "selected".into(),
+            },
+            true,
+        )
+        .unwrap();
+        let config = Config {
+            version: 1,
+            site_url: "https://synthetic.invalid".into(),
+            account_id: "account".into(),
+            org_id: "org".into(),
+            workspace_id: "workspace".into(),
+            // Invalid URL fails before any credentials or transport can be used.
+            history_url: "invalid synthetic URL".into(),
+            delivery_account: job.config.account_id,
+            job_id: job.job_id,
+            include_existing: false,
+            sharing_mode: Some(super::super::bridge::SharingMode::Selected),
+            acknowledge_uninspected_schedules: false,
+        };
+        save_json(&home.path().join("config.json"), &config).unwrap();
+        let events = || {
+            conn.query_row("SELECT COUNT(*) FROM session_events", [], |r| {
+                r.get::<_, usize>(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(events(), 0);
+        // Background setup stays shallow; the collector will hydrate later.
+        assert!(finish_setup(home.path(), &config, false).is_err());
+        assert_eq!(events(), 0);
+        delivery::pause_job(&conn, &config.job_id).unwrap();
+        finish_setup(home.path(), &config, true).unwrap();
+        assert_eq!(events(), 0, "paused selected setup must not hydrate");
+        delivery::resume_job(&conn, &config.job_id).unwrap();
+        assert!(finish_setup(home.path(), &config, true).is_err());
+        assert_eq!(
+            events(),
+            1,
+            "selected --once must capture before returning the delivery error"
+        );
+        let session: String = conn
+            .query_row("SELECT session_id FROM session_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(session, "selected");
+        let diagnostic: serde_json::Value =
+            serde_json::from_slice(&fs::read(home.path().join("capture-diagnostic.json")).unwrap())
+                .unwrap();
+        assert_eq!(diagnostic["sessions_captured"], 1);
+        assert_eq!(diagnostic["failures"], 0);
+    }
+
+    #[test]
+    fn selected_inventory_discovers_sessions_older_than_the_first_thousand() {
+        let home = tempfile::tempdir().unwrap();
+        let project = home.path().join(".claude/projects/synthetic");
+        fs::create_dir_all(&project).unwrap();
+        for n in 0..1001 {
+            let path = project.join(format!("session-{n:04}.jsonl"));
+            let record = json!({"sessionId":format!("session-{n:04}"),"uuid":format!("u-{n}"),"type":"user","message":{"role":"user","content":"synthetic"},"timestamp":"2026-09-01T01:00:00Z"});
+            fs::write(&path, format!("{record}\n")).unwrap();
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(
+                    fs::FileTimes::new().set_modified(
+                        std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(n + 1),
+                    ),
+                )
+                .unwrap();
+        }
+        let conn = relayhistory_plugin::delivery::open_db(&home.path().join("history.db")).unwrap();
+        let job = delivery::create_session_job(&conn, &job_config(true), now()).unwrap();
+        let env = ai_hist::DiscoveryEnv::with_roots(
+            &conn,
+            home.path().to_path_buf(),
+            home.path().join("opencode.db"),
+        );
+        for _ in 0..2 {
+            let mut found = std::collections::HashSet::new();
+            ai_hist::discover_sessions_with_env(&env, &inventory_options(), |row| {
+                found.insert(row.session_id.clone());
+            })
+            .unwrap();
+            assert_eq!(
+                found.len(),
+                1001,
+                "periodic inventory must not repeatedly cap the same newest sessions"
+            );
+            assert!(found.contains("session-0000"));
+        }
+        let oldest_known: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sessions WHERE source='claude' AND session_id='session-0000')", [], |r| r.get(0)).unwrap();
+        assert!(oldest_known);
+        assert!(delivery::job_sessions(&conn, &job.job_id)
+            .unwrap()
+            .is_empty());
+        assert!(delivery::prepare_batch(&conn, &job.job_id, now())
+            .unwrap()
+            .batch_id
+            .is_none());
+    }
+
+    #[test]
+    fn fake_receiver_drains_selected_backlog_despite_failing_capture_and_private_discovery() {
+        struct Fake(std::cell::RefCell<Vec<String>>);
+        impl worker::Receiver for Fake {
+            fn mapping_version(&self) -> &str {
+                destination::MAPPING_VERSION
+            }
+            fn supported_kinds(&self) -> &[&str] {
+                &["history", "session_event", "session"]
+            }
+            fn supports_tombstones(&self) -> bool {
+                true
+            }
+            fn prepare(
+                &self,
+                batch: &delivery::HistoryExportBatch,
+                _: &worker::ReceiverContext<'_>,
+            ) -> std::result::Result<worker::PreparedBody, worker::ReceiverFailure> {
+                Ok(worker::PreparedBody {
+                    content_type: "application/json".into(),
+                    body: serde_json::to_string(batch).unwrap(),
+                })
+            }
+            fn send(
+                &self,
+                _: &delivery::PreparedPayload,
+                batch: &delivery::HistoryExportBatch,
+                _: &worker::ReceiverContext<'_>,
+            ) -> std::result::Result<delivery::DeliveryAcknowledgment, worker::ReceiverFailure>
+            {
+                self.0
+                    .borrow_mut()
+                    .extend(batch.records.iter().map(|r| r.session_id.clone().unwrap()));
+                Ok(delivery::DeliveryAcknowledgment {
+                    batch_id: batch.batch_id.clone(),
+                    accepted_revision_ids: batch
+                        .records
+                        .iter()
+                        .map(|r| r.revision_id.clone())
+                        .collect(),
+                    unsupported_revision_ids: vec![],
+                    acceptance_level: delivery::AcceptanceLevel::Durable,
+                })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        let conn = relayhistory_plugin::delivery::open_db(&path).unwrap();
+        conn.execute(
+            "INSERT INTO sessions(source,session_id) VALUES ('claude','selected')",
+            [],
+        )
+        .unwrap();
+        for n in 0..20 {
+            conn.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES('claude','selected',?,1,'user','text','synthetic')",[n.to_string()]).unwrap();
+        }
+        let mut jc = job_config(true);
+        jc.limits.max_batch_records = 1;
+        let job = delivery::create_session_job(&conn, &jc, now()).unwrap();
+        delivery::set_job_session(
+            &conn,
+            &job.job_id,
+            &delivery::SessionIdentity {
+                source: "claude".into(),
+                session_id: "selected".into(),
+            },
+            true,
+        )
+        .unwrap();
+        // A newly discovered catalog row is visible, but never authorized.
+        conn.execute(
+            "INSERT INTO sessions(source,session_id) VALUES ('codex','new-private')",
+            [],
+        )
+        .unwrap();
+        let config = Config {
+            version: 1,
+            site_url: "https://example.invalid".into(),
+            account_id: "account".into(),
+            org_id: "org".into(),
+            workspace_id: "workspace".into(),
+            history_url: "https://example.invalid".into(),
+            delivery_account: jc.account_id,
+            job_id: job.job_id,
+            include_existing: false,
+            sharing_mode: Some(super::super::bridge::SharingMode::Selected),
+            acknowledge_uninspected_schedules: false,
+        };
+        let fake = Fake(std::cell::RefCell::new(vec![]));
+        let capture_calls = std::cell::Cell::new(0);
+        for _ in 0..4 {
+            let _ = run_capture_cycle(
+                true,
+                || deliver_with_receiver(&path, &config, &fake, &|| false).map(|_| ()),
+                || {
+                    let s = delivery::status(&conn, &config.job_id)?;
+                    Ok(s.bootstrap_complete && s.pending_records == 0 && s.unqueued_changes == 0)
+                },
+                || {
+                    capture_calls.set(capture_calls.get() + 1);
+                    Err(anyhow::anyhow!("synthetic missing selected source"))
+                },
+                || panic!("unrelated slow/failing provider called"),
+                || false,
+            );
+        }
+        assert_eq!(fake.0.borrow().len(), 21);
+        assert!(fake.0.borrow().iter().all(|id| id == "selected"));
+        assert!(capture_calls.get() > 0);
+        assert_eq!(
+            delivery::status(&conn, &config.job_id)
+                .unwrap()
+                .acknowledged_records,
+            21
+        );
+    }
+    #[test]
+    fn delivery_errors_do_not_prevent_selected_or_broad_capture() {
+        for selected in [true, false] {
+            let calls = std::cell::RefCell::new(Vec::new());
+            let error = run_capture_cycle(
+                selected,
+                || {
+                    calls.borrow_mut().push("deliver");
+                    Err(anyhow::anyhow!("synthetic credential failure"))
+                },
+                || panic!("delivery failure must not suppress capture behind backlog"),
+                || {
+                    calls.borrow_mut().push("targeted");
+                    Ok(())
+                },
+                || {
+                    calls.borrow_mut().push("broad");
+                    Ok(())
+                },
+                || false,
+            )
+            .unwrap_err();
+            assert_eq!(
+                calls.into_inner(),
+                vec![
+                    "deliver",
+                    if selected { "targeted" } else { "broad" },
+                    "deliver"
+                ]
+            );
+            assert_eq!(error.to_string(), "synthetic credential failure");
+        }
+    }
+
+    #[test]
+    fn selected_retry_backoff_does_not_starve_local_capture() {
+        let conn = Connection::open_in_memory().unwrap();
+        relayhistory_plugin::delivery::init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO sessions(source,session_id) VALUES ('claude','selected')",
+            [],
+        )
+        .unwrap();
+        let job = delivery::create_session_job(&conn, &job_config(true), now()).unwrap();
+        delivery::set_job_session(
+            &conn,
+            &job.job_id,
+            &delivery::SessionIdentity {
+                source: "claude".into(),
+                session_id: "selected".into(),
+            },
+            true,
+        )
+        .unwrap();
+        delivery::prepare_batch(&conn, &job.job_id, now()).unwrap();
+        assert!(
+            delivery::status(&conn, &job.job_id)
+                .unwrap()
+                .pending_records
+                > 0
+        );
+        let captures = std::cell::Cell::new(0);
+        for waiting in [false, true, false] {
+            conn.execute(
+                "UPDATE delivery_jobs SET next_attempt_ms=? WHERE id=?",
+                rusqlite::params![if waiting { now() + 60_000 } else { 0 }, job.job_id],
+            )
+            .unwrap();
+            run_capture_cycle(
+                true,
+                || Ok(()),
+                || ready_to_capture(&conn, &job.job_id),
+                || {
+                    captures.set(captures.get() + 1);
+                    Ok(())
+                },
+                || panic!("selected mode must not use broad capture"),
+                || false,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            captures.get(),
+            1,
+            "capture runs during backoff, but an eligible backlog retains priority"
+        );
+    }
+
+    #[test]
+    fn selected_backlog_does_not_enter_unrelated_capture() {
+        use std::cell::Cell;
+        let delivered = Cell::new(0);
+        for _ in 0..3 {
+            run_capture_cycle(
+                true,
+                || {
+                    delivered.set(delivered.get() + 1);
+                    Ok(())
+                },
+                || Ok(false),
+                || panic!("backlog must drain first"),
+                || panic!("blocked unrelated provider entered"),
+                || false,
+            )
+            .unwrap();
+        }
+        assert_eq!(delivered.get(), 3);
+        run_capture_cycle(
+            true,
+            || {
+                delivered.set(delivered.get() + 1);
+                Ok(())
+            },
+            || Ok(true),
+            || Err(anyhow::anyhow!("synthetic selected capture failure")),
+            || panic!("failing unrelated provider entered"),
+            || false,
+        )
+        .unwrap_err();
+        assert_eq!(delivered.get(), 5);
+    }
+
+    #[test]
+    fn capture_diagnostics_never_include_raw_errors_or_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "secret prompt /private/source https://token:secret@example.invalid",
+        ));
+        capture_diagnostic(
+            dir.path(),
+            "targeted_hydration",
+            Instant::now(),
+            2,
+            1,
+            Some(&error),
+        )
+        .unwrap();
+        let value = std::fs::read_to_string(dir.path().join("capture-diagnostic.json")).unwrap();
+        assert!(value.contains("permission_denied"));
+        for forbidden in ["secret", "prompt", "private", "https", "example"] {
+            assert!(!value.contains(forbidden));
+        }
+    }
+
+    /// Verify failed members retain their typed cause while healthy members are captured.
+    #[test]
+    fn targeted_storage_failure_keeps_its_class_and_other_members_still_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let captured = std::cell::Cell::new(0);
+        let members = ["full", "healthy"]
+            .iter()
+            .map(|id| delivery::SessionIdentity {
+                source: "codex".into(),
+                session_id: (*id).into(),
+            })
+            .collect();
+        let result = capture_members(
+            dir.path(),
+            members,
+            || false,
+            |member| {
+                if member.session_id == "full" {
+                    Err(anyhow::Error::new(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER),
+                        Some("delivery retention limit exceeded; secret transcript".into()),
+                    )))
+                } else {
+                    captured.set(captured.get() + 1);
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(captured.get(), 1);
+        let report = cycle_report(&result);
+        assert_eq!(report["error_class"], "retention_limit");
+        assert!(!report.to_string().contains("secret"));
+        assert!(!report["message"].as_str().unwrap().contains("offline"));
+    }
+
+    /// Verify SQLite failure guidance and cycle reports never reveal raw sensitive details.
+    #[test]
+    fn cycle_errors_classify_local_storage_without_exposing_raw_details() {
+        for (code, class) in [
+            (rusqlite::ffi::SQLITE_CORRUPT, "database_corrupt"),
+            (rusqlite::ffi::SQLITE_FULL, "disk_full"),
+            (rusqlite::ffi::SQLITE_BUSY, "database_busy"),
+            (rusqlite::ffi::SQLITE_READONLY, "permission_denied"),
+            (
+                rusqlite::ffi::SQLITE_READONLY_DIRECTORY,
+                "permission_denied",
+            ),
+            (rusqlite::ffi::SQLITE_PERM, "permission_denied"),
+            (rusqlite::ffi::SQLITE_CANTOPEN, "database_unavailable"),
+        ] {
+            let error = anyhow::Error::new(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                Some("secret prompt https://token:secret@example.invalid".into()),
+            ));
+            let report = cycle_report(&Err(error));
+            assert_eq!(report["error_class"], class);
+            assert_eq!(report["ok"], false);
+            assert!(!report["message"].as_str().unwrap().contains("offline"));
+            for forbidden in ["secret", "prompt", "https", "example"] {
+                assert!(!report.to_string().contains(forbidden));
+            }
+        }
+        let error = anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER),
+            Some("delivery retention limit exceeded; secret".into()),
+        ));
+        assert_eq!(cycle_report(&Err(error))["error_class"], "retention_limit");
+        let healthy = cycle_report(&Ok(()));
+        assert_eq!(healthy["ok"], true);
+        assert!(healthy["message"].is_null());
+        assert!(healthy["error_class"].is_null());
+    }
+
+    /// Verify contextual StorageFull and native ENOSPC errors retain safe disk guidance.
+    #[test]
+    fn filesystem_disk_full_uses_safe_local_guidance_through_context() {
+        let errors = vec![std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            "secret prompt /private/token",
+        )];
+        #[cfg(unix)]
+        let errors = {
+            let mut errors = errors;
+            errors.push(std::io::Error::from_raw_os_error(libc::ENOSPC));
+            errors
+        };
+        for error in errors {
+            let error = anyhow::Error::new(error).context("writing secret runtime.json");
+            assert!(local_failure_message(&error)
+                .unwrap()
+                .contains("Free disk space"));
+            let report = cycle_report(&Err(error));
+            assert_eq!(report["error_class"], "disk_full");
+            assert_eq!(report["ok"], false);
+            assert!(!report.to_string().contains("secret"));
+            assert!(!report.to_string().contains("offline"));
+        }
+    }
+
+    /// A full log disk cannot make advisory cycle reporting terminate the collector.
+    #[test]
+    fn cycle_reporting_tolerates_failed_status_and_log_writes() {
+        struct FullDisk;
+        impl Write for FullDisk {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::StorageFull.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cycle.json");
+        fs::create_dir(&path).unwrap();
+        let result = Err(anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            "secret runtime path",
+        )));
+        persist_cycle_report(directory.path(), &result, FullDisk);
+        let mut output = Vec::new();
+        persist_cycle_report(directory.path(), &result, &mut output);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("Sync status could not be saved"));
+        assert!(output.contains("Free disk space"));
+        assert!(!output.contains("secret"));
+        fs::remove_dir(&path).unwrap();
+        persist_cycle_report(directory.path(), &Ok(()), FullDisk);
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(saved["ok"], true);
+    }
+
     fn job_config(include_existing: bool) -> delivery::DeliveryJobConfig {
         delivery::DeliveryJobConfig {
             destination_id: DESTINATION.into(),
@@ -565,7 +1412,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("history.db");
-        let conn = ai_hist::open_db(&db_path).unwrap();
+        let conn = relayhistory_plugin::delivery::open_db(&db_path).unwrap();
         conn.execute(
             "INSERT INTO sessions(source,session_id) VALUES ('claude','in-flight')",
             [],
@@ -672,7 +1519,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("history.db");
-        let conn = ai_hist::open_db(&db).unwrap();
+        let conn = relayhistory_plugin::delivery::open_db(&db).unwrap();
         conn.execute(
             "INSERT INTO sessions(source,session_id) VALUES ('claude','queued')",
             [],
@@ -770,7 +1617,7 @@ mod tests {
     #[test]
     fn new_only_baseline_is_durable_and_independent_of_history_size() {
         let conn = Connection::open_in_memory().unwrap();
-        ai_hist::init_db(&conn).unwrap();
+        relayhistory_plugin::delivery::init_db(&conn).unwrap();
         for index in 0..1200 {
             conn.execute(
                 "INSERT INTO sessions(source, session_id) VALUES ('claude', ?1)",
@@ -807,7 +1654,7 @@ mod tests {
     #[test]
     fn include_existing_records_no_baseline() {
         let conn = Connection::open_in_memory().unwrap();
-        ai_hist::init_db(&conn).unwrap();
+        relayhistory_plugin::delivery::init_db(&conn).unwrap();
         conn.execute(
             "INSERT INTO sessions(source, session_id) VALUES ('claude','before')",
             [],
@@ -823,7 +1670,7 @@ mod tests {
     #[test]
     fn an_abandoned_baseline_does_not_outlive_a_later_include_existing_setup() {
         let conn = Connection::open_in_memory().unwrap();
-        ai_hist::init_db(&conn).unwrap();
+        relayhistory_plugin::delivery::init_db(&conn).unwrap();
         conn.execute(
             "INSERT INTO sessions(source, session_id) VALUES ('claude','before')",
             [],

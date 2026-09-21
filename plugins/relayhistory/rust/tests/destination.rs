@@ -1,4 +1,4 @@
-use ai_hist::delivery::{HistoryExportBatch, PreparedPayload};
+use relayhistory_plugin::delivery::{HistoryExportBatch, PreparedPayload};
 use relayhistory_plugin::destination::{account_id, prepare, MAPPING_VERSION};
 use serde_json::{json, Value};
 use std::{

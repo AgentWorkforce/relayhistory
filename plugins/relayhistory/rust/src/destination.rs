@@ -1,6 +1,6 @@
 //! Versioned durable transport. The local coordinator persists prepared bytes and owns retries.
 use crate::cloud;
-use ai_hist::delivery::{
+use crate::delivery::{
     worker::{PreparedBody, Receiver, ReceiverContext, ReceiverFailure},
     AcceptanceLevel, DeliveryAcknowledgment, DeliveryFailure, HistoryExportBatch, PreparedPayload,
     SUPPORTED_KINDS,
@@ -378,7 +378,7 @@ pub struct ReadPage {
     pub protocol_version: u32,
     /// Live keyset listing. A later refresh starts from the beginning; this is not a change feed.
     pub listing: String,
-    pub records: Vec<ai_hist::delivery::HistoryExportRecord>,
+    pub records: Vec<crate::delivery::HistoryExportRecord>,
     pub next_cursor: Option<String>,
 }
 pub fn read_page(base_url: Option<&str>, options: &ReadOptions) -> Result<ReadPage> {
