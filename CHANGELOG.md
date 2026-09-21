@@ -127,6 +127,43 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Rust API
 
+- `SessionStore` is now the whole default surface of the `ai-hist` crate:
+  seven operations, typed evidence, no raw connection, no contract constant
+  (`docs/sourcing-sdk.md`). `open` and `sync` keep their shape; `sync` takes
+  `SyncOptions { force, lock_timeout_ms }` and reports `swept` plus the
+  `changed` `SessionRef`s (catalog rows a sweep created or changed), and a
+  held `SyncRunLock` is `Error::SyncLocked` after the caller's timeout rather
+  than a silent skip. New: `hydrate(&SessionRef, HydrateOptions)` — by id, or
+  by transcript path for the hook fast path — `watch(WatchOptions)` returning
+  a `WatchHandle` iterator of `TickReport`s over the live-capture loop,
+  `sessions(CatalogQuery)` walking the catalog on an internal keyset, and
+  `session(&SessionRef, SessionQuery) -> Option<SessionEvidence>` reading
+  every table for one session on one SQLite snapshot: `prompts`, `messages`
+  (one per `message_id`, with `role`, `request_id`, `provider_message_id`,
+  `stop_reason`, `turn_id`, normalized `usage`, and typed `blocks`),
+  `tool_calls` (`args` parsed), `tool_results` (per-result fidelity),
+  `file_edits` (`structured_patch` parsed), `markers` (`payload` parsed),
+  `relationships` (delegation and continuity, with the side the session is
+  seen from), `requests`, `usage`, `user_turns`, `coverage` and `loaded`.
+  `SessionQuery { include_text, kinds }` maps onto burn's content modes:
+  `include_text: false` keeps byte lengths and hashes and never moves the
+  `text` column out of SQLite; `kinds` skips the tables a consumer does not
+  need. Every JSON column arrives parsed and the stored string is reachable
+  only through `raw_args()`, `raw_structured_patch()`, `raw_payload()` and
+  `raw_usage()`. `Source::capabilities()` declares, statically, a source's
+  evidence kinds, relationship capabilities, usage accounting mode, whether
+  its message ids are provider-issued or synthesized, whether it hydrates by
+  path, and its watch roots. `Error` is now an enum whose `code()` mirrors the
+  TypeScript native error codes plus `SyncLocked`, `SessionSourceMismatch` and
+  the reserved `WatermarkAheadOfStore`. Every struct on the surface is
+  `#[non_exhaustive]`, `Clone`, `Serialize`, `Deserialize` and `PartialEq`.
+  **Removed** the per-kind page methods `SessionStore::session_user_turns_page`,
+  `session_markers_page`, `session_requests_page` and `session_usage`; the
+  same data is `SessionEvidence::user_turns`, `markers`, `requests` and
+  `usage`. A read-only `open` now also checks the marker and relationship
+  schema, so it refuses at open — naming the remedy — rather than inside a
+  read. `crates/ai-hist/tests/sourcing_api.rs` holds the surface on the
+  crate's default features against the fixture-corpus snapshots.
 - Stop dropping the record types neither parser could normalize. A new
   `session_markers` table records compaction and summary boundaries, provider
   `system` rows, non-text content blocks (`image`, `document`,

@@ -7,7 +7,9 @@ which decides _who owns sourcing_; this file decides _what the surface has to
 carry_ before burn can stop parsing logs.
 
 The shape is `SessionEvidence` from
-[#178](https://github.com/AgentWorkforce/relayhistory/issues/178). The demand
+[#178](https://github.com/AgentWorkforce/relayhistory/issues/178), served by
+`SessionStore::session` and documented in
+[`docs/sourcing-sdk.md`](sourcing-sdk.md). The demand
 side is burn's `DerivedRecords` trait
 (`crates/relayburn-sdk/src/ingest/ingest.rs`) and its record types
 (`crates/relayburn-sdk/src/reader/types.rs`). Sections marked **TODO** are
@@ -141,8 +143,9 @@ Blocks of a human turn with `byte_len`, `approx_tokens`, `tool_use_id` and
 ledger stores the prompt text and the surrounding events but no per-block
 accounting.
 
-Shipped for Claude and Codex as `SessionStore::session_user_turns_page` and
-the corresponding Node/TypeScript page and pagination helpers. Blocks carry
+Shipped for Claude and Codex as `SessionEvidence::user_turns` (read through
+`SessionStore::session`) and the corresponding Node/TypeScript page and
+pagination helpers. Blocks carry
 `byte_len`, `tool_use_id`, and three-state `is_error`, and each turn carries
 `preceding_message_id` / `following_message_id` — the nearest messages recorded
 either side of it, null only where the session recorded no named message on
@@ -176,6 +179,11 @@ capability (`always` / `sometimes` / `never` stable child identity — already
 modelled in `relationship_capabilities()`), its usage accounting mode
 (per-request, per-session, cumulative-delta, none), whether its message ids are
 provider-issued or synthesized, and its watch roots.
+
+Shipped as `Source::capabilities()` — `evidence_kinds`, `relationships`,
+`usage_accounting`, `message_ids` (`Provider` / `Synthesized` / `Mixed` /
+`None`), `hydrates_by_path` and `watch_roots(home)`; `SessionEvidence::coverage`
+repeats the kinds per read.
 
 This is the contract that lets a consumer distinguish "this session has no tool
 calls" from "this source cannot report tool calls". Today the hydration result

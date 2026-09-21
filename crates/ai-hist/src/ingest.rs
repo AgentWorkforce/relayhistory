@@ -231,10 +231,22 @@ fn capture_files(source: &'static str, files: Vec<PathBuf>) -> impl Iterator<Ite
 }
 
 /// Full local ingest using an explicit provider home instead of the process
-/// `HOME`. Used by [`crate::SessionStore`] when the embedder overrides home.
+/// `HOME`. The facade reads the richer [`sync_facade_tick`]; the boolean form
+/// remains for the in-module tests that predate it.
+#[cfg(test)]
 pub(crate) fn sync_local_at_with_home(db_path: &Path, home: &Path) -> Result<bool> {
+    sync_facade_tick(db_path, home, false).map(|tick| tick.attempted)
+}
+
+/// One local sweep for [`crate::SessionStore`]: silent, against an explicit
+/// provider home, forcing past the source fingerprint when asked.
+///
+/// The facade reads the returned [`SyncTick`] rather than a boolean because
+/// it has to tell "another process holds the sync lock" apart from "nothing
+/// moved", and turn the former into an error instead of a silent no-op.
+pub(crate) fn sync_facade_tick(db_path: &Path, home: &Path, force: bool) -> Result<SyncTick> {
     SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
-    sync_exclusive_with_home(db_path, home, false).map(|tick| tick.attempted)
+    sync_exclusive_with_home(db_path, home, force)
 }
 
 /// One live-capture tick against an explicit provider home.
@@ -1433,12 +1445,17 @@ fn sync_basic(
     capture_progress("catalog", 0, None);
     check_capture_cancelled()?;
     let discovery_env = DiscoveryEnv::with_provider_roots(conn, roots.clone());
+    // Coded like the hydration failures, so `SessionStore` can tell a sweep
+    // whose evidence landed but whose catalog pass did not from one that
+    // failed outright; the CLI prints the same chain it always did, behind
+    // the code.
     let discovered = discover::discover_sessions_with_providers(
         &discovery_env,
         &DiscoverOptions::default(),
         &providers,
         |_| {},
-    )?;
+    )
+    .context("DISCOVERY_FAILED: shallow discovery after the sweep")?;
     // After discovery, not before: shallow discovery is what fills in `cwd`
     // and `repo_url` for sessions a provider's history file mentions without
     // describing, and inheritance needs every relationship this run recorded

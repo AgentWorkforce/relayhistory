@@ -2634,6 +2634,35 @@ pub fn session_events(
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// Every normalized event for one session, oldest first, with the UTF-8
+/// length of its `text` column beside it — and, when `include_text` is
+/// false, without moving the text column out of SQLite at all.
+///
+/// For [`crate::SessionStore::session`]: a hash-only consumer must not pay
+/// to carry transcript text, and dropping it after the row was materialized
+/// is still paying for it.
+pub(crate) fn session_events_sized(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+    include_text: bool,
+) -> Result<Vec<(SessionEvent, Option<i64>)>> {
+    let columns = if include_text {
+        SESSION_EVENT_COLUMNS.to_string()
+    } else {
+        SESSION_EVENT_COLUMNS.replacen(", text, ", ", NULL AS text, ", 1)
+    };
+    let sql = format!(
+        "SELECT {columns}, LENGTH(CAST(text AS BLOB)) FROM session_events \
+         WHERE source = ? AND session_id = ? ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params![source, session_id], |row| {
+        Ok((row_to_session_event(row)?, row.get::<_, Option<i64>>(37)?))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 /// One bounded page of normalized events for a session, oldest first.
 pub fn session_events_page(
     conn: &Connection,

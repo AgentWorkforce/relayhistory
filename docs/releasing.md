@@ -105,10 +105,15 @@ cargo add ai-hist
 ```
 
 ```rust
-use ai_hist::SessionStore;
+use ai_hist::{SessionQuery, SessionStore};
 let store = SessionStore::open(Default::default())?;
-store.sync(Default::default())?;
+let report = store.sync(Default::default())?;
+for changed in &report.changed {
+    let _evidence = store.session(changed, SessionQuery::default())?;
+}
 ```
+
+The full surface is documented in [`docs/sourcing-sdk.md`](sourcing-sdk.md).
 
 ## Dry runs
 

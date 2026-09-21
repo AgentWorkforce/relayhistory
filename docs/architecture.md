@@ -154,20 +154,24 @@ archive relocation.
 | `getSession` | none | indexed identity read | empty result |
 | `getSessionEventsPage` | none | bounded keyset page | empty page |
 | `getSessionUserTurnsPage` | none | bounded keyset page plus ordered block reads on one snapshot | empty page |
-| `SessionStore::session_user_turns_page` | none | bounded keyset page plus ordered block reads on one snapshot | not reached: `SessionStore::open` created the database (writable) or already failed (read-only) |
+| `SessionStore::sessions` | none | keyset-paged catalog reads, one page at a time | not reached: `SessionStore::open` created the database (writable) or already failed (read-only) |
+| `SessionStore::session` | none | every evidence table for one session on one read snapshot; `kinds` skips tables, `include_text: false` never moves the text column | `None` for an uncatalogued session |
 | `getSessionRelationships` | none | indexed relationship reads | empty result |
 | `getSessionTree` | none | indexed relationship reads, one child query per emitted node | root-only tree |
 | `getSessionChildrenPage` | none | bounded keyset page | empty page |
 | `getSessionToolCallsPage`, `getSessionFileEditsPage` | none | bounded keyset page over one source's session | empty page |
-| `session_markers_page`, `SessionStore::session_markers_page` (no SDK/MCP surface yet) | none | bounded keyset page over one source's session | empty page; a read-only store over a database older than the marker page index is refused, naming the remedy |
+| `session_markers_page` (no SDK/MCP surface yet; `SessionStore::session` carries markers) | none | bounded keyset page over one source's session | empty page; a read-only `SessionStore::open` over a database older than the marker page index is refused, naming the remedy |
 | `sync` (`local`, default) | full explicit scan | migrations + ingestion | creates DB |
 | `sync` (`remote`) | explicitly selected source plugins (error when none) | observations, normalized evidence, checkpoints | creates DB |
 | `sync` (`all`) | full local scan + explicitly selected source plugins | migrations + ingestion | creates DB |
+| `SessionStore::sync`, `SessionStore::watch` | full local scan (fingerprint-gated; forced on fs-event ticks) | the `local` sync under `SyncRunLock`; a held lock is `SyncLocked` after the caller's timeout, never a silent skip | not reached: created at `open` |
+| `SessionStore::hydrate` | one session by id, or one transcript by path (hook fast path, Claude only) | as `hydrateSession`; a missing transcript is a status, not an error | `SESSION_NOT_FOUND` for an id; `Missing` for a path |
 
 A writable `SessionStore::open` migrates the database it opens; a read-only
 one cannot, so it refuses a database older than the shape this version reads
 and names the remedy, rather than handing back a store whose first read fails
-inside a query.
+inside a query. The facade's full surface, its error codes and lock semantics
+are in [`docs/sourcing-sdk.md`](sourcing-sdk.md).
 
 No read operation invokes discovery or sync. A common cold start is:
 

@@ -1,8 +1,9 @@
 //! Local coding-agent session history.
 //!
 //! The default public surface is [`SessionStore`] plus the evidence types an
-//! embedder reads back. Workspace crates enable `unstable-internal` for the
-//! maintenance APIs that still take a raw database connection.
+//! embedder reads back — see `docs/sourcing-sdk.md`. Workspace crates enable
+//! `unstable-internal` for the maintenance APIs that still take a raw database
+//! connection.
 
 macro_rules! workspace_mod {
     ($name:ident) => {
@@ -73,14 +74,18 @@ pub use store::*;
 pub(crate) use store::*;
 
 pub use discover::{declared_evidence_kinds, missing_evidence_kinds};
+pub use relationship_graph::RelationshipCapabilities;
 pub use session_store::{
-    Error, SessionRef, SessionStore, Source, StoreOptions, SyncOptions, SyncReport,
+    Block, BlockKind, Capability, CatalogIter, CatalogQuery, CatalogSession, Diagnostic,
+    DiscoveryState, Error, FileEdit, HydrateOptions, HydrateReport, HydrateStatus, Marker, Message,
+    MessageIdOrigin, Prompt, Relationship, RelationshipSide, Role, SessionEvidence, SessionQuery,
+    SessionRef, SessionStore, Source, SourceCapabilities, StoreOptions, SyncOptions, SyncReport,
+    TickReport, ToolCall, ToolResult, WatchHandle, WatchOptions, WatchStop,
 };
 /// The usage reads that take a raw connection. Embedders reach the same data
-/// through [`SessionStore::session_requests_page`] and
-/// [`SessionStore::session_usage`], which open the store's configured path
-/// read-only; these are for the workspace crates that already hold a
-/// connection.
+/// through [`SessionStore::session`], whose `requests` and `usage` fields
+/// carry the same grouping; these are for the workspace crates that already
+/// hold a connection.
 #[cfg(feature = "unstable-internal")]
 pub use session_usage::{session_requests_page, session_usage_summary};
 pub use session_usage::{
@@ -92,11 +97,7 @@ pub use usage::{
     attribute_usage_to_prompts, normalize_usage, normalize_usage_str, source_accounting,
     NormalizedUsage, PromptKey, UsageAccounting, UsageCoverage, UsageError, NORMALIZABLE_SOURCES,
 };
-
-/// Reachable without `unstable-internal` so a crate that only builds the
-/// default surface still sees the same grouping rules the store applies.
-#[cfg(not(feature = "unstable-internal"))]
-pub(crate) use session_usage::{session_requests_page, session_usage_summary};
+pub use watch::{TickTrigger, WatchDriver};
 
 #[cfg(not(feature = "unstable-internal"))]
 pub use store::{

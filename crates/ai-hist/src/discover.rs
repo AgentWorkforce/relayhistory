@@ -3142,6 +3142,55 @@ fn fetch_catalog_row(
         .ok())
 }
 
+/// One catalog row, or `None` when the session is not catalogued.
+///
+/// Unlike [`fetch_catalog_row`] this propagates a query failure instead of
+/// folding it into `None`: the facade answers "no such session" from it, and
+/// a database it could not read must not be reported as an empty catalog.
+pub(crate) fn catalog_row(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+) -> Result<Option<ShallowSession>> {
+    Ok(conn
+        .prepare_cached(&CATALOG_ROW_SQL)?
+        .query_row(params![source, session_id], row_to_session)
+        .optional()?)
+}
+
+/// The catalog row whose local locator is `raw_path`, if any.
+pub(crate) fn catalog_row_by_path(
+    conn: &Connection,
+    source: &str,
+    raw_path: &str,
+) -> Result<Option<ShallowSession>> {
+    Ok(conn
+        .prepare(&format!(
+            "SELECT {SESSION_COLUMNS} FROM sessions WHERE source = ? AND raw_path = ? \
+             ORDER BY session_id LIMIT 1"
+        ))?
+        .query_row(params![source, raw_path], row_to_session)
+        .optional()?)
+}
+
+/// The filesystem roots one source's adapter watches under `roots`.
+pub(crate) fn provider_watch_roots(source: &str, roots: &crate::ProviderRoots) -> Vec<WatchRoot> {
+    let providers = shallow_providers();
+    let Some(provider) = providers.iter().find(|provider| provider.source() == source) else {
+        return Vec::new();
+    };
+    watch_roots(
+        std::slice::from_ref(provider),
+        &ProviderRoots {
+            home: &roots.home,
+            claude: &roots.claude,
+            codex: &roots.codex,
+            grok: &roots.grok,
+            opencode_db: &roots.opencode_db,
+        },
+    )
+}
+
 #[cfg(test)]
 fn fetch_catalog_row_at_location(
     conn: &Connection,
