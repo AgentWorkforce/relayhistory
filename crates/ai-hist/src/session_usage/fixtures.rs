@@ -227,17 +227,158 @@ fn records_with_no_captured_identity_are_flagged_and_not_summed() {
     assert_eq!(summary.models, vec!["claude-opus-4-7".to_string()]);
 }
 
-/// Codex attaches one delta to one event, so a key built from the record id
-/// is already one per request and must not be flagged.
+/// Codex delimits its requests with usage snapshots, so its rows group on the
+/// span between them — a real request identity, and not flagged.
+///
+/// This test used to assert `RecordId`, on the reasoning that Codex attaches
+/// one delta to one event so the record id is already one per request. That
+/// held only for a turn whose single row is the whole call. A turn that
+/// reasons or calls a tool writes several rows for one call, and keyed on the
+/// record id each became its own request — see
+/// `one_codex_request_written_as_several_rows_is_one_request`.
 #[test]
-fn codex_record_keys_are_request_keys_and_are_not_flagged() {
+fn codex_requests_group_on_their_snapshot_span_and_are_not_flagged() {
     let conn = codex_store("codex/compaction.jsonl");
     let page = session_requests_page(&conn, "codex", "sess_codex_compact", 50, None).unwrap();
     assert_eq!(page.requests.len(), 2);
     for request in &page.requests {
-        assert_eq!(request.request_key_source, RequestKeySource::RecordId);
+        assert_eq!(request.request_key_source, RequestKeySource::RequestSpan);
         assert!(request.diagnostics.is_empty());
     }
+    // One snapshot each, so the spans are consecutive and distinct.
+    assert_eq!(page.requests[0].request_key, "request-span:0");
+    assert_eq!(page.requests[1].request_key, "request-span:1");
+}
+
+/// Codex writes one API request as several rows — `agent_reasoning`, one per
+/// `function_call`, then `agent_message` — and records no request id on any of
+/// them. Keyed on the record id, each row became its own request, so a session
+/// reported more requests than API calls and `getSessionRequestsPage` returned
+/// rows carrying no usage that were never separate calls.
+///
+/// The provider does delimit its requests, just not by naming them: a
+/// `token_count` snapshot ends one. That span is the request.
+#[test]
+fn one_codex_request_written_as_several_rows_is_one_request() {
+    let conn = codex_store("codex/one-request-three-rows.jsonl");
+    let rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM session_events \
+             WHERE source='codex' AND role='assistant'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        rows, 3,
+        "the fixture really is one call written as three rows"
+    );
+
+    let page = session_requests_page(&conn, "codex", "sess_codex_three_rows", 50, None).unwrap();
+    assert_eq!(
+        page.requests.len(),
+        1,
+        "one snapshot, one request: {:?}",
+        page.requests
+            .iter()
+            .map(|r| r.request_key.as_str())
+            .collect::<Vec<_>>()
+    );
+    let request = &page.requests[0];
+    assert_eq!(request.request_key_source, RequestKeySource::RequestSpan);
+    assert_eq!(request.event_count, 3, "and it keeps all three rows");
+    assert!(request.has_thinking, "including the reasoning");
+    assert_eq!(
+        request.tool_use_ids,
+        vec!["call_1".to_string()],
+        "and the tool call it made"
+    );
+    let usage = request.usage.as_ref().expect("the snapshot measured it");
+    assert_eq!((usage.input_tokens, usage.output_tokens), (500, 120));
+    assert!(request.diagnostics.is_empty());
+
+    let summary = session_usage_summary(&conn, "codex", "sess_codex_three_rows")
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.total_request_count, 1, "the count is API calls");
+    assert_eq!(summary.request_count, 1);
+    assert_eq!(summary.usage.as_ref().unwrap().output_tokens, 120);
+}
+
+/// And the span is *not* the turn. One Codex turn runs a tool loop: the model
+/// is called, asks for a tool, the tool runs, and the model is called again.
+/// Each call gets its own `token_count`, so one `turn_id` covers two genuine
+/// API requests with two different measurements.
+///
+/// Grouping by turn would merge them into a single request holding two
+/// disagreeing usage blobs, which is `ambiguous-usage-copies` — the session
+/// would report *no* usage where it currently reports a correct total. That is
+/// the same over-merge this view refuses for Claude, so the boundary has to be
+/// the snapshot, not the turn.
+#[test]
+fn a_codex_tool_loop_is_two_requests_within_one_turn() {
+    let conn = codex_store("codex/two-requests-one-turn.jsonl");
+    let turns: i64 = conn
+        .query_row(
+            "SELECT COUNT(DISTINCT turn_id) FROM session_events \
+             WHERE source='codex' AND role='assistant'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(turns, 1, "the fixture really is a single turn");
+
+    let page = session_requests_page(&conn, "codex", "sess_codex_tool_loop", 50, None).unwrap();
+    assert_eq!(page.requests.len(), 2, "two snapshots, two requests");
+
+    // The reasoning belongs to the call that produced the tool use, not to the
+    // later one that answered.
+    let first = &page.requests[0];
+    assert_eq!(first.event_count, 2);
+    assert!(first.has_thinking);
+    assert_eq!(first.tool_use_ids, vec!["call_1".to_string()]);
+    assert_eq!(
+        first
+            .usage
+            .as_ref()
+            .map(|u| (u.input_tokens, u.output_tokens)),
+        Some((500, 60))
+    );
+
+    let second = &page.requests[1];
+    assert_eq!(second.event_count, 1);
+    assert!(!second.has_thinking);
+    assert_eq!(
+        second
+            .usage
+            .as_ref()
+            .map(|u| (u.input_tokens, u.output_tokens)),
+        Some((400, 80))
+    );
+
+    assert_ne!(
+        first.request_key, second.request_key,
+        "two calls, two keys — merging them would lose both measurements"
+    );
+    let summary = session_usage_summary(&conn, "codex", "sess_codex_tool_loop")
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.total_request_count, 2);
+    assert!(
+        !summary
+            .diagnostics
+            .contains(&UsageDiagnostic::AmbiguousUsageCopies),
+        "{:?}",
+        summary.diagnostics
+    );
+    assert_eq!(
+        summary
+            .usage
+            .as_ref()
+            .map(|u| (u.input_tokens, u.output_tokens)),
+        Some((900, 140)),
+        "and the session total is still the sum of the two calls"
+    );
 }
 
 /// A transcript that reports input but no output is missing evidence, not a

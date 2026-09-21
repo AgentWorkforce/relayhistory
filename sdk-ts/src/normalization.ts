@@ -385,7 +385,12 @@ export function usageAccounting(value: unknown): UsageAccounting {
 }
 
 export function requestKeySource(value: unknown): RequestKeySource {
-  if (value === 'request-id' || value === 'provider-message-id' || value === 'record-id') {
+  if (
+    value === 'request-id' ||
+    value === 'provider-message-id' ||
+    value === 'request-span' ||
+    value === 'record-id'
+  ) {
     return value;
   }
   throw new NativeContractMismatchError(

@@ -145,9 +145,32 @@ call by the number of records it was split across.
 `session_events`, one row per `(source, session_id, request_key)`:
 
 - `request_key` is the provider's own identity for the API call: `request_id`
-  (Claude's `requestId`) first, then `provider_message_id` (`message.id`), and
-  the event's `message_id` only as a last resort. `requestKeySource` says which
-  of the three was used.
+  (Claude's `requestId`) first, then `provider_message_id` (`message.id`), then
+  `request_span` for a provider that ends a call without naming it, and the
+  event's `message_id` only as a last resort. `requestKeySource` says which of
+  the four was used.
+- **`request-span` is for a provider that delimits its requests instead of
+  naming them.** Codex records no request id and no message id, but it reports
+  a cumulative `token_count` after each API call, so one snapshot ends one
+  call and every assistant row since the previous snapshot belongs to it —
+  `agent_reasoning`, each `function_call`, then `agent_message`. The parser
+  numbers those spans per session as it reads the rollout, because the
+  boundary is knowable only in order. Keyed on the record id instead, each of
+  those rows became a request of its own and a session reported several
+  requests, most carrying no usage, for one API call.
+
+  The span is deliberately **not** the turn. A Codex turn runs a tool loop and
+  holds as many API calls as it made round trips, each with its own snapshot.
+  Grouping by `turn_id` would merge calls with different measurements into one
+  request, which is `ambiguous-usage-copies` — the session would report no
+  usage where it now reports a correct total. The boundary is the snapshot.
+
+  A span is closed by **every** snapshot the provider reported, whether or not
+  it could be differenced. Two turns whose snapshots were both unreadable are
+  two refused requests; folding them into one span would merge their refusals
+  into a single request holding two disagreeing blobs, reported as ambiguous
+  rather than as two rejections. What a span *cost* is a separate question,
+  settled by the refusal rule above.
 - The key is **namespace-qualified** — `request-id:req_1`, not `req_1`. Those
   three namespaces are separate and can carry the same text, and a bare value
   merged one call whose `request_id` was `msg_1` with an older call whose

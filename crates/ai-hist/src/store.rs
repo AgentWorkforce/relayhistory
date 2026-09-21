@@ -211,6 +211,7 @@ CREATE TABLE IF NOT EXISTS session_events (
     is_sidechain INTEGER,
     is_meta INTEGER,
     turn_id TEXT,
+    request_span TEXT,
     raw_facts_version INTEGER,
     UNIQUE(source, session_id, event_uid)
 );
@@ -582,6 +583,15 @@ const REQUIRED_SESSION_EVENT_COLUMNS: &[(&str, &str)] = &[
     ("is_sidechain", "INTEGER"),
     ("is_meta", "INTEGER"),
     ("turn_id", "TEXT"),
+    // Which API request a row belongs to, for a provider that delimits its
+    // requests without naming them. Codex reports cumulative `token_count`
+    // snapshots; one snapshot ends one request, and every assistant row since
+    // the previous snapshot belongs to it. The parser numbers those spans per
+    // session, because the boundary is knowable only while reading the
+    // rollout in order -- a reader cannot recover it from the stored rows
+    // without scanning the session. Null for providers that name their
+    // requests, which group on `request_id` instead.
+    ("request_span", "TEXT"),
     // Not a provider fact: the generation of raw-fact parsing the local parser
     // wrote the row with. It is the only field stamped on every event the
     // parser writes, whatever the provider recorded, which is what lets a
@@ -2084,6 +2094,15 @@ pub struct SessionEvent {
     pub is_sidechain: Option<i64>,
     pub is_meta: Option<i64>,
     pub turn_id: Option<String>,
+    /// Which API request this row belongs to, when the provider delimits its
+    /// requests without naming them — see `request_span` in
+    /// `REQUIRED_SESSION_EVENT_COLUMNS`.
+    ///
+    /// On the struct, not only in the table, so a connector supplying
+    /// normalized events preserves the grouping: without it a remotely
+    /// hydrated Codex session arrives with null spans and reads as one request
+    /// per row, which is the defect this column exists to prevent.
+    pub request_span: Option<String>,
 }
 
 /// Stable continuation for normalized session events.
@@ -2177,7 +2196,7 @@ const SESSION_EVENT_COLUMNS: &str =
      ts_ms, role, kind, text, model, token_json, event_uid, tool_use_id, payload_bytes, \
      payload_truncated, payload_hash, call_index, event_index, result_status, event_source, \
      error_signal, subagent_session_id, agent_id, request_id, provider_message_id, \
-     stop_reason, agent_version, is_sidechain, is_meta, turn_id";
+     stop_reason, agent_version, is_sidechain, is_meta, turn_id, request_span";
 
 fn row_to_session_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionEvent> {
     Ok(SessionEvent {
@@ -2215,6 +2234,7 @@ fn row_to_session_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionEven
         is_sidechain: row.get(31)?,
         is_meta: row.get(32)?,
         turn_id: row.get(33)?,
+        request_span: row.get(34)?,
     })
 }
 

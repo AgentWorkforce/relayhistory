@@ -552,11 +552,18 @@ export type UsageAccounting =
  * Where a request's grouping key came from.
  *
  * `request-id` and `provider-message-id` are identities the provider gave the
- * API call. `record-id` is not: it is the stored event's own id, and for a
- * source that writes one call as several records a key built from it can be
- * finer than one row per request.
+ * API call. `request-span` is one the provider implied rather than named: a
+ * source that reports a cumulative usage snapshot after each call ends a
+ * request with every snapshot, so the span between two of them is one call.
+ * `record-id` is not an API identity at all: it is the stored event's own id,
+ * and for a source that writes one call as several records a key built from it
+ * can be finer than one row per request.
  */
-export type RequestKeySource = 'request-id' | 'provider-message-id' | 'record-id';
+export type RequestKeySource =
+  | 'request-id'
+  | 'provider-message-id'
+  | 'request-span'
+  | 'record-id';
 
 /** Why a request's usage is absent, or narrower than it looks. */
 export type UsageDiagnostic =

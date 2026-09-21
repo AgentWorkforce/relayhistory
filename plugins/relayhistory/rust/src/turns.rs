@@ -259,7 +259,7 @@ mod tests {
                 agent_id TEXT,
                 request_id TEXT, provider_message_id TEXT,
                 stop_reason TEXT, agent_version TEXT,
-                is_sidechain INTEGER, is_meta INTEGER, turn_id TEXT
+                is_sidechain INTEGER, is_meta INTEGER, turn_id TEXT, request_span TEXT
             );",
         )
         .unwrap();

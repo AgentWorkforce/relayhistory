@@ -540,6 +540,22 @@ const CORPUS: &[Fixture] = &[
         files: &["codex/two-unreadable-turns.jsonl"],
         quirk: "two unrecovered turns each retain their own unreadable usage refusal",
     },
+    Fixture {
+        source: "codex",
+        name: "one-request-three-rows",
+        layout: Layout::CodexRollout,
+        origin: Origin::RelayHistory,
+        files: &["codex/one-request-three-rows.jsonl"],
+        quirk: "one API call written as reasoning, a tool call and a message is one request, not three",
+    },
+    Fixture {
+        source: "codex",
+        name: "two-requests-one-turn",
+        layout: Layout::CodexRollout,
+        origin: Origin::RelayHistory,
+        files: &["codex/two-requests-one-turn.jsonl"],
+        quirk: "a tool loop makes two API calls inside one turn_id, so the turn is not the request",
+    },
     // -- cursor, authored here ---------------------------------------------
     Fixture {
         source: "cursor",

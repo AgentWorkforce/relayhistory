@@ -21,7 +21,7 @@ use std::collections::BTreeSet;
 
 /// Bump whenever the request row / summary shapes, ordering, or cursor
 /// semantics require an SDK change.
-pub const SESSION_USAGE_CONTRACT_VERSION: u32 = 1;
+pub const SESSION_USAGE_CONTRACT_VERSION: u32 = 2;
 
 /// The `session_requests` view: one row per model request.
 ///
@@ -72,11 +72,13 @@ SELECT
     CASE
         WHEN NULLIF(e.request_id, '') IS NOT NULL THEN 'request-id:' || e.request_id
         WHEN NULLIF(e.provider_message_id, '') IS NOT NULL THEN 'provider-message-id:' || e.provider_message_id
+        WHEN NULLIF(e.request_span, '') IS NOT NULL THEN 'request-span:' || e.request_span
         ELSE 'record-id:' || e.message_id
     END AS request_key,
     CASE
         WHEN NULLIF(e.request_id, '') IS NOT NULL THEN 'request-id'
         WHEN NULLIF(e.provider_message_id, '') IS NOT NULL THEN 'provider-message-id'
+        WHEN NULLIF(e.request_span, '') IS NOT NULL THEN 'request-span'
         ELSE 'record-id'
     END AS request_key_source,
     json_group_array(DISTINCT e.message_id) AS message_ids,
@@ -97,6 +99,7 @@ WHERE e.role = 'assistant'
 GROUP BY e.source, e.session_id, CASE
         WHEN NULLIF(e.request_id, '') IS NOT NULL THEN 'request-id:' || e.request_id
         WHEN NULLIF(e.provider_message_id, '') IS NOT NULL THEN 'provider-message-id:' || e.provider_message_id
+        WHEN NULLIF(e.request_span, '') IS NOT NULL THEN 'request-span:' || e.request_span
         ELSE 'record-id:' || e.message_id
     END";
 
@@ -134,6 +137,22 @@ pub enum RequestKeySource {
     /// The provider's own message id — Claude's `message.id` — because the
     /// record carried no request id.
     ProviderMessageId,
+    /// The span between two usage snapshots, for a provider that delimits
+    /// its requests without naming them.
+    ///
+    /// Codex records no request id and no message id, but it reports a
+    /// cumulative `token_count` after each API call, so one snapshot ends one
+    /// request and every assistant row since the previous snapshot belongs to
+    /// it. Without this the rows of one call — `agent_reasoning`, each
+    /// `function_call`, then `agent_message` — each became a request of their
+    /// own, and a session reported several requests, most of them carrying no
+    /// usage, for one API call.
+    ///
+    /// The span is deliberately **not** the turn. A Codex turn runs a tool
+    /// loop and holds as many API calls as it made round trips, each with its
+    /// own snapshot; grouping by `turn_id` would merge them into one request
+    /// with disagreeing usage blobs, which reports no usage at all.
+    RequestSpan,
     /// The stored `message_id`, because the provider recorded neither. For a
     /// source that writes one request as several records this is a *record*
     /// identity, not a request one, and the grouping built on it may be
@@ -146,6 +165,7 @@ impl RequestKeySource {
         match self {
             Self::RequestId => "request-id",
             Self::ProviderMessageId => "provider-message-id",
+            Self::RequestSpan => "request-span",
             Self::RecordId => "record-id",
         }
     }
@@ -154,6 +174,7 @@ impl RequestKeySource {
         match value {
             "request-id" => Some(Self::RequestId),
             "provider-message-id" => Some(Self::ProviderMessageId),
+            "request-span" => Some(Self::RequestSpan),
             "record-id" => Some(Self::RecordId),
             _ => None,
         }

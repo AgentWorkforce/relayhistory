@@ -2801,6 +2801,21 @@ pub(crate) fn ingest_codex_rollout(
     // Which baseline `prev_totals` currently holds. Bumped every time it is
     // replaced, so each fact above can name the baseline it belongs to.
     let mut baseline_generation: u64 = 0;
+    // Which API request the rows being written belong to.
+    //
+    // Codex names no request — no request id, no message id — but it *ends*
+    // one with every `token_count`: the span between two snapshots is one API
+    // call, and `agent_reasoning`, each `function_call` and the closing
+    // `agent_message` of that call all fall inside it. Numbered here because
+    // the boundary is only knowable while reading the rollout in order; a
+    // reader given the stored rows would have to scan the session to find the
+    // next row carrying a measurement.
+    //
+    // Deliberately not the turn: a turn runs a tool loop and holds as many
+    // calls as it made round trips. Grouping by `turn_id` would merge calls
+    // with different measurements into one request and report no usage for
+    // either.
+    let mut request_span: u64 = 0;
     // Set when a snapshot is unreadable while no baseline has been
     // established. A resumed rollout opens with the cumulative total it
     // carried over; if that opening snapshot cannot be read, there is no
@@ -2880,6 +2895,8 @@ pub(crate) fn ingest_codex_rollout(
                 None,
                 None,
                 turn_id.as_deref(),
+                // A user turn is not a request, and the view does not read it.
+                None,
             )?;
             outcome.events += 1;
             // A subagent's "user" turns are the parent agent's task prompts;
@@ -2935,6 +2952,7 @@ pub(crate) fn ingest_codex_rollout(
                             token_json.as_deref(),
                             None,
                             turn_id.as_deref(),
+                            Some(request_span.to_string().as_str()),
                         )?;
                         outcome.events += 1;
                         untokened_assistant_uid = token_json.is_none().then(|| uid.clone());
@@ -2961,6 +2979,7 @@ pub(crate) fn ingest_codex_rollout(
                             None,
                             None,
                             turn_id.as_deref(),
+                            Some(request_span.to_string().as_str()),
                         )?;
                         outcome.events += 1;
                         untokened_assistant_uid = Some(uid);
@@ -2974,6 +2993,21 @@ pub(crate) fn ingest_codex_rollout(
                     else {
                         continue;
                     };
+                    // The provider reported a call here, so the rows written
+                    // since the last snapshot are that call and the rows after
+                    // this one are the next. The boundary is the snapshot
+                    // itself, not whether it could be differenced: two turns
+                    // whose snapshots were both unreadable are two refused
+                    // requests, and folding them into one span would merge
+                    // their refusals into a single request holding two
+                    // disagreeing blobs — reported as ambiguous rather than as
+                    // two rejections.
+                    //
+                    // Measurement is a separate question, settled by
+                    // `surviving_refusals`: a span whose snapshot could not be
+                    // read has its spend reported inside whichever later delta
+                    // covers it, and reads as a request with no usage.
+                    request_span += 1;
                     let Some(totals) = CodexTokenTotals::from_usage(usage) else {
                         // A counter that is not a non-negative integer cannot
                         // be differenced — which is the same situation as a
@@ -3258,6 +3292,7 @@ pub(crate) fn ingest_codex_rollout(
                         token_json.as_deref(),
                         None,
                         turn_id.as_deref(),
+                        Some(request_span.to_string().as_str()),
                     )?;
                     outcome.events += 1;
                     untokened_assistant_uid = token_json.is_none().then(|| uid.clone());
@@ -3315,6 +3350,8 @@ pub(crate) fn ingest_codex_rollout(
                         None,
                         Some(&facts),
                         turn_id.as_deref(),
+                        // Likewise: a tool's own output is not an API call.
+                        None,
                     )?;
                     outcome.events += 1;
                     if !call_id.is_empty() {
@@ -3419,6 +3456,7 @@ fn insert_codex_event(
     token_json: Option<&str>,
     tool_result_facts: Option<&ToolResultFacts>,
     turn_id: Option<&str>,
+    request_span: Option<&str>,
 ) -> Result<()> {
     insert_session_event(
         conn,
@@ -3440,6 +3478,7 @@ fn insert_codex_event(
         tool_result_facts,
         RawMessageFacts {
             turn_id,
+            request_span,
             ..RawMessageFacts::default()
         },
     )
@@ -4618,6 +4657,9 @@ fn ingest_claude_transcript_as(
             is_sidechain,
             is_meta,
             turn_id: None,
+            // Claude names its requests, so it groups on `request_id` and
+            // needs no span.
+            request_span: None,
         };
         // Heal what an earlier parser version wrote for this record: it
         // attributed every sidechain row to the parent, and stored the rows
@@ -5001,7 +5043,9 @@ fn opencode_step_finish_stop_reason(part: &Value) -> Option<&str> {
 /// of them can answer "was this row indexed before the facts existed?".
 /// This can, which is what the full-sync backfill probes read. Bump it when a
 /// later change adds facts that existing rows should be re-read for.
-const RAW_MESSAGE_FACTS_VERSION: i64 = 1;
+/// 2 adds `request_span`: Codex rows indexed before it have none, so they
+/// would keep grouping one API call into a request per row until re-read.
+const RAW_MESSAGE_FACTS_VERSION: i64 = 2;
 
 #[derive(Debug, Default, Clone, Copy)]
 struct RawMessageFacts<'a> {
@@ -5011,6 +5055,10 @@ struct RawMessageFacts<'a> {
     is_sidechain: Option<bool>,
     is_meta: Option<bool>,
     turn_id: Option<&'a str>,
+    /// Which API request this row belongs to, for a provider that delimits
+    /// its requests with usage snapshots instead of naming them. Numbered per
+    /// session by the parser; see `codex_request_span` at its call site.
+    request_span: Option<&'a str>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5128,7 +5176,7 @@ fn insert_session_event(
          (source, session_id, project, project_key, project_key_method, cwd, git_branch, message_id, parent_id, ts_ms, role, kind, text, model, token_json, event_uid, \
           tool_use_id, payload_bytes, payload_truncated, payload_hash, call_index, event_index, result_status, event_source, \
           error_signal, subagent_session_id, agent_id, \
-          request_id, provider_message_id, stop_reason, agent_version, is_sidechain, is_meta, turn_id, raw_facts_version) \
+          request_id, provider_message_id, stop_reason, agent_version, is_sidechain, is_meta, turn_id, request_span, raw_facts_version) \
          VALUES (?1, ?2, ?3, \
            COALESCE((SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2), ?15), \
            CASE WHEN (SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2) IS NOT NULL \
@@ -5136,7 +5184,7 @@ fn insert_session_event(
                 ELSE ?16 END, \
            ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
            ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, \
-           ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35) \
+           ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36) \
          ON CONFLICT(source, session_id, event_uid) DO UPDATE SET \
          project=excluded.project, \
          project_key=COALESCE((SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2), session_events.project_key, ?15), \
@@ -5157,6 +5205,7 @@ fn insert_session_event(
          provider_message_id=excluded.provider_message_id, \
          stop_reason=excluded.stop_reason, agent_version=excluded.agent_version, \
          is_sidechain=excluded.is_sidechain, is_meta=excluded.is_meta, turn_id=excluded.turn_id, \
+         request_span=excluded.request_span, \
          raw_facts_version=excluded.raw_facts_version",
         params![
             source,
@@ -5193,6 +5242,7 @@ fn insert_session_event(
             raw_facts.is_sidechain,
             raw_facts.is_meta,
             raw_facts.turn_id,
+            raw_facts.request_span,
             RAW_MESSAGE_FACTS_VERSION,
         ],
     )?;

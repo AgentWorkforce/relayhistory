@@ -255,7 +255,7 @@ export interface NativeSessionRequest {
   source: string
   sessionId: string
   requestKey: string
-  /** `request-id`, `provider-message-id` or `record-id`. */
+  /** `request-id`, `provider-message-id`, `request-span` or `record-id`. */
   requestKeySource: string
   messageIds: Array<string>
   model?: string

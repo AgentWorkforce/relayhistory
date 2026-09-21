@@ -646,7 +646,7 @@ pub struct NativeSessionRequest {
     pub source: String,
     pub session_id: String,
     pub request_key: String,
-    /// `request-id`, `provider-message-id` or `record-id`.
+    /// `request-id`, `provider-message-id`, `request-span` or `record-id`.
     pub request_key_source: String,
     pub message_ids: Vec<String>,
     pub model: Option<String>,

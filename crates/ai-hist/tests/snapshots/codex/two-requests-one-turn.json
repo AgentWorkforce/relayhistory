@@ -1,0 +1,131 @@
+{
+  "corpus_files": [
+    "codex/two-requests-one-turn.jsonl"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "codex/two-requests-one-turn",
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "go",
+      "session_id": "sess_codex_tool_loop",
+      "source": "codex",
+      "timestamp_ms": 1776765600300
+    }
+  ],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "sess_codex_tool_loop",
+      "source": "codex",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "CodexRollout",
+  "notes": [],
+  "origin": "relayhistory",
+  "quirk": "a tool loop makes two API calls inside one turn_id, so the turn is not the request",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "3:user_message",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "3:user_message",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "sess_codex_tool_loop",
+      "source": "codex",
+      "text": "go",
+      "token_json": null,
+      "ts_ms": 1776765600300
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "4:agent_reasoning",
+      "git_branch": null,
+      "kind": "thinking",
+      "message_id": "4:agent_reasoning",
+      "model": "gpt-5.4",
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "sess_codex_tool_loop",
+      "source": "codex",
+      "text": "I should look first.",
+      "token_json": null,
+      "ts_ms": 1776765600500
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "5:function_call",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "5:function_call",
+      "model": "gpt-5.4",
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "sess_codex_tool_loop",
+      "source": "codex",
+      "text": "shell {\"command\":[\"ls\"]}",
+      "token_json": "{\"cache_write_input_tokens\":0,\"cached_input_tokens\":0,\"input_tokens\":500,\"output_tokens\":60,\"reasoning_output_tokens\":20,\"total_tokens\":560}",
+      "ts_ms": 1776765600600
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "8:agent_message",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "8:agent_message",
+      "model": "gpt-5.4",
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "sess_codex_tool_loop",
+      "source": "codex",
+      "text": "Done.",
+      "token_json": "{\"cache_write_input_tokens\":0,\"cached_input_tokens\":0,\"input_tokens\":400,\"output_tokens\":80,\"reasoning_output_tokens\":20,\"total_tokens\":480}",
+      "ts_ms": 1776765600900
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": null,
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776765600000,
+      "first_prompt": "go",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776765602000,
+      "last_assistant_text": "Done.",
+      "models_json": "[\"gpt-5.4\"]",
+      "originator": null,
+      "raw_path": "<home>/.codex/sessions/2026/04/20/rollout-2026-04-20T00-00-00-two-requests-one-turn.jsonl",
+      "repo_url": null,
+      "session_id": "sess_codex_tool_loop",
+      "source": "codex",
+      "source_stamp": "<n>:1631",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "codex",
+  "tool_calls": [
+    {
+      "args_json": "{\"command\":[\"ls\"]}",
+      "is_error": 0,
+      "message_id": "5:function_call",
+      "name": "shell",
+      "session_id": "sess_codex_tool_loop",
+      "source": "codex",
+      "target": null,
+      "tool_use_id": "call_1",
+      "ts_ms": 1776765600600
+    }
+  ]
+}

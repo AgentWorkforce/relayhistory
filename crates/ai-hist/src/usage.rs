@@ -548,6 +548,8 @@ pub(crate) fn request_key(event: &SessionEvent) -> String {
         format!("request-id:{id}")
     } else if let Some(id) = present(event.provider_message_id.as_ref()) {
         format!("provider-message-id:{id}")
+    } else if let Some(span) = present(event.request_span.as_ref()) {
+        format!("request-span:{span}")
     } else {
         format!(
             "record-id:{}",
@@ -1245,6 +1247,7 @@ mod tests {
             is_sidechain: None,
             is_meta: None,
             turn_id: None,
+            request_span: None,
         }
     }
 
