@@ -13,12 +13,13 @@ export function isRegistryVisibilityFailure(output) {
   return /\b(?:ETARGET|E404)\b/.test(output);
 }
 
-function runNpmInstall(args) {
+function runNpmInstall(args, extra = {}) {
   const cache = mkdtempSync(join(tmpdir(), 'ai-hist-npm-cache-'));
   try {
     const result = spawnSync('npm', ['install', '--prefer-online', ...args], {
       encoding: 'utf8',
-      env: { ...process.env, npm_config_cache: cache },
+      cwd: extra.cwd,
+      env: { ...process.env, ...extra.env, npm_config_cache: cache },
     });
     if (result.error) throw result.error;
     return {
@@ -54,9 +55,11 @@ export async function installWithRegistryRetry(args, options = {}) {
 
   const attempts = options.attempts ?? DEFAULT_ATTEMPTS;
   const delayMs = options.delayMs ?? DEFAULT_DELAY_MS;
-  const runInstall = options.runInstall ?? runNpmInstall;
+  const cwd = options.cwd;
+  const env = options.env;
+  const runInstall = options.runInstall ?? ((installArgs) => runNpmInstall(installArgs, { cwd, env }));
   const sleep = options.sleep ?? delay;
-  const reset = options.reset ?? clearPartialInstall;
+  const reset = options.reset ?? (() => clearPartialInstall(cwd ?? process.cwd()));
   const emit = options.emit ?? ((stream, output) => stream.write(output));
   const log = options.log ?? ((message) => console.error(message));
 

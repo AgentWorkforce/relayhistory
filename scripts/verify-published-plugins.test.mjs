@@ -4,7 +4,13 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import { packageName, platforms, plugins } from "./history-package-contract.mjs";
-import { waitForPublishedPackages } from "./verify-published-plugins.mjs";
+import {
+  hostLibc,
+  pluginInstallArgs,
+  publicRegistryEnv,
+  verifyPluginManifest,
+  waitForPublishedPackages,
+} from "./verify-published-plugins.mjs";
 
 const script = fileURLToPath(new URL("./verify-published-plugins.mjs", import.meta.url));
 
@@ -132,6 +138,51 @@ test("process launch failures preserve the package context and original error", 
     assert.match(error.message, /@relayhistory\/capture@0\.19\.0.*ENOENT/);
     return true;
   });
+});
+
+test("verify project depends on both JS packages at the release version", () => {
+  const manifest = verifyPluginManifest(version);
+  assert.deepEqual(manifest.dependencies, {
+    "@relayhistory/capture": version,
+    "@relayhistory/provider-sources": version,
+  });
+  assert.equal("optionalDependencies" in manifest, false);
+});
+
+test("linux install tells npm the helper's libc family", () => {
+  assert.deepEqual(
+    pluginInstallArgs("/tmp/verify", "glibc"),
+    ["--prefix", "/tmp/verify", "--libc=glibc"],
+  );
+  assert.deepEqual(
+    pluginInstallArgs("/tmp/verify", "musl"),
+    ["--prefix", "/tmp/verify", "--libc=musl"],
+  );
+  assert.deepEqual(pluginInstallArgs("/tmp/verify", undefined), ["--prefix", "/tmp/verify"]);
+});
+
+test("public registry install drops the publish job's npm token and userconfig", () => {
+  const env = publicRegistryEnv({
+    PATH: "/usr/bin",
+    NODE_AUTH_TOKEN: "secret",
+    NPM_CONFIG_USERCONFIG: "/tmp/publish.npmrc",
+    npm_config_userconfig: "/tmp/publish.npmrc",
+  });
+  assert.equal(env.PATH, "/usr/bin");
+  assert.equal("NODE_AUTH_TOKEN" in env, false);
+  assert.equal("NPM_CONFIG_USERCONFIG" in env, false);
+  assert.equal("npm_config_userconfig" in env, false);
+});
+
+test("host libc is the contract field for this machine's platform", () => {
+  const libc = hostLibc();
+  if (process.platform === "linux") {
+    assert.ok(libc === "glibc" || libc === "musl");
+    const key = `${process.platform}-${process.arch}-${libc === "glibc" ? "gnu" : "musl"}`;
+    assert.equal(platforms[key][2], libc);
+  } else {
+    assert.equal(libc, undefined);
+  }
 });
 
 test("invalid published manifests fail immediately instead of being treated as propagation", async () => {
