@@ -50,6 +50,7 @@
   "quirk": "two transcripts share one source session id: a fork, not a continuation",
   "session_events": [
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-fork-a-1:0",
       "git_branch": null,
@@ -66,6 +67,7 @@
       "ts_ms": 1776902400000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-fork-a-asst:0",
       "git_branch": null,
@@ -82,6 +84,7 @@
       "ts_ms": 1776902401000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-fork-b-1:0",
       "git_branch": null,
@@ -98,6 +101,7 @@
       "ts_ms": 1776902405000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-fork-b-asst:0",
       "git_branch": null,
@@ -114,6 +118,7 @@
       "ts_ms": 1776902406000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-original-user:0",
       "git_branch": null,
@@ -130,6 +135,7 @@
       "ts_ms": 1776815940000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-original-asst:0",
       "git_branch": null,
@@ -146,6 +152,7 @@
       "ts_ms": 1776815941000
     }
   ],
+  "session_markers": [],
   "session_relationships": [
     {
       "child_agent_name": null,

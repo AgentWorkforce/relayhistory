@@ -219,6 +219,11 @@ CREATE TABLE IF NOT EXISTS session_events (
     request_span TEXT,
     raw_facts_version INTEGER,
     raw_kind TEXT,
+    -- Why a user-role row is not a human prompt: a slash-command triad row,
+    -- a task notification, hook output, a system reminder, Codex context.
+    -- Null for a genuine prompt and for every model-output row. See
+    -- `ingest::control`.
+    control_kind TEXT,
     UNIQUE(source, session_id, event_uid)
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS session_events_fts USING fts5(
@@ -641,6 +646,12 @@ const REQUIRED_SESSION_EVENT_COLUMNS: &[(&str, &str)] = &[
     // `type: "system"` subagent notification. Both land in the same `kind`;
     // the normalized `kind` vocabulary is deliberately not widened for it.
     ("raw_kind", "TEXT"),
+    // Why a user-role row is not a human prompt, from the vocabulary in
+    // `ingest::control::ControlKind`. Null on every prompt and every
+    // model-output row. Derived by the parser, not copied off the envelope,
+    // so it is re-stamped by the same raw-facts backfill that repairs the
+    // columns above: a row without it is a row the classifier never saw.
+    ("control_kind", "TEXT"),
 ];
 /// Columns the v2 `session_relationships` shape adds. A v1 row set cannot
 /// represent related evidence whose child has no provider-recorded identity,
@@ -2439,6 +2450,20 @@ pub struct SessionEvent {
     /// hydrated Codex session arrives with null spans and reads as one request
     /// per row, which is the defect this column exists to prevent.
     pub request_span: Option<String>,
+    /// Why a user-role row is not a human prompt, or `None` for a genuine
+    /// prompt and for every model-output row.
+    ///
+    /// One of `slash_command_caveat`, `slash_command_invocation`,
+    /// `slash_command_output`, `task_notification`, `hook_output`,
+    /// `bash_passthrough_input`, `bash_passthrough_output`,
+    /// `system_reminder`, `codex_context_wrapper`, `meta`, `resume_marker`.
+    /// The row keeps `role = "user"` and `kind = "text"` and its text
+    /// verbatim; this column is what a consumer building human turns, prompt
+    /// roots or an overhead breakdown filters on, so none of them has to
+    /// re-read the transcript to tell a `<task-notification>` from a prompt.
+    /// `None` also on rows written before the column existed, which the next
+    /// plain `sync` re-stamps.
+    pub control_kind: Option<String>,
 }
 
 /// Stable continuation for normalized session events.
@@ -2570,7 +2595,8 @@ const SESSION_EVENT_COLUMNS: &str =
      ts_ms, role, kind, text, model, token_json, provider, event_uid, tool_use_id, payload_bytes, \
      payload_truncated, payload_hash, call_index, event_index, result_status, event_source, \
      error_signal, subagent_session_id, agent_id, request_id, provider_message_id, \
-     stop_reason, agent_version, is_sidechain, is_meta, turn_id, request_span, raw_kind";
+     stop_reason, agent_version, is_sidechain, is_meta, turn_id, request_span, raw_kind, \
+     control_kind";
 
 fn row_to_session_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionEvent> {
     Ok(SessionEvent {
@@ -2611,6 +2637,7 @@ fn row_to_session_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionEven
         turn_id: row.get(34)?,
         request_span: row.get(35)?,
         raw_kind: row.get(36)?,
+        control_kind: row.get(37)?,
     })
 }
 

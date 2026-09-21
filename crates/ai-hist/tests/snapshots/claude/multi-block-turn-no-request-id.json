@@ -28,6 +28,7 @@
   "quirk": "assistant records omit `requestId` but share one `message.id`, which is the fallback request identity",
   "session_events": [
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-user-1:0",
       "git_branch": null,
@@ -44,6 +45,7 @@
       "ts_ms": 1776643200000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-asst-1b:0",
       "git_branch": null,
@@ -60,6 +62,7 @@
       "ts_ms": 1776643201500
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-asst-1c:0",
       "git_branch": null,
@@ -76,6 +79,7 @@
       "ts_ms": 1776643202000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-asst-1d:0",
       "git_branch": null,
@@ -90,6 +94,21 @@
       "text": "Agent {\"description\":\"Research task\",\"prompt\":\"do something\",\"subagent_type\":\"general-purpose\"}",
       "token_json": "{\"cache_creation\":{\"ephemeral_1h_input_tokens\":4773,\"ephemeral_5m_input_tokens\":0},\"cache_creation_input_tokens\":4773,\"cache_read_input_tokens\":11496,\"input_tokens\":3,\"output_tokens\":43,\"service_tier\":\"standard\"}",
       "ts_ms": 1776643202500
+    }
+  ],
+  "session_markers": [
+    {
+      "kind": "unsupported_block",
+      "marker_uid": "u-asst-1a:0:signature",
+      "message_id": "u-asst-1a",
+      "parent_id": "u-user-1",
+      "payload_json": "{\"bytes\":3,\"has_signature\":true}",
+      "session_id": "22222222-2222-2222-2222-222222222222",
+      "source": "claude",
+      "subkind": "thinking_signature",
+      "text": null,
+      "ts_ms": 1776643201000,
+      "turn_id": null
     }
   ],
   "session_relationships": [],

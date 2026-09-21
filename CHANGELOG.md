@@ -127,6 +127,40 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Rust API
 
+- Type the rows a harness writes into the user role that are not prompts.
+  `session_events` gains `control_kind`, null for a genuine prompt and for
+  model output, and otherwise one of `slash_command_caveat`,
+  `slash_command_invocation`, `slash_command_output`, `task_notification`,
+  `hook_output`, `bash_passthrough_input`, `bash_passthrough_output`,
+  `system_reminder`, `codex_context_wrapper`, `meta`, `resume_marker`. The
+  row keeps its role, kind and verbatim text; the column is what a consumer
+  building human turns, prompt roots or an overhead breakdown filters on.
+  Claude reads `origin.kind` and `attachment.{type, commandMode}` for task
+  notifications, and a slash command's caveat → invocation → output records,
+  chained by `parentUuid`, are grouped into one `session_markers` row of
+  `kind = "slash_command"` whose payload carries `command_name`,
+  `command_message`, `command_args`, `command_mode`, `origin_kind`, the three
+  rows' event uids and `stdout_bytes` — the whole of what an activity
+  classifier reads, with no raw JSON. The pending triad travels in the
+  transcript cursor, so a command split across two hydration passes is still
+  one marker. A `<system-reminder>` block inside a prompt becomes a
+  `system_reminder` row sharing the prompt's `message_id`
+  (`<uid>:reminder:<n>`), and the prompt row and `history` carry only the
+  human's text. Codex's `<environment_context>` and sibling wrappers are
+  stored as `codex_context_wrapper` rows instead of falling to an `unknown`
+  marker. `history`, `sessions.first_prompt` and `attribute_usage_to_prompts`
+  all derive from that one classification (`ingest::control`), which
+  replaced the `CLAUDE_CONTROL_PREFIXES` list: a task notification or a bare
+  `/resume <id>` is no longer a `history` row or a first prompt, and the
+  answer to a slash command is charged to the human prompt before it rather
+  than to the command's output row. `SessionEvent` gains `control_kind`,
+  returned by `session_events` and `session_events_page` and carried by the
+  source-evidence row contract. `HYDRATION_PARSER_VERSION` 10 -> 11 and the
+  raw-facts generation 2 -> 3, so an existing install re-stamps every row
+  once on the next hydration or plain `sync`. `history` rows an earlier
+  parser wrote for rows now classified as control are not removed by that
+  re-read. The fixture corpus snapshots now include `control_kind` and a
+  `session_markers` dump. napi/TS/MCP exposure is not included.
 - Stop dropping the record types neither parser could normalize. A new
   `session_markers` table records compaction and summary boundaries, provider
   `system` rows, non-text content blocks (`image`, `document`,

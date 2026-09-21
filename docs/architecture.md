@@ -280,9 +280,11 @@ holds that record, and two or more transcripts carrying one in-log session id.
 
 A `/resume` is read in both forms Claude writes: the bare `/resume <id>` a
 human types, and the control wrapper Claude Code actually stores —
-`<command-name>/resume</command-name>` with the target in `<command-args>`,
-which this crate already classifies as a control prompt. Matching only the bare
-form matched the one shape a real transcript never contains.
+`<command-name>/resume</command-name>` with the target in `<command-args>`.
+Both are control rows (`session_events.control_kind` = `resume_marker` and
+`slash_command_invocation`; see `src/ingest/control.rs`), so neither is a
+prompt. Matching only the bare form matched the one shape a real transcript
+never contains.
 
 Unlike delegation, continuity is not observable inside a single transcript, so
 each transcript's evidence is banked in `session_continuity_evidence`, keyed by

@@ -35,6 +35,7 @@
   "quirk": "legacy layout with several tool parts of different sizes, one errored",
   "session_events": [
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "text:prt_u1_text",
       "git_branch": null,
@@ -51,6 +52,7 @@
       "ts_ms": 1776990000000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "tool_result:call_b1",
       "git_branch": null,
@@ -67,6 +69,7 @@
       "ts_ms": 1776990001000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "tool_result:call_fail",
       "git_branch": null,
@@ -83,6 +86,7 @@
       "ts_ms": 1776990001000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "tool_use:call_b1",
       "git_branch": null,
@@ -99,6 +103,7 @@
       "ts_ms": 1776990001000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "tool_use:call_fail",
       "git_branch": null,
@@ -115,6 +120,7 @@
       "ts_ms": 1776990001000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "text:prt_u2_text",
       "git_branch": null,
@@ -131,6 +137,7 @@
       "ts_ms": 1776990002000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "text:prt_a2_1_text",
       "git_branch": null,
@@ -147,6 +154,7 @@
       "ts_ms": 1776990003000
     }
   ],
+  "session_markers": [],
   "session_relationships": [],
   "sessions": [
     {

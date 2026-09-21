@@ -51,6 +51,7 @@
   "quirk": "older Claude-shaped grok directory: per-record timestamps, `tool_use` blocks in `content`, `updates.jsonl` as `file_changed` rows, plus `prompt_context.json`, `signals.json` and `subagents/`",
   "session_events": [
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "r0",
       "git_branch": "main",
@@ -67,6 +68,7 @@
       "ts_ms": 1776643200000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "r1",
       "git_branch": "main",
@@ -83,6 +85,7 @@
       "ts_ms": 1776643201000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "tool:grok_tool_1",
       "git_branch": "main",
@@ -99,6 +102,7 @@
       "ts_ms": 1776643202000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "result:grok_tool_1",
       "git_branch": "main",
@@ -115,6 +119,7 @@
       "ts_ms": 1776643203000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "r4",
       "git_branch": "main",
@@ -131,6 +136,7 @@
       "ts_ms": 1776643320000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "r6",
       "git_branch": "main",
@@ -145,6 +151,47 @@
       "text": "Added the test.",
       "token_json": null,
       "ts_ms": 1776643440000
+    }
+  ],
+  "session_markers": [
+    {
+      "kind": "synthetic_turn",
+      "marker_uid": "r5",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"synthetic_reason\":\"tool_loop\"}",
+      "session_id": "grok-00000001",
+      "source": "grok",
+      "subkind": null,
+      "text": "auto-continue",
+      "ts_ms": 1776643321000,
+      "turn_id": null
+    },
+    {
+      "kind": "signals",
+      "marker_uid": "signals",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"interrupted\":false,\"tool_failures\":0,\"turns\":2}",
+      "session_id": "grok-00000001",
+      "source": "grok",
+      "subkind": null,
+      "text": "turns=2",
+      "ts_ms": 1776643440000,
+      "turn_id": null
+    },
+    {
+      "kind": "prompt_context",
+      "marker_uid": "prompt_context",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"bytes\":158,\"path\":\"<home>/.grok/sessions/%2Ftmp%2Fproject/grok-00000001/prompt_context.json\",\"sha256\":\"fe0fdb10c9193bdcdea043ecf1b317bfa06c076034ecbfb2fb530211bd6e1886\"}",
+      "session_id": "grok-00000001",
+      "source": "grok",
+      "subkind": null,
+      "text": "<home>/.grok/sessions/%2Ftmp%2Fproject/grok-00000001/prompt_context.json",
+      "ts_ms": null,
+      "turn_id": null
     }
   ],
   "session_relationships": [

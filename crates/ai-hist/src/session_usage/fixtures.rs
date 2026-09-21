@@ -994,3 +994,64 @@ fn the_rust_request_key_agrees_with_the_view() {
         assert_eq!(from_rust, from_view, "{fixture}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Control rows and prompt attribution (#180). A row the harness wrote into
+// the user role is not a prompt, so it is never charged for a response.
+// ---------------------------------------------------------------------------
+
+/// A `<task-notification>` sits in the parent chain between a prompt and the
+/// answer that followed it. The chain walks through the notification to the
+/// human prompt; the notification itself owns nothing.
+#[test]
+fn a_task_notification_is_never_the_parent_prompt() {
+    let conn = claude_store("claude/task-notification.jsonl");
+    let events = crate::store::session_events(&conn, "tn-session", Some("claude")).unwrap();
+    let attributed = crate::usage::attribute_usage_to_prompts(&events, "claude");
+    let mut prompts: Vec<(&str, u64)> = attributed
+        .iter()
+        .map(|((_, prompt), usage)| (prompt.as_str(), usage.input_tokens))
+        .collect();
+    prompts.sort();
+    assert_eq!(
+        prompts,
+        vec![
+            ("please fix the build", 10),
+            ("thanks, also add a changelog entry", 12),
+        ],
+        "{attributed:?}"
+    );
+}
+
+/// The response to a slash command hangs off the command's output row. That
+/// row is control, so the walk continues up through the triad to the human
+/// prompt that preceded it, and the command's cost lands there -- and the
+/// third response, two triads up the chain, lands on the same prompt.
+#[test]
+fn a_slash_command_response_is_charged_to_the_human_prompt_before_it() {
+    let conn = claude_store("claude/slash-command-triad.jsonl");
+    let events = crate::store::session_events(&conn, "slash-session", Some("claude")).unwrap();
+    let attributed = crate::usage::attribute_usage_to_prompts(&events, "claude");
+    assert_eq!(attributed.len(), 1, "{attributed:?}");
+    let ((_, prompt), usage) = attributed.iter().next().unwrap();
+    assert_eq!(prompt, "hi");
+    assert_eq!(
+        (usage.input_tokens, usage.output_tokens),
+        (10 + 20 + 25, 5 + 3 + 4)
+    );
+}
+
+/// Codex persists no parent ids, so ownership is by the ordered human-turn
+/// stream. The app's `<environment_context>` row precedes the human's turn
+/// with its own timestamp; as a boundary it would own the answer.
+#[test]
+fn a_codex_context_wrapper_is_not_a_turn_boundary() {
+    let conn = codex_store("codex/context-wrapper.jsonl");
+    let events =
+        crate::store::session_events(&conn, "sess_context_wrapper_1", Some("codex")).unwrap();
+    let attributed = crate::usage::attribute_usage_to_prompts(&events, "codex");
+    assert_eq!(attributed.len(), 1, "{attributed:?}");
+    let ((_, prompt), usage) = attributed.iter().next().unwrap();
+    assert_eq!(prompt, "fix the importer");
+    assert_eq!(usage.output_tokens, 60);
+}

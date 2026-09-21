@@ -28,6 +28,7 @@
   "quirk": "a tool loop makes two API calls inside one turn_id, so the turn is not the request",
   "session_events": [
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "3:user_message",
       "git_branch": null,
@@ -44,6 +45,7 @@
       "ts_ms": 1776765600300
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "4:agent_reasoning",
       "git_branch": null,
@@ -60,6 +62,7 @@
       "ts_ms": 1776765600500
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "5:function_call",
       "git_branch": null,
@@ -76,6 +79,7 @@
       "ts_ms": 1776765600600
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "8:agent_message",
       "git_branch": null,
@@ -90,6 +94,34 @@
       "text": "Done.",
       "token_json": "{\"cache_write_input_tokens\":0,\"cached_input_tokens\":0,\"input_tokens\":400,\"output_tokens\":80,\"reasoning_output_tokens\":20,\"total_tokens\":480}",
       "ts_ms": 1776765600900
+    }
+  ],
+  "session_markers": [
+    {
+      "kind": "task_started",
+      "marker_uid": "2:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_codex_tool_loop",
+      "source": "codex",
+      "subkind": "task_started",
+      "text": null,
+      "ts_ms": 1776765600200,
+      "turn_id": "t1"
+    },
+    {
+      "kind": "task_complete",
+      "marker_uid": "10:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_codex_tool_loop",
+      "source": "codex",
+      "subkind": "task_complete",
+      "text": null,
+      "ts_ms": 1776765602000,
+      "turn_id": "t1"
     }
   ],
   "session_relationships": [],

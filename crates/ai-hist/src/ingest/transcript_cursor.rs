@@ -194,6 +194,16 @@ pub(crate) struct ClaudeCursorState {
     /// reads it can resume after the message that stated one.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub cache_reads: std::collections::HashMap<String, i64>,
+    /// The slash-command triad still being chained, per session.
+    ///
+    /// A command's caveat, invocation and output are three records, and a
+    /// pass can end between any two of them; the next pass has to know which
+    /// invocation the output row it reads belongs to.
+    #[serde(
+        default,
+        skip_serializing_if = "super::control::SlashCommandTriads::is_empty"
+    )]
+    pub slash_commands: super::control::SlashCommandTriads,
     /// Tool-result ordering as of the committed offset.
     ///
     /// `call_index` and `event_index` are assigned over the whole transcript,

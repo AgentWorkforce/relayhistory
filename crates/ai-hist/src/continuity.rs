@@ -1221,16 +1221,13 @@ fn record_resume_marker(
         return;
     };
     let trimmed = text.trim();
-    let (command, rest) = if crate::discover::is_claude_control_prompt(trimmed) {
-        match wrapped_command(trimmed) {
-            Some(parsed) => parsed,
-            None => return,
-        }
-    } else {
-        match bare_command(trimmed) {
-            Some(parsed) => parsed,
-            None => return,
-        }
+    // The wrapped form first: a record that opens with a control tag is never
+    // a bare command, and `bare_command` refuses anything not starting with
+    // `/`, so an unparseable wrapper falls through to nothing rather than to
+    // a false match.
+    let Some((command, rest)) = wrapped_command(trimmed).or_else(|| bare_command(trimmed))
+    else {
+        return;
     };
     if command != "resume" && command != "continue" {
         return;
@@ -1262,20 +1259,20 @@ fn bare_command(text: &str) -> Option<(String, &str)> {
 ///
 /// `<command-args>` is absent when the command took none, and the elements can
 /// arrive in either order, so each is read independently rather than by
-/// position.
+/// position -- the same read `ingest::control` makes for the `slash_command`
+/// marker.
 fn wrapped_command(text: &str) -> Option<(String, &str)> {
-    let name = tag_body(text, "command-name")?;
+    if crate::ingest::control::claude_text_control_kind(text)
+        != Some(crate::ingest::control::ControlKind::SlashCommandInvocation)
+    {
+        return None;
+    }
+    let name = crate::ingest::control::tag_body(text, "command-name")?;
     let command = name.trim().trim_start_matches('/').to_lowercase();
-    let args = tag_body(text, "command-args").unwrap_or("").trim_start();
+    let args = crate::ingest::control::tag_body(text, "command-args")
+        .unwrap_or("")
+        .trim_start();
     Some((command, args))
-}
-
-fn tag_body<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let start = text.find(&open)? + open.len();
-    let end = text[start..].find(&close)? + start;
-    Some(&text[start..end])
 }
 
 /// The user's own typed text, from either content shape. Tool results and

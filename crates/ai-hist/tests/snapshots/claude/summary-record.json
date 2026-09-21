@@ -28,6 +28,7 @@
   "quirk": "a `type: \"summary\"` record with a `leafUuid` between two ordinary turns",
   "session_events": [
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-sum-user-1:0",
       "git_branch": null,
@@ -44,6 +45,7 @@
       "ts_ms": 1776643200000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-sum-asst-1:0",
       "git_branch": null,
@@ -58,6 +60,21 @@
       "text": "Summarized above.",
       "token_json": "{\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":8,\"output_tokens\":4}",
       "ts_ms": 1776643202000
+    }
+  ],
+  "session_markers": [
+    {
+      "kind": "summary",
+      "marker_uid": "s-sum-1:marker",
+      "message_id": "s-sum-1",
+      "parent_id": null,
+      "payload_json": "{\"leaf_uuid\":\"u-sum-user-1\",\"summary\":\"Reworked the retry client and added a regression test.\"}",
+      "session_id": "summary-session",
+      "source": "claude",
+      "subkind": "summary",
+      "text": null,
+      "ts_ms": 1776643201000,
+      "turn_id": null
     }
   ],
   "session_relationships": [],

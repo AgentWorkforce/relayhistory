@@ -1,0 +1,134 @@
+{
+  "corpus_files": [
+    "codex/context-wrapper.jsonl"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "codex/context-wrapper",
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "fix the importer",
+      "session_id": "sess_context_wrapper_1",
+      "source": "codex",
+      "timestamp_ms": 1776816000400
+    }
+  ],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "sess_context_wrapper_1",
+      "source": "codex",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "CodexRollout",
+  "notes": [],
+  "origin": "relayhistory",
+  "quirk": "an `<environment_context>` wrapper the app injects as a user `response_item` ahead of the human's mirrored turn",
+  "session_events": [
+    {
+      "control_kind": "codex_context_wrapper",
+      "cwd": "/tmp/project",
+      "event_uid": "4:response_item_user_message",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "msg_ctx_env",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "sess_context_wrapper_1",
+      "source": "codex",
+      "text": "<environment_context>\n  <cwd>/tmp/project</cwd>\n  <shell>zsh</shell>\n</environment_context>",
+      "token_json": null,
+      "ts_ms": 1776816000300
+    },
+    {
+      "control_kind": null,
+      "cwd": "/tmp/project",
+      "event_uid": "5:response_item_user_message",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "msg_ctx_prompt",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "sess_context_wrapper_1",
+      "source": "codex",
+      "text": "fix the importer",
+      "token_json": null,
+      "ts_ms": 1776816000400
+    },
+    {
+      "control_kind": null,
+      "cwd": "/tmp/project",
+      "event_uid": "7:agent_message",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "7:agent_message",
+      "model": "gpt-5.4",
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "sess_context_wrapper_1",
+      "source": "codex",
+      "text": "Fixed the importer.",
+      "token_json": "{\"cache_write_input_tokens\":0,\"cached_input_tokens\":200,\"input_tokens\":800,\"output_tokens\":60,\"reasoning_output_tokens\":10,\"total_tokens\":860}",
+      "ts_ms": 1776816003000
+    }
+  ],
+  "session_markers": [
+    {
+      "kind": "task_started",
+      "marker_uid": "2:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_context_wrapper_1",
+      "source": "codex",
+      "subkind": "task_started",
+      "text": null,
+      "ts_ms": 1776816000200,
+      "turn_id": "turn_ctx_1"
+    },
+    {
+      "kind": "task_complete",
+      "marker_uid": "9:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"duration_ms\":3000}",
+      "session_id": "sess_context_wrapper_1",
+      "source": "codex",
+      "subkind": "task_complete",
+      "text": null,
+      "ts_ms": 1776816003200,
+      "turn_id": "turn_ctx_1"
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": "0.121.0",
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776816000000,
+      "first_prompt": "fix the importer",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776816003200,
+      "last_assistant_text": "Fixed the importer.",
+      "models_json": "[\"gpt-5.4\"]",
+      "originator": null,
+      "raw_path": "<home>/.codex/sessions/2026/04/20/rollout-2026-04-20T00-00-00-context-wrapper.jsonl",
+      "repo_url": null,
+      "session_id": "sess_context_wrapper_1",
+      "source": "codex",
+      "source_stamp": "<n>:1817",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "codex",
+  "tool_calls": []
+}

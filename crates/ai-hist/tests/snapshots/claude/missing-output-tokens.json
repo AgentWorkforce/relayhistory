@@ -28,6 +28,7 @@
   "quirk": "usage carries `input_tokens` only — `output_tokens` is absent, which is not the same as zero",
   "session_events": [
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-user-1:0",
       "git_branch": null,
@@ -44,6 +45,7 @@
       "ts_ms": 1776643200000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-asst-1:0",
       "git_branch": null,
@@ -58,6 +60,21 @@
       "text": "Hello!",
       "token_json": "{\"input_tokens\":10}",
       "ts_ms": 1776643201000
+    }
+  ],
+  "session_markers": [
+    {
+      "kind": "unknown",
+      "marker_uid": "missing-output-tokens:sha256:27fe004c5f542b3a:marker",
+      "message_id": "missing-output-tokens:sha256:27fe004c5f542b3a",
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "22222222-2222-2222-2222-222222222222",
+      "source": "claude",
+      "subkind": "permission-mode",
+      "text": null,
+      "ts_ms": null,
+      "turn_id": null
     }
   ],
   "session_relationships": [],

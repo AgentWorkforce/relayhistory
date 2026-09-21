@@ -85,7 +85,13 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 3;
 /// cursor, so the first hydration after upgrading re-parses that transcript
 /// once from offset 0 and writes the cursor; every hydration after that
 /// resumes from it.
-const HYDRATION_PARSER_VERSION: i64 = 10;
+///
+/// Version 11 is control rows as typed evidence (#180): `control_kind` on
+/// `session_events`, `<system-reminder>` blocks as rows of their own and the
+/// `slash_command` marker. A checkpoint at 10 has the column null on every
+/// row and the reminders folded into the prompt text, so every session
+/// re-parses once.
+const HYDRATION_PARSER_VERSION: i64 = 11;
 
 #[derive(Debug, Clone)]
 pub struct HydrateSessionOptions {
@@ -5700,6 +5706,92 @@ mod tests {
             session_event_snapshot(&grown_db, session_id),
             expected,
             "{name} must hydrate identically in one pass and in three appends"
+        );
+    }
+
+    /// The `slash_command` marker's payload, per command, for one session.
+    fn slash_command_payloads(db: &Path, session_id: &str) -> Vec<Value> {
+        let conn = open_db(db).unwrap();
+        let mut statement = conn
+            .prepare(
+                "SELECT payload_json FROM session_markers \
+                 WHERE source = 'claude' AND session_id = ? AND kind = 'slash_command' \
+                 ORDER BY marker_uid",
+            )
+            .unwrap();
+        statement
+            .query_map([session_id], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|payload| serde_json::from_str(&payload.unwrap()).unwrap())
+            .collect()
+    }
+
+    /// A slash command's caveat and invocation can be the last records a
+    /// pass reads, with the output row arriving before the next one. The
+    /// pending invocation travels in the cursor, so the second pass chains
+    /// the output onto the marker the first pass wrote instead of leaving
+    /// the command without its output.
+    #[test]
+    fn a_slash_command_split_across_two_hydration_passes_is_still_one_marker() {
+        let bytes = fs::read(fixture("slash-command-triad.jsonl")).unwrap();
+        let session_id = "slash-session";
+        let line_starts: Vec<usize> = std::iter::once(0)
+            .chain(
+                bytes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, byte)| **byte == b'\n')
+                    .map(|(index, _)| index + 1),
+            )
+            .collect();
+        // Records 1-4: prompt, answer, caveat, invocation. The output row is
+        // record 5.
+        let cut = line_starts[4];
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("history.db");
+        let transcript = seed_claude_transcript(dir.path(), session_id, &bytes[..cut]);
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", session_id, Some(&transcript));
+        drop(conn);
+        hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        let opened = slash_command_payloads(&db, session_id);
+        assert_eq!(opened.len(), 1, "{opened:?}");
+        assert_eq!(opened[0]["command_name"], "/review");
+        assert_eq!(opened[0]["invocation_event_uid"], "u-inv-1:0");
+        assert!(
+            opened[0].get("output_event_uid").is_none(),
+            "no output has been read yet: {opened:?}"
+        );
+
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        file.write_all(&bytes[cut..]).unwrap();
+        drop(file);
+        hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        let closed = slash_command_payloads(&db, session_id);
+        assert_eq!(closed.len(), 2, "{closed:?}");
+        assert_eq!(closed[0]["command_name"], "/review");
+        assert_eq!(closed[0]["output_event_uid"], "u-out-1:0");
+        assert_eq!(closed[0]["stdout_bytes"], "review summary: no issues".len());
+        assert_eq!(closed[1]["command_name"], "/init");
+        assert_eq!(closed[1]["output_event_uid"], "u-out-2:0");
+
+        // And the split read agrees with a single read of the whole file.
+        let whole_dir = tempfile::tempdir().unwrap();
+        let whole_db = whole_dir.path().join("history.db");
+        let whole = seed_claude_transcript(whole_dir.path(), session_id, &bytes);
+        let conn = open_db(&whole_db).unwrap();
+        catalog_row(&conn, "claude", session_id, Some(&whole));
+        drop(conn);
+        hydrate_session_at_with_home(&whole_db, &options("claude", session_id), whole_dir.path())
+            .unwrap();
+        assert_eq!(slash_command_payloads(&whole_db, session_id), closed);
+        assert_eq!(
+            session_event_snapshot(&whole_db, session_id),
+            session_event_snapshot(&db, session_id)
         );
     }
 
