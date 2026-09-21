@@ -1517,12 +1517,22 @@ fn sdk_announcer(interactive: bool) -> Result<Announcer> {
 /// workspace, a default a caller may use, never an authorization.
 pub struct CloudIdentity {
     pub user_id: String,
+    pub email: Option<String>,
+    pub name: Option<String>,
+    pub avatar_url: Option<String>,
     pub workspace_id: Option<String>,
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct WhoamiUser {
     id: String,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    avatar_url: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1546,6 +1556,9 @@ pub fn whoami(api_url: &str, bearer: &str) -> Result<CloudIdentity> {
     let identity: WhoamiResponse = serde_json::from_value(value)?;
     Ok(CloudIdentity {
         user_id: identity.user.id,
+        email: identity.user.email,
+        name: identity.user.name,
+        avatar_url: identity.user.avatar_url,
         workspace_id: identity.current_workspace.map(|workspace| workspace.id),
     })
 }
