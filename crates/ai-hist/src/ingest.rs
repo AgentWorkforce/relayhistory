@@ -4116,7 +4116,7 @@ fn sync_claude_session_metadata(
         };
         let mut scan_cursor = transcript_cursor::load_cursor(conn, &scan_key)?;
         let mut scan = scan_cursor.claude.clone().unwrap_or_default().scan;
-        let (scanned_meta, scanned_continuity) =
+        let (scanned_meta, scanned_continuity, scan_superseded) =
             match scan_claude_session_file_resumed(&path, &mut scan) {
                 Ok(scanned) if scanned.read_nothing_decodable() => {
                     // Nothing in the file decoded. Publishing the cursor would
@@ -4133,7 +4133,7 @@ fn sync_claude_session_metadata(
                     read_error.get_or_insert(error);
                     continue;
                 }
-                Ok(scanned) => (scanned.meta, scanned.continuity),
+                Ok(scanned) => (scanned.meta, scanned.continuity, scanned.superseded),
                 Err(error) => {
                     if error.is::<CaptureCancelled>() {
                         return Err(error);
@@ -4188,7 +4188,15 @@ fn sync_claude_session_metadata(
             // reach; a branch read before its origin is resolved by the same
             // pass rather than needing a second sync. Folded by the metadata
             // walk above, so banking it reads nothing.
-            crate::continuity::capture_folded(conn, &path, scanned_continuity)?;
+            //
+            // A fold over bytes that were rewritten under the walk is not
+            // published: an absent row retracts continuity, so a partial fold
+            // would replace real topology rather than leave it alone.
+            // An absent row retracts continuity, so "said nothing" and "could
+            // not be trusted to have read it" must not look alike here.
+            if !scan_superseded {
+                crate::continuity::capture_folded(conn, &path, scanned_continuity)?;
+            }
             upserted += 1;
         }
     }

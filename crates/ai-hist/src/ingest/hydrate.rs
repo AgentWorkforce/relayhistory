@@ -1964,7 +1964,16 @@ fn ingest_claude(
         // there is nothing to count: the two folds ask different questions of
         // the same records, and asking them in one pass is the difference
         // between two reads of an append and three.
-        crate::continuity::capture_folded(conn, path, scan_continuity)?;
+        //
+        // A superseded fold is not published. Its records came from bytes that
+        // were rewritten under the walk, and an absent continuity row
+        // *retracts* the edges it established — so a partial fold would
+        // replace real topology, and there is no "leave it alone" to express
+        // by passing one. The next pass folds the file again from zero,
+        // because no position was recorded for it either.
+        if !scan_superseded {
+            crate::continuity::capture_folded(conn, path, scan_continuity)?;
+        }
         crate::continuity::reconcile(conn, "claude")?;
     }
     // The snapshot already walked and parsed these sidecars to stamp them, so

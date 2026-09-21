@@ -95,10 +95,17 @@
 
 use super::*;
 
-/// The cursor document's shape version. Bumped only when an existing key
-/// changes meaning; adding a key does not need it, because an older reader
+/// The cursor document's shape version. Bumped when an existing key changes
+/// meaning; adding a key usually does not need it, because an older reader
 /// preserves what it does not understand.
-pub(crate) const TRANSCRIPT_CURSOR_VERSION: u32 = 1;
+///
+/// Version 2 is a key that *is* such a change: the metadata fold now carries
+/// continuity, folded from the records already consumed. A v1 document's
+/// position therefore no longer implies its fold has seen those records —
+/// resuming on one would fold only the tail and publish continuity evidence
+/// built from part of the file, overwriting the complete row already stored.
+/// Discarding v1 reads each transcript once from zero and rebuilds it.
+pub(crate) const TRANSCRIPT_CURSOR_VERSION: u32 = 2;
 
 /// How much of the committed region each end of the validation window covers.
 pub(crate) const PREFIX_WINDOW_BYTES: u64 = 64 * 1024;
@@ -841,12 +848,27 @@ impl TranscriptReader {
                 let identity_changed = saved.device.is_some()
                     && device.is_some()
                     && (saved.device, saved.inode) != (device, inode);
-                let saved_window = match prefix_window_digest_counted(&mut file, saved.offset) {
-                    Ok((digest, read)) => {
-                        validation_bytes += read;
-                        Some(digest)
+                // Checked before the digest, not after. Hashing a window that
+                // extends past the end reads every byte it can and then errors,
+                // and those bytes left with the error rather than reaching
+                // `validation_bytes` — a truncated file's validation pass went
+                // unreported. A `stat` answers it without reading anything.
+                let saved_window = if size < saved.offset {
+                    // A truncated file cannot match a window that ends past
+                    // its end. Hashing anyway read every byte it could and
+                    // then errored, and those bytes left with the error rather
+                    // than reaching `validation_bytes`, so a truncated file's
+                    // validation went unreported. `valid` below refuses a
+                    // short file on the `stat` alone.
+                    None
+                } else {
+                    match prefix_window_digest_counted(&mut file, saved.offset) {
+                        Ok((digest, read)) => {
+                            validation_bytes += read;
+                            Some(digest)
+                        }
+                        Err(_) => None,
                     }
-                    Err(_) => None,
                 };
                 // The same region, so the hash is the same: reuse it rather
                 // than reading those bytes a second time.
