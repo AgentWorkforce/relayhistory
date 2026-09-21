@@ -949,7 +949,16 @@ fn record_fidelity_backfill(state: &mut Map<String, Value>, key: &str) {
 /// an unchanged file on every sync while never repairing anything.
 ///
 /// Recording the generation per provider makes the pass happen exactly once.
-const RAW_MESSAGE_FACTS_GENERATION: i64 = 1;
+///
+/// **Moves with `RAW_MESSAGE_FACTS_VERSION`, always.** The version decides what
+/// `events_lack_raw_facts` counts as stale; this decides whether that probe is
+/// consulted at all, because sync only asks while the pass is pending. Raising
+/// the version alone leaves an install sitting at the recorded generation
+/// answering "not pending", skipping every unchanged transcript and never
+/// repairing the rows the bump was for — a change that reads as done and does
+/// nothing, for exactly the installs that needed it.
+/// `the_raw_facts_version_and_generation_are_bumped_together` is the guard.
+const RAW_MESSAGE_FACTS_GENERATION: i64 = 2;
 const CLAUDE_RAW_MESSAGE_FACTS_KEY: &str = "claude_raw_message_facts";
 const CODEX_RAW_MESSAGE_FACTS_KEY: &str = "codex_raw_message_facts";
 
@@ -12333,10 +12342,28 @@ mod tests {
         conn.execute(
             "UPDATE session_events SET request_id = NULL, stop_reason = NULL, \
              agent_version = NULL, is_sidechain = NULL, is_meta = NULL, turn_id = NULL, \
-             raw_facts_version = NULL WHERE source = ?",
+             request_span = NULL, raw_facts_version = NULL WHERE source = ?",
             [source],
         )
         .unwrap();
+    }
+
+    /// The two raw-facts constants move together or the bump does nothing.
+    ///
+    /// `RAW_MESSAGE_FACTS_VERSION` is stamped on each row and is what
+    /// `events_lack_raw_facts` compares against; `RAW_MESSAGE_FACTS_GENERATION`
+    /// is the per-install sync-state marker that decides whether that probe is
+    /// consulted at all. Raising the version alone leaves the probe able to see
+    /// stale rows on an install that is never asked — a bump that reads as done
+    /// and repairs nothing, for exactly the installs that needed it. Raising
+    /// the generation alone runs a pass that finds nothing to repair.
+    #[test]
+    fn the_raw_facts_version_and_generation_are_bumped_together() {
+        assert_eq!(
+            super::RAW_MESSAGE_FACTS_VERSION,
+            super::RAW_MESSAGE_FACTS_GENERATION,
+            "bump both, or the backfill it exists to trigger never runs"
+        );
     }
 
     #[test]
@@ -12885,6 +12912,136 @@ mod tests {
                 .get(super::CLAUDE_RAW_MESSAGE_FACTS_KEY)
                 .and_then(Value::as_i64),
             Some(super::RAW_MESSAGE_FACTS_GENERATION)
+        );
+    }
+
+    /// An install already at the recorded generation must still re-read its
+    /// unchanged Codex rollouts once when a new fact is added.
+    ///
+    /// `events_lack_raw_facts` compares `raw_facts_version`, but sync only
+    /// consults it while `raw_facts_backfill_pending` is true, and that is
+    /// `state < RAW_MESSAGE_FACTS_GENERATION`. An install sitting at the
+    /// recorded generation answers "not pending", skips every unchanged
+    /// rollout, and leaves the new fact null forever \u2014 so raising the row
+    /// version alone is a bump that reads as done and repairs nothing.
+    #[test]
+    fn an_install_at_the_old_generation_backfills_codex_request_spans() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let state_path = home.join(".sync-state.json");
+        let day = home.join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-2026-04-20T05-00-00-sess_span.jsonl");
+        // Reasoning, a tool call and a message: one API call, three rows.
+        let lines = concat!(
+            r#"{"timestamp":"2026-04-20T05:00:00.000Z","type":"session_meta","payload":{"id":"sess_span","cwd":"/tmp/project"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-04-20T05:00:00.100Z","type":"turn_context","payload":{"turn_id":"t1","cwd":"/tmp/project","model":"gpt-5.4"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-04-20T05:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"run it"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-04-20T05:00:01.500Z","type":"event_msg","payload":{"type":"agent_reasoning","text":"Thinking."}}"#,
+            "\n",
+            r#"{"timestamp":"2026-04-20T05:00:01.700Z","type":"response_item","payload":{"type":"function_call","name":"shell","call_id":"c1","arguments":"{\"command\":[\"ls\"]}"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-04-20T05:00:02.000Z","type":"event_msg","payload":{"type":"agent_message","message":"done"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-04-20T05:00:03.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":500,"cached_input_tokens":0,"output_tokens":120,"reasoning_output_tokens":40,"total_tokens":620}}}}"#,
+            "\n",
+        );
+        fs::write(&rollout, lines).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let sync = |conn: &Connection| {
+            let mut state = super::load_sync_state(&state_path).unwrap();
+            super::sync_codex_rollouts(conn, &mut state, &home.join(".codex")).unwrap();
+            super::checkpoint_sync_state(&state_path, &state);
+            super::load_sync_state(&state_path).unwrap()
+        };
+        let spans = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM session_events \
+                 WHERE source='codex' AND role='assistant' AND request_span IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let requests = |conn: &Connection| -> usize {
+            crate::session_usage::session_requests_page(conn, "codex", "sess_span", 50, None)
+                .unwrap()
+                .requests
+                .len()
+        };
+
+        let state = sync(&conn);
+        assert_eq!(spans(&conn), 3, "a fresh sync stamps every assistant row");
+        assert_eq!(requests(&conn), 1);
+        let modified = rollout.metadata().unwrap().modified().unwrap();
+
+        // Now the install this fix is for: rows written by the parser one
+        // version back, and the sync state already retired at that
+        // generation. The transcript is byte-identical and its mtime unmoved,
+        // so nothing but the backfill can bring it back.
+        let mut state = state;
+        //
+        // The literal 1 is deliberate: this is the install that exists in the
+        // world today, the one that shipped before `request_span` and has
+        // already retired its raw-facts pass at generation 1. Written
+        // relative to the constants the test would be vacuous \u2014 it would pass
+        // whether or not the generation was bumped alongside the version.
+        conn.execute(
+            "UPDATE session_events SET request_span = NULL, raw_facts_version = 1 \
+             WHERE source = 'codex'",
+            [],
+        )
+        .unwrap();
+        state.insert(
+            super::CODEX_RAW_MESSAGE_FACTS_KEY.to_string(),
+            json!(1),
+        );
+        super::save_sync_state(&state_path, &state).unwrap();
+        assert_eq!(spans(&conn), 0);
+        assert_eq!(
+            requests(&conn),
+            3,
+            "and the defect is back: one call read as a request per row"
+        );
+
+        let state = sync(&conn);
+        assert_eq!(
+            spans(&conn),
+            3,
+            "an unchanged rollout is re-read once for the new fact"
+        );
+        assert_eq!(requests(&conn), 1, "and the call is one request again");
+        assert_eq!(
+            state
+                .get(super::CODEX_RAW_MESSAGE_FACTS_KEY)
+                .and_then(Value::as_i64),
+            Some(super::RAW_MESSAGE_FACTS_GENERATION),
+            "the pass is retired at the new generation"
+        );
+
+        // Positive control: already at the new generation, an unchanged
+        // rollout is not re-read. Without this the test would pass just as
+        // well if sync re-read every rollout every time, which is the cost
+        // this generation marker exists to avoid.
+        let mut state = state;
+        conn.execute(
+            "UPDATE session_events SET request_span = NULL WHERE source = 'codex'",
+            [],
+        )
+        .unwrap();
+        super::save_sync_state(&state_path, &state).unwrap();
+        restore_unchanged(&rollout, lines, modified);
+        let _ = &mut state;
+        sync(&conn);
+        assert_eq!(
+            spans(&conn),
+            0,
+            "an install already at this generation does not re-read"
         );
     }
 
