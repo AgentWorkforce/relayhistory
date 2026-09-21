@@ -9,7 +9,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
@@ -18,6 +18,7 @@ use std::time::Duration;
 pub(crate) mod codex;
 pub(crate) mod cursor;
 pub(crate) mod grok;
+pub(crate) mod hook;
 pub(crate) mod hydrate;
 pub(crate) mod incremental;
 pub(crate) mod jsonl;
@@ -48,10 +49,14 @@ pub use crate::discover::{
     DISCOVERY_EXEMPTIONS, SESSION_CATALOG_CONTRACT_VERSION, SHALLOW_SCANNER_VERSION,
 };
 pub use crate::relationship_capture::{record_relationship, ObservedRelationship};
+pub use hook::{
+    ingest_transcript_at, ingest_transcript_at_with_home, TranscriptIngest, TranscriptStatus,
+    HOOK_HARNESSES,
+};
 pub use hydrate::{
-    hydrate_session, hydrate_session_at, hydrate_session_at_with_connectors, HydrateSessionOptions,
-    HydrateSessionResult, HydrationDiagnostic, HydrationEvidence, HydrationIndexedThrough,
-    SESSION_HYDRATION_CONTRACT_VERSION,
+    hydrate_session, hydrate_session_at, hydrate_session_at_with_connectors,
+    hydrate_session_at_with_home, HydrateSessionOptions, HydrateSessionResult, HydrationDiagnostic,
+    HydrationEvidence, HydrationIndexedThrough, SESSION_HYDRATION_CONTRACT_VERSION,
 };
 pub use tool_result_facts::{
     content_hash, stable_stringify, ToolResultFacts, ToolResultIndexer, ERROR_SIGNAL_EXIT_CODE,
@@ -229,7 +234,57 @@ fn capture_files(source: &'static str, files: Vec<PathBuf>) -> impl Iterator<Ite
 /// `HOME`. Used by [`crate::SessionStore`] when the embedder overrides home.
 pub(crate) fn sync_local_at_with_home(db_path: &Path, home: &Path) -> Result<bool> {
     SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
-    sync_exclusive_with_home(db_path, home)
+    sync_exclusive_with_home(db_path, home, false).map(|tick| tick.attempted)
+}
+
+/// One live-capture tick against an explicit provider home.
+///
+/// `force` bypasses the stat-only source fingerprint. The watch loop sets it
+/// for filesystem-event ticks, where the event can arrive before the write
+/// flushes and the fingerprint is therefore not yet trustworthy.
+pub fn sync_tick_at_with_home(
+    db_path: &Path,
+    home: &Path,
+    output: SyncOutput,
+    force: bool,
+) -> Result<SyncTick> {
+    SYNC_QUIET.store(
+        matches!(output, SyncOutput::Silent),
+        AtomicOrdering::Relaxed,
+    );
+    sync_exclusive_with_home(db_path, home, force)
+}
+
+/// One live-capture tick. Local scope only: remote connectors are not driven
+/// from watch mode, and a `remote`-only request is rejected the same way
+/// [`sync_scoped_at_with_connectors`] rejects it.
+pub fn sync_tick_at(
+    db_path: &Path,
+    scope: SessionScope,
+    connectors: &remote::SourceConnectorSelection,
+    output: SyncOutput,
+    force: bool,
+) -> Result<SyncTick> {
+    SYNC_QUIET.store(
+        matches!(output, SyncOutput::Silent),
+        AtomicOrdering::Relaxed,
+    );
+    if scope == SessionScope::Remote {
+        remote::ensure_selected_remote_connectors_configured_for_at(
+            "sync",
+            &home_dir(),
+            &[],
+            connectors,
+        )?;
+    }
+    let mut tick = SyncTick::default();
+    if matches!(scope, SessionScope::Local | SessionScope::All) {
+        tick = sync_exclusive_with_home(db_path, &home_dir(), force)?;
+    }
+    if matches!(scope, SessionScope::Remote | SessionScope::All) {
+        tick.attempted |= sync_remote_connectors(db_path, scope, connectors)?;
+    }
+    Ok(tick)
 }
 
 /// Full ingestion for a selected scope into the default database.
@@ -524,7 +579,610 @@ impl SyncSourceReport {
     }
 }
 
-fn sync_basic(conn: &Connection, db_path: &Path, roots: &crate::ProviderRoots) -> Result<()> {
+/// Where [`discover::source_fingerprint`] is remembered between sweeps, inside
+/// the sync state file that already holds every per-source cursor.
+const SOURCE_FINGERPRINT_KEY: &str = "source_fingerprint";
+
+/// Where the destination's own generation is remembered, beside the source
+/// fingerprint it qualifies.
+const DESTINATION_GENERATION_KEY: &str = "destination_generation";
+
+/// The parser and state generations a stored fingerprint is valid for.
+///
+/// These are the sync-state keys whose *names* carry a generation: bumping one
+/// is how an upgrade says "re-read sources whose bytes never changed". The
+/// fingerprint has to carry them, because it is a statement about the sources
+/// on disk and those do not move across an upgrade. A stamp written by the
+/// previous generation would otherwise match on the first tick after the
+/// upgrade and skip the very sweep the bump exists to force — the repair would
+/// then wait for an unrelated transcript to change, which on a finished
+/// session's rollout is never.
+///
+/// Add the new key here in the same change that introduces it; the old one
+/// stays in [`RETIRED_SYNC_STATE_KEYS`] for the migration, but only live
+/// generations belong in the stamp.
+const SWEEP_PARSER_GENERATIONS: &[&str] = &["claude_sessions_v3", "codex_rollouts_v5"];
+
+/// The generation half of a stored fingerprint: what this build of the sweep
+/// would produce from a given tree, independent of the tree itself.
+fn sweep_generation() -> String {
+    let parts = SWEEP_PARSER_GENERATIONS.join("|");
+    format!(
+        "g{:016x}",
+        discover::fingerprint_hash(
+            "sweep-generation",
+            &discover::SHALLOW_SCANNER_VERSION.to_string(),
+            &parts,
+        )
+    )
+}
+
+/// Version tag of the destination marker's encoding, so a marker written by a
+/// build with a different shape is rejected rather than misread.
+const DESTINATION_MARKER_VERSION: &str = "v4";
+
+/// The sources whose evidence a *sweep* can put back.
+///
+/// The marker is a repair guard, so it may only promise what the sweep can
+/// honour. Codex rollouts and Claude transcripts are re-read and re-ingested
+/// by this sweep, so a loss in one is repairable and belongs in the marker.
+/// Everything else does not: `history` rows come from cursor-backed flat logs
+/// that sit at EOF and cannot be safely rewound, and a provider with no sweep
+/// repair path would be a shortfall nothing could ever clear — a marker that
+/// counted them would disarm the fast path forever over a loss it could not
+/// undo, which is a worse failure than not guarding them. Adding a source here
+/// means adding its repair path in the same change.
+///
+/// OpenCode joined them when its sweep gained an event-level parser: a plain
+/// sync now re-reads a session indexed as prompts-only, so a loss in one is
+/// repairable on the same terms. Its rows do not come from a flat log, which
+/// is what kept it out before.
+const REPAIRABLE_EVENT_SOURCES: &[&str] = &["claude", "codex", "opencode"];
+
+/// What one session is expected to hold.
+///
+/// Every row here is re-created by re-reading the session's own transcript or
+/// rollout, which is what makes the whole tuple repairable and therefore
+/// guardable. `catalog` is the `sessions` row itself: losing it is not an
+/// evidence loss but a *catalog* loss, and discovery would otherwise skip the
+/// source whose stamp still matched and leave the row missing.
+///
+/// Counts are unsigned on purpose. A count cannot be negative, so a marker
+/// that carries one is corrupt — and under a `>=` comparison a negative stored
+/// count is satisfied by *anything*, which would turn a corrupt marker into a
+/// blanket licence to skip the sweep. Unsigned makes that unrepresentable, and
+/// the parser rejects it, so a corrupt marker reads as unknown and sweeps.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SessionHoldings {
+    events: u64,
+    tool_calls: u64,
+    file_edits: u64,
+    catalog: u64,
+}
+
+impl SessionHoldings {
+    fn covers(&self, stored: &Self) -> bool {
+        self.events >= stored.events
+            && self.tool_calls >= stored.tool_calls
+            && self.file_edits >= stored.file_edits
+            && self.catalog >= stored.catalog
+    }
+}
+
+/// What the destination holds, per session the sweep is answerable for.
+///
+/// The fast path's job is to skip a sweep, and a sweep owes more than
+/// ingestion: it reconciles sessions whose per-file stamp matches but whose
+/// rows are gone (see the [`codex_session_events_exist`] arm). Evidence can be
+/// lost under a stamp that still matches — a half-restored backup, a truncated
+/// write, a maintenance query — and the source bytes of a finished session
+/// never move again to reopen it.
+///
+/// Per session, not in total. Global counts cannot tell a loss from a
+/// coincidence: delete one row here, let an unrelated write land there, and
+/// every total is unchanged or larger while one session is permanently short.
+/// One row per session is what makes the two distinguishable at all — and the
+/// same argument applies table by table, which is why the entry is a tuple
+/// rather than one number. Structured evidence (`tool_calls`, `file_edits`)
+/// and the catalog row are re-created by the same re-read that restores the
+/// events, so they are guarded by the same marker.
+///
+/// Four grouped reads, each an index-ordered scan over a `(source,
+/// session_id)` key, merged in memory — not four correlated subqueries per
+/// session.
+fn destination_generation(conn: &Connection) -> Result<String> {
+    let holdings = session_holdings(conn)?;
+    // The entry count comes first so that a truncated marker is detectable.
+    // Without it, a marker cut short reads as a *shorter* one — and an empty
+    // database legitimately produces no entries at all, so "no entries" could
+    // not otherwise be told from "the entries are missing".
+    let mut marker = format!("{DESTINATION_MARKER_VERSION} n{}", holdings.len());
+    for (session, held) in holdings {
+        marker.push_str(&format!(
+            " {session:016x}={}.{}.{}.{}",
+            held.events, held.tool_calls, held.file_edits, held.catalog
+        ));
+    }
+    Ok(marker)
+}
+
+/// Which count in [`SessionHoldings`] one grouped read fills in.
+type HoldingField = fn(&mut SessionHoldings) -> &mut u64;
+
+/// Every session the marker is answerable for, keyed by the hash the marker
+/// stores.
+fn session_holdings(conn: &Connection) -> Result<BTreeMap<u64, SessionHoldings>> {
+    let mut holdings: BTreeMap<u64, SessionHoldings> = BTreeMap::new();
+    let counted: [(&str, HoldingField); 4] = [
+        (
+            "SELECT source, session_id, COUNT(*) FROM session_events",
+            |held| &mut held.events,
+        ),
+        (
+            "SELECT source, session_id, COUNT(*) FROM tool_calls",
+            |held| &mut held.tool_calls,
+        ),
+        (
+            "SELECT source, session_id, COUNT(*) FROM file_edits",
+            |held| &mut held.file_edits,
+        ),
+        (
+            "SELECT source, session_id, COUNT(*) FROM sessions",
+            |held| &mut held.catalog,
+        ),
+    ];
+    for (select, field) in counted {
+        let mut statement = conn.prepare(&format!(
+            "{select} WHERE source IN (SELECT value FROM json_each(?)) \
+             GROUP BY source, session_id"
+        ))?;
+        let mut rows = statement.query([repairable_event_sources()])?;
+        while let Some(row) = rows.next()? {
+            let source: String = row.get(0)?;
+            let session_id: String = row.get(1)?;
+            // `COUNT(*)` is never negative; a driver that somehow produced
+            // one must not become a marker entry that covers everything.
+            let count = u64::try_from(row.get::<_, i64>(2)?).unwrap_or(0);
+            // Hashed rather than spelled out: the marker is rewritten with
+            // every sweep and read on every tick, and a session's identity
+            // only has to be *distinguishable*, not recoverable. 64 bits keeps
+            // two sessions from sharing an entry, which is the one way a hash
+            // here could reintroduce the masking this marker exists to catch.
+            let key = discover::fingerprint_hash("session-events", &source, &session_id);
+            *field(holdings.entry(key).or_default()) = count;
+        }
+    }
+    Ok(holdings)
+}
+
+/// A destination marker, or `None` for anything this build did not write.
+///
+/// Total by construction: every step is a `strip_prefix`, a `split_once` or a
+/// `parse`, and each returns `None` rather than indexing into a string it has
+/// not checked. An empty marker — which the sweep itself stores when the
+/// generation query fails — has to reach `sources_unchanged` as "unknown, go
+/// and sweep", never as a panic that kills the tick and wedges every sync
+/// after it.
+fn parse_destination_marker(value: &str) -> Option<DestinationMarker> {
+    let mut parts = value.split(' ');
+    if parts.next()? != DESTINATION_MARKER_VERSION {
+        return None;
+    }
+    let expected = parts.next()?.strip_prefix('n')?.parse::<usize>().ok()?;
+    let mut sessions = BTreeMap::new();
+    for part in parts {
+        let (session, held) = part.split_once('=')?;
+        let session = u64::from_str_radix(session, 16).ok()?;
+        let mut counts = held.split('.');
+        // Unsigned: `-1` is a parse error rather than a count that every
+        // current value satisfies.
+        let mut next = || counts.next()?.parse::<u64>().ok();
+        let held = SessionHoldings {
+            events: next()?,
+            tool_calls: next()?,
+            file_edits: next()?,
+            catalog: next()?,
+        };
+        if counts.next().is_some() {
+            return None;
+        }
+        // A repeated session is not a marker this build produced: the grouped
+        // reads yield each one once.
+        if sessions.insert(session, held).is_some() {
+            return None;
+        }
+    }
+    if sessions.len() != expected {
+        return None;
+    }
+    Some(DestinationMarker { sessions })
+}
+
+struct DestinationMarker {
+    sessions: BTreeMap<u64, SessionHoldings>,
+}
+
+/// `REPAIRABLE_EVENT_SOURCES` as a bound parameter, so the grouped reads and
+/// the shortfall scan cannot drift apart.
+fn repairable_event_sources() -> rusqlite::types::Value {
+    rusqlite::types::Value::Text(
+        serde_json::to_string(REPAIRABLE_EVENT_SOURCES).unwrap_or_else(|_| "[]".to_string()),
+    )
+}
+
+/// Whether the destination still holds everything the stamp was written over.
+///
+/// Growth is fine and must be: the hook fast path and hydration both add rows
+/// between sweeps, and treating that as a reason to re-walk every source would
+/// cost a full sweep per tool call. A session holding *less* than it did is
+/// the signal, and it is asked per session and per table so that growth
+/// somewhere else cannot answer for it.
+fn destination_covers(stored: &str, current: &str) -> bool {
+    let (Some(stored), Some(current)) = (
+        parse_destination_marker(stored),
+        parse_destination_marker(current),
+    ) else {
+        // An unreadable marker is one this build did not write, or one a
+        // failed generation query left empty. Re-sweep rather than guess: the
+        // cost is one walk, and the alternative is a skip that cannot be
+        // justified.
+        return false;
+    };
+    stored.sessions.iter().all(|(session, stored)| {
+        current
+            .sessions
+            .get(session)
+            .is_some_and(|current| current.covers(stored))
+    })
+}
+
+/// Sessions the destination lost evidence for since the marker was written.
+///
+/// Detecting a loss is not the same as repairing it. The sweep skips a source
+/// whose per-file stamp is unchanged, and a session that is *short* rather
+/// than empty still satisfies the existence check that guards that skip, so
+/// without naming the sessions the sweep would run and repair nothing.
+#[derive(Debug, Default)]
+pub(crate) struct SweepRepairs {
+    sessions: HashSet<(String, String)>,
+    all: bool,
+}
+
+impl SweepRepairs {
+    fn all() -> Self {
+        Self {
+            sessions: HashSet::new(),
+            all: true,
+        }
+    }
+
+    fn repairs_all(&self) -> bool {
+        self.all
+    }
+
+    fn is_empty(&self) -> bool {
+        !self.all && self.sessions.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.sessions.len()
+    }
+
+    fn contains(&self, source: &str, session_id: &str) -> bool {
+        // Cheap enough to build the key: this is asked once per rollout whose
+        // stamp matched, not per row.
+        self.all
+            || self
+                .sessions
+                .contains(&(source.to_string(), session_id.to_string()))
+    }
+}
+
+/// The shortfall against whatever marker the sync state currently holds.
+fn destination_shortfall_against(
+    conn: &Connection,
+    state: &Map<String, Value>,
+) -> Result<SweepRepairs> {
+    let Some(stored) = state.get(DESTINATION_GENERATION_KEY) else {
+        return Ok(SweepRepairs::default());
+    };
+    let Some(stored) = stored.as_str() else {
+        return Ok(SweepRepairs::all());
+    };
+    destination_shortfall(conn, stored)
+}
+
+/// Which sessions hold less than the stored marker recorded.
+///
+/// The marker keys sessions by hash, which is enough to *detect* a loss but
+/// not to name one. The names come back from the destination itself: every
+/// session that still holds a row is hashed the same way, so matching the
+/// short hashes against the current groups recovers exactly the sessions to
+/// repair. A session with nothing left at all cannot be named this way, and
+/// does not need to be — an empty session already fails the existence check
+/// the skip is guarded by.
+fn destination_shortfall(conn: &Connection, stored: &str) -> Result<SweepRepairs> {
+    let Some(stored) = parse_destination_marker(stored) else {
+        // Absence is handled by `destination_shortfall_against`; a value that
+        // is present but unreadable cannot name the short sessions. Re-read
+        // every repairable session instead. Treating it as an empty set would
+        // let the sweep checkpoint today's reduced holdings over the malformed
+        // marker and permanently ratify any short, still-nonempty session.
+        return Ok(SweepRepairs::all());
+    };
+    let mut repairs = SweepRepairs::default();
+    let current = session_holdings(conn)?;
+    // Named from the *session* side rather than from the evidence, because a
+    // session whose catalog row and events are both gone has no row left to be
+    // found by. The union of the two tables the sweep reaches it through is
+    // what keeps it nameable.
+    let mut statement = conn.prepare(
+        "SELECT source, session_id FROM sessions \
+         WHERE source IN (SELECT value FROM json_each(?1)) \
+         UNION \
+         SELECT source, session_id FROM session_events \
+         WHERE source IN (SELECT value FROM json_each(?1))",
+    )?;
+    let mut rows = statement.query([repairable_event_sources()])?;
+    while let Some(row) = rows.next()? {
+        let source: String = row.get(0)?;
+        let session_id: String = row.get(1)?;
+        let key = discover::fingerprint_hash("session-events", &source, &session_id);
+        let Some(before) = stored.sessions.get(&key) else {
+            continue;
+        };
+        let current = current.get(&key).copied().unwrap_or_default();
+        // A local-only Codex subagent is deliberately removed from the root
+        // session catalog once its rollout proves the delegation. Its events
+        // remain queryable through the relationship, so the catalog drop is
+        // expected evidence reclassification rather than destination loss.
+        // A remote presence keeps the canonical catalog row and must retain
+        // the ordinary catalog guard.
+        let expected_subagent_deregistration = source == "codex"
+            && before.catalog > 0
+            && current.catalog == 0
+            && codex_delegation_recorded(conn, &session_id)?
+            && !codex_session_has_remote_presence(conn, &session_id)?;
+        let covered = current.events >= before.events
+            && current.tool_calls >= before.tool_calls
+            && current.file_edits >= before.file_edits
+            && (current.catalog >= before.catalog || expected_subagent_deregistration);
+        if !covered {
+            repairs.sessions.insert((source, session_id));
+        }
+    }
+    Ok(repairs)
+}
+
+/// The sources a sweep reads that discovery never enumerates.
+///
+/// Discovery is about *sessions*, so its adapters walk the transcript trees.
+/// The sweep also reads two flat per-harness logs and the trajectory records,
+/// and `trajectory` is a declared [`discover::DISCOVERY_EXEMPTIONS`] entry
+/// precisely because it is not a provider session. Folding only the adapters
+/// into the fingerprint would leave these three outside it: after one
+/// successful sweep, a change confined to them would match the stored value
+/// and the sweep would return before ever reaching
+/// `sync_jsonl_incremental` / `sync_trajectories`. The records would then wait
+/// for an unrelated transcript to move — indefinitely, on a machine that only
+/// uses the flat log.
+///
+/// Stat-only, like the adapters' own inputs: enumerating trajectory files is a
+/// directory walk, and the two logs are one stat each.
+fn sweep_only_fingerprint_inputs(roots: &crate::ProviderRoots) -> Vec<Candidate> {
+    let mut paths = vec![
+        roots.claude.join("history.jsonl"),
+        roots.codex.join("history.jsonl"),
+    ];
+    // Errors here mean an unreadable directory, not "no trajectories". The
+    // fold simply omits what it could not enumerate, which can only cause an
+    // extra sweep, never a skipped one.
+    paths.extend(trajectory_files(&roots.home).unwrap_or_default());
+    let mut candidates: Vec<Candidate> = Vec::new();
+    // OpenCode's legacy layout is a *tree*, and the evidence a sweep reads
+    // lives in the message and part files under it rather than in the session
+    // file. Enumerating session paths alone would leave a replaced part
+    // invisible to this fingerprint, and the sweep that would have picked it
+    // up gets skipped. `stamp_json_tree_session` folds the same files the
+    // ingest walks, so the two cannot disagree about whether a session moved.
+    if let Some(crate::ingest::opencode::OpencodeLayout::JsonTree(tree)) =
+        crate::ingest::opencode::OpencodeLayout::detect(
+            &roots.opencode_db,
+            &roots.opencode_storage_dir,
+        )
+    {
+        for session_file in crate::ingest::opencode::list_json_tree_session_files(&tree).sessions {
+            let session_id = session_file
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let Ok(stamp) =
+                crate::ingest::opencode::stamp_json_tree_session(&session_file, &session_id)
+            else {
+                continue;
+            };
+            candidates.push(Candidate {
+                source: "sweep",
+                locator: session_file.to_string_lossy().into_owned(),
+                session_id: Some(session_id),
+                recency_hint_ms: stamp.newest_ms(),
+                stamp: stamp.token(),
+            });
+        }
+    }
+    candidates.extend(paths.into_iter().filter_map(|path| {
+        let (stamp, recency_hint_ms) = crate::file_stamp_and_modified(&path).ok()?;
+        Some(Candidate {
+            source: "sweep",
+            locator: path.to_string_lossy().into_owned(),
+            session_id: None,
+            recency_hint_ms,
+            stamp,
+        })
+    }));
+    candidates
+}
+
+/// Every path live capture watches for a local sweep: the providers' own roots
+/// plus the sweep-only sources above.
+///
+/// The flat logs are watched through their parent directory rather than
+/// directly. A watch on a file follows that file's inode, so it stops firing
+/// the moment the log is replaced instead of appended to; and `~/.claude`
+/// watched recursively would pull in the todo files and shell snapshots an
+/// active session rewrites constantly, each one waking a full fingerprint
+/// walk.
+///
+/// Trajectory roots come from [`trajectory_roots`], not from the parents of
+/// the files found inside them. Deriving a watch from an existing file's
+/// parent covers only the shape the tree happens to have right now: an empty
+/// root, a root that does not exist yet, and the next `completed/<month>/`
+/// directory to be created would all go unwatched. The roots themselves are
+/// watched recursively, and a root that does not exist is kept — the loop
+/// retries it, so the first trajectory written there wakes live capture rather
+/// than waiting for the backstop.
+///
+/// Call this again to pick up a `.trajectories` directory created after the
+/// loop started; [`crate::watch::WatchLoop::with_roots_refresh`] does exactly
+/// that on each backstop tick.
+pub fn sync_watch_roots(home: &Path, opencode_db: &Path) -> Vec<discover::WatchRoot> {
+    let mut provider_roots = crate::ProviderRoots::from_env(home.to_path_buf());
+    provider_roots.opencode_db = opencode_db.to_path_buf();
+    sync_watch_roots_with_provider_roots(&provider_roots)
+}
+
+fn sync_watch_roots_with_provider_roots(
+    provider_roots: &crate::ProviderRoots,
+) -> Vec<discover::WatchRoot> {
+    let home = &provider_roots.home;
+    let mut roots = discover::watch_roots(
+        &shallow_providers(),
+        &discover::ProviderRoots {
+            home,
+            claude: &provider_roots.claude,
+            codex: &provider_roots.codex,
+            grok: &provider_roots.grok,
+            opencode_db: &provider_roots.opencode_db,
+        },
+    );
+    // The flat logs, each as the one file it is. A `directory` root here would
+    // cover every entry beside them — `~/.claude/settings.json`, the
+    // credentials file, whatever a harness release adds next — and each of
+    // those writes would drive a *forced* sweep, the kind that bypasses the
+    // fingerprint. A file root registers the same parent (a watch on the file
+    // itself dies with the next atomic rewrite) and then filters back down to
+    // the one name, which is exactly the distinction it exists for.
+    roots.push(discover::WatchRoot::file(
+        provider_roots.claude.join("history.jsonl"),
+    ));
+    roots.push(discover::WatchRoot::file(
+        provider_roots.codex.join("history.jsonl"),
+    ));
+    for root in trajectory_roots(home).unwrap_or_default() {
+        roots.push(trajectory_watch_root(root));
+    }
+    roots.sort();
+    roots.dedup_by(|later, first| {
+        if later.path != first.path {
+            return false;
+        }
+        first.depth = first.depth.max(later.depth);
+        true
+    });
+    roots
+}
+
+/// How one `TRAJECTORY_ROOT` entry is watched.
+///
+/// An entry naming a single JSON file is watched as a *file*: the parent is
+/// what gets registered, because an atomic rewrite would take a watch on the
+/// file itself with it, but only events on that one name count. The parent of
+/// such an entry is routinely `$HOME` — or `/` — so treating it as a tree
+/// would make every unrelated write on the machine a forced sweep. Anything
+/// else is a directory the roll-ups grow inside, and is watched as a tree.
+fn trajectory_watch_root(root: PathBuf) -> discover::WatchRoot {
+    if root.extension().and_then(|extension| extension.to_str()) == Some("json") {
+        return discover::WatchRoot::file(root);
+    }
+    discover::WatchRoot::tree(root)
+}
+
+/// Whether a sweep read everything the fingerprint counted.
+///
+/// This is deliberately a different question from whether the sweep
+/// *succeeded*. A provider that hits a per-file failure absorbs it, records
+/// the count, leaves that file's stamp unrecorded so the next sweep retries
+/// it, and returns `Ok` — correct partial-success behaviour, and the whole
+/// source never appears in `SyncSourceReport::failures`. But that file was
+/// already folded into the fingerprint, so caching the fingerprint would mean
+/// the next tick matches, returns early, and the retry never happens: one
+/// transient read error becomes permanent, and every symptom of it is
+/// "nothing new".
+///
+/// So partial success and fingerprint eligibility are tracked separately. A
+/// run may make progress and still be ineligible to arm the fast path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SweepCoverage {
+    /// Sources counted into the fingerprint that this sweep could not read.
+    unread: u64,
+}
+
+impl SweepCoverage {
+    /// A source was statted into the fingerprint but not read. Not for a
+    /// source deliberately classified as ignorable — an unparseable line in a
+    /// file that was read, or a file the parser decided is not a session —
+    /// because re-reading those produces the same answer forever, and
+    /// blocking the fast path on them would disable it permanently.
+    fn note_unread(&mut self) {
+        self.unread = self.unread.saturating_add(1);
+    }
+
+    fn complete(self) -> bool {
+        self.unread == 0
+    }
+}
+
+/// Whether the stat-only fingerprint says this sweep has nothing to do.
+///
+/// The catalog check is the guard that keeps the fast path honest across a
+/// database that went away: `.sync-state.json` lives beside the database but
+/// outlives it, so a fingerprint recorded against a catalog that has since been
+/// deleted must not skip the sweep that would rebuild it. An empty catalog also
+/// means an empty fingerprint walk, so the sweep it forces is the cheap one.
+fn sources_unchanged(conn: &Connection, state: &Map<String, Value>, current: &str) -> bool {
+    let Some(stored) = state.get(SOURCE_FINGERPRINT_KEY).and_then(Value::as_str) else {
+        return false;
+    };
+    if stored.is_empty() || stored != current {
+        return false;
+    }
+    // The sources are where the last sweep left them. That alone does not
+    // license a skip: the stamp also has to vouch for the destination those
+    // sources were read into.
+    let Some(stored_destination) = state
+        .get(DESTINATION_GENERATION_KEY)
+        .and_then(Value::as_str)
+    else {
+        // A stamp from a build that recorded no destination marker cannot say
+        // anything about one. The sweep below writes it.
+        return false;
+    };
+    match destination_generation(conn) {
+        Ok(current_destination) => destination_covers(stored_destination, &current_destination),
+        // Prefer a loud extra sweep to a confident skip.
+        Err(_) => false,
+    }
+}
+
+/// Runs the local sweep. `Ok(false)` means the stat-only source fingerprint
+/// matched the last sweep's and nothing was walked.
+fn sync_basic(
+    conn: &Connection,
+    db_path: &Path,
+    roots: &crate::ProviderRoots,
+    force: bool,
+) -> Result<bool> {
     let home = &roots.home;
     // See `begin_acquisition_pass`: the resolver's cache is sound only within
     // one pass, and a long-lived host (watch, the Node addon, a desktop app)
@@ -574,6 +1232,59 @@ fn sync_basic(conn: &Connection, db_path: &Path, roots: &crate::ProviderRoots) -
         }
     }
     let mut state = load_sync_state(&state_path)?;
+    let mut coverage = SweepCoverage::default();
+    let providers = shallow_providers();
+    // Captured before the sweep, not after. Anything that changes while the
+    // sweep runs yields a different fingerprint next time and forces one more
+    // pass — cheap, because the per-session stamps then skip what already
+    // landed. A fingerprint recorded ahead of the work it describes would lose
+    // that append instead.
+    let fingerprint = {
+        let env = DiscoveryEnv::with_provider_roots(conn, roots.clone());
+        let taken = discover::source_fingerprint_with(
+            &env,
+            &providers
+                .iter()
+                .map(|provider| provider.as_ref())
+                .collect::<Vec<_>>(),
+            &sweep_only_fingerprint_inputs(roots),
+        );
+        if let Err(error) = &taken {
+            sync_note!("  [sync] source fingerprint unavailable: {error:#}");
+        }
+        // Qualified by the generation that produced it, so an upgrade that
+        // bumps a parser or scanner generation cannot honour the stamp the
+        // previous one wrote.
+        taken
+            .ok()
+            .map(|sources| format!("{}/{sources}", sweep_generation()))
+    };
+    if !force {
+        if let Some(current) = fingerprint.as_deref() {
+            if sources_unchanged(conn, &state, current) {
+                sync_note!("  [sync] sources unchanged since the last sweep; skipped");
+                return Ok(false);
+            }
+        }
+    }
+    // Named before anything is written, because the sweep below is what
+    // repairs them and it decides per session whether its unchanged stamp
+    // licenses a skip. A failure here costs the repair, not the sweep.
+    let (repairs, repair_plan_known) = match destination_shortfall_against(conn, &state) {
+        Ok(repairs) => (repairs, true),
+        Err(error) => {
+            sync_note!("  [sync] could not name the sessions to repair: {error:#}");
+            (SweepRepairs::default(), false)
+        }
+    };
+    if repairs.repairs_all() {
+        sync_note!("  [sync] destination marker unreadable; repairing all replayable sessions");
+    } else if !repairs.is_empty() {
+        sync_note!(
+            "  [sync] {} session(s) lost evidence since the last sweep; repairing",
+            repairs.len()
+        );
+    }
     // Checkpoint after every source that advances `state`, rather than once at
     // the end. A run can die partway through -- killed process, locked database,
     // full disk -- and state written only at the end discards every source that
@@ -602,7 +1313,13 @@ fn sync_basic(conn: &Connection, db_path: &Path, roots: &crate::ProviderRoots) -
     if report
         .capture(
             "claude-metadata",
-            sync_claude_session_metadata(conn, &mut state, &roots.claude.join("projects")),
+            sync_claude_session_metadata_with_repairs_and_coverage(
+                conn,
+                &mut state,
+                &roots.claude.join("projects"),
+                &repairs,
+                &mut coverage,
+            ),
         )
         .is_some()
     {
@@ -610,7 +1327,16 @@ fn sync_basic(conn: &Connection, db_path: &Path, roots: &crate::ProviderRoots) -
     }
     capture_progress("codex", 0, None);
     check_capture_cancelled()?;
-    if let Some(inserted) = report.capture("codex", sync_codex(conn, &mut state, &roots.codex)) {
+    if let Some(inserted) = report.capture(
+        "codex",
+        sync_codex_with_repairs_and_coverage(
+            conn,
+            &mut state,
+            &roots.codex,
+            &repairs,
+            &mut coverage,
+        ),
+    ) {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);
     }
@@ -618,7 +1344,12 @@ fn sync_basic(conn: &Connection, db_path: &Path, roots: &crate::ProviderRoots) -
     check_capture_cancelled()?;
     if let Some(inserted) = report.capture(
         "cursor",
-        sync_cursor(conn, &mut state, &home.join(".cursor/projects")),
+        sync_cursor(
+            conn,
+            &mut state,
+            &home.join(".cursor/projects"),
+            &mut coverage,
+        ),
     ) {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);
@@ -627,15 +1358,22 @@ fn sync_basic(conn: &Connection, db_path: &Path, roots: &crate::ProviderRoots) -
     check_capture_cancelled()?;
     if let Some(inserted) = report.capture(
         "grok",
-        sync_grok(conn, &mut state, &roots.grok.join("sessions")),
+        sync_grok_with_coverage(
+            conn,
+            &mut state,
+            &roots.grok.join("sessions"),
+            &mut coverage,
+        ),
     ) {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);
     }
     capture_progress("trajectory", 0, None);
     check_capture_cancelled()?;
-    if let Some(inserted) = report.capture("trajectory", sync_trajectories(conn, &mut state, home))
-    {
+    if let Some(inserted) = report.capture(
+        "trajectory",
+        sync_trajectories(conn, &mut state, home, &mut coverage),
+    ) {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);
     }
@@ -675,6 +1413,19 @@ fn sync_basic(conn: &Connection, db_path: &Path, roots: &crate::ProviderRoots) -
         total_inserted += open_inserted;
     }
     check_capture_cancelled()?;
+
+    // A source that was statted into the fingerprint but could not be read is
+    // the one case where caching the fingerprint would make a transient
+    // failure permanent: the next sweep would match the stored value and skip
+    // before retrying. Leave the stored fingerprint stale instead. The cost is
+    // one full re-walk per tick until the source reads again, which is the
+    // conservative side of the trade.
+    //
+    // Both halves are needed. `failures` catches a source that failed
+    // outright; `coverage` catches the per-file failures a source absorbs on
+    // its way to a successful partial run, which never reach `failures` at
+    // all.
+    let sweep_read_everything = report.failures.is_empty() && coverage.complete();
     report.finish(db_path)?;
     // Establish connector-owned locators from actual provider enumeration after
     // ingestion, including on a checkpoint-only retry. Never infer an adapter
@@ -682,18 +1433,100 @@ fn sync_basic(conn: &Connection, db_path: &Path, roots: &crate::ProviderRoots) -
     capture_progress("catalog", 0, None);
     check_capture_cancelled()?;
     let discovery_env = DiscoveryEnv::with_provider_roots(conn, roots.clone());
-    discover::discover_sessions_with_providers(
+    let discovered = discover::discover_sessions_with_providers(
         &discovery_env,
         &DiscoverOptions::default(),
-        &shallow_providers(),
+        &providers,
         |_| {},
     )?;
     // After discovery, not before: shallow discovery is what fills in `cwd`
     // and `repo_url` for sessions a provider's history file mentions without
     // describing, and inheritance needs every relationship this run recorded
-    // to already be in the ledger.
+    // to already be in the ledger. Ahead of the checkpoint below, because the
+    // destination marker is taken from what this sweep wrote and this is part
+    // of what it writes.
     check_capture_cancelled()?;
     refresh_project_identity_after_sync(conn);
+    // Discovery reads the same files the fingerprint counted, and its
+    // failures are *non-fatal* — a candidate it could not read leaves a
+    // diagnostic and the run returns `Ok`. Caching the fingerprint over that
+    // would make a transient failure permanent in the same way a swallowed
+    // per-file sweep error would: the next tick matches the stored value and
+    // skips before retrying, so the file is never read again until its
+    // metadata happens to change. This run is local-scope, so every
+    // diagnostic here is a file that was not read or a provider that could
+    // not enumerate; neither is a clean read.
+    for diagnostic in &discovered.diagnostics {
+        sync_note!(
+            "  [discovery] {} not read: {}",
+            diagnostic.locator.as_deref().unwrap_or(&diagnostic.source),
+            diagnostic.error
+        );
+        coverage.note_unread();
+    }
+    let all_sources_read = sweep_read_everything && coverage.complete();
+    // Written after every cursor this sweep advanced, and in its own
+    // checkpoint. A crash between them leaves cursors ahead of a stale
+    // fingerprint, which costs one extra full walk that then finds nothing —
+    // never a missed append. The reverse order would lose one.
+    // A loss the sweep was told about and did not put back must stay visible.
+    // Writing the marker here would record the short counts as the new truth,
+    // and the next tick would compare against them and skip: detection
+    // followed by re-baselining is how a loss becomes permanent and silent,
+    // which is the failure this marker exists to prevent. Leaving both the
+    // marker and the fingerprint stale costs a full sweep per tick until the
+    // evidence is back — loud and expensive, which is the right side to fail
+    // on — and the note below names how many sessions are still owed.
+    let outstanding = if repairs.repairs_all() && all_sources_read {
+        // There was no readable baseline to compare against, but every source
+        // was replayed without a gap. That is the one case where the sweep
+        // itself proves a fresh marker is safe and lets an unreadable marker
+        // recover instead of forcing full sweeps forever.
+        Some(SweepRepairs::default())
+    } else {
+        match destination_shortfall_against(conn, &state) {
+            Ok(outstanding) => Some(outstanding),
+            Err(error) => {
+                sync_note!("  [sync] could not re-check the destination: {error:#}");
+                None
+            }
+        }
+    };
+    if let Some(outstanding) = outstanding
+        .as_ref()
+        .filter(|repairs| !repairs.is_empty() && !repairs.repairs_all())
+    {
+        eprintln!(
+            "ai-hist: {} session(s) are still missing evidence after this sweep; \
+             the source may be gone. Sync will keep re-sweeping until they are \
+             restored or the catalog is rebuilt.",
+            outstanding.len()
+        );
+    }
+    if checkpoint_is_safe(all_sources_read, repair_plan_known, outstanding.as_ref()) {
+        if let Some(fingerprint) = fingerprint {
+            // The destination marker is taken *after* the sweep, from what the
+            // sweep just wrote — the opposite of the source fingerprint, which
+            // describes what it was about to read. A marker taken before the
+            // work would never match again afterwards and the fast path would
+            // never arm at all.
+            //
+            // An empty value on failure rather than a removal: the sync-state
+            // merge only ever folds keys forward, so an in-memory `remove` is
+            // invisible on disk and would leave a stale marker vouching for a
+            // destination nobody measured.
+            let destination = destination_generation(conn).unwrap_or_else(|error| {
+                sync_note!("  [sync] destination generation unavailable: {error:#}");
+                String::new()
+            });
+            state.insert(SOURCE_FINGERPRINT_KEY.to_string(), Value::from(fingerprint));
+            state.insert(
+                DESTINATION_GENERATION_KEY.to_string(),
+                Value::from(destination),
+            );
+            checkpoint_sync_state(&state_path, &state);
+        }
+    }
     let total: i64 = conn.query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))?;
     // Fold the WAL back into the database now that the writes are done. Best
     // effort: a concurrent reader pinning an old snapshot blocks a full
@@ -726,7 +1559,23 @@ fn sync_basic(conn: &Connection, db_path: &Path, roots: &crate::ProviderRoots) -
     }
     sync_note!("  [rust-sync] +{total_inserted} rows");
     sync_note!("  Total: {total} entries");
-    Ok(())
+    Ok(true)
+}
+
+/// Whether this sweep knows enough to make its source and destination state a
+/// new fast-path baseline.
+///
+/// Both destination reads matter. The first names short sessions so the sweep
+/// can override their otherwise-valid per-file stamps; the second proves the
+/// repair landed. Treating an error from either read as an empty shortfall
+/// turns "unknown" into "nothing missing" and can permanently ratify lost
+/// evidence.
+fn checkpoint_is_safe(
+    all_sources_read: bool,
+    repair_plan_known: bool,
+    outstanding: Option<&SweepRepairs>,
+) -> bool {
+    all_sources_read && repair_plan_known && outstanding.is_some_and(SweepRepairs::is_empty)
 }
 
 /// Cross-process sync guard for one canonical database identity. Reflex, launchd, cron, and
@@ -786,23 +1635,68 @@ fn try_acquire_sync_lock(db_path: &Path) -> Result<Option<SyncRunLock>> {
 
 fn sync_exclusive(db_path: &Path) -> Result<bool> {
     let roots = crate::ProviderRoots::from_env(home_dir());
-    sync_exclusive_with_roots(db_path, &roots)
+    sync_exclusive_with_roots(db_path, &roots, false).map(|tick| tick.attempted)
 }
 
-fn sync_exclusive_with_home(db_path: &Path, home: &Path) -> Result<bool> {
+/// What one local sweep did, for callers that need to tell "no provider source
+/// moved" apart from "another process holds the sync lock".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct SyncTick {
+    /// This process took the sync lock and entered the sweep path.
+    pub attempted: bool,
+    /// A full walk ran. False when the stat-only source fingerprint matched
+    /// the previous sweep's, and false when the lock was held elsewhere.
+    pub swept: bool,
+}
+
+impl SyncTick {
+    /// The sweep was skipped because no provider source had moved.
+    pub fn skipped_unchanged(&self) -> bool {
+        self.attempted && !self.swept
+    }
+}
+
+/// How the watch loop reads a sweep's result.
+///
+/// One conversion rather than one per caller: a tick that never took the lock
+/// looked at nothing, and a caller that folded that into `skipped_unchanged`
+/// would be telling the loop the change had been considered and dismissed.
+impl From<SyncTick> for crate::watch::TickOutcome {
+    fn from(tick: SyncTick) -> Self {
+        Self {
+            swept: tick.swept,
+            skipped_unchanged: tick.skipped_unchanged(),
+            contended: !tick.attempted,
+        }
+    }
+}
+
+pub(crate) fn sync_exclusive_with_home(
+    db_path: &Path,
+    home: &Path,
+    force: bool,
+) -> Result<SyncTick> {
     let roots = crate::ProviderRoots::from_env(home.to_path_buf());
-    sync_exclusive_with_roots(db_path, &roots)
+    sync_exclusive_with_roots(db_path, &roots, force)
 }
 
-fn sync_exclusive_with_roots(db_path: &Path, roots: &crate::ProviderRoots) -> Result<bool> {
+fn sync_exclusive_with_roots(
+    db_path: &Path,
+    roots: &crate::ProviderRoots,
+    force: bool,
+) -> Result<SyncTick> {
     check_capture_cancelled()?;
     let Some(_sync_lock) = try_acquire_sync_lock(db_path)? else {
         sync_note!("  [sync] another sync is already running; skipped");
-        return Ok(false);
+        return Ok(SyncTick::default());
     };
     let conn = open_db(db_path).map_err(|error| enrich_sync_error(db_path, error))?;
-    sync_basic(&conn, db_path, roots).map_err(|error| enrich_sync_error(db_path, error))?;
-    Ok(true)
+    let swept = sync_basic(&conn, db_path, roots, force)
+        .map_err(|error| enrich_sync_error(db_path, error))?;
+    Ok(SyncTick {
+        attempted: true,
+        swept,
+    })
 }
 
 fn sync_opencode_exclusive(db_path: &Path, opencode_path: &Path) -> Result<bool> {
@@ -893,7 +1787,7 @@ pub fn prepare_local_sync_snapshot(db_path: &Path) -> Result<(Connection, bool)>
     };
     let conn = open_db(db_path).map_err(|error| enrich_sync_error(db_path, error))?;
     let roots = crate::ProviderRoots::from_env(home_dir());
-    sync_basic(&conn, db_path, &roots).map_err(|error| enrich_sync_error(db_path, error))?;
+    sync_basic(&conn, db_path, &roots, false).map_err(|error| enrich_sync_error(db_path, error))?;
     drop(sync_lock);
     Ok((conn, false))
 }
@@ -1968,8 +2862,31 @@ fn sync_jsonl_incremental(
     Ok(inserted)
 }
 
+#[cfg(test)]
 fn sync_codex(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> Result<usize> {
-    let (cwds, branches, mut inserted) = sync_codex_rollouts(conn, state, root)?;
+    sync_codex_with_repairs(conn, state, root, &SweepRepairs::default())
+}
+
+#[cfg(test)]
+fn sync_codex_with_repairs(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    root: &Path,
+    repairs: &SweepRepairs,
+) -> Result<usize> {
+    let mut coverage = SweepCoverage::default();
+    sync_codex_with_repairs_and_coverage(conn, state, root, repairs, &mut coverage)
+}
+
+fn sync_codex_with_repairs_and_coverage(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    root: &Path,
+    repairs: &SweepRepairs,
+    coverage: &mut SweepCoverage,
+) -> Result<usize> {
+    let (cwds, branches, mut inserted) =
+        sync_codex_rollouts_with_repairs_and_coverage(conn, state, root, repairs, coverage)?;
     let path = root.join("history.jsonl");
     if !path.exists() {
         sync_note!("  [codex] not found: {} (skipped)", path.display());
@@ -2129,10 +3046,32 @@ fn cleanup_codex_subagent_history(conn: &Connection, session_id: &str) -> Result
     Ok(())
 }
 
+#[cfg(test)]
 fn sync_codex_rollouts(
     conn: &Connection,
     state: &mut Map<String, Value>,
     root: &Path,
+) -> Result<CodexRolloutWalk> {
+    sync_codex_rollouts_with_repairs(conn, state, root, &SweepRepairs::default())
+}
+
+#[cfg(test)]
+fn sync_codex_rollouts_with_repairs(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    root: &Path,
+    repairs: &SweepRepairs,
+) -> Result<CodexRolloutWalk> {
+    let mut coverage = SweepCoverage::default();
+    sync_codex_rollouts_with_repairs_and_coverage(conn, state, root, repairs, &mut coverage)
+}
+
+fn sync_codex_rollouts_with_repairs_and_coverage(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    root: &Path,
+    repairs: &SweepRepairs,
+    coverage: &mut SweepCoverage,
 ) -> Result<CodexRolloutWalk> {
     let mut cwds = load_state_string_map(state, "codex_session_cwds");
     let mut branches = load_state_string_map(state, "codex_session_branches");
@@ -2254,6 +3193,10 @@ fn sync_codex_rollouts(
                     // No session id was recorded because the file had no
                     // usable session_meta; there is nothing to re-ingest.
                     None => continue,
+                    // Present but short: the destination marker says this
+                    // session lost rows since the last sweep. Existence is not
+                    // enough to answer that — re-ingest, which is idempotent.
+                    Some(id) if repairs.contains("codex", id) => {}
                     Some(id)
                         if codex_session_evidence_exists(conn, id)?
                             && !(backfill_fidelity
@@ -2391,6 +3334,9 @@ fn sync_codex_rollouts(
     }
     crate::continuity::reconcile(conn, "codex")?;
     record_raw_facts_backfill(state, CODEX_RAW_MESSAGE_FACTS_KEY, walked_every_known_root);
+    if repairs.repairs_all() && !walked_every_known_root {
+        coverage.note_unread();
+    }
     if scanned > 0 {
         sync_note!(
             "  [codex-rollouts] scanned {scanned} files; +{inserted} prompts, +{events} events"
@@ -2447,7 +3393,8 @@ fn record_codex_delegation(
 fn codex_delegation_recorded(conn: &Connection, child_session_id: &str) -> Result<bool> {
     let exists: i64 = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM session_relationships \
-         WHERE source = 'codex' AND child_session_id = ? LIMIT 1)",
+         WHERE source = 'codex' AND child_session_id = ? \
+           AND relationship = 'delegated' LIMIT 1)",
         [child_session_id],
         |row| row.get(0),
     )?;
@@ -4229,15 +5176,51 @@ fn backfill_codex_metadata(
     Ok(updated)
 }
 
+#[cfg(test)]
 fn sync_claude_session_metadata(
     conn: &Connection,
     state: &mut Map<String, Value>,
     root: &Path,
 ) -> Result<()> {
+    sync_claude_session_metadata_with_repairs(conn, state, root, &SweepRepairs::default())
+}
+
+#[cfg(test)]
+fn sync_claude_session_metadata_with_repairs(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    root: &Path,
+    repairs: &SweepRepairs,
+) -> Result<()> {
+    let mut coverage = SweepCoverage::default();
+    sync_claude_session_metadata_with_repairs_and_coverage(
+        conn,
+        state,
+        root,
+        repairs,
+        &mut coverage,
+    )
+}
+
+fn sync_claude_session_metadata_with_repairs_and_coverage(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    root: &Path,
+    repairs: &SweepRepairs,
+    coverage: &mut SweepCoverage,
+) -> Result<()> {
     // Load-bearing for the raw-facts generation below: an absent root returns
     // before anything is recorded, so a run that could not see the archive
     // does not retire the one-time backfill pass over it.
     if !root.exists() {
+        if repairs.repairs_all()
+            && state
+                .get("claude_sessions_v3")
+                .and_then(Value::as_object)
+                .is_some_and(|known| state_names_files_under(known, root))
+        {
+            coverage.note_unread();
+        }
         return Ok(());
     }
     // The `claude_sessions*` path -> stamp maps are retired. They recorded only
@@ -4303,7 +5286,13 @@ fn sync_claude_session_metadata(
         let backfill = (backfill_fidelity
             && claude_transcript_lacks_tool_result_fidelity(conn, &path)?)
             || (backfill_raw_facts && claude_transcript_lacks_raw_facts(conn, &path)?);
-        if indexed && !backfill && claude_transcript_unchanged(conn, &path)? {
+        // Present but short: the destination marker says this transcript's
+        // session lost rows. A cursor cannot answer that — it describes bytes,
+        // not evidence — and the transcript's bytes will never move again to
+        // reopen it, so an unchanged cursor does not license a skip here.
+        // Re-reading is idempotent.
+        let needs_repair = claude_transcript_needs_repair(conn, &path, repairs)?;
+        if indexed && !backfill && !needs_repair && claude_transcript_unchanged(conn, &path)? {
             // A transcript registered as a session and indexed before
             // continuity existed still owes its evidence. Reading it here
             // rather than falling through keeps the skip's promise: continuity
@@ -4343,14 +5332,15 @@ fn sync_claude_session_metadata(
             );
             continue;
         }
-        if !indexed || backfill {
+        if !indexed || backfill || needs_repair {
             // Either the cursor claims these bytes already produced rows and
             // the rows are not there — a wiped database, or evidence a repair
             // removed — or a backfill pass needs the whole file read again for
-            // columns the earlier parser never wrote. A resumed read of a file
-            // whose cursor sits at EOF reads nothing, so a backfill that left
-            // the cursor in place would retire its generation having written
-            // nothing at all.
+            // columns the earlier parser never wrote, or the destination
+            // marker says this session is short of the rows these bytes
+            // produced. A resumed read of a file whose cursor sits at EOF
+            // reads nothing, so any of those left with the cursor in place
+            // would "re-read" the file and write nothing at all.
             transcript_cursor::forget_locator_cursor(conn, "claude", &path)?;
         }
         scanned += 1;
@@ -4459,6 +5449,9 @@ fn sync_claude_session_metadata(
     }
     crate::continuity::reconcile(conn, "claude")?;
     record_raw_facts_backfill(state, CLAUDE_RAW_MESSAGE_FACTS_KEY, walked_every_known_root);
+    if repairs.repairs_all() && !walked_every_known_root {
+        coverage.note_unread();
+    }
     if scanned > 0 {
         sync_note!("  [claude-sessions] scanned {scanned} files, {upserted} sessions updated");
     }
@@ -4541,6 +5534,48 @@ fn claude_sidecar_evidence_exists(conn: &Connection, path: &Path) -> Result<bool
         |row| row.get(0),
     )?;
     Ok(exists != 0)
+}
+
+/// Whether this file owns a session the destination marker says is short.
+///
+/// Two joins, because a Claude transcript is reached two ways. A top-level
+/// session is registered in the catalog, so `sessions.raw_path` names it — the
+/// same join the existence check uses. A delegated child is *deliberately*
+/// never registered as a session, so it has no catalog row at all and that
+/// join finds nothing; its identity lives in `session_relationships`, keyed by
+/// the sidecar's locator, which is also how `claude_sidecar_evidence_exists`
+/// reaches it. Asking only the first would leave a short subagent
+/// unrepairable while its surviving events went on satisfying the existence
+/// check — a loss the sweep can fix, detected on every tick and repaired
+/// never, which turns the "keep sweeping until it is restored" rule into a
+/// permanent full sweep.
+fn claude_transcript_needs_repair(
+    conn: &Connection,
+    path: &Path,
+    repairs: &SweepRepairs,
+) -> Result<bool> {
+    if repairs.repairs_all() {
+        return Ok(true);
+    }
+    if repairs.is_empty() {
+        return Ok(false);
+    }
+    let raw_path = path.to_string_lossy();
+    let mut statement = conn.prepare(
+        "SELECT session_id FROM sessions \
+         WHERE source = 'claude' AND raw_path = ?1 \
+         UNION \
+         SELECT COALESCE(child_session_id, parent_session_id) FROM session_relationships \
+         WHERE source = 'claude' AND evidence_locator = ?1",
+    )?;
+    let mut rows = statement.query([raw_path.as_ref()])?;
+    while let Some(row) = rows.next()? {
+        let session_id: String = row.get(0)?;
+        if repairs.contains("claude", &session_id) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Whether a session's indexed tool results predate the fidelity columns.
@@ -4763,6 +5798,7 @@ fn claude_transcript_events_exist(conn: &Connection, path: &Path) -> Result<bool
     Ok(exists != 0)
 }
 
+#[derive(Clone, Debug)]
 pub(crate) struct ClaudeSessionMeta {
     session_id: String,
     remote_session_id: Option<String>,
@@ -4830,6 +5866,9 @@ pub(crate) struct ClaudeMetaFold {
     /// grown since the last pass.
     #[serde(default)]
     pub continuity_any: bool,
+    /// Two different `sessionId` values were seen in one transcript.
+    #[serde(default)]
+    pub conflicting_session_ids: bool,
 }
 
 impl ClaudeMetaFold {
@@ -4851,6 +5890,19 @@ impl ClaudeMetaFold {
             self.identified_records += 1;
             if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
                 self.sidechain_records += 1;
+            }
+            // A transcript carries one conversation. Two different ids in one
+            // file means the file is not what it claims, and indexing it would
+            // attribute one session's records to another. Recorded rather than
+            // raised here, because a fold has no way to fail: the scan turns
+            // it into the error.
+            if let Some(record_session_id) = value.get("sessionId").and_then(Value::as_str) {
+                match self.session_id.as_deref() {
+                    Some(expected) if expected != record_session_id => {
+                        self.conflicting_session_ids = true;
+                    }
+                    _ => {}
+                }
             }
         }
         if self.agent_id.is_none() {
@@ -4971,6 +6023,67 @@ impl ClaudeScanPass {
     }
 }
 
+/// The same metadata fold, over bytes the lifecycle hook already captured.
+///
+/// The hook hands over what it read, so there is no file to walk and no
+/// position to keep. It folds through `ClaudeMetaFold` like every other
+/// reader, so what a record means cannot differ between the two.
+fn scan_claude_session_text(path: &Path, text: &str) -> Result<Option<ClaudeSessionMeta>> {
+    let mut fold = ClaudeMetaFold::default();
+    for line in text.lines() {
+        check_capture_cancelled()?;
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        fold.observe(&value);
+    }
+    anyhow::ensure!(
+        !fold.conflicting_session_ids,
+        "conflicting sessionId values in Claude transcript {}",
+        path.display()
+    );
+    Ok(fold.finish())
+}
+
+/// Index the records in bytes the hook captured.
+fn ingest_claude_transcript_text_as(
+    conn: &Connection,
+    path: &Path,
+    text: &str,
+    attributed_session_id: Option<&str>,
+) -> Result<()> {
+    let file_session_id = text.lines().find_map(|line| {
+        serde_json::from_str::<Value>(line)
+            .ok()?
+            .get("sessionId")?
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+    });
+    let mut indexer = tool_result_facts::ToolResultIndexer::default();
+    let mut cache_reads: HashMap<String, i64> = HashMap::new();
+    for line in text.lines() {
+        check_capture_cancelled()?;
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(obj) = value.as_object() else {
+            continue;
+        };
+        ingest_claude_record(
+            conn,
+            path,
+            attributed_session_id,
+            file_session_id.as_deref(),
+            line,
+            obj,
+            &mut indexer,
+            &mut cache_reads,
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn scan_claude_session_file_resumed(
     path: &Path,
     state: &mut Option<transcript_cursor::ClaudeScanState>,
@@ -5041,6 +6154,11 @@ pub(crate) fn scan_claude_session_file_resumed(
         .saturating_sub(start_offset)
         .saturating_add(reader.tail_bytes())
         .saturating_add(validation_bytes);
+    anyhow::ensure!(
+        !fold.conflicting_session_ids,
+        "conflicting sessionId values in Claude transcript {}",
+        path.display()
+    );
     let continuity =
         crate::continuity::finish_claude_fold(fold.continuity.clone(), fold.continuity_any, path);
     Ok(ClaudeScanPass {
@@ -7547,6 +8665,96 @@ fn modified_ms_of(metadata: &fs::Metadata) -> Option<i64> {
         .map(|d| d.as_millis() as i64)
 }
 
+/// One Claude transcript captured through one open file handle.
+///
+/// Lifecycle hooks carry an untrusted path. Keeping the bytes and metadata
+/// together prevents a path replacement between identity validation, shallow
+/// cataloging, and full ingestion from changing which transcript is written.
+#[derive(Debug)]
+pub(crate) struct ClaudeTranscriptSnapshot {
+    pub(crate) path: PathBuf,
+    pub(crate) text: String,
+    pub(crate) stamp: String,
+    pub(crate) modified_ms: Option<i64>,
+    meta: Option<ClaudeSessionMeta>,
+}
+
+impl ClaudeTranscriptSnapshot {
+    #[cfg(test)]
+    pub(crate) fn open(path: &Path) -> Result<Self> {
+        Self::open_checked(path, |_| Ok(()))
+    }
+
+    /// Open once, validate that exact handle, and only then read its bytes.
+    pub(crate) fn open_checked(
+        path: &Path,
+        validate: impl FnOnce(&fs::File) -> Result<()>,
+    ) -> Result<Self> {
+        let mut file = fs::File::open(path)
+            .with_context(|| format!("opening Claude transcript {}", path.display()))?;
+        let metadata = file.metadata()?;
+        anyhow::ensure!(
+            metadata.is_file(),
+            "{} is not a regular file",
+            path.display()
+        );
+        validate(&file)?;
+        let mut text = String::with_capacity(metadata.len() as usize);
+        file.read_to_string(&mut text)
+            .with_context(|| format!("reading Claude transcript {}", path.display()))?;
+        let meta = scan_claude_session_text(path, &text)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            text,
+            stamp: stamp_of(&metadata),
+            modified_ms: modified_ms_of(&metadata),
+            meta,
+        })
+    }
+
+    pub(crate) fn session_id(&self) -> Option<String> {
+        self.meta.as_ref().map(|meta| meta.session_id.clone())
+    }
+
+    pub(crate) fn meta(&self) -> Option<ClaudeSessionMeta> {
+        self.meta.clone()
+    }
+
+    pub(crate) fn is_subagent(&self) -> bool {
+        self.meta.as_ref().is_some_and(|meta| meta.subagent)
+    }
+
+    pub(crate) fn records(&self) -> i64 {
+        jsonl::rows(&self.text)
+            .filter(|row| {
+                matches!(
+                    jsonl::classify(row.text, row.complete),
+                    jsonl::Row::Record(_)
+                )
+            })
+            .count() as i64
+    }
+}
+
+/// Confirm that a validated pathname still names the file handle already
+/// opened for a Claude snapshot.
+///
+/// The hook validates the path between `open` and `read`; matching filesystem
+/// identity binds that validation to the handle, so swapping a symlink or a
+/// directory entry cannot redirect the later read outside the provider root.
+pub(crate) fn validate_opened_file_identity(path: &Path, opened: &fs::File) -> Result<()> {
+    let opened = same_file::Handle::from_file(opened.try_clone()?)
+        .with_context(|| format!("checking opened Claude transcript {}", path.display()))?;
+    let current = same_file::Handle::from_path(path)
+        .with_context(|| format!("checking opened Claude transcript {}", path.display()))?;
+    anyhow::ensure!(
+        opened == current,
+        "Claude transcript changed while its provider path was validated: {}",
+        path.display()
+    );
+    Ok(())
+}
+
 fn file_stamp(path: &Path) -> Result<String> {
     Ok(stamp_of(&path.metadata()?))
 }
@@ -7563,8 +8771,13 @@ pub(crate) fn file_stamp_and_modified(path: &Path) -> Result<(String, Option<i64
     Ok((stamp_of(&metadata), modified_ms_of(&metadata)))
 }
 
-fn sync_cursor(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> Result<usize> {
-    sync_cursor_with_scan_hook(conn, state, root, &mut |_| {})
+fn sync_cursor(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    root: &Path,
+    coverage: &mut SweepCoverage,
+) -> Result<usize> {
+    sync_cursor_with_scan_hook(conn, state, root, coverage, &mut |_| {})
 }
 
 struct PreparedCursorTranscript {
@@ -7599,9 +8812,10 @@ fn sync_cursor_with_scan_hook(
     conn: &Connection,
     state: &mut Map<String, Value>,
     root: &Path,
+    coverage: &mut SweepCoverage,
     before_transcript: &mut dyn FnMut(&Path),
 ) -> Result<usize> {
-    sync_cursor_with_hooks(conn, state, root, before_transcript, &mut |_| {})
+    sync_cursor_with_hooks(conn, state, root, coverage, before_transcript, &mut |_| {})
 }
 
 /// `after_read` runs between a transcript's byte scan and the cursor that scan
@@ -7611,6 +8825,7 @@ fn sync_cursor_with_hooks(
     conn: &Connection,
     state: &mut Map<String, Value>,
     root: &Path,
+    coverage: &mut SweepCoverage,
     before_transcript: &mut dyn FnMut(&Path),
     after_read: &mut dyn FnMut(&Path),
 ) -> Result<usize> {
@@ -7618,7 +8833,7 @@ fn sync_cursor_with_hooks(
         return Ok(0);
     }
     // Finish provider I/O and parsing before taking the destination writer lock.
-    let prepared = prepare_cursor_sync(state, root, before_transcript, after_read)
+    let prepared = prepare_cursor_sync(state, root, coverage, before_transcript, after_read)
         .with_context(|| format!("prepare Cursor transcripts from {}", root.display()))?;
     // Match rollback to the source-wide checkpoint boundary: replaying committed
     // prompts after a file's mtime changes can duplicate them.
@@ -8016,6 +9231,7 @@ pub(crate) fn cursor_transcript_was_replaced(
 fn prepare_cursor_sync(
     state: &Map<String, Value>,
     root: &Path,
+    coverage: &mut SweepCoverage,
     before_transcript: &mut dyn FnMut(&Path),
     after_read: &mut dyn FnMut(&Path),
 ) -> Result<PreparedCursorSync> {
@@ -8067,6 +9283,7 @@ fn prepare_cursor_sync(
                     }
                     sync_note!("  [cursor] skipping {}: {error:#}", jsonl.display());
                     errors += 1;
+                    coverage.note_unread();
                     continue;
                 }
             };
@@ -8688,7 +9905,17 @@ pub(crate) fn decode_cursor_project(name: &str) -> String {
     format!("/{}", name.replace('-', "/"))
 }
 
+#[cfg(test)]
 fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> Result<usize> {
+    sync_grok_with_coverage(conn, state, root, &mut SweepCoverage::default())
+}
+
+fn sync_grok_with_coverage(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    root: &Path,
+    coverage: &mut SweepCoverage,
+) -> Result<usize> {
     if !root.exists() {
         sync_note!("  [grok] not found: {} (skipped)", root.display());
         return Ok(0);
@@ -8728,6 +9955,7 @@ fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
                 }
                 scanned += 1;
                 errors += 1;
+                coverage.note_unread();
                 sync_note!("  [grok] unreadable session {}: {error:#}", chat.display());
                 continue;
             }
@@ -8822,6 +10050,10 @@ fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
                     return Err(error);
                 }
                 errors += 1;
+                // The stamp is deliberately not recorded so the next sweep
+                // retries this directory. Keep the source fingerprint stale
+                // too, or the next tick would skip before reaching it.
+                coverage.note_unread();
                 sync_note!("  [grok] unreadable session {}: {error:#}", chat.display());
             }
         }
@@ -10298,6 +11530,7 @@ fn sync_trajectories(
     conn: &Connection,
     state: &mut Map<String, Value>,
     home: &Path,
+    coverage: &mut SweepCoverage,
 ) -> Result<usize> {
     let files = trajectory_files(home)?;
     if files.is_empty() {
@@ -10318,6 +11551,7 @@ fn sync_trajectories(
             Ok(metadata) => metadata,
             Err(_) => {
                 errors += 1;
+                coverage.note_unread();
                 continue;
             }
         };
@@ -10350,6 +11584,7 @@ fn sync_trajectories(
                 return Err(error);
             }
             errors += 1;
+            coverage.note_unread();
             continue;
         }
         trajectory_state.insert(key, json!(stamp));
@@ -10393,7 +11628,15 @@ struct TrajectoryRow {
     timestamp_ms: i64,
 }
 
-fn trajectory_files(home: &Path) -> Result<Vec<PathBuf>> {
+/// The trajectory roots this machine is configured for, whether or not
+/// anything exists inside them yet.
+///
+/// Split out from [`trajectory_files`] because the watcher and the file walk
+/// need different answers. A root that is empty, or that does not exist at
+/// all, contributes no files — but it is exactly what has to be watched, so
+/// the first trajectory written into it wakes live capture instead of waiting
+/// for the backstop.
+pub(crate) fn trajectory_roots(home: &Path) -> Result<Vec<PathBuf>> {
     let mut roots = Vec::new();
     if let Some(raw) = std::env::var_os("TRAJECTORY_ROOT") {
         for part in std::env::split_paths(&raw) {
@@ -10407,8 +11650,14 @@ fn trajectory_files(home: &Path) -> Result<Vec<PathBuf>> {
             collect_named_dirs(&projects, ".trajectories", &mut roots)?;
         }
     }
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
+fn trajectory_files(home: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
-    for root in roots {
+    for root in trajectory_roots(home)? {
         check_capture_cancelled()?;
         if root.is_file() && root.extension().and_then(|s| s.to_str()) == Some("json") {
             files.push(root);
@@ -10426,6 +11675,22 @@ fn trajectory_files(home: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+/// Directory names never worth descending into when looking for a project's
+/// `.trajectories`, and expensive enough to matter: a dependency tree or an
+/// object store can be most of the files on the disk.
+const SKIP_PROJECT_SCAN_DIRS: &[&str] = &["node_modules", "target", "vendor"];
+
+/// Find directories named `name` under `root`.
+///
+/// The pruning is load-bearing, not a micro-optimisation. This runs once per
+/// watch tick as part of the stat-only fingerprint, and an unpruned walk of
+/// `~/Projects` means walking every dependency tree and every `.git` object
+/// store on the machine before deciding that nothing has changed — which is
+/// the opposite of what a fast path is for.
+///
+/// Pruned: the names above, and any hidden directory that is not the one being
+/// looked for. A match is not descended into either; nothing nests a
+/// `.trajectories` inside another one.
 fn collect_named_dirs(root: &Path, name: &str, out: &mut Vec<PathBuf>) -> Result<()> {
     if !root.is_dir() {
         return Ok(());
@@ -10438,23 +11703,23 @@ fn collect_named_dirs(root: &Path, name: &str, out: &mut Vec<PathBuf>) -> Result
             continue;
         }
         let path = entry.path();
-        let file_name = entry.file_name();
-        let child = file_name.to_str().unwrap_or("");
-        if child == name {
+        let Some(entry_name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if entry_name == name {
             out.push(path);
-        } else if !matches!(
-            child,
-            "node_modules"
-                | ".git"
-                | "target"
-                | ".next"
-                | ".venv"
-                | "venv"
-                | "__pycache__"
-                | ".cache"
-        ) {
-            collect_named_dirs(&path, name, out)?;
+            continue;
         }
+        if entry_name.starts_with('.')
+            || SKIP_PROJECT_SCAN_DIRS.contains(&entry_name)
+            || matches!(
+                entry_name,
+                ".next" | ".venv" | "venv" | "__pycache__" | ".cache"
+            )
+        {
+            continue;
+        }
+        collect_named_dirs(&path, name, out)?;
     }
     Ok(())
 }
@@ -10716,6 +11981,269 @@ mod tests {
     use rusqlite::Connection;
     use serde_json::{json, Map, Value};
     use std::{fs, io::Write as _, time::Duration};
+
+    #[test]
+    fn checkpoint_requires_both_destination_checks_to_be_known_and_clear() {
+        let clear = SweepRepairs::default();
+        assert!(checkpoint_is_safe(true, true, Some(&clear)));
+        assert!(
+            !checkpoint_is_safe(true, false, Some(&clear)),
+            "a failed pre-sweep repair query must not become a new baseline"
+        );
+        assert!(
+            !checkpoint_is_safe(true, true, None),
+            "a failed post-sweep verification must not become a new baseline"
+        );
+
+        let mut short = SweepRepairs::default();
+        short
+            .sessions
+            .insert(("claude".to_string(), "short".to_string()));
+        assert!(!checkpoint_is_safe(true, true, Some(&short)));
+        assert!(!checkpoint_is_safe(false, true, Some(&clear)));
+    }
+
+    #[test]
+    fn a_malformed_destination_marker_repairs_every_replayable_session() {
+        let conn = Connection::open_in_memory().unwrap();
+        let mut state = Map::new();
+
+        assert!(
+            destination_shortfall_against(&conn, &state)
+                .unwrap()
+                .is_empty(),
+            "no prior marker means there is no prior destination to repair"
+        );
+
+        state.insert(
+            DESTINATION_GENERATION_KEY.to_string(),
+            Value::from("not-a-destination-marker"),
+        );
+        let repairs = destination_shortfall_against(&conn, &state).unwrap();
+        assert!(repairs.repairs_all());
+        assert!(repairs.contains("claude", "any-session"));
+        assert!(repairs.contains("codex", "any-session"));
+
+        state.insert(DESTINATION_GENERATION_KEY.to_string(), Value::from(7));
+        assert!(destination_shortfall_against(&conn, &state)
+            .unwrap()
+            .repairs_all());
+    }
+
+    #[test]
+    fn expected_codex_subagent_deregistration_is_not_a_catalog_shortfall() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (session_id, source, cwd) \
+             VALUES ('child', 'codex', '/tmp/project')",
+            [],
+        )
+        .unwrap();
+        crate::mark_session_presence(&conn, "codex", "child", super::SessionLocation::Local)
+            .unwrap();
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('codex', 'child', 1, 'assistant', 'text', 'kept', 'event-1')",
+            [],
+        )
+        .unwrap();
+        let marker = destination_generation(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO session_relationships \
+             (source, parent_session_id, relationship_uid, child_session_id, relationship, \
+              identity_status, evidence_kind, child_has_events, created_ms, updated_ms) \
+             VALUES ('codex', 'parent', 'parent:child', 'child', 'delegated', \
+                     'observed', 'codex_session_meta', 1, 1, 1)",
+            [],
+        )
+        .unwrap();
+
+        cleanup_codex_subagent_registration(&conn, "child").unwrap();
+        assert!(destination_shortfall(&conn, &marker).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_non_delegation_child_still_has_the_catalog_shortfall_guard() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (session_id, source, cwd) \
+             VALUES ('child', 'codex', '/tmp/project')",
+            [],
+        )
+        .unwrap();
+        crate::mark_session_presence(&conn, "codex", "child", super::SessionLocation::Local)
+            .unwrap();
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('codex', 'child', 1, 'assistant', 'text', 'kept', 'event-1')",
+            [],
+        )
+        .unwrap();
+        let marker = destination_generation(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO session_relationships \
+             (source, parent_session_id, relationship_uid, child_session_id, relationship, \
+              identity_status, evidence_kind, child_has_events, created_ms, updated_ms) \
+             VALUES ('codex', 'parent', 'fork:child', 'child', 'fork', \
+                     'observed', 'source_fork', 1, 1, 1)",
+            [],
+        )
+        .unwrap();
+
+        cleanup_codex_subagent_registration(&conn, "child").unwrap();
+        let repairs = destination_shortfall(&conn, &marker).unwrap();
+        assert!(repairs.contains("codex", "child"));
+    }
+
+    #[test]
+    fn the_full_claude_scanner_rejects_conflicting_session_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conflicting.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"sessionId":"one","uuid":"1","type":"user"}"#,
+                "\n",
+                r#"{"sessionId":"two","uuid":"2","type":"assistant"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let mut state = None;
+        let error = match scan_claude_session_file_resumed(&path, &mut state) {
+            Err(error) => error,
+            Ok(_) => panic!("conflicting identities must fail the full scanner"),
+        };
+        assert!(error.to_string().contains("conflicting sessionId"));
+    }
+
+    #[test]
+    fn a_claude_snapshot_keeps_the_opened_bytes_after_path_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        fs::write(
+            &path,
+            r#"{"sessionId":"opened","uuid":"1","type":"assistant","message":{"role":"assistant","content":"kept"}}"#.to_string()
+                + "\n",
+        )
+        .unwrap();
+        let snapshot = ClaudeTranscriptSnapshot::open(&path).unwrap();
+        fs::write(
+            &path,
+            r#"{"sessionId":"replacement","uuid":"2","type":"assistant","message":{"role":"assistant","content":"wrong"}}"#.to_string()
+                + "\n",
+        )
+        .unwrap();
+
+        let meta = scan_claude_session_text(&path, &snapshot.text)
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta.session_id, "opened");
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript_text_as(&conn, &path, &snapshot.text, None).unwrap();
+        let count = |session: &str| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM session_events WHERE source='claude' AND session_id=?",
+                [session],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+        assert!(count("opened") > 0);
+        assert_eq!(count("replacement"), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_claude_snapshot_rejects_replacement_between_open_and_validation() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside.jsonl");
+        let allowed = dir.path().join("allowed.jsonl");
+        let link = dir.path().join("session.jsonl");
+        fs::write(&outside, r#"{"sessionId":"outside"}"#).unwrap();
+        fs::write(&allowed, r#"{"sessionId":"allowed"}"#).unwrap();
+        symlink(&outside, &link).unwrap();
+
+        let error = ClaudeTranscriptSnapshot::open_checked(&link, |opened| {
+            fs::remove_file(&link)?;
+            symlink(&allowed, &link)?;
+            validate_opened_file_identity(&link, opened)
+        })
+        .expect_err("a replacement after open must not redirect the validated handle");
+
+        assert!(error
+            .to_string()
+            .contains("changed while its provider path"));
+    }
+
+    /// `TRAJECTORY_ROOT=trajectory.json` is a legal setting, and a relative
+    /// root has to end up in the same spelling as the events the watcher
+    /// reports for it — otherwise it registers, never matches, and its
+    /// trajectories are only ever found by the backstop.
+    ///
+    /// This is the cheap half of that property. The half with teeth is
+    /// `tests/relative_watch_roots.rs`, which puts a real watcher's own event
+    /// paths through the filter: a test that supplies its own path cannot see
+    /// a disagreement between the two.
+    #[test]
+    fn a_relative_file_root_is_resolved_against_the_working_directory() {
+        let cwd = std::env::current_dir().expect("current dir");
+        let bare = super::trajectory_watch_root(PathBuf::from("trajectory.json"));
+        assert_eq!(bare.depth, crate::discover::WatchDepth::File);
+        assert_eq!(bare.path, cwd.join("trajectory.json"));
+        assert_eq!(bare.registered_path(), cwd.as_path());
+        assert!(bare.covers(&cwd.join("trajectory.json")));
+        assert!(
+            !bare.covers(&cwd.join("other.json")),
+            "resolving the root must not widen what it covers"
+        );
+
+        // Positive controls: a nested relative path keeps its own parent, and
+        // an absolute one is left exactly as it was given.
+        let nested = super::trajectory_watch_root(PathBuf::from("runs/trajectory.json"));
+        assert_eq!(nested.registered_path(), cwd.join("runs"));
+        let absolute = super::trajectory_watch_root(PathBuf::from("/home/someone/trajectory.json"));
+        assert_eq!(absolute.registered_path(), Path::new("/home/someone"));
+        // And a path that names its own directory resolves to the same root
+        // as the plain spelling, since the two mean the same file.
+        let dotted = super::trajectory_watch_root(PathBuf::from("./runs/../trajectory.json"));
+        assert_eq!(dotted.path, bare.path);
+    }
+
+    /// A `TRAJECTORY_ROOT` naming one JSON file must not promote its parent —
+    /// often `$HOME`, sometimes `/` — into a watched tree.
+    #[test]
+    fn a_json_trajectory_entry_is_watched_as_a_file() {
+        let named = PathBuf::from("/home/someone/trajectory.json");
+        let root = super::trajectory_watch_root(named.clone());
+        assert_eq!(root.path, named, "the root names the file, not its parent");
+        assert_eq!(root.depth, crate::discover::WatchDepth::File);
+        assert_eq!(
+            root.registered_path(),
+            Path::new("/home/someone"),
+            "a file root is registered through its parent"
+        );
+        assert!(root.covers(&named));
+        assert!(
+            !root.covers(Path::new("/home/someone/unrelated.log")),
+            "a sibling in the parent must not wake a sweep"
+        );
+
+        // Positive control: a directory entry is still the recursive tree the
+        // roll-ups grow inside, so the narrowing above is specific to files.
+        let dir = PathBuf::from("/home/someone/.trajectories");
+        let root = super::trajectory_watch_root(dir.clone());
+        assert_eq!(root.depth, crate::discover::WatchDepth::Tree);
+        assert!(root.covers(&dir.join("completed/2026-09/run.json")));
+    }
+
     fn refusal(uid: &str, generation: u64, raw: &str) -> UnreadableSnapshot {
         UnreadableSnapshot {
             uid: uid.to_string(),
@@ -10816,6 +12344,48 @@ mod tests {
             super::DecodedFileCursor::Typed(cursor) => cursor,
             super::DecodedFileCursor::Legacy(_) => panic!("expected typed cursor"),
         }
+    }
+
+    /// A sweep that never took the lock is not a sweep that found nothing.
+    /// Reading it as `skipped_unchanged` is what told the watch loop the
+    /// change had been considered.
+    #[test]
+    fn a_contended_tick_is_not_an_unchanged_one() {
+        use crate::watch::TickOutcome;
+
+        assert_eq!(
+            TickOutcome::from(SyncTick::default()),
+            TickOutcome {
+                swept: false,
+                skipped_unchanged: false,
+                contended: true,
+            },
+            "the lock was held elsewhere: nothing was read and nothing compared"
+        );
+        assert_eq!(
+            TickOutcome::from(SyncTick {
+                attempted: true,
+                swept: false,
+            }),
+            TickOutcome {
+                swept: false,
+                skipped_unchanged: true,
+                contended: false,
+            },
+            "the sweep ran and no source had moved"
+        );
+        assert_eq!(
+            TickOutcome::from(SyncTick {
+                attempted: true,
+                swept: true,
+            }),
+            TickOutcome {
+                swept: true,
+                skipped_unchanged: false,
+                contended: false,
+            },
+            "the sweep ran and walked"
+        );
     }
 
     #[test]
@@ -13815,13 +15385,19 @@ mod tests {
         let mut competing_write = None;
         let mut state = Map::new();
         assert_eq!(
-            super::sync_cursor_with_scan_hook(&conn, &mut state, dir.path(), &mut |path| {
-                visited.push(path.to_path_buf());
-                if path == second {
-                    competing_write =
-                        Some(competitor.execute("INSERT INTO writer_probe VALUES (1)", []));
+            super::sync_cursor_with_scan_hook(
+                &conn,
+                &mut state,
+                dir.path(),
+                &mut SweepCoverage::default(),
+                &mut |path| {
+                    visited.push(path.to_path_buf());
+                    if path == second {
+                        competing_write =
+                            Some(competitor.execute("INSERT INTO writer_probe VALUES (1)", []));
+                    }
                 }
-            })
+            )
             .unwrap(),
             2
         );
@@ -13864,7 +15440,8 @@ mod tests {
         init_db(&conn).unwrap();
         let mut state = Map::new();
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .unwrap(),
             1
         );
         let saved = state.clone();
@@ -13889,8 +15466,12 @@ mod tests {
         )
         .unwrap();
         let mut visited = Vec::new();
-        let inserted =
-            super::sync_cursor_with_scan_hook(&conn, &mut state, dir.path(), &mut |path| {
+        let inserted = super::sync_cursor_with_scan_hook(
+            &conn,
+            &mut state,
+            dir.path(),
+            &mut SweepCoverage::default(),
+            &mut |path| {
                 visited.push(path.to_path_buf());
                 if path == second {
                     assert_eq!(
@@ -13903,8 +15484,9 @@ mod tests {
                     // The hook runs after the existence check, forcing open to fail.
                     fs::remove_file(path).unwrap();
                 }
-            })
-            .expect("one vanished transcript must not abort the whole Cursor source");
+            },
+        )
+        .expect("one vanished transcript must not abort the whole Cursor source");
         assert_eq!(visited, vec![first.clone(), second.clone()]);
         assert_eq!(
             inserted, 1,
@@ -13950,7 +15532,8 @@ mod tests {
         init_db(&conn).unwrap();
         let mut state = Map::new();
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .unwrap(),
             1
         );
         assert_eq!(
@@ -13978,8 +15561,9 @@ mod tests {
         )
         .unwrap();
 
-        let error = super::sync_cursor(&conn, &mut state, dir.path())
-            .expect_err("a failed database write must fail Cursor sync");
+        let error =
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .expect_err("a failed database write must fail Cursor sync");
         assert!(format!("{error:#}").contains("forced Cursor write failure"));
         assert_eq!(
             state, saved,
@@ -14015,7 +15599,8 @@ mod tests {
         conn.execute_batch("DROP TRIGGER reject_cursor_prompt;")
             .unwrap();
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .unwrap(),
             4
         );
         assert_eq!(
@@ -14025,7 +15610,8 @@ mod tests {
             fs::metadata(&cursor).unwrap().len()
         );
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .unwrap(),
             0
         );
         let prompts: Vec<(String, i64)> = conn
@@ -14080,8 +15666,9 @@ mod tests {
         .unwrap();
         let mut state = Map::new();
         let saved = state.clone();
-        let error = super::sync_cursor(&conn, &mut state, dir.path())
-            .expect_err("the later file must fail the entire source");
+        let error =
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .expect_err("the later file must fail the entire source");
         assert!(format!("{error:#}").contains("forced Cursor write failure"));
         assert_eq!(state, saved, "first failed sync must not publish any state");
         assert_eq!(
@@ -14122,7 +15709,8 @@ mod tests {
         conn.execute_batch("DROP TRIGGER reject_cursor_prompt;")
             .unwrap();
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .unwrap(),
             6
         );
         for path in [&first, &second] {
@@ -14134,7 +15722,8 @@ mod tests {
             );
         }
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .unwrap(),
             0
         );
         let prompts: Vec<(String, i64)> = conn
@@ -14270,7 +15859,10 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let mut state = Map::new();
-        assert_eq!(super::sync_cursor(&conn, &mut state, &root).unwrap(), 1);
+        assert_eq!(
+            super::sync_cursor(&conn, &mut state, &root, &mut Default::default()).unwrap(),
+            1
+        );
         let committed = state.clone();
         assert_eq!(cursor_row_count(&conn, "history", "s-fail"), 1);
 
@@ -14297,11 +15889,17 @@ mod tests {
         )
         .unwrap();
         let mut next = state.clone();
-        let error = super::sync_cursor_with_scan_hook(&conn, &mut next, &root, &mut |path| {
-            if path == later {
-                fs::remove_file(&transcript).unwrap();
-            }
-        })
+        let error = super::sync_cursor_with_scan_hook(
+            &conn,
+            &mut next,
+            &root,
+            &mut Default::default(),
+            &mut |path| {
+                if path == later {
+                    fs::remove_file(&transcript).unwrap();
+                }
+            },
+        )
         .expect_err("an unreadable transcript must fail the Cursor sync");
         assert!(
             format!("{error:#}").contains("index Cursor transcript"),
@@ -14342,7 +15940,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let mut state = Map::new();
-        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        super::sync_cursor(&conn, &mut state, &root, &mut Default::default()).unwrap();
         assert_eq!(cursor_row_count(&conn, "tool_calls", "s-rewrite"), 2);
         assert_eq!(cursor_row_count(&conn, "file_edits", "s-rewrite"), 2);
 
@@ -14358,7 +15956,7 @@ mod tests {
             ),
         )
         .unwrap();
-        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        super::sync_cursor(&conn, &mut state, &root, &mut Default::default()).unwrap();
 
         assert_eq!(
             cursor_row_count(&conn, "tool_calls", "s-rewrite"),
@@ -14403,12 +16001,12 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let mut state = Map::new();
-        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        super::sync_cursor(&conn, &mut state, &root, &mut Default::default()).unwrap();
         assert_eq!(cursor_row_count(&conn, "tool_calls", "s-empty"), 1);
         assert_eq!(cursor_row_count(&conn, "history", "s-empty"), 1);
 
         fs::write(&transcript, "").unwrap();
-        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        super::sync_cursor(&conn, &mut state, &root, &mut Default::default()).unwrap();
 
         assert_eq!(
             cursor_row_count(&conn, "tool_calls", "s-empty"),
@@ -14684,7 +16282,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let mut state = Map::new();
-        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        super::sync_cursor(&conn, &mut state, &root, &mut Default::default()).unwrap();
         assert_eq!(cursor_row_count(&conn, "tool_calls", "s-replaced"), 1);
         assert_eq!(cursor_row_count(&conn, "history", "s-replaced"), 2);
 
@@ -14720,14 +16318,20 @@ mod tests {
                 "\n"
             ),
         );
-        super::sync_cursor_with_scan_hook(&conn, &mut state, &root, &mut |path| {
-            if path == later {
-                // Replace, not truncate-in-place: a fresh inode is what a
-                // real Cursor rewrite produces.
-                fs::remove_file(&transcript).unwrap();
-                fs::write(&transcript, replacement).unwrap();
-            }
-        })
+        super::sync_cursor_with_scan_hook(
+            &conn,
+            &mut state,
+            &root,
+            &mut Default::default(),
+            &mut |path| {
+                if path == later {
+                    // Replace, not truncate-in-place: a fresh inode is what a
+                    // real Cursor rewrite produces.
+                    fs::remove_file(&transcript).unwrap();
+                    fs::write(&transcript, replacement).unwrap();
+                }
+            },
+        )
         .unwrap();
 
         // Nothing from the replaced generation may survive.
@@ -14797,7 +16401,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let mut state = Map::new();
-        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        super::sync_cursor(&conn, &mut state, &root, &mut Default::default()).unwrap();
         let committed = state.clone();
 
         // Give the next sync something to resume for.
@@ -14824,12 +16428,18 @@ mod tests {
             ),
         );
         let mut next = state.clone();
-        let error = super::sync_cursor_with_scan_hook(&conn, &mut next, &root, &mut |path| {
-            if path == later {
-                fs::remove_file(&transcript).unwrap();
-                fs::create_dir(&transcript).unwrap();
-            }
-        })
+        let error = super::sync_cursor_with_scan_hook(
+            &conn,
+            &mut next,
+            &root,
+            &mut Default::default(),
+            &mut |path| {
+                if path == later {
+                    fs::remove_file(&transcript).unwrap();
+                    fs::create_dir(&transcript).unwrap();
+                }
+            },
+        )
         .expect_err("an unreadable transcript must fail the sync, not silently rebuild");
         let rendered = format!("{error:#}");
         assert!(
@@ -14926,7 +16536,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let mut state = Map::new();
-        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        super::sync_cursor(&conn, &mut state, &root, &mut Default::default()).unwrap();
         assert_eq!(cursor_row_count(&conn, "tool_calls", "s-truncated"), 1);
 
         // Grow it so the next sync resumes, then truncate it below what that
@@ -14957,11 +16567,17 @@ mod tests {
                 "\n"
             ),
         );
-        super::sync_cursor_with_scan_hook(&conn, &mut state, &root, &mut |path| {
-            if path == later {
-                fs::write(&transcript, shorter).unwrap();
-            }
-        })
+        super::sync_cursor_with_scan_hook(
+            &conn,
+            &mut state,
+            &root,
+            &mut Default::default(),
+            &mut |path| {
+                if path == later {
+                    fs::write(&transcript, shorter).unwrap();
+                }
+            },
+        )
         .unwrap();
 
         let edits = crate::session_file_edits(&conn, "s-truncated", Some("cursor")).unwrap();
@@ -15034,7 +16650,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let mut state = Map::new();
-        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        super::sync_cursor(&conn, &mut state, &root, &mut Default::default()).unwrap();
 
         let newest_event: i64 = conn
             .query_row(
@@ -15099,7 +16715,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let mut state = Map::new();
-        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        super::sync_cursor(&conn, &mut state, &root, &mut Default::default()).unwrap();
 
         let (first, last): (i64, i64) = conn
             .query_row(
@@ -15146,7 +16762,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let mut state = Map::new();
-        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        super::sync_cursor(&conn, &mut state, &root, &mut Default::default()).unwrap();
         assert_eq!(cursor_row_count(&conn, "history", "s-lateappend"), 1);
 
         // Give the next sync something to resume for, then append again from
@@ -15171,7 +16787,10 @@ mod tests {
                 "\n"
             ),
         );
-        super::sync_cursor_with_scan_hook(&conn, &mut state, &root, &mut |path| {
+        super::sync_cursor_with_scan_hook(
+            &conn, &mut state, &root,
+            &mut Default::default(),
+            &mut |path| {
             if path == later {
                 let mut file = fs::OpenOptions::new()
                     .append(true)
@@ -15298,7 +16917,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let mut state = Map::new();
-        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        super::sync_cursor(&conn, &mut state, &root, &mut Default::default()).unwrap();
         let resumed_from = saved_cursor_offset(
             &state[super::CURSOR_SYNC_STATE_KEY][transcript.to_string_lossy().as_ref()],
         );
@@ -15318,7 +16937,10 @@ mod tests {
         .unwrap();
         drop(file);
         // One new prompt inserted, not a rebuild of both.
-        assert_eq!(super::sync_cursor(&conn, &mut state, &root).unwrap(), 1);
+        assert_eq!(
+            super::sync_cursor(&conn, &mut state, &root, &mut Default::default()).unwrap(),
+            1
+        );
         let prompts: Vec<String> = conn
             .prepare(
                 "SELECT prompt FROM history WHERE source = 'cursor' AND session_id = 's-plainappend' \
@@ -15376,21 +16998,27 @@ mod tests {
                 "\n"
             ),
         );
-        super::sync_cursor_with_scan_hook(&conn, &mut state, &root, &mut |path| {
-            if path == later {
-                let mut file = fs::OpenOptions::new()
-                    .append(true)
-                    .open(&transcript)
-                    .unwrap();
-                file.write_all(appended.as_bytes()).unwrap();
-            }
-        })
+        super::sync_cursor_with_scan_hook(
+            &conn,
+            &mut state,
+            &root,
+            &mut Default::default(),
+            &mut |path| {
+                if path == later {
+                    let mut file = fs::OpenOptions::new()
+                        .append(true)
+                        .open(&transcript)
+                        .unwrap();
+                    file.write_all(appended.as_bytes()).unwrap();
+                }
+            },
+        )
         .unwrap();
 
         // Whatever the first pass indexed, the second must not double it. The
         // raced turn is untimed, so re-reading it after the mtime moved
         // inserts a second row rather than upserting the first.
-        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        super::sync_cursor(&conn, &mut state, &root, &mut Default::default()).unwrap();
         let prompts: Vec<String> = conn
             .prepare(
                 "SELECT prompt FROM history WHERE source = 'cursor' AND session_id = 's-append' \
@@ -15433,7 +17061,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let mut state = Map::new();
-        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        super::sync_cursor(&conn, &mut state, &root, &mut Default::default()).unwrap();
         let quoted: Option<String> = conn
             .query_row(
                 "SELECT last_assistant_text FROM sessions \
@@ -15453,7 +17081,7 @@ mod tests {
             ),
         )
         .unwrap();
-        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        super::sync_cursor(&conn, &mut state, &root, &mut Default::default()).unwrap();
 
         let quoted: Option<String> = conn
             .query_row(
@@ -15558,7 +17186,7 @@ mod tests {
         .unwrap();
 
         let mut state = Map::new();
-        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        super::sync_cursor(&conn, &mut state, &root, &mut Default::default()).unwrap();
 
         let (first, last): (i64, i64) = conn
             .query_row(
@@ -15589,7 +17217,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let mut state = Map::new();
-        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        super::sync_cursor(&conn, &mut state, &root, &mut Default::default()).unwrap();
 
         // Append a later turn; the sync resumes mid-file.
         let mut file = fs::OpenOptions::new()
@@ -15605,7 +17233,7 @@ mod tests {
         )
         .unwrap();
         drop(file);
-        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        super::sync_cursor(&conn, &mut state, &root, &mut Default::default()).unwrap();
 
         let (first, last): (i64, i64) = conn
             .query_row(
@@ -15906,7 +17534,10 @@ mod tests {
         init_db(&conn).unwrap();
 
         let mut state = Map::new();
-        assert_eq!(super::sync_cursor(&conn, &mut state, &root).unwrap(), 2);
+        assert_eq!(
+            super::sync_cursor(&conn, &mut state, &root, &mut Default::default()).unwrap(),
+            2
+        );
         assert!(state.contains_key(super::CURSOR_SYNC_STATE_KEY));
         let events = crate::session_events(&conn, "s-sync", Some("cursor")).unwrap();
         assert!(
@@ -15921,7 +17552,10 @@ mod tests {
         );
 
         // An unchanged transcript is skipped while the key matches.
-        assert_eq!(super::sync_cursor(&conn, &mut state, &root).unwrap(), 0);
+        assert_eq!(
+            super::sync_cursor(&conn, &mut state, &root, &mut Default::default()).unwrap(),
+            0
+        );
 
         // A store written by the prompt-only parser carries the retired key and
         // no events. Retiring it is what makes plain `sync` re-read the file.
@@ -15929,7 +17563,10 @@ mod tests {
         legacy.insert("cursor".into(), state[super::CURSOR_SYNC_STATE_KEY].clone());
         let fresh = Connection::open_in_memory().unwrap();
         init_db(&fresh).unwrap();
-        assert_eq!(super::sync_cursor(&fresh, &mut legacy, &root).unwrap(), 2);
+        assert_eq!(
+            super::sync_cursor(&fresh, &mut legacy, &root, &mut Default::default()).unwrap(),
+            2
+        );
         assert!(crate::session_events(&fresh, "s-sync", Some("cursor"))
             .unwrap()
             .iter()
@@ -15960,7 +17597,7 @@ mod tests {
         .unwrap();
 
         let mut state = Map::new();
-        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        super::sync_cursor(&conn, &mut state, &root, &mut Default::default()).unwrap();
 
         let rows: Vec<(String, i64)> = conn
             .prepare("SELECT prompt, timestamp_ms FROM history WHERE source = 'cursor' ORDER BY timestamp_ms")
@@ -16006,7 +17643,8 @@ mod tests {
         init_db(&conn).unwrap();
         let mut state = Map::new();
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .unwrap(),
             2
         );
         assert_eq!(
@@ -16016,7 +17654,8 @@ mod tests {
             fs::metadata(&cursor).unwrap().len()
         );
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .unwrap(),
             0
         );
 
@@ -16028,7 +17667,8 @@ mod tests {
         .unwrap();
         drop(file);
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .unwrap(),
             1
         );
         assert_eq!(
@@ -16038,7 +17678,8 @@ mod tests {
             fs::metadata(&cursor).unwrap().len()
         );
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .unwrap(),
             0
         );
         let prompts: Vec<String> = conn
@@ -16062,7 +17703,13 @@ mod tests {
         fs::create_dir_all(codex.parent().unwrap()).unwrap();
         fs::write(&codex, r#"{"text":"codex"#).unwrap();
         assert_eq!(
-            super::sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap(),
+            super::sync_codex_with_repairs(
+                &conn,
+                &mut state,
+                &dir.path().join(".codex"),
+                &Default::default(),
+            )
+            .unwrap(),
             0
         );
         assert_eq!(saved_cursor_offset(&state["codex"]), 0);
@@ -16072,7 +17719,13 @@ mod tests {
         file.write_all(b"\n").unwrap();
         drop(file);
         assert_eq!(
-            super::sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap(),
+            super::sync_codex_with_repairs(
+                &conn,
+                &mut state,
+                &dir.path().join(".codex"),
+                &Default::default(),
+            )
+            .unwrap(),
             1
         );
 
@@ -16081,7 +17734,13 @@ mod tests {
         fs::create_dir_all(cursor.parent().unwrap()).unwrap();
         fs::write(&cursor, r#"{"role":"user","message":{"content":"cursor"#).unwrap();
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, &cursor_root).unwrap(),
+            super::sync_cursor(
+                &conn,
+                &mut state,
+                &cursor_root,
+                &mut SweepCoverage::default()
+            )
+            .unwrap(),
             0
         );
         assert_eq!(
@@ -16095,11 +17754,23 @@ mod tests {
         file.write_all(b"\n").unwrap();
         drop(file);
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, &cursor_root).unwrap(),
+            super::sync_cursor(
+                &conn,
+                &mut state,
+                &cursor_root,
+                &mut SweepCoverage::default()
+            )
+            .unwrap(),
             1
         );
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, &cursor_root).unwrap(),
+            super::sync_cursor(
+                &conn,
+                &mut state,
+                &cursor_root,
+                &mut SweepCoverage::default()
+            )
+            .unwrap(),
             0
         );
         assert_eq!(
@@ -16389,7 +18060,13 @@ mod tests {
             Value::Object(claude_sessions),
         );
 
-        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        sync_claude_session_metadata_with_repairs(
+            &conn,
+            &mut state,
+            dir.path(),
+            &Default::default(),
+        )
+        .unwrap();
 
         let event_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM session_events", [], |row| row.get(0))
@@ -17463,7 +19140,13 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let mut state = Map::new();
-        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        sync_claude_session_metadata_with_repairs(
+            &conn,
+            &mut state,
+            dir.path(),
+            &Default::default(),
+        )
+        .unwrap();
         let cached: (String, String) = conn
             .query_row(
                 "SELECT local_session_id, remote_session_id \
@@ -17529,7 +19212,13 @@ mod tests {
 
         // No hydration anywhere: a plain sync is the only thing that has ever
         // read these files.
-        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        sync_claude_session_metadata_with_repairs(
+            &conn,
+            &mut state,
+            dir.path(),
+            &Default::default(),
+        )
+        .unwrap();
 
         let row = delegation_row(&conn, "claude_subagent_meta");
         assert_eq!(row.parent, "claude-root");
@@ -17576,7 +19265,13 @@ mod tests {
         init_db(&conn).unwrap();
         let mut state = Map::new();
 
-        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        sync_claude_session_metadata_with_repairs(
+            &conn,
+            &mut state,
+            dir.path(),
+            &Default::default(),
+        )
+        .unwrap();
 
         let row = delegation_row(&conn, "claude_sidechain_records");
         assert_eq!(row.parent, "claude-root");
@@ -17613,14 +19308,26 @@ mod tests {
         init_db(&conn).unwrap();
         let mut state = Map::new();
 
-        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        sync_claude_session_metadata_with_repairs(
+            &conn,
+            &mut state,
+            dir.path(),
+            &Default::default(),
+        )
+        .unwrap();
         let first = (
             delegation_row(&conn, "claude_subagent_meta").created_ms,
             delegation_row(&conn, "claude_sidechain_records").created_ms,
         );
 
         // The second walk sees unchanged stamps for every file.
-        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        sync_claude_session_metadata_with_repairs(
+            &conn,
+            &mut state,
+            dir.path(),
+            &Default::default(),
+        )
+        .unwrap();
         let rows: i64 = conn
             .query_row("SELECT COUNT(*) FROM session_relationships", [], |row| {
                 row.get(0)
@@ -18911,7 +20618,13 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let mut state = Map::new();
-        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        sync_claude_session_metadata_with_repairs(
+            &conn,
+            &mut state,
+            dir.path(),
+            &Default::default(),
+        )
+        .unwrap();
 
         // Rewrite the sidecar and record the rewritten file as already seen: a
         // walk that re-reads every unchanged sidecar, because a sidecar never
@@ -18929,7 +20642,13 @@ mod tests {
         // row says the same thing in the shape the walk now reads.
         transcript_cursor::stamp_whole_file(&conn, "claude", &named).unwrap();
 
-        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        sync_claude_session_metadata_with_repairs(
+            &conn,
+            &mut state,
+            dir.path(),
+            &Default::default(),
+        )
+        .unwrap();
         let rewritten = |conn: &Connection| -> i64 {
             conn.query_row(
                 "SELECT COUNT(*) FROM session_events \
@@ -18948,7 +20667,13 @@ mod tests {
             [],
         )
         .unwrap();
-        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        sync_claude_session_metadata_with_repairs(
+            &conn,
+            &mut state,
+            dir.path(),
+            &Default::default(),
+        )
+        .unwrap();
         assert_eq!(rewritten(&conn), 1);
     }
 
@@ -19309,7 +21034,13 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let mut state = Map::new();
-        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        sync_claude_session_metadata_with_repairs(
+            &conn,
+            &mut state,
+            dir.path(),
+            &Default::default(),
+        )
+        .unwrap();
 
         // The transcript never moves; only what describes the child changes.
         fs::write(
@@ -19317,7 +21048,13 @@ mod tests {
             r#"{"agentType":"Explore","description":"explore the code","toolUseId":"toolu_1","spawnDepth":2,"model":"other-model"}"#,
         )
         .unwrap();
-        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        sync_claude_session_metadata_with_repairs(
+            &conn,
+            &mut state,
+            dir.path(),
+            &Default::default(),
+        )
+        .unwrap();
 
         let row = delegation_row(&conn, "claude_subagent_meta");
         assert_eq!(row.agent_type.as_deref(), Some("Explore"));
@@ -19365,7 +21102,13 @@ mod tests {
         }
         let mut state = Map::new();
 
-        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        sync_claude_session_metadata_with_repairs(
+            &conn,
+            &mut state,
+            dir.path(),
+            &Default::default(),
+        )
+        .unwrap();
 
         assert_eq!(
             delegation_row(&conn, "claude_subagent_meta")
@@ -21649,7 +23392,13 @@ mod tests {
                 "session": "sess-repair"
             }}),
         );
-        super::sync_codex_rollouts(&conn, &mut state, &home.join(".codex")).unwrap();
+        super::sync_codex_rollouts_with_repairs(
+            &conn,
+            &mut state,
+            &home.join(".codex"),
+            &Default::default(),
+        )
+        .unwrap();
         let counts: (i64, i64, i64, Option<String>) = conn
             .query_row(
                 "SELECT \
@@ -21673,7 +23422,13 @@ mod tests {
         assert!(state.get("codex_rollouts_v3").is_none());
         assert!(state.get("codex_rollouts_v6").is_some());
 
-        super::sync_codex_rollouts(&conn, &mut state, &home.join(".codex")).unwrap();
+        super::sync_codex_rollouts_with_repairs(
+            &conn,
+            &mut state,
+            &home.join(".codex"),
+            &Default::default(),
+        )
+        .unwrap();
         let second_counts: (i64, i64, i64, i64) = conn
             .query_row(
                 "SELECT \
@@ -21847,8 +23602,13 @@ mod tests {
             json!({"sess-unchanged-sub": "main"}),
         );
 
-        let (cwds, branches, inserted) =
-            super::sync_codex_rollouts(&conn, &mut state, &home.join(".codex")).unwrap();
+        let (cwds, branches, inserted) = super::sync_codex_rollouts_with_repairs(
+            &conn,
+            &mut state,
+            &home.join(".codex"),
+            &Default::default(),
+        )
+        .unwrap();
         assert_eq!(inserted, 0);
         assert!(!cwds.contains_key("sess-unchanged-sub"));
         assert!(!branches.contains_key("sess-unchanged-sub"));
@@ -21913,7 +23673,13 @@ mod tests {
         .unwrap();
         let mut state = unchanged_subagent_state(&rollout, "sess-unchanged-sub");
 
-        super::sync_codex_rollouts(&conn, &mut state, &home.join(".codex")).unwrap();
+        super::sync_codex_rollouts_with_repairs(
+            &conn,
+            &mut state,
+            &home.join(".codex"),
+            &Default::default(),
+        )
+        .unwrap();
         let edge: (String, String, String, i64) = conn
             .query_row(
                 "SELECT parent_session_id, relationship_uid, evidence_kind, created_ms \
@@ -21929,7 +23695,13 @@ mod tests {
 
         // A second pass over the same unchanged state neither duplicates the
         // row nor re-reads the rollout to rewrite it.
-        super::sync_codex_rollouts(&conn, &mut state, &home.join(".codex")).unwrap();
+        super::sync_codex_rollouts_with_repairs(
+            &conn,
+            &mut state,
+            &home.join(".codex"),
+            &Default::default(),
+        )
+        .unwrap();
         let (count, created): (i64, i64) = conn
             .query_row(
                 "SELECT COUNT(*), MIN(created_ms) FROM session_relationships \
@@ -21979,7 +23751,13 @@ mod tests {
         .unwrap();
         let mut state = unchanged_subagent_state(&rollout, "sess-unchanged-sub");
 
-        super::sync_codex_rollouts(&conn, &mut state, &home.join(".codex")).unwrap();
+        super::sync_codex_rollouts_with_repairs(
+            &conn,
+            &mut state,
+            &home.join(".codex"),
+            &Default::default(),
+        )
+        .unwrap();
         let registrations: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sessions \
@@ -22100,8 +23878,13 @@ mod tests {
             }),
         );
 
-        let (_, _, inserted) =
-            super::sync_codex_rollouts(&conn, &mut state, &home.join(".codex")).unwrap();
+        let (_, _, inserted) = super::sync_codex_rollouts_with_repairs(
+            &conn,
+            &mut state,
+            &home.join(".codex"),
+            &Default::default(),
+        )
+        .unwrap();
         // `codex_rollouts_v6` is not seeded from an older map, because a marker
         // exists nowhere but the rollout and a carried-forward stamp would skip
         // the files whose markers are missing. So both non-subagent rollouts are
@@ -22203,7 +23986,13 @@ mod tests {
         )
         .unwrap();
 
-        super::sync_codex_rollouts(&conn, &mut Map::new(), &home.join(".codex")).unwrap();
+        super::sync_codex_rollouts_with_repairs(
+            &conn,
+            &mut Map::new(),
+            &home.join(".codex"),
+            &Default::default(),
+        )
+        .unwrap();
 
         let prompts: Vec<String> = conn
             .prepare(
@@ -22259,8 +24048,13 @@ mod tests {
         )
         .unwrap();
 
-        let error = super::sync_codex_rollouts(&conn, &mut Map::new(), &home.join(".codex"))
-            .expect_err("the trigger must fail ingestion");
+        let error = super::sync_codex_rollouts_with_repairs(
+            &conn,
+            &mut Map::new(),
+            &home.join(".codex"),
+            &Default::default(),
+        )
+        .expect_err("the trigger must fail ingestion");
         assert!(error.to_string().contains("forced subagent ingest failure"));
         let stale_rows: i64 = conn
             .query_row(
@@ -22324,8 +24118,13 @@ mod tests {
             [],
         )
         .unwrap();
-        let (cwds, _, inserted) =
-            super::sync_codex_rollouts(&conn, &mut state, &home.join(".codex")).unwrap();
+        let (cwds, _, inserted) = super::sync_codex_rollouts_with_repairs(
+            &conn,
+            &mut state,
+            &home.join(".codex"),
+            &Default::default(),
+        )
+        .unwrap();
         assert_eq!(inserted, 1);
         // Subagent threads never reach the maps, prompt history, or session
         // registration — including rows left behind by earlier syncs.
@@ -22373,8 +24172,13 @@ mod tests {
         let before: i64 = conn
             .query_row("SELECT COUNT(*) FROM session_events", [], |r| r.get(0))
             .unwrap();
-        let (_, _, inserted_again) =
-            super::sync_codex_rollouts(&conn, &mut state, &home.join(".codex")).unwrap();
+        let (_, _, inserted_again) = super::sync_codex_rollouts_with_repairs(
+            &conn,
+            &mut state,
+            &home.join(".codex"),
+            &Default::default(),
+        )
+        .unwrap();
         assert_eq!(inserted_again, 0);
         let after: i64 = conn
             .query_row("SELECT COUNT(*) FROM session_events", [], |r| r.get(0))
@@ -22445,7 +24249,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let mut state = Map::new();
-        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        super::sync_cursor(&conn, &mut state, &root, &mut Default::default()).unwrap();
         assert_eq!(cursor_row_count(&conn, "tool_calls", "s-midscan"), 1);
 
         // Grow it so the next sync has something to resume for, then replace
@@ -22474,12 +24278,19 @@ mod tests {
             "\n"
         );
         let mut replaced_once = false;
-        super::sync_cursor_with_hooks(&conn, &mut state, &root, &mut |_| {}, &mut |path| {
-            if path == transcript && !replaced_once {
-                replaced_once = true;
-                fs::write(&transcript, replacement).unwrap();
-            }
-        })
+        super::sync_cursor_with_hooks(
+            &conn,
+            &mut state,
+            &root,
+            &mut Default::default(),
+            &mut |_| {},
+            &mut |path| {
+                if path == transcript && !replaced_once {
+                    replaced_once = true;
+                    fs::write(&transcript, replacement).unwrap();
+                }
+            },
+        )
         .unwrap();
         assert!(replaced_once, "the replacement hook must have run");
 
@@ -22535,7 +24346,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let mut state = Map::new();
-        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        super::sync_cursor(&conn, &mut state, &root, &mut Default::default()).unwrap();
         let first_edit_id: i64 = conn
             .query_row(
                 "SELECT MIN(id) FROM file_edits WHERE source = 'cursor' \
@@ -22559,7 +24370,13 @@ mod tests {
         .unwrap();
         drop(file);
 
-        super::sync_cursor_with_hooks(&conn, &mut state, &root, &mut |_| {}, &mut |path| {
+        super::sync_cursor_with_hooks(
+            &conn,
+            &mut state,
+            &root,
+            &mut Default::default(),
+            &mut |_| {},
+            &mut |path| {
             if path == transcript {
                 let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
                 file.write_all(
@@ -22634,7 +24451,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let mut state = Map::new();
-        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        super::sync_cursor(&conn, &mut state, &root, &mut Default::default()).unwrap();
 
         let ts_of = |kind: &str| -> i64 {
             conn.query_row(
@@ -22698,7 +24515,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let mut state = Map::new();
-        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        super::sync_cursor(&conn, &mut state, &root, &mut Default::default()).unwrap();
         let last_activity = |conn: &Connection| -> i64 {
             conn.query_row(
                 "SELECT last_activity_ms FROM sessions WHERE source = 'cursor' \
@@ -22725,7 +24542,7 @@ mod tests {
         .unwrap();
         drop(file);
         set_file_mtime_ms(&transcript, 1_789_600_000_000);
-        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        super::sync_cursor(&conn, &mut state, &root, &mut Default::default()).unwrap();
 
         let dated: i64 = conn
             .query_row(
@@ -22758,7 +24575,7 @@ mod tests {
         .unwrap();
         drop(file);
         set_file_mtime_ms(&transcript, 1_789_602_000_000);
-        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        super::sync_cursor(&conn, &mut state, &root, &mut Default::default()).unwrap();
         assert_eq!(
             last_activity(&conn),
             1_789_602_000_000,
@@ -22792,7 +24609,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let mut state = Map::new();
-        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        super::sync_cursor(&conn, &mut state, &root, &mut Default::default()).unwrap();
 
         // Append a dated turn and move the mtime well past it.
         let mut file = fs::OpenOptions::new()
@@ -22819,7 +24636,7 @@ mod tests {
             [],
         )
         .unwrap();
-        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        super::sync_cursor(&conn, &mut state, &root, &mut Default::default()).unwrap();
 
         let last_activity: i64 = conn
             .query_row(
