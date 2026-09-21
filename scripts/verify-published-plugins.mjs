@@ -24,7 +24,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -36,7 +36,7 @@ import { packageName, platforms, plugins } from "./history-package-contract.mjs"
 import { installWithRegistryRetry, isRegistryVisibilityFailure } from "./npm-install-with-registry-retry.mjs";
 
 /** This machine's platform key, to check the helper that should have installed. */
-function currentPlatform() {
+export function currentPlatform() {
   const libc =
     process.platform === "linux"
       ? (process.report?.getReport()?.header?.glibcVersionRuntime ? "gnu" : "musl")
@@ -47,6 +47,39 @@ function currentPlatform() {
     ?? known.find((candidate) => candidate.startsWith(`${process.platform}-${process.arch}`));
   assert.ok(match, `no platform entry for ${key}; known: ${known.join(", ")}`);
   return match;
+}
+
+/** npm `libc` field for this machine (`glibc` / `musl`), or undefined off Linux. */
+export function hostLibc(platform = currentPlatform()) {
+  return platforms[platform]?.[2];
+}
+
+/** `npm install` args that select the helper this runner's package.json declares. */
+export function pluginInstallArgs(project, libc = hostLibc()) {
+  const args = ["--prefix", project];
+  if (libc) args.push(`--libc=${libc}`);
+  return args;
+}
+
+/** Clean project that depends on the published JS packages the way a user does. */
+export function verifyPluginManifest(version) {
+  return {
+    name: "verify-published-plugins",
+    private: true,
+    version: "0.0.0",
+    dependencies: Object.fromEntries(
+      Object.values(plugins).map((info) => [packageName(info), version]),
+    ),
+  };
+}
+
+/** Drop the publish job's npmrc/token so this is a public registry install. */
+export function publicRegistryEnv(base = process.env) {
+  const env = { ...base };
+  delete env.NODE_AUTH_TOKEN;
+  delete env.NPM_CONFIG_USERCONFIG;
+  delete env.npm_config_userconfig;
+  return env;
 }
 
 /** Every name this release published, JavaScript package and platform helper. */
@@ -138,18 +171,24 @@ async function main(version) {
 
   const project = await mkdtemp(join(tmpdir(), "relayhistory-verify-"));
   try {
+    const platform = currentPlatform();
+    const libc = hostLibc(platform);
     await writeFile(
       join(project, "package.json"),
-      `${JSON.stringify({ name: "verify-published-plugins", private: true, version: "0.0.0" }, null, 2)}\n`,
+      `${JSON.stringify(verifyPluginManifest(version), null, 2)}\n`,
     );
 
-    // Installing the JavaScript packages pulls each one's platform helper for
-    // this machine through optionalDependencies, so a helper published at the
-    // wrong version or not at all fails here rather than in a user's install.
-    const jsPackages = Object.values(plugins).map(
-      (info) => `${packageName(info)}@${version}`,
-    );
-    console.log(`installing ${jsPackages.join(" ")}`);
+    // Ordinary dependencies, not `npm install --no-save pkg`: npm 11 can omit
+    // libc-tagged optionals of a package that is not in package.json.
+    // `--libc` is the same family the helper manifests declare (`glibc` /
+    // `musl`). npm-install-checks skips any package with a `libc` field when
+    // host libc is undetected; its auto-detect reads `/usr/bin/ldd` first and
+    // does not fall back to Node's report when ldd exists but is unrecognized.
+    // `glibcVersionRuntime` is already how `runtimePlatform` chooses gnu vs
+    // musl, so the install and the assertion share that value.
+    const jsPackages = Object.values(plugins).map((info) => packageName(info));
+    const installArgs = pluginInstallArgs(project, libc);
+    console.log(`installing ${jsPackages.map((name) => `${name}@${version}`).join(" ")}${libc ? ` --libc=${libc}` : ""}`);
     // 5 minutes, not the helper's 90s default. A newly created name took ~120s
     // to become readable when these were first published, so the default budget
     // failed the very release this step exists to protect (0.18.7: every
@@ -159,23 +198,31 @@ async function main(version) {
     // Resolves on success and throws on exhaustion — it returns no result to
     // inspect. Reading a `.status` off it crashed this step even when the
     // install had worked.
-    await installWithRegistryRetry(
-      ["--prefix", project, "--no-save", ...jsPackages],
-      { attempts: 60, delayMs: 5_000 },
-    );
+    await installWithRegistryRetry(installArgs, {
+      attempts: 60,
+      delayMs: 5_000,
+      cwd: project,
+      env: publicRegistryEnv(),
+    });
 
     // npm skips an optionalDependency it cannot resolve and still exits 0, so a
     // helper missing from the registry produces a silent half-install rather
     // than a failure. Check this machine's helper actually landed.
     const require_ = createRequire(join(project, "noop.js"));
+    let installedScope = [];
+    try {
+      installedScope = (await readdir(join(project, "node_modules", "@relayhistory"))).sort();
+    } catch {
+      installedScope = [];
+    }
     for (const info of Object.values(plugins)) {
-      const helper = packageName(info, currentPlatform());
+      const helper = packageName(info, platform);
       try {
         require_.resolve(`${helper}/package.json`);
         console.log(`  installed ${helper}`);
       } catch {
         assert.fail(
-          `${helper} did not install: npm skips an unresolvable optional dependency silently`,
+          `${helper} did not install (npm libc=${libc ?? "default"}; installed @relayhistory/*: ${installedScope.join(", ") || "none"}). npm skips an unresolvable optional dependency silently`,
         );
       }
     }
