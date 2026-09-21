@@ -1219,6 +1219,7 @@ fn scoped_child_reinclusion_rejects_old_prepared_relationships() {
     }
 }
 
+/// Verify adoption reclaims a suffix behind pinned revisions and preserves all unread data at the cap.
 #[test]
 fn scoped_adoption_recovers_full_retention_without_discarding_unconsumed_revisions() {
     for pinned_by_other_job in [false, true] {

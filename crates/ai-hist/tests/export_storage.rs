@@ -172,6 +172,7 @@ fn compaction_passes_a_retained_prefix_in_bounded_steps() {
     );
 }
 
+/// Verify recovery visits reclaimable rows around a pinned prefix regardless of the saved scan cursor.
 #[test]
 fn recovery_compaction_visits_the_whole_journal_despite_the_background_cursor() {
     for cursor in [0, 1000, 9999] {

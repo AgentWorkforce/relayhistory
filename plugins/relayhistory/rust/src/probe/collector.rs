@@ -308,6 +308,7 @@ fn run_capture_cycle(
     delivered.and(capture).and(drained)
 }
 
+/// Hydrate only authorized members using core observation locks and cancellation.
 fn capture_selected(directory: &Path, config: &Config, cancelled: &Arc<AtomicBool>) -> Result<()> {
     let conn = relayhistory_plugin::delivery::open_db(&directory.join("history.db"))?;
     let members = delivery::job_sessions(&conn, &config.job_id)?;
@@ -334,6 +335,7 @@ fn capture_selected(directory: &Path, config: &Config, cancelled: &Arc<AtomicBoo
     )
 }
 
+/// Continue across member failures while retaining the first typed cause for safe reporting.
 fn capture_members(
     directory: &Path,
     members: Vec<delivery::SessionIdentity>,
@@ -375,6 +377,7 @@ fn capture_members(
     Ok(())
 }
 
+/// Classify typed causes into stable public labels without exposing raw error details.
 fn capture_error_class(error: &anyhow::Error) -> &'static str {
     if error.downcast_ref::<ai_hist::CaptureCancelled>().is_some() {
         return "cancelled";
@@ -412,6 +415,7 @@ fn capture_error_class(error: &anyhow::Error) -> &'static str {
     "capture_error"
 }
 
+/// Return actionable, allowlisted storage guidance suitable for desktop status and stderr.
 pub(super) fn local_failure_message(error: &anyhow::Error) -> Option<&'static str> {
     match capture_error_class(error) {
         "retention_limit" => Some("The local upload journal is full. Uploads will retry after consumed records can be compacted; queued sessions are preserved."),
@@ -424,6 +428,7 @@ pub(super) fn local_failure_message(error: &anyhow::Error) -> Option<&'static st
     }
 }
 
+/// Build the advisory cycle status from typed errors without including provider data.
 fn cycle_report(result: &Result<()>) -> serde_json::Value {
     let error = result.as_ref().err();
     json!({
@@ -433,6 +438,21 @@ fn cycle_report(result: &Result<()>) -> serde_json::Value {
             "Sync paused or offline. Retrying; local data remains queued."
         )),
     })
+}
+
+/// Persist advisory status without interrupting retries when either status or logs cannot be written.
+fn persist_cycle_report(directory: &Path, result: &Result<()>, mut diagnostics: impl Write) {
+    let report = cycle_report(result);
+    if let Err(error) = save_json(&directory.join("cycle.json"), &report) {
+        let message = local_failure_message(&error)
+            .unwrap_or("Sync status could not be saved. Retrying; local data remains queued.");
+        // collector.log may be on the same full disk. Logging must not panic
+        // or propagate another I/O error out of the retry loop either.
+        let _ = writeln!(diagnostics, "{message}");
+    }
+    if let Some(message) = report["message"].as_str() {
+        let _ = writeln!(diagnostics, "{message}");
+    }
 }
 
 fn capture_diagnostic(
@@ -668,6 +688,7 @@ fn start_inventory(directory: &Path, cancelled: Arc<AtomicBool>) -> InventoryWor
     InventoryWorker(finish)
 }
 
+/// Own the collector lock and retry capture/delivery until stopped; status writes are advisory.
 pub fn run_background(directory: &Path, startup_id: &str) -> Result<()> {
     let _lock = lock(directory)?;
     ensure!(
@@ -713,11 +734,7 @@ pub fn run_background(directory: &Path, startup_id: &str) -> Result<()> {
         if stopping(&stop.cancelled) {
             break;
         }
-        let report = cycle_report(&result);
-        save_json(&directory.join("cycle.json"), &report)?;
-        if let Some(message) = report["message"].as_str() {
-            eprintln!("{message}");
-        }
+        persist_cycle_report(directory, &result, std::io::stderr());
         for _ in 0..200 {
             if stopping(&stop.cancelled) {
                 break;
@@ -1213,6 +1230,7 @@ mod tests {
         }
     }
 
+    /// Verify failed members retain their typed cause while healthy members are captured.
     #[test]
     fn targeted_storage_failure_keeps_its_class_and_other_members_still_capture() {
         let dir = tempfile::tempdir().unwrap();
@@ -1247,6 +1265,7 @@ mod tests {
         assert!(!report["message"].as_str().unwrap().contains("offline"));
     }
 
+    /// Verify SQLite failure guidance and cycle reports never reveal raw sensitive details.
     #[test]
     fn cycle_errors_classify_local_storage_without_exposing_raw_details() {
         for (code, class) in [
@@ -1284,6 +1303,7 @@ mod tests {
         assert!(healthy["error_class"].is_null());
     }
 
+    /// Verify contextual StorageFull and native ENOSPC errors retain safe disk guidance.
     #[test]
     fn filesystem_disk_full_uses_safe_local_guidance_through_context() {
         let errors = vec![std::io::Error::new(
@@ -1307,6 +1327,38 @@ mod tests {
             assert!(!report.to_string().contains("secret"));
             assert!(!report.to_string().contains("offline"));
         }
+    }
+
+    /// A full log disk cannot make advisory cycle reporting terminate the collector.
+    #[test]
+    fn cycle_reporting_tolerates_failed_status_and_log_writes() {
+        struct FullDisk;
+        impl Write for FullDisk {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::StorageFull.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cycle.json");
+        fs::create_dir(&path).unwrap();
+        let result = Err(anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            "secret runtime path",
+        )));
+        persist_cycle_report(directory.path(), &result, FullDisk);
+        let mut output = Vec::new();
+        persist_cycle_report(directory.path(), &result, &mut output);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("Sync status could not be saved"));
+        assert!(output.contains("Free disk space"));
+        assert!(!output.contains("secret"));
+        fs::remove_dir(&path).unwrap();
+        persist_cycle_report(directory.path(), &Ok(()), FullDisk);
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(saved["ok"], true);
     }
 
     fn job_config(include_existing: bool) -> delivery::DeliveryJobConfig {

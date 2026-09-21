@@ -265,6 +265,7 @@ pub fn compact_journal_pass(conn: &Connection, page_size: usize) -> Result<usize
     Ok(removed)
 }
 
+/// Delete only revisions consumed by every interested subscription and advance the scan cursor.
 fn compact_journal_range(tx: &Transaction<'_>, after: i64, end: i64) -> Result<usize> {
     let removed = tx.execute(
         "DELETE FROM delivery_journal AS j WHERE seq>? AND seq<=? AND NOT EXISTS (

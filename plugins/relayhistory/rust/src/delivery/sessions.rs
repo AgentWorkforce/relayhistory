@@ -380,6 +380,7 @@ pub fn adopt_session_job(
     }
 }
 
+/// Atomically adopt authorized members; a failed snapshot leaves the legacy job unchanged.
 fn adopt_session_job_once(
     conn: &Connection,
     job_id: &str,

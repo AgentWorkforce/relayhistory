@@ -123,6 +123,7 @@ impl std::error::Error for UserError {}
 fn user_error(message: &'static str) -> anyhow::Error {
     UserError(message).into()
 }
+/// Dispatch probe commands and report only explicitly safe user-facing errors.
 fn main() {
     let cli = Cli::parse();
     bridge::set_json(cli.json);
