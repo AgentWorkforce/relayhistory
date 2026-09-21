@@ -902,6 +902,107 @@ fn a_session_can_be_hydrated_by_id_and_by_transcript_path() {
     assert_eq!(evidence.session.session_id, row.session_id);
 }
 
+/// A changed transcript re-hydrates as `Updated` — by id and by path — with
+/// the new evidence readable, and one that has not changed as `Unchanged`.
+#[test]
+fn re_hydrating_a_changed_transcript_reports_updated() {
+    let (_dir, store, transcript) = synced(&CORPUS[0]); // claude/simple-turn
+    let path = transcript.expect("a single-file fixture");
+    let by_id = store
+        .sessions(CatalogQuery::default())
+        .next()
+        .unwrap()
+        .unwrap()
+        .session_ref();
+    let prompts = |store: &SessionStore| {
+        store
+            .session(&by_id, SessionQuery::default())
+            .unwrap()
+            .unwrap()
+            .prompts
+            .len()
+    };
+    assert_eq!(prompts(&store), 1);
+
+    // The sweep catalogued and indexed it; the first *targeted* hydration
+    // writes the session's own checkpoint and reports a first ingestion, and
+    // the one after that finds nothing moved.
+    let first = store.hydrate(&by_id, HydrateOptions::default()).unwrap();
+    assert_eq!(first.status, HydrateStatus::Hydrated, "{first:?}");
+    let same = store.hydrate(&by_id, HydrateOptions::default()).unwrap();
+    assert_eq!(same.status, HydrateStatus::Unchanged, "{same:?}");
+
+    let append = |uuid: &str, parent: &str, text: &str, ts: &str| {
+        let record = format!(
+            "{{\"parentUuid\":\"{parent}\",\"isSidechain\":false,\"promptId\":\"p-{uuid}\",\
+             \"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"{text}\"}},\
+             \"uuid\":\"{uuid}\",\"timestamp\":\"{ts}\",\"cwd\":\"/tmp/project\",\
+             \"sessionId\":\"11111111-1111-1111-1111-111111111111\",\"version\":\"2.1.96\"}}\n"
+        );
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        std::io::Write::write_all(&mut file, record.as_bytes()).unwrap();
+    };
+
+    append("u-user-2", "u-asst-1", "again", "2026-04-20T00:00:02.000Z");
+    let updated = store.hydrate(&by_id, HydrateOptions::default()).unwrap();
+    assert_eq!(updated.status, HydrateStatus::Updated, "{updated:?}");
+    assert_eq!(prompts(&store), 2, "the appended prompt is readable");
+
+    append(
+        "u-user-3",
+        "u-user-2",
+        "once more",
+        "2026-04-20T00:00:03.000Z",
+    );
+    let by_path = store
+        .hydrate(
+            &SessionRef::path(Source::Claude, &path),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(by_path.status, HydrateStatus::Updated, "{by_path:?}");
+    assert_eq!(by_path.session, by_id);
+    assert_eq!(prompts(&store), 3);
+
+    let settled = store.hydrate(&by_id, HydrateOptions::default()).unwrap();
+    assert_eq!(settled.status, HydrateStatus::Unchanged);
+}
+
+/// A hydration's coverage is the same declaration `session()` reports for
+/// the source, markers included, not the adapter list the engine narrows
+/// its own capability classification from.
+#[test]
+fn hydration_coverage_agrees_with_the_session_read() {
+    let (_dir, store, _) = synced(&CORPUS[3]); // claude/compact-boundary
+    let row = store
+        .sessions(CatalogQuery::default())
+        .next()
+        .unwrap()
+        .unwrap();
+    let report = store
+        .hydrate(&row.session_ref(), HydrateOptions::default())
+        .unwrap();
+    assert!(
+        report.coverage.contains(&EvidenceKind::SessionMarker),
+        "the parse that stored the compaction marker covers markers: {:?}",
+        report.coverage
+    );
+    let evidence = store
+        .session(&row.session_ref(), SessionQuery::default())
+        .unwrap()
+        .unwrap();
+    assert_eq!(evidence.coverage, report.coverage);
+    assert!(!evidence.markers.is_empty());
+
+    // The request's narrowing still applies: without related transcripts the
+    // relationship kind is not claimed.
+    let mut narrow = HydrateOptions::default();
+    narrow.include_related = false;
+    let narrowed = store.hydrate(&row.session_ref(), narrow).unwrap();
+    assert!(!narrowed.coverage.contains(&EvidenceKind::Relationship));
+    assert!(narrowed.coverage.contains(&EvidenceKind::SessionMarker));
+}
+
 #[test]
 fn a_second_sync_over_unchanged_sources_reports_nothing_changed() {
     let (_dir, store, _) = synced(&CORPUS[7]); // codex/simple-turn

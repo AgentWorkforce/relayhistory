@@ -123,10 +123,13 @@ transcripts beside the session — Claude subagent sidecars, Codex child rollout
 — and never walks the rest of the provider root.
 
 `HydrateReport` carries the resolved `session`, a `HydrateStatus`
-(`Hydrated`, `Unchanged`, `CapabilityLimited`, and for the path form
-`Missing`, `Unidentified`, `Mismatched`), the declared `Capability`
-(`Full`, `Partial`, `ShallowOnly`), the `coverage` kinds, `related` sessions,
-`bytes_read` and diagnostics. A missing transcript is a status, not an error: a
+(`Hydrated` for a first ingestion, `Updated` when a changed source was read on
+top of an existing checkpoint, `Unchanged`, `CapabilityLimited`, and for the
+path form `Missing`, `Unidentified`, `Mismatched`), the engine's `Capability`
+classification (`Full`, `Partial`, `ShallowOnly`), the `coverage` kinds — the
+source's `SourceCapabilities::evidence_kinds`, the same set `session()` reports,
+narrowed by the request (no `Relationship` when `include_related` is off) —
+`related` sessions, `bytes_read` and diagnostics. A missing transcript is a status, not an error: a
 hook fires inside the harness's tool call, and a file that was cleaned up
 before the hook ran is an answer.
 

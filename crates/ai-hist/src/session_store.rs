@@ -710,12 +710,17 @@ impl SessionStore {
                     opts.include_related,
                 )
                 .map_err(Error::hydration)?;
-                let status = match ingest.status {
-                    TranscriptStatus::Ingested => HydrateStatus::Hydrated,
-                    TranscriptStatus::Unchanged => HydrateStatus::Unchanged,
-                    TranscriptStatus::Missing => HydrateStatus::Missing,
-                    TranscriptStatus::Unidentified => HydrateStatus::Unidentified,
-                    TranscriptStatus::Mismatched => HydrateStatus::Mismatched,
+                // The hook layer folds a first ingestion and an update into
+                // one `Ingested`; the hydration it ran still says which, and
+                // that is the status reported here. Only the outcomes with no
+                // hydration behind them come from the hook's own vocabulary.
+                let status = match (&ingest.hydration, ingest.status) {
+                    (Some(hydration), _) => HydrateStatus::parse(&hydration.status)?,
+                    (None, TranscriptStatus::Ingested) => HydrateStatus::Hydrated,
+                    (None, TranscriptStatus::Unchanged) => HydrateStatus::Unchanged,
+                    (None, TranscriptStatus::Missing) => HydrateStatus::Missing,
+                    (None, TranscriptStatus::Unidentified) => HydrateStatus::Unidentified,
+                    (None, TranscriptStatus::Mismatched) => HydrateStatus::Mismatched,
                 };
                 let session_id = ingest.session_id.clone().unwrap_or_default();
                 let mut report = hydrate_report(*source, session_id, status, ingest.hydration)?;
@@ -1223,8 +1228,12 @@ impl Default for HydrateOptions {
 #[non_exhaustive]
 #[serde(rename_all = "snake_case")]
 pub enum HydrateStatus {
-    /// Evidence was read from the provider into the store.
+    /// Evidence was read from the provider into the store for the first
+    /// time — no hydration checkpoint existed for the session.
     Hydrated,
+    /// The provider source had changed since the last hydration and the new
+    /// evidence was read on top of the checkpoint.
+    Updated,
     /// The provider source had not changed since it was last hydrated.
     Unchanged,
     /// The source's adapter cannot produce full evidence; the catalog row is
@@ -1242,9 +1251,13 @@ pub enum HydrateStatus {
 }
 
 impl HydrateStatus {
+    /// Every status the engine's local hydration path emits is named here;
+    /// an unknown one can only come from a genuinely new engine value, and
+    /// is reported rather than guessed at.
     fn parse(value: &str) -> Result<Self, Error> {
         match value {
             "hydrated" => Ok(Self::Hydrated),
+            "updated" => Ok(Self::Updated),
             "unchanged" => Ok(Self::Unchanged),
             "capability_limited" => Ok(Self::CapabilityLimited),
             other => Err(Error::HydrationFailed(format!(
@@ -1291,9 +1304,13 @@ pub struct HydrateReport {
     /// `None` when no hydration ran (`Missing`, `Unidentified`,
     /// `Mismatched`).
     pub capability: Option<Capability>,
-    /// The evidence kinds this hydration can have indexed: the source
-    /// adapter's declared coverage. A zero count for a covered kind means the
-    /// session has none of it.
+    /// The evidence kinds this hydration can have indexed: the source's
+    /// [`SourceCapabilities::evidence_kinds`] — the same set
+    /// [`SessionEvidence::coverage`] reports — narrowed by the request
+    /// (`Relationship` is absent when `include_related` is off, or when a
+    /// bounded Codex child search could not cover it). A zero count for a
+    /// covered kind means the session has none of it. `capability` is the
+    /// engine's own classification and is not derived from this list.
     pub coverage: Vec<EvidenceKind>,
     /// Related sessions hydrated alongside this one.
     pub related: Vec<SessionRef>,
@@ -1330,11 +1347,28 @@ fn hydrate_report(
             diagnostics: Vec::new(),
         });
     };
+    // The engine's coverage comes from the adapter declaration, which leaves
+    // parser-derived markers out on purpose (a connector cannot supply them);
+    // the facade's contract is the capability declaration `session()` also
+    // reports. Markers are written by the same parse that writes events, so
+    // they are covered exactly when events are; everything else follows the
+    // engine's narrowing (`include_related`, incomplete Codex child search).
+    let engine = &result.coverage;
+    let coverage = source
+        .capabilities()
+        .evidence_kinds
+        .into_iter()
+        .filter(|kind| {
+            engine.contains(kind)
+                || (*kind == EvidenceKind::SessionMarker
+                    && engine.contains(&EvidenceKind::SessionEvent))
+        })
+        .collect();
     Ok(HydrateReport {
         session,
         status,
         capability: Some(Capability::parse(&result.capability)?),
-        coverage: result.coverage,
+        coverage,
         related: result
             .related_session_ids
             .into_iter()
