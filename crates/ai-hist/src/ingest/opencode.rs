@@ -25,7 +25,9 @@ use super::{
     insert_session_event_with_provenance, insert_tool_call, upsert_file_edit_from_call,
     upsert_session, RawMessageFacts, OPENCODE_MARKER_COMPACTION_BOUNDARY,
 };
-use crate::relationship_capture::{record_relationship, ObservedRelationship};
+use crate::relationship_capture::{
+    record_relationship_replacing_child_model, ObservedRelationship,
+};
 use crate::{insert_history, prompt_hash, HistoryEntry};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -1547,7 +1549,7 @@ fn normalize_session(
             .and_then(|message| {
                 build_model(message.provider_id.as_deref(), message.model_id.as_deref())
             });
-        record_relationship(
+        record_relationship_replacing_child_model(
             conn,
             &ObservedRelationship {
                 source: "opencode",
@@ -1686,7 +1688,7 @@ fn insert_session_marker(
          VALUES ('opencode', ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(source, session_id, marker_uid) DO UPDATE SET \
          kind=excluded.kind, message_id=excluded.message_id, ts_ms=excluded.ts_ms, \
-         detail_json=COALESCE(excluded.detail_json, session_markers.detail_json)",
+         detail_json=excluded.detail_json",
         params![session_id, kind, message_id, ts_ms, detail_json, marker_uid],
     )?)
 }

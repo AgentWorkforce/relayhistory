@@ -780,6 +780,21 @@ fn a_compaction_part_records_one_boundary_marker() {
         "marker writes are idempotent"
     );
 
+    // The part is a replacement snapshot. If OpenCode removes `auto`, the
+    // marker must not keep reporting the prior automatic-compaction detail.
+    write_json(
+        &tree.join("part/msg_compact_uc/prt_uc_compaction.json"),
+        r#"{"id":"prt_uc_compaction","sessionID":"ses_compact","messageID":"msg_compact_uc","type":"compaction"}"#,
+    );
+    sync_local_at(&db_path).unwrap();
+    let conn = open_db(&db_path).unwrap();
+    let markers = session_markers(&conn, "opencode", "ses_compact").unwrap();
+    assert_eq!(markers.len(), 1);
+    assert_eq!(
+        markers[0].detail_json, None,
+        "a removed compaction detail must not survive the replacement part"
+    );
+
     fs::remove_dir_all(&root).ok();
 }
 
@@ -2230,12 +2245,13 @@ fn a_removed_tool_output_stops_being_served() {
     let home = root.join("home");
     let tree = home.join(".local/share/opencode/storage");
     let part = tree.join("part/msg_retire_a1/prt_retire_tool.json");
+    let message = tree.join("message/ses_retire/msg_retire_a1.json");
     write_json(
         &tree.join("session/global/ses_retire.json"),
         r#"{"id":"ses_retire","parentID":"ses_retire_parent","directory":"/tmp/project","time":{"created":1777200000000,"updated":1777200002000}}"#,
     );
     write_json(
-        &tree.join("message/ses_retire/msg_retire_a1.json"),
+        &message,
         r#"{"id":"msg_retire_a1","sessionID":"ses_retire","role":"assistant","time":{"created":1777200001000},"providerID":"anthropic","modelID":"claude-opus-4-5","path":{"cwd":"/tmp/project"}}"#,
     );
     write_json(
@@ -2263,6 +2279,28 @@ fn a_removed_tool_output_stops_being_served() {
         texts(&db_path)
     );
     assert_eq!(relationship_count(&db_path, "ses_retire"), 1);
+
+    // The parent link remains, but the complete child snapshot no longer
+    // names an assistant model. That observed removal must clear the model
+    // rather than being treated as a thinner partial observation.
+    write_json(
+        &message,
+        r#"{"id":"msg_retire_a1","sessionID":"ses_retire","role":"assistant","time":{"created":1777200001000},"path":{"cwd":"/tmp/project"}}"#,
+    );
+    sync_local_at(&db_path).unwrap();
+    let child_model = open_db(&db_path)
+        .unwrap()
+        .query_row(
+            "SELECT child_model FROM session_relationships \
+             WHERE source='opencode' AND child_session_id='ses_retire'",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .unwrap();
+    assert_eq!(
+        child_model, None,
+        "a model removed from the child snapshot must not survive on its relationship"
+    );
 
     // OpenCode rewrites the part without the output, and drops the parent link.
     write_json(
