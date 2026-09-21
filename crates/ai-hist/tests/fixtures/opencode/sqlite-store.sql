@@ -30,8 +30,7 @@ INSERT INTO session (id, parent_id, directory, time_created, time_updated)
 VALUES ('ses_sqlite_root', NULL, '/tmp/project', 1776643200000, 1776643260000);
 
 -- A child session carrying the provider's parent link, the SQLite equivalent
--- of the `ses_child` sidechain in the legacy JSON corpus. relayhistory's
--- OpenCode adapter does not read this column today (#168).
+-- of the `ses_child` sidechain in the legacy JSON corpus.
 INSERT INTO session (id, parent_id, directory, time_created, time_updated)
 VALUES ('ses_sqlite_child', 'ses_sqlite_root', '/tmp/project', 1776643230000, 1776643240000);
 

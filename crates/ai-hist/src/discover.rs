@@ -64,6 +64,7 @@ use crate::{
     open_db_readonly, upsert_session_presence, EvidenceKind, SessionLocation, SessionScope,
     FULL_SESSION_KINDS, SOURCE_CHOICES,
 };
+use crate::ingest::opencode::OpencodeLayout;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -83,7 +84,7 @@ pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 4;
 /// invalidates every stored stamp, so a scanner that learns to extract a new
 /// field re-reads sources whose bytes never changed. `parser_version` keeps its
 /// existing meaning (full-ingest parser generation) and is untouched.
-pub const SHALLOW_SCANNER_VERSION: u32 = 4;
+pub const SHALLOW_SCANNER_VERSION: u32 = 5;
 
 /// Version 2 shipped the classification that hid standalone guardians (see
 /// [`crate::codex_is_subagent`]). Their rollouts never change on disk, so the
@@ -100,6 +101,13 @@ const _: () = assert!(SHALLOW_SCANNER_VERSION > 2);
 /// forever. Kept as a compile-time guard for the same reason as the pair
 /// above.
 const _: () = assert!(SHALLOW_SCANNER_VERSION > 3);
+
+/// Version 4 stored OpenCode model IDs without their provider prefix. Version
+/// 5 qualifies them consistently with full ingestion (for example,
+/// `anthropic/claude-sonnet`). An unchanged provider database keeps the same
+/// change marker, so only the scanner-version prefix can force those cached
+/// rows through the corrected reader once.
+const _: () = assert!(SHALLOW_SCANNER_VERSION > 4);
 
 /// Most bytes a shallow head read may consume from one transcript.
 pub const HEAD_SCAN_MAX_BYTES: u64 = 256 * 1024;
@@ -288,6 +296,9 @@ pub struct DiscoveryEnv<'a> {
     pub grok_home: PathBuf,
     /// Path to the opencode database.
     pub opencode_db: PathBuf,
+    /// Root of OpenCode's legacy `storage/` JSON tree, read only when there
+    /// is no `opencode.db`.
+    pub opencode_storage_dir: PathBuf,
     conn: &'a Connection,
     counters: CounterCell,
 }
@@ -309,6 +320,7 @@ impl<'a> DiscoveryEnv<'a> {
             codex_home: roots.codex,
             grok_home: roots.grok,
             opencode_db: roots.opencode_db,
+            opencode_storage_dir: roots.opencode_storage_dir,
             conn,
             counters: CounterCell::default(),
         }
@@ -330,6 +342,10 @@ impl<'a> DiscoveryEnv<'a> {
         grok_home: PathBuf,
         opencode_db: PathBuf,
     ) -> Self {
+        let opencode_storage_dir = opencode_db
+            .parent()
+            .map(|parent| parent.join("storage"))
+            .unwrap_or_else(|| home.join(".local/share/opencode/storage"));
         Self::with_provider_roots(
             conn,
             crate::ProviderRoots {
@@ -338,9 +354,19 @@ impl<'a> DiscoveryEnv<'a> {
                 codex: codex_home,
                 grok: grok_home,
                 opencode_db,
+                opencode_storage_dir,
                 use_env_roots: false,
             },
         )
+    }
+
+    /// Point the legacy JSON tree somewhere other than beside the database.
+    /// Hosts that set `OPENCODE_STORAGE_DIR` independently of `OPENCODE_DB`
+    /// need this; so do tests, which must not mutate process-wide variables.
+    #[must_use]
+    pub fn with_opencode_storage_dir(mut self, storage_dir: PathBuf) -> Self {
+        self.opencode_storage_dir = storage_dir;
+        self
     }
 
     /// The catalog connection. `relay` discovers from already-synced local
@@ -359,6 +385,7 @@ impl<'a> DiscoveryEnv<'a> {
             codex_home: &self.codex_home,
             grok_home: &self.grok_home,
             opencode_db: &self.opencode_db,
+            opencode_storage_dir: &self.opencode_storage_dir,
             counters: &self.counters,
         }
     }
@@ -400,6 +427,8 @@ pub struct ScanEnv<'a> {
     pub grok_home: &'a Path,
     /// Path to the opencode database.
     pub opencode_db: &'a Path,
+    /// Root of OpenCode's legacy `storage/` JSON tree.
+    pub opencode_storage_dir: &'a Path,
     counters: &'a CounterCell,
 }
 
@@ -437,6 +466,17 @@ pub enum ShallowReadAccess {
     Catalog,
 }
 
+/// Opaque lifetime guard held by the discovery engine for one provider pass.
+///
+/// Most adapters are stateless and use no guard. An adapter that pins live
+/// provider state can return a lock guard so two calls through a reusable
+/// registry cannot replace each other's snapshot between enumeration and
+/// shallow reads.
+#[doc(hidden)]
+pub trait DiscoveryPassGuard {}
+
+impl<T> DiscoveryPassGuard for T {}
+
 /// One provider's shallow adapter.
 ///
 /// Implementations must be cheap: [`enumerate`](ShallowSessionProvider::enumerate)
@@ -446,6 +486,12 @@ pub enum ShallowReadAccess {
 /// not a session" (a codex subagent thread, a file with no usable metadata) —
 /// it is not an error.
 pub trait ShallowSessionProvider: Sync {
+    /// Start one enumerate/read cycle. The returned guard remains alive until
+    /// every candidate from this pass has been consumed.
+    fn begin_discovery_pass(&self) -> Result<Option<Box<dyn DiscoveryPassGuard + '_>>> {
+        Ok(None)
+    }
+
     /// Stable acquisition identity, independent of the evidence source.
     fn connector_id(&self) -> &str {
         self.source()
@@ -1512,6 +1558,7 @@ fn grok_update_bounds(
 /// but prompt/model extraction is omitted when it would require a table scan.
 #[derive(Default)]
 struct OpencodeProvider {
+    pass: Mutex<()>,
     live: Mutex<Option<OpencodeReadSnapshot>>,
 }
 
@@ -1538,13 +1585,24 @@ struct OpencodeReadSnapshot {
 
 impl OpencodeProvider {
     /// Open the provider once, read-only, and start the transaction that pins
-    /// the run's SQLite snapshot. `None` means there is no OpenCode store.
+    /// the run's SQLite snapshot. `None` means this host is not on the SQLite
+    /// layout — either it has the legacy JSON tree, or it has no OpenCode
+    /// store at all.
     fn snapshot(&self, scan: &ScanEnv<'_>) -> Result<MutexGuard<'_, Option<OpencodeReadSnapshot>>> {
         let mut guard = self.live.lock().expect("opencode live snapshot lock");
-        if guard.is_none() && scan.opencode_db.exists() {
+        if guard.is_none() && matches!(scan.opencode_layout(), Some(OpencodeLayout::Sqlite(_))) {
             *guard = Some(open_opencode_snapshot(scan)?);
         }
         Ok(guard)
+    }
+}
+
+impl ScanEnv<'_> {
+    /// Which OpenCode layout this host actually has. `opencode.db` wins when
+    /// both are present: newer releases write SQLite and leave the old tree
+    /// behind, so preferring the tree would serve stale history.
+    pub(crate) fn opencode_layout(&self) -> Option<OpencodeLayout> {
+        OpencodeLayout::detect(self.opencode_db, self.opencode_storage_dir)
     }
 }
 
@@ -1643,6 +1701,16 @@ fn table_columns(conn: &Connection, table: &str) -> Result<BTreeSet<String>> {
 }
 
 impl ShallowSessionProvider for OpencodeProvider {
+    fn begin_discovery_pass(&self) -> Result<Option<Box<dyn DiscoveryPassGuard + '_>>> {
+        let pass = self.pass.lock().expect("opencode discovery pass lock");
+        // A SourceRegistry retains this adapter across calls. Drop the last
+        // call's SQLite transaction before detecting this call's layout, while
+        // the pass lock prevents a concurrent call from replacing the state
+        // between enumeration and reads.
+        *self.live.lock().expect("opencode live snapshot lock") = None;
+        Ok(Some(Box::new(pass)))
+    }
+
     fn acquire(
         &self,
         _home: &Path,
@@ -1653,10 +1721,10 @@ impl ShallowSessionProvider for OpencodeProvider {
     fn source(&self) -> &'static str {
         "opencode"
     }
-    /// The session-keyed query reads user text parts only; assistant turns,
-    /// tool calls and file edits in OpenCode's store are not read.
+    /// Both supported OpenCode layouts produce prompts, events, tool calls,
+    /// file edits and child-session relationships.
     fn evidence_kinds(&self) -> &'static [EvidenceKind] {
-        &[EvidenceKind::History]
+        FULL_SESSION_KINDS
     }
 
     fn enumerate(
@@ -1665,6 +1733,9 @@ impl ShallowSessionProvider for OpencodeProvider {
         requested_limit: Option<usize>,
     ) -> Result<Vec<Candidate>> {
         let scan = env.scan();
+        if let Some(OpencodeLayout::JsonTree(root)) = scan.opencode_layout() {
+            return enumerate_opencode_json_tree(&scan, &root);
+        }
         let mut guard = self.snapshot(&scan)?;
         let Some(snapshot) = guard.as_mut() else {
             return Ok(Vec::new());
@@ -1768,7 +1839,16 @@ impl ShallowSessionProvider for OpencodeProvider {
         _catalog: Option<&Connection>,
         candidate: &Candidate,
     ) -> Result<Option<ShallowSession>> {
-        let guard = self.snapshot(scan)?;
+        // Layout is encoded by the candidate shape: SQLite enumeration uses
+        // the session id itself as the locator, while the JSON tree uses its
+        // session-file path (and may have no session id for an unreadable
+        // directory). Do not re-detect the host here: OpenCode can create its
+        // SQLite store after JSON enumeration, and those locators must still
+        // be read by the layout that produced them.
+        if candidate.session_id.as_deref() != Some(candidate.locator.as_str()) {
+            return read_shallow_opencode_json_tree(scan, candidate);
+        }
+        let guard = self.live.lock().expect("opencode live snapshot lock");
         let Some(snapshot) = guard.as_ref() else {
             return Ok(None);
         };
@@ -1808,6 +1888,7 @@ impl ShallowSessionProvider for OpencodeProvider {
                  WHERE {keyed_predicate} AND json_valid(m.data) AND json_valid(p.data) \
                  AND json_extract(m.data, '$.role') = 'user' \
                  AND json_extract(p.data, '$.type') = 'text' \
+                 AND COALESCE(json_type(p.data, '$.synthetic'), 'null') <> 'true' \
                  AND json_type(p.data, '$.text') = 'text' \
                  AND trim(substr(json_extract(p.data, '$.text'), 1, ?), ?) <> '' \
                  ORDER BY {order} ASC LIMIT 1"
@@ -1840,16 +1921,47 @@ impl ShallowSessionProvider for OpencodeProvider {
         {
             scan.note_query();
             let model = {
-                let mut stmt = conn.prepare_cached(
-                    "SELECT COALESCE(json_extract(data, '$.modelID'), \
-                                            json_extract(data, '$.model.modelID')) \
+                // Match `parse_message` and `OpencodeSession::first_model`:
+                // payload time wins, the relational column is its fallback,
+                // and a message with neither is not parseable. Checking for a
+                // JSON integer mirrors `Value::as_i64`; a string that merely
+                // looks numeric must not take precedence here.
+                let payload_created = "CASE WHEN json_type(data, '$.time.created') = 'integer' \
+                                       AND typeof(json_extract(data, '$.time.created')) = 'integer' \
+                                       THEN json_extract(data, '$.time.created') END";
+                let created = if snapshot.message_columns.contains("time_created") {
+                    format!("COALESCE({payload_created}, time_created)")
+                } else {
+                    payload_created.to_string()
+                };
+                let order_by = if snapshot.message_columns.contains("id") {
+                    format!("ORDER BY {created} ASC, id ASC")
+                } else {
+                    format!("ORDER BY {created} ASC")
+                };
+                let sql = format!(
+                    "SELECT json_extract(data, '$.providerID'), \
+                            COALESCE(json_extract(data, '$.modelID'), \
+                                     json_extract(data, '$.model.modelID')) \
                      FROM message WHERE session_id = ? AND json_valid(data) \
-                     AND COALESCE(json_extract(data, '$.modelID'), \
-                                  json_extract(data, '$.model.modelID')) IS NOT NULL LIMIT 1",
-                )?;
-                stmt.query_row([&candidate.locator], |row| row.get::<_, Option<String>>(0))
-                    .optional()?
-                    .flatten()
+                     AND json_extract(data, '$.role') = 'assistant' \
+                     AND {created} IS NOT NULL \
+                     AND (NULLIF(json_extract(data, '$.providerID'), '') IS NOT NULL \
+                          OR NULLIF(COALESCE(json_extract(data, '$.modelID'), \
+                                             json_extract(data, '$.model.modelID')), '') IS NOT NULL) \
+                     {order_by} LIMIT 1"
+                );
+                let mut stmt = conn.prepare_cached(&sql)?;
+                stmt.query_row([&candidate.locator], |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                })
+                .optional()?
+                .and_then(|(provider, model)| {
+                    crate::ingest::opencode::build_model(provider.as_deref(), model.as_deref())
+                })
             };
             scan.note_records(u64::from(model.is_some()));
             push_unique(&mut models, model.as_deref());
@@ -1868,6 +1980,194 @@ impl ShallowSessionProvider for OpencodeProvider {
             ..Default::default()
         }))
     }
+}
+
+/// Enumerate the legacy tree's `session/<scope>/ses_*.json` files.
+///
+/// The tree has no index, so both the stamp and the recency hint are computed
+/// over *every file that composes a session* — the session JSON, its messages
+/// and their parts — by the same helper hydration stamps with.
+///
+/// Two things make that necessary rather than thorough. OpenCode appends a
+/// turn by writing new files under `message/` and `part/` without touching the
+/// session JSON, so a stamp over that file alone reports an active session as
+/// unchanged and the cache serves its stale first prompt and model forever;
+/// with a `--limit`, ordering on the same unchanged timestamp also ranks a
+/// busy session as old and can drop it from the page entirely. And the birth
+/// time `file_generation_time` prefers does not move when a session file is
+/// rewritten in place, so it cannot be the change signal here either — the
+/// helper reads modification time, and carries a file count and a byte total
+/// so an edit that preserves both size and mtime still moves the stamp.
+///
+/// The cost is one `stat` per file in the tree, no reads and no parsing, and
+/// it is paid before the limit because a limit applied to stale recency is
+/// the bug above.
+fn enumerate_opencode_json_tree(scan: &ScanEnv<'_>, root: &Path) -> Result<Vec<Candidate>> {
+    // One session's failure is that session's failure. The stamp reads files
+    // now, so an unlistable `message/` directory or an unreadable recent part
+    // can fail it -- and propagating that out of the enumeration would take
+    // every healthy session in the same tree down with it, neither cataloged
+    // nor indexed for as long as the one path stays broken. `read_shallow`
+    // already isolates exactly this failure per locator; the enumeration has
+    // to as well.
+    //
+    // The candidate is still emitted, and deliberately not with a stamp that
+    // could match a stored one: this run cannot say the session is unchanged,
+    // and a stamp that compares equal is how the cached-skip path turns a read
+    // failure into a permanent omission. A token unique to this run bypasses
+    // that, `read_shallow` reaches the same failure, and the engine reports it
+    // as a diagnostic against this locator alone -- no skip row, no catalog row
+    // stamped as current.
+    let unreadable = format!(
+        "unreadable:{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default()
+    );
+    let listing = crate::ingest::opencode::list_json_tree_session_files(root);
+    let mut rows = Vec::new();
+    // A directory the walk could not list is emitted as a candidate of its
+    // own. `read_shallow` reaches the same failure and the engine reports it
+    // against that path -- which is the difference between "there are no
+    // sessions under here" and "we could not look".
+    for dir in &listing.unreadable {
+        rows.push((
+            String::new(),
+            dir.path.clone(),
+            session_file_mtime_ns(&dir.path),
+            None,
+            unreadable.clone(),
+        ));
+    }
+    for path in listing.sessions {
+        let Some(session_id) = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        if !path.is_file() {
+            continue;
+        }
+        let (order_ns, recency_hint_ms, stamp) =
+            match crate::ingest::opencode::stamp_json_tree_session(&path, &session_id) {
+                Ok(stamp) => (stamp.newest_ns, stamp.newest_ms(), stamp.token()),
+                Err(_) => {
+                    // Order it by the one file that is certainly its own, so a
+                    // broken session neither jumps the queue nor sinks out of
+                    // sight of a bounded page.
+                    let own_ns = session_file_mtime_ns(&path);
+                    (
+                        own_ns,
+                        i64::try_from(own_ns / 1_000_000).ok(),
+                        unreadable.clone(),
+                    )
+                }
+            };
+        rows.push((session_id, path, order_ns, recency_hint_ms, stamp));
+    }
+    // Newest first, then by id, so the engine takes the same bounded head
+    // every run and the tie-break is total.
+    //
+    // Not truncated here. A `ses_*.json` file is a *candidate*, and
+    // `read_shallow` is what decides whether it is a session -- truncating
+    // first lets a newest malformed file consume the whole of a `--limit 1`
+    // and the valid session behind it is never discovered at all. The engine
+    // stops after the requested number of sessions it actually emitted, which
+    // is the contract the candidate window is written to. (The SQLite side
+    // still limits in SQL, because there a `session` row *is* a session.)
+    rows.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    scan.note_records(rows.len() as u64);
+    Ok(rows
+        .into_iter()
+        .map(|(session_id, path, _, recency_hint_ms, stamp)| Candidate {
+            source: "opencode",
+            locator: path.to_string_lossy().into_owned(),
+            // Empty for an unlistable directory: it names no session, and
+            // claiming one would have the engine reject the read as a mismatched
+            // identity instead of reporting what actually went wrong.
+            session_id: Some(session_id).filter(|id| !id.is_empty()),
+            recency_hint_ms,
+            stamp,
+        })
+        .collect())
+}
+
+/// A session file's own modification time in nanoseconds, or zero.
+fn session_file_mtime_ns(path: &Path) -> u128 {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default()
+}
+
+/// One session's catalog row from the legacy tree. This reads the session
+/// file plus that session's own messages and parts — never the whole tree.
+fn read_shallow_opencode_json_tree(
+    scan: &ScanEnv<'_>,
+    candidate: &Candidate,
+) -> Result<Option<ShallowSession>> {
+    let path = Path::new(&candidate.locator);
+    scan.note_open();
+    if path.is_dir() {
+        // Enumeration hands the directory it could not walk straight through
+        // to here, so the failure is reported against that path.
+        fs::read_dir(path)
+            .with_context(|| format!("listing OpenCode session directory {}", path.display()))?;
+        // It lists now, so the outage was transient. It is still not a session,
+        // and the next run walks what is under it.
+        return Ok(None);
+    }
+    let Some(loaded) = crate::ingest::opencode::load_from_json_tree(path)? else {
+        return Ok(None);
+    };
+    scan.note_records(loaded.messages.len() as u64);
+    let first_prompt = loaded
+        .first_user_text()
+        .map(excerpt)
+        .filter(|text| !text.is_empty());
+    let mut models = Vec::new();
+    push_unique(&mut models, loaded.first_model().as_deref());
+    let times: Vec<i64> = loaded
+        .messages
+        .iter()
+        .map(|message| message.time_created)
+        .collect();
+    Ok(Some(ShallowSession {
+        source: "opencode".into(),
+        session_id: loaded.session.id.clone(),
+        cwd: loaded
+            .messages
+            .iter()
+            .find_map(|message| message.path_cwd.clone())
+            .or_else(|| loaded.session.directory.clone()),
+        first_activity_ms: loaded
+            .session
+            .created_ms
+            .or_else(|| times.iter().min().copied()),
+        // The later of the two, not whichever exists. OpenCode appends a
+        // turn without rewriting the session JSON, so `updated` routinely
+        // lags its own newest message -- and preferring it catalogued a busy
+        // session as last active whenever its JSON last changed, which sorts
+        // it behind genuinely older sessions in the newest-first listing and
+        // lets a bounded page drop it. Neither value supersedes the other, so
+        // either one alone stands when the other is absent.
+        last_activity_ms: match (loaded.session.updated_ms, times.iter().max().copied()) {
+            (Some(updated), Some(newest)) => Some(updated.max(newest)),
+            (Some(updated), None) => Some(updated),
+            (None, newest) => newest,
+        },
+        first_prompt,
+        models,
+        // The concrete session file, so hydration can stamp exactly what
+        // discovery read.
+        raw_path: Some(candidate.locator.clone()),
+        ..Default::default()
+    }))
 }
 
 fn file_generation_time(metadata: &fs::Metadata) -> u128 {
@@ -2968,6 +3268,15 @@ pub fn discover_sessions_with_provider_refs(
             "INVALID_ARGUMENT: duplicate source connector instance"
         );
     }
+    // Provider instances can belong to a reusable SourceRegistry. Validate
+    // the whole set before taking any non-reentrant pass lock: callers of the
+    // public ref API may accidentally repeat the same provider instance.
+    // Hold each guard across enumeration, parallel reads and writes so a
+    // concurrent call cannot replace live provider state mid-pass.
+    let _pass_guards = providers
+        .iter()
+        .map(|provider| provider.begin_discovery_pass())
+        .collect::<Result<Vec<_>>>()?;
     let conn = env.conn();
     let mut summary = DiscoverySummary {
         contract_version: SESSION_CATALOG_CONTRACT_VERSION,

@@ -70,6 +70,11 @@ export interface NativeSessionEvent {
   text?: string
   model?: string
   tokenJson?: string
+  /**
+   * The upstream inference provider the harness named, when it names one
+   * (OpenCode's `providerID`). Null elsewhere rather than inferred.
+   */
+  provider?: string
   eventUid: string
   /**
    * Per-tool-result fidelity. Null on every row that is not a tool result,
@@ -95,6 +100,7 @@ export interface NativeSessionEvent {
   subagentSessionId?: string
   agentId?: string
   requestId?: string
+  /** Why the turn ended, as the harness reported it. */
   stopReason?: string
   agentVersion?: string
   isSidechain?: boolean

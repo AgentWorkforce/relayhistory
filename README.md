@@ -54,6 +54,14 @@ ai-hist stats                                        # how much history is index
 
 `ai-hist resume` prints a native resume command for Claude Code, Codex, Cursor, and Grok sessions. OpenCode and Agent Relay sessions are searchable and packable, but have no native resume command to print, so use `ai-hist pack` to carry that context forward instead.
 
+OpenCode is read from whichever of its two stores the machine has: the SQLite
+`opencode.db` that current releases write (`OPENCODE_DB`), or the older JSON
+tree under `storage/` (`OPENCODE_STORAGE_DIR`). Either way you get the full
+turn — text, tool calls and their results, file edits, per-message token
+counts, the provider-qualified model, why the turn stopped, compaction
+boundaries, and the link from a subagent session to the session that spawned
+it.
+
 ## MCP
 
 ```sh

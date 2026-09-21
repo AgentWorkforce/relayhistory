@@ -21,7 +21,7 @@ use std::collections::BTreeSet;
 
 /// Bump whenever the request row / summary shapes, ordering, or cursor
 /// semantics require an SDK change.
-pub const SESSION_USAGE_CONTRACT_VERSION: u32 = 2;
+pub const SESSION_USAGE_CONTRACT_VERSION: u32 = 3;
 
 /// The `session_requests` view: one row per model request.
 ///
@@ -82,7 +82,8 @@ SELECT
         ELSE 'record-id'
     END AS request_key_source,
     json_group_array(DISTINCT e.message_id) AS message_ids,
-    NULL AS provider,
+    MIN(e.provider) AS provider,
+    COUNT(DISTINCT e.provider) AS provider_variants,
     MIN(e.id) AS id,
     MIN(e.ts_ms) AS first_ts_ms,
     MAX(e.ts_ms) AS last_ts_ms,
@@ -208,6 +209,8 @@ pub enum UsageDiagnostic {
     UnnormalizableUsage,
     /// The rows of one request name more than one model.
     AmbiguousModel,
+    /// The rows of one request name more than one provider.
+    AmbiguousProvider,
     /// The provider recorded no request identity for a source that writes one
     /// request as several records, so these rows may be per record rather
     /// than per request. A session carrying this does not get summed totals.
@@ -230,6 +233,7 @@ impl UsageDiagnostic {
             Self::AmbiguousUsageCopies => "ambiguous-usage-copies",
             Self::UnnormalizableUsage => "unnormalizable-usage",
             Self::AmbiguousModel => "ambiguous-model",
+            Self::AmbiguousProvider => "ambiguous-provider",
             Self::UnresolvedRequestIdentity => "unresolved-request-identity",
             Self::PartialCacheWriteSplit => "partial-cache-write-split",
             Self::PartialReportedCost => "partial-reported-cost",
@@ -252,9 +256,9 @@ pub struct SessionRequest {
     /// per-content-block layout.
     pub message_ids: Vec<String>,
     pub model: Option<String>,
-    /// The provider behind the model, when the source records one. No local
-    /// source does today, so this is always `None`; it is never inferred from
-    /// a model string (burn owns that inference).
+    /// The provider behind the model, when the source records one. OpenCode
+    /// supplies this directly; it is never inferred from a model string (burn
+    /// owns that inference).
     pub provider: Option<String>,
     pub first_ts_ms: i64,
     pub last_ts_ms: i64,
@@ -328,7 +332,7 @@ pub struct SessionUsageSummary {
 }
 
 const REQUEST_COLUMNS: &str = "id, source, session_id, request_key, request_key_source, \
-     message_ids, provider, model, model_variants, first_ts_ms, last_ts_ms, \
+     message_ids, provider, provider_variants, model, model_variants, first_ts_ms, last_ts_ms, \
      token_json, usage_variants, has_thinking, event_count";
 
 /// A request row as the view returns it, before normalization.
@@ -340,6 +344,7 @@ struct RawRequest {
     request_key_source: String,
     message_ids: Vec<String>,
     provider: Option<String>,
+    provider_variants: i64,
     model: Option<String>,
     model_variants: i64,
     first_ts_ms: i64,
@@ -379,14 +384,15 @@ fn row_to_raw_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRequest> {
         // turned `part,1` into two ids that match nothing.
         message_ids: decode_message_ids(row.get::<_, Option<String>>(5)?.as_deref())?,
         provider: row.get(6)?,
-        model: row.get(7)?,
-        model_variants: row.get(8)?,
-        first_ts_ms: row.get(9)?,
-        last_ts_ms: row.get(10)?,
-        token_json: row.get(11)?,
-        usage_variants: row.get(12)?,
-        has_thinking: row.get::<_, Option<i64>>(13)?.unwrap_or(0) != 0,
-        event_count: row.get(14)?,
+        provider_variants: row.get(7)?,
+        model: row.get(8)?,
+        model_variants: row.get(9)?,
+        first_ts_ms: row.get(10)?,
+        last_ts_ms: row.get(11)?,
+        token_json: row.get(12)?,
+        usage_variants: row.get(13)?,
+        has_thinking: row.get::<_, Option<i64>>(14)?.unwrap_or(0) != 0,
+        event_count: row.get(15)?,
     })
 }
 
@@ -410,6 +416,9 @@ fn resolve_usage(raw: &RawRequest) -> ResolvedUsage {
     }
     if raw.model_variants > 1 {
         diagnostics.push(UsageDiagnostic::AmbiguousModel);
+    }
+    if raw.provider_variants > 1 {
+        diagnostics.push(UsageDiagnostic::AmbiguousProvider);
     }
     // Disagreeing copies of one message's usage cannot establish what the
     // request cost. Picking one would be a guess presented as a fact.
@@ -789,6 +798,62 @@ mod tests {
         assert_eq!(usage.input_tokens, 3);
         assert_eq!(usage.output_tokens, 43);
         assert_eq!(usage.cache_write_1h_tokens, Some(4773));
+    }
+
+    #[test]
+    fn a_recorded_request_provider_is_preserved_and_conflicts_are_diagnosed() {
+        let conn = db();
+        for (uid, kind) in [("request:0", "thinking"), ("request:1", "text")] {
+            conn.execute(
+                "INSERT INTO session_events \
+                 (source, session_id, message_id, provider_message_id, ts_ms, role, kind, \
+                  text, model, provider, event_uid) \
+                 VALUES ('opencode', 's1', ?1, 'provider-message-1', 1000, 'assistant', \
+                         ?2, 'x', 'anthropic/claude-sonnet', 'anthropic', ?3)",
+                rusqlite::params![uid, kind, uid],
+            )
+            .unwrap();
+        }
+
+        let page = session_requests_page(&conn, "opencode", "s1", 50, None).unwrap();
+        assert_eq!(page.requests.len(), 1);
+        assert_eq!(page.requests[0].provider.as_deref(), Some("anthropic"));
+        assert!(page.requests[0].diagnostics.is_empty());
+
+        conn.execute(
+            "UPDATE session_events SET provider = 'openai' WHERE event_uid = 'request:1'",
+            [],
+        )
+        .unwrap();
+        let page = session_requests_page(&conn, "opencode", "s1", 50, None).unwrap();
+        assert_eq!(page.requests[0].provider.as_deref(), Some("anthropic"));
+        assert_eq!(
+            page.requests[0].diagnostics,
+            vec![UsageDiagnostic::AmbiguousProvider]
+        );
+    }
+
+    #[test]
+    fn opening_a_database_rebuilds_a_request_view_that_drops_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale-request-view.db");
+        {
+            let conn = open_db(&path).unwrap();
+            let stale = SESSION_REQUESTS_VIEW_DDL.replace(
+                "    MIN(e.provider) AS provider,\n    COUNT(DISTINCT e.provider) AS provider_variants,",
+                "    NULL AS provider,\n    0 AS provider_variants,",
+            );
+            assert_ne!(stale, SESSION_REQUESTS_VIEW_DDL);
+            conn.execute_batch("DROP VIEW session_requests").unwrap();
+            conn.execute_batch(&stale).unwrap();
+            assert!(!session_requests_view_is_current(&conn).unwrap());
+        }
+
+        let conn = open_db(&path).unwrap();
+        assert!(
+            session_requests_view_is_current(&conn).unwrap(),
+            "writable open must rebuild the derived view for upgraded databases"
+        );
     }
 
     /// The failure this whole grouping exists to prevent: summing the stored

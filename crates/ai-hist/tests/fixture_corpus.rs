@@ -50,8 +50,7 @@ enum Layout {
     /// A `.sql` file executed into `~/.local/share/opencode/opencode.db`.
     OpencodeSqlite,
     /// burn's older OpenCode JSON layout, copied under
-    /// `~/.local/share/opencode/`. relayhistory reads the SQLite store only,
-    /// so these snapshot as empty until #168.
+    /// `~/.local/share/opencode/`.
     OpencodeLegacyJson,
     /// Kept for provenance, never staged and never snapshotted.
     Reference,
@@ -1937,10 +1936,8 @@ fn codex_cumulative_token_counters_are_recorded_per_turn() {
     assert_eq!(usages, 2, "one usage payload per turn: {events:?}");
 }
 
-/// burn: `opencode` legacy `storage/` JSON layout. relayhistory reads the
-/// SQLite store only, so the whole legacy corpus snapshots as empty.
+/// burn: `opencode` legacy `storage/` JSON layout.
 #[test]
-#[ignore = "closed by #168"]
 fn opencode_legacy_json_layout_is_read() {
     let sessions = rows("opencode/legacy-json-multi-turn", "sessions")
         .iter()
@@ -1953,7 +1950,6 @@ fn opencode_legacy_json_layout_is_read() {
 /// burn: OpenCode `multi-turn`'s `ses_child` states its parent through
 /// `parentID`; the SQLite store says the same thing in `session.parent_id`.
 #[test]
-#[ignore = "closed by #168"]
 fn opencode_child_session_parent_link_is_recorded() {
     let relationships = rows("opencode/sqlite-store", "session_relationships");
     assert_eq!(relationships.len(), 1, "{relationships:?}");
@@ -1968,17 +1964,16 @@ fn opencode_child_session_parent_link_is_recorded() {
 }
 
 /// OpenCode records provider, model and a full token payload per assistant
-/// message. relayhistory captures prompts only.
+/// message.
 #[test]
-#[ignore = "closed by #168"]
 fn opencode_assistant_messages_carry_model_and_tokens() {
     let events = rows("opencode/sqlite-store", "session_events");
     let models = events
         .iter()
         .filter_map(|event| field(event, "model").as_str())
         .collect::<BTreeSet<_>>();
-    assert!(models.contains("claude-sonnet-4-5"), "{models:?}");
-    assert!(models.contains("claude-opus-4-5"), "{models:?}");
+    assert!(models.contains("anthropic/claude-sonnet-4-5"), "{models:?}");
+    assert!(models.contains("anthropic/claude-opus-4-5"), "{models:?}");
 }
 
 /// Cursor records assistant text, tool uses and tool results, and all three

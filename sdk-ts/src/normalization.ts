@@ -225,6 +225,7 @@ export function sessionEvent(value: UnknownRecord): SessionEvent {
     text: nullableString(value.text),
     model: nullableString(value.model),
     tokenUsage: tokenUsage(value.tokenJson),
+    provider: nullableString(value.provider),
     eventUid: String(value.eventUid),
     toolUseId: nullableString(value.toolUseId),
     payloadBytes: nullableNumber(value.payloadBytes),
@@ -358,6 +359,7 @@ const USAGE_ACCOUNTING: readonly string[] = [
 ];
 const USAGE_DIAGNOSTICS: readonly string[] = [
   'ambiguous-usage-copies', 'unnormalizable-usage', 'ambiguous-model',
+  'ambiguous-provider',
   'unresolved-request-identity', 'partial-cache-write-split',
   'partial-reported-cost', 'count-not-representable',
 ];
