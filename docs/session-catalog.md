@@ -1492,12 +1492,11 @@ copy. In the benchmark below, a rescan of 450 unchanged sessions performs
 The `v{N}` prefix is the *scanner* version (`SHALLOW_SCANNER_VERSION`), separate
 from `parser_version` (the full-ingest parser generation). Bumping it
 invalidates every stored stamp, so a scanner taught to extract a new field
-re-reads sources whose bytes never changed. It is at **4**: version 3 shipped
-the prompt-only Cursor reader, and 4 adds that provider's injected turn times,
-models and last assistant reply. Without the bump those rows would be served
-from cache with the new fields null forever, because a Cursor transcript'''s
-bytes do not change when the release does. The cost is one re-read per source,
-once.
+re-reads sources whose bytes never changed. It is at **5**: version 3 shipped
+the prompt-only Cursor reader, 4 added that provider's injected turn times,
+models and last assistant reply, and 5 qualifies OpenCode model IDs with their
+provider. Without these bumps, unchanged sources would keep serving the older
+cached shape forever. The cost is one re-read per source, once.
 
 ---
 

@@ -1561,6 +1561,74 @@ fn opencode_sessions_come_from_the_session_table_with_a_first_prompt() {
     assert_eq!(second.summary.counters.shallow_reads, 0);
 }
 
+/// Version 4 learned the provider from OpenCode messages but stored only the
+/// bare model ID. Since the provider database can remain byte-for-byte
+/// unchanged across an ai-hist upgrade, the scanner version is the only cache
+/// key that can make the corrected reader qualify an existing catalog row.
+#[test]
+fn an_opencode_row_from_scanner_v4_is_read_again_to_qualify_its_model() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    opencode_db(
+        home.path(),
+        r#"INSERT INTO session VALUES ('oc-v4', '/work/oc', 1750000600000, 1750000700000);
+           INSERT INTO message VALUES ('m1', 'oc-v4', 1750000600000, '{"role":"user"}');
+           INSERT INTO message VALUES ('m2', 'oc-v4', 1750000700000, '{"role":"assistant","providerID":"anthropic","modelID":"claude-sonnet"}');
+           INSERT INTO part VALUES ('p1', 'm1', 'oc-v4', 1750000600000, '{"type":"text","text":"qualify the cached model"}');"#,
+    );
+
+    let initial = discover(&conn, home.path(), &only(&["opencode"]));
+    assert_eq!(
+        initial.row("oc-v4").models,
+        vec!["anthropic/claude-sonnet"]
+    );
+
+    let stored: String = conn
+        .query_row(
+            "SELECT source_stamp FROM sessions WHERE source = 'opencode' \
+             AND session_id = 'oc-v4'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let raw = stored
+        .split_once(':')
+        .expect("stored stamps carry a version prefix")
+        .1;
+    let previous = format!("v4:{raw}");
+    conn.execute(
+        "UPDATE sessions SET source_stamp = ?, models_json = '[\"claude-sonnet\"]' \
+         WHERE source = 'opencode' AND session_id = 'oc-v4'",
+        params![previous],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE session_presences SET source_stamp = ? WHERE source = 'opencode' \
+         AND session_id = 'oc-v4'",
+        params![previous],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE session_observations SET source_stamp = ? WHERE source = 'opencode' \
+         AND session_id = 'oc-v4'",
+        params![previous],
+    )
+    .unwrap();
+
+    let upgraded = discover(&conn, home.path(), &only(&["opencode"]));
+    assert_eq!(upgraded.summary.counters.shallow_reads, 1);
+    assert_eq!(upgraded.summary.skipped_unchanged, 0);
+    assert_eq!(
+        upgraded.row("oc-v4").models,
+        vec!["anthropic/claude-sonnet"],
+        "the v4 cached model must be replaced with the provider-qualified ID"
+    );
+
+    let settled = discover(&conn, home.path(), &only(&["opencode"]));
+    assert_eq!(settled.summary.counters.shallow_reads, 0);
+    assert_eq!(settled.summary.skipped_unchanged, 1);
+}
+
 #[test]
 fn opencode_model_order_rejects_payload_times_outside_i64() {
     let conn = catalog();

@@ -1284,12 +1284,14 @@ fn normalize_session(
         .find_map(|message| message.path_cwd.clone())
         .or_else(|| loaded.session.directory.clone());
 
-    let first_ts = loaded
-        .messages
-        .first()
-        .map(|message| message.time_created)
-        .or(loaded.session.created_ms)
-        .unwrap_or(0);
+    let first_ts = [
+        loaded.session.created_ms,
+        loaded.messages.first().map(|message| message.time_created),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+    .unwrap_or(0);
     // The later of the two, which is what discovery's shallow read already
     // computes for the same session. Taking the newest message whenever one
     // exists is right for the usual case -- OpenCode appends a turn without

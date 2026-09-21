@@ -278,6 +278,7 @@ fn use_layout(home: &Path, db: Option<&Path>, storage: Option<&Path>) {
 fn opencode_reaches_event_level_parity_across_both_storage_layouts() {
     targeted_sync_honors_the_configured_legacy_storage_root();
     shallow_discovery_qualifies_models_identically_across_layouts();
+    full_ingest_preserves_the_earlier_session_creation_time();
     the_two_layouts_normalize_to_identical_evidence();
     every_session_in_the_corpus_is_parsed();
     a_parent_id_links_a_child_session_and_the_tree_returns_it();
@@ -383,6 +384,43 @@ fn targeted_sync_honors_the_configured_legacy_storage_root() {
         "targeted sync must discover the independently configured legacy tree"
     );
 
+    fs::remove_dir_all(&root).ok();
+}
+
+fn full_ingest_preserves_the_earlier_session_creation_time() {
+    let root = temp_root("first-activity");
+    let provider_db = root.join("provider/opencode.db");
+    build_sqlite_store(&provider_db);
+    Connection::open(&provider_db)
+        .unwrap()
+        .execute(
+            "UPDATE session SET time_created = 1776643199000 \
+             WHERE id = 'ses_sqlite_root'",
+            [],
+        )
+        .unwrap();
+
+    // Sync directly into an empty catalog. Going through discovery first would
+    // mask a normalizer regression because the session upsert widens an
+    // existing activity window with MIN(existing, incoming).
+    let db_path = root.join("history.db");
+    let conn = open_db(&db_path).unwrap();
+    sync_opencode_db(&conn, &provider_db).unwrap();
+    let first_activity: Option<i64> = conn
+        .query_row(
+            "SELECT first_activity_ms FROM sessions \
+             WHERE source='opencode' AND session_id='ses_sqlite_root'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        first_activity,
+        Some(1_776_643_199_000),
+        "the session was created before its first message and that earlier timestamp must win"
+    );
+
+    drop(conn);
     fs::remove_dir_all(&root).ok();
 }
 

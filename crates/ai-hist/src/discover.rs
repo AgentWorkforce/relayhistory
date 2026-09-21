@@ -84,7 +84,7 @@ pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 4;
 /// invalidates every stored stamp, so a scanner that learns to extract a new
 /// field re-reads sources whose bytes never changed. `parser_version` keeps its
 /// existing meaning (full-ingest parser generation) and is untouched.
-pub const SHALLOW_SCANNER_VERSION: u32 = 4;
+pub const SHALLOW_SCANNER_VERSION: u32 = 5;
 
 /// Version 2 shipped the classification that hid standalone guardians (see
 /// [`crate::codex_is_subagent`]). Their rollouts never change on disk, so the
@@ -101,6 +101,13 @@ const _: () = assert!(SHALLOW_SCANNER_VERSION > 2);
 /// forever. Kept as a compile-time guard for the same reason as the pair
 /// above.
 const _: () = assert!(SHALLOW_SCANNER_VERSION > 3);
+
+/// Version 4 stored OpenCode model IDs without their provider prefix. Version
+/// 5 qualifies them consistently with full ingestion (for example,
+/// `anthropic/claude-sonnet`). An unchanged provider database keeps the same
+/// change marker, so only the scanner-version prefix can force those cached
+/// rows through the corrected reader once.
+const _: () = assert!(SHALLOW_SCANNER_VERSION > 4);
 
 /// Most bytes a shallow head read may consume from one transcript.
 pub const HEAD_SCAN_MAX_BYTES: u64 = 256 * 1024;
