@@ -50,8 +50,7 @@ enum Layout {
     /// A `.sql` file executed into `~/.local/share/opencode/opencode.db`.
     OpencodeSqlite,
     /// burn's older OpenCode JSON layout, copied under
-    /// `~/.local/share/opencode/`. relayhistory reads the SQLite store only,
-    /// so these snapshot as empty until #168.
+    /// `~/.local/share/opencode/`.
     OpencodeLegacyJson,
     /// Kept for provenance, never staged and never snapshotted.
     Reference,
@@ -102,6 +101,46 @@ const CORPUS: &[Fixture] = &[
         origin: Origin::Burn,
         files: &["claude/multi-block-turn.jsonl"],
         quirk: "four assistant records share one `message.id` and one `requestId`; only the first carries the usage payload",
+    },
+    Fixture {
+        source: "claude",
+        name: "multi-block-turn-no-request-id",
+        layout: Layout::ClaudeTranscript,
+        origin: Origin::RelayHistory,
+        files: &["claude/multi-block-turn-no-request-id.jsonl"],
+        quirk: "assistant records omit `requestId` but share one `message.id`, which is the fallback request identity",
+    },
+    Fixture {
+        source: "claude",
+        name: "padded-request-id",
+        layout: Layout::ClaudeTranscript,
+        origin: Origin::RelayHistory,
+        files: &["claude/padded-request-id.jsonl"],
+        quirk: "two request ids differ only by surrounding whitespace and must remain distinct grouping keys",
+    },
+    Fixture {
+        source: "claude",
+        name: "multi-record-request",
+        layout: Layout::ClaudeTranscript,
+        origin: Origin::RelayHistory,
+        files: &["claude/multi-record-request.jsonl"],
+        quirk: "two assistant records copy one request's usage, which prompt attribution must charge exactly once",
+    },
+    Fixture {
+        source: "claude",
+        name: "multi-record-bad-copy",
+        layout: Layout::ClaudeTranscript,
+        origin: Origin::RelayHistory,
+        files: &["claude/multi-record-bad-copy.jsonl"],
+        quirk: "one request has a readable usage copy and an unreadable sibling, so its measurement is disputed",
+    },
+    Fixture {
+        source: "claude",
+        name: "multi-record-broken-sibling",
+        layout: Layout::ClaudeTranscript,
+        origin: Origin::RelayHistory,
+        files: &["claude/multi-record-broken-sibling.jsonl"],
+        quirk: "one request record has broken ancestry while a sibling establishes both ownership and usage",
     },
     Fixture {
         source: "claude",
@@ -412,6 +451,118 @@ const CORPUS: &[Fixture] = &[
         files: &["codex/archived-session"],
         quirk: "a rollout under `~/.codex/archived_sessions/`, the second codex discovery root",
     },
+    Fixture {
+        source: "codex",
+        name: "counter-regressed",
+        layout: Layout::CodexRollout,
+        origin: Origin::RelayHistory,
+        files: &["codex/counter-regressed.jsonl"],
+        quirk: "a cached-input counter grows faster than total input, making the cumulative delta unnormalizable",
+    },
+    Fixture {
+        source: "codex",
+        name: "counter-negative",
+        layout: Layout::CodexRollout,
+        origin: Origin::RelayHistory,
+        files: &["codex/counter-negative.jsonl"],
+        quirk: "a cumulative snapshot contains a negative input counter that must be preserved and refused",
+    },
+    Fixture {
+        source: "codex",
+        name: "counter-fractional",
+        layout: Layout::CodexRollout,
+        origin: Origin::RelayHistory,
+        files: &["codex/counter-fractional.jsonl"],
+        quirk: "a cumulative snapshot contains a fractional output counter that must be preserved and refused",
+    },
+    Fixture {
+        source: "codex",
+        name: "counter-above-i64",
+        layout: Layout::CodexRollout,
+        origin: Origin::RelayHistory,
+        files: &["codex/counter-above-i64.jsonl"],
+        quirk: "a valid cumulative counter exceeds `i64::MAX` and must survive parsing as a `u64`",
+    },
+    Fixture {
+        source: "codex",
+        name: "counter-recovers",
+        layout: Layout::CodexRollout,
+        origin: Origin::RelayHistory,
+        files: &["codex/counter-recovers.jsonl"],
+        quirk: "an unreadable cumulative snapshot is superseded by a later valid snapshot for the same waiting turn",
+    },
+    Fixture {
+        source: "codex",
+        name: "counter-unusable-then-new-turn",
+        layout: Layout::CodexRollout,
+        origin: Origin::RelayHistory,
+        files: &["codex/counter-unusable-then-new-turn.jsonl"],
+        quirk: "a later advancing delta covers an earlier unreadable snapshot and clears only refusals in that span",
+    },
+    Fixture {
+        source: "codex",
+        name: "reasoning-then-unreadable",
+        layout: Layout::CodexRollout,
+        origin: Origin::RelayHistory,
+        files: &["codex/reasoning-then-unreadable.jsonl"],
+        quirk: "a reasoning row waits through an unreadable snapshot before a valid delta measures the turn",
+    },
+    Fixture {
+        source: "codex",
+        name: "refusal-across-baseline-reinstall",
+        layout: Layout::CodexRollout,
+        origin: Origin::RelayHistory,
+        files: &["codex/refusal-across-baseline-reinstall.jsonl"],
+        quirk: "a refusal predating a cumulative-baseline reinstall must not be cleared by a later delta",
+    },
+    Fixture {
+        source: "codex",
+        name: "refusal-overwritten-after-reinstall",
+        layout: Layout::CodexRollout,
+        origin: Origin::RelayHistory,
+        files: &["codex/refusal-overwritten-after-reinstall.jsonl"],
+        quirk: "two refusals for one turn straddle a baseline reinstall and remain tied to their own generations",
+    },
+    Fixture {
+        source: "codex",
+        name: "resume-baseline-corrupt",
+        layout: Layout::CodexRollout,
+        origin: Origin::RelayHistory,
+        files: &["codex/resume-baseline-corrupt.jsonl"],
+        quirk: "a resumed rollout starts with an unreadable baseline, so carried-over totals cannot become one request's delta",
+    },
+    Fixture {
+        source: "codex",
+        name: "two-unreadable-turns",
+        layout: Layout::CodexRollout,
+        origin: Origin::RelayHistory,
+        files: &["codex/two-unreadable-turns.jsonl"],
+        quirk: "two unrecovered turns each retain their own unreadable usage refusal",
+    },
+    Fixture {
+        source: "codex",
+        name: "one-request-three-rows",
+        layout: Layout::CodexRollout,
+        origin: Origin::RelayHistory,
+        files: &["codex/one-request-three-rows.jsonl"],
+        quirk: "one API call written as reasoning, a tool call and a message is one request, not three",
+    },
+    Fixture {
+        source: "codex",
+        name: "recovered-span-covers-two-turns",
+        layout: Layout::CodexRollout,
+        origin: Origin::RelayHistory,
+        files: &["codex/recovered-span-covers-two-turns.jsonl"],
+        quirk: "a readable snapshot recovers a span an unreadable one left open, so its delta measures both turns as one request",
+    },
+    Fixture {
+        source: "codex",
+        name: "two-requests-one-turn",
+        layout: Layout::CodexRollout,
+        origin: Origin::RelayHistory,
+        files: &["codex/two-requests-one-turn.jsonl"],
+        quirk: "a tool loop makes two API calls inside one turn_id, so the turn is not the request",
+    },
     // -- cursor, authored here ---------------------------------------------
     Fixture {
         source: "cursor",
@@ -420,6 +571,30 @@ const CORPUS: &[Fixture] = &[
         origin: Origin::RelayHistory,
         files: &["cursor/prompt-transcript"],
         quirk: "`agent-transcripts/<id>/<id>.jsonl` with string, block-array and `<user_query>`-wrapped prompts, assistant text, a tool_use and a tool_result; the provider records no timestamps",
+    },
+    Fixture {
+        source: "cursor",
+        name: "observed-3-13-25",
+        layout: Layout::Reference,
+        origin: Origin::RelayHistory,
+        files: &["cursor/observed-3.13.25.jsonl"],
+        quirk: "the reported Cursor IDE 3.13.25 record shape: id-less `tool_use`, a `turn_ended` marker and `<timestamp>`/`<user_query>` framing; staged by the ai-hist cursor parser tests rather than by this harness",
+    },
+    Fixture {
+        source: "cursor",
+        name: "legacy-string-content",
+        layout: Layout::Reference,
+        origin: Origin::RelayHistory,
+        files: &["cursor/legacy-string-content.jsonl"],
+        quirk: "the older row shape, `message.content` as a bare string with no framing; staged by the ai-hist cursor parser tests rather than by this harness",
+    },
+    Fixture {
+        source: "cursor",
+        name: "extended-unverified",
+        layout: Layout::Reference,
+        origin: Origin::RelayHistory,
+        files: &["cursor/extended-unverified.jsonl"],
+        quirk: "an **unverified** build that also writes `message.model`, `message.usage`, `thinking` blocks, `tool_use` ids and `tool_result` blocks; it proves the parser records them when present, not that Cursor writes them",
     },
     // -- grok, authored here -----------------------------------------------
     Fixture {
@@ -1455,10 +1630,17 @@ fn codex_parent_thread_id_becomes_a_delegation_edge() {
     assert_eq!(catalog, vec!["sess_parent_thread_root".to_string()]);
 }
 
-/// Cursor records no timestamps at all, so every prompt in one transcript is
-/// stamped from the file's mtime. The prompts themselves are the raw fact:
-/// string content, block-array content and a `<user_query>` wrapper all
+/// This transcript carries no `<timestamp>` tag on any turn, so every prompt
+/// in it is stamped from the file's mtime. The prompts themselves are the raw
+/// fact: string content, block-array content and a `<user_query>` wrapper all
 /// unwrap, assistant and tool records do not.
+///
+/// A user turn is one prompt carrying every text block the record held. The
+/// prompt-only parser this replaced stopped at the first block, so a second
+/// one ("ignored second block" here) was dropped on the floor; emitting a row
+/// per block instead would collide on `history`'s
+/// `(source, timestamp_ms, prompt)` identity whenever a turn repeated itself.
+/// Joining the blocks loses neither. `session_events` still keeps them apart.
 #[test]
 fn cursor_transcript_yields_only_unwrapped_user_prompts() {
     let prompts = rows("cursor/prompt-transcript", "history")
@@ -1469,7 +1651,7 @@ fn cursor_transcript_yields_only_unwrapped_user_prompts() {
         prompts,
         vec![
             "add a retry to the client".to_string(),
-            "now write the test".to_string(),
+            "now write the test\n\nignored second block".to_string(),
             "wrapped query".to_string(),
         ],
         "assistant text, tool uses, tool results and blank prompts are not prompts"
@@ -1754,10 +1936,8 @@ fn codex_cumulative_token_counters_are_recorded_per_turn() {
     assert_eq!(usages, 2, "one usage payload per turn: {events:?}");
 }
 
-/// burn: `opencode` legacy `storage/` JSON layout. relayhistory reads the
-/// SQLite store only, so the whole legacy corpus snapshots as empty.
+/// burn: `opencode` legacy `storage/` JSON layout.
 #[test]
-#[ignore = "closed by #168"]
 fn opencode_legacy_json_layout_is_read() {
     let sessions = rows("opencode/legacy-json-multi-turn", "sessions")
         .iter()
@@ -1770,7 +1950,6 @@ fn opencode_legacy_json_layout_is_read() {
 /// burn: OpenCode `multi-turn`'s `ses_child` states its parent through
 /// `parentID`; the SQLite store says the same thing in `session.parent_id`.
 #[test]
-#[ignore = "closed by #168"]
 fn opencode_child_session_parent_link_is_recorded() {
     let relationships = rows("opencode/sqlite-store", "session_relationships");
     assert_eq!(relationships.len(), 1, "{relationships:?}");
@@ -1785,23 +1964,21 @@ fn opencode_child_session_parent_link_is_recorded() {
 }
 
 /// OpenCode records provider, model and a full token payload per assistant
-/// message. relayhistory captures prompts only.
+/// message.
 #[test]
-#[ignore = "closed by #168"]
 fn opencode_assistant_messages_carry_model_and_tokens() {
     let events = rows("opencode/sqlite-store", "session_events");
     let models = events
         .iter()
         .filter_map(|event| field(event, "model").as_str())
         .collect::<BTreeSet<_>>();
-    assert!(models.contains("claude-sonnet-4-5"), "{models:?}");
-    assert!(models.contains("claude-opus-4-5"), "{models:?}");
+    assert!(models.contains("anthropic/claude-sonnet-4-5"), "{models:?}");
+    assert!(models.contains("anthropic/claude-opus-4-5"), "{models:?}");
 }
 
-/// Cursor records assistant text, tool uses and tool results that never reach
-/// `session_events` today.
+/// Cursor records assistant text, tool uses and tool results, and all three
+/// reach `session_events` now that the transcript parser is event-level.
 #[test]
-#[ignore = "closed by #166"]
 fn cursor_assistant_and_tool_records_reach_session_events() {
     let events = rows("cursor/prompt-transcript", "session_events");
     assert!(

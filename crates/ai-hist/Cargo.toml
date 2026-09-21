@@ -1,6 +1,6 @@
 [package]
 name = "ai-hist"
-version = "0.20.0"
+version = "0.22.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -90,6 +90,10 @@ name = "hydration_preflight"
 required-features = ["unstable-internal"]
 
 [[test]]
+name = "opencode_parity"
+required-features = ["delivery", "unstable-internal"]
+
+[[test]]
 name = "session_continuity"
 required-features = ["unstable-internal"]
 
@@ -99,6 +103,10 @@ required-features = ["unstable-internal"]
 
 [[test]]
 name = "session_relationships"
+required-features = ["unstable-internal"]
+
+[[test]]
+name = "session_usage_plan"
 required-features = ["unstable-internal"]
 
 [[test]]

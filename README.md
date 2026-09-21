@@ -54,6 +54,14 @@ ai-hist stats                                        # how much history is index
 
 `ai-hist resume` prints a native resume command for Claude Code, Codex, Cursor, and Grok sessions. OpenCode and Agent Relay sessions are searchable and packable, but have no native resume command to print, so use `ai-hist pack` to carry that context forward instead.
 
+OpenCode is read from whichever of its two stores the machine has: the SQLite
+`opencode.db` that current releases write (`OPENCODE_DB`), or the older JSON
+tree under `storage/` (`OPENCODE_STORAGE_DIR`). Either way you get the full
+turn — text, tool calls and their results, file edits, per-message token
+counts, the provider-qualified model, why the turn stopped, compaction
+boundaries, and the link from a subagent session to the session that spawned
+it.
+
 ## MCP
 
 ```sh
@@ -111,7 +119,7 @@ for authentication, durable delivery, readback, and the legacy sharing API.
 ## Why `ai-hist`
 
 - **Every harness, one search.** Claude Code, Codex, Cursor, Grok, OpenCode, Agent Relay — indexed side-by-side. No per-harness silo.
-- **Provider-aware evidence.** Prompts, tool calls, and edits are preserved as raw evidence, not summarized away — as much of it as each harness actually exposes. Hydration reports `full`, `partial`, or `shallow_only` per session, so you can tell thin coverage from a thing that never happened. Where a harness records less than the others, the gap is named: Grok, for instance, logs no per-turn billing tokens at all, so its only token fact is a context-window proxy, and its hydration says so every time.
+- **Provider-aware evidence.** Prompts, tool calls, and edits are preserved as raw evidence, not summarized away — as much of it as each harness actually exposes. Hydration reports `full`, `partial`, or `shallow_only` per session, so you can tell thin coverage from a thing that never happened. Where a harness records less than the others, the gap is named. Cursor transcripts carry the assistant's prose and every tool call, but no tool output, model id, token usage or timestamp field — those are reported as unavailable, and a turn whose injected `<timestamp>` tag cannot be read is stamped from the file mtime with `CURSOR_TIMESTAMP_FROM_MTIME`. Grok logs no per-turn billing tokens, so its only token fact is a context-window proxy, and its hydration says so every time. The per-field detail is in [the session catalog](docs/session-catalog.md).
 - **Local by default.** SQLite on your machine. Export and delivery require an explicit selection; remote acquisition requires an installed source plugin.
 - **Handoff-native.** `pack` and `resume` are first-class commands, not afterthoughts.
 - **MCP-native.** Your agent queries its own memory the same way you do.

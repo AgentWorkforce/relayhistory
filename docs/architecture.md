@@ -21,9 +21,10 @@ Rust owns provider discovery/parsing, schema creation and migration, direct
 SQLite connections, catalog queries, history/event queries, search,
 statistics, and sync. Blocking filesystem and SQLite work is dispatched away
 from Node's event loop. TypeScript validates inputs, validates native contract
-version 17, catalog contract version 4, hydration contract version 3,
+version 19, catalog contract version 4, hydration contract version 3,
 session-relationship contract version 2, and session evidence contract version
-2, normalizes nullable fields, maps native errors, and supplies pagination
+2 and session usage contract version 3, normalizes nullable fields, maps native
+errors, and supplies pagination
 helpers.
 
 The CLI and MCP server import only the SDK's public functions. They do not
@@ -158,6 +159,7 @@ archive relocation.
 | `getSessionTree` | none | indexed relationship reads, one child query per emitted node | root-only tree |
 | `getSessionChildrenPage` | none | bounded keyset page | empty page |
 | `getSessionToolCallsPage`, `getSessionFileEditsPage` | none | bounded keyset page over one source's session | empty page |
+| `session_markers_page`, `SessionStore::session_markers_page` (no SDK/MCP surface yet) | none | bounded keyset page over one source's session | empty page; a read-only store over a database older than the marker page index is refused, naming the remedy |
 | `sync` (`local`, default) | full explicit scan | migrations + ingestion | creates DB |
 | `sync` (`remote`) | explicitly selected source plugins (error when none) | observations, normalized evidence, checkpoints | creates DB |
 | `sync` (`all`) | full local scan + explicitly selected source plugins | migrations + ingestion | creates DB |
@@ -347,7 +349,7 @@ payload persistence, the eligibility recheck before transport, acknowledgment
 checking and failure classification - runs once, in the Rust core worker, for
 both foreground and background delivery. The SDK host is a thin adapter: it
 registers explicitly selected destination modules, describes them to the worker,
-and answers the worker's prepare/send calls. Native contract 15 includes a
+and answers the worker's prepare/send calls. Native contract 16 includes a
 typed serialized delivery/export bridge to the existing addon. No TypeScript or
 plugin code queries SQLite. [Delivery documentation](history-delivery.md) describes
 selection, failure states, background operation, and the independent NDJSON path.

@@ -66,6 +66,9 @@ import type {
   EvidencePageOptions,
   SessionToolCallsPage,
   SessionFileEditsPage,
+  SessionRequest,
+  RequestCursor,
+  RequestPageOptions,
   UserTurnsPageOptions,
   SessionUserTurn,
   Stats,
@@ -115,6 +118,7 @@ import {
   getSessionEventsPage,
   getSessionToolCallsPage,
   getSessionFileEditsPage,
+  getSessionRequestsPage,
   getSessionUserTurnsPage,
   getSessionChildrenPage,
 } from './operations.js';
@@ -184,6 +188,33 @@ export async function getSessionToolCalls(
   const calls: SessionToolCall[] = [];
   for await (const call of sessionToolCalls(source, sessionId, options)) calls.push(call);
   return calls;
+}
+
+/**
+ * Lazily walks a session's model requests, oldest first, one bounded page at
+ * a time.
+ */
+export async function* sessionRequests(
+  source: Source,
+  sessionId: string,
+  options: Omit<RequestPageOptions, 'after'> = {},
+): AsyncGenerator<SessionRequest> {
+  let after: RequestCursor | undefined;
+  do {
+    const page = await getSessionRequestsPage(source, sessionId, { ...options, after });
+    for (const request of page.requests) yield request;
+    after = page.nextCursor ?? undefined;
+  } while (after);
+}
+
+export async function getSessionRequests(
+  source: Source,
+  sessionId: string,
+  options: Omit<RequestPageOptions, 'after'> = {},
+): Promise<SessionRequest[]> {
+  const requests: SessionRequest[] = [];
+  for await (const request of sessionRequests(source, sessionId, options)) requests.push(request);
+  return requests;
 }
 
 /**

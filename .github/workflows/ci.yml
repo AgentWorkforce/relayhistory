@@ -45,8 +45,15 @@ jobs:
       - name: Sync and hydration throughput gate
         run: node scripts/benchmark-sync.mjs --gate
 
-      - name: Published crate builds without optional features
-        run: cargo build -p ai-hist --no-default-features
+      # `test`, not `build`: it compiles everything `build` did and then runs
+      # what only exists in this configuration. Two whole classes of test are
+      # invisible to the `--all-features` run above -- the `#[cfg(not(feature
+      # = "delivery"))]` ones, and the integration tests that exercise the
+      # public surface an embedder actually gets, where `unstable-internal`
+      # is not there to re-export the internals. Both were passing locally
+      # and gated by nothing.
+      - name: Published crate builds and tests without optional features
+        run: cargo test -p ai-hist --no-default-features
 
       - name: Crate publish dry-run
         run: cargo publish --dry-run -p ai-hist --allow-dirty

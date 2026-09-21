@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
-pub(crate) use schema::{init_schema, schema_is_current};
+pub(crate) use schema::{init_schema, journal_migrated_rows, schema_is_current, shadow_preimages};
 pub const EXPORT_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_RETENTION_LIMIT_BYTES: i64 = 256 * 1_048_576;
 pub const SUPPORTED_KINDS: &[&str] = &[
@@ -789,6 +789,27 @@ pub fn claim_batch(
         batch,
         prepared,
     }))
+}
+
+/// Return a host-interrupted attempt to pending without treating shutdown as a
+/// receiver failure. Keep its immutable payload for idempotent redelivery and
+/// undo only this claim's contribution to the retry counter. Ownership is
+/// checked inside the write transaction so an old worker cannot release a new
+/// worker's claim or reverse a concurrent pause/exclusion.
+fn release_stopped_claim(
+    conn: &Connection,
+    lease: &DeliveryLease,
+    clock: &dyn Fn() -> i64,
+) -> Result<()> {
+    let tx = write_transaction(conn)?;
+    check_lease(&tx, lease, clock(), LeaseCheck::Owned)?;
+    tx.execute(
+        "UPDATE delivery_batches SET state='pending' WHERE id=?",
+        [&lease.batch_id],
+    )?;
+    tx.execute("UPDATE delivery_jobs SET fence=fence+1,worker_id=NULL,lease_until_ms=NULL,attempts=MAX(attempts-1,0),next_attempt_ms=0 WHERE id=?", [&lease.job_id])?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// Extend a claim, dating the extension from *inside* the write transaction.

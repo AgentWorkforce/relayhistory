@@ -127,6 +127,42 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Rust API
 
+- Stop dropping the record types neither parser could normalize. A new
+  `session_markers` table records compaction and summary boundaries, provider
+  `system` rows, non-text content blocks (`image`, `document`,
+  `redacted_thinking`, thinking `signature`s), tool-replacement metadata, and
+  Codex lifecycle events (`compacted`, `turn_diff`, `stream_error`,
+  `*_begin`, `task_started`/`task_complete`, review mode, `subagent_*`,
+  encrypted `reasoning`). A provider type no classifier knows is stored as
+  `kind = "unknown"` carrying its verbatim type in `subkind` — the table has
+  no CHECK constraint, because a constraint would turn tomorrow's unknown
+  record back into today's silent drop. `payload_json` is always bounded —
+  every string at 128 characters and every container at 32 entries,
+  recursively — so an image or document block contributes its size, never its
+  bytes. Where this parser classifies the record it names the fields it keeps;
+  where the payload is a provider's own document whose keys are theirs (Grok's
+  `signals` sidecar, a compaction checkpoint) the document is bounded whole,
+  because enumerating their keys would silently drop whatever they add next. Read one bounded page with
+  `session_markers_page(conn, source, session_id, limit, after)`, which uses
+  the same `(ts_ms IS NULL, ts_ms, id)` keyset as tool calls and file edits,
+  or, from an embedder on the crate's default features,
+  `SessionStore::session_markers_page` — a marker an embedder can sync and
+  cannot read back is a write-only table for everyone outside this workspace.
+  `SessionEvent` gains `raw_kind`, the provider-native record or block type an
+  event came from, returned by both `session_events` and `session_events_page`
+  and carried by the normalized source-evidence row contract, so a
+  `tool_result` synthesized from a `system` subagent notification stays
+  distinguishable from one that came from a `tool_result` content block.
+  Grok's own markers, added separately, move onto this model: its `detail_json`
+  becomes `payload_json` and its readable `text` keeps a column of its own, so
+  one `kind` reads the same whichever provider wrote it. A database written by
+  the first marker shape is migrated forward by `session_markers_v2`, which
+  copies every payload across before the old column is dropped.
+  `HYDRATION_PARSER_VERSION` is 7 and the global sync state generations advance
+  to `claude_sessions_v4` / `codex_rollouts_v6`, so an existing install re-reads
+  each transcript once — a marker exists nowhere but the transcript, and the
+  parser version alone only invalidates targeted hydration checkpoints.
+  napi/TS/MCP exposure is not included.
 - Record per-tool-result fidelity on `session_events`: `tool_use_id`,
   `payload_bytes`, `payload_truncated`, `payload_hash`, `call_index`,
   `event_index`, `result_status`, `event_source`, `error_signal`,
@@ -256,7 +292,52 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Breaking
 
-- The native-addon contract is now 17 and the session evidence contract is now
+- Bump the native-addon contract from 17 to 18 for the usage surface below. An older
+  addon is rejected rather than served a shape it does not implement.
+
+### Added
+
+- Normalize token usage in the core crate. `ai_hist::normalize_usage` turns a
+  provider's stored `token_json` into a `NormalizedUsage`: input always
+  excludes cache reads, Anthropic's `cache_creation.ephemeral_5m`/`1h` split is
+  preserved, `provider_total_tokens` is what the provider wrote and is never
+  recomputed, and `reported_cost_usd` appears only when the source data carried
+  a cost. A negative, fractional, non-finite, or out-of-range counter is a
+  `UsageError` with a stable code, never a clamped zero, and a `UsageCoverage`
+  records which counters the provider actually wrote so a reported zero stays
+  distinguishable from silence.
+
+- Capture the provider's own request identity on `session_events`:
+  `request_id` (Claude's `requestId`) and `provider_message_id`
+  (`message.id`), both stored verbatim. The pre-existing `message_id` column
+  holds each JSONL record's `uuid`, and one Claude request is written as
+  several records, so only these establish which rows belong to one API call.
+  Hydration parser version 5 -> 6 so existing sessions backfill them; until a
+  session is re-parsed its requests carry an `unresolved-request-identity`
+  diagnostic and its rollup reports no totals rather than one figure per
+  content block.
+
+- Carry `request_id` and `provider_message_id` through the session-event
+  evidence contract and on the normalized `SessionEvent`, so a remotely
+  hydrated Claude session and a connector supplying normalized events both
+  keep the request identity their records had.
+
+- Add per-request usage records and a session rollup. The `session_requests`
+  view is one row per model request — Claude's per-content-block copies of
+  `message.usage` collapse into one — read with `session_requests_page` /
+  `getSessionRequestsPage` (keyset on `(firstTsMs, id)`) and
+  `session_usage_summary` / `getSessionUsage`, plus the MCP tools
+  `get_session_requests` and `get_session_usage`. Session usage contract 1. A
+  session with no usage evidence reports `null`, not zeros. See
+  [docs/usage-accounting.md](docs/usage-accounting.md).
+
+- Move prompt usage attribution out of the commercial plugin into
+  `ai_hist::attribute_usage_to_prompts`, refusal semantics unchanged; the
+  plugin keeps its wire shape and becomes a thin caller.
+
+### Breaking
+
+- The native-addon contract is now 18 and the session evidence contract is now
   2: `session_events` rows carry the per-message raw provider facts and the
   per-tool-result fidelity columns (see Added). Hydration parser version 3 re-parses existing databases once on the
   next `sessions hydrate` so rows already indexed gain the facts instead of

@@ -1,0 +1,126 @@
+{
+  "corpus_files": [
+    "codex/two-unreadable-turns.jsonl"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "codex/two-unreadable-turns",
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "first",
+      "session_id": "sess_codex_two_bad",
+      "source": "codex",
+      "timestamp_ms": 1776675600300
+    },
+    {
+      "project": "/tmp/project",
+      "prompt": "second",
+      "session_id": "sess_codex_two_bad",
+      "source": "codex",
+      "timestamp_ms": 1776675602000
+    }
+  ],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "sess_codex_two_bad",
+      "source": "codex",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "CodexRollout",
+  "notes": [],
+  "origin": "relayhistory",
+  "quirk": "two unrecovered turns each retain their own unreadable usage refusal",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "3:user_message",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "3:user_message",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "sess_codex_two_bad",
+      "source": "codex",
+      "text": "first",
+      "token_json": null,
+      "ts_ms": 1776675600300
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "4:agent_message",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "4:agent_message",
+      "model": "gpt-5.4",
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "sess_codex_two_bad",
+      "source": "codex",
+      "text": "First answer.",
+      "token_json": "{\"cached_input_tokens\":0,\"input_tokens\":-1,\"output_tokens\":70,\"reasoning_output_tokens\":0,\"total_tokens\":69}",
+      "ts_ms": 1776675600900
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "6:user_message",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "6:user_message",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "sess_codex_two_bad",
+      "source": "codex",
+      "text": "second",
+      "token_json": null,
+      "ts_ms": 1776675602000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "7:agent_message",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "7:agent_message",
+      "model": "gpt-5.4",
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "sess_codex_two_bad",
+      "source": "codex",
+      "text": "Second answer.",
+      "token_json": "{\"cached_input_tokens\":0,\"input_tokens\":200,\"output_tokens\":90.5,\"reasoning_output_tokens\":0,\"total_tokens\":290}",
+      "ts_ms": 1776675602900
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": null,
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776675600000,
+      "first_prompt": "first",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776675606000,
+      "last_assistant_text": "Second answer.",
+      "models_json": "[\"gpt-5.4\"]",
+      "originator": null,
+      "raw_path": "<home>/.codex/sessions/2026/04/20/rollout-2026-04-20T00-00-00-two-unreadable-turns.jsonl",
+      "repo_url": null,
+      "session_id": "sess_codex_two_bad",
+      "source": "codex",
+      "source_stamp": "<n>:1443",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "codex",
+  "tool_calls": []
+}

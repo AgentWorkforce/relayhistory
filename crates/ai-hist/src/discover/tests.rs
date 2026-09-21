@@ -165,9 +165,69 @@ fn only(sources: &[&str]) -> DiscoverOptions {
     }
 }
 
+struct PassCountingProvider {
+    pass_starts: AtomicUsize,
+}
+
+impl ShallowSessionProvider for PassCountingProvider {
+    fn begin_discovery_pass(&self) -> Result<Option<Box<dyn DiscoveryPassGuard + '_>>> {
+        self.pass_starts.fetch_add(1, Ordering::Relaxed);
+        Ok(None)
+    }
+
+    fn source(&self) -> &'static str {
+        "codex"
+    }
+
+    fn enumerate(
+        &self,
+        _env: &DiscoveryEnv<'_>,
+        _requested_limit: Option<usize>,
+    ) -> Result<Vec<Candidate>> {
+        Ok(Vec::new())
+    }
+
+    fn read_shallow(
+        &self,
+        _scan: &ScanEnv<'_>,
+        _catalog: Option<&Connection>,
+        _candidate: &Candidate,
+    ) -> Result<Option<ShallowSession>> {
+        Ok(None)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // registry
 // ---------------------------------------------------------------------------
+
+#[test]
+fn duplicate_provider_is_rejected_before_pass_guards_are_acquired() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let env = env_at(&conn, home.path());
+    let provider = PassCountingProvider {
+        pass_starts: AtomicUsize::new(0),
+    };
+
+    let error = discover_sessions_with_provider_refs(
+        &env,
+        &DiscoverOptions::default(),
+        &[&provider, &provider],
+        |_| {},
+    )
+    .unwrap_err();
+
+    assert!(
+        format!("{error:#}").contains("duplicate source connector instance"),
+        "{error:#}"
+    );
+    assert_eq!(
+        provider.pass_starts.load(Ordering::Relaxed),
+        0,
+        "validation must finish before any provider pass lock is taken"
+    );
+}
 
 #[test]
 fn every_source_is_either_discoverable_or_explicitly_exempt() {
@@ -801,10 +861,395 @@ fn cursor_reports_mtime_as_last_activity_and_leaves_first_activity_null() {
     let row = found.row("cursor-1");
     assert_eq!(row.first_prompt.as_deref(), Some("fix the flaky test"));
     assert_eq!(row.cwd.as_deref(), Some("/work/app"));
-    // Cursor records no per-message timestamps, so mtime is the only signal
-    // and it is reported as last activity only.
+    // This transcript's turns carry no readable time, so mtime is the only
+    // signal and it is reported as last activity only — never as a first
+    // activity the provider did not record.
     assert_eq!(row.last_activity_ms, Some(1_750_000_400_000));
     assert_eq!(row.first_activity_ms, None);
+    assert!(row.models.is_empty());
+}
+
+/// A turn time that only the head can see still sets the catalog's recency.
+///
+/// Reported by Devin as "head timestamp lost from recency". Past
+/// `HEAD_SCAN_MAX_BYTES` the tail is a separate region, so a transcript whose
+/// one dated human turn is followed by a long run of assistant and tool
+/// records has a tail with no `<timestamp>` in it — only a human turn carries
+/// one. `last_activity_ms` fell straight to the file mtime, so the catalog
+/// reported the session as having last spoken "now", while full ingestion had
+/// those records inheriting the open turn's time. Worse, the discovery upsert
+/// merges `last_activity_ms` with `MAX`, so that mtime would also re-expand a
+/// window a rebuild had just retracted.
+///
+/// Positive control: without the head fallback this failed at
+/// `a head-only turn time must outrank the mtime: left: Some(1750000400000),
+/// right: Some(1789587420000)` — the mtime, not the turn.
+#[test]
+fn cursor_recency_uses_a_turn_time_only_the_head_can_see() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    // One dated human turn, then enough assistant prose to push the tail
+    // region past the head budget. The tail therefore holds only assistant
+    // records, none of which carries a tag.
+    let mut body = String::new();
+    body.push_str(
+        r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp>\n<user_query>start</user_query>"}]}}"#,
+    );
+    body.push('\n');
+    let filler = "x".repeat(2048);
+    while body.len() < (super::HEAD_SCAN_MAX_BYTES + super::TAIL_SCAN_MAX_BYTES) as usize * 2 {
+        body.push_str(&format!(
+            r#"{{"role":"assistant","message":{{"content":[{{"type":"text","text":"{filler}"}}]}}}}"#
+        ));
+        body.push('\n');
+    }
+    cursor_session(home.path(), "work-app", "cursor-head-time", &body, 1_750_000_400_000);
+
+    let found = discover(&conn, home.path(), &only(&["cursor"]));
+    let row = found.row("cursor-head-time");
+    assert_eq!(
+        row.last_activity_ms,
+        Some(1_789_587_420_000),
+        "a head-only turn time must outrank the mtime"
+    );
+    assert_eq!(row.first_activity_ms, Some(1_789_587_420_000));
+}
+
+/// The catalog's `first_prompt` and the indexed `history` row are the same
+/// string for a turn Cursor split into several text blocks.
+///
+/// Reported by Devin as "multi-block first prompts stay truncated".
+/// `parse_cursor_text` stopped at the first text block while the event parser
+/// joins them all, so a two-block opening turn was stored whole in `history`
+/// and truncated in the catalog — and hydration does not rewrite
+/// `sessions.first_prompt`, so the short version survived full indexing.
+/// Both now go through `cursor::human_turn_prompt`.
+///
+/// Positive control: with the `break` in `parse_cursor_text` this failed at
+/// `discovery and ingestion must agree on the first prompt:
+/// left: Some("now write the test"), right: Some("now write the
+/// test\n\ninclude the timeout case")`.
+#[test]
+fn cursor_first_prompt_is_the_same_before_and_after_hydration() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let transcript = cursor_session(
+        home.path(),
+        "work-app",
+        "cursor-split",
+        concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query>now write the test</user_query>"},{"type":"text","text":"include the timeout case"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"content":[{"type":"text","text":"on it"}]}}"#,
+            "\n"
+        ),
+        1_750_000_400_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["cursor"]));
+    let discovered = found.row("cursor-split").first_prompt.clone();
+
+    let ingest_conn = Connection::open_in_memory().unwrap();
+    init_db(&ingest_conn).unwrap();
+    crate::ingest::ingest_cursor_transcript(
+        &ingest_conn,
+        &transcript,
+        "cursor-split",
+        Some("/work/app"),
+        1_750_000_400_000,
+        0,
+        u64::MAX,
+    )
+    .unwrap();
+    let indexed: Option<String> = ingest_conn
+        .query_row(
+            "SELECT prompt FROM history WHERE source = 'cursor' \
+             AND session_id = 'cursor-split' ORDER BY id LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+
+    assert_eq!(
+        discovered, indexed,
+        "discovery and ingestion must agree on the first prompt"
+    );
+    assert_eq!(
+        discovered.as_deref(),
+        Some("now write the test\n\ninclude the timeout case"),
+    );
+}
+
+/// The catalog's activity window comes from human turns, not from an
+/// assistant that quotes a `<timestamp>` tag back.
+///
+/// `cursor_record_time` ran the same unrestricted block scan the event parser
+/// did, so a model explaining the transcript format moved `first_activity_ms`
+/// and `last_activity_ms` and re-sorted the session in the catalog. Both paths
+/// now share `cursor::injected_turn_time`, which reads the tag only out of a
+/// human turn's own text blocks.
+///
+/// Positive control: with the scan unrestricted this failed at
+/// `assistant prose must not move the catalog window: left: Some(1789587660000),
+/// right: Some(1789587420000)` — the quoted instant became the session's last
+/// activity.
+#[test]
+fn cursor_activity_ignores_a_timestamp_quoted_by_the_assistant() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    cursor_session(
+        home.path(),
+        "work-app",
+        "cursor-quoted",
+        concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp>\n<user_query>when was this?</user_query>"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"content":[{"type":"text","text":"Cursor writes <timestamp>Wednesday, Sep 16, 2026, 3:41 PM (UTC-4)</timestamp> into the turn."}]}}"#,
+            "\n"
+        ),
+        1_750_000_400_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["cursor"]));
+    let row = found.row("cursor-quoted");
+    // Both endpoints are the human turn's own time. The mtime is not reached
+    // either: a readable turn time outranks it.
+    assert_eq!(
+        row.last_activity_ms,
+        Some(1_789_587_420_000),
+        "assistant prose must not move the catalog window"
+    );
+    assert_eq!(row.first_activity_ms, Some(1_789_587_420_000));
+}
+
+/// Discovery's session summary and the one full ingestion writes have to be
+/// the same string, or hydrating a session silently rewrites its summary.
+///
+/// A Cursor assistant record can hold several text blocks — prose, a tool
+/// call, then more prose. Ingestion walks the blocks in order and keeps the
+/// last non-empty one, so discovery must too.
+///
+/// Positive control: with `.find()` in `cursor_assistant_text` this failed
+/// with `discovery and ingestion must agree on the session summary:
+/// left: Some("Let me check the test."), right: Some("Fixed it.")` — the
+/// catalog advertised the opening line and hydration replaced it with the
+/// closing one.
+#[test]
+fn cursor_summary_is_the_same_before_and_after_hydration() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let transcript = cursor_session(
+        home.path(),
+        "work-app",
+        "cursor-multi",
+        concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query>fix it</user_query>"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"content":[{"type":"text","text":"Let me check the test."},{"type":"tool_use","name":"Read","input":{"path":"t.rs"}},{"type":"text","text":"Fixed it."},{"type":"turn_ended","status":"success"}]}}"#,
+            "\n"
+        ),
+        1_750_000_400_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["cursor"]));
+    let discovered = found.row("cursor-multi").last_assistant_text.clone();
+
+    let ingest_conn = Connection::open_in_memory().unwrap();
+    init_db(&ingest_conn).unwrap();
+    let outcome = crate::ingest::ingest_cursor_transcript(
+        &ingest_conn,
+        &transcript,
+        "cursor-multi",
+        Some("/work/app"),
+        1_750_000_400_000,
+        0,
+        u64::MAX,
+    )
+    .unwrap();
+
+    assert_eq!(
+        discovered, outcome.last_assistant_text,
+        "discovery and ingestion must agree on the session summary"
+    );
+    assert_eq!(
+        discovered.as_deref(),
+        Some("Fixed it."),
+        "the summary is the reply's last word, not its first"
+    );
+}
+
+/// Discovery caps `last_assistant_text` at `EXCERPT_MAX_CHARS`. Ingestion
+/// used to keep the full block, so hydrating a long Cursor reply rewrote the
+/// catalog summary.
+#[test]
+fn cursor_summary_stays_capped_after_ingestion() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let long = "x".repeat(EXCERPT_MAX_CHARS + 80);
+    let transcript = cursor_session(
+        home.path(),
+        "work-app",
+        "cursor-long",
+        &format!(
+            "{{\"role\":\"user\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"<user_query>go</user_query>\"}}]}}}}\n\
+             {{\"role\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{long}\"}}]}}}}\n"
+        ),
+        1_750_000_400_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["cursor"]));
+    let discovered = found.row("cursor-long").last_assistant_text.clone();
+    assert_eq!(
+        discovered.as_ref().map(|text| text.chars().count()),
+        Some(EXCERPT_MAX_CHARS)
+    );
+
+    let ingest_conn = Connection::open_in_memory().unwrap();
+    init_db(&ingest_conn).unwrap();
+    let outcome = crate::ingest::ingest_cursor_transcript(
+        &ingest_conn,
+        &transcript,
+        "cursor-long",
+        Some("/work/app"),
+        1_750_000_400_000,
+        0,
+        u64::MAX,
+    )
+    .unwrap();
+    assert_eq!(
+        discovered, outcome.last_assistant_text,
+        "discovery and ingestion must agree on a long session summary"
+    );
+}
+
+#[test]
+fn cursor_reports_the_injected_turn_times_when_the_build_writes_them() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    cursor_session(
+        home.path(),
+        "work-app",
+        "cursor-2",
+        concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp>\n<user_query>fix the flaky test</user_query>"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"model":"claude-4.5-sonnet","content":[{"type":"text","text":"Reading the test."},{"type":"tool_use","name":"Read","input":{"path":"t.rs"}}]}}"#,
+            "\n",
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:41 PM (UTC-4)</timestamp>\n<user_query>now ship it</user_query>"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"content":[{"type":"text","text":"Shipped."},{"type":"turn_ended","status":"success"}]}}"#,
+            "\n"
+        ),
+        1_750_000_400_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["cursor"]));
+    let row = found.row("cursor-2");
+    // The injected tag is a real recorded time, so it is preferred over mtime
+    // at both ends.
+    assert_eq!(row.first_activity_ms, Some(1_789_587_420_000));
+    assert_eq!(row.last_activity_ms, Some(1_789_587_660_000));
+    assert_eq!(row.models, vec!["claude-4.5-sonnet".to_string()]);
+    assert_eq!(row.last_assistant_text.as_deref(), Some("Shipped."));
+}
+
+/// A catalog row written by the scanner that shipped *before* this change
+/// carries `v3:` and the fields that reader never extracted: no
+/// `first_activity_ms`, no `models`, no `last_assistant_text`. The stamp is
+/// compared before the provider reader is invoked, so if the scanner version
+/// does not move, those rows are served from cache and stay null forever —
+/// the transcript's bytes never change, so nothing else can ever invalidate
+/// them.
+///
+/// Positive control: with `SHALLOW_SCANNER_VERSION` left at 3 this failed at
+/// `a row from the previous scanner must be read again: left: None, right:
+/// Some(1789587420000)` — the upgraded install kept serving the prompt-only
+/// row.
+#[test]
+fn a_cursor_row_from_the_previous_scanner_is_read_again_after_the_upgrade() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    cursor_session(
+        home.path(),
+        "work-app",
+        "cursor-upgrade",
+        concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp>\n<user_query>fix the flaky test</user_query>"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"model":"claude-4.5-sonnet","content":[{"type":"text","text":"Shipped."},{"type":"turn_ended","status":"success"}]}}"#,
+            "\n"
+        ),
+        1_750_000_400_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["cursor"]));
+    assert_eq!(
+        found.row("cursor-upgrade").first_activity_ms,
+        Some(1_789_587_420_000)
+    );
+
+    // Rewrite the catalog into what the previous scanner left behind: the same
+    // bytes, its own version prefix, and none of the fields this one learned
+    // to extract. The stamp lives in three places and the cache check reads
+    // the observation, so all three move together.
+    let stored: String = conn
+        .query_row(
+            "SELECT source_stamp FROM sessions WHERE source = 'cursor' \
+             AND session_id = 'cursor-upgrade'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let raw = stored
+        .split_once(':')
+        .expect("stored stamps carry a version prefix")
+        .1
+        .to_string();
+    let previous = format!("v3:{raw}");
+    conn.execute(
+        "UPDATE sessions SET source_stamp = ?, first_activity_ms = NULL, \
+         last_assistant_text = NULL WHERE source = 'cursor' \
+         AND session_id = 'cursor-upgrade'",
+        params![previous],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE session_presences SET source_stamp = ? WHERE source = 'cursor' \
+         AND session_id = 'cursor-upgrade'",
+        params![previous],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE session_observations SET source_stamp = ? WHERE source = 'cursor' \
+         AND session_id = 'cursor-upgrade'",
+        params![previous],
+    )
+    .unwrap();
+
+    let upgraded = discover(&conn, home.path(), &only(&["cursor"]));
+    let row = upgraded.row("cursor-upgrade");
+    assert_eq!(
+        row.first_activity_ms,
+        Some(1_789_587_420_000),
+        "a row from the previous scanner must be read again"
+    );
+    assert_eq!(row.last_assistant_text.as_deref(), Some("Shipped."));
+    assert_eq!(row.models, vec!["claude-4.5-sonnet".to_string()]);
+    assert_eq!(
+        upgraded.summary.counters.shallow_reads, 1,
+        "the re-read is the point: the row must not have come from cache"
+    );
+
+    // Control: the bump costs exactly one re-read. The pass after it is
+    // cached again, so this is a one-time migration and not a permanent
+    // rescan of every unchanged transcript.
+    let settled = discover(&conn, home.path(), &only(&["cursor"]));
+    assert_eq!(settled.summary.counters.shallow_reads, 0);
+    assert_eq!(settled.summary.skipped_unchanged, 1);
+    assert_eq!(
+        settled.row("cursor-upgrade").first_activity_ms,
+        Some(1_789_587_420_000)
+    );
 }
 
 #[test]
@@ -1152,7 +1597,9 @@ fn opencode_sessions_come_from_the_session_table_with_a_first_prompt() {
     opencode_db(
         home.path(),
         r#"INSERT INTO session VALUES ('oc-1', '/work/oc', 1750000600000, 1750000700000);
-           INSERT INTO message VALUES ('m1', 'oc-1', 1750000600000, '{"role":"user","modelID":"claude-sonnet"}');
+           INSERT INTO message VALUES ('m1', 'oc-1', 1750000600000, '{"role":"user","providerID":"openai","modelID":"gpt-5"}');
+           INSERT INTO message VALUES ('m2', 'oc-1', NULL, '{"role":"assistant","time":{"created":200},"providerID":"anthropic","modelID":"claude-opus"}');
+           INSERT INTO message VALUES ('m3', 'oc-1', 100, '{"role":"assistant","time":{"created":100},"providerID":"anthropic","modelID":"claude-sonnet"}');
            INSERT INTO part VALUES ('p1', 'm1', 'oc-1', 1750000600000, '{"type":"text","text":"port the parser"}');"#,
     );
 
@@ -1162,7 +1609,7 @@ fn opencode_sessions_come_from_the_session_table_with_a_first_prompt() {
     assert_eq!(row.first_prompt.as_deref(), Some("port the parser"));
     assert_eq!(row.first_activity_ms, Some(1_750_000_600_000));
     assert_eq!(row.last_activity_ms, Some(1_750_000_700_000));
-    assert_eq!(row.models, vec!["claude-sonnet".to_string()]);
+    assert_eq!(row.models, vec!["anthropic/claude-sonnet".to_string()]);
     assert_eq!(
         row.raw_path.as_deref(),
         Some(home.path().join("opencode.db").to_string_lossy().as_ref()),
@@ -1172,6 +1619,93 @@ fn opencode_sessions_come_from_the_session_table_with_a_first_prompt() {
     let second = discover(&conn, home.path(), &only(&["opencode"]));
     assert_eq!(second.summary.skipped_unchanged, 1);
     assert_eq!(second.summary.counters.shallow_reads, 0);
+}
+
+/// Version 4 learned the provider from OpenCode messages but stored only the
+/// bare model ID. Since the provider database can remain byte-for-byte
+/// unchanged across an ai-hist upgrade, the scanner version is the only cache
+/// key that can make the corrected reader qualify an existing catalog row.
+#[test]
+fn an_opencode_row_from_scanner_v4_is_read_again_to_qualify_its_model() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    opencode_db(
+        home.path(),
+        r#"INSERT INTO session VALUES ('oc-v4', '/work/oc', 1750000600000, 1750000700000);
+           INSERT INTO message VALUES ('m1', 'oc-v4', 1750000600000, '{"role":"user"}');
+           INSERT INTO message VALUES ('m2', 'oc-v4', 1750000700000, '{"role":"assistant","providerID":"anthropic","modelID":"claude-sonnet"}');
+           INSERT INTO part VALUES ('p1', 'm1', 'oc-v4', 1750000600000, '{"type":"text","text":"qualify the cached model"}');"#,
+    );
+
+    let initial = discover(&conn, home.path(), &only(&["opencode"]));
+    assert_eq!(
+        initial.row("oc-v4").models,
+        vec!["anthropic/claude-sonnet"]
+    );
+
+    let stored: String = conn
+        .query_row(
+            "SELECT source_stamp FROM sessions WHERE source = 'opencode' \
+             AND session_id = 'oc-v4'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let raw = stored
+        .split_once(':')
+        .expect("stored stamps carry a version prefix")
+        .1;
+    let previous = format!("v4:{raw}");
+    conn.execute(
+        "UPDATE sessions SET source_stamp = ?, models_json = '[\"claude-sonnet\"]' \
+         WHERE source = 'opencode' AND session_id = 'oc-v4'",
+        params![previous],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE session_presences SET source_stamp = ? WHERE source = 'opencode' \
+         AND session_id = 'oc-v4'",
+        params![previous],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE session_observations SET source_stamp = ? WHERE source = 'opencode' \
+         AND session_id = 'oc-v4'",
+        params![previous],
+    )
+    .unwrap();
+
+    let upgraded = discover(&conn, home.path(), &only(&["opencode"]));
+    assert_eq!(upgraded.summary.counters.shallow_reads, 1);
+    assert_eq!(upgraded.summary.skipped_unchanged, 0);
+    assert_eq!(
+        upgraded.row("oc-v4").models,
+        vec!["anthropic/claude-sonnet"],
+        "the v4 cached model must be replaced with the provider-qualified ID"
+    );
+
+    let settled = discover(&conn, home.path(), &only(&["opencode"]));
+    assert_eq!(settled.summary.counters.shallow_reads, 0);
+    assert_eq!(settled.summary.skipped_unchanged, 1);
+}
+
+#[test]
+fn opencode_model_order_rejects_payload_times_outside_i64() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    opencode_db(
+        home.path(),
+        r#"INSERT INTO session VALUES ('oc-overflow', '/work/oc', 1, 2);
+           INSERT INTO message VALUES ('m1', 'oc-overflow', 1, '{"role":"assistant","time":{"created":9223372036854775808},"providerID":"anthropic","modelID":"claude-opus"}');
+           INSERT INTO message VALUES ('m2', 'oc-overflow', 2, '{"role":"assistant","time":{"created":2},"providerID":"anthropic","modelID":"claude-sonnet"}');"#,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["opencode"]));
+    assert_eq!(
+        found.row("oc-overflow").models,
+        vec!["anthropic/claude-opus"],
+        "the out-of-i64 payload time must fall back to relational time_created"
+    );
 }
 
 /// A single opencode part can hold a whole pasted file. The excerpt is cut in
@@ -1238,6 +1772,96 @@ fn empty_and_minimal_opencode_schemas_are_tolerated() {
     assert_eq!(row.cwd, None);
     assert_eq!(row.first_prompt, None);
     assert!(row.models.is_empty());
+
+    // `time_created` is optional in older message schemas. Discovery still
+    // filters to assistant messages and deterministically falls back to id.
+    fs::remove_file(home.path().join("opencode.db")).unwrap();
+    let db = Connection::open(home.path().join("opencode.db")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE session (id TEXT PRIMARY KEY); \
+         CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, data TEXT); \
+         CREATE INDEX message_session_id_idx ON message(session_id, id); \
+         INSERT INTO session VALUES ('ses_legacy_message'); \
+         INSERT INTO message VALUES ('m1', 'ses_legacy_message', \
+             '{\"role\":\"user\",\"time\":{\"created\":1},\"providerID\":\"openai\",\"modelID\":\"gpt-5\"}'); \
+         INSERT INTO message VALUES ('m2', 'ses_legacy_message', \
+             '{\"role\":\"assistant\",\"time\":{\"created\":2},\"providerID\":\"anthropic\",\"modelID\":\"claude-sonnet\"}');",
+    )
+    .unwrap();
+    drop(db);
+    let legacy = discover(&conn, home.path(), &only(&["opencode"]));
+    assert_eq!(
+        legacy.row("ses_legacy_message").models,
+        vec!["anthropic/claude-sonnet"]
+    );
+}
+
+#[test]
+fn opencode_pins_the_json_layout_between_enumeration_and_read() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let storage = home.path().join("storage");
+    write(
+        &storage.join("session/global/ses_tree.json"),
+        r#"{"id":"ses_tree","directory":"/work/tree","time":{"created":10,"updated":20}}"#,
+    );
+    write(
+        &storage.join("message/ses_tree/msg_tree.json"),
+        r#"{"id":"msg_tree","sessionID":"ses_tree","role":"user","time":{"created":10}}"#,
+    );
+    write(
+        &storage.join("part/msg_tree/part_tree.json"),
+        r#"{"id":"part_tree","sessionID":"ses_tree","messageID":"msg_tree","type":"text","text":"tree prompt"}"#,
+    );
+
+    let env = env_at(&conn, home.path());
+    let provider = OpencodeProvider::default();
+    let candidate = provider.enumerate(&env, None).unwrap().remove(0);
+    assert!(candidate.locator.ends_with("ses_tree.json"));
+
+    // Current OpenCode creates SQLite while this discovery pass still holds
+    // JSON-tree locators. Re-detecting here would look up the file path as a
+    // SQLite session id and silently return no row.
+    opencode_db(
+        home.path(),
+        "INSERT INTO session VALUES ('ses_sqlite', '/work/sqlite', 30, 40);",
+    );
+    let row = provider
+        .read_shallow(&env.scan(), None, &candidate)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.session_id, "ses_tree");
+    assert_eq!(row.first_prompt.as_deref(), Some("tree prompt"));
+}
+
+#[test]
+fn opencode_redetects_its_layout_on_the_next_registry_pass() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let env = env_at(&conn, home.path());
+    let provider = OpencodeProvider::default();
+    let providers: [&dyn ShallowSessionProvider; 1] = [&provider];
+    let options = only(&["opencode"]);
+
+    let first = discover_sessions_with_provider_refs(&env, &options, &providers, |_| {}).unwrap();
+    assert_eq!(first.providers["opencode"].candidates, 0);
+
+    opencode_db(
+        home.path(),
+        "INSERT INTO session VALUES ('ses_later', '/work/later', 30, 40);",
+    );
+    let mut rows = Vec::new();
+    discover_sessions_with_provider_refs(&env, &options, &providers, |row| {
+        rows.push(row.clone())
+    })
+    .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.session_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["ses_later"],
+        "a reusable registry must not keep the previous pass's absent layout"
+    );
 }
 
 #[test]
@@ -1285,6 +1909,11 @@ fn opencode_fixed_limit_does_not_inspect_unrelated_history() {
         db.execute(
             "INSERT INTO message VALUES (?, ?, ?, '{\"role\":\"user\",\"modelID\":\"bounded-model\"}')",
             params![message, id, index],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO message VALUES (?, ?, ?, '{\"role\":\"assistant\",\"modelID\":\"bounded-model\"}')",
+            params![format!("assistant_{index:06}"), id, index + 1],
         )
         .unwrap();
         db.execute(
@@ -1407,10 +2036,27 @@ fn opencode_selected_session_queries_use_provider_indexes() {
 
     let model = explain_details(
         &db,
-        "SELECT COALESCE(json_extract(data, '$.modelID'), json_extract(data, '$.model.modelID'))
+        "SELECT json_extract(data, '$.providerID'),
+                COALESCE(json_extract(data, '$.modelID'), json_extract(data, '$.model.modelID'))
          FROM message WHERE session_id = 'selected' AND json_valid(data)
-         AND COALESCE(json_extract(data, '$.modelID'),
-                      json_extract(data, '$.model.modelID')) IS NOT NULL LIMIT 1",
+         AND json_extract(data, '$.role') = 'assistant'
+         AND COALESCE(
+               CASE WHEN json_type(data, '$.time.created') = 'integer'
+                    AND typeof(json_extract(data, '$.time.created')) = 'integer'
+                    THEN json_extract(data, '$.time.created') END,
+               time_created
+             ) IS NOT NULL
+         AND (NULLIF(json_extract(data, '$.providerID'), '') IS NOT NULL
+              OR NULLIF(COALESCE(json_extract(data, '$.modelID'),
+                                 json_extract(data, '$.model.modelID')), '') IS NOT NULL)
+         ORDER BY COALESCE(
+                    CASE WHEN json_type(data, '$.time.created') = 'integer'
+                         AND typeof(json_extract(data, '$.time.created')) = 'integer'
+                         THEN json_extract(data, '$.time.created') END,
+                    time_created
+                  ) ASC,
+                  id ASC
+         LIMIT 1",
         [],
     );
     assert!(
@@ -1500,8 +2146,9 @@ fn current_opencode_schema_without_recency_index_uses_primary_key_fallback() {
          CREATE INDEX part_message_id_id_idx ON part(message_id, id);
          INSERT INTO session VALUES ('ses_ffffffffffffold', '/old', 1, 1000);
          INSERT INTO session VALUES ('ses_000000000000new', '/new', 2, 2);
-         INSERT INTO message VALUES ('m_new', 'ses_000000000000new', 2, '{\"role\":\"user\",\"modelID\":\"fallback-model\"}');
-         INSERT INTO part VALUES ('p_new', 'm_new', 'ses_000000000000new', 2, '{\"type\":\"text\",\"text\":\"fallback prompt\"}');",
+         INSERT INTO message VALUES ('m_new_user', 'ses_000000000000new', 2, '{\"role\":\"user\",\"modelID\":\"requested-model\"}');
+         INSERT INTO message VALUES ('m_new_assistant', 'ses_000000000000new', 3, '{\"role\":\"assistant\",\"modelID\":\"fallback-model\"}');
+         INSERT INTO part VALUES ('p_new', 'm_new_user', 'ses_000000000000new', 2, '{\"type\":\"text\",\"text\":\"fallback prompt\"}');",
     )
     .unwrap();
     let plan = explain_details(
@@ -1540,8 +2187,9 @@ fn opencode_wal_append_does_not_tear_the_read_snapshot() {
     opencode_db(
         home.path(),
         "INSERT INTO session VALUES ('ses_snapshot', '/work/oc', 10, 20);
-         INSERT INTO message VALUES ('m_old', 'ses_snapshot', 10, '{\"role\":\"user\",\"modelID\":\"old-model\"}');
-         INSERT INTO part VALUES ('p_old', 'm_old', 'ses_snapshot', 10, '{\"type\":\"text\",\"text\":\"coherent old prompt\"}');",
+         INSERT INTO message VALUES ('m_old_user', 'ses_snapshot', 10, '{\"role\":\"user\",\"modelID\":\"old-requested-model\"}');
+         INSERT INTO message VALUES ('m_old_assistant', 'ses_snapshot', 11, '{\"role\":\"assistant\",\"modelID\":\"old-model\"}');
+         INSERT INTO part VALUES ('p_old', 'm_old_user', 'ses_snapshot', 10, '{\"type\":\"text\",\"text\":\"coherent old prompt\"}');",
     );
     let writer = Connection::open(home.path().join("opencode.db")).unwrap();
     writer.pragma_update(None, "journal_mode", "WAL").unwrap();
@@ -1551,8 +2199,9 @@ fn opencode_wal_append_does_not_tear_the_read_snapshot() {
     let candidate = provider.enumerate(&env, Some(1)).unwrap().remove(0);
     writer
         .execute_batch(
-            "INSERT INTO message VALUES ('m_new', 'ses_snapshot', 5, '{\"role\":\"user\",\"modelID\":\"new-model\"}');
-             INSERT INTO part VALUES ('p_new', 'm_new', 'ses_snapshot', 5, '{\"type\":\"text\",\"text\":\"new prompt outside snapshot\"}');
+            "INSERT INTO message VALUES ('m_new_user', 'ses_snapshot', 5, '{\"role\":\"user\",\"modelID\":\"new-requested-model\"}');
+             INSERT INTO message VALUES ('m_new_assistant', 'ses_snapshot', 6, '{\"role\":\"assistant\",\"modelID\":\"new-model\"}');
+             INSERT INTO part VALUES ('p_new', 'm_new_user', 'ses_snapshot', 5, '{\"type\":\"text\",\"text\":\"new prompt outside snapshot\"}');
              UPDATE session SET time_updated = 30 WHERE id = 'ses_snapshot';",
         )
         .unwrap();

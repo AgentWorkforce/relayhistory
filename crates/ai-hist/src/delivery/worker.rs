@@ -22,9 +22,10 @@
 
 use super::{
     acknowledge, claim_batch, compact_journal, compact_receipts, expire_exports,
-    is_retention_limit, list_jobs, prepare_batch, record_failure, renew_lease, retained_bytes,
-    status, store_prepared_payload, validate_dispatch, ClaimedBatch, DeliveryAcknowledgment,
-    DeliveryFailure, DeliveryJobConfig, DeliveryStatus, HistoryExportBatch, PreparedPayload,
+    is_retention_limit, list_jobs, prepare_batch, record_failure, release_stopped_claim,
+    renew_lease, retained_bytes, status, store_prepared_payload, validate_dispatch, ClaimedBatch,
+    DeliveryAcknowledgment, DeliveryFailure, DeliveryJobConfig, DeliveryStatus, HistoryExportBatch,
+    PreparedPayload,
 };
 use anyhow::{anyhow, bail, Result};
 use rusqlite::Connection;
@@ -527,10 +528,28 @@ impl Worker<'_> {
                 result
             })
         };
+        // A host stop is an orderly interruption, not a failed upload. The
+        // transient result also covers a receiver honoring ctx.cancelled().
+        // Keep explicit receiver refusals (including Retry-After) authoritative.
+        // Even a completed send stays unacknowledged on stop: replay the same
+        // persisted bytes/id after restart. The release is fenced in core.
+        if host()
+            && matches!(
+                &outcome,
+                Ok(_)
+                    | Err(ReceiverFailure {
+                        failure: DeliveryFailure::Transient,
+                        retry_after_ms: None
+                    })
+            )
+        {
+            return release_stopped_claim(&self.conn, &claim.lease, self.clock);
+        }
         let verdict = match outcome {
-            // Never acknowledge work whose lease was lost or whose host asked
-            // to stop: the outcome is uncertain and stays retryable.
-            Ok(_) if stopping() => Err(DeliveryFailure::Transient.into()),
+            // Lease loss still fences acknowledgments. If a stop arrives after
+            // the outcome decision above, a completed owned send can commit;
+            // do not turn that late stop into a synthetic receiver failure.
+            Ok(_) if lost.load(Ordering::SeqCst) => Err(DeliveryFailure::Transient.into()),
             Ok(ack) => acknowledge(&self.conn, &claim.lease, &ack, self.clock)
                 .map(|_| ())
                 .map_err(|_| ReceiverFailure::from(DeliveryFailure::Transient)),

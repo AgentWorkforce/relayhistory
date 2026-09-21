@@ -573,6 +573,176 @@ fn malformed_complete_batch_never_creates_database() -> Result<()> {
     assert!(!path.exists());
     Ok(())
 }
+/// Remote Claude hydration must carry the provider's request identity.
+///
+/// `ClaudeFull` evidence is parsed in an isolated database and then projected
+/// back out through the evidence row contract. While that projection omitted
+/// `request_id` / `provider_message_id`, a remotely hydrated session arrived
+/// with null identities: its four records read as four `record-id` requests,
+/// each flagged unresolved, and the session reported no total at all — the
+/// same multiplied-then-withheld shape the local path was fixed to avoid.
+#[test]
+fn remote_claude_hydration_preserves_the_provider_request_identity() -> Result<()> {
+    use ai_hist::sources::{normalize_source_evidence, AcquiredEvidence};
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("history.db");
+    observe(&path, "a")?;
+    // One API request the provider split across two records, exactly as
+    // Claude writes a multi-block turn.
+    let records = (0..2)
+        .map(|index| {
+            json!({
+                "sessionId": "s",
+                "uuid": format!("rec-{index}"),
+                "requestId": "req_remote",
+                "type": "assistant",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "message": {
+                    "role": "assistant",
+                    "id": "msg_remote",
+                    "model": "claude-test",
+                    "usage": {"input_tokens": 3, "output_tokens": 11},
+                    "content": [{"type": "text", "text": format!("part {index}")}],
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    let evidence = normalize_source_evidence(
+        "claude",
+        "s",
+        AcquiredEvidence::ClaudeFull {
+            records,
+            source_stamp: "raw1".into(),
+            source_bytes: 100,
+        },
+    )?;
+    // The identity survives the projection itself, before anything applies it.
+    let carried = evidence
+        .records
+        .iter()
+        .filter(|record| record.kind == EvidenceKind::SessionEvent)
+        .filter(|record| {
+            record.payload.get("request_id").and_then(|v| v.as_str()) == Some("req_remote")
+        })
+        .count();
+    assert_eq!(carried, 2, "both event rows carry the provider request id");
+
+    apply_source_evidence(ApplyEvidenceRequest {
+        db_path: Some(path.clone()),
+        key: key("a"),
+        expected_revision: state(&path, "a")?.revision.unwrap(),
+        include_related: None,
+        evidence,
+    })?;
+
+    let conn = ai_hist::open_db(&path)?;
+    let stored: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM session_events \
+         WHERE request_id = 'req_remote' AND provider_message_id = 'msg_remote'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(stored, 2, "applying the evidence keeps both identities");
+
+    // And the point of carrying them: one request, one total.
+    let page = ai_hist::session_requests_page(&conn, "claude", "s", 50, None)?;
+    assert_eq!(page.requests.len(), 1);
+    assert_eq!(page.requests[0].request_key, "request-id:req_remote");
+    assert!(page.requests[0].diagnostics.is_empty());
+    let summary = ai_hist::session_usage_summary(&conn, "claude", "s")?
+        .expect("a hydrated session has a summary");
+    assert_eq!(summary.usage.as_ref().unwrap().output_tokens, 11);
+    Ok(())
+}
+
+/// A remote `ClaudeFull` snapshot is parsed by the same local parser, into a
+/// temporary database, and then projected back out as evidence records. The
+/// projection is what decides which tables survive that round trip, so a table
+/// missing from it is written during normalization and silently thrown away
+/// before anything durable sees it.
+///
+/// Markers were missing, so remote Claude hydration produced none at all --
+/// the same class of gap #194 hit with its new columns.
+#[test]
+fn claude_remote_hydration_carries_session_markers() -> Result<()> {
+    use ai_hist::sources::{normalize_source_evidence, AcquiredEvidence};
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("history.db");
+    observe(&path, "a")?;
+
+    let records = vec![
+        json!({"sessionId":"s","uuid":"u-asst","type":"assistant","timestamp":"2026-01-01T00:00:00Z",
+               "message":{"role":"assistant","model":"m","content":[{"type":"text","text":"hi"}],
+                          "usage":{"cache_read_input_tokens":9000}}}),
+        json!({"sessionId":"s","uuid":"s-compact","type":"system","subtype":"compact_boundary",
+               "timestamp":"2026-01-01T00:00:01Z"}),
+    ];
+    let evidence = normalize_source_evidence(
+        "claude",
+        "s",
+        AcquiredEvidence::ClaudeFull {
+            records,
+            source_stamp: "raw1".into(),
+            source_bytes: 100,
+        },
+    )?;
+    assert!(
+        evidence
+            .records
+            .iter()
+            .any(|r| r.kind == EvidenceKind::SessionMarker),
+        "the projection must carry what the parser wrote"
+    );
+
+    apply_source_evidence(ApplyEvidenceRequest {
+        db_path: Some(path.clone()),
+        key: key("a"),
+        expected_revision: state(&path, "a")?.revision.unwrap(),
+        evidence,
+        include_related: None,
+    })?;
+
+    let conn = ai_hist::open_db(&path)?;
+    let (kind, payload): (String, Option<String>) = conn.query_row(
+        "SELECT kind, payload_json FROM session_markers WHERE source='claude' AND session_id='s'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    assert_eq!(kind, "compaction_boundary");
+    assert!(
+        payload
+            .as_deref()
+            .is_some_and(|payload| payload.contains("9000")),
+        "the marker keeps the context it recorded: {payload:?}"
+    );
+
+    // A later complete snapshot without that record must take the marker back
+    // out again, exactly as it does for every other evidence table.
+    let empty = normalize_source_evidence(
+        "claude",
+        "s",
+        AcquiredEvidence::ClaudeFull {
+            records: vec![],
+            source_stamp: "raw2".into(),
+            source_bytes: 0,
+        },
+    )?;
+    apply_source_evidence(ApplyEvidenceRequest {
+        db_path: Some(path.clone()),
+        key: key("a"),
+        expected_revision: state(&path, "a")?.revision.unwrap(),
+        evidence: empty,
+        include_related: None,
+    })?;
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM session_markers", [], |r| r
+            .get::<_, i64>(0))?,
+        0,
+        "a marker the snapshot no longer carries must not survive it"
+    );
+    Ok(())
+}
+
 #[test]
 fn claude_snapshots_use_same_reconciliation_for_both_scan_orders() -> Result<()> {
     use ai_hist::sources::{normalize_source_evidence, AcquiredEvidence};
@@ -1354,5 +1524,171 @@ fn enrichment_does_not_revoke_the_adapter_s_ownership_of_its_event() -> Result<(
         Some("edited locally"),
         "an externally edited row must be protected from the connector that used to own it"
     );
+    Ok(())
+}
+
+/// A connector cannot submit a marker payload the local parser could not write.
+///
+/// `payload_json` is a bounded projection: every string at 128 characters,
+/// every container at 32 entries, recursively. That bound is applied by the
+/// parsers, and `EvidenceKind::SessionMarker` put the same column on the public
+/// normalized-evidence contract — where the generic validator accepts any
+/// string and stores it verbatim. So a contributed marker could hold what a
+/// parsed one cannot, in the one place the bound exists to defend.
+///
+/// Rejected rather than silently bounded, which is how this boundary treats
+/// every other out-of-contract value: an unknown `result_status`, a negative
+/// `payload_bytes`, a tool-result field on a row that is not one. The boundary
+/// derives (`prompt_hash`) and fills absent columns with null, but it never
+/// rewrites a value a connector supplied — doing so here would store something
+/// the connector did not send and cannot reconcile against.
+#[test]
+fn a_contributed_marker_payload_obeys_the_same_bound() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("history.db");
+    observe(&path, "a")?;
+
+    let marker = |payload: serde_json::Value| -> EvidenceRecord {
+        EvidenceRecord {
+            kind: EvidenceKind::SessionMarker,
+            payload: json!({
+                "source": "claude",
+                "session_id": "s",
+                "marker_uid": "m1",
+                "kind": "unknown",
+                "payload_json": payload.to_string(),
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            record_id: Some("upstream:m1".into()),
+            revision_id: Some("upstream:1".into()),
+        }
+    };
+
+    let huge = "x".repeat(5_000);
+    let rejected = apply(
+        &path,
+        "a",
+        state(&path, "a")?.revision.unwrap(),
+        vec![EvidenceKind::SessionMarker],
+        vec![marker(json!({ "nested": { "deeper": huge } }))],
+    );
+    let message = format!(
+        "{:#}",
+        rejected.expect_err("an oversized payload is refused")
+    );
+    assert!(
+        message.contains("INVALID_ARGUMENT"),
+        "refused as a contract violation, like every other one: {message}"
+    );
+
+    // Malformed JSON is refused too: the column's contract is that it is
+    // bounded, and text nothing can parse cannot be shown to be.
+    let broken = EvidenceRecord {
+        kind: EvidenceKind::SessionMarker,
+        payload: json!({
+            "source": "claude",
+            "session_id": "s",
+            "marker_uid": "m2",
+            "kind": "unknown",
+            "payload_json": "{not json",
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+        record_id: Some("upstream:m2".into()),
+        revision_id: Some("upstream:1".into()),
+    };
+    assert!(apply(
+        &path,
+        "a",
+        state(&path, "a")?.revision.unwrap(),
+        vec![EvidenceKind::SessionMarker],
+        vec![broken],
+    )
+    .is_err());
+
+    // Positive control: a payload within the bound round-trips untouched, so
+    // this rejects what breaks the contract rather than markers in general.
+    apply(
+        &path,
+        "a",
+        state(&path, "a")?.revision.unwrap(),
+        vec![EvidenceKind::SessionMarker],
+        vec![marker(json!({ "tokens_before_compact": 9000 }))],
+    )?;
+    let conn = ai_hist::open_db(&path)?;
+    let stored: String = conn.query_row(
+        "SELECT payload_json FROM session_markers WHERE source='claude' AND session_id='s'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&stored)?,
+        json!({ "tokens_before_compact": 9000 })
+    );
+    Ok(())
+}
+
+/// An empty `kind` is not a kind.
+///
+/// `kind` is in the marker spec's `required` list, but that check only asks
+/// whether the field is present and non-null -- so `""` passed, and the
+/// NOT NULL column stored it happily. A marker whose classification is the
+/// empty string is indistinguishable from one whose classifier failed, which
+/// is the state this table exists to make impossible.
+///
+/// Refused rather than rewritten, consistent with every other out-of-contract
+/// value at this boundary.
+#[test]
+fn a_contributed_marker_needs_a_real_kind() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("history.db");
+    observe(&path, "a")?;
+
+    let marker = |kind: &str, uid: &str| -> EvidenceRecord {
+        EvidenceRecord {
+            kind: EvidenceKind::SessionMarker,
+            payload: json!({
+                "source": "claude",
+                "session_id": "s",
+                "marker_uid": uid,
+                "kind": kind,
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            record_id: Some(format!("upstream:{uid}")),
+            revision_id: Some("upstream:1".into()),
+        }
+    };
+
+    let refused = apply(
+        &path,
+        "a",
+        state(&path, "a")?.revision.unwrap(),
+        vec![EvidenceKind::SessionMarker],
+        vec![marker("", "m-empty")],
+    );
+    let message = format!("{:#}", refused.expect_err("an empty kind is refused"));
+    assert!(message.contains("INVALID_ARGUMENT"), "{message}");
+
+    // Positive control: `unknown` is a real classification and is accepted,
+    // so this refuses empty rather than refusing unclassified.
+    apply(
+        &path,
+        "a",
+        state(&path, "a")?.revision.unwrap(),
+        vec![EvidenceKind::SessionMarker],
+        vec![marker("unknown", "m-unknown")],
+    )?;
+    let conn = ai_hist::open_db(&path)?;
+    let stored: String = conn.query_row(
+        "SELECT kind FROM session_markers WHERE source='claude' AND session_id='s'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(stored, "unknown");
     Ok(())
 }

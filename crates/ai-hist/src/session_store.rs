@@ -1,9 +1,14 @@
 //! Embedder entry point. Cargo semver is the contract; there is no separate
 //! Rust contract-version constant.
 use crate::ingest::{sync_local_at, sync_local_at_with_home};
+use crate::session_usage::{
+    session_requests_page, session_usage_summary, SessionRequestCursor, SessionRequestPage,
+    SessionUsageSummary,
+};
 use crate::store::{
     default_db_path, open_db, open_db_readonly, schema_is_event_read_current,
-    session_user_turns_page, SessionEventCursor, SessionUserTurnPage,
+    schema_is_evidence_read_current, session_markers_page, session_user_turns_page,
+    SessionEventCursor, SessionEvidenceCursor, SessionMarkerPage, SessionUserTurnPage,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -167,6 +172,76 @@ impl SessionStore {
         session_user_turns_page(&conn, source.as_str(), session_id, limit, after)
             .map_err(Error::from_anyhow)
     }
+
+    /// Read one bounded page of a session's markers, oldest first.
+    ///
+    /// Markers are the records the normalized event model cannot carry --
+    /// compaction and summary boundaries, provider system rows, non-text
+    /// content blocks, agent lifecycle events. An embedder that syncs them
+    /// needs a supported way to read them back; without one this table is
+    /// write-only for everyone outside this workspace, and the only reachable
+    /// alternative is a hand-written query against a schema that is explicitly
+    /// not a contract.
+    ///
+    /// Unlike the user-turn page, the schema check is made here rather than at
+    /// `open`: the marker page index arrived after `SessionStore` shipped, so
+    /// gating `open` on it would turn "cannot read markers" into "cannot open
+    /// this database at all" for a caller that never asks for one. A read-only
+    /// store over a database written before this schema is told what to do
+    /// instead of being served an unindexed scan -- or `no such table`.
+    pub fn session_markers_page(
+        &self,
+        source: Source,
+        session_id: &str,
+        limit: i64,
+        after: Option<&SessionEvidenceCursor>,
+    ) -> Result<SessionMarkerPage, Error> {
+        let conn = open_db_readonly(&self.db_path)?;
+        if !schema_is_evidence_read_current(&conn).map_err(Error::from_anyhow)? {
+            return Err(Error {
+                message: format!(
+                    "{} predates the session-marker schema this version reads; \
+                     open it writable once (or run a sync) to migrate it",
+                    self.db_path.display()
+                ),
+            });
+        }
+        session_markers_page(&conn, source.as_str(), session_id, limit, after)
+            .map_err(Error::from_anyhow)
+    }
+
+    /// Read one bounded page of a session's model requests, oldest first.
+    ///
+    /// The grouping is what makes this worth a facade method rather than a
+    /// query an embedder writes itself: one API call is several stored rows
+    /// for every provider here, by a different rule for each, and counting
+    /// rows reports a session as costing several times what it did.
+    pub fn session_requests_page(
+        &self,
+        source: Source,
+        session_id: &str,
+        limit: i64,
+        after: Option<&SessionRequestCursor>,
+    ) -> Result<SessionRequestPage, Error> {
+        let conn = open_db_readonly(&self.db_path)?;
+        session_requests_page(&conn, source.as_str(), session_id, limit, after)
+            .map_err(Error::from_anyhow)
+    }
+
+    /// The whole-session usage rollup, or `None` when no request was recorded.
+    ///
+    /// `None` means the session has no requests at all. A session whose usage
+    /// could not be established answers `Some` with `usage: None` and the
+    /// diagnostics saying why — the two are different answers and the facade
+    /// keeps them apart.
+    pub fn session_usage(
+        &self,
+        source: Source,
+        session_id: &str,
+    ) -> Result<Option<SessionUsageSummary>, Error> {
+        let conn = open_db_readonly(&self.db_path)?;
+        session_usage_summary(&conn, source.as_str(), session_id).map_err(Error::from_anyhow)
+    }
 }
 
 fn resolve_db_path(opts: &StoreOptions) -> PathBuf {
@@ -193,6 +268,30 @@ mod tests {
         })
         .unwrap();
         assert!(db.exists());
+    }
+
+    /// Usage is reachable without a raw connection, through the same store a
+    /// caller already has. Exporting only the connection-taking functions left
+    /// an embedder with no supported way to ask what a session cost.
+    #[test]
+    fn usage_is_readable_through_the_public_facade() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ai-history.db");
+        let store = SessionStore::open(StoreOptions {
+            db_path: Some(db.clone()),
+            ..StoreOptions::default()
+        })
+        .unwrap();
+
+        // A session that was never recorded is `None`, not an empty rollup.
+        assert!(store
+            .session_usage(Source::Codex, "missing")
+            .unwrap()
+            .is_none());
+        let page = store
+            .session_requests_page(Source::Codex, "missing", 10, None)
+            .unwrap();
+        assert!(page.requests.is_empty());
     }
 
     #[test]
