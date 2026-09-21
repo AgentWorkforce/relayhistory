@@ -53,12 +53,16 @@ and `crates/ai-hist-napi/src/lib.rs`).
    already-published `custom_version`; the job checks out `sdk-ts-v<version>`
    and publishes the crate from that tag.
 5. After the clean registry install and the older-glibc CLI smoke tests pass,
-   `publish` pushes the version commit — only if the branch has not advanced —
-   and creates the `sdk-ts-v<version>` tag and GitHub Release. The registry
-   smoke installs `ai-hist` as an ordinary dependency with npm's `--libc` set
-   to this runner's family so `ai-hist-native-linux-x64-gnu` (or musl) is
-   selected.
-6. `plugins` checks out that persisted commit, packages each helper binary at
+   `publish` tags the published tree as `sdk-ts-v<version>` and creates the
+   GitHub Release. A separate `persist-version` job rebases the version-only
+   commit onto the current branch tip and pushes, so a merge that landed
+   during publish does not drop the tag. Crate, plugins and probe depend on
+   `publish` (the tag), not on that persist. A rebase conflict still leaves
+   the tag and Release in place; `skip_core` with this `custom_version`
+   finishes anything that did not. The registry smoke installs `ai-hist` as
+   an ordinary dependency with npm's `--libc` set to this runner's family so
+   `ai-hist-native-linux-x64-gnu` (or musl) is selected.
+6. `plugins` checks out the tagged published tree, packages each helper binary at
    the release version, verifies staged tarballs, verifies the *published* core
    at each plugin's peer minimum, then publishes the seven helpers of each
    plugin before its JavaScript package. Post-publish verification waits for
