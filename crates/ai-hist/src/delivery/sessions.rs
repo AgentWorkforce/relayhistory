@@ -351,6 +351,28 @@ pub fn adopt_session_job(
     job_id: &str,
     members: &[SessionIdentity],
 ) -> Result<()> {
+    loop {
+        match adopt_session_job_once(conn, job_id, members) {
+            // Adoption temporarily duplicates selected snapshot preimages.
+            // A legacy collector may have filled retention before its worker
+            // could compact consumed revisions. Retry only after reclaiming
+            // data that every consumer has already copied; never raise the
+            // cap, discard pending batches, or advance an unread cursor.
+            Err(error) if is_retention_limit(&error) => {
+                if compact_journal(conn, 1_000)? == 0 {
+                    return Err(error);
+                }
+            }
+            result => return result,
+        }
+    }
+}
+
+fn adopt_session_job_once(
+    conn: &Connection,
+    job_id: &str,
+    members: &[SessionIdentity],
+) -> Result<()> {
     let tx = write_transaction(conn)?;
     if is_session_job(&tx, job_id)? {
         tx.commit()?;

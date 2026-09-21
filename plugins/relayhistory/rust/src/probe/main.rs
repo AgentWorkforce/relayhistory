@@ -132,6 +132,8 @@ fn main() {
             eprintln!("{safe}");
         } else if let Some(safe) = error.downcast_ref::<cloud::CloudAuthError>() {
             eprintln!("{safe}");
+        } else if let Some(safe) = collector::local_failure_message(&error) {
+            eprintln!("{safe}");
         } else {
             eprintln!("Probe could not finish. Check your connection and run setup again. Credentials and session content were not logged.");
         }

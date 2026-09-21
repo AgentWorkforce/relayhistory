@@ -1219,3 +1219,70 @@ fn scoped_child_reinclusion_rejects_old_prepared_relationships() {
         assert_ne!(records[0].revision_id, old.batch.records[0].revision_id);
     }
 }
+
+#[test]
+fn scoped_adoption_recovers_full_retention_without_discarding_unconsumed_revisions() {
+    for pinned_by_other_job in [false, true] {
+        let conn = db();
+        let seed = create_job(&conn, &config("retention-seed"), 0).unwrap();
+        event(&conn, "private", &"private backlog".repeat(10_000));
+        event(&conn, "a", &"original".repeat(4_000));
+        if !pinned_by_other_job {
+            cancel_job(&conn, &seed.job_id).unwrap();
+        }
+        let old = create_job(&conn, &config("retention-adopt"), 1).unwrap();
+        conn.execute(
+            "UPDATE session_events SET text='latest' WHERE session_id='a'",
+            [],
+        )
+        .unwrap();
+        pause_job(&conn, &old.job_id).unwrap();
+        let (used, _) = retained_bytes(&conn).unwrap();
+        set_retention_limit(&conn, used).unwrap();
+        let member = SessionIdentity {
+            source: "claude".into(),
+            session_id: "a".into(),
+        };
+        let result = adopt_session_job(&conn, &old.job_id, std::slice::from_ref(&member));
+        assert_eq!(
+            retained_bytes(&conn).unwrap().1,
+            used,
+            "must not raise the retention cap"
+        );
+        assert_eq!(status(&conn, &old.job_id).unwrap().state, "paused");
+        if pinned_by_other_job {
+            assert!(is_retention_limit(&result.unwrap_err()));
+            assert!(!is_session_job(&conn, &old.job_id).unwrap());
+            assert!(job_sessions(&conn, &old.job_id).unwrap().is_empty());
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM delivery_journal WHERE kind='session_event'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                3
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM delivery_shadow WHERE job_id=?",
+                    [&old.job_id],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                1
+            );
+        } else {
+            result.unwrap();
+            assert!(is_session_job(&conn, &old.job_id).unwrap());
+            assert_eq!(job_sessions(&conn, &old.job_id).unwrap(), vec![member]);
+            resume_job(&conn, &old.job_id).unwrap();
+            let records = drain(&conn, &old.job_id);
+            assert!(records.iter().all(|r| r.session_id.as_deref() == Some("a")));
+            assert!(records
+                .iter()
+                .any(|r| r.payload["text"] == "original".repeat(4_000)));
+            assert!(records.iter().any(|r| r.payload["text"] == "latest"));
+        }
+    }
+}

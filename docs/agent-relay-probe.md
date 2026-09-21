@@ -78,6 +78,19 @@ Run setup again after restarting the machine. It preserves the existing queue.
 
 ## State and delivery
 
+Selected-session delivery runs before targeted hydration and independently of
+unrelated provider discovery. An old selected queue at its retention cap can
+reclaim consumed journal entries and retry its atomic membership migration.
+This preserves the cap, queued batches, snapshot preimages, and other jobs'
+unread revisions. If nothing can safely be reclaimed, migration stays pending.
+
+The desktop status `last_cycle` includes an optional, allowlisted `error_class`
+and a safe message for local retention, database corruption, disk-space,
+contention, and permission failures. These also cover failures before capture
+starts. No raw SQLite/provider error, transcript, credential, or path is
+included. Database corruption requires separate recovery from a preserved copy;
+the collector does not delete or recreate a damaged queue automatically.
+
 Each `(site origin, user, workspace)` has an independent SHA-256-named directory
 under `~/.agentworkforce/probe/`. It contains an SDK-owned `history.db`, persisted
 selection/job metadata, scoped RelayHistory auth, a log, a runtime record and a
