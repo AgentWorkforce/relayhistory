@@ -58,22 +58,6 @@
       "text": "done",
       "token_json": "{\"cache_creation\":{\"ephemeral_1h_input_tokens\":0,\"ephemeral_5m_input_tokens\":0},\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":5,\"output_tokens\":2}",
       "ts_ms": 1776643201000
-    },
-    {
-      "cwd": "/tmp/project",
-      "event_uid": "u-asst-2:0",
-      "git_branch": null,
-      "kind": "text",
-      "message_id": "u-asst-2",
-      "model": "claude-sonnet-4-6",
-      "parent_id": "u-asst-1",
-      "project": "/tmp/project",
-      "role": "assistant",
-      "session_id": "33333333-3333-3333-3333-333333333333",
-      "source": "claude",
-      "text": "working...",
-      "token_json": "{\"cache_creation\":{\"ephemeral_1h_input_tokens\":0,\"ephemeral_5m_input_tokens\":0},\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":7,\"output_tokens\":3}",
-      "ts_ms": 1776643202000
     }
   ],
   "session_relationships": [],

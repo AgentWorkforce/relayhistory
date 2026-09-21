@@ -22,7 +22,7 @@ dependencies = [
 
 [[package]]
 name = "ai-hist"
-version = "0.22.1"
+version = "0.23.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -303,7 +303,7 @@ dependencies = [
 
 [[package]]
 name = "history-provider-sources"
-version = "0.22.1"
+version = "0.23.0"
 dependencies = [
  "ai-hist",
  "anyhow",

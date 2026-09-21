@@ -508,12 +508,16 @@ jobs:
       # Passed through so the plugin and probe jobs need only one dependency
       # for the version, whether or not the core was published in this run.
       version: ${{ needs.version.outputs.version }}
-      release_sha: ${{ steps.persist-version.outputs.sha }}
+      # The tagged published tree, not the post-rebase branch tip. Plugins
+      # package this SHA so a merge that landed during publish cannot sneak
+      # into the version that was just put on the registry.
+      release_sha: ${{ steps.tag-published-tree.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
-          # A real release persists its version commit once publishing and
-          # the registry smoke tests succeed.
+          # A real release tags the published tree once publishing and the
+          # registry smoke tests succeed; persist-version then rebases that
+          # commit onto the branch.
           persist-credentials: true
       - uses: actions/setup-node@v6
         with:
@@ -771,13 +775,56 @@ jobs:
             bash scripts/smoke-linux-native.sh "$image" registry "$VERSION"
           done
 
-      # The branch only advances once every package is published and the
-      # registry smoke tests pass, so a failed release never persists its
-      # version bump. The commit itself was prepared before the publish-only
-      # sdk-ts/package.json rewrite, so it stays version-only.
-      - name: Persist release version
-        id: persist-version
+      # Tag the tree that was published, then create the GitHub Release,
+      # before pushing the version commit. skip_core rebuilds from this tag,
+      # so a later persist failure (or a merge that lands during smoke)
+      # cannot leave npm at a version that has no tag.
+      # The commit itself was prepared before the publish-only
+      # sdk-ts/package.json rewrite, so the tag stays version-only.
+      - name: Tag the published tree
+        id: tag-published-tree
         if: ${{ !inputs.dry_run }}
+        working-directory: .
+        run: |
+          set -euo pipefail
+          test -n "$VERSION"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Discard the publish-only sdk-ts dependency rewrite so the tag
+          # matches the version commit prepared earlier in this job.
+          git reset --hard HEAD
+          git tag -a "sdk-ts-v$VERSION" HEAD -m "ai-hist@$VERSION"
+          git push origin "refs/tags/sdk-ts-v$VERSION"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Create GitHub Release
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "sdk-ts-v$VERSION" \
+            --target "${{ steps.tag-published-tree.outputs.sha }}" \
+            --title "ai-hist@$VERSION" \
+            --generate-notes
+  persist-version:
+    name: Persist release version
+    needs: [version, publish]
+    # Bookkeeping only: npm, the tag and the GitHub Release already exist.
+    # Crate, plugins and probe depend on `publish`, not this job, so a rebase
+    # conflict cannot drop a version that is already on the registry.
+    if: ${{ !cancelled() && !inputs.dry_run && !inputs.skip_core && needs.publish.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.publish.outputs.release_sha }}
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Persist release version
         working-directory: .
         run: |
           set -euo pipefail
@@ -785,25 +832,9 @@ jobs:
             echo "Release versions can only be persisted from a branch checkout" >&2
             exit 1
           fi
-          BRANCH="${GITHUB_REF#refs/heads/}"
-          git fetch origin "$BRANCH"
-          REMOTE_SHA=$(git rev-parse "origin/$BRANCH")
-          if [[ "$REMOTE_SHA" != "$GITHUB_SHA" ]]; then
-            echo "The release branch advanced from $GITHUB_SHA to $REMOTE_SHA; rerun from the new tip" >&2
-            exit 1
-          fi
-          git push origin "HEAD:$GITHUB_REF"
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      - name: Create GitHub Release and tag
-        if: ${{ !inputs.dry_run }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh release create "sdk-ts-v$VERSION" \
-            --target "${{ steps.persist-version.outputs.sha }}" \
-            --title "ai-hist@$VERSION" \
-            --generate-notes
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          bash scripts/persist-release-version.sh "${GITHUB_REF#refs/heads/}" "${{ github.sha }}"
 
   publish-crate:
     name: Publish crate to crates.io
@@ -904,11 +935,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # A real core release already persisted the plugin manifests at this
-          # version; a dry run applies them below instead. A skip_core re-run
-          # packages the code the named release shipped, from its tag, never the
-          # newer dispatch commit (`format` is never empty, so the release sha
-          # and the dispatch fallback only apply when skip_core is off).
+          # The tagged published tree (or that same SHA via release_sha on a
+          # normal run). A dry run applies the version below instead. A
+          # skip_core re-run packages the code the named release shipped, from
+          # its tag, never the newer dispatch commit (`format` is never empty,
+          # so the release sha and the dispatch fallback only apply when
+          # skip_core is off).
           ref: ${{ inputs.skip_core && format('refs/tags/sdk-ts-v{0}', needs.version.outputs.version) || needs.publish.outputs.release_sha || github.sha }}
           persist-credentials: false
       - uses: actions/setup-node@v4
@@ -1134,4 +1166,13 @@ jobs:
             cp "probe/$platform/agent-relay-probe" "probe/agent-relay-probe-$platform"
             cp "probe/$platform/agent-relay-probe.sha256" "probe/agent-relay-probe-$platform.sha256"
           done
+          # skip_core requires the tag. A publish that pushed the tag and then
+          # failed at `gh release create` leaves that tag with no Release;
+          # upload would fail. Create the Release from the existing tag.
+          if ! gh release view "sdk-ts-v$VERSION" >/dev/null 2>&1; then
+            gh api "repos/${GH_REPO}/git/ref/tags/sdk-ts-v$VERSION" >/dev/null
+            gh release create "sdk-ts-v$VERSION" \
+              --title "ai-hist@$VERSION" \
+              --generate-notes
+          fi
           gh release upload "sdk-ts-v$VERSION" --clobber probe/agent-relay-probe-*

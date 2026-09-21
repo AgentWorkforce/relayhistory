@@ -630,6 +630,16 @@ export function evidenceIdentity(source: unknown, sessionId: unknown, operation:
  * only meaningful against 'release'.
  */
 
+function requireFiniteNumber(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new NativeContractMismatchError(
+      'ai-hist-native returned an invalid hydration result.',
+      'NATIVE_CONTRACT_MISMATCH',
+    );
+  }
+  return value;
+}
+
 /**
  * Validate the reported coverage rather than cast it: an unknown kind is a
  * native contract mismatch, not a value to hand a caller that will branch on it.
@@ -763,6 +773,12 @@ export function combineHydration(
       relatedSessions: Math.max(previous.evidence.relatedSessions, next.evidence.relatedSessions),
     },
     coverage,
+    // Summed, not taken from `selected`, which is spread above. Evidence
+    // counts are the same rows counted by two sources, so the larger is the
+    // truth; bytes are disjoint work each source actually did, so the truth is
+    // the total. Spreading the winner alone let a local read of a whole
+    // transcript be reported as the connector's zero.
+    bytesRead: previous.bytesRead + next.bytesRead,
     relatedSessionIds: [...new Set([...previous.relatedSessionIds, ...next.relatedSessionIds])],
     diagnostics,
   };
@@ -824,6 +840,13 @@ export function normalizeHydration(value: UnknownRecord): HydrateSessionResult {
       fileEdits: Number(evidence.fileEdits),
       relatedSessions: Number(evidence.relatedSessions),
     },
+    // A missing counter is a broken contract, not a read of nothing. Zero is
+    // the one value a caller cannot tell apart from "this hydration read
+    // nothing", so defaulting to it turns an addon that has fallen behind the
+    // contract into a watch loop that sees no activity and reports none.
+    // Version 3 requires the field; if it is absent the result is not
+    // version 3, whatever it says it is.
+    bytesRead: requireFiniteNumber(value.bytesRead),
     coverage,
     relatedSessionIds: Array.isArray(value.relatedSessionIds)
       ? value.relatedSessionIds.map(String)

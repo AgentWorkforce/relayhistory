@@ -113,6 +113,31 @@ pub(crate) enum HumanMessageOutcome {
 }
 
 impl HumanMessageDeduper {
+    /// Rebuild the one-record memory a resumed pass left behind.
+    ///
+    /// The mirror pair that has to be suppressed can straddle the byte offset
+    /// a pass committed at, so the deduper's single previous message is part
+    /// of the rollout's resume state. `(true, text)` is a `response_item`.
+    pub(crate) fn restore(previous: Option<(bool, String)>) -> Self {
+        Self {
+            previous: previous.map(|(response_item, text)| {
+                let format = if response_item {
+                    HumanMessageFormat::ResponseItem
+                } else {
+                    HumanMessageFormat::EventMessage
+                };
+                (format, text)
+            }),
+        }
+    }
+
+    /// The memory to carry across a resume, in [`Self::restore`]'s shape.
+    pub(crate) fn remembered(&self) -> Option<(bool, String)> {
+        self.previous
+            .as_ref()
+            .map(|(format, text)| (*format == HumanMessageFormat::ResponseItem, text.clone()))
+    }
+
     pub(crate) fn observe(&mut self, value: &Value) -> HumanMessageOutcome {
         let current = human_message(value);
         let Some(current) = current else {

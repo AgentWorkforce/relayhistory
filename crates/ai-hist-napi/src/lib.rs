@@ -1605,6 +1605,12 @@ pub struct HydrateSessionResult {
     pub presence: String,
     pub indexed_through: HydrationIndexedThrough,
     pub evidence: HydrationEvidence,
+    /// Bytes read from provider files by this hydration. About the size of
+    /// the append when a live transcript grew, and small but **not zero** when
+    /// the session was unchanged: deciding nothing changed means validating
+    /// each cursor against a bounded window of the file it was written from.
+    /// Zero is reserved for a pass that opened no provider file at all.
+    pub bytes_read: i64,
     /// Evidence kinds this hydration can have indexed, as wire names
     /// (`history`, `session_event`, `tool_call`, `file_edit`,
     /// `relationship`, `commit_link`).
@@ -1670,6 +1676,7 @@ pub async fn hydrate_session(options: HydrateSessionOptions) -> napi::Result<Hyd
             file_edits: result.evidence.file_edits as i64,
             related_sessions: result.evidence.related_sessions as i64,
         },
+        bytes_read: result.bytes_read,
         coverage: result
             .coverage
             .iter()

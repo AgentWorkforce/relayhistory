@@ -350,6 +350,9 @@ pub(crate) fn apply_normalized(
         // contradict a hydration that did index delegation.
         include_related,
         full,
+        // A remote connector delivers records, not a growing local file:
+        // there is no byte position in the source to resume from.
+        None,
     )?;
     // Inside the transaction that wrote the records, for the same reason the
     // local hydration path does it: a snapshot supplies `session_events` rows
