@@ -466,6 +466,122 @@ which this table must stay consistent with.
 | **opencode** | ✓ | ✓ (directory / message `path.cwd`) | – | ✓ | ✓ | ✓ | ✓ (`providerID/modelID`) | – | – | – | – | – |
 | **relay** | ✓ | – (never) | – | ✓ (synced min ts) | ✓ (synced max ts) | ✓ (earliest synced prompt) | – | – | – | – | – | – |
 
+### Session markers
+
+Not every provider record is a message. Compaction and summary boundaries,
+system rows, non-text content blocks and agent lifecycle events all describe a
+session without being a turn in it, and the normalized `session_events` model
+has no `kind` for any of them. They are recorded in `session_markers` instead
+of being dropped, and read with `session_markers_page` — the same
+`(ts_ms IS NULL, ts_ms, id)` keyset the tool call and file edit pages use.
+
+`kind` is the classified vocabulary below; `subkind` is the provider-native
+type verbatim. A record type no classifier knows yet is stored as
+`kind = "unknown"` with its real name in `subkind`, so it is recoverable
+later.
+
+`payload_json` is always bounded — every string at 128 characters and every
+container at 32 entries, recursively — so an `image` or `document` block
+contributes its size and never its bytes. How it is *built* depends on whose
+keys they are. Where this parser classifies the record it names the fields it
+keeps, which is the tighter contract. Where the payload is the provider's own
+document and its keys are theirs — Grok's `signals` sidecar, a compaction
+checkpoint — the document is bounded whole instead: enumerating the provider's
+keys would silently drop whatever it adds next, which is the failure this
+table exists to end. Either way the bound is the promise the column makes, and
+it holds for every kind.
+
+| `kind` | claude | codex | grok | `subkind` examples |
+|---|---|---|---|---|
+| `compaction_boundary` | ✓ `type:"system"`, `subtype:"compact_boundary"` | ✓ top-level `compacted`, `context_compacted` | ✓ | `compact_boundary`, `compacted` |
+| `summary` | ✓ `type:"summary"` | – | – | `summary` |
+| `subagent_notification` | ✓ system rows with `parent_tool_use_id`; tool results carrying `toolUseResult.agentId` | ✓ `subagent_*` | – | `subagent_completed`, `tool_use_result_agent_id`, `subagent_message_complete` |
+| `task_started` | – | ✓ | – | `task_started` |
+| `task_complete` | – | ✓ | – | `task_complete` |
+| `turn_diff` | – | ✓ | – | `turn_diff` |
+| `stream_error` | – | ✓ | – | `stream_error` |
+| `tool_begin` | – | ✓ any `*_begin` | – | `exec_command_begin`, `patch_apply_begin`, `mcp_tool_call_begin` |
+| `review_mode` | – | ✓ | – | `entered_review_mode`, `exited_review_mode` |
+| `unsupported_block` | ✓ any content block with no event `kind`, plus thinking signatures | – | – | `image`, `document`, `redacted_thinking`, `server_tool_use`, `thinking_signature` |
+| `encrypted_reasoning` | – | ✓ `response_item/reasoning` | ✓ an opaque reasoning trace with no summary | `reasoning` |
+| `tool_replacement` | ✓ `_meta.replaces` / `_meta.collapsedCalls` | – | – | `tool_result` |
+| `system` | – | – | ✓ a system preamble, in `text` | – |
+| `synthetic_turn` | – | – | ✓ a turn the harness wrote, in `text` | – |
+| `signals` | – | – | ✓ | – |
+| `prompt_context` | – | – | ✓ | – |
+| `unknown` | ✓ any unclassified record type, plus a `user`/`assistant` record that produced no event at all | ✓ any unclassified payload type, including `agent_reasoning_raw_content` and `agent_reasoning_section_break` | – | the provider type, verbatim |
+
+`text` is the provider's own readable prose for a marker, and `payload_json`
+its structure; a marker may carry either, both or neither. Grok records a
+system preamble and a synthetic turn as prose, which is why the column exists
+rather than that prose being flattened into JSON that no longer reads as prose.
+Where a `kind` is written by more than one provider, the writers populate the
+same columns for it, so `compaction_boundary` reads the same whether Claude,
+Codex or Grok produced it.
+
+Every provider line leaves a row behind: an event, a marker, or both. A record
+type is silent here only when some other part of the parser is known to store
+it — a claim that is checked, not assumed, by
+`every_codex_line_leaves_an_event_or_a_marker_behind`. A record's outer `type`
+is classified independently of whether it also carries message content, so a
+future record type that happens to carry some is not filed away as an ordinary
+text event with its native type recorded nowhere.
+
+The invariant is enforced by *counting the rows a record produced*, not by
+predicting them from the shape of its content. Content can be present and still
+reach nothing — `""`, `[]`, or blocks that are all blank — and each such shape
+is one more rule to miss. A Claude record that wrote no row falls back to
+`unknown` carrying its provider type, and a Codex line measured against
+SQLite's own `total_changes` does the same: a blank `agent_message` or a
+`*_end` with no `call_id` is stored by nothing, whatever the handler list says.
+
+Codex keeps one explicit exception list, for lines that are state updates
+rather than records and whose information is stored elsewhere: `session_meta`
+and `turn_context` populate the catalog, `token_count` is folded into the
+adjacent assistant event's `token_json`, `thread_settings_applied` carries the
+model forward, a `*_delta` is a fragment of an event recorded whole, and an
+assistant `message` is the mirrored twin of the `agent_message` that stores the
+text.
+
+A **user** message is deliberately not on that list, and the reason is the
+lesson the list itself taught. Codex writes a user turn in two representations
+and a deduplicator stores one row for the pair — but only when it accepts the
+turn. It refuses blank text, application-injected control wrappers, and content
+with no `input_text` part, such as an image-only turn. Exempting user messages
+by type alone therefore asserted a row had been written when none had, and
+those lines vanished. The exemption is now *earned*: it applies to a mirrored
+twin, where the deduplicator reports that its partner really did write, and
+every other user line is settled by measurement like anything else.
+
+That is the general shape to keep: an exception list must be oriented so a
+wrong entry costs a redundant marker rather than a vanished line, and an entry
+that asserts "something else stored this" has to be checked against what was
+stored.
+
+Markers are evidence, so they are removed with the rest when a complete remote
+snapshot replaces a session: a marker left behind would tell a caller that
+something is still there which the provider has stopped sending.
+
+They also have to *survive* that path. A remote Claude snapshot is parsed by
+the same local parser into a temporary database and then projected back out as
+evidence records, so whatever the projection list omits is written during
+normalization and discarded before anything durable sees it. Markers are in
+that list — `PARSED_SESSION_KINDS`, everything this crate's parser writes —
+which is deliberately separate from `FULL_SESSION_KINDS`, the set a remote
+connector must supply for its snapshot to count as complete. A source plugin
+cannot derive markers, so requiring them there would silently demote every
+third-party connector to partial.
+
+A compaction boundary states no size of its own, so a Claude
+`compaction_boundary` payload carries `tokens_before_compact` taken from the
+`cache_read_input_tokens` of the assistant message immediately before it.
+
+`session_events.raw_kind` names the provider-native record or block an event
+came from. Two very different records normalize to `kind = "tool_result"` — a
+`tool_result` content block (`raw_kind = "tool_result_block"`) and a Claude
+`type: "system"` subagent notification
+(`raw_kind = "system_subagent_notification"`) — and `raw_kind` is what keeps
+them apart without widening the `kind` vocabulary readers switch on.
 Tool-result fidelity is a separate capability. The columns live on the
 `session_events` rows whose `kind` is `tool_result`, and every one of them is
 null when the provider does not record it — never a stand-in zero or a guessed

@@ -91,6 +91,7 @@ fn event(uid: &str, text: &str) -> SessionEvent {
         request_id: Some(format!("req-{uid}")),
         provider_message_id: Some(format!("msg-{uid}")),
         event_uid: uid.into(),
+        raw_kind: None,
         // A synthetic assistant text event: none of the tool-result fidelity
         // facts apply to it, and the absence is the honest answer.
         tool_use_id: None,

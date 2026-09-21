@@ -105,7 +105,14 @@ use super::*;
 /// resuming on one would fold only the tail and publish continuity evidence
 /// built from part of the file, overwriting the complete row already stored.
 /// Discarding v1 reads each transcript once from zero and rebuilds it.
-pub(crate) const TRANSCRIPT_CURSOR_VERSION: u32 = 2;
+///
+/// Version 3 is the marker parsers. A marker exists nowhere but the
+/// transcript, so an install upgrading into them has to read every transcript
+/// once — which is what main expressed by advancing its `claude_sessions_v3`
+/// stamp map to v4. This branch retired that map, so the same one-time
+/// re-read is expressed here: a cursor is what the skip path consults now, and
+/// discarding the old ones is what makes the pass happen.
+pub(crate) const TRANSCRIPT_CURSOR_VERSION: u32 = 3;
 
 /// How much of the committed region each end of the validation window covers.
 pub(crate) const PREFIX_WINDOW_BYTES: u64 = 64 * 1024;
@@ -182,6 +189,11 @@ pub(crate) struct ClaudeCursorState {
     /// The continuity walk's position and fold over the same file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuity: Option<ClaudeContinuityState>,
+    /// The cache read of the assistant message before a compaction boundary,
+    /// per session. A boundary reports no size of its own, and the pass that
+    /// reads it can resume after the message that stated one.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub cache_reads: std::collections::HashMap<String, i64>,
     /// Tool-result ordering as of the committed offset.
     ///
     /// `call_index` and `event_index` are assigned over the whole transcript,

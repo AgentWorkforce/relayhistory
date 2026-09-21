@@ -94,6 +94,24 @@ pub(crate) struct HumanMessageDeduper {
     previous: Option<(HumanMessageFormat, String)>,
 }
 
+/// What [`HumanMessageDeduper::observe`] did with a record.
+///
+/// `Suppressed` and `Rejected` both mean "no message came back", but they are
+/// opposite facts about the ledger: a suppressed mirror was already stored
+/// under its twin, while a rejected record was stored by nobody. Collapsing
+/// them into one `None` is what let an image-only user turn -- a `message`
+/// with no `input_text` part -- disappear from both tables.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HumanMessageOutcome {
+    /// A human turn to store.
+    Stored(HumanMessage),
+    /// The mirrored encoding of the turn just stored; its twin wrote the row.
+    Suppressed,
+    /// Not a storable human turn: no text part, a control wrapper, or not a
+    /// user message at all. Nothing wrote a row on its behalf.
+    Rejected,
+}
+
 impl HumanMessageDeduper {
     /// Rebuild the one-record memory a resumed pass left behind.
     ///
@@ -120,11 +138,11 @@ impl HumanMessageDeduper {
             .map(|(format, text)| (*format == HumanMessageFormat::ResponseItem, text.clone()))
     }
 
-    pub(crate) fn observe(&mut self, value: &Value) -> Option<HumanMessage> {
+    pub(crate) fn observe(&mut self, value: &Value) -> HumanMessageOutcome {
         let current = human_message(value);
         let Some(current) = current else {
             self.previous = None;
-            return None;
+            return HumanMessageOutcome::Rejected;
         };
         let mirrored = self
             .previous
@@ -132,10 +150,10 @@ impl HumanMessageDeduper {
             .is_some_and(|(format, text)| *format != current.format && text == &current.text);
         if mirrored {
             self.previous = None;
-            return None;
+            return HumanMessageOutcome::Suppressed;
         }
         self.previous = Some((current.format, current.text.clone()));
-        Some(current)
+        HumanMessageOutcome::Stored(current)
     }
 }
 
@@ -208,10 +226,41 @@ mod tests {
             "payload": {"type": "agent_message", "message": "working"}
         });
         let mut deduper = HumanMessageDeduper::default();
-        assert!(deduper.observe(&response).is_some());
-        assert!(deduper.observe(&event).is_none());
-        assert!(deduper.observe(&event).is_some());
-        assert!(deduper.observe(&assistant).is_none());
-        assert!(deduper.observe(&event).is_some());
+        assert!(matches!(
+            deduper.observe(&response),
+            HumanMessageOutcome::Stored(_)
+        ));
+        // The mirrored encoding of the same turn: silent, but only because
+        // its twin wrote the row.
+        assert_eq!(deduper.observe(&event), HumanMessageOutcome::Suppressed);
+        assert!(matches!(
+            deduper.observe(&event),
+            HumanMessageOutcome::Stored(_)
+        ));
+        // Not a human turn at all, so nothing wrote on its behalf -- a
+        // different fact from the suppression above, and the caller has to be
+        // able to tell them apart.
+        assert_eq!(deduper.observe(&assistant), HumanMessageOutcome::Rejected);
+        assert!(matches!(
+            deduper.observe(&event),
+            HumanMessageOutcome::Stored(_)
+        ));
+    }
+
+    /// A user turn whose content carries no `input_text` part -- an
+    /// image-only message -- is rejected, not suppressed. Reporting it as a
+    /// suppression would claim a row had been written for it.
+    #[test]
+    fn an_image_only_user_message_is_rejected_rather_than_suppressed() {
+        let image_only = json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_image", "image_url": "data:image/png;base64,AAAA"}]
+            }
+        });
+        let mut deduper = HumanMessageDeduper::default();
+        assert_eq!(deduper.observe(&image_only), HumanMessageOutcome::Rejected);
     }
 }

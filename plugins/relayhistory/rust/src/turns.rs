@@ -243,6 +243,7 @@ mod tests {
                 text TEXT, model TEXT, token_json TEXT,
                 provider TEXT,
                 event_uid TEXT NOT NULL,
+                raw_kind TEXT,
                 -- Per-tool-result fidelity columns. `ai_hist::session_events`
                 -- selects every column the crate defines, so a hand-built
                 -- fixture table that stops at `event_uid` fails the read with

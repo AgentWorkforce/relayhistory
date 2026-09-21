@@ -144,6 +144,12 @@ pub(crate) fn ingest_claude_transcript_incremental(
             claude.tool_results = rewound;
         }
     }
+    // The session this file belongs to. The metadata fold has already read it
+    // from the head, so a resumed pass does not go looking for it again.
+    let file_session_id = claude
+        .scan
+        .as_ref()
+        .and_then(|scan| scan.fold.session_id.clone());
     // Nothing has been appended since the last pass, so whatever was still
     // being written then is not going to be finished. Holding it back again
     // would hold it back forever.
@@ -238,6 +244,8 @@ pub(crate) fn ingest_claude_transcript_incremental(
                             &mut deferred_order,
                             &mut deferred_bytes,
                             &mut claude.tool_results,
+                            file_session_id.as_deref(),
+                            &mut claude.cache_reads,
                         )?;
                     }
                 } else if complete || !defer_unfinished {
@@ -245,9 +253,11 @@ pub(crate) fn ingest_claude_transcript_incremental(
                         conn,
                         path,
                         attributed_session_id,
+                        file_session_id.as_deref(),
                         record,
                         obj,
                         &mut claude.tool_results,
+                        &mut claude.cache_reads,
                     )?;
                 } else {
                     deferred_bytes += line.len();
@@ -270,9 +280,11 @@ pub(crate) fn ingest_claude_transcript_incremental(
                 conn,
                 path,
                 attributed_session_id,
+                file_session_id.as_deref(),
                 record,
                 obj,
                 &mut claude.tool_results,
+                &mut claude.cache_reads,
             )?,
         }
         if kind == ReadRecord::Unterminated {
@@ -294,6 +306,8 @@ pub(crate) fn ingest_claude_transcript_incremental(
                 &mut deferred_order,
                 &mut deferred_bytes,
                 &mut claude.tool_results,
+                file_session_id.as_deref(),
+                &mut claude.cache_reads,
             )?;
         }
     }
@@ -366,6 +380,8 @@ fn flush_deferred(
     deferred_order: &mut Vec<String>,
     deferred_bytes: &mut usize,
     indexer: &mut crate::ingest::tool_result_facts::ToolResultIndexer,
+    file_session_id: Option<&str>,
+    cache_reads: &mut std::collections::HashMap<String, i64>,
 ) -> Result<()> {
     let Some(entry) = deferred.remove(message_id) else {
         return Ok(());
@@ -380,7 +396,16 @@ fn flush_deferred(
         let Some(obj) = value.as_object() else {
             continue;
         };
-        ingest_claude_record(conn, path, attributed_session_id, record, obj, indexer)?;
+        ingest_claude_record(
+            conn,
+            path,
+            attributed_session_id,
+            file_session_id,
+            record,
+            obj,
+            indexer,
+            cache_reads,
+        )?;
     }
     Ok(())
 }
