@@ -697,6 +697,21 @@ mod tests {
         assert_eq!(status.state, "active");
         assert_eq!(status.acknowledged_records, 0);
         assert!(status.pending_records > 0);
+        assert_eq!(status.failure, None);
+        assert_eq!(status.next_attempt_ms, 0);
+        let attempts: i64 = conn
+            .query_row(
+                "SELECT attempts FROM delivery_jobs WHERE id=?",
+                [&config.job_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempts, 0);
+        assert!(
+            delivery::claim_batch(&conn, &config.job_id, "restarted", 60_000, &now)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

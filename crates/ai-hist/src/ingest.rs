@@ -3732,6 +3732,7 @@ fn backfill_codex_metadata(
 ) -> Result<usize> {
     let mut updated = 0;
     for (session_id, cwd) in cwds {
+        check_capture_cancelled()?;
         let branch = branches.get(session_id);
         updated += conn.execute(
             "UPDATE history SET project = COALESCE(project, ?), git_branch = COALESCE(git_branch, ?) WHERE source = 'codex' AND session_id = ? AND (project IS NULL OR git_branch IS NULL)",
@@ -8711,6 +8712,7 @@ fn trajectory_files(home: &Path) -> Result<Vec<PathBuf>> {
     }
     let mut files = Vec::new();
     for root in roots {
+        check_capture_cancelled()?;
         if root.is_file() && root.extension().and_then(|s| s.to_str()) == Some("json") {
             files.push(root);
             continue;
@@ -8732,6 +8734,7 @@ fn collect_named_dirs(root: &Path, name: &str, out: &mut Vec<PathBuf>) -> Result
         return Ok(());
     }
     for entry in fs::read_dir(root)? {
+        check_capture_cancelled()?;
         let entry = entry?;
         // Never follow symlinks: dependency links can revisit the same tree or cycle.
         if !entry.file_type()?.is_dir() {
@@ -8767,6 +8770,7 @@ fn collect_trajectory_json(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
         return Ok(());
     }
     for entry in fs::read_dir(dir)? {
+        check_capture_cancelled()?;
         let entry = entry?;
         let file_type = entry.file_type()?;
         let path = entry.path();
@@ -20014,6 +20018,79 @@ mod capture_progress_tests {
             .unwrap(),
             200
         );
+    }
+
+    #[test]
+    fn cancellation_interrupts_codex_metadata_backfill_and_retry_completes_it() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::init_db(&conn).unwrap();
+        let cwds: HashMap<String, String> = (0..20)
+            .map(|i| (format!("session-{i}"), "/project".into()))
+            .collect();
+        for id in cwds.keys() {
+            conn.execute("INSERT INTO history(source,session_id,prompt,timestamp_ms) VALUES ('codex',?1,?1,1)", [id]).unwrap();
+        }
+        let checks = std::cell::Cell::new(0);
+        let error = with_capture_stop(
+            move || {
+                checks.set(checks.get() + 1);
+                checks.get() > 5
+            },
+            || backfill_codex_metadata(&conn, &cwds, &HashMap::new()),
+        )
+        .unwrap_err();
+        assert!(error.is::<CaptureCancelled>());
+        let count = || {
+            conn.query_row(
+                "SELECT COUNT(*) FROM history WHERE project IS NOT NULL",
+                [],
+                |row| row.get::<_, usize>(0),
+            )
+            .unwrap()
+        };
+        assert!((1..20).contains(&count()));
+        backfill_codex_metadata(&conn, &cwds, &HashMap::new()).unwrap();
+        assert_eq!(count(), 20);
+    }
+
+    #[test]
+    fn cancellation_interrupts_both_trajectory_directory_walks() {
+        let home = tempfile::tempdir().unwrap();
+        for i in 0..20 {
+            let directory = home
+                .path()
+                .join(format!("project-{i}/.trajectories/completed"));
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("run.json"), "{}").unwrap();
+        }
+        for named in [true, false] {
+            let checks = std::cell::Cell::new(0);
+            let mut found = Vec::new();
+            let error = with_capture_stop(
+                move || {
+                    checks.set(checks.get() + 1);
+                    checks.get() > 5
+                },
+                || {
+                    if named {
+                        collect_named_dirs(home.path(), ".trajectories", &mut found)
+                    } else {
+                        collect_trajectory_json(home.path(), &mut found)
+                    }
+                },
+            )
+            .unwrap_err();
+            assert!(error.is::<CaptureCancelled>());
+            assert!(found.len() < 20, "stop must interrupt enumeration itself");
+            let mut resumed = Vec::new();
+            if named {
+                collect_named_dirs(home.path(), ".trajectories", &mut resumed)
+            } else {
+                collect_trajectory_json(home.path(), &mut resumed)
+            }
+            .unwrap();
+            assert_eq!(resumed.len(), 20);
+        }
     }
 
     #[test]

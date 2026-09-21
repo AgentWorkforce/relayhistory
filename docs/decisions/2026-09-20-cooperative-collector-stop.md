@@ -23,6 +23,13 @@ on return, error or panic. Existing capture APIs retain their behavior. Checks
 at provider, file, record and catalog-window boundaries abort with the typed
 `CaptureCancelled` error. Committed chunks and checkpoints survive; unfinished
 transactions roll back, and incomplete transcripts are reread on the next run.
+The directory walks and Codex metadata backfill also check between entries.
+
+When a host stops a claimed delivery attempt, the worker returns the batch to
+pending without recording a transient failure or adding retry backoff. Release
+checks lease ownership in the same transaction, preserves prepared bytes for
+idempotent replay, and reverses only that claim's retry-counter increment.
+Explicit receiver refusals and retry deadlines remain authoritative.
 
 ## Alternatives and consequences
 
