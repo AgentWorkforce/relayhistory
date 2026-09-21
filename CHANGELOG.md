@@ -4,6 +4,93 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ## [Unreleased]
 
+### Live capture
+
+- `ai-hist watch` now wakes on filesystem events over everything a local sweep
+  reads — the providers' session roots, the flat `~/.claude/history.jsonl` and
+  `~/.codex/history.jsonl` logs, and `.trajectories` directories — with a
+  200 ms debounce and a 30 s slow-poll backstop, falling back to polling when
+  no root can be watched. The flat logs are watched as the single files they
+  are, so their neighbours — `~/.claude/settings.json` and the rest — do not
+  each force a sweep, and re-deriving the root set stays on the backstop once
+  the watcher is attached rather than following a short `--interval`. New flags: `--no-fsevents`, `--debounce-ms`,
+  alongside the existing `--interval`. The watcher backend is behind the
+  optional `fs-events` crate feature, which the CLI enables; a
+  `--no-default-features` build polls.
+- Startup reports the driver **and any root not covered yet** — only where a
+  retry is actually pending. A loop with no filesystem backend at all
+  (`--no-fsevents`, a build without the feature, a watcher that could not be
+  brought up) reports none, because polling covers every root at `--interval`
+  and nothing would ever promote them. Roots that do
+  not exist are retried on the backstop — not on `--interval`, which may be an
+  hour — so a provider installed after `watch` started becomes covered in
+  seconds without a restart, while sweeps keep the cadence that was asked for.
+  Every configurable interval is bounded at seven days where it enters, so an
+  absurd `--debounce-ms` cannot stop capture on the first change event. Watch
+  roots and event paths are resolved to one absolute spelling, and a root also
+  remembers its symlink-resolved spelling, so a root given relatively or
+  reached through a symlink matches the events the watcher reports for it on
+  either backend. A change arriving while a manual `tick()` holds the sweep
+  slot is swept as soon as that tick finishes, rather than waiting for the
+  backstop. A sweep another process's sync lock turned away is likewise kept
+  rather than counted as done: the lock holder may already have walked past
+  the provider that just wrote, so the forced sweep is retried 250 ms later,
+  backing off to the backstop while the lock stays held, and the change is
+  swept as soon as a sync can take it. A forced sweep that *failed* is kept the
+  same way: a transient database error covered nothing either, and logging it
+  and waiting for the backstop loses the change it was woken for.
+  A registration is re-made only when the directory it was made against is
+  gone or has been replaced, so a deleted-and-recreated root is watched again
+  instead of being silently reported as covered, and a live one is not
+  re-registered on every tick. A registration the backend reports as gone is
+  acted on when the report arrives and retried four times a second until it is
+  back, rather than waiting out the backstop — long enough for a whole short
+  session to be written to a recreated directory and cleaned up unseen. That
+  report cuts the debounce window short and is acted on before the sweep the
+  window was opening, because on a busy tree the window is where the loop
+  spends nearly all of its time. The faster retry lasts exactly as long as the
+  recovery does: a root that has *never* existed — a provider that is not
+  installed — stays pending on the backstop and no longer holds the short
+  cadence open for the rest of the run. A root taken on by a refresher while
+  its directory does not exist yet is reported as pending straight away,
+  rather than only once it becomes watchable. Reconciliation runs on an absolute deadline
+  rather than when the wait expires, so a busy session writing every few
+  hundred milliseconds cannot postpone attaching the roots beside it. `watch --remote` installs
+  no local roots, so local writes cannot drive remote connector traffic.
+- `sync` now short-circuits on a stat-only source fingerprint folded over
+  everything the sweep reads — the enumerated transcripts, the Claude subagent
+  `agent-*.meta.json` sidecars, the two flat logs and the trajectory records —
+  recorded in `.sync-state.json`. A tick over unchanged sources opens no files.
+  Filesystem-event ticks force past it, because an event can arrive before the
+  write flushes. A file that could not be read — by the sweep or by discovery,
+  whose per-file failures are non-fatal — leaves the fingerprint stale so the
+  next tick retries it, rather than caching the failure in place.
+- The fingerprint is qualified by the sweep's parser and scanner generations,
+  and paired with a `destination_generation` marker in `.sync-state.json`
+  recorded after each sweep. An upgrade that bumps a generation cannot honour
+  the previous one's stamp, and a session that has *lost* evidence — a
+  half-restored backup, a truncated write — reopens the sweep and is
+  re-ingested, rather than being skipped forever behind sources that will
+  never change again. The marker holds one entry per session, so growth
+  elsewhere cannot answer for a loss; rows arriving between sweeps (the hook
+  fast path, hydration) are growth, not loss, and still skip. Each entry
+  covers the session's events, tool calls, file edits and catalog row, so
+  structured evidence and a lost `sessions` row are guarded on the same terms
+  as the transcript. It covers only what a sweep can put back — Claude
+  transcripts and Codex rollouts — including a delegated subagent, reached by
+  its own id rather than through a catalog row it deliberately never has —
+  and a loss the sweep could not restore leaves the marker and the fingerprint
+  stale rather than recording the shortfall as the new truth.
+- New `ai-hist ingest --hook claude [--quiet] [--json]` reads a Claude Code
+  lifecycle-hook payload from stdin and hydrates exactly the transcript it
+  names — and only if the transcript is the session the payload named. A
+  payload whose two claims disagree (a delayed or replayed hook pairing a live
+  session id with another session's file) is reported as `mismatched` and
+  ingests nothing. It always exits 0, and `--quiet` outranks `--json` so a hook wired
+  with both stays silent. See `docs/agent-integration.md` for the
+  `settings.json` wiring, including why `PreCompact` cannot be replaced by
+  watch mode.
+
 ### Session topology
 
 - Record fork, resume and continuation relationships, not delegation alone.

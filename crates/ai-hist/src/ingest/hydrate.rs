@@ -169,6 +169,9 @@ struct SourceSnapshot {
     /// reading exists to remove.
     records: SnapshotRecords,
     path: Option<PathBuf>,
+    /// Top-level Claude bytes captured by the lifecycle hook before catalog
+    /// writes. Ordinary hydration leaves this absent and reads by path.
+    claude_transcript: Option<ClaudeTranscriptSnapshot>,
     /// For OpenCode: which of the provider's two layouts this locator was
     /// validated against. Carried rather than re-derived, because the only
     /// thing that can be re-derived from a path is its spelling — and
@@ -262,8 +265,10 @@ pub fn hydrate_session_at_with_connectors(
     hydrate_session_at_with_roots_and_connectors(db_path, options, &roots, connectors)
 }
 
-#[cfg(test)]
-fn hydrate_session_at_with_home(
+/// Hydrate against an explicit provider home instead of the process `HOME`.
+/// The provider-root check that guards every locator resolves against it, so
+/// a host (or a test) with its own layout never has to mutate process state.
+pub fn hydrate_session_at_with_home(
     db_path: &Path,
     options: &HydrateSessionOptions,
     home: &Path,
@@ -282,7 +287,13 @@ fn hydrate_session_at_with_home(
 
 #[cfg(test)]
 fn test_sync_cursor(conn: &Connection, home: &Path, state: &mut Map<String, Value>) {
-    super::sync_cursor(conn, state, &home.join(".cursor/projects")).unwrap();
+    super::sync_cursor(
+        conn,
+        state,
+        &home.join(".cursor/projects"),
+        &mut Default::default(),
+    )
+    .unwrap();
 }
 
 #[cfg(test)]
@@ -296,11 +307,23 @@ fn test_load_sync_state(db_path: &Path) -> Map<String, Value> {
     .unwrap()
 }
 
-fn hydrate_session_at_with_roots_and_connectors(
+pub(crate) fn hydrate_session_at_with_roots_and_connectors(
     db_path: &Path,
     options: &HydrateSessionOptions,
     roots: &crate::ProviderRoots,
     connectors: &crate::remote::SourceConnectorSelection,
+) -> Result<HydrateSessionResult> {
+    hydrate_session_at_with_roots_connectors_and_claude_snapshot(
+        db_path, options, roots, connectors, None,
+    )
+}
+
+pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
+    db_path: &Path,
+    options: &HydrateSessionOptions,
+    roots: &crate::ProviderRoots,
+    connectors: &crate::remote::SourceConnectorSelection,
+    claude_snapshot: Option<ClaudeTranscriptSnapshot>,
 ) -> Result<HydrateSessionResult> {
     let home = &roots.home;
     validate_options(options)?;
@@ -354,7 +377,7 @@ fn hydrate_session_at_with_roots_and_connectors(
             "CONNECTOR_NOT_CONFIGURED: the builtin local adapter has not observed this session"
         );
     }
-    let snapshot = source_snapshot(&conn, options, &target, roots)?;
+    let snapshot = source_snapshot(&conn, options, &target, roots, claude_snapshot)?;
     let previous = observations::checkpoint(&conn, &local_key)?.map(|checkpoint| {
         (
             checkpoint.source_stamp,
@@ -471,6 +494,7 @@ fn hydrate_session_at_with_roots_and_connectors(
         &target,
         snapshot.path.as_deref(),
         &snapshot.claude_subagents,
+        snapshot.claude_transcript.as_ref(),
         &mut cursor,
         records_parsed,
         snapshot.opencode_layout,
@@ -1351,6 +1375,7 @@ fn source_snapshot(
     options: &HydrateSessionOptions,
     target: &CatalogTarget,
     roots: &crate::ProviderRoots,
+    claude_snapshot: Option<ClaudeTranscriptSnapshot>,
 ) -> Result<SourceSnapshot> {
     if options.source == "relay" {
         return Err(hydration_error(
@@ -1480,6 +1505,7 @@ fn source_snapshot(
             // complete `part` table on older stores missing its usual index.
             records: SnapshotRecords::Counted(0),
             path: Some(path),
+            claude_transcript: None,
             claude_subagents: Vec::new(),
             scanned_bytes: 0,
             scanned_superseded: false,
@@ -1496,16 +1522,36 @@ fn source_snapshot(
         )
     })?;
     let path = PathBuf::from(locator);
-    if !path.is_file() {
-        return Err(hydration_error(
-            "SESSION_SOURCE_UNAVAILABLE",
-            format!(
-                "provider source {} disappeared after discovery",
-                path.display()
-            ),
-        ));
+    let captured_claude = if options.source == "claude" {
+        claude_snapshot
+    } else {
+        anyhow::ensure!(
+            claude_snapshot.is_none(),
+            "SESSION_SOURCE_MISMATCH: Claude snapshot supplied for another provider"
+        );
+        None
+    };
+    if let Some(snapshot) = captured_claude.as_ref() {
+        anyhow::ensure!(
+            snapshot.path == path,
+            "SESSION_SOURCE_MISMATCH: Claude hook snapshot does not match the catalog locator"
+        );
+        // The hook validated this path against the configured Claude root
+        // immediately before opening the snapshot. Do not canonicalize the
+        // live path again here: rotation may remove it after the bytes were
+        // safely captured, and those bytes are the evidence being hydrated.
+    } else {
+        if !path.is_file() {
+            return Err(hydration_error(
+                "SESSION_SOURCE_UNAVAILABLE",
+                format!(
+                    "provider source {} disappeared after discovery",
+                    path.display()
+                ),
+            ));
+        }
+        validate_provider_path(&options.source, &path, roots)?;
     }
-    validate_provider_path(&options.source, &path, roots)?;
     // Grok's source is a directory, not a file. Its inventory is metadata
     // only — the same walk as its change stamp, so the two can never describe
     // different sets of files — and the record count is deferred, because
@@ -1517,6 +1563,13 @@ fn source_snapshot(
             inventory.bytes,
             SnapshotRecords::DeferredGrok(path.clone()),
             inventory.stamp,
+        )
+    } else if let Some(snapshot) = captured_claude.as_ref() {
+        // The hook already read these bytes; nothing here opens the file.
+        (
+            snapshot.text.len() as i64,
+            SnapshotRecords::Counted(snapshot.records()),
+            snapshot.stamp.clone(),
         )
     } else if matches!(options.source.as_str(), "claude" | "codex") {
         // Counted by the pass that parses, not by a walk over the whole file
@@ -1594,6 +1647,7 @@ fn source_snapshot(
         bytes,
         records,
         path: Some(path),
+        claude_transcript: captured_claude,
         claude_subagents: subagents,
         scanned_bytes,
         scanned_superseded,
@@ -1801,6 +1855,7 @@ fn opencode_json_tree_snapshot(
         records: SnapshotRecords::Counted(i64::try_from(stamp.files).unwrap_or(i64::MAX)),
         path: Some(session_file.to_path_buf()),
         claude_subagents: Vec::new(),
+        claude_transcript: None,
         scanned_bytes: 0,
         scanned_superseded: false,
         stamped_cursors: Vec::new(),
@@ -1809,7 +1864,7 @@ fn opencode_json_tree_snapshot(
     })
 }
 
-fn validate_provider_path(
+pub(crate) fn validate_provider_path(
     source: &str,
     path: &Path,
     provider_roots: &crate::ProviderRoots,
@@ -2017,6 +2072,7 @@ fn ingest_selected(
     target: &CatalogTarget,
     path: Option<&Path>,
     claude_subagents: &[ClaudeSubagentEvidence],
+    claude_snapshot: Option<&ClaudeTranscriptSnapshot>,
     cursor: &mut TranscriptCursorState,
     records: i64,
     opencode_layout: Option<OpencodeIngestLayout>,
@@ -2030,8 +2086,15 @@ fn ingest_selected(
         ..Default::default()
     };
     match options.source.as_str() {
-        "claude" => ingest_claude(conn, options, path.unwrap(), claude_subagents, cursor)
-            .map(|outcome| (outcome, Vec::new(), None)),
+        "claude" => ingest_claude(
+            conn,
+            options,
+            path.unwrap(),
+            claude_subagents,
+            claude_snapshot,
+            cursor,
+        )
+        .map(|outcome| (outcome, Vec::new(), None)),
         "codex" => ingest_codex(conn, options, path.unwrap(), cursor)
             .map(|outcome| (outcome, Vec::new(), None)),
         "cursor" => {
@@ -2090,22 +2153,34 @@ fn ingest_claude(
     options: &HydrateSessionOptions,
     path: &Path,
     subagents: &[ClaudeSubagentEvidence],
+    snapshot: Option<&ClaudeTranscriptSnapshot>,
     cursor: &mut TranscriptCursorState,
 ) -> Result<IngestOutcome> {
     // Resumed from the same cursor document the record walk uses, so a
     // hydration of a transcript that grew by a kilobyte reads a kilobyte in
-    // total. Recovering identity by reading the whole file here made the
-    // incremental reader behind it pointless and its `bytes_read` a report
-    // about one of the two walks rather than about the hydration.
+    // total. Skipped entirely when the hook already handed over the bytes:
+    // there is nothing to resume from and nothing to read.
     let mut scan = cursor.claude.clone().unwrap_or_default().scan;
-    let scan_pass = scan_claude_session_file_resumed(path, &mut scan)?;
-    let (meta, scanned_bytes, scan_validation, scan_superseded, scan_continuity) = (
-        scan_pass.meta,
-        scan_pass.bytes_read,
-        scan_pass.validation_bytes,
-        scan_pass.superseded,
-        scan_pass.continuity,
-    );
+    let scan_pass = match snapshot {
+        Some(_) => None,
+        None => Some(scan_claude_session_file_resumed(path, &mut scan)?),
+    };
+    let (meta, scanned_bytes, scan_validation, scan_superseded, scan_continuity) = match scan_pass {
+        Some(pass) => (
+            pass.meta,
+            pass.bytes_read,
+            pass.validation_bytes,
+            pass.superseded,
+            pass.continuity,
+        ),
+        None => (
+            snapshot.map(|s| s.meta()).unwrap_or(None),
+            0,
+            0,
+            false,
+            None,
+        ),
+    };
     let meta = meta.ok_or_else(|| {
         hydration_error(
             "SESSION_SOURCE_MISMATCH",
@@ -2137,13 +2212,42 @@ fn ingest_claude(
         superseded: scan_superseded,
         ..Default::default()
     };
-    outcome.absorb(incremental::ingest_claude_transcript_incremental(
-        conn, path, None, cursor,
-    )?);
-    // The record walk rewrites `cursor.claude`; put the metadata walk's own
-    // position back on it so both survive the same store.
-    if let Some(claude) = cursor.claude.as_mut() {
-        claude.scan = scan;
+    match snapshot {
+        // The hook's bytes, parsed once — and a cursor recorded over exactly
+        // them. Writing none left the file looking never-read: the sweep and
+        // the next hook both decide "unchanged" from the cursor, so every one
+        // of them re-read a transcript the hook had already indexed. The
+        // offset is the snapshot's length, not the file's: if the file grew
+        // after the hook captured it, the next pass resumes at the tail rather
+        // than claiming bytes nobody parsed.
+        Some(snapshot) => {
+            ingest_claude_transcript_text_as(conn, path, &snapshot.text, None)?;
+            //
+            // Best-effort, and deliberately so: the snapshot exists precisely
+            // because the hook read bytes the file may no longer have. A
+            // source removed between capture and hydration still indexes, and
+            // simply records no position — there is no file for one to
+            // describe.
+            if let Ok(mut reader) =
+                crate::ingest::transcript_cursor::TranscriptReader::open(path, None, None)
+            {
+                if let Ok(crate::ingest::transcript_cursor::CommitOutcome::Published(file)) =
+                    reader.commit(snapshot.text.len() as u64)
+                {
+                    cursor.file = Some(file);
+                }
+            }
+        }
+        None => {
+            outcome.absorb(incremental::ingest_claude_transcript_incremental(
+                conn, path, None, cursor,
+            )?);
+            // The record walk rewrites `cursor.claude`; put the metadata
+            // walk's own position back on it so both survive the same store.
+            if let Some(claude) = cursor.claude.as_mut() {
+                claude.scan = scan;
+            }
+        }
     }
     record_claude_remote_relationship(conn, &meta, options.include_related)?;
     if options.include_related {
@@ -2151,19 +2255,23 @@ fn ingest_claude(
         // A request for this session alone leaves relationship evidence for
         // a later hydration that includes related sessions.
         //
-        // Already folded by the metadata walk above, so this reads nothing and
-        // there is nothing to count: the two folds ask different questions of
-        // the same records, and asking them in one pass is the difference
-        // between two reads of an append and three.
+        // Folded by the metadata walk above when there was one, so that path
+        // reads nothing here. The hook's bytes have no such walk behind them,
+        // so they are folded from the text.
         //
         // A superseded fold is not published. Its records came from bytes that
         // were rewritten under the walk, and an absent continuity row
         // *retracts* the edges it established — so a partial fold would
         // replace real topology, and there is no "leave it alone" to express
-        // by passing one. The next pass folds the file again from zero,
-        // because no position was recorded for it either.
-        if !scan_superseded {
-            crate::continuity::capture_folded(conn, path, scan_continuity)?;
+        // by passing one.
+        match snapshot {
+            Some(snapshot) => {
+                crate::continuity::capture_claude_transcript_text(conn, path, &snapshot.text)?
+            }
+            None if !scan_superseded => {
+                crate::continuity::capture_folded(conn, path, scan_continuity)?
+            }
+            None => {}
         }
         crate::continuity::reconcile(conn, "claude")?;
     }
@@ -3717,6 +3825,56 @@ mod tests {
             ],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn a_captured_claude_snapshot_survives_source_removal_before_hydration() {
+        let home = tempfile::tempdir().unwrap();
+        let projects = home.path().join(".claude/projects/proj");
+        fs::create_dir_all(&projects).unwrap();
+        let transcript = projects.join("vanishing.jsonl");
+        fs::write(
+            &transcript,
+            concat!(
+                r#"{"sessionId":"vanishing","uuid":"1","type":"assistant","message":{"role":"assistant","content":"captured"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let opencode = home.path().join("opencode.db");
+        let roots = crate::ProviderRoots::from_home(home.path().to_path_buf(), opencode);
+        validate_provider_path("claude", &transcript, &roots).unwrap();
+        let snapshot = ClaudeTranscriptSnapshot::open(&transcript).unwrap();
+
+        let db = home.path().join("history.db");
+        let conn = crate::open_db(&db).unwrap();
+        catalog_row(&conn, "claude", "vanishing", Some(&transcript));
+        drop(conn);
+        fs::remove_file(&transcript).unwrap();
+
+        let result = hydrate_session_at_with_roots_connectors_and_claude_snapshot(
+            &db,
+            &HydrateSessionOptions {
+                source: "claude".into(),
+                session_id: "vanishing".into(),
+                scope: SessionScope::Local,
+                include_related: false,
+            },
+            &roots,
+            &crate::remote::SourceConnectorSelection::default(),
+            Some(snapshot),
+        )
+        .unwrap();
+        assert_eq!(result.status, "hydrated");
+        let conn = crate::open_db(&db).unwrap();
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE source='claude' AND session_id='vanishing'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(events > 0, "captured bytes must survive path removal");
     }
 
     /// One `tool_calls` row as the Grok assertions read it back:
@@ -5635,7 +5793,14 @@ mod tests {
         assert!(diagnostic(&upgraded, "HYDRATION_SOURCE_ROTATED").is_none());
 
         // And from here the cursor carries: an append reads only the append.
-        let addition = incomplete_fixture_completion();
+        //
+        // Re-stamped with this transcript's own session. The snippet is
+        // borrowed from another fixture for its shape, and a transcript that
+        // carried two identities would be rejected as the mis-stamped file it
+        // looks like — the ids are the same length, so what this measures is
+        // unchanged.
+        let addition = incomplete_fixture_completion()
+            .replace("33333333-3333-3333-3333-333333333333", session_id);
         let mut file = fs::OpenOptions::new()
             .append(true)
             .open(&transcript)
@@ -9707,7 +9872,13 @@ mod tests {
         // pull the child's output back onto the parent, take over the
         // parent's catalog locator, or register itself.
         for _ in 0..2 {
-            sync_claude_session_metadata(&conn, &mut Map::new(), &projects).unwrap();
+            sync_claude_session_metadata_with_repairs(
+                &conn,
+                &mut Map::new(),
+                &projects,
+                &Default::default(),
+            )
+            .unwrap();
             let placement: (i64, i64, i64, String) = conn
                 .query_row(
                     "SELECT \

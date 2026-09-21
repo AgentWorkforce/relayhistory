@@ -194,7 +194,7 @@ fn capture_with_stop(
     cancelled: Arc<AtomicBool>,
 ) -> Result<()> {
     let started = Instant::now();
-    let progress = super::progress::Monitor::start(directory, history_url, None);
+    let progress = super::progress::Monitor::start(directory, history_url, None, false);
     let latest = Arc::new(std::sync::Mutex::new(ai_hist::CaptureProgress::default()));
     let seen = latest.clone();
     let observer = progress.observer();
@@ -463,8 +463,12 @@ fn deliver_captured_with_stop(
     // its verdict is a generic permission refusal. Name the cause here first so
     // the user sees which uploader to stop instead of a reconnect suggestion.
     super::check_legacy_schedules(config.acknowledge_uninspected_schedules)?;
-    let progress =
-        super::progress::Monitor::start(directory, &config.history_url, Some(&config.job_id));
+    let progress = super::progress::Monitor::start(
+        directory,
+        &config.history_url,
+        Some(&config.job_id),
+        before_exit,
+    );
     let result = deliver(&db_path, config, cancelled);
     if before_exit {
         let connected =

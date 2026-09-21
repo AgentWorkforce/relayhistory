@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::Arc;
 
 use ai_hist::diagnostics::{doctor_report, human_bytes, DoctorReport};
 use ai_hist::git_helpers::*;
@@ -240,11 +240,40 @@ enum Command {
         interval: u64,
     },
     /// Repeatedly sync agent history using the requested configured connectors.
+    ///
+    /// Wakes on filesystem events under the providers' session roots, with a
+    /// slow poll as a backstop. Falls back to pure polling at `--interval`
+    /// when no root can be watched.
     Watch {
         #[command(flatten)]
         scope: SessionScopeArgs,
+        /// Seconds between polls. Used as the only cadence when filesystem
+        /// events are unavailable or disabled.
         #[arg(long, default_value_t = 60)]
         interval: u64,
+        /// Poll only. Use on filesystems where change notifications are
+        /// unreliable (network mounts, some container filesystems).
+        #[arg(long)]
+        no_fsevents: bool,
+        /// Milliseconds of filesystem events to collapse into one sweep.
+        #[arg(long, default_value_t = ai_hist::watch::DEFAULT_DEBOUNCE_MS)]
+        debounce_ms: u64,
+    },
+    /// Ingest one agent session from a lifecycle hook payload on stdin.
+    ///
+    /// Reads the harness's hook JSON (`session_id`, `transcript_path`, …) and
+    /// hydrates exactly that transcript. Always exits 0: a hook that fails
+    /// would fail the tool call the agent is in the middle of.
+    Ingest {
+        /// Harness whose hook payload is on stdin. Only `claude` today.
+        #[arg(long, value_name = "HARNESS")]
+        hook: String,
+        /// Say nothing at all, on any stream. Wins over --json.
+        #[arg(long)]
+        quiet: bool,
+        /// Print the ingest report as JSON on stdout. Ignored under --quiet.
+        #[arg(long)]
+        json: bool,
     },
     /// Diagnose database health: size, WAL, free space, and who holds the write lock.
     Doctor {
@@ -567,11 +596,28 @@ pub fn run() -> Result<()> {
             )
             .map(|_| ());
         }
-        Command::Watch { scope, interval } => {
+        Command::Watch {
+            scope,
+            interval,
+            no_fsevents,
+            debounce_ms,
+        } => {
             if scope.resolve() == SessionScope::Remote {
                 remote::ensure_selected_remote_connectors_configured_for("sync", &[], &connectors)?;
             }
-            return watch_loop_with_connectors(&db_path, *interval, scope.resolve(), &connectors);
+            return watch_loop_with_connectors(
+                &db_path,
+                *interval,
+                scope.resolve(),
+                &connectors,
+                WatchDrivers {
+                    use_fs_events: !*no_fsevents,
+                    debounce_ms: *debounce_ms,
+                },
+            );
+        }
+        Command::Ingest { hook, quiet, json } => {
+            return run_hook_ingest(&db_path, hook, *quiet, *json);
         }
         Command::Sessions {
             action: SessionsAction::Discover { scope, source, .. },
@@ -854,7 +900,10 @@ pub fn run() -> Result<()> {
             }
             Ok(())
         }
-        Command::SyncOpencode { .. } | Command::Sync { .. } | Command::Watch { .. } => {
+        Command::SyncOpencode { .. }
+        | Command::Sync { .. }
+        | Command::Watch { .. }
+        | Command::Ingest { .. } => {
             unreachable!("sync commands are handled before opening the shared database")
         }
         Command::Export {
@@ -2085,12 +2134,25 @@ fn doctor(db_path: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// How `watch` should be driven. Both knobs exist because filesystem change
+/// notifications are not uniformly trustworthy: `--no-fsevents` is the escape
+/// hatch for a filesystem that lies, and the debounce window is how long a
+/// burst of events is allowed to collapse for.
+struct WatchDrivers {
+    use_fs_events: bool,
+    debounce_ms: u64,
+}
+
 fn watch_loop(db_path: &Path, interval: u64, scope: SessionScope) -> Result<()> {
     watch_loop_with_connectors(
         db_path,
         interval,
         scope,
         &remote::SourceConnectorSelection::default(),
+        WatchDrivers {
+            use_fs_events: true,
+            debounce_ms: ai_hist::watch::DEFAULT_DEBOUNCE_MS,
+        },
     )
 }
 
@@ -2099,15 +2161,179 @@ fn watch_loop_with_connectors(
     interval: u64,
     scope: SessionScope,
     connectors: &remote::SourceConnectorSelection,
+    drivers: WatchDrivers,
 ) -> Result<()> {
-    println!("Watching every {interval}s (Ctrl-C to stop)...");
-    loop {
-        match sync_scoped_at_with_output(db_path, scope, connectors, SyncOutput::Progress) {
-            Ok(_) => {}
-            Err(err) => eprintln!("Error: {err:#}"),
-        }
-        std::thread::sleep(Duration::from_secs(interval));
+    let roots = watch_roots_for_scope(scope);
+    let remote_only = scope == SessionScope::Remote;
+    let db = db_path.to_path_buf();
+    let connectors = connectors.clone();
+    let tick: ai_hist::watch::TickFn = Arc::new(move |force| {
+        let tick = sync_tick_at(&db, scope, &connectors, SyncOutput::Progress, force)?;
+        Ok(ai_hist::watch::TickOutcome::from(tick))
+    });
+    let mut watch = ai_hist::watch::WatchLoop::new(tick)
+        .with_roots(roots)
+        .with_fs_events(drivers.use_fs_events)
+        .with_debounce_ms(drivers.debounce_ms)
+        .with_poll_interval_ms(interval.saturating_mul(1000))
+        .with_immediate(true)
+        .on_error(Arc::new(|error| eprintln!("Error: {error:#}")))
+        .on_driver(Arc::new(move |status| {
+            match status.driver {
+                ai_hist::watch::WatchDriver::FsEvents => println!(
+                    "Watching {} session root(s) for changes (debounce {}ms, {}s backstop; Ctrl-C to stop)...",
+                    status.watched.len(),
+                    drivers.debounce_ms,
+                    ai_hist::watch::DEFAULT_SLOW_POLL_MS / 1000
+                ),
+                ai_hist::watch::WatchDriver::Polling if remote_only => println!(
+                    "Watching remote connectors every {interval}s (Ctrl-C to stop)..."
+                ),
+                ai_hist::watch::WatchDriver::Polling => {
+                    println!("Watching every {interval}s (Ctrl-C to stop)...")
+                }
+            }
+            // Saying which roots are uncovered is the difference between "live
+            // capture is on" and "live capture is on for the providers that
+            // were installed when you started it".
+            if !status.pending.is_empty() {
+                println!(
+                    "  not watched yet (retried every {}s): {}",
+                    ai_hist::watch::DEFAULT_SLOW_POLL_MS / 1000,
+                    status
+                        .pending
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+        }));
+    if !remote_only {
+        // A project that grows a `.trajectories` directory after the run
+        // started is a root whose name could not have been known at startup,
+        // so the pending-retry path alone would never reach it.
+        watch = watch.with_roots_refresh(Arc::new(|| watch_roots_for_scope(SessionScope::Local)));
     }
+    watch.run().map(|_| ())
+}
+
+/// The roots watch installs for a scope.
+///
+/// A remote-scoped watch installs none. Local provider roots would otherwise
+/// select the filesystem-event driver, and every local Claude or Codex write —
+/// which a remote-only run is not collecting at all — would fire the remote
+/// connectors, plus the 30s backstop on top. The user asked for remote at
+/// `--interval`; that is what they get.
+fn watch_roots_for_scope(scope: SessionScope) -> Vec<ai_hist::discover::WatchRoot> {
+    if scope == SessionScope::Remote {
+        return Vec::new();
+    }
+    sync_watch_roots(&home_dir(), &default_opencode_db_path())
+}
+
+/// `ingest --hook <harness>`: read one lifecycle-hook payload from stdin and
+/// ingest the transcript it names.
+///
+/// Never returns `Err`. A hook runs inside the agent's tool call, and a
+/// non-zero exit there is a failed tool call — so a missing transcript, an
+/// unparseable payload, or a locked database are all reported and shrugged off.
+/// `--quiet` silences the reporting, not the shrug.
+fn run_hook_ingest(db_path: &Path, hook: &str, quiet: bool, json: bool) -> Result<()> {
+    let note = |message: String| {
+        if !quiet {
+            eprintln!("ai-hist ingest: {message}");
+        }
+    };
+    if !ai_hist::HOOK_HARNESSES.contains(&hook) {
+        note(format!(
+            "unsupported hook harness '{hook}'; known: {}",
+            ai_hist::HOOK_HARNESSES.join(", ")
+        ));
+        return Ok(());
+    }
+    let mut payload = String::new();
+    if let Err(error) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut payload) {
+        note(format!("could not read the hook payload: {error}"));
+        return Ok(());
+    }
+    if payload.trim().is_empty() {
+        note("empty hook payload; nothing to do".into());
+        return Ok(());
+    }
+    let parsed: serde_json::Value = match serde_json::from_str(&payload) {
+        Ok(value) => value,
+        Err(error) => {
+            note(format!("hook payload is not JSON: {error}"));
+            return Ok(());
+        }
+    };
+    // Mirrors the harness contract: a payload with no `session_id` is not a
+    // session lifecycle event we can attribute, so it is ignored rather than
+    // guessed at.
+    let Some(session_id) = parsed
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())
+    else {
+        note("hook payload has no session_id; ignoring".into());
+        return Ok(());
+    };
+    let transcript = parsed
+        .get("transcript_path")
+        .and_then(serde_json::Value::as_str)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
+
+    let outcome = match &transcript {
+        // Some hook events elide `transcript_path`. Falling back to a forced
+        // sweep still makes progress rather than dropping the event: forced,
+        // because the hook fired precisely because something just changed.
+        None => {
+            note("hook payload has no transcript_path; running a full sweep".into());
+            sync_tick_at(
+                db_path,
+                SessionScope::Local,
+                &remote::SourceConnectorSelection::default(),
+                SyncOutput::Silent,
+                true,
+            )
+            .map(|tick| {
+                serde_json::json!({
+                    "source": hook,
+                    "status": if tick.swept { "swept" } else { "skipped" },
+                })
+            })
+        }
+        // The payload names both the session and the file. Passing the
+        // session through is what lets the ingest refuse a pairing the two
+        // disagree about, rather than hydrating whatever the file turns out
+        // to be.
+        Some(path) => ai_hist::ingest_transcript_at(db_path, hook, path, Some(session_id), true)
+            .and_then(|report| Ok(serde_json::to_value(&report)?)),
+    };
+    match outcome {
+        Ok(report) => {
+            // `--quiet` outranks `--json`. A hook's contract is "exit 0, say
+            // nothing"; a caller passing both asked for silence and for a
+            // shape to parse if anything *is* said, and silence is the
+            // stronger of the two. Printing anyway would put JSON on the
+            // stdout of a hook that was told to stay out of the way.
+            match (quiet, json) {
+                (true, _) => {}
+                (false, true) => println!("{report}"),
+                (false, false) => {
+                    let status = report
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("done");
+                    eprintln!("ai-hist ingest: {hook} {status}");
+                }
+            }
+        }
+        Err(error) => note(format!("{error:#}")),
+    }
+    Ok(())
 }
 
 /// A background service managed by ai-hist. Both the local `sync` job and the
@@ -3178,6 +3404,25 @@ mod tests {
     use rusqlite::Connection;
     use serde_json::{json, Value};
     use std::fs;
+
+    /// A remote-scoped watch must install no local roots. If it did, the
+    /// filesystem-event driver would be selected by local writes the run is
+    /// not even collecting, and every one of them would fire the remote
+    /// connectors — plus the 30s backstop, instead of the requested interval.
+    #[test]
+    fn a_remote_watch_installs_no_local_roots() {
+        assert!(
+            watch_roots_for_scope(SessionScope::Remote).is_empty(),
+            "remote scope must not watch local provider roots"
+        );
+        for scope in [SessionScope::Local, SessionScope::All] {
+            assert!(
+                !watch_roots_for_scope(scope).is_empty(),
+                "{scope:?} must still watch local provider roots"
+            );
+        }
+    }
+
     #[test]
     fn cron_schedule_maps_intervals_to_step_expressions() {
         assert_eq!(cron_schedule(60).0, "* * * * *");
