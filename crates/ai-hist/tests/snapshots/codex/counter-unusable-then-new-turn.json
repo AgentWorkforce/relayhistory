@@ -1,0 +1,126 @@
+{
+  "corpus_files": [
+    "codex/counter-unusable-then-new-turn.jsonl"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "codex/counter-unusable-then-new-turn",
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "first",
+      "session_id": "sess_codex_wrong_turn",
+      "source": "codex",
+      "timestamp_ms": 1776672000300
+    },
+    {
+      "project": "/tmp/project",
+      "prompt": "second",
+      "session_id": "sess_codex_wrong_turn",
+      "source": "codex",
+      "timestamp_ms": 1776672002000
+    }
+  ],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "sess_codex_wrong_turn",
+      "source": "codex",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "CodexRollout",
+  "notes": [],
+  "origin": "relayhistory",
+  "quirk": "a later advancing delta covers an earlier unreadable snapshot and clears only refusals in that span",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "3:user_message",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "3:user_message",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "sess_codex_wrong_turn",
+      "source": "codex",
+      "text": "first",
+      "token_json": null,
+      "ts_ms": 1776672000300
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "4:agent_message",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "4:agent_message",
+      "model": "gpt-5.4",
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "sess_codex_wrong_turn",
+      "source": "codex",
+      "text": "First answer.",
+      "token_json": null,
+      "ts_ms": 1776672000900
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "6:user_message",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "6:user_message",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "sess_codex_wrong_turn",
+      "source": "codex",
+      "text": "second",
+      "token_json": null,
+      "ts_ms": 1776672002000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "7:agent_message",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "7:agent_message",
+      "model": "gpt-5.4",
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "sess_codex_wrong_turn",
+      "source": "codex",
+      "text": "Second answer.",
+      "token_json": "{\"cache_write_input_tokens\":0,\"cached_input_tokens\":0,\"input_tokens\":400,\"output_tokens\":140,\"reasoning_output_tokens\":0,\"total_tokens\":540}",
+      "ts_ms": 1776672002900
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": null,
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776672000000,
+      "first_prompt": "first",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776672004000,
+      "last_assistant_text": "Second answer.",
+      "models_json": "[\"gpt-5.4\"]",
+      "originator": null,
+      "raw_path": "<home>/.codex/sessions/2026/04/20/rollout-2026-04-20T00-00-00-counter-unusable-then-new-turn.jsonl",
+      "repo_url": null,
+      "session_id": "sess_codex_wrong_turn",
+      "source": "codex",
+      "source_stamp": "<n>:1445",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "codex",
+  "tool_calls": []
+}

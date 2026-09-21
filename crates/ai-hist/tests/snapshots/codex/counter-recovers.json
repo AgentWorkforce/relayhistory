@@ -1,0 +1,87 @@
+{
+  "corpus_files": [
+    "codex/counter-recovers.jsonl"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "codex/counter-recovers",
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "start",
+      "session_id": "sess_codex_recovers",
+      "source": "codex",
+      "timestamp_ms": 1776664800300
+    }
+  ],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "sess_codex_recovers",
+      "source": "codex",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "CodexRollout",
+  "notes": [],
+  "origin": "relayhistory",
+  "quirk": "an unreadable cumulative snapshot is superseded by a later valid snapshot for the same waiting turn",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "3:user_message",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "3:user_message",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "sess_codex_recovers",
+      "source": "codex",
+      "text": "start",
+      "token_json": null,
+      "ts_ms": 1776664800300
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "4:agent_message",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "4:agent_message",
+      "model": "gpt-5.4",
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "sess_codex_recovers",
+      "source": "codex",
+      "text": "Answer.",
+      "token_json": "{\"cache_write_input_tokens\":0,\"cached_input_tokens\":1000,\"input_tokens\":3000,\"output_tokens\":200,\"reasoning_output_tokens\":50,\"total_tokens\":3200}",
+      "ts_ms": 1776664800900
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": null,
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776664800000,
+      "first_prompt": "start",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776664802000,
+      "last_assistant_text": "Answer.",
+      "models_json": "[\"gpt-5.4\"]",
+      "originator": null,
+      "raw_path": "<home>/.codex/sessions/2026/04/20/rollout-2026-04-20T00-00-00-counter-recovers.jsonl",
+      "repo_url": null,
+      "session_id": "sess_codex_recovers",
+      "source": "codex",
+      "source_stamp": "<n>:1207",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "codex",
+  "tool_calls": []
+}
