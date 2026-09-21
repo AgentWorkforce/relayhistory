@@ -10,7 +10,7 @@
 //! See [`super::cursor`] for the cursor's shape, its two key spaces, the
 //! rotation rule and what the prefix hash covers.
 
-use super::cursor::*;
+use super::transcript_cursor::*;
 use super::*;
 
 /// How many bytes of deferred records one pass will hold before it gives up on

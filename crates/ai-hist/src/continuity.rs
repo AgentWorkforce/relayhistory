@@ -109,13 +109,13 @@ impl ContinuityEvidence {
 
 /// Read one newline-delimited record into `raw`; `false` at end of file.
 ///
-/// Bounded by [`crate::ingest::cursor::MAX_RECORD_BYTES`]: a record that runs
+/// Bounded by [`crate::ingest::transcript_cursor::MAX_RECORD_BYTES`]: a record that runs
 /// past the ceiling is walked to its newline in fixed-size chunks and `raw` is
 /// left empty, so one pathological line cannot cost this walk the file's size
 /// in memory. `raw` is reused across calls, so the buffer is grown once.
 fn next_record(reader: &mut impl std::io::BufRead, raw: &mut Vec<u8>) -> std::io::Result<bool> {
     use std::io::{BufRead, Read};
-    const CEILING: u64 = crate::ingest::cursor::MAX_RECORD_BYTES;
+    const CEILING: u64 = crate::ingest::transcript_cursor::MAX_RECORD_BYTES;
     raw.clear();
     // The cap is on the reader rather than a check around it: `read_until`
     // extends `raw` until it finds a newline, so a budget consulted afterwards
@@ -214,9 +214,9 @@ pub(crate) struct ContinuityPass {
 /// reported the kilobyte while the process read the file.
 pub(crate) fn scan_claude_transcript_resumed(
     path: &Path,
-    state: &mut Option<crate::ingest::cursor::ClaudeContinuityState>,
+    state: &mut Option<crate::ingest::transcript_cursor::ClaudeContinuityState>,
 ) -> Result<ContinuityPass> {
-    use crate::ingest::cursor::{CommitOutcome, TranscriptReader};
+    use crate::ingest::transcript_cursor::{CommitOutcome, TranscriptReader};
     let saved = state.clone().unwrap_or_default();
     let mut reader = TranscriptReader::open(path, saved.file.as_ref(), None)?;
     let resumed = reader.start_offset() > 0;
@@ -245,7 +245,7 @@ pub(crate) fn scan_claude_transcript_resumed(
                 fold_claude_record(&mut evidence, &mut first_user_seen, object);
             }
         }
-        if kind == crate::ingest::cursor::ReadRecord::Unterminated {
+        if kind == crate::ingest::transcript_cursor::ReadRecord::Unterminated {
             break;
         }
     }
@@ -253,7 +253,7 @@ pub(crate) fn scan_claude_transcript_resumed(
     let consumed = reader.position();
     match reader.commit(consumed)? {
         CommitOutcome::Published(file) => {
-            *state = Some(crate::ingest::cursor::ClaudeContinuityState {
+            *state = Some(crate::ingest::transcript_cursor::ClaudeContinuityState {
                 file: Some(file),
                 evidence: evidence.clone(),
                 first_user_seen,
@@ -656,7 +656,7 @@ pub fn capture_claude_transcript(conn: &Connection, path: &Path) -> Result<u64> 
 pub(crate) fn capture_claude_transcript_resumed(
     conn: &Connection,
     path: &Path,
-    cursor: &mut crate::ingest::cursor::TranscriptCursorState,
+    cursor: &mut crate::ingest::transcript_cursor::TranscriptCursorState,
 ) -> Result<u64> {
     let mut state = cursor
         .claude
@@ -678,13 +678,13 @@ pub(crate) fn capture_claude_transcript_resumed(
 /// locator is what it reads transcripts by.
 pub fn capture_claude_transcript_at_locator(conn: &Connection, path: &Path) -> Result<u64> {
     let locator = path.to_string_lossy().to_string();
-    let key = crate::ingest::cursor::CursorKey::Locator {
+    let key = crate::ingest::transcript_cursor::CursorKey::Locator {
         source: CONTINUITY_CURSOR_SOURCE,
         locator: &locator,
     };
-    let mut cursor = crate::ingest::cursor::load_cursor(conn, &key)?;
+    let mut cursor = crate::ingest::transcript_cursor::load_cursor(conn, &key)?;
     let bytes = capture_claude_transcript_resumed(conn, path, &mut cursor)?;
-    crate::ingest::cursor::store_cursor(conn, &key, &cursor)?;
+    crate::ingest::transcript_cursor::store_cursor(conn, &key, &cursor)?;
     Ok(bytes)
 }
 
