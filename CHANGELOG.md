@@ -158,9 +158,13 @@ Notable changes to the native `ai-hist` CLI are documented here.
   evidence kinds, relationship capabilities, usage accounting mode, whether
   its message ids are provider-issued or synthesized, whether it hydrates by
   path, and its watch roots. `Error` is now an enum whose `code()` mirrors the
-  TypeScript native error codes plus `SyncLocked`, `SessionSourceMismatch` and
-  the reserved `WatermarkAheadOfStore`. Every struct on the surface is
-  `#[non_exhaustive]`, `Clone`, `Serialize`, `Deserialize` and `PartialEq`.
+  TypeScript native error codes plus `SyncLocked`, `SourceMismatch` and
+  the reserved `WatermarkAheadOfStore`. Every value type the facade returns
+  — `SessionEvidence` and its parts, `CatalogSession`, the reports and
+  options, `SourceCapabilities`, `Error` — is `#[non_exhaustive]`, `Clone`,
+  `Serialize`, `Deserialize` and `PartialEq`; `CatalogIter` and `WatchHandle`
+  are deliberately not value types (one holds a read snapshot, the other a
+  running thread) and implement none of those.
   **Removed** the per-kind page methods `SessionStore::session_user_turns_page`,
   `session_markers_page`, `session_requests_page` and `session_usage`; the
   same data is `SessionEvidence::user_turns`, `markers`, `requests` and

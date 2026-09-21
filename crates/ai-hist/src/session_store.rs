@@ -19,8 +19,9 @@
 //!
 //! The change feed (`changes_since`, #179) is not part of this module yet.
 //!
-//! Every struct here is `#[non_exhaustive]`, `Clone`, `Serialize` and
-//! `Deserialize`. JSON columns arrive parsed; the raw string is reachable
+//! Every value type here is `#[non_exhaustive]`, `Clone`, `Serialize`,
+//! `Deserialize` and `PartialEq`; only [`CatalogIter`] (a read snapshot) and
+//! [`WatchHandle`] (a running thread) are not. JSON columns arrive parsed; the raw string is reachable
 //! through a `raw_*()` accessor and is never a public field. No signature
 //! names a `rusqlite` type.
 
@@ -32,7 +33,8 @@ use crate::ingest::hydrate::{
     hydrate_session_at_with_roots_and_connectors, HydrateSessionOptions, HydrateSessionResult,
 };
 use crate::ingest::{
-    sync_facade_tick, sync_watch_roots_with_provider_roots, SyncTick, HOOK_HARNESSES,
+    source_watch_roots, sync_facade_tick, sync_watch_roots_with_provider_roots, SyncTick,
+    HOOK_HARNESSES,
 };
 use crate::paths::home_dir;
 pub use crate::paths::ProviderRoots;
@@ -408,16 +410,57 @@ pub struct SourceCapabilities {
 }
 
 impl SourceCapabilities {
-    /// The filesystem roots this source's adapter watches under `roots`, as
-    /// [`SessionStore::watch`] registers them for a store opened with the
-    /// same roots ([`SessionStore::roots`]). Empty for a source with no local
-    /// files (relay) or no live-capture root (trajectory reads project
-    /// directories, which `watch` derives per run).
-    pub fn watch_roots(&self, roots: &ProviderRoots) -> Vec<PathBuf> {
-        discover::provider_watch_roots(self.source.as_str(), roots)
-            .iter()
-            .map(|root| root.registered_path().to_path_buf())
+    /// Everything [`SessionStore::watch`] watches for this source under
+    /// `roots`, from the same builder the loop registers with: the adapter's
+    /// transcript roots and, for Claude and Codex, the flat `history.jsonl`
+    /// prompt log beside them, each with the scope the loop applies. Empty
+    /// for a source with no local files (relay); for trajectory it is the
+    /// `.trajectories` directories known at the time of the call, which the
+    /// loop re-derives on every backstop tick.
+    pub fn watch_roots(&self, roots: &ProviderRoots) -> Vec<WatchedPath> {
+        source_watch_roots(self.source.as_str(), roots)
+            .into_iter()
+            .map(WatchedPath::from_root)
             .collect()
+    }
+}
+
+/// How much of a [`WatchedPath`] the watcher covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[non_exhaustive]
+#[serde(rename_all = "snake_case")]
+pub enum WatchScope {
+    /// Only the one file the path names. The watcher registers the file's
+    /// *parent* (a watch on the file itself dies with the next atomic
+    /// rewrite) and filters every other entry back out; a consumer building
+    /// its own watcher must do the same, not watch the parent as a tree.
+    File,
+    /// The directory's own entries, and nothing below them.
+    Directory,
+    /// The path and its whole subtree.
+    Tree,
+}
+
+/// One path the live-capture watcher covers, and how much of it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct WatchedPath {
+    /// The root's own path: the file for a `File` scope, the directory
+    /// otherwise.
+    pub path: PathBuf,
+    pub scope: WatchScope,
+}
+
+impl WatchedPath {
+    fn from_root(root: discover::WatchRoot) -> Self {
+        Self {
+            scope: match root.depth {
+                discover::WatchDepth::File => WatchScope::File,
+                discover::WatchDepth::Directory => WatchScope::Directory,
+                discover::WatchDepth::Tree => WatchScope::Tree,
+            },
+            path: root.path,
+        }
     }
 }
 
@@ -2726,6 +2769,48 @@ mod tests {
         .unwrap();
         assert!(changed.is_empty());
         assert_eq!(base.as_ref(), Some(&after));
+    }
+
+    /// The roots the facade advertises per source are the roots the watch
+    /// loop registers, path for path and scope for scope — including the
+    /// flat prompt logs, which are watched as single files.
+    #[test]
+    fn advertised_watch_roots_are_the_roots_the_loop_registers() {
+        let dir = tempfile::tempdir().unwrap();
+        let roots =
+            ProviderRoots::from_home(dir.path().to_path_buf(), dir.path().join("opencode.db"));
+        let mut advertised: BTreeMap<PathBuf, WatchScope> = BTreeMap::new();
+        for source in Source::ALL {
+            for root in source.capabilities().watch_roots(&roots) {
+                let scope = advertised.entry(root.path).or_insert(root.scope);
+                *scope = (*scope).max(root.scope);
+            }
+        }
+        let registered: BTreeMap<PathBuf, WatchScope> =
+            sync_watch_roots_with_provider_roots(&roots)
+                .into_iter()
+                .map(WatchedPath::from_root)
+                .map(|root| (root.path, root.scope))
+                .collect();
+        assert_eq!(advertised, registered);
+        for (source, flat_log) in [
+            (Source::Claude, roots.claude.join("history.jsonl")),
+            (Source::Codex, roots.codex.join("history.jsonl")),
+        ] {
+            let mine = source.capabilities().watch_roots(&roots);
+            assert!(
+                mine.contains(&WatchedPath {
+                    path: flat_log.clone(),
+                    scope: WatchScope::File,
+                }),
+                "{source} advertises its flat log as a file root: {mine:?}"
+            );
+            assert!(
+                mine.iter().any(|root| root.scope == WatchScope::Tree),
+                "{source} advertises its transcript tree: {mine:?}"
+            );
+        }
+        assert!(Source::Relay.capabilities().watch_roots(&roots).is_empty());
     }
 
     /// A source exempt from shallow discovery still declares the rows its

@@ -200,8 +200,13 @@ is read is `coverage ∩ kinds`, reported back as `loaded`, so a kind the source
 cannot produce is never fetched and never listed. `CommitLink` is not carried
 by `session()`.
 
-Every struct is `#[non_exhaustive]`, `Clone`, `Serialize`, `Deserialize` and
-`PartialEq`, so a consumer can persist and round-trip it. JSON columns arrive
+Every value type the facade returns — `SessionEvidence` and its parts,
+`CatalogSession`, `SyncReport`, `HydrateReport`, `TickReport`, the option
+structs, `SourceCapabilities`, `Error` — is `#[non_exhaustive]`, `Clone`,
+`Serialize`, `Deserialize` and `PartialEq`, so a consumer can persist and
+round-trip it. `CatalogIter` and `WatchHandle` are deliberately not value
+types: one holds a read snapshot, the other a running thread, and neither is
+cloned or serialized. JSON columns arrive
 parsed (`ToolCall::args`, `FileEdit::structured_patch`, `Marker::payload`,
 `Message::usage` as `NormalizedUsage`); the stored string is reachable through
 `raw_args()`, `raw_structured_patch()`, `raw_payload()` and `raw_usage()`, and
@@ -227,8 +232,11 @@ has none; relay and trajectory, which shallow discovery exempts, still declare
 / `never` stable child identity and which delegation facts are recorded),
 `usage_accounting` (`per-request`, `per-message`, `cumulative-delta`,
 `context-proxy`, or `None`), `message_ids`, `hydrates_by_path`, and
-`watch_roots(&roots)` — the paths the watcher registers for that source under a
-`ProviderRoots`, the same value a store opened with those roots watches.
+`watch_roots(&roots)` — every path the watcher covers for that source under a
+`ProviderRoots`, as `Vec<WatchedPath { path, scope }>` from the same builder
+`watch` registers with: the transcript tree, and for Claude and Codex the flat
+`history.jsonl` prompt log as a `File` scope (register its parent, filter to
+the one name — never watch the parent as a tree).
 
 ## Errors
 

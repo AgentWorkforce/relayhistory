@@ -996,12 +996,14 @@ fn sync_hydrate_and_watch_roots_share_one_root_resolution() {
 
     let watched = Source::Codex.capabilities().watch_roots(&roots);
     assert!(
-        watched.iter().any(|path| path.starts_with(&roots.codex)),
+        watched
+            .iter()
+            .any(|root| root.path.starts_with(&roots.codex)),
         "the advertised watch roots follow the configured root: {watched:?}"
     );
     assert!(!watched
         .iter()
-        .any(|path| path.starts_with(dir.path().join(".codex"))));
+        .any(|root| root.path.starts_with(dir.path().join(".codex"))));
 }
 
 // ---------------------------------------------------------------------------

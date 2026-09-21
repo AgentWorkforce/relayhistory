@@ -1093,33 +1093,51 @@ pub fn sync_watch_roots(home: &Path, opencode_db: &Path) -> Vec<discover::WatchR
 pub(crate) fn sync_watch_roots_with_provider_roots(
     provider_roots: &crate::ProviderRoots,
 ) -> Vec<discover::WatchRoot> {
-    let home = &provider_roots.home;
-    let mut roots = discover::watch_roots(
-        &shallow_providers(),
-        &discover::ProviderRoots {
-            home,
-            claude: &provider_roots.claude,
-            codex: &provider_roots.codex,
-            grok: &provider_roots.grok,
-            opencode_db: &provider_roots.opencode_db,
-        },
-    );
-    // The flat logs, each as the one file it is. A `directory` root here would
-    // cover every entry beside them — `~/.claude/settings.json`, the
-    // credentials file, whatever a harness release adds next — and each of
-    // those writes would drive a *forced* sweep, the kind that bypasses the
-    // fingerprint. A file root registers the same parent (a watch on the file
-    // itself dies with the next atomic rewrite) and then filters back down to
-    // the one name, which is exactly the distinction it exists for.
-    roots.push(discover::WatchRoot::file(
-        provider_roots.claude.join("history.jsonl"),
-    ));
-    roots.push(discover::WatchRoot::file(
-        provider_roots.codex.join("history.jsonl"),
-    ));
-    for root in trajectory_roots(home).unwrap_or_default() {
-        roots.push(trajectory_watch_root(root));
+    // Per source, through the one builder `Source::capabilities()` also
+    // reads, so the roots the loop registers and the roots the facade
+    // advertises cannot drift apart.
+    let mut roots = Vec::new();
+    for source in crate::store::SOURCE_CHOICES {
+        roots.extend(source_watch_roots(source, provider_roots));
     }
+    merge_watch_roots(roots)
+}
+
+/// Everything the sweep reads for one source, as the watcher registers it:
+/// the adapter's transcript roots, plus the flat prompt log Claude and Codex
+/// keep beside them, plus the trajectory directories for that source.
+///
+/// The flat logs are watched each as the one file it is. A `directory` root
+/// would cover every entry beside them — `~/.claude/settings.json`, the
+/// credentials file, whatever a harness release adds next — and each of
+/// those writes would drive a *forced* sweep, the kind that bypasses the
+/// fingerprint. A file root registers the same parent (a watch on the file
+/// itself dies with the next atomic rewrite) and then filters back down to
+/// the one name, which is exactly the distinction it exists for.
+pub(crate) fn source_watch_roots(
+    source: &str,
+    provider_roots: &crate::ProviderRoots,
+) -> Vec<discover::WatchRoot> {
+    let mut roots = discover::provider_watch_roots(source, provider_roots);
+    match source {
+        "claude" => roots.push(discover::WatchRoot::file(
+            provider_roots.claude.join("history.jsonl"),
+        )),
+        "codex" => roots.push(discover::WatchRoot::file(
+            provider_roots.codex.join("history.jsonl"),
+        )),
+        "trajectory" => {
+            for root in trajectory_roots(&provider_roots.home).unwrap_or_default() {
+                roots.push(trajectory_watch_root(root));
+            }
+        }
+        _ => {}
+    }
+    merge_watch_roots(roots)
+}
+
+/// One entry per path, at the widest depth any claim asked for.
+fn merge_watch_roots(mut roots: Vec<discover::WatchRoot>) -> Vec<discover::WatchRoot> {
     roots.sort();
     roots.dedup_by(|later, first| {
         if later.path != first.path {
