@@ -925,6 +925,15 @@ fn refresh_lock_path(base_url: &str) -> Result<PathBuf> {
 }
 
 pub(crate) fn acquire_refresh_lock(base_url: &str) -> Result<AuthRefreshLock> {
+    acquire_refresh_lock_with_budget(base_url, None)
+}
+
+type RequestBudget<'a> = Option<&'a dyn Fn() -> Result<std::time::Duration>>;
+
+fn acquire_refresh_lock_with_budget(
+    base_url: &str,
+    budget: RequestBudget<'_>,
+) -> Result<AuthRefreshLock> {
     let path = refresh_lock_path(base_url)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -935,8 +944,21 @@ pub(crate) fn acquire_refresh_lock(base_url: &str) -> Result<AuthRefreshLock> {
         .read(true)
         .write(true)
         .open(&path)?;
-    fs2::FileExt::lock_exclusive(&file)
-        .with_context(|| format!("locking token refresh state at {}", path.display()))?;
+    if let Some(remaining) = budget {
+        loop {
+            let wait = remaining()?;
+            match fs2::FileExt::try_lock_exclusive(&file) {
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(wait.min(std::time::Duration::from_millis(10)));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    } else {
+        fs2::FileExt::lock_exclusive(&file)
+            .with_context(|| format!("locking token refresh state at {}", path.display()))?;
+    }
     Ok(AuthRefreshLock { _file: file })
 }
 
@@ -963,15 +985,52 @@ pub(crate) fn send_with_auth_refresh_checked(
     map_error: impl Fn(ureq::Error) -> anyhow::Error,
     check: impl Fn(&StoredAuth) -> Result<()>,
 ) -> Result<ureq::Response> {
+    send_with_auth_refresh_checked_with_budget(
+        auth,
+        |current, _| send(current),
+        map_error,
+        check,
+        None,
+    )
+}
+
+/// Share one caller budget across lock acquisition, refresh and every retry.
+/// A successful rotation is persisted even if cancellation arrives meanwhile.
+pub(crate) fn send_with_auth_refresh_checked_with_budget(
+    auth: &StoredAuth,
+    send: impl Fn(
+        &StoredAuth,
+        Option<std::time::Duration>,
+    ) -> std::result::Result<ureq::Response, Box<ureq::Error>>,
+    map_error: impl Fn(ureq::Error) -> anyhow::Error,
+    check: impl Fn(&StoredAuth) -> Result<()>,
+    budget: RequestBudget<'_>,
+) -> Result<ureq::Response> {
+    let remaining = || budget.map(|remaining| remaining()).transpose();
+    let send = |current: &StoredAuth| -> Result<ureq::Response> {
+        // Keep raw HTTP errors until the shared unauthorized/refresh handling.
+        send(current, remaining()?).map_err(|error| anyhow::Error::new(*error))
+    };
+    let mapped = |error: anyhow::Error| match error.downcast::<ureq::Error>() {
+        Ok(error) => map_error(error),
+        Err(error) => error,
+    };
+    remaining()?;
     let attempted = load_auth(Some(&auth.base_url))?.unwrap_or_else(|| auth.clone());
     check(&attempted)?;
     let mut unauthorized = match send(&attempted) {
         Ok(response) => return Ok(response),
-        Err(error) if is_unauthorized(&error) => *error,
-        Err(error) => return Err(map_error(*error)),
+        Err(error)
+            if error
+                .downcast_ref::<ureq::Error>()
+                .is_some_and(is_unauthorized) =>
+        {
+            error
+        }
+        Err(error) => return Err(mapped(error)),
     };
 
-    let _refresh_lock = acquire_refresh_lock(&auth.base_url)?;
+    let _refresh_lock = acquire_refresh_lock_with_budget(&auth.base_url, budget)?;
     let current = load_auth(Some(&auth.base_url))?.unwrap_or_else(|| auth.clone());
 
     // A concurrent process may have completed rotation while this caller waited. Try its
@@ -980,8 +1039,14 @@ pub(crate) fn send_with_auth_refresh_checked(
     if current.access_token != attempted.access_token {
         match send(&current) {
             Ok(response) => return Ok(response),
-            Err(error) if is_unauthorized(&error) => unauthorized = *error,
-            Err(error) => return Err(map_error(*error)),
+            Err(error)
+                if error
+                    .downcast_ref::<ureq::Error>()
+                    .is_some_and(is_unauthorized) =>
+            {
+                unauthorized = error
+            }
+            Err(error) => return Err(mapped(error)),
         }
     }
 
@@ -990,11 +1055,21 @@ pub(crate) fn send_with_auth_refresh_checked(
         .as_deref()
         .is_none_or(|token| token.trim().is_empty())
     {
-        return Err(map_error(unauthorized));
+        return Err(mapped(unauthorized));
     }
-    let refreshed = refresh_and_save_auth(&current)?;
+    let refreshed = if let Some(timeout) = remaining()? {
+        let agent = ureq::AgentBuilder::new()
+            .redirects(0)
+            .timeout(timeout)
+            .build();
+        let refreshed = refresh_auth_with_agent(&current, &agent)?;
+        save_auth(&refreshed).context("persisting refreshed relayhistory session")?;
+        refreshed
+    } else {
+        refresh_and_save_auth(&current)?
+    };
     check(&refreshed)?;
-    send(&refreshed).map_err(|error| map_error(*error))
+    send(&refreshed).map_err(mapped)
 }
 
 /// Retry a rejected SDK bearer using the same locked rotation as native transports.

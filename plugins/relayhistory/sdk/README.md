@@ -58,6 +58,13 @@ are read-only and repeat before prepare/send. Background operation runs in `agen
 use the same probe-owned Rust worker. Core `ai-hist delivery` commands now return
 `HISTORY_DELIVERY_MOVED`.
 
+`drainProbeDelivery` applies `requestTimeoutMs` to each receiver call, including
+HTTP response bodies, credential-refresh lock waits, token refresh and retries.
+Those steps share the remaining budget. Cancellation and lost leases are checked
+before each blocking request; an in-flight synchronous HTTP request finishes or
+reaches its remaining timeout before returning. A completed token rotation is
+persisted even when cancellation prevents the subsequent upload retry.
+
 Jobs bind both the canonical service endpoint and the auth-derived organization/
 workspace account. Changing endpoint requires a new instance/job; changing
 account requires a new job. A swapped token cannot send an old account's batch.
