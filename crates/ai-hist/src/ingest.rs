@@ -4913,6 +4913,10 @@ fn ingest_claude_transcript_as(
     // gives it `leafUuid` instead of `sessionId`, so a fallback that learned
     // the id from earlier records would always be too late for the one record
     // that needs it.
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("session");
     let file_session_id = text.lines().find_map(|line| {
         serde_json::from_str::<Value>(line)
             .ok()?
@@ -4947,8 +4951,16 @@ fn ingest_claude_transcript_as(
             // inventing one would put the record on a session that does not
             // exist. Those are still skipped.
             _ => {
-                if let Some(session_id) = file_session_id.as_deref() {
-                    insert_sessionless_record_marker(conn, session_id, obj)?;
+                // `attributed_session_id` first, because that is the id the
+                // rest of this file is ingested under. A subagent sidecar
+                // carries the PARENT's `sessionId` on every row plus a
+                // per-child `agentId`, so reading the file's first
+                // `sessionId` would put the child's summary on the parent --
+                // the child losing it, and the parent gaining evidence from a
+                // conversation that is not its own. That is worse than the
+                // drop it replaced: a wrong attribution reads as a real one.
+                if let Some(session_id) = attributed_session_id.or(file_session_id.as_deref()) {
+                    insert_sessionless_record_marker(conn, session_id, obj, line, stem)?;
                 }
                 continue;
             }
@@ -4980,19 +4992,12 @@ fn ingest_claude_transcript_as(
         // identities disjoint from the legacy positional `{stem}:{digits}`
         // namespace, so the legacy detector below can never select a row
         // the new parser wrote (an all-decimal hash would otherwise match).
-        let digest = Sha256::digest(line.as_bytes());
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("session");
-        let fallback_uid = format!(
-            "{stem}:sha256:{}",
-            digest
-                .iter()
-                .take(8)
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>()
-        );
+        // Derived by `claude_record_identity`, shared with the sessionless
+        // path above. The same line reaches both -- a summary read locally
+        // carries no `sessionId`, and the same summary in a remote snapshot
+        // has one injected -- so a rule per path made one record into two rows
+        // the unique key could not collapse.
+        let fallback_uid = claude_record_identity(obj, line, stem);
         // A pre-upgrade parse stored id-less records under a positional
         // `{stem}:{line}` identity that no current parse emits. Heals remove
         // exactly the current identity and never guess the historical one:
@@ -5002,9 +5007,7 @@ fn ingest_claude_transcript_as(
         // positional leftovers are preserved by design — retention-safe
         // duplication, bounded to id-less files — rather than healed by
         // position.
-        let message_uuid = uuid
-            .or_else(|| message.and_then(|m| m.get("id")).and_then(Value::as_str))
-            .unwrap_or(&fallback_uid);
+        let message_uuid = fallback_uid.as_str();
         let id_less = uuid.is_none()
             && message
                 .and_then(|m| m.get("id"))
@@ -5509,6 +5512,46 @@ fn ingest_claude_transcript_as(
     Ok(())
 }
 
+/// The identity the Claude record loop keys a record by.
+///
+/// Named so the sessionless path and the ordinary path cannot derive it
+/// differently for the same line -- which is exactly what turned one summary
+/// into two rows when each had its own rule.
+fn claude_record_identity(obj: &Map<String, Value>, line: &str, stem: &str) -> String {
+    if let Some(uuid) = obj
+        .get("uuid")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    {
+        return uuid.to_string();
+    }
+    if let Some(id) = obj
+        .get("message")
+        .and_then(Value::as_object)
+        .and_then(|message| message.get("id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    {
+        return id.to_string();
+    }
+    if let Some(leaf) = obj
+        .get("leafUuid")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    {
+        return leaf.to_string();
+    }
+    let digest = Sha256::digest(line.as_bytes());
+    format!(
+        "{stem}:sha256:{}",
+        digest
+            .iter()
+            .take(8)
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
+}
+
 /// Record a transcript line that names no session, under the file's own.
 ///
 /// Keyed by whatever identity the record does carry -- Claude's summaries have
@@ -5520,25 +5563,22 @@ fn insert_sessionless_record_marker(
     conn: &Connection,
     session_id: &str,
     obj: &Map<String, Value>,
+    line: &str,
+    stem: &str,
 ) -> Result<()> {
     let record_type = obj.get("type").and_then(Value::as_str).unwrap_or("record");
-    let identity = obj
-        .get("leafUuid")
-        .or_else(|| obj.get("uuid"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            let digest = Sha256::digest(Value::Object(obj.clone()).to_string().as_bytes());
-            format!(
-                "sha256:{}",
-                digest
-                    .iter()
-                    .take(8)
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-            )
-        });
-    let marker_uid = format!("{record_type}:{identity}:marker");
+    // The same identity the ordinary record path derives, in the same order.
+    //
+    // These two paths see the same line: a summary read locally has no
+    // `sessionId`, and the same summary in a remote snapshot has one injected,
+    // so it goes the other way. Deriving the uid differently on each made one
+    // summary into two rows that the unique key could not collapse -- not a
+    // crash, just a count every consumer quietly gets wrong. `leafUuid` is
+    // consulted last, as an identity a summary has and the record path has no
+    // reason to look for, so it can only break a tie the shared derivation
+    // does not already settle.
+    let identity = claude_record_identity(obj, line, stem);
+    let marker_uid = format!("{identity}:marker");
     let draft = claude_marker_for_record(obj, None)
         .unwrap_or_else(|| MarkerDraft::new("unknown", Some(record_type)));
     insert_session_marker(
@@ -11190,6 +11230,124 @@ mod tests {
             after.len() > markers.len(),
             "a changed transcript must still be re-read: {after:?}"
         );
+    }
+
+    /// A sidecar's summary belongs to the child, not to the parent.
+    ///
+    /// A Claude subagent transcript carries the PARENT's `sessionId` on every
+    /// row plus a per-child `agentId`, and when the provider records that id
+    /// the whole file is ingested under the child. My sessionless fallback
+    /// read the first `sessionId` in the file instead -- which in a sidecar is
+    /// the parent's. So the child lost its summary and the parent gained
+    /// evidence from a conversation that is not its own: worse than the drop
+    /// it replaced, because a wrong attribution reads as a real one.
+    ///
+    /// The attribution has to be the id the rest of the file is ingested
+    /// under, which is exactly what `attributed_session_id` already is.
+    #[test]
+    fn a_sidecar_summary_attaches_to_the_child_not_the_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sidecar.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"summary","summary":"what the subagent did","leafUuid":"leaf-kid"}"#, "\n",
+                r#"{"type":"assistant","uuid":"k1","sessionId":"parent-session","agentId":"child-session","isSidechain":true,"cwd":"/tmp/p","timestamp":"2026-09-13T00:00:00.000Z","message":{"role":"assistant","model":"m","content":[{"type":"text","text":"working"}]}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        super::ingest_claude_transcript_as(&conn, &path, Some("child-session")).unwrap();
+
+        let child = crate::session_markers_page(&conn, "claude", "child-session", 50, None)
+            .unwrap()
+            .markers;
+        assert!(
+            child.iter().any(|marker| marker.kind == "summary"),
+            "the summary must land on the session the file is ingested under: {child:?}"
+        );
+        let parent = crate::session_markers_page(&conn, "claude", "parent-session", 50, None)
+            .unwrap()
+            .markers;
+        assert!(
+            parent.is_empty(),
+            "and the parent must gain nothing from a conversation that is not its own: {parent:?}"
+        );
+    }
+
+    /// One summary is one row, however it reached the database.
+    ///
+    /// A summary read locally has no `sessionId`; the same line arriving in a
+    /// remote snapshot has one injected, so it takes the ordinary record path.
+    /// Those two paths derived the marker uid differently -- one from
+    /// `leafUuid`, the other from `uuid` or a line hash -- so the unique key
+    /// could not collapse them and one summary became two rows. A duplicate is
+    /// not a crash; it is a count every consumer quietly gets wrong.
+    #[test]
+    fn one_summary_is_one_marker_however_it_arrives() {
+        let dir = tempfile::tempdir().unwrap();
+        let summary = r#"{"type":"summary","summary":"same summary","leafUuid":"leaf-same"}"#;
+        let sessionless = dir.path().join("local.jsonl");
+        fs::write(
+            &sessionless,
+            format!(
+                "{summary}\n{}\n",
+                r#"{"type":"user","uuid":"u0","sessionId":"dedup-session","cwd":"/tmp/p","timestamp":"2026-09-13T00:00:00.000Z","message":{"role":"user","content":"hi"}}"#
+            ),
+        )
+        .unwrap();
+        // What a remote snapshot looks like: the same line, with the session
+        // injected so it takes the ordinary record path.
+        let injected = dir.path().join("remote.jsonl");
+        fs::write(
+            &injected,
+            format!(
+                "{}\n{}\n",
+                r#"{"type":"summary","summary":"same summary","leafUuid":"leaf-same","sessionId":"dedup-session"}"#,
+                r#"{"type":"user","uuid":"u0","sessionId":"dedup-session","cwd":"/tmp/p","timestamp":"2026-09-13T00:00:00.000Z","message":{"role":"user","content":"hi"}}"#
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &sessionless).unwrap();
+        ingest_claude_transcript(&conn, &injected).unwrap();
+
+        let summaries: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM session_markers \
+                 WHERE source = 'claude' AND session_id = 'dedup-session' AND kind = 'summary'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(summaries, 1, "one summary, one row, whichever path it took");
+
+        // Positive control: two genuinely different summaries stay two rows,
+        // so this collapses duplicates rather than collapsing summaries.
+        let other = dir.path().join("other.jsonl");
+        fs::write(
+            &other,
+            format!(
+                "{}\n{}\n",
+                r#"{"type":"summary","summary":"a different summary","leafUuid":"leaf-other"}"#,
+                r#"{"type":"user","uuid":"u1","sessionId":"dedup-session","cwd":"/tmp/p","timestamp":"2026-09-13T00:00:02.000Z","message":{"role":"user","content":"more"}}"#
+            ),
+        )
+        .unwrap();
+        ingest_claude_transcript(&conn, &other).unwrap();
+        let summaries: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM session_markers \
+                 WHERE source = 'claude' AND session_id = 'dedup-session' AND kind = 'summary'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(summaries, 2, "distinct summaries must stay distinct");
     }
 
     /// Every sidecar read obeys the same three-way rule: absent is nothing,
