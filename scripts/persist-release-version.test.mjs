@@ -42,9 +42,10 @@ async function stageRepos() {
   git(work, "commit", "-m", "start");
   git(work, "branch", "-M", "main");
   git(work, "push", "-u", "origin", "main");
+  git(origin, "symbolic-ref", "HEAD", "refs/heads/main");
   const startSha = git(work, "rev-parse", "HEAD");
 
-  git(root, "clone", origin, other);
+  git(root, "clone", "--branch", "main", origin, other);
   git(other, "config", "user.name", "persist-test");
   git(other, "config", "user.email", "persist-test@example.com");
 

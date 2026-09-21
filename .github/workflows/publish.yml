@@ -1166,4 +1166,13 @@ jobs:
             cp "probe/$platform/agent-relay-probe" "probe/agent-relay-probe-$platform"
             cp "probe/$platform/agent-relay-probe.sha256" "probe/agent-relay-probe-$platform.sha256"
           done
+          # skip_core requires the tag. A publish that pushed the tag and then
+          # failed at `gh release create` leaves that tag with no Release;
+          # upload would fail. Create the Release from the existing tag.
+          if ! gh release view "sdk-ts-v$VERSION" >/dev/null 2>&1; then
+            gh api "repos/${GH_REPO}/git/ref/tags/sdk-ts-v$VERSION" >/dev/null
+            gh release create "sdk-ts-v$VERSION" \
+              --title "ai-hist@$VERSION" \
+              --generate-notes
+          fi
           gh release upload "sdk-ts-v$VERSION" --clobber probe/agent-relay-probe-*

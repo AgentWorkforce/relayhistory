@@ -74,8 +74,10 @@ and `crates/ai-hist-napi/src/lib.rs`).
    metadata fail immediately. Exhausted retries include npm's original error
    output.
 7. `probe` attaches `agent-relay-probe-<platform>` and a matching `.sha256` to
-   the same Release. See [agent-relay-probe.md](agent-relay-probe.md) for the
-   asset names the website mirrors.
+   the same Release. If the tag exists and the Release does not — a
+   `skip_core` retry after `gh release create` failed — probe creates the
+   Release from that tag first. See [agent-relay-probe.md](agent-relay-probe.md)
+   for the asset names the website mirrors.
 
 `scripts/set-release-version.mjs <version>` is the only place that knows what a
 plugin release version touches (version, the seven helper pins, the `ai-hist`
