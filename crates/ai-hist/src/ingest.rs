@@ -7133,6 +7133,23 @@ fn ingest_claude_record(
     if system_record {
         return Ok(());
     }
+    // Reminder rows carry derived identities, `{uid}:{block}:reminder:{n}`,
+    // that the upsert can only add to or overwrite, and a record Claude
+    // rewrites under the same uuid can lose the blocks that produced them --
+    // fewer reminders in a block, a block removed, its type changed, the
+    // content emptied. Every reminder row this record ever produced is
+    // therefore retired here, once per user record and before its current
+    // content is walked, so what the walk writes back is exactly the
+    // reminders the text has today. Keyed on the record's message id and the
+    // one kind the split writes, which is one probe on the message index.
+    if message_role == "user" && !sidechain {
+        conn.execute(
+            "DELETE FROM session_events \
+             WHERE source = 'claude' AND session_id = ?1 AND message_id = ?2 \
+               AND control_kind = 'system_reminder'",
+            params![session_id, message_uuid],
+        )?;
+    }
     let Some(content) = message.and_then(|m| m.get("content")) else {
         // Nothing below can run for this record, so whether it left a row
         // behind is already settled: it is the marker above, or nothing.
@@ -7562,25 +7579,10 @@ impl ClaudeTextRows<'_> {
         if !self.split_reminders {
             return write(text, event_uid, self.control);
         }
+        // The reminder rows this record produced last time were retired by
+        // the record walk before any block was written, so the rows below
+        // are exactly the current text's.
         let split = control::split_system_reminders(text);
-        // Reminder rows carry derived identities, `{event_uid}:reminder:{n}`,
-        // that the upsert can only add to or overwrite. A record Claude
-        // rewrites under the same uuid with fewer reminders -- or none --
-        // would keep the rows the earlier text produced, so the derived rows
-        // are cleared first and recreated from the current text. A bounded
-        // range on the unique index, so the clearing costs one index probe
-        // per prompt row rather than a scan; `;` is the character after `:`,
-        // which makes the range exactly the derived identities and nothing
-        // else.
-        conn.execute(
-            "DELETE FROM session_events \
-             WHERE source = 'claude' AND session_id = ?1 AND event_uid >= ?2 AND event_uid < ?3",
-            params![
-                self.session_id,
-                format!("{event_uid}:reminder:"),
-                format!("{event_uid}:reminder;")
-            ],
-        )?;
         if split.reminders.is_empty() {
             return write(text, event_uid, None);
         }
@@ -21629,6 +21631,71 @@ mod tests {
         .unwrap();
         ingest_claude_transcript(&conn, &path).unwrap();
         assert_eq!(rows(&conn).len(), 3);
+    }
+
+    /// The block that carried a reminder can itself disappear from a
+    /// rewritten record -- dropped, emptied out, or turned into another block
+    /// type -- and then no text block reaches the split at all. The record
+    /// walk retires the record's reminder rows before it looks at any block.
+    #[test]
+    fn a_rewritten_record_drops_the_reminder_rows_of_blocks_it_no_longer_has() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rewritten-blocks.jsonl");
+        let record = |content: &str| {
+            format!(
+                "{{\"type\":\"user\",\"uuid\":\"u1\",\"sessionId\":\"rewrite-blocks\",\"cwd\":\"/tmp/project\",\"timestamp\":\"2026-04-21T00:00:00.000Z\",\"message\":{{\"role\":\"user\",\"content\":{content}}}}}\n"
+            )
+        };
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let rows = |conn: &Connection| typed_event_uids(conn, "rewrite-blocks", "u1");
+        let reminders = |conn: &Connection| -> Vec<String> {
+            rows(conn)
+                .into_iter()
+                .filter(|(_, kind)| kind.as_deref() == Some("system_reminder"))
+                .map(|(uid, _)| uid)
+                .collect()
+        };
+        let two_blocks = r#"[{"type":"text","text":"fix it"},{"type":"text","text":"<system-reminder>b</system-reminder>"}]"#;
+
+        fs::write(&path, record(two_blocks)).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        assert_eq!(
+            rows(&conn),
+            vec![
+                ("u1:0".to_string(), None),
+                (
+                    "u1:1:reminder:0".to_string(),
+                    Some("system_reminder".to_string())
+                ),
+            ]
+        );
+
+        // The reminder's block is gone.
+        fs::write(&path, record(r#"[{"type":"text","text":"fix it"}]"#)).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        assert_eq!(rows(&conn), vec![("u1:0".to_string(), None)]);
+
+        // Back, then the whole content emptied.
+        fs::write(&path, record(two_blocks)).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        assert_eq!(reminders(&conn), vec!["u1:1:reminder:0".to_string()]);
+        fs::write(&path, record("[]")).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        assert!(reminders(&conn).is_empty(), "{:?}", rows(&conn));
+
+        // Back, then the block turned into something that is not text.
+        fs::write(&path, record(two_blocks)).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        assert_eq!(reminders(&conn), vec!["u1:1:reminder:0".to_string()]);
+        fs::write(
+            &path,
+            record(r#"[{"type":"text","text":"fix it"},{"type":"image","source":{"type":"base64","data":"AAAA"}}]"#),
+        )
+        .unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        assert!(reminders(&conn).is_empty(), "{:?}", rows(&conn));
+        assert_eq!(rows(&conn)[0], ("u1:0".to_string(), None));
     }
 
     /// The same shape for Codex: a context wrapper used to store nothing and
