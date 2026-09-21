@@ -25,12 +25,11 @@
 
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
-import { createRequire } from "node:module";
 
 import { packageName, platforms, plugins } from "./history-package-contract.mjs";
 import { installWithRegistryRetry, isRegistryVisibilityFailure } from "./npm-install-with-registry-retry.mjs";
@@ -52,7 +51,6 @@ export const pluginInstallArgs = hostInstallArgs;
  * as that miss. An empty string means every host helper is on disk.
  */
 export function hostHelperInstallRejection(project, platform, libc) {
-  const require_ = createRequire(join(project, "noop.js"));
   let installedScope = [];
   try {
     installedScope = readdirSync(join(project, "node_modules", "@relayhistory")).sort();
@@ -62,11 +60,12 @@ export function hostHelperInstallRejection(project, platform, libc) {
   const missing = [];
   for (const info of Object.values(plugins)) {
     const helper = packageName(info, platform);
-    try {
-      require_.resolve(`${helper}/package.json`);
-    } catch {
-      missing.push(helper);
-    }
+    // Stat the file. require.resolve caches a successful lookup for the
+    // process, and a retry deletes node_modules between attempts, so a helper
+    // that was present once would still look installed after a later install
+    // omitted it.
+    const packageJson = join(project, "node_modules", ...helper.split("/"), "package.json");
+    if (!existsSync(packageJson)) missing.push(helper);
   }
   if (missing.length === 0) return "";
   return (

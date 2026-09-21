@@ -167,6 +167,9 @@ test("a zero-exit install without the host helpers is a retryable miss", () => {
       writeFileSync(join(dir, "package.json"), "{}\n");
     }
     assert.equal(hostHelperInstallRejection(project, platform, "glibc"), "");
+    rmSync(join(project, "node_modules"), { recursive: true, force: true });
+    const afterReset = hostHelperInstallRejection(project, platform, "glibc");
+    assert.match(afterReset, /capture-linux-x64-gnu, @relayhistory\/provider-sources-linux-x64-gnu did not install/);
   } finally {
     rmSync(project, { recursive: true, force: true });
   }
