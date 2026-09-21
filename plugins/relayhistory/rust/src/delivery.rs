@@ -21,8 +21,8 @@
 mod schema;
 mod sessions;
 pub use sessions::{
-    adopt_session_job, create_session_job, is_session_job, job_session_included, job_sessions,
-    set_job_session,
+    adopt_session_job, create_session_job, include_job_session, is_session_job,
+    job_session_included, job_sessions, set_job_session,
 };
 pub mod rpc;
 pub mod worker;
@@ -403,35 +403,50 @@ pub fn set_session_excluded(
     value: bool,
 ) -> Result<()> {
     let tx = write_transaction(conn)?;
-    let current: bool = tx.query_row(
+    set_session_excluded_in_transaction(&tx, session, value, None)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn set_session_excluded_in_transaction(
+    conn: &Connection,
+    session: &SessionIdentity,
+    value: bool,
+    fresh_session_job: Option<&str>,
+) -> Result<()> {
+    let current: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM delivery_exclusions WHERE source=? AND session_id=?)",
         params![session.source, session.session_id],
         |r| r.get(0),
     )?;
     if current == value {
-        tx.commit()?;
         return Ok(());
     }
     if value {
-        tx.execute(
+        conn.execute(
             "INSERT OR IGNORE INTO delivery_exclusions(source,session_id) VALUES (?,?)",
             params![session.source, session.session_id],
         )?;
     } else {
-        if tx.query_row(
+        if conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM delivery_exclusions WHERE source=? AND session_id=?)",
             params![session.source, session.session_id],
             |row| row.get::<_, bool>(0),
         )? {
-            let mut statement =
-                tx.prepare("SELECT id,config_json FROM delivery_jobs WHERE state <> 'cancelled'")?;
+            let mut statement = conn
+                .prepare("SELECT id,config_json FROM delivery_jobs WHERE state <> 'cancelled'")?;
             let configs = statement.query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?;
             for config in configs {
                 let (id, config) = config?;
+                // The caller establishes a fresh member cutoff in this same
+                // transaction. Every other affected job must still be guarded.
+                if fresh_session_job == Some(id.as_str()) {
+                    continue;
+                }
                 let config: DeliveryJobConfig = serde_json::from_str(&config)?;
-                if is_session_job(&tx,&id)? && !tx.query_row("SELECT EXISTS(SELECT 1 FROM delivery_session_members WHERE job_id=? AND source=? AND (session_id=? OR ?))",params![id,session.source,session.session_id,config.selection.kinds.iter().any(|k|k=="relationship")],|r|r.get::<_,bool>(0))? { continue; }
+                if is_session_job(conn,&id)? && !conn.query_row("SELECT EXISTS(SELECT 1 FROM delivery_session_members WHERE job_id=? AND source=? AND (session_id=? OR ?))",params![id,session.source,session.session_id,config.selection.kinds.iter().any(|k|k=="relationship")],|r|r.get::<_,bool>(0))? { continue; }
                 let selection = &config.selection;
                 // A child exclusion also suppresses relationship records selected
                 // through a parent. Conservatively include same-source parent
@@ -448,18 +463,17 @@ pub fn set_session_excluded(
                 ensure!(!affected, "DELIVERY_GENERATION_REQUIRED: cancel affected delivery jobs before removing an exclusion, then create new jobs to backfill skipped history");
             }
         }
-        tx.execute(
+        conn.execute(
             "DELETE FROM delivery_exclusions WHERE source=? AND session_id=?",
             params![session.source, session.session_id],
         )?;
     }
     // Fence all active claims. A worker must re-claim and recheck before dispatch.
-    tx.execute("UPDATE delivery_jobs SET fence=fence+1,worker_id=NULL,lease_until_ms=NULL WHERE state <> 'cancelled'", [])?;
-    tx.execute(
+    conn.execute("UPDATE delivery_jobs SET fence=fence+1,worker_id=NULL,lease_until_ms=NULL WHERE state <> 'cancelled'", [])?;
+    conn.execute(
         "UPDATE delivery_batches SET state='pending' WHERE state='leased'",
         [],
     )?;
-    tx.commit()?;
     Ok(())
 }
 

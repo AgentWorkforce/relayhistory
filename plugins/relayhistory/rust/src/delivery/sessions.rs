@@ -49,17 +49,53 @@ pub fn set_job_session(
     session: &SessionIdentity,
     include: bool,
 ) -> Result<bool> {
+    let tx = write_transaction(conn)?;
+    let changed = set_job_session_in_transaction(&tx, job_id, session, include)?;
+    tx.commit()?;
+    Ok(changed)
+}
+
+/// Include a session with a fresh baseline when a legacy global exclusion must
+/// be lifted. Consent, subscription, relationships and fencing commit together.
+/// Other affected jobs still require a new generation before broadening access.
+pub fn include_job_session(
+    conn: &Connection,
+    job_id: &str,
+    session: &SessionIdentity,
+) -> Result<bool> {
+    let tx = write_transaction(conn)?;
+    let excluded: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM delivery_exclusions WHERE source=? AND session_id=?)",
+        params![session.source, session.session_id],
+        |r| r.get(0),
+    )?;
+    if excluded {
+        // Validate the scoped job and retire any old membership before lifting
+        // its exclusion. A failed guard or snapshot rolls all of this back.
+        set_job_session_in_transaction(&tx, job_id, session, false)?;
+        set_session_excluded_in_transaction(&tx, session, false, Some(job_id))?;
+    }
+    let changed = set_job_session_in_transaction(&tx, job_id, session, true)?;
+    tx.commit()?;
+    Ok(changed)
+}
+
+fn set_job_session_in_transaction(
+    conn: &Connection,
+    job_id: &str,
+    session: &SessionIdentity,
+    include: bool,
+) -> Result<bool> {
     ensure!(
         !session.source.is_empty() && !session.session_id.is_empty(),
         "invalid session identity"
     );
-    let tx = write_transaction(conn)?;
-    let root = job(&tx, job_id)?;
+    let root = job(conn, job_id)?;
     ensure!(
-        root.state != "cancelled" && is_session_job(&tx, job_id)?,
+        root.state != "cancelled" && is_session_job(conn, job_id)?,
         "active session job required"
     );
-    let existing: Option<String> = tx
+    let existing: Option<String> = conn
         .query_row(
             "SELECT id FROM delivery_session_members WHERE job_id=? AND source=? AND session_id=?",
             params![job_id, session.source, session.session_id],
@@ -67,19 +103,18 @@ pub fn set_job_session(
         )
         .optional()?;
     if existing.is_some() == include {
-        tx.commit()?;
         return Ok(false);
     }
     if let Some(id) = existing {
-        capture::release_subscription(&tx, &id)?;
-        tx.execute("DELETE FROM delivery_session_members WHERE id=?", [&id])?;
+        capture::release_subscription(conn, &id)?;
+        conn.execute("DELETE FROM delivery_session_members WHERE id=?", [&id])?;
     } else {
-        let id: String = tx.query_row("SELECT lower(hex(randomblob(16)))", [], |r| r.get(0))?;
-        let cutoff = capture::reserve_revision(&tx)?;
-        tx.execute("INSERT INTO delivery_session_members(id,job_id,source,session_id,cutoff,cursor) VALUES (?,?,?,?,?,?)", params![id,job_id,session.source,session.session_id,cutoff,cutoff])?;
-        capture::snapshot_bounds(&tx, &id)?;
+        let id: String = conn.query_row("SELECT lower(hex(randomblob(16)))", [], |r| r.get(0))?;
+        let cutoff = capture::reserve_revision(conn)?;
+        conn.execute("INSERT INTO delivery_session_members(id,job_id,source,session_id,cutoff,cursor) VALUES (?,?,?,?,?,?)", params![id,job_id,session.source,session.session_id,cutoff,cutoff])?;
+        capture::snapshot_bounds(conn, &id)?;
         capture::save_subscription(
-            &tx,
+            conn,
             &capture::Subscription {
                 id: &id,
                 session: Some(session),
@@ -101,32 +136,31 @@ pub fn set_job_session(
         // A parent may have skipped this private child earlier. Capture only
         // those now-eligible edges as fresh revisions; do not restart the
         // parent's completed event/history backfill.
-        for record in capture::incoming_relationships(&tx, session)? {
+        for record in capture::incoming_relationships(conn, session)? {
             if let Some(parent) = &record.session {
                 if job_session_included(
-                    &tx,
+                    conn,
                     job_id,
                     &SessionIdentity {
                         source: record.source.clone(),
                         session_id: parent.clone(),
                     },
                 )? {
-                    capture::append_revision(&tx, &record)?;
+                    capture::append_revision(conn, &record)?;
                 }
             }
         }
     }
     // Invalidate dispatch authorization, but keep immutable pending work and
     // retry/failure state. Claim filters removed/re-included snapshot records.
-    tx.execute(
+    conn.execute(
         "UPDATE delivery_jobs SET fence=fence+1,worker_id=NULL,lease_until_ms=NULL WHERE id=?",
         [job_id],
     )?;
-    tx.execute(
+    conn.execute(
         "UPDATE delivery_batches SET state='pending' WHERE job_id=? AND state='leased'",
         [job_id],
     )?;
-    tx.commit()?;
     Ok(true)
 }
 

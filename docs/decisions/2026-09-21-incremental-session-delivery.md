@@ -38,8 +38,10 @@ previous inclusion; an already transmitted request cannot be recalled.
 Relationship evidence requires both parent and child membership. Adding a
 previously private child journals only its newly eligible incoming edges;
 it does not replay the parent's completed history. Persistent global exclusions
-remain authoritative and cannot be cleared while an affected active destination
-could have skipped evidence.
+remain authoritative. The probe can atomically clear a legacy exclusion for its
+selected job by taking a fresh member snapshot and journaling newly eligible
+relationships. Other affected jobs still require a new generation; any failed
+guard or snapshot rolls back consent, membership and fencing together.
 
 The probe persists a durable change intent under its existing control locks.
 Ordinary selected-mode mutations call the probe membership API, retain the

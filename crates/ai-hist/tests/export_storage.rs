@@ -222,3 +222,65 @@ fn recovery_compaction_visits_the_whole_journal_despite_the_background_cursor() 
         assert!(export::compact_journal_pass(&conn, 10_001).is_err());
     }
 }
+
+#[test]
+fn cached_ingest_statements_observe_subscription_changes() {
+    let conn = db();
+    let identity = SessionIdentity {
+        source: "claude".into(),
+        session_id: "one".into(),
+    };
+    let insert = |prompt: &str, timestamp_ms| {
+        ai_hist::insert_history(
+            &conn,
+            &ai_hist::HistoryEntry {
+                id: 0,
+                source: identity.source.clone(),
+                session_id: Some(identity.session_id.clone()),
+                project: None,
+                prompt: prompt.into(),
+                prompt_hash: None,
+                timestamp_ms,
+            },
+        )
+        .unwrap();
+    };
+    // Compile both the presence and history statements before any subscriber exists.
+    insert("before", 1);
+    assert!(capture::next_change(&conn, 0, Some(&identity))
+        .unwrap()
+        .is_none());
+    let tx = conn.unchecked_transaction().unwrap();
+    let cutoff = capture::reserve_revision(&tx).unwrap();
+    capture::save_subscription(
+        &tx,
+        &capture::Subscription {
+            id: "reader",
+            session: Some(&identity),
+            cursor: cutoff,
+            kind: 0,
+            rowid: 0,
+            complete: true,
+        },
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    insert("during", 2);
+    let revision = capture::next_change(&conn, cutoff, Some(&identity))
+        .unwrap()
+        .unwrap();
+    assert_eq!(revision.kind, "history");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&revision.payload).unwrap()["prompt"],
+        "during"
+    );
+    let tx = conn.unchecked_transaction().unwrap();
+    capture::release_subscription(&tx, "reader").unwrap();
+    tx.commit().unwrap();
+    insert("after", 3);
+    assert!(
+        capture::next_change(&conn, revision.position, Some(&identity))
+            .unwrap()
+            .is_none()
+    );
+}

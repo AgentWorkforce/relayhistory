@@ -1,6 +1,6 @@
 //! Probe-owned helper RPC; leases use the same clock rules as the old addon.
 use super as core;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::time::Instant;
 #[derive(Deserialize)]
@@ -97,7 +97,8 @@ enum Request {
 }
 
 pub fn request(path: &std::path::Path, value: serde_json::Value) -> Result<serde_json::Value> {
-    let request: Request = serde_json::from_value(value)?;
+    let request: Request =
+        serde_json::from_value(value).context("INVALID_ARGUMENT: invalid delivery request")?;
     let received = Instant::now();
     let conn = core::open_db(path)?;
     let result: anyhow::Result<serde_json::Value> = (|| {

@@ -34,12 +34,15 @@ enum Request {
 fn moved() -> napi::Error {
     crate::native_error("HISTORY_DELIVERY_MOVED", "Upload jobs are owned by agent-relay-probe / @relayhistory/capture. Use that package to manage existing jobs; local history and export remain available here.")
 }
+// Core caps the decoded selection at 64 KiB. The wire envelope also carries
+// metadata and may encode each ASCII character as a six-byte Unicode escape.
+const MAX_EXPORT_REQUEST_BYTES: usize = 6 * 65_536 + 4_096;
 #[napi]
 pub async fn history_export(request_json: String, db_path: Option<String>) -> napi::Result<String> {
-    if request_json.len() > 65_536 {
+    if request_json.len() > MAX_EXPORT_REQUEST_BYTES {
         return Err(crate::native_error(
             "INVALID_ARGUMENT",
-            "export request exceeds 64 KiB",
+            "export request exceeds bounded envelope limit",
         ));
     }
     let request: Request = serde_json::from_str(&request_json)

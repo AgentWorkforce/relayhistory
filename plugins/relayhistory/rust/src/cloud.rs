@@ -4247,6 +4247,9 @@ pub(crate) mod tests {
                         Err(_) => panic!("device client did not complete expected request"),
                     }
                 };
+                // Accepted sockets inherit nonblocking mode on macOS. The
+                // request reader below intentionally uses blocking reads.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(std::time::Duration::from_secs(3)))
                     .unwrap();

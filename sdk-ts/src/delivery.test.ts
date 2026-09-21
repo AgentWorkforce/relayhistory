@@ -1,3 +1,4 @@
+import { nativeCall } from './native.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import assert from 'node:assert/strict';
@@ -185,4 +186,24 @@ test('SDK, CLI and MCP report migration without creating a store or invoking rec
   try { await client.connect(transport);const result=await client.callTool({name:'delivery_status',arguments:{}});assert.equal(result.isError,true);assert.match(JSON.stringify(result),/agent-relay-probe/); }
   finally { await client.close(); }
   await assert.rejects(access(join(root,'absent')),{code:'ENOENT'});
+});
+
+test('native export accepts the full decoded selection budget and bounds the wire envelope separately', async () => {
+  await fixture(async dbPath => {
+    const large: HistoryExportSelection = { ...selection, sources: [], sessions: [{ source: 'claude', session_id: '' }] };
+    large.sessions[0].session_id = 'x'.repeat(65_536 - Buffer.byteLength(JSON.stringify(large)));
+    assert.equal(Buffer.byteLength(JSON.stringify(large)), 65_536);
+    const snapshot = await beginHistoryExport(large, { dbPath });
+    await closeHistoryExport(snapshot.snapshot_id, { dbPath });
+    const request = JSON.stringify({ operation: 'create_export', selection: large,
+      limits: DEFAULT_DELIVERY_LIMITS, ttl_ms: 60_000, now_ms: Date.now() });
+    assert.ok(Buffer.byteLength(request) > 65_536);
+    const escaped = request.replace(/x/g, '\\u0078');
+    const wireSnapshot = JSON.parse(await nativeCall(native => native.historyExport(escaped, dbPath))) as { snapshot_id: string };
+    await closeHistoryExport(wireSnapshot.snapshot_id, { dbPath });
+    large.sessions[0].session_id += 'x';
+    await assert.rejects(beginHistoryExport(large, { dbPath }), { code: 'HISTORY_EXPORT_FAILED' });
+    await assert.rejects(nativeCall(native => native.historyExport(' '.repeat(6 * 65_536 + 4097), dbPath)),
+      (error: unknown) => error instanceof Error && /bounded envelope limit/.test(error.message));
+  });
 });

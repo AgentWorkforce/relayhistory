@@ -8169,10 +8169,12 @@ fn insert_session_event_with_provenance(
     // key with no method is indistinguishable from one that was never
     // resolved: the denormalizing pass would then replace a delegated
     // thread's own repository with its delegator's, on every sync, forever.
+    // Reuse the compiled statement and capture triggers across records. Trigger
+    // predicates still read current subscription state on every execution.
     let resolved = cwd.and_then(|cwd| crate::project_identity::identity_for(Some(cwd), None));
     let resolved_key = resolved.as_ref().map(|(key, _)| key.as_str());
     let resolved_method = resolved.as_ref().map(|(_, method)| method.as_str());
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO session_events \
          (source, session_id, project, project_key, project_key_method, cwd, git_branch, message_id, parent_id, ts_ms, role, kind, text, model, token_json, provider, event_uid, \
           tool_use_id, payload_bytes, payload_truncated, payload_hash, call_index, event_index, result_status, event_source, \
@@ -8208,6 +8210,7 @@ fn insert_session_event_with_provenance(
          is_sidechain=excluded.is_sidechain, is_meta=excluded.is_meta, turn_id=excluded.turn_id, \
          request_span=excluded.request_span, \
          raw_facts_version=excluded.raw_facts_version, raw_kind=excluded.raw_kind",
+    )?.execute(
         params![
             source,
             session_id,
@@ -8266,13 +8269,14 @@ fn insert_tool_call(
     ts_ms: i64,
 ) -> Result<()> {
     crate::mark_session_presence(conn, source, session_id, SessionLocation::Local)?;
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO tool_calls \
          (source, session_id, message_id, tool_use_id, name, target, args_json, is_error, ts_ms) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(source, session_id, tool_use_id) DO UPDATE SET \
          message_id=excluded.message_id, name=excluded.name, target=excluded.target, args_json=excluded.args_json, \
          is_error=COALESCE(excluded.is_error, tool_calls.is_error), ts_ms=excluded.ts_ms",
+    )?.execute(
         params![
             source,
             session_id,
@@ -8295,8 +8299,9 @@ fn set_tool_call_error(
     tool_use_id: &str,
     is_error: bool,
 ) -> Result<()> {
-    conn.execute(
+    conn.prepare_cached(
         "UPDATE tool_calls SET is_error = ? WHERE source = ? AND session_id = ? AND tool_use_id = ?",
+    )?.execute(
         params![if is_error { 1 } else { 0 }, source, session_id, tool_use_id],
     )?;
     Ok(())
@@ -8316,13 +8321,14 @@ fn upsert_file_edit_from_call(
     cwd: Option<&str>,
 ) -> Result<()> {
     crate::mark_session_presence(conn, source, session_id, SessionLocation::Local)?;
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO file_edits \
          (source, session_id, message_id, tool_use_id, file_path, tool_name, ts_ms, git_branch, cwd) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(source, session_id, tool_use_id) DO UPDATE SET \
          message_id=excluded.message_id, file_path=excluded.file_path, tool_name=excluded.tool_name, \
          ts_ms=excluded.ts_ms, git_branch=COALESCE(excluded.git_branch, file_edits.git_branch), cwd=COALESCE(excluded.cwd, file_edits.cwd)",
+    )?.execute(
         params![
             source,
             session_id,
