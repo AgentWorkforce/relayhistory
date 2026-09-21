@@ -195,6 +195,10 @@ call by the number of records it was split across.
 - `messageIds` is a list, carried across the boundary as a JSON array. A
   provider id may contain a comma, so it is never joined into one string and
   split back.
+- `provider` is carried from the grouped event rows when the source records it;
+  it is never inferred from the model. If one request's rows name more than one
+  non-null provider, the request carries `ambiguous-provider`, mirroring the
+  existing `ambiguous-model` treatment.
 - `message_id` is **not** a request identity. It holds the JSONL record's own
   `uuid`, and one Claude request is written as several records with different
   uuids. A request keyed on it, from a source that spreads requests across

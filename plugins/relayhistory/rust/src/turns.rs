@@ -241,6 +241,7 @@ mod tests {
                 role TEXT NOT NULL,
                 kind TEXT NOT NULL,
                 text TEXT, model TEXT, token_json TEXT,
+                provider TEXT,
                 event_uid TEXT NOT NULL,
                 -- Per-tool-result fidelity columns. `ai_hist::session_events`
                 -- selects every column the crate defines, so a hand-built

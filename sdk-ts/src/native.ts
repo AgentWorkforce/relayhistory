@@ -19,7 +19,7 @@ import {
   ConnectorFailureError,
 } from './sdk-common.js';
 
-export const NATIVE_CONTRACT_VERSION = 18;
+export const NATIVE_CONTRACT_VERSION = 19;
 type UnknownRecord = Record<string, unknown>;
 
 interface NativeBinding {

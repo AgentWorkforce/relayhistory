@@ -5,15 +5,106 @@
   "discovery_diagnostics": [],
   "file_edits": [],
   "fixture": "opencode/legacy-json-with-compaction",
-  "history": [],
-  "hydration": [],
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "do some long work that fills the cache",
+      "session_id": "ses_compact",
+      "source": "opencode",
+      "timestamp_ms": 1776999001000
+    },
+    {
+      "project": "/tmp/project",
+      "prompt": "continue working",
+      "session_id": "ses_compact",
+      "source": "opencode",
+      "timestamp_ms": 1776999005000
+    }
+  ],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "ses_compact",
+      "source": "opencode",
+      "status": "hydrated"
+    }
+  ],
   "layout": "OpencodeLegacyJson",
   "notes": [],
   "origin": "burn",
   "quirk": "legacy layout with a summarized/compacted message",
-  "session_events": [],
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "text:prt_u1_text",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "msg_compact_u1",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "ses_compact",
+      "source": "opencode",
+      "text": "do some long work that fills the cache",
+      "token_json": null,
+      "ts_ms": 1776999001000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "text:prt_summary_1_text",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "msg_compact_summary",
+      "model": "anthropic/claude-sonnet-4-5",
+      "parent_id": "msg_compact_uc",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "ses_compact",
+      "source": "opencode",
+      "text": "## Goal\n- summarized prior work",
+      "token_json": "{\"cache\":{\"read\":0,\"write\":800},\"input\":8,\"output\":150,\"reasoning\":0}",
+      "ts_ms": 1776999004000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "text:prt_u2_text",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "msg_compact_u2",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "ses_compact",
+      "source": "opencode",
+      "text": "continue working",
+      "token_json": null,
+      "ts_ms": 1776999005000
+    }
+  ],
   "session_relationships": [],
-  "sessions": [],
+  "sessions": [
+    {
+      "agent_version": null,
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776999000000,
+      "first_prompt": "do some long work that fills the cache",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776999010000,
+      "last_assistant_text": "## Goal\n- summarized prior work",
+      "models_json": "[\"anthropic/claude-sonnet-4-5\"]",
+      "originator": null,
+      "raw_path": "<home>/.local/share/opencode/storage/session/global/ses_compact.json",
+      "repo_url": null,
+      "session_id": "ses_compact",
+      "source": "opencode",
+      "source_stamp": "3204:14:<n>:4d30209f0db7b1d9",
+      "workspace_roots_json": null
+    }
+  ],
   "source": "opencode",
   "tool_calls": []
 }

@@ -192,6 +192,10 @@ CREATE TABLE IF NOT EXISTS session_events (
     text TEXT,
     model TEXT,
     token_json TEXT,
+    -- The upstream inference provider, when the harness records it as its own
+    -- field. OpenCode writes `providerID`; Claude and Codex do not name one,
+    -- so theirs stays null rather than being guessed from the model string.
+    provider TEXT,
     event_uid TEXT NOT NULL,
     tool_use_id TEXT,
     payload_bytes INTEGER,
@@ -206,6 +210,7 @@ CREATE TABLE IF NOT EXISTS session_events (
     agent_id TEXT,
     request_id TEXT,
     provider_message_id TEXT,
+    -- Why the turn ended, as the harness itself reported it.
     stop_reason TEXT,
     agent_version TEXT,
     is_sidechain INTEGER,
@@ -217,6 +222,21 @@ CREATE TABLE IF NOT EXISTS session_events (
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS session_events_fts USING fts5(
     text, role, project, content='session_events', content_rowid='id'
+);
+-- Points in a session that are not turns: a context compaction, a resume, a
+-- fork. `marker_uid` is derived from the provider record that established the
+-- marker, so re-ingesting the same session is idempotent.
+CREATE TABLE IF NOT EXISTS session_markers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    message_id TEXT,
+    ts_ms INTEGER,
+    text TEXT,
+    detail_json TEXT,
+    marker_uid TEXT NOT NULL,
+    UNIQUE(source, session_id, marker_uid)
 );
 CREATE TABLE IF NOT EXISTS tool_calls (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -247,17 +267,6 @@ CREATE TABLE IF NOT EXISTS file_edits (
     git_branch TEXT,
     cwd TEXT,
     UNIQUE(source, session_id, tool_use_id)
-);
-CREATE TABLE IF NOT EXISTS session_markers (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source TEXT NOT NULL,
-    session_id TEXT NOT NULL,
-    marker_uid TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    ts_ms INTEGER,
-    text TEXT,
-    detail_json TEXT,
-    UNIQUE(source, session_id, marker_uid)
 );
 CREATE TABLE IF NOT EXISTS session_commit_links (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -492,6 +501,7 @@ const REQUIRED_TABLES: &[&str] = &[
     "history_fts",
     "session_events",
     "session_events_fts",
+    "session_markers",
     "tool_calls",
     "file_edits",
     "session_commit_links",
@@ -552,6 +562,11 @@ const REQUIRED_SESSIONS_COLUMNS: &[&str] = &[
 const REQUIRED_HYDRATION_CHECKPOINT_COLUMNS: &[&str] = &["source_diagnostics_json"];
 const REQUIRED_SESSION_PRESENCE_COLUMNS: &[&str] =
     &["raw_locator", "source_stamp", "discovery_state"];
+/// The two marker producers landed independently: OpenCode records the
+/// enclosing message while Grok records a displayable marker excerpt. A
+/// database created by either implementation must gain the other column.
+const REQUIRED_SESSION_MARKER_COLUMNS: &[(&str, &str)] =
+    &[("message_id", "TEXT"), ("text", "TEXT")];
 /// Columns [`init_db`] adds to `session_events` after the original DDL, with
 /// the SQL type each one is added as.
 ///
@@ -576,6 +591,7 @@ const REQUIRED_SESSION_PRESENCE_COLUMNS: &[&str] =
 const REQUIRED_SESSION_EVENT_COLUMNS: &[(&str, &str)] = &[
     ("project_key", "TEXT"),
     ("project_key_method", "TEXT"),
+    ("provider", "TEXT"),
     ("request_id", "TEXT"),
     ("provider_message_id", "TEXT"),
     ("stop_reason", "TEXT"),
@@ -710,6 +726,7 @@ const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &[
     "session_presences_local_backfill_v1",
     "session_relationships_v2",
     "session_markers_v1",
+    "session_markers_combined_v1",
     "session_events_tool_result_fidelity_v1",
     // `delete_session_hydration_state` gained a step, and `CREATE TRIGGER IF
     // NOT EXISTS` would otherwise leave an existing database on the old body
@@ -846,6 +863,16 @@ fn schema_has_required_indexes(conn: &Connection, required_indexes: &[&str]) -> 
     if !REQUIRED_SESSION_PRESENCE_COLUMNS
         .iter()
         .all(|needed| presence_columns.contains(*needed))
+    {
+        return Ok(false);
+    }
+    let marker_columns: HashSet<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('session_markers')")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if !REQUIRED_SESSION_MARKER_COLUMNS
+        .iter()
+        .all(|(needed, _)| marker_columns.contains(*needed))
     {
         return Ok(false);
     }
@@ -1157,6 +1184,11 @@ END;
     ensure_text_columns(conn, "history", REQUIRED_HISTORY_COLUMNS)?;
     ensure_text_columns(conn, "sessions", REQUIRED_SESSIONS_COLUMNS)?;
     ensure_text_columns(conn, "session_presences", REQUIRED_SESSION_PRESENCE_COLUMNS)?;
+    ensure_columns(conn, "session_markers", REQUIRED_SESSION_MARKER_COLUMNS)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations (name) VALUES ('session_markers_combined_v1')",
+        [],
+    )?;
     ensure_text_columns(
         conn,
         "session_hydration_checkpoints",
@@ -1350,6 +1382,10 @@ VALUES ('session_presences_local_backfill_v1');
     )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_file_edits_path ON file_edits(file_path)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_markers_session ON session_markers(source, session_id, ts_ms)",
         [],
     )?;
     conn.execute(
@@ -1867,7 +1903,7 @@ pub fn upsert_session_presence(
 /// `kind` that are both untrue. Markers carry no role and their `ts_ms` is
 /// nullable, because a provider may record that something happened without
 /// recording when.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionMarker {
     pub source: String,
@@ -1875,6 +1911,7 @@ pub struct SessionMarker {
     /// Stable per-session identity, so re-reading the same evidence upserts.
     pub marker_uid: String,
     pub kind: String,
+    pub message_id: Option<String>,
     pub ts_ms: Option<i64>,
     pub text: Option<String>,
     /// The provider's own fields for this marker, verbatim.
@@ -1886,16 +1923,17 @@ pub struct SessionMarker {
 pub fn insert_session_marker(conn: &Connection, marker: &SessionMarker) -> Result<usize> {
     let changed = conn.execute(
         "INSERT INTO session_markers \
-         (source, session_id, marker_uid, kind, ts_ms, text, detail_json) \
-         VALUES (?, ?, ?, ?, ?, ?, ?) \
+         (source, session_id, marker_uid, kind, message_id, ts_ms, text, detail_json) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(source, session_id, marker_uid) DO UPDATE SET \
-         kind = excluded.kind, ts_ms = excluded.ts_ms, text = excluded.text, \
-         detail_json = excluded.detail_json",
+         kind = excluded.kind, message_id = excluded.message_id, \
+         ts_ms = excluded.ts_ms, text = excluded.text, detail_json = excluded.detail_json",
         params![
             marker.source,
             marker.session_id,
             marker.marker_uid,
             marker.kind,
+            marker.message_id,
             marker.ts_ms,
             marker.text,
             marker.detail_json,
@@ -1912,7 +1950,7 @@ pub fn session_markers(
     session_id: &str,
 ) -> Result<Vec<SessionMarker>> {
     let mut stmt = conn.prepare(
-        "SELECT source, session_id, marker_uid, kind, ts_ms, text, detail_json \
+        "SELECT source, session_id, marker_uid, kind, message_id, ts_ms, text, detail_json \
          FROM session_markers WHERE source = ? AND session_id = ? \
          ORDER BY ts_ms IS NULL, ts_ms, id",
     )?;
@@ -1922,9 +1960,10 @@ pub fn session_markers(
             session_id: row.get(1)?,
             marker_uid: row.get(2)?,
             kind: row.get(3)?,
-            ts_ms: row.get(4)?,
-            text: row.get(5)?,
-            detail_json: row.get(6)?,
+            message_id: row.get(4)?,
+            ts_ms: row.get(5)?,
+            text: row.get(6)?,
+            detail_json: row.get(7)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -2045,6 +2084,8 @@ pub struct SessionEvent {
     pub text: Option<String>,
     pub model: Option<String>,
     pub token_json: Option<String>,
+    /// The upstream inference provider the harness named, when it names one.
+    pub provider: Option<String>,
     pub event_uid: String,
     /// Per-tool-result fidelity. Every field below is `None` on a row that is
     /// not a tool result, and on a tool-result row whose provider does not
@@ -2079,6 +2120,7 @@ pub struct SessionEvent {
     /// Together with `request_id`, this preserves a stable request identity
     /// when one Claude response spans multiple JSONL records.
     pub provider_message_id: Option<String>,
+    /// Why the turn ended, as the harness reported it.
     pub stop_reason: Option<String>,
     pub agent_version: Option<String>,
     pub is_sidechain: Option<i64>,
@@ -2183,7 +2225,7 @@ pub struct SessionFileEditPage {
 /// wrong field.
 const SESSION_EVENT_COLUMNS: &str =
     "id, source, session_id, project, project_key, cwd, git_branch, message_id, parent_id, \
-     ts_ms, role, kind, text, model, token_json, event_uid, tool_use_id, payload_bytes, \
+     ts_ms, role, kind, text, model, token_json, provider, event_uid, tool_use_id, payload_bytes, \
      payload_truncated, payload_hash, call_index, event_index, result_status, event_source, \
      error_signal, subagent_session_id, agent_id, request_id, provider_message_id, \
      stop_reason, agent_version, is_sidechain, is_meta, turn_id, request_span";
@@ -2205,26 +2247,27 @@ fn row_to_session_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionEven
         text: row.get(12)?,
         model: row.get(13)?,
         token_json: row.get(14)?,
-        event_uid: row.get(15)?,
-        tool_use_id: row.get(16)?,
-        payload_bytes: row.get(17)?,
-        payload_truncated: row.get(18)?,
-        payload_hash: row.get(19)?,
-        call_index: row.get(20)?,
-        event_index: row.get(21)?,
-        result_status: row.get(22)?,
-        event_source: row.get(23)?,
-        error_signal: row.get(24)?,
-        subagent_session_id: row.get(25)?,
-        agent_id: row.get(26)?,
-        request_id: row.get(27)?,
-        provider_message_id: row.get(28)?,
-        stop_reason: row.get(29)?,
-        agent_version: row.get(30)?,
-        is_sidechain: row.get(31)?,
-        is_meta: row.get(32)?,
-        turn_id: row.get(33)?,
-        request_span: row.get(34)?,
+        provider: row.get(15)?,
+        event_uid: row.get(16)?,
+        tool_use_id: row.get(17)?,
+        payload_bytes: row.get(18)?,
+        payload_truncated: row.get(19)?,
+        payload_hash: row.get(20)?,
+        call_index: row.get(21)?,
+        event_index: row.get(22)?,
+        result_status: row.get(23)?,
+        event_source: row.get(24)?,
+        error_signal: row.get(25)?,
+        subagent_session_id: row.get(26)?,
+        agent_id: row.get(27)?,
+        request_id: row.get(28)?,
+        provider_message_id: row.get(29)?,
+        stop_reason: row.get(30)?,
+        agent_version: row.get(31)?,
+        is_sidechain: row.get(32)?,
+        is_meta: row.get(33)?,
+        turn_id: row.get(34)?,
+        request_span: row.get(35)?,
     })
 }
 
@@ -3637,13 +3680,39 @@ pub fn shell_quote(value: &str) -> String {
     }
 }
 
+/// Whether the caller explicitly asked for the whole-database copy.
+///
+/// The copy is a per-sync `Connection::backup` of the provider's entire store
+/// plus a provider-side index build on the copy; on a large `opencode.db` that
+/// is hundreds of megabytes of I/O for evidence the bounded path reads with
+/// session-keyed queries. It is now opt-in at *runtime* as well as at compile
+/// time, so the default path does not copy even in a build that has the
+/// feature — which is what `--all-features` gives CI.
+#[cfg(feature = "opencode-backup")]
+fn opencode_backup_requested() -> bool {
+    std::env::var_os("AI_HIST_OPENCODE_BACKUP").is_some_and(|value| value == "1")
+}
+
+/// Index every OpenCode session the provider store holds.
+///
+/// The default path opens the live store read-only, pins one deferred read
+/// transaction, and runs session-keyed queries against it. Nothing is copied,
+/// no temporary database is created, and no provider DDL is issued, so the
+/// cost is proportional to the history actually read rather than to the size
+/// of the provider's database.
 pub fn sync_opencode_db(conn: &Connection, opencode_db: &Path) -> Result<usize> {
     crate::ingest::check_capture_cancelled()?;
-    if !opencode_db.exists() {
+    // `is_file`, the same question `OpencodeLayout::detect` asks. `exists` is
+    // true for a directory, and `OPENCODE_DB` is an arbitrary path, so the
+    // looser guard let a directory reach `Connection::open` and fail there --
+    // a caller that classified first would never send one, and one that did
+    // not deserves the same answer as an absent store rather than an SQLite
+    // error about a path that is not a database.
+    if !opencode_db.is_file() {
         return Ok(0);
     }
     #[cfg(feature = "opencode-backup")]
-    {
+    if opencode_backup_requested() {
         let tmp = tempfile::NamedTempFile::new()?.into_temp_path();
         let src_live = Connection::open_with_flags(
             opencode_db,
@@ -3658,39 +3727,139 @@ pub fn sync_opencode_db(conn: &Connection, opencode_db: &Path) -> Result<usize> 
         src.execute_batch(
             "CREATE INDEX IF NOT EXISTS ai_hist_sync_part_session ON part(session_id);",
         )?;
-        sync_opencode_sessions_from_source(conn, &src)
+        return sync_opencode_sessions_from_source(conn, &src, opencode_db);
     }
-    #[cfg(not(feature = "opencode-backup"))]
-    {
-        let src = Connection::open_with_flags(
-            opencode_db,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-        )
-        .with_context(|| format!("opening {}", opencode_db.display()))?;
-        src.busy_timeout(std::time::Duration::from_secs(5))?;
-        src.execute_batch("BEGIN")?;
-        let result = sync_opencode_sessions_from_source(conn, &src);
-        let _ = src.execute_batch("ROLLBACK");
-        result
-    }
+    let src = Connection::open_with_flags(
+        opencode_db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| format!("opening {}", opencode_db.display()))?;
+    src.busy_timeout(std::time::Duration::from_secs(5))?;
+    src.execute_batch("BEGIN")?;
+    let result = sync_opencode_sessions_from_source(conn, &src, opencode_db);
+    let _ = src.execute_batch("ROLLBACK");
+    result
 }
 
-fn sync_opencode_sessions_from_source(conn: &Connection, src: &Connection) -> Result<usize> {
-    let session_ids = src
-        .prepare("SELECT id FROM session WHERE id IS NOT NULL AND id <> ''")?
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+/// Index every OpenCode session in a legacy `storage/` JSON tree.
+pub fn sync_opencode_storage_dir(conn: &Connection, storage_dir: &Path) -> Result<usize> {
+    crate::ingest::check_capture_cancelled()?;
+    if !storage_dir.join("session").is_dir() {
+        return Ok(0);
+    }
+    // One session's failure is that session's failure. The loader reports I/O
+    // errors now, and propagating the first one would leave every healthy
+    // session in the same tree unindexed for as long as the one path stays
+    // broken -- the opposite of what making the read failure visible was for.
+    // So each session is indexed or reported on its own, and the error at the
+    // end names them all rather than the first.
     let mut inserted = 0;
-    for session_id in session_ids {
+    let listing = crate::ingest::opencode::list_json_tree_session_files(storage_dir);
+    // A subtree that could not be walked is not a subtree with no sessions in
+    // it. It joins the per-session failures rather than being dropped, so the
+    // sessions under it are reported missing instead of silently absent.
+    let mut failures: Vec<String> = listing
+        .unreadable
+        .iter()
+        .map(|dir| format!("{}: {}", dir.path.display(), dir.error))
+        .collect();
+    for session_file in listing.sessions {
         crate::ingest::check_capture_cancelled()?;
-        inserted += sync_opencode_session_from_connection(conn, src, &session_id)?;
+        let indexed =
+            crate::ingest::opencode::load_from_json_tree(&session_file).and_then(|loaded| {
+                match loaded {
+                    Some(loaded) => crate::ingest::opencode::normalize(
+                        conn,
+                        &loaded,
+                        &session_file.to_string_lossy(),
+                    )
+                    .map(|counts| counts.prompts),
+                    None => Ok(0),
+                }
+            });
+        match indexed {
+            Ok(prompts) => inserted += prompts,
+            Err(error) => failures.push(format!("{}: {error:#}", session_file.display())),
+        }
+    }
+    if !failures.is_empty() {
+        anyhow::bail!(
+            "{} OpenCode path(s) under {} could not be read (the rest were indexed): {}",
+            failures.len(),
+            storage_dir.display(),
+            failures.join("; ")
+        );
+    }
+    Ok(inserted)
+}
+
+fn sync_opencode_sessions_from_source(
+    conn: &Connection,
+    src: &Connection,
+    raw_path: &Path,
+) -> Result<usize> {
+    crate::ingest::check_capture_cancelled()?;
+    let raw_path = raw_path.to_string_lossy().into_owned();
+    let mut inserted = 0;
+    // One session's failure is that session's failure, the same way the legacy
+    // tree's sweep treats it. The loader reports a row it cannot map rather
+    // than calling the session absent, and taking that error out of the loop
+    // with `?` would end the sweep at the first bad row -- every session after
+    // it in the store unindexed for as long as that one row stays bad.
+    let mut failures: Vec<String> = Vec::new();
+    // Session-keyed queries are bounded only when the provider indexes the
+    // column they seek on. Without that index each one scans `part`, and this
+    // loop runs one per session -- quadratic on exactly the large stores the
+    // bounded path exists to protect. Read the whole store once instead.
+    match crate::ingest::opencode::sync_plan(src)? {
+        crate::ingest::opencode::OpencodeSyncPlan::PerSession => {
+            for session_id in crate::ingest::opencode::list_sqlite_session_ids(src)? {
+                crate::ingest::check_capture_cancelled()?;
+                let indexed = crate::ingest::opencode::load_from_sqlite(src, &session_id).and_then(
+                    |loaded| match loaded {
+                        Some(loaded) => {
+                            crate::ingest::opencode::normalize(conn, &loaded, &raw_path)
+                                .map(|counts| counts.prompts)
+                        }
+                        None => Ok(0),
+                    },
+                );
+                match indexed {
+                    Ok(prompts) => inserted += prompts,
+                    Err(error) => failures.push(format!("{session_id}: {error:#}")),
+                }
+            }
+        }
+        crate::ingest::opencode::OpencodeSyncPlan::SinglePass => {
+            crate::ingest::check_capture_cancelled()?;
+            let load = crate::ingest::opencode::load_all_from_sqlite(src)?;
+            failures.extend(
+                load.failures
+                    .iter()
+                    .map(|failure| format!("{}: {}", failure.session_id, failure.error)),
+            );
+            for loaded in load.sessions {
+                crate::ingest::check_capture_cancelled()?;
+                match crate::ingest::opencode::normalize(conn, &loaded, &raw_path) {
+                    Ok(counts) => inserted += counts.prompts,
+                    Err(error) => failures.push(format!("{}: {error:#}", loaded.session.id)),
+                }
+            }
+        }
+    }
+    if !failures.is_empty() {
+        anyhow::bail!(
+            "{} OpenCode session(s) in {raw_path} could not be read (the rest were indexed): {}",
+            failures.len(),
+            failures.join("; ")
+        );
     }
     Ok(inserted)
 }
 
 /// Ingest one OpenCode session with session-keyed queries against the live
-/// source database. Unlike global sync this never copies or enumerates the
-/// complete provider store.
+/// source database. Unlike global sync this never enumerates the complete
+/// provider store.
 pub fn sync_opencode_session(
     conn: &Connection,
     opencode_db: &Path,
@@ -3703,61 +3872,42 @@ pub fn sync_opencode_session(
     .with_context(|| format!("opening {}", opencode_db.display()))?;
     src.busy_timeout(std::time::Duration::from_secs(5))?;
     src.execute_batch("BEGIN")?;
-    let result = sync_opencode_session_from_connection(conn, &src, session_id);
+    let result = sync_opencode_session_from_connection(conn, &src, session_id, opencode_db);
     let _ = src.execute_batch("ROLLBACK");
     result
+}
+
+/// Ingest one OpenCode session from a legacy `storage/` JSON tree.
+pub fn sync_opencode_session_from_storage_dir(
+    conn: &Connection,
+    session_file: &Path,
+    session_id: &str,
+) -> Result<usize> {
+    crate::ingest::check_capture_cancelled()?;
+    let Some(loaded) = crate::ingest::opencode::load_from_json_tree(session_file)? else {
+        return Ok(0);
+    };
+    if loaded.session.id != session_id {
+        anyhow::bail!(
+            "OpenCode session file {} holds session '{}', not '{session_id}'",
+            session_file.display(),
+            loaded.session.id
+        );
+    }
+    Ok(crate::ingest::opencode::normalize(conn, &loaded, &session_file.to_string_lossy())?.prompts)
 }
 
 fn sync_opencode_session_from_connection(
     conn: &Connection,
     src: &Connection,
     session_id: &str,
+    raw_path: &Path,
 ) -> Result<usize> {
-    let mut stmt = src.prepare(
-        "SELECT s.directory, p.data, COALESCE(p.time_created, m.time_created, s.time_created) \
-         FROM session s \
-         JOIN part p ON p.session_id = s.id \
-         JOIN message m ON m.id = p.message_id \
-         WHERE s.id = ? \
-           AND json_extract(m.data, '$.role') = 'user' \
-           AND json_extract(p.data, '$.type') = 'text' \
-         ORDER BY COALESCE(p.time_created, m.time_created, s.time_created) ASC",
-    )?;
-    let rows = stmt
-        .query_map([session_id], |row| {
-            Ok((
-                row.get::<_, Option<String>>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut inserted = 0;
-    for (project, data, timestamp_ms) in rows {
-        crate::ingest::check_capture_cancelled()?;
-        let value: serde_json::Value = serde_json::from_str(&data).unwrap_or_default();
-        let prompt = value
-            .get("text")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim();
-        if prompt.is_empty() {
-            continue;
-        }
-        inserted += insert_history(
-            conn,
-            &HistoryEntry {
-                id: 0,
-                source: "opencode".into(),
-                session_id: Some(session_id.to_string()),
-                project,
-                prompt: prompt.to_string(),
-                prompt_hash: Some(prompt_hash(prompt)),
-                timestamp_ms,
-            },
-        )?;
-    }
-    Ok(inserted)
+    crate::ingest::check_capture_cancelled()?;
+    let Some(loaded) = crate::ingest::opencode::load_from_sqlite(src, session_id)? else {
+        return Ok(0);
+    };
+    Ok(crate::ingest::opencode::normalize(conn, &loaded, &raw_path.to_string_lossy())?.prompts)
 }
 
 pub fn export_json(conn: &Connection) -> Result<Vec<HistoryEntry>> {
@@ -3799,6 +3949,68 @@ mod tests {
         // A database opened through init_db has everything.
         let current = open_db(&dir.join("current.db")).unwrap();
         assert!(schema_is_current(&current).unwrap());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A database written by a release before OpenCode carried event-level
+    /// evidence: `session_events` without `provider`/`stop_reason`, and no
+    /// `session_markers` at all. The migration has to be additive — the rows
+    /// already there survive it — and the read-only guard has to refuse the
+    /// database until it has run, or a search would meet `no such column`.
+    #[test]
+    fn a_database_from_before_opencode_event_evidence_migrates_additively() {
+        let dir = std::env::temp_dir().join(format!(
+            "ai-hist-opencode-migration-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.db");
+
+        {
+            let old = Connection::open(&path).unwrap();
+            old.execute_batch(
+                "CREATE TABLE session_events (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     source TEXT NOT NULL,
+                     session_id TEXT NOT NULL,
+                     project TEXT, cwd TEXT, git_branch TEXT,
+                     message_id TEXT, parent_id TEXT,
+                     ts_ms INTEGER NOT NULL,
+                     role TEXT NOT NULL,
+                     kind TEXT NOT NULL,
+                     text TEXT, model TEXT, token_json TEXT,
+                     event_uid TEXT NOT NULL,
+                     UNIQUE(source, session_id, event_uid)
+                 );
+                 INSERT INTO session_events
+                     (source, session_id, ts_ms, role, kind, text, event_uid)
+                 VALUES ('opencode', 'ses_old', 1, 'user', 'text', 'kept', 'uid-1');",
+            )
+            .unwrap();
+            assert!(
+                !schema_is_current(&old).unwrap(),
+                "an unmigrated database must not be served read-only"
+            );
+        }
+
+        // Opening writably migrates.
+        let migrated = open_db(&path).unwrap();
+        assert!(schema_is_current(&migrated).unwrap());
+        let (text, provider, stop_reason): (String, Option<String>, Option<String>) = migrated
+            .query_row(
+                "SELECT text, provider, stop_reason FROM session_events WHERE event_uid = 'uid-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(text, "kept", "the existing row survives the migration");
+        assert_eq!(provider, None, "a backfilled column starts null");
+        assert_eq!(stop_reason, None);
+        assert!(session_markers(&migrated, "opencode", "ses_old")
+            .unwrap()
+            .is_empty());
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -5471,6 +5683,7 @@ mod tests {
                 session_id: "kept-1".into(),
                 marker_uid: "compaction:1.json".into(),
                 kind: "compaction_boundary".into(),
+                message_id: None,
                 ts_ms: Some(11),
                 text: None,
                 detail_json: None,
@@ -5485,6 +5698,7 @@ mod tests {
                 session_id: "kept-1".into(),
                 marker_uid: "compaction:1.json".into(),
                 kind: "compaction_boundary".into(),
+                message_id: None,
                 ts_ms: Some(12),
                 text: Some("second read".into()),
                 detail_json: None,
@@ -5847,6 +6061,63 @@ mod tests {
             init_db(&conn).unwrap();
             assert!(schema_is_current(&conn).unwrap());
         }
+    }
+
+    /// Delivery is an optional feature, and that is what opens the hole. A
+    /// database can carry delivery tables and capture triggers from a
+    /// delivery-enabled build, then be opened by a `--no-default-features`
+    /// build: that build adds the new `session_events` columns, because the
+    /// migration is not delivery-gated, but it never rebuilds the triggers,
+    /// because `init_delivery_schema` is compiled out. On the next
+    /// delivery-enabled open the trigger names are all still present, so a
+    /// read-only fast path that checks names alone is satisfied, `init_db`
+    /// never reaches the rebuild, and delivery goes on reporting success while
+    /// the new fields never leave the machine.
+    ///
+    /// So a name is not enough: the payload has to be checked too.
+    ///
+    #[cfg(feature = "delivery")]
+    #[test]
+    fn a_capture_trigger_missing_provider_is_not_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("stale-trigger.db");
+        let conn = open_db(&db_path).unwrap();
+        assert!(schema_is_current(&conn).unwrap());
+
+        let capture_sql = |conn: &Connection| -> String {
+            conn.query_row(
+                "SELECT sql FROM sqlite_master \
+                 WHERE type='trigger' AND name='delivery_session_events_insert'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        // Rewrite the trigger to the shape a build before these columns left
+        // behind: same name, payload one column short.
+        let omitted = "'provider',NEW.\"provider\"";
+        let sql = capture_sql(&conn);
+        assert!(
+            sql.contains(omitted),
+            "the payload must carry {omitted} before removing it, or this test proves nothing"
+        );
+        let stale_sql = sql.replace(&format!(",{omitted}"), "");
+        assert_ne!(stale_sql, sql);
+        conn.execute_batch("DROP TRIGGER delivery_session_events_insert;")
+            .unwrap();
+        conn.execute_batch(&stale_sql).unwrap();
+
+        assert!(
+            !schema_is_current(&conn).unwrap(),
+            "a trigger whose payload predates a column its table has is not current"
+        );
+
+        // And the writable open repairs it, which is the point of saying so.
+        drop(conn);
+        let conn = open_db(&db_path).unwrap();
+        assert!(capture_sql(&conn).contains(omitted));
+        assert!(schema_is_current(&conn).unwrap());
     }
 
     #[test]

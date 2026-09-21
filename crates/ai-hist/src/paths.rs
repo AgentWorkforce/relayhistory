@@ -28,6 +28,13 @@ pub fn opencode_db_path(home: &Path) -> PathBuf {
         .unwrap_or_else(|| home.join(".local/share/opencode/opencode.db"))
 }
 
+/// Where OpenCode's legacy JSON tree lives: `session/<scope>/<id>.json`,
+/// `message/<sessionId>/*.json`, `part/<messageId>/*.json`.
+pub fn opencode_storage_dir(home: &Path) -> PathBuf {
+    env_dir("OPENCODE_STORAGE_DIR")
+        .unwrap_or_else(|| home.join(".local/share/opencode/storage"))
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ProviderRoots {
     pub home: PathBuf,
@@ -35,6 +42,7 @@ pub(crate) struct ProviderRoots {
     pub codex: PathBuf,
     pub grok: PathBuf,
     pub opencode_db: PathBuf,
+    pub opencode_storage_dir: PathBuf,
     pub use_env_roots: bool,
 }
 
@@ -45,18 +53,24 @@ impl ProviderRoots {
             codex: codex_home(&home),
             grok: grok_home(&home),
             opencode_db: opencode_db_path(&home),
+            opencode_storage_dir: opencode_storage_dir(&home),
             use_env_roots: true,
             home,
         }
     }
 
     pub(crate) fn from_home(home: PathBuf, opencode_db: PathBuf) -> Self {
+        let opencode_storage_dir = opencode_db
+            .parent()
+            .map(|parent| parent.join("storage"))
+            .unwrap_or_else(|| home.join(".local/share/opencode/storage"));
         Self {
             claude: home.join(".claude"),
             codex: home.join(".codex"),
             grok: home.join(".grok"),
             home,
             opencode_db,
+            opencode_storage_dir,
             use_env_roots: false,
         }
     }
@@ -64,6 +78,10 @@ impl ProviderRoots {
 
 pub fn default_opencode_db_path() -> PathBuf {
     opencode_db_path(&home_dir())
+}
+
+pub fn default_opencode_storage_dir() -> PathBuf {
+    opencode_storage_dir(&home_dir())
 }
 
 pub fn home_dir() -> PathBuf {

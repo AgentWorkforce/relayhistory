@@ -233,6 +233,12 @@ export interface SessionEvent {
   text: string | null;
   model: string | null;
   tokenUsage: Record<string, unknown> | null;
+  /**
+   * The upstream inference provider, when the harness records one of its own
+   * (OpenCode's `providerID`). Null for harnesses that do not name one — it is
+   * never inferred from `model`.
+  */
+  provider: string | null;
   eventUid: string;
   /**
    * Per-tool-result fidelity. Null on every row that is not a tool result,
@@ -570,6 +576,7 @@ export type UsageDiagnostic =
   | 'ambiguous-usage-copies'
   | 'unnormalizable-usage'
   | 'ambiguous-model'
+  | 'ambiguous-provider'
   /** No provider request identity was captured, so rows may be per record. */
   | 'unresolved-request-identity'
   /** Only some contributing requests reported the cache-write TTL split. */
