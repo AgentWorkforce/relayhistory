@@ -324,6 +324,20 @@ pub fn validate_records(
             }
         }
         if record.kind == EvidenceKind::SessionMarker {
+            // `required` only asks whether the field is present and non-null,
+            // so `""` passed it and the NOT NULL column stored it happily. A
+            // marker whose classification is the empty string is
+            // indistinguishable from one whose classifier failed, which is the
+            // state this table exists to make impossible. `unknown` is the
+            // answer for a record nothing recognises.
+            ensure!(
+                record
+                    .payload
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| !kind.trim().is_empty()),
+                "INVALID_ARGUMENT: marker kind must not be empty"
+            );
             if let Some(payload_json) = record
                 .payload
                 .get("payload_json")

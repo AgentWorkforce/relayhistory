@@ -1630,3 +1630,65 @@ fn a_contributed_marker_payload_obeys_the_same_bound() -> Result<()> {
     );
     Ok(())
 }
+
+/// An empty `kind` is not a kind.
+///
+/// `kind` is in the marker spec's `required` list, but that check only asks
+/// whether the field is present and non-null -- so `""` passed, and the
+/// NOT NULL column stored it happily. A marker whose classification is the
+/// empty string is indistinguishable from one whose classifier failed, which
+/// is the state this table exists to make impossible.
+///
+/// Refused rather than rewritten, consistent with every other out-of-contract
+/// value at this boundary.
+#[test]
+fn a_contributed_marker_needs_a_real_kind() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("history.db");
+    observe(&path, "a")?;
+
+    let marker = |kind: &str, uid: &str| -> EvidenceRecord {
+        EvidenceRecord {
+            kind: EvidenceKind::SessionMarker,
+            payload: json!({
+                "source": "claude",
+                "session_id": "s",
+                "marker_uid": uid,
+                "kind": kind,
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            record_id: Some(format!("upstream:{uid}")),
+            revision_id: Some("upstream:1".into()),
+        }
+    };
+
+    let refused = apply(
+        &path,
+        "a",
+        state(&path, "a")?.revision.unwrap(),
+        vec![EvidenceKind::SessionMarker],
+        vec![marker("", "m-empty")],
+    );
+    let message = format!("{:#}", refused.expect_err("an empty kind is refused"));
+    assert!(message.contains("INVALID_ARGUMENT"), "{message}");
+
+    // Positive control: `unknown` is a real classification and is accepted,
+    // so this refuses empty rather than refusing unclassified.
+    apply(
+        &path,
+        "a",
+        state(&path, "a")?.revision.unwrap(),
+        vec![EvidenceKind::SessionMarker],
+        vec![marker("unknown", "m-unknown")],
+    )?;
+    let conn = ai_hist::open_db(&path)?;
+    let stored: String = conn.query_row(
+        "SELECT kind FROM session_markers WHERE source='claude' AND session_id='s'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(stored, "unknown");
+    Ok(())
+}

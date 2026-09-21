@@ -2144,6 +2144,22 @@ pub fn session_markers(
     source: &str,
     session_id: &str,
 ) -> Result<Vec<SessionMarker>> {
+    // Every page on one SQLite snapshot. The walk issues a statement per page
+    // and the keyset includes `ts_ms`, so a sync writing between them can move
+    // a row the walk has already returned past the cursor and hand it back
+    // again -- or move an unread one behind it, so it is never returned at
+    // all. Either way the caller gets a list that existed at no instant.
+    //
+    // WAL readers do not block the writer, so this costs nothing. The paged
+    // call is deliberately left alone: a caller holding a cursor across time
+    // is reading the database as it changes, which is the point of a cursor.
+    //
+    // A caller that already holds a transaction supplies the snapshot itself;
+    // opening a nested one would fail outright.
+    let snapshot = conn
+        .is_autocommit()
+        .then(|| conn.unchecked_transaction())
+        .transpose()?;
     let mut markers = Vec::new();
     let mut cursor = None;
     loop {
@@ -2153,9 +2169,13 @@ pub fn session_markers(
             // A cursor is handed back only alongside a full page, so this
             // terminates on the first short page.
             Some(next) => cursor = Some(next),
-            None => return Ok(markers),
+            None => break,
         }
     }
+    if let Some(snapshot) = snapshot {
+        snapshot.finish()?;
+    }
+    Ok(markers)
 }
 
 pub fn insert_history(conn: &Connection, entry: &HistoryEntry) -> Result<usize> {
@@ -6831,6 +6851,106 @@ mod tests {
         }
         let conn = open_db(&other).expect("an expired export owes nothing");
         assert_eq!(session_markers(&conn, "grok", "exp").unwrap().len(), 1);
+    }
+
+    /// The unpaged marker read is one snapshot, not one per page.
+    ///
+    /// `session_markers` walks the keyset cursor across several statements to
+    /// return every marker. With no enclosing transaction each page reads its
+    /// own snapshot, so a sync writing between them can move a row's `ts_ms` --
+    /// part of the keyset -- and the walk hands back a marker it has already
+    /// returned. The caller gets a list that existed at no instant.
+    ///
+    /// `session_markers_page` keeps its old behaviour: a caller paging across
+    /// time is deliberately reading the database as it changes.
+    ///
+    /// The write has to land *between* two pages or it proves nothing -- one
+    /// that commits before the walk starts is simply an earlier snapshot,
+    /// which every implementation reports consistently. So the first page's
+    /// cost is measured in progress ticks, and the write is injected just past
+    /// it. Same technique as
+    /// `a_user_turn_page_reads_one_snapshot_even_while_a_sync_writes`.
+    #[test]
+    fn the_unpaged_marker_read_stays_on_one_snapshot_while_a_sync_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("snapshot.db");
+        let total = 1_200usize;
+        {
+            let conn = open_db(&db_path).unwrap();
+            for index in 0..total {
+                insert_session_marker(
+                    &conn,
+                    "codex",
+                    "busy",
+                    &NewSessionMarker {
+                        marker_uid: &format!("m{index:05}"),
+                        ts_ms: Some(index as i64),
+                        kind: "unknown",
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            }
+        }
+
+        // What one page costs, measured against the same data.
+        let page_ticks = {
+            let probe = open_db(&db_path).unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            probe.progress_handler(
+                1,
+                Some(move || {
+                    let _ = tx.send(());
+                    false
+                }),
+            );
+            let page = session_markers_page(&probe, "codex", "busy", 1_000, None).unwrap();
+            assert_eq!(page.markers.len(), 1_000, "the fixture must span two pages");
+            probe.progress_handler(0, None::<fn() -> bool>);
+            let mut ticks = 0u32;
+            while rx.try_recv().is_ok() {
+                ticks += 1;
+            }
+            ticks
+        };
+        assert!(page_ticks > 0, "a page must cost some ticks");
+
+        // From just past the first page onwards, move an already-returned row
+        // to the far end of the keyset. The statement is idempotent, so it
+        // does not matter how many ticks fire; what matters is that the first
+        // one falls between the two pages.
+        let writer_path = db_path.clone();
+        let tick = std::sync::atomic::AtomicU32::new(0);
+        let conn = open_db(&db_path).unwrap();
+        conn.progress_handler(
+            1,
+            Some(move || {
+                // Exactly once, on the first tick past the first page. Opening
+                // a connection on every later tick would be the same write and
+                // would take minutes to do nothing.
+                if tick.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == page_ticks {
+                    let writer = Connection::open(&writer_path).unwrap();
+                    let _ = writer.execute(
+                        "UPDATE session_markers SET ts_ms = 99999 \
+                         WHERE source = 'codex' AND session_id = 'busy' \
+                           AND marker_uid = 'm00001'",
+                        [],
+                    );
+                }
+                false
+            }),
+        );
+        let markers = session_markers(&conn, "codex", "busy").unwrap();
+        conn.progress_handler(0, None::<fn() -> bool>);
+
+        let uids: std::collections::HashSet<&str> =
+            markers.iter().map(|m| m.marker_uid.as_str()).collect();
+        assert_eq!(
+            uids.len(),
+            markers.len(),
+            "no marker may be returned twice by one walk"
+        );
+        assert_eq!(markers.len(), total, "and none may be stepped over");
     }
 
     /// The project-identity columns, marker and index reach a database that

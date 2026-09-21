@@ -5659,16 +5659,39 @@ fn insert_sessionless_record_marker(
     let marker_uid = format!("{identity}:marker");
     let draft = claude_marker_for_record(obj, None)
         .unwrap_or_else(|| MarkerDraft::new("unknown", Some(record_type)));
+    // Read from the record, not left at their defaults.
+    //
+    // Sharing one identity with the ordinary path is what stops a summary
+    // becoming two rows -- and it makes them the same row, so whichever pass
+    // runs last decides every column. `insert_session_marker` upserts and
+    // overwrites, so any column this path leaves empty is a column it erases
+    // from what an earlier pass stored. Dedup and erasure are one mechanism
+    // seen twice.
+    let ts_ms = obj
+        .get("timestamp")
+        .and_then(|value| {
+            value
+                .as_str()
+                .and_then(parse_iso_ms)
+                .or_else(|| value.as_i64())
+        })
+        .filter(|ts| *ts != 0);
+    let message_id = obj.get("uuid").and_then(Value::as_str);
+    let parent_id = obj.get("parentUuid").and_then(Value::as_str);
     insert_session_marker(
         conn,
         "claude",
         session_id,
         &NewSessionMarker {
             marker_uid: &marker_uid,
+            ts_ms,
+            message_id,
+            parent_id: draft.parent_id.as_deref().or(parent_id),
+            turn_id: draft.turn_id.as_deref(),
             kind: draft.kind,
             subkind: draft.subkind.as_deref(),
+            text: None,
             payload_json: draft.payload_json.as_deref(),
-            ..Default::default()
         },
     )?;
     Ok(())
@@ -11448,6 +11471,75 @@ mod tests {
             )
             .unwrap();
         assert_eq!(summaries, 2, "distinct summaries must stay distinct");
+    }
+
+    /// A sessionless re-read must not blank what the record already carried.
+    ///
+    /// Sharing one identity between the two paths is what stops a summary
+    /// becoming two rows -- and it makes them the *same* row, so whichever
+    /// runs last decides every column. `insert_session_marker` upserts and
+    /// overwrites, so a sessionless pass that left `ts_ms`, `message_id` and
+    /// `parent_id` at their defaults wiped values an earlier pass had stored.
+    ///
+    /// Dedup and erasure are the same mechanism seen twice: any column the two
+    /// paths do not both populate is a column the later one destroys.
+    #[test]
+    fn a_sessionless_re_read_keeps_the_identity_the_record_carries() {
+        let dir = tempfile::tempdir().unwrap();
+        let with_session = dir.path().join("remote.jsonl");
+        fs::write(
+            &with_session,
+            concat!(
+                r#"{"type":"summary","summary":"s","leafUuid":"leaf-keep","uuid":"rec-keep","parentUuid":"par-1","sessionId":"keep-session","timestamp":"2026-09-14T00:00:00.000Z"}"#, "\n",
+                r#"{"type":"user","uuid":"u0","sessionId":"keep-session","cwd":"/tmp/p","timestamp":"2026-09-14T00:00:01.000Z","message":{"role":"user","content":"hi"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        // The same record as it is read locally: no sessionId of its own.
+        let sessionless = dir.path().join("local.jsonl");
+        fs::write(
+            &sessionless,
+            concat!(
+                r#"{"type":"summary","summary":"s","leafUuid":"leaf-keep","uuid":"rec-keep","parentUuid":"par-1","timestamp":"2026-09-14T00:00:00.000Z"}"#, "\n",
+                r#"{"type":"user","uuid":"u0","sessionId":"keep-session","cwd":"/tmp/p","timestamp":"2026-09-14T00:00:01.000Z","message":{"role":"user","content":"hi"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &with_session).unwrap();
+        let before = crate::session_markers_page(&conn, "claude", "keep-session", 50, None)
+            .unwrap()
+            .markers;
+        let before = before.iter().find(|m| m.kind == "summary").unwrap().clone();
+        assert!(before.ts_ms.is_some(), "the premise: it starts populated");
+        assert_eq!(before.message_id.as_deref(), Some("rec-keep"));
+
+        ingest_claude_transcript(&conn, &sessionless).unwrap();
+        let after = crate::session_markers_page(&conn, "claude", "keep-session", 50, None)
+            .unwrap()
+            .markers;
+        let after = after.iter().find(|m| m.kind == "summary").unwrap();
+        assert_eq!(
+            after.ts_ms, before.ts_ms,
+            "a re-read must not blank the time"
+        );
+        assert_eq!(
+            after.message_id, before.message_id,
+            "nor the message identity"
+        );
+        assert_eq!(after.parent_id, before.parent_id, "nor the parent");
+        // Positive control: still one row, so this did not fix erasure by
+        // reintroducing the duplicate.
+        let rows: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM session_markers WHERE kind = 'summary'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
     }
 
     /// Every sidecar read obeys the same three-way rule: absent is nothing,
@@ -22665,9 +22757,15 @@ mod capture_progress_tests {
         )
         .unwrap_err();
         assert!(error.is::<CaptureCancelled>());
-        assert!(!state.contains_key("claude_sessions_v3"));
+        // The current Claude stamp map. This branch advanced the generation to
+        // v4 so an upgraded install re-reads each transcript once for markers;
+        // a test that names the retired key still compiles and then panics on
+        // the second index, which is how this one arrived here from main.
+        // Whoever advances it again has to come through this line.
+        let stamp_map = "claude_sessions_v4";
+        assert!(!state.contains_key(stamp_map));
         sync_claude_session_metadata(&conn, &mut state, &dir.path().join("projects")).unwrap();
-        assert!(state["claude_sessions_v3"]
+        assert!(state[stamp_map]
             .get(path.to_string_lossy().as_ref())
             .is_some());
         assert_eq!(

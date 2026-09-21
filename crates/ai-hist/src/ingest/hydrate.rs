@@ -69,6 +69,11 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 3;
 /// in isolation, so there is nothing here for a test to catch. Whoever merges
 /// main onto this branch next must re-read this number from main and take
 /// main's plus one if it has moved again.
+///
+/// At the time of writing #204 also holds 9, with main still at 8, so
+/// whichever of the two merges second owes the other a 10. The rule is the
+/// number, not the branch: read main, add one, never assume the value that was
+/// right when the branch opened is still right.
 const HYDRATION_PARSER_VERSION: i64 = 9;
 
 #[derive(Debug, Clone)]
