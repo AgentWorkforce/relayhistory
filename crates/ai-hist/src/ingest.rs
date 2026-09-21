@@ -109,6 +109,61 @@ thread_local! {
     static CAPTURE_OBSERVER: std::cell::RefCell<Option<CaptureObserver>> = std::cell::RefCell::new(None);
 }
 
+/// A cooperative host stop, distinct from an ingest failure or a skipped lock.
+#[derive(Debug)]
+pub struct CaptureCancelled;
+impl std::fmt::Display for CaptureCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("local capture cancelled")
+    }
+}
+impl std::error::Error for CaptureCancelled {}
+
+type CaptureStop = std::rc::Rc<dyn Fn() -> bool>;
+thread_local! {
+    static CAPTURE_STOP: std::cell::RefCell<Option<CaptureStop>> = std::cell::RefCell::new(None);
+}
+
+fn with_capture_stop<T>(
+    cancelled: impl Fn() -> bool + 'static,
+    run: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    struct Restore(Option<CaptureStop>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CAPTURE_STOP.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore =
+        Restore(CAPTURE_STOP.with(|slot| slot.replace(Some(std::rc::Rc::new(cancelled)))));
+    check_capture_cancelled()?;
+    let result = run();
+    // A provider may treat a read failure as recoverable. Cancellation must
+    // still propagate rather than reporting a partial scan as complete.
+    check_capture_cancelled()?;
+    result
+}
+
+pub(crate) fn check_capture_cancelled() -> Result<()> {
+    let stop = CAPTURE_STOP.with(|slot| slot.borrow().clone());
+    if stop.is_some_and(|stop| stop()) {
+        return Err(CaptureCancelled.into());
+    }
+    Ok(())
+}
+
+/// Capture with cooperative cancellation at provider, file and record boundaries.
+/// Committed chunks remain durable; an unfinished transaction rolls back and
+/// its checkpoint is retried by the next capture. The callback is scoped to
+/// this thread and restored on return, error, or panic.
+pub fn sync_local_at_cancellable(
+    db_path: &Path,
+    observer: impl Fn(CaptureProgress) + 'static,
+    cancelled: impl Fn() -> bool + 'static,
+) -> Result<bool> {
+    with_capture_stop(cancelled, || sync_local_at_with_progress(db_path, observer))
+}
+
 /// Observes this thread's capture only; no paths or session contents are exposed.
 pub fn sync_local_at_with_progress(
     db_path: &Path,
@@ -124,6 +179,7 @@ pub fn sync_local_at_with_progress(
         Restore(CAPTURE_OBSERVER.with(|slot| slot.replace(Some(std::rc::Rc::new(observer)))));
     capture_progress("initializing", 0, None);
     let result = sync_local_at(db_path);
+    check_capture_cancelled()?;
     if result.is_ok() {
         capture_progress("complete", 0, None);
     }
@@ -516,6 +572,7 @@ fn sync_basic(conn: &Connection, db_path: &Path, roots: &crate::ProviderRoots) -
     // and never persists anything. Checkpointing makes each source's cursor
     // durable the moment that source completes.
     capture_progress("claude-history", 0, None);
+    check_capture_cancelled()?;
     if let Some(inserted) = report.capture(
         "claude",
         sync_jsonl_incremental(
@@ -531,6 +588,7 @@ fn sync_basic(conn: &Connection, db_path: &Path, roots: &crate::ProviderRoots) -
         checkpoint_sync_state(&state_path, &state);
     }
     capture_progress("claude", 0, None);
+    check_capture_cancelled()?;
     if report
         .capture(
             "claude-metadata",
@@ -541,11 +599,13 @@ fn sync_basic(conn: &Connection, db_path: &Path, roots: &crate::ProviderRoots) -
         checkpoint_sync_state(&state_path, &state);
     }
     capture_progress("codex", 0, None);
+    check_capture_cancelled()?;
     if let Some(inserted) = report.capture("codex", sync_codex(conn, &mut state, &roots.codex)) {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);
     }
     capture_progress("cursor", 0, None);
+    check_capture_cancelled()?;
     if let Some(inserted) = report.capture(
         "cursor",
         sync_cursor(conn, &mut state, &home.join(".cursor/projects")),
@@ -554,6 +614,7 @@ fn sync_basic(conn: &Connection, db_path: &Path, roots: &crate::ProviderRoots) -
         checkpoint_sync_state(&state_path, &state);
     }
     capture_progress("grok", 0, None);
+    check_capture_cancelled()?;
     if let Some(inserted) = report.capture(
         "grok",
         sync_grok(conn, &mut state, &roots.grok.join("sessions")),
@@ -562,12 +623,14 @@ fn sync_basic(conn: &Connection, db_path: &Path, roots: &crate::ProviderRoots) -
         checkpoint_sync_state(&state_path, &state);
     }
     capture_progress("trajectory", 0, None);
+    check_capture_cancelled()?;
     if let Some(inserted) = report.capture("trajectory", sync_trajectories(conn, &mut state, home))
     {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);
     }
     capture_progress("opencode", 0, None);
+    check_capture_cancelled()?;
     let opencode = roots.opencode_db.clone();
     if let Some(open_inserted) = report.capture("opencode", sync_opencode_db(conn, &opencode)) {
         if opencode.exists() {
@@ -577,11 +640,13 @@ fn sync_basic(conn: &Connection, db_path: &Path, roots: &crate::ProviderRoots) -
         }
         total_inserted += open_inserted;
     }
+    check_capture_cancelled()?;
     report.finish(db_path)?;
     // Establish connector-owned locators from actual provider enumeration after
     // ingestion, including on a checkpoint-only retry. Never infer an adapter
     // from an old aggregate presence row.
     capture_progress("catalog", 0, None);
+    check_capture_cancelled()?;
     let discovery_env = DiscoveryEnv::with_provider_roots(conn, roots.clone());
     discover::discover_sessions_with_providers(
         &discovery_env,
@@ -593,6 +658,7 @@ fn sync_basic(conn: &Connection, db_path: &Path, roots: &crate::ProviderRoots) -
     // and `repo_url` for sessions a provider's history file mentions without
     // describing, and inheritance needs every relationship this run recorded
     // to already be in the ledger.
+    check_capture_cancelled()?;
     refresh_project_identity_after_sync(conn);
     let total: i64 = conn.query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))?;
     // Fold the WAL back into the database now that the writes are done. Best
@@ -695,6 +761,7 @@ fn sync_exclusive_with_home(db_path: &Path, home: &Path) -> Result<bool> {
 }
 
 fn sync_exclusive_with_roots(db_path: &Path, roots: &crate::ProviderRoots) -> Result<bool> {
+    check_capture_cancelled()?;
     let Some(_sync_lock) = try_acquire_sync_lock(db_path)? else {
         sync_note!("  [sync] another sync is already running; skipped");
         return Ok(false);
@@ -1673,6 +1740,7 @@ impl CompleteJsonlReader {
     /// Returns only newline-terminated records. A partial final buffer remains
     /// uncommitted and will be read again after the writer completes it.
     fn next_line(&mut self, line: &mut String) -> Result<Option<u64>> {
+        check_capture_cancelled()?;
         line.clear();
         let mut raw = Vec::new();
         let read = self.reader.read_until(b'\n', &mut raw)?;
@@ -1746,6 +1814,7 @@ fn hash_file_prefix(path: &Path, offset: u64) -> Result<(String, Sha256)> {
     let mut buffer = [0u8; 64 * 1024];
     let mut last = None;
     while remaining > 0 {
+        check_capture_cancelled()?;
         let wanted = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
         let read = file.read(&mut buffer[..wanted])?;
         anyhow::ensure!(read > 0, "cursor offset extends past end of file");
@@ -2078,6 +2147,7 @@ fn sync_codex_rollouts(
             }
         }
         for rollout in capture_files("codex", rollouts) {
+            check_capture_cancelled()?;
             let key = rollout.to_string_lossy().to_string();
             let stamp = file_stamp(&rollout)?;
             let record = seen.get(&key).and_then(Value::as_object);
@@ -2976,6 +3046,7 @@ pub(crate) fn ingest_codex_rollout(
     let mut unwritten_line: Option<UnwrittenCodexLine> = None;
     let mut changes_before_line = conn.total_changes();
     loop {
+        check_capture_cancelled()?;
         raw.clear();
         if reader.read_until(b'\n', &mut raw)? == 0 {
             break;
@@ -3860,6 +3931,7 @@ fn backfill_codex_metadata(
 ) -> Result<usize> {
     let mut updated = 0;
     for (session_id, cwd) in cwds {
+        check_capture_cancelled()?;
         let branch = branches.get(session_id);
         updated += conn.execute(
             "UPDATE history SET project = COALESCE(project, ?), git_branch = COALESCE(git_branch, ?) WHERE source = 'codex' AND session_id = ? AND (project IS NULL OR git_branch IS NULL)",
@@ -3939,6 +4011,7 @@ fn sync_claude_session_metadata(
     let mut scanned = 0;
     let mut upserted = 0;
     for path in capture_files("claude", transcripts) {
+        check_capture_cancelled()?;
         let key = path.to_string_lossy().to_string();
         let stamp = claude_sync_stamp(&path)?;
         let transcript_events = claude_transcript_events_exist(conn, &path)?;
@@ -3987,6 +4060,9 @@ fn sync_claude_session_metadata(
         let scanned_meta = match scan_claude_session_file(&path) {
             Ok(meta) => meta,
             Err(error) => {
+                if error.is::<CaptureCancelled>() {
+                    return Err(error);
+                }
                 // Only a file that would otherwise be skipped holds the pass
                 // open. An unstamped file, or one whose stamp has moved, is
                 // reopened by the next walk regardless -- and a pending
@@ -4369,6 +4445,7 @@ fn scan_claude_session_file(path: &Path) -> Result<Option<ClaudeSessionMeta>> {
     let mut sidechain_records = 0usize;
     let mut agent_id: Option<String> = None;
     for line in text.lines() {
+        check_capture_cancelled()?;
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
@@ -4926,6 +5003,7 @@ fn ingest_claude_transcript_as(
             .map(str::to_string)
     });
     for line in text.lines() {
+        check_capture_cancelled()?;
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
@@ -6786,6 +6864,7 @@ fn collect_matching_files_inner(
         return Ok(());
     }
     for entry in fs::read_dir(root)? {
+        check_capture_cancelled()?;
         let entry = entry?;
         // The directory read already knows each entry's type; only a symlink
         // needs a stat to see what it points at.
@@ -6910,6 +6989,7 @@ fn sync_cursor_with_hooks(
     let mut inserted = 0;
     let mut cursor_state = prepared.cursor_state;
     for mut transcript in prepared.transcripts {
+        check_capture_cancelled()?;
         // Cursor can replace a transcript between the scan and this read. The
         // scan's `restarted`, `history_from_offset` and `scanned_through` then
         // describe a file that is gone, and using them commits a mixture of
@@ -7311,6 +7391,7 @@ fn prepare_cursor_sync(
     let mut errors = 0;
     let mut files_seen = 0;
     for project_dir in sorted_dirs(root)? {
+        check_capture_cancelled()?;
         let ts_root = project_dir.join("agent-transcripts");
         if !ts_root.is_dir() {
             continue;
@@ -7322,6 +7403,7 @@ fn prepare_cursor_sync(
                 .unwrap_or_default(),
         );
         for session_dir in sorted_dirs(&ts_root)? {
+            check_capture_cancelled()?;
             let session_id = session_dir
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -7343,6 +7425,9 @@ fn prepare_cursor_sync(
             {
                 Ok(scan) => scan,
                 Err(error) => {
+                    if error.is::<CaptureCancelled>() {
+                        return Err(error);
+                    }
                     sync_note!("  [cursor] skipping {}: {error:#}", jsonl.display());
                     errors += 1;
                     continue;
@@ -7519,6 +7604,7 @@ pub(crate) fn ingest_cursor_transcript(
         .split_inclusive('\n')
         .filter(|line| line.ends_with('\n'))
     {
+        check_capture_cancelled()?;
         let record_offset = offset;
         offset += line.len() as u64;
         // Cursor can append between the byte scan and this read. Those bytes
@@ -7990,6 +8076,7 @@ fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
         "grok",
         collect_matching_files(root, "chat_history", "jsonl")?,
     ) {
+        check_capture_cancelled()?;
         let key = chat.to_string_lossy().to_string();
         // One unreadable session directory does not stop the rest, and it does
         // not update its saved stamp either: the next run tries again. It is
@@ -7999,6 +8086,9 @@ fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
         let stamp = match grok_session_stamp(&chat) {
             Ok(stamp) => stamp,
             Err(error) => {
+                if error.is::<CaptureCancelled>() {
+                    return Err(error);
+                }
                 scanned += 1;
                 errors += 1;
                 sync_note!("  [grok] unreadable session {}: {error:#}", chat.display());
@@ -8091,6 +8181,9 @@ fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
                 grok_state.insert(key, json!({ "stamp": stamp }));
             }
             Err(error) => {
+                if error.is::<CaptureCancelled>() {
+                    return Err(error);
+                }
                 errors += 1;
                 sync_note!("  [grok] unreadable session {}: {error:#}", chat.display());
             }
@@ -8202,6 +8295,7 @@ fn ingest_grok_session(
     let mut turn_tool_tail: HashMap<usize, String> = HashMap::new();
 
     for (idx, line) in session.lines.iter().enumerate() {
+        check_capture_cancelled()?;
         // Looked up on use rather than cached: a record that establishes
         // which turn it is in (a prose chunk that joined to a group) changes
         // the answer for the rest of its own branch, and a cached value would
@@ -8581,6 +8675,7 @@ fn ingest_grok_session(
     // snapshot and not billed usage: Grok logs no per-turn input/output token
     // counts, and none are estimated here.
     for (turn, timing) in session.updates.turns.iter().enumerate() {
+        check_capture_cancelled()?;
         let tail = turn_tail.get(&turn).or_else(|| turn_tool_tail.get(&turn));
         let (Some(total), Some(uid)) = (timing.total_tokens, tail) else {
             continue;
@@ -9182,6 +9277,7 @@ fn scan_grok_session_file(chat: &Path) -> Result<Option<GrokSession>> {
     let contents = fs::read_to_string(chat)
         .with_context(|| format!("read Grok chat history {}", chat.display()))?;
     for (number, row) in jsonl::rows(&contents).enumerate() {
+        check_capture_cancelled()?;
         // A complete row that does not parse fails the read. The ingestion
         // this feeds replaces the session's evidence, so dropping the row
         // would commit a transcript that is missing a turn Grok did write --
@@ -9580,6 +9676,7 @@ fn sync_trajectories(
     let mut skipped = 0;
     let mut errors = 0;
     for path in capture_files("trajectory", files) {
+        check_capture_cancelled()?;
         let metadata = match path.metadata() {
             Ok(metadata) => metadata,
             Err(_) => {
@@ -9675,6 +9772,7 @@ fn trajectory_files(home: &Path) -> Result<Vec<PathBuf>> {
     }
     let mut files = Vec::new();
     for root in roots {
+        check_capture_cancelled()?;
         if root.is_file() && root.extension().and_then(|s| s.to_str()) == Some("json") {
             files.push(root);
             continue;
@@ -9696,6 +9794,7 @@ fn collect_named_dirs(root: &Path, name: &str, out: &mut Vec<PathBuf>) -> Result
         return Ok(());
     }
     for entry in fs::read_dir(root)? {
+        check_capture_cancelled()?;
         let entry = entry?;
         // Never follow symlinks: dependency links can revisit the same tree or cycle.
         if !entry.file_type()?.is_dir() {
@@ -9731,6 +9830,7 @@ fn collect_trajectory_json(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
         return Ok(());
     }
     for entry in fs::read_dir(dir)? {
+        check_capture_cancelled()?;
         let entry = entry?;
         let file_type = entry.file_type()?;
         let path = entry.path();
@@ -22466,6 +22566,193 @@ mod tests {
 mod capture_progress_tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn cancelled_capture_does_not_start_or_emit_completion_and_restores_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("history.db");
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let observed = updates.clone();
+        let error =
+            sync_local_at_cancellable(&db, move |p| observed.lock().unwrap().push(p), || true)
+                .unwrap_err();
+        assert!(error.is::<CaptureCancelled>());
+        assert!(!db.exists());
+        assert!(updates.lock().unwrap().is_empty());
+        check_capture_cancelled().unwrap();
+        let _ = std::panic::catch_unwind(|| {
+            with_capture_stop(|| false, || -> Result<()> { panic!("test unwind") })
+        });
+        check_capture_cancelled().unwrap();
+    }
+
+    #[test]
+    fn cancelled_jsonl_rolls_back_open_chunk_and_resumes_committed_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.jsonl");
+        let lines: Vec<String> = (0..JSONL_CHUNK_LINES + 100).map(|i| {
+            format!("{}\n", json!({"display":format!("prompt {i}"),"timestamp":1700000000000_i64+i as i64,"project":"/tmp/project","sessionId":"session"}))
+        }).collect();
+        fs::write(&path, lines.concat()).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        crate::init_db(&conn).unwrap();
+        let mut state = Map::new();
+        let checks = std::rc::Rc::new(std::cell::Cell::new(0));
+        let checked = checks.clone();
+        let error = with_capture_stop(
+            move || {
+                checked.set(checked.get() + 1);
+                checked.get() > JSONL_CHUNK_LINES + 50
+            },
+            || {
+                sync_jsonl_incremental(
+                    &conn,
+                    &mut state,
+                    "claude",
+                    &path,
+                    parse_claude_line,
+                    &mut |_| {},
+                )
+            },
+        )
+        .unwrap_err();
+        assert!(error.is::<CaptureCancelled>());
+        assert!(conn.is_autocommit());
+        let count = || {
+            conn.query_row("SELECT COUNT(*) FROM history", [], |row| {
+                row.get::<_, usize>(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(count(), JSONL_CHUNK_LINES);
+        assert_eq!(
+            state["claude"]["offset"].as_u64(),
+            Some(lines[..JSONL_CHUNK_LINES].concat().len() as u64)
+        );
+        sync_jsonl_incremental(
+            &conn,
+            &mut state,
+            "claude",
+            &path,
+            parse_claude_line,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(count(), lines.len());
+        assert_eq!(
+            state["claude"]["offset"].as_u64(),
+            Some(fs::metadata(&path).unwrap().len())
+        );
+    }
+
+    #[test]
+    fn cancellation_aborts_provider_scan_without_marking_transcript_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let projects = dir.path().join("projects/project");
+        fs::create_dir_all(&projects).unwrap();
+        let path = projects.join("session.jsonl");
+        fs::write(&path, (0..200).map(|i| format!("{}\n", json!({"type":"user","sessionId":"session","uuid":format!("msg-{i}"),"timestamp":"2026-09-20T00:00:00Z","message":{"role":"user","content":format!("prompt {i}")}}))).collect::<String>()).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        crate::init_db(&conn).unwrap();
+        let mut state = Map::new();
+        let checks = std::rc::Rc::new(std::cell::Cell::new(0));
+        let error = with_capture_stop(
+            move || {
+                checks.set(checks.get() + 1);
+                checks.get() > 50
+            },
+            || sync_claude_session_metadata(&conn, &mut state, &dir.path().join("projects")),
+        )
+        .unwrap_err();
+        assert!(error.is::<CaptureCancelled>());
+        assert!(!state.contains_key("claude_sessions_v3"));
+        sync_claude_session_metadata(&conn, &mut state, &dir.path().join("projects")).unwrap();
+        assert!(state["claude_sessions_v3"]
+            .get(path.to_string_lossy().as_ref())
+            .is_some());
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM session_events WHERE source='claude'",
+                [],
+                |r| r.get::<_, usize>(0)
+            )
+            .unwrap(),
+            200
+        );
+    }
+
+    #[test]
+    fn cancellation_interrupts_codex_metadata_backfill_and_retry_completes_it() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::init_db(&conn).unwrap();
+        let cwds: HashMap<String, String> = (0..20)
+            .map(|i| (format!("session-{i}"), "/project".into()))
+            .collect();
+        for id in cwds.keys() {
+            conn.execute("INSERT INTO history(source,session_id,prompt,timestamp_ms) VALUES ('codex',?1,?1,1)", [id]).unwrap();
+        }
+        let checks = std::cell::Cell::new(0);
+        let error = with_capture_stop(
+            move || {
+                checks.set(checks.get() + 1);
+                checks.get() > 5
+            },
+            || backfill_codex_metadata(&conn, &cwds, &HashMap::new()),
+        )
+        .unwrap_err();
+        assert!(error.is::<CaptureCancelled>());
+        let count = || {
+            conn.query_row(
+                "SELECT COUNT(*) FROM history WHERE project IS NOT NULL",
+                [],
+                |row| row.get::<_, usize>(0),
+            )
+            .unwrap()
+        };
+        assert!((1..20).contains(&count()));
+        backfill_codex_metadata(&conn, &cwds, &HashMap::new()).unwrap();
+        assert_eq!(count(), 20);
+    }
+
+    #[test]
+    fn cancellation_interrupts_both_trajectory_directory_walks() {
+        let home = tempfile::tempdir().unwrap();
+        for i in 0..20 {
+            let directory = home
+                .path()
+                .join(format!("project-{i}/.trajectories/completed"));
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("run.json"), "{}").unwrap();
+        }
+        for named in [true, false] {
+            let checks = std::cell::Cell::new(0);
+            let mut found = Vec::new();
+            let error = with_capture_stop(
+                move || {
+                    checks.set(checks.get() + 1);
+                    checks.get() > 5
+                },
+                || {
+                    if named {
+                        collect_named_dirs(home.path(), ".trajectories", &mut found)
+                    } else {
+                        collect_trajectory_json(home.path(), &mut found)
+                    }
+                },
+            )
+            .unwrap_err();
+            assert!(error.is::<CaptureCancelled>());
+            assert!(found.len() < 20, "stop must interrupt enumeration itself");
+            let mut resumed = Vec::new();
+            if named {
+                collect_named_dirs(home.path(), ".trajectories", &mut resumed)
+            } else {
+                collect_trajectory_json(home.path(), &mut resumed)
+            }
+            .unwrap();
+            assert_eq!(resumed.len(), 20);
+        }
+    }
 
     #[test]
     fn file_progress_counts_completed_files_and_restores_observer() {

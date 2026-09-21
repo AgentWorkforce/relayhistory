@@ -4039,6 +4039,7 @@ pub fn shell_quote(value: &str) -> String {
 }
 
 pub fn sync_opencode_db(conn: &Connection, opencode_db: &Path) -> Result<usize> {
+    crate::ingest::check_capture_cancelled()?;
     if !opencode_db.exists() {
         return Ok(0);
     }
@@ -4082,6 +4083,7 @@ fn sync_opencode_sessions_from_source(conn: &Connection, src: &Connection) -> Re
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut inserted = 0;
     for session_id in session_ids {
+        crate::ingest::check_capture_cancelled()?;
         inserted += sync_opencode_session_from_connection(conn, src, &session_id)?;
     }
     Ok(inserted)
@@ -4133,6 +4135,7 @@ fn sync_opencode_session_from_connection(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut inserted = 0;
     for (project, data, timestamp_ms) in rows {
+        crate::ingest::check_capture_cancelled()?;
         let value: serde_json::Value = serde_json::from_str(&data).unwrap_or_default();
         let prompt = value
             .get("text")
