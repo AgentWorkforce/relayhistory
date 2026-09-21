@@ -466,6 +466,17 @@ pub enum ShallowReadAccess {
     Catalog,
 }
 
+/// Opaque lifetime guard held by the discovery engine for one provider pass.
+///
+/// Most adapters are stateless and use no guard. An adapter that pins live
+/// provider state can return a lock guard so two calls through a reusable
+/// registry cannot replace each other's snapshot between enumeration and
+/// shallow reads.
+#[doc(hidden)]
+pub trait DiscoveryPassGuard {}
+
+impl<T> DiscoveryPassGuard for T {}
+
 /// One provider's shallow adapter.
 ///
 /// Implementations must be cheap: [`enumerate`](ShallowSessionProvider::enumerate)
@@ -475,6 +486,12 @@ pub enum ShallowReadAccess {
 /// not a session" (a codex subagent thread, a file with no usable metadata) —
 /// it is not an error.
 pub trait ShallowSessionProvider: Sync {
+    /// Start one enumerate/read cycle. The returned guard remains alive until
+    /// every candidate from this pass has been consumed.
+    fn begin_discovery_pass(&self) -> Result<Option<Box<dyn DiscoveryPassGuard + '_>>> {
+        Ok(None)
+    }
+
     /// Stable acquisition identity, independent of the evidence source.
     fn connector_id(&self) -> &str {
         self.source()
@@ -1541,11 +1558,7 @@ fn grok_update_bounds(
 /// but prompt/model extraction is omitted when it would require a table scan.
 #[derive(Default)]
 struct OpencodeProvider {
-    /// `None` means no choice has been made; `Some(None)` means the pass found
-    /// no store. Enumeration fixes the choice before it creates locators, and
-    /// every read uses that same choice even if OpenCode upgrades layouts in
-    /// the middle of the pass.
-    layout: Mutex<Option<Option<OpencodeLayout>>>,
+    pass: Mutex<()>,
     live: Mutex<Option<OpencodeReadSnapshot>>,
 }
 
@@ -1571,21 +1584,13 @@ struct OpencodeReadSnapshot {
 }
 
 impl OpencodeProvider {
-    fn layout(&self, scan: &ScanEnv<'_>) -> Option<OpencodeLayout> {
-        let mut guard = self.layout.lock().expect("opencode layout lock");
-        if guard.is_none() {
-            *guard = Some(scan.opencode_layout());
-        }
-        guard.as_ref().cloned().flatten()
-    }
-
     /// Open the provider once, read-only, and start the transaction that pins
     /// the run's SQLite snapshot. `None` means this host is not on the SQLite
     /// layout — either it has the legacy JSON tree, or it has no OpenCode
     /// store at all.
     fn snapshot(&self, scan: &ScanEnv<'_>) -> Result<MutexGuard<'_, Option<OpencodeReadSnapshot>>> {
         let mut guard = self.live.lock().expect("opencode live snapshot lock");
-        if guard.is_none() && matches!(self.layout(scan), Some(OpencodeLayout::Sqlite(_))) {
+        if guard.is_none() && matches!(scan.opencode_layout(), Some(OpencodeLayout::Sqlite(_))) {
             *guard = Some(open_opencode_snapshot(scan)?);
         }
         Ok(guard)
@@ -1696,6 +1701,16 @@ fn table_columns(conn: &Connection, table: &str) -> Result<BTreeSet<String>> {
 }
 
 impl ShallowSessionProvider for OpencodeProvider {
+    fn begin_discovery_pass(&self) -> Result<Option<Box<dyn DiscoveryPassGuard + '_>>> {
+        let pass = self.pass.lock().expect("opencode discovery pass lock");
+        // A SourceRegistry retains this adapter across calls. Drop the last
+        // call's SQLite transaction before detecting this call's layout, while
+        // the pass lock prevents a concurrent call from replacing the state
+        // between enumeration and reads.
+        *self.live.lock().expect("opencode live snapshot lock") = None;
+        Ok(Some(Box::new(pass)))
+    }
+
     fn acquire(
         &self,
         _home: &Path,
@@ -1718,7 +1733,7 @@ impl ShallowSessionProvider for OpencodeProvider {
         requested_limit: Option<usize>,
     ) -> Result<Vec<Candidate>> {
         let scan = env.scan();
-        if let Some(OpencodeLayout::JsonTree(root)) = self.layout(&scan) {
+        if let Some(OpencodeLayout::JsonTree(root)) = scan.opencode_layout() {
             return enumerate_opencode_json_tree(&scan, &root);
         }
         let mut guard = self.snapshot(&scan)?;
@@ -1824,10 +1839,16 @@ impl ShallowSessionProvider for OpencodeProvider {
         _catalog: Option<&Connection>,
         candidate: &Candidate,
     ) -> Result<Option<ShallowSession>> {
-        if let Some(OpencodeLayout::JsonTree(_)) = self.layout(scan) {
+        // Layout is encoded by the candidate shape: SQLite enumeration uses
+        // the session id itself as the locator, while the JSON tree uses its
+        // session-file path (and may have no session id for an unreadable
+        // directory). Do not re-detect the host here: OpenCode can create its
+        // SQLite store after JSON enumeration, and those locators must still
+        // be read by the layout that produced them.
+        if candidate.session_id.as_deref() != Some(candidate.locator.as_str()) {
             return read_shallow_opencode_json_tree(scan, candidate);
         }
-        let guard = self.snapshot(scan)?;
+        let guard = self.live.lock().expect("opencode live snapshot lock");
         let Some(snapshot) = guard.as_ref() else {
             return Ok(None);
         };
@@ -3234,6 +3255,13 @@ pub fn discover_sessions_with_provider_refs(
     // up across many passes must not keep answering from a checkout's state at
     // the first one.
     crate::project_identity::begin_acquisition_pass();
+    // Provider instances can belong to a reusable SourceRegistry. Hold each
+    // adapter's pass guard across enumeration, parallel reads and writes so a
+    // concurrent call cannot replace live provider state mid-pass.
+    let _pass_guards = providers
+        .iter()
+        .map(|provider| provider.begin_discovery_pass())
+        .collect::<Result<Vec<_>>>()?;
     let mut identities = std::collections::HashSet::new();
     for provider in providers {
         observation_key(*provider, provider.source(), "validation").validate()?;

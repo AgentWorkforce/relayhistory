@@ -1775,6 +1775,36 @@ fn opencode_pins_the_json_layout_between_enumeration_and_read() {
 }
 
 #[test]
+fn opencode_redetects_its_layout_on_the_next_registry_pass() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let env = env_at(&conn, home.path());
+    let provider = OpencodeProvider::default();
+    let providers: [&dyn ShallowSessionProvider; 1] = [&provider];
+    let options = only(&["opencode"]);
+
+    let first = discover_sessions_with_provider_refs(&env, &options, &providers, |_| {}).unwrap();
+    assert_eq!(first.providers["opencode"].candidates, 0);
+
+    opencode_db(
+        home.path(),
+        "INSERT INTO session VALUES ('ses_later', '/work/later', 30, 40);",
+    );
+    let mut rows = Vec::new();
+    discover_sessions_with_provider_refs(&env, &options, &providers, |row| {
+        rows.push(row.clone())
+    })
+    .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.session_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["ses_later"],
+        "a reusable registry must not keep the previous pass's absent layout"
+    );
+}
+
+#[test]
 #[cfg(target_pointer_width = "64")]
 fn opencode_rejects_a_limit_that_sqlite_cannot_represent() {
     let catalog = catalog();
