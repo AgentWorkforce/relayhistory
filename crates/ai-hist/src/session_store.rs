@@ -7,25 +7,54 @@ use crate::session_usage::{
 };
 use crate::store::{
     default_db_path, open_db, open_db_readonly, schema_is_event_read_current,
-    schema_is_evidence_read_current, session_markers_page, session_user_turns_page,
-    SessionEventCursor, SessionEvidenceCursor, SessionMarkerPage, SessionUserTurnPage,
+    schema_is_evidence_read_current, schema_is_usage_read_current, session_markers_page,
+    session_user_turns_page, SessionEventCursor, SessionEvidenceCursor, SessionMarkerPage,
+    SessionUserTurnPage,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Recoverable failure from [`SessionStore`].
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct Error {
     message: String,
+    stale_schema: bool,
 }
 
 impl Error {
     pub(crate) fn from_anyhow(error: anyhow::Error) -> Self {
         Self {
             message: format!("{error:#}"),
+            stale_schema: false,
         }
+    }
+
+    /// A read-only store refused a database written before the schema this
+    /// version reads. The remedy is named in the message: open it writable
+    /// once, which migrates it.
+    fn stale_schema(db_path: &Path, what: &str) -> Self {
+        Self {
+            message: format!(
+                "{} predates the {what} schema this version reads; \
+                 open it writable once (or run a sync) to migrate it",
+                db_path.display()
+            ),
+            stale_schema: true,
+        }
+    }
+
+    /// Whether this failure is a read-only store refusing a database it
+    /// would have to migrate first.
+    ///
+    /// Exposed as a fact rather than left to the message text, because a
+    /// caller that is allowed to write has a remedy for exactly this failure
+    /// and for no other: reopening writable migrates a stale database, but
+    /// it also takes the writer lock and runs initialization, which is the
+    /// wrong answer to a query that failed for any other reason.
+    pub fn is_stale_schema(&self) -> bool {
+        self.stale_schema
     }
 }
 
@@ -125,13 +154,7 @@ impl SessionStore {
         if opts.read_only {
             let conn = open_db_readonly(&db_path)?;
             if !schema_is_event_read_current(&conn)? {
-                return Err(Error {
-                    message: format!(
-                        "{} predates the session-event schema this version reads; \
-                         open it writable once (or run a sync) to migrate it",
-                        db_path.display()
-                    ),
-                });
+                return Err(Error::stale_schema(&db_path, "session-event"));
             }
         } else {
             let _ = open_db(&db_path)?;
@@ -148,6 +171,7 @@ impl SessionStore {
         if self.read_only {
             return Err(Error {
                 message: "SessionStore is read-only".to_string(),
+                stale_schema: false,
             });
         }
         let _ran = match &self.home {
@@ -198,13 +222,7 @@ impl SessionStore {
     ) -> Result<SessionMarkerPage, Error> {
         let conn = open_db_readonly(&self.db_path)?;
         if !schema_is_evidence_read_current(&conn).map_err(Error::from_anyhow)? {
-            return Err(Error {
-                message: format!(
-                    "{} predates the session-marker schema this version reads; \
-                     open it writable once (or run a sync) to migrate it",
-                    self.db_path.display()
-                ),
-            });
+            return Err(Error::stale_schema(&self.db_path, "session-marker"));
         }
         session_markers_page(&conn, source.as_str(), session_id, limit, after)
             .map_err(Error::from_anyhow)
@@ -224,6 +242,9 @@ impl SessionStore {
         after: Option<&SessionRequestCursor>,
     ) -> Result<SessionRequestPage, Error> {
         let conn = open_db_readonly(&self.db_path)?;
+        if !schema_is_usage_read_current(&conn).map_err(Error::from_anyhow)? {
+            return Err(Error::stale_schema(&self.db_path, "session-usage"));
+        }
         session_requests_page(&conn, source.as_str(), session_id, limit, after)
             .map_err(Error::from_anyhow)
     }
@@ -240,6 +261,9 @@ impl SessionStore {
         session_id: &str,
     ) -> Result<Option<SessionUsageSummary>, Error> {
         let conn = open_db_readonly(&self.db_path)?;
+        if !schema_is_usage_read_current(&conn).map_err(Error::from_anyhow)? {
+            return Err(Error::stale_schema(&self.db_path, "session-usage"));
+        }
         session_usage_summary(&conn, source.as_str(), session_id).map_err(Error::from_anyhow)
     }
 }
@@ -355,10 +379,19 @@ mod tests {
             read_only: true,
             ..StoreOptions::default()
         });
-        let message = match refused {
+        let error = match refused {
             Ok(_) => panic!("a read-only open cannot migrate, so it must refuse"),
-            Err(error) => error.to_string(),
+            Err(error) => error,
         };
+        assert!(
+            error.is_stale_schema(),
+            "the refusal is typed, so a caller with a remedy can apply it"
+        );
+        assert!(
+            !Error::from(anyhow::anyhow!("no such column: x")).is_stale_schema(),
+            "an ordinary query failure is not a stale schema"
+        );
+        let message = error.to_string();
         assert!(
             message.contains("predates the session-event schema"),
             "the error names the mismatch: {message}",

@@ -42,7 +42,15 @@ Notable changes to the native `ai-hist` CLI are documented here.
   facade read is one arm in the Rust dispatcher and one entry there, not
   another hand-mirrored native function. The dispatcher calls only the facade
   and the crate's pure capability tables, and a missing database answers an
-  empty page without being created.
+  empty page without being created. It reads through a read-only store first
+  and reopens writable — which migrates — only when the facade reports a
+  stale schema; any other read failure is returned as `DATABASE_QUERY_FAILED`
+  rather than retried through a writer-lock-taking open.
+- `ai_hist::Error::is_stale_schema()` says whether a `SessionStore` failure
+  is a read-only store refusing a database it would have to migrate first,
+  so a caller that may write can apply that one remedy and no other.
+  `session_requests_page` and `session_usage` now make the same check the
+  marker page does instead of failing inside a query.
 
 ### Live capture
 

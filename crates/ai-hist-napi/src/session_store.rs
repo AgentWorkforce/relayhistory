@@ -193,26 +193,38 @@ fn open_store(path: &Path, read_only: bool) -> Result<SessionStore, ai_hist::Err
     SessionStore::open(options)
 }
 
+fn query_error(error: ai_hist::Error) -> napi::Error {
+    native_error("DATABASE_QUERY_FAILED", format!("{error:#}"))
+}
+
 /// Run one facade read against the database at `path`.
 ///
 /// A read-only handle is tried first so a query never contends with a writer.
 /// The facade refuses a read-only handle over a database older than the shape
-/// it reads, naming the remedy; here the remedy is applied — the database is
-/// reopened writable, which migrates it — exactly as the typed functions do,
-/// because a Node caller asked for a page, not for a store it promised not to
-/// write. A failure that survives the writable retry is the real answer.
+/// it reads, and says so with a typed error; that one failure — and no other
+/// — is answered by reopening writable, which migrates the database exactly
+/// as the typed functions do, because a Node caller asked for a page, not for
+/// a store it promised not to write. Every other failure is the caller's
+/// answer as it stands: a writable reopen takes the writer lock and runs
+/// initialization, so retrying a genuine query failure through it would at
+/// best repeat the failure and at worst replace it with a contention error
+/// from a writer the read had no business meeting.
 fn with_store<T>(
     path: PathBuf,
     read: impl Fn(&SessionStore) -> Result<T, ai_hist::Error>,
 ) -> napi::Result<T> {
-    if let Ok(store) = open_store(&path, true) {
-        if let Ok(value) = read(&store) {
-            return Ok(value);
-        }
+    match open_store(&path, true) {
+        Ok(store) => match read(&store) {
+            Ok(value) => return Ok(value),
+            Err(error) if error.is_stale_schema() => {}
+            Err(error) => return Err(query_error(error)),
+        },
+        Err(error) if error.is_stale_schema() => {}
+        Err(error) => return Err(database_error(&path, format!("{error:#}"))),
     }
     let store =
         open_store(&path, false).map_err(|error| database_error(&path, format!("{error:#}")))?;
-    read(&store).map_err(|error| native_error("DATABASE_QUERY_FAILED", format!("{error:#}")))
+    read(&store).map_err(query_error)
 }
 
 fn evidence_cursor(cursor: Option<CursorArgs>) -> Option<SessionEvidenceCursor> {
@@ -510,6 +522,60 @@ mod tests {
         )
         .unwrap();
         assert_eq!(other["markers"], json!([]));
+    }
+
+    /// A read that fails for any reason other than a stale schema is the
+    /// answer: it is not retried through a writable open, which would take
+    /// the writer lock and run initialization for a query that would only
+    /// fail again — or fail differently, as `DATABASE_OPEN_FAILED` against a
+    /// concurrent writer, hiding the real error.
+    #[test]
+    fn a_query_failure_is_returned_not_retried_through_a_writable_open() {
+        let dir = seeded_markers();
+        let db = dir.path().join("history.db");
+        let calls = std::cell::Cell::new(0);
+        let error = super::with_store::<()>(db, |_store| {
+            calls.set(calls.get() + 1);
+            Err(anyhow::anyhow!("no such column: payload_json").into())
+        })
+        .unwrap_err();
+        assert_eq!(calls.get(), 1, "the read ran once, on the read-only store");
+        assert!(
+            error.reason.contains("DATABASE_QUERY_FAILED"),
+            "{}",
+            error.reason
+        );
+        assert!(error.reason.contains("no such column"), "{}", error.reason);
+    }
+
+    /// The one failure a writable reopen answers: a read-only store refusing
+    /// a database older than the shape it reads. The reopen migrates it and
+    /// the same read then succeeds.
+    #[test]
+    fn a_stale_schema_is_migrated_by_a_writable_reopen_and_read_again() {
+        let dir = seeded_markers();
+        let db = dir.path().join("history.db");
+        // Drop the index the marker page depends on, so a read-only store
+        // refuses the page as stale while the database itself opens fine.
+        open_db(&db)
+            .unwrap()
+            .execute_batch("DROP INDEX idx_session_markers_page")
+            .unwrap();
+        let calls = std::cell::Cell::new(0);
+        let page = super::with_store(db.clone(), |store| {
+            calls.set(calls.get() + 1);
+            store.session_markers_page(ai_hist::Source::Claude, "sess-1", 10, None)
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 2, "read-only refusal, then the migrated read");
+        assert_eq!(page.markers.len(), 3);
+        // And through the dispatcher, the page is simply served.
+        let served = call(
+            "markers",
+            json!({ "dbPath": db, "source": "claude", "sessionId": "sess-1" }),
+        )
+        .unwrap();
+        assert_eq!(served["markers"].as_array().unwrap().len(), 3);
     }
 
     #[test]
