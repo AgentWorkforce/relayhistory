@@ -193,10 +193,57 @@ fn heartbeat_schedule(directory: &Path, url: &str) -> Arc<Mutex<HeartbeatSchedul
         .clone()
 }
 
+// Local publication has its own lock, never held during a network request.
+// Closing a publisher flushes the terminal snapshot and fences delayed worker
+// snapshots before the collector can hand progress ownership to its next monitor.
+struct LocalProgress {
+    directory: PathBuf,
+    closed: Mutex<bool>,
+}
+impl LocalProgress {
+    fn publish(&self, progress: &Progress) {
+        let closed = self.closed.lock().unwrap();
+        if !*closed {
+            self.write(progress);
+        }
+    }
+
+    fn finish(&self, mut progress: Progress, job: Option<&str>, success: bool) {
+        let mut closed = self.closed.lock().unwrap();
+        if *closed {
+            return;
+        }
+        *closed = true;
+        progress.read_counts(&self.directory.join("history.db"), job);
+        if !success {
+            progress.phase = if job.is_some() {
+                "paused"
+            } else {
+                "capture_paused"
+            }
+            .into();
+        }
+        self.write(&progress);
+    }
+
+    fn write(&self, progress: &Progress) {
+        let _ = super::save_json(
+            &self.directory.join("progress.json"),
+            &serde_json::json!({
+                "updated_at_ms": chrono::Utc::now().timestamp_millis(), "progress": progress
+            }),
+        );
+        if super::bridge::json_mode() {
+            super::bridge::emit(serde_json::json!({"event":"progress", "progress":progress}));
+        }
+    }
+}
+
 pub struct Monitor {
     snapshot: Arc<Mutex<Progress>>,
     stop: Option<mpsc::Sender<bool>>,
     completion: mpsc::Receiver<bool>,
+    local: Option<(Arc<LocalProgress>, Option<String>)>,
 }
 impl Monitor {
     pub fn start(
@@ -206,27 +253,21 @@ impl Monitor {
         confirm_completion: bool,
     ) -> Self {
         let url = history_url.to_owned();
-        let local_directory = directory.to_owned();
+        let local = Arc::new(LocalProgress {
+            directory: directory.to_owned(),
+            closed: Mutex::new(false),
+        });
+        let publisher = local.clone();
         let report_delivery = job.is_some();
         let schedule = heartbeat_schedule(directory, history_url);
         let started = Instant::now();
-        Self::start_with_report(
+        let mut monitor = Self::start_with_report(
             directory,
             job,
             !super::bridge::json_mode(),
             move |progress, finished| {
                 // Full capture details stay on this Mac, including during first sign-in.
-                let _ = super::save_json(
-                    &local_directory.join("progress.json"),
-                    &serde_json::json!({
-                        "updated_at_ms": chrono::Utc::now().timestamp_millis(), "progress": progress
-                    }),
-                );
-                if super::bridge::json_mode() {
-                    super::bridge::emit(
-                        serde_json::json!({"event":"progress", "progress":progress}),
-                    );
-                }
+                publisher.publish(progress);
                 if !report_delivery {
                     return true;
                 }
@@ -239,7 +280,9 @@ impl Monitor {
                     || heartbeat(&url, &progress),
                 )
             },
-        )
+        );
+        monitor.local = Some((local, job.map(str::to_owned)));
+        monitor
     }
     fn start_with_report(
         directory: &Path,
@@ -265,13 +308,7 @@ impl Monitor {
         thread::spawn(move || {
             let started = Instant::now();
             let mut finish = None;
-            let mut acknowledged = false;
-            loop {
-                // The next upload monitor now owns progress. Do not send a
-                // delayed final "scanning" heartbeat after successful capture.
-                if finish == Some(true) && job.is_none() {
-                    break;
-                }
+            let acknowledged = loop {
                 let mut progress = shared.lock().unwrap().clone();
                 progress.read_counts(&db, job.as_deref());
                 if finish == Some(false) {
@@ -287,22 +324,23 @@ impl Monitor {
                 {
                     println!("{line}");
                 }
-                acknowledged = report(&progress, finish.is_some());
+                let acknowledged = report(&progress, finish.is_some());
                 if finish.is_some() {
-                    break;
+                    break acknowledged;
                 }
                 match receive.recv_timeout(PROGRESS_INTERVAL) {
                     Ok(success) => finish = Some(success),
                     Err(mpsc::RecvTimeoutError::Disconnected) => finish = Some(false),
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                 }
-            }
+            };
             let _ = completed.send(acknowledged);
         });
         Self {
             snapshot,
             stop: Some(stop),
             completion,
+            local: None,
         }
     }
     pub fn observer(&self) -> impl Fn(ai_hist::CaptureProgress) + 'static {
@@ -314,17 +352,29 @@ impl Monitor {
             p.total_files = capture.total_files;
         }
     }
+    fn finish_local(&mut self, success: bool) {
+        if let Some((local, job)) = self.local.take() {
+            local.finish(
+                self.snapshot.lock().unwrap().clone(),
+                job.as_deref(),
+                success,
+            );
+        }
+    }
+
     pub fn finish_before_exit(mut self, success: bool, timeout: Duration) -> bool {
+        self.finish_local(success);
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(success);
         }
         // Setup/--once gets a chance to flush final queue counts, with a strict
-        // deadline. Ordinary background finish/drop still never waits.
+        // deadline. Ordinary background finish/drop never waits for the network.
         self.completion.recv_timeout(timeout).unwrap_or(false)
     }
-    // Background/capture callers only signal stop; the worker exits after its
-    // bounded request/final report without holding up the caller.
+    // Flush local state before handoff. Background callers never wait for the
+    // worker's network request or remote final report.
     pub fn finish(mut self, success: bool) {
+        self.finish_local(success);
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(success);
         }
@@ -336,6 +386,7 @@ fn human_progress_line(progress: &Progress, elapsed: Duration, enabled: bool) ->
 }
 impl Drop for Monitor {
     fn drop(&mut self) {
+        self.finish_local(false);
         self.stop.take();
     }
 }
@@ -676,7 +727,7 @@ mod tests {
             let (release, blocked) = mpsc::channel::<()>();
             let (finished, done) = mpsc::channel();
             let mut first = true;
-            let monitor =
+            let mut monitor =
                 Monitor::start_with_report(directory.path(), None, false, move |progress, _| {
                     if first {
                         first = false;
@@ -687,6 +738,13 @@ mod tests {
                     }
                     true
                 });
+            monitor.local = Some((
+                Arc::new(LocalProgress {
+                    directory: directory.path().to_owned(),
+                    closed: Mutex::new(false),
+                }),
+                None,
+            ));
             started.recv_timeout(Duration::from_secs(2)).unwrap();
             let start = Instant::now();
             if let Some(success) = success {
@@ -698,14 +756,76 @@ mod tests {
             release.send(()).unwrap();
             let final_phase = done.recv_timeout(Duration::from_secs(2));
             if success == Some(true) {
-                assert!(matches!(
-                    final_phase,
-                    Err(mpsc::RecvTimeoutError::Disconnected)
-                ));
+                assert_eq!(final_phase.unwrap(), "scanning");
             } else {
                 assert_eq!(final_phase.unwrap(), "capture_paused");
             }
         }
+    }
+
+    #[test]
+    fn capture_finish_flushes_final_counts_before_returning() {
+        let directory = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(directory.path().join("history.db")).unwrap();
+        conn.execute_batch("CREATE TABLE sessions (discovery_state TEXT);")
+            .unwrap();
+        let monitor = Monitor::start(directory.path(), "not a URL", None, false);
+        conn.execute_batch("INSERT INTO sessions VALUES (NULL), ('full'), ('partial');")
+            .unwrap();
+        monitor.observer()(ai_hist::CaptureProgress {
+            source: "complete".into(),
+            processed_files: 7,
+            total_files: Some(7),
+        });
+        monitor.finish(true);
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(directory.path().join("progress.json")).unwrap())
+                .unwrap();
+        assert_eq!(saved["progress"]["source"], "complete");
+        assert_eq!(saved["progress"]["processedFiles"], 7);
+        assert_eq!(saved["progress"]["totalFiles"], 7);
+        assert_eq!(saved["progress"]["sessionsCaptured"], 2);
+    }
+
+    #[test]
+    fn closed_local_publisher_cannot_overwrite_the_next_monitor() {
+        let directory = tempfile::tempdir().unwrap();
+        let old = Arc::new(LocalProgress {
+            directory: directory.path().to_owned(),
+            closed: Mutex::new(false),
+        });
+        let worker = old.clone();
+        let (release, blocked) = mpsc::channel();
+        let delayed = thread::spawn(move || {
+            // A worker may already have read its scanning snapshot when capture
+            // finishes. Let it attempt publication only after delivery starts.
+            let stale = Progress {
+                phase: "scanning".into(),
+                ..Default::default()
+            };
+            blocked.recv().unwrap();
+            worker.publish(&stale);
+        });
+        old.finish(
+            Progress {
+                source: "complete".into(),
+                ..Default::default()
+            },
+            None,
+            true,
+        );
+        let next = LocalProgress {
+            directory: directory.path().to_owned(),
+            closed: Mutex::new(false),
+        };
+        next.publish(&watching());
+        release.send(()).unwrap();
+        delayed.join().unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(directory.path().join("progress.json")).unwrap())
+                .unwrap();
+        assert_eq!(saved["progress"]["phase"], "watching");
+        assert_eq!(saved["progress"]["recordsUploaded"], 100);
     }
 
     #[test]
