@@ -478,9 +478,18 @@ of being dropped, and read with `session_markers_page` — the same
 `kind` is the classified vocabulary below; `subkind` is the provider-native
 type verbatim. A record type no classifier knows yet is stored as
 `kind = "unknown"` with its real name in `subkind`, so it is recoverable
-later. `payload_json` carries an allowlisted projection with every string
-field bounded — an `image` or `document` block contributes its size, never its
-bytes.
+later.
+
+`payload_json` is always bounded — every string at 128 characters and every
+container at 32 entries, recursively — so an `image` or `document` block
+contributes its size and never its bytes. How it is *built* depends on whose
+keys they are. Where this parser classifies the record it names the fields it
+keeps, which is the tighter contract. Where the payload is the provider's own
+document and its keys are theirs — Grok's `signals` sidecar, a compaction
+checkpoint — the document is bounded whole instead: enumerating the provider's
+keys would silently drop whatever it adds next, which is the failure this
+table exists to end. Either way the bound is the promise the column makes, and
+it holds for every kind.
 
 | `kind` | claude | codex | grok | `subkind` examples |
 |---|---|---|---|---|

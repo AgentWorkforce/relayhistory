@@ -49,9 +49,13 @@ Notable changes to the native `ai-hist` CLI are documented here.
   encrypted `reasoning`). A provider type no classifier knows is stored as
   `kind = "unknown"` carrying its verbatim type in `subkind` — the table has
   no CHECK constraint, because a constraint would turn tomorrow's unknown
-  record back into today's silent drop. `payload_json` is an allowlisted,
-  per-field-bounded projection: an image or document block contributes its
-  size, never its bytes. Read one bounded page with
+  record back into today's silent drop. `payload_json` is always bounded —
+  every string at 128 characters and every container at 32 entries,
+  recursively — so an image or document block contributes its size, never its
+  bytes. Where this parser classifies the record it names the fields it keeps;
+  where the payload is a provider's own document whose keys are theirs (Grok's
+  `signals` sidecar, a compaction checkpoint) the document is bounded whole,
+  because enumerating their keys would silently drop whatever they add next. Read one bounded page with
   `session_markers_page(conn, source, session_id, limit, after)`, which uses
   the same `(ts_ms IS NULL, ts_ms, id)` keyset as tool calls and file edits.
   `SessionEvent` gains `raw_kind`, the provider-native record or block type an
