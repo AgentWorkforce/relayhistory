@@ -16,9 +16,7 @@ dependencies = [
 
 [[package]]
 name = "ai-hist"
-version = "0.24.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c5fe130d064a986e0dd3a77e2c38a977c1bf42f0d801c7ff70ca978013bb80c4"
+version = "0.25.0"
 dependencies = [
  "anyhow",
  "chrono",

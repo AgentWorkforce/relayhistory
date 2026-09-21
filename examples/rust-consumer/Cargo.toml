@@ -20,6 +20,6 @@ description = "Smoke test: an out-of-tree embedder of the ai-hist crate"
 # Bumped by hand after each crates.io release, together with Cargo.lock; the
 # nightly published-crate job (`.github/workflows/published-crate-consumer.yml`)
 # is what notices when a release does not build for an embedder.
-ai-hist = "0.24.0"
+ai-hist = "0.25.0"
 serde_json = "1"
 tempfile = "3"
