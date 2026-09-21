@@ -9,6 +9,11 @@ pub(super) struct Table {
     pub key: &'static [&'static str],
 }
 
+/// Every consumer a capture trigger has to serve: live delivery jobs and
+/// unexpired file exports. Named once so the preimage sweep below cannot drift
+/// from the triggers it stands in for.
+const CONSUMERS: &str = "SELECT id,state,bootstrap_done,bootstrap_kind,bootstrap_rowid FROM delivery_jobs WHERE state <> 'cancelled' UNION ALL SELECT id,'active',bootstrap_done,bootstrap_kind,bootstrap_rowid FROM history_exports WHERE expires_at_ms > CAST(unixepoch('subsec')*1000 AS INTEGER)";
+
 pub(super) const TABLES: &[Table] = &[
     Table {
         name: "history",
@@ -284,7 +289,7 @@ CREATE TRIGGER IF NOT EXISTS {table}_count_delete AFTER DELETE ON {table} BEGIN
 END;
 "#))?;
     }
-    let consumers = "SELECT id,state,bootstrap_done,bootstrap_kind,bootstrap_rowid FROM delivery_jobs WHERE state <> 'cancelled' UNION ALL SELECT id,'active',bootstrap_done,bootstrap_kind,bootstrap_rowid FROM history_exports WHERE expires_at_ms > CAST(unixepoch('subsec')*1000 AS INTEGER)";
+    let consumers = CONSUMERS;
     for table in TABLES {
         drop_triggers_that_predate_a_column(conn, table)?;
     }
@@ -369,6 +374,70 @@ END;
     Ok(())
 }
 
+/// Freeze the rows a migration is about to rewrite, for consumers mid-snapshot.
+///
+/// A bootstrap or an export fixes a rowid cutoff and reads its pages over time,
+/// and the capture triggers keep that view immutable by writing the OLD row
+/// into `delivery_shadow` whenever a row inside an unread bound changes. A
+/// migration has to retire those triggers before it can drop a column, so the
+/// rows it rewrites are exactly the rows nothing shadows.
+///
+/// Unlike the journal, this cannot be repaired afterwards: once the column is
+/// gone the preimage exists nowhere to reconstruct from. So it is taken here,
+/// before the first write, while the old shape is still the shape.
+///
+/// The predicate is the triggers' own, down to `INSERT OR IGNORE` and the
+/// not-already-shadowed clause -- a consumer that has already shadowed this row
+/// keeps the copy it took, and one that has read past it is not owed anything.
+pub(crate) fn shadow_preimages(conn: &Connection, table_name: &str) -> Result<()> {
+    let Some((index, table)) = TABLES
+        .iter()
+        .enumerate()
+        .find(|(_, table)| table.name == table_name)
+    else {
+        return Ok(());
+    };
+    // The delivery schema is opt-in and this runs from `init_db`, before
+    // `init_schema` has had a chance to create it -- on a database no
+    // delivery-enabled build has ever opened, these tables are simply absent.
+    // A statement naming a missing table fails when it is prepared, so the
+    // check has to come first. Absent means no consumer, which means nothing
+    // is owed.
+    let ready: bool = conn
+        .prepare(
+            "SELECT count(*) = 3 FROM sqlite_master WHERE type = 'table' \
+             AND name IN ('delivery_shadow','delivery_bootstrap_bounds','delivery_jobs')",
+        )?
+        .query_row([], |row| row.get(0))?;
+    if !ready {
+        return Ok(());
+    }
+    let payload = table.payload(conn, "m")?;
+    let key = table.key("m");
+    let source = table.source("m");
+    let kind = table.kind;
+    let session = table.session;
+    let name = table.name;
+    conn.execute(
+        &format!(
+            "INSERT OR IGNORE INTO delivery_shadow\
+             (job_id,kind,row_id,source,session_id,record_key,payload) \
+             SELECT j.id,'{kind}',m.rowid,{source},m.{session},{key},{payload} \
+             FROM {name} m \
+             JOIN ({consumers}) j \
+             JOIN delivery_bootstrap_bounds b ON b.job_id=j.id AND b.kind='{kind}' \
+             WHERE j.state <> 'cancelled' AND j.bootstrap_done=0 AND m.rowid <= b.max_rowid \
+             AND (j.bootstrap_kind < {index} \
+                  OR (j.bootstrap_kind={index} AND j.bootstrap_rowid < m.rowid)) \
+             AND NOT EXISTS(SELECT 1 FROM delivery_shadow s \
+                            WHERE s.job_id=j.id AND s.kind='{kind}' AND s.row_id=m.rowid)",
+            consumers = CONSUMERS,
+        ),
+        [],
+    )?;
+    Ok(())
+}
+
 /// Journal rows a migration rewrote behind the capture triggers' back.
 ///
 /// A column migration has to retire the triggers first -- SQLite validates
@@ -390,6 +459,11 @@ pub(crate) fn journal_migrated_rows(conn: &Connection, table_name: &str) -> Resu
     let source = table.source("m");
     let kind = table.kind;
     let session = table.session;
+    // The interpolated name is the resolved entry's own `&'static str`, not
+    // the caller's argument. Behaviour is identical -- the lookup above already
+    // restricts it to `TABLES` -- but the safety is then visible in this one
+    // statement rather than inferred from a return three lines up.
+    let name = table.name;
     // Guarded by the same predicate the triggers use, so a database with no
     // subscriber writes nothing: a job created later bootstraps from the table
     // itself and already sees these rows.
@@ -397,7 +471,7 @@ pub(crate) fn journal_migrated_rows(conn: &Connection, table_name: &str) -> Resu
         &format!(
             "INSERT INTO delivery_journal(kind,source,session_id,record_key,operation,payload) \
              SELECT '{kind}',{source},m.{session},{key},'upsert',{payload} \
-             FROM {table_name} m \
+             FROM {name} m \
              WHERE EXISTS(SELECT 1 FROM delivery_jobs WHERE state <> 'cancelled')",
         ),
         [],

@@ -41,27 +41,35 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 3;
 /// hydrates by name. Databases that already ran Grok's 6 keep that number
 /// until this bump, so Cursor would otherwise stay prompt-only forever.
 ///
-/// Version 8 extends `session_markers` to the Claude and Codex parsers, for
-/// the record types they used to drop — compaction and summary boundaries,
-/// system rows, non-text content blocks and Codex lifecycle events — and
-/// carries Grok's own markers onto the merged marker model. A database
-/// checkpointed at 7 or earlier has the Claude and Codex rows nowhere, and
-/// nothing short of re-reading the transcript can recover them, so every
-/// session re-parses once. The number is 8 rather than 7 because Cursor's
-/// event-level parser took 7 while this branch was in review: two changes
-/// each needing their own one-time re-parse cannot share a version, or
-/// whichever lands second is skipped by every database that already ran the
-/// first.
+/// Version 8 is usage grouping. It captures Claude's provider message id, so
+/// records from transcripts without a request id can still be grouped per API
+/// call, and Codex's `request_span`, so the rows of one Codex call group
+/// together instead of each becoming a request of its own. Both live only in
+/// the transcript, so an already indexed session keeps the old grouping until
+/// it is read again.
 ///
-/// Which is a standing hazard, not a one-off. Two branches that each need a
-/// re-parse will both pick `main + 1` while they are open, and the collision
-/// is an identical-line change that merges cleanly and passes every gate --
-/// there is nothing here for a test to catch, because each value is correct in
-/// isolation. So: whenever this branch merges main, re-check this number
-/// against main's and take main's plus one if main has moved. At the time of
-/// writing #194 (usage normalization) also sits at 8, and whichever of the two
-/// merges second owes the other a bump.
-const HYDRATION_PARSER_VERSION: i64 = 8;
+/// This began as a second version 7, written before Cursor's landed on main.
+/// Two different re-parses cannot share a number: a database that ran the
+/// Cursor 7 would report the usage 7 as already done and keep answering with
+/// the old grouping forever.
+///
+/// Version 9 extends `session_markers` to the Claude and Codex parsers, for
+/// the record types they used to drop -- compaction and summary boundaries,
+/// system rows, non-text content blocks and Codex lifecycle events -- and
+/// carries Grok's own markers onto the merged marker model. A database
+/// checkpointed at 8 or earlier has the Claude and Codex rows nowhere, and
+/// nothing short of re-reading the transcript can recover them, so every
+/// session re-parses once.
+///
+/// It is 9 for the third time of asking, and that is the point worth keeping.
+/// It was 7 until Cursor's event-level parser took 7; 8 until usage grouping
+/// took 8. Two branches that each need a one-time re-parse will both pick
+/// `main + 1` while they are open, and the collision is an identical-line
+/// change that merges cleanly and passes every gate -- each value is correct
+/// in isolation, so there is nothing here for a test to catch. Whoever merges
+/// main onto this branch next must re-read this number from main and take
+/// main's plus one if it has moved again.
+const HYDRATION_PARSER_VERSION: i64 = 9;
 
 #[derive(Debug, Clone)]
 pub struct HydrateSessionOptions {

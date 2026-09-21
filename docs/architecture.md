@@ -21,9 +21,10 @@ Rust owns provider discovery/parsing, schema creation and migration, direct
 SQLite connections, catalog queries, history/event queries, search,
 statistics, and sync. Blocking filesystem and SQLite work is dispatched away
 from Node's event loop. TypeScript validates inputs, validates native contract
-version 17, catalog contract version 4, hydration contract version 3,
+version 18, catalog contract version 4, hydration contract version 3,
 session-relationship contract version 2, and session evidence contract version
-2, normalizes nullable fields, maps native errors, and supplies pagination
+2 and session usage contract version 2, normalizes nullable fields, maps native
+errors, and supplies pagination
 helpers.
 
 The CLI and MCP server import only the SDK's public functions. They do not
@@ -348,7 +349,7 @@ payload persistence, the eligibility recheck before transport, acknowledgment
 checking and failure classification - runs once, in the Rust core worker, for
 both foreground and background delivery. The SDK host is a thin adapter: it
 registers explicitly selected destination modules, describes them to the worker,
-and answers the worker's prepare/send calls. Native contract 15 includes a
+and answers the worker's prepare/send calls. Native contract 16 includes a
 typed serialized delivery/export bridge to the existing addon. No TypeScript or
 plugin code queries SQLite. [Delivery documentation](history-delivery.md) describes
 selection, failure states, background operation, and the independent NDJSON path.

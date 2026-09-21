@@ -84,6 +84,11 @@ fn event(uid: &str, text: &str) -> SessionEvent {
         text: Some(text.into()),
         model: None,
         token_json: None,
+        // A connector that knows the provider's request identity supplies it
+        // here; the round trip through evidence must preserve it, or a
+        // remotely hydrated session loses the grouping its records had.
+        request_id: Some(format!("req-{uid}")),
+        provider_message_id: Some(format!("msg-{uid}")),
         event_uid: uid.into(),
         raw_kind: None,
         // A synthetic assistant text event: none of the tool-result fidelity
@@ -99,12 +104,12 @@ fn event(uid: &str, text: &str) -> SessionEvent {
         error_signal: None,
         subagent_session_id: None,
         agent_id: None,
-        request_id: None,
         stop_reason: None,
         agent_version: None,
         is_sidechain: None,
         is_meta: None,
         turn_id: None,
+        request_span: None,
     }
 }
 impl ShallowSessionProvider for Fixture {

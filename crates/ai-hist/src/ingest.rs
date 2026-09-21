@@ -950,7 +950,16 @@ fn record_fidelity_backfill(state: &mut Map<String, Value>, key: &str) {
 /// an unchanged file on every sync while never repairing anything.
 ///
 /// Recording the generation per provider makes the pass happen exactly once.
-const RAW_MESSAGE_FACTS_GENERATION: i64 = 1;
+///
+/// **Moves with `RAW_MESSAGE_FACTS_VERSION`, always.** The version decides what
+/// `events_lack_raw_facts` counts as stale; this decides whether that probe is
+/// consulted at all, because sync only asks while the pass is pending. Raising
+/// the version alone leaves an install sitting at the recorded generation
+/// answering "not pending", skipping every unchanged transcript and never
+/// repairing the rows the bump was for — a change that reads as done and does
+/// nothing, for exactly the installs that needed it.
+/// `the_raw_facts_version_and_generation_are_bumped_together` is the guard.
+const RAW_MESSAGE_FACTS_GENERATION: i64 = 2;
 const CLAUDE_RAW_MESSAGE_FACTS_KEY: &str = "claude_raw_message_facts";
 const CODEX_RAW_MESSAGE_FACTS_KEY: &str = "codex_raw_message_facts";
 
@@ -2429,7 +2438,7 @@ fn codex_session_events_exist(conn: &Connection, session_id: &str) -> Result<boo
     session_events_exist(conn, "codex", session_id)
 }
 
-struct CodexSessionMeta {
+pub(crate) struct CodexSessionMeta {
     session_id: String,
     cwd: String,
     git_branch: Option<String>,
@@ -2522,7 +2531,7 @@ pub(crate) fn codex_is_subagent(payload: Option<&Value>, session_id: &str) -> bo
 /// (`thread_source`, or the object form of `payload.source` *together with* an
 /// explicit parent) and excluded from session registration. A standalone
 /// guardian carries `source.subagent` without a parent and stays discoverable.
-fn read_codex_session_meta(path: &Path) -> Result<Option<CodexSessionMeta>> {
+pub(crate) fn read_codex_session_meta(path: &Path) -> Result<Option<CodexSessionMeta>> {
     let first = fs::read_to_string(path)
         .ok()
         .and_then(|text| text.lines().next().map(str::to_string))
@@ -2599,7 +2608,7 @@ fn read_codex_session_meta(path: &Path) -> Result<Option<CodexSessionMeta>> {
 }
 
 #[derive(Default)]
-struct CodexIngestOutcome {
+pub(crate) struct CodexIngestOutcome {
     prompts: usize,
     events: usize,
     first_ts: Option<i64>,
@@ -2610,31 +2619,88 @@ struct CodexIngestOutcome {
 
 /// Cumulative token totals from a Codex `token_count` event
 /// (`info.total_token_usage`). `input` is inclusive of `cached_input`.
+///
+/// Counters are `u64` because that is what a token count is. They were `i64`
+/// read with `unwrap_or(0)`, which turned every counter the provider wrote
+/// badly — negative, fractional, out of range — into a zero, and the
+/// differencing below then clamped the result back to a plausible
+/// non-negative delta. The stored JSON was valid, so nothing downstream could
+/// tell a corrupted snapshot from a reported zero.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct CodexTokenTotals {
-    input: i64,
-    cached_input: i64,
-    cache_write: i64,
-    output: i64,
-    reasoning_output: i64,
-    total: i64,
+    input: u64,
+    cached_input: u64,
+    cache_write: u64,
+    output: u64,
+    reasoning_output: u64,
+    total: u64,
+}
+
+/// Usage measured but not yet attached to an assistant event.
+enum PendingCodexUsage {
+    /// A per-request delta between two strictly-advancing snapshots.
+    Delta(CodexTokenTotals),
+    /// The provider's own snapshot object, kept **verbatim** because it could
+    /// not be differenced: a counter is not a non-negative integer, or the
+    /// arithmetic would leave `u64`.
+    ///
+    /// Storing the raw object is what makes the refusal reach a caller:
+    /// `normalize_usage` rejects it with a stable code, so the request reports
+    /// `usage: null` with `unnormalizable-usage` instead of a delta of zeros
+    /// that looks like a measurement. Nothing is fabricated — this is what the
+    /// provider wrote.
+    Unusable(String),
+}
+
+impl PendingCodexUsage {
+    fn into_token_json(self) -> String {
+        match self {
+            Self::Delta(totals) => totals.to_token_json(),
+            Self::Unusable(raw) => raw,
+        }
+    }
+
+    /// Fold a newly measured delta into whatever is already pending.
+    ///
+    /// An unusable snapshot poisons the sum. A total that silently omits a
+    /// segment it could not measure is worse than one that says so.
+    fn merged(self, delta: CodexTokenTotals, raw: &Value) -> Self {
+        match self {
+            Self::Unusable(raw) => Self::Unusable(raw),
+            Self::Delta(pending) => match pending.plus(&delta) {
+                Some(sum) => Self::Delta(sum),
+                None => Self::Unusable(raw.to_string()),
+            },
+        }
+    }
 }
 
 impl CodexTokenTotals {
+    /// Read one snapshot, or `None` when any counter the provider wrote is
+    /// not a non-negative integer.
+    ///
+    /// An absent or null counter is "not reported" and reads as zero, which
+    /// is the shape `total_token_usage` genuinely has. A *present* counter
+    /// that is negative, fractional, or larger than `u64` is corruption, and
+    /// the caller keeps the provider's object instead of inventing a number
+    /// for it.
     fn from_usage(value: &Value) -> Option<Self> {
         let obj = value.as_object()?;
-        let get = |key: &str| obj.get(key).and_then(Value::as_i64).unwrap_or(0);
+        let get = |key: &str| match obj.get(key) {
+            None | Some(Value::Null) => Some(0),
+            Some(value) => value.as_u64(),
+        };
         Some(Self {
-            input: get("input_tokens"),
-            cached_input: get("cached_input_tokens"),
-            cache_write: get("cache_write_input_tokens"),
-            output: get("output_tokens"),
-            reasoning_output: get("reasoning_output_tokens"),
-            total: get("total_tokens"),
+            input: get("input_tokens")?,
+            cached_input: get("cached_input_tokens")?,
+            cache_write: get("cache_write_input_tokens")?,
+            output: get("output_tokens")?,
+            reasoning_output: get("reasoning_output_tokens")?,
+            total: get("total_tokens")?,
         })
     }
 
-    fn fields(&self) -> [i64; 6] {
+    fn fields(&self) -> [u64; 6] {
         [
             self.input,
             self.cached_input,
@@ -2659,26 +2725,31 @@ impl CodexTokenTotals {
             .any(|(x, y)| x < y)
     }
 
-    fn minus(&self, prev: &Self) -> Self {
-        Self {
-            input: (self.input - prev.input).max(0),
-            cached_input: (self.cached_input - prev.cached_input).max(0),
-            cache_write: (self.cache_write - prev.cache_write).max(0),
-            output: (self.output - prev.output).max(0),
-            reasoning_output: (self.reasoning_output - prev.reasoning_output).max(0),
-            total: (self.total - prev.total).max(0),
-        }
+    /// Difference two snapshots, or `None` if any field would go backwards.
+    ///
+    /// Checked rather than clamped per field: the caller only calls this once
+    /// [`Self::advanced_from`] holds, so an underflow here means an invariant
+    /// broke, and `max(0)` would hide it behind a plausible zero.
+    fn minus(&self, prev: &Self) -> Option<Self> {
+        Some(Self {
+            input: self.input.checked_sub(prev.input)?,
+            cached_input: self.cached_input.checked_sub(prev.cached_input)?,
+            cache_write: self.cache_write.checked_sub(prev.cache_write)?,
+            output: self.output.checked_sub(prev.output)?,
+            reasoning_output: self.reasoning_output.checked_sub(prev.reasoning_output)?,
+            total: self.total.checked_sub(prev.total)?,
+        })
     }
 
-    fn plus(&self, other: &Self) -> Self {
-        Self {
-            input: self.input + other.input,
-            cached_input: self.cached_input + other.cached_input,
-            cache_write: self.cache_write + other.cache_write,
-            output: self.output + other.output,
-            reasoning_output: self.reasoning_output + other.reasoning_output,
-            total: self.total + other.total,
-        }
+    fn plus(&self, other: &Self) -> Option<Self> {
+        Some(Self {
+            input: self.input.checked_add(other.input)?,
+            cached_input: self.cached_input.checked_add(other.cached_input)?,
+            cache_write: self.cache_write.checked_add(other.cache_write)?,
+            output: self.output.checked_add(other.output)?,
+            reasoning_output: self.reasoning_output.checked_add(other.reasoning_output)?,
+            total: self.total.checked_add(other.total)?,
+        })
     }
 
     fn to_token_json(self) -> String {
@@ -2692,6 +2763,91 @@ impl CodexTokenTotals {
         })
         .to_string()
     }
+}
+
+/// One Codex snapshot that could not be differenced, recorded as it arrived.
+///
+/// The log is **append-only**: an entry is never edited, replaced or removed
+/// while the rollout is being read. Nothing is decided during ingestion — the
+/// refusals are computed once, at the end, by [`surviving_refusals`].
+///
+/// Four defects in a row came from deciding incrementally instead: attaching a
+/// refusal immediately stole the turn a later snapshot was owed; holding a
+/// single slot let one turn's refusal overwrite another's; clearing every held
+/// refusal on a measured delta dropped ones the delta could not account for;
+/// and clearing by generation still let a second refusal for one turn inherit
+/// a newer generation than the evidence supported. Each fix was locally right
+/// and produced the next defect, because the rule lived in three places and
+/// nowhere in full.
+struct UnreadableSnapshot {
+    /// The assistant event waiting for a measurement when this arrived. That
+    /// is the turn this snapshot failed to measure, named now rather than
+    /// looked up later, because the waiting slot moves on as turns appear.
+    uid: String,
+    /// Which baseline `prev_totals` held at that moment — see
+    /// `baseline_generation`.
+    generation: u64,
+    /// The provider's own object, verbatim, so the request can report what was
+    /// rejected rather than a zero that reads like a measurement.
+    raw: String,
+}
+
+/// **The invariant.** A turn keeps a refusal exactly when no measured delta
+/// was differenced from the baseline generation that refusal was recorded
+/// under.
+///
+/// Everything the ingest loop knows about refusals is in its two arguments,
+/// and this is the only place that interprets them.
+///
+/// Why the generation is the whole test: an unreadable snapshot does not
+/// advance the baseline, so a delta differenced from generation `g` spans
+/// every refusal recorded under `g` — those turns' spend is reported inside
+/// that delta's request and they are owed nothing. A baseline *reinstall*
+/// advances it without measuring anything, absorbing every earlier span into
+/// itself, so no later delta can ever account for a refusal recorded under an
+/// older generation. Those survive.
+///
+/// A turn refused more than once keeps the **earliest** surviving refusal: it
+/// is the first thing that went wrong for that turn, and a later one is a
+/// consequence. Crucially a later refusal never erases an earlier one, which
+/// is only true because the log is append-only.
+fn surviving_refusals(
+    log: &[UnreadableSnapshot],
+    measured_generations: &HashSet<u64>,
+) -> Vec<(String, String)> {
+    let mut refused = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for entry in log {
+        if measured_generations.contains(&entry.generation) {
+            continue;
+        }
+        if seen.insert(entry.uid.as_str()) {
+            refused.push((entry.uid.clone(), entry.raw.clone()));
+        }
+    }
+    refused
+}
+
+/// Attach measured usage to the assistant event that earned it, or hold it
+/// until one appears.
+fn attach_codex_usage(
+    conn: &Connection,
+    session_id: &str,
+    pending: &mut Option<PendingCodexUsage>,
+    untokened_assistant_uid: &mut Option<String>,
+    usage: PendingCodexUsage,
+) -> Result<()> {
+    match untokened_assistant_uid.take() {
+        Some(uid) => {
+            conn.execute(
+                "UPDATE session_events SET token_json = ? \
+                 WHERE source = 'codex' AND session_id = ? AND event_uid = ?",
+                params![usage.into_token_json(), session_id, uid],
+            )?;
+        }
+        None => *pending = Some(usage),
+    }
+    Ok(())
 }
 
 /// Ingest one rollout file's conversation into `session_events`,
@@ -2733,7 +2889,7 @@ fn repair_codex_rollout_user_messages(
     Ok(outcome)
 }
 
-fn ingest_codex_rollout(
+pub(crate) fn ingest_codex_rollout(
     conn: &Connection,
     path: &Path,
     meta: &CodexSessionMeta,
@@ -2745,7 +2901,53 @@ fn ingest_codex_rollout(
     let mut outcome = CodexIngestOutcome::default();
     let mut model: Option<String> = None;
     let mut prev_totals: Option<CodexTokenTotals> = None;
-    let mut pending_delta: Option<CodexTokenTotals> = None;
+    let mut pending_usage: Option<PendingCodexUsage> = None;
+    // Every snapshot that could not be differenced, in arrival order and never
+    // rewritten, plus the baselines a delta was actually measured from. These
+    // two are facts about the rollout; what they *mean* is decided once, after
+    // the loop, by `surviving_refusals` — which is the only place the rule
+    // lives.
+    let mut unreadable_snapshots: Vec<UnreadableSnapshot> = Vec::new();
+    let mut measured_generations: HashSet<u64> = HashSet::new();
+    // Which baseline `prev_totals` currently holds. Bumped every time it is
+    // replaced, so each fact above can name the baseline it belongs to.
+    let mut baseline_generation: u64 = 0;
+    // Which API request the rows being written belong to.
+    //
+    // Codex names no request — no request id, no message id — but it *ends*
+    // one with every `token_count`: the span between two snapshots is one API
+    // call, and `agent_reasoning`, each `function_call` and the closing
+    // `agent_message` of that call all fall inside it. Numbered here because
+    // the boundary is only knowable while reading the rollout in order; a
+    // reader given the stored rows would have to scan the session to find the
+    // next row carrying a measurement.
+    //
+    // Deliberately not the turn: a turn runs a tool loop and holds as many
+    // calls as it made round trips. Grouping by `turn_id` would merge calls
+    // with different measurements into one request and report no usage for
+    // either.
+    let mut request_span: u64 = 0;
+    // The first span no measured delta has accounted for yet, and the spans a
+    // single delta turned out to cover.
+    //
+    // An unreadable snapshot ends a request but measures nothing, and it does
+    // not advance the baseline — so the next readable snapshot's delta is the
+    // spend of *every* span since the last measured one, not of the last span
+    // alone. Attributing it to the last span charged one request for what
+    // several did, and left the others reading as unmeasured with nothing to
+    // say why.
+    //
+    // Those spans are therefore one request: the unit the provider actually
+    // measured. The merge is applied after the walk, because which spans a
+    // delta covers is only known when it arrives.
+    let mut span_run_start: u64 = 0;
+    let mut span_merges: Vec<(u64, u64)> = Vec::new();
+    // Set when a snapshot is unreadable while no baseline has been
+    // established. A resumed rollout opens with the cumulative total it
+    // carried over; if that opening snapshot cannot be read, there is no
+    // baseline, and differencing the next good one against zero would charge
+    // the session's entire carried-over history to one request.
+    let mut baseline_unknown = false;
     let mut untokened_assistant_uid: Option<String> = None;
     // The turn a record falls inside, stamped from the last `turn_context`
     // until the next one names a different turn. Codex writes it once per turn
@@ -2885,6 +3087,8 @@ fn ingest_codex_rollout(
                 None,
                 None,
                 turn_id.as_deref(),
+                // A user turn is not a request, and the view does not read it.
+                None,
             )?;
             outcome.events += 1;
             // A subagent's "user" turns are the parent agent's task prompts;
@@ -2923,7 +3127,8 @@ fn ingest_codex_rollout(
                 "agent_message" => {
                     if let Some(message) = payload_str("message").filter(|m| !m.trim().is_empty()) {
                         let uid = format!("{index}:agent_message");
-                        let token_json = pending_delta.take().map(CodexTokenTotals::to_token_json);
+                        let token_json =
+                            pending_usage.take().map(PendingCodexUsage::into_token_json);
                         insert_codex_event(
                             conn,
                             session_id,
@@ -2939,6 +3144,7 @@ fn ingest_codex_rollout(
                             token_json.as_deref(),
                             None,
                             turn_id.as_deref(),
+                            Some(request_span.to_string().as_str()),
                         )?;
                         outcome.events += 1;
                         untokened_assistant_uid = token_json.is_none().then(|| uid.clone());
@@ -2965,6 +3171,7 @@ fn ingest_codex_rollout(
                             None,
                             None,
                             turn_id.as_deref(),
+                            Some(request_span.to_string().as_str()),
                         )?;
                         outcome.events += 1;
                         untokened_assistant_uid = Some(uid);
@@ -2972,18 +3179,91 @@ fn ingest_codex_rollout(
                     }
                 }
                 "token_count" => {
-                    let Some(totals) = payload
+                    let Some(usage) = payload
                         .get("info")
                         .and_then(|info| info.get("total_token_usage"))
-                        .and_then(CodexTokenTotals::from_usage)
                     else {
+                        continue;
+                    };
+                    // The provider reported a call here, so the rows written
+                    // since the last snapshot are that call and the rows after
+                    // this one are the next. The boundary is the snapshot
+                    // itself, not whether it could be differenced: two turns
+                    // whose snapshots were both unreadable are two refused
+                    // requests, and folding them into one span would merge
+                    // their refusals into a single request holding two
+                    // disagreeing blobs — reported as ambiguous rather than as
+                    // two rejections.
+                    //
+                    // Measurement is a separate question, settled by
+                    // `surviving_refusals`: a span whose snapshot could not be
+                    // read has its spend reported inside whichever later delta
+                    // covers it, and reads as a request with no usage.
+                    let closing_span = request_span;
+                    request_span += 1;
+                    let Some(totals) = CodexTokenTotals::from_usage(usage) else {
+                        // A counter that is not a non-negative integer cannot
+                        // be differenced — which is the same situation as a
+                        // regressed snapshot below, and gets the same
+                        // treatment: change nothing.
+                        //
+                        // Attaching the refusal here would consume the
+                        // assistant event still waiting for its measurement,
+                        // so the next *valid* snapshot would have nowhere to
+                        // land and the turn the provider did report would be
+                        // marked unreadable while its real delta went
+                        // elsewhere. The baseline is untouched, so that next
+                        // snapshot's delta already covers this whole span;
+                        // the number is recoverable and the turn must get it.
+                        //
+                        // It is only recorded. Whether it ends up refusing
+                        // anything is `surviving_refusals`' decision, taken
+                        // once the whole rollout is known. With no turn
+                        // waiting, it measured a span no turn is missing and
+                        // there is nothing to record.
+                        if let Some(uid) = &untokened_assistant_uid {
+                            unreadable_snapshots.push(UnreadableSnapshot {
+                                uid: uid.clone(),
+                                generation: baseline_generation,
+                                raw: usage.to_string(),
+                            });
+                        }
+                        // With no baseline yet, this was the resume snapshot,
+                        // and nothing now says where the session started.
+                        if prev_totals.is_none() && !saw_model_output {
+                            baseline_unknown = true;
+                        }
                         continue;
                     };
                     match prev_totals {
                         // The first snapshot before any model output is the
                         // carried-over baseline of a resumed session (a fresh
                         // session's opening snapshot has `info: null`).
-                        None if !saw_model_output => prev_totals = Some(totals),
+                        None if !saw_model_output => {
+                            prev_totals = Some(totals);
+                            baseline_generation += 1;
+                            // Nothing was measured, and the baseline moved:
+                            // no later delta can reach the spans before it.
+                            span_run_start = request_span;
+                        }
+                        // The carried-over baseline was unreadable, so this
+                        // snapshot establishes one and measures nothing. A
+                        // delta from zero here would be this session's whole
+                        // history reported as a single request's spend — a
+                        // well-formed number that is wrong by however much the
+                        // session had already used.
+                        None if baseline_unknown => {
+                            prev_totals = Some(totals);
+                            baseline_unknown = false;
+                            span_run_start = request_span;
+                            // This installs a baseline without measuring, so
+                            // everything spent up to here — a refused turn
+                            // included — is absorbed into it and can never
+                            // appear in a later delta. The generation bump is
+                            // what records that, and `surviving_refusals` is
+                            // what acts on it.
+                            baseline_generation += 1;
+                        }
                         // A regressed snapshot is treated as a transient
                         // glitch: keeping the prior baseline means the next
                         // advancing snapshot's delta covers exactly the spend
@@ -2993,20 +3273,39 @@ fn ingest_codex_rollout(
                         Some(prev) if !totals.advanced_from(&prev) => {}
                         _ => {
                             let baseline = prev_totals.unwrap_or_default();
-                            let mut delta = totals.minus(&baseline);
+                            let measured = totals.minus(&baseline);
                             prev_totals = Some(totals);
-                            if let Some(pending) = pending_delta.take() {
-                                delta = delta.plus(&pending);
+                            // Record which baseline was measured from, and
+                            // only when something really was measured — the
+                            // `None` arm below produces no delta, so it spans
+                            // nothing and settles nothing.
+                            if measured.is_some() {
+                                measured_generations.insert(baseline_generation);
+                                // This delta is the spend of the whole run,
+                                // so the run is one request.
+                                if closing_span > span_run_start {
+                                    span_merges.push((span_run_start, closing_span));
+                                }
                             }
-                            if let Some(uid) = untokened_assistant_uid.take() {
-                                conn.execute(
-                                    "UPDATE session_events SET token_json = ? \
-                                     WHERE source = 'codex' AND session_id = ? AND event_uid = ?",
-                                    params![delta.to_token_json(), session_id, uid],
-                                )?;
-                            } else {
-                                pending_delta = Some(delta);
-                            }
+                            span_run_start = request_span;
+                            baseline_generation += 1;
+                            let next = match measured {
+                                Some(delta) => match pending_usage.take() {
+                                    Some(pending) => pending.merged(delta, usage),
+                                    None => PendingCodexUsage::Delta(delta),
+                                },
+                                // `advanced_from` held, so this cannot
+                                // underflow; if it ever does, say so rather
+                                // than publish a clamped zero.
+                                None => PendingCodexUsage::Unusable(usage.to_string()),
+                            };
+                            attach_codex_usage(
+                                conn,
+                                session_id,
+                                &mut pending_usage,
+                                &mut untokened_assistant_uid,
+                                next,
+                            )?;
                         }
                     }
                 }
@@ -3180,7 +3479,7 @@ fn ingest_codex_rollout(
                     let uid = format!("{index}:{payload_type}");
                     let message_id = payload_str("id").unwrap_or(uid.as_str()).to_string();
                     let event_text = format_tool_event_text(name, target.as_deref(), &args);
-                    let token_json = pending_delta.take().map(CodexTokenTotals::to_token_json);
+                    let token_json = pending_usage.take().map(PendingCodexUsage::into_token_json);
                     insert_codex_event(
                         conn,
                         session_id,
@@ -3196,6 +3495,7 @@ fn ingest_codex_rollout(
                         token_json.as_deref(),
                         None,
                         turn_id.as_deref(),
+                        Some(request_span.to_string().as_str()),
                     )?;
                     outcome.events += 1;
                     untokened_assistant_uid = token_json.is_none().then(|| uid.clone());
@@ -3253,6 +3553,8 @@ fn ingest_codex_rollout(
                         None,
                         Some(&facts),
                         turn_id.as_deref(),
+                        // Likewise: a tool's own output is not an API call.
+                        None,
                     )?;
                     outcome.events += 1;
                     if !call_id.is_empty() {
@@ -3277,6 +3579,33 @@ fn ingest_codex_rollout(
         &mut unwritten_line,
         conn.total_changes() == changes_before_line,
     )?;
+    // Collapse each measured run onto its first span, so the rows a single
+    // delta accounted for read as the one request it measured rather than as
+    // one measured request and a trail of unmeasured ones.
+    for (from, to) in span_merges {
+        for span in (from + 1)..=to {
+            conn.execute(
+                "UPDATE session_events SET request_span = ?1 \
+                 WHERE source = 'codex' AND session_id = ?2 AND request_span = ?3",
+                params![from.to_string(), session_id, span.to_string()],
+            )?;
+        }
+    }
+    // The whole rollout is known, so the refusals can be worked out from what
+    // was recorded. `token_json IS NULL` keeps one from overwriting a real
+    // measurement the turn acquired by another route.
+    for (uid, raw) in surviving_refusals(&unreadable_snapshots, &measured_generations) {
+        conn.execute(
+            "UPDATE session_events SET token_json = ? \
+             WHERE source = 'codex' AND session_id = ? AND event_uid = ? \
+               AND token_json IS NULL",
+            params![
+                PendingCodexUsage::Unusable(raw).into_token_json(),
+                session_id,
+                uid
+            ],
+        )?;
+    }
     // End of file is not a turn boundary. A live rollout's last turn has no
     // `task_complete` yet, and the `exec_command_end` that fails one of its
     // calls can still be written after the bytes this pass read. Failures
@@ -3441,6 +3770,7 @@ fn insert_codex_event(
     token_json: Option<&str>,
     tool_result_facts: Option<&ToolResultFacts>,
     turn_id: Option<&str>,
+    request_span: Option<&str>,
 ) -> Result<()> {
     insert_session_event(
         conn,
@@ -3457,10 +3787,12 @@ fn insert_codex_event(
         Some(text),
         model,
         token_json,
+        RequestIdentity::none(),
         uid,
         tool_result_facts,
         RawMessageFacts {
             turn_id,
+            request_span,
             ..RawMessageFacts::default()
         },
     )
@@ -4645,6 +4977,9 @@ fn ingest_claude_transcript_as(
         let token_json = message
             .and_then(|m| m.get("usage"))
             .and_then(|v| serde_json::to_string(v).ok());
+        // Read once per record: every row this record produces belongs to the
+        // same provider request, whatever `message_uuid` the block gets.
+        let identity = RequestIdentity::from_claude_record(obj, message);
         let cwd = obj.get("cwd").and_then(Value::as_str);
         let project = cwd;
         let git_branch = obj.get("gitBranch").and_then(Value::as_str);
@@ -4665,6 +5000,9 @@ fn ingest_claude_transcript_as(
             is_sidechain,
             is_meta,
             turn_id: None,
+            // Claude names its requests, so it groups on `request_id` and
+            // needs no span.
+            request_span: None,
         };
         if message_role == "assistant" && !sidechain {
             match message
@@ -4789,6 +5127,7 @@ fn ingest_claude_transcript_as(
                     notification_text,
                     None,
                     None,
+                    identity,
                     &format!("{message_uuid}:subagent_notification"),
                     Some(&tool_facts),
                     raw_facts,
@@ -4886,6 +5225,7 @@ fn ingest_claude_transcript_as(
                     Some(s),
                     model,
                     token_json.as_deref(),
+                    identity,
                     &format!("{message_uuid}:0"),
                     None,
                     raw_facts,
@@ -4944,6 +5284,7 @@ fn ingest_claude_transcript_as(
                                 Some(text),
                                 model,
                                 token_json.as_deref(),
+                                identity,
                                 &event_uid,
                                 None,
                                 raw_facts,
@@ -4973,6 +5314,7 @@ fn ingest_claude_transcript_as(
                             text,
                             model,
                             token_json.as_deref(),
+                            identity,
                             &event_uid,
                             None,
                             raw_facts,
@@ -5001,6 +5343,7 @@ fn ingest_claude_transcript_as(
                         Some(&event_text),
                         model,
                         token_json.as_deref(),
+                        identity,
                         &event_uid,
                         None,
                         raw_facts,
@@ -5070,6 +5413,7 @@ fn ingest_claude_transcript_as(
                         text.as_deref(),
                         model,
                         token_json.as_deref(),
+                        identity,
                         &event_uid,
                         Some(&facts),
                         raw_facts,
@@ -5660,7 +6004,9 @@ fn opencode_step_finish_stop_reason(part: &Value) -> Option<&str> {
 /// of them can answer "was this row indexed before the facts existed?".
 /// This can, which is what the full-sync backfill probes read. Bump it when a
 /// later change adds facts that existing rows should be re-read for.
-const RAW_MESSAGE_FACTS_VERSION: i64 = 1;
+/// 2 adds `request_span`: Codex rows indexed before it have none, so they
+/// would keep grouping one API call into a request per row until re-read.
+const RAW_MESSAGE_FACTS_VERSION: i64 = 2;
 
 #[derive(Debug, Default, Clone, Copy)]
 struct RawMessageFacts<'a> {
@@ -5670,6 +6016,58 @@ struct RawMessageFacts<'a> {
     is_sidechain: Option<bool>,
     is_meta: Option<bool>,
     turn_id: Option<&'a str>,
+    /// Which API request this row belongs to, for a provider that delimits
+    /// its requests with usage snapshots instead of naming them. Numbered per
+    /// session by the parser; see `codex_request_span` at its call site.
+    request_span: Option<&'a str>,
+}
+
+#[allow(clippy::too_many_arguments)]
+/// The provider's own identities for the request a record belongs to, read
+/// once per record and stored verbatim.
+///
+/// These are *not* the `message_id` column, which holds the record's own
+/// `uuid`. One Claude request is written as several records with different
+/// uuids and the same `requestId`, so only these establish which rows belong
+/// to one API call.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct RequestIdentity<'a> {
+    /// Claude's `requestId` (older transcripts spell it `request_id`).
+    pub request_id: Option<&'a str>,
+    /// The provider's own message id — Claude's `message.id`.
+    pub provider_message_id: Option<&'a str>,
+}
+
+impl<'a> RequestIdentity<'a> {
+    /// What a source that records neither supplies. Its stored records are
+    /// already one per request.
+    fn none() -> Self {
+        Self::default()
+    }
+
+    /// Read both from one Claude transcript record.
+    ///
+    /// The value is stored **verbatim**. Trimming would make `"req"` and
+    /// `" req "` the same grouping key, merging two providers' requests into
+    /// one row and summing usage that belongs to neither — the same reason
+    /// the napi boundary rejects a padded session id rather than trimming it.
+    /// A value that is empty once trimmed is not an identity at all and is
+    /// stored as absent, so the key never becomes `""` for every record in a
+    /// session.
+    fn from_claude_record(
+        object: &'a Map<String, Value>,
+        message: Option<&'a Map<String, Value>>,
+    ) -> Self {
+        let text = |value: Option<&'a Value>| {
+            value
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+        };
+        Self {
+            request_id: text(object.get("requestId")).or_else(|| text(object.get("request_id"))),
+            provider_message_id: text(message.and_then(|message| message.get("id"))),
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5688,6 +6086,7 @@ fn insert_session_event(
     text: Option<&str>,
     model: Option<&str>,
     token_json: Option<&str>,
+    identity: RequestIdentity<'_>,
     event_uid: &str,
     // Carried as one struct rather than ten more positional arguments: the
     // fidelity columns are only meaningful together, and a tenth `None` in a
@@ -5710,6 +6109,7 @@ fn insert_session_event(
         text,
         model,
         token_json,
+        identity,
         event_uid,
         tool_result_facts,
         raw_facts,
@@ -5741,6 +6141,7 @@ fn insert_session_event_with_raw_kind(
     text: Option<&str>,
     model: Option<&str>,
     token_json: Option<&str>,
+    identity: RequestIdentity<'_>,
     event_uid: &str,
     tool_result_facts: Option<&ToolResultFacts>,
     raw_facts: RawMessageFacts<'_>,
@@ -5789,7 +6190,7 @@ fn insert_session_event_with_raw_kind(
          (source, session_id, project, project_key, project_key_method, cwd, git_branch, message_id, parent_id, ts_ms, role, kind, text, model, token_json, event_uid, \
           tool_use_id, payload_bytes, payload_truncated, payload_hash, call_index, event_index, result_status, event_source, \
           error_signal, subagent_session_id, agent_id, \
-          request_id, stop_reason, agent_version, is_sidechain, is_meta, turn_id, raw_facts_version, raw_kind) \
+          request_id, provider_message_id, stop_reason, agent_version, is_sidechain, is_meta, turn_id, request_span, raw_facts_version, raw_kind) \
          VALUES (?1, ?2, ?3, \
            COALESCE((SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2), ?15), \
            CASE WHEN (SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2) IS NOT NULL \
@@ -5797,7 +6198,7 @@ fn insert_session_event_with_raw_kind(
                 ELSE ?16 END, \
            ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
            ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, \
-           ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35) \
+           ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37) \
          ON CONFLICT(source, session_id, event_uid) DO UPDATE SET \
          project=excluded.project, \
          project_key=COALESCE((SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2), session_events.project_key, ?15), \
@@ -5815,8 +6216,10 @@ fn insert_session_event_with_raw_kind(
          result_status=excluded.result_status, event_source=excluded.event_source, \
          error_signal=excluded.error_signal, subagent_session_id=excluded.subagent_session_id, \
          agent_id=excluded.agent_id, request_id=excluded.request_id, \
+         provider_message_id=excluded.provider_message_id, \
          stop_reason=excluded.stop_reason, agent_version=excluded.agent_version, \
          is_sidechain=excluded.is_sidechain, is_meta=excluded.is_meta, turn_id=excluded.turn_id, \
+         request_span=excluded.request_span, \
          raw_facts_version=excluded.raw_facts_version, raw_kind=excluded.raw_kind",
         params![
             source,
@@ -5846,12 +6249,14 @@ fn insert_session_event_with_raw_kind(
             tool_result_facts.error_signal,
             tool_result_facts.subagent_session_id,
             tool_result_facts.agent_id,
-            raw_facts.request_id,
+            identity.request_id.or(raw_facts.request_id),
+            identity.provider_message_id,
             raw_facts.stop_reason,
             raw_facts.agent_version,
             raw_facts.is_sidechain,
             raw_facts.is_meta,
             raw_facts.turn_id,
+            raw_facts.request_span,
             RAW_MESSAGE_FACTS_VERSION,
             raw_kind,
         ],
@@ -7138,6 +7543,8 @@ pub(crate) fn ingest_cursor_transcript(
                         Some(&text),
                         model,
                         token_json.as_deref(),
+                        // Cursor records no request identity on this path.
+                        RequestIdentity::none(),
                         &event_uid,
                         None,
                         RawMessageFacts::default(),
@@ -7167,6 +7574,7 @@ pub(crate) fn ingest_cursor_transcript(
                             Some(thinking),
                             model,
                             token_json.as_deref(),
+                            RequestIdentity::none(),
                             &event_uid,
                             None,
                             RawMessageFacts::default(),
@@ -7217,6 +7625,8 @@ pub(crate) fn ingest_cursor_transcript(
                         Some(&format_tool_event_text(&name, target.as_deref(), args)),
                         model,
                         token_json.as_deref(),
+                        // Cursor records no request identity on this path.
+                        RequestIdentity::none(),
                         &event_uid,
                         None,
                         RawMessageFacts::default(),
@@ -7319,6 +7729,8 @@ pub(crate) fn ingest_cursor_transcript(
                         materialize_tool_result_text(content).as_deref(),
                         model,
                         token_json.as_deref(),
+                        // Cursor records no request identity on this path.
+                        RequestIdentity::none(),
                         &event_uid,
                         None,
                         RawMessageFacts::default(),
@@ -7761,6 +8173,7 @@ fn ingest_grok_session(
                     Some(text),
                     None,
                     None,
+                    RequestIdentity::none(),
                     &uid,
                     None,
                     RawMessageFacts::default(),
@@ -7836,6 +8249,7 @@ fn ingest_grok_session(
                     Some(summary),
                     None,
                     None,
+                    RequestIdentity::none(),
                     &uid,
                     None,
                     RawMessageFacts::default(),
@@ -7875,6 +8289,7 @@ fn ingest_grok_session(
                         Some(text),
                         model.as_deref(),
                         None,
+                        RequestIdentity::none(),
                         &uid,
                         None,
                         RawMessageFacts::default(),
@@ -7921,6 +8336,7 @@ fn ingest_grok_session(
                         )),
                         model.as_deref(),
                         None,
+                        RequestIdentity::none(),
                         &uid,
                         None,
                         RawMessageFacts::default(),
@@ -8011,6 +8427,7 @@ fn ingest_grok_session(
                     text.as_deref(),
                     None,
                     None,
+                    RequestIdentity::none(),
                     &uid,
                     None,
                     RawMessageFacts::default(),
@@ -9427,6 +9844,77 @@ mod tests {
     use rusqlite::Connection;
     use serde_json::{json, Map, Value};
     use std::{fs, io::Write as _, time::Duration};
+    fn refusal(uid: &str, generation: u64, raw: &str) -> UnreadableSnapshot {
+        UnreadableSnapshot {
+            uid: uid.to_string(),
+            generation,
+            raw: raw.to_string(),
+        }
+    }
+
+    /// The whole refusal rule, read directly rather than through a rollout.
+    ///
+    /// Four rounds of review found four different ways to get this wrong while
+    /// it was spread across the ingest loop. It is one function now, and this
+    /// is the test that says what it means — a reviewer has one thing to
+    /// check.
+    #[test]
+    fn a_refusal_survives_exactly_when_no_delta_was_measured_from_its_baseline() {
+        let log = vec![
+            refusal("a", 0, "{\"first\":true}"),
+            refusal("b", 1, "{\"second\":true}"),
+            refusal("c", 2, "{\"third\":true}"),
+        ];
+
+        // Nothing measured: every turn is owed its refusal.
+        assert_eq!(
+            surviving_refusals(&log, &HashSet::new())
+                .iter()
+                .map(|(uid, _)| uid.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+
+        // A delta from generation 1 spans only what was recorded under 1.
+        let measured = HashSet::from([1]);
+        assert_eq!(
+            surviving_refusals(&log, &measured)
+                .iter()
+                .map(|(uid, _)| uid.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "c"],
+            "a generation that was measured settles its own refusals and no others"
+        );
+
+        // Measuring a generation nothing was recorded under changes nothing.
+        assert_eq!(surviving_refusals(&log, &HashSet::from([7])).len(), 3);
+    }
+
+    /// One turn, refused on either side of a baseline reinstall. The later
+    /// refusal must not stand in for the earlier one: the delta that follows
+    /// covers the newer generation only, and the earlier span was absorbed
+    /// into the reinstalled baseline where no delta can reach it.
+    #[test]
+    fn a_later_refusal_never_erases_an_earlier_one_for_the_same_turn() {
+        let log = vec![
+            refusal("a", 0, "{\"before\":true}"),
+            refusal("a", 1, "{\"after\":true}"),
+        ];
+        let surviving = surviving_refusals(&log, &HashSet::from([1]));
+        assert_eq!(
+            surviving,
+            vec![("a".to_string(), "{\"before\":true}".to_string())],
+            "the pre-reinstall refusal survives, and is what the turn reports"
+        );
+
+        // And when both are settled, the turn is silent rather than refused:
+        // its spend is inside the requests those deltas produced.
+        assert!(surviving_refusals(&log, &HashSet::from([0, 1])).is_empty());
+
+        // One entry per turn either way — a turn has one `token_json`.
+        assert_eq!(surviving_refusals(&log, &HashSet::new()).len(), 1);
+    }
+
     fn saved_cursor_offset(value: &Value) -> u64 {
         match super::FileCursor::decode(value).expect("valid file cursor") {
             super::DecodedFileCursor::Legacy(offset) => offset,
@@ -11465,6 +11953,7 @@ mod tests {
             Some("hello"),
             None,
             None,
+            RequestIdentity::none(),
             "event-1",
             None,
             super::RawMessageFacts::default(),
@@ -15846,10 +16335,28 @@ mod tests {
         conn.execute(
             "UPDATE session_events SET request_id = NULL, stop_reason = NULL, \
              agent_version = NULL, is_sidechain = NULL, is_meta = NULL, turn_id = NULL, \
-             raw_facts_version = NULL WHERE source = ?",
+             request_span = NULL, raw_facts_version = NULL WHERE source = ?",
             [source],
         )
         .unwrap();
+    }
+
+    /// The two raw-facts constants move together or the bump does nothing.
+    ///
+    /// `RAW_MESSAGE_FACTS_VERSION` is stamped on each row and is what
+    /// `events_lack_raw_facts` compares against; `RAW_MESSAGE_FACTS_GENERATION`
+    /// is the per-install sync-state marker that decides whether that probe is
+    /// consulted at all. Raising the version alone leaves the probe able to see
+    /// stale rows on an install that is never asked — a bump that reads as done
+    /// and repairs nothing, for exactly the installs that needed it. Raising
+    /// the generation alone runs a pass that finds nothing to repair.
+    #[test]
+    fn the_raw_facts_version_and_generation_are_bumped_together() {
+        assert_eq!(
+            super::RAW_MESSAGE_FACTS_VERSION,
+            super::RAW_MESSAGE_FACTS_GENERATION,
+            "bump both, or the backfill it exists to trigger never runs"
+        );
     }
 
     #[test]
@@ -16398,6 +16905,133 @@ mod tests {
                 .get(super::CLAUDE_RAW_MESSAGE_FACTS_KEY)
                 .and_then(Value::as_i64),
             Some(super::RAW_MESSAGE_FACTS_GENERATION)
+        );
+    }
+
+    /// An install already at the recorded generation must still re-read its
+    /// unchanged Codex rollouts once when a new fact is added.
+    ///
+    /// `events_lack_raw_facts` compares `raw_facts_version`, but sync only
+    /// consults it while `raw_facts_backfill_pending` is true, and that is
+    /// `state < RAW_MESSAGE_FACTS_GENERATION`. An install sitting at the
+    /// recorded generation answers "not pending", skips every unchanged
+    /// rollout, and leaves the new fact null forever \u2014 so raising the row
+    /// version alone is a bump that reads as done and repairs nothing.
+    #[test]
+    fn an_install_at_the_old_generation_backfills_codex_request_spans() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let state_path = home.join(".sync-state.json");
+        let day = home.join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-2026-04-20T05-00-00-sess_span.jsonl");
+        // Reasoning, a tool call and a message: one API call, three rows.
+        let lines = concat!(
+            r#"{"timestamp":"2026-04-20T05:00:00.000Z","type":"session_meta","payload":{"id":"sess_span","cwd":"/tmp/project"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-04-20T05:00:00.100Z","type":"turn_context","payload":{"turn_id":"t1","cwd":"/tmp/project","model":"gpt-5.4"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-04-20T05:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"run it"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-04-20T05:00:01.500Z","type":"event_msg","payload":{"type":"agent_reasoning","text":"Thinking."}}"#,
+            "\n",
+            r#"{"timestamp":"2026-04-20T05:00:01.700Z","type":"response_item","payload":{"type":"function_call","name":"shell","call_id":"c1","arguments":"{\"command\":[\"ls\"]}"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-04-20T05:00:02.000Z","type":"event_msg","payload":{"type":"agent_message","message":"done"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-04-20T05:00:03.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":500,"cached_input_tokens":0,"output_tokens":120,"reasoning_output_tokens":40,"total_tokens":620}}}}"#,
+            "\n",
+        );
+        fs::write(&rollout, lines).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let sync = |conn: &Connection| {
+            let mut state = super::load_sync_state(&state_path).unwrap();
+            super::sync_codex_rollouts(conn, &mut state, &home.join(".codex")).unwrap();
+            super::checkpoint_sync_state(&state_path, &state);
+            super::load_sync_state(&state_path).unwrap()
+        };
+        let spans = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM session_events \
+                 WHERE source='codex' AND role='assistant' AND request_span IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let requests = |conn: &Connection| -> usize {
+            crate::session_usage::session_requests_page(conn, "codex", "sess_span", 50, None)
+                .unwrap()
+                .requests
+                .len()
+        };
+
+        let state = sync(&conn);
+        assert_eq!(spans(&conn), 3, "a fresh sync stamps every assistant row");
+        assert_eq!(requests(&conn), 1);
+        let modified = rollout.metadata().unwrap().modified().unwrap();
+
+        // Now the install this fix is for: rows written by the parser one
+        // version back, and the sync state already retired at that
+        // generation. The transcript is byte-identical and its mtime unmoved,
+        // so nothing but the backfill can bring it back.
+        let mut state = state;
+        //
+        // The literal 1 is deliberate: this is the install that exists in the
+        // world today, the one that shipped before `request_span` and has
+        // already retired its raw-facts pass at generation 1. Written
+        // relative to the constants the test would be vacuous \u2014 it would pass
+        // whether or not the generation was bumped alongside the version.
+        conn.execute(
+            "UPDATE session_events SET request_span = NULL, raw_facts_version = 1 \
+             WHERE source = 'codex'",
+            [],
+        )
+        .unwrap();
+        state.insert(super::CODEX_RAW_MESSAGE_FACTS_KEY.to_string(), json!(1));
+        super::save_sync_state(&state_path, &state).unwrap();
+        assert_eq!(spans(&conn), 0);
+        assert_eq!(
+            requests(&conn),
+            3,
+            "and the defect is back: one call read as a request per row"
+        );
+
+        let state = sync(&conn);
+        assert_eq!(
+            spans(&conn),
+            3,
+            "an unchanged rollout is re-read once for the new fact"
+        );
+        assert_eq!(requests(&conn), 1, "and the call is one request again");
+        assert_eq!(
+            state
+                .get(super::CODEX_RAW_MESSAGE_FACTS_KEY)
+                .and_then(Value::as_i64),
+            Some(super::RAW_MESSAGE_FACTS_GENERATION),
+            "the pass is retired at the new generation"
+        );
+
+        // Positive control: already at the new generation, an unchanged
+        // rollout is not re-read. Without this the test would pass just as
+        // well if sync re-read every rollout every time, which is the cost
+        // this generation marker exists to avoid.
+        let mut state = state;
+        conn.execute(
+            "UPDATE session_events SET request_span = NULL WHERE source = 'codex'",
+            [],
+        )
+        .unwrap();
+        super::save_sync_state(&state_path, &state).unwrap();
+        restore_unchanged(&rollout, lines, modified);
+        let _ = &mut state;
+        sync(&conn);
+        assert_eq!(
+            spans(&conn),
+            0,
+            "an install already at this generation does not re-read"
         );
     }
 
@@ -19230,6 +19864,7 @@ mod tests {
             Some("Done."),
             None,
             None,
+            RequestIdentity::none(),
             "3:agent_message",
             None,
             super::RawMessageFacts::default(),

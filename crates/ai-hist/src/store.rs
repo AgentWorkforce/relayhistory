@@ -205,11 +205,13 @@ CREATE TABLE IF NOT EXISTS session_events (
     subagent_session_id TEXT,
     agent_id TEXT,
     request_id TEXT,
+    provider_message_id TEXT,
     stop_reason TEXT,
     agent_version TEXT,
     is_sidechain INTEGER,
     is_meta INTEGER,
     turn_id TEXT,
+    request_span TEXT,
     raw_facts_version INTEGER,
     raw_kind TEXT,
     UNIQUE(source, session_id, event_uid)
@@ -580,11 +582,21 @@ const REQUIRED_SESSION_EVENT_COLUMNS: &[(&str, &str)] = &[
     ("project_key", "TEXT"),
     ("project_key_method", "TEXT"),
     ("request_id", "TEXT"),
+    ("provider_message_id", "TEXT"),
     ("stop_reason", "TEXT"),
     ("agent_version", "TEXT"),
     ("is_sidechain", "INTEGER"),
     ("is_meta", "INTEGER"),
     ("turn_id", "TEXT"),
+    // Which API request a row belongs to, for a provider that delimits its
+    // requests without naming them. Codex reports cumulative `token_count`
+    // snapshots; one snapshot ends one request, and every assistant row since
+    // the previous snapshot belongs to it. The parser numbers those spans per
+    // session, because the boundary is knowable only while reading the
+    // rollout in order -- a reader cannot recover it from the stored rows
+    // without scanning the session. Null for providers that name their
+    // requests, which group on `request_id` instead.
+    ("request_span", "TEXT"),
     // Not a provider fact: the generation of raw-fact parsing the local parser
     // wrote the row with. It is the only field stamped on every event the
     // parser writes, whatever the provider recorded, which is what lets a
@@ -782,6 +794,13 @@ pub fn schema_is_evidence_read_current(conn: &Connection) -> Result<bool> {
     schema_has_required_indexes(conn, REQUIRED_EVIDENCE_READ_INDEXES)
 }
 
+/// Whether per-request usage reads can be served: the `session_requests` view
+/// has to exist, and the grouped scan behind it rides the same session-scoped
+/// event indexes as the event page.
+pub fn schema_is_usage_read_current(conn: &Connection) -> Result<bool> {
+    schema_has_required_indexes(conn, REQUIRED_EVENT_READ_INDEXES)
+}
+
 fn schema_has_required_indexes(conn: &Connection, required_indexes: &[&str]) -> Result<bool> {
     let mut table = conn.prepare("SELECT 1 FROM sqlite_master WHERE name = ? LIMIT 1")?;
     for name in REQUIRED_TABLES
@@ -796,6 +815,12 @@ fn schema_has_required_indexes(conn: &Connection, required_indexes: &[&str]) -> 
         if !table.exists([name])? {
             return Ok(false);
         }
+    }
+    // A view is a query shape, not a row set: it can be present and still be
+    // derived from a column set the table no longer has, which is why this
+    // asks whether it is *current* rather than whether it exists.
+    if !crate::session_usage::session_requests_view_is_current(conn)? {
+        return Ok(false);
     }
     let mut migration = conn.prepare("SELECT 1 FROM schema_migrations WHERE name = ? LIMIT 1")?;
     for name in REQUIRED_SCHEMA_MIGRATIONS
@@ -1372,6 +1397,10 @@ VALUES ('session_presences_local_backfill_v1');
         "INSERT OR IGNORE INTO schema_migrations (name) VALUES ('session_markers_v1');",
     )?;
     migrate_session_markers_v2(conn)?;
+    // Derived from `session_events`, so it must come after the DDL and the
+    // column migrations above, and needs no backfill: the first query over an
+    // upgraded database already sees every request its events describe.
+    crate::session_usage::ensure_session_requests_view(conn)?;
     crate::observations::init_schema(conn)?;
     init_delivery_schema(conn)?;
     // Only now, with the capture triggers rebuilt and the journal certain to
@@ -1387,6 +1416,53 @@ fn init_delivery_schema(conn: &Connection) -> Result<()> {
 
 #[cfg(not(feature = "delivery"))]
 fn init_delivery_schema(_conn: &Connection) -> Result<()> {
+    Ok(())
+}
+
+/// Preserve the pre-migration marker rows for consumers mid-snapshot.
+#[cfg(feature = "delivery")]
+fn shadow_marker_preimages(conn: &Connection) -> Result<()> {
+    crate::delivery::shadow_preimages(conn, "session_markers")
+}
+
+/// Without the delivery feature there is no `delivery_shadow` to write to and
+/// no way to build the payload, so a database with a consumer mid-snapshot is
+/// refused rather than migrated.
+///
+/// This is the one place the migration stops instead of deferring, and the
+/// asymmetry is the point. Everywhere else the rows survive, so the work can
+/// wait for a build that can do it. A preimage cannot wait: proceeding would
+/// drop the only copy of a shape a consumer was promised, and no later open
+/// could put it back. A failed open naming the remedy is recoverable; silent
+/// destruction is not.
+///
+/// Only an *unfinished* consumer is owed anything, so an ordinary install --
+/// no delivery tables at all, or no snapshot in flight -- migrates normally.
+#[cfg(not(feature = "delivery"))]
+fn shadow_marker_preimages(conn: &Connection) -> Result<()> {
+    let has_bounds: bool = conn
+        .prepare(
+            "SELECT 1 FROM sqlite_master \
+             WHERE type = 'table' AND name = 'delivery_bootstrap_bounds'",
+        )?
+        .exists([])?;
+    if !has_bounds {
+        return Ok(());
+    }
+    let unfinished: bool = conn
+        .prepare(
+            "SELECT 1 FROM delivery_jobs j \
+             JOIN delivery_bootstrap_bounds b ON b.job_id = j.id AND b.kind = 'session_marker' \
+             WHERE j.state <> 'cancelled' AND j.bootstrap_done = 0",
+        )?
+        .exists([])?;
+    anyhow::ensure!(
+        !unfinished,
+        "session_markers cannot be migrated by a build without the delivery feature while a \
+         delivery snapshot is still in flight: the pre-migration rows would be lost for it \
+         and cannot be recovered afterwards. Open this database once with a delivery-enabled \
+         build, or let the snapshot finish, and retry."
+    );
     Ok(())
 }
 
@@ -1632,6 +1708,20 @@ fn ensure_columns(conn: &Connection, table: &str, required: &[(&str, &str)]) -> 
 /// the other order loses every v1 marker's payload and looks like a clean
 /// migration while doing it.
 fn migrate_session_markers_v2(conn: &Connection) -> Result<()> {
+    let has_detail_json: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('session_markers') WHERE name = 'detail_json'")?
+        .exists([])?;
+    if has_detail_json {
+        // Freeze the old shape for anyone mid-snapshot, before anything at all
+        // happens to the table -- ahead of the added columns as well as the
+        // writes, so the preimage is the shape their snapshot was promised
+        // rather than that shape plus some nulls.
+        //
+        // This one is not recoverable later: the journal backfill can be
+        // deferred because the rows survive, but a preimage cannot be
+        // reconstructed once the column it holds is gone.
+        shadow_marker_preimages(conn)?;
+    }
     ensure_columns(
         conn,
         "session_markers",
@@ -1644,9 +1734,6 @@ fn migrate_session_markers_v2(conn: &Connection) -> Result<()> {
             ("payload_json", "TEXT"),
         ],
     )?;
-    let has_detail_json: bool = conn
-        .prepare("SELECT 1 FROM pragma_table_info('session_markers') WHERE name = 'detail_json'")?
-        .exists([])?;
     if has_detail_json {
         // Retire the capture triggers *before* touching a row, not merely
         // before the column drop.
@@ -2212,11 +2299,24 @@ pub struct SessionEvent {
     pub agent_id: Option<String>,
     /// Verbatim provider envelope facts; see [`REQUIRED_SESSION_EVENT_COLUMNS`].
     pub request_id: Option<String>,
+    /// The provider's own message id — Claude's `message.id` — verbatim.
+    /// Together with `request_id`, this preserves a stable request identity
+    /// when one Claude response spans multiple JSONL records.
+    pub provider_message_id: Option<String>,
     pub stop_reason: Option<String>,
     pub agent_version: Option<String>,
     pub is_sidechain: Option<i64>,
     pub is_meta: Option<i64>,
     pub turn_id: Option<String>,
+    /// Which API request this row belongs to, when the provider delimits its
+    /// requests without naming them — see `request_span` in
+    /// `REQUIRED_SESSION_EVENT_COLUMNS`.
+    ///
+    /// On the struct, not only in the table, so a connector supplying
+    /// normalized events preserves the grouping: without it a remotely
+    /// hydrated Codex session arrives with null spans and reads as one request
+    /// per row, which is the defect this column exists to prevent.
+    pub request_span: Option<String>,
 }
 
 /// Stable continuation for normalized session events.
@@ -2347,8 +2447,8 @@ const SESSION_EVENT_COLUMNS: &str =
     "id, source, session_id, project, project_key, cwd, git_branch, message_id, parent_id, \
      ts_ms, role, kind, text, model, token_json, event_uid, tool_use_id, payload_bytes, \
      payload_truncated, payload_hash, call_index, event_index, result_status, event_source, \
-     error_signal, subagent_session_id, agent_id, request_id, stop_reason, \
-     agent_version, is_sidechain, is_meta, turn_id, raw_kind";
+     error_signal, subagent_session_id, agent_id, request_id, provider_message_id, \
+     stop_reason, agent_version, is_sidechain, is_meta, turn_id, request_span, raw_kind";
 
 fn row_to_session_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionEvent> {
     Ok(SessionEvent {
@@ -2380,12 +2480,14 @@ fn row_to_session_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionEven
         subagent_session_id: row.get(25)?,
         agent_id: row.get(26)?,
         request_id: row.get(27)?,
-        stop_reason: row.get(28)?,
-        agent_version: row.get(29)?,
-        is_sidechain: row.get(30)?,
-        is_meta: row.get(31)?,
-        turn_id: row.get(32)?,
-        raw_kind: row.get(33)?,
+        provider_message_id: row.get(28)?,
+        stop_reason: row.get(29)?,
+        agent_version: row.get(30)?,
+        is_sidechain: row.get(31)?,
+        is_meta: row.get(32)?,
+        turn_id: row.get(33)?,
+        request_span: row.get(34)?,
+        raw_kind: row.get(35)?,
     })
 }
 
@@ -6504,6 +6606,101 @@ mod tests {
         assert_eq!(again, 2, "a cleared flag must not re-journal on every open");
     }
 
+    /// An in-flight consumer keeps the shape it was promised.
+    ///
+    /// A bootstrap or an export fixes a rowid cutoff and then reads its pages
+    /// over time. The capture triggers keep that view immutable by writing the
+    /// OLD row into `delivery_shadow` whenever a row inside an unread bound
+    /// changes -- so a resumed consumer reads the preimage, not whatever the
+    /// row became.
+    ///
+    /// This migration retires those triggers before it rewrites anything, so
+    /// nothing shadows the rows it rewrites. A consumer whose cutoff predates
+    /// the shape change would resume and read `payload_json` where its
+    /// snapshot promised `detail_json` -- and unlike the journal, this cannot
+    /// be repaired afterwards: once the column is dropped the preimage does not
+    /// exist anywhere to reconstruct from.
+    #[cfg(feature = "delivery")]
+    #[test]
+    fn an_unfinished_consumer_keeps_the_marker_preimage_it_was_promised() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("preimage.db");
+        {
+            let conn = open_db(&db_path).unwrap();
+            conn.execute_batch(
+                "DROP TRIGGER IF EXISTS delivery_session_markers_insert;
+                 DROP TRIGGER IF EXISTS delivery_session_markers_update;
+                 DROP TRIGGER IF EXISTS delivery_session_markers_delete;
+                 DROP TABLE session_markers;
+                 CREATE TABLE session_markers (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     source TEXT NOT NULL, session_id TEXT NOT NULL,
+                     marker_uid TEXT NOT NULL, kind TEXT NOT NULL,
+                     ts_ms INTEGER, text TEXT, detail_json TEXT,
+                     UNIQUE(source, session_id, marker_uid)
+                 );
+                 INSERT INTO session_markers
+                     (source, session_id, marker_uid, kind, ts_ms, text, detail_json)
+                 VALUES ('grok','pre','c1','compaction_boundary',11,'compacted','{\"c\":1}');
+                 DELETE FROM schema_migrations WHERE name = 'session_markers_v2';",
+            )
+            .unwrap();
+            init_delivery_schema(&conn).unwrap();
+            // A job part way through its bootstrap, whose marker bound still
+            // covers this row: exactly the consumer the shadow exists for.
+            conn.execute(
+                "INSERT INTO delivery_jobs \
+                 (id, destination_id, instance_id, account_id, generation, config_json, \
+                  state, created_ms, cutoff, journal_cursor, bootstrap_done, \
+                  bootstrap_kind, bootstrap_rowid) \
+                 VALUES ('j1','d1','i1','a1',1,'{}','active',1,0,0,0,0,0)",
+                [],
+            )
+            .unwrap();
+            let rowid: i64 = conn
+                .query_row("SELECT rowid FROM session_markers", [], |row| row.get(0))
+                .unwrap();
+            conn.execute(
+                "INSERT INTO delivery_bootstrap_bounds(job_id, kind, max_rowid) \
+                 VALUES ('j1','session_marker',?)",
+                params![rowid],
+            )
+            .unwrap();
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM delivery_shadow", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0,
+                "the premise: nothing shadowed yet"
+            );
+        }
+
+        let conn = open_db(&db_path).unwrap();
+        let preimage: Option<String> = conn
+            .query_row(
+                "SELECT payload FROM delivery_shadow \
+                 WHERE job_id = 'j1' AND kind = 'session_marker'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+            .flatten();
+        let preimage = preimage.expect("the row inside an unread bound must be shadowed");
+        let preimage: serde_json::Value = serde_json::from_str(&preimage).unwrap();
+        assert_eq!(
+            preimage.get("detail_json").and_then(|v| v.as_str()),
+            Some("{\"c\":1}"),
+            "a resumed consumer must read the shape its snapshot promised: {preimage}"
+        );
+
+        // Positive control: the live row really did move on, so this is a
+        // preimage rather than a copy of the current state.
+        let markers = session_markers(&conn, "grok", "pre").unwrap();
+        assert_eq!(markers[0].payload_json.as_deref(), Some("{\"c\":1}"));
+        assert!(preimage.get("payload_json").is_none(), "{preimage}");
+    }
+
     /// The project-identity columns, marker and index reach a database that
     /// predates them — and the migration deliberately invents no keys.
     ///
@@ -7181,6 +7378,12 @@ mod tests {
     /// never referenced them either; SQLite refuses to drop a column a trigger
     /// still names.
     fn drop_session_event_capture_triggers(conn: &Connection) {
+        // A pre-usage database also predates the derived request view. Current
+        // SQLite correctly refuses to drop one of its source columns while
+        // that view still references it, so remove the view while recreating
+        // the legacy shape this helper models.
+        conn.execute_batch("DROP VIEW IF EXISTS session_requests;")
+            .unwrap();
         let names = conn
             .prepare(
                 "SELECT name FROM sqlite_master \

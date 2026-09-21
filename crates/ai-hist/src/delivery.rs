@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
-pub(crate) use schema::{init_schema, journal_migrated_rows, schema_is_current};
+pub(crate) use schema::{init_schema, journal_migrated_rows, schema_is_current, shadow_preimages};
 pub const EXPORT_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_RETENTION_LIMIT_BYTES: i64 = 256 * 1_048_576;
 pub const SUPPORTED_KINDS: &[&str] = &[
