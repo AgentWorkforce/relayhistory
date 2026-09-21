@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -128,4 +128,31 @@ test("fails closed when the version commit conflicts with the new tip", async ()
   git(work, "fetch", "origin", "main");
   assert.equal(git(work, "rev-parse", "origin/main"), remoteSha);
   assert.equal(git(work, "rev-parse", "HEAD"), versionSha);
+});
+
+test("retries the push when origin rejects the first fast-forward", async () => {
+  const { origin, work, startSha } = await stageRepos();
+  await writeFile(join(work, "version.txt"), "0.21.2\n");
+  git(work, "add", "version.txt");
+  git(work, "commit", "-m", "chore: release 0.21.2");
+  const hook = join(origin, "hooks", "pre-receive");
+  await writeFile(
+    hook,
+    `#!/bin/sh
+if [ -f "\$GIT_DIR/reject-once" ]; then
+  rm -f "\$GIT_DIR/reject-once"
+  echo "reject once" >&2
+  exit 1
+fi
+exit 0
+`,
+  );
+  await chmod(hook, 0o755);
+  await writeFile(join(origin, "reject-once"), "");
+
+  const result = persistRelease(work, "main", startSha);
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stdout, /rejected \(attempt 1\/5\)/);
+  git(work, "fetch", "origin", "main");
+  assert.equal(git(work, "show", "origin/main:version.txt"), "0.21.2");
 });
