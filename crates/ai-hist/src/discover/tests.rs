@@ -801,10 +801,395 @@ fn cursor_reports_mtime_as_last_activity_and_leaves_first_activity_null() {
     let row = found.row("cursor-1");
     assert_eq!(row.first_prompt.as_deref(), Some("fix the flaky test"));
     assert_eq!(row.cwd.as_deref(), Some("/work/app"));
-    // Cursor records no per-message timestamps, so mtime is the only signal
-    // and it is reported as last activity only.
+    // This transcript's turns carry no readable time, so mtime is the only
+    // signal and it is reported as last activity only — never as a first
+    // activity the provider did not record.
     assert_eq!(row.last_activity_ms, Some(1_750_000_400_000));
     assert_eq!(row.first_activity_ms, None);
+    assert!(row.models.is_empty());
+}
+
+/// A turn time that only the head can see still sets the catalog's recency.
+///
+/// Reported by Devin as "head timestamp lost from recency". Past
+/// `HEAD_SCAN_MAX_BYTES` the tail is a separate region, so a transcript whose
+/// one dated human turn is followed by a long run of assistant and tool
+/// records has a tail with no `<timestamp>` in it — only a human turn carries
+/// one. `last_activity_ms` fell straight to the file mtime, so the catalog
+/// reported the session as having last spoken "now", while full ingestion had
+/// those records inheriting the open turn's time. Worse, the discovery upsert
+/// merges `last_activity_ms` with `MAX`, so that mtime would also re-expand a
+/// window a rebuild had just retracted.
+///
+/// Positive control: without the head fallback this failed at
+/// `a head-only turn time must outrank the mtime: left: Some(1750000400000),
+/// right: Some(1789587420000)` — the mtime, not the turn.
+#[test]
+fn cursor_recency_uses_a_turn_time_only_the_head_can_see() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    // One dated human turn, then enough assistant prose to push the tail
+    // region past the head budget. The tail therefore holds only assistant
+    // records, none of which carries a tag.
+    let mut body = String::new();
+    body.push_str(
+        r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp>\n<user_query>start</user_query>"}]}}"#,
+    );
+    body.push('\n');
+    let filler = "x".repeat(2048);
+    while body.len() < (super::HEAD_SCAN_MAX_BYTES + super::TAIL_SCAN_MAX_BYTES) as usize * 2 {
+        body.push_str(&format!(
+            r#"{{"role":"assistant","message":{{"content":[{{"type":"text","text":"{filler}"}}]}}}}"#
+        ));
+        body.push('\n');
+    }
+    cursor_session(home.path(), "work-app", "cursor-head-time", &body, 1_750_000_400_000);
+
+    let found = discover(&conn, home.path(), &only(&["cursor"]));
+    let row = found.row("cursor-head-time");
+    assert_eq!(
+        row.last_activity_ms,
+        Some(1_789_587_420_000),
+        "a head-only turn time must outrank the mtime"
+    );
+    assert_eq!(row.first_activity_ms, Some(1_789_587_420_000));
+}
+
+/// The catalog's `first_prompt` and the indexed `history` row are the same
+/// string for a turn Cursor split into several text blocks.
+///
+/// Reported by Devin as "multi-block first prompts stay truncated".
+/// `parse_cursor_text` stopped at the first text block while the event parser
+/// joins them all, so a two-block opening turn was stored whole in `history`
+/// and truncated in the catalog — and hydration does not rewrite
+/// `sessions.first_prompt`, so the short version survived full indexing.
+/// Both now go through `cursor::human_turn_prompt`.
+///
+/// Positive control: with the `break` in `parse_cursor_text` this failed at
+/// `discovery and ingestion must agree on the first prompt:
+/// left: Some("now write the test"), right: Some("now write the
+/// test\n\ninclude the timeout case")`.
+#[test]
+fn cursor_first_prompt_is_the_same_before_and_after_hydration() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let transcript = cursor_session(
+        home.path(),
+        "work-app",
+        "cursor-split",
+        concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query>now write the test</user_query>"},{"type":"text","text":"include the timeout case"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"content":[{"type":"text","text":"on it"}]}}"#,
+            "\n"
+        ),
+        1_750_000_400_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["cursor"]));
+    let discovered = found.row("cursor-split").first_prompt.clone();
+
+    let ingest_conn = Connection::open_in_memory().unwrap();
+    init_db(&ingest_conn).unwrap();
+    crate::ingest::ingest_cursor_transcript(
+        &ingest_conn,
+        &transcript,
+        "cursor-split",
+        Some("/work/app"),
+        1_750_000_400_000,
+        0,
+        u64::MAX,
+    )
+    .unwrap();
+    let indexed: Option<String> = ingest_conn
+        .query_row(
+            "SELECT prompt FROM history WHERE source = 'cursor' \
+             AND session_id = 'cursor-split' ORDER BY id LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+
+    assert_eq!(
+        discovered, indexed,
+        "discovery and ingestion must agree on the first prompt"
+    );
+    assert_eq!(
+        discovered.as_deref(),
+        Some("now write the test\n\ninclude the timeout case"),
+    );
+}
+
+/// The catalog's activity window comes from human turns, not from an
+/// assistant that quotes a `<timestamp>` tag back.
+///
+/// `cursor_record_time` ran the same unrestricted block scan the event parser
+/// did, so a model explaining the transcript format moved `first_activity_ms`
+/// and `last_activity_ms` and re-sorted the session in the catalog. Both paths
+/// now share `cursor::injected_turn_time`, which reads the tag only out of a
+/// human turn's own text blocks.
+///
+/// Positive control: with the scan unrestricted this failed at
+/// `assistant prose must not move the catalog window: left: Some(1789587660000),
+/// right: Some(1789587420000)` — the quoted instant became the session's last
+/// activity.
+#[test]
+fn cursor_activity_ignores_a_timestamp_quoted_by_the_assistant() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    cursor_session(
+        home.path(),
+        "work-app",
+        "cursor-quoted",
+        concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp>\n<user_query>when was this?</user_query>"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"content":[{"type":"text","text":"Cursor writes <timestamp>Wednesday, Sep 16, 2026, 3:41 PM (UTC-4)</timestamp> into the turn."}]}}"#,
+            "\n"
+        ),
+        1_750_000_400_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["cursor"]));
+    let row = found.row("cursor-quoted");
+    // Both endpoints are the human turn's own time. The mtime is not reached
+    // either: a readable turn time outranks it.
+    assert_eq!(
+        row.last_activity_ms,
+        Some(1_789_587_420_000),
+        "assistant prose must not move the catalog window"
+    );
+    assert_eq!(row.first_activity_ms, Some(1_789_587_420_000));
+}
+
+/// Discovery's session summary and the one full ingestion writes have to be
+/// the same string, or hydrating a session silently rewrites its summary.
+///
+/// A Cursor assistant record can hold several text blocks — prose, a tool
+/// call, then more prose. Ingestion walks the blocks in order and keeps the
+/// last non-empty one, so discovery must too.
+///
+/// Positive control: with `.find()` in `cursor_assistant_text` this failed
+/// with `discovery and ingestion must agree on the session summary:
+/// left: Some("Let me check the test."), right: Some("Fixed it.")` — the
+/// catalog advertised the opening line and hydration replaced it with the
+/// closing one.
+#[test]
+fn cursor_summary_is_the_same_before_and_after_hydration() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let transcript = cursor_session(
+        home.path(),
+        "work-app",
+        "cursor-multi",
+        concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query>fix it</user_query>"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"content":[{"type":"text","text":"Let me check the test."},{"type":"tool_use","name":"Read","input":{"path":"t.rs"}},{"type":"text","text":"Fixed it."},{"type":"turn_ended","status":"success"}]}}"#,
+            "\n"
+        ),
+        1_750_000_400_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["cursor"]));
+    let discovered = found.row("cursor-multi").last_assistant_text.clone();
+
+    let ingest_conn = Connection::open_in_memory().unwrap();
+    init_db(&ingest_conn).unwrap();
+    let outcome = crate::ingest::ingest_cursor_transcript(
+        &ingest_conn,
+        &transcript,
+        "cursor-multi",
+        Some("/work/app"),
+        1_750_000_400_000,
+        0,
+        u64::MAX,
+    )
+    .unwrap();
+
+    assert_eq!(
+        discovered, outcome.last_assistant_text,
+        "discovery and ingestion must agree on the session summary"
+    );
+    assert_eq!(
+        discovered.as_deref(),
+        Some("Fixed it."),
+        "the summary is the reply's last word, not its first"
+    );
+}
+
+/// Discovery caps `last_assistant_text` at `EXCERPT_MAX_CHARS`. Ingestion
+/// used to keep the full block, so hydrating a long Cursor reply rewrote the
+/// catalog summary.
+#[test]
+fn cursor_summary_stays_capped_after_ingestion() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let long = "x".repeat(EXCERPT_MAX_CHARS + 80);
+    let transcript = cursor_session(
+        home.path(),
+        "work-app",
+        "cursor-long",
+        &format!(
+            "{{\"role\":\"user\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"<user_query>go</user_query>\"}}]}}}}\n\
+             {{\"role\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{long}\"}}]}}}}\n"
+        ),
+        1_750_000_400_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["cursor"]));
+    let discovered = found.row("cursor-long").last_assistant_text.clone();
+    assert_eq!(
+        discovered.as_ref().map(|text| text.chars().count()),
+        Some(EXCERPT_MAX_CHARS)
+    );
+
+    let ingest_conn = Connection::open_in_memory().unwrap();
+    init_db(&ingest_conn).unwrap();
+    let outcome = crate::ingest::ingest_cursor_transcript(
+        &ingest_conn,
+        &transcript,
+        "cursor-long",
+        Some("/work/app"),
+        1_750_000_400_000,
+        0,
+        u64::MAX,
+    )
+    .unwrap();
+    assert_eq!(
+        discovered, outcome.last_assistant_text,
+        "discovery and ingestion must agree on a long session summary"
+    );
+}
+
+#[test]
+fn cursor_reports_the_injected_turn_times_when_the_build_writes_them() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    cursor_session(
+        home.path(),
+        "work-app",
+        "cursor-2",
+        concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp>\n<user_query>fix the flaky test</user_query>"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"model":"claude-4.5-sonnet","content":[{"type":"text","text":"Reading the test."},{"type":"tool_use","name":"Read","input":{"path":"t.rs"}}]}}"#,
+            "\n",
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:41 PM (UTC-4)</timestamp>\n<user_query>now ship it</user_query>"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"content":[{"type":"text","text":"Shipped."},{"type":"turn_ended","status":"success"}]}}"#,
+            "\n"
+        ),
+        1_750_000_400_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["cursor"]));
+    let row = found.row("cursor-2");
+    // The injected tag is a real recorded time, so it is preferred over mtime
+    // at both ends.
+    assert_eq!(row.first_activity_ms, Some(1_789_587_420_000));
+    assert_eq!(row.last_activity_ms, Some(1_789_587_660_000));
+    assert_eq!(row.models, vec!["claude-4.5-sonnet".to_string()]);
+    assert_eq!(row.last_assistant_text.as_deref(), Some("Shipped."));
+}
+
+/// A catalog row written by the scanner that shipped *before* this change
+/// carries `v3:` and the fields that reader never extracted: no
+/// `first_activity_ms`, no `models`, no `last_assistant_text`. The stamp is
+/// compared before the provider reader is invoked, so if the scanner version
+/// does not move, those rows are served from cache and stay null forever —
+/// the transcript's bytes never change, so nothing else can ever invalidate
+/// them.
+///
+/// Positive control: with `SHALLOW_SCANNER_VERSION` left at 3 this failed at
+/// `a row from the previous scanner must be read again: left: None, right:
+/// Some(1789587420000)` — the upgraded install kept serving the prompt-only
+/// row.
+#[test]
+fn a_cursor_row_from_the_previous_scanner_is_read_again_after_the_upgrade() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    cursor_session(
+        home.path(),
+        "work-app",
+        "cursor-upgrade",
+        concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp>\n<user_query>fix the flaky test</user_query>"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"model":"claude-4.5-sonnet","content":[{"type":"text","text":"Shipped."},{"type":"turn_ended","status":"success"}]}}"#,
+            "\n"
+        ),
+        1_750_000_400_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["cursor"]));
+    assert_eq!(
+        found.row("cursor-upgrade").first_activity_ms,
+        Some(1_789_587_420_000)
+    );
+
+    // Rewrite the catalog into what the previous scanner left behind: the same
+    // bytes, its own version prefix, and none of the fields this one learned
+    // to extract. The stamp lives in three places and the cache check reads
+    // the observation, so all three move together.
+    let stored: String = conn
+        .query_row(
+            "SELECT source_stamp FROM sessions WHERE source = 'cursor' \
+             AND session_id = 'cursor-upgrade'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let raw = stored
+        .split_once(':')
+        .expect("stored stamps carry a version prefix")
+        .1
+        .to_string();
+    let previous = format!("v3:{raw}");
+    conn.execute(
+        "UPDATE sessions SET source_stamp = ?, first_activity_ms = NULL, \
+         last_assistant_text = NULL WHERE source = 'cursor' \
+         AND session_id = 'cursor-upgrade'",
+        params![previous],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE session_presences SET source_stamp = ? WHERE source = 'cursor' \
+         AND session_id = 'cursor-upgrade'",
+        params![previous],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE session_observations SET source_stamp = ? WHERE source = 'cursor' \
+         AND session_id = 'cursor-upgrade'",
+        params![previous],
+    )
+    .unwrap();
+
+    let upgraded = discover(&conn, home.path(), &only(&["cursor"]));
+    let row = upgraded.row("cursor-upgrade");
+    assert_eq!(
+        row.first_activity_ms,
+        Some(1_789_587_420_000),
+        "a row from the previous scanner must be read again"
+    );
+    assert_eq!(row.last_assistant_text.as_deref(), Some("Shipped."));
+    assert_eq!(row.models, vec!["claude-4.5-sonnet".to_string()]);
+    assert_eq!(
+        upgraded.summary.counters.shallow_reads, 1,
+        "the re-read is the point: the row must not have come from cache"
+    );
+
+    // Control: the bump costs exactly one re-read. The pass after it is
+    // cached again, so this is a one-time migration and not a permanent
+    // rescan of every unchanged transcript.
+    let settled = discover(&conn, home.path(), &only(&["cursor"]));
+    assert_eq!(settled.summary.counters.shallow_reads, 0);
+    assert_eq!(settled.summary.skipped_unchanged, 1);
+    assert_eq!(
+        settled.row("cursor-upgrade").first_activity_ms,
+        Some(1_789_587_420_000)
+    );
 }
 
 #[test]

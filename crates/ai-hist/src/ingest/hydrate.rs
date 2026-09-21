@@ -10,6 +10,10 @@ use std::time::Instant;
 
 /// Bumped to 3 when capability became derived from declared evidence coverage.
 pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 3;
+/// Bumped to 2 when Claude subagent transcripts that carry an `agentId`
+/// started being indexed under that child id: existing databases re-parse once
+/// and the earlier parent-attributed rows are healed in place.
+///
 /// Version 3 re-parsed existing sessions for per-message raw provider facts.
 /// Version 4 also invalidates checkpoints from the unbounded Codex child scan,
 /// so their relationship coverage is recomputed under the bounded search.
@@ -22,9 +26,33 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 3;
 /// `created_at + index` times the previous parser synthesized. Plain `sync`
 /// needs the same push, which is why the `grok_sessions` sync-state key was
 /// retired for `grok_events_v1`.
-/// Version 7 captures Claude's provider message id so usage records from
-/// transcripts without a request id can still be grouped per API request.
-const HYDRATION_PARSER_VERSION: i64 = 7;
+///
+/// Version 7 is the Cursor event-level parser that landed beside Grok's 6:
+/// already indexed Cursor sessions re-parse once and gain `session_events`,
+/// `tool_calls`, `file_edits` and real turn timestamps. The same bump carries
+/// the fix that stopped a user-role record carrying only a `tool_result` from
+/// closing the open turn — those records were dated with the file mtime, so an
+/// already indexed Cursor session holds tool results timed hours after the
+/// calls they answer, and session windows that were dragged to the mtime by
+/// records that store no evidence at all. Neither heals in place — the window
+/// only ever widens — so the transcript has to be read again. Plain `sync`
+/// needs the same push, which is why `CURSOR_SYNC_STATE_KEY` was retired in
+/// the same change: a parser version alone only reaches sessions somebody
+/// hydrates by name. Databases that already ran Grok's 6 keep that number
+/// until this bump, so Cursor would otherwise stay prompt-only forever.
+///
+/// Version 8 is usage grouping. It captures Claude's provider message id, so
+/// records from transcripts without a request id can still be grouped per API
+/// call, and Codex's `request_span`, so the rows of one Codex call group
+/// together instead of each becoming a request of its own. Both live only in
+/// the transcript, so an already indexed session keeps the old grouping until
+/// it is read again.
+///
+/// This began as a second version 7, written before Cursor's landed on main.
+/// Two different re-parses cannot share a number: a database that ran the
+/// Cursor 7 would report the usage 7 as already done and keep answering with
+/// the old grouping forever.
+const HYDRATION_PARSER_VERSION: i64 = 8;
 
 #[derive(Debug, Clone)]
 pub struct HydrateSessionOptions {
@@ -181,6 +209,22 @@ fn hydrate_session_at_with_home(
     )
 }
 
+#[cfg(test)]
+fn test_sync_cursor(conn: &Connection, home: &Path, state: &mut Map<String, Value>) {
+    super::sync_cursor(conn, state, &home.join(".cursor/projects")).unwrap();
+}
+
+#[cfg(test)]
+fn test_load_sync_state(db_path: &Path) -> Map<String, Value> {
+    super::load_sync_state(
+        &db_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(".sync-state.json"),
+    )
+    .unwrap()
+}
+
 fn hydrate_session_at_with_roots_and_connectors(
     db_path: &Path,
     options: &HydrateSessionOptions,
@@ -296,7 +340,7 @@ fn hydrate_session_at_with_roots_and_connectors(
     // table has a provider-native uniqueness key, so interruption followed by
     // retry is safe for both new and growing sessions.
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let source_diagnostics = ingest_selected(
+    let (source_diagnostics, cursor_consumed_through) = ingest_selected(
         &tx,
         options,
         &target,
@@ -362,6 +406,14 @@ fn hydrate_session_at_with_roots_and_connectors(
     // session with a null project key in between.
     crate::store::refresh_project_identity(&tx)?;
     tx.commit()?;
+    if let (Some(path), Some(consumed)) = (snapshot.path.as_deref(), cursor_consumed_through) {
+        // Hydration rebuilt history from offset 0 and does not otherwise
+        // move the Cursor byte cursor. A later incremental sync would
+        // resume from the old offset and insert untimed prompts again
+        // under the current mtime. Checkpoint exactly the bytes this
+        // pass indexed: a later append is the next sync's work.
+        record_cursor_hydrate_checkpoint(db_path, path, consumed)?;
+    }
 
     let status = if previous_stamp.is_some() {
         "updated"
@@ -1435,17 +1487,19 @@ fn ingest_selected(
     target: &CatalogTarget,
     path: Option<&Path>,
     claude_subagents: &[ClaudeSubagentEvidence],
-) -> Result<Vec<HydrationDiagnostic>> {
+) -> Result<(Vec<HydrationDiagnostic>, Option<u64>)> {
     match options.source.as_str() {
-        "claude" => {
-            ingest_claude(conn, options, path.unwrap(), claude_subagents).map(|()| Vec::new())
+        "claude" => ingest_claude(conn, options, path.unwrap(), claude_subagents)
+            .map(|()| (Vec::new(), None)),
+        "codex" => ingest_codex(conn, options, path.unwrap()).map(|()| (Vec::new(), None)),
+        "cursor" => {
+            let (diagnostics, consumed) = ingest_cursor(conn, options, target, path.unwrap())?;
+            Ok((diagnostics, Some(consumed)))
         }
-        "codex" => ingest_codex(conn, options, path.unwrap()).map(|()| Vec::new()),
-        "cursor" => ingest_cursor(conn, options, target, path.unwrap()).map(|()| Vec::new()),
-        "grok" => ingest_grok(conn, options, path.unwrap()),
+        "grok" => ingest_grok(conn, options, path.unwrap()).map(|diagnostics| (diagnostics, None)),
         "opencode" => {
             sync_opencode_session(conn, path.unwrap(), &options.session_id)?;
-            Ok(Vec::new())
+            Ok((Vec::new(), None))
         }
         _ => Err(hydration_error(
             "HYDRATION_UNSUPPORTED",
@@ -1881,7 +1935,7 @@ fn ingest_cursor(
     options: &HydrateSessionOptions,
     _target: &CatalogTarget,
     path: &Path,
-) -> Result<()> {
+) -> Result<(Vec<HydrationDiagnostic>, u64)> {
     let project = path
         .ancestors()
         .find(|ancestor| {
@@ -1894,24 +1948,81 @@ fn ingest_cursor(
         .and_then(Path::file_name)
         .and_then(|s| s.to_str())
         .map(decode_cursor_project);
-    let ts_ms = file_modified_ms(path).unwrap_or(0);
-    let reader = BufReader::new(fs::File::open(path)?);
-    for line in reader.lines().map_while(std::result::Result::ok) {
-        if let Some(project) = project.as_deref() {
-            ingest_cursor_line(conn, &line, &options.session_id, project, ts_ms)?;
-        }
-    }
-    upsert_session(
+    let mtime_ms = file_modified_ms(path).unwrap_or(0);
+    // Targeted hydration always re-reads the whole transcript, so it is a
+    // rebuild: clear every row a previous read left before writing the new
+    // one. Upserting on top is not enough. Cursor evidence is keyed on the
+    // record's byte offset, and a rewritten transcript reuses those offsets
+    // for different records, so the rows an earlier generation wrote past the
+    // new end of the file would survive as tool calls and edits this session
+    // never made. `history` cannot be upserted at all, because a prompt's
+    // identity includes a timestamp an earlier parser took from the mtime.
+    //
+    // The read happens inside the caller's transaction, and it propagates its
+    // error, so a transcript that has vanished or turned unreadable since the
+    // snapshot rolls this delete back rather than committing an empty session.
+    clear_cursor_session_evidence(conn, &options.session_id)?;
+    let outcome = ingest_cursor_transcript(
+        conn,
+        path,
+        &options.session_id,
+        project.as_deref(),
+        mtime_ms,
+        0,
+        // Hydration re-reads the whole file. The Cursor byte checkpoint is
+        // advanced after this transaction commits, so a later incremental
+        // sync does not re-insert the untimed prompts this pass just wrote.
+        u64::MAX,
+    )?;
+    // Authoritative about both ends of the window, having just read the whole
+    // file: an expanding merge would keep a mtime endpoint an earlier parser
+    // wrote, which MAX() can never retract.
+    upsert_session_rebuilt(
         conn,
         &options.session_id,
         "cursor",
         project.as_deref(),
         None,
-        ts_ms,
-        ts_ms,
-        None,
+        outcome.first_ts_ms.unwrap_or(mtime_ms),
+        outcome.last_ts_ms.unwrap_or(mtime_ms),
+        outcome.last_assistant_text.as_deref(),
         Some(&path.to_string_lossy()),
-    )
+    )?;
+    Ok((cursor_diagnostics(&outcome), outcome.consumed_through))
+}
+
+/// What a Cursor transcript could not establish on its own.
+///
+/// Both codes describe an absence in the provider's records, not a failure of
+/// this run: reporting them is the difference between "Cursor does not write
+/// this" and "RelayHistory did not read it".
+fn cursor_diagnostics(outcome: &CursorTranscriptOutcome) -> Vec<HydrationDiagnostic> {
+    let mut diagnostics = Vec::new();
+    if outcome.used_mtime_fallback {
+        diagnostics.push(HydrationDiagnostic {
+            code: "CURSOR_TIMESTAMP_FROM_MTIME".to_string(),
+            message: "cursor records carry no timestamp field; events in turns with no readable \
+                      <timestamp> tag are stamped with the transcript file mtime"
+                .to_string(),
+            duration_ms: None,
+            source_bytes: None,
+            records_parsed: None,
+        });
+    }
+    if outcome.subagent_calls > 0 {
+        diagnostics.push(HydrationDiagnostic {
+            code: "CURSOR_SUBAGENT_SPAWN_UNLINKED".to_string(),
+            message: format!(
+                "cursor recorded {} subagent spawn call(s) but writes no child transcript id; \
+                 the delegation is visible as a tool call and the child is not addressable",
+                outcome.subagent_calls
+            ),
+            duration_ms: None,
+            source_bytes: None,
+            records_parsed: None,
+        });
+    }
+    diagnostics
 }
 
 fn ingest_grok(
@@ -4283,6 +4394,213 @@ mod tests {
         assert_eq!(count, 0);
     }
 
+    /// Copy a checked-in Cursor fixture to where a real install would put it.
+    fn cursor_fixture_home(home: &Path, fixture: &str, session_id: &str) -> PathBuf {
+        let transcript = home
+            .join(".cursor/projects/home-dev-demo/agent-transcripts")
+            .join(session_id)
+            .join(format!("{session_id}.jsonl"));
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/cursor")
+                .join(fixture),
+            &transcript,
+        )
+        .unwrap();
+        transcript
+    }
+
+    #[test]
+    fn cursor_hydration_indexes_events_tools_and_edits_with_recorded_turn_times() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = cursor_fixture_home(dir.path(), "observed-3.13.25.jsonl", "cur-1");
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "cursor", "cur-1", Some(&transcript));
+        drop(conn);
+
+        let result =
+            hydrate_session_at_with_home(&db, &options("cursor", "cur-1"), dir.path()).unwrap();
+        assert_eq!(result.status, "hydrated");
+        assert!(result.evidence.events > 0, "{:?}", result.evidence);
+        assert!(result.evidence.tool_calls > 0, "{:?}", result.evidence);
+        assert!(result.evidence.file_edits > 0, "{:?}", result.evidence);
+        // Every turn here carries a readable `<timestamp>`, so nothing fell
+        // back to the file mtime and the diagnostic must stay silent.
+        assert!(
+            !result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "CURSOR_TIMESTAMP_FROM_MTIME"),
+            "{:?}",
+            result.diagnostics
+        );
+
+        let conn = open_db(&db).unwrap();
+        let session: (Option<i64>, Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT first_activity_ms, last_activity_ms, last_assistant_text \
+                 FROM sessions WHERE source = 'cursor' AND session_id = 'cur-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(session.0, Some(1_789_587_420_000));
+        assert_eq!(session.1, Some(1_789_587_660_000));
+        assert_eq!(session.2.as_deref(), Some("Fixed the failing assertion."));
+
+        // Re-hydrating the same unchanged file neither duplicates evidence nor
+        // duplicates the prompts it rebuilds.
+        let again =
+            hydrate_session_at_with_home(&db, &options("cursor", "cur-1"), dir.path()).unwrap();
+        assert_eq!(again.status, "unchanged");
+        assert_eq!(again.evidence.events, result.evidence.events);
+        let prompts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM history WHERE source = 'cursor'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(prompts, 2);
+    }
+
+    #[test]
+    fn cursor_hydration_reports_the_mtime_fallback_and_unlinked_subagent_spawns() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = cursor_fixture_home(dir.path(), "legacy-string-content.jsonl", "cur-legacy");
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "cursor", "cur-legacy", Some(&legacy));
+        drop(conn);
+        let result =
+            hydrate_session_at_with_home(&db, &options("cursor", "cur-legacy"), dir.path())
+                .unwrap();
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "CURSOR_TIMESTAMP_FROM_MTIME"),
+            "a transcript with no readable turn time must say that it used the mtime: {:?}",
+            result.diagnostics
+        );
+
+        let extended = cursor_fixture_home(dir.path(), "extended-unverified.jsonl", "cur-ext");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "cursor", "cur-ext", Some(&extended));
+        drop(conn);
+        let result =
+            hydrate_session_at_with_home(&db, &options("cursor", "cur-ext"), dir.path()).unwrap();
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "CURSOR_SUBAGENT_SPAWN_UNLINKED"),
+            "a recorded spawn with no child id must be reported, not silently dropped: {:?}",
+            result.diagnostics
+        );
+        // Cursor never names the child, so no relationship row is invented.
+        let conn = open_db(&db).unwrap();
+        let relationships: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_relationships WHERE source = 'cursor'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(relationships, 0);
+        assert_eq!(
+            crate::relationships::relationship_capabilities("cursor").stable_child_identity,
+            "never"
+        );
+
+        // Diagnostics describe the stored evidence, not this run. Re-hydrating
+        // the same file must still report them.
+        let again =
+            hydrate_session_at_with_home(&db, &options("cursor", "cur-ext"), dir.path()).unwrap();
+        assert_eq!(again.status, "unchanged");
+        assert!(
+            again
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "CURSOR_SUBAGENT_SPAWN_UNLINKED"),
+            "unchanged hydration dropped the unlinked-spawn diagnostic: {:?}",
+            again.diagnostics
+        );
+        let again_mtime =
+            hydrate_session_at_with_home(&db, &options("cursor", "cur-legacy"), dir.path())
+                .unwrap();
+        assert_eq!(again_mtime.status, "unchanged");
+        assert!(
+            again_mtime
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "CURSOR_TIMESTAMP_FROM_MTIME"),
+            "unchanged hydration dropped the mtime-fallback diagnostic: {:?}",
+            again_mtime.diagnostics
+        );
+    }
+
+    /// Targeted hydration re-reads from offset 0 and used not to move the
+    /// Cursor byte checkpoint. A later incremental sync then inserted every
+    /// untimed prompt past the old offset again, under the new mtime.
+    ///
+    /// Positive control: without `record_cursor_hydrate_checkpoint` this
+    /// failed with `hydrate then sync duplicated untimed prompts: left: 2,
+    /// right: 1`.
+    #[test]
+    fn hydrating_a_cursor_session_does_not_let_later_sync_duplicate_untimed_prompts() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query>do it</user_query>"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"content":[{"type":"text","text":"done"}]}}"#,
+            "\n"
+        );
+        let transcript = cursor_fixture_home(dir.path(), "legacy-string-content.jsonl", "s-dup");
+        fs::write(&transcript, body).unwrap();
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "cursor", "s-dup", Some(&transcript));
+        let mut state = Map::new();
+        super::test_sync_cursor(&conn, dir.path(), &mut state);
+        let prompts_after_sync: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM history WHERE source = 'cursor' AND session_id = 's-dup'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(prompts_after_sync, 1);
+        drop(conn);
+
+        hydrate_session_at_with_home(&db, &options("cursor", "s-dup"), dir.path()).unwrap();
+
+        // Move the mtime without changing bytes, so an untimed re-insert would
+        // be a new history row rather than folding into the hydrated one.
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&transcript)
+            .unwrap();
+        file.set_times(fs::FileTimes::new().set_modified(later))
+            .unwrap();
+        drop(file);
+
+        let conn = open_db(&db).unwrap();
+        let mut state = super::test_load_sync_state(&db);
+        super::test_sync_cursor(&conn, dir.path(), &mut state);
+        let prompts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM history WHERE source = 'cursor' AND session_id = 's-dup'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(prompts, 1, "hydrate then sync duplicated untimed prompts");
+    }
+
     #[test]
     fn claude_hydration_is_incremental_idempotent_and_ignores_partial_tail() {
         let dir = tempfile::tempdir().unwrap();
@@ -4388,6 +4706,26 @@ mod tests {
         path
     }
 
+    /// Write an OpenCode store with one user prompt. OpenCode is the remaining
+    /// prompt-only local parser: Cursor and Grok both write events now.
+    fn opencode_prompt_only(home: &Path, session_id: &str, prompt: &str) -> PathBuf {
+        let source = home.join(".local/share/opencode/opencode.db");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        let src = Connection::open(&source).unwrap();
+        let escaped = prompt.replace('\'', "''");
+        src.execute_batch(&format!(
+            "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER); \
+             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT); \
+             CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT); \
+             INSERT INTO session VALUES ('{session_id}', '/work/app', 1); \
+             INSERT INTO message VALUES ('m1', '{session_id}', 1, '{{\"role\":\"user\"}}'); \
+             INSERT INTO part VALUES ('p1', 'm1', '{session_id}', 2, '{{\"type\":\"text\",\"text\":\"{escaped}\"}}');"
+        ))
+        .unwrap();
+        drop(src);
+        source
+    }
+
     /// A completed prompt-only hydration is `partial`, and says which evidence
     /// nobody looked for. Reporting `full` here is the defect contract 3 fixes:
     /// the SDK ranks merges on `capability`, so "prompts only" outranked a
@@ -4395,14 +4733,14 @@ mod tests {
     #[test]
     fn prompt_only_providers_report_partial_capability_and_name_what_is_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let transcript = cursor_transcript(dir.path(), "cursor-1", "cursor prompt");
+        let store = opencode_prompt_only(dir.path(), "oc-1", "opencode prompt");
         let db = dir.path().join("history.db");
         let conn = open_db(&db).unwrap();
-        catalog_row(&conn, "cursor", "cursor-1", Some(&transcript));
+        catalog_row(&conn, "opencode", "oc-1", Some(&store));
         drop(conn);
 
         let result =
-            hydrate_session_at_with_home(&db, &options("cursor", "cursor-1"), dir.path()).unwrap();
+            hydrate_session_at_with_home(&db, &options("opencode", "oc-1"), dir.path()).unwrap();
         assert_eq!(result.contract_version, 3);
         assert_eq!(result.status, "hydrated");
         assert_eq!(result.capability, "partial");
@@ -4431,7 +4769,7 @@ mod tests {
         // Unchanged re-hydration reports the same capability: a consumer that
         // polls must not see the claim change under it.
         let unchanged =
-            hydrate_session_at_with_home(&db, &options("cursor", "cursor-1"), dir.path()).unwrap();
+            hydrate_session_at_with_home(&db, &options("opencode", "oc-1"), dir.path()).unwrap();
         assert_eq!(unchanged.status, "unchanged");
         assert_eq!(unchanged.capability, "partial");
         assert_eq!(unchanged.coverage, vec![EvidenceKind::History]);
@@ -4722,13 +5060,13 @@ mod tests {
     #[test]
     fn declining_related_evidence_does_not_change_a_prompt_only_provider() {
         let dir = tempfile::tempdir().unwrap();
-        let transcript = cursor_transcript(dir.path(), "cursor-3", "cursor prompt");
+        let store = opencode_prompt_only(dir.path(), "oc-3", "opencode prompt");
         let db = dir.path().join("history.db");
         let conn = open_db(&db).unwrap();
-        catalog_row(&conn, "cursor", "cursor-3", Some(&transcript));
+        catalog_row(&conn, "opencode", "oc-3", Some(&store));
         drop(conn);
 
-        let mut request = options("cursor", "cursor-3");
+        let mut request = options("opencode", "oc-3");
         request.include_related = false;
         let alone = hydrate_session_at_with_home(&db, &request, dir.path()).unwrap();
         assert_eq!(alone.capability, "partial");
@@ -5005,10 +5343,10 @@ mod tests {
         assert_eq!(widened.capability, "full");
     }
 
-    /// The opt-out explains an absent `relationship` and nothing else. A
-    /// prompt-only source is missing four kinds because its parser never reads
-    /// them, and blaming the request for that sends the reader looking for an
-    /// option to change instead of at the provider.
+    /// The opt-out explains an absent `relationship` and nothing else. Cursor
+    /// is missing that kind because its parser never reads it — a `Task` block
+    /// names no child transcript — and blaming the request for that sends the
+    /// reader looking for an option to change instead of at the provider.
     #[test]
     fn the_partial_diagnostic_blames_the_opt_out_only_for_what_it_removed() {
         let dir = tempfile::tempdir().unwrap();
@@ -5025,7 +5363,7 @@ mod tests {
             .diagnostics
             .iter()
             .find(|diagnostic| diagnostic.code == "HYDRATION_PARTIAL_COVERAGE")
-            .expect("a prompt-only hydration names its missing kinds")
+            .expect("a partial hydration names its missing kinds")
             .message
             .clone();
         assert!(
@@ -5070,22 +5408,36 @@ mod tests {
             );
             assert!(crate::discover::missing_evidence_kinds(source).is_empty());
         }
-        for source in ["cursor", "opencode"] {
-            assert_eq!(
-                crate::discover::declared_evidence_kinds(source),
-                &[EvidenceKind::History],
-                "{source} parses prompts only"
-            );
-            assert_eq!(
-                crate::discover::missing_evidence_kinds(source),
-                vec![
-                    EvidenceKind::SessionEvent,
-                    EvidenceKind::ToolCall,
-                    EvidenceKind::FileEdit,
-                    EvidenceKind::Relationship,
-                ],
-            );
-        }
+        // Cursor parses every kind but delegation: a `Task` block names no
+        // child transcript, so no relationship row is ever written.
+        assert_eq!(
+            crate::discover::declared_evidence_kinds("cursor"),
+            &[
+                EvidenceKind::History,
+                EvidenceKind::SessionEvent,
+                EvidenceKind::ToolCall,
+                EvidenceKind::FileEdit,
+            ],
+            "cursor parses everything except delegation"
+        );
+        assert_eq!(
+            crate::discover::missing_evidence_kinds("cursor"),
+            vec![EvidenceKind::Relationship],
+        );
+        assert_eq!(
+            crate::discover::declared_evidence_kinds("opencode"),
+            &[EvidenceKind::History],
+            "opencode parses prompts only"
+        );
+        assert_eq!(
+            crate::discover::missing_evidence_kinds("opencode"),
+            vec![
+                EvidenceKind::SessionEvent,
+                EvidenceKind::ToolCall,
+                EvidenceKind::FileEdit,
+                EvidenceKind::Relationship,
+            ],
+        );
         // Relay rows come out of already-ingested history and an unknown
         // source has no adapter at all: neither declares anything.
         assert!(crate::discover::declared_evidence_kinds("relay").is_empty());

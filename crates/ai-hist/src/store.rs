@@ -1631,29 +1631,19 @@ pub fn parse_cursor_text(line: &str) -> Result<Option<String>> {
     if obj.get("role").and_then(|v| v.as_str()) != Some("user") {
         return Ok(None);
     }
-    let content = obj.pointer("/message/content");
-    let mut text = String::new();
-    if let Some(s) = content.and_then(|v| v.as_str()) {
-        text = s.to_string();
-    } else if let Some(items) = content.and_then(|v| v.as_array()) {
-        for item in items {
-            if item.get("type").and_then(|v| v.as_str()) == Some("text") {
-                text = item
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                break;
-            }
-        }
-    }
-    let mut trimmed = text.trim().to_string();
-    if trimmed.starts_with("<user_query>") && trimmed.ends_with("</user_query>") {
-        trimmed = trimmed["<user_query>".len()..trimmed.len() - "</user_query>".len()]
-            .trim()
-            .to_string();
-    }
-    Ok((!trimmed.is_empty()).then_some(trimmed))
+    // Cursor's client wraps a human turn in `<user_query>` and, on builds that
+    // record a time, prefixes it with a `<timestamp>` tag. Stripping only a
+    // whole-string envelope leaves the markup in the catalog's prompt excerpt
+    // whenever the timestamp tag is there, so both wrappers are handled in one
+    // place with the full parser -- and a turn Cursor split into several text
+    // blocks is joined the same way `history` joins it, so the catalog and the
+    // indexed prompt cannot disagree.
+    let Some(obj) = obj.as_object() else {
+        return Ok(None);
+    };
+    Ok(crate::ingest::cursor::human_turn_prompt(
+        &crate::ingest::cursor::record_blocks(obj),
+    ))
 }
 
 pub fn build_fts_query(terms: &[String], raw: bool) -> String {
@@ -4745,6 +4735,23 @@ mod tests {
         assert_eq!(
             parse_cursor_text(r#"{"role":"user","message":{"content":"tag the release"}}"#)
                 .unwrap(),
+            Some("tag the release".to_string())
+        );
+        // Builds that record a time put a <timestamp> tag in front of the
+        // envelope. The prompt is still the query, not the markup.
+        assert_eq!(
+            parse_cursor_text(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp>\n<user_query>\ntag the release\n</user_query>"}]}}"#
+            )
+            .unwrap(),
+            Some("tag the release".to_string())
+        );
+        // A turn with the tag but no envelope keeps its text and loses the tag.
+        assert_eq!(
+            parse_cursor_text(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp>\ntag the release"}]}}"#
+            )
+            .unwrap(),
             Some("tag the release".to_string())
         );
     }

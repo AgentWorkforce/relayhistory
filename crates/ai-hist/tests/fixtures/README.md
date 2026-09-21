@@ -152,6 +152,9 @@ source without deciding which one fails the test.
 | Fixture | Origin | Corpus files | Quirk it encodes |
 | --- | --- | --- | --- |
 | `cursor/prompt-transcript` | relayhistory | `cursor/prompt-transcript` | `agent-transcripts/<id>/<id>.jsonl` with string, block-array and `<user_query>`-wrapped prompts, assistant text, a tool_use and a tool_result; the provider records no timestamps |
+| `cursor/observed-3-13-25` | relayhistory | `cursor/observed-3.13.25.jsonl` | the reported Cursor IDE 3.13.25 record shape: id-less `tool_use`, a `turn_ended` marker and `<timestamp>`/`<user_query>` framing; staged by the ai-hist cursor parser tests rather than by this harness |
+| `cursor/legacy-string-content` | relayhistory | `cursor/legacy-string-content.jsonl` | the older row shape, `message.content` as a bare string with no framing; staged by the ai-hist cursor parser tests rather than by this harness |
+| `cursor/extended-unverified` | relayhistory | `cursor/extended-unverified.jsonl` | an **unverified** build that also writes `message.model`, `message.usage`, `thinking` blocks, `tool_use` ids and `tool_result` blocks; it proves the parser records them when present, not that Cursor writes them |
 
 ### `grok`
 
