@@ -52,6 +52,15 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 3;
 /// each needing their own one-time re-parse cannot share a version, or
 /// whichever lands second is skipped by every database that already ran the
 /// first.
+///
+/// Which is a standing hazard, not a one-off. Two branches that each need a
+/// re-parse will both pick `main + 1` while they are open, and the collision
+/// is an identical-line change that merges cleanly and passes every gate --
+/// there is nothing here for a test to catch, because each value is correct in
+/// isolation. So: whenever this branch merges main, re-check this number
+/// against main's and take main's plus one if main has moved. At the time of
+/// writing #194 (usage normalization) also sits at 8, and whichever of the two
+/// merges second owes the other a bump.
 const HYDRATION_PARSER_VERSION: i64 = 8;
 
 #[derive(Debug, Clone)]

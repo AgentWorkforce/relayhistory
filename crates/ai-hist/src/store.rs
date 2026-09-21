@@ -1387,6 +1387,22 @@ fn init_delivery_schema(_conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Tell subscribed destinations about rows the marker migration rewrote.
+///
+/// Feature-gated the same way the capture triggers are: a build without
+/// delivery has no journal to write to, and a database it migrates is
+/// journalled by the next delivery-enabled open, which finds the triggers
+/// absent and rebuilds them.
+#[cfg(feature = "delivery")]
+fn journal_migrated_markers(conn: &Connection, ids: &[i64]) -> Result<()> {
+    crate::delivery::journal_migrated_rows(conn, "session_markers", ids)
+}
+
+#[cfg(not(feature = "delivery"))]
+fn journal_migrated_markers(_conn: &Connection, _ids: &[i64]) -> Result<()> {
+    Ok(())
+}
+
 /// Whether a named migration has already run, on a database that may predate
 /// the `schema_migrations` table itself.
 fn migration_applied(conn: &Connection, name: &str) -> Result<bool> {
@@ -1603,6 +1619,27 @@ fn migrate_session_markers_v2(conn: &Connection) -> Result<()> {
         .prepare("SELECT 1 FROM pragma_table_info('session_markers') WHERE name = 'detail_json'")?
         .exists([])?;
     if has_detail_json {
+        // Retire the capture triggers *before* touching a row, not merely
+        // before the column drop.
+        //
+        // They are built from the column list they were created with, so on a
+        // v1 database they know nothing of `payload_json`: the copy below
+        // would run under triggers whose `WHEN old_payload <> new_payload`
+        // guard compares two `json_object`s that both omit the column being
+        // written, so it is false and nothing is journalled at all. A
+        // destination with an active job would never be told that any marker
+        // predating the upgrade had gained a payload, and no part of the
+        // delivery would look wrong. Dropping them first makes that explicit
+        // rather than incidental, and it is required anyway for the column
+        // drop, which SQLite refuses while a dependent trigger names it.
+        //
+        // `IF EXISTS` because a database opened by a build without the
+        // delivery feature has none of them.
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS delivery_session_markers_insert; \
+             DROP TRIGGER IF EXISTS delivery_session_markers_update; \
+             DROP TRIGGER IF EXISTS delivery_session_markers_delete;",
+        )?;
         // Bounded on the way across, not copied verbatim. `payload_json` is
         // documented as a projection whose strings and containers are bounded,
         // and every kind the parsers write goes through that bounder -- so a
@@ -1617,6 +1654,7 @@ fn migrate_session_markers_v2(conn: &Connection) -> Result<()> {
             )?
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
+        let mut migrated = Vec::new();
         for (id, detail_json) in legacy {
             // A legacy value that does not parse is dropped rather than stored
             // raw: unparsed text is exactly what the bound exists to keep out.
@@ -1627,26 +1665,15 @@ fn migrate_session_markers_v2(conn: &Connection) -> Result<()> {
                 "UPDATE session_markers SET payload_json = ? WHERE id = ?",
                 params![bounded, id],
             )?;
+            migrated.push(id);
         }
-        // The delivery capture triggers build their payload with a
-        // `json_object` over the column list as it stood when they were
-        // created, so on a v1 database all three name `detail_json`. SQLite
-        // validates dependent triggers when a column is dropped, so the drop
-        // below fails against them -- and it fails inside `open_db`, which
-        // makes every open of that database error rather than just the first.
-        //
-        // Retiring them here rather than working around the drop: they are
-        // rebuilt from `pragma_table_info` by `init_delivery_schema` later in
-        // this same open, so the window where capture is off does not outlive
-        // the migration, and the rebuilt triggers name the column list that
-        // now exists. `IF EXISTS` because a database opened by a build without
-        // the delivery feature has none of them.
-        conn.execute_batch(
-            "DROP TRIGGER IF EXISTS delivery_session_markers_insert; \
-             DROP TRIGGER IF EXISTS delivery_session_markers_update; \
-             DROP TRIGGER IF EXISTS delivery_session_markers_delete;",
-        )?;
         conn.execute("ALTER TABLE session_markers DROP COLUMN detail_json", [])?;
+        // Now that the table has its final shape, tell any subscribed
+        // destination what these rows became. The rebuilt triggers cannot: they
+        // only see future writes, and a no-op touch would not wake them either,
+        // since their guard is false for a row whose values did not change.
+        // Journalled once, in one shape, built from the table as it now is.
+        journal_migrated_markers(conn, &migrated)?;
     }
     conn.execute(
         "INSERT OR IGNORE INTO schema_migrations (name) VALUES ('session_markers_v2')",
@@ -6140,6 +6167,94 @@ mod tests {
         assert_eq!(payload, serde_json::json!({ "checkpoint": 1 }));
         // The prose column is untouched by any of this.
         assert_eq!(big.text.as_deref(), Some("prose"));
+    }
+
+    /// What a delivery destination receives for a migrated marker.
+    ///
+    /// The v1 capture triggers build their payload from the column list they
+    /// were created with, so while they are live they journal `detail_json`
+    /// and no `payload_json`. The migration's copy is an ordinary `UPDATE`, so
+    /// it fired them — a subscriber got an update in the *old* shape, and once
+    /// the triggers were rebuilt nothing ever journalled the migrated rows
+    /// again. A destination with an active job would never receive
+    /// `payload_json` for any marker that existed before the upgrade, and
+    /// nothing about the delivery would look wrong.
+    ///
+    /// So: retire the triggers before the copy rather than only before the
+    /// column drop, and journal the migrated rows explicitly afterwards, in the
+    /// new shape, exactly once.
+    #[cfg(feature = "delivery")]
+    #[test]
+    fn migrated_markers_are_delivered_in_the_new_shape_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("v1-journal.db");
+        {
+            let conn = open_db(&db_path).unwrap();
+            conn.execute_batch(
+                "DROP TRIGGER IF EXISTS delivery_session_markers_insert;
+                 DROP TRIGGER IF EXISTS delivery_session_markers_update;
+                 DROP TRIGGER IF EXISTS delivery_session_markers_delete;
+                 DROP TABLE session_markers;
+                 CREATE TABLE session_markers (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     source TEXT NOT NULL,
+                     session_id TEXT NOT NULL,
+                     marker_uid TEXT NOT NULL,
+                     kind TEXT NOT NULL,
+                     ts_ms INTEGER,
+                     text TEXT,
+                     detail_json TEXT,
+                     UNIQUE(source, session_id, marker_uid)
+                 );
+                 INSERT INTO session_markers
+                     (source, session_id, marker_uid, kind, ts_ms, text, detail_json)
+                 VALUES ('grok', 'v1-j', 'c1', 'compaction_boundary', 11, 'compacted',
+                         '{\"checkpoint\":1}');
+                 DELETE FROM schema_migrations WHERE name = 'session_markers_v2';",
+            )
+            .unwrap();
+            init_delivery_schema(&conn).unwrap();
+            // A destination is subscribed, or nothing is journalled at all and
+            // the test would pass over an empty table.
+            conn.execute(
+                "INSERT INTO delivery_jobs \
+                 (id, destination_id, instance_id, account_id, generation, config_json, \
+                  state, created_ms, cutoff, journal_cursor) \
+                 VALUES ('j1','d1','i1','a1',1,'{}','active',1,0,0)",
+                [],
+            )
+            .unwrap();
+            conn.execute("DELETE FROM delivery_journal", []).unwrap();
+        }
+
+        let conn = open_db(&db_path).unwrap();
+        let rows: Vec<(String, String)> = conn
+            .prepare(
+                "SELECT operation, payload FROM delivery_journal \
+                 WHERE kind = 'session_marker' ORDER BY seq",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactly one journal row per migrated marker, in one shape: {rows:?}"
+        );
+        let (operation, payload) = &rows[0];
+        assert_eq!(operation, "upsert");
+        let payload: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(
+            payload.get("payload_json").and_then(|v| v.as_str()),
+            Some("{\"checkpoint\":1}"),
+            "the destination must receive the migrated payload: {payload}"
+        );
+        assert!(
+            payload.get("detail_json").is_none(),
+            "and never the retired column: {payload}"
+        );
     }
 
     /// The project-identity columns, marker and index reach a database that

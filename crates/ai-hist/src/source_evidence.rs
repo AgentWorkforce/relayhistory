@@ -323,6 +323,33 @@ pub fn validate_records(
                 }
             }
         }
+        if record.kind == EvidenceKind::SessionMarker {
+            if let Some(payload_json) = record
+                .payload
+                .get("payload_json")
+                .and_then(Value::as_str)
+            {
+                // `payload_json` is a bounded projection -- every string at 128
+                // characters, every container at 32 entries, recursively. The
+                // parsers apply that bound; putting the column on this contract
+                // handed a connector a way around it, in the one place the
+                // bound exists to defend.
+                //
+                // Refused rather than silently bounded, because that is how
+                // this boundary treats every other out-of-contract value. It
+                // derives `prompt_hash` and fills absent columns with null, but
+                // it never rewrites a value a connector supplied: doing so here
+                // would store something the submitter did not send and cannot
+                // reconcile its own copy against.
+                let parsed: Value = serde_json::from_str(payload_json).map_err(|err| {
+                    anyhow::anyhow!("INVALID_ARGUMENT: payload_json must be JSON: {err}")
+                })?;
+                ensure!(
+                    crate::ingest::marker_payload_is_bounded(&parsed),
+                    "INVALID_ARGUMENT: payload_json exceeds the marker payload bound"
+                );
+            }
+        }
         if record.kind == EvidenceKind::Relationship {
             let status = record.payload["identity_status"]
                 .as_str()

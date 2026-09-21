@@ -369,6 +369,47 @@ END;
     Ok(())
 }
 
+/// Journal rows a migration rewrote behind the capture triggers' back.
+///
+/// A column migration has to retire the triggers first -- SQLite validates
+/// them when a column is dropped -- so the writes it makes are invisible to
+/// capture. They are also invisible to the rebuilt triggers afterwards, which
+/// only see future writes, and a no-op touch cannot wake them either: their
+/// `WHEN old_payload <> new_payload` guard is false for a row whose values did
+/// not change. So the rows are journalled here, explicitly, once.
+///
+/// The payload is built by the same [`Table::payload`] the triggers use, from
+/// `pragma_table_info` at call time, so it is the post-migration shape by
+/// construction and cannot drift from what capture emits for the same row.
+pub(crate) fn journal_migrated_rows(
+    conn: &Connection,
+    table_name: &str,
+    ids: &[i64],
+) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let Some(table) = TABLES.iter().find(|table| table.name == table_name) else {
+        return Ok(());
+    };
+    let payload = table.payload(conn, "m")?;
+    let key = table.key("m");
+    let source = table.source("m");
+    let kind = table.kind;
+    let session = table.session;
+    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    conn.execute(
+        &format!(
+            "INSERT INTO delivery_journal(kind,source,session_id,record_key,operation,payload) \
+             SELECT '{kind}',{source},m.{session},{key},'upsert',{payload} \
+             FROM {table_name} m WHERE m.id IN ({placeholders}) \
+             AND EXISTS(SELECT 1 FROM delivery_jobs WHERE state <> 'cancelled')",
+        ),
+        rusqlite::params_from_iter(ids.iter()),
+    )?;
+    Ok(())
+}
+
 /// Whether a retained capture trigger still emits the column list its table
 /// has now.
 ///

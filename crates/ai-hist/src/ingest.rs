@@ -2121,7 +2121,7 @@ fn sync_codex_rollouts(
                     // usable session_meta; there is nothing to re-ingest.
                     None => continue,
                     Some(id)
-                        if codex_session_events_exist(conn, id)?
+                        if codex_session_evidence_exists(conn, id)?
                             && !(backfill_fidelity
                                 && tool_results_lack_fidelity(conn, "codex", id)?)
                             && !(backfill_raw_facts
@@ -2397,6 +2397,28 @@ fn grok_catalog_row_exists(conn: &Connection, session_id: &str) -> Result<bool> 
 fn session_events_exist(conn: &Connection, source: &str, session_id: &str) -> Result<bool> {
     let exists: i64 = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM session_events WHERE source = ? AND session_id = ? LIMIT 1)",
+        params![source, session_id],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
+}
+
+/// Whether a session has any evidence this parser wrote, of any kind.
+///
+/// Not just `session_events`: a lifecycle-only rollout -- one that started,
+/// streamed an error and never produced a message -- writes markers and no
+/// events. Asking only about events answers "nothing indexed" forever for
+/// those, so the stamp fast path re-reads and re-upserts the file on every
+/// sync and the cost never converges. Nothing is lost by that, which is why it
+/// survived review once; it is pure waste that grows with the archive.
+fn codex_session_evidence_exists(conn: &Connection, session_id: &str) -> Result<bool> {
+    Ok(session_events_exist(conn, "codex", session_id)?
+        || session_markers_exist(conn, "codex", session_id)?)
+}
+
+fn session_markers_exist(conn: &Connection, source: &str, session_id: &str) -> Result<bool> {
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM session_markers WHERE source = ? AND session_id = ? LIMIT 1)",
         params![source, session_id],
         |row| row.get(0),
     )?;
@@ -5140,13 +5162,13 @@ fn insert_unknown_record_marker(
 /// its contents. Bounding every field here is what makes the "never store
 /// image or document bytes" rule structural rather than a promise: a payload
 /// cannot grow with the record it describes.
-const MARKER_PAYLOAD_FIELD_LIMIT: usize = 128;
+pub(crate) const MARKER_PAYLOAD_FIELD_LIMIT: usize = 128;
 
 /// Most elements any array or object inside a marker payload keeps.
 ///
 /// The element count is provider-chosen too, so bounding element *length*
 /// alone still lets a payload grow without limit.
-const MARKER_PAYLOAD_ARRAY_LIMIT: usize = 32;
+pub(crate) const MARKER_PAYLOAD_ARRAY_LIMIT: usize = 32;
 
 /// One marker a parser decided to record, before it is keyed and written.
 ///
@@ -10353,6 +10375,74 @@ mod tests {
             )
             .unwrap();
         assert!(text.is_some_and(|text| !text.is_empty()));
+    }
+
+    /// A rollout that yields only markers is still indexed evidence.
+    ///
+    /// The stamp fast path asks "does this session have events?", which was the
+    /// whole question before markers existed. A lifecycle-only rollout -- a run
+    /// that started, streamed an error and never produced a message -- writes
+    /// markers and no events, so that question answers no forever: every sync
+    /// re-reads and re-upserts the file, and the cost never converges. Nothing
+    /// is lost, which is why it took a review to spot; it is pure waste that
+    /// grows with the archive.
+    #[test]
+    fn a_marker_only_rollout_stays_on_the_stamp_fast_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let day = home.join(".codex/sessions/2026/09/12");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-markers-only.jsonl");
+        fs::write(
+            &rollout,
+            concat!(
+                r#"{"timestamp":"2026-09-12T00:00:00.000Z","type":"session_meta","payload":{"id":"sess-markers-only","cwd":"/tmp/proj","cli_version":"0.148.0"}}"#, "\n",
+                r#"{"timestamp":"2026-09-12T00:00:00.100Z","type":"event_msg","payload":{"type":"task_started"}}"#, "\n",
+                r#"{"timestamp":"2026-09-12T00:00:01.000Z","type":"event_msg","payload":{"type":"stream_error","message":"upstream reset"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let codex = home.join(".codex");
+        let mut state = Map::new();
+        super::sync_codex_rollouts(&conn, &mut state, &codex).unwrap();
+
+        // The premise: markers and no events at all.
+        let kinds = marker_kinds(&conn, "codex", "sess-markers-only");
+        assert!(
+            kinds.iter().any(|kind| kind == "task_started"),
+            "the fixture must produce markers: {kinds:?}"
+        );
+        assert!(
+            !super::session_events_exist(&conn, "codex", "sess-markers-only").unwrap(),
+            "the fixture must produce no events, or it proves nothing"
+        );
+
+        // A sentinel a re-ingest would overwrite, since the marker upsert
+        // rewrites every column it sets.
+        conn.execute(
+            "UPDATE session_markers SET subkind = 'sentinel' \
+             WHERE source = 'codex' AND session_id = 'sess-markers-only'",
+            [],
+        )
+        .unwrap();
+
+        super::sync_codex_rollouts(&conn, &mut state, &codex).unwrap();
+        let survivors: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM session_markers \
+                 WHERE source = 'codex' AND session_id = 'sess-markers-only' \
+                 AND subkind = 'sentinel'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            survivors > 0,
+            "an unchanged marker-only rollout must not be re-read on every sync"
+        );
     }
 
     /// Every sidecar read obeys the same three-way rule: absent is nothing,
@@ -21424,5 +21514,28 @@ mod capture_progress_tests {
         let mut files = vec![];
         collect_trajectory_json(&wanted, &mut files).unwrap();
         assert_eq!(files, vec![wanted.join("completed/month/run.json")]);
+    }
+}
+
+/// Whether a parsed marker payload already satisfies the bound.
+///
+/// Structural rather than a string comparison against
+/// [`bound_marker_json`]: re-serialising can reorder keys or change spacing
+/// without exceeding anything, and a checker that failed on that would reject
+/// payloads that are perfectly within contract.
+pub(crate) fn marker_payload_is_bounded(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text.chars().count() <= MARKER_PAYLOAD_FIELD_LIMIT,
+        Value::Array(items) => {
+            items.len() <= MARKER_PAYLOAD_ARRAY_LIMIT && items.iter().all(marker_payload_is_bounded)
+        }
+        Value::Object(fields) => {
+            fields.len() <= MARKER_PAYLOAD_ARRAY_LIMIT
+                && fields.iter().all(|(name, field)| {
+                    name.chars().count() <= MARKER_PAYLOAD_FIELD_LIMIT
+                        && marker_payload_is_bounded(field)
+                })
+        }
+        _ => true,
     }
 }

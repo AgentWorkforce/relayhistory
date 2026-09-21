@@ -1444,3 +1444,107 @@ fn enrichment_does_not_revoke_the_adapter_s_ownership_of_its_event() -> Result<(
     );
     Ok(())
 }
+
+/// A connector cannot submit a marker payload the local parser could not write.
+///
+/// `payload_json` is a bounded projection: every string at 128 characters,
+/// every container at 32 entries, recursively. That bound is applied by the
+/// parsers, and `EvidenceKind::SessionMarker` put the same column on the public
+/// normalized-evidence contract — where the generic validator accepts any
+/// string and stores it verbatim. So a contributed marker could hold what a
+/// parsed one cannot, in the one place the bound exists to defend.
+///
+/// Rejected rather than silently bounded, which is how this boundary treats
+/// every other out-of-contract value: an unknown `result_status`, a negative
+/// `payload_bytes`, a tool-result field on a row that is not one. The boundary
+/// derives (`prompt_hash`) and fills absent columns with null, but it never
+/// rewrites a value a connector supplied — doing so here would store something
+/// the connector did not send and cannot reconcile against.
+#[test]
+fn a_contributed_marker_payload_obeys_the_same_bound() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("history.db");
+    observe(&path, "a")?;
+
+    let marker = |payload: serde_json::Value| -> EvidenceRecord {
+        EvidenceRecord {
+            kind: EvidenceKind::SessionMarker,
+            payload: json!({
+                "source": "claude",
+                "session_id": "s",
+                "marker_uid": "m1",
+                "kind": "unknown",
+                "payload_json": payload.to_string(),
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            record_id: Some("upstream:m1".into()),
+            revision_id: Some("upstream:1".into()),
+        }
+    };
+
+    let huge = "x".repeat(5_000);
+    let rejected = apply(
+        &path,
+        "a",
+        state(&path, "a")?.revision.unwrap(),
+        vec![EvidenceKind::SessionMarker],
+        vec![marker(json!({ "nested": { "deeper": huge } }))],
+    );
+    let message = format!(
+        "{:#}",
+        rejected.expect_err("an oversized payload is refused")
+    );
+    assert!(
+        message.contains("INVALID_ARGUMENT"),
+        "refused as a contract violation, like every other one: {message}"
+    );
+
+    // Malformed JSON is refused too: the column's contract is that it is
+    // bounded, and text nothing can parse cannot be shown to be.
+    let broken = EvidenceRecord {
+        kind: EvidenceKind::SessionMarker,
+        payload: json!({
+            "source": "claude",
+            "session_id": "s",
+            "marker_uid": "m2",
+            "kind": "unknown",
+            "payload_json": "{not json",
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+        record_id: Some("upstream:m2".into()),
+        revision_id: Some("upstream:1".into()),
+    };
+    assert!(apply(
+        &path,
+        "a",
+        state(&path, "a")?.revision.unwrap(),
+        vec![EvidenceKind::SessionMarker],
+        vec![broken],
+    )
+    .is_err());
+
+    // Positive control: a payload within the bound round-trips untouched, so
+    // this rejects what breaks the contract rather than markers in general.
+    apply(
+        &path,
+        "a",
+        state(&path, "a")?.revision.unwrap(),
+        vec![EvidenceKind::SessionMarker],
+        vec![marker(json!({ "tokens_before_compact": 9000 }))],
+    )?;
+    let conn = ai_hist::open_db(&path)?;
+    let stored: String = conn.query_row(
+        "SELECT payload_json FROM session_markers WHERE source='claude' AND session_id='s'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&stored)?,
+        json!({ "tokens_before_compact": 9000 })
+    );
+    Ok(())
+}
