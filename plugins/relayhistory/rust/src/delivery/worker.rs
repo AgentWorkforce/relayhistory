@@ -9,8 +9,8 @@
 //! happens here; receivers never see this module's database connections.
 //!
 //! A drain is bounded: it attempts at most `max_batches` batches, starts no
-//! attempt once `max_elapsed` has passed, never waits for a retry deadline and
-//! never enables, pauses or resumes a job. Delivery stays at least once, so
+//! further attempt once `max_elapsed` has passed, never waits for a retry
+//! deadline and never enables, pauses or resumes a job. Delivery stays at least once, so
 //! receivers must remain idempotent per revision.
 //!
 //! The core cannot forcibly interrupt a receiver: Rust has no way to cancel a
@@ -137,9 +137,12 @@ pub struct DrainOptions {
     pub worker_id: String,
     pub max_batches: usize,
     pub max_prepare_steps: usize,
-    /// Wall-clock budget for the whole drain. No new attempt or prepare step
-    /// starts after it passes; an attempt already under way runs to its
-    /// receiver's own timeout. `None` bounds the drain by counts alone.
+    /// Wall-clock budget for the drain's delivery work, measured from the end
+    /// of its own maintenance. Once it passes no further attempt or prepare
+    /// step starts, and an attempt already under way runs to its receiver's own
+    /// timeout. The budget bounds how long a drain keeps going, not whether it
+    /// goes at all: the first attempt always starts, so however short the
+    /// budget the queue still moves. `None` bounds the drain by counts alone.
     pub max_elapsed: Option<Duration>,
     pub lease_ms: i64,
     pub request_timeout_ms: i64,
@@ -299,20 +302,9 @@ pub fn drain(
     keepalive.busy_timeout(Duration::from_millis(keepalive_busy_timeout_ms(
         options.lease_ms,
     )))?;
-    let mut worker = Worker {
-        conn: super::open_db(db_path)?,
-        keepalive: Mutex::new(keepalive),
-        receivers,
-        options,
-        clock,
-        cancelled,
-        started: Instant::now(),
-        attempts: 0,
-        prepare_steps: 0,
-        issues: Vec::new(),
-    };
-    compact(&worker.conn, clock())?;
-    let listed = list_jobs(&worker.conn)?;
+    let conn = super::open_db(db_path)?;
+    compact(&conn, clock())?;
+    let listed = list_jobs(&conn)?;
     let selection = options.job_ids.as_deref();
     if let Some(ids) = selection {
         if ids
@@ -327,6 +319,21 @@ pub fn drain(
         .filter(|job| chosen(selection, &job.job_id))
         .map(|job| job.job_id)
         .collect();
+    // The budget covers delivery, so the clock starts once the drain's own
+    // maintenance is done: on a loaded host, setup alone can outlast a short
+    // budget and leave the drain no time to deliver anything.
+    let mut worker = Worker {
+        conn,
+        keepalive: Mutex::new(keepalive),
+        receivers,
+        options,
+        clock,
+        cancelled,
+        started: Instant::now(),
+        attempts: 0,
+        prepare_steps: 0,
+        issues: Vec::new(),
+    };
     // Round-robin jobs: one failed destination never consumes another's cursor.
     let mut progressed = true;
     while progressed && worker.budget() && !cancelled() {
@@ -397,10 +404,17 @@ struct Worker<'a> {
 }
 
 impl Worker<'_> {
+    /// Whether the drain may start more work. The count ceilings are absolute;
+    /// the elapsed budget bounds *further* attempts, so however little of it is
+    /// left a drain always makes one attempt and the queue always moves.
     fn budget(&self) -> bool {
         self.attempts < self.options.max_batches
             && self.prepare_steps < self.options.max_prepare_steps
-            && self
+            && self.may_attempt()
+    }
+    fn may_attempt(&self) -> bool {
+        self.attempts == 0
+            || self
                 .options
                 .max_elapsed
                 .is_none_or(|limit| self.started.elapsed() < limit)
@@ -439,6 +453,13 @@ impl Worker<'_> {
                     Step::Idle
                 },
             );
+        }
+        // Preparing a batch can wait on the busy handler for longer than the
+        // budget that remains. The batch stays pending for the next drain
+        // rather than starting a network attempt past the deadline the host's
+        // stop request and heartbeat depend on.
+        if !self.may_attempt() {
+            return Ok(Step::Progressed);
         }
         let Some(claim) = claim_batch(
             &self.conn,
