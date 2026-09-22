@@ -209,6 +209,86 @@ pub fn retained_bytes(conn: &Connection) -> Result<(i64, i64)> {
 /// examines.
 pub const MAX_COMPACTION_PAGE: usize = 10_000;
 
+/// The share of the retention cap above which capture applies backpressure:
+/// it reclaims consumed changes first and stops the pass if that is not enough.
+pub const RETENTION_HIGH_WATER_PERCENT: i64 = 90;
+
+/// Capture stopped because the delivery retention budget is exhausted.
+///
+/// Carried in the error chain of every capture failure caused by the cap,
+/// whether the pass stopped at the high-water check or a trigger aborted a
+/// session transaction, so a host can report the usage without reading the
+/// database again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionLimitReached {
+    pub used_bytes: i64,
+    pub limit_bytes: i64,
+}
+impl std::fmt::Display for RetentionLimitReached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "delivery retention limit exceeded; {} of {} bytes retained; compact consumed data or raise the retention cap",
+            self.used_bytes, self.limit_bytes
+        )
+    }
+}
+impl std::error::Error for RetentionLimitReached {}
+
+/// Whether `used_bytes` is over the high-water mark of `limit_bytes`: the
+/// usage at which capture stops rather than attempting another session.
+pub fn above_high_water(used_bytes: i64, limit_bytes: i64) -> bool {
+    i128::from(used_bytes) * 100
+        > i128::from(limit_bytes) * i128::from(RETENTION_HIGH_WATER_PERCENT)
+}
+
+/// Backpressure before a source pass or a session transaction. Above the
+/// high-water mark this reclaims consumed changes down to the low-water mark
+/// with [`compact_to_low_water`]; if the budget is still above the high-water
+/// mark the caller stops its pass with a [`RetentionLimitReached`] error
+/// instead of attempting the remaining sessions. Requires autocommit mode:
+/// compaction takes its own transactions.
+pub fn ensure_capture_headroom(conn: &Connection) -> Result<()> {
+    let (used_bytes, limit_bytes) = retained_bytes(conn)?;
+    if !above_high_water(used_bytes, limit_bytes) {
+        return Ok(());
+    }
+    compact_to_low_water(conn, MAX_COMPACTION_PAGE)?;
+    let (used_bytes, limit_bytes) = retained_bytes(conn)?;
+    if above_high_water(used_bytes, limit_bytes) {
+        return Err(RetentionLimitReached {
+            used_bytes,
+            limit_bytes,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// The retention usage a capture failure carries, if the cap caused it. The
+/// usage is attached as context, which `anyhow` resolves through the
+/// top-level downcast rather than the source chain.
+pub fn retention_limit_usage(error: &anyhow::Error) -> Option<RetentionLimitReached> {
+    error.downcast_ref::<RetentionLimitReached>().copied()
+}
+
+/// Attach the current retention usage to a trigger-aborted capture failure so
+/// it reports like a high-water stop. Any other error is returned unchanged.
+/// Read after the failed transaction rolled back; a usage read that fails
+/// leaves the error as it was.
+pub fn annotate_retention_limit(conn: &Connection, error: anyhow::Error) -> anyhow::Error {
+    if !is_retention_limit(&error) || retention_limit_usage(&error).is_some() {
+        return error;
+    }
+    match retained_bytes(conn) {
+        Ok((used_bytes, limit_bytes)) => error.context(RetentionLimitReached {
+            used_bytes,
+            limit_bytes,
+        }),
+        Err(_) => error,
+    }
+}
+
 fn validate_compaction_page(limit: usize) -> Result<()> {
     ensure!(
         (1..=MAX_COMPACTION_PAGE).contains(&limit),
@@ -526,6 +606,11 @@ fn record_excluded(
     Ok(false)
 }
 
+/// Whether a failure was caused by the retention cap: a high-water stop or a
+/// capture trigger abort inside a session transaction.
 pub fn is_retention_limit(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause|matches!(cause.downcast_ref::<rusqlite::Error>(),Some(rusqlite::Error::SqliteFailure(_,Some(message))) if message.starts_with("delivery retention limit exceeded;")))
+    retention_limit_usage(error).is_some()
+        || error.chain().any(|cause| {
+            matches!(cause.downcast_ref::<rusqlite::Error>(),Some(rusqlite::Error::SqliteFailure(_,Some(message))) if message.starts_with("delivery retention limit exceeded;"))
+        })
 }

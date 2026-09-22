@@ -367,5 +367,7 @@ See the [ownership ADR](decisions/2026-09-21-probe-owns-uploads.md) and
 
 Storage and uploads still share a retention budget in an enabled database.
 An unread durable subscription can therefore hold evidence and exhaust capacity;
-capture fails visibly and rolls back instead of losing records. Moving code
-ownership does not provide resource isolation.
+capture checks the budget before each source pass and each session's write,
+compacts consumed changes above 90% of the cap, and stops the pass with a typed
+`retention_limit` failure instead of losing records or attempting every
+remaining session. Moving code ownership does not provide resource isolation.

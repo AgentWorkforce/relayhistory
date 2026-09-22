@@ -4299,6 +4299,7 @@ pub fn sync_opencode_storage_dir(conn: &Connection, storage_dir: &Path) -> Resul
         .collect();
     for session_file in listing.sessions {
         crate::ingest::check_capture_cancelled()?;
+        crate::ingest::ensure_capture_headroom(conn)?;
         let indexed =
             crate::ingest::opencode::load_from_json_tree(&session_file).and_then(|loaded| {
                 match loaded {
@@ -4313,7 +4314,9 @@ pub fn sync_opencode_storage_dir(conn: &Connection, storage_dir: &Path) -> Resul
             });
         match indexed {
             Ok(prompts) => inserted += prompts,
-            Err(error) => failures.push(format!("{}: {error:#}", session_file.display())),
+            Err(error) => {
+                opencode_session_failed(conn, &mut failures, &session_file.display(), error)?
+            }
         }
     }
     if !failures.is_empty() {
@@ -4325,6 +4328,22 @@ pub fn sync_opencode_storage_dir(conn: &Connection, storage_dir: &Path) -> Resul
         );
     }
     Ok(inserted)
+}
+
+/// One OpenCode session's failure is that session's failure, except at the
+/// retention cap: the session has rolled back, every later session would meet
+/// the same budget, and the typed cause ends the pass.
+fn opencode_session_failed(
+    conn: &Connection,
+    failures: &mut Vec<String>,
+    session: &dyn std::fmt::Display,
+    error: anyhow::Error,
+) -> Result<()> {
+    if crate::ingest::is_delivery_retention_limit(&error) {
+        return Err(crate::ingest::annotate_retention_limit(conn, error));
+    }
+    failures.push(format!("{session}: {error:#}"));
+    Ok(())
 }
 
 fn sync_opencode_sessions_from_source(
@@ -4349,6 +4368,7 @@ fn sync_opencode_sessions_from_source(
         crate::ingest::opencode::OpencodeSyncPlan::PerSession => {
             for session_id in crate::ingest::opencode::list_sqlite_session_ids(src)? {
                 crate::ingest::check_capture_cancelled()?;
+                crate::ingest::ensure_capture_headroom(conn)?;
                 let indexed = crate::ingest::opencode::load_from_sqlite(src, &session_id).and_then(
                     |loaded| match loaded {
                         Some(loaded) => {
@@ -4360,7 +4380,7 @@ fn sync_opencode_sessions_from_source(
                 );
                 match indexed {
                     Ok(prompts) => inserted += prompts,
-                    Err(error) => failures.push(format!("{session_id}: {error:#}")),
+                    Err(error) => opencode_session_failed(conn, &mut failures, &session_id, error)?,
                 }
             }
         }
@@ -4374,9 +4394,12 @@ fn sync_opencode_sessions_from_source(
             );
             for loaded in load.sessions {
                 crate::ingest::check_capture_cancelled()?;
+                crate::ingest::ensure_capture_headroom(conn)?;
                 match crate::ingest::opencode::normalize(conn, &loaded, &raw_path) {
                     Ok(counts) => inserted += counts.prompts,
-                    Err(error) => failures.push(format!("{}: {error:#}", loaded.session.id)),
+                    Err(error) => {
+                        opencode_session_failed(conn, &mut failures, &loaded.session.id, error)?
+                    }
                 }
             }
         }

@@ -9,9 +9,13 @@
 //! are necessary to prevent duplicate effects after uncertain outcomes.
 //!
 //! The retention cap bounds logical retained bytes, not physical database pages.
-//! Capture fails the affected SQLite statement visibly when full. Callers that
-//! transact ingestion and provider checkpoints must roll back that transaction
-//! on error. Batch materialization always has room: batch rows are checked
+//! Capture applies backpressure against it: before each source pass and each
+//! session transaction it reclaims consumed rows above 90% of the cap and, if
+//! still above, stops the pass with a typed `RetentionLimitReached` carrying
+//! the usage. A write that still reaches the cap fails its SQLite statement
+//! visibly and ends the pass the same way. Callers that transact ingestion and
+//! provider checkpoints must roll back that transaction on error. Batch
+//! materialization always has room: batch rows are checked
 //! against the cap plus a reserve bounded by design, the sum over
 //! non-cancelled jobs of one batch's configured payload and prepared bytes
 //! plus the settled receipts compaction has not released, so retained bytes
@@ -26,7 +30,7 @@
 //! mid-drain, the worker runs that recovery and retries the write once,
 //! reporting `DELIVERY_RETENTION_LIMIT` only when nothing was reclaimable or
 //! the retry is refused again. Un-uploaded backlog is never deleted: a full
-//! cap of unconsumed rows keeps failing capture visibly until a drain delivers
+//! cap of unconsumed rows keeps stopping capture visibly until a drain delivers
 //! them or the cap is raised with `set_retention_limit`. No checkpoint moves
 //! on a capacity failure. Pausing preserves capture; cancellation is an
 //! explicit discard.
@@ -50,8 +54,8 @@ use std::collections::HashSet;
 
 use ai_hist::export::capture::{self, make_record, snapshot_record, RawRecord};
 pub use ai_hist::export::{
-    ExportSelection, HistoryExportRecord, SessionIdentity, DEFAULT_RETENTION_LIMIT_BYTES,
-    EXPORT_SCHEMA_VERSION, SUPPORTED_KINDS,
+    above_high_water, ExportSelection, HistoryExportRecord, SessionIdentity,
+    DEFAULT_RETENTION_LIMIT_BYTES, EXPORT_SCHEMA_VERSION, SUPPORTED_KINDS,
 };
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeliveryLimits {
@@ -1257,13 +1261,15 @@ pub fn compact_receipts(conn: &Connection, limit: usize) -> Result<usize> {
     Ok(removed)
 }
 
-/// Recognize the coordinator's trigger-originated capacity error without
-/// forwarding arbitrary SQLite/provider error text to a host or plugin.
-/// Hosts should expose a stable DELIVERY_RETENTION_LIMIT code and offer
-/// compact_journal_pass/compact_receipts or an explicit set_retention_limit action.
+/// Recognize a capacity failure — the capture trigger's abort or the typed
+/// high-water stop — without forwarding arbitrary SQLite/provider error text
+/// to a host or plugin. Hosts should expose a stable DELIVERY_RETENTION_LIMIT
+/// code and offer compact_journal_pass/compact_receipts or an explicit
+/// set_retention_limit action.
 pub fn is_retention_limit(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause|matches!(cause.downcast_ref::<rusqlite::Error>(),Some(rusqlite::Error::SqliteFailure(_,Some(message))) if message.starts_with("delivery retention limit exceeded;")))
+    ai_hist::export::is_retention_limit(error)
 }
+pub use ai_hist::export::{retention_limit_usage, RetentionLimitReached};
 
 /// Open evidence and upload state. Ordinary ai-hist opens never initialize jobs.
 pub fn open_db(path: &std::path::Path) -> Result<Connection> {

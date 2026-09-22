@@ -95,11 +95,15 @@ capture verdict standing, so a condition the capture cycle measured stays
 visible between those cycles. The top-level `ok`, `error_class` and `message`
 are the effective verdict — the capture fault when there is one, otherwise the
 delivery fault — and messages are rendered at report time, so a retention
-sentence always carries the current usage. A compaction that reports while a
-pass is running has re-measured the cap that pass observed, so the pass does
-not report the older reading over it, and the collector and a compaction
-serialize their updates to the report so neither replaces an answer it never
-read. Database corruption requires separate recovery from a preserved copy;
+sentence always carries the current usage. A `retention_limit` verdict also
+carries that usage as `used_bytes` and `limit_bytes`; the
+`capture-diagnostic.json` of the pass that stopped carries the retained budget
+it stopped at after compacting consumed changes. Capture stops such a pass after
+at most one session attempt rather than trying every remaining session. A
+compaction that reports while a pass is running has re-measured the cap that
+pass observed, so the pass does not report the older reading over it, and the
+collector and a compaction serialize their updates to the report so neither
+replaces an answer it never read. Database corruption requires separate recovery from a preserved copy;
 the collector does not delete or recreate a damaged queue automatically.
 
 Each `(site origin, user, workspace)` has an independent SHA-256-named directory
@@ -250,10 +254,14 @@ human-readable install/status/stop commands remain available.
 
   `used_bytes` is everything retained, including a batch in flight, which
   lives in its own reserve above the cap; it can exceed `limit_bytes` by that
-  reserve until the batch is acknowledged. When a cycle fails on that cap, `last_cycle.error_class` is
-  `retention_limit` and its message carries the same numbers:
-  `Upload journal full (256 MB of 256 MB). Compacting consumed records; queued
-  sessions are preserved.`
+  reserve until the batch is acknowledged. When a cycle stops on that cap,
+  `last_cycle.error_class` is `retention_limit`, `last_cycle.used_bytes` and
+  `last_cycle.limit_bytes` carry the journal's usage when the report is
+  written, and the message shows the same figures: `Upload journal full (251
+  MB of 256 MB). Compacting consumed records; queued sessions are preserved.`
+  The sentence is the same for a pass stopped at the cap and one stopped over
+  the 90% high-water mark: the verdict names the condition, and the figures
+  are the reading.
 - `compact <target> --json`: reclaims every journal record already consumed by
   all subscriptions and every settled batch receipt, under the desktop control
   lock. Queued and unacknowledged records are untouched, so it is safe while
