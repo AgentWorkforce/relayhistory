@@ -254,10 +254,14 @@ human-readable install/status/stop commands remain available.
 
   `used_bytes` is everything retained, including a batch in flight, which
   lives in its own reserve above the cap; it can exceed `limit_bytes` by that
-  reserve until the batch is acknowledged. When a cycle fails on that cap, `last_cycle.error_class` is
-  `retention_limit` and its message carries the same numbers:
-  `Upload journal full (256 MB of 256 MB). Compacting consumed records; queued
-  sessions are preserved.`
+  reserve until the batch is acknowledged. When a cycle stops on that cap,
+  `last_cycle.error_class` is `retention_limit`, `last_cycle.used_bytes` and
+  `last_cycle.limit_bytes` carry the budget the pass stopped at, and the
+  message shows the same figures: `Upload journal full (256 MB of 256 MB).
+  Compacting consumed records; queued sessions are preserved.` at the cap, or
+  `Upload journal nearly full (231 MB of 256 MB); capture is waiting for room.
+  Compacting consumed records; queued sessions are preserved.` for a pass
+  stopped over the 90% high-water mark.
 - `compact <target> --json`: reclaims every journal record already consumed by
   all subscriptions and every settled batch receipt, under the desktop control
   lock. Queued and unacknowledged records are untouched, so it is safe while

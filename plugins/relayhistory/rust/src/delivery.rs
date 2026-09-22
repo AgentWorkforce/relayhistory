@@ -9,9 +9,13 @@
 //! are necessary to prevent duplicate effects after uncertain outcomes.
 //!
 //! The retention cap bounds logical retained bytes, not physical database pages.
-//! Capture fails the affected SQLite statement visibly when full. Callers that
-//! transact ingestion and provider checkpoints must roll back that transaction
-//! on error. Batch materialization always has room: batch rows are checked
+//! Capture applies backpressure against it: before each source pass and each
+//! session transaction it reclaims consumed rows above 90% of the cap and, if
+//! still above, stops the pass with a typed `RetentionLimitReached` carrying
+//! the usage. A write that still reaches the cap fails its SQLite statement
+//! visibly and ends the pass the same way. Callers that transact ingestion and
+//! provider checkpoints must roll back that transaction on error. Batch
+//! materialization always has room: batch rows are checked
 //! against the cap plus a reserve bounded by design, the sum over
 //! non-cancelled jobs of one batch's configured payload and prepared bytes
 //! plus the settled receipts compaction has not released, so retained bytes
@@ -26,7 +30,7 @@
 //! mid-drain, the worker runs that recovery and retries the write once,
 //! reporting `DELIVERY_RETENTION_LIMIT` only when nothing was reclaimable or
 //! the retry is refused again. Un-uploaded backlog is never deleted: a full
-//! cap of unconsumed rows keeps failing capture visibly until a drain delivers
+//! cap of unconsumed rows keeps stopping capture visibly until a drain delivers
 //! them or the cap is raised with `set_retention_limit`. No checkpoint moves
 //! on a capacity failure. Pausing preserves capture; cancellation is an
 //! explicit discard.

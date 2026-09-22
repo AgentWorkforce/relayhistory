@@ -160,8 +160,14 @@ the cap inside a session transaction. Before each source pass and each session
 transaction it reads the retained bytes; above 90% of the cap it runs the
 low-water recovery above, then reads them again. If the budget is still above
 90% the pass stops with a typed `retention_limit` failure carrying `used_bytes`
-and `limit_bytes` instead of attempting the remaining sessions. A capture
-trigger abort inside a session transaction rolls that session back and ends the
-pass the same way. Sessions committed earlier in the pass stay persisted. The
+and `limit_bytes` instead of attempting the remaining sessions. A write the
+capture trigger refuses inside the pass ends it the same way, with the usage
+attached. What that refusal leaves behind is the provider's write granularity:
+targeted hydration, OpenCode, Grok and the Claude history log write a session
+(or a log chunk) in one transaction, so the refused session rolls back; Codex
+rollouts, the Claude transcript walk and trajectories commit statement by
+statement, so a refused rollout keeps the rows it wrote before the refusal and
+the next pass rewrites them idempotently, because no cursor or stamp is
+recorded for it. Sessions committed earlier in the pass stay persisted. The
 carried `used_bytes` is the retained total, so while batches are in flight it
 can exceed `limit_bytes` by at most the materialization reserve.

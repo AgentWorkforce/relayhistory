@@ -7,7 +7,18 @@
 
 use ai_hist::export::{self, capture, is_retention_limit, retention_limit_usage};
 use ai_hist::{HydrateSessionOptions, SessionScope, SyncOutput};
+use rusqlite::Connection;
 use std::path::{Path, PathBuf};
+
+/// The body every fake session carries, so one session's journal cost is
+/// large next to a store's fixed first-sync overhead and a cap set from a
+/// measured usage lands where a test means it to: below the high-water mark
+/// with less than one session of room, or with room for exactly one more.
+const SESSION_BODY_BYTES: usize = 32 * 1024;
+
+fn session_body() -> String {
+    "x".repeat(SESSION_BODY_BYTES)
+}
 
 /// One finished Codex rollout carrying a prompt, an answer and a tool call.
 fn write_codex_rollout(home: &Path, session_id: &str) -> PathBuf {
@@ -23,8 +34,11 @@ fn write_codex_rollout(home: &Path, session_id: &str) -> PathBuf {
         "{\"timestamp\":\"2026-09-19T10:00:01.000Z\",\"type\":\"response_item\",\
          \"payload\":{\"type\":\"message\",\"role\":\"user\",\
          \"content\":[{\"type\":\"input_text\",\"text\":\"capture me\"}]}}",
-        "{\"timestamp\":\"2026-09-19T10:00:02.000Z\",\"type\":\"event_msg\",\
-         \"payload\":{\"type\":\"agent_message\",\"message\":\"Done.\"}}",
+        format_args!(
+            "{{\"timestamp\":\"2026-09-19T10:00:02.000Z\",\"type\":\"event_msg\",\
+             \"payload\":{{\"type\":\"agent_message\",\"message\":\"{}\"}}}}",
+            session_body()
+        ),
         "{\"timestamp\":\"2026-09-19T10:00:03.000Z\",\"type\":\"response_item\",\
          \"payload\":{\"type\":\"function_call\",\"id\":\"fc_1\",\
          \"name\":\"exec_command\",\"arguments\":\"{\\\"cmd\\\":\\\"git status\\\"}\",\
@@ -46,6 +60,63 @@ fn append_codex_answer(path: &Path, text: &str) {
          \"payload\":{{\"type\":\"agent_message\",\"message\":\"{text}\"}}}}"
     )
     .expect("append answer");
+}
+
+/// A fake OpenCode SQLite store where OpenCode keeps its own, with `part`
+/// seekable by session so sync takes the per-session plan the live log
+/// showed attempting every session. Every session carries the same prompt.
+fn opencode_store(home: &Path) -> PathBuf {
+    let path = home.join(".local/share/opencode/opencode.db");
+    std::fs::create_dir_all(path.parent().expect("store dir")).expect("opencode dir");
+    let src = Connection::open(&path).expect("open opencode store");
+    src.execute_batch(
+        "CREATE TABLE IF NOT EXISTS session (id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER, time_updated INTEGER);
+         CREATE TABLE IF NOT EXISTS message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+         CREATE TABLE IF NOT EXISTS part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+         CREATE INDEX IF NOT EXISTS part_session ON part(session_id);",
+    )
+    .expect("opencode schema");
+    path
+}
+
+fn write_opencode_session(home: &Path, session_id: &str) {
+    let src = Connection::open(opencode_store(home)).expect("open opencode store");
+    src.execute(
+        "INSERT INTO session VALUES (?1, '/tmp/project', 1, 2)",
+        [session_id],
+    )
+    .expect("session row");
+    src.execute(
+        "INSERT INTO message VALUES (?1, ?2, 1, '{\"role\":\"user\",\"modelID\":\"test-model\"}')",
+        [&format!("{session_id}-m1"), session_id],
+    )
+    .expect("message row");
+    src.execute(
+        "INSERT INTO part VALUES (?1, ?2, ?3, 1, ?4)",
+        [
+            &format!("{session_id}-p1"),
+            &format!("{session_id}-m1"),
+            session_id,
+            &format!("{{\"type\":\"text\",\"text\":\"{}\"}}", session_body()),
+        ],
+    )
+    .expect("part row");
+}
+
+fn sync_opencode(db: &Path, home: &Path) -> anyhow::Result<bool> {
+    ai_hist::sync_opencode_at(db, &opencode_store(home), SyncOutput::Silent)
+}
+
+/// Whether a capture trigger refused a write inside the pass, as opposed to
+/// the high-water check stopping it before one.
+fn refused_by_trigger(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(_, Some(message)))
+                if message.starts_with("delivery retention limit exceeded;")
+        )
+    })
 }
 
 /// A whole-store reader whose journal cursor decides what compaction may
@@ -84,10 +155,30 @@ fn cap_at(db: &Path, max_bytes: i64) {
     export::set_retention_limit(&conn, max_bytes).expect("set retention limit");
 }
 
-fn codex_sessions(db: &Path) -> Vec<String> {
+fn sessions_of(db: &Path, source: &str) -> Vec<String> {
     let conn = ai_hist::open_db(db).expect("open db");
     let mut statement = conn
-        .prepare("SELECT session_id FROM sessions WHERE source = 'codex' ORDER BY session_id")
+        .prepare("SELECT session_id FROM sessions WHERE source = ? ORDER BY session_id")
+        .expect("prepare");
+    statement
+        .query_map([source], |row| row.get(0))
+        .expect("query")
+        .collect::<Result<Vec<String>, _>>()
+        .expect("rows")
+}
+
+fn codex_sessions(db: &Path) -> Vec<String> {
+    sessions_of(db, "codex")
+}
+
+/// Every Codex session id with evidence rows, whether or not it has a
+/// session row: a rollout refused mid-file keeps the rows it committed.
+fn codex_sessions_with_events(db: &Path) -> Vec<String> {
+    let conn = ai_hist::open_db(db).expect("open db");
+    let mut statement = conn
+        .prepare(
+            "SELECT DISTINCT session_id FROM session_events WHERE source = 'codex' ORDER BY session_id",
+        )
         .expect("prepare");
     statement
         .query_map([], |row| row.get(0))
@@ -187,15 +278,19 @@ fn a_full_budget_that_is_fully_consumed_is_compacted_and_the_pass_completes() {
 fn sessions_committed_before_a_mid_pass_stop_remain_persisted() {
     let (home, db) = seeded(1);
     let (one_session, _) = usage(&db);
-    // Room for a few more sessions below the high-water mark, so the stop is
-    // a capture trigger abort inside a session transaction rather than the
-    // pre-session check.
-    cap_at(&db, one_session * 9 / 2);
+    // Room for one more session and half of another: the pass is below the
+    // high-water mark when it checks before the second, which the capture
+    // trigger then refuses.
+    cap_at(&db, one_session + (SESSION_BODY_BYTES as i64) * 3 / 2);
     for index in 0..8 {
         write_codex_rollout(home.path(), &format!("new-{index}"));
     }
     let error = sync(&db, home.path()).expect_err("the pass must stop at the cap");
     assert!(is_retention_limit(&error), "{error:#}");
+    assert!(
+        refused_by_trigger(&error),
+        "the stop is the trigger's refusal, carried through the pass: {error:#}"
+    );
     let reached = retention_limit_usage(&error).expect("typed usage");
     assert!(reached.used_bytes <= reached.limit_bytes);
     let sessions = codex_sessions(&db);
@@ -209,6 +304,86 @@ fn sessions_committed_before_a_mid_pass_stop_remain_persisted() {
             "{session} committed before the stop keeps its evidence"
         );
     }
+    // Codex rollouts commit statement by statement, so the refused rollout
+    // may keep the rows it wrote before the refusal; every rollout after it
+    // was never attempted and has none.
+    let orphaned: Vec<_> = codex_sessions_with_events(&db)
+        .into_iter()
+        .filter(|session| !sessions.contains(session))
+        .collect();
+    assert!(
+        orphaned.len() <= 1,
+        "only the refused rollout may hold rows without a session: {orphaned:?}"
+    );
+}
+
+/// The live-log regression: a store of many OpenCode sessions at a full,
+/// unreclaimable budget. The pass stops before the first session instead of
+/// attempting each one and aggregating their refusals.
+#[test]
+fn opencode_sessions_are_not_attempted_at_a_full_unreclaimable_budget() {
+    let home = tempfile::tempdir().expect("home");
+    let db = home.path().join("history.db");
+    subscribe(&db, 0);
+    write_opencode_session(home.path(), "seed");
+    assert!(sync_opencode(&db, home.path()).expect("seed sync"));
+    let (used, _) = usage(&db);
+    assert!(used > 0, "the seed must journal revisions");
+    cap_at(&db, used);
+    for index in 0..20 {
+        write_opencode_session(home.path(), &format!("new-{index:02}"));
+    }
+    let error = sync_opencode(&db, home.path()).expect_err("the pass must stop at the cap");
+    assert!(is_retention_limit(&error), "{error:#}");
+    assert!(
+        !refused_by_trigger(&error),
+        "no session was attempted: {error:#}"
+    );
+    let reached = retention_limit_usage(&error).expect("typed usage");
+    assert_eq!((reached.used_bytes, reached.limit_bytes), (used, used));
+    let rendered = format!("{error:#}");
+    assert!(
+        !rendered.contains("could not be read"),
+        "no per-session failure aggregate: {rendered}"
+    );
+    assert_eq!(sessions_of(&db, "opencode"), vec!["seed".to_string()]);
+    assert_eq!(usage(&db), (used, used));
+}
+
+/// An OpenCode session the capture trigger refuses ends the pass with that
+/// refusal: the session rolls back, the sessions after it are not attempted,
+/// and nothing is aggregated.
+#[test]
+fn an_opencode_session_refused_by_the_trigger_ends_the_pass() {
+    let home = tempfile::tempdir().expect("home");
+    let db = home.path().join("history.db");
+    subscribe(&db, 0);
+    write_opencode_session(home.path(), "seed");
+    assert!(sync_opencode(&db, home.path()).expect("seed sync"));
+    let (one_session, _) = usage(&db);
+    // Below the high-water mark with half a session of room.
+    let limit = one_session + (SESSION_BODY_BYTES as i64) / 2;
+    cap_at(&db, limit);
+    for index in 0..20 {
+        write_opencode_session(home.path(), &format!("new-{index:02}"));
+    }
+    let error = sync_opencode(&db, home.path()).expect_err("the pass must stop at the cap");
+    assert!(is_retention_limit(&error), "{error:#}");
+    assert!(refused_by_trigger(&error), "{error:#}");
+    let reached = retention_limit_usage(&error).expect("typed usage");
+    assert_eq!(reached.limit_bytes, limit);
+    assert!(reached.used_bytes <= reached.limit_bytes);
+    let rendered = format!("{error:#}");
+    assert!(
+        !rendered.contains("could not be read"),
+        "no per-session failure aggregate: {rendered}"
+    );
+    assert_eq!(
+        sessions_of(&db, "opencode"),
+        vec!["seed".to_string()],
+        "the refused session rolled back and no later session was attempted"
+    );
+    assert_eq!(usage(&db).0, one_session);
 }
 
 #[test]
