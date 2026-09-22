@@ -1868,3 +1868,31 @@ fn scoped_include_rolls_back_exclusion_and_fences_when_snapshot_fails() {
         .unwrap();
     assert!(include_job_session(&conn, &root.job_id, &child).unwrap());
 }
+
+#[test]
+fn cancelling_the_last_job_lets_compaction_drop_the_whole_journal() {
+    let conn = db();
+    for id in 0..300 {
+        event(&conn, &id.to_string(), "before the generation");
+    }
+    let job = create_job(&conn, &config("only"), 0).unwrap();
+    for id in 0..1500 {
+        event(&conn, &format!("live-{id}"), "captured for the generation");
+    }
+    let count = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
+    assert!(count("SELECT COUNT(*) FROM delivery_journal") >= 1500);
+    assert!(retained_bytes(&conn).unwrap().0 > 0);
+    cancel_job(&conn, &job.job_id).unwrap();
+    assert_eq!(count("SELECT COUNT(*) FROM history_subscriptions"), 0);
+    // One bounded compaction step reclaims everything: nothing can read it.
+    assert!(compact_journal(&conn, 100).unwrap() >= 1500);
+    compact_receipts(&conn, 100).unwrap();
+    assert_eq!(count("SELECT COUNT(*) FROM delivery_journal"), 0);
+    assert_eq!(count("SELECT COUNT(*) FROM delivery_shadow"), 0);
+    assert_eq!(retained_bytes(&conn).unwrap().0, 0);
+    // Later local writes are not journaled for a consumer that no longer exists.
+    event(&conn, "after", "nobody is listening");
+    assert_eq!(compact_journal(&conn, 100).unwrap(), 0);
+    assert_eq!(count("SELECT COUNT(*) FROM delivery_journal"), 0);
+    assert_eq!(retained_bytes(&conn).unwrap().0, 0);
+}

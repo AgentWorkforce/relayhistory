@@ -108,8 +108,10 @@ backlog is never deleted:
   cursor of any subscription that still pins something: one reading every
   session always does; one reading a single session only while that session
   has a row past its cursor, so a finished session's cursor does not hold the
-  floor down. The work is proportional to the rows reclaimed, not to the
-  journal's length, and a consumed row never waits on a sweep cursor.
+  floor down. With nothing pinning at all — every generation cancelled, so
+  every subscription released — the floor is the tail and the whole journal
+  goes. The work is proportional to the rows reclaimed, not to the journal's
+  length, and a consumed row never waits on a sweep cursor.
 - Above the floor, where a lagging session subscription pins its own rows
   among other sessions' reclaimable ones, a persistent sweep cursor examines
   one bounded page per drain with the exact per-session predicate. The sweep

@@ -227,6 +227,37 @@ fn save_json(path: &Path, value: &impl Serialize) -> Result<()> {
     temporary.persist(path).map_err(|e| e.error)?;
     Ok(())
 }
+/// The generation a setup inherits, if this database already holds one.
+///
+/// A generation outlives an interrupted setup: create_job commits before
+/// config.json is written. Adopting it records no second baseline behind a
+/// generation nothing can reach.
+///
+/// Only a generation that could still be adopted is read. A cancelled one
+/// never is, so its stored configuration is never parsed — decommissioning
+/// cancels a generation without parsing it, and a row it left behind, or one
+/// written by an older build, must not fail every later setup on this
+/// install. A candidate that cannot be read is still an error: nothing can
+/// tell whether it matches, and creating a second generation beside it would
+/// be worse than refusing.
+fn adoptable_generation(
+    conn: &rusqlite::Connection,
+    wanted: &relayhistory_plugin::delivery::DeliveryJobConfig,
+) -> Result<Option<relayhistory_plugin::delivery::DeliveryStatus>> {
+    for (job_id, state) in relayhistory_plugin::delivery::list_job_states(conn)? {
+        if state == "cancelled" {
+            continue;
+        }
+        let job = relayhistory_plugin::delivery::status(conn, &job_id)?;
+        if job.config.destination_id == wanted.destination_id
+            && job.config.instance_id == wanted.instance_id
+            && job.config.account_id == wanted.account_id
+        {
+            return Ok(Some(job));
+        }
+    }
+    Ok(None)
+}
 fn read_config(directory: &Path) -> Result<Config> {
     let config: Config = serde_json::from_slice(&fs::read(directory.join("config.json"))?)?;
     ensure!(
@@ -464,17 +495,7 @@ fn install(options: Install) -> Result<()> {
                 selection: collector::selection(include_existing),
                 limits: Default::default(),
             };
-            // A generation outlives an interrupted setup: create_job commits
-            // before config.json is written. Adopt that job instead of recording
-            // a second baseline behind a generation nothing can reach.
-            let adopted = relayhistory_plugin::delivery::list_jobs(&conn)?
-                .into_iter()
-                .find(|job| {
-                    job.state != "cancelled"
-                        && job.config.destination_id == job_config.destination_id
-                        && job.config.instance_id == job_config.instance_id
-                        && job.config.account_id == job_config.account_id
-                });
+            let adopted = adoptable_generation(&conn, &job_config)?;
             let job_id = match adopted {
                 Some(job) => {
                     if job.config.selection != job_config.selection {
@@ -558,6 +579,44 @@ fn install(options: Install) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Reconnecting the same account must not be refused by a generation it
+    /// would never adopt anyway. Decommissioning cancels a generation without
+    /// parsing its stored configuration, so an unreadable one survives the
+    /// sign-out that this install is expected to reconnect after.
+    #[test]
+    fn a_cancelled_generation_that_cannot_be_read_does_not_refuse_a_reconnect() {
+        let directory = tempfile::tempdir().unwrap();
+        let wanted = relayhistory_plugin::delivery::DeliveryJobConfig {
+            destination_id: "relayhistory".into(),
+            instance_id: "teams-probe".into(),
+            account_id: destination::account_id("org", Some("workspace")),
+            mapping_version: destination::MAPPING_VERSION.into(),
+            selection: collector::selection(true),
+            limits: Default::default(),
+        };
+        let conn =
+            relayhistory_plugin::delivery::open_db(&directory.path().join("history.db")).unwrap();
+        let job = relayhistory_plugin::delivery::create_job(&conn, &wanted, 0).unwrap();
+        assert_eq!(
+            adoptable_generation(&conn, &wanted)
+                .unwrap()
+                .map(|j| j.job_id),
+            Some(job.job_id.clone())
+        );
+
+        // Decommissioned the way `disconnect` does it, then left unreadable.
+        relayhistory_plugin::delivery::cancel_generation(&conn, &job.job_id).unwrap();
+        conn.execute(
+            "UPDATE delivery_jobs SET config_json='{not json' WHERE id=?",
+            [&job.job_id],
+        )
+        .unwrap();
+        assert!(relayhistory_plugin::delivery::list_jobs(&conn).is_err());
+
+        // The reconnect starts a fresh generation instead of failing.
+        assert!(adoptable_generation(&conn, &wanted).unwrap().is_none());
+    }
+
     #[test]
     fn conflicting_sharing_choices_are_rejected() {
         assert!(Cli::try_parse_from([

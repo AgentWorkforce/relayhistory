@@ -967,13 +967,23 @@ pub(super) fn stop_requested(directory: &Path, startup_id: &str) -> bool {
 extern "C" fn stop_signal(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
-// Provider enumeration runs independently of selected delivery. The channel
-// wakes its idle wait on shutdown; an in-flight provider read never owns the
-// collector's control lock or blocks a delivery cycle waiting for a join.
-struct InventoryWorker(mpsc::Sender<()>);
+// Provider enumeration runs independently of selected delivery: an in-flight
+// provider read never owns the collector's control lock or blocks a delivery
+// cycle. The channel wakes its idle wait on shutdown and the join bounds its
+// lifetime by the collector's, so nothing writes a diagnostic into the install
+// directory after the collector lock is released and a disconnect has reclaimed
+// it. Cancellation is cooperative at provider and file boundaries, so the join
+// costs at most the read in flight.
+struct InventoryWorker {
+    finish: mpsc::Sender<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
 impl Drop for InventoryWorker {
     fn drop(&mut self) {
-        let _ = self.0.send(());
+        let _ = self.finish.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 fn inventory_options() -> ai_hist::DiscoverOptions {
@@ -989,7 +999,7 @@ fn inventory_options() -> ai_hist::DiscoverOptions {
 fn start_inventory(directory: &Path, cancelled: Arc<AtomicBool>) -> InventoryWorker {
     let directory = directory.to_path_buf();
     let (finish, done) = mpsc::channel();
-    std::thread::spawn(move || {
+    let thread = std::thread::spawn(move || {
         // Give the first delivery pass priority over inventory initialization.
         if done.recv_timeout(Duration::from_secs(1)).is_ok() {
             return;
@@ -1011,6 +1021,11 @@ fn start_inventory(directory: &Path, cancelled: Arc<AtomicBool>) -> InventoryWor
                 )?;
                 Ok(count)
             })();
+            // A cancelled scan has nothing to report, and its diagnostic would
+            // land in a directory a disconnect is reclaiming.
+            if stopping(&cancelled) {
+                break;
+            }
             let _ = capture_diagnostic(
                 &directory,
                 "shallow_inventory",
@@ -1024,7 +1039,10 @@ fn start_inventory(directory: &Path, cancelled: Arc<AtomicBool>) -> InventoryWor
             }
         }
     });
-    InventoryWorker(finish)
+    InventoryWorker {
+        finish,
+        thread: Some(thread),
+    }
 }
 
 /// Own the collector lock and retry capture/delivery until stopped; status writes are advisory.
@@ -1062,7 +1080,23 @@ pub fn run_background(directory: &Path, startup_id: &str) -> Result<()> {
         None
     };
     let mut capture_due = Instant::now();
+    // Only the process whose output is the log rotates it. A --foreground run
+    // has the terminal on stdout and would be silenced by a redirect into a
+    // file it does not write.
+    let owns_log = writes_to_log(directory);
+    let mut reopen = false;
     while !stopping(&stop.cancelled) {
+        if owns_log {
+            reopen |= matches!(rotate_log(directory), Ok(true));
+            if reopen {
+                // The rotated-out file keeps receiving output until
+                // stdout/stderr point at the replacement, so a reopen that
+                // fails stays pending and is retried on the next iteration.
+                reopen = open_log(directory)
+                    .and_then(|log| redirect_output(&log))
+                    .is_err();
+            }
+        }
         let started_ms = now();
         let outcome = if Instant::now() >= capture_due {
             capture_due = Instant::now() + Duration::from_secs(60);
@@ -1119,19 +1153,99 @@ fn pass_interval(backlog: bool) -> Duration {
         IDLE_PASS_INTERVAL
     }
 }
-pub fn start_background(directory: &Path) -> Result<()> {
-    let executable = std::env::current_exe()?;
-    let startup_id = format!("{}-{}", std::process::id(), now());
-    let log_path = directory.join("collector.log");
-    let mut log = fs::OpenOptions::new()
+/// `collector.log` rotates into `collector.log.1..3` once it reaches this size.
+const LOG_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
+const LOG_KEEP: usize = 3;
+fn rotated_log(directory: &Path, generation: usize) -> std::path::PathBuf {
+    directory.join(format!("collector.log.{generation}"))
+}
+/// Every file the rotation owns: the live log and its predecessors.
+pub(super) fn log_files(directory: &Path) -> Vec<std::path::PathBuf> {
+    std::iter::once(directory.join("collector.log"))
+        .chain((1..=LOG_KEEP).map(|generation| rotated_log(directory, generation)))
+        .collect()
+}
+/// Whether this process's stdout is the install's `collector.log`. A
+/// supervised collector is spawned with the log on its descriptors and owns
+/// the rotation; a foreground run writes to the terminal, which it must keep.
+#[cfg(unix)]
+fn writes_to_log(directory: &Path) -> bool {
+    use std::mem::ManuallyDrop;
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::io::FromRawFd;
+    let Ok(log) = fs::metadata(directory.join("collector.log")) else {
+        return false;
+    };
+    // Borrowed, never closed: this process keeps writing to that descriptor.
+    let stdout = ManuallyDrop::new(unsafe { fs::File::from_raw_fd(libc::STDOUT_FILENO) });
+    stdout
+        .metadata()
+        .is_ok_and(|stdout| stdout.dev() == log.dev() && stdout.ino() == log.ino())
+}
+#[cfg(not(unix))]
+fn writes_to_log(_: &Path) -> bool {
+    false
+}
+/// Shift a full `collector.log` behind its numbered predecessors, dropping the
+/// oldest. Returns whether a rotation happened; the caller owning the log's
+/// file descriptors reopens them afterwards.
+fn rotate_log(directory: &Path) -> std::io::Result<bool> {
+    let path = directory.join("collector.log");
+    match fs::metadata(&path) {
+        Ok(metadata) if metadata.len() >= LOG_ROTATE_BYTES => {}
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    }
+    let oldest = rotated_log(directory, LOG_KEEP);
+    if oldest.exists() {
+        fs::remove_file(&oldest)?;
+    }
+    for generation in (1..LOG_KEEP).rev() {
+        let from = rotated_log(directory, generation);
+        if from.exists() {
+            fs::rename(from, rotated_log(directory, generation + 1))?;
+        }
+    }
+    fs::rename(path, rotated_log(directory, 1))?;
+    Ok(true)
+}
+/// The private, append-only `collector.log` of one install.
+fn open_log(directory: &Path) -> std::io::Result<fs::File> {
+    let log = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(log_path)?;
+        .open(directory.join("collector.log"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         log.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
+    Ok(log)
+}
+/// Point this process's stdout and stderr at `log` in place, so buffered
+/// `println!`/`eprintln!` writers keep working across a rotation.
+#[cfg(unix)]
+fn redirect_output(log: &fs::File) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    for target in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        // dup2 atomically replaces the descriptor; the previous open file is
+        // closed by the kernel once nothing else references it.
+        if unsafe { libc::dup2(log.as_raw_fd(), target) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+#[cfg(not(unix))]
+fn redirect_output(_: &fs::File) -> std::io::Result<()> {
+    Ok(())
+}
+pub fn start_background(directory: &Path) -> Result<()> {
+    let executable = std::env::current_exe()?;
+    let startup_id = format!("{}-{}", std::process::id(), now());
+    rotate_log(directory)?;
+    let mut log = open_log(directory)?;
     writeln!(log, "Starting Agent Relay Probe")?;
     let mut command = Command::new(executable);
     command
@@ -1192,6 +1306,66 @@ pub fn start_background(directory: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use fs2::FileExt;
+    /// Only the process the log belongs to rotates it. A `--foreground` run
+    /// writes to the terminal and must keep it: redirecting its output into an
+    /// install's log would silence the setup the user is watching.
+    #[test]
+    fn a_process_that_does_not_write_the_log_does_not_own_its_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!writes_to_log(dir.path()));
+        fs::write(dir.path().join("collector.log"), vec![b'a'; 16]).unwrap();
+        // This test's stdout is the harness, not the install's log.
+        assert!(!writes_to_log(dir.path()));
+        assert_eq!(
+            log_files(dir.path()),
+            vec![
+                dir.path().join("collector.log"),
+                dir.path().join("collector.log.1"),
+                dir.path().join("collector.log.2"),
+                dir.path().join("collector.log.3"),
+            ]
+        );
+    }
+    #[test]
+    fn collector_log_rotates_at_the_cap_and_keeps_three_predecessors() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("collector.log");
+        let size = |path: &Path| fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        fs::write(&log, vec![b'a'; LOG_ROTATE_BYTES as usize - 1]).unwrap();
+        assert!(!rotate_log(dir.path()).unwrap());
+        assert_eq!(size(&log), LOG_ROTATE_BYTES - 1);
+        for generation in 1..=5u8 {
+            fs::write(&log, vec![b'0' + generation; LOG_ROTATE_BYTES as usize]).unwrap();
+            assert!(rotate_log(dir.path()).unwrap());
+            // The live log is under the cap again and the newest predecessor
+            // holds exactly what was just rotated out.
+            assert!(size(&log) < LOG_ROTATE_BYTES);
+            assert_eq!(
+                fs::read(rotated_log(dir.path(), 1)).unwrap()[0],
+                b'0' + generation
+            );
+            let kept: Vec<_> = fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .filter(|name| name.starts_with("collector.log."))
+                .collect();
+            assert_eq!(kept.len(), usize::from(generation).min(LOG_KEEP));
+            assert!(!rotated_log(dir.path(), LOG_KEEP + 1).exists());
+        }
+        assert_eq!(fs::read(rotated_log(dir.path(), 3)).unwrap()[0], b'3');
+        // The reopened log is private and appends after the rotated file.
+        let mut reopened = open_log(dir.path()).unwrap();
+        writeln!(reopened, "after rotation").unwrap();
+        assert_eq!(fs::read_to_string(&log).unwrap(), "after rotation\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&log).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
     #[test]
     fn selected_once_setup_hydrates_only_members_even_when_delivery_is_unavailable() {
         // Hydration validates source paths against configured provider roots.

@@ -498,3 +498,64 @@ fn the_sweep_stops_at_the_lowest_global_cursor_and_wraps_on_a_short_page() {
     assert_eq!(export::compact_journal(&conn, 4).unwrap(), 0);
     assert_eq!(sweep_cursor(&conn), floor);
 }
+
+/// With the last subscription gone the whole journal is consumed, so the
+/// floor reclaims it in bounded transactions. A file export is not a
+/// subscription: it keeps the preimages of the rows it still has to read
+/// until it is closed.
+#[test]
+fn releasing_the_last_subscription_reclaims_the_journal_and_keeps_export_preimages() {
+    let conn = db();
+    let tx = conn.unchecked_transaction().unwrap();
+    capture::save_subscription(&tx, &global_reader(0)).unwrap();
+    for id in 0..2500 {
+        tx.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude','one',?,1,'user','text','unread')", [id.to_string()]).unwrap();
+    }
+    tx.execute("UPDATE history_compaction SET cursor=2000", [])
+        .unwrap();
+    tx.commit().unwrap();
+    conn.execute(
+        "INSERT INTO sessions(source,session_id,first_prompt) VALUES ('claude','one','before')",
+        [],
+    )
+    .unwrap();
+    let snapshot = export::create_export(
+        &conn,
+        &ExportSelection {
+            all_sources: true,
+            kinds: vec!["session".into()],
+            ..Default::default()
+        },
+        &ExportLimits::default(),
+        60_000,
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .unwrap();
+    conn.execute("UPDATE sessions SET first_prompt='after'", [])
+        .unwrap();
+    let count = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
+    assert!(count("SELECT COUNT(*) FROM delivery_shadow") > 0);
+    let tx = conn.unchecked_transaction().unwrap();
+    capture::release_subscription(&tx, "reader").unwrap();
+    tx.commit().unwrap();
+    // Every row goes, in pages of a hundred, whatever the sweep cursor says.
+    assert!(export::compact_journal(&conn, 100).unwrap() >= 2500);
+    assert_eq!(journal_rows(&conn), 0);
+    assert_eq!(export::compact_journal(&conn, 100).unwrap(), 0);
+    assert!(count("SELECT COUNT(*) FROM delivery_shadow") > 0);
+    // The snapshot still reads the sessions as they were when it was taken.
+    let mut cursor = Some(snapshot.cursor);
+    let mut records = Vec::new();
+    while let Some(value) = cursor {
+        let page =
+            export::export_page(&conn, &value, chrono::Utc::now().timestamp_millis()).unwrap();
+        records.extend(page.records);
+        cursor = page.next_cursor;
+    }
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].payload["first_prompt"], "before");
+    export::close_export(&conn, &snapshot.snapshot_id).unwrap();
+    assert_eq!(export::compact_journal_pass(&conn, 1000).unwrap(), 0);
+    assert_eq!(count("SELECT COUNT(*) FROM delivery_shadow"), 0);
+    assert_eq!(export::retained_bytes(&conn).unwrap().0, 0);
+}

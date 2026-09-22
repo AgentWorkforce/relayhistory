@@ -161,14 +161,43 @@ fn summary(directory: &Path, config: &Config) -> Result<Value> {
 }
 pub fn installs() -> Result<()> {
     let root = super::home()?.join(".agentworkforce/probe");
+    emit(json!({"installs":installs_in(&root)?}));
+    Ok(())
+}
+/// Every install under `root` with a valid configuration. A directory without
+/// `config.json` is decommissioned: it is never listed, and its logs, advisory
+/// status and journal are reclaimed here.
+fn installs_in(root: &Path) -> Result<Vec<Value>> {
     let mut installs = Vec::new();
     if root.exists() {
+        // An entry that cannot be read fails the listing rather than being
+        // skipped: a short listing is indistinguishable from having no
+        // install, and a caller that reads it that way signs the user out.
+        let mut directories = Vec::new();
         for entry in fs::read_dir(root)? {
             let entry = entry?;
-            if !entry.file_type()?.is_dir() {
+            if entry.file_type()?.is_dir() {
+                directories.push(entry.path());
+            }
+        }
+        // A stable order so the same decommissioned install is the one worked
+        // on until it is finished, rather than whichever the filesystem
+        // happened to return first.
+        directories.sort();
+        let mut reclaimed = false;
+        for directory in directories {
+            if !directory.join("config.json").exists() {
+                // At most one decommissioned install is reclaimed per listing.
+                // The bound below is per directory, and nothing bounds how
+                // many a machine accumulates: cloud uninstalls and account
+                // switches are exactly the cases that leave one behind, so a
+                // listing that reclaimed every one it found would scale with
+                // the backlog it exists to clear.
+                if !reclaimed {
+                    reclaimed = sweep_decommissioned(&directory).unwrap_or(false);
+                }
                 continue;
             }
-            let directory = entry.path();
             if let Ok(config) = read_config(&directory) {
                 if let Ok(value) = summary(&directory, &config) {
                     installs.push(value);
@@ -177,8 +206,158 @@ pub fn installs() -> Result<()> {
         }
     }
     installs.sort_by_key(|v| v["directory"].as_str().unwrap_or_default().to_owned());
-    emit(json!({"installs":installs}));
-    Ok(())
+    Ok(installs)
+}
+/// Install directory names are the SHA-256 of a `(site, account, workspace)`
+/// identity, so anything else under the probe root belongs to somebody else.
+fn install_name(directory: &Path) -> bool {
+    directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.len() == 64 && name.bytes().all(|c| c.is_ascii_hexdigit()))
+}
+/// Reclaim a decommissioned install found by the sweep. Both locks are taken
+/// without waiting, so a collector still holding its own keeps its directory
+/// until it lets go. `stages/` means a setup that has not written its
+/// configuration yet: its capture is in progress, not abandoned, so the sweep
+/// leaves it alone. `disconnect` removes `stages/` before `config.json`, which
+/// is why a disconnected install has neither.
+fn sweep_decommissioned(directory: &Path) -> Result<bool> {
+    ensure!(install_name(directory), "not an install directory");
+    ensure!(
+        !directory.join("stages").exists(),
+        "setup is still in progress"
+    );
+    let _control = control_lock(directory)?;
+    let _guard = lock(directory)?;
+    ensure!(
+        !directory.join("config.json").exists(),
+        "install is configured"
+    );
+    reclaim_decommissioned(directory)
+}
+/// Advisory files a decommissioned install no longer has a use for: its logs,
+/// its runtime and status records and the selection of a generation that is
+/// gone. Lock files stay. They are empty, so removing one reclaims nothing,
+/// and unlinking a lock somebody may hold is how two processes end up on
+/// different inodes believing they are excluded.
+fn decommissioned_files(directory: &Path) -> Vec<std::path::PathBuf> {
+    let mut paths: Vec<_> = [
+        "runtime.json",
+        "stop.json",
+        "cycle.json",
+        "progress.json",
+        "capture-diagnostic.json",
+        "inventory-diagnostic.json",
+        "sharing-change.json",
+        "selected.json",
+    ]
+    .iter()
+    .map(|name| directory.join(name))
+    .collect();
+    paths.extend(collector::log_files(directory));
+    paths
+}
+/// The database of an install being decommissioned, if it has one that opens.
+/// `db` is never called blind: it would otherwise create a database in a
+/// directory whose whole point is that nothing is connected to it.
+fn decommissioned_db(directory: &Path) -> Option<Result<Connection>> {
+    directory.join("history.db").exists().then(|| db(directory))
+}
+/// Cancel every delivery generation this install still has, which also
+/// releases each one's subscription and preimages.
+///
+/// Every cancellation must succeed. A generation that survives is adopted by
+/// the next setup for the same account, which resumes its queued records — so
+/// a cancellation lost to database contention would resume uploads from an
+/// install the user was told had been disconnected. A database that will not
+/// open at all is the one tolerated case, and it is not that case: setup opens
+/// it the same way and fails the same way, so it has no generation to adopt.
+///
+/// Nothing on this path reads a generation's stored configuration: they are
+/// enumerated by identity and state, and cancelled without it. A row whose
+/// configuration no longer parses is cancelled like any other rather than
+/// refusing a sign-out — it cannot dispatch a batch either, so holding the
+/// install open for it protects nothing.
+fn cancel_generations(directory: &Path) -> Result<usize> {
+    let conn = match decommissioned_db(directory) {
+        None => return Ok(0),
+        Some(Ok(conn)) => conn,
+        // A busy database opens next time, so tolerating it would let a
+        // generation outlive a sign-out that reported success. Only a database
+        // that will still be unusable next time is treated as decommissioned.
+        Some(Err(error)) if database_is_busy(&error) => return Err(error),
+        Some(Err(_)) => return Ok(0),
+    };
+    let live: Vec<_> = delivery::list_job_states(&conn)?
+        .into_iter()
+        .filter(|(_, state)| state != "cancelled")
+        .map(|(job_id, _)| job_id)
+        .collect();
+    delivery::cancel_generations(&conn, &live)?;
+    Ok(live.len())
+}
+/// Whether an error is the database being busy rather than unusable. The two
+/// are the same `Err` at the call site and mean opposite things to a
+/// decommissioning: one will succeed on a retry, the other never will.
+fn database_is_busy(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<rusqlite::Error>()
+        .is_some_and(|error| {
+            matches!(
+                error,
+                rusqlite::Error::SqliteFailure(failure, _)
+                    if matches!(
+                        failure.code,
+                        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                    )
+            )
+        })
+}
+/// Reclaim what a decommissioned install still holds, with both locks held.
+/// Cancelling its generations leaves the journal consumed; expired snapshots
+/// are closed and a bounded compaction step then reclaims the journal and the
+/// settled receipts. The logs and the advisory status go with them.
+///
+/// Every step is bounded, and the work converges across calls rather than
+/// finishing in one: a decommissioned install is reclaimed by whichever
+/// `installs` listing reaches it, and a listing that compacted an arbitrarily
+/// long journal in passing would make every caller of a read wait for
+/// maintenance it did not ask for. One call closes at most 32 snapshots,
+/// deletes at most one page of journal rows and examines one sweep page, and
+/// releases at most one page of receipts.
+///
+/// `history.db` is retained. Its origin identity keys every record the Cloud
+/// already holds, so reconnecting the same account resumes incrementally from
+/// the revisions it has; a fresh database would upload every existing session
+/// a second time under a second machine identity. Reclaiming the captured
+/// evidence itself is local retention, not decommissioning.
+///
+/// An export that has not reached its expiry keeps its preimages until it
+/// does; the next sweep takes them.
+fn reclaim_decommissioned(directory: &Path) -> Result<bool> {
+    // Both callers reach this only once `config.json` is gone, so there is no
+    // live install left to protect: a database that will not open right now
+    // is the next sweep's work rather than a failure to report.
+    let mut reclaimed = cancel_generations(directory).unwrap_or(0) > 0;
+    // Reclamation itself is advisory: an install whose database will not open
+    // has nothing left that can upload, and what it still holds is bounded.
+    if let Some(Ok(conn)) = decommissioned_db(directory) {
+        for step in [
+            delivery::expire_exports(&conn, collector::now(), 32),
+            delivery::compact_journal_while(&conn, delivery::MAX_COMPACTION_PAGE, &|| false),
+            delivery::compact_receipts(&conn, delivery::MAX_COMPACTION_PAGE),
+        ] {
+            reclaimed |= step.is_ok_and(|count| count > 0);
+        }
+    }
+    // Advisory files are reclaimed best-effort: one that cannot be removed is
+    // worth neither failing a sign-out nor refusing the rest, and the next
+    // sweep comes back for it.
+    for path in decommissioned_files(directory) {
+        reclaimed |= fs::remove_file(path).is_ok();
+    }
+    Ok(reclaimed)
 }
 pub fn start(directory: &Path) -> Result<()> {
     let _control = control_lock(directory)?;
@@ -615,10 +794,19 @@ fn make_plan(
 /// partial write; replay is idempotent, with delivery stopped until completion.
 pub fn recover(directory: &Path) -> Result<()> {
     let path = directory.join("sharing-change.json");
-    if path.exists() {
-        apply_plan(directory, serde_json::from_slice(&fs::read(path)?)?)?;
+    if !path.exists() {
+        return Ok(());
     }
-    Ok(())
+    // A plan belongs to a configured install: `apply_plan` leaves the old
+    // configuration in place until it writes the new one, so a plan without
+    // one is the remains of a disconnect rather than an interrupted change.
+    // Replaying it would write a generation and a configuration into an
+    // install the user has signed out of.
+    if !directory.join("config.json").exists() {
+        fs::remove_file(path)?;
+        return Ok(());
+    }
+    apply_plan(directory, serde_json::from_slice(&fs::read(path)?)?)
 }
 fn apply_plan(directory: &Path, mut plan: ChangePlan) -> Result<()> {
     let conn = db(directory)?;
@@ -638,13 +826,20 @@ fn apply_plan(directory: &Path, mut plan: ChangePlan) -> Result<()> {
         fs::remove_file(directory.join("sharing-change.json"))?;
         return Ok(());
     }
-    for job in delivery::list_jobs(&conn)? {
-        if job.state != "cancelled"
-            && job.config.destination_id == plan.job.destination_id
+    // Only a generation that could still match is read. A cancelled one never
+    // can, and decommissioning cancels without parsing a configuration, so an
+    // unreadable row that a sign-out and a reconnect both accept must not
+    // refuse a sharing change and strand `sharing-change.json` behind it.
+    for (job_id, state) in delivery::list_job_states(&conn)? {
+        if state == "cancelled" {
+            continue;
+        }
+        let job = delivery::status(&conn, &job_id)?;
+        if job.config.destination_id == plan.job.destination_id
             && job.config.instance_id == plan.job.instance_id
             && job.config.account_id == plan.job.account_id
         {
-            delivery::cancel_job(&conn, &job.job_id)?;
+            delivery::cancel_generation(&conn, &job_id)?;
         }
     }
     let wanted: HashSet<_> = plan.excluded.iter().cloned().collect();
@@ -676,37 +871,56 @@ fn apply_plan(directory: &Path, mut plan: ChangePlan) -> Result<()> {
     Ok(())
 }
 
+/// Decommission an install: cancel its delivery generations, best-effort
+/// revoke its RelayHistory token, and reclaim what is left behind. A
+/// configuration or a database that cannot be read is already decommissioned:
+/// there is no generation to cancel and no token to revoke, and refusing here
+/// would leave the desktop unable to finish a sign-out at all.
 pub fn disconnect(directory: &Path) -> Result<()> {
     let _control = control_lock(directory)?;
     collector::stop(directory)?;
     let _guard = lock(directory)?;
-    let config = read_config(directory)?;
-    let conn = db(directory)?;
-    for job in delivery::list_jobs(&conn)? {
-        if job.state != "cancelled" {
-            delivery::cancel_job(&conn, &job.job_id)?;
+    // Before anything is removed: a cancellation that cannot be committed
+    // leaves the install exactly as it was, rather than reporting a sign-out
+    // over a generation that is still able to upload.
+    cancel_generations(directory)?;
+    if let Ok(config) = read_config(directory) {
+        std::env::set_var("RELAYHISTORY_HOME", directory);
+        if let Ok(Some(auth)) = relayhistory_plugin::cloud::load_auth(Some(&config.history_url)) {
+            let token = auth.refresh_token.as_deref().unwrap_or(&auth.access_token);
+            let _ = ureq::AgentBuilder::new()
+                .timeout(Duration::from_secs(5))
+                .redirects(0)
+                .build()
+                .post(&format!("{}/v1/auth/token/revoke", config.history_url))
+                .send_json(json!({"token":token}));
         }
     }
-    std::env::set_var("RELAYHISTORY_HOME", directory);
-    if let Ok(Some(auth)) = relayhistory_plugin::cloud::load_auth(Some(&config.history_url)) {
-        let token = auth.refresh_token.as_deref().unwrap_or(&auth.access_token);
-        let _ = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(5))
-            .redirects(0)
-            .build()
-            .post(&format!("{}/v1/auth/token/revoke", config.history_url))
-            .send_json(json!({"token":token}));
+    // Removal order is most of the correctness here: anything that could
+    // bring the install back goes before its configuration, and the
+    // configuration goes last. A pending sharing change is exactly such a
+    // thing — `recover` replays it into a new generation and a new
+    // configuration — so it goes first, then the stage credentials. A
+    // directory with neither stages nor configuration is decommissioned, so
+    // an interrupted disconnect is finished by the next `installs` sweep,
+    // while one that still has its stages is a setup the sweep leaves alone.
+    let pending = directory.join("sharing-change.json");
+    if pending.exists() {
+        fs::remove_file(pending)?;
     }
     let stages = directory.join("stages");
     if stages.exists() {
         fs::remove_dir_all(stages)?;
     }
-    for name in ["sharing-change.json", "selected.json", "config.json"] {
-        let path = directory.join(name);
-        if path.exists() {
-            fs::remove_file(path)?;
-        }
+    let config_path = directory.join("config.json");
+    if config_path.exists() {
+        fs::remove_file(config_path)?;
     }
+    // The install is decommissioned from here, so the sign-out has already
+    // succeeded. What is left is reclamation, which the `installs` sweep does
+    // anyway: a database that is busy now must not turn a completed
+    // decommission into a failed one that the desktop gates sign-in on.
+    let _ = reclaim_decommissioned(directory);
     emit(json!({"disconnected":true}));
     Ok(())
 }
@@ -735,19 +949,35 @@ mod tests {
 
     use super::*;
     use clap::Parser;
+    use sha2::Digest;
 
     fn fixture(mode: SharingMode) -> (tempfile::TempDir, Config) {
         let dir = tempfile::tempdir().unwrap();
-        let conn = db(dir.path()).unwrap();
-        conn.execute("INSERT INTO sessions(source,session_id,first_prompt,last_activity_ms) VALUES ('claude','old','Fix authentication',10),('codex','recent','Add tests',20)", []).unwrap();
-        let job = DeliveryJobConfig {
+        let config = fixture_in(dir.path(), mode);
+        (dir, config)
+    }
+    /// An install directory is named by the SHA-256 of its identity.
+    fn name(identity: &str) -> String {
+        format!("{:x}", sha2::Sha256::digest(identity))
+    }
+    fn job_config(mode: SharingMode) -> DeliveryJobConfig {
+        DeliveryJobConfig {
             destination_id: "relayhistory".into(),
             instance_id: "teams-probe".into(),
             account_id: relayhistory_plugin::destination::account_id("org", Some("workspace")),
             mapping_version: relayhistory_plugin::destination::MAPPING_VERSION.into(),
             selection: collector::selection(mode == SharingMode::All),
             limits: Default::default(),
-        };
+        }
+    }
+    fn journal_rows(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM delivery_journal", [], |r| r.get(0))
+            .unwrap()
+    }
+    fn fixture_in(dir: &Path, mode: SharingMode) -> Config {
+        let conn = db(dir).unwrap();
+        conn.execute("INSERT INTO sessions(source,session_id,first_prompt,last_activity_ms) VALUES ('claude','old','Fix authentication',10),('codex','recent','Add tests',20)", []).unwrap();
+        let job = job_config(mode);
         if mode != SharingMode::All {
             collector::record_baseline(&conn, false).unwrap();
         }
@@ -768,9 +998,369 @@ mod tests {
             sharing_mode: Some(mode),
             acknowledge_uninspected_schedules: false,
         };
-        save_json(&dir.path().join("config.json"), &config).unwrap();
-        (dir, config)
+        save_json(&dir.join("config.json"), &config).unwrap();
+        config
     }
+
+    /// The per-directory bound is a constant, but nothing bounds how many
+    /// decommissioned installs a machine accumulates — cloud uninstalls and
+    /// account switches leave one each. A listing that reclaimed every one it
+    /// found would scale with exactly the backlog it exists to clear, so it
+    /// reclaims one and the next listing takes the next.
+    #[test]
+    fn a_listing_reclaims_one_decommissioned_install_and_converges() {
+        let root = tempfile::tempdir().unwrap();
+        let mut stale = [name("first"), name("second")];
+        stale.sort();
+        for identity in &stale {
+            let directory = root.path().join(identity);
+            db(&directory).unwrap();
+            fs::write(directory.join("collector.log"), "left behind").unwrap();
+            fs::write(directory.join("cycle.json"), "{}").unwrap();
+        }
+        let log = |identity: &str| root.path().join(identity).join("collector.log");
+
+        // One listing reclaims the first and leaves the second alone.
+        assert!(installs_in(root.path()).unwrap().is_empty());
+        assert!(!log(&stale[0]).exists());
+        assert!(log(&stale[1]).exists());
+
+        // The next takes the second: the first is already clean, so it does
+        // not consume the reclaim and does not starve the one behind it.
+        assert!(installs_in(root.path()).unwrap().is_empty());
+        assert!(!log(&stale[1]).exists());
+
+        // Both databases are retained throughout.
+        for identity in &stale {
+            assert!(root.path().join(identity).join("history.db").exists());
+        }
+    }
+
+    #[test]
+    fn installs_reclaims_decommissioned_directories_and_never_lists_them() {
+        let root = tempfile::tempdir().unwrap();
+        let configured = root.path().join(name("configured"));
+        fixture_in(&configured, SharingMode::New);
+        // A decommissioned install: a database, a journal and logs, no config.
+        let stale = root.path().join(name("stale"));
+        let job = {
+            let conn = db(&stale).unwrap();
+            let job = delivery::create_job(&conn, &job_config(SharingMode::All), collector::now())
+                .unwrap();
+            conn.execute("INSERT INTO sessions(source,session_id,first_prompt,last_activity_ms) VALUES ('claude','one','Fix authentication',10)", []).unwrap();
+            assert!(journal_rows(&conn) > 0);
+            job.job_id
+        };
+        for path in [
+            "collector.log",
+            "collector.log.1",
+            "collector.log.3",
+            "runtime.json",
+            "cycle.json",
+            "inventory-diagnostic.json",
+        ] {
+            fs::write(stale.join(path), "left behind").unwrap();
+        }
+        // A setup interrupted before it wrote its configuration: its staged
+        // credentials say the capture under way is not abandoned.
+        let installing = root.path().join(name("installing"));
+        fs::create_dir_all(installing.join("stages")).unwrap();
+        fs::write(installing.join("collector.log"), "capturing").unwrap();
+        // A running collector holds its own lock.
+        let running = root.path().join(name("running"));
+        let _running = lock(&running).unwrap();
+        fs::write(running.join("collector.log"), "running").unwrap();
+        // Somebody's own copy, not an install identity.
+        let backup = root.path().join(format!("{}-backup", name("stale")));
+        fs::create_dir_all(&backup).unwrap();
+        fs::write(backup.join("collector.log"), "a hand-made copy").unwrap();
+        fs::write(root.path().join("not-a-directory"), "").unwrap();
+
+        let listed = installs_in(root.path()).unwrap();
+        let directories: Vec<_> = listed
+            .iter()
+            .map(|v| v["directory"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(directories, vec![configured.to_str().unwrap().to_owned()]);
+        // The decommissioned install keeps its database and loses everything
+        // a generation that is gone was holding.
+        assert!(stale.join("history.db").exists());
+        let conn = db(&stale).unwrap();
+        assert_eq!(delivery::status(&conn, &job).unwrap().state, "cancelled");
+        assert_eq!(journal_rows(&conn), 0);
+        assert_eq!(delivery::retained_bytes(&conn).unwrap().0, 0);
+        drop(conn);
+        for path in collector::log_files(&stale) {
+            assert!(!path.exists(), "{path:?}");
+        }
+        for path in ["runtime.json", "cycle.json", "inventory-diagnostic.json"] {
+            assert!(!stale.join(path).exists(), "{path}");
+        }
+        // Neither the setup in progress, the running collector nor the copy
+        // is touched, and none of them is listed.
+        assert!(installing.join("collector.log").exists());
+        assert!(running.join("collector.log").exists());
+        assert!(backup.join("collector.log").exists());
+
+        // Once the collector releases its lock the sweep reaches it.
+        drop(_running);
+        assert_eq!(installs_in(root.path()).unwrap().len(), 1);
+        assert!(!running.join("collector.log").exists());
+        assert!(installing.join("collector.log").exists());
+        assert!(configured.join("history.db").exists());
+    }
+
+    #[test]
+    fn disconnect_reclaims_the_install_and_keeps_its_history() {
+        let (dir, config) = fixture(SharingMode::All);
+        fs::create_dir_all(dir.path().join("stages")).unwrap();
+        fs::write(dir.path().join("stages/token"), "staged").unwrap();
+        fs::write(dir.path().join("collector.log"), "log").unwrap();
+        fs::write(dir.path().join("collector.log.2"), "older log").unwrap();
+        fs::write(dir.path().join("runtime.json"), "{}").unwrap();
+        let sessions = |conn: &Connection| -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+                .unwrap()
+        };
+        let captured = sessions(&db(dir.path()).unwrap());
+        assert!(captured > 0);
+
+        disconnect(dir.path()).unwrap();
+
+        assert!(!dir.path().join("config.json").exists());
+        assert!(!dir.path().join("stages").exists());
+        assert!(!dir.path().join("runtime.json").exists());
+        for path in collector::log_files(dir.path()) {
+            assert!(!path.exists(), "{path:?}");
+        }
+        // The captured history and its origin identity stay: reconnecting the
+        // same account resumes from the revisions the Cloud already holds.
+        let conn = db(dir.path()).unwrap();
+        assert_eq!(sessions(&conn), captured);
+        assert_eq!(
+            delivery::status(&conn, &config.job_id).unwrap().state,
+            "cancelled"
+        );
+        assert_eq!(journal_rows(&conn), 0);
+        assert_eq!(delivery::retained_bytes(&conn).unwrap().0, 0);
+        drop(conn);
+        // A second disconnect of a decommissioned directory is not an error.
+        disconnect(dir.path()).unwrap();
+        assert!(dir.path().join("history.db").exists());
+    }
+
+    /// Decommissioning reads only what it takes to cancel, so a historical
+    /// generation whose stored configuration no longer parses cannot refuse a
+    /// sign-out over the live one beside it.
+    #[test]
+    fn disconnect_cancels_past_an_unreadable_historical_generation() {
+        let (dir, config) = fixture(SharingMode::All);
+        // A generation left by an older build, whose stored configuration this
+        // one no longer parses. Cloning the live row keeps every other column
+        // valid, so only the configuration is unreadable.
+        let stale = "stale-generation";
+        {
+            let conn = db(dir.path()).unwrap();
+            conn.execute(
+                "CREATE TEMP TABLE clone AS SELECT * FROM delivery_jobs WHERE id=?",
+                [&config.job_id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE clone SET id=?, state='cancelled', config_json='{not json'",
+                [stale],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO delivery_jobs SELECT * FROM clone", [])
+                .unwrap();
+            // A full enumeration cannot get past that row.
+            assert!(delivery::list_jobs(&conn).is_err());
+            assert_eq!(delivery::list_job_states(&conn).unwrap().len(), 2);
+        }
+
+        disconnect(dir.path()).unwrap();
+
+        assert!(!dir.path().join("config.json").exists());
+        let conn = db(dir.path()).unwrap();
+        assert_eq!(
+            delivery::status(&conn, &config.job_id).unwrap().state,
+            "cancelled"
+        );
+        // The unreadable row is left exactly as it was.
+        assert_eq!(
+            delivery::list_job_states(&conn)
+                .unwrap()
+                .into_iter()
+                .find(|(id, _)| id == stale)
+                .map(|(_, state)| state),
+            Some("cancelled".to_owned())
+        );
+    }
+
+    /// A pending sharing change outlives the install if it is removed after
+    /// the configuration, and setup runs `recover` before it looks for a
+    /// configuration at all — so the plan would replay into a new generation
+    /// and a new configuration, reconnecting an install the user signed out
+    /// of. Both halves are covered: the order, and the guard behind it.
+    #[test]
+    fn a_pending_sharing_change_does_not_survive_a_disconnect() {
+        let (dir, config) = fixture(SharingMode::All);
+        let conn = db(dir.path()).unwrap();
+        let plan = make_plan(
+            &conn,
+            dir.path(),
+            config,
+            Some(SharingMode::New),
+            &[],
+            false,
+        )
+        .unwrap();
+        save_json(&dir.path().join("sharing-change.json"), &plan).unwrap();
+        drop(conn);
+
+        disconnect(dir.path()).unwrap();
+
+        assert!(!dir.path().join("sharing-change.json").exists());
+        assert!(!dir.path().join("config.json").exists());
+        // What setup does first, on a directory the user just signed out of.
+        recover(dir.path()).unwrap();
+        assert!(
+            !dir.path().join("config.json").exists(),
+            "recover resurrected the install"
+        );
+
+        // And the guard holds on its own, for a plan left behind some other
+        // way: it is discarded rather than replayed.
+        save_json(&dir.path().join("sharing-change.json"), &plan).unwrap();
+        recover(dir.path()).unwrap();
+        assert!(!dir.path().join("sharing-change.json").exists());
+        assert!(!dir.path().join("config.json").exists());
+    }
+
+    /// Cancelling several generations is all or nothing. A sign-out that
+    /// reports failure must not have stopped an install that still looks
+    /// connected, because nothing would tell the user to retry it.
+    #[test]
+    fn a_refused_cancellation_leaves_every_generation_alive() {
+        let (dir, config) = fixture(SharingMode::All);
+        let conn = db(dir.path()).unwrap();
+        // A second generation that no longer exists: cancelling it fails, and
+        // it is reached after the live one in the same transaction.
+        let missing = "absent-generation".to_owned();
+        let live = vec![config.job_id.clone(), missing];
+
+        let refused = delivery::cancel_generations(&conn, &live).unwrap_err();
+
+        assert!(format!("{refused:#}").contains("not found"), "{refused:#}");
+        // The generation that could be cancelled was rolled back with it.
+        assert_eq!(
+            delivery::status(&conn, &config.job_id).unwrap().state,
+            "active"
+        );
+        assert!(
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM history_subscriptions WHERE id=?)",
+                [&config.job_id],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap(),
+            "the subscription survives a refused cancellation"
+        );
+    }
+
+    /// A live generation whose stored configuration no longer parses cannot
+    /// dispatch a batch either, so holding the install open for it protects
+    /// nothing and only leaves the desktop unable to sign out.
+    #[test]
+    fn disconnect_cancels_a_generation_whose_configuration_is_unreadable() {
+        let (dir, config) = fixture(SharingMode::All);
+        {
+            let conn = db(dir.path()).unwrap();
+            assert_eq!(
+                delivery::status(&conn, &config.job_id).unwrap().state,
+                "active"
+            );
+            conn.execute(
+                "UPDATE delivery_jobs SET config_json='{not json' WHERE id=?",
+                [&config.job_id],
+            )
+            .unwrap();
+            // Neither reading the generation nor cancelling it through the
+            // status-returning entry point can get past its configuration.
+            assert!(delivery::status(&conn, &config.job_id).is_err());
+            assert!(delivery::cancel_job(&conn, &config.job_id).is_err());
+        }
+
+        disconnect(dir.path()).unwrap();
+
+        assert!(!dir.path().join("config.json").exists());
+        let conn = db(dir.path()).unwrap();
+        assert_eq!(
+            delivery::list_job_states(&conn)
+                .unwrap()
+                .into_iter()
+                .find(|(id, _)| *id == config.job_id)
+                .map(|(_, state)| state),
+            Some("cancelled".to_owned())
+        );
+        // Cancellation released what the generation was retaining, so nothing
+        // is left pinning the journal.
+        assert_eq!(journal_rows(&conn), 0);
+        assert_eq!(delivery::retained_bytes(&conn).unwrap().0, 0);
+    }
+
+    /// A generation that survives is adopted by the next setup for the same
+    /// account, which resumes its queued records. A cancellation that cannot
+    /// be committed must therefore fail the disconnect with the install
+    /// untouched, not report a sign-out over a generation still able to upload.
+    #[test]
+    fn disconnect_fails_rather_than_leaving_a_generation_able_to_upload() {
+        let (dir, config) = fixture(SharingMode::All);
+        fs::write(dir.path().join("collector.log"), "log").unwrap();
+        // Another writer holds the database beyond the bridge's busy timeout.
+        let holder = db(dir.path()).unwrap();
+        holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+        let refused = disconnect(dir.path()).unwrap_err();
+
+        holder.execute_batch("ROLLBACK").unwrap();
+        assert!(
+            format!("{refused:#}").to_lowercase().contains("lock")
+                || format!("{refused:#}").to_lowercase().contains("busy"),
+            "{refused:#}"
+        );
+        // The install is exactly as it was, so a retry can finish the job.
+        assert!(dir.path().join("config.json").exists());
+        assert!(dir.path().join("collector.log").exists());
+        let conn = db(dir.path()).unwrap();
+        assert_eq!(
+            delivery::status(&conn, &config.job_id).unwrap().state,
+            "active"
+        );
+        drop(conn);
+        disconnect(dir.path()).unwrap();
+        assert!(!dir.path().join("config.json").exists());
+        let conn = db(dir.path()).unwrap();
+        assert_eq!(
+            delivery::status(&conn, &config.job_id).unwrap().state,
+            "cancelled"
+        );
+    }
+
+    /// A configuration or a database a disconnect cannot read must not leave
+    /// the desktop unable to sign out.
+    #[test]
+    fn disconnect_reclaims_an_install_with_an_unreadable_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        fixture_in(dir.path(), SharingMode::All);
+        fs::write(dir.path().join("config.json"), "{not json").unwrap();
+        fs::write(dir.path().join("collector.log"), "log").unwrap();
+        disconnect(dir.path()).unwrap();
+        assert!(!dir.path().join("config.json").exists());
+        assert!(!dir.path().join("collector.log").exists());
+        assert!(dir.path().join("history.db").exists());
+    }
+
     fn apply(
         dir: &Path,
         config: Config,
