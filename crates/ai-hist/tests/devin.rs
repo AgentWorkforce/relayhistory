@@ -1064,3 +1064,79 @@ fn devin_content_swapped_between_rows_still_resyncs() {
         "a content swap must re-normalize the row"
     );
 }
+
+#[test]
+fn devin_hidden_session_retires_after_sync_state_is_lost() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let store = stage_devin_db(home, BASE_SESSION_SQL);
+    let _env = EnvGuard::set(home);
+    let db = home.join("history.db");
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+
+    // Hide the session, then destroy the persisted stamp map: the local
+    // catalog rows are the durable baseline, so the hidden session must
+    // still retire instead of surviving orphaned.
+    let provider = Connection::open(&store).unwrap();
+    provider
+        .execute("UPDATE sessions SET hidden=1 WHERE id='devin-test'", [])
+        .unwrap();
+    drop(provider);
+    std::fs::remove_file(home.join(".sync-state.json")).unwrap();
+
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+    let conn = open_db(&db).unwrap();
+    let local_rows: i64 = conn
+        .query_row(
+            "SELECT \
+               (SELECT COUNT(*) FROM sessions \
+                WHERE source='devin' AND session_id='devin-test') + \
+               (SELECT COUNT(*) FROM session_events \
+                WHERE source='devin' AND session_id='devin-test') + \
+               (SELECT COUNT(*) FROM session_presences \
+                WHERE source='devin' AND session_id='devin-test' AND location='local')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(local_rows, 0, "state loss must not strand a hidden session");
+}
+
+#[test]
+fn devin_retired_stamp_stays_out_of_the_persisted_state() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let store = stage_devin_db(home, BASE_SESSION_SQL);
+    let _env = EnvGuard::set(home);
+    let db = home.join("history.db");
+    let state_path = home.join(".sync-state.json");
+    let stamped = |path: &std::path::Path| {
+        serde_json::from_slice::<serde_json::Value>(&std::fs::read(path).unwrap())
+            .unwrap()
+            .get("devin_sessions_v1")
+            .and_then(|map| map.get("devin-test"))
+            .is_some()
+    };
+
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+    assert!(stamped(&state_path), "first sync must stamp the session");
+
+    let provider = Connection::open(&store).unwrap();
+    provider
+        .execute("UPDATE sessions SET hidden=1 WHERE id='devin-test'", [])
+        .unwrap();
+    drop(provider);
+
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+    assert!(
+        !stamped(&state_path),
+        "the checkpoint merge must not resurrect a retired stamp"
+    );
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+    assert!(
+        !stamped(&state_path),
+        "a retired stamp stays retired on the next sync"
+    );
+}

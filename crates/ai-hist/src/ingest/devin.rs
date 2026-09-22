@@ -1555,6 +1555,27 @@ pub(super) fn sync_devin_db(
     result
 }
 
+/// Session ids this install has already acquired locally.
+///
+/// Local discovery and ingestion write a `session_presences` row, and local
+/// observation bookkeeping writes a `session_observations` row, for every
+/// session they touch — those rows are the durable record that survives a
+/// lost `.sync-state.json`. Remote-only sessions carry neither and so never
+/// appear here.
+fn local_devin_session_ids(conn: &Connection) -> Result<BTreeSet<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT session_id FROM session_presences \
+         WHERE source = 'devin' AND location = 'local' \
+         UNION \
+         SELECT session_id FROM session_observations \
+         WHERE source = 'devin' AND location = 'local'",
+    )?;
+    let ids = stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    Ok(ids)
+}
+
 fn sync_devin_from_source(
     conn: &Connection,
     state: &mut Map<String, Value>,
@@ -1577,15 +1598,35 @@ fn sync_devin_from_source(
     let visible: BTreeSet<&str> = ids.iter().map(String::as_str).collect();
     // A session that became hidden or was deleted since the last pass keeps
     // no catalog row, no evidence and no stamp state — and reappears cleanly
-    // if it is unhidden again.
-    let gone: Vec<String> = devin_state
+    // if it is unhidden again. The baseline for "this install saw it locally"
+    // is the union of the persisted stamp map and the local presence and
+    // observation rows: a lost or rewritten `.sync-state.json` must not
+    // strand retired sessions in the catalog. Remote-only rows are
+    // deliberately absent, so a session only a connector sees is never
+    // retired by a local pass.
+    let mut gone: BTreeSet<String> = devin_state
         .keys()
         .filter(|id| !visible.contains(id.as_str()))
         .cloned()
         .collect();
-    for session_id in gone {
-        retire_session(conn, &session_id)?;
-        devin_state.remove(&session_id);
+    for session_id in local_devin_session_ids(conn)? {
+        if !visible.contains(session_id.as_str()) {
+            gone.insert(session_id);
+        }
+    }
+    // Dropping the entry from this run's map is not enough — the checkpoint
+    // merge overlays our keys onto the on-disk map, so a removed key survives
+    // and retirement repeats every pass. `forget_unobserved_paths` records
+    // the drop for the merge, which deletes it from disk. Its return value
+    // gates file-walk generations; a routine retirement is not a shortfall.
+    let _ = super::forget_unobserved_paths(
+        state,
+        &mut devin_state,
+        SYNC_STATE_KEY,
+        gone.iter().cloned().collect(),
+    );
+    for session_id in &gone {
+        retire_session(conn, session_id)?;
     }
     let mut inserted = 0usize;
     let mut failures: Vec<String> = Vec::new();
