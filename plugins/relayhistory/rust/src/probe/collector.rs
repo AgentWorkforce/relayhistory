@@ -631,6 +631,29 @@ fn saved_report(directory: &Path) -> SavedReport {
         .unwrap_or_default()
 }
 
+/// Serialize one report's read-modify-write against the other writer's. The
+/// collector reports every pass and a desktop compaction re-measures the cap
+/// between them, so without this the later write of two overlapping sequences
+/// silently replaces the other's answer. The guard is advisory: a report that
+/// cannot take it is still written, because status must never hold up a retry.
+fn cycle_guard(directory: &Path) -> Option<fs::File> {
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(directory.join("cycle.lock"))
+        .ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .ok()?;
+    }
+    fs2::FileExt::lock_exclusive(&file).ok()?;
+    Some(file)
+}
+
 /// Persist advisory status without interrupting retries when either status or logs cannot be written.
 fn write_cycle_report(directory: &Path, verdicts: &Verdicts, mut diagnostics: impl Write) {
     let retention = verdicts
@@ -665,6 +688,7 @@ fn persist_cycle_report(
     started_ms: i64,
     diagnostics: impl Write,
 ) {
+    let _guard = cycle_guard(directory);
     let saved = saved_report(directory);
     let recompacted = saved.at_ms > started_ms;
     let current = |observed: Option<String>, saved: &Option<String>| match (&observed, saved) {
@@ -696,6 +720,7 @@ pub(super) fn refresh_retention_verdict(
     reclaimed_bytes: i64,
     diagnostics: impl Write,
 ) {
+    let _guard = cycle_guard(directory);
     let mut verdicts = saved_report(directory).verdicts;
     if !verdicts.retention_limited() {
         return;
@@ -1926,6 +1951,31 @@ mod tests {
             saved_cycle(directory.path())["error_class"],
             "retention_limit"
         );
+    }
+
+    /// Two writers update one report, so each one's read-modify-write waits
+    /// for the other: neither replaces an answer it never read.
+    #[test]
+    fn a_cycle_report_waits_for_the_other_writer() {
+        let directory = capped_directory(10 * 1_048_576);
+        let guard = cycle_guard(directory.path()).expect("the guard is available");
+        let path = directory.path().to_owned();
+        let writing = std::thread::spawn(move || {
+            persist_cycle_report(
+                &path,
+                &PassOutcome::delivery_only(Ok(())),
+                now(),
+                Vec::new(),
+            );
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !directory.path().join("cycle.json").exists(),
+            "a report was written while another writer held the guard"
+        );
+        drop(guard);
+        writing.join().unwrap();
+        assert_eq!(saved_cycle(directory.path())["ok"], true);
     }
 
     /// A pass reports what it observed, and a compaction that reported while
