@@ -256,8 +256,8 @@ human-readable install/status/stop commands remain available.
   lives in its own reserve above the cap; it can exceed `limit_bytes` by that
   reserve until the batch is acknowledged. When a cycle stops on that cap,
   `last_cycle.error_class` is `retention_limit`, `last_cycle.used_bytes` and
-  `last_cycle.limit_bytes` carry the budget the pass stopped at, and the
-  message shows the same figures: `Upload journal full (256 MB of 256 MB).
+  `last_cycle.limit_bytes` carry the journal's usage when the report is
+  written, and the message shows the same figures: `Upload journal full (256 MB of 256 MB).
   Compacting consumed records; queued sessions are preserved.` at the cap, or
   `Upload journal nearly full (231 MB of 256 MB); capture is waiting for room.
   Compacting consumed records; queued sessions are preserved.` for a pass

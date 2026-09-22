@@ -1669,7 +1669,11 @@ mod tests {
             },
         );
         assert_eq!(attempted.get(), 2, "the member after the stop is not tried");
-        persist_cycle_report(dir.path(), &result, Vec::new());
+        let outcome = PassOutcome {
+            capture: Some(result),
+            delivery: Ok(()),
+        };
+        persist_cycle_report(dir.path(), &outcome, now(), Vec::new());
         let report: serde_json::Value =
             serde_json::from_slice(&fs::read(dir.path().join("cycle.json")).unwrap()).unwrap();
         assert_eq!(report["error_class"], "retention_limit");
@@ -1834,9 +1838,19 @@ mod tests {
             std::io::ErrorKind::StorageFull,
             "secret runtime path",
         )));
-        write_cycle_report(directory.path(), &Verdicts::capture(&result), None, FullDisk);
+        write_cycle_report(
+            directory.path(),
+            &Verdicts::capture(&result),
+            None,
+            FullDisk,
+        );
         let mut output = Vec::new();
-        write_cycle_report(directory.path(), &Verdicts::capture(&result), None, &mut output);
+        write_cycle_report(
+            directory.path(),
+            &Verdicts::capture(&result),
+            None,
+            &mut output,
+        );
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("Sync status could not be saved"));
         assert!(output.contains("Free disk space"));
@@ -1855,7 +1869,10 @@ mod tests {
             used_bytes: 231 * 1_048_576,
             limit_bytes: 256 * 1_048_576,
         });
-        let report = cycle_report(&Err(stopped), Some((231 * 1_048_576, 256 * 1_048_576)));
+        let report = cycle_report(
+            &Verdicts::capture(&Err(stopped)),
+            Some((231 * 1_048_576, 256 * 1_048_576)),
+        );
         assert_eq!(report["error_class"], "retention_limit");
         assert_eq!(
             report["message"],
@@ -1894,7 +1911,12 @@ mod tests {
             Some("delivery retention limit exceeded; secret".into()),
         )));
         let mut output = Vec::new();
-        write_cycle_report(directory.path(), &Verdicts::capture(&result), None, &mut output);
+        write_cycle_report(
+            directory.path(),
+            &Verdicts::capture(&result),
+            None,
+            &mut output,
+        );
         let saved: serde_json::Value =
             serde_json::from_slice(&fs::read(directory.path().join("cycle.json")).unwrap())
                 .unwrap();
@@ -1906,7 +1928,12 @@ mod tests {
 
         let unreadable = tempfile::tempdir().unwrap();
         fs::create_dir(unreadable.path().join("history.db")).unwrap();
-        write_cycle_report(unreadable.path(), &Verdicts::capture(&result), None, Vec::new());
+        write_cycle_report(
+            unreadable.path(),
+            &Verdicts::capture(&result),
+            None,
+            Vec::new(),
+        );
         let saved: serde_json::Value =
             serde_json::from_slice(&fs::read(unreadable.path().join("cycle.json")).unwrap())
                 .unwrap();
@@ -1988,6 +2015,30 @@ mod tests {
         directory
     }
 
+    /// A retention report carries the journal's current reading, not the
+    /// usage the stopped pass measured before compacting.
+    #[test]
+    fn a_retention_report_carries_the_current_reading_over_the_stopped_usage() {
+        let directory = capped_directory(10 * 1_048_576);
+        let current = read_retention(directory.path()).unwrap();
+        let stopped = PassOutcome {
+            capture: Some(Err(anyhow::Error::new(delivery::RetentionLimitReached {
+                used_bytes: 9_500_000,
+                limit_bytes: 10 * 1_048_576,
+            }))),
+            delivery: Ok(()),
+        };
+        persist_cycle_report(directory.path(), &stopped, now(), Vec::new());
+        let report = saved_cycle(directory.path());
+        assert_eq!(report["error_class"], "retention_limit");
+        assert_eq!(report["used_bytes"], current.0);
+        assert_eq!(report["limit_bytes"], current.1);
+        assert!(report["message"]
+            .as_str()
+            .unwrap()
+            .contains("(0 MB of 10 MB)"));
+    }
+
     /// Capture and delivery are observed at different cadences: a pass that
     /// only delivered leaves the capture verdict, and the desktop banner it
     /// drives, exactly where the capture cycle put it.
@@ -2017,7 +2068,7 @@ mod tests {
         assert_eq!(report["error_class"], "retention_limit");
         assert_eq!(
             report["message"],
-            "Upload journal full (0 MB of 10 MB). Compacting consumed records; queued sessions are preserved."
+            "Upload journal nearly full (0 MB of 10 MB); capture is waiting for room. Compacting consumed records; queued sessions are preserved."
         );
         assert_eq!(report["capture"]["error_class"], "retention_limit");
         assert_eq!(report["delivery"]["ok"], true);
