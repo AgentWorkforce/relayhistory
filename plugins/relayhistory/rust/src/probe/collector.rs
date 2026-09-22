@@ -760,10 +760,12 @@ fn observed_usage(outcome: &PassOutcome) -> Option<(i64, i64)> {
 /// The cap rejects the write that would exceed it without recording it, so a
 /// journal that is full for the next record still reads below its cap: usage
 /// alone never shows the condition, and only reclaiming space changes it. A
-/// pass that freed space and left the journal under its cap therefore clears
-/// the verdict, and one that freed nothing — a cap held by un-uploaded backlog
-/// — leaves it standing with the current reading. Either way the next capture
-/// or delivery pass measures the condition itself.
+/// pass that freed space clears a verdict whose condition the reading no
+/// longer meets: capture's once the journal is back under the high-water mark
+/// at which capture stops, delivery's once it is under the cap. One that freed
+/// nothing — a cap held by un-uploaded backlog — leaves both standing with the
+/// current reading. Either way the next capture or delivery pass measures the
+/// condition itself.
 pub(super) fn refresh_retention_verdict(
     directory: &Path,
     reclaimed_bytes: i64,
@@ -774,13 +776,18 @@ pub(super) fn refresh_retention_verdict(
     if !verdicts.retention_limited() {
         return;
     }
-    let resolved =
-        reclaimed_bytes > 0 && read_retention(directory).is_some_and(|(used, limit)| used < limit);
-    if resolved {
-        for class in [&mut verdicts.capture, &mut verdicts.delivery] {
-            if class.as_deref() == Some("retention_limit") {
-                *class = None;
-            }
+    let reading = (reclaimed_bytes > 0)
+        .then(|| read_retention(directory))
+        .flatten();
+    let capture_room =
+        reading.is_some_and(|(used, limit)| !delivery::above_high_water(used, limit));
+    let delivery_room = reading.is_some_and(|(used, limit)| used < limit);
+    for (class, room) in [
+        (&mut verdicts.capture, capture_room),
+        (&mut verdicts.delivery, delivery_room),
+    ] {
+        if room && class.as_deref() == Some("retention_limit") {
+            *class = None;
         }
     }
     write_cycle_report(directory, &verdicts, None, diagnostics);
@@ -2176,6 +2183,37 @@ mod tests {
             saved_cycle(directory.path())["error_class"],
             "retention_limit"
         );
+    }
+
+    /// A compaction that leaves the journal over the high-water mark leaves
+    /// capture stopped, so the capture verdict stands; the journal is under
+    /// its cap, so a delivery verdict clears.
+    #[test]
+    fn compaction_above_the_high_water_mark_keeps_the_capture_verdict() {
+        let directory = capped_directory(10 * 1_048_576);
+        persist_cycle_report(
+            directory.path(),
+            &PassOutcome {
+                capture: Some(Err(retention_error())),
+                delivery: Err(retention_error()),
+            },
+            now(),
+            Vec::new(),
+        );
+        Connection::open(directory.path().join("history.db"))
+            .unwrap()
+            .execute(
+                "UPDATE delivery_state SET retained_bytes=95, max_retained_bytes=100 WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+        refresh_retention_verdict(directory.path(), 4_096, Vec::new());
+        let report = saved_cycle(directory.path());
+        assert_eq!(report["error_class"], "retention_limit");
+        assert_eq!(report["capture"]["error_class"], "retention_limit");
+        assert!(report["delivery"]["error_class"].is_null());
+        assert_eq!(report["used_bytes"], 95);
+        assert_eq!(report["limit_bytes"], 100);
     }
 
     /// Two writers update one report, so each one's read-modify-write waits

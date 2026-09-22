@@ -54,8 +54,8 @@ use std::collections::HashSet;
 
 use ai_hist::export::capture::{self, make_record, snapshot_record, RawRecord};
 pub use ai_hist::export::{
-    ExportSelection, HistoryExportRecord, SessionIdentity, DEFAULT_RETENTION_LIMIT_BYTES,
-    EXPORT_SCHEMA_VERSION, SUPPORTED_KINDS,
+    above_high_water, ExportSelection, HistoryExportRecord, SessionIdentity,
+    DEFAULT_RETENTION_LIMIT_BYTES, EXPORT_SCHEMA_VERSION, SUPPORTED_KINDS,
 };
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeliveryLimits {

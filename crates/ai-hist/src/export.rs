@@ -235,7 +235,9 @@ impl std::fmt::Display for RetentionLimitReached {
 }
 impl std::error::Error for RetentionLimitReached {}
 
-fn above_high_water(used_bytes: i64, limit_bytes: i64) -> bool {
+/// Whether `used_bytes` is over the high-water mark of `limit_bytes`: the
+/// usage at which capture stops rather than attempting another session.
+pub fn above_high_water(used_bytes: i64, limit_bytes: i64) -> bool {
     i128::from(used_bytes) * 100
         > i128::from(limit_bytes) * i128::from(RETENTION_HIGH_WATER_PERCENT)
 }
