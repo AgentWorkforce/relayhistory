@@ -253,11 +253,13 @@ fn compact_value(directory: &Path) -> Result<Value> {
     // write lock for several seconds delays a page, it does not abandon a pass
     // the user asked for and leave its count unreported.
     let conn = relayhistory_plugin::delivery::open_db(&directory.join("history.db"))?;
+    let (used_before, _) = delivery::retained_bytes(&conn)?;
     let removed_records = ai_hist::export::compact_journal_pass(&conn, 10_000)?;
     while delivery::compact_receipts(&conn, 10_000)? == 10_000 {}
     let retention = retention(&conn)?;
     // The persisted verdict measured a journal this pass has just changed.
-    collector::refresh_retention_verdict(directory, std::io::stderr());
+    let reclaimed = used_before - retention["used_bytes"].as_i64().unwrap_or(used_before);
+    collector::refresh_retention_verdict(directory, reclaimed, std::io::stderr());
     Ok(json!({"removed_records":removed_records, "retention":retention}))
 }
 pub fn pause(directory: &Path, paused: bool) -> Result<()> {
