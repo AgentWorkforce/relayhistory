@@ -91,6 +91,17 @@ a fresh cutoff, and relationships require both endpoints to be eligible.
 An already transmitted request cannot be recalled. Cancellation discards local
 pending work explicitly; it does not erase previously accepted remote records.
 
+Capture journals a change only when a subscription is interested in it: an
+all-sources job, or a session-job member for that identity, and the identity is
+shareable. A relationship change is journaled when either endpoint qualifies.
+Excluded and unselected sessions consume no journal retention. Whether an
+identity is shareable is one SQL rule (`capture::shareable`): the capture
+triggers embed it, and prepare, claim, dispatch, file exports and the sharing
+status read it through `capture::is_shareable`, so consent means the same thing
+at every step. A session included later starts from a fresh snapshot rather
+than from the journal. A session job subscribes through its members only; it
+carries no all-sources subscription of its own.
+
 Pausing preserves capture and queued work. Bounded maintenance expires exports,
 compacts consumed changes and releases completed bodies. An idle session
 subscription does not retain unrelated revisions. The evidence and upload queues
