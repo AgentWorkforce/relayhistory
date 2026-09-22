@@ -134,6 +134,44 @@ impl Table {
                 .join(",")
         )
     }
+    /// Whether some subscription can deliver one identity of this row: it
+    /// holds a subscription naming no session, or a member subscription for
+    /// that identity, and the identity is [`shareable`]. Every lookup is an
+    /// indexed seek.
+    fn interested(&self, row: &str, session: &str) -> String {
+        let source = self.source(row);
+        let shareable = shareable(&source, session);
+        format!(
+            "((EXISTS(SELECT 1 FROM history_subscriptions WHERE source IS NULL) \
+             OR EXISTS(SELECT 1 FROM history_subscriptions WHERE source={source} AND session_id={session})) \
+             AND {shareable})"
+        )
+    }
+    /// The predicate a tombstone is gated on. A tombstone carries a null
+    /// payload and names the row's own identity alone, so that identity is
+    /// the whole disclosure -- the carve-out `raw_excluded` applies when it
+    /// prepares a delete. An edge already delivered is retracted even after
+    /// its child becomes ineligible, rather than outliving its source row at
+    /// the destination.
+    pub fn tombstoned(&self, row: &str) -> String {
+        self.interested(row, &format!("{row}.{}", self.session))
+    }
+    /// The predicate a revision is gated on. A revision carries the whole
+    /// payload, and a relationship's payload discloses both endpoints, so it
+    /// is journaled only when its parent qualifies and its child is unlinked
+    /// or qualifies too -- the rule prepare applies before dispatch. A child
+    /// included later receives its incoming edges as fresh revisions, not
+    /// from the journal.
+    pub fn journaled(&self, row: &str) -> String {
+        let own = self.tombstoned(row);
+        if self.kind == "relationship" {
+            let child = format!("{row}.child_session_id");
+            let linked = self.interested(row, &child);
+            format!("({own} AND ({child} IS NULL OR {linked}))")
+        } else {
+            own
+        }
+    }
     pub fn payload(&self, conn: &Connection, row: &str) -> Result<String> {
         let columns = conn
             .prepare(&format!(
@@ -151,6 +189,17 @@ impl Table {
                 .join(",")
         ))
     }
+}
+
+/// The one consent rule for an identity leaving the machine: SQL that is true
+/// when `(source, session)` may be shared. `source` and `session` are SQL
+/// expressions -- a trigger's `NEW.source`, a scan's `m.session_id`, or bound
+/// parameters -- so the same text gates capture, snapshot reads and dispatch.
+/// Changing what consent means is a change to this function alone.
+pub fn shareable(source: &str, session: &str) -> String {
+    format!(
+        "NOT EXISTS(SELECT 1 FROM delivery_exclusions WHERE source={source} AND session_id={session})"
+    )
 }
 
 /// Drop a table's capture triggers when they predate one of its columns.
@@ -289,8 +338,12 @@ CREATE TRIGGER IF NOT EXISTS {table}_count_delete AFTER DELETE ON {table} BEGIN
 END;
 "#))?;
     }
-    let members_current: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE name='history_export_storage_v1')",
+    // Every capture trigger embeds the member and exclusion predicate its
+    // journal writes are gated on. Each marker records that the retained
+    // triggers carry that predicate; a database missing one has triggers that
+    // journal on a different rule, and they are all rebuilt in this pass.
+    let triggers_current: bool = conn.query_row(
+        "SELECT COUNT(*)=2 FROM schema_migrations WHERE name IN ('history_export_storage_v1','delivery_capture_filter_v1')",
         [],
         |r| r.get(0),
     )?;
@@ -306,7 +359,7 @@ END;
             "CREATE INDEX IF NOT EXISTS delivery_identity_{} ON {}({})",
             table.name, table.name, columns
         ))?;
-        if !members_current {
+        if !triggers_current {
             for operation in ["insert", "update", "delete"] {
                 conn.execute_batch(&format!(
                     "DROP TRIGGER IF EXISTS delivery_{}_{}",
@@ -326,6 +379,8 @@ END;
         let new_key = table.key("NEW");
         let old_source = table.source("OLD");
         let new_source = table.source("NEW");
+        let old_tombstoned = table.tombstoned("OLD");
+        let new_journaled = table.journaled("NEW");
         let name = table.name;
         let kind = table.kind;
         let session = table.session;
@@ -375,7 +430,7 @@ CREATE TRIGGER IF NOT EXISTS delivery_{name}_insert AFTER INSERT ON {name}
 WHEN EXISTS(SELECT 1 FROM ({consumers})) BEGIN
  {insert_shadow}
  INSERT INTO delivery_journal(kind,source,session_id,record_key,operation,payload)
- SELECT '{kind}',{new_source},NEW.{session},{new_key},'upsert',{new_payload} WHERE EXISTS(SELECT 1 FROM history_subscriptions);
+ SELECT '{kind}',{new_source},NEW.{session},{new_key},'upsert',{new_payload} WHERE {new_journaled};
 END;
 CREATE TRIGGER IF NOT EXISTS delivery_{name}_update AFTER UPDATE ON {name}
 WHEN EXISTS(SELECT 1 FROM ({consumers})) AND {old_payload} <> {new_payload} BEGIN
@@ -388,15 +443,15 @@ WHEN EXISTS(SELECT 1 FROM ({consumers})) AND {old_payload} <> {new_payload} BEGI
  AND (j.bootstrap_kind < {index} OR (j.bootstrap_kind={index} AND j.bootstrap_rowid < NEW.rowid))
  AND NOT EXISTS(SELECT 1 FROM delivery_shadow s WHERE s.job_id=j.id AND s.kind='{kind}' AND s.row_id=NEW.rowid);
  INSERT INTO delivery_journal(kind,source,session_id,record_key,operation,payload)
- SELECT '{kind}',{old_source},OLD.{session},{old_key},'delete','null' WHERE {old_key} <> {new_key} AND EXISTS(SELECT 1 FROM history_subscriptions);
+ SELECT '{kind}',{old_source},OLD.{session},{old_key},'delete','null' WHERE {old_key} <> {new_key} AND {old_tombstoned};
  INSERT INTO delivery_journal(kind,source,session_id,record_key,operation,payload)
- SELECT '{kind}',{new_source},NEW.{session},{new_key},'upsert',{new_payload} WHERE EXISTS(SELECT 1 FROM history_subscriptions);
+ SELECT '{kind}',{new_source},NEW.{session},{new_key},'upsert',{new_payload} WHERE {new_journaled};
 END;
 CREATE TRIGGER IF NOT EXISTS delivery_{name}_delete AFTER DELETE ON {name}
 WHEN EXISTS(SELECT 1 FROM ({consumers})) BEGIN
  {before_shadow}
  INSERT INTO delivery_journal(kind,source,session_id,record_key,operation,payload)
- SELECT '{kind}',{old_source},OLD.{session},{old_key},'delete','null' WHERE EXISTS(SELECT 1 FROM history_subscriptions);
+ SELECT '{kind}',{old_source},OLD.{session},{old_key},'delete','null' WHERE {old_tombstoned};
 END;
 "#))?;
     }
@@ -406,6 +461,10 @@ END;
     )?;
     conn.execute(
         "INSERT OR IGNORE INTO schema_migrations(name) VALUES ('history_export_storage_v1')",
+        [],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations(name) VALUES ('delivery_capture_filter_v1')",
         [],
     )?;
     Ok(())
@@ -516,15 +575,16 @@ pub(crate) fn journal_migrated_rows(conn: &Connection, table_name: &str) -> Resu
     // restricts it to `TABLES` -- but the safety is then visible in this one
     // statement rather than inferred from a return three lines up.
     let name = table.name;
-    // Guarded by the same predicate the triggers use, so a database with no
-    // subscriber writes nothing: a job created later bootstraps from the table
-    // itself and already sees these rows.
+    // Guarded by the same predicate the triggers use, so a row no subscriber
+    // is interested in writes nothing: a job created later bootstraps from the
+    // table itself and already sees these rows.
+    let journaled = table.journaled("m");
     conn.execute(
         &format!(
             "INSERT INTO delivery_journal(kind,source,session_id,record_key,operation,payload) \
              SELECT '{kind}',{source},m.{session},{key},'upsert',{payload} \
              FROM {name} m \
-             WHERE EXISTS(SELECT 1 FROM history_subscriptions)",
+             WHERE {journaled}",
         ),
         [],
     )?;
@@ -560,7 +620,7 @@ fn capture_payload_is_current(conn: &Connection, table: &Table) -> Result<bool> 
 
 pub(crate) fn schema_is_current(conn: &Connection) -> Result<bool> {
     if !conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE name='history_export_storage_v1')",
+        "SELECT COUNT(*)=2 FROM schema_migrations WHERE name IN ('history_export_storage_v1','delivery_capture_filter_v1')",
         [],
         |r| r.get::<_, bool>(0),
     )? {
