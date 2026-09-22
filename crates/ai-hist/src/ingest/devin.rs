@@ -406,10 +406,14 @@ pub(crate) fn session_stamp(
     let Some((last_activity, head_digest)) = head else {
         return Ok(None);
     };
+    // Each row's identity is folded into its own hash, so a rewrite that
+    // swaps content between rows — the multiset stays identical — still
+    // changes the sum.
     let (node_count, node_max, node_rows, node_digest): (i64, i64, i64, i64) = src.query_row(
         "SELECT COUNT(*), COALESCE(MAX(row_id), 0), COALESCE(SUM(row_id), 0), \
-         COALESCE(SUM(ai_hist_fnv(chat_message) + ai_hist_fnv(metadata) + \
-         ai_hist_fnv(CAST(created_at AS TEXT))), 0) \
+         COALESCE(SUM(ai_hist_fnv(\
+             CAST(row_id AS TEXT) || '|' || COALESCE(chat_message, '') || '|' || \
+             COALESCE(metadata, '') || '|' || CAST(created_at AS TEXT))), 0) \
          FROM message_nodes WHERE session_id = ?1",
         params![session_id],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
@@ -417,8 +421,9 @@ pub(crate) fn session_stamp(
     let (tool_count, tool_rows, tool_digest): (i64, i64, i64) = src
         .query_row(
             "SELECT COUNT(*), COALESCE(SUM(rowid), 0), \
-             COALESCE(SUM(ai_hist_fnv(tool_call_json) + \
-             ai_hist_fnv(tool_call_update_json)), 0) \
+             COALESCE(SUM(ai_hist_fnv(\
+                 COALESCE(tool_call_id, '') || '|' || COALESCE(tool_call_json, '') || '|' || \
+                 COALESCE(tool_call_update_json, ''))), 0) \
              FROM tool_call_state WHERE session_id = ?1",
             params![session_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),

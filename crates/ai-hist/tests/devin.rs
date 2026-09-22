@@ -1020,3 +1020,47 @@ VALUES
         .unwrap();
     assert_eq!(marker.as_deref(), Some("malformed_node"));
 }
+
+#[test]
+fn devin_content_swapped_between_rows_still_resyncs() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let store = stage_devin_db(home, BASE_SESSION_SQL);
+    let _env = EnvGuard::set(home);
+    let db = home.join("history.db");
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+
+    // Swap chat_message between the two nodes: identical timestamps, row ids,
+    // counts and content multiset — only the row↔content pairing changed.
+    let provider = Connection::open(&store).unwrap();
+    provider
+        .execute_batch(
+            "UPDATE message_nodes SET chat_message = ( \
+               SELECT chat_message FROM message_nodes \
+               WHERE session_id='devin-test' AND node_id=1) \
+             WHERE session_id='devin-test' AND node_id=0; \
+             UPDATE message_nodes SET chat_message = \
+               '{\"message_id\":\"u0\",\"role\":\"user\",\"content\":\"first prompt\",\"metadata\":{\"is_user_input\":true},\"tool_calls\":null,\"thinking\":null,\"tool_call_id\":null,\"phase\":null}' \
+             WHERE session_id='devin-test' AND node_id=1;",
+        )
+        .unwrap();
+    drop(provider);
+
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+    let conn = open_db(&db).unwrap();
+    // Node 1 now holds the user turn: its node-derived event uid is stable,
+    // and its role must flip from assistant to user.
+    let node1_role: String = conn
+        .query_row(
+            "SELECT role FROM session_events \
+             WHERE source='devin' AND session_id='devin-test' AND event_uid='n1:text'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        node1_role, "user",
+        "a content swap must re-normalize the row"
+    );
+}
