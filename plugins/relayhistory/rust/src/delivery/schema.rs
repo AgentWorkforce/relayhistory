@@ -3,7 +3,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 pub(super) fn is_current(conn: &Connection) -> Result<bool> {
     if !conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('delivery_session_jobs') WHERE name='last_member')", [], |r| r.get::<_,bool>(0))? { return Ok(false); }
-    Ok(conn.query_row("SELECT COUNT(*)=10 FROM sqlite_master WHERE (type='table' AND name IN ('delivery_jobs','delivery_batches','delivery_session_jobs','delivery_session_members')) OR (type='trigger' AND name IN ('delivery_session_ready','delivery_batches_cap_insert','delivery_batches_count_insert','delivery_batches_cap_update','delivery_batches_count_update','delivery_batches_count_delete'))", [], |r| r.get(0))?)
+    Ok(conn.query_row("SELECT COUNT(*)=10 FROM sqlite_master WHERE (type='table' AND name IN ('delivery_jobs','delivery_batches','delivery_session_jobs','delivery_session_members')) OR (type='trigger' AND name IN ('delivery_session_ready','delivery_batches_reserve_insert','delivery_batches_count_insert','delivery_batches_reserve_update','delivery_batches_count_update','delivery_batches_count_delete'))", [], |r| r.get(0))?)
 }
 pub(super) fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(r#"CREATE TABLE IF NOT EXISTS delivery_jobs (
@@ -55,15 +55,26 @@ END;
     };
     let new = qualified("NEW");
     let old = qualified("OLD");
+    // Batch materialization always has room: a batch is the deliverable form
+    // of journal rows the cap already holds, and the only way a journal full
+    // of unconsumed backlog ever drains. Batch writes are checked against the
+    // cap plus a reserve that is bounded by design: every non-cancelled job
+    // holds at most one unresolved batch of at most its configured payload
+    // and prepared bytes plus the row's own accounting, and settled receipts
+    // keep their accounting until compaction releases them. Every other
+    // retained table is checked against the plain cap.
+    let reserve = "(SELECT COALESCE(SUM(json_extract(config_json,'$.limits.max_batch_bytes')+json_extract(config_json,'$.limits.max_prepared_bytes')+512),0) FROM delivery_jobs WHERE state<>'cancelled')+(SELECT COUNT(*)*512 FROM delivery_batches WHERE state IN ('acknowledged','suppressed','cancelled'))";
     conn.execute_batch(&format!(r#"
-CREATE TRIGGER IF NOT EXISTS {table}_cap_insert BEFORE INSERT ON {table} BEGIN
- SELECT CASE WHEN (SELECT retained_bytes+({new})>max_retained_bytes FROM delivery_state WHERE singleton=1) THEN RAISE(ABORT,'delivery retention limit exceeded; compact consumed data or raise the retention cap') END;
+DROP TRIGGER IF EXISTS {table}_cap_insert;
+DROP TRIGGER IF EXISTS {table}_cap_update;
+CREATE TRIGGER IF NOT EXISTS {table}_reserve_insert BEFORE INSERT ON {table} BEGIN
+ SELECT CASE WHEN (SELECT retained_bytes+({new})>max_retained_bytes+{reserve} FROM delivery_state WHERE singleton=1) THEN RAISE(ABORT,'delivery retention limit exceeded; compact consumed data or raise the retention cap') END;
 END;
 CREATE TRIGGER IF NOT EXISTS {table}_count_insert AFTER INSERT ON {table} BEGIN
  UPDATE delivery_state SET retained_bytes=retained_bytes+({new}) WHERE singleton=1;
 END;
-CREATE TRIGGER IF NOT EXISTS {table}_cap_update BEFORE UPDATE ON {table} BEGIN
- SELECT CASE WHEN (SELECT retained_bytes+({new})-({old})>max_retained_bytes FROM delivery_state WHERE singleton=1) THEN RAISE(ABORT,'delivery retention limit exceeded; compact consumed data or raise the retention cap') END;
+CREATE TRIGGER IF NOT EXISTS {table}_reserve_update BEFORE UPDATE ON {table} BEGIN
+ SELECT CASE WHEN (SELECT retained_bytes+({new})-({old})>max_retained_bytes+{reserve} FROM delivery_state WHERE singleton=1) THEN RAISE(ABORT,'delivery retention limit exceeded; compact consumed data or raise the retention cap') END;
 END;
 CREATE TRIGGER IF NOT EXISTS {table}_count_update AFTER UPDATE ON {table} BEGIN
  UPDATE delivery_state SET retained_bytes=retained_bytes+({new})-({old}) WHERE singleton=1;

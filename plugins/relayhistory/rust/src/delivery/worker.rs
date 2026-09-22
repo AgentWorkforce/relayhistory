@@ -244,20 +244,22 @@ fn range(value: i64, name: &str, minimum: i64, maximum: i64) -> Result<()> {
     }
     Ok(())
 }
-/// Bounded maintenance at the start and end of a drain: expire abandoned
-/// snapshots, release terminal receipts, reclaim every consumed journal row,
-/// then keep running complete passes while retained bytes exceed three
-/// quarters of the cap.
+/// Maintenance at the start and end of a drain, proportional to what is
+/// reclaimable: expire abandoned snapshots, release every settled receipt,
+/// reclaim every consumed journal row, then keep running complete passes
+/// while retained bytes exceed three quarters of the cap.
 fn compact(conn: &Connection, now_ms: i64) -> Result<()> {
     expire_exports(conn, now_ms, 32)?;
-    compact_receipts(conn, 1_000)?;
+    while compact_receipts(conn, MAX_COMPACTION_PAGE)? == MAX_COMPACTION_PAGE {}
     compact_journal(conn, MAX_COMPACTION_PAGE)?;
     compact_to_low_water(conn, MAX_COMPACTION_PAGE)?;
     Ok(())
 }
 /// Run one local state write; when the retention cap refuses it, reclaim
 /// consumed journal rows and retry it once. The refusal escapes only when
-/// nothing was reclaimable or the retry is refused again.
+/// nothing was reclaimable or the retry is refused again. Batch writes have
+/// their own reserve above the cap, so this fires only if that reserve is
+/// exhausted.
 fn with_retention_recovery<T>(
     conn: &Connection,
     mut operation: impl FnMut() -> Result<T>,

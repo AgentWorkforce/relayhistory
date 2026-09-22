@@ -636,30 +636,100 @@ fn excluded_child_relationship_metadata_is_not_exported_through_its_parent() {
     assert_eq!(status(&conn, &job.job_id).unwrap().suppressed_records, 1);
 }
 
+/// A journal at the cap still materializes, prepares and acknowledges its
+/// batch: batch rows are checked against the cap plus a reserve bounded by
+/// every non-cancelled job's configured batch and prepared bytes, so the
+/// backlog the cap holds is always deliverable. Capture stays refused until
+/// the delivered rows are compacted.
 #[test]
-fn a_full_journal_requires_explicit_headroom_and_failed_queueing_loses_nothing() {
+fn a_full_journal_still_materializes_its_batch_inside_the_reserve() {
     let conn = db();
     let job = create_job(&conn, &config("one"), 0).unwrap();
     event(&conn, "a", "retained revision");
     let used = retained_bytes(&conn).unwrap().0;
     set_retention_limit(&conn, used).unwrap();
-    let before = status(&conn, &job.job_id).unwrap();
-    let error = prepare_batch(&conn, &job.job_id, 1).unwrap_err();
-    assert!(error.to_string().contains("raise the retention cap"));
-    assert!(is_retention_limit(&error));
-    let after = status(&conn, &job.job_id).unwrap();
-    assert_eq!(after.journal_cursor, before.journal_cursor);
-    assert_eq!(after.bootstrap_complete, before.bootstrap_complete);
-    assert_eq!(after.pending_records, 0);
-    assert_eq!(retained_bytes(&conn).unwrap().0, used);
-    set_retention_limit(&conn, used + 20_000).unwrap();
-    let records = drain(&conn, &job.job_id);
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].payload["text"], "retained revision");
+    let refused = conn.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude','b','b',42,'user','text','refused')", []);
+    assert!(is_retention_limit(&refused.unwrap_err().into()));
+    let claim = claim(&conn, &job.job_id, 1).unwrap();
+    assert_eq!(claim.batch.records[0].payload["text"], "retained revision");
+    let (held, cap) = retained_bytes(&conn).unwrap();
+    assert_eq!(cap, used, "materialization never raises the cap");
+    assert!(held > used, "the batch is retained above the cap");
+    prepare(&conn, &claim, 1);
+    acknowledge(&conn, &claim.lease, &ack(&claim), &|| 2).unwrap();
+    assert!(drain(&conn, &job.job_id).is_empty());
     compact_journal(&conn, 100).unwrap();
     compact_receipts(&conn, 100).unwrap();
     assert_eq!(retained_bytes(&conn).unwrap().0, 0);
     assert_eq!(status(&conn, &job.job_id).unwrap().acknowledged_records, 1);
+    event(&conn, "b", "accepted");
+}
+
+/// The reserve is exactly what unresolved batches may hold: one row per
+/// non-cancelled job of at most its configured payload and prepared bytes
+/// plus the row's accounting, and the settled receipts compaction has not
+/// released carry their own accounting. A batch row beyond that is refused
+/// as the cap, and a cancelled job's share is gone.
+#[test]
+fn the_materialization_reserve_is_the_configured_per_job_bound() {
+    let conn = db();
+    let limits = DeliveryLimits {
+        max_batch_bytes: 4_096,
+        max_prepared_bytes: 1_024,
+        ..DeliveryLimits::default()
+    };
+    let one = create_job(
+        &conn,
+        &DeliveryJobConfig {
+            limits: limits.clone(),
+            ..config("one")
+        },
+        0,
+    )
+    .unwrap();
+    let two = create_job(
+        &conn,
+        &DeliveryJobConfig {
+            limits,
+            ..config("two")
+        },
+        0,
+    )
+    .unwrap();
+    let used = retained_bytes(&conn).unwrap().0;
+    set_retention_limit(&conn, used.max(1)).unwrap();
+    let share: usize = 4_096 + 1_024 + 512;
+    // An unresolved row whose accounting (payload plus 512) is `bytes`.
+    let pending = |job_id: &str, id: &str, bytes: usize| {
+        conn.execute(
+            "INSERT INTO delivery_batches(id,job_id,state,payload,records,bytes,journal_end,created_ms) VALUES (?,?,'pending',?,1,?,0,0)",
+            params![id, job_id, "x".repeat(bytes - 512), (bytes - 512) as i64],
+        )
+        .map(|_| ())
+        .map_err(anyhow::Error::from)
+    };
+    // Two jobs: a row filling both shares fits, one more byte does not.
+    pending(&one.job_id, "both", 2 * share).unwrap();
+    assert!(is_retention_limit(
+        &pending(&two.job_id, "over", 513).unwrap_err()
+    ));
+    // A settled receipt keeps its 512 bytes inside the reserve rather than
+    // consuming a share.
+    conn.execute(
+        "UPDATE delivery_batches SET state='acknowledged',payload=NULL WHERE id='both'",
+        [],
+    )
+    .unwrap();
+    pending(&two.job_id, "both-again", 2 * share).unwrap();
+    assert!(is_retention_limit(
+        &pending(&one.job_id, "over-again", 513).unwrap_err()
+    ));
+    // Cancelling a job removes its share; its cancelled batch is a receipt.
+    cancel_job(&conn, &two.job_id).unwrap();
+    assert!(is_retention_limit(
+        &pending(&one.job_id, "over-one-share", share + 1).unwrap_err()
+    ));
+    pending(&one.job_id, "one-share", share).unwrap();
 }
 
 #[test]

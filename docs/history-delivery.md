@@ -114,12 +114,27 @@ backlog is never deleted:
 - Each drain reclaims the consumed floor in full, then runs complete passes
   (floor plus a sweep from the floor to the tail) while retained bytes exceed
   three quarters of the cap or until a pass reclaims nothing.
-- When the cap refuses a batch write during a drain, the worker runs that
+- If the cap refuses a batch write during a drain, the worker runs that
   recovery and retries the write once. The drain reports
   `DELIVERY_RETENTION_LIMIT` only when nothing was reclaimable or the retry is
   refused again; no cursor moves on a refused write.
 
-A full journal of unconsumed rows keeps failing capture until the destination
-consumes them, the job is cancelled, or the cap is raised with
-`setHistoryDeliveryRetention`. Hosts run the same complete pass on demand
-through `compactHistoryDelivery` (the `compact_journal_pass` delivery request).
+## Batch materialization reserve
+
+A batch is the deliverable form of journal rows the cap already holds, and the
+only way a journal full of unconsumed backlog ever drains. Batch rows are
+therefore checked against the cap plus a reserve that is bounded by design:
+every non-cancelled job holds at most one unresolved batch of at most its
+configured `max_batch_bytes` plus `max_prepared_bytes` (plus 512 bytes of row
+accounting), and settled receipts keep their 512 bytes until compaction
+releases them. The journal, bootstrap preimages and export pages are checked
+against the plain cap. `historyDeliveryRetention` therefore reports
+`usedBytes` above `limitBytes` by at most the reserve while batches are in
+flight; the cap itself never moves.
+
+A journal of unconsumed rows at the cap keeps failing capture until a drain
+delivers them and compaction frees them, the job is cancelled, or the cap is
+raised with `setHistoryDeliveryRetention`. Backlog a destination cannot take
+stays in its batch, unacknowledged, until it can. Hosts run the same complete
+compaction pass on demand through `compactHistoryDelivery` (the
+`compact_journal_pass` delivery request).
