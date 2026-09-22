@@ -2,7 +2,7 @@
 
 **Search, resume, and hand off every coding-agent session — across every harness on your machine.**
 
-Local memory for **Claude Code**, **Codex**, **Cursor**, **Grok**, **OpenCode**, and [**Agent Relay**](https://github.com/AgentWorkforce/relay). Your agent sessions are indexed into one local SQLite database. Search them all at once, jump back into a session with its harness's native resume command, and hand a compact context pack to another agent — or to a teammate's agent — to continue the work.
+Local memory for **Claude Code**, **Codex**, **Cursor**, **Grok**, **OpenCode**, **Devin CLI**, and [**Agent Relay**](https://github.com/AgentWorkforce/relay). Your agent sessions are indexed into one local SQLite database. Search them all at once, jump back into a session with its harness's native resume command, and hand a compact context pack to another agent — or to a teammate's agent — to continue the work.
 
 ```sh
 ai-hist search "auth rewrite"
@@ -52,7 +52,7 @@ ai-hist stats                                        # how much history is index
 
 `<harness>` is the session's source — `claude`, `codex`, `cursor`, `grok`, `opencode`, `devin`, or `relay` — and is required alongside the ID, because session IDs collide across providers. `ai-hist sessions list` prints both.
 
-`ai-hist resume` prints a native resume command for Claude Code, Codex, Cursor, and Grok sessions. OpenCode and Agent Relay sessions are searchable and packable, but have no native resume command to print, so use `ai-hist pack` to carry that context forward instead.
+`ai-hist resume` prints a native resume command for Claude Code, Codex, Cursor, and Grok sessions. OpenCode, Devin CLI, and Agent Relay sessions are searchable and packable, but have no native resume command to print, so use `ai-hist pack` to carry that context forward instead.
 
 OpenCode is read from whichever of its two stores the machine has: the SQLite
 `opencode.db` that current releases write (`OPENCODE_DB`), or the older JSON
@@ -118,7 +118,7 @@ for authentication, durable delivery, readback, and the legacy sharing API.
 
 ## Why `ai-hist`
 
-- **Every harness, one search.** Claude Code, Codex, Cursor, Grok, OpenCode, Agent Relay — indexed side-by-side. No per-harness silo.
+- **Every harness, one search.** Claude Code, Codex, Cursor, Grok, OpenCode, Devin CLI, Agent Relay — indexed side-by-side. No per-harness silo.
 - **Provider-aware evidence.** Prompts, tool calls, and edits are preserved as raw evidence, not summarized away — as much of it as each harness actually exposes. Hydration reports `full`, `partial`, or `shallow_only` per session, so you can tell thin coverage from a thing that never happened. Where a harness records less than the others, the gap is named. Cursor transcripts carry the assistant's prose and every tool call, but no tool output, model id, token usage or timestamp field — those are reported as unavailable, and a turn whose injected `<timestamp>` tag cannot be read is stamped from the file mtime with `CURSOR_TIMESTAMP_FROM_MTIME`. Grok logs no per-turn billing tokens, so its only token fact is a context-window proxy, and its hydration says so every time. The per-field detail is in [the session catalog](docs/session-catalog.md).
 - **Local by default.** SQLite on your machine. Export and delivery require an explicit selection; remote acquisition requires an installed source plugin.
 - **Handoff-native.** `pack` and `resume` are first-class commands, not afterthoughts.

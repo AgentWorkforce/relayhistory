@@ -2582,10 +2582,15 @@ fn open_devin_snapshot(scan: &ScanEnv<'_>) -> Result<DevinReadSnapshot> {
         let conn = open_db_readonly(&db)?;
         scan.note_open();
         conn.execute_batch("PRAGMA query_only = ON; BEGIN DEFERRED")?;
-        if !crate::ingest::devin::is_devin_store(&conn) {
-            anyhow::bail!("{} is not a Devin CLI session store", db.display());
-        }
-        let session_columns = table_columns(&conn, "sessions")?;
+        // An existing but partially initialized sessions.db is not a Devin
+        // store: sync returns empty for it, and discovery must too rather
+        // than failing the whole pass. Empty `session_columns` short-circuits
+        // `enumerate` before it can name a table that does not exist.
+        let session_columns = if crate::ingest::devin::is_devin_store(&conn) {
+            table_columns(&conn, "sessions")?
+        } else {
+            BTreeSet::new()
+        };
         let schema_version: i64 = conn.query_row("PRAGMA schema_version", [], |row| row.get(0))?;
         let generation_after = sqlite_store_generation(&db)?;
         if generation_before != generation_after {

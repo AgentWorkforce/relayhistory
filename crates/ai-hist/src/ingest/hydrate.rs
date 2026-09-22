@@ -1540,6 +1540,7 @@ fn source_snapshot(
             ));
         }
         let src = crate::store::open_db_readonly(&path)?;
+        crate::ingest::devin::register_stamp_fn(&src)?;
         let stamp = crate::ingest::devin::session_stamp(
             &src,
             &options.session_id,

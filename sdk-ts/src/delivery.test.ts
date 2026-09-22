@@ -149,7 +149,7 @@ test('arbitrary plugin MCP tools have conservative side-effect annotations', asy
     await writeFile(plugin, `export function createHistoryPlugin() { return {tools:[{name:'write_fixture',description:'Arbitrary fixture action',run:async()=>({ok:true})}]}; }`);
     const configPath=join(root,'tools.json'); await writeFile(configPath,JSON.stringify({plugins:[{module:plugin}]}));
     const env = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string,string]=>entry[1]!==undefined));
-    Object.assign(env,{HOME:root,USERPROFILE:root,AI_HIST_DB:dbPath,AI_HIST_PLUGIN_CONFIG:configPath});
+    Object.assign(env,{HOME:root,USERPROFILE:root,XDG_DATA_HOME:join(root,'share'),AI_HIST_DB:dbPath,AI_HIST_PLUGIN_CONFIG:configPath});
     const transport = new StdioClientTransport({command:process.execPath,args:[join(sdkRoot,'dist/mcp-server.js')],env,stderr:'pipe'});
     const client = new Client({name:'plugin-annotations-test',version:'1'});
     try {

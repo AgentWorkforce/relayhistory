@@ -20,8 +20,8 @@ const READ = { readOnlyHint: true, idempotentHint: true, openWorldHint: false } 
 // Acquisition can reach provider services when a remote scope is requested
 // (claude.ai/code web sessions, Codex cloud tasks), so it is open-world.
 const ACQUIRE = { readOnlyHint: false, idempotentHint: true, openWorldHint: true } as const;
-const SOURCE = z.enum(['claude', 'codex', 'cursor', 'grok', 'relay', 'trajectory', 'opencode']);
-const CATALOG_SOURCE = z.enum(['claude', 'codex', 'cursor', 'grok', 'relay', 'opencode']);
+const SOURCE = z.enum(['claude', 'codex', 'cursor', 'grok', 'relay', 'trajectory', 'opencode', 'devin']);
+const CATALOG_SOURCE = z.enum(['claude', 'codex', 'cursor', 'grok', 'relay', 'opencode', 'devin']);
 const SESSION_SCOPE = z.enum(['local', 'remote', 'all']);
 const SOURCE_CONNECTORS = z.array(z.string().min(1)).optional().describe('Explicit configured source-plugin IDs; [] disables remote acquisition.');
 const packageVersion = JSON.parse(

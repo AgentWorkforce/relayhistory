@@ -17,7 +17,7 @@ type AuthState = typeof states[number];
 
 async function withFixture(state: AuthState, body: (dbPath: string) => Promise<void>): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), 'relayhistory-cached-scope-'));
-  const keys = ['HOME', 'USERPROFILE', 'RELAYHISTORY_HOME', 'RELAYHISTORY_BASE_URL', 'AI_HIST_BASE_URL', 'RELAYHISTORY_NO_UPDATE_CHECK'];
+  const keys = ['HOME', 'USERPROFILE', 'XDG_DATA_HOME', 'RELAYHISTORY_HOME', 'RELAYHISTORY_BASE_URL', 'AI_HIST_BASE_URL', 'RELAYHISTORY_NO_UPDATE_CHECK'];
   const saved = new Map(keys.map((name) => [name, process.env[name]]));
   for (const name of keys) delete process.env[name];
   process.env.HOME = root;

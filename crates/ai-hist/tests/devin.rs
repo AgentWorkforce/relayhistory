@@ -383,6 +383,289 @@ VALUES
     assert_eq!(events[0].role, "user");
 }
 
+/// A second session for lifecycle tests: two prompts, one assistant reply.
+const SECOND_SESSION_SQL: &str = r#"
+INSERT INTO sessions
+  (id, working_directory, backend_type, model, agent_mode, created_at,
+   last_activity_at, title, workspace_dirs, hidden, metadata)
+VALUES
+  ('devin-extra', '/work/other', 'devin', 'test-model', 'normal',
+   1776643300, 1776643304, 'Extra session', '["/work/other"]', 0, NULL);
+INSERT INTO message_nodes
+  (session_id, node_id, parent_node_id, chat_message, created_at, metadata)
+VALUES
+  ('devin-extra', 0, NULL,
+   '{"message_id":"x0","role":"user","content":"extra prompt","metadata":{"is_user_input":true},"tool_calls":null,"thinking":null,"tool_call_id":null,"phase":null}',
+   1776643301, NULL),
+  ('devin-extra', 1, 0,
+   '{"message_id":"x1","role":"assistant","content":"extra answer","thinking":null,"metadata":{"num_tokens":4,"generation_model":"test-model"},"tool_calls":null,"tool_call_id":null,"phase":null}',
+   1776643304, NULL);
+"#;
+
+fn devin_counts(conn: &Connection, session_id: &str) -> (i64, i64, i64, i64) {
+    let sessions = count(
+        conn,
+        &format!(
+            "SELECT COUNT(*) FROM sessions WHERE source='devin' AND session_id='{session_id}'"
+        ),
+    );
+    let events = count(
+        conn,
+        &format!(
+            "SELECT COUNT(*) FROM session_events WHERE source='devin' AND session_id='{session_id}'"
+        ),
+    );
+    let prompts = count(
+        conn,
+        &format!("SELECT COUNT(*) FROM history WHERE source='devin' AND session_id='{session_id}'"),
+    );
+    let markers = count(
+        conn,
+        &format!(
+            "SELECT COUNT(*) FROM session_markers WHERE source='devin' AND session_id='{session_id}'"
+        ),
+    );
+    (sessions, events, prompts, markers)
+}
+
+#[test]
+fn devin_retires_hidden_and_deleted_sessions_and_reindexes_on_unhide() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let store = stage_devin_db(home, &format!("{BASE_SESSION_SQL}{SECOND_SESSION_SQL}"));
+    let _env = EnvGuard::set(home);
+    let db = home.join("history.db");
+
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+    let conn = open_db(&db).unwrap();
+    assert!(devin_counts(&conn, "devin-extra").0 == 1);
+
+    // Hiding an indexed session retires its catalog row and evidence.
+    let provider = Connection::open(&store).unwrap();
+    provider
+        .execute_batch("UPDATE sessions SET hidden = 1 WHERE id = 'devin-extra'")
+        .unwrap();
+    drop(provider);
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+    let conn = open_db(&db).unwrap();
+    assert_eq!(
+        devin_counts(&conn, "devin-extra"),
+        (0, 0, 0, 0),
+        "hidden session's catalog row and evidence must be retired"
+    );
+    assert_eq!(
+        devin_counts(&conn, "devin-test").0,
+        1,
+        "the still-visible session is untouched"
+    );
+
+    // Unhiding with the same timestamps re-indexes from scratch — the state
+    // entry went away with the evidence, so the stamp cannot mask it.
+    let provider = Connection::open(&store).unwrap();
+    provider
+        .execute_batch("UPDATE sessions SET hidden = 0 WHERE id = 'devin-extra'")
+        .unwrap();
+    drop(provider);
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+    let conn = open_db(&db).unwrap();
+    let (sessions, events, prompts, markers) = devin_counts(&conn, "devin-extra");
+    assert_eq!(sessions, 1, "unhidden session must be re-indexed");
+    assert_eq!(events, 2);
+    assert_eq!(prompts, 1);
+    assert!(markers >= 1, "title marker is restored");
+
+    // Deleting the provider row retires the session the same way — the CLI's
+    // own removal takes the child rows with it.
+    let provider = Connection::open(&store).unwrap();
+    provider
+        .execute_batch(
+            "DELETE FROM message_nodes WHERE session_id = 'devin-extra'; \
+             DELETE FROM tool_call_state WHERE session_id = 'devin-extra'; \
+             DELETE FROM sessions WHERE id = 'devin-extra';",
+        )
+        .unwrap();
+    drop(provider);
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+    let conn = open_db(&db).unwrap();
+    assert_eq!(devin_counts(&conn, "devin-extra"), (0, 0, 0, 0));
+}
+
+#[test]
+fn devin_in_place_rewrite_without_timestamp_change_still_syncs() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let store = stage_devin_db(home, BASE_SESSION_SQL);
+    let _env = EnvGuard::set(home);
+    let db = home.join("history.db");
+
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+
+    // Rewrite a chat_message in place: identical length, no new row, no
+    // last_activity bump. A count/max/length stamp would never notice; the
+    // content checksum must.
+    let provider = Connection::open(&store).unwrap();
+    provider
+        .execute_batch(
+            "UPDATE message_nodes SET chat_message = \
+             '{\"message_id\":\"u0\",\"role\":\"user\",\"content\":\"fixed prompt\",\"metadata\":{\"is_user_input\":true},\"tool_calls\":null,\"thinking\":null,\"tool_call_id\":null,\"phase\":null}' \
+             WHERE session_id = 'devin-test' AND node_id = 0",
+        )
+        .unwrap();
+    drop(provider);
+
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+    let conn = open_db(&db).unwrap();
+    let prompt: String = conn
+        .query_row(
+            "SELECT prompt FROM history WHERE source='devin' AND session_id='devin-test'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(prompt, "fixed prompt", "in-place rewrite must re-index");
+}
+
+#[test]
+fn devin_partial_evidence_loss_repairs_on_unchanged_stamp() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    stage_devin_db(home, BASE_SESSION_SQL);
+    let _env = EnvGuard::set(home);
+    let db = home.join("history.db");
+
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+    let conn = open_db(&db).unwrap();
+    // Drop one canonical row out from under a matching stamp.
+    conn.execute(
+        "DELETE FROM session_events WHERE source='devin' AND session_id='devin-test' \
+         AND role='assistant'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+    let conn = open_db(&db).unwrap();
+    assert_eq!(
+        devin_counts(&conn, "devin-test").1,
+        2,
+        "partially lost evidence must be restored even though the stamp matches"
+    );
+}
+
+#[test]
+fn devin_shared_prompt_is_reassigned_not_dropped() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    // Two sessions containing the identical prompt at the identical
+    // timestamp share one `history` row under UNIQUE(source, timestamp_ms,
+    // prompt).
+    stage_devin_db(
+        home,
+        r#"
+INSERT INTO sessions
+  (id, working_directory, backend_type, model, agent_mode, created_at,
+   last_activity_at, title, workspace_dirs, hidden, metadata)
+VALUES
+  ('devin-a', '/work/a', 'devin', 'test-model', 'normal',
+   1776643200, 1776643202, NULL, '[]', 0, NULL),
+  ('devin-b', '/work/b', 'devin', 'test-model', 'normal',
+   1776643200, 1776643202, NULL, '[]', 0, NULL);
+INSERT INTO message_nodes
+  (session_id, node_id, parent_node_id, chat_message, created_at, metadata)
+VALUES
+  ('devin-a', 0, NULL,
+   '{"message_id":"ua","role":"user","content":"shared prompt","metadata":{"is_user_input":true},"tool_calls":null,"thinking":null,"tool_call_id":null,"phase":null}',
+   1776643201, NULL),
+  ('devin-b', 0, NULL,
+   '{"message_id":"ub","role":"user","content":"shared prompt","metadata":{"is_user_input":true},"tool_calls":null,"thinking":null,"tool_call_id":null,"phase":null}',
+   1776643201, NULL);
+"#,
+    );
+    let _env = EnvGuard::set(home);
+    let db = home.join("history.db");
+
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+    let conn = open_db(&db).unwrap();
+    let owner: String = conn
+        .query_row(
+            "SELECT session_id FROM history WHERE source='devin' AND prompt='shared prompt'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let loser = if owner == "devin-a" {
+        "devin-b"
+    } else {
+        "devin-a"
+    };
+
+    // The owner session goes away; the surviving session's identical user
+    // event must keep the shared row indexed — now under its own id.
+    let store = devin_cli_dir(home).join("sessions.db");
+    let provider = Connection::open(&store).unwrap();
+    provider
+        .execute_batch(&format!(
+            "UPDATE sessions SET hidden = 1 WHERE id = '{owner}'"
+        ))
+        .unwrap();
+    drop(provider);
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+    let conn = open_db(&db).unwrap();
+    let remaining: Option<String> = conn
+        .query_row(
+            "SELECT session_id FROM history WHERE source='devin' AND prompt='shared prompt'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    assert_eq!(
+        remaining.as_deref(),
+        Some(loser),
+        "the shared prompt must be reassigned to the session that still has it"
+    );
+}
+
+#[test]
+fn devin_discovery_treats_an_incomplete_store_as_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    // sessions.db exists but was never fully initialized — no sessions or
+    // message tables. Discovery must report "nothing to read", matching the
+    // sync path, instead of failing the provider.
+    let cli_dir = devin_cli_dir(home);
+    fs::create_dir_all(&cli_dir).unwrap();
+    let conn = Connection::open(cli_dir.join("sessions.db")).unwrap();
+    conn.execute_batch("CREATE TABLE bootstrap_marker(step TEXT);")
+        .unwrap();
+    drop(conn);
+
+    let db = home.join("history.db");
+    let conn = open_db(&db).unwrap();
+    let env = DiscoveryEnv::with_roots(&conn, home.to_path_buf(), home.join("missing-opencode.db"));
+    let mut found = Vec::new();
+    let summary = discover_sessions_with_env(
+        &env,
+        &DiscoverOptions {
+            scope: SessionScope::Local,
+            sources: vec!["devin".to_string()],
+            limit: None,
+        },
+        |row| found.push((row.source.clone(), row.session_id.clone())),
+    )
+    .unwrap();
+    assert!(found.is_empty());
+    assert_eq!(
+        summary.providers.get("devin").map(|p| p.failed),
+        Some(false),
+        "an incomplete sessions.db is not a store, not a failure"
+    );
+}
+
 #[test]
 fn devin_discovery_reports_shallow_metadata() {
     let dir = tempfile::tempdir().unwrap();

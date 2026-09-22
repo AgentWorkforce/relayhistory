@@ -319,13 +319,56 @@ pub(crate) fn list_session_ids(src: &Connection) -> Result<Vec<String>> {
     Ok(ids)
 }
 
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// FNV-1a, the same non-cryptographic fold the opencode stamp uses: it only
+/// has to change when the bytes change.
+fn fnv(mut hash: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Register `ai_hist_fnv` on a read-only Devin connection.
+///
+/// [`session_stamp`] skips loading message content, but SQLite exposes no
+/// hash aggregate, and a provider rewrite that keeps row ids, counts and
+/// `last_activity_at` unchanged — an in-place compaction, or a rewrite that
+/// preserves byte length — would go unseen by a metadata-only stamp. The UDF
+/// is connection-local: the provider database itself is never modified.
+pub(crate) fn register_stamp_fn(src: &Connection) -> Result<()> {
+    src.create_scalar_function(
+        "ai_hist_fnv",
+        1,
+        rusqlite::functions::FunctionFlags::SQLITE_UTF8
+            | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let hash = match ctx.get::<Option<String>>(0)? {
+                Some(text) => fnv(FNV_OFFSET, text.as_bytes()),
+                None => FNV_OFFSET,
+            };
+            // SUM overflows i64 on enough rows; masking to 31 bits keeps the
+            // fold deterministic and the aggregate far below the limit.
+            Ok((hash & 0x7FFF_FFFF) as i64)
+        },
+    )?;
+    Ok(())
+}
+
 /// A change stamp covering everything the ingest reads for one session.
 ///
 /// `None` means the session is absent or hidden. The stamp folds in the
-/// activity timestamp, the message-node count and max row id, the tool-state
-/// count and payload size, and the transcript file's own stamp — discovery,
-/// sync and hydration all derive "did this change" from the same tuple so no
-/// surface can skip evidence the others would re-read.
+/// activity timestamp, a checksum of the session row's own fields (title,
+/// cwd, workspace, model, mode, metadata), the message-node count, max and
+/// sum of row ids, a content checksum of every `chat_message`/`metadata`,
+/// the tool-state count and a checksum of its payloads, and the transcript
+/// file's own stamp — discovery, sync and hydration all derive "did this
+/// change" from the same tuple so no surface can skip evidence the others
+/// would re-read.
+///
+/// Requires [`register_stamp_fn`] on `src`.
 pub(crate) fn session_stamp(
     src: &Connection,
     session_id: &str,
@@ -336,39 +379,47 @@ pub(crate) fn session_stamp(
     } else {
         "1=1"
     };
-    let head: Option<(i64,)> = src
+    let head: Option<(i64, i64)> = src
         .query_row(
             &format!(
-                "SELECT COALESCE(last_activity_at, 0) FROM sessions \
-                 WHERE id = ?1 AND {hidden_pred}"
+                "SELECT COALESCE(last_activity_at, 0), ai_hist_fnv(\
+                 COALESCE(title, '') || '|' || COALESCE(working_directory, '') || '|' || \
+                 COALESCE(workspace_dirs, '') || '|' || COALESCE(model, '') || '|' || \
+                 COALESCE(agent_mode, '') || '|' || COALESCE(backend_type, '') || '|' || \
+                 COALESCE(metadata, '') || '|' || COALESCE(created_at, -1)) \
+                 FROM sessions WHERE id = ?1 AND {hidden_pred}"
             ),
             params![session_id],
-            |row| Ok((row.get::<_, i64>(0)?,)),
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
         )
         .optional()?;
-    let Some((last_activity,)) = head else {
+    let Some((last_activity, head_digest)) = head else {
         return Ok(None);
     };
-    let (node_count, node_max): (i64, i64) = src.query_row(
-        "SELECT COUNT(*), COALESCE(MAX(row_id), 0) FROM message_nodes WHERE session_id = ?1",
+    let (node_count, node_max, node_rows, node_digest): (i64, i64, i64, i64) = src.query_row(
+        "SELECT COUNT(*), COALESCE(MAX(row_id), 0), COALESCE(SUM(row_id), 0), \
+         COALESCE(SUM(ai_hist_fnv(chat_message) + ai_hist_fnv(metadata) + \
+         ai_hist_fnv(CAST(created_at AS TEXT))), 0) \
+         FROM message_nodes WHERE session_id = ?1",
         params![session_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     )?;
-    let (tool_count, tool_bytes): (i64, i64) = src
+    let (tool_count, tool_rows, tool_digest): (i64, i64, i64) = src
         .query_row(
-            "SELECT COUNT(*), COALESCE(SUM(LENGTH(COALESCE(tool_call_json,'')) + \
-             LENGTH(COALESCE(tool_call_update_json,''))), 0) \
+            "SELECT COUNT(*), COALESCE(SUM(rowid), 0), \
+             COALESCE(SUM(ai_hist_fnv(tool_call_json) + \
+             ai_hist_fnv(tool_call_update_json)), 0) \
              FROM tool_call_state WHERE session_id = ?1",
             params![session_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
-        .unwrap_or((0, 0));
+        .unwrap_or((0, 0, 0));
     let transcript_stamp =
         super::file_stamp_and_modified(&transcripts_dir.join(format!("{session_id}.json")))
             .map(|(stamp, _)| stamp)
             .unwrap_or_else(|_| "absent".to_string());
     Ok(Some(format!(
-        "{last_activity}:{node_count}:{node_max}:{tool_count}:{tool_bytes}|{transcript_stamp}"
+        "{last_activity}:{head_digest}:{node_count}:{node_max}:{node_rows}:{node_digest}:{tool_count}:{tool_rows}:{tool_digest}|{transcript_stamp}"
     )))
 }
 
@@ -1265,69 +1316,123 @@ struct AbsentKeys {
 /// provider uid each table keys on.
 fn retire_absent_rows(conn: &Connection, session_id: &str, keys: &AbsentKeys) -> Result<usize> {
     let mut retired = 0;
+    let present_prompts = serde_json::to_string(&keys.prompts).unwrap_or_else(|_| "[]".into());
+    // A prompt another session still references is reassigned, not deleted.
+    retired += reassign_shared_prompts(conn, session_id, &present_prompts)?;
     for (sql, present) in [
         (
             "DELETE FROM session_events WHERE source = 'devin' AND session_id = ?1 \
              AND event_uid NOT IN (SELECT value FROM json_each(?2))",
-            &keys.events,
+            serde_json::to_string(&keys.events).unwrap_or_else(|_| "[]".into()),
         ),
         (
             "DELETE FROM tool_calls WHERE source = 'devin' AND session_id = ?1 \
              AND tool_use_id NOT IN (SELECT value FROM json_each(?2))",
-            &keys.tool_calls,
+            serde_json::to_string(&keys.tool_calls).unwrap_or_else(|_| "[]".into()),
         ),
         (
             "DELETE FROM file_edits WHERE source = 'devin' AND session_id = ?1 \
              AND tool_use_id NOT IN (SELECT value FROM json_each(?2))",
-            &keys.file_edits,
+            serde_json::to_string(&keys.file_edits).unwrap_or_else(|_| "[]".into()),
         ),
         (
             "DELETE FROM session_markers WHERE source = 'devin' AND session_id = ?1 \
              AND marker_uid NOT IN (SELECT value FROM json_each(?2))",
-            &keys.markers,
+            serde_json::to_string(&keys.markers).unwrap_or_else(|_| "[]".into()),
         ),
         (
             "DELETE FROM history WHERE source = 'devin' AND session_id = ?1 \
              AND (timestamp_ms || ':' || coalesce(prompt_hash, '')) \
              NOT IN (SELECT value FROM json_each(?2))",
-            &keys.prompts,
+            present_prompts,
         ),
     ] {
-        let present = serde_json::to_string(present).unwrap_or_else(|_| "[]".into());
         retired += conn.execute(sql, params![session_id, present])?;
     }
     Ok(retired)
 }
 
-/// Whether any canonical evidence row exists for this session — the "not
-/// masked by an empty destination" check the sweep uses before trusting a
-/// recorded stamp.
-fn evidence_exists(conn: &Connection, session_id: &str) -> Result<bool> {
-    for sql in [
-        "SELECT 1 FROM session_events WHERE source = 'devin' AND session_id = ?1 LIMIT 1",
-        "SELECT 1 FROM tool_calls WHERE source = 'devin' AND session_id = ?1 LIMIT 1",
-        "SELECT 1 FROM session_markers WHERE source = 'devin' AND session_id = ?1 LIMIT 1",
-        "SELECT 1 FROM history WHERE source = 'devin' AND session_id = ?1 LIMIT 1",
+/// The per-table evidence counts a pass leaves behind, so a stamp match is
+/// trusted only while the destination still holds exactly the rows a
+/// previous pass recorded. A partial loss — one event or edit row after an
+/// incomplete restore — fails the comparison and repairs rather than being
+/// masked by whatever evidence survived.
+fn evidence_holdings(conn: &Connection, session_id: &str) -> Result<Value> {
+    let mut holdings = Map::new();
+    for (key, table) in [
+        ("events", "session_events"),
+        ("tool_calls", "tool_calls"),
+        ("file_edits", "file_edits"),
+        ("markers", "session_markers"),
+        ("prompts", "history"),
+        ("catalog", "sessions"),
     ] {
-        let found: Option<i64> = conn
-            .query_row(sql, params![session_id], |row| row.get(0))
-            .optional()?;
-        if found.is_some() {
-            return Ok(true);
-        }
+        let count: i64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE source = 'devin' AND session_id = ?1"),
+            [session_id],
+            |row| row.get(0),
+        )?;
+        holdings.insert(key.to_string(), Value::from(count));
     }
-    Ok(false)
+    Ok(Value::Object(holdings))
 }
 
-fn catalog_row_exists(conn: &Connection, session_id: &str) -> Result<bool> {
-    Ok(conn
-        .query_row(
-            "SELECT 1 FROM sessions WHERE source = 'devin' AND session_id = ?1",
-            params![session_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()?
-        .is_some())
+/// `history` is keyed `(source, timestamp_ms, prompt)`, so two Devin
+/// sessions can share one row. Before this session's rows are deleted,
+/// hand every prompt another Devin session still references to that
+/// session instead of dropping shared evidence.
+fn reassign_shared_prompts(
+    conn: &Connection,
+    session_id: &str,
+    present_json: &str,
+) -> Result<usize> {
+    conn.execute(
+        "UPDATE history SET session_id = ( \
+            SELECT e.session_id FROM session_events e \
+            WHERE e.source = 'devin' AND e.session_id <> ?1 \
+              AND e.role = 'user' AND e.kind = 'text' \
+              AND e.ts_ms = history.timestamp_ms AND e.text = history.prompt \
+            LIMIT 1) \
+         WHERE source = 'devin' AND session_id = ?1 \
+           AND (timestamp_ms || ':' || COALESCE(prompt_hash, '')) \
+               NOT IN (SELECT value FROM json_each(?2)) \
+           AND EXISTS ( \
+             SELECT 1 FROM session_events e \
+             WHERE e.source = 'devin' AND e.session_id <> ?1 \
+               AND e.role = 'user' AND e.kind = 'text' \
+               AND e.ts_ms = history.timestamp_ms AND e.text = history.prompt)",
+        params![session_id, present_json],
+    )
+    .map_err(Into::into)
+}
+
+/// Remove every canonical row a previously indexed session left behind: the
+/// provider says it is gone or hidden, so its evidence must go too.
+/// Deleting the `sessions` row cascades markers, presences, observations and
+/// hydration state through the catalog's own delete triggers.
+fn retire_session(conn: &Connection, session_id: &str) -> Result<()> {
+    reassign_shared_prompts(conn, session_id, "[]")?;
+    conn.execute(
+        "DELETE FROM history WHERE source = 'devin' AND session_id = ?1",
+        [session_id],
+    )?;
+    conn.execute(
+        "DELETE FROM session_events WHERE source = 'devin' AND session_id = ?1",
+        [session_id],
+    )?;
+    conn.execute(
+        "DELETE FROM tool_calls WHERE source = 'devin' AND session_id = ?1",
+        [session_id],
+    )?;
+    conn.execute(
+        "DELETE FROM file_edits WHERE source = 'devin' AND session_id = ?1",
+        [session_id],
+    )?;
+    conn.execute(
+        "DELETE FROM sessions WHERE source = 'devin' AND session_id = ?1",
+        [session_id],
+    )?;
+    Ok(())
 }
 
 /// Read one Devin store and normalize every changed session.
@@ -1342,6 +1447,7 @@ pub(super) fn sync_devin_db(
     conn: &Connection,
     state: &mut Map<String, Value>,
     cli_dir: &Path,
+    repairs: &super::SweepRepairs,
     coverage: &mut super::SweepCoverage,
 ) -> Result<usize> {
     super::check_capture_cancelled()?;
@@ -1351,8 +1457,9 @@ pub(super) fn sync_devin_db(
     }
     let src = open_db_readonly(&db_path)
         .with_context(|| format!("open devin store {}", db_path.display()))?;
+    register_stamp_fn(&src)?;
     src.execute_batch("PRAGMA query_only = ON; BEGIN DEFERRED")?;
-    let result = sync_devin_from_source(conn, state, &src, cli_dir, coverage);
+    let result = sync_devin_from_source(conn, state, &src, cli_dir, coverage, repairs);
     let _ = src.execute_batch("ROLLBACK");
     result
 }
@@ -1363,6 +1470,7 @@ fn sync_devin_from_source(
     src: &Connection,
     cli_dir: &Path,
     coverage: &mut super::SweepCoverage,
+    repairs: &super::SweepRepairs,
 ) -> Result<usize> {
     if !is_devin_store(src) {
         return Ok(0);
@@ -1374,9 +1482,23 @@ fn sync_devin_from_source(
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    let ids = list_session_ids(src)?;
+    let visible: BTreeSet<&str> = ids.iter().map(String::as_str).collect();
+    // A session that became hidden or was deleted since the last pass keeps
+    // no catalog row, no evidence and no stamp state — and reappears cleanly
+    // if it is unhidden again.
+    let gone: Vec<String> = devin_state
+        .keys()
+        .filter(|id| !visible.contains(id.as_str()))
+        .cloned()
+        .collect();
+    for session_id in gone {
+        retire_session(conn, &session_id)?;
+        devin_state.remove(&session_id);
+    }
     let mut inserted = 0usize;
     let mut failures: Vec<String> = Vec::new();
-    for session_id in list_session_ids(src)? {
+    for session_id in ids {
         super::check_capture_cancelled()?;
         let stamp = match session_stamp(src, &session_id, &transcripts) {
             Ok(Some(stamp)) => stamp,
@@ -1388,20 +1510,26 @@ fn sync_devin_from_source(
             }
         };
         let recorded = devin_state.get(&session_id);
-        if recorded
-            .and_then(|e| e.get("stamp"))
-            .and_then(Value::as_str)
-            == Some(stamp.as_str())
+        // A session the destination marker names as short is re-read even
+        // when its stamp matches — that is the repair the marker exists for.
+        let needs_repair = repairs.contains(SOURCE, &session_id);
+        if !needs_repair
+            && recorded
+                .and_then(|e| e.get("stamp"))
+                .and_then(Value::as_str)
+                == Some(stamp.as_str())
         {
-            // Unchanged per the stamp — but only trustworthy when the
-            // destination still holds the rows a previous pass wrote.
-            let had_evidence = recorded
-                .and_then(|e| e.get("evidence"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let intact = !had_evidence
-                || (evidence_exists(conn, &session_id).unwrap_or(false)
-                    && catalog_row_exists(conn, &session_id).unwrap_or(false));
+            // Unchanged per the stamp — but only trustworthy while the
+            // destination still holds exactly the rows the previous pass
+            // recorded. Entries recorded before holdings existed
+            // re-normalize once and pick the new shape up.
+            let intact = recorded
+                .and_then(|e| e.get("holdings"))
+                .is_some_and(|held| {
+                    evidence_holdings(conn, &session_id)
+                        .map(|current| current == *held)
+                        .unwrap_or(false)
+                });
             if intact {
                 continue;
             }
@@ -1412,13 +1540,13 @@ fn sync_devin_from_source(
                 match outcome {
                     Ok(counts) => {
                         inserted += counts.prompts;
+                        let holdings = evidence_holdings(conn, &session_id)?;
                         devin_state.insert(
                             session_id,
                             serde_json::json!({
                                 "stamp": stamp,
                                 "session": loaded.info.id,
-                                "evidence": counts.events + counts.markers + counts.prompts
-                                    + counts.tool_calls > 0,
+                                "holdings": holdings,
                             }),
                         );
                     }
@@ -1429,9 +1557,15 @@ fn sync_devin_from_source(
                 }
             }
             Ok(None) => {
-                // Hidden between enumeration and load: record the stamp so the
-                // session is not re-queried until it changes again.
-                devin_state.insert(session_id, serde_json::json!({ "stamp": stamp }));
+                // Hidden between enumeration and load: record the stamp so
+                // the session is not re-queried until it changes again. Its
+                // holdings are whatever the last visible pass left — the
+                // next sweep retires it once it drops out of `visible`.
+                let holdings = evidence_holdings(conn, &session_id)?;
+                devin_state.insert(
+                    session_id,
+                    serde_json::json!({ "stamp": stamp, "holdings": holdings }),
+                );
             }
             Err(err) => {
                 coverage.note_unread();

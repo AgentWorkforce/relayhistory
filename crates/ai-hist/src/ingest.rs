@@ -1438,7 +1438,7 @@ fn sync_basic(
     check_capture_cancelled()?;
     if let Some(inserted) = report.capture(
         "devin",
-        devin::sync_devin_db(conn, &mut state, &roots.devin, &mut coverage),
+        devin::sync_devin_db(conn, &mut state, &roots.devin, &repairs, &mut coverage),
     ) {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);

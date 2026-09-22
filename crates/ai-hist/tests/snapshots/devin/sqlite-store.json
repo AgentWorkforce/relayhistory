@@ -223,7 +223,7 @@
       "repo_url": null,
       "session_id": "fixture-devin-session",
       "source": "devin",
-      "source_stamp": "<n>:8:8:3:876|<n>:307",
+      "source_stamp": "<n>:<n>:8:8:36:<n>:3:6:<n>|<n>:307",
       "workspace_roots_json": "[\"/work/fixture-repo\",\"/work/fixture-extras\"]"
     }
   ],

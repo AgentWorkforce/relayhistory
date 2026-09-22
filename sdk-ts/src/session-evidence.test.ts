@@ -59,15 +59,17 @@ async function seededDatabase(): Promise<{
   await mkdir(codex, { recursive: true });
   await writeFile(join(claude, `${SHARED_SESSION}.jsonl`), `${CLAUDE_TRANSCRIPT.map((line) => JSON.stringify(line)).join('\n')}\n`);
   await writeFile(join(codex, `rollout-${SHARED_SESSION}.jsonl`), `${CODEX_ROLLOUT.map((line) => JSON.stringify(line)).join('\n')}\n`);
-  const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+  const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, XDG_DATA_HOME: process.env.XDG_DATA_HOME };
   process.env.HOME = home;
   process.env.USERPROFILE = home;
+  process.env.XDG_DATA_HOME = join(home, 'share');
   const dbPath = join(root, 'history.db');
   try {
     await sync({ dbPath });
   } finally {
     if (saved.HOME === undefined) delete process.env.HOME; else process.env.HOME = saved.HOME;
     if (saved.USERPROFILE === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = saved.USERPROFILE;
+    if (saved.XDG_DATA_HOME === undefined) delete process.env.XDG_DATA_HOME; else process.env.XDG_DATA_HOME = saved.XDG_DATA_HOME;
   }
   return { dbPath, home, cleanup: () => rm(root, { recursive: true, force: true }) };
 }
@@ -286,7 +288,7 @@ test('an unsupported provider is rejected, not answered with an empty page', asy
 
     // Every id the SDK does publish stays accepted, including `trajectory`,
     // which the catalog excludes but evidence rows may carry.
-    for (const source of ['claude', 'codex', 'cursor', 'grok', 'relay', 'trajectory', 'opencode'] as const) {
+    for (const source of ['claude', 'codex', 'cursor', 'grok', 'relay', 'trajectory', 'opencode', 'devin'] as const) {
       assert.equal((await getSessionToolCallsPage(source, 'no-such-session', { dbPath })).source, source);
       assert.equal((await getSessionFileEditsPage(source, 'no-such-session', { dbPath })).source, source);
     }
@@ -297,9 +299,10 @@ test('an unsupported provider is rejected, not answered with an empty page', asy
 
 test('hydration reports coverage alongside a capability computed from it', async () => {
   const { dbPath, home, cleanup } = await seededDatabase();
-  const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+  const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, XDG_DATA_HOME: process.env.XDG_DATA_HOME };
   process.env.HOME = home;
   process.env.USERPROFILE = home;
+  process.env.XDG_DATA_HOME = join(home, 'share');
   try {
     const hydrated = await hydrateSession({ source: 'claude', sessionId: SHARED_SESSION, dbPath });
     assert.equal(hydrated.contractVersion, SESSION_HYDRATION_CONTRACT_VERSION);
@@ -327,6 +330,8 @@ test('hydration reports coverage alongside a capability computed from it', async
     if (saved.HOME === undefined) delete process.env.HOME; else process.env.HOME = saved.HOME;
     if (saved.USERPROFILE === undefined) delete process.env.USERPROFILE;
     else process.env.USERPROFILE = saved.USERPROFILE;
+    if (saved.XDG_DATA_HOME === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = saved.XDG_DATA_HOME;
     await cleanup();
   }
 });

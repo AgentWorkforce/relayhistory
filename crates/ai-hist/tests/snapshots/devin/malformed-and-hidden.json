@@ -110,7 +110,7 @@
       "repo_url": null,
       "session_id": "fixture-devin-partial",
       "source": "devin",
-      "source_stamp": "<n>:3:3:2:424|absent",
+      "source_stamp": "<n>:<n>:3:3:6:<n>:2:3:<n>|absent",
       "workspace_roots_json": null
     }
   ],

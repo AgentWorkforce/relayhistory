@@ -375,11 +375,14 @@ test('a real local history store is written and read back through surface.run()'
   const db = join(root, 'history.db');
   const previousHome = process.env.HOME;
   const previousProfile = process.env.USERPROFILE;
+  const previousXdg = process.env.XDG_DATA_HOME;
   process.env.HOME = home;
   process.env.USERPROFILE = home;
+  process.env.XDG_DATA_HOME = join(home, 'share');
   t.after(() => {
     if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
     if (previousProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = previousProfile;
+    if (previousXdg === undefined) delete process.env.XDG_DATA_HOME; else process.env.XDG_DATA_HOME = previousXdg;
   });
 
   const surface = createRelayCliSurface();
