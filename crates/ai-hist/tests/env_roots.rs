@@ -57,6 +57,7 @@ fn configured_provider_roots_drive_sync_discovery_and_hydration() {
         .env("CODEX_HOME", &codex)
         .env("GROK_HOME", &grok)
         .env("OPENCODE_DB", dir.path().join("missing-opencode.db"))
+        .env("XDG_DATA_HOME", dir.path().join("xdg"))
         .output()
         .unwrap();
     assert!(
@@ -152,6 +153,7 @@ fn explicit_store_home_honors_provider_env_roots() {
         .env("RH_EXPLICIT_HOME", dir.path().join("empty-home"))
         .env("CODEX_HOME", codex)
         .env("OPENCODE_DB", provider_db)
+        .env("XDG_DATA_HOME", dir.path().join("xdg"))
         .output()
         .unwrap();
     assert!(
@@ -205,6 +207,7 @@ fn whitespace_provider_roots_fall_back_to_home() {
         .env("CLAUDE_CONFIG_DIR", "  ")
         .env("CODEX_HOME", "\t")
         .env("GROK_HOME", "")
+        .env("XDG_DATA_HOME", " ")
         .output()
         .unwrap();
     assert!(
@@ -227,4 +230,8 @@ fn whitespace_provider_roots_child() {
     );
     assert_eq!(ai_hist::paths::codex_home(home), home.join(".codex"));
     assert_eq!(ai_hist::paths::grok_home(home), home.join(".grok"));
+    assert_eq!(
+        ai_hist::paths::devin_cli_dir(home),
+        home.join(".local/share/devin/cli")
+    );
 }

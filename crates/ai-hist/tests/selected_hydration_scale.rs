@@ -10,6 +10,7 @@ fn selected_hydration_does_not_reconcile_unrelated_history() {
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("HOME", home.path());
     std::env::set_var("USERPROFILE", home.path());
+    std::env::set_var("XDG_DATA_HOME", home.path().join("missing-xdg"));
     std::env::remove_var("CLAUDE_CONFIG_DIR");
     std::env::remove_var("AI_HIST_DB");
     let transcript = home

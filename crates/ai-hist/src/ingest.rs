@@ -17,6 +17,7 @@ use std::time::Duration;
 
 pub(crate) mod codex;
 pub(crate) mod cursor;
+pub(crate) mod devin;
 pub(crate) mod grok;
 pub(crate) mod hook;
 pub(crate) mod hydrate;
@@ -657,7 +658,7 @@ const DESTINATION_MARKER_VERSION: &str = "v4";
 /// sync now re-reads a session indexed as prompts-only, so a loss in one is
 /// repairable on the same terms. Its rows do not come from a flat log, which
 /// is what kept it out before.
-const REPAIRABLE_EVENT_SOURCES: &[&str] = &["claude", "codex", "opencode"];
+const REPAIRABLE_EVENT_SOURCES: &[&str] = &["claude", "codex", "opencode", "devin"];
 
 /// What one session is expected to hold.
 ///
@@ -1083,6 +1084,7 @@ fn sync_watch_roots_with_provider_roots(
             claude: &provider_roots.claude,
             codex: &provider_roots.codex,
             grok: &provider_roots.grok,
+            devin: &provider_roots.devin,
             opencode_db: &provider_roots.opencode_db,
         },
     );
@@ -1431,6 +1433,18 @@ fn sync_basic(
             }
         }
         total_inserted += open_inserted;
+    }
+    capture_progress("devin", 0, None);
+    check_capture_cancelled()?;
+    if let Some(inserted) = report.capture(
+        "devin",
+        devin::sync_devin_db(conn, &mut state, &roots.devin, &mut coverage),
+    ) {
+        total_inserted += inserted;
+        checkpoint_sync_state(&state_path, &state);
+        if inserted > 0 {
+            sync_note!("  [devin] +{inserted} rows");
+        }
     }
     check_capture_cancelled()?;
 

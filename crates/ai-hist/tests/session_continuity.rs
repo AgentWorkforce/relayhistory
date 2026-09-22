@@ -73,6 +73,7 @@ fn a_plain_sync_records_continuity_and_leaves_delegation_untouched() {
     std::env::set_var("HOME", home.path());
     std::env::set_var("USERPROFILE", home.path());
     std::env::set_var("OPENCODE_DB", home.path().join("missing-opencode.db"));
+    std::env::set_var("XDG_DATA_HOME", home.path().join("missing-xdg"));
     std::env::remove_var("AI_HIST_DB");
     let db = home.path().join("history.db");
     sync_scoped_at(&db, SessionScope::Local).unwrap();

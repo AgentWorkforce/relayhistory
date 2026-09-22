@@ -30,6 +30,7 @@ pub const SOURCE_CHOICES: &[&str] = &[
     "relay",
     "trajectory",
     "opencode",
+    "devin",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

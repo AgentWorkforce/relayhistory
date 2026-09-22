@@ -49,6 +49,11 @@ enum Layout {
     HomeTree,
     /// A `.sql` file executed into `~/.local/share/opencode/opencode.db`.
     OpencodeSqlite,
+    /// `.sql` files executed into `~/.local/share/devin/cli/sessions.db`;
+    /// every other listed path is copied under `~/.local/share/devin/cli/`
+    /// preserving its path relative to `fixtures/devin/` (so
+    /// `devin/transcripts/x.json` lands at `cli/transcripts/x.json`).
+    DevinSqlite,
     /// burn's older OpenCode JSON layout, copied under
     /// `~/.local/share/opencode/`.
     OpencodeLegacyJson,
@@ -662,6 +667,26 @@ const CORPUS: &[Fixture] = &[
         files: &["opencode/legacy-json-user-turn-blocks"],
         quirk: "legacy layout with several tool parts of different sizes, one errored",
     },
+    // -- devin -------------------------------------------------------------
+    Fixture {
+        source: "devin",
+        name: "sqlite-store",
+        layout: Layout::DevinSqlite,
+        origin: Origin::RelayHistory,
+        files: &[
+            "devin/sqlite-store.sql",
+            "devin/transcripts/fixture-devin-session.json",
+        ],
+        quirk: "the SQLite store: epoch-second timestamps, `chat_message` JSON per node, ACP `tool_call_state` with a completed read and a failed edit, a `summarized_from` node marker and a transcript `agent` envelope",
+    },
+    Fixture {
+        source: "devin",
+        name: "malformed-and-hidden",
+        layout: Layout::DevinSqlite,
+        origin: Origin::RelayHistory,
+        files: &["devin/malformed-and-hidden.sql"],
+        quirk: "a `chat_message` that is not JSON is skipped per record, an in-progress tool call stays `running`, an orphan `tool_call_state` row is still indexed, and `hidden` sessions are excluded entirely",
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -779,6 +804,29 @@ fn stage(fixture: &Fixture, home: &Path) {
                 db.execute_batch(&sql).expect("apply opencode fixture sql");
             }
         }
+        Layout::DevinSqlite => {
+            let cli_dir = home.join(".local/share/devin/cli");
+            fs::create_dir_all(&cli_dir).expect("devin cli dir");
+            let db_path = cli_dir.join("sessions.db");
+            let mut db: Option<Connection> = None;
+            for file in fixture.files {
+                let from = root.join(file);
+                if from.extension().and_then(|e| e.to_str()) == Some("sql") {
+                    let conn = db.get_or_insert_with(|| {
+                        Connection::open(&db_path).expect("open devin fixture store")
+                    });
+                    let sql = fs::read_to_string(&from).expect("read devin fixture sql");
+                    conn.execute_batch(&sql).expect("apply devin fixture sql");
+                } else {
+                    // `devin/transcripts/<name>.json` stages at
+                    // `cli/transcripts/<name>.json`.
+                    let rel = from
+                        .strip_prefix(root.join("devin"))
+                        .expect("devin fixture path");
+                    copy_tree(&from, &cli_dir.join(rel));
+                }
+            }
+        }
         Layout::OpencodeLegacyJson => {
             let target = home.join(".local/share/opencode");
             for file in fixture.files {
@@ -829,6 +877,10 @@ fn capture(fixture: &Fixture, home: &Path) -> Value {
     std::env::set_var("HOME", home);
     std::env::set_var("USERPROFILE", home);
     std::env::set_var("OPENCODE_DB", &opencode_db);
+    // Devin's root follows `XDG_DATA_HOME`; pin it to the staged home so a
+    // host that sets the variable does not leak its real store into a
+    // fixture run.
+    std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
     std::env::remove_var("AI_HIST_DB");
 
     let db = home.join("ai-history.db");

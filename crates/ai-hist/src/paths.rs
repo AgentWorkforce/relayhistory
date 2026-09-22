@@ -35,12 +35,29 @@ pub fn opencode_storage_dir(home: &Path) -> PathBuf {
         .unwrap_or_else(|| home.join(".local/share/opencode/storage"))
 }
 
+/// The Devin CLI data directory: `$XDG_DATA_HOME/devin/cli`, defaulting to
+/// `~/.local/share/devin/cli`. It holds `sessions.db` plus the per-session
+/// `transcripts/<id>.json` exports.
+pub fn devin_cli_dir(home: &Path) -> PathBuf {
+    env_dir("XDG_DATA_HOME")
+        .map(|data| data.join("devin").join("cli"))
+        .unwrap_or_else(|| home.join(".local/share/devin/cli"))
+}
+
+/// The home-relative default, ignoring `XDG_DATA_HOME` — for hosts that hand
+/// every provider root in explicitly rather than through the process env.
+pub(crate) fn devin_cli_dir_under(home: &Path) -> PathBuf {
+    home.join(".local/share/devin/cli")
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ProviderRoots {
     pub home: PathBuf,
     pub claude: PathBuf,
     pub codex: PathBuf,
     pub grok: PathBuf,
+    /// Devin CLI data directory (`sessions.db` plus `transcripts/`).
+    pub devin: PathBuf,
     pub opencode_db: PathBuf,
     pub opencode_storage_dir: PathBuf,
     pub use_env_roots: bool,
@@ -52,6 +69,7 @@ impl ProviderRoots {
             claude: claude_config_dir(&home),
             codex: codex_home(&home),
             grok: grok_home(&home),
+            devin: devin_cli_dir(&home),
             opencode_db: opencode_db_path(&home),
             opencode_storage_dir: opencode_storage_dir(&home),
             use_env_roots: true,
@@ -68,6 +86,7 @@ impl ProviderRoots {
             claude: home.join(".claude"),
             codex: home.join(".codex"),
             grok: home.join(".grok"),
+            devin: devin_cli_dir_under(&home),
             home,
             opencode_db,
             opencode_storage_dir,

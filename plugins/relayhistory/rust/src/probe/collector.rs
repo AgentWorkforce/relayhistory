@@ -844,6 +844,10 @@ mod tests {
         std::env::set_var("HOME", home.path());
         std::env::set_var("USERPROFILE", home.path());
         std::env::set_var("CLAUDE_CONFIG_DIR", home.path().join(".claude"));
+        // Devin's root resolves through the process-wide XDG_DATA_HOME, not
+        // HOME; pin it under the synthetic home or the capture reads the real
+        // store.
+        std::env::set_var("XDG_DATA_HOME", home.path().join(".local/share"));
         let project = home.path().join(".claude/projects/synthetic");
         fs::create_dir_all(&project).unwrap();
         for session in ["selected", "private"] {

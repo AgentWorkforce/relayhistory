@@ -1697,7 +1697,9 @@ pub async fn hydrate_session(options: HydrateSessionOptions) -> napi::Result<Hyd
     })
 }
 
-const CATALOG_SOURCES: &[&str] = &["claude", "codex", "cursor", "grok", "relay", "opencode"];
+const CATALOG_SOURCES: &[&str] = &[
+    "claude", "codex", "cursor", "grok", "relay", "opencode", "devin",
+];
 
 /// Reject an unusable identity before opening anything, so a typo is an
 /// argument error rather than an empty result that looks like real data.

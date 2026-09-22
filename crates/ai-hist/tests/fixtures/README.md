@@ -174,3 +174,10 @@ source without deciding which one fails the test.
 | `opencode/legacy-json-with-tool` | burn | `opencode/legacy-json-with-tool` | legacy layout with a `tool` part and its completed state |
 | `opencode/legacy-json-with-compaction` | burn | `opencode/legacy-json-with-compaction` | legacy layout with a summarized/compacted message |
 | `opencode/legacy-json-user-turn-blocks` | burn | `opencode/legacy-json-user-turn-blocks` | legacy layout with several tool parts of different sizes, one errored |
+
+### `devin`
+
+| Fixture | Origin | Corpus files | Quirk it encodes |
+| --- | --- | --- | --- |
+| `devin/sqlite-store` | relayhistory | `devin/sqlite-store.sql`<br>`devin/transcripts/fixture-devin-session.json` | the SQLite store: epoch-second timestamps, `chat_message` JSON per node, ACP `tool_call_state` with a completed read and a failed edit, a `summarized_from` node marker and a transcript `agent` envelope |
+| `devin/malformed-and-hidden` | relayhistory | `devin/malformed-and-hidden.sql` | a `chat_message` that is not JSON is skipped per record, an in-progress tool call stays `running`, an orphan `tool_call_state` row is still indexed, and `hidden` sessions are excluded entirely |
