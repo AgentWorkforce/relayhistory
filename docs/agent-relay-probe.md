@@ -99,7 +99,11 @@ No Cloud bearer credential is persisted by the probe. Tokens are never command
 arguments, and provider errors, response bodies and session content are not logged.
 The device approval URL is intentionally displayed in the interactive terminal.
 
-Each cycle delivers through the probe-owned Rust worker. The plugin helper
+Each pass delivers through the probe-owned Rust worker. A pass is bounded by
+wall time (15 s), so it moves as many batches as the destination accepts in
+that window and the next pass continues the backlog; the collector runs passes
+2 s apart while the job has queued, unqueued or unscanned records and 20 s
+apart once it is caught up. Stop requests are polled between batches. The plugin helper
 uses that same bounded drain and RelayHistory receiver. The worker owns
 immutable batches, leases and their keepalive, prepared-byte persistence, the
 eligibility recheck immediately before dispatch, retry/backoff, acknowledgment
@@ -223,8 +227,28 @@ human-readable install/status/stop commands remain available.
   login boundary before the probe provisions RelayHistory upload credentials.
   `connected` confirms those upload credentials are stored. JSON setup requires
   one explicit sharing choice and runs in the background.
-- `start`, `status`, `pause`, `resume`, `disconnect`: pass `--account ID`,
-  `--workspace ID`, and optionally `--site-url URL`, plus `--json`.
+- `start`, `status`, `pause`, `resume`, `disconnect`, `compact`: pass
+  `--account ID`, `--workspace ID`, and optionally `--site-url URL`, plus
+  `--json`.
+- `status --json` includes the upload journal's usage against its cap:
+
+  ```json
+  { "retention": { "used_bytes": 268433716, "limit_bytes": 268435456 } }
+  ```
+
+  When a cycle fails on that cap, `last_cycle.error_class` is
+  `retention_limit` and its message carries the same numbers:
+  `Upload journal full (256 MB of 256 MB). Compacting consumed records; queued
+  sessions are preserved.`
+- `compact <target> --json`: reclaims every journal record already consumed by
+  all subscriptions and every settled batch receipt, under the desktop control
+  lock. Queued and unacknowledged records are untouched, so it is safe while
+  the collector runs. It returns the journal rows removed and the usage left:
+
+  ```json
+  { "removed_records": 114490, "retention": { "used_bytes": 1048576, "limit_bytes": 268435456 } }
+  ```
+
 - `sessions list <target> --json --limit 500`: newest sessions with title,
   source, project path, activity and upload status. `uploading` means a record
   from the session is in the currently leased batch; `queued` means a pending
