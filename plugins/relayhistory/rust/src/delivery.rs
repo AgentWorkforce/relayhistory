@@ -319,6 +319,8 @@ fn create_job_inner(
     let cutoff = capture::reserve_revision(&tx)?;
     tx.execute("INSERT INTO delivery_jobs(id,destination_id,instance_id,account_id,generation,config_json,state,created_ms,cutoff,journal_cursor) VALUES (?,?,?,?,?,?,'active',?,?,?)", params![id,config.destination_id,config.instance_id,config.account_id,generation,serde_json::to_string(config)?,now_ms,cutoff,cutoff])?;
     if scoped {
+        // A session job's subscriptions are its members; each carries its own
+        // snapshot and cursor, so the job itself subscribes to nothing.
         tx.execute(
             "INSERT INTO delivery_session_jobs(job_id) VALUES (?)",
             [&id],
@@ -327,9 +329,10 @@ fn create_job_inner(
             "UPDATE delivery_jobs SET bootstrap_done=1 WHERE id=?",
             [&id],
         )?;
+    } else {
+        capture::snapshot_bounds(&tx, &id)?;
+        update_root_subscription(&tx, &id)?;
     }
-    capture::snapshot_bounds(&tx, &id)?;
-    update_root_subscription(&tx, &id)?;
     tx.commit()?;
     status(conn, &id)
 }
@@ -376,11 +379,7 @@ fn excluded(
     {
         return Ok(true);
     }
-    Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM delivery_exclusions WHERE source=? AND session_id=?)",
-        params![source, session_id],
-        |row| row.get(0),
-    )?)
+    Ok(!capture::is_shareable(conn, source, session_id)?)
 }
 fn selected(selection: &ExportSelection, kind: &str, source: &str, session: Option<&str>) -> bool {
     selection.kinds.iter().any(|value| value == kind)
