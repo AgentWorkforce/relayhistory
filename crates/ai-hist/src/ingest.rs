@@ -563,10 +563,13 @@ pub fn discover_sessions_scoped_at_with_connectors(
     Ok((rows, summary))
 }
 
-struct SyncSourceReport {
+/// Per-source outcomes of one sync pass. Failures are written to `out`,
+/// stderr outside tests.
+struct SyncSourceReport<W: io::Write = io::Stderr> {
     db_path: PathBuf,
     succeeded: usize,
     failures: Vec<SyncSourceFailure>,
+    out: W,
 }
 
 struct SyncSourceFailure {
@@ -580,11 +583,25 @@ impl SyncSourceReport {
     /// `db_path` is where a contention diagnostic lands when a failure does
     /// not name its own database.
     fn new(db_path: &Path) -> Self {
+        SyncSourceReport::with_output(db_path, io::stderr())
+    }
+}
+
+impl<W: io::Write> SyncSourceReport<W> {
+    fn with_output(db_path: &Path, out: W) -> Self {
         Self {
             db_path: db_path.to_path_buf(),
             succeeded: 0,
             failures: Vec::new(),
+            out,
         }
+    }
+
+    /// The retention-cap gate before `source`'s pass. A stop here ends the
+    /// pass like a stop inside a source, so the failures recorded before it
+    /// are reported first.
+    fn ensure_headroom(&mut self, conn: &Connection, source: &str) -> Result<()> {
+        ensure_source_headroom(conn, source).inspect_err(|_| self.report_failures())
     }
 
     /// Record one source's outcome. A failure at the retention cap ends the
@@ -622,28 +639,31 @@ impl SyncSourceReport {
 
     /// Print every recorded failure, with one contention diagnostic per
     /// database it names.
-    fn report_failures(&self) {
+    /// A failure report that cannot be written must not replace the pass's
+    /// own outcome, so write errors are dropped.
+    fn report_failures(&mut self) {
         if self.failures.is_empty() {
             return;
         }
-        eprintln!(
+        let _ = writeln!(
+            self.out,
             "ai-hist: {} history source(s) failed; {} source(s) completed:",
             self.failures.len(),
             self.succeeded
         );
         for failure in &self.failures {
-            eprintln!("  [{}] {:#}", failure.source, failure.error);
+            let _ = writeln!(self.out, "  [{}] {:#}", failure.source, failure.error);
         }
         let mut diagnosed = HashSet::new();
         for failure in self.failures.iter().filter(|failure| failure.is_contention) {
             let path = failure.contention_path.as_deref().unwrap_or(&self.db_path);
             if diagnosed.insert(path.to_path_buf()) {
-                eprintln!("{}", write_contention_diagnostic(path));
+                let _ = writeln!(self.out, "{}", write_contention_diagnostic(path));
             }
         }
     }
 
-    fn finish(self) -> Result<()> {
+    fn finish(mut self) -> Result<()> {
         if self.failures.is_empty() {
             return Ok(());
         }
@@ -1373,7 +1393,7 @@ fn sync_basic(
     // durable the moment that source completes.
     capture_progress("claude-history", 0, None);
     check_capture_cancelled()?;
-    ensure_source_headroom(conn, "claude")?;
+    report.ensure_headroom(conn, "claude")?;
     if let Some(inserted) = report.capture(
         conn,
         "claude",
@@ -1391,7 +1411,7 @@ fn sync_basic(
     }
     capture_progress("claude", 0, None);
     check_capture_cancelled()?;
-    ensure_source_headroom(conn, "claude-metadata")?;
+    report.ensure_headroom(conn, "claude-metadata")?;
     if report
         .capture(
             conn,
@@ -1410,7 +1430,7 @@ fn sync_basic(
     }
     capture_progress("codex", 0, None);
     check_capture_cancelled()?;
-    ensure_source_headroom(conn, "codex")?;
+    report.ensure_headroom(conn, "codex")?;
     if let Some(inserted) = report.capture(
         conn,
         "codex",
@@ -1427,7 +1447,7 @@ fn sync_basic(
     }
     capture_progress("cursor", 0, None);
     check_capture_cancelled()?;
-    ensure_source_headroom(conn, "cursor")?;
+    report.ensure_headroom(conn, "cursor")?;
     if let Some(inserted) = report.capture(
         conn,
         "cursor",
@@ -1443,7 +1463,7 @@ fn sync_basic(
     }
     capture_progress("grok", 0, None);
     check_capture_cancelled()?;
-    ensure_source_headroom(conn, "grok")?;
+    report.ensure_headroom(conn, "grok")?;
     if let Some(inserted) = report.capture(
         conn,
         "grok",
@@ -1459,7 +1479,7 @@ fn sync_basic(
     }
     capture_progress("trajectory", 0, None);
     check_capture_cancelled()?;
-    ensure_source_headroom(conn, "trajectory")?;
+    report.ensure_headroom(conn, "trajectory")?;
     if let Some(inserted) = report.capture(
         conn,
         "trajectory",
@@ -1470,7 +1490,7 @@ fn sync_basic(
     }
     capture_progress("opencode", 0, None);
     check_capture_cancelled()?;
-    ensure_source_headroom(conn, "opencode")?;
+    report.ensure_headroom(conn, "opencode")?;
     let opencode = roots.opencode_db.clone();
     let opencode_storage = roots.opencode_storage_dir.clone();
     // One owner, two layouts: `opencode.db` when the host has it, the legacy
@@ -12671,6 +12691,36 @@ mod tests {
         // and has been reported.
         assert_eq!(report.failures.len(), 1);
         assert_eq!(report.failures[0].source, "grok");
+    }
+
+    /// A stop at the gate before a source ends the pass like a stop inside
+    /// one: the failures recorded before it are reported, not dropped.
+    #[cfg(feature = "export")]
+    #[test]
+    fn a_retention_stop_at_the_source_gate_reports_earlier_failures() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::init_db(&conn).unwrap();
+        let mut report =
+            SyncSourceReport::with_output(std::path::Path::new("unused.db"), Vec::new());
+        report
+            .capture::<usize>(&conn, "grok", Err(anyhow::anyhow!("its own failure")))
+            .unwrap();
+        report.ensure_headroom(&conn, "codex").unwrap();
+        assert!(report.out.is_empty(), "a gate with room reports nothing");
+
+        conn.execute(
+            "UPDATE delivery_state SET retained_bytes=95, max_retained_bytes=100 WHERE singleton=1",
+            [],
+        )
+        .unwrap();
+        let error = report.ensure_headroom(&conn, "codex").unwrap_err();
+        assert!(crate::export::is_retention_limit(&error));
+        assert!(error.to_string().contains("codex"), "{error:#}");
+        let written = String::from_utf8(report.out).unwrap();
+        assert!(
+            written.contains("[grok] its own failure"),
+            "the earlier failure is reported: {written}"
+        );
     }
 
     #[test]
