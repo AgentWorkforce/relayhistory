@@ -8,9 +8,10 @@
 //! classified failure afterwards. No network, credential or environment access
 //! happens here; receivers never see this module's database connections.
 //!
-//! A drain is bounded: it attempts at most `max_batches` batches, never waits
-//! for a retry deadline and never enables, pauses or resumes a job. Delivery
-//! stays at least once, so receivers must remain idempotent per revision.
+//! A drain is bounded: it attempts at most `max_batches` batches, starts no
+//! attempt once `max_elapsed` has passed, never waits for a retry deadline and
+//! never enables, pauses or resumes a job. Delivery stays at least once, so
+//! receivers must remain idempotent per revision.
 //!
 //! The core cannot forcibly interrupt a receiver: Rust has no way to cancel a
 //! synchronous call. [`ReceiverContext::timeout_ms`] is the deadline a receiver
@@ -136,6 +137,10 @@ pub struct DrainOptions {
     pub worker_id: String,
     pub max_batches: usize,
     pub max_prepare_steps: usize,
+    /// Wall-clock budget for the whole drain. No new attempt or prepare step
+    /// starts after it passes; an attempt already under way runs to its
+    /// receiver's own timeout. `None` bounds the drain by counts alone.
+    pub max_elapsed: Option<Duration>,
     pub lease_ms: i64,
     pub request_timeout_ms: i64,
 }
@@ -146,6 +151,7 @@ impl DrainOptions {
             worker_id: worker_id.into(),
             max_batches: 100,
             max_prepare_steps: 100,
+            max_elapsed: None,
             lease_ms: 30_000,
             request_timeout_ms: 30_000,
         }
@@ -275,6 +281,14 @@ pub fn drain(
         1,
         3_600_000,
     )?;
+    if let Some(limit) = options.max_elapsed {
+        range(
+            i64::try_from(limit.as_millis()).unwrap_or(i64::MAX),
+            "max_elapsed_ms",
+            1,
+            86_400_000,
+        )?;
+    }
     let keepalive = super::open_db(db_path)?;
     // The shared busy policy retries for about thirty seconds, which is right
     // for a sync that must not give up and exactly wrong for a keepalive: a
@@ -292,6 +306,7 @@ pub fn drain(
         options,
         clock,
         cancelled,
+        started: Instant::now(),
         attempts: 0,
         prepare_steps: 0,
         issues: Vec::new(),
@@ -375,6 +390,7 @@ struct Worker<'a> {
     options: &'a DrainOptions,
     clock: &'a (dyn Fn() -> i64 + Sync),
     cancelled: &'a (dyn Fn() -> bool + Sync),
+    started: Instant,
     attempts: usize,
     prepare_steps: usize,
     issues: Vec<DrainIssue>,
@@ -384,6 +400,10 @@ impl Worker<'_> {
     fn budget(&self) -> bool {
         self.attempts < self.options.max_batches
             && self.prepare_steps < self.options.max_prepare_steps
+            && self
+                .options
+                .max_elapsed
+                .is_none_or(|limit| self.started.elapsed() < limit)
     }
     /// At most one issue per job, whatever its cause, exactly as the host SDK.
     fn issue(&mut self, job_id: &str, code: DrainIssueCode, detail: Option<String>) {

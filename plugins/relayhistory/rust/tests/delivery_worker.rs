@@ -540,9 +540,89 @@ fn invalid_selections_and_bounds_are_invalid_arguments() {
             request_timeout_ms: 0,
             ..options()
         },
+        DrainOptions {
+            max_elapsed: Some(Duration::ZERO),
+            ..options()
+        },
+        DrainOptions {
+            max_elapsed: Some(Duration::from_millis(86_400_001)),
+            ..options()
+        },
     ] {
         assert!(failure(invalid).starts_with("INVALID_ARGUMENT:"));
     }
+}
+
+/// A time-bounded drain against a large backlog keeps attempting batches for
+/// as long as its wall-clock budget lasts, so throughput follows the backlog
+/// instead of a fixed batch count; the count bounds stay as ceilings.
+#[test]
+fn a_time_bounded_drain_delivers_a_backlog_beyond_a_fixed_batch_count() {
+    let fixture = fixture();
+    for n in 0..3_000 {
+        fixture.conn.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude','both',?1,43,'user','text','backlog')",params![format!("backlog-{n}")]).unwrap();
+    }
+    let job = create_job(&fixture.conn, &config("one"), 0).unwrap();
+    let receiver = Fake::default();
+    let started = Instant::now();
+    let result = run(
+        &fixture.path(),
+        &one(&receiver),
+        &DrainOptions {
+            max_elapsed: Some(Duration::from_secs(15)),
+            max_batches: 1_000,
+            max_prepare_steps: 1_000,
+            ..options()
+        },
+    );
+    assert!(started.elapsed() < Duration::from_secs(15));
+    assert!(result.attempts > 8, "attempts: {}", result.attempts);
+    assert_eq!(result.issues, vec![]);
+    assert_eq!(result.statuses[0].job_id, job.job_id);
+    assert_eq!(result.statuses[0].pending_records, 0);
+    assert_eq!(result.statuses[0].unqueued_changes, 0);
+    assert_eq!(result.statuses[0].acknowledged_records, 3_003);
+}
+
+/// Once the budget has passed no further attempt starts, and the attempt that
+/// was under way is recorded normally: nothing acknowledged is lost.
+#[test]
+fn a_drain_stops_starting_attempts_once_its_time_budget_has_passed() {
+    let fixture = fixture();
+    for n in 0..500 {
+        fixture.conn.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude','both',?1,43,'user','text','backlog')",params![format!("backlog-{n}")]).unwrap();
+    }
+    create_job(&fixture.conn, &config("one"), 0).unwrap();
+    let receiver = Fake {
+        send: Box::new(|_payload, batch| {
+            std::thread::sleep(Duration::from_millis(40));
+            Ok(ack(batch))
+        }),
+        ..Fake::default()
+    };
+    let result = run(
+        &fixture.path(),
+        &one(&receiver),
+        &DrainOptions {
+            max_elapsed: Some(Duration::from_millis(100)),
+            max_batches: 1_000,
+            max_prepare_steps: 1_000,
+            ..options()
+        },
+    );
+    assert!(
+        result.attempts >= 1 && result.attempts < 6,
+        "attempts: {}",
+        result.attempts
+    );
+    assert_eq!(result.issues, vec![]);
+    assert_eq!(
+        result.statuses[0].acknowledged_records,
+        result.attempts as i64 * 100
+    );
+    // Unscanned bootstrap rows remain: the budget, not the backlog, ended it.
+    assert!(!result.statuses[0].bootstrap_complete);
+    assert!(result.statuses[0].failure.is_none());
 }
 
 /// Prepare and claim one batch, the way the drain loop does. `create_job`

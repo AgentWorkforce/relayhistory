@@ -226,11 +226,32 @@ fn status_value(directory: &Path) -> Result<Value> {
             json!("Upload failed. The probe will retry; check your connection.");
     }
     result["sessions"] = json!({"total":rows.len(), "shared":shared, "excluded":rows.len()-shared});
+    result["retention"] = retention(&conn)?;
     result["last_cycle"] = fs::read(directory.join("cycle.json"))
         .ok()
         .and_then(|data| serde_json::from_slice::<Value>(&data).ok())
         .unwrap_or(Value::Null);
     Ok(result)
+}
+fn retention(conn: &Connection) -> Result<Value> {
+    let (used_bytes, limit_bytes) = delivery::retained_bytes(conn)?;
+    Ok(json!({"used_bytes":used_bytes, "limit_bytes":limit_bytes}))
+}
+/// Reclaim every journal record already consumed by all subscriptions and
+/// every settled batch receipt. Queued and unacknowledged data is untouched,
+/// so this is safe while the collector runs; it serializes only with other
+/// desktop control actions.
+pub fn compact(directory: &Path) -> Result<()> {
+    emit(compact_value(directory)?);
+    Ok(())
+}
+fn compact_value(directory: &Path) -> Result<Value> {
+    let _control = control_lock(directory)?;
+    read_config(directory)?;
+    let conn = db(directory)?;
+    let removed_records = ai_hist::export::compact_journal_pass(&conn, 10_000)?;
+    while delivery::compact_receipts(&conn, 10_000)? == 10_000 {}
+    Ok(json!({"removed_records":removed_records, "retention":retention(&conn)?}))
 }
 pub fn pause(directory: &Path, paused: bool) -> Result<()> {
     let _control = control_lock(directory)?;
@@ -754,6 +775,101 @@ mod tests {
         read_config(dir).unwrap()
     }
 
+    /// Deliver every prepared batch through the core API alone, so consumed
+    /// journal rows stay in place for the compaction under test.
+    fn acknowledge_everything(conn: &Connection, job_id: &str) {
+        for _ in 0..100 {
+            let now = collector::now();
+            let prepared = delivery::prepare_batch(conn, job_id, now).unwrap();
+            if prepared.batch_id.is_none() {
+                if prepared.bootstrap_complete && prepared.scanned_records == 0 {
+                    return;
+                }
+                continue;
+            }
+            let claim = delivery::claim_batch(conn, job_id, "test", 30_000, &|| now)
+                .unwrap()
+                .unwrap();
+            delivery::store_prepared_payload(
+                conn,
+                &claim.lease,
+                &claim.batch.mapping_version,
+                "application/json",
+                "{}",
+                &|| now,
+            )
+            .unwrap();
+            let ack = delivery::DeliveryAcknowledgment {
+                batch_id: claim.batch.batch_id.clone(),
+                accepted_revision_ids: claim
+                    .batch
+                    .records
+                    .iter()
+                    .map(|record| record.revision_id.clone())
+                    .collect(),
+                unsupported_revision_ids: vec![],
+                acceptance_level: delivery::AcceptanceLevel::Durable,
+            };
+            delivery::acknowledge(conn, &claim.lease, &ack, &|| now).unwrap();
+        }
+        panic!("bounded fixture failed to drain");
+    }
+
+    /// Status reports journal usage against its cap, and compaction reclaims
+    /// consumed journal rows, lowering that usage while queued data survives.
+    #[test]
+    fn status_reports_retention_and_compact_reclaims_consumed_journal_rows() {
+        let (dir, config) = fixture(SharingMode::All);
+        let conn = db(dir.path()).unwrap();
+        acknowledge_everything(&conn, &config.job_id);
+        for n in 0..50 {
+            conn.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES('claude','old',?,1,'user','text','synthetic transcript line')",[n.to_string()]).unwrap();
+        }
+        let before = status_value(dir.path()).unwrap();
+        let (used, limit) = delivery::retained_bytes(&conn).unwrap();
+        assert_eq!(before["retention"]["used_bytes"], used);
+        assert_eq!(before["retention"]["limit_bytes"], limit);
+        assert_eq!(limit, delivery::DEFAULT_RETENTION_LIMIT_BYTES);
+        assert!(used > 0);
+
+        // Only the generation's consumed cutoff marker is reclaimable: every
+        // queued event row survives compaction.
+        let untouched = compact_value(dir.path()).unwrap();
+        assert_eq!(untouched["removed_records"], 1);
+        let marker_freed = used - untouched["retention"]["used_bytes"].as_i64().unwrap();
+        assert!(
+            marker_freed > 0 && marker_freed < 2_048,
+            "freed {marker_freed}"
+        );
+        assert_eq!(
+            delivery::status(&conn, &config.job_id)
+                .unwrap()
+                .unqueued_changes,
+            50
+        );
+
+        acknowledge_everything(&conn, &config.job_id);
+        let compacted = compact_value(dir.path()).unwrap();
+        assert_eq!(compacted["removed_records"], 50);
+        let after = compacted["retention"]["used_bytes"].as_i64().unwrap();
+        assert!(after < used - 50 * 512);
+        assert_eq!(compacted["retention"]["limit_bytes"], limit);
+        let receipts: i64 = conn
+            .query_row("SELECT COUNT(*) FROM delivery_batches", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(receipts, 0);
+        assert_eq!(
+            status_value(dir.path()).unwrap()["retention"]["used_bytes"],
+            after
+        );
+        assert_eq!(
+            delivery::status(&conn, &config.job_id)
+                .unwrap()
+                .acknowledged_records,
+            52
+        );
+    }
+
     #[test]
     fn desktop_summary_includes_the_signed_in_profile() {
         let (dir, config) = fixture(SharingMode::Selected);
@@ -978,7 +1094,14 @@ mod tests {
     #[test]
     fn every_desktop_command_accepts_json_and_target_flags() {
         let target = ["--account", "account", "--workspace", "workspace", "--json"];
-        for name in ["start", "status", "pause", "resume", "disconnect"] {
+        for name in [
+            "start",
+            "status",
+            "pause",
+            "resume",
+            "disconnect",
+            "compact",
+        ] {
             assert!(
                 super::super::Cli::try_parse_from([vec!["probe", name], target.to_vec()].concat())
                     .is_ok(),

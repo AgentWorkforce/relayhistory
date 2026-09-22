@@ -20,6 +20,20 @@ use std::{
 /// saved job configuration, so they cannot change for an existing install.
 const DESTINATION: &str = "relayhistory";
 const INSTANCE: &str = "teams-probe";
+/// Wall-clock budget of one delivery pass. A pass runs as many batches as the
+/// destination accepts within it, so throughput follows the backlog, while a
+/// stop request and the heartbeat still get the thread back promptly.
+const DRAIN_TIME_BUDGET: Duration = Duration::from_secs(15);
+/// Safety ceiling on attempts and prepare steps within one pass, well above
+/// what the time budget admits against a live destination.
+const DRAIN_STEP_CEILING: usize = 1_000;
+/// Gap between passes while the job still has queued, unqueued or unscanned work.
+const BACKLOG_PASS_INTERVAL: Duration = Duration::from_secs(2);
+/// Gap between passes once the job is caught up.
+const IDLE_PASS_INTERVAL: Duration = Duration::from_secs(20);
+/// The retention sentence without a usage reading; the cycle report adds one.
+const RETENTION_LIMIT_MESSAGE: &str =
+    "Upload journal full. Compacting consumed records; queued sessions are preserved.";
 static STOP: AtomicBool = AtomicBool::new(false);
 /// Poll the generation-scoped stop file independently of a long capture. The
 /// hot record loops read an atomic flag rather than opening a file per record.
@@ -148,9 +162,12 @@ fn deliver_with_receiver(
 ) -> Result<delivery::DeliveryStatus> {
     let options = worker::DrainOptions {
         job_ids: Some(vec![config.job_id.clone()]),
-        // A cycle stays bounded so a stop request and the heartbeat are never
-        // starved by an unbounded backlog; the next cycle continues it.
-        max_batches: 8,
+        // A pass is bounded by wall time so a stop request and the heartbeat
+        // are never starved by an unbounded backlog; the next pass continues
+        // it. The count bounds are ceilings the time budget rarely reaches.
+        max_elapsed: Some(DRAIN_TIME_BUDGET),
+        max_batches: DRAIN_STEP_CEILING,
+        max_prepare_steps: DRAIN_STEP_CEILING,
         ..worker::DrainOptions::new(format!("probe-{}", std::process::id()))
     };
     let result = worker::drain(
@@ -418,7 +435,7 @@ fn capture_error_class(error: &anyhow::Error) -> &'static str {
 /// Return actionable, allowlisted storage guidance suitable for desktop status and stderr.
 pub(super) fn local_failure_message(error: &anyhow::Error) -> Option<&'static str> {
     match capture_error_class(error) {
-        "retention_limit" => Some("The local upload journal is full. Uploads will retry after consumed records can be compacted; queued sessions are preserved."),
+        "retention_limit" => Some(RETENTION_LIMIT_MESSAGE),
         "database_corrupt" => Some("The local history database needs repair. Preserve the database before recovery; reconnecting will not repair it."),
         "disk_full" => Some("The local disk is full. Free disk space to resume session uploads."),
         "database_busy" => Some("Local history is busy. Agent Relay will retry when the other operation finishes."),
@@ -428,21 +445,51 @@ pub(super) fn local_failure_message(error: &anyhow::Error) -> Option<&'static st
     }
 }
 
+/// The retention sentence with the measured usage, so the desktop can show the
+/// number and offer compaction. Without a reading it names the condition alone.
+fn retention_limit_message(retention: Option<(i64, i64)>) -> String {
+    let megabytes = |bytes: i64| (bytes + 524_288) / 1_048_576;
+    match retention {
+        Some((used, limit)) => format!(
+            "Upload journal full ({} MB of {} MB). Compacting consumed records; queued sessions are preserved.",
+            megabytes(used),
+            megabytes(limit)
+        ),
+        None => RETENTION_LIMIT_MESSAGE.to_owned(),
+    }
+}
+
+/// Current journal usage against its cap, for reports; `None` when the
+/// database cannot be read, which the report tolerates.
+fn read_retention(directory: &Path) -> Option<(i64, i64)> {
+    let conn = ai_hist::open_db_readonly(&directory.join("history.db")).ok()?;
+    delivery::retained_bytes(&conn).ok()
+}
+
 /// Build the advisory cycle status from typed errors without including provider data.
-fn cycle_report(result: &Result<()>) -> serde_json::Value {
+fn cycle_report(result: &Result<()>, retention: Option<(i64, i64)>) -> serde_json::Value {
     let error = result.as_ref().err();
+    let class = error.map(capture_error_class);
     json!({
         "at_ms": now(), "ok": result.is_ok(),
-        "error_class": error.map(capture_error_class),
-        "message": error.map(|error| local_failure_message(error).unwrap_or(
-            "Sync paused or offline. Retrying; local data remains queued."
-        )),
+        "error_class": class,
+        "message": error.map(|error| match class {
+            Some("retention_limit") => retention_limit_message(retention),
+            _ => local_failure_message(error).unwrap_or(
+                "Sync paused or offline. Retrying; local data remains queued."
+            ).to_owned(),
+        }),
     })
 }
 
 /// Persist advisory status without interrupting retries when either status or logs cannot be written.
 fn persist_cycle_report(directory: &Path, result: &Result<()>, mut diagnostics: impl Write) {
-    let report = cycle_report(result);
+    let retention = result
+        .as_ref()
+        .err()
+        .filter(|error| capture_error_class(error) == "retention_limit")
+        .and_then(|_| read_retention(directory));
+    let report = cycle_report(result, retention);
     if let Err(error) = save_json(&directory.join("cycle.json"), &report) {
         let message = local_failure_message(&error)
             .unwrap_or("Sync status could not be saved. Retrying; local data remains queued.");
@@ -735,10 +782,8 @@ pub fn run_background(directory: &Path, startup_id: &str) -> Result<()> {
             break;
         }
         persist_cycle_report(directory, &result, std::io::stderr());
-        for _ in 0..200 {
-            if stopping(&stop.cancelled) {
-                break;
-            }
+        let deadline = Instant::now() + pass_interval(backlog_pending(directory, &config));
+        while !stopping(&stop.cancelled) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
@@ -747,6 +792,28 @@ pub fn run_background(directory: &Path, startup_id: &str) -> Result<()> {
         &json!({"startup_id":startup_id,"pid":std::process::id(),"ready":false}),
     )?;
     Ok(())
+}
+/// Whether the active job still has work a further pass can move: batches
+/// queued for delivery, journal changes not yet queued, or an unfinished
+/// historical snapshot. A paused job has nothing to move, whatever it holds.
+fn backlog_pending(directory: &Path, config: &Config) -> bool {
+    let status = ai_hist::open_db_readonly(&directory.join("history.db"))
+        .and_then(|conn| delivery::status(&conn, &config.job_id));
+    status.is_ok_and(|status| {
+        status.state == "active"
+            && (status.pending_records > 0
+                || status.unqueued_changes > 0
+                || !status.bootstrap_complete)
+    })
+}
+/// The gap between two delivery passes: short while there is backlog, so
+/// throughput follows capture, and long once caught up.
+fn pass_interval(backlog: bool) -> Duration {
+    if backlog {
+        BACKLOG_PASS_INTERVAL
+    } else {
+        IDLE_PASS_INTERVAL
+    }
 }
 pub fn start_background(directory: &Path) -> Result<()> {
     let executable = std::env::current_exe()?;
@@ -1265,7 +1332,7 @@ mod tests {
             },
         );
         assert_eq!(captured.get(), 1);
-        let report = cycle_report(&result);
+        let report = cycle_report(&result, None);
         assert_eq!(report["error_class"], "retention_limit");
         assert!(!report.to_string().contains("secret"));
         assert!(!report["message"].as_str().unwrap().contains("offline"));
@@ -1290,7 +1357,7 @@ mod tests {
                 rusqlite::ffi::Error::new(code),
                 Some("secret prompt https://token:secret@example.invalid".into()),
             ));
-            let report = cycle_report(&Err(error));
+            let report = cycle_report(&Err(error), None);
             assert_eq!(report["error_class"], class);
             assert_eq!(report["ok"], false);
             assert!(!report["message"].as_str().unwrap().contains("offline"));
@@ -1302,8 +1369,11 @@ mod tests {
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER),
             Some("delivery retention limit exceeded; secret".into()),
         ));
-        assert_eq!(cycle_report(&Err(error))["error_class"], "retention_limit");
-        let healthy = cycle_report(&Ok(()));
+        assert_eq!(
+            cycle_report(&Err(error), None)["error_class"],
+            "retention_limit"
+        );
+        let healthy = cycle_report(&Ok(()), None);
         assert_eq!(healthy["ok"], true);
         assert!(healthy["message"].is_null());
         assert!(healthy["error_class"].is_null());
@@ -1327,7 +1397,7 @@ mod tests {
             assert!(local_failure_message(&error)
                 .unwrap()
                 .contains("Free disk space"));
-            let report = cycle_report(&Err(error));
+            let report = cycle_report(&Err(error), None);
             assert_eq!(report["error_class"], "disk_full");
             assert_eq!(report["ok"], false);
             assert!(!report.to_string().contains("secret"));
@@ -1365,6 +1435,95 @@ mod tests {
         persist_cycle_report(directory.path(), &Ok(()), FullDisk);
         let saved: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         assert_eq!(saved["ok"], true);
+    }
+
+    /// The retention sentence carries the measured usage when the database is
+    /// readable and still names the condition when it is not.
+    #[test]
+    fn retention_limit_report_carries_usage_in_megabytes() {
+        let error = anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER),
+            Some("delivery retention limit exceeded; secret transcript".into()),
+        ));
+        let report = cycle_report(&Err(error), Some((268_433_716, 268_435_456)));
+        assert_eq!(report["error_class"], "retention_limit");
+        assert_eq!(
+            report["message"],
+            "Upload journal full (256 MB of 256 MB). Compacting consumed records; queued sessions are preserved."
+        );
+        assert!(!report.to_string().contains("secret"));
+
+        let directory = tempfile::tempdir().unwrap();
+        let conn =
+            relayhistory_plugin::delivery::open_db(&directory.path().join("history.db")).unwrap();
+        delivery::set_retention_limit(&conn, 10 * 1_048_576).unwrap();
+        drop(conn);
+        let result = Err(anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER),
+            Some("delivery retention limit exceeded; secret".into()),
+        )));
+        let mut output = Vec::new();
+        persist_cycle_report(directory.path(), &result, &mut output);
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(directory.path().join("cycle.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            saved["message"],
+            "Upload journal full (0 MB of 10 MB). Compacting consumed records; queued sessions are preserved."
+        );
+        assert!(String::from_utf8(output).unwrap().contains("0 MB of 10 MB"));
+
+        let unreadable = tempfile::tempdir().unwrap();
+        fs::create_dir(unreadable.path().join("history.db")).unwrap();
+        persist_cycle_report(unreadable.path(), &result, Vec::new());
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(unreadable.path().join("cycle.json")).unwrap())
+                .unwrap();
+        assert_eq!(saved["message"], RETENTION_LIMIT_MESSAGE);
+    }
+
+    /// Passes follow the backlog: two seconds apart while the active job has
+    /// queued or unqueued work, twenty once caught up or paused.
+    #[test]
+    fn pass_interval_follows_the_active_jobs_backlog() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = relayhistory_plugin::delivery::open_db(&dir.path().join("history.db")).unwrap();
+        let job = delivery::create_job(&conn, &job_config(true), now()).unwrap();
+        let config = Config {
+            version: 1,
+            site_url: "https://agentrelay.com".into(),
+            account_id: "account".into(),
+            account_email: None,
+            account_name: None,
+            account_avatar_url: None,
+            org_id: "org".into(),
+            workspace_id: "workspace".into(),
+            history_url: "https://history.agentrelay.com".into(),
+            delivery_account: job.config.account_id,
+            job_id: job.job_id,
+            include_existing: true,
+            sharing_mode: None,
+            acknowledge_uninspected_schedules: false,
+        };
+        // An empty database still owes one bootstrap scan before it is caught up.
+        assert!(backlog_pending(dir.path(), &config));
+        let prepared = delivery::prepare_batch(&conn, &config.job_id, now()).unwrap();
+        assert!(prepared.bootstrap_complete && prepared.batch_id.is_none());
+        assert!(!backlog_pending(dir.path(), &config));
+        assert_eq!(pass_interval(false), Duration::from_secs(20));
+        conn.execute(
+            "INSERT INTO sessions(source,session_id) VALUES ('claude','queued')",
+            [],
+        )
+        .unwrap();
+        assert!(backlog_pending(dir.path(), &config));
+        assert_eq!(pass_interval(true), Duration::from_secs(2));
+        delivery::pause_job(&conn, &config.job_id).unwrap();
+        assert!(!backlog_pending(dir.path(), &config));
+        assert!(!backlog_pending(
+            tempfile::tempdir().unwrap().path(),
+            &config
+        ));
     }
 
     fn job_config(include_existing: bool) -> delivery::DeliveryJobConfig {
