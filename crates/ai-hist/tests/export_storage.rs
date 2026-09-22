@@ -623,54 +623,59 @@ fn one_consent_rule_gates_capture_and_reads() {
 fn a_delivered_edge_is_retracted_after_its_child_becomes_ineligible() {
     let conn = db();
     subscribe(&conn, "root", None);
+    let edge = ("relationship".to_string(), Some("parent".to_string()));
     conn.execute("INSERT INTO session_relationships(source,parent_session_id,relationship_uid,child_session_id,relationship,identity_status,evidence_kind,created_ms,updated_ms) VALUES ('claude','parent','edge','child','delegation','observed','fixture',1,1)", []).unwrap();
     assert_eq!(
         journal_sessions(&conn),
-        vec![(
-            "relationship".into(),
-            Some("parent".into()),
-            "upsert".into()
-        )]
+        vec![(edge.0.clone(), edge.1.clone(), "upsert".into())]
     );
     conn.execute(
         "INSERT INTO delivery_exclusions(source,session_id) VALUES ('claude','child')",
         [],
     )
     .unwrap();
-    // The edge now discloses an ineligible child: no further revision of it is
-    // journaled, under its own key or a new one.
+    // The edge now discloses an ineligible child. A revision of it is not
+    // journaled, under its own key or a new one; the consent change alone
+    // retracts nothing, matching the rule that an accepted record is never
+    // recalled.
     conn.execute("UPDATE session_relationships SET updated_ms=2", [])
         .unwrap();
+    assert_eq!(
+        journal_sessions(&conn),
+        vec![(edge.0.clone(), edge.1.clone(), "upsert".into())]
+    );
     conn.execute(
         "UPDATE session_relationships SET relationship_uid='renamed'",
         [],
     )
     .unwrap();
+    // Rekeying retires the delivered key: the tombstone names the parent and
+    // carries no payload, so it is journaled although the child is excluded.
     assert_eq!(
         journal_sessions(&conn),
         vec![
-            (
-                "relationship".into(),
-                Some("parent".into()),
-                "upsert".into()
-            ),
-            (
-                "relationship".into(),
-                Some("parent".into()),
-                "delete".into()
-            ),
+            (edge.0.clone(), edge.1.clone(), "upsert".into()),
+            (edge.0.clone(), edge.1.clone(), "delete".into()),
         ]
     );
     conn.execute("DELETE FROM session_relationships", [])
         .unwrap();
     assert_eq!(
-        journal_sessions(&conn)
-            .into_iter()
-            .filter(|(_, _, operation)| operation == "delete")
-            .count(),
-        2
+        journal_sessions(&conn),
+        vec![
+            (edge.0.clone(), edge.1.clone(), "upsert".into()),
+            (edge.0.clone(), edge.1.clone(), "delete".into()),
+            (edge.0.clone(), edge.1.clone(), "delete".into()),
+        ]
     );
-    // An excluded parent retracts nothing: its edge was never delivered.
+    // An excluded parent retracts nothing: its edge was never delivered. The
+    // child is shareable here, so only the parent's exclusion can hold the
+    // journal empty.
+    conn.execute(
+        "DELETE FROM delivery_exclusions WHERE source='claude' AND session_id='child'",
+        [],
+    )
+    .unwrap();
     conn.execute(
         "INSERT INTO delivery_exclusions(source,session_id) VALUES ('claude','private')",
         [],
