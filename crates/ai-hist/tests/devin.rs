@@ -969,6 +969,58 @@ fn devin_retirement_preserves_the_remote_view_of_a_session() {
         local_rows, 0,
         "local presence, observation and checkpoint retire"
     );
+
+    // The surviving catalog row must stop quoting the retired local copy:
+    // preview text is erased and the locator, stamp and discovery state are
+    // rebuilt from the surviving remote observation.
+    let field = |column: &str| -> Option<String> {
+        conn.query_row(
+            &format!(
+                "SELECT {column} FROM sessions \
+                 WHERE source='devin' AND session_id='devin-test'"
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(field("first_prompt"), None, "local preview text must go");
+    assert_eq!(
+        field("last_assistant_text"),
+        None,
+        "local preview text must go"
+    );
+    assert_eq!(field("raw_path").as_deref(), Some("remote/devin-test"));
+    assert_eq!(field("source_stamp").as_deref(), Some("stamp-1"));
+    assert_eq!(field("discovery_state").as_deref(), Some("shallow"));
+
+    // Scope reads agree: the session is visible remotely and absent locally.
+    let remote_ids = ai_hist::discover::list_session_catalog(
+        &conn,
+        &ai_hist::discover::CatalogListOptions {
+            scope: SessionScope::Remote,
+            sources: vec!["devin".to_string()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        remote_ids.iter().any(|s| s.session_id == "devin-test"),
+        "remote scope must still see the session"
+    );
+    let local_ids = ai_hist::discover::list_session_catalog(
+        &conn,
+        &ai_hist::discover::CatalogListOptions {
+            scope: SessionScope::Local,
+            sources: vec!["devin".to_string()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        !local_ids.iter().any(|s| s.session_id == "devin-test"),
+        "local scope must not see the retired session"
+    );
 }
 
 #[test]

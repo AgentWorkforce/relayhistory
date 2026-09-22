@@ -1514,7 +1514,50 @@ fn retire_session(conn: &Connection, session_id: &str) -> Result<()> {
          WHERE source = 'devin' AND session_id = ?1 AND location = 'local'",
         [session_id],
     )?;
-    if !has_remote {
+    if has_remote {
+        // The shared catalog row survives for the remote view, so it must
+        // stop quoting the retired local copy: local preview text is erased,
+        // and the locator, stamp and discovery state are rebuilt from the
+        // surviving remote observation and presence rows. Remote evidence
+        // lives in `observation_evidence` — nothing canonical speaks for it,
+        // so the row must not keep looking hydrated off the deleted local
+        // events.
+        conn.execute(
+            "UPDATE sessions SET \
+               first_prompt = NULL, \
+               last_assistant_text = NULL, \
+               raw_path = COALESCE(\
+                 (SELECT raw_locator FROM session_observations \
+                  WHERE source = 'devin' AND session_id = ?1 \
+                    AND location = 'remote' AND raw_locator IS NOT NULL \
+                  ORDER BY access_state = 'available' DESC, updated_ms DESC \
+                  LIMIT 1), \
+                 (SELECT raw_locator FROM session_presences \
+                  WHERE source = 'devin' AND session_id = ?1 \
+                    AND location = 'remote' AND raw_locator IS NOT NULL \
+                  LIMIT 1)), \
+               source_stamp = COALESCE(\
+                 (SELECT source_stamp FROM session_observations \
+                  WHERE source = 'devin' AND session_id = ?1 \
+                    AND location = 'remote' AND source_stamp IS NOT NULL \
+                  ORDER BY access_state = 'available' DESC, updated_ms DESC \
+                  LIMIT 1), \
+                 (SELECT source_stamp FROM session_presences \
+                  WHERE source = 'devin' AND session_id = ?1 \
+                    AND location = 'remote' AND source_stamp IS NOT NULL \
+                  LIMIT 1)), \
+               discovery_state = CASE \
+                 WHEN EXISTS(SELECT 1 FROM session_observations \
+                             WHERE source = 'devin' AND session_id = ?1 \
+                               AND location = 'remote' AND discovery_state = 'full') \
+                   OR EXISTS(SELECT 1 FROM session_presences \
+                             WHERE source = 'devin' AND session_id = ?1 \
+                               AND location = 'remote' AND discovery_state = 'full') \
+                 THEN 'full' ELSE 'shallow' END \
+             WHERE source = 'devin' AND session_id = ?1",
+            [session_id],
+        )?;
+    } else {
         // No surviving remote view of the session: the catalog row goes, and
         // its delete triggers cascade whatever presence, observation,
         // relationship and hydration rows remain.
