@@ -342,6 +342,12 @@ pub fn compact_journal_while(
 ) -> Result<usize> {
     validate_compaction_page(limit)?;
     let (mut removed, _) = reclaim_below(conn, consumed_floor, limit, more)?;
+    // A stop that arrives during reclamation ends the call there: the sweep is
+    // its own transaction, and one more of those is exactly what the stop asked
+    // the caller not to wait for.
+    if !more() {
+        return Ok(removed);
+    }
     let tx = write_transaction(conn)?;
     let floor = consumed_floor(&tx)?;
     let ceiling = sweep_ceiling(&tx)?;

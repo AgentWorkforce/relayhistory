@@ -498,3 +498,37 @@ fn the_sweep_stops_at_the_lowest_global_cursor_and_wraps_on_a_short_page() {
     assert_eq!(export::compact_journal(&conn, 4).unwrap(), 0);
     assert_eq!(sweep_cursor(&conn), floor);
 }
+
+/// A stop that arrives while the floor is being reclaimed ends the call there.
+/// The sweep is a transaction of its own, and the cursor it would advance stays
+/// where the stopped call left it.
+#[test]
+fn a_stop_during_reclamation_leaves_the_sweep_for_the_next_call() {
+    let conn = db();
+    let lagging = SessionIdentity {
+        source: "claude".into(),
+        session_id: "lagging".into(),
+    };
+    let tx = conn.unchecked_transaction().unwrap();
+    capture::save_subscription(&tx, &global_reader(0)).unwrap();
+    for id in 0..40 {
+        let session = if id % 2 == 0 { "lagging" } else { "other" };
+        tx.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude',?,?,1,'user','text','mixed')", [session, &id.to_string()]).unwrap();
+    }
+    tx.commit().unwrap();
+    let floor = journal_seq_at(&conn, 4);
+    let ceiling = journal_seq_at(&conn, 19);
+    let tx = conn.unchecked_transaction().unwrap();
+    capture::save_subscription(&tx, &session_reader("lagging-reader", &lagging, floor)).unwrap();
+    capture::save_subscription(&tx, &global_reader(ceiling)).unwrap();
+    tx.commit().unwrap();
+    let before = sweep_cursor(&conn);
+    // Reclaiming the floor is one bounded transaction that completes before the
+    // stop is consulted, so its five rows go; the sweep that would have removed
+    // the eight "other" rows above the floor is left for a later call.
+    let removed = export::compact_journal_while(&conn, 1000, &|| false).unwrap();
+    assert_eq!(removed, 5);
+    assert_eq!(sweep_cursor(&conn), before);
+    // The next call, unstopped, does the sweep the stop deferred.
+    assert_eq!(export::compact_journal(&conn, 1000).unwrap(), 8);
+}
