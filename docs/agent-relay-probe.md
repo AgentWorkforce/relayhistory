@@ -95,7 +95,9 @@ capture verdict standing, so a condition the capture cycle measured stays
 visible between those cycles. The top-level `ok`, `error_class` and `message`
 are the effective verdict — the capture fault when there is one, otherwise the
 delivery fault — and messages are rendered at report time, so a retention
-sentence always carries the current usage. Database corruption requires separate recovery from a preserved copy;
+sentence always carries the current usage. A compaction that reports while a
+pass is running has re-measured the cap that pass observed, so the pass does
+not report the older reading over it. Database corruption requires separate recovery from a preserved copy;
 the collector does not delete or recreate a damaged queue automatically.
 
 Each `(site origin, user, workspace)` has an independent SHA-256-named directory
@@ -272,8 +274,12 @@ human-readable install/status/stop commands remain available.
 
   Compaction reclaims consumed records only: a cap filled by un-uploaded
   backlog frees as those uploads are acknowledged. A `retention_limit` verdict
-  in `last_cycle` is re-measured as part of the pass, so a journal back under
-  its cap stops being reported full without waiting for the next capture cycle.
+  in `last_cycle` is re-measured as part of the pass: a pass that reclaims
+  space and leaves the journal under its cap clears the verdict without waiting
+  for the next capture cycle, and a pass that reclaims nothing leaves it
+  standing. The cap rejects the record that would exceed it without recording
+  it, so a journal that is full for the next record still reads below its cap;
+  reclaimed space, not usage, is what resolves the condition.
 
 - `sessions list <target> --json --limit 500`: newest sessions with title,
   source, project path, activity and upload status. `uploading` means a record
