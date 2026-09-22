@@ -4631,6 +4631,12 @@ pub fn discover_sessions_with_provider_refs(
                     discovery_state: session.discovery_state.clone(),
                     access_state: "available".into(),
                     updated_ms: now_ms(),
+                    // The shared catalog row cannot say which location a
+                    // preview came from — each observation keeps its own, so
+                    // a location retiring later restores the survivor's text
+                    // instead of nulling it.
+                    first_prompt: session.first_prompt.clone(),
+                    last_assistant_text: session.last_assistant_text.clone(),
                 },
             ) {
                 window_error = Some(error);

@@ -1516,16 +1516,33 @@ fn retire_session(conn: &Connection, session_id: &str) -> Result<()> {
     )?;
     if has_remote {
         // The shared catalog row survives for the remote view, so it must
-        // stop quoting the retired local copy: local preview text is erased,
-        // and the locator, stamp and discovery state are rebuilt from the
-        // surviving remote observation and presence rows. Remote evidence
-        // lives in `observation_evidence` — nothing canonical speaks for it,
-        // so the row must not keep looking hydrated off the deleted local
-        // events.
+        // stop quoting the retired local copy: the locator, stamp, preview
+        // text and discovery state are rebuilt from the surviving remote
+        // observation and presence rows, using the same observation
+        // preference as `refresh_projection`. A remote preview recorded on
+        // the observation survives; one with no provenance does not — rows
+        // predating the columns resolve to NULL rather than keep text that
+        // may be the hidden local transcript's. Remote evidence lives in
+        // `observation_evidence` — nothing canonical speaks for it, so the
+        // row must not keep looking hydrated off the deleted local events.
         conn.execute(
             "UPDATE sessions SET \
-               first_prompt = NULL, \
-               last_assistant_text = NULL, \
+               first_prompt = (\
+                 SELECT first_prompt FROM session_observations \
+                 WHERE source = 'devin' AND session_id = ?1 \
+                   AND location = 'remote' AND first_prompt IS NOT NULL \
+                 ORDER BY connector_id = 'legacy-unknown', \
+                          access_state != 'available', \
+                          connector_id, connector_instance \
+                 LIMIT 1), \
+               last_assistant_text = (\
+                 SELECT last_assistant_text FROM session_observations \
+                 WHERE source = 'devin' AND session_id = ?1 \
+                   AND location = 'remote' AND last_assistant_text IS NOT NULL \
+                 ORDER BY connector_id = 'legacy-unknown', \
+                          access_state != 'available', \
+                          connector_id, connector_instance \
+                 LIMIT 1), \
                raw_path = COALESCE(\
                  (SELECT raw_locator FROM session_observations \
                   WHERE source = 'devin' AND session_id = ?1 \

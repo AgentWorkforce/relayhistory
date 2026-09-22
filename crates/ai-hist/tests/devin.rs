@@ -912,9 +912,11 @@ fn devin_retirement_preserves_the_remote_view_of_a_session() {
          VALUES('devin','devin-test','remote'); \
          INSERT INTO session_observations(\
            source,session_id,location,connector_id,connector_instance,\
-           raw_locator,source_stamp,discovery_state,access_state,updated_ms) \
+           raw_locator,source_stamp,discovery_state,access_state,updated_ms,\
+           first_prompt,last_assistant_text) \
          VALUES('devin','devin-test','remote','devin-cloud','default',\
-           'remote/devin-test','stamp-1','shallow','available',1); \
+           'remote/devin-test','stamp-1','shallow','available',1,\
+           'remote prompt','remote tail'); \
          INSERT INTO session_hydration_checkpoints(\
            source,session_id,location,parser_version,source_bytes,records_parsed,updated_ms) \
          VALUES('devin','devin-test','remote',1,10,2,1);",
@@ -984,11 +986,15 @@ fn devin_retirement_preserves_the_remote_view_of_a_session() {
         )
         .unwrap()
     };
-    assert_eq!(field("first_prompt"), None, "local preview text must go");
     assert_eq!(
-        field("last_assistant_text"),
-        None,
-        "local preview text must go"
+        field("first_prompt").as_deref(),
+        Some("remote prompt"),
+        "the remote observation's preview survives local retirement"
+    );
+    assert_eq!(
+        field("last_assistant_text").as_deref(),
+        Some("remote tail"),
+        "the remote observation's preview survives local retirement"
     );
     assert_eq!(field("raw_path").as_deref(), Some("remote/devin-test"));
     assert_eq!(field("source_stamp").as_deref(), Some("stamp-1"));
@@ -1021,6 +1027,78 @@ fn devin_retirement_preserves_the_remote_view_of_a_session() {
         !local_ids.iter().any(|s| s.session_id == "devin-test"),
         "local scope must not see the retired session"
     );
+}
+
+#[test]
+fn devin_retirement_drops_unattributed_previews() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let store = stage_devin_db(home, BASE_SESSION_SQL);
+    let _env = EnvGuard::set(home);
+    let db = home.join("history.db");
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+
+    // Shallow discovery is what writes preview text to the shared catalog
+    // row — run it so the row quotes the local transcript.
+    let conn = open_db(&db).unwrap();
+    let env = DiscoveryEnv::with_roots(&conn, home.to_path_buf(), home.join("missing-opencode.db"));
+    let mut found = Vec::new();
+    discover_sessions_with_env(
+        &env,
+        &DiscoverOptions {
+            scope: SessionScope::Local,
+            sources: vec!["devin".to_string()],
+            limit: None,
+        },
+        |row| found.push(row.session_id.clone()),
+    )
+    .unwrap();
+    drop(env);
+    assert!(found.contains(&"devin-test".to_string()));
+    let seeded: Option<String> = conn
+        .query_row(
+            "SELECT first_prompt FROM sessions \
+             WHERE source='devin' AND session_id='devin-test'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(seeded.is_some(), "local discovery must seed a first_prompt");
+
+    // A remote observation predating preview provenance: the catalog cannot
+    // tell the stored text apart from the hidden local transcript's, so it
+    // must go rather than leak.
+    conn.execute_batch(
+        "INSERT INTO session_presences(source,session_id,location) \
+         VALUES('devin','devin-test','remote'); \
+         INSERT INTO session_observations(\
+           source,session_id,location,connector_id,connector_instance,\
+           raw_locator,source_stamp,discovery_state,access_state,updated_ms) \
+         VALUES('devin','devin-test','remote','devin-cloud','default',\
+           'remote/devin-test','stamp-1','shallow','available',1);",
+    )
+    .unwrap();
+    drop(conn);
+
+    let provider = Connection::open(&store).unwrap();
+    provider
+        .execute_batch("UPDATE sessions SET hidden = 1 WHERE id = 'devin-test'")
+        .unwrap();
+    drop(provider);
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+
+    let conn = open_db(&db).unwrap();
+    let (first_prompt, last_text): (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT first_prompt, last_assistant_text FROM sessions \
+             WHERE source='devin' AND session_id='devin-test'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(first_prompt, None, "unattributed preview text must go");
+    assert_eq!(last_text, None, "unattributed preview text must go");
 }
 
 #[test]
