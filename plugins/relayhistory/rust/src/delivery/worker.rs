@@ -9,8 +9,8 @@
 //! happens here; receivers never see this module's database connections.
 //!
 //! A drain is bounded: it attempts at most `max_batches` batches, starts no
-//! further attempt once `max_elapsed` has passed, never waits for a retry
-//! deadline and never enables, pauses or resumes a job. Delivery stays at least once, so
+//! further step once `max_elapsed` has passed, never waits for a retry deadline
+//! and never enables, pauses or resumes a job. Delivery stays at least once, so
 //! receivers must remain idempotent per revision.
 //!
 //! The core cannot forcibly interrupt a receiver: Rust has no way to cancel a
@@ -138,11 +138,12 @@ pub struct DrainOptions {
     pub max_batches: usize,
     pub max_prepare_steps: usize,
     /// Wall-clock budget for the drain's delivery work, measured from the end
-    /// of its own maintenance. Once it passes no further attempt or prepare
-    /// step starts, and an attempt already under way runs to its receiver's own
-    /// timeout. The budget bounds how long a drain keeps going, not whether it
-    /// goes at all: the first attempt always starts, so however short the
-    /// budget the queue still moves. `None` bounds the drain by counts alone.
+    /// of its own maintenance. Once it passes no further prepare step or
+    /// attempt starts, and an attempt already under way runs to its receiver's
+    /// own timeout. The budget bounds how long a drain keeps going, not whether
+    /// it goes at all: its first step, and the first attempt that step
+    /// prepares, always run, so however short the budget the queue still moves.
+    /// `None` bounds the drain by counts alone.
     pub max_elapsed: Option<Duration>,
     pub lease_ms: i64,
     pub request_timeout_ms: i64,
@@ -404,20 +405,25 @@ struct Worker<'a> {
 }
 
 impl Worker<'_> {
-    /// Whether the drain may start more work. The count ceilings are absolute;
-    /// the elapsed budget bounds *further* attempts, so however little of it is
-    /// left a drain always makes one attempt and the queue always moves.
+    /// Whether the drain may start another step. The count ceilings are
+    /// absolute; the elapsed budget bounds every step after the first, so a
+    /// drain always does one unit of work however little budget is left, and
+    /// scanning that produces no batch cannot run on past the deadline either.
     fn budget(&self) -> bool {
         self.attempts < self.options.max_batches
             && self.prepare_steps < self.options.max_prepare_steps
-            && self.may_attempt()
+            && (self.prepare_steps == 0 || self.within_budget())
     }
+    /// Whether an attempt may start. The first attempt of a drain always runs,
+    /// so a batch is never left undelivered by a budget that expired while that
+    /// same step was preparing it.
     fn may_attempt(&self) -> bool {
-        self.attempts == 0
-            || self
-                .options
-                .max_elapsed
-                .is_none_or(|limit| self.started.elapsed() < limit)
+        self.attempts == 0 || self.within_budget()
+    }
+    fn within_budget(&self) -> bool {
+        self.options
+            .max_elapsed
+            .is_none_or(|limit| self.started.elapsed() < limit)
     }
     /// At most one issue per job, whatever its cause, exactly as the host SDK.
     fn issue(&mut self, job_id: &str, code: DrainIssueCode, detail: Option<String>) {
