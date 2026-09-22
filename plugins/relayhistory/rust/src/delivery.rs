@@ -1233,7 +1233,7 @@ pub fn compact_receipts(conn: &Connection, limit: usize) -> Result<usize> {
 /// Recognize the coordinator's trigger-originated capacity error without
 /// forwarding arbitrary SQLite/provider error text to a host or plugin.
 /// Hosts should expose a stable DELIVERY_RETENTION_LIMIT code and offer
-/// compact_journal/compact_receipts or an explicit set_retention_limit action.
+/// compact_journal_pass/compact_receipts or an explicit set_retention_limit action.
 pub fn is_retention_limit(error: &anyhow::Error) -> bool {
     error.chain().any(|cause|matches!(cause.downcast_ref::<rusqlite::Error>(),Some(rusqlite::Error::SqliteFailure(_,Some(message))) if message.starts_with("delivery retention limit exceeded;")))
 }
