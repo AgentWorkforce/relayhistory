@@ -377,9 +377,8 @@ fn a_root_subscription_journals_nothing_for_an_excluded_session() {
             "upsert".into()
         )]
     );
-    // A row whose identity moves out of an excluded session journals the
-    // tombstone for the excluded key and the revision for the public one only
-    // on the side that is interested.
+    // A row whose identity moves into an excluded session journals the
+    // tombstone for the public key and nothing for the private one.
     conn.execute(
         "UPDATE session_events SET session_id='private' WHERE session_id='public'",
         [],
@@ -400,6 +399,17 @@ fn a_root_subscription_journals_nothing_for_an_excluded_session() {
             ),
         ]
     );
+    // A relationship discloses both endpoints: an excluded parent journals
+    // nothing, linked or unlinked, and neither does an excluded child.
+    conn.execute("INSERT INTO session_relationships(source,parent_session_id,relationship_uid,child_session_id,relationship,identity_status,evidence_kind,created_ms,updated_ms) VALUES ('claude','private','linked','public','delegation','observed','fixture',1,1),('claude','private','unlinked',NULL,'delegation','unlinked','fixture',1,1),('claude','public','into-private','private','delegation','observed','fixture',1,1),('claude','public','shared',NULL,'delegation','unlinked','fixture',1,1)", []).unwrap();
+    let relationships: Vec<String> = conn
+        .prepare("SELECT json_extract(payload,'$.relationship_uid') FROM delivery_journal WHERE kind='relationship' ORDER BY seq")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(relationships, vec!["shared".to_string()]);
     // Without an exclusion the same subscription journals every session.
     conn.execute("DELETE FROM delivery_exclusions", []).unwrap();
     conn.execute(
@@ -407,57 +417,94 @@ fn a_root_subscription_journals_nothing_for_an_excluded_session() {
         [],
     )
     .unwrap();
-    assert_eq!(journal_sessions(&conn).len(), 3);
+    assert_eq!(journal_sessions(&conn).len(), 4);
 }
 
 #[test]
-fn member_subscriptions_journal_only_their_own_sessions_and_either_relationship_endpoint() {
+fn member_subscriptions_journal_their_own_sessions_and_relationships_between_members() {
     let conn = db();
-    let one = SessionIdentity {
-        source: "claude".into(),
-        session_id: "one".into(),
-    };
-    subscribe(&conn, "member", Some(&one));
+    for id in ["one", "two"] {
+        subscribe(
+            &conn,
+            id,
+            Some(&SessionIdentity {
+                source: "claude".into(),
+                session_id: id.into(),
+            }),
+        );
+    }
     conn.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude','one','a',1,'user','text','mine'),('claude','other','b',1,'user','text','theirs'),('codex','one','c',1,'user','text','other source')", []).unwrap();
     conn.execute(
         "INSERT INTO sessions(source,session_id,first_prompt) VALUES ('claude','other','theirs')",
         [],
     )
     .unwrap();
-    conn.execute("INSERT INTO session_relationships(source,parent_session_id,relationship_uid,child_session_id,relationship,identity_status,evidence_kind,created_ms,updated_ms) VALUES ('claude','other','incoming','one','delegation','observed','fixture',1,1),('claude','other','unrelated','third','delegation','observed','fixture',1,1),('claude','one','outgoing','third','delegation','observed','fixture',1,1)", []).unwrap();
-    let mut rows = journal_sessions(&conn);
+    // A relationship needs both endpoints to belong to a member; an unlinked
+    // child needs only its parent.
+    conn.execute("INSERT INTO session_relationships(source,parent_session_id,relationship_uid,child_session_id,relationship,identity_status,evidence_kind,created_ms,updated_ms) VALUES ('claude','one','between','two','delegation','observed','fixture',1,1),('claude','two','back','one','delegation','observed','fixture',1,1),('claude','one','outgoing','third','delegation','observed','fixture',1,1),('claude','other','incoming','one','delegation','observed','fixture',1,1),('claude','one','unlinked',NULL,'delegation','unlinked','fixture',1,1)", []).unwrap();
+    let mut rows: Vec<(String, Option<String>, String, Option<String>)> = conn
+        .prepare("SELECT kind,session_id,operation,json_extract(payload,'$.relationship_uid') FROM delivery_journal WHERE kind <> '__cutoff'")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
     rows.sort();
     assert_eq!(
         rows,
         vec![
-            ("relationship".into(), Some("one".into()), "upsert".into()),
-            ("relationship".into(), Some("other".into()), "upsert".into()),
-            ("session_event".into(), Some("one".into()), "upsert".into()),
+            (
+                "relationship".into(),
+                Some("one".into()),
+                "upsert".into(),
+                Some("between".into())
+            ),
+            (
+                "relationship".into(),
+                Some("one".into()),
+                "upsert".into(),
+                Some("unlinked".into())
+            ),
+            (
+                "relationship".into(),
+                Some("two".into()),
+                "upsert".into(),
+                Some("back".into())
+            ),
+            (
+                "session_event".into(),
+                Some("one".into()),
+                "upsert".into(),
+                None
+            ),
         ]
     );
-    let incoming: String = conn
-        .query_row(
-            "SELECT payload FROM delivery_journal WHERE kind='relationship' AND session_id='other'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&incoming).unwrap()["child_session_id"],
-        "one"
-    );
+    // A row handed from a member to a stranger journals the member's
+    // tombstone and nothing for the stranger.
+    conn.execute(
+        "UPDATE session_events SET session_id='other' WHERE session_id='one' AND source='claude'",
+        [],
+    )
+    .unwrap();
+    let mut latest = journal_sessions(&conn);
+    latest.sort();
+    assert_eq!(latest.len(), 5);
+    assert!(latest.contains(&("session_event".into(), Some("one".into()), "delete".into())));
+    assert!(!latest
+        .iter()
+        .any(|(_, session, _)| session.as_deref() == Some("other")));
     // An excluded member journals nothing, even while it stays subscribed.
     conn.execute(
-        "INSERT INTO delivery_exclusions(source,session_id) VALUES ('claude','one')",
+        "INSERT INTO delivery_exclusions(source,session_id) VALUES ('claude','two')",
         [],
     )
     .unwrap();
     conn.execute(
-        "UPDATE session_events SET text='hidden' WHERE session_id='one'",
+        "UPDATE session_relationships SET updated_ms=2 WHERE relationship_uid IN ('between','back')",
         [],
     )
     .unwrap();
-    assert_eq!(journal_sessions(&conn).len(), 3);
+    assert_eq!(journal_sessions(&conn).len(), 5);
 }
 
 /// Triggers created before the capture filter journal on subscription

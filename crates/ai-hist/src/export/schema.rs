@@ -134,11 +134,15 @@ impl Table {
                 .join(",")
         )
     }
-    /// Whether some subscription is interested in this row, the predicate
-    /// every journal write is gated on. A subscription is interested when it
-    /// is a root subscription (NULL source) or a member subscription for the
-    /// row's identity, and the identity is [`shareable`]. A relationship row
-    /// qualifies through either endpoint. Every lookup is an indexed seek.
+    /// Whether some subscription can deliver this row, the predicate every
+    /// journal write is gated on. A subscription is interested in an identity
+    /// when it is a root subscription (NULL source) or a member subscription
+    /// for that identity, and the identity is [`shareable`]. A relationship
+    /// discloses both endpoints, so it is journaled only when its parent
+    /// qualifies and its child is unlinked or qualifies too -- the rule
+    /// prepare applies before dispatch. A child included later receives its
+    /// incoming edges as fresh revisions, not from the journal. Every lookup
+    /// is an indexed seek.
     pub fn journaled(&self, row: &str) -> String {
         let interested = |session: String| {
             let source = self.source(row);
@@ -151,10 +155,9 @@ impl Table {
         };
         let own = interested(format!("{row}.{}", self.session));
         if self.kind == "relationship" {
-            format!(
-                "({own} OR {})",
-                interested(format!("{row}.child_session_id"))
-            )
+            let child = format!("{row}.child_session_id");
+            let linked = interested(child.clone());
+            format!("({own} AND ({child} IS NULL OR {linked}))")
         } else {
             own
         }
