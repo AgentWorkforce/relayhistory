@@ -42,6 +42,6 @@ export async function setHistoryDeliveryRetention(maxBytes: number, options: Pro
 }
 export async function compactHistoryDelivery(options: ProbeDeliveryOptions = {}): Promise<void> {
   await deliveryRequest({ operation: 'expire_exports', now_ms: Date.now(), limit: 32 }, options);
-  await deliveryRequest({ operation: 'compact_journal', limit: 1000 }, options);
+  await deliveryRequest({ operation: 'compact_journal_pass', page_size: 10_000 }, options);
   await deliveryRequest({ operation: 'compact_receipts', limit: 1000 }, options);
 }

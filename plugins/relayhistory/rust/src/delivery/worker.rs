@@ -22,11 +22,11 @@
 //! was lost, and nothing is acknowledged.
 
 use super::{
-    acknowledge, claim_batch, compact_journal, compact_receipts, expire_exports,
-    is_retention_limit, list_jobs, prepare_batch, record_failure, release_stopped_claim,
-    renew_lease, retained_bytes, status, store_prepared_payload, validate_dispatch, ClaimedBatch,
-    DeliveryAcknowledgment, DeliveryFailure, DeliveryJobConfig, DeliveryStatus, HistoryExportBatch,
-    PreparedPayload,
+    acknowledge, claim_batch, compact_journal, compact_receipts, compact_to_low_water,
+    expire_exports, is_retention_limit, list_jobs, prepare_batch, record_failure,
+    release_stopped_claim, renew_lease, retained_bytes, status, store_prepared_payload,
+    validate_dispatch, ClaimedBatch, DeliveryAcknowledgment, DeliveryFailure, DeliveryJobConfig,
+    DeliveryStatus, HistoryExportBatch, PreparedPayload, MAX_COMPACTION_PAGE,
 };
 use anyhow::{anyhow, bail, Result};
 use rusqlite::Connection;
@@ -244,11 +244,33 @@ fn range(value: i64, name: &str, minimum: i64, maximum: i64) -> Result<()> {
     }
     Ok(())
 }
+/// Bounded maintenance at the start and end of a drain: expire abandoned
+/// snapshots, release terminal receipts, reclaim every consumed journal row,
+/// then keep running complete passes while retained bytes exceed three
+/// quarters of the cap.
 fn compact(conn: &Connection, now_ms: i64) -> Result<()> {
     expire_exports(conn, now_ms, 32)?;
-    compact_journal(conn, 1_000)?;
     compact_receipts(conn, 1_000)?;
+    compact_journal(conn, MAX_COMPACTION_PAGE)?;
+    compact_to_low_water(conn, MAX_COMPACTION_PAGE)?;
     Ok(())
+}
+/// Run one local state write; when the retention cap refuses it, reclaim
+/// consumed journal rows and retry it once. The refusal escapes only when
+/// nothing was reclaimable or the retry is refused again.
+fn with_retention_recovery<T>(
+    conn: &Connection,
+    mut operation: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    match operation() {
+        Err(error) if is_retention_limit(&error) => {
+            if compact_to_low_water(conn, MAX_COMPACTION_PAGE)? == 0 {
+                return Err(error);
+            }
+            operation()
+        }
+        result => result,
+    }
 }
 fn chosen(selection: Option<&[String]>, job_id: &str) -> bool {
     match selection {
@@ -448,7 +470,9 @@ impl Worker<'_> {
         else {
             return Ok(Step::Unregistered);
         };
-        let prepared = prepare_batch(&self.conn, job_id, (self.clock)())?;
+        let prepared = with_retention_recovery(&self.conn, || {
+            prepare_batch(&self.conn, job_id, (self.clock)())
+        })?;
         self.prepare_steps += 1;
         if prepared.batch_id.is_none() {
             // Scanning only excluded or unselected rows still moves a cursor.
@@ -467,13 +491,15 @@ impl Worker<'_> {
         if !self.may_attempt() {
             return Ok(Step::Progressed);
         }
-        let Some(claim) = claim_batch(
-            &self.conn,
-            job_id,
-            &self.options.worker_id,
-            self.options.lease_ms,
-            self.clock,
-        )?
+        let Some(claim) = with_retention_recovery(&self.conn, || {
+            claim_batch(
+                &self.conn,
+                job_id,
+                &self.options.worker_id,
+                self.options.lease_ms,
+                self.clock,
+            )
+        })?
         else {
             // A privacy recheck can suppress the obsolete pending batch. If
             // re-inclusion has a fresh baseline ready, continue this bounded
@@ -506,6 +532,10 @@ impl Worker<'_> {
     ) -> Result<()> {
         let lost = AtomicBool::new(false);
         let stop = AtomicBool::new(false);
+        // A cap refusal that recovery could not clear is recorded as a
+        // transient failure like any other local error, and then reported at
+        // the job boundary so the host sees the cap rather than a retry.
+        let mut retention_refusal = None;
         let host = self.cancelled;
         let stopping = || host() || lost.load(Ordering::SeqCst);
         let outcome = {
@@ -579,7 +609,7 @@ impl Worker<'_> {
                 // so one misbehaving destination cannot take the host down.
                 let guard = StopOnDrop(&stop);
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    self.dispatch(receiver, claim, config, &stopping)
+                    self.dispatch(receiver, claim, config, &stopping, &mut retention_refusal)
                 }))
                 .unwrap_or_else(|_| Err(DeliveryFailure::Transient.into()));
                 drop(guard);
@@ -626,7 +656,10 @@ impl Worker<'_> {
                 self.clock,
             )?;
         }
-        Ok(())
+        match retention_refusal {
+            Some(refusal) => Err(refusal),
+            None => Ok(()),
+        }
     }
 
     /// Mapping, payload persistence, the eligibility recheck and transport.
@@ -638,6 +671,7 @@ impl Worker<'_> {
         claim: &ClaimedBatch,
         config: &DeliveryJobConfig,
         stopping: &dyn Fn() -> bool,
+        retention_refusal: &mut Option<anyhow::Error>,
     ) -> Result<DeliveryAcknowledgment, ReceiverFailure> {
         let transient = || ReceiverFailure::from(DeliveryFailure::Transient);
         let context = ReceiverContext {
@@ -670,15 +704,22 @@ impl Worker<'_> {
             {
                 return Err(DeliveryFailure::InvalidPayload.into());
             }
-            store_prepared_payload(
-                &self.conn,
-                &claim.lease,
-                receiver.mapping_version(),
-                &prepared.content_type,
-                &prepared.body,
-                self.clock,
-            )
-            .map_err(|_| transient())?;
+            with_retention_recovery(&self.conn, || {
+                store_prepared_payload(
+                    &self.conn,
+                    &claim.lease,
+                    receiver.mapping_version(),
+                    &prepared.content_type,
+                    &prepared.body,
+                    self.clock,
+                )
+            })
+            .map_err(|error| {
+                if is_retention_limit(&error) {
+                    *retention_refusal = Some(error);
+                }
+                transient()
+            })?;
         }
         if stopping() {
             return Err(transient());

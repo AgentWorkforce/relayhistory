@@ -1425,3 +1425,186 @@ fn reinclusion_filters_old_batch_then_sends_fresh_snapshot_in_the_same_drain() {
     assert!(delivered.issues.is_empty());
     assert_eq!(delivered.statuses[0].acknowledged_records, 1);
 }
+
+fn journal_events(conn: &Connection) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM delivery_journal WHERE kind='session_event'",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+fn journal_tail(conn: &Connection) -> i64 {
+    conn.query_row(
+        "SELECT COALESCE(MAX(seq),0) FROM delivery_journal",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+fn capture(conn: &Connection, session: &str, uid: &str) -> Result<usize, rusqlite::Error> {
+    conn.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude',?1,?2,42,'user','text',?2)",params![session, uid])
+}
+/// Materialize and acknowledge every revision through the core API alone, so
+/// the job's cursor reaches the tail while no compaction runs.
+fn consume(conn: &Connection, job_id: &str) {
+    for _ in 0..100 {
+        let now = system_clock();
+        let prepared = prepare_batch(conn, job_id, now).unwrap();
+        if prepared.batch_id.is_some() {
+            let claim = claim_batch(conn, job_id, "worker", 60_000, &|| now)
+                .unwrap()
+                .unwrap();
+            let prepared = body(&claim.batch);
+            store_prepared_payload(
+                conn,
+                &claim.lease,
+                "1",
+                &prepared.content_type,
+                &prepared.body,
+                &|| now,
+            )
+            .unwrap();
+            acknowledge(conn, &claim.lease, &ack(&claim.batch), &|| now).unwrap();
+        } else if prepared.bootstrap_complete && prepared.scanned_records == 0 {
+            return;
+        }
+    }
+    panic!("bounded fixture failed to converge")
+}
+
+/// A journal at the cap whose every row the job has consumed is freed by the
+/// drain's own maintenance, and capture succeeds again afterwards.
+#[test]
+fn a_full_and_fully_consumed_journal_is_freed_by_one_drain() {
+    let fixture = fixture();
+    let job = create_job(&fixture.conn, &config("one"), 0).unwrap();
+    assert!(run(&fixture.path(), &one(&Fake::default()), &options())
+        .issues
+        .is_empty());
+    for index in 0..200 {
+        capture(&fixture.conn, "both", &format!("later-{index}")).unwrap();
+    }
+    consume(&fixture.conn, &job.job_id);
+    assert_eq!(journal_events(&fixture.conn), 200);
+    assert_eq!(
+        status(&fixture.conn, &job.job_id).unwrap().journal_cursor,
+        journal_tail(&fixture.conn)
+    );
+    let (used, _) = retained_bytes(&fixture.conn).unwrap();
+    set_retention_limit(&fixture.conn, used).unwrap();
+    let refused = capture(&fixture.conn, "both", "refused").unwrap_err();
+    assert!(is_retention_limit(&anyhow::Error::from(refused)));
+
+    let result = run(&fixture.path(), &one(&Fake::default()), &options());
+    assert!(result.issues.is_empty());
+    assert_eq!(journal_events(&fixture.conn), 0);
+    assert_eq!(result.retention.used_bytes, 0);
+    assert_eq!(result.retention.limit_bytes, used);
+    capture(&fixture.conn, "both", "accepted").unwrap();
+    let delivered = run(&fixture.path(), &one(&Fake::default()), &options());
+    assert!(delivered.issues.is_empty());
+    assert_eq!(delivered.statuses[0].acknowledged_records, 204);
+}
+
+/// Rows no job has consumed are backlog, not reclaimable: at the cap the drain
+/// reports the cap, moves no cursor and deletes nothing.
+#[test]
+fn an_unconsumed_backlog_survives_a_drain_at_the_cap() {
+    let fixture = fixture();
+    let job = create_job(&fixture.conn, &config("one"), 0).unwrap();
+    assert!(run(&fixture.path(), &one(&Fake::default()), &options())
+        .issues
+        .is_empty());
+    for index in 0..50 {
+        capture(&fixture.conn, "both", &format!("backlog-{index}")).unwrap();
+    }
+    let before = status(&fixture.conn, &job.job_id).unwrap();
+    let (used, _) = retained_bytes(&fixture.conn).unwrap();
+    set_retention_limit(&fixture.conn, used).unwrap();
+
+    let result = run(&fixture.path(), &one(&Fake::default()), &options());
+    assert_eq!(result.attempts, 0);
+    assert_eq!(result.issues.len(), 1);
+    assert_eq!(result.issues[0].job_id, job.job_id);
+    assert_eq!(
+        result.issues[0].code,
+        DrainIssueCode::DeliveryRetentionLimit
+    );
+    let after = status(&fixture.conn, &job.job_id).unwrap();
+    assert_eq!(after.journal_cursor, before.journal_cursor);
+    assert_eq!(after.pending_records, 0);
+    assert_eq!(after.acknowledged_records, before.acknowledged_records);
+    assert_eq!(journal_events(&fixture.conn), 50);
+    assert_eq!(result.retention.used_bytes, used);
+    let refused = capture(&fixture.conn, "both", "still-refused").unwrap_err();
+    assert!(is_retention_limit(&anyhow::Error::from(refused)));
+}
+
+/// A cap refusal while persisting the mapped body is recovered by reclaiming
+/// consumed rows and retrying once; with nothing reclaimable it is recorded as
+/// a transient failure and reported as the cap.
+#[test]
+fn a_cap_refusal_while_storing_the_payload_is_recovered_or_reported() {
+    let fixture = fixture();
+    let job = create_job(&fixture.conn, &config("one"), 0).unwrap();
+    assert!(run(&fixture.path(), &one(&Fake::default()), &options())
+        .issues
+        .is_empty());
+    for index in 0..3 {
+        capture(&fixture.conn, "both", &format!("batch-{index}")).unwrap();
+    }
+    // While the receiver maps the batch, capture appends rows the job then
+    // consumes, and the cap closes on exactly the bytes in use.
+    let path = fixture.path();
+    let recoverable = Fake {
+        prepare: Box::new(move |batch| {
+            let conn = open_db(&path).unwrap();
+            for index in 0..100 {
+                capture(&conn, "remote-only", &format!("consumed-{index}")).unwrap();
+            }
+            let tail = journal_tail(&conn);
+            conn.execute("UPDATE delivery_jobs SET journal_cursor=?", [tail])
+                .unwrap();
+            conn.execute("UPDATE history_subscriptions SET journal_cursor=?", [tail])
+                .unwrap();
+            set_retention_limit(&conn, retained_bytes(&conn).unwrap().0).unwrap();
+            Ok(body(batch))
+        }),
+        ..Fake::default()
+    };
+    let recovered = run(&fixture.path(), &one(&recoverable), &options());
+    assert_eq!(recovered.attempts, 1);
+    assert!(recovered.issues.is_empty());
+    assert_eq!(recovered.statuses[0].acknowledged_records, 6);
+    assert_eq!(journal_events(&fixture.conn), 0);
+
+    // The same refusal with nothing left to reclaim.
+    let (used, _) = retained_bytes(&fixture.conn).unwrap();
+    set_retention_limit(&fixture.conn, used + 1_000_000).unwrap();
+    capture(&fixture.conn, "both", "oversized").unwrap();
+    let path = fixture.path();
+    let exhausted = Fake {
+        prepare: Box::new(move |_batch| {
+            let conn = open_db(&path).unwrap();
+            set_retention_limit(&conn, retained_bytes(&conn).unwrap().0).unwrap();
+            Ok(PreparedBody {
+                content_type: "application/json".into(),
+                body: "x".repeat(1 << 20),
+            })
+        }),
+        send: Box::new(|_, _| panic!("a body the cap refused is never sent")),
+        ..Fake::default()
+    };
+    let reported = run(&fixture.path(), &one(&exhausted), &options());
+    assert_eq!(reported.attempts, 1);
+    assert_eq!(reported.issues.len(), 1);
+    assert_eq!(reported.issues[0].job_id, job.job_id);
+    assert_eq!(
+        reported.issues[0].code,
+        DrainIssueCode::DeliveryRetentionLimit
+    );
+    assert_eq!(reported.statuses[0].failure.as_deref(), Some("transient"));
+    assert_eq!(reported.statuses[0].pending_records, 1);
+    assert_eq!(reported.statuses[0].acknowledged_records, 6);
+}

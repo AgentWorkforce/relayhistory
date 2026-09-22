@@ -285,3 +285,112 @@ fn cached_ingest_statements_observe_subscription_changes() {
             .is_none()
     );
 }
+
+fn global_reader(cursor: i64) -> capture::Subscription<'static> {
+    capture::Subscription {
+        id: "reader",
+        session: None,
+        cursor,
+        kind: 0,
+        rowid: 0,
+        complete: true,
+    }
+}
+fn journal_rows(conn: &Connection) -> usize {
+    conn.query_row("SELECT COUNT(*) FROM delivery_journal", [], |r| r.get(0))
+        .unwrap()
+}
+fn journal_seq_at(conn: &Connection, offset: usize) -> i64 {
+    conn.query_row(
+        "SELECT seq FROM delivery_journal ORDER BY seq LIMIT 1 OFFSET ?",
+        [offset as i64],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// Rows every subscription has consumed are reclaimed by their range, not by
+/// the sweep cursor reaching them again after a wrap.
+#[test]
+fn consumed_rows_behind_the_sweep_cursor_are_reclaimed_without_a_wrap() {
+    let conn = db();
+    let tx = conn.unchecked_transaction().unwrap();
+    capture::save_subscription(&tx, &global_reader(0)).unwrap();
+    for id in 0..30 {
+        tx.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude','one',?,1,'user','text','retained')", [id.to_string()]).unwrap();
+    }
+    tx.commit().unwrap();
+    // The reader consumed the first twenty rows after the sweep cursor had
+    // already passed them, and rows remain above the cursor so it does not
+    // wrap.
+    let consumed = journal_seq_at(&conn, 19);
+    let tx = conn.unchecked_transaction().unwrap();
+    capture::save_subscription(&tx, &global_reader(consumed)).unwrap();
+    tx.execute(
+        "UPDATE history_compaction SET cursor=?",
+        [journal_seq_at(&conn, 24)],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    assert_eq!(export::compact_journal(&conn, 1000).unwrap(), 20);
+    assert_eq!(journal_rows(&conn), 10);
+    assert!(journal_seq_at(&conn, 0) > consumed);
+    assert_eq!(export::compact_journal(&conn, 1000).unwrap(), 0);
+    assert_eq!(journal_rows(&conn), 10);
+}
+
+/// The steady-state step reclaims the whole consumed range in one call, in
+/// transactions no larger than its limit.
+#[test]
+fn a_fully_consumed_journal_is_reclaimed_by_one_bounded_step() {
+    let conn = db();
+    let tx = conn.unchecked_transaction().unwrap();
+    capture::save_subscription(&tx, &global_reader(0)).unwrap();
+    for id in 0..2_500 {
+        tx.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude','one',?,1,'user','text','consumed')", [id.to_string()]).unwrap();
+    }
+    tx.commit().unwrap();
+    let tail = journal_seq_at(&conn, 2_499);
+    let tx = conn.unchecked_transaction().unwrap();
+    capture::save_subscription(&tx, &global_reader(tail)).unwrap();
+    tx.commit().unwrap();
+    assert_eq!(export::compact_journal(&conn, 1000).unwrap(), 2_500);
+    assert_eq!(journal_rows(&conn), 0);
+}
+
+/// Recovery spends passes only while retained bytes exceed three quarters of
+/// the cap, and a pass that reclaims nothing ends it with every row intact.
+#[test]
+fn recovery_stops_below_the_low_water_mark_or_when_nothing_is_reclaimable() {
+    let conn = db();
+    let tx = conn.unchecked_transaction().unwrap();
+    capture::save_subscription(&tx, &global_reader(0)).unwrap();
+    for id in 0..100 {
+        tx.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude','one',?,1,'user','text','backlog')", [id.to_string()]).unwrap();
+    }
+    tx.commit().unwrap();
+    let (used, _) = export::retained_bytes(&conn).unwrap();
+    export::set_retention_limit(&conn, used).unwrap();
+    // Nothing consumed: one pass, nothing reclaimed, nothing deleted.
+    assert_eq!(export::compact_to_low_water(&conn, 10).unwrap(), 0);
+    assert_eq!(journal_rows(&conn), 100);
+    // Half consumed: one pass takes the journal under the low-water mark.
+    let tx = conn.unchecked_transaction().unwrap();
+    capture::save_subscription(&tx, &global_reader(journal_seq_at(&conn, 49))).unwrap();
+    tx.commit().unwrap();
+    assert_eq!(export::compact_to_low_water(&conn, 10).unwrap(), 50);
+    assert_eq!(journal_rows(&conn), 50);
+    let (after, cap) = export::retained_bytes(&conn).unwrap();
+    assert!(after * 4 < cap * 3);
+    // Under the low-water mark recovery does no work; the steady-state step
+    // still reclaims what is consumed.
+    let tx = conn.unchecked_transaction().unwrap();
+    capture::save_subscription(&tx, &global_reader(journal_seq_at(&conn, 49))).unwrap();
+    tx.commit().unwrap();
+    assert_eq!(export::compact_to_low_water(&conn, 10).unwrap(), 0);
+    assert_eq!(journal_rows(&conn), 50);
+    assert_eq!(export::compact_journal(&conn, 10).unwrap(), 50);
+    assert_eq!(journal_rows(&conn), 0);
+    assert!(export::compact_to_low_water(&conn, 0).is_err());
+    assert!(export::compact_to_low_water(&conn, 10_001).is_err());
+}

@@ -74,6 +74,9 @@ enum Request {
     CompactJournal {
         limit: usize,
     },
+    CompactJournalPass {
+        page_size: usize,
+    },
     CompactReceipts {
         limit: usize,
     },
@@ -191,6 +194,9 @@ pub fn request(path: &std::path::Path, value: serde_json::Value) -> Result<serde
             Request::RetainedBytes => serde_json::to_value(core::retained_bytes(&conn)?)?,
             Request::CompactJournal { limit } => {
                 serde_json::to_value(core::compact_journal(&conn, limit)?)?
+            }
+            Request::CompactJournalPass { page_size } => {
+                serde_json::to_value(core::compact_journal_pass(&conn, page_size)?)?
             }
             Request::CompactReceipts { limit } => {
                 serde_json::to_value(core::compact_receipts(&conn, limit)?)?

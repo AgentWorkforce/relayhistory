@@ -96,3 +96,30 @@ compacts consumed changes and releases completed bodies. An idle session
 subscription does not retain unrelated revisions. The evidence and upload queues
 share a retention budget; a full budget fails capture visibly and rolls back
 rather than silently dropping evidence. No parser or ingestion path uploads.
+
+## Journal compaction
+
+The journal keeps a captured revision until every subscription that reads its
+session has consumed it. Compaction reclaims consumed rows only, so un-uploaded
+backlog is never deleted:
+
+- Every row at or below the lowest subscription cursor is reclaimed by an
+  indexed range delete, in transactions of at most 10,000 rows. The work is
+  proportional to the rows reclaimed, not to the journal's length, and a
+  consumed row never waits on a sweep cursor.
+- Above that floor, where a lagging session subscription pins its own rows
+  among other sessions' reclaimable ones, a persistent sweep cursor examines
+  one bounded page per drain with the exact per-session predicate. It never
+  sits below the floor and wraps back to it at the tail.
+- Each drain reclaims the consumed floor in full, then runs complete passes
+  (floor plus a sweep from the floor to the tail) while retained bytes exceed
+  three quarters of the cap or until a pass reclaims nothing.
+- When the cap refuses a batch write during a drain, the worker runs that
+  recovery and retries the write once. The drain reports
+  `DELIVERY_RETENTION_LIMIT` only when nothing was reclaimable or the retry is
+  refused again; no cursor moves on a refused write.
+
+A full journal of unconsumed rows keeps failing capture until the destination
+consumes them, the job is cancelled, or the cap is raised with
+`setHistoryDeliveryRetention`. Hosts run the same complete pass on demand
+through `compactHistoryDelivery` (the `compact_journal_pass` delivery request).

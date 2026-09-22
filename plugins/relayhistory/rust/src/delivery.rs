@@ -11,10 +11,19 @@
 //! The retention cap bounds logical retained bytes, not physical database pages.
 //! Capture fails the affected SQLite statement visibly when full. Callers that
 //! transact ingestion and provider checkpoints must roll back that transaction
-//! on error. Materializing a batch needs headroom in this same cap; if retained
-//! journal data fills it, compact already-consumed journal/receipts or explicitly
-//! raise the cap with `set_retention_limit` before draining. No checkpoint moves
-//! on a capacity failure. Pausing preserves capture; cancellation is an explicit discard.
+//! on error. Materializing a batch needs headroom in this same cap. Compaction
+//! reclaims only journal rows every subscription has consumed: everything at or
+//! below the lowest subscription cursor by indexed range, and above it exactly
+//! the rows no subscription reading their session still needs. A drain
+//! reclaims the consumed floor in full, then runs complete passes while
+//! retained bytes exceed three quarters of the cap; when the cap refuses a
+//! batch write mid-drain, the worker runs that recovery and retries the write
+//! once, reporting `DELIVERY_RETENTION_LIMIT` only when nothing was reclaimable
+//! or the retry is refused again. Un-uploaded backlog is never deleted: a full
+//! cap of unconsumed rows keeps failing capture visibly until the destination
+//! consumes them or the cap is raised with `set_retention_limit`. No checkpoint
+//! moves on a capacity failure. Pausing preserves capture; cancellation is an
+//! explicit discard.
 //! Deletes are exported as tombstones, but remote deletion requires a destination
 //! that supports them. Presence is its own revisioned provenance evidence kind.
 
@@ -1134,13 +1143,16 @@ pub fn retained_bytes(conn: &Connection) -> Result<(i64, i64)> {
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?)
 }
-/// Remove a bounded number of journal rows already copied into every active
-/// job's immutable queue. Bootstrap preimages live separately until scanned.
-/// Acknowledged batch bodies are released at acknowledgment; small receipts
-/// and job generations remain for audit and safe generation numbering.
+/// Reclaim journal rows already copied into every active job's immutable
+/// queue: everything at or below the consumed floor, then one examined page
+/// above it, in transactions of at most `limit` rows. Bootstrap preimages live
+/// separately until scanned. Acknowledged batch bodies are released at
+/// acknowledgment; small receipts and job generations remain for audit and
+/// safe generation numbering.
 pub fn compact_journal(conn: &Connection, limit: usize) -> Result<usize> {
     ai_hist::export::compact_journal(conn, limit)
 }
+pub use ai_hist::export::{compact_journal_pass, compact_to_low_water, MAX_COMPACTION_PAGE};
 
 /// Recheck immediately before dispatch, after async mapping or lease renewal.
 /// Returns only the exact persisted body. Local fencing cannot retract a socket
