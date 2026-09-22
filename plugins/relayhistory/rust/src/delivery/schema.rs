@@ -7,6 +7,10 @@ pub(super) const BATCH_ROW_BYTES: &str =
     "coalesce(length(CAST(payload AS BLOB)),0)+coalesce(length(CAST(prepared AS BLOB)),0)+512";
 pub(super) fn is_current(conn: &Connection) -> Result<bool> {
     if !conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('delivery_session_jobs') WHERE name='last_member')", [], |r| r.get::<_,bool>(0))? { return Ok(false); }
+    // A build that predates the batch reserve recreates its own plain-cap
+    // triggers beside the reserve ones, and they refuse a batch write the
+    // reserve allows. Their presence alone makes the schema stale.
+    if conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name IN ('delivery_batches_cap_insert','delivery_batches_cap_update'))", [], |r| r.get::<_,bool>(0))? { return Ok(false); }
     Ok(conn.query_row("SELECT COUNT(*)=10 FROM sqlite_master WHERE (type='table' AND name IN ('delivery_jobs','delivery_batches','delivery_session_jobs','delivery_session_members')) OR (type='trigger' AND name IN ('delivery_session_ready','delivery_batches_reserve_insert','delivery_batches_count_insert','delivery_batches_reserve_update','delivery_batches_count_update','delivery_batches_count_delete'))", [], |r| r.get(0))?)
 }
 pub(super) fn init_schema(conn: &Connection) -> Result<()> {
@@ -65,7 +69,14 @@ END;
     // and prepared bytes plus the row's own accounting, and settled receipts
     // keep their accounting until compaction releases them. Every other
     // retained table is checked against the plain cap.
-    let reserve = "(SELECT COALESCE(SUM(json_extract(config_json,'$.limits.max_batch_bytes')+json_extract(config_json,'$.limits.max_prepared_bytes')+512),0) FROM delivery_jobs WHERE state<>'cancelled')+(SELECT COUNT(*)*512 FROM delivery_batches WHERE state IN ('acknowledged','suppressed','cancelled'))";
+    let settled = "state IN ('acknowledged','suppressed','cancelled')";
+    let reserve = format!("(SELECT COALESCE(SUM(json_extract(config_json,'$.limits.max_batch_bytes')+json_extract(config_json,'$.limits.max_prepared_bytes')+512),0) FROM delivery_jobs WHERE state<>'cancelled')+(SELECT COUNT(*)*512 FROM delivery_batches WHERE {settled})");
+    // An update that settles a row earns that row's receipt allowance in the
+    // same statement. The count above still sees the row unresolved, and
+    // cancelling a job drops the share that covered it in the transaction
+    // that settles its batch.
+    let settling =
+        format!("{reserve}+CASE WHEN NEW.{settled} AND NOT OLD.{settled} THEN 512 ELSE 0 END");
     conn.execute_batch(&format!(r#"
 DROP TRIGGER IF EXISTS {table}_cap_insert;
 DROP TRIGGER IF EXISTS {table}_cap_update;
@@ -76,7 +87,7 @@ CREATE TRIGGER IF NOT EXISTS {table}_count_insert AFTER INSERT ON {table} BEGIN
  UPDATE delivery_state SET retained_bytes=retained_bytes+({new}) WHERE singleton=1;
 END;
 CREATE TRIGGER IF NOT EXISTS {table}_reserve_update BEFORE UPDATE ON {table} BEGIN
- SELECT CASE WHEN (SELECT retained_bytes+({new})-({old})>max_retained_bytes+{reserve} FROM delivery_state WHERE singleton=1) THEN RAISE(ABORT,'delivery retention limit exceeded; compact consumed data or raise the retention cap') END;
+ SELECT CASE WHEN (SELECT retained_bytes+({new})-({old})>max_retained_bytes+{settling} FROM delivery_state WHERE singleton=1) THEN RAISE(ABORT,'delivery retention limit exceeded; compact consumed data or raise the retention cap') END;
 END;
 CREATE TRIGGER IF NOT EXISTS {table}_count_update AFTER UPDATE ON {table} BEGIN
  UPDATE delivery_state SET retained_bytes=retained_bytes+({new})-({old}) WHERE singleton=1;

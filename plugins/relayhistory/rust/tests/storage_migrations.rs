@@ -387,6 +387,17 @@ fn batch_cap_triggers_are_replaced_by_the_reserve_on_reopen() {
         )
         .unwrap();
     }
+    // A rollback to a build that predates the reserve recreates its own cap
+    // triggers beside the reserve ones; both must be gone after this open.
+    {
+        let conn = open_db(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER delivery_batches_cap_insert BEFORE INSERT ON delivery_batches BEGIN
+              SELECT RAISE(ABORT,'delivery retention limit exceeded; plain cap');
+             END;",
+        )
+        .unwrap();
+    }
     let conn = open_db(&path).unwrap();
     let triggers: Vec<String> = conn
         .prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='delivery_batches' ORDER BY name")

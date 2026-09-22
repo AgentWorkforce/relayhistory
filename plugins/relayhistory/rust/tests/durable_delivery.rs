@@ -906,6 +906,32 @@ fn the_prepared_limit_bounds_the_stored_envelope_not_the_body() {
     assert_eq!(retained_bytes(&conn).unwrap().0, 0);
 }
 
+/// Cancelling a job settles its unresolved batch into a receipt. The row's
+/// own receipt allowance is part of that transaction's reserve, so the
+/// cancellation holds even with the cap at the bytes retained outside
+/// batches, where the job's share disappears as it is cancelled.
+#[test]
+fn cancelling_a_job_with_a_pending_batch_holds_at_the_minimum_cap() {
+    let conn = db();
+    let job = create_job(&conn, &config("one"), 0).unwrap();
+    event(&conn, "a", "retained revision");
+    let claim = claim(&conn, &job.job_id, 1).unwrap();
+    prepare(&conn, &claim, 1);
+    let outside = retained_bytes(&conn).unwrap().0 - batch_bytes(&conn);
+    set_retention_limit(&conn, outside).unwrap();
+
+    assert_eq!(cancel_job(&conn, &job.job_id).unwrap().state, "cancelled");
+    assert_eq!(
+        conn.query_row("SELECT state FROM delivery_batches", [], |r| r
+            .get::<_, String>(0))
+            .unwrap(),
+        "cancelled"
+    );
+    assert_eq!(retained_bytes(&conn).unwrap().0, outside + 512);
+    compact_receipts(&conn, 100).unwrap();
+    assert_eq!(retained_bytes(&conn).unwrap().0, outside);
+}
+
 #[test]
 fn terminal_receipts_can_be_compacted_without_accepting_a_stale_ack() {
     let conn = db();
