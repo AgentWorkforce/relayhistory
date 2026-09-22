@@ -4,6 +4,12 @@
 //! Fake provider homes and a temporary database only: no harness runs. A
 //! whole-store subscription makes every evidence write journal a revision, so
 //! the retention budget fills the way it does under a live delivery job.
+//!
+//! One `#[test]`, because a broad sweep resolves its provider roots from the
+//! process environment and Rust runs a binary's tests concurrently: each
+//! scenario points those roots at its own home, which siblings running beside
+//! it would overwrite. Every scenario is a named function, so a failure names
+//! itself.
 
 use ai_hist::export::{self, capture, is_retention_limit, retention_limit_usage};
 use ai_hist::{HydrateSessionOptions, SessionScope, SyncOutput};
@@ -218,9 +224,38 @@ fn hydrate(
     )
 }
 
+/// Point the process's provider roots at one fake home. A sweep reads
+/// `CODEX_HOME` and friends ahead of the home it is handed, so a host that has
+/// them set would otherwise pull its real transcripts into these stores.
+fn use_home(home: &Path) {
+    std::env::set_var("HOME", home);
+    std::env::set_var("USERPROFILE", home);
+    std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+    std::env::set_var("CLAUDE_CONFIG_DIR", home.join(".claude"));
+    std::env::set_var("CODEX_HOME", home.join(".codex"));
+    std::env::set_var("GROK_HOME", home.join(".grok"));
+    std::env::set_var(
+        "OPENCODE_DB",
+        home.join(".local/share/opencode/opencode.db"),
+    );
+    std::env::set_var(
+        "OPENCODE_STORAGE_DIR",
+        home.join(".local/share/opencode/storage"),
+    );
+    std::env::set_var("TRAJECTORY_ROOT", home.join("no-such-trajectories"));
+    std::env::remove_var("AI_HIST_DB");
+}
+
+/// A fake home whose provider roots this process now resolves to.
+fn isolated_home() -> tempfile::TempDir {
+    let home = tempfile::tempdir().expect("home");
+    use_home(home.path());
+    home
+}
+
 /// A seeded store with `sessions` captured under a reader at cursor zero.
 fn seeded(sessions: usize) -> (tempfile::TempDir, PathBuf) {
-    let home = tempfile::tempdir().expect("home");
+    let home = isolated_home();
     let db = home.path().join("history.db");
     subscribe(&db, 0);
     for index in 0..sessions {
@@ -232,6 +267,15 @@ fn seeded(sessions: usize) -> (tempfile::TempDir, PathBuf) {
 }
 
 #[test]
+fn capture_applies_backpressure_at_the_retention_cap() {
+    a_full_budget_with_nothing_reclaimable_stops_the_pass_before_any_session();
+    a_full_budget_that_is_fully_consumed_is_compacted_and_the_pass_completes();
+    sessions_committed_before_a_mid_pass_stop_remain_persisted();
+    opencode_sessions_are_not_attempted_at_a_full_unreclaimable_budget();
+    an_opencode_session_refused_by_the_trigger_ends_the_pass();
+    hydration_stops_at_a_full_unreclaimable_budget_and_resumes_once_compacted();
+}
+
 fn a_full_budget_with_nothing_reclaimable_stops_the_pass_before_any_session() {
     let (home, db) = seeded(1);
     let (used, _) = usage(&db);
@@ -251,7 +295,6 @@ fn a_full_budget_with_nothing_reclaimable_stops_the_pass_before_any_session() {
     assert_eq!(usage(&db), (used, used));
 }
 
-#[test]
 fn a_full_budget_that_is_fully_consumed_is_compacted_and_the_pass_completes() {
     let (home, db) = seeded(10);
     let (used, _) = usage(&db);
@@ -274,7 +317,6 @@ fn a_full_budget_that_is_fully_consumed_is_compacted_and_the_pass_completes() {
     );
 }
 
-#[test]
 fn sessions_committed_before_a_mid_pass_stop_remain_persisted() {
     let (home, db) = seeded(1);
     let (one_session, _) = usage(&db);
@@ -320,9 +362,8 @@ fn sessions_committed_before_a_mid_pass_stop_remain_persisted() {
 /// The live-log regression: a store of many OpenCode sessions at a full,
 /// unreclaimable budget. The pass stops before the first session instead of
 /// attempting each one and aggregating their refusals.
-#[test]
 fn opencode_sessions_are_not_attempted_at_a_full_unreclaimable_budget() {
-    let home = tempfile::tempdir().expect("home");
+    let home = isolated_home();
     let db = home.path().join("history.db");
     subscribe(&db, 0);
     write_opencode_session(home.path(), "seed");
@@ -353,9 +394,8 @@ fn opencode_sessions_are_not_attempted_at_a_full_unreclaimable_budget() {
 /// An OpenCode session the capture trigger refuses ends the pass with that
 /// refusal: the session rolls back, the sessions after it are not attempted,
 /// and nothing is aggregated.
-#[test]
 fn an_opencode_session_refused_by_the_trigger_ends_the_pass() {
-    let home = tempfile::tempdir().expect("home");
+    let home = isolated_home();
     let db = home.path().join("history.db");
     subscribe(&db, 0);
     write_opencode_session(home.path(), "seed");
@@ -386,7 +426,6 @@ fn an_opencode_session_refused_by_the_trigger_ends_the_pass() {
     assert_eq!(usage(&db).0, one_session);
 }
 
-#[test]
 fn hydration_stops_at_a_full_unreclaimable_budget_and_resumes_once_compacted() {
     let (home, db) = seeded(3);
     let (used, _) = usage(&db);

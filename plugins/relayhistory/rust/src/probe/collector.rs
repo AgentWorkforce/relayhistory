@@ -451,12 +451,15 @@ fn capture_members(
                     failed,
                     Some(&error),
                 )?;
-                let retention = delivery::is_retention_limit(&error);
+                // The retention stop is why the pass ended and is the only
+                // cause carrying the budget, so it replaces an earlier
+                // member's failure; ordinary failures keep the first.
+                if delivery::is_retention_limit(&error) {
+                    first_error = Some(error);
+                    break;
+                }
                 if first_error.is_none() {
                     first_error = Some(error);
-                }
-                if retention {
-                    break;
                 }
             }
         }
@@ -1639,6 +1642,40 @@ mod tests {
         assert_eq!(report["error_class"], "database_corrupt");
         assert!(!report.to_string().contains("secret"));
         assert!(!report["message"].as_str().unwrap().contains("offline"));
+    }
+
+    /// A retention stop after an ordinary member failure is still what the
+    /// cycle reports: it ended the pass and carries the budget.
+    #[test]
+    fn a_retention_stop_outranks_an_earlier_members_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let attempted = std::cell::Cell::new(0);
+        let result = capture_members(
+            dir.path(),
+            members(&["corrupt", "full", "never"]),
+            || false,
+            |member| {
+                attempted.set(attempted.get() + 1);
+                if member.session_id == "corrupt" {
+                    return Err(anyhow::Error::new(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+                        Some("secret transcript".into()),
+                    )));
+                }
+                Err(anyhow::Error::new(delivery::RetentionLimitReached {
+                    used_bytes: 9_000,
+                    limit_bytes: 10_000,
+                }))
+            },
+        );
+        assert_eq!(attempted.get(), 2, "the member after the stop is not tried");
+        persist_cycle_report(dir.path(), &result, Vec::new());
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.path().join("cycle.json")).unwrap()).unwrap();
+        assert_eq!(report["error_class"], "retention_limit");
+        assert_eq!(report["used_bytes"], 9_000);
+        assert_eq!(report["limit_bytes"], 10_000);
+        assert!(!report.to_string().contains("secret"));
     }
 
     /// A member that stops at the retention cap ends the pass after at most
