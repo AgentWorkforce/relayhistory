@@ -533,19 +533,16 @@ fn class_failure_message(class: &str) -> Option<&'static str> {
 }
 
 /// The retention sentence with the measured usage, so the desktop can show the
-/// number and offer compaction. A journal the shown figures put at its cap is
-/// "full"; one capture stopped at over the high-water mark is "nearly full".
+/// number and offer compaction. The verdict alone names the condition: the cap
+/// refuses the write that would exceed it without recording it, and a pass
+/// stops above the high-water mark before reaching the cap, so usage never
+/// separates a journal that is full for the next record from one that is not.
 /// Without a reading it names the condition alone.
 fn retention_limit_message(retention: Option<(i64, i64)>) -> String {
     let megabytes = |bytes: i64| (bytes + 524_288) / 1_048_576;
     match retention {
-        Some((used, limit)) if megabytes(used) >= megabytes(limit) => format!(
-            "Upload journal full ({} MB of {} MB). Compacting consumed records; queued sessions are preserved.",
-            megabytes(used),
-            megabytes(limit)
-        ),
         Some((used, limit)) => format!(
-            "Upload journal nearly full ({} MB of {} MB); capture is waiting for room. Compacting consumed records; queued sessions are preserved.",
+            "Upload journal full ({} MB of {} MB). Compacting consumed records; queued sessions are preserved.",
             megabytes(used),
             megabytes(limit)
         ),
@@ -1861,10 +1858,10 @@ mod tests {
         assert_eq!(saved["ok"], true);
     }
 
-    /// A pass stopped over the high-water mark reports the journal as nearly
-    /// full with the figures it stopped at; one at the cap reports it full.
+    /// A pass stopped over the high-water mark reports the journal as full,
+    /// like one stopped at the cap, with the figures of its reading.
     #[test]
-    fn a_high_water_stop_reports_the_journal_as_nearly_full() {
+    fn a_high_water_stop_reports_the_journal_as_full() {
         let stopped = anyhow::Error::new(delivery::RetentionLimitReached {
             used_bytes: 231 * 1_048_576,
             limit_bytes: 256 * 1_048_576,
@@ -1876,7 +1873,7 @@ mod tests {
         assert_eq!(report["error_class"], "retention_limit");
         assert_eq!(
             report["message"],
-            "Upload journal nearly full (231 MB of 256 MB); capture is waiting for room. Compacting consumed records; queued sessions are preserved."
+            "Upload journal full (231 MB of 256 MB). Compacting consumed records; queued sessions are preserved."
         );
         assert_eq!(report["used_bytes"], 231 * 1_048_576);
         assert_eq!(report["limit_bytes"], 256 * 1_048_576);
@@ -1922,7 +1919,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             saved["message"],
-            "Upload journal nearly full (0 MB of 10 MB); capture is waiting for room. Compacting consumed records; queued sessions are preserved."
+            "Upload journal full (0 MB of 10 MB). Compacting consumed records; queued sessions are preserved."
         );
         assert!(String::from_utf8(output).unwrap().contains("0 MB of 10 MB"));
 
@@ -2068,7 +2065,7 @@ mod tests {
         assert_eq!(report["error_class"], "retention_limit");
         assert_eq!(
             report["message"],
-            "Upload journal nearly full (0 MB of 10 MB); capture is waiting for room. Compacting consumed records; queued sessions are preserved."
+            "Upload journal full (0 MB of 10 MB). Compacting consumed records; queued sessions are preserved."
         );
         assert_eq!(report["capture"]["error_class"], "retention_limit");
         assert_eq!(report["delivery"]["ok"], true);

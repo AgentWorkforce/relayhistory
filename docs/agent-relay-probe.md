@@ -257,11 +257,11 @@ human-readable install/status/stop commands remain available.
   reserve until the batch is acknowledged. When a cycle stops on that cap,
   `last_cycle.error_class` is `retention_limit`, `last_cycle.used_bytes` and
   `last_cycle.limit_bytes` carry the journal's usage when the report is
-  written, and the message shows the same figures: `Upload journal full (256 MB of 256 MB).
-  Compacting consumed records; queued sessions are preserved.` at the cap, or
-  `Upload journal nearly full (231 MB of 256 MB); capture is waiting for room.
-  Compacting consumed records; queued sessions are preserved.` for a pass
-  stopped over the 90% high-water mark.
+  written, and the message shows the same figures: `Upload journal full (251
+  MB of 256 MB). Compacting consumed records; queued sessions are preserved.`
+  The sentence is the same for a pass stopped at the cap and one stopped over
+  the 90% high-water mark: the verdict names the condition, and the figures
+  are the reading.
 - `compact <target> --json`: reclaims every journal record already consumed by
   all subscriptions and every settled batch receipt, under the desktop control
   lock. Queued and unacknowledged records are untouched, so it is safe while
