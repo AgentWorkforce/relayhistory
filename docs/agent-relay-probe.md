@@ -88,7 +88,14 @@ The desktop status `last_cycle` includes an optional, allowlisted `error_class`
 and a safe message for local retention, database corruption, disk-space,
 contention, and permission failures. These also cover failures before capture
 starts. No raw SQLite/provider error, transcript, credential, or path is
-included. Database corruption requires separate recovery from a preserved copy;
+included. Capture and delivery are reported separately in `last_cycle.capture`
+and `last_cycle.delivery`, each with its own `ok`, `error_class` and message: a
+pass that only delivered reports its own delivery outcome and leaves the last
+capture verdict standing, so a condition the capture cycle measured stays
+visible between those cycles. The top-level `ok`, `error_class` and `message`
+are the effective verdict — the capture fault when there is one, otherwise the
+delivery fault — and messages are rendered at report time, so a retention
+sentence always carries the current usage. Database corruption requires separate recovery from a preserved copy;
 the collector does not delete or recreate a damaged queue automatically.
 
 Each `(site origin, user, workspace)` has an independent SHA-256-named directory
@@ -102,8 +109,9 @@ The device approval URL is intentionally displayed in the interactive terminal.
 Each pass delivers through the probe-owned Rust worker. A pass is bounded by
 wall time (15 s), so it moves as many batches as the destination accepts in
 that window and the next pass continues the backlog; the collector runs passes
-2 s apart while the job has queued, unqueued or unscanned records and 20 s
-apart once it is caught up. Stop requests are polled between batches. The plugin helper
+2 s apart while the active job has queued, unqueued or unscanned records it can
+attempt now, and 20 s apart once it is caught up, paused, or waiting out a
+retry deadline. Stop requests are polled between batches. The plugin helper
 uses that same bounded drain and RelayHistory receiver. The worker owns
 immutable batches, leases and their keepalive, prepared-byte persistence, the
 eligibility recheck immediately before dispatch, retry/backoff, acknowledgment
@@ -248,6 +256,11 @@ human-readable install/status/stop commands remain available.
   ```json
   { "removed_records": 114490, "retention": { "used_bytes": 1048576, "limit_bytes": 268435456 } }
   ```
+
+  Compaction reclaims consumed records only: a cap filled by un-uploaded
+  backlog frees as those uploads are acknowledged. A `retention_limit` verdict
+  in `last_cycle` is re-measured as part of the pass, so a journal back under
+  its cap stops being reported full without waiting for the next capture cycle.
 
 - `sessions list <target> --json --limit 500`: newest sessions with title,
   source, project path, activity and upload status. `uploading` means a record

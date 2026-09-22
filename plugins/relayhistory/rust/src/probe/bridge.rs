@@ -247,10 +247,18 @@ pub fn compact(directory: &Path) -> Result<()> {
 fn compact_value(directory: &Path) -> Result<Value> {
     let _control = control_lock(directory)?;
     read_config(directory)?;
-    let conn = db(directory)?;
+    // Each page is its own write transaction against the database capture and
+    // delivery also write, so compaction takes the shared busy policy's full
+    // grace rather than the short interactive one: a source ingest holding the
+    // write lock for several seconds delays a page, it does not abandon a pass
+    // the user asked for and leave its count unreported.
+    let conn = relayhistory_plugin::delivery::open_db(&directory.join("history.db"))?;
     let removed_records = ai_hist::export::compact_journal_pass(&conn, 10_000)?;
     while delivery::compact_receipts(&conn, 10_000)? == 10_000 {}
-    Ok(json!({"removed_records":removed_records, "retention":retention(&conn)?}))
+    let retention = retention(&conn)?;
+    // The persisted verdict measured a journal this pass has just changed.
+    collector::refresh_retention_verdict(directory, std::io::stderr());
+    Ok(json!({"removed_records":removed_records, "retention":retention}))
 }
 pub fn pause(directory: &Path, paused: bool) -> Result<()> {
     let _control = control_lock(directory)?;
@@ -867,6 +875,58 @@ mod tests {
                 .acknowledged_records,
             52
         );
+    }
+
+    /// Compaction answers the verdict the desktop is showing: a journal back
+    /// under its cap is no longer reported full, without waiting for the next
+    /// capture cycle to measure it.
+    #[test]
+    fn compact_clears_the_retention_verdict_the_desktop_is_showing() {
+        let (dir, config) = fixture(SharingMode::All);
+        let conn = db(dir.path()).unwrap();
+        acknowledge_everything(&conn, &config.job_id);
+        let full = "Upload journal full (1 MB of 1 MB). Compacting consumed records; queued sessions are preserved.";
+        save_json(
+            &dir.path().join("cycle.json"),
+            &json!({"at_ms":1,"ok":false,"error_class":"retention_limit","message":full,
+                "capture":{"ok":false,"error_class":"retention_limit","message":full},
+                "delivery":{"ok":true,"error_class":null,"message":null}}),
+        )
+        .unwrap();
+        assert_eq!(
+            status_value(dir.path()).unwrap()["last_cycle"]["error_class"],
+            "retention_limit"
+        );
+        compact_value(dir.path()).unwrap();
+        let cycle = status_value(dir.path()).unwrap()["last_cycle"].clone();
+        assert_eq!(cycle["ok"], true);
+        assert!(cycle["error_class"].is_null());
+        assert!(cycle["capture"]["error_class"].is_null());
+    }
+
+    /// Compaction is a user action against the database capture also writes.
+    /// A source ingest holding the write lock for several seconds delays a
+    /// page; it does not abandon the pass with no count reported.
+    #[test]
+    fn compact_waits_out_a_writer_holding_the_lock_past_the_interactive_timeout() {
+        let (dir, config) = fixture(SharingMode::All);
+        let conn = db(dir.path()).unwrap();
+        acknowledge_everything(&conn, &config.job_id);
+        let path = dir.path().join("history.db");
+        let (locked, taken) = std::sync::mpsc::channel();
+        let holding = std::thread::spawn(move || {
+            let blocker = relayhistory_plugin::delivery::open_db(&path).unwrap();
+            blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+            locked.send(()).unwrap();
+            // Longer than the interactive timeout, well inside the shared
+            // busy policy's grace.
+            std::thread::sleep(Duration::from_secs(6));
+            blocker.execute_batch("ROLLBACK").unwrap();
+        });
+        taken.recv().unwrap();
+        let compacted = compact_value(dir.path()).unwrap();
+        holding.join().unwrap();
+        assert_eq!(compacted["removed_records"], 1);
     }
 
     #[test]
