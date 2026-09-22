@@ -1176,7 +1176,10 @@ pub fn retained_bytes(conn: &Connection) -> Result<(i64, i64)> {
 pub fn compact_journal(conn: &Connection, limit: usize) -> Result<usize> {
     ai_hist::export::compact_journal(conn, limit)
 }
-pub use ai_hist::export::{compact_journal_pass, compact_to_low_water, MAX_COMPACTION_PAGE};
+pub use ai_hist::export::{
+    compact_journal_pass, compact_journal_while, compact_to_low_water, compact_to_low_water_while,
+    MAX_COMPACTION_PAGE,
+};
 
 /// Recheck immediately before dispatch, after async mapping or lease renewal.
 /// Returns only the exact persisted body. Local fencing cannot retract a socket

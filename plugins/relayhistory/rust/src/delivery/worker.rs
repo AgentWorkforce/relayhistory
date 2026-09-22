@@ -22,10 +22,10 @@
 //! was lost, and nothing is acknowledged.
 
 use super::{
-    acknowledge, claim_batch, compact_journal, compact_journal_pass, compact_receipts,
-    compact_to_low_water, expire_exports, is_retention_limit, list_jobs, prepare_batch,
-    record_failure, release_stopped_claim, renew_lease, retained_bytes, status,
-    store_prepared_payload, validate_dispatch, ClaimedBatch, DeliveryAcknowledgment,
+    acknowledge, claim_batch, compact_journal_pass, compact_journal_while, compact_receipts,
+    compact_to_low_water, compact_to_low_water_while, expire_exports, is_retention_limit,
+    list_jobs, prepare_batch, record_failure, release_stopped_claim, renew_lease, retained_bytes,
+    status, store_prepared_payload, validate_dispatch, ClaimedBatch, DeliveryAcknowledgment,
     DeliveryFailure, DeliveryJobConfig, DeliveryStatus, HistoryExportBatch, PreparedPayload,
     MAX_COMPACTION_PAGE,
 };
@@ -251,12 +251,16 @@ fn range(value: i64, name: &str, minimum: i64, maximum: i64) -> Result<()> {
 /// goes to delivery; at the end, complete passes keep running while retained
 /// bytes exceed three quarters of the cap, once the drain's acknowledgments
 /// have released their bodies.
-fn compact(conn: &Connection, now_ms: i64, recover: bool) -> Result<()> {
+///
+/// Every transaction is bounded, and `more` is consulted between them: a host
+/// stop or a spent drain budget ends maintenance where it stands rather than
+/// holding the collector for as long as the backlog takes.
+fn compact(conn: &Connection, now_ms: i64, more: &dyn Fn() -> bool, recover: bool) -> Result<()> {
     expire_exports(conn, now_ms, 32)?;
-    while compact_receipts(conn, MAX_COMPACTION_PAGE)? == MAX_COMPACTION_PAGE {}
-    compact_journal(conn, MAX_COMPACTION_PAGE)?;
+    while compact_receipts(conn, MAX_COMPACTION_PAGE)? == MAX_COMPACTION_PAGE && more() {}
+    compact_journal_while(conn, MAX_COMPACTION_PAGE, more)?;
     if recover {
-        compact_to_low_water(conn, MAX_COMPACTION_PAGE)?;
+        compact_to_low_water_while(conn, MAX_COMPACTION_PAGE, more)?;
     }
     Ok(())
 }
@@ -335,7 +339,11 @@ pub fn drain(
         options.lease_ms,
     )))?;
     let conn = super::open_db(db_path)?;
-    compact(&conn, clock(), false)?;
+    // Startup maintenance frees the room the first batch needs and stops on a
+    // host stop, but it runs before the budget's clock: on a loaded host it can
+    // outlast a short budget, and a drain that spent its time on maintenance
+    // would deliver nothing. Anything left is the end's to finish.
+    compact(&conn, clock(), &|| !cancelled(), false)?;
     let listed = list_jobs(&conn)?;
     let selection = options.job_ids.as_deref();
     if let Some(ids) = selection {
@@ -403,7 +411,10 @@ pub fn drain(
         .into_iter()
         .filter(|job| chosen(selection, &job.job_id))
         .collect();
-    compact(&worker.conn, clock(), true)?;
+    // Closing maintenance is the drain's own completion work, so a spent
+    // batch budget does not skip the recovery that frees capture; only a host
+    // stop ends it early.
+    compact(&worker.conn, clock(), &|| !cancelled(), true)?;
     let (used_bytes, limit_bytes) = retained_bytes(&worker.conn)?;
     Ok(DrainResult {
         attempts: worker.attempts,

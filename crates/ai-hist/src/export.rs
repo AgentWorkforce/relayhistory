@@ -296,6 +296,7 @@ fn reclaim_below(
     conn: &Connection,
     floor: impl Fn(&Connection) -> Result<i64>,
     limit: usize,
+    more: &dyn Fn() -> bool,
 ) -> Result<(usize, i64)> {
     let mut removed = 0;
     loop {
@@ -304,10 +305,14 @@ fn reclaim_below(
         let reclaimed = reclaim_consumed(&tx, floor, limit)?;
         tx.commit()?;
         removed += reclaimed;
-        if reclaimed < limit {
+        if reclaimed < limit || !more() {
             return Ok((removed, floor));
         }
     }
+}
+/// A caller with no deadline of its own.
+fn always() -> &'static dyn Fn() -> bool {
+    &|| true
 }
 
 /// The steady-state compaction step: reclaim everything every subscription has
@@ -324,8 +329,19 @@ fn reclaim_below(
 /// the floor and wraps back to it whenever a page is short. Bootstrap
 /// preimages are retained independently of this journal.
 pub fn compact_journal(conn: &Connection, limit: usize) -> Result<usize> {
+    compact_journal_while(conn, limit, always())
+}
+
+/// [`compact_journal`] for a caller that owns a deadline or a stop signal:
+/// `more` is consulted between transactions, and a false answer ends the
+/// reclaim where it stands. Each transaction is bounded either way.
+pub fn compact_journal_while(
+    conn: &Connection,
+    limit: usize,
+    more: &dyn Fn() -> bool,
+) -> Result<usize> {
     validate_compaction_page(limit)?;
-    let (mut removed, _) = reclaim_below(conn, consumed_floor, limit)?;
+    let (mut removed, _) = reclaim_below(conn, consumed_floor, limit, more)?;
     let tx = write_transaction(conn)?;
     let floor = consumed_floor(&tx)?;
     let ceiling = sweep_ceiling(&tx)?;
@@ -356,11 +372,15 @@ pub fn compact_journal(conn: &Connection, limit: usize) -> Result<usize> {
 /// reclaimable.
 pub fn compact_journal_pass(conn: &Connection, page_size: usize) -> Result<usize> {
     validate_compaction_page(page_size)?;
+    journal_pass(conn, page_size, always())
+}
+
+fn journal_pass(conn: &Connection, page_size: usize, more: &dyn Fn() -> bool) -> Result<usize> {
     let through = sweep_ceiling(conn)?;
     let floor = |conn: &Connection| Ok(consumed_floor(conn)?.min(through));
-    let (mut removed, floor) = reclaim_below(conn, floor, page_size)?;
+    let (mut removed, floor) = reclaim_below(conn, floor, page_size, more)?;
     let mut after = floor;
-    while after < through {
+    while after < through && more() {
         let tx = write_transaction(conn)?;
         let Some((count, end)) = sweep_page(&tx, after, through, page_size)? else {
             break;
@@ -386,10 +406,21 @@ fn below_low_water(conn: &Connection) -> Result<bool> {
 /// consumers freed meanwhile and ends the loop. Below the low-water mark this
 /// does no work. Returns the number of rows removed.
 pub fn compact_to_low_water(conn: &Connection, page_size: usize) -> Result<usize> {
+    compact_to_low_water_while(conn, page_size, always())
+}
+
+/// [`compact_to_low_water`] for a caller that owns a deadline or a stop
+/// signal: `more` is consulted between transactions and between passes, and a
+/// false answer ends the recovery where it stands.
+pub fn compact_to_low_water_while(
+    conn: &Connection,
+    page_size: usize,
+    more: &dyn Fn() -> bool,
+) -> Result<usize> {
     validate_compaction_page(page_size)?;
     let mut removed = 0;
-    while !below_low_water(conn)? {
-        let reclaimed = compact_journal_pass(conn, page_size)?;
+    while !below_low_water(conn)? && more() {
+        let reclaimed = journal_pass(conn, page_size, more)?;
         removed += reclaimed;
         if reclaimed < page_size {
             break;

@@ -1739,3 +1739,35 @@ fn a_body_that_exceeds_the_stored_prepared_limit_is_the_receivers_invalid_payloa
     assert!(payload <= limits.max_batch_bytes as i64);
     assert!(prepared <= limits.max_prepared_bytes as i64);
 }
+
+/// Closing maintenance is the drain's own completion work: a drain that spent
+/// its batch budget still reclaims what its own acknowledgments consumed, so
+/// capture is not left blocked until the next drain.
+#[test]
+fn a_drain_that_spends_its_batch_budget_still_reclaims_what_it_consumed() {
+    let fixture = fixture();
+    let job = create_job(&fixture.conn, &config("one"), 0).unwrap();
+    assert!(run(&fixture.path(), &one(&Fake::default()), &options())
+        .issues
+        .is_empty());
+    for index in 0..200 {
+        capture(&fixture.conn, "both", &format!("backlog-{index}")).unwrap();
+    }
+    assert_eq!(journal_events(&fixture.conn), 200);
+
+    let result = run(
+        &fixture.path(),
+        &one(&Fake::default()),
+        &DrainOptions {
+            max_batches: 1,
+            ..options()
+        },
+    );
+    assert_eq!(result.attempts, 1);
+    assert!(result.issues.is_empty());
+    assert_eq!(result.statuses[0].job_id, job.job_id);
+    assert_eq!(result.statuses[0].acknowledged_records, 103);
+    // The hundred rows this drain scanned and acknowledged are gone; the rest
+    // are still backlog.
+    assert_eq!(journal_events(&fixture.conn), 100);
+}
