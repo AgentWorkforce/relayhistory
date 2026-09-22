@@ -97,7 +97,9 @@ are the effective verdict — the capture fault when there is one, otherwise the
 delivery fault — and messages are rendered at report time, so a retention
 sentence always carries the current usage. A compaction that reports while a
 pass is running has re-measured the cap that pass observed, so the pass does
-not report the older reading over it. Database corruption requires separate recovery from a preserved copy;
+not report the older reading over it, and the collector and a compaction
+serialize their updates to the report so neither replaces an answer it never
+read. Database corruption requires separate recovery from a preserved copy;
 the collector does not delete or recreate a damaged queue automatically.
 
 Each `(site origin, user, workspace)` has an independent SHA-256-named directory
