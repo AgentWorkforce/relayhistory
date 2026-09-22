@@ -256,8 +256,11 @@ fn range(value: i64, name: &str, minimum: i64, maximum: i64) -> Result<()> {
 /// stop or a spent drain budget ends maintenance where it stands rather than
 /// holding the collector for as long as the backlog takes.
 fn compact(conn: &Connection, now_ms: i64, more: &dyn Fn() -> bool, recover: bool) -> Result<()> {
+    if !more() {
+        return Ok(());
+    }
     expire_exports(conn, now_ms, 32)?;
-    while compact_receipts(conn, MAX_COMPACTION_PAGE)? == MAX_COMPACTION_PAGE && more() {}
+    while more() && compact_receipts(conn, MAX_COMPACTION_PAGE)? == MAX_COMPACTION_PAGE {}
     compact_journal_while(conn, MAX_COMPACTION_PAGE, more)?;
     if recover {
         compact_to_low_water_while(conn, MAX_COMPACTION_PAGE, more)?;

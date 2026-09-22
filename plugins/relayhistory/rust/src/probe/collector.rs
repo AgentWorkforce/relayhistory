@@ -2075,6 +2075,15 @@ mod tests {
         let job = delivery::create_job(&conn, &job_config(true), now()).unwrap();
         delivery::set_retention_limit(&conn, delivery::retained_bytes(&conn).unwrap().0.max(1))
             .unwrap();
+        // Batch materialization has its own reserve above the cap, so a full
+        // journal alone no longer refuses a batch: the drain is meant to
+        // deliver its way out of one. This stands in for the exhausted reserve,
+        // which is the only state that still refuses the write.
+        conn.execute_batch(
+            "CREATE TRIGGER synthetic_reserve_exhausted BEFORE INSERT ON delivery_batches
+             BEGIN SELECT RAISE(ABORT,'delivery retention limit exceeded; synthetic reserve exhausted'); END;",
+        )
+        .unwrap();
         let config = Config {
             version: 1,
             site_url: "https://agentrelay.com".into(),
