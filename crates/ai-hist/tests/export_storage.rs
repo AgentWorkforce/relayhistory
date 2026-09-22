@@ -394,3 +394,107 @@ fn recovery_stops_below_the_low_water_mark_or_when_nothing_is_reclaimable() {
     assert!(export::compact_to_low_water(&conn, 0).is_err());
     assert!(export::compact_to_low_water(&conn, 10_001).is_err());
 }
+
+fn session_reader<'a>(
+    id: &'a str,
+    identity: &'a SessionIdentity,
+    cursor: i64,
+) -> capture::Subscription<'a> {
+    capture::Subscription {
+        id,
+        session: Some(identity),
+        cursor,
+        kind: 0,
+        rowid: 0,
+        complete: true,
+    }
+}
+fn sweep_cursor(conn: &Connection) -> i64 {
+    conn.query_row("SELECT cursor FROM history_compaction", [], |r| r.get(0))
+        .unwrap()
+}
+
+/// A session subscription whose session has nothing past its cursor pins
+/// nothing, so its stale cursor does not hold the consumed floor down: rows
+/// every other subscription has consumed go by range, not by the sweep.
+#[test]
+fn an_idle_session_subscription_does_not_pin_the_consumed_floor() {
+    let conn = db();
+    let idle = SessionIdentity {
+        source: "claude".into(),
+        session_id: "idle".into(),
+    };
+    let tx = conn.unchecked_transaction().unwrap();
+    capture::save_subscription(&tx, &global_reader(0)).unwrap();
+    for id in 0..5 {
+        tx.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude','idle',?,1,'user','text','finished')", [id.to_string()]).unwrap();
+    }
+    tx.commit().unwrap();
+    let finished = journal_seq_at(&conn, 4);
+    let tx = conn.unchecked_transaction().unwrap();
+    capture::save_subscription(&tx, &session_reader("idle-reader", &idle, finished)).unwrap();
+    for id in 0..35 {
+        tx.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude','busy',?,1,'user','text','consumed')", [id.to_string()]).unwrap();
+    }
+    tx.commit().unwrap();
+    let consumed = journal_seq_at(&conn, 29);
+    let tx = conn.unchecked_transaction().unwrap();
+    capture::save_subscription(&tx, &global_reader(consumed)).unwrap();
+    tx.commit().unwrap();
+    // Everything through the global reader goes in one step, not one page.
+    assert_eq!(export::compact_journal(&conn, 10).unwrap(), 30);
+    assert_eq!(journal_rows(&conn), 10);
+    // A new row for the idle session pins from its cursor again until it is
+    // read; rows behind it were already reclaimed, so nothing is lost.
+    conn.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude','idle','again',1,'user','text','pinned')", []).unwrap();
+    let tx = conn.unchecked_transaction().unwrap();
+    capture::save_subscription(&tx, &global_reader(journal_seq_at(&conn, 10))).unwrap();
+    tx.commit().unwrap();
+    assert_eq!(export::compact_journal(&conn, 10).unwrap(), 10);
+    assert_eq!(journal_rows(&conn), 1);
+}
+
+/// The sweep examines only rows below the lowest cursor of a subscription
+/// reading every session, since everything past it is retained, and its
+/// cursor wraps back to the floor whenever a page is short.
+#[test]
+fn the_sweep_stops_at_the_lowest_global_cursor_and_wraps_on_a_short_page() {
+    let conn = db();
+    let lagging = SessionIdentity {
+        source: "claude".into(),
+        session_id: "lagging".into(),
+    };
+    let tx = conn.unchecked_transaction().unwrap();
+    capture::save_subscription(&tx, &global_reader(0)).unwrap();
+    for id in 0..40 {
+        let session = if id % 2 == 0 { "lagging" } else { "other" };
+        tx.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude',?,?,1,'user','text','mixed')", [session, &id.to_string()]).unwrap();
+    }
+    tx.commit().unwrap();
+    let floor = journal_seq_at(&conn, 4);
+    let ceiling = journal_seq_at(&conn, 19);
+    let tx = conn.unchecked_transaction().unwrap();
+    capture::save_subscription(&tx, &session_reader("lagging-reader", &lagging, floor)).unwrap();
+    capture::save_subscription(&tx, &global_reader(ceiling)).unwrap();
+    tx.commit().unwrap();
+    // Five rows by range; in (floor, ceiling] the eight "other" rows by sweep;
+    // the twenty rows past the global cursor are not examined.
+    assert_eq!(export::compact_journal(&conn, 1000).unwrap(), 13);
+    assert_eq!(journal_rows(&conn), 27);
+    assert!(journal_seq_at(&conn, 0) > floor);
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM delivery_journal WHERE seq>? AND session_id='other'",
+            [ceiling],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        10
+    );
+    assert_eq!(sweep_cursor(&conn), floor);
+    // A full page leaves the cursor at its end; the short page after it wraps.
+    assert_eq!(export::compact_journal(&conn, 4).unwrap(), 0);
+    assert!(sweep_cursor(&conn) > floor);
+    assert_eq!(export::compact_journal(&conn, 4).unwrap(), 0);
+    assert_eq!(sweep_cursor(&conn), floor);
+}

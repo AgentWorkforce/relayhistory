@@ -732,6 +732,103 @@ fn the_materialization_reserve_is_the_configured_per_job_bound() {
     pending(&one.job_id, "one-share", share).unwrap();
 }
 
+/// With batches in flight the cap may be set down to the bytes retained
+/// outside them and no lower: the batch lives in the reserve, not the cap.
+#[test]
+fn the_cap_is_bounded_by_bytes_retained_outside_batches() {
+    let conn = db();
+    let job = create_job(&conn, &config("one"), 0).unwrap();
+    event(&conn, "a", "retained revision");
+    let claim = claim(&conn, &job.job_id, 1).unwrap();
+    prepare(&conn, &claim, 1);
+    let (used, _) = retained_bytes(&conn).unwrap();
+    let outside: i64 = conn
+        .query_row(
+            "SELECT retained_bytes-(SELECT SUM(length(CAST(payload AS BLOB))+length(CAST(prepared AS BLOB))+512) FROM delivery_batches) FROM delivery_state",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(outside < used);
+    set_retention_limit(&conn, outside).unwrap();
+    assert_eq!(retained_bytes(&conn).unwrap(), (used, outside));
+    assert!(set_retention_limit(&conn, outside - 1).is_err());
+    acknowledge(&conn, &claim.lease, &ack(&claim), &|| 2).unwrap();
+    compact_journal(&conn, 100).unwrap();
+    compact_receipts(&conn, 100).unwrap();
+    assert_eq!(retained_bytes(&conn).unwrap().0, 0);
+}
+
+/// A session job's finished member holds its cursor where its session ended;
+/// the consumed floor follows the members still reading, so the rows every
+/// consumer has passed go by range rather than one sweep page at a time.
+#[test]
+fn a_finished_member_does_not_pin_the_consumed_floor() {
+    let conn = db();
+    let mut cfg = config("members");
+    cfg.limits.max_batch_records = 1;
+    let job = create_session_job(&conn, &cfg, 0).unwrap();
+    let member = |id: &str| SessionIdentity {
+        source: "claude".into(),
+        session_id: id.into(),
+    };
+    event(&conn, "finished", "only");
+    set_job_session(&conn, &job.job_id, &member("finished"), true).unwrap();
+    set_job_session(&conn, &job.job_id, &member("active"), true).unwrap();
+    assert_eq!(drain(&conn, &job.job_id).len(), 1);
+    let finished: (i64, bool) = conn
+        .query_row(
+            "SELECT cursor,ready FROM delivery_session_members WHERE session_id='finished'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(!finished.1);
+    // Unselected sessions keep journalling past the finished member's cursor.
+    let append = |session: &str, uid: String| {
+        conn.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude',?,?,42,'user','text','captured')", params![session, uid]).unwrap();
+    };
+    for n in 0..250 {
+        append("unselected", format!("captured-{n}"));
+    }
+    for n in 0..5 {
+        append("active", format!("backlog-{n}"));
+    }
+    let first = claim(&conn, &job.job_id, 1).unwrap();
+    assert_eq!(first.batch.records[0].session_id.as_deref(), Some("active"));
+    let read: i64 = conn
+        .query_row(
+            "SELECT cursor FROM delivery_session_members WHERE session_id='active'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(read > finished.0);
+    // One bounded step reclaims everything the active member has passed.
+    assert!(compact_journal(&conn, 100).unwrap() > 250);
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM delivery_journal WHERE seq<=?",
+            [read],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM delivery_journal WHERE kind='session_event'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        4
+    );
+    prepare(&conn, &first, 1);
+    acknowledge(&conn, &first.lease, &ack(&first), &|| 2).unwrap();
+    assert_eq!(drain(&conn, &job.job_id).len(), 4);
+}
+
 #[test]
 fn terminal_receipts_can_be_compacted_without_accepting_a_stale_ack() {
     let conn = db();

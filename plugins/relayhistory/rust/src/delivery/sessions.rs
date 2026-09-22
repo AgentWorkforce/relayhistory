@@ -371,7 +371,7 @@ pub fn adopt_session_job(
             // Scan a complete bounded pass: a pinned page can remove nothing
             // even when later journal pages contain reclaimable records.
             Err(error) if is_retention_limit(&error) => {
-                if ai_hist::export::compact_journal_pass(conn, 1_000)? == 0 {
+                if compact_journal_pass(conn, MAX_COMPACTION_PAGE)? == 0 {
                     return Err(error);
                 }
             }

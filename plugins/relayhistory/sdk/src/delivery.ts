@@ -40,8 +40,10 @@ export async function historyDeliveryRetention(options: ProbeDeliveryOptions = {
 export async function setHistoryDeliveryRetention(maxBytes: number, options: ProbeDeliveryOptions = {}): Promise<void> {
   await deliveryRequest({ operation: 'set_retention_limit', max_bytes: maxBytes }, options);
 }
+/** Largest number of journal rows one compaction transaction deletes or examines. */
+export const MAX_COMPACTION_PAGE = 10_000;
 export async function compactHistoryDelivery(options: ProbeDeliveryOptions = {}): Promise<void> {
   await deliveryRequest({ operation: 'expire_exports', now_ms: Date.now(), limit: 32 }, options);
-  await deliveryRequest({ operation: 'compact_journal_pass', page_size: 10_000 }, options);
-  await deliveryRequest({ operation: 'compact_receipts', limit: 1000 }, options);
+  await deliveryRequest({ operation: 'compact_journal_pass', page_size: MAX_COMPACTION_PAGE }, options);
+  await deliveryRequest({ operation: 'compact_receipts', limit: MAX_COMPACTION_PAGE }, options);
 }

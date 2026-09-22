@@ -254,8 +254,10 @@ fn compact_value(directory: &Path) -> Result<Value> {
     // the user asked for and leave its count unreported.
     let conn = relayhistory_plugin::delivery::open_db(&directory.join("history.db"))?;
     let (used_before, _) = delivery::retained_bytes(&conn)?;
-    let removed_records = ai_hist::export::compact_journal_pass(&conn, 10_000)?;
-    while delivery::compact_receipts(&conn, 10_000)? == 10_000 {}
+    let removed_records = delivery::compact_journal_pass(&conn, delivery::MAX_COMPACTION_PAGE)?;
+    while delivery::compact_receipts(&conn, delivery::MAX_COMPACTION_PAGE)?
+        == delivery::MAX_COMPACTION_PAGE
+    {}
     let retention = retention(&conn)?;
     // The persisted verdict measured a journal this pass has just changed.
     let reclaimed = used_before - retention["used_bytes"].as_i64().unwrap_or(used_before);

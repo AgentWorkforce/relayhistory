@@ -1,6 +1,10 @@
 //! Probe-owned upload tables. Evidence schema and snapshot capture stay in ai-hist.
 use anyhow::Result;
 use rusqlite::Connection;
+/// The retained bytes one `delivery_batches` row accounts for: its bodies plus
+/// a fixed allowance for the row itself.
+pub(super) const BATCH_ROW_BYTES: &str =
+    "coalesce(length(CAST(payload AS BLOB)),0)+coalesce(length(CAST(prepared AS BLOB)),0)+512";
 pub(super) fn is_current(conn: &Connection) -> Result<bool> {
     if !conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('delivery_session_jobs') WHERE name='last_member')", [], |r| r.get::<_,bool>(0))? { return Ok(false); }
     Ok(conn.query_row("SELECT COUNT(*)=10 FROM sqlite_master WHERE (type='table' AND name IN ('delivery_jobs','delivery_batches','delivery_session_jobs','delivery_session_members')) OR (type='trigger' AND name IN ('delivery_session_ready','delivery_batches_reserve_insert','delivery_batches_count_insert','delivery_batches_reserve_update','delivery_batches_count_update','delivery_batches_count_delete'))", [], |r| r.get(0))?)
@@ -46,11 +50,9 @@ END;
         conn.execute_batch("ALTER TABLE delivery_session_jobs ADD COLUMN last_member TEXT NOT NULL DEFAULT '';")?;
     }
     let table = "delivery_batches";
-    let size =
-        "coalesce(length(CAST(payload AS BLOB)),0)+coalesce(length(CAST(prepared AS BLOB)),0)+512";
     let qualified = |row: &str| {
-        size.replace("payload", &format!("{row}.payload"))
-            .replace("record_key", &format!("{row}.record_key"))
+        BATCH_ROW_BYTES
+            .replace("payload", &format!("{row}.payload"))
             .replace("prepared", &format!("{row}.prepared"))
     };
     let new = qualified("NEW");

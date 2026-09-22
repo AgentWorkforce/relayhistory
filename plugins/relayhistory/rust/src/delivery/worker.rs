@@ -22,11 +22,12 @@
 //! was lost, and nothing is acknowledged.
 
 use super::{
-    acknowledge, claim_batch, compact_journal, compact_receipts, compact_to_low_water,
-    expire_exports, is_retention_limit, list_jobs, prepare_batch, record_failure,
-    release_stopped_claim, renew_lease, retained_bytes, status, store_prepared_payload,
-    validate_dispatch, ClaimedBatch, DeliveryAcknowledgment, DeliveryFailure, DeliveryJobConfig,
-    DeliveryStatus, HistoryExportBatch, PreparedPayload, MAX_COMPACTION_PAGE,
+    acknowledge, claim_batch, compact_journal, compact_journal_pass, compact_receipts,
+    compact_to_low_water, expire_exports, is_retention_limit, list_jobs, prepare_batch,
+    record_failure, release_stopped_claim, renew_lease, retained_bytes, status,
+    store_prepared_payload, validate_dispatch, ClaimedBatch, DeliveryAcknowledgment,
+    DeliveryFailure, DeliveryJobConfig, DeliveryStatus, HistoryExportBatch, PreparedPayload,
+    MAX_COMPACTION_PAGE,
 };
 use anyhow::{anyhow, bail, Result};
 use rusqlite::Connection;
@@ -244,29 +245,35 @@ fn range(value: i64, name: &str, minimum: i64, maximum: i64) -> Result<()> {
     }
     Ok(())
 }
-/// Maintenance at the start and end of a drain, proportional to what is
-/// reclaimable: expire abandoned snapshots, release every settled receipt,
-/// reclaim every consumed journal row, then keep running complete passes
-/// while retained bytes exceed three quarters of the cap.
-fn compact(conn: &Connection, now_ms: i64) -> Result<()> {
+/// Maintenance proportional to what is reclaimable: expire abandoned
+/// snapshots, release every settled receipt and reclaim every consumed
+/// journal row. At the start of a drain that is all, so the wall-clock budget
+/// goes to delivery; at the end, complete passes keep running while retained
+/// bytes exceed three quarters of the cap, once the drain's acknowledgments
+/// have released their bodies.
+fn compact(conn: &Connection, now_ms: i64, recover: bool) -> Result<()> {
     expire_exports(conn, now_ms, 32)?;
     while compact_receipts(conn, MAX_COMPACTION_PAGE)? == MAX_COMPACTION_PAGE {}
     compact_journal(conn, MAX_COMPACTION_PAGE)?;
-    compact_to_low_water(conn, MAX_COMPACTION_PAGE)?;
+    if recover {
+        compact_to_low_water(conn, MAX_COMPACTION_PAGE)?;
+    }
     Ok(())
 }
-/// Run one local state write; when the retention cap refuses it, reclaim
-/// consumed journal rows and retry it once. The refusal escapes only when
-/// nothing was reclaimable or the retry is refused again. Batch writes have
-/// their own reserve above the cap, so this fires only if that reserve is
-/// exhausted.
+/// Run one local state write; when the retention cap refuses it, run one
+/// complete compaction pass, recover to the low-water mark and retry the
+/// write once. The refusal escapes only when nothing was reclaimable or the
+/// retry is refused again. Batch writes have their own reserve above the
+/// cap, so this fires only if that reserve is exhausted.
 fn with_retention_recovery<T>(
     conn: &Connection,
     mut operation: impl FnMut() -> Result<T>,
 ) -> Result<T> {
     match operation() {
         Err(error) if is_retention_limit(&error) => {
-            if compact_to_low_water(conn, MAX_COMPACTION_PAGE)? == 0 {
+            let reclaimed = compact_journal_pass(conn, MAX_COMPACTION_PAGE)?
+                + compact_to_low_water(conn, MAX_COMPACTION_PAGE)?;
+            if reclaimed == 0 {
                 return Err(error);
             }
             operation()
@@ -328,7 +335,7 @@ pub fn drain(
         options.lease_ms,
     )))?;
     let conn = super::open_db(db_path)?;
-    compact(&conn, clock())?;
+    compact(&conn, clock(), false)?;
     let listed = list_jobs(&conn)?;
     let selection = options.job_ids.as_deref();
     if let Some(ids) = selection {
@@ -396,7 +403,7 @@ pub fn drain(
         .into_iter()
         .filter(|job| chosen(selection, &job.job_id))
         .collect();
-    compact(&worker.conn, clock())?;
+    compact(&worker.conn, clock(), true)?;
     let (used_bytes, limit_bytes) = retained_bytes(&worker.conn)?;
     Ok(DrainResult {
         attempts: worker.attempts,

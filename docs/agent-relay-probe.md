@@ -248,7 +248,9 @@ human-readable install/status/stop commands remain available.
   { "retention": { "used_bytes": 268433716, "limit_bytes": 268435456 } }
   ```
 
-  When a cycle fails on that cap, `last_cycle.error_class` is
+  `used_bytes` is everything retained, including a batch in flight, which
+  lives in its own reserve above the cap; it can exceed `limit_bytes` by that
+  reserve until the batch is acknowledged. When a cycle fails on that cap, `last_cycle.error_class` is
   `retention_limit` and its message carries the same numbers:
   `Upload journal full (256 MB of 256 MB). Compacting consumed records; queued
   sessions are preserved.`

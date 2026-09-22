@@ -217,13 +217,30 @@ fn validate_compaction_page(limit: usize) -> Result<()> {
     Ok(())
 }
 
-/// The sequence every subscription has consumed through. Every journal row at
-/// or below it is reclaimable outright; above it a row is retained exactly
-/// while some subscription that reads its session has not passed it. With no
-/// subscription the whole journal is consumed.
+/// The sequence every subscription has consumed through: every journal row
+/// at or below it is reclaimable outright. A subscription reading every
+/// session pins everything past its cursor; one reading a single session pins
+/// only that session's rows past its cursor, so it counts only while such a
+/// row exists. With nothing pinning, the whole journal is consumed.
 fn consumed_floor(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row(
-        "SELECT COALESCE((SELECT MIN(journal_cursor) FROM history_subscriptions),(SELECT COALESCE(MAX(seq),0) FROM delivery_journal))",
+        "SELECT COALESCE((SELECT MIN(s.journal_cursor) FROM history_subscriptions s
+            WHERE s.source IS NULL OR EXISTS (
+                SELECT 1 FROM delivery_journal j
+                WHERE j.source=s.source AND j.session_id=s.session_id AND j.seq>s.journal_cursor)),
+            (SELECT COALESCE(MAX(seq),0) FROM delivery_journal))",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
+/// The last sequence a sweep can reclaim: the lowest cursor of a subscription
+/// reading every session, or the tail without one. Every row past it is
+/// retained by that subscription, so no sweep examines it.
+fn sweep_ceiling(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT MIN(COALESCE((SELECT MIN(journal_cursor) FROM history_subscriptions WHERE source IS NULL),t.tail),t.tail)
+         FROM (SELECT COALESCE(MAX(seq),0) AS tail FROM delivery_journal) t",
         [],
         |r| r.get(0),
     )?)
@@ -238,24 +255,25 @@ fn reclaim_consumed(tx: &Transaction<'_>, floor: i64, limit: usize) -> Result<us
     )?)
 }
 
-/// The last sequence of the next sweep page: at most `limit` rows after
-/// `after` and no later than `through`.
-fn sweep_boundary(
+/// The next sweep page: at most `limit` rows after `after` and no later than
+/// `through`, as its row count and last sequence.
+fn sweep_page(
     tx: &Transaction<'_>,
     after: i64,
     through: i64,
     limit: usize,
-) -> Result<Option<i64>> {
-    Ok(tx.query_row(
-        "SELECT MAX(seq) FROM (SELECT seq FROM delivery_journal WHERE seq>? AND seq<=? ORDER BY seq LIMIT ?)",
+) -> Result<Option<(usize, i64)>> {
+    let (count, end): (i64, Option<i64>) = tx.query_row(
+        "SELECT COUNT(*),MAX(seq) FROM (SELECT seq FROM delivery_journal WHERE seq>? AND seq<=? ORDER BY seq LIMIT ?)",
         params![after, through, limit as i64],
-        |r| r.get(0),
-    )?)
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok(end.map(|end| (count as usize, end)))
 }
 
 /// Delete the rows in `(after, end]` no interested subscription still needs
-/// and move the sweep cursor to `end`.
-fn sweep_range(tx: &Transaction<'_>, after: i64, end: i64) -> Result<usize> {
+/// and leave the sweep cursor at `cursor`.
+fn sweep_range(tx: &Transaction<'_>, after: i64, end: i64, cursor: i64) -> Result<usize> {
     let removed = tx.execute(
         "DELETE FROM delivery_journal AS j WHERE seq>? AND seq<=? AND NOT EXISTS (
             SELECT 1 FROM history_subscriptions s
@@ -266,26 +284,28 @@ fn sweep_range(tx: &Transaction<'_>, after: i64, end: i64) -> Result<usize> {
     )?;
     tx.execute(
         "UPDATE history_compaction SET cursor=? WHERE singleton=1",
-        [end],
+        [cursor],
     )?;
     Ok(removed)
 }
 
 /// Reclaim every row at or below `floor` in transactions of at most `limit`
-/// rows. Returns the number of rows removed.
+/// rows. Returns the number of rows removed and the floor the last
+/// transaction observed.
 fn reclaim_below(
     conn: &Connection,
     floor: impl Fn(&Connection) -> Result<i64>,
     limit: usize,
-) -> Result<usize> {
+) -> Result<(usize, i64)> {
     let mut removed = 0;
     loop {
         let tx = write_transaction(conn)?;
-        let reclaimed = reclaim_consumed(&tx, floor(&tx)?, limit)?;
+        let floor = floor(&tx)?;
+        let reclaimed = reclaim_consumed(&tx, floor, limit)?;
         tx.commit()?;
         removed += reclaimed;
         if reclaimed < limit {
-            return Ok(removed);
+            return Ok((removed, floor));
         }
     }
 }
@@ -298,27 +318,31 @@ fn reclaim_below(
 /// never to the journal's length, and no consumed row waits on a cursor. Above
 /// the floor, where a lagging session subscription pins its own rows among
 /// other sessions' reclaimable ones, one page of `limit` rows is examined with
-/// the exact per-session predicate from the persistent sweep cursor, which
-/// never sits below the floor and wraps back to it at the tail. Bootstrap
+/// the exact per-session predicate from the persistent sweep cursor. The sweep
+/// reaches only as far as the lowest cursor of a subscription reading every
+/// session, since everything past it is retained; the cursor never sits below
+/// the floor and wraps back to it whenever a page is short. Bootstrap
 /// preimages are retained independently of this journal.
 pub fn compact_journal(conn: &Connection, limit: usize) -> Result<usize> {
     validate_compaction_page(limit)?;
-    let mut removed = reclaim_below(conn, consumed_floor, limit)?;
+    let (mut removed, _) = reclaim_below(conn, consumed_floor, limit)?;
     let tx = write_transaction(conn)?;
     let floor = consumed_floor(&tx)?;
+    let ceiling = sweep_ceiling(&tx)?;
     let saved: i64 = tx.query_row(
         "SELECT cursor FROM history_compaction WHERE singleton=1",
         [],
         |r| r.get(0),
     )?;
     let mut after = saved.max(floor);
-    let mut end = sweep_boundary(&tx, after, i64::MAX, limit)?;
-    if end.is_none() && after != floor {
+    let mut page = sweep_page(&tx, after, ceiling, limit)?;
+    if page.is_none() && after != floor {
         after = floor;
-        end = sweep_boundary(&tx, after, i64::MAX, limit)?;
+        page = sweep_page(&tx, after, ceiling, limit)?;
     }
-    if let Some(end) = end {
-        removed += sweep_range(&tx, after, end)?;
+    if let Some((count, end)) = page {
+        let cursor = if count < limit { floor } else { end };
+        removed += sweep_range(&tx, after, end, cursor)?;
     }
     tx.commit()?;
     Ok(removed)
@@ -326,25 +350,23 @@ pub fn compact_journal(conn: &Connection, limit: usize) -> Result<usize> {
 
 /// One complete pass for retention recovery: every row at or below the
 /// consumed floor, then a sweep with the exact predicate from the floor to the
-/// tail as it stood on entry, so concurrent appends cannot extend the pass.
-/// Each transaction deletes or examines at most `page_size` rows. Returns the
-/// number of rows removed; zero means nothing in the journal is reclaimable.
+/// sweep ceiling as it stood on entry, so concurrent appends cannot extend the
+/// pass. Each transaction deletes or examines at most `page_size` rows.
+/// Returns the number of rows removed; zero means nothing in the journal is
+/// reclaimable.
 pub fn compact_journal_pass(conn: &Connection, page_size: usize) -> Result<usize> {
     validate_compaction_page(page_size)?;
-    let through: i64 = conn.query_row(
-        "SELECT COALESCE(MAX(seq),0) FROM delivery_journal",
-        [],
-        |r| r.get(0),
-    )?;
+    let through = sweep_ceiling(conn)?;
     let floor = |conn: &Connection| Ok(consumed_floor(conn)?.min(through));
-    let mut removed = reclaim_below(conn, floor, page_size)?;
-    let mut after = consumed_floor(conn)?.min(through);
+    let (mut removed, floor) = reclaim_below(conn, floor, page_size)?;
+    let mut after = floor;
     while after < through {
         let tx = write_transaction(conn)?;
-        let Some(end) = sweep_boundary(&tx, after, through, page_size)? else {
+        let Some((count, end)) = sweep_page(&tx, after, through, page_size)? else {
             break;
         };
-        removed += sweep_range(&tx, after, end)?;
+        let cursor = if count < page_size { floor } else { end };
+        removed += sweep_range(&tx, after, end, cursor)?;
         tx.commit()?;
         after = end;
     }
@@ -358,16 +380,18 @@ fn below_low_water(conn: &Connection) -> Result<bool> {
     Ok(i128::from(used) * 4 < i128::from(limit) * 3)
 }
 
-/// Budget-driven recovery: run complete passes until retained bytes are below
-/// three quarters of the retention cap or a pass reclaims nothing. Below the
-/// low-water mark this does no work. Returns the number of rows removed.
+/// Budget-driven recovery: run complete passes while retained bytes are at or
+/// above three quarters of the retention cap and the last pass reclaimed a
+/// full page, so a pass that reclaimed less has caught up with whatever other
+/// consumers freed meanwhile and ends the loop. Below the low-water mark this
+/// does no work. Returns the number of rows removed.
 pub fn compact_to_low_water(conn: &Connection, page_size: usize) -> Result<usize> {
     validate_compaction_page(page_size)?;
     let mut removed = 0;
     while !below_low_water(conn)? {
         let reclaimed = compact_journal_pass(conn, page_size)?;
         removed += reclaimed;
-        if reclaimed == 0 {
+        if reclaimed < page_size {
             break;
         }
     }

@@ -103,21 +103,30 @@ The journal keeps a captured revision until every subscription that reads its
 session has consumed it. Compaction reclaims consumed rows only, so un-uploaded
 backlog is never deleted:
 
-- Every row at or below the lowest subscription cursor is reclaimed by an
-  indexed range delete, in transactions of at most 10,000 rows. The work is
-  proportional to the rows reclaimed, not to the journal's length, and a
-  consumed row never waits on a sweep cursor.
-- Above that floor, where a lagging session subscription pins its own rows
+- Every row at or below the consumed floor is reclaimed by an indexed range
+  delete, in transactions of at most 10,000 rows. The floor is the lowest
+  cursor of any subscription that still pins something: one reading every
+  session always does; one reading a single session only while that session
+  has a row past its cursor, so a finished session's cursor does not hold the
+  floor down. The work is proportional to the rows reclaimed, not to the
+  journal's length, and a consumed row never waits on a sweep cursor.
+- Above the floor, where a lagging session subscription pins its own rows
   among other sessions' reclaimable ones, a persistent sweep cursor examines
-  one bounded page per drain with the exact per-session predicate. It never
-  sits below the floor and wraps back to it at the tail.
-- Each drain reclaims the consumed floor in full, then runs complete passes
-  (floor plus a sweep from the floor to the tail) while retained bytes exceed
-  three quarters of the cap or until a pass reclaims nothing.
-- If the cap refuses a batch write during a drain, the worker runs that
-  recovery and retries the write once. The drain reports
-  `DELIVERY_RETENTION_LIMIT` only when nothing was reclaimable or the retry is
-  refused again; no cursor moves on a refused write.
+  one bounded page per drain with the exact per-session predicate. The sweep
+  reaches only as far as the lowest cursor of a subscription reading every
+  session, since everything past it is retained; the cursor never sits below
+  the floor and wraps back to it whenever a page is short.
+- A drain starts by reclaiming the consumed floor in full, so its wall-clock
+  budget goes to delivery. It ends, once its acknowledgments have released
+  their bodies, by running complete passes (floor plus a sweep from the floor
+  to that ceiling) while retained bytes are at or above three quarters of the
+  cap and the last pass reclaimed a full page; a pass that reclaimed less has
+  caught up with whatever other consumers freed meanwhile.
+- If the cap refuses a batch write during a drain, the worker runs one
+  complete pass, recovers to the low-water mark and retries the write once.
+  The drain reports `DELIVERY_RETENTION_LIMIT` only when nothing was
+  reclaimable or the retry is refused again; no cursor moves on a refused
+  write.
 
 ## Batch materialization reserve
 
@@ -128,13 +137,18 @@ every non-cancelled job holds at most one unresolved batch of at most its
 configured `max_batch_bytes` plus `max_prepared_bytes` (plus 512 bytes of row
 accounting), and settled receipts keep their 512 bytes until compaction
 releases them. The journal, bootstrap preimages and export pages are checked
-against the plain cap. `historyDeliveryRetention` therefore reports
-`usedBytes` above `limitBytes` by at most the reserve while batches are in
-flight; the cap itself never moves.
+against the plain cap, and the low-water mark is three quarters of the plain
+cap. `historyDeliveryRetention` therefore reports `usedBytes` above
+`limitBytes` by at most the reserve while batches are in flight; the cap
+itself never moves, and `setHistoryDeliveryRetention` accepts any value down
+to the bytes retained outside batches.
 
-A journal of unconsumed rows at the cap keeps failing capture until a drain
-delivers them and compaction frees them, the job is cancelled, or the cap is
-raised with `setHistoryDeliveryRetention`. Backlog a destination cannot take
-stays in its batch, unacknowledged, until it can. Hosts run the same complete
-compaction pass on demand through `compactHistoryDelivery` (the
-`compact_journal_pass` delivery request).
+While a pending batch keeps retained bytes above the cap, capture stays
+refused for the life of that batch: the drain acknowledges it, which releases
+its bodies, and its end-of-drain compaction then frees the rows it carried. A
+journal of unconsumed rows at the cap keeps failing capture until that
+happens, the job is cancelled, or the cap is raised with
+`setHistoryDeliveryRetention`. Backlog a destination cannot take stays in its
+batch, unacknowledged, until it can. Hosts run the same complete compaction
+pass on demand through `compactHistoryDelivery` (the `compact_journal_pass`
+delivery request).

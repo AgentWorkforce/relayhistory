@@ -17,17 +17,18 @@
 //! plus the settled receipts compaction has not released, so retained bytes
 //! exceed the cap by at most that reserve while batches are in flight and a
 //! journal full of unconsumed backlog is always deliverable. Compaction
-//! reclaims only journal rows every subscription has consumed: everything at or
-//! below the lowest subscription cursor by indexed range, and above it exactly
-//! the rows no subscription reading their session still needs. A drain
-//! reclaims the consumed floor in full, then runs complete passes while
-//! retained bytes exceed three quarters of the cap; if the cap refuses a
-//! batch write mid-drain, the worker runs that recovery and retries the write
-//! once, reporting `DELIVERY_RETENTION_LIMIT` only when nothing was reclaimable
-//! or the retry is refused again. Un-uploaded backlog is never deleted: a full
-//! cap of unconsumed rows keeps failing capture visibly until the destination
-//! consumes them or the cap is raised with `set_retention_limit`. No checkpoint
-//! moves on a capacity failure. Pausing preserves capture; cancellation is an
+//! reclaims only journal rows every subscription has consumed: everything at
+//! or below the lowest cursor of a subscription that still pins something by
+//! indexed range, and above it exactly the rows no subscription reading their
+//! session still needs. A drain reclaims the consumed floor in full at its
+//! start and runs complete passes at its end while retained bytes are at or
+//! above three quarters of the cap; if the cap refuses a batch write
+//! mid-drain, the worker runs that recovery and retries the write once,
+//! reporting `DELIVERY_RETENTION_LIMIT` only when nothing was reclaimable or
+//! the retry is refused again. Un-uploaded backlog is never deleted: a full
+//! cap of unconsumed rows keeps failing capture visibly until a drain delivers
+//! them or the cap is raised with `set_retention_limit`. No checkpoint moves
+//! on a capacity failure. Pausing preserves capture; cancellation is an
 //! explicit discard.
 //! Deletes are exported as tombstones, but remote deletion requires a destination
 //! that supports them. Presence is its own revisioned provenance evidence kind.
@@ -1123,10 +1124,13 @@ pub fn cancel_job(conn: &Connection, job_id: &str) -> Result<DeliveryStatus> {
 
 /// Explicit retained-byte cap. Exceeding it aborts capture rather than silently
 /// dropping revisions or advancing ingestion. Raising it can unblock ingestion.
+/// The cap bounds what capture retains; batches in flight live in their own
+/// reserve above it, so it may be set down to the bytes retained outside
+/// `delivery_batches` and no lower.
 pub fn set_retention_limit(conn: &Connection, max_bytes: i64) -> Result<()> {
     let tx = write_transaction(conn)?;
     let used: i64 = tx.query_row(
-        "SELECT retained_bytes FROM delivery_state WHERE singleton=1",
+        &format!("SELECT retained_bytes-(SELECT COALESCE(SUM({}),0) FROM delivery_batches) FROM delivery_state WHERE singleton=1", schema::BATCH_ROW_BYTES),
         [],
         |row| row.get(0),
     )?;
