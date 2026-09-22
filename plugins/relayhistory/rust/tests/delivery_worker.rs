@@ -630,6 +630,53 @@ fn a_drain_stops_starting_attempts_once_its_time_budget_has_passed() {
     }
 }
 
+/// Scanning is bounded by the same budget as delivery. A job whose rows are
+/// all withheld produces no batch and no attempt, so nothing but the clock
+/// stops it walking its whole journal a prepare step at a time.
+#[test]
+fn a_drain_stops_scanning_once_its_time_budget_has_passed() {
+    let fixture = fixture();
+    let mut job_config = config("one");
+    job_config.limits.max_scan_records = 5;
+    let job = create_job(&fixture.conn, &job_config, 0).unwrap();
+    for n in 0..2_000 {
+        fixture.conn.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude','both',?1,43,'user','text','withheld')",params![format!("withheld-{n}")]).unwrap();
+    }
+    for session in SESSIONS {
+        set_session_excluded(
+            &fixture.conn,
+            &SessionIdentity {
+                source: "claude".into(),
+                session_id: (*session).into(),
+            },
+            true,
+        )
+        .unwrap();
+    }
+    let receiver = Fake::default();
+    let result = run(
+        &fixture.path(),
+        &one(&receiver),
+        &DrainOptions {
+            max_elapsed: Some(Duration::from_millis(1)),
+            max_batches: 1_000,
+            max_prepare_steps: 1_000,
+            ..options()
+        },
+    );
+    assert_eq!(result.attempts, 0);
+    assert_eq!(result.issues, vec![]);
+    assert_eq!(result.statuses[0].job_id, job.job_id);
+    assert_eq!(result.statuses[0].acknowledged_records, 0);
+    // Five rows a step: the deadline stopped the scan long before the steps
+    // that would walk the journal, and after at least one of them.
+    let scanned = 2_000 - result.statuses[0].unqueued_changes;
+    assert!(
+        (1..=1_000).contains(&scanned),
+        "scanned: {scanned} of 2 000 withheld rows"
+    );
+}
+
 /// Prepare and claim one batch, the way the drain loop does. `create_job`
 /// alone leaves nothing to claim: a batch has to be materialized first.
 fn prepare_and_claim(conn: &Connection, job_id: &str, lease_ms: i64) -> ClaimedBatch {
