@@ -2214,6 +2214,19 @@ fn table_columns(conn: &Connection, table: &str) -> Result<BTreeSet<String>> {
         .collect::<rusqlite::Result<BTreeSet<String>>>()?)
 }
 
+/// Holds the pass lock and ends the retained read snapshot when the pass
+/// ends, so a WAL-mode provider database is not pinned open between passes.
+struct OpencodePassGuard<'a> {
+    _pass: MutexGuard<'a, ()>,
+    live: &'a Mutex<Option<OpencodeReadSnapshot>>,
+}
+
+impl Drop for OpencodePassGuard<'_> {
+    fn drop(&mut self) {
+        *self.live.lock().expect("opencode live snapshot lock") = None;
+    }
+}
+
 impl ShallowSessionProvider for OpencodeProvider {
     fn begin_discovery_pass(&self) -> Result<Option<Box<dyn DiscoveryPassGuard + '_>>> {
         let pass = self.pass.lock().expect("opencode discovery pass lock");
@@ -2222,7 +2235,10 @@ impl ShallowSessionProvider for OpencodeProvider {
         // the pass lock prevents a concurrent call from replacing the state
         // between enumeration and reads.
         *self.live.lock().expect("opencode live snapshot lock") = None;
-        Ok(Some(Box::new(pass)))
+        Ok(Some(Box::new(OpencodePassGuard {
+            _pass: pass,
+            live: &self.live,
+        })))
     }
 
     fn acquire(
@@ -2609,11 +2625,28 @@ fn open_devin_snapshot(scan: &ScanEnv<'_>) -> Result<DevinReadSnapshot> {
     )
 }
 
+/// Holds the pass lock and ends the retained read snapshot when the pass
+/// ends. Without the drop a `BEGIN DEFERRED` reader stays open between
+/// passes, which pins a WAL-mode provider database and blocks checkpointing.
+struct DevinPassGuard<'a> {
+    _pass: MutexGuard<'a, ()>,
+    live: &'a Mutex<Option<DevinReadSnapshot>>,
+}
+
+impl Drop for DevinPassGuard<'_> {
+    fn drop(&mut self) {
+        *self.live.lock().expect("devin live snapshot lock") = None;
+    }
+}
+
 impl ShallowSessionProvider for DevinProvider {
     fn begin_discovery_pass(&self) -> Result<Option<Box<dyn DiscoveryPassGuard + '_>>> {
         let pass = self.pass.lock().expect("devin discovery pass lock");
         *self.live.lock().expect("devin live snapshot lock") = None;
-        Ok(Some(Box::new(pass)))
+        Ok(Some(Box::new(DevinPassGuard {
+            _pass: pass,
+            live: &self.live,
+        })))
     }
 
     fn acquire(

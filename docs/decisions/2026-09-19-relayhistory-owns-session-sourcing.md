@@ -246,8 +246,9 @@ correlation, claude only). Claude's `delegated` is `◐` because a subagent
 sidecar carries the _parent's_ `sessionId` on every record — the child is only
 independently addressable when the provider emits a per-child `agentId`;
 otherwise `relationship_capture` records it as `identity_status = 'unlinked'`
-with a null child id. `relationship_capabilities()` declares codex `always`,
-claude `sometimes`, and cursor/grok/opencode/devin/relay `never`. Fork, resume and
+with a null child id. `relationship_capabilities().stable_child_identity` is
+`always` for codex and opencode, `sometimes` for claude and grok, and `never`
+for cursor/devin/relay. Fork, resume and
 continuation are not written by any path.
 
 **Session metadata.** The `sessions` table has `originator`, `agent_version`,

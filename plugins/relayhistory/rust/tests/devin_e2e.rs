@@ -67,9 +67,16 @@ fn devin_sessions_reach_preview_and_an_isolated_install() {
     };
 
     // Isolate HOME so preview metadata and the fake install land in a tempdir.
-    // XDG_DATA_HOME deliberately keeps its real value: that is how the Devin
-    // root resolves.
+    // Pin XDG_DATA_HOME to the data root the Devin dir came from first: when
+    // it was unset, `devin_cli_dir` derived the root from the real HOME, which
+    // is about to change for this process and the probe subprocess.
+    let data_root = cli_dir
+        .parent()
+        .and_then(Path::parent)
+        .expect("devin/cli has a data root")
+        .to_path_buf();
     let home = tempfile::tempdir().expect("temp home");
+    std::env::set_var("XDG_DATA_HOME", &data_root);
     std::env::set_var("HOME", home.path());
     std::env::set_var("USERPROFILE", home.path());
 
