@@ -584,45 +584,50 @@ fn a_time_bounded_drain_delivers_a_backlog_beyond_a_fixed_batch_count() {
     assert_eq!(result.statuses[0].acknowledged_records, 3_003);
 }
 
-/// Once the budget has passed no further attempt starts, and the attempt that
-/// was under way is recorded normally: nothing acknowledged is lost.
+/// The budget bounds how long a drain keeps going, not whether it goes at all.
+/// Whatever the host and the clock are doing, a drain with deliverable work
+/// makes at least one attempt and records it normally, and a budget already
+/// spent stops the next one: nothing acknowledged is lost either way.
 #[test]
 fn a_drain_stops_starting_attempts_once_its_time_budget_has_passed() {
-    let fixture = fixture();
-    for n in 0..500 {
-        fixture.conn.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude','both',?1,43,'user','text','backlog')",params![format!("backlog-{n}")]).unwrap();
+    // A budget the first attempt alone outlasts, and one that admits a few.
+    for budget in [Duration::from_millis(1), Duration::from_millis(100)] {
+        let fixture = fixture();
+        for n in 0..500 {
+            fixture.conn.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude','both',?1,43,'user','text','backlog')",params![format!("backlog-{n}")]).unwrap();
+        }
+        create_job(&fixture.conn, &config("one"), 0).unwrap();
+        let receiver = Fake {
+            send: Box::new(|_payload, batch| {
+                std::thread::sleep(Duration::from_millis(40));
+                Ok(ack(batch))
+            }),
+            ..Fake::default()
+        };
+        let result = run(
+            &fixture.path(),
+            &one(&receiver),
+            &DrainOptions {
+                max_elapsed: Some(budget),
+                max_batches: 1_000,
+                max_prepare_steps: 1_000,
+                ..options()
+            },
+        );
+        assert!(
+            result.attempts >= 1 && result.attempts < 6,
+            "attempts: {} on a {budget:?} budget",
+            result.attempts
+        );
+        assert_eq!(result.issues, vec![]);
+        assert_eq!(
+            result.statuses[0].acknowledged_records,
+            result.attempts as i64 * 100
+        );
+        // Unscanned bootstrap rows remain: the budget, not the backlog, ended it.
+        assert!(!result.statuses[0].bootstrap_complete);
+        assert!(result.statuses[0].failure.is_none());
     }
-    create_job(&fixture.conn, &config("one"), 0).unwrap();
-    let receiver = Fake {
-        send: Box::new(|_payload, batch| {
-            std::thread::sleep(Duration::from_millis(40));
-            Ok(ack(batch))
-        }),
-        ..Fake::default()
-    };
-    let result = run(
-        &fixture.path(),
-        &one(&receiver),
-        &DrainOptions {
-            max_elapsed: Some(Duration::from_millis(100)),
-            max_batches: 1_000,
-            max_prepare_steps: 1_000,
-            ..options()
-        },
-    );
-    assert!(
-        result.attempts >= 1 && result.attempts < 6,
-        "attempts: {}",
-        result.attempts
-    );
-    assert_eq!(result.issues, vec![]);
-    assert_eq!(
-        result.statuses[0].acknowledged_records,
-        result.attempts as i64 * 100
-    );
-    // Unscanned bootstrap rows remain: the budget, not the backlog, ended it.
-    assert!(!result.statuses[0].bootstrap_complete);
-    assert!(result.statuses[0].failure.is_none());
 }
 
 /// Prepare and claim one batch, the way the drain loop does. `create_job`
