@@ -381,7 +381,11 @@ impl Changes {
     /// watermark under a name that has already moved past it — leaves the
     /// cursor where it is, so the returned watermark can exceed
     /// [`Changes::position`]; a consumer that wants to reprocess drains from
-    /// an explicit `from` and does not commit. A named cursor is bound to the
+    /// an explicit `from` and does not commit. The one exception is a stored
+    /// cursor ahead of the store's head, which a resume refuses with
+    /// [`ErrorKind::WatermarkAheadOfStore`]: it names no revision of this
+    /// store, so the commit that follows the resync from
+    /// [`Watermark::START`] replaces it. A named cursor is bound to the
     /// kind set it was first committed for: a drain over other kinds cannot
     /// resume it or move it ([`ErrorKind::ConsumerKindsMismatch`]), because
     /// its position accounts for nothing outside its own kinds. Fails on a
@@ -746,13 +750,25 @@ fn commit_cursor(
     kinds: &KindSet,
 ) -> Result<Watermark, Error> {
     let offered = kinds.stored();
+    // A stored cursor past the clock is not a position in this store's
+    // history: every drain's position is at most its head, and the clock
+    // never moves back, so only a reset or replaced clock puts one there.
+    // `changes_since` refuses to resume it and sends the consumer to
+    // `Watermark::START`; that resync's commit replaces it, where keeping
+    // the maximum would pin the consumer to a revision the store may never
+    // reach. The head is read in the same statement, so a cursor at or
+    // below it keeps the monotonic rule.
     let revision: Option<i64> = conn
         .query_row(
             &format!(
                 "INSERT INTO consumer_cursors (name, revision, updated_ms, {KINDS_COLUMN}) \
                  VALUES (?, ?, ?, ?) \
                  ON CONFLICT(name) DO UPDATE SET \
-                     revision = MAX(consumer_cursors.revision, excluded.revision), \
+                     revision = CASE \
+                         WHEN consumer_cursors.revision > COALESCE( \
+                             (SELECT version FROM observation_clock WHERE singleton = 1), 0) \
+                         THEN excluded.revision \
+                         ELSE MAX(consumer_cursors.revision, excluded.revision) END, \
                      updated_ms = excluded.updated_ms \
                      WHERE consumer_cursors.{KINDS_COLUMN} = excluded.{KINDS_COLUMN} \
                  RETURNING revision"
@@ -1630,6 +1646,49 @@ mod tests {
                 .unwrap()
         )
         .is_empty());
+    }
+
+    /// A stored cursor past the head names no revision of this store. A
+    /// resume refuses it and sends the consumer to `Watermark::START`, and
+    /// the commit after that resync replaces it -- keeping the maximum would
+    /// leave the name refused until the store happened to pass 99.
+    #[test]
+    fn a_resync_from_start_replaces_a_cursor_ahead_of_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, conn) = store(dir.path());
+        for index in 0..5 {
+            insert_event(&conn, "s1", &format!("e{index}"), "x");
+        }
+        conn.execute(
+            "INSERT INTO consumer_cursors (name, revision, updated_ms) VALUES ('c', 99, 0)",
+            [],
+        )
+        .unwrap();
+        let query = || ChangeQuery::default().consumer("c");
+        let error = store
+            .changes_since(Watermark::CONSUMER, query())
+            .expect_err("a cursor past the head cannot be resumed from");
+        assert_eq!(error.kind(), ErrorKind::WatermarkAheadOfStore);
+
+        // The resync, committed partway: the cursor is now where it reached.
+        let mut resync = store.changes_since(Watermark::START, query()).unwrap();
+        assert_eq!(resync.head().revision, 5);
+        resync.next().unwrap().unwrap();
+        resync.next().unwrap().unwrap();
+        assert_eq!(resync.commit().unwrap().revision, 2);
+
+        // From there the ordinary rules hold: the name resumes, and the
+        // cursor only moves forward.
+        let mut rest = store.changes_since(Watermark::CONSUMER, query()).unwrap();
+        assert_eq!(rest.position().revision, 2);
+        while rest.next().is_some() {}
+        assert_eq!(rest.commit().unwrap().revision, 5);
+        assert_eq!(
+            resync.commit().unwrap().revision,
+            5,
+            "a stale commit after the replacement does not rewind it"
+        );
+        assert!(drain(store.changes_since(Watermark::CONSUMER, query()).unwrap()).is_empty());
     }
 
     #[test]
