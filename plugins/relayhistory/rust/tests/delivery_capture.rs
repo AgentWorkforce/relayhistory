@@ -59,7 +59,9 @@ fn sync_failure(home: &Path) {
         .query_row("SELECT COUNT(*) FROM history", [], |r| r.get(0))
         .unwrap();
     assert_eq!(count, 0);
-    assert_eq!(retained_bytes(&conn).unwrap().0, used);
+    // Backpressure may reclaim consumed revisions before the pass stops, so
+    // the failed pass never retains more than it found.
+    assert!(retained_bytes(&conn).unwrap().0 <= used);
     assert!(
         result.is_err(),
         "capture capacity failure must be visible even when other providers are absent"

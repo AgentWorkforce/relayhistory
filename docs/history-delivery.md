@@ -94,8 +94,8 @@ pending work explicitly; it does not erase previously accepted remote records.
 Pausing preserves capture and queued work. Bounded maintenance expires exports,
 compacts consumed changes and releases completed bodies. An idle session
 subscription does not retain unrelated revisions. The evidence and upload queues
-share a retention budget; a full budget fails capture visibly and rolls back
-rather than silently dropping evidence. No parser or ingestion path uploads.
+share a retention budget. No evidence is silently dropped and no parser or
+ingestion path uploads.
 
 ## Journal compaction
 
@@ -146,9 +146,22 @@ to the bytes retained outside batches.
 While a pending batch keeps retained bytes above the cap, capture stays
 refused for the life of that batch: the drain acknowledges it, which releases
 its bodies, and its end-of-drain compaction then frees the rows it carried. A
-journal of unconsumed rows at the cap keeps failing capture until that
+journal of unconsumed rows at the cap keeps stopping capture until that
 happens, the job is cancelled, or the cap is raised with
 `setHistoryDeliveryRetention`. Backlog a destination cannot take stays in its
 batch, unacknowledged, until it can. Hosts run the same complete compaction
 pass on demand through `compactHistoryDelivery` (the `compact_journal_pass`
 delivery request).
+
+## Capture backpressure
+
+Capture applies backpressure against the shared budget instead of discovering
+the cap inside a session transaction. Before each source pass and each session
+transaction it reads the retained bytes; above 90% of the cap it runs the
+low-water recovery above, then reads them again. If the budget is still above
+90% the pass stops with a typed `retention_limit` failure carrying `used_bytes`
+and `limit_bytes` instead of attempting the remaining sessions. A capture
+trigger abort inside a session transaction rolls that session back and ends the
+pass the same way. Sessions committed earlier in the pass stay persisted. The
+carried `used_bytes` is the retained total, so while batches are in flight it
+can exceed `limit_bytes` by at most the materialization reserve.

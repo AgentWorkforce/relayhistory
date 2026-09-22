@@ -66,7 +66,7 @@ pub use tool_result_facts::{
     STATUS_UNKNOWN,
 };
 
-fn is_delivery_retention_limit(error: &anyhow::Error) -> bool {
+pub(crate) fn is_delivery_retention_limit(error: &anyhow::Error) -> bool {
     #[cfg(feature = "export")]
     {
         crate::export::is_retention_limit(error)
@@ -75,6 +75,45 @@ fn is_delivery_retention_limit(error: &anyhow::Error) -> bool {
     {
         let _ = error;
         false
+    }
+}
+
+/// Retention backpressure before a source pass or a session transaction:
+/// reclaims consumed delivery changes above the high-water mark and stops the
+/// pass with a typed retention error when that is not enough. Without the
+/// export schema there is no retention budget to check.
+pub(crate) fn ensure_capture_headroom(conn: &Connection) -> Result<()> {
+    #[cfg(feature = "export")]
+    {
+        crate::export::ensure_capture_headroom(conn)
+    }
+    #[cfg(not(feature = "export"))]
+    {
+        let _ = conn;
+        Ok(())
+    }
+}
+
+/// The retention-cap gate for one named source pass.
+fn ensure_source_headroom(conn: &Connection, source: &str) -> Result<()> {
+    ensure_capture_headroom(conn).with_context(|| retention_stop_context(source))
+}
+
+fn retention_stop_context(source: &str) -> String {
+    format!("{source} history delivery capture stopped at the retention cap")
+}
+
+/// A trigger-aborted session transaction reports like a high-water stop:
+/// the pass ends and the failure carries the retention usage.
+pub(crate) fn annotate_retention_limit(conn: &Connection, error: anyhow::Error) -> anyhow::Error {
+    #[cfg(feature = "export")]
+    {
+        crate::export::annotate_retention_limit(conn, error)
+    }
+    #[cfg(not(feature = "export"))]
+    {
+        let _ = conn;
+        error
     }
 }
 
@@ -538,11 +577,23 @@ struct SyncSourceFailure {
 }
 
 impl SyncSourceReport {
-    fn capture<T>(&mut self, source: &str, result: Result<T>) -> Option<T> {
+    /// Record one source's outcome. A failure at the retention cap ends the
+    /// whole pass: every later source would stop at the same budget, and an
+    /// enabled durable capture job cannot silently lose history, so the typed
+    /// cause is returned rather than folded into the partial-source policy.
+    fn capture<T>(
+        &mut self,
+        conn: &Connection,
+        source: &str,
+        result: Result<T>,
+    ) -> Result<Option<T>> {
         match result {
             Ok(value) => {
                 self.succeeded += 1;
-                Some(value)
+                Ok(Some(value))
+            }
+            Err(error) if is_delivery_retention_limit(&error) => {
+                Err(annotate_retention_limit(conn, error).context(retention_stop_context(source)))
             }
             Err(error) => {
                 self.failures.push(SyncSourceFailure {
@@ -551,12 +602,12 @@ impl SyncSourceReport {
                     contention_path: source_database_path(&error).map(Path::to_path_buf),
                     error,
                 });
-                None
+                Ok(None)
             }
         }
     }
 
-    fn finish(mut self, db_path: &Path) -> Result<()> {
+    fn finish(self, db_path: &Path) -> Result<()> {
         if self.failures.is_empty() {
             return Ok(());
         }
@@ -575,19 +626,6 @@ impl SyncSourceReport {
             if diagnosed.insert(path.to_path_buf()) {
                 eprintln!("{}", write_contention_diagnostic(path));
             }
-        }
-        // An enabled durable capture job cannot silently lose history. Missing
-        // providers count as successful no-ops, so the ordinary partial-source
-        // policy would otherwise turn a full capture store into sync success.
-        // Preserve the cause so native/SDK callers can report its safe code.
-        if let Some(index) = self
-            .failures
-            .iter()
-            .position(|failure| is_delivery_retention_limit(&failure.error))
-        {
-            let failure = self.failures.remove(index);
-            return Err(failure.error)
-                .with_context(|| format!("{} history delivery capture failed", failure.source));
         }
         if self.succeeded == 0 {
             anyhow::bail!(
@@ -1314,7 +1352,9 @@ fn sync_basic(
     // durable the moment that source completes.
     capture_progress("claude-history", 0, None);
     check_capture_cancelled()?;
+    ensure_source_headroom(conn, "claude")?;
     if let Some(inserted) = report.capture(
+        conn,
         "claude",
         sync_jsonl_incremental(
             conn,
@@ -1324,14 +1364,16 @@ fn sync_basic(
             parse_claude_line,
             &mut |in_progress| checkpoint_sync_state(&state_path, in_progress),
         ),
-    ) {
+    )? {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);
     }
     capture_progress("claude", 0, None);
     check_capture_cancelled()?;
+    ensure_source_headroom(conn, "claude-metadata")?;
     if report
         .capture(
+            conn,
             "claude-metadata",
             sync_claude_session_metadata_with_repairs_and_coverage(
                 conn,
@@ -1340,14 +1382,16 @@ fn sync_basic(
                 &repairs,
                 &mut coverage,
             ),
-        )
+        )?
         .is_some()
     {
         checkpoint_sync_state(&state_path, &state);
     }
     capture_progress("codex", 0, None);
     check_capture_cancelled()?;
+    ensure_source_headroom(conn, "codex")?;
     if let Some(inserted) = report.capture(
+        conn,
         "codex",
         sync_codex_with_repairs_and_coverage(
             conn,
@@ -1356,13 +1400,15 @@ fn sync_basic(
             &repairs,
             &mut coverage,
         ),
-    ) {
+    )? {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);
     }
     capture_progress("cursor", 0, None);
     check_capture_cancelled()?;
+    ensure_source_headroom(conn, "cursor")?;
     if let Some(inserted) = report.capture(
+        conn,
         "cursor",
         sync_cursor(
             conn,
@@ -1370,13 +1416,15 @@ fn sync_basic(
             &home.join(".cursor/projects"),
             &mut coverage,
         ),
-    ) {
+    )? {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);
     }
     capture_progress("grok", 0, None);
     check_capture_cancelled()?;
+    ensure_source_headroom(conn, "grok")?;
     if let Some(inserted) = report.capture(
+        conn,
         "grok",
         sync_grok_with_coverage(
             conn,
@@ -1384,21 +1432,24 @@ fn sync_basic(
             &roots.grok.join("sessions"),
             &mut coverage,
         ),
-    ) {
+    )? {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);
     }
     capture_progress("trajectory", 0, None);
     check_capture_cancelled()?;
+    ensure_source_headroom(conn, "trajectory")?;
     if let Some(inserted) = report.capture(
+        conn,
         "trajectory",
         sync_trajectories(conn, &mut state, home, &mut coverage),
-    ) {
+    )? {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);
     }
     capture_progress("opencode", 0, None);
     check_capture_cancelled()?;
+    ensure_source_headroom(conn, "opencode")?;
     let opencode = roots.opencode_db.clone();
     let opencode_storage = roots.opencode_storage_dir.clone();
     // One owner, two layouts: `opencode.db` when the host has it, the legacy
@@ -1418,7 +1469,7 @@ fn sync_basic(
         }
         None => Ok(0),
     };
-    if let Some(open_inserted) = report.capture("opencode", opencode_result) {
+    if let Some(open_inserted) = report.capture(conn, "opencode", opencode_result)? {
         match &layout {
             Some(crate::ingest::opencode::OpencodeLayout::Sqlite(_)) => {
                 sync_note!("  [opencode] +{open_inserted} rows");
@@ -2830,6 +2881,7 @@ fn sync_jsonl_incremental(
     let mut consumed = offset;
     let ingest = {
         let mut run = || -> Result<()> {
+            ensure_capture_headroom(conn)?;
             conn.execute_batch("BEGIN")?;
             let mut pending = 0usize;
             let mut line = String::new();
@@ -2853,6 +2905,7 @@ fn sync_jsonl_incremental(
                         source.committed_cursor(consumed, false)?.to_value(),
                     );
                     checkpoint(state);
+                    ensure_capture_headroom(conn)?;
                     conn.execute_batch("BEGIN")?;
                     pending = 0;
                 }
@@ -3243,6 +3296,8 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                 seen.insert(key, json!({ "stamp": stamp }));
                 continue;
             };
+            // One rollout is one transaction against the retention budget.
+            ensure_capture_headroom(conn)?;
             scanned += 1;
             if meta.is_subagent {
                 // Earlier syncs (before subagent detection) registered these
@@ -5364,6 +5419,10 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
             transcript_cursor::forget_locator_cursor(conn, "claude", &path)?;
         }
         scanned += 1;
+        // Asked before the read: a transcript that cannot be written at the
+        // retention cap is not worth parsing, and the stop has to land before
+        // this file's cursor is published.
+        ensure_capture_headroom(conn)?;
         // Resumed for the same reason hydration resumes it: a sync over a
         // fleet machine's transcripts should read what arrived, not what is
         // there.
@@ -8863,6 +8922,7 @@ fn sync_cursor_with_hooks(
         .with_context(|| format!("prepare Cursor transcripts from {}", root.display()))?;
     // Match rollback to the source-wide checkpoint boundary: replaying committed
     // prompts after a file's mtime changes can duplicate them.
+    ensure_capture_headroom(conn)?;
     let tx = conn.unchecked_transaction()?;
     let mut inserted = 0;
     let mut cursor_state = prepared.cursor_state;
@@ -10035,6 +10095,7 @@ fn sync_grok_with_coverage(
             }
         }
         scanned += 1;
+        ensure_capture_headroom(conn)?;
         match scan_grok_session_file(&chat) {
             Ok(Some(session)) => {
                 let raw_path = chat.to_string_lossy().to_string();
@@ -10043,7 +10104,16 @@ fn sync_grok_with_coverage(
                 // replaced, not merged, and a reader must never see the gap
                 // between the two halves of that.
                 let tx = conn.unchecked_transaction()?;
-                let outcome = ingest_grok_session(&tx, &session, &raw_path)?;
+                let outcome = match ingest_grok_session(&tx, &session, &raw_path) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        // A retention abort ends the pass once this session
+                        // has rolled back; every later session would meet
+                        // the same budget.
+                        drop(tx);
+                        return Err(annotate_retention_limit(conn, error));
+                    }
+                };
                 inserted += outcome.prompts;
                 tx.commit()?;
                 // Whether this session has any evidence to go looking for on
@@ -11605,9 +11675,10 @@ fn sync_trajectories(
                 r.get(0)
             })
             .ok();
+        ensure_capture_headroom(conn)?;
         if let Err(error) = upsert_trajectory(conn, &row) {
             if is_delivery_retention_limit(&error) {
-                return Err(error);
+                return Err(annotate_retention_limit(conn, error));
             }
             errors += 1;
             coverage.note_unread();
@@ -12525,20 +12596,49 @@ mod tests {
 
     #[test]
     fn a_failed_source_does_not_prevent_later_sources_from_completing() {
+        let conn = Connection::open_in_memory().unwrap();
         let mut report = SyncSourceReport::default();
         assert!(report
-            .capture::<usize>("broken", Err(anyhow::anyhow!("bad source")))
+            .capture::<usize>(&conn, "broken", Err(anyhow::anyhow!("bad source")))
+            .unwrap()
             .is_none());
-        assert_eq!(report.capture("healthy", Ok(7)), Some(7));
+        assert_eq!(report.capture(&conn, "healthy", Ok(7)).unwrap(), Some(7));
         assert_eq!(report.succeeded, 1);
         assert_eq!(report.failures.len(), 1);
         assert!(report.finish(std::path::Path::new("unused.db")).is_ok());
 
         let mut all_failed = SyncSourceReport::default();
-        all_failed.capture::<usize>("only", Err(anyhow::anyhow!("still bad")));
+        all_failed
+            .capture::<usize>(&conn, "only", Err(anyhow::anyhow!("still bad")))
+            .unwrap();
         assert!(all_failed
             .finish(std::path::Path::new("unused.db"))
             .is_err());
+    }
+
+    /// A source that stopped at the retention cap ends the pass with its
+    /// typed cause instead of joining the partial-source policy.
+    #[cfg(feature = "export")]
+    #[test]
+    fn a_retention_stop_ends_the_pass_with_its_typed_cause() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::init_db(&conn).unwrap();
+        let mut report = SyncSourceReport::default();
+        let abort = anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER),
+            Some("delivery retention limit exceeded; compact consumed data".into()),
+        ));
+        let error = report
+            .capture::<usize>(&conn, "codex", Err(abort))
+            .unwrap_err();
+        assert!(crate::export::is_retention_limit(&error));
+        let usage = crate::export::retention_limit_usage(&error).unwrap();
+        assert_eq!(
+            (usage.used_bytes, usage.limit_bytes),
+            crate::export::retained_bytes(&conn).unwrap()
+        );
+        assert!(error.to_string().contains("codex"), "{error:#}");
+        assert!(report.failures.is_empty());
     }
 
     #[test]
