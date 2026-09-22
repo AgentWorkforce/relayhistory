@@ -606,18 +606,27 @@ fn cycle_report(verdicts: &Verdicts, retention: Option<(i64, i64)>) -> serde_jso
     })
 }
 
-/// The verdicts the persisted report already holds. A report that cannot be
-/// read carries nothing: the next pass of each kind re-establishes its side.
-fn saved_verdicts(directory: &Path) -> Verdicts {
+/// The persisted report: when it was written, and the verdict it holds on each
+/// side. A report that cannot be read carries nothing, and the next pass of
+/// each kind re-establishes its side.
+#[derive(Default)]
+struct SavedReport {
+    at_ms: i64,
+    verdicts: Verdicts,
+}
+fn saved_report(directory: &Path) -> SavedReport {
     let side = |report: &serde_json::Value, name: &str| {
         report[name]["error_class"].as_str().map(str::to_owned)
     };
     fs::read(directory.join("cycle.json"))
         .ok()
         .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok())
-        .map(|report| Verdicts {
-            capture: side(&report, "capture"),
-            delivery: side(&report, "delivery"),
+        .map(|report| SavedReport {
+            at_ms: report["at_ms"].as_i64().unwrap_or_default(),
+            verdicts: Verdicts {
+                capture: side(&report, "capture"),
+                delivery: side(&report, "delivery"),
+            },
         })
         .unwrap_or_default()
 }
@@ -641,29 +650,59 @@ fn write_cycle_report(directory: &Path, verdicts: &Verdicts, mut diagnostics: im
     }
 }
 
-/// Report one pass. A pass that only delivered observed nothing about capture,
-/// so the last capture verdict stands: a full journal stays visible, with its
-/// numbers, between the capture cycles that measure it.
-fn persist_cycle_report(directory: &Path, outcome: &PassOutcome, diagnostics: impl Write) {
+/// Report one pass, which began at `started_ms`. A pass that only delivered
+/// observed nothing about capture, so the last capture verdict stands: a full
+/// journal stays visible, with its numbers, between the capture cycles that
+/// measure it.
+///
+/// A compaction that reported while this pass ran has re-measured the cap the
+/// pass observed, and its answer is the current one. The older reading is
+/// dropped rather than putting a resolved condition back on screen until
+/// another pass measures it again.
+fn persist_cycle_report(
+    directory: &Path,
+    outcome: &PassOutcome,
+    started_ms: i64,
+    diagnostics: impl Write,
+) {
+    let saved = saved_report(directory);
+    let recompacted = saved.at_ms > started_ms;
+    let current = |observed: Option<String>, saved: &Option<String>| match (&observed, saved) {
+        (Some(class), None) if recompacted && class == "retention_limit" => None,
+        _ => observed,
+    };
     let verdicts = Verdicts {
         capture: match &outcome.capture {
-            Some(result) => verdict(result),
-            None => saved_verdicts(directory).capture,
+            Some(result) => current(verdict(result), &saved.verdicts.capture),
+            None => saved.verdicts.capture.clone(),
         },
-        delivery: verdict(&outcome.delivery),
+        delivery: current(verdict(&outcome.delivery), &saved.verdicts.delivery),
     };
     write_cycle_report(directory, &verdicts, diagnostics);
 }
 
-/// Re-measure a retention verdict after compaction: a journal back under its
-/// cap is no longer full, and one still over it reports its new usage. Without
-/// a retention verdict to revisit there is nothing to report.
-pub(super) fn refresh_retention_verdict(directory: &Path, diagnostics: impl Write) {
-    let mut verdicts = saved_verdicts(directory);
+/// Re-measure a retention verdict after a compaction pass that reclaimed
+/// `reclaimed_bytes`.
+///
+/// The cap rejects the write that would exceed it without recording it, so a
+/// journal that is full for the next record still reads below its cap: usage
+/// alone never shows the condition, and only reclaiming space changes it. A
+/// pass that freed space and left the journal under its cap therefore clears
+/// the verdict, and one that freed nothing — a cap held by un-uploaded backlog
+/// — leaves it standing with the current reading. Either way the next capture
+/// or delivery pass measures the condition itself.
+pub(super) fn refresh_retention_verdict(
+    directory: &Path,
+    reclaimed_bytes: i64,
+    diagnostics: impl Write,
+) {
+    let mut verdicts = saved_report(directory).verdicts;
     if !verdicts.retention_limited() {
         return;
     }
-    if read_retention(directory).is_some_and(|(used, limit)| used < limit) {
+    let resolved =
+        reclaimed_bytes > 0 && read_retention(directory).is_some_and(|(used, limit)| used < limit);
+    if resolved {
         for class in [&mut verdicts.capture, &mut verdicts.delivery] {
             if class.as_deref() == Some("retention_limit") {
                 *class = None;
@@ -942,6 +981,7 @@ pub fn run_background(directory: &Path, startup_id: &str) -> Result<()> {
     };
     let mut capture_due = Instant::now();
     while !stopping(&stop.cancelled) {
+        let started_ms = now();
         let outcome = if Instant::now() >= capture_due {
             capture_due = Instant::now() + Duration::from_secs(60);
             // A pass that cannot start reports one local fault on the delivery
@@ -960,7 +1000,7 @@ pub fn run_background(directory: &Path, startup_id: &str) -> Result<()> {
         if stopping(&stop.cancelled) {
             break;
         }
-        persist_cycle_report(directory, &outcome, std::io::stderr());
+        persist_cycle_report(directory, &outcome, started_ms, std::io::stderr());
         let deadline = Instant::now() + pass_interval(backlog_pending(directory, &config));
         while !stopping(&stop.cancelled) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
@@ -1735,7 +1775,7 @@ mod tests {
             Some("delivery retention limit exceeded; secret".into()),
         ))
     }
-    fn saved_report(directory: &Path) -> serde_json::Value {
+    fn saved_cycle(directory: &Path) -> serde_json::Value {
         serde_json::from_slice(&fs::read(directory.join("cycle.json")).unwrap()).unwrap()
     }
     fn capped_directory(limit_bytes: i64) -> tempfile::TempDir {
@@ -1756,9 +1796,9 @@ mod tests {
             capture: Some(Err(retention_error())),
             delivery: Ok(()),
         };
-        persist_cycle_report(directory.path(), &full, Vec::new());
+        persist_cycle_report(directory.path(), &full, now(), Vec::new());
         assert_eq!(
-            saved_report(directory.path())["error_class"],
+            saved_cycle(directory.path())["error_class"],
             "retention_limit"
         );
 
@@ -1766,10 +1806,11 @@ mod tests {
             persist_cycle_report(
                 directory.path(),
                 &PassOutcome::delivery_only(Ok(())),
+                now(),
                 Vec::new(),
             );
         }
-        let report = saved_report(directory.path());
+        let report = saved_cycle(directory.path());
         assert_eq!(report["ok"], false);
         assert_eq!(report["error_class"], "retention_limit");
         assert_eq!(
@@ -1787,9 +1828,10 @@ mod tests {
                 capture: Some(Ok(())),
                 delivery: Ok(()),
             },
+            now(),
             Vec::new(),
         );
-        let report = saved_report(directory.path());
+        let report = saved_cycle(directory.path());
         assert_eq!(report["ok"], true);
         assert!(report["error_class"].is_null());
         assert!(report["message"].is_null());
@@ -1806,9 +1848,10 @@ mod tests {
                 capture: Some(Ok(())),
                 delivery: Err(anyhow::anyhow!("synthetic transport failure")),
             },
+            now(),
             Vec::new(),
         );
-        let report = saved_report(directory.path());
+        let report = saved_cycle(directory.path());
         assert_eq!(report["ok"], false);
         assert_eq!(report["error_class"], "capture_error");
         assert_eq!(
@@ -1823,9 +1866,10 @@ mod tests {
                 capture: Some(Err(retention_error())),
                 delivery: Err(anyhow::anyhow!("synthetic transport failure")),
             },
+            now(),
             Vec::new(),
         );
-        let report = saved_report(directory.path());
+        let report = saved_cycle(directory.path());
         assert_eq!(report["error_class"], "retention_limit");
         assert_eq!(report["delivery"]["error_class"], "capture_error");
     }
@@ -1836,7 +1880,7 @@ mod tests {
     fn compaction_refreshes_the_retention_verdict_it_resolved() {
         let directory = capped_directory(10 * 1_048_576);
         // Without a persisted verdict there is nothing to refresh.
-        refresh_retention_verdict(directory.path(), Vec::new());
+        refresh_retention_verdict(directory.path(), 4_096, Vec::new());
         assert!(!directory.path().join("cycle.json").exists());
 
         persist_cycle_report(
@@ -1845,10 +1889,18 @@ mod tests {
                 capture: Some(Err(retention_error())),
                 delivery: Err(retention_error()),
             },
+            now(),
             Vec::new(),
         );
-        refresh_retention_verdict(directory.path(), Vec::new());
-        let report = saved_report(directory.path());
+        // A pass that reclaimed nothing leaves the verdict standing: the cap
+        // is held by records compaction cannot touch.
+        refresh_retention_verdict(directory.path(), 0, Vec::new());
+        assert_eq!(
+            saved_cycle(directory.path())["error_class"],
+            "retention_limit"
+        );
+        refresh_retention_verdict(directory.path(), 4_096, Vec::new());
+        let report = saved_cycle(directory.path());
         assert_eq!(report["ok"], true);
         assert!(report["capture"]["error_class"].is_null());
         assert!(report["delivery"]["error_class"].is_null());
@@ -1866,11 +1918,64 @@ mod tests {
                 capture: Some(Err(retention_error())),
                 delivery: Ok(()),
             },
+            now(),
             Vec::new(),
         );
-        refresh_retention_verdict(directory.path(), Vec::new());
+        refresh_retention_verdict(directory.path(), 4_096, Vec::new());
         assert_eq!(
-            saved_report(directory.path())["error_class"],
+            saved_cycle(directory.path())["error_class"],
+            "retention_limit"
+        );
+    }
+
+    /// A pass reports what it observed, and a compaction that reported while
+    /// it ran has since re-measured the same cap: the banner the user cleared
+    /// does not come back for a pass interval.
+    #[test]
+    fn a_compaction_during_a_pass_outranks_the_reading_it_invalidated() {
+        let directory = capped_directory(10 * 1_048_576);
+        persist_cycle_report(
+            directory.path(),
+            &PassOutcome {
+                capture: Some(Err(retention_error())),
+                delivery: Ok(()),
+            },
+            now(),
+            Vec::new(),
+        );
+        // A pass starts, observes the cap, and a compaction resolves it while
+        // that pass is still running.
+        let pass_started = now();
+        std::thread::sleep(Duration::from_millis(2));
+        refresh_retention_verdict(directory.path(), 4_096, Vec::new());
+        assert_eq!(saved_cycle(directory.path())["ok"], true);
+
+        persist_cycle_report(
+            directory.path(),
+            &PassOutcome {
+                capture: Some(Err(retention_error())),
+                delivery: Err(retention_error()),
+            },
+            pass_started,
+            Vec::new(),
+        );
+        let report = saved_cycle(directory.path());
+        assert_eq!(report["ok"], true);
+        assert!(report["capture"]["error_class"].is_null());
+        assert!(report["delivery"]["error_class"].is_null());
+
+        // A pass that starts after the compaction reports what it measured.
+        persist_cycle_report(
+            directory.path(),
+            &PassOutcome {
+                capture: Some(Err(retention_error())),
+                delivery: Ok(()),
+            },
+            now(),
+            Vec::new(),
+        );
+        assert_eq!(
+            saved_cycle(directory.path())["error_class"],
             "retention_limit"
         );
     }
