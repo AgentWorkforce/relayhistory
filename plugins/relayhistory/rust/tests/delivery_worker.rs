@@ -1666,3 +1666,76 @@ fn a_cap_refusal_of_a_batch_write_is_recovered_or_reported() {
     assert_eq!(reported.statuses[0].acknowledged_records, 6);
     assert_eq!(journal_events(&fixture.conn), 1);
 }
+
+/// The prepared limit bounds the destination body as retained, so a body that
+/// serializes past it is the receiver's invalid payload rather than a capacity
+/// failure: nothing is stored and the job blocks. A body whose retained size
+/// is exactly the limit is delivered, and every stored row stays inside the
+/// share the reserve gives it.
+#[test]
+fn a_body_that_exceeds_the_stored_prepared_limit_is_the_receivers_invalid_payload() {
+    let fixture = fixture();
+    let limits = DeliveryLimits {
+        max_prepared_bytes: 4_096,
+        ..DeliveryLimits::default()
+    };
+    let job = create_job(
+        &fixture.conn,
+        &DeliveryJobConfig {
+            limits: limits.clone(),
+            ..config("one")
+        },
+        0,
+    )
+    .unwrap();
+    let escaped = |len: usize| {
+        Box::new(move |_: &HistoryExportBatch| {
+            Ok(PreparedBody {
+                content_type: "application/json".into(),
+                body: "\"".repeat(len),
+            })
+        })
+    };
+
+    // Under the limit as a body, over it once escaped and enveloped.
+    let oversized = Fake {
+        prepare: escaped(4_096),
+        send: Box::new(|_, _| panic!("a payload the limit refused is never sent")),
+        ..Fake::default()
+    };
+    let refused = run(&fixture.path(), &one(&oversized), &options());
+    assert!(refused.issues.is_empty(), "not a capacity failure");
+    assert_eq!(refused.statuses[0].state, "blocked");
+    assert_eq!(
+        refused.statuses[0].failure.as_deref(),
+        Some("invalid_payload")
+    );
+    assert_eq!(refused.statuses[0].acknowledged_records, 0);
+    assert!(fixture
+        .conn
+        .query_row("SELECT prepared IS NULL FROM delivery_batches", [], |r| {
+            r.get::<_, bool>(0)
+        })
+        .unwrap());
+
+    // The same body one escaped character shorter fits exactly.
+    retry_job(&fixture.conn, &job.job_id).unwrap();
+    let envelope = PreparedPayload::stored("1", "application/json", "")
+        .retained_bytes()
+        .unwrap();
+    let fitting = Fake {
+        prepare: escaped((4_096 - envelope) / 2),
+        ..Fake::default()
+    };
+    let delivered = run(&fixture.path(), &one(&fitting), &options());
+    assert!(delivered.issues.is_empty());
+    assert_eq!(delivered.statuses[0].acknowledged_records, 3);
+    // Both stored columns stay within the per-row share the reserve assumes.
+    let (payload, prepared): (i64, i64) = fixture.conn.query_row(
+        "SELECT COALESCE(MAX(length(CAST(payload AS BLOB))),0),COALESCE(MAX(length(CAST(prepared AS BLOB))),0) FROM delivery_batches",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ).unwrap();
+    assert!(payload <= limits.max_batch_bytes as i64);
+    assert!(prepared <= limits.max_prepared_bytes as i64);
+}

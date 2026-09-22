@@ -64,6 +64,9 @@ fn prepare(conn: &Connection, claim: &ClaimedBatch, now: i64) {
     )
     .unwrap();
 }
+fn batch_bytes(conn: &Connection) -> i64 {
+    conn.query_row("SELECT COALESCE(SUM(coalesce(length(CAST(payload AS BLOB)),0)+coalesce(length(CAST(prepared AS BLOB)),0)+512),0) FROM delivery_batches",[],|r| r.get(0)).unwrap()
+}
 fn drain(conn: &Connection, id: &str) -> Vec<HistoryExportRecord> {
     let mut records = vec![];
     for step in 0..100 {
@@ -827,6 +830,80 @@ fn a_finished_member_does_not_pin_the_consumed_floor() {
     prepare(&conn, &first, 1);
     acknowledge(&conn, &first.lease, &ack(&first), &|| 2).unwrap();
     assert_eq!(drain(&conn, &job.job_id).len(), 4);
+}
+
+/// A destination body is retained as a JSON envelope, where escaping can
+/// double it. The configured prepared limit bounds those stored bytes, so a
+/// body that fills it exactly is stored with the journal at the cap — the
+/// reserve covers one whole batch row — and one that would overflow it is
+/// refused with the row untouched.
+#[test]
+fn the_prepared_limit_bounds_the_stored_envelope_not_the_body() {
+    let conn = db();
+    let mut cfg = config("one");
+    cfg.limits.max_prepared_bytes = 4_096;
+    let job = create_job(&conn, &cfg, 0).unwrap();
+    event(&conn, "a", "retained revision");
+    // Every byte after this point comes out of the batch reserve.
+    let (used, _) = retained_bytes(&conn).unwrap();
+    set_retention_limit(&conn, used).unwrap();
+    let claim = claim(&conn, &job.job_id, 1).unwrap();
+
+    // A body of quote characters: each is two bytes once escaped.
+    let stored_len = |body: &str| {
+        serde_json::to_string(&PreparedPayload {
+            mapping_version: "1".into(),
+            content_type: "application/json".into(),
+            body: body.into(),
+            sha256: "0".repeat(64),
+        })
+        .unwrap()
+        .len()
+    };
+    let envelope = stored_len("");
+    let room = 4_096 - envelope;
+    let exact = "\"".repeat(room / 2) + &"a".repeat(room % 2);
+    assert_eq!(stored_len(&exact), 4_096);
+    assert!(
+        exact.len() < 4_096,
+        "the body itself is well under the limit"
+    );
+
+    let oversized = "\"".repeat(4_096);
+    let refused = store_prepared_payload(
+        &conn,
+        &claim.lease,
+        "1",
+        "application/json",
+        &oversized,
+        &|| 1,
+    )
+    .unwrap_err();
+    assert!(refused
+        .to_string()
+        .contains("prepared delivery payload too large"));
+    assert!(!is_retention_limit(&refused));
+    assert_eq!(retained_bytes(&conn).unwrap().0, used + batch_bytes(&conn));
+    assert!(conn
+        .query_row("SELECT prepared IS NULL FROM delivery_batches", [], |r| {
+            r.get::<_, bool>(0)
+        })
+        .unwrap());
+
+    store_prepared_payload(&conn, &claim.lease, "1", "application/json", &exact, &|| 1).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT length(CAST(prepared AS BLOB)) FROM delivery_batches",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        4_096
+    );
+    acknowledge(&conn, &claim.lease, &ack(&claim), &|| 2).unwrap();
+    compact_journal(&conn, 100).unwrap();
+    compact_receipts(&conn, 100).unwrap();
+    assert_eq!(retained_bytes(&conn).unwrap().0, 0);
 }
 
 #[test]

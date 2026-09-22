@@ -59,6 +59,8 @@ pub struct DeliveryLimits {
     pub max_batch_bytes: usize,
     /// Bounds both bootstrap and journal scans, including excluded rows.
     pub max_scan_records: usize,
+    /// Bounds the destination body as retained: the JSON envelope around it,
+    /// not the body's own length.
     pub max_prepared_bytes: usize,
 }
 impl Default for DeliveryLimits {
@@ -115,6 +117,23 @@ pub struct PreparedPayload {
     pub content_type: String,
     pub body: String,
     pub sha256: String,
+}
+impl PreparedPayload {
+    /// The destination body as it is retained: a JSON envelope whose escaping
+    /// of the body can far exceed the body's own length.
+    pub fn stored(mapping_version: &str, content_type: &str, body: &str) -> Self {
+        Self {
+            mapping_version: mapping_version.into(),
+            content_type: content_type.into(),
+            body: body.into(),
+            sha256: hash(body),
+        }
+    }
+    /// The exact bytes the batch row holds for this payload, which is what
+    /// `max_prepared_bytes` bounds and what the retention cap accounts for.
+    pub fn retained_bytes(&self) -> Result<usize> {
+        Ok(serde_json::to_vec(self)?.len())
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ClaimedBatch {
@@ -877,8 +896,10 @@ pub fn store_prepared_payload(
         mapping_version == job.config.mapping_version,
         "destination mapping version mismatch"
     );
+    let payload = PreparedPayload::stored(mapping_version, content_type, body);
+    let retained = serde_json::to_string(&payload)?;
     ensure!(
-        body.len() <= job.config.limits.max_prepared_bytes,
+        retained.len() <= job.config.limits.max_prepared_bytes,
         "prepared delivery payload too large"
     );
     let (batch, stored, _) =
@@ -890,12 +911,6 @@ pub fn store_prepared_payload(
             "delivery batch is now excluded"
         );
     }
-    let payload = PreparedPayload {
-        mapping_version: mapping_version.into(),
-        content_type: content_type.into(),
-        body: body.into(),
-        sha256: hash(body),
-    };
     if let Some(stored) = stored {
         ensure!(
             stored == payload,
@@ -905,7 +920,7 @@ pub fn store_prepared_payload(
     }
     tx.execute(
         "UPDATE delivery_batches SET prepared=? WHERE id=?",
-        params![serde_json::to_string(&payload)?, lease.batch_id],
+        params![retained, lease.batch_id],
     )?;
     tx.commit()?;
     Ok(payload)

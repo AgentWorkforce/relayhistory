@@ -706,10 +706,17 @@ impl Worker<'_> {
             if stopping() {
                 return Err(transient());
             }
+            let retained = PreparedPayload::stored(
+                receiver.mapping_version(),
+                &prepared.content_type,
+                &prepared.body,
+            )
+            .retained_bytes()
+            .map_err(|_| transient())?;
             if prepared.content_type.is_empty()
                 || prepared.content_type.len() > 200
                 || prepared.content_type.contains(['\r', '\n'])
-                || prepared.body.len() > config.limits.max_prepared_bytes
+                || retained > config.limits.max_prepared_bytes
             {
                 return Err(DeliveryFailure::InvalidPayload.into());
             }
