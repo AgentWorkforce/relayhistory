@@ -269,31 +269,41 @@ fn numeric_fields(map: Map<String, Value>) -> Map<String, Value> {
         .collect::<Map<_, _>>()
 }
 
+/// The top-level transcript envelope. `steps` — the full duplicated session —
+/// and every other unlisted key are walked by the parser but never
+/// materialized: serde skips them through `IgnoredAny`, so reading a large
+/// transcript costs the envelope, not the steps tree.
+#[derive(serde::Deserialize)]
+struct DevinTranscriptEnvelope {
+    agent: Option<DevinAgentMeta>,
+    schema_version: Option<Value>,
+    final_metrics: Option<Value>,
+}
+
+#[derive(serde::Deserialize)]
+struct DevinAgentMeta {
+    name: Option<String>,
+    version: Option<String>,
+    model_name: Option<String>,
+}
+
 /// Read the `agent` envelope and `final_metrics` of `transcripts/<id>.json`.
 ///
-/// The transcript `steps` duplicate `message_nodes`, so they are never read
-/// here. A missing or malformed transcript is not an error: the database is
+/// A missing or malformed transcript is not an error: the database is
 /// authoritative and `None` simply means no envelope was recorded.
 fn load_transcript_meta(path: &Path) -> Option<DevinTranscriptMeta> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let value: Value = serde_json::from_str(&text).ok()?;
-    let agent = value.get("agent").and_then(Value::as_object);
+    let file = std::fs::File::open(path).ok()?;
+    let envelope: DevinTranscriptEnvelope =
+        serde_json::from_reader(std::io::BufReader::new(file)).ok()?;
+    let agent = envelope.agent;
     Some(DevinTranscriptMeta {
-        agent_name: agent
-            .and_then(|a| a.get("name"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        agent_version: agent
-            .and_then(|a| a.get("version"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        model_name: agent
-            .and_then(|a| a.get("model_name"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        schema_version: value.get("schema_version").cloned(),
-        final_metrics: value
-            .get("final_metrics")
+        agent_name: agent.as_ref().and_then(|a| a.name.clone()),
+        agent_version: agent.as_ref().and_then(|a| a.version.clone()),
+        model_name: agent.as_ref().and_then(|a| a.model_name.clone()),
+        schema_version: envelope.schema_version,
+        final_metrics: envelope
+            .final_metrics
+            .as_ref()
             .and_then(Value::as_object)
             .cloned()
             .map(numeric_fields),
@@ -658,6 +668,32 @@ fn normalize_inner(
             .cloned();
         let Some(message) = node.message.as_ref() else {
             counts.malformed_nodes += 1;
+            // Record the gap under the node's own message id: children that
+            // name this node as their parent then anchor to an addressable
+            // row instead of dangling.
+            let uid = format!("n{}:malformed", node.node_id);
+            present_markers.insert(uid.clone());
+            counts.markers += insert_session_marker(
+                conn,
+                SOURCE,
+                session_id,
+                &NewSessionMarker {
+                    marker_uid: &uid,
+                    ts_ms: Some(ts),
+                    message_id: Some(&message_id),
+                    parent_id: parent_id.as_deref(),
+                    turn_id: None,
+                    kind: "malformed_node",
+                    subkind: None,
+                    text: node
+                        .node_metadata
+                        .as_ref()
+                        .and_then(|m| serde_json::to_string(m).ok())
+                        .map(|s| super::truncate_marker_text(&s))
+                        .as_deref(),
+                    payload_json: None,
+                },
+            )?;
             continue;
         };
         let meta = message.get("metadata").and_then(Value::as_object);
@@ -1272,7 +1308,13 @@ fn normalize_inner(
         }
     }
 
-    let first_ts = first_ts.or(loaded.info.created_ms).unwrap_or(0);
+    // The session's own `created_at` can precede every node timestamp;
+    // earliest activity is the minimum of the two, not the first node.
+    let first_ts = [first_ts, loaded.info.created_ms]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(0);
     let last_ts = last_ts.or(loaded.info.last_activity_ms).unwrap_or(first_ts);
     let last_ts = last_ts.max(loaded.info.last_activity_ms.unwrap_or(last_ts));
     super::upsert_session_rebuilt(
@@ -1406,11 +1448,29 @@ fn reassign_shared_prompts(
     .map_err(Into::into)
 }
 
-/// Remove every canonical row a previously indexed session left behind: the
-/// provider says it is gone or hidden, so its evidence must go too.
-/// Deleting the `sessions` row cascades markers, presences, observations and
-/// hydration state through the catalog's own delete triggers.
+/// Remove the local footprint of a previously indexed session: the provider
+/// says it is gone or hidden, so the evidence the local pass wrote must go
+/// too — otherwise a hidden local transcript stays searchable forever.
+///
+/// The `(source, session_id)` catalog identity is shared between local and
+/// remote acquisition, so when a remote presence or remote observation
+/// survives, the catalog row and the remote rows are kept and the session
+/// stays visible as remote-only. Remote connector evidence lives in
+/// `observation_evidence`, keyed per observation — it never touches the
+/// canonical tables, so the canonical rows removed here are always the local
+/// pass's own output.
 fn retire_session(conn: &Connection, session_id: &str) -> Result<()> {
+    let has_remote: bool = conn.query_row(
+        "SELECT EXISTS(\
+           SELECT 1 FROM session_presences \
+           WHERE source = 'devin' AND session_id = ?1 AND location = 'remote'\
+         ) OR EXISTS(\
+           SELECT 1 FROM session_observations \
+           WHERE source = 'devin' AND session_id = ?1 AND location = 'remote'\
+         )",
+        [session_id],
+        |row| row.get(0),
+    )?;
     reassign_shared_prompts(conn, session_id, "[]")?;
     conn.execute(
         "DELETE FROM history WHERE source = 'devin' AND session_id = ?1",
@@ -1429,9 +1489,35 @@ fn retire_session(conn: &Connection, session_id: &str) -> Result<()> {
         [session_id],
     )?;
     conn.execute(
-        "DELETE FROM sessions WHERE source = 'devin' AND session_id = ?1",
+        "DELETE FROM session_markers WHERE source = 'devin' AND session_id = ?1",
         [session_id],
     )?;
+    // Only the local footprint goes: remote presences, remote observations
+    // and remote hydration state belong to a session that still exists.
+    conn.execute(
+        "DELETE FROM session_presences \
+         WHERE source = 'devin' AND session_id = ?1 AND location = 'local'",
+        [session_id],
+    )?;
+    conn.execute(
+        "DELETE FROM session_observations \
+         WHERE source = 'devin' AND session_id = ?1 AND location = 'local'",
+        [session_id],
+    )?;
+    conn.execute(
+        "DELETE FROM session_hydration_checkpoints \
+         WHERE source = 'devin' AND session_id = ?1 AND location = 'local'",
+        [session_id],
+    )?;
+    if !has_remote {
+        // No surviving remote view of the session: the catalog row goes, and
+        // its delete triggers cascade whatever presence, observation,
+        // relationship and hydration rows remain.
+        conn.execute(
+            "DELETE FROM sessions WHERE source = 'devin' AND session_id = ?1",
+            [session_id],
+        )?;
+    }
     Ok(())
 }
 

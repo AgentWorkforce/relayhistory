@@ -1555,10 +1555,28 @@ fn source_snapshot(
                 ),
             )
         })?;
+        // records_parsed must reflect the provider rows the pass reads: the
+        // session row, its message_nodes, and whatever tool_call_state holds.
+        // `tool_call_state` predates nothing — an older store may lack it, so
+        // its count is best-effort like the stamp's.
+        let nodes: i64 = src
+            .query_row(
+                "SELECT COUNT(*) FROM message_nodes WHERE session_id = ?1",
+                params![options.session_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        let tools: i64 = src
+            .query_row(
+                "SELECT COUNT(*) FROM tool_call_state WHERE session_id = ?1",
+                params![options.session_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
         return Ok(SourceSnapshot {
             stamp,
             bytes: 0,
-            records: SnapshotRecords::Counted(0),
+            records: SnapshotRecords::Counted(1 + nodes + tools),
             path: Some(path),
             claude_transcript: None,
             claude_subagents: Vec::new(),

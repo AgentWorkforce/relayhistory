@@ -2598,6 +2598,10 @@ fn open_devin_snapshot(scan: &ScanEnv<'_>) -> Result<DevinReadSnapshot> {
         let conn = open_db_readonly(&db)?;
         scan.note_open();
         conn.execute_batch("PRAGMA query_only = ON; BEGIN DEFERRED")?;
+        // The stamp function lives on the connection, so it must be
+        // registered on the retained snapshot too — candidates stamp from the
+        // same content-sensitive tuple sync and hydration use.
+        crate::ingest::devin::register_stamp_fn(&conn)?;
         // An existing but partially initialized sessions.db is not a Devin
         // store: sync returns empty for it, and discovery must too rather
         // than failing the whole pass. Empty `session_columns` short-circuits
@@ -2816,21 +2820,34 @@ impl ShallowSessionProvider for DevinProvider {
                 )
             })
             .collect();
+        // The stamp must be content-sensitive: `store_identity` only tracks
+        // database replacement and schema generation, and created/updated
+        // timestamps do not move on an in-place `chat_message` rewrite. Reuse
+        // the sync/hydration stamp so a cached first_prompt, model, workspace
+        // or cwd is refreshed whenever the evidence behind it changed.
+        let transcripts = crate::ingest::devin::transcripts_dir(scan.devin_dir);
         Ok(rows
             .into_iter()
-            .map(|(id, _cwd, _dirs, created, updated, _model)| Candidate {
-                source: "devin",
-                locator: id.clone(),
-                session_id: Some(id),
-                recency_hint_ms: updated
-                    .or(created)
-                    .map(|s| s.saturating_mul(1000)),
-                stamp: format!(
-                    "{}:{}:{}",
-                    snapshot.store_identity,
-                    created.unwrap_or(0),
-                    updated.unwrap_or(0)
-                ),
+            .map(|(id, _cwd, _dirs, created, updated, _model)| {
+                let content_stamp = crate::ingest::devin::session_stamp(
+                    &snapshot.conn,
+                    &id,
+                    &transcripts,
+                )
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| {
+                    format!("{}:{}", created.unwrap_or(0), updated.unwrap_or(0))
+                });
+                Candidate {
+                    source: "devin",
+                    locator: id.clone(),
+                    session_id: Some(id),
+                    recency_hint_ms: updated
+                        .or(created)
+                        .map(|s| s.saturating_mul(1000)),
+                    stamp: format!("{}:{}", snapshot.store_identity, content_stamp),
+                }
             })
             .collect())
     }

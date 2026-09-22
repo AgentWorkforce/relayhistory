@@ -737,3 +737,286 @@ fn devin_targeted_hydration_and_export() {
     let edits = session_file_edits(&conn, "devin-test", Some("devin")).unwrap();
     assert!(edits.is_empty() || edits.iter().all(|e| e.source == "devin"));
 }
+
+#[test]
+fn devin_discovery_stamp_tracks_in_place_content_rewrites() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let store = stage_devin_db(home, BASE_SESSION_SQL);
+    let db = home.join("history.db");
+    let conn = open_db(&db).unwrap();
+    let first_prompt = |conn: &Connection| -> String {
+        conn.query_row(
+            "SELECT first_prompt FROM sessions WHERE source='devin' AND session_id='devin-test'",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .unwrap()
+        .unwrap_or_default()
+    };
+    let discover = |conn: &Connection| {
+        let env =
+            DiscoveryEnv::with_roots(conn, home.to_path_buf(), home.join("missing-opencode.db"));
+        discover_sessions_with_env(
+            &env,
+            &DiscoverOptions {
+                scope: SessionScope::Local,
+                sources: vec!["devin".to_string()],
+                limit: None,
+            },
+            |_| {},
+        )
+        .unwrap();
+    };
+
+    discover(&conn);
+    assert_eq!(first_prompt(&conn), "first prompt");
+
+    // Rewrite the prompt in place: no new row, no created/last_activity bump.
+    // A timestamp-only stamp would keep serving the cached shallow row.
+    let provider = Connection::open(&store).unwrap();
+    provider
+        .execute_batch(
+            "UPDATE message_nodes SET chat_message = \
+             '{\"message_id\":\"u0\",\"role\":\"user\",\"content\":\"rewritten prompt\",\"metadata\":{\"is_user_input\":true},\"tool_calls\":null,\"thinking\":null,\"tool_call_id\":null,\"phase\":null}' \
+             WHERE session_id = 'devin-test' AND node_id = 0",
+        )
+        .unwrap();
+    drop(provider);
+
+    discover(&conn);
+    assert_eq!(
+        first_prompt(&conn),
+        "rewritten prompt",
+        "an in-place rewrite must refresh the cached shallow row"
+    );
+}
+
+#[test]
+fn devin_session_start_is_the_earliest_of_created_and_node_times() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    // BASE_SESSION_SQL records created_at = 1776643200, one second before the
+    // first node at 1776643201 — the session's start is the earlier value.
+    stage_devin_db(home, BASE_SESSION_SQL);
+    let _env = EnvGuard::set(home);
+    let db = home.join("history.db");
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+    let conn = open_db(&db).unwrap();
+    let first_ts: i64 = conn
+        .query_row(
+            "SELECT first_activity_ms FROM sessions WHERE source='devin' AND session_id='devin-test'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(first_ts, 1_776_643_200_000);
+}
+
+#[test]
+fn devin_hydration_reports_the_provider_records_it_parsed() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    stage_devin_db(home, BASE_SESSION_SQL);
+    let _env = EnvGuard::set(home);
+    let db = home.join("history.db");
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+    hydrate_session_at(
+        &db,
+        &HydrateSessionOptions {
+            source: "devin".into(),
+            session_id: "devin-test".into(),
+            scope: SessionScope::Local,
+            include_related: false,
+        },
+    )
+    .unwrap();
+    let conn = open_db(&db).unwrap();
+    // The pass reads the session row plus two message_nodes; the provider has
+    // no tool_call_state rows for it.
+    let parsed: i64 = conn
+        .query_row(
+            "SELECT records_parsed FROM session_hydration_checkpoints \
+             WHERE source='devin' AND session_id='devin-test' AND location='local'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        parsed, 3,
+        "records_parsed must count what was read, not zero"
+    );
+}
+
+#[test]
+fn devin_transcript_meta_reads_the_envelope_without_materializing_steps() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let cli_dir = stage_devin_db(home, BASE_SESSION_SQL)
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let _env = EnvGuard::set(home);
+    // A transcript whose `steps` dwarf the envelope: only `agent`,
+    // `schema_version` and `final_metrics` may be materialized.
+    let steps = format!("[{}]", vec!["{\"big\":1}"; 20_000].join(","));
+    let transcripts = cli_dir.join("transcripts");
+    fs::create_dir_all(&transcripts).unwrap();
+    fs::write(
+        transcripts.join("devin-test.json"),
+        format!(
+            "{{\"agent\":{{\"name\":\"devin\",\"version\":\"9.9.9\",\"model_name\":\"env-model\"}},\
+             \"schema_version\":2,\"final_metrics\":{{\"total_cost\":1.5}},\"steps\":{steps}}}"
+        ),
+    )
+    .unwrap();
+    let db = home.join("history.db");
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+    let conn = open_db(&db).unwrap();
+    let version: Option<String> = conn
+        .query_row(
+            "SELECT agent_version FROM session_events \
+             WHERE source='devin' AND session_id='devin-test' AND agent_version IS NOT NULL LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version.as_deref(), Some("9.9.9"));
+
+    // A malformed transcript falls back to the database's own metadata.
+    fs::write(transcripts.join("devin-test.json"), "{not json").unwrap();
+    let db2 = home.join("history2.db");
+    sync_scoped_at(&db2, SessionScope::Local).unwrap();
+    let conn = open_db(&db2).unwrap();
+    assert_eq!(devin_counts(&conn, "devin-test").0, 1);
+}
+
+#[test]
+fn devin_retirement_preserves_the_remote_view_of_a_session() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let store = stage_devin_db(home, BASE_SESSION_SQL);
+    let _env = EnvGuard::set(home);
+    let db = home.join("history.db");
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+
+    // A remote connector observed the same provider id: the catalog row is
+    // shared, and remote presence/observation/checkpoint rows ride on it.
+    let conn = open_db(&db).unwrap();
+    conn.execute_batch(
+        "INSERT INTO session_presences(source,session_id,location) \
+         VALUES('devin','devin-test','remote'); \
+         INSERT INTO session_observations(\
+           source,session_id,location,connector_id,connector_instance,\
+           raw_locator,source_stamp,discovery_state,access_state,updated_ms) \
+         VALUES('devin','devin-test','remote','devin-cloud','default',\
+           'remote/devin-test','stamp-1','shallow','available',1); \
+         INSERT INTO session_hydration_checkpoints(\
+           source,session_id,location,parser_version,source_bytes,records_parsed,updated_ms) \
+         VALUES('devin','devin-test','remote',1,10,2,1);",
+    )
+    .unwrap();
+    drop(conn);
+
+    // The local provider hides the session: the local footprint retires, the
+    // remote view must survive.
+    let provider = Connection::open(&store).unwrap();
+    provider
+        .execute_batch("UPDATE sessions SET hidden = 1 WHERE id = 'devin-test'")
+        .unwrap();
+    drop(provider);
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+
+    let conn = open_db(&db).unwrap();
+    assert_eq!(
+        devin_counts(&conn, "devin-test"),
+        (1, 0, 0, 0),
+        "the catalog row survives remote-only; the hidden local transcript's \
+         evidence must not"
+    );
+    let remote_presence: i64 = count(
+        &conn,
+        "SELECT COUNT(*) FROM session_presences \
+         WHERE source='devin' AND session_id='devin-test' AND location='remote'",
+    );
+    assert_eq!(remote_presence, 1);
+    let remote_observation: i64 = count(
+        &conn,
+        "SELECT COUNT(*) FROM session_observations \
+         WHERE source='devin' AND session_id='devin-test' AND location='remote'",
+    );
+    assert_eq!(remote_observation, 1);
+    let remote_checkpoint: i64 = count(
+        &conn,
+        "SELECT COUNT(*) FROM session_hydration_checkpoints \
+         WHERE source='devin' AND session_id='devin-test' AND location='remote'",
+    );
+    assert_eq!(remote_checkpoint, 1);
+    let local_rows: i64 = count(
+        &conn,
+        "SELECT (SELECT COUNT(*) FROM session_presences \
+                WHERE source='devin' AND session_id='devin-test' AND location='local') \
+              + (SELECT COUNT(*) FROM session_observations \
+                WHERE source='devin' AND session_id='devin-test' AND location='local') \
+              + (SELECT COUNT(*) FROM session_hydration_checkpoints \
+                WHERE source='devin' AND session_id='devin-test' AND location='local')",
+    );
+    assert_eq!(
+        local_rows, 0,
+        "local presence, observation and checkpoint retire"
+    );
+}
+
+#[test]
+fn devin_malformed_parent_still_anchors_its_children() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    // Node 0's chat_message does not parse; node 1 is valid and names it as
+    // its parent. The child must anchor to an addressable row — the bounded
+    // malformed_node marker — not a dangling id.
+    stage_devin_db(
+        home,
+        r#"
+INSERT INTO sessions
+  (id, working_directory, backend_type, model, agent_mode, created_at,
+   last_activity_at, title, workspace_dirs, hidden, metadata)
+VALUES
+  ('devin-broken', '/work/repo', 'devin', 'test-model', 'normal',
+   1776643200, 1776643202, 'Broken', '["/work/repo"]', 0, NULL);
+INSERT INTO message_nodes
+  (session_id, node_id, parent_node_id, chat_message, created_at, metadata)
+VALUES
+  ('devin-broken', 0, NULL, '{truncated', 1776643201, '{"origin":"test"}'),
+  ('devin-broken', 1, 0,
+   '{"message_id":"a1","role":"assistant","content":"answer","thinking":null,"metadata":{},"tool_calls":null,"tool_call_id":null,"phase":null}',
+   1776643202, NULL);
+"#,
+    );
+    let _env = EnvGuard::set(home);
+    let db = home.join("history.db");
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+    let conn = open_db(&db).unwrap();
+    let child_parent: Option<String> = conn
+        .query_row(
+            "SELECT parent_id FROM session_events \
+             WHERE source='devin' AND session_id='devin-broken' AND message_id='a1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(child_parent.as_deref(), Some("n0"));
+    let marker: Option<String> = conn
+        .query_row(
+            "SELECT kind FROM session_markers \
+             WHERE source='devin' AND session_id='devin-broken' AND message_id='n0'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(marker.as_deref(), Some("malformed_node"));
+}
