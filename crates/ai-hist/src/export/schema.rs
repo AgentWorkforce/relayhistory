@@ -134,29 +134,39 @@ impl Table {
                 .join(",")
         )
     }
-    /// Whether some subscription can deliver this row, the predicate every
-    /// journal write is gated on. A subscription is interested in an identity
-    /// when it is a root subscription (NULL source) or a member subscription
-    /// for that identity, and the identity is [`shareable`]. A relationship
-    /// discloses both endpoints, so it is journaled only when its parent
-    /// qualifies and its child is unlinked or qualifies too -- the rule
-    /// prepare applies before dispatch. A child included later receives its
-    /// incoming edges as fresh revisions, not from the journal. Every lookup
-    /// is an indexed seek.
+    /// Whether some subscription can deliver one identity of this row: it
+    /// holds a subscription naming no session, or a member subscription for
+    /// that identity, and the identity is [`shareable`]. Every lookup is an
+    /// indexed seek.
+    fn interested(&self, row: &str, session: &str) -> String {
+        let source = self.source(row);
+        let shareable = shareable(&source, session);
+        format!(
+            "((EXISTS(SELECT 1 FROM history_subscriptions WHERE source IS NULL) \
+             OR EXISTS(SELECT 1 FROM history_subscriptions WHERE source={source} AND session_id={session})) \
+             AND {shareable})"
+        )
+    }
+    /// The predicate a tombstone is gated on. A tombstone carries a null
+    /// payload and names the row's own identity alone, so that identity is
+    /// the whole disclosure -- the carve-out `raw_excluded` applies when it
+    /// prepares a delete. An edge already delivered is retracted even after
+    /// its child becomes ineligible, rather than outliving its source row at
+    /// the destination.
+    pub fn tombstoned(&self, row: &str) -> String {
+        self.interested(row, &format!("{row}.{}", self.session))
+    }
+    /// The predicate a revision is gated on. A revision carries the whole
+    /// payload, and a relationship's payload discloses both endpoints, so it
+    /// is journaled only when its parent qualifies and its child is unlinked
+    /// or qualifies too -- the rule prepare applies before dispatch. A child
+    /// included later receives its incoming edges as fresh revisions, not
+    /// from the journal.
     pub fn journaled(&self, row: &str) -> String {
-        let interested = |session: String| {
-            let source = self.source(row);
-            let shareable = shareable(&source, &session);
-            format!(
-                "((EXISTS(SELECT 1 FROM history_subscriptions WHERE source IS NULL) \
-                 OR EXISTS(SELECT 1 FROM history_subscriptions WHERE source={source} AND session_id={session})) \
-                 AND {shareable})"
-            )
-        };
-        let own = interested(format!("{row}.{}", self.session));
+        let own = self.tombstoned(row);
         if self.kind == "relationship" {
             let child = format!("{row}.child_session_id");
-            let linked = interested(child.clone());
+            let linked = self.interested(row, &child);
             format!("({own} AND ({child} IS NULL OR {linked}))")
         } else {
             own
@@ -369,7 +379,7 @@ END;
         let new_key = table.key("NEW");
         let old_source = table.source("OLD");
         let new_source = table.source("NEW");
-        let old_journaled = table.journaled("OLD");
+        let old_tombstoned = table.tombstoned("OLD");
         let new_journaled = table.journaled("NEW");
         let name = table.name;
         let kind = table.kind;
@@ -433,7 +443,7 @@ WHEN EXISTS(SELECT 1 FROM ({consumers})) AND {old_payload} <> {new_payload} BEGI
  AND (j.bootstrap_kind < {index} OR (j.bootstrap_kind={index} AND j.bootstrap_rowid < NEW.rowid))
  AND NOT EXISTS(SELECT 1 FROM delivery_shadow s WHERE s.job_id=j.id AND s.kind='{kind}' AND s.row_id=NEW.rowid);
  INSERT INTO delivery_journal(kind,source,session_id,record_key,operation,payload)
- SELECT '{kind}',{old_source},OLD.{session},{old_key},'delete','null' WHERE {old_key} <> {new_key} AND {old_journaled};
+ SELECT '{kind}',{old_source},OLD.{session},{old_key},'delete','null' WHERE {old_key} <> {new_key} AND {old_tombstoned};
  INSERT INTO delivery_journal(kind,source,session_id,record_key,operation,payload)
  SELECT '{kind}',{new_source},NEW.{session},{new_key},'upsert',{new_payload} WHERE {new_journaled};
 END;
@@ -441,7 +451,7 @@ CREATE TRIGGER IF NOT EXISTS delivery_{name}_delete AFTER DELETE ON {name}
 WHEN EXISTS(SELECT 1 FROM ({consumers})) BEGIN
  {before_shadow}
  INSERT INTO delivery_journal(kind,source,session_id,record_key,operation,payload)
- SELECT '{kind}',{old_source},OLD.{session},{old_key},'delete','null' WHERE {old_journaled};
+ SELECT '{kind}',{old_source},OLD.{session},{old_key},'delete','null' WHERE {old_tombstoned};
 END;
 "#))?;
     }

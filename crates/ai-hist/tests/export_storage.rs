@@ -615,3 +615,72 @@ fn one_consent_rule_gates_capture_and_reads() {
     assert_eq!(page.records.len(), 1);
     assert_eq!(page.records[0].session_id.as_deref(), Some("two"));
 }
+
+/// A tombstone names one identity and carries no payload, so a delivered edge
+/// is retracted even once its child stops being eligible; the revision that
+/// would disclose that child is not journaled.
+#[test]
+fn a_delivered_edge_is_retracted_after_its_child_becomes_ineligible() {
+    let conn = db();
+    subscribe(&conn, "root", None);
+    conn.execute("INSERT INTO session_relationships(source,parent_session_id,relationship_uid,child_session_id,relationship,identity_status,evidence_kind,created_ms,updated_ms) VALUES ('claude','parent','edge','child','delegation','observed','fixture',1,1)", []).unwrap();
+    assert_eq!(
+        journal_sessions(&conn),
+        vec![(
+            "relationship".into(),
+            Some("parent".into()),
+            "upsert".into()
+        )]
+    );
+    conn.execute(
+        "INSERT INTO delivery_exclusions(source,session_id) VALUES ('claude','child')",
+        [],
+    )
+    .unwrap();
+    // The edge now discloses an ineligible child: no further revision of it is
+    // journaled, under its own key or a new one.
+    conn.execute("UPDATE session_relationships SET updated_ms=2", [])
+        .unwrap();
+    conn.execute(
+        "UPDATE session_relationships SET relationship_uid='renamed'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        journal_sessions(&conn),
+        vec![
+            (
+                "relationship".into(),
+                Some("parent".into()),
+                "upsert".into()
+            ),
+            (
+                "relationship".into(),
+                Some("parent".into()),
+                "delete".into()
+            ),
+        ]
+    );
+    conn.execute("DELETE FROM session_relationships", [])
+        .unwrap();
+    assert_eq!(
+        journal_sessions(&conn)
+            .into_iter()
+            .filter(|(_, _, operation)| operation == "delete")
+            .count(),
+        2
+    );
+    // An excluded parent retracts nothing: its edge was never delivered.
+    conn.execute(
+        "INSERT INTO delivery_exclusions(source,session_id) VALUES ('claude','private')",
+        [],
+    )
+    .unwrap();
+    conn.execute("INSERT INTO session_relationships(source,parent_session_id,relationship_uid,child_session_id,relationship,identity_status,evidence_kind,created_ms,updated_ms) VALUES ('claude','private','hidden','child','delegation','observed','fixture',1,1)", []).unwrap();
+    conn.execute(
+        "DELETE FROM session_relationships WHERE parent_session_id='private'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(journal_sessions(&conn).len(), 3);
+}

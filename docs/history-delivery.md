@@ -92,18 +92,26 @@ An already transmitted request cannot be recalled. Cancellation discards local
 pending work explicitly; it does not erase previously accepted remote records.
 
 Capture journals a change only when a subscription can deliver it: a job
-without session membership (its subscription names no session and is filtered
-by its selection at prepare), or a session-job member for that identity, and
-the identity is shareable. A relationship is journaled only when its parent
-qualifies and its child is unlinked or qualifies too; a child included later
-receives its incoming edges as fresh revisions. Excluded and unselected
-sessions consume no journal retention. Whether an identity is shareable is one
-SQL rule (`capture::shareable`): the capture triggers and the sharing status
-query embed it, and prepare, claim, dispatch, file exports and the sharing
-change check evaluate it through `capture::is_shareable`, so consent means the
-same thing at every step. A session included later starts from a fresh
-snapshot rather than from the journal. A session job subscribes through its
-members only; it carries no subscription of its own.
+without session membership, or a session-job member for that identity, and the
+identity is shareable. A revision of a relationship is journaled only when its
+parent qualifies and its child is unlinked or qualifies too; a tombstone names
+one identity and carries no payload, so it is journaled on that identity alone
+and retracts a delivered edge whose child has since become ineligible. A child
+included later receives its incoming edges as fresh revisions. Excluded and
+unselected sessions consume no journal retention. Whether an identity is
+shareable is one SQL rule (`capture::shareable`): the capture triggers and the
+sharing status query embed it, and prepare, claim, dispatch, file exports and
+the sharing change check evaluate it through `capture::is_shareable`, so
+consent means the same thing at every step. A session included later starts
+from a fresh snapshot rather than from the journal. A session job subscribes
+through its members only; it carries no subscription of its own.
+
+A job without session membership holds one subscription naming no session, so
+it journals every shareable identity and its own source/session selection is
+applied at prepare. For the probe's sharing modes this is exact: `all` selects
+every source, and `new` and `selected` are session jobs. A legacy job carrying
+an explicit source or session list therefore still journals identities it will
+never send, until it is adopted as a session job.
 
 Pausing preserves capture and queued work. Bounded maintenance expires exports,
 compacts consumed changes and releases completed bodies. An idle session

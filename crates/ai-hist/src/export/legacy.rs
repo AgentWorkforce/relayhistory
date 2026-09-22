@@ -38,9 +38,12 @@ pub(super) fn adopt_subscriptions(conn: &Connection) -> Result<()> {
     )?;
     Ok(())
 }
-/// A session job's own subscription row and snapshot bounds serve nothing its
-/// members do not: the members carry the snapshots and cursors, and a root row
-/// would gate capture open for every session. Every lookup is indexed.
+/// A session job's own subscription row, snapshot bounds and preimages serve
+/// nothing its members do not: the members carry the snapshots and cursors,
+/// and a root row would gate capture open for every session. The three are
+/// retired together, as `release_subscription` retires them, so no preimage
+/// stays charged to the retention budget with nothing left to read it. Every
+/// lookup is indexed.
 fn retire_session_job_roots(conn: &Connection) -> Result<()> {
     if !exists(conn, "delivery_session_jobs")? {
         return Ok(());
@@ -49,11 +52,13 @@ fn retire_session_job_roots(conn: &Connection) -> Result<()> {
         "DELETE FROM history_subscriptions WHERE source IS NULL AND id IN (SELECT job_id FROM delivery_session_jobs)",
         [],
     )?;
-    if exists(conn, "delivery_bootstrap_bounds")? {
-        conn.execute(
-            "DELETE FROM delivery_bootstrap_bounds WHERE job_id IN (SELECT job_id FROM delivery_session_jobs)",
-            [],
-        )?;
+    for table in ["delivery_bootstrap_bounds", "delivery_shadow"] {
+        if exists(conn, table)? {
+            conn.execute(
+                &format!("DELETE FROM {table} WHERE job_id IN (SELECT job_id FROM delivery_session_jobs)"),
+                [],
+            )?;
+        }
     }
     Ok(())
 }

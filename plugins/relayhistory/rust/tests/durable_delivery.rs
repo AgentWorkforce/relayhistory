@@ -1685,9 +1685,9 @@ fn non_member_sessions_cost_no_journal_retention_under_a_session_job() {
     assert_eq!(status(&conn, &root.job_id).unwrap().suppressed_records, 0);
 }
 
-/// A session job carries no subscription row or snapshot bounds of its own;
-/// those left by an earlier writer are retired by the same migration that
-/// rebuilds capture.
+/// A session job carries no subscription row, snapshot bounds or preimages of
+/// its own; those left by an earlier writer are retired by the same migration
+/// that rebuilds capture, and their retention is returned with them.
 #[test]
 fn upgrade_retires_a_session_jobs_own_subscription_row() {
     let directory = tempfile::tempdir().unwrap();
@@ -1714,6 +1714,8 @@ fn upgrade_retires_a_session_jobs_own_subscription_row() {
         [&root.job_id],
     )
     .unwrap();
+    conn.execute("INSERT INTO delivery_shadow(job_id,kind,row_id,source,session_id,record_key,payload) VALUES (?,'session_event',1,'claude','member','[\"session_event\",\"claude\",\"member\",\"a\"]',?)", params![root.job_id,"x".repeat(4096)]).unwrap();
+    let charged = retained_bytes(&conn).unwrap().0;
     conn.execute(
         "DELETE FROM schema_migrations WHERE name='delivery_capture_filter_v1'",
         [],
@@ -1738,6 +1740,15 @@ fn upgrade_retires_a_session_jobs_own_subscription_row() {
         )
         .unwrap();
     assert_eq!(own_bounds, 0);
+    let own_preimages: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM delivery_shadow WHERE job_id=?",
+            [&root.job_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(own_preimages, 0);
+    assert!(retained_bytes(&conn).unwrap().0 < charged - 4096);
     event(&conn, "member", "mine");
     event(&conn, "stranger", "theirs");
     assert_eq!(journaled_sessions(&conn), vec!["member".to_string()]);
