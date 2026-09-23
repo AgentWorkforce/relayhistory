@@ -3835,14 +3835,17 @@ static UPSERT_SESSION_SQL: LazyLock<String> = LazyLock::new(|| {
 
 /// Write a shallow row into the catalog, returning the merged row as stored.
 ///
-/// Never nulls out a value the catalog already holds, never lowers
-/// `first_activity_ms` past what a fuller pass observed for append-only
-/// providers, and never downgrades a fully indexed row to `'shallow'` —
-/// including a row from a database that predates `discovery_state`, whose NULL
-/// readers deliberately interpret as `'full'`. Grok is the exception on the
-/// activity bounds: a session directory is a replacement snapshot, so a later
-/// compaction can move the start forward and the end backward. A shallow
-/// rescan of such a row still refreshes its metadata and stamp.
+/// Preview columns (`first_prompt`, `last_assistant_text`) are preserved when
+/// a shallow pass does not supply a value, because a shallow pass does not read
+/// the transcript and therefore cannot authoritatively clear one. Other values
+/// are merged defensively — never lowers `first_activity_ms` past what a fuller
+/// pass observed for append-only providers, and never downgrades a fully
+/// indexed row to `'shallow'` — including a row from a database that predates
+/// `discovery_state`, whose NULL readers deliberately interpret as `'full'`.
+/// Grok is the exception on the activity bounds: a session directory is a
+/// replacement snapshot, so a later compaction can move the start forward and the
+/// end backward. A shallow rescan of such a row still refreshes its metadata
+/// and stamp.
 ///
 /// The returned row is what the catalog now holds (including a preserved
 /// `full` state), read back through the write's own `RETURNING` clause so the

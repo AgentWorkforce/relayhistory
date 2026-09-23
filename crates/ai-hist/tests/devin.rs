@@ -557,6 +557,84 @@ fn devin_partial_evidence_loss_repairs_on_unchanged_stamp() {
 }
 
 #[test]
+fn devin_history_loss_repairs_on_unchanged_stamp() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    stage_devin_db(home, BASE_SESSION_SQL);
+    let _env = EnvGuard::set(home);
+    let db = home.join("history.db");
+
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+    let conn = open_db(&db).unwrap();
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM history WHERE source='devin' AND session_id='devin-test'"
+        ),
+        1,
+        "fixture must produce one history row"
+    );
+    conn.execute(
+        "DELETE FROM history WHERE source='devin' AND session_id='devin-test'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+    let conn = open_db(&db).unwrap();
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM history WHERE source='devin' AND session_id='devin-test'"
+        ),
+        1,
+        "a deleted history row must be restored even though the source stamp is unchanged"
+    );
+}
+
+#[test]
+fn devin_marker_loss_repairs_on_unchanged_stamp() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    stage_devin_db(home, BASE_SESSION_SQL);
+    let _env = EnvGuard::set(home);
+    let db = home.join("history.db");
+
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+    let conn = open_db(&db).unwrap();
+    assert_eq!(
+        session_markers(&conn, "devin", "devin-test")
+            .unwrap()
+            .iter()
+            .filter(|m| m.kind == "session_title")
+            .count(),
+        1,
+        "fixture must produce one session_title marker"
+    );
+    conn.execute(
+        "DELETE FROM session_markers WHERE source='devin' AND session_id='devin-test'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+    let conn = open_db(&db).unwrap();
+    assert_eq!(
+        session_markers(&conn, "devin", "devin-test")
+            .unwrap()
+            .iter()
+            .filter(|m| m.kind == "session_title")
+            .count(),
+        1,
+        "a deleted marker row must be restored even though the source stamp is unchanged"
+    );
+}
+
+#[test]
 fn devin_shared_prompt_is_reassigned_not_dropped() {
     let _lock = ENV_LOCK.lock().unwrap();
     let dir = tempfile::tempdir().unwrap();

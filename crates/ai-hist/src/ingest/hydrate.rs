@@ -555,7 +555,30 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
     // a resume position without the checkpoint it belongs to would describe
     // evidence nothing recorded.
     store_cursor(&tx, &cursor_key, &cursor)?;
-    let local_observation=local_observation.unwrap_or_else(||SessionObservation{key:local_key,raw_locator:target.locator.clone(),source_stamp:tx.query_row("SELECT source_stamp FROM session_presences WHERE source=? AND session_id=? AND location='local'",params![options.source,options.session_id],|row|row.get(0)).optional().ok().flatten().flatten(),discovery_state:"shallow".into(),access_state:"available".into(),updated_ms:now_ms(),first_prompt:tx.query_row("SELECT first_prompt FROM sessions WHERE source=? AND session_id=?",params![options.source,options.session_id],|row|row.get(0)).optional().ok().flatten().flatten(),last_assistant_text:tx.query_row("SELECT last_assistant_text FROM sessions WHERE source=? AND session_id=?",params![options.source,options.session_id],|row|row.get(0)).optional().ok().flatten().flatten()});
+    let local_observation = local_observation.unwrap_or_else(|| SessionObservation {
+        key: local_key,
+        raw_locator: target.locator.clone(),
+        source_stamp: tx
+            .query_row(
+                "SELECT source_stamp FROM session_presences \
+                 WHERE source=? AND session_id=? AND location='local'",
+                params![options.source, options.session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .flatten(),
+        // A newly created local observation must not inherit shared catalog
+        // previews. Those columns are location-agnostic; they may have come
+        // from a remote observation or another connector. Start with no local
+        // preview provenance unless local discovery itself supplied it later.
+        discovery_state: "shallow".into(),
+        access_state: "available".into(),
+        updated_ms: now_ms(),
+        first_prompt: None,
+        last_assistant_text: None,
+    });
     save_observation_progress(
         &tx,
         &local_observation,
@@ -3660,7 +3683,7 @@ pub(crate) fn save_observation_progress(
     if full {
         observation.discovery_state = "full".into();
     }
-    observations::upsert(conn, &observation)?;
+    observations::upsert_preserving_previews(conn, &observation)?;
     observations::write_checkpoint(
         conn,
         &observation.key,

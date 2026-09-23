@@ -3585,7 +3585,7 @@ fn a_negative_count_in_the_marker_does_not_license_a_skip() {
     let corrupted = marker
         .split(' ')
         .map(|part| match part.split_once('=') {
-            Some((session, _)) => format!("{session}=-1.-1.-1.-1"),
+            Some((session, _)) => format!("{session}=-1.-1.-1.-1.-1.-1"),
             None => part.to_string(),
         })
         .collect::<Vec<_>>()
@@ -3620,26 +3620,27 @@ fn a_negative_count_in_the_marker_does_not_license_a_skip() {
 fn an_unreadable_destination_marker_sweeps_instead_of_panicking() {
     for marker in [
         serde_json::Value::from(""),
-        serde_json::Value::from("v4"),
+        serde_json::Value::from("v5"),
         // Shaped like this build's marker, and wrong in one way each.
-        serde_json::Value::from("v4 n1"),
-        serde_json::Value::from("v4 nx abcdef0123456789=1.0.0.1"),
-        serde_json::Value::from("v4 n1 notanentry"),
-        serde_json::Value::from("v4 n1 zzzz=1.2.3.4"),
-        serde_json::Value::from("v4 n1 abcdef0123456789=1.2.3"),
-        serde_json::Value::from("v4 n1 abcdef0123456789=1.2.3.4.5"),
-        serde_json::Value::from("v4 n1 abcdef0123456789=1.x.3.4"),
+        serde_json::Value::from("v5 n1"),
+        serde_json::Value::from("v5 nx abcdef0123456789=1.0.0.0.0.1"),
+        serde_json::Value::from("v5 n1 notanentry"),
+        serde_json::Value::from("v5 n1 zzzz=1.2.3.4.5.6"),
+        serde_json::Value::from("v5 n1 abcdef0123456789=1.2.3"),
+        serde_json::Value::from("v5 n1 abcdef0123456789=1.2.3.4.5.6.7"),
+        serde_json::Value::from("v5 n1 abcdef0123456789=1.x.3.4.5.6"),
         // Truncated: the count is what makes this distinguishable from a
         // database that legitimately holds fewer sessions.
-        serde_json::Value::from("v4 n2 abcdef0123456789=1.0.0.1"),
+        serde_json::Value::from("v5 n2 abcdef0123456789=1.0.0.0.0.1"),
         // A negative count is the dangerous one: under a `>=` comparison it is
         // satisfied by every current value, so a corrupt marker would license
         // a skip over missing evidence rather than a sweep.
-        serde_json::Value::from("v4 n1 abcdef0123456789=-1.0.0.1"),
-        serde_json::Value::from("v4 n1 abcdef0123456789=0.0.0.-1"),
+        serde_json::Value::from("v5 n1 abcdef0123456789=-1.0.0.0.0.1"),
+        serde_json::Value::from("v5 n1 abcdef0123456789=0.0.0.0.0.-1"),
         // An entry repeated is not something the grouped reads can produce.
-        serde_json::Value::from("v4 n2 abcdef0123456789=1.0.0.1 abcdef0123456789=2.0.0.1"),
+        serde_json::Value::from("v5 n2 abcdef0123456789=1.0.0.0.0.1 abcdef0123456789=2.0.0.0.0.1"),
         // Markers from the shapes this one replaced.
+        serde_json::Value::from("v4 n1 abcdef0123456789=1.0.0.1"),
         serde_json::Value::from("v3 s1 h1"),
         serde_json::Value::from("v2 s1:e1:r1:h1"),
         serde_json::Value::from(":::"),
