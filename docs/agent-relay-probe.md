@@ -83,6 +83,9 @@ unrelated provider discovery. An old selected queue at its retention cap can
 reclaim consumed journal entries and retry its atomic membership migration.
 This preserves the cap, queued batches, snapshot preimages, and other jobs'
 unread revisions. If nothing can safely be reclaimed, migration stays pending.
+Cancelling a generation releases its subscription and its preimages, so once
+the last one is gone the whole journal is consumed and the next compaction
+reclaims it by range, returning the retained-byte count to zero.
 
 The desktop status `last_cycle` includes an optional, allowlisted `error_class`
 and a safe message for local retention, database corruption, disk-space,
@@ -110,6 +113,28 @@ Each `(site origin, user, workspace)` has an independent SHA-256-named directory
 under `~/.agentworkforce/probe/`. It contains an SDK-owned `history.db`, persisted
 selection/job metadata, scoped RelayHistory auth, a log, a runtime record and a
 collector lock. Directories are mode 0700; credentials/config/logs are mode 0600.
+`collector.log` rotates into `collector.log.1` through `.3` once it reaches
+10 MB, oldest dropped. The supervised collector checks the size once per
+delivery pass and reopens its own stdout and stderr onto the replacement, so
+the live file exceeds the cap by at most one pass; a reopen that fails is
+retried on the next one. A `--foreground` run writes to the terminal rather
+than the log, so it neither rotates nor redirects.
+
+A directory without `config.json` is a decommissioned install. `installs`
+never lists one and reclaims it instead: it cancels any delivery generation
+left behind, closes expired snapshots, compacts the journal and the settled
+receipts, and removes the logs, the runtime record and the advisory status.
+One listing reclaims at most one decommissioned install, and does a bounded
+amount of work on it: at most 32 snapshots, one page of journal rows, one
+sweep page and one page of receipts. Neither what an abandoned install
+accumulated nor how many of them a machine has puts a listing behind
+maintenance nobody asked for; successive listings converge. `history.db` is retained —
+its origin identity keys every record the Cloud already holds, so reconnecting
+the same account resumes incrementally instead of uploading a second copy of
+every session under a second machine identity. A directory that still has
+`stages/` is a setup in progress, not a decommissioned install, and the sweep
+leaves it alone; so does a directory a setup or a collector has locked, until
+it lets go.
 No Cloud bearer credential is persisted by the probe. Tokens are never command
 arguments, and provider errors, response bodies and session content are not logged.
 The device approval URL is intentionally displayed in the interactive terminal.
@@ -236,7 +261,8 @@ storage, capture and delivery. All bridge commands accept `--json`; every JSON
 object has `bridge_version: 1`. Status output contains no credentials. Existing
 human-readable install/status/stop commands remain available.
 
-- `installs --json`: discover configured probe directories.
+- `installs --json`: discover configured probe directories. A directory that
+  has lost its `config.json` is reclaimed instead of listed.
 - `cloud install --json --include-existing|--new-sessions-only|--selected-sessions-only`:
   emit NDJSON `approval`, `authenticated`, `connected`, and `ready` events. The
   browser approves the device; `authenticated` establishes the Agent Relay
@@ -335,9 +361,13 @@ that a receiver acknowledged the session. `shared`, `queued`, `uploading` and
 capture failures cannot be diagnosed from the old generic logs; their cause
 remains unknown until a redacted diagnostic is reproduced.
 
-Disconnect stops the collector, cancels jobs, best-effort revokes the workspace
-RelayHistory token, and removes this install's stage credentials/configuration.
-The local history database is retained. It does not remove shared Cloud login
+Disconnect stops the collector, best-effort revokes the workspace RelayHistory
+token, and removes this install's stage credentials and configuration before
+reclaiming it as a decommissioned install: cancelled generations, a compacted
+journal, no logs and no advisory status. The local history database is
+retained. A configuration or a database that cannot be read is already
+decommissioned and is reclaimed the same way rather than refused, so a corrupt
+install cannot block a sign-out. Disconnect does not remove shared Cloud login
 credentials belonging to other Cloud clients.
 
 ### Local title preview

@@ -398,6 +398,21 @@ pub fn list_jobs(conn: &Connection) -> Result<Vec<DeliveryStatus>> {
     ids.iter().map(|id| status(conn, id)).collect()
 }
 
+/// The identity and state of every delivery generation, without the stored
+/// configuration or the batch and journal accounting a full status computes.
+///
+/// Deciding what to cancel needs no more than this, and asking for more makes
+/// the answer depend on rows it will never read again: a full status parses
+/// each generation's configuration and counts the journal past its cursor, so
+/// one unreadable historical row would refuse the whole enumeration, and a
+/// long journal is scanned once per generation to no purpose.
+pub fn list_job_states(conn: &Connection) -> Result<Vec<(String, String)>> {
+    Ok(conn
+        .prepare("SELECT id,state FROM delivery_jobs ORDER BY created_ms,id")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 fn excluded(
     conn: &Connection,
     selection: &ExportSelection,
@@ -1128,16 +1143,60 @@ pub fn retry_job(conn: &Connection, job_id: &str) -> Result<DeliveryStatus> {
     tx.commit()?;
     status(conn, job_id)
 }
-/// Explicit discard, separate from pause. Already accepted remote data is not
-/// deleted. A later create_job starts a new generation and historical backfill.
-pub fn cancel_job(conn: &Connection, job_id: &str) -> Result<DeliveryStatus> {
+/// Explicit discard, separate from pause: the generation's queued batches, its
+/// session members and its subscription with the preimages behind it are all
+/// released. Already accepted remote data is not deleted, and a later
+/// create_job starts a new generation and historical backfill.
+///
+/// Nothing here reads the stored configuration, and nothing needs to. A
+/// generation whose configuration no longer parses is therefore still
+/// cancellable — which is the point, because it cannot dispatch a batch
+/// either, so refusing to cancel it would leave a decommissioning unable to
+/// finish over a generation that can never upload again.
+pub fn cancel_generation(conn: &Connection, job_id: &str) -> Result<()> {
     let tx = write_transaction(conn)?;
-    job(&tx, job_id)?;
+    cancel_within(&tx, job_id)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Cancel every named generation in one transaction, so a failure part-way
+/// through cancels none of them. Decommissioning an install with several
+/// generations reports failure only over state it did not change: a partial
+/// cancellation would stop an install that still looks connected, and the
+/// user would have no reason to retry the sign-out that caused it.
+pub fn cancel_generations(conn: &Connection, job_ids: &[String]) -> Result<()> {
+    if job_ids.is_empty() {
+        return Ok(());
+    }
+    let tx = write_transaction(conn)?;
+    for job_id in job_ids {
+        cancel_within(&tx, job_id)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn cancel_within(tx: &Transaction<'_>, job_id: &str) -> Result<()> {
+    ensure!(
+        tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM delivery_jobs WHERE id=?)",
+            [job_id],
+            |row| row.get::<_, bool>(0)
+        )?,
+        "delivery job not found"
+    );
     tx.execute("UPDATE delivery_jobs SET state='cancelled',fence=fence+1,worker_id=NULL,lease_until_ms=NULL WHERE id=?",[job_id])?;
     tx.execute("UPDATE delivery_batches SET state='cancelled',payload=NULL,prepared=NULL WHERE job_id=? AND state IN ('pending','leased','retry_wait','blocked')",[job_id])?;
-    sessions::cancel(&tx, job_id)?;
-    capture::release_subscription(&tx, job_id)?;
-    tx.commit()?;
+    sessions::cancel(tx, job_id)?;
+    capture::release_subscription(tx, job_id)?;
+    Ok(())
+}
+
+/// [`cancel_generation`] for a caller that wants the resulting status, which
+/// reads the cancelled generation's stored configuration to report it.
+pub fn cancel_job(conn: &Connection, job_id: &str) -> Result<DeliveryStatus> {
+    cancel_generation(conn, job_id)?;
     status(conn, job_id)
 }
 
