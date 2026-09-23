@@ -440,9 +440,12 @@ Three rules a consumer must hold:
   (`change_feed_store`). `SessionStore::head_revision` reports the head with
   it; a stored watermark with another epoch, or beyond the head, fails with
   `ErrorKind::WatermarkAheadOfStore`, and the recovery is a full resync from
-  `Watermark::START`, which names no store. A copy of a database keeps its
-  epoch, so a restore from backup is caught by the revision check alone,
-  while the restored store is still behind the watermark. A named cursor
+  `Watermark::START`, which names no store. `Changes::commit()` checks the
+  same two things against the database it writes into, so a drain whose
+  path was replaced under it cannot plant its position as the replacement's
+  cursor. A copy of a database keeps its epoch, so a restore from backup is
+  caught by the revision check alone, while the restored store is still
+  behind the watermark. A named cursor
   past the head names no revision of this store, so the resync's commit
   replaces it: the one commit that moves a cursor back.
 

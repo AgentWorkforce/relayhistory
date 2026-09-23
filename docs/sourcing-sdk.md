@@ -336,7 +336,9 @@ only recovery is a resync from `Watermark::START`, which names no store; a named
 names no revision of this store, so that resync's commit replaces it.
 `head_revision()` reports
 the head on its own, and `SyncReport::head_revision` reports it after a sweep.
-A read-only handle drains the feed but cannot commit a cursor.
+A read-only handle drains the feed but cannot commit a cursor, and a commit
+writes only into the database the drain read: one whose path now holds another
+database is `Error::WatermarkAheadOfStore`.
 
 ### `Source::capabilities()`
 
