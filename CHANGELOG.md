@@ -268,7 +268,9 @@ Notable changes to the native `ai-hist` CLI are documented here.
   marker or catalog row. `SessionStore::head_revision()` and `SyncReport::head_revision`
   report the head; a stored watermark beyond it (the database was reset)
   fails with `ErrorKind::WatermarkAheadOfStore`, read through the new
-  `Error::kind()`. A re-parse re-stamps every row it upserts, so a consumer
+  `Error::kind()`, and the commit that follows the resync from
+  `Watermark::START` replaces a named cursor stuck beyond the head. A
+  re-parse re-stamps every row it upserts, so a consumer
   must treat a re-seen `record_key` as a replace, never a duplicate. A
   message still being written is never in the feed: incremental hydration
   holds it until it completes, and its blocks then arrive together, once.

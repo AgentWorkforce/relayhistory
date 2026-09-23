@@ -436,7 +436,9 @@ Three rules a consumer must hold:
 - **A watermark ahead of the head is a reset.** `SessionStore::head_revision`
   and `SyncReport::head_revision` report the head; a stored watermark beyond it
   fails with `ErrorKind::WatermarkAheadOfStore`, and the recovery is a full
-  resync from `Watermark::START`.
+  resync from `Watermark::START`. A named cursor past the head names no
+  revision of this store, so the resync's commit replaces it: the one commit
+  that moves a cursor back.
 
 An in-progress message is never in the feed. Incremental hydration holds a
 Claude message whose `stop_reason` is still `null` and writes nothing for it;

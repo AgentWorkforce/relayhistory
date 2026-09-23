@@ -1,6 +1,14 @@
 //! Transaction-scoped evidence reads; callers own upload policy.
+pub use super::schema::shareable;
 use super::*;
 pub use super::{make_record, snapshot_record, RawRecord};
+
+/// [`shareable`] evaluated for one identity: the consent check a reader
+/// applies to a record it is about to prepare, claim or dispatch.
+pub fn is_shareable(conn: &Connection, source: &str, session_id: &str) -> Result<bool> {
+    let sql = format!("SELECT {}", shareable("?1", "?2"));
+    Ok(conn.query_row(&sql, params![source, session_id], |r| r.get(0))?)
+}
 pub fn session_snapshot_record(
     conn: &Connection,
     id: &str,
