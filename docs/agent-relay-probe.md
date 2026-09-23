@@ -110,6 +110,14 @@ job waits out its own backoff, which is normal operation rather than a fault.
 Transport credentials refresh through the existing RelayHistory auth
 implementation.
 
+Each new probe version retries a previously blocked job once, before setup
+delivery or background collection begins. Later starts of that version preserve
+its blocked verdicts. The `verdict-retry.json` marker is advisory: if it cannot
+be saved, collection continues and the process remembers the version to avoid
+repeating the retry during foreground startup. That fallback lasts only for the
+current process; a subsequent process can retry again until the marker is saved.
+Paused and cancelled jobs remain unchanged.
+
 Local capture progress is written to private `progress.json` and emitted as
 `event: "progress"` on the desktop install JSON stream every three seconds.
 Source names, files processed/total, and sessions captured never leave the Mac.

@@ -5,13 +5,14 @@ use relayhistory_plugin::destination;
 use rusqlite::Connection;
 use serde_json::json;
 use std::{
+    collections::HashMap,
     fs,
     io::Write,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc,
+        mpsc, Arc, Mutex, OnceLock,
     },
     time::{Duration, Instant},
 };
@@ -479,6 +480,7 @@ fn capture_diagnostic(
 /// All/new setup has already captured before creating its baseline. Selected
 /// setup stays shallow unless --once makes this the only capture opportunity.
 pub fn finish_setup(directory: &Path, config: &Config, once: bool) -> Result<()> {
+    retry_verdict_of_another_build(directory, &config.job_id, env!("CARGO_PKG_VERSION"))?;
     if once && super::bridge::mode(config) == super::bridge::SharingMode::Selected {
         cycle_with_stop(directory, config, Arc::new(AtomicBool::new(false)), true)
     } else {
@@ -688,13 +690,19 @@ fn start_inventory(directory: &Path, cancelled: Arc<AtomicBool>) -> InventoryWor
     InventoryWorker(finish)
 }
 
-/// Own the collector lock and retry capture/delivery until stopped; status writes are advisory.
 /// A blocked job holds the verdict of the probe build that reached it, and a
 /// different build can judge the same exchange differently — a receipt it now
 /// parses, say. The first run under each new build retries a blocked job once;
 /// later runs of that build leave its own verdicts alone.
+/// If the advisory marker cannot be saved, remember the version in this process
+/// so foreground setup and collector startup cannot retry the same verdict twice.
 fn retry_verdict_of_another_build(directory: &Path, job_id: &str, version: &str) -> Result<()> {
-    let marker = directory.join("verdict-retry.json");
+    static UNSAVED: OnceLock<Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
+    let mut unsaved = UNSAVED
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let marker = directory.canonicalize()?.join("verdict-retry.json");
     let retried = fs::read(&marker)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
@@ -702,13 +710,26 @@ fn retry_verdict_of_another_build(directory: &Path, job_id: &str, version: &str)
     if retried.as_deref() == Some(version) {
         return Ok(());
     }
-    let conn = relayhistory_plugin::delivery::open_db(&directory.join("history.db"))?;
-    if delivery::status(&conn, job_id)?.state == "blocked" {
-        delivery::retry_job(&conn, job_id)?;
+    if unsaved.get(&marker).map(String::as_str) != Some(version) {
+        let conn = relayhistory_plugin::delivery::open_db(&directory.join("history.db"))?;
+        if delivery::status(&conn, job_id)?.state == "blocked" {
+            delivery::retry_job(&conn, job_id)?;
+        }
     }
-    save_json(&marker, &json!({ "probe_version": version }))
+    if save_json(&marker, &json!({ "probe_version": version })).is_err() {
+        unsaved.insert(marker, version.to_owned());
+        // Keep diagnostics free of paths, credentials and raw filesystem errors.
+        let _ = writeln!(
+            std::io::stderr(),
+            "Probe retry state could not be saved. Collection will continue."
+        );
+    } else {
+        unsaved.remove(&marker);
+    }
+    Ok(())
 }
 
+/// Own the collector lock and retry capture/delivery until stopped; status writes are advisory.
 pub fn run_background(directory: &Path, startup_id: &str) -> Result<()> {
     let _lock = lock(directory)?;
     ensure!(
@@ -1502,6 +1523,109 @@ mod tests {
 
         retry_verdict_of_another_build(dir.path(), &job.job_id, "1.0.1").unwrap();
         assert_eq!(state().state, "active");
+    }
+
+    #[test]
+    fn unwritable_retry_marker_is_advisory_and_remembers_the_build() {
+        for initial_state in ["active", "blocked", "paused", "cancelled"] {
+            let dir = tempfile::tempdir().unwrap();
+            let conn = delivery::open_db(&dir.path().join("history.db")).unwrap();
+            let job = delivery::create_job(&conn, &job_config(true), now()).unwrap();
+            conn.execute(
+                "UPDATE delivery_jobs SET state=? WHERE id=?",
+                [initial_state, &job.job_id],
+            )
+            .unwrap();
+            // A directory at the marker path makes atomic replacement fail on
+            // every platform, without making the database itself unwritable.
+            let marker = dir.path().join("verdict-retry.json");
+            fs::create_dir(&marker).unwrap();
+            retry_verdict_of_another_build(dir.path(), &job.job_id, "1.0.0").unwrap();
+            assert_eq!(
+                delivery::status(&conn, &job.job_id).unwrap().state,
+                if initial_state == "blocked" {
+                    "active"
+                } else {
+                    initial_state
+                }
+            );
+            conn.execute(
+                "UPDATE delivery_jobs SET state='blocked',failure='invalid_payload' WHERE id=?",
+                [&job.job_id],
+            )
+            .unwrap();
+            retry_verdict_of_another_build(dir.path(), &job.job_id, "1.0.0").unwrap();
+            assert_eq!(
+                delivery::status(&conn, &job.job_id).unwrap().state,
+                "blocked"
+            );
+
+            // Once storage recovers, persist the remembered version without
+            // granting another retry, including on subsequent invocations.
+            fs::remove_dir(&marker).unwrap();
+            retry_verdict_of_another_build(dir.path(), &job.job_id, "1.0.0").unwrap();
+            assert!(marker.is_file());
+            retry_verdict_of_another_build(dir.path(), &job.job_id, "1.0.0").unwrap();
+            assert_eq!(
+                delivery::status(&conn, &job.job_id).unwrap().state,
+                "blocked"
+            );
+            retry_verdict_of_another_build(dir.path(), &job.job_id, "1.0.1").unwrap();
+            assert_eq!(
+                delivery::status(&conn, &job.job_id).unwrap().state,
+                "active"
+            );
+        }
+    }
+
+    #[test]
+    fn setup_retries_an_older_build_before_attempting_delivery() {
+        for once in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let conn = delivery::open_db(&dir.path().join("history.db")).unwrap();
+            let job = delivery::create_job(&conn, &job_config(true), now()).unwrap();
+            let config = Config {
+                version: 1,
+                site_url: "https://synthetic.invalid".into(),
+                account_id: "account".into(),
+                account_email: None,
+                account_name: None,
+                account_avatar_url: None,
+                org_id: "org".into(),
+                workspace_id: "workspace".into(),
+                // Stop at destination validation, before credentials/network.
+                history_url: "invalid synthetic URL".into(),
+                delivery_account: job.config.account_id,
+                job_id: job.job_id,
+                include_existing: true,
+                sharing_mode: None,
+                acknowledge_uninspected_schedules: false,
+            };
+            let block = || {
+                conn.execute(
+                    "UPDATE delivery_jobs SET state='blocked',failure='invalid_payload' WHERE id=?",
+                    [&config.job_id],
+                )
+                .unwrap();
+            };
+            save_json(
+                &dir.path().join("verdict-retry.json"),
+                &json!({ "probe_version": "older-build" }),
+            )
+            .unwrap();
+            block();
+            assert!(finish_setup(dir.path(), &config, once).is_err());
+            let status = delivery::status(&conn, &config.job_id).unwrap();
+            assert_eq!(status.state, "active");
+            assert_eq!(status.failure, None);
+
+            block();
+            assert!(finish_setup(dir.path(), &config, once).is_err());
+            assert_eq!(
+                delivery::status(&conn, &config.job_id).unwrap().state,
+                "blocked"
+            );
+        }
     }
 
     #[test]
