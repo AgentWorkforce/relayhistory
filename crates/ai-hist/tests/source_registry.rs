@@ -111,6 +111,7 @@ fn event(uid: &str, text: &str) -> SessionEvent {
         is_meta: None,
         turn_id: None,
         request_span: None,
+        control_kind: None,
     }
 }
 impl ShallowSessionProvider for Fixture {

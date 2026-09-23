@@ -1,8 +1,10 @@
 use ai_hist::{
     default_db_path, import_json, insert_history, normalize_tag_name, open_db, open_db_readonly,
     prompt_hash, recent, resume_command, schema_is_current, search, session, session_events,
-    session_file_edits, session_tool_calls, untag_session, HistoryEntry, ProjectGrouping,
-    QueryFilter, SOURCE_CHOICES,
+    session_file_edits, session_markers_page, session_tool_calls, session_usage_summary,
+    untag_session, HistoryEntry, ProjectGrouping, QueryFilter, SessionEvidenceCursor,
+    SessionMarkerPage, SessionUsageSummary, SESSION_EVIDENCE_CONTRACT_VERSION,
+    SESSION_USAGE_CONTRACT_VERSION, SOURCE_CHOICES,
 };
 pub use ai_hist::{SessionLocation, SessionScope};
 use anyhow::{Context, Result};
@@ -399,6 +401,46 @@ enum SessionsAction {
         #[arg(long)]
         json: bool,
     },
+    /// Page through one session's markers from the database only.
+    ///
+    /// Markers are the provider records the event model cannot carry:
+    /// compaction and summary boundaries, provider `system` rows, non-text
+    /// content blocks, agent lifecycle events. Same `(ts_ms IS NULL, ts_ms,
+    /// id)` keyset as tool calls and file edits; undated markers page last.
+    Markers {
+        /// Coding-agent source (claude, codex, cursor, grok, relay, opencode).
+        source: String,
+        /// Native session identifier within that source.
+        session_id: String,
+        /// Maximum rows per page (default 200, at most 1000).
+        #[arg(long)]
+        limit: Option<i64>,
+        /// Precise continuation: `id` of the previous page's last row.
+        #[arg(long)]
+        after_id: Option<i64>,
+        /// Precise continuation: `ts_ms` of the previous page's last row. Omit
+        /// (with --after-id given) to continue through the undated tail.
+        #[arg(long, requires = "after_id")]
+        after_ms: Option<i64>,
+        /// Emit `{"contract_version":N,"source":…,"session_id":…,"markers":[...],"next_cursor":…}`
+        /// as one JSON object.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Provider-reported token usage rollup for one session, from the
+    /// database only. Usage is what the provider recorded, never estimated,
+    /// and cost is never computed: `reported_cost_usd` appears only when the
+    /// source data carried one.
+    Usage {
+        /// Coding-agent source (claude, codex, cursor, grok, relay, opencode).
+        source: String,
+        /// Native session identifier within that source.
+        session_id: String,
+        /// Emit `{"contract_version":N,"source":…,"session_id":…,"summary":{…}|null}`
+        /// as one JSON object. The summary keeps the crate's camelCase wire form.
+        #[arg(long)]
+        json: bool,
+    },
     /// Discover sessions from the requested provider locations with bounded reads.
     ///
     /// Enumerates every provider, orders candidates globally by recency, reads
@@ -522,6 +564,8 @@ fn is_read_only(command: &Command) -> bool {
             // upserts, so it is deliberately absent.
             | Command::Sessions {
                 action: SessionsAction::List { .. }
+                    | SessionsAction::Markers { .. }
+                    | SessionsAction::Usage { .. }
             }
     )
 }
@@ -1085,6 +1129,45 @@ pub fn run() -> Result<()> {
                 )?;
                 print_session_catalog(&page, json)
             }
+            SessionsAction::Markers {
+                source,
+                session_id,
+                limit,
+                after_id,
+                after_ms,
+                json,
+            } => {
+                validate_source(Some(&source))?;
+                anyhow::ensure!(
+                    !session_id.trim().is_empty(),
+                    "SESSION_ID must not be empty"
+                );
+                let limit = limit.unwrap_or(200);
+                anyhow::ensure!(
+                    (1..=1_000).contains(&limit),
+                    "--limit must be between 1 and 1000 (got {limit})"
+                );
+                let after = after_id.map(|id| SessionEvidenceCursor {
+                    ts_ms: after_ms,
+                    id,
+                });
+                let page =
+                    session_markers_page(&conn, &source, &session_id, limit, after.as_ref())?;
+                print_session_markers(&source, &session_id, &page, json)
+            }
+            SessionsAction::Usage {
+                source,
+                session_id,
+                json,
+            } => {
+                validate_source(Some(&source))?;
+                anyhow::ensure!(
+                    !session_id.trim().is_empty(),
+                    "SESSION_ID must not be empty"
+                );
+                let summary = session_usage_summary(&conn, &source, &session_id)?;
+                print_session_usage(&source, &session_id, summary.as_ref(), json)
+            }
             SessionsAction::Discover {
                 scope,
                 source,
@@ -1093,6 +1176,142 @@ pub fn run() -> Result<()> {
             } => run_session_discovery(&conn, scope.resolve(), source, limit, json, &connectors),
         },
     }
+}
+
+/// Render `ai-hist sessions markers`.
+///
+/// One JSON object, so the contract version and the cursor travel with the
+/// rows. Feed `next_cursor` back as `--after-id` (and `--after-ms` when it is
+/// not null) to continue; it is null once the session's markers are exhausted.
+fn print_session_markers(
+    source: &str,
+    session_id: &str,
+    page: &SessionMarkerPage,
+    as_json: bool,
+) -> Result<()> {
+    if as_json {
+        println!(
+            "{}",
+            json!({
+                "contract_version": SESSION_EVIDENCE_CONTRACT_VERSION,
+                "source": source,
+                "session_id": session_id,
+                "markers": page.markers,
+                "next_cursor": page.next_cursor,
+            })
+        );
+        return Ok(());
+    }
+    if page.markers.is_empty() {
+        println!("No markers for {source}/{session_id}.");
+        return Ok(());
+    }
+    for marker in &page.markers {
+        let ts = marker
+            .ts_ms
+            .and_then(|ms| Local.timestamp_millis_opt(ms).single())
+            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{ts}  {}  {}  {}  {}",
+            marker.kind,
+            marker.subkind.as_deref().unwrap_or("-"),
+            marker.message_id.as_deref().unwrap_or("-"),
+            marker.text.as_deref().unwrap_or("-"),
+        );
+    }
+    println!("  {} marker(s)", page.markers.len());
+    if let Some(cursor) = &page.next_cursor {
+        println!(
+            "  more available: --after-id {}{}",
+            cursor.id,
+            cursor
+                .ts_ms
+                .map(|ts| format!(" --after-ms {ts}"))
+                .unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+/// Render `ai-hist sessions usage`.
+///
+/// A session with no recorded request is `summary: null`; a session whose
+/// usage could not be established is a summary with `usage: null` and the
+/// diagnostics saying why. Neither is zero, because zero is a claim.
+fn print_session_usage(
+    source: &str,
+    session_id: &str,
+    summary: Option<&SessionUsageSummary>,
+    as_json: bool,
+) -> Result<()> {
+    if as_json {
+        println!(
+            "{}",
+            json!({
+                "contract_version": SESSION_USAGE_CONTRACT_VERSION,
+                "source": source,
+                "session_id": session_id,
+                "summary": summary,
+            })
+        );
+        return Ok(());
+    }
+    let Some(summary) = summary else {
+        println!("No requests recorded for {source}/{session_id}.");
+        return Ok(());
+    };
+    println!(
+        "{source}/{session_id}: {} of {} request(s) with usage",
+        summary.request_count, summary.total_request_count
+    );
+    match &summary.usage {
+        Some(usage) => {
+            println!(
+                "tokens: input={} output={} cache_read={} cache_write={} reasoning={} provider_total={}",
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_read_tokens,
+                usage.cache_write_tokens,
+                usage
+                    .reasoning_tokens
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                usage
+                    .provider_total_tokens
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+            );
+            println!(
+                "accounting: {}; reported cost: {}",
+                summary
+                    .accounting
+                    .iter()
+                    .map(|mode| mode.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                usage
+                    .reported_cost_usd
+                    .map(|cost| cost.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+            );
+        }
+        None => println!(
+            "tokens: none established{}",
+            if summary.overflowed {
+                " (overflowed)"
+            } else {
+                ""
+            }
+        ),
+    }
+    if !summary.models.is_empty() {
+        println!("models: {}", summary.models.join(", "));
+    }
+    for diagnostic in &summary.diagnostics {
+        println!("diagnostic: {}", diagnostic.as_str());
+    }
+    Ok(())
 }
 
 /// Render `ai-hist sessions list`.
@@ -3444,6 +3663,38 @@ mod tests {
         assert_eq!(cron_schedule(300).2, 300);
         assert_eq!(cron_schedule(5400).2, 7200);
         assert_eq!(cron_schedule(420).2, 600);
+    }
+
+    /// `sessions markers` and `sessions usage` are cache-only reads over the
+    /// evidence tables, so they must not take the write lock any more than
+    /// `sessions list` does; `sessions discover` upserts and must.
+    #[test]
+    fn session_evidence_reads_get_a_read_only_handle() {
+        assert!(super::is_read_only(&super::Command::Sessions {
+            action: super::SessionsAction::Markers {
+                source: "claude".into(),
+                session_id: "s".into(),
+                limit: None,
+                after_id: None,
+                after_ms: None,
+                json: false,
+            }
+        }));
+        assert!(super::is_read_only(&super::Command::Sessions {
+            action: super::SessionsAction::Usage {
+                source: "claude".into(),
+                session_id: "s".into(),
+                json: false,
+            }
+        }));
+        assert!(!super::is_read_only(&super::Command::Sessions {
+            action: super::SessionsAction::Discover {
+                scope: super::SessionScopeArgs::default(),
+                source: Vec::new(),
+                limit: None,
+                json: false,
+            }
+        }));
     }
 
     #[test]

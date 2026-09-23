@@ -1298,15 +1298,16 @@ fn scoped_adoption_preserves_deleted_records_pending_batches_and_pause() {
         session_id: "a".into(),
     };
     adopt_session_job(&conn, &old.job_id, &[a.clone(), a.clone()]).unwrap();
-    assert_eq!(
-        conn.query_row(
-            "SELECT COUNT(DISTINCT job_id) FROM delivery_bootstrap_bounds",
-            [],
-            |r| r.get::<_, i64>(0)
-        )
-        .unwrap(),
-        2
-    );
+    // The member owns the only snapshot; the job's own bounds are released.
+    let owners: Vec<String> = conn
+        .prepare("SELECT DISTINCT job_id FROM delivery_bootstrap_bounds")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(owners.len(), 1);
+    assert_ne!(owners[0], old.job_id);
     adopt_session_job(&conn, &old.job_id, &[]).unwrap();
     assert_eq!(status(&conn, &old.job_id).unwrap().state, "paused");
     assert_eq!(job_sessions(&conn, &old.job_id).unwrap(), vec![a]);
@@ -1658,7 +1659,23 @@ fn probe_split_adopts_legacy_queue_and_core_only_writes_preserve_capture() {
         // Restore pre-split capture consumers; no source file or network involved.
         let triggers=conn.prepare("SELECT name,sql FROM sqlite_master WHERE type='trigger' AND sql LIKE '%history_subscriptions%'").unwrap().query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
         for (name, sql) in triggers {
-            let legacy=sql.replace("SELECT id,'active' AS state,bootstrap_done,bootstrap_kind,bootstrap_rowid,source AS member_source,session_id AS member_session FROM history_subscriptions", "SELECT m.id,j.state,m.bootstrap_done,m.bootstrap_kind,m.bootstrap_rowid,m.source AS member_source,m.session_id AS member_session FROM delivery_session_members m JOIN delivery_jobs j ON j.id=m.job_id WHERE j.state <> 'cancelled' UNION ALL SELECT id,state,bootstrap_done,bootstrap_kind,bootstrap_rowid,NULL,NULL FROM delivery_jobs WHERE state <> 'cancelled'").replace("EXISTS(SELECT 1 FROM history_subscriptions)","EXISTS(SELECT 1 FROM delivery_jobs WHERE state <> 'cancelled')");
+            let mut legacy=sql.replace("SELECT id,'active' AS state,bootstrap_done,bootstrap_kind,bootstrap_rowid,source AS member_source,session_id AS member_session FROM history_subscriptions", "SELECT m.id,j.state,m.bootstrap_done,m.bootstrap_kind,m.bootstrap_rowid,m.source AS member_source,m.session_id AS member_session FROM delivery_session_members m JOIN delivery_jobs j ON j.id=m.job_id WHERE j.state <> 'cancelled' UNION ALL SELECT id,state,bootstrap_done,bootstrap_kind,bootstrap_rowid,NULL,NULL FROM delivery_jobs WHERE state <> 'cancelled'");
+            // Pre-split journal writes are gated on any active job; the
+            // per-identity predicate runs from its opening parentheses to the
+            // end of its statement.
+            let marker = "EXISTS(SELECT 1 FROM history_subscriptions WHERE source IS NULL)";
+            while let Some(found) = legacy.find(marker) {
+                let mut begin = found;
+                while begin > 0 && legacy.as_bytes()[begin - 1] == b'(' {
+                    begin -= 1;
+                }
+                let end = found + legacy[found..].find(';').unwrap();
+                legacy.replace_range(
+                    begin..end,
+                    "EXISTS(SELECT 1 FROM delivery_jobs WHERE state <> 'cancelled')",
+                );
+            }
+            assert!(!legacy.contains("history_subscriptions"), "{legacy}");
             conn.execute_batch(&format!("DROP TRIGGER \"{name}\"; {legacy};"))
                 .unwrap();
         }
@@ -1867,4 +1884,143 @@ fn scoped_include_rolls_back_exclusion_and_fences_when_snapshot_fails() {
     conn.execute_batch("DROP TRIGGER fail_member_snapshot;")
         .unwrap();
     assert!(include_job_session(&conn, &root.job_id, &child).unwrap());
+}
+
+fn journaled_sessions(conn: &Connection) -> Vec<String> {
+    conn.prepare("SELECT DISTINCT session_id FROM delivery_journal WHERE kind <> '__cutoff' ORDER BY session_id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+#[test]
+fn excluded_sessions_cost_no_journal_retention_under_a_root_job() {
+    let conn = db();
+    let job = create_job(&conn, &config("one"), 0).unwrap();
+    set_session_excluded(
+        &conn,
+        &SessionIdentity {
+            source: "claude".into(),
+            session_id: "private".into(),
+        },
+        true,
+    )
+    .unwrap();
+    let before = retained_bytes(&conn).unwrap().0;
+    event(&conn, "private", "secret");
+    conn.execute(
+        "UPDATE session_events SET text='edited' WHERE session_id='private'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(retained_bytes(&conn).unwrap().0, before);
+    event(&conn, "public", "shared");
+    assert_eq!(journaled_sessions(&conn), vec!["public".to_string()]);
+    let records = drain(&conn, &job.job_id);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].session_id.as_deref(), Some("public"));
+    assert_eq!(status(&conn, &job.job_id).unwrap().suppressed_records, 0);
+    // Once delivered, the journal holds nothing for this job to retain.
+    compact_journal(&conn, 100).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM delivery_journal", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn non_member_sessions_cost_no_journal_retention_under_a_session_job() {
+    let conn = db();
+    let root = create_session_job(&conn, &config("scoped"), 0).unwrap();
+    set_job_session(
+        &conn,
+        &root.job_id,
+        &SessionIdentity {
+            source: "claude".into(),
+            session_id: "member".into(),
+        },
+        true,
+    )
+    .unwrap();
+    event(&conn, "member", "mine");
+    event(&conn, "stranger", "theirs");
+    assert_eq!(journaled_sessions(&conn), vec!["member".to_string()]);
+    let records = drain(&conn, &root.job_id);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].session_id.as_deref(), Some("member"));
+    assert_eq!(status(&conn, &root.job_id).unwrap().suppressed_records, 0);
+}
+
+/// A session job carries no subscription row, snapshot bounds or preimages of
+/// its own; those left by an earlier writer are retired by the same migration
+/// that rebuilds capture, and their retention is returned with them.
+#[test]
+fn upgrade_retires_a_session_jobs_own_subscription_row() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("history.db");
+    let conn = open_db(&path).unwrap();
+    let root = create_session_job(&conn, &config("scoped"), 0).unwrap();
+    set_job_session(
+        &conn,
+        &root.job_id,
+        &SessionIdentity {
+            source: "claude".into(),
+            session_id: "member".into(),
+        },
+        true,
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO history_subscriptions(id,journal_cursor,bootstrap_done) VALUES (?,0,1)",
+        [&root.job_id],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO delivery_bootstrap_bounds(job_id,kind,max_rowid) VALUES (?,'session',0)",
+        [&root.job_id],
+    )
+    .unwrap();
+    conn.execute("INSERT INTO delivery_shadow(job_id,kind,row_id,source,session_id,record_key,payload) VALUES (?,'session_event',1,'claude','member','[\"session_event\",\"claude\",\"member\",\"a\"]',?)", params![root.job_id,"x".repeat(4096)]).unwrap();
+    let charged = retained_bytes(&conn).unwrap().0;
+    conn.execute(
+        "DELETE FROM schema_migrations WHERE name='delivery_capture_filter_v1'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let conn = open_db(&path).unwrap();
+    assert!(ai_hist::schema_is_current(&conn).unwrap());
+    let roots: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM history_subscriptions WHERE source IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(roots, 0);
+    let own_bounds: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM delivery_bootstrap_bounds WHERE job_id=?",
+            [&root.job_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(own_bounds, 0);
+    let own_preimages: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM delivery_shadow WHERE job_id=?",
+            [&root.job_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(own_preimages, 0);
+    assert!(retained_bytes(&conn).unwrap().0 < charged - 4096);
+    event(&conn, "member", "mine");
+    event(&conn, "stranger", "theirs");
+    assert_eq!(journaled_sessions(&conn), vec!["member".to_string()]);
+    assert_eq!(drain(&conn, &root.job_id).len(), 1);
 }

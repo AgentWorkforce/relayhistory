@@ -58,6 +58,7 @@
   "quirk": "`agent-transcripts/<id>/<id>.jsonl` with string, block-array and `<user_query>`-wrapped prompts, assistant text, a tool_use and a tool_result; the provider records no timestamps",
   "session_events": [
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "0:0",
       "git_branch": null,
@@ -74,6 +75,7 @@
       "ts_ms": 1776643200000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "163:0",
       "git_branch": null,
@@ -90,6 +92,7 @@
       "ts_ms": 1776643200000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "163:1",
       "git_branch": null,
@@ -106,6 +109,7 @@
       "ts_ms": 1776643200000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "293:0",
       "git_branch": null,
@@ -122,6 +126,7 @@
       "ts_ms": 1776643200000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "372:0",
       "git_branch": null,
@@ -138,6 +143,7 @@
       "ts_ms": 1776643200000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "518:0",
       "git_branch": null,
@@ -154,6 +160,7 @@
       "ts_ms": 1776643200000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "66:0",
       "git_branch": null,
@@ -170,6 +177,7 @@
       "ts_ms": 1776643200000
     }
   ],
+  "session_markers": [],
   "session_relationships": [],
   "sessions": [
     {

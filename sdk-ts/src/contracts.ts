@@ -288,7 +288,26 @@ export interface SessionEvent {
   isSidechain: boolean | null;
   isMeta: boolean | null;
   turnId: string | null;
+  /**
+   * Why a user-role row is not a human prompt, or null for a genuine prompt
+   * and for every model-output row. Only ever set on a `user` / `text` row;
+   * the row keeps its role, kind and verbatim text.
+   */
+  controlKind: ControlKind | null;
 }
+
+export type ControlKind =
+  | 'slash_command_caveat'
+  | 'slash_command_invocation'
+  | 'slash_command_output'
+  | 'task_notification'
+  | 'hook_output'
+  | 'bash_passthrough_input'
+  | 'bash_passthrough_output'
+  | 'system_reminder'
+  | 'codex_context_wrapper'
+  | 'meta'
+  | 'resume_marker';
 
 export type ToolResultStatus = 'running' | 'completed' | 'errored' | 'cancelled' | 'unknown';
 
@@ -556,6 +575,70 @@ export interface SessionFileEditsPage {
   sessionId: string;
   fileEdits: SessionFileEdit[];
   nextCursor: EvidenceCursor | null;
+}
+
+/**
+ * One record a provider wrote about a session that the normalized event model
+ * cannot carry: a compaction or summary boundary, a provider `system` row, a
+ * non-text content block, an agent lifecycle event. A marker is deliberately
+ * not an event — it has no role, and its `tsMs` is nullable because a
+ * provider may record that something happened without recording when.
+ */
+export interface SessionMarker {
+  id: number;
+  source: Source;
+  sessionId: string;
+  /** Deterministic per record, so a re-parse updates the row in place. */
+  markerUid: string;
+  tsMs: number | null;
+  messageId: string | null;
+  parentId: string | null;
+  turnId: string | null;
+  /**
+   * Classified vocabulary (`compaction_boundary`, `summary`,
+   * `subagent_notification`, ...). A record type no classifier knows is
+   * `unknown`, with the provider-native type kept verbatim in `subkind`.
+   */
+  kind: string;
+  subkind: string | null;
+  /** The provider's own readable text for this marker, when it wrote one. */
+  text: string | null;
+  /** Parsed bounded payload projection, or null when absent or unparseable. */
+  payload: JsonValue | null;
+  /** The stored payload string exactly as indexed, parseable or not. */
+  payloadJson: string | null;
+}
+
+/** Markers page on the evidence keyset: `(tsMs IS NULL, tsMs, id)`. */
+export interface SessionMarkersPage {
+  contractVersion: number;
+  source: Source;
+  sessionId: string;
+  markers: SessionMarker[];
+  nextCursor: EvidenceCursor | null;
+}
+
+/**
+ * What one provider's local parser can record, answered from RelayHistory's
+ * own capability tables rather than from any database — so it is correct
+ * before a first sync and for a database that does not exist yet.
+ *
+ * `evidenceKinds` is the `coverage` a hydration of this source reports;
+ * `fullCoverage` is whether that hydration can ever say `full`.
+ * `relationships` is the same table `getSessionRelationships` returns as
+ * `capabilities`.
+ */
+export interface SourceCapabilities {
+  /** The contract whose `EvidenceKind` vocabulary `evidenceKinds` uses. */
+  hydrationContractVersion: number;
+  /** The contract `relationships` is spelled in. */
+  relationshipContractVersion: number;
+  source: CatalogSource;
+  evidenceKinds: EvidenceKind[];
+  /** The `FULL_SESSION_KINDS` the parser does not produce, in canonical order. */
+  missingEvidenceKinds: EvidenceKind[];
+  fullCoverage: boolean;
+  relationships: RelationshipCapabilities;
 }
 
 /** How a source accounts for the usage one stored record stands for. */

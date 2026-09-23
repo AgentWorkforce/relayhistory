@@ -47,11 +47,13 @@ classification, or similarity-based session linking.
 | [`docs/architecture.md`](docs/architecture.md)           | Production call graph, package boundaries, ledger and scope          |
 | [`docs/session-catalog.md`](docs/session-catalog.md)     | Shallow discovery, per-provider capability matrix, adding a provider |
 | [`docs/sourcing-contract.md`](docs/sourcing-contract.md) | Record types the Rust SDK must expose                                |
+| [`docs/sourcing-sdk.md`](docs/sourcing-sdk.md)           | Embedder guide: the `SessionStore` facade, its structs and errors, lifecycle and locks, evidence model, semver |
 | [`docs/decisions/`](docs/decisions/)                     | Architecture decision records                                        |
 | [`docs/getting-started.md`](docs/getting-started.md)     | Install and first run                                                |
 | [`docs/releasing.md`](docs/releasing.md)                 | npm and crates.io release pipelines, semver policy                   |
 | [`docs/agent-integration.md`](docs/agent-integration.md) | Wiring RelayHistory into an agent                                    |
 | [`crates/ai-hist/README.md`](crates/ai-hist/README.md)   | Embedding from Rust                                                  |
+| [`examples/rust-consumer`](examples/rust-consumer)       | Out-of-tree consumer of the published crate; CI smoke test          |
 
 ## Decision records
 
@@ -72,7 +74,11 @@ cargo build -p ai-hist --no-default-features
 cargo publish --dry-run -p ai-hist --allow-dirty
 ```
 
-plus the TypeScript SDK tests, the native binding contract check, and the
-optional-plugin jobs. The plugin crates are not workspace members, so
+plus the TypeScript SDK tests, the native binding contract check, the
+optional-plugin jobs, the out-of-tree consumer build (`examples/rust-consumer`
+with `[patch.crates-io]` at this checkout) and the public-API snapshot diff
+(`node scripts/check-public-api.mjs`; a change to the crate's default surface
+updates `crates/ai-hist/public-api.txt` with `--update` and adds a `### Rust
+API` changelog entry in the same PR). The plugin crates are not workspace members, so
 `cargo test --workspace` does not reach them — run them directly when you touch
 `plugins/`.

@@ -139,11 +139,7 @@ fn excluded(
     {
         return Ok(true);
     }
-    Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM delivery_exclusions WHERE source=? AND session_id=?)",
-        params![source, session_id],
-        |row| row.get(0),
-    )?)
+    Ok(!capture::is_shareable(conn, source, session_id)?)
 }
 fn selected(selection: &ExportSelection, kind: &str, source: &str, session: Option<&str>) -> bool {
     selection.kinds.iter().any(|value| value == kind)

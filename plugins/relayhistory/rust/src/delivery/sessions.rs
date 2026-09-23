@@ -339,7 +339,6 @@ pub(super) fn prepare(conn: &Connection, root: &Job, now_ms: i64) -> Result<Prep
         |r| r.get(0),
     )?;
     conn.execute("UPDATE delivery_jobs SET journal_cursor=?,suppressed_records=suppressed_records+? WHERE id=?",params![floor,suppressed,root.id])?;
-    update_root_subscription(conn, &root.id)?;
     let batch_id = if batch.records.is_empty() {
         None
     } else {
@@ -417,13 +416,14 @@ fn adopt_session_job_once(
             },
         )?;
     }
-    capture::clear_preimages(&tx, job_id)?;
+    // The members now own every snapshot and cursor; the job's own
+    // subscription, bounds and preimages have nothing left to serve.
+    capture::release_subscription(&tx, job_id)?;
     tx.execute("UPDATE delivery_jobs SET bootstrap_done=1,fence=fence+1,worker_id=NULL,lease_until_ms=NULL WHERE id=?",[job_id])?;
     tx.execute(
         "UPDATE delivery_batches SET state='pending' WHERE job_id=? AND state='leased'",
         [job_id],
     )?;
-    update_root_subscription(&tx, job_id)?;
     tx.commit()?;
     Ok(())
 }

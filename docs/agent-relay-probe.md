@@ -95,7 +95,7 @@ capture verdict standing, so a condition the capture cycle measured stays
 visible between those cycles. The top-level `ok`, `error_class` and `message`
 are the effective verdict — the capture fault when there is one, otherwise the
 delivery fault — and messages are rendered at report time, so a retention
-sentence always carries the current usage. A `retention_limit` verdict also
+`retention_limit` verdict also
 carries that usage as `used_bytes` and `limit_bytes`; the
 `capture-diagnostic.json` of the pass that stopped carries the retained budget
 it stopped at after compacting consumed changes. Capture stops such a pass after

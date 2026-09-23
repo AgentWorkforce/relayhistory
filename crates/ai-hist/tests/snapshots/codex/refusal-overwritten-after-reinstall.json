@@ -35,6 +35,7 @@
   "quirk": "two refusals for one turn straddle a baseline reinstall and remain tied to their own generations",
   "session_events": [
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "4:user_message",
       "git_branch": null,
@@ -51,6 +52,7 @@
       "ts_ms": 1776686400300
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "5:agent_message",
       "git_branch": null,
@@ -67,6 +69,7 @@
       "ts_ms": 1776686400900
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "9:user_message",
       "git_branch": null,
@@ -83,6 +86,7 @@
       "ts_ms": 1776686402000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "10:agent_message",
       "git_branch": null,
@@ -97,6 +101,34 @@
       "text": "Second answer.",
       "token_json": "{\"cache_write_input_tokens\":0,\"cached_input_tokens\":0,\"input_tokens\":400,\"output_tokens\":140,\"reasoning_output_tokens\":0,\"total_tokens\":540}",
       "ts_ms": 1776686402900
+    }
+  ],
+  "session_markers": [
+    {
+      "kind": "task_started",
+      "marker_uid": "3:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_codex_overwrite",
+      "source": "codex",
+      "subkind": "task_started",
+      "text": null,
+      "ts_ms": 1776686400200,
+      "turn_id": "t1"
+    },
+    {
+      "kind": "task_complete",
+      "marker_uid": "12:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_codex_overwrite",
+      "source": "codex",
+      "subkind": "task_complete",
+      "text": null,
+      "ts_ms": 1776686404000,
+      "turn_id": "t1"
     }
   ],
   "session_relationships": [],

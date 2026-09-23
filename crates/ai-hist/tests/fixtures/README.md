@@ -7,8 +7,8 @@ string in whichever test the author happened to open.
 `tests/fixture_corpus.rs` stages each fixture below into an isolated provider
 `HOME`, runs the acquisition path a host actually uses — local sync, shallow
 discovery, targeted hydration — and writes a canonical JSON dump of `sessions`,
-`session_events`, `tool_calls`, `file_edits`, `session_relationships` and
-`history` to `tests/snapshots/<source>/<fixture>.json`.
+`session_events`, `tool_calls`, `file_edits`, `session_relationships`,
+`session_markers` and `history` to `tests/snapshots/<source>/<fixture>.json`.
 
 **The snapshots record current behaviour, gaps included.** They are not a
 statement of what relayhistory *should* extract. When a parity issue from
@@ -117,6 +117,8 @@ source without deciding which one fails the test.
 | `claude/fork-reconciliation` | burn | `claude/original-session.jsonl`<br>`claude/fork-branch-a.jsonl`<br>`claude/fork-branch-b.jsonl` | two transcripts share one source session id: a fork, not a continuation |
 | `claude/settings-reference` | burn | `claude/settings/oversized-bash-output-length.json` | burn's Claude settings input that sets the Bash output cap; relayhistory reads no settings file, so it is kept for provenance only |
 | `claude/summary-record` | relayhistory | `claude/summary-record.jsonl` | a `type: "summary"` record with a `leafUuid` between two ordinary turns |
+| `claude/system-reminder` | relayhistory | `claude/system-reminder.jsonl` | `<system-reminder>` blocks injected into user content, as a block of their own, inline in a string prompt, and alone on an `isMeta` record |
+| `claude/hook-and-passthrough` | relayhistory | `claude/hook-and-passthrough.jsonl` | a `<user-prompt-submit-hook>` row flagged `isMeta`, a `<bash-input>` / `<bash-stdout>` pass-through pair, and a bare `isMeta` bookkeeping row between two prompts |
 | `claude/sidecar-subagent` | relayhistory | `claude/sidecar-subagent` | a subagent transcript in `<sessionId>/subagents/agent-<id>.jsonl` with its `agent-<id>.meta.json` sidecar, carrying the PARENT's sessionId |
 
 ### `codex`
@@ -146,6 +148,7 @@ source without deciding which one fails the test.
 | `codex/two-unreadable-turns` | relayhistory | `codex/two-unreadable-turns.jsonl` | two unrecovered turns each retain their own unreadable usage refusal |
 | `codex/one-request-three-rows` | relayhistory | `codex/one-request-three-rows.jsonl` | one API call written as reasoning, a tool call and a message is one request, not three |
 | `codex/recovered-span-covers-two-turns` | relayhistory | `codex/recovered-span-covers-two-turns.jsonl` | a readable snapshot recovers a span an unreadable one left open, so its delta measures both turns as one request |
+| `codex/context-wrapper` | relayhistory | `codex/context-wrapper.jsonl` | an `<environment_context>` wrapper the app injects as a user `response_item` ahead of the human's mirrored turn |
 | `codex/two-requests-one-turn` | relayhistory | `codex/two-requests-one-turn.jsonl` | a tool loop makes two API calls inside one turn_id, so the turn is not the request |
 
 ### `cursor`

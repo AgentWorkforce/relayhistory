@@ -66,6 +66,7 @@
   "quirk": "an Edit is applied and then reverted; tool_results carry pre/post file hashes",
   "session_events": [
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-user-1:0",
       "git_branch": null,
@@ -82,6 +83,7 @@
       "ts_ms": 1776643200000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-asst-1:0",
       "git_branch": null,
@@ -98,6 +100,7 @@
       "ts_ms": 1776643201000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-user-2:0",
       "git_branch": null,
@@ -114,6 +117,7 @@
       "ts_ms": 1776643202000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-asst-2:0",
       "git_branch": null,
@@ -130,6 +134,7 @@
       "ts_ms": 1776643203000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-user-3:0",
       "git_branch": null,
@@ -146,6 +151,7 @@
       "ts_ms": 1776643204000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-asst-3:0",
       "git_branch": null,
@@ -162,6 +168,7 @@
       "ts_ms": 1776643205000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-user-4:0",
       "git_branch": null,
@@ -178,6 +185,7 @@
       "ts_ms": 1776643206000
     }
   ],
+  "session_markers": [],
   "session_relationships": [],
   "sessions": [
     {

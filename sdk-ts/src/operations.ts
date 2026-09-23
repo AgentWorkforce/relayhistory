@@ -15,7 +15,7 @@ import {
  * re-exports of local contracts.
  */
 
-import { nativeCall } from './native.js';
+import { nativeCall, sessionStoreCall, SESSION_STORE_OPS } from './native.js';
 import {
   SESSION_CATALOG_CONTRACT_VERSION,
   SESSION_HYDRATION_CONTRACT_VERSION,
@@ -106,6 +106,8 @@ import type {
   SessionUsageOptions,
   UserTurnsPageOptions,
   SessionUserTurnsPage,
+  SessionMarkersPage,
+  SourceCapabilities,
   Stats,
   StatsOptions,
   SyncOptions,
@@ -144,6 +146,8 @@ import {
   usageDiagnostics,
   sessionRequest,
   requestCursor,
+  sessionMarker,
+  sourceCapabilities,
   catalogSource,
   relationshipType,
   identityStatus,
@@ -538,19 +542,19 @@ export async function getSessionRequestsPage(
   options: RequestPageOptions = {},
 ): Promise<SessionRequestsPage> {
   evidenceIdentity(source, sessionId, 'getSessionRequestsPage');
-  return nativeCall(async (native) => {
-    const page = await native.getSessionRequestsPage(source, sessionId, options);
-    assertUsageContract(Number(page.contractVersion));
-    return {
-      contractVersion: Number(page.contractVersion),
-      source: String(page.source) as Source,
-      sessionId: String(page.sessionId),
-      requests: Array.isArray(page.requests)
-        ? (page.requests as UnknownRecord[]).map(sessionRequest)
-        : [],
-      nextCursor: requestCursor(page.nextCursor),
-    };
+  const page = await sessionStoreCall(SESSION_STORE_OPS.requests, {
+    dbPath: options.dbPath, source, sessionId, limit: options.limit, after: options.after,
   });
+  assertUsageContract(Number(page.contractVersion));
+  return {
+    contractVersion: Number(page.contractVersion),
+    source: String(page.source) as Source,
+    sessionId: String(page.sessionId),
+    requests: Array.isArray(page.requests)
+      ? (page.requests as UnknownRecord[]).map(sessionRequest)
+      : [],
+    nextCursor: requestCursor(page.nextCursor),
+  };
 }
 
 /**
@@ -566,24 +570,24 @@ export async function getSessionUsage(
   options: SessionUsageOptions = {},
 ): Promise<SessionUsage> {
   evidenceIdentity(source, sessionId, 'getSessionUsage');
-  return nativeCall(async (native) => {
-    const value = await native.getSessionUsage(source, sessionId, options);
-    assertUsageContract(Number(value.contractVersion));
-    return {
-      contractVersion: Number(value.contractVersion),
-      source: String(value.source) as Source,
-      sessionId: String(value.sessionId),
-      usage: normalizedUsage(value.usage),
-      requestCount: Number(value.requestCount),
-      totalRequestCount: Number(value.totalRequestCount),
-      accounting: Array.isArray(value.accounting) ? value.accounting.map(usageAccounting) : [],
-      models: Array.isArray(value.models) ? value.models.map(String) : [],
-      firstTsMs: nullableNumber(value.firstTsMs),
-      lastTsMs: nullableNumber(value.lastTsMs),
-      diagnostics: usageDiagnostics(value.diagnostics),
-      overflowed: Boolean(value.overflowed),
-    };
+  const value = await sessionStoreCall(SESSION_STORE_OPS.usageSummary, {
+    dbPath: options.dbPath, source, sessionId,
   });
+  assertUsageContract(Number(value.contractVersion));
+  return {
+    contractVersion: Number(value.contractVersion),
+    source: String(value.source) as Source,
+    sessionId: String(value.sessionId),
+    usage: normalizedUsage(value.usage),
+    requestCount: Number(value.requestCount),
+    totalRequestCount: Number(value.totalRequestCount),
+    accounting: Array.isArray(value.accounting) ? value.accounting.map(usageAccounting) : [],
+    models: Array.isArray(value.models) ? value.models.map(String) : [],
+    firstTsMs: nullableNumber(value.firstTsMs),
+    lastTsMs: nullableNumber(value.lastTsMs),
+    diagnostics: usageDiagnostics(value.diagnostics),
+    overflowed: Boolean(value.overflowed),
+  };
 }
 
 /**
@@ -600,25 +604,76 @@ export async function getSessionUserTurnsPage(
   options: UserTurnsPageOptions = {},
 ): Promise<SessionUserTurnsPage> {
   evidenceIdentity(source, sessionId, 'getSessionUserTurnsPage');
-  return nativeCall(async (native) => {
-    const page = await native.getSessionUserTurnsPage(source, sessionId, options);
-    assertEvidenceContract(Number(page.contractVersion));
-    return {
-      contractVersion: Number(page.contractVersion),
-      source: String(page.source) as Source,
-      sessionId: String(page.sessionId),
-      userTurns: Array.isArray(page.userTurns)
-        ? (page.userTurns as UnknownRecord[]).map(sessionUserTurn)
-        : [],
-      nextCursor:
-        page.nextCursor && typeof page.nextCursor === 'object'
-          ? {
-              tsMs: Number((page.nextCursor as UnknownRecord).tsMs),
-              id: Number((page.nextCursor as UnknownRecord).id),
-           }
-           : null,
-    };
+  const page = await sessionStoreCall(SESSION_STORE_OPS.userTurns, {
+    dbPath: options.dbPath, source, sessionId, limit: options.limit, after: options.after,
   });
+  assertEvidenceContract(Number(page.contractVersion));
+  return {
+    contractVersion: Number(page.contractVersion),
+    source: String(page.source) as Source,
+    sessionId: String(page.sessionId),
+    userTurns: Array.isArray(page.userTurns)
+      ? (page.userTurns as UnknownRecord[]).map(sessionUserTurn)
+      : [],
+    nextCursor:
+      page.nextCursor && typeof page.nextCursor === 'object'
+        ? {
+            tsMs: Number((page.nextCursor as UnknownRecord).tsMs),
+            id: Number((page.nextCursor as UnknownRecord).id),
+          }
+        : null,
+  };
+}
+
+/**
+ * One bounded page of a session's markers, oldest first — the records a
+ * provider wrote that the normalized event model cannot carry: compaction and
+ * summary boundaries, provider `system` rows, non-text content blocks, agent
+ * lifecycle events. Same `(tsMs IS NULL, tsMs, id)` keyset as tool calls and
+ * file edits, so an undated marker pages last through a null-timestamp cursor.
+ * A missing database is an empty page.
+ */
+export async function getSessionMarkersPage(
+  source: Source,
+  sessionId: string,
+  options: EvidencePageOptions = {},
+): Promise<SessionMarkersPage> {
+  evidenceIdentity(source, sessionId, 'getSessionMarkersPage');
+  const page = await sessionStoreCall(SESSION_STORE_OPS.markers, {
+    dbPath: options.dbPath,
+    source,
+    sessionId,
+    limit: options.limit,
+    // Unlike the typed boundary, JSON carries an undated cursor's `null`
+    // intact, so the SDK's emitted cursor goes back in as it came out.
+    after: options.after ? { tsMs: options.after.tsMs ?? null, id: options.after.id } : undefined,
+  });
+  assertEvidenceContract(Number(page.contractVersion));
+  return {
+    contractVersion: Number(page.contractVersion),
+    source: String(page.source) as Source,
+    sessionId: String(page.sessionId),
+    markers: Array.isArray(page.markers)
+      ? (page.markers as UnknownRecord[]).map(sessionMarker)
+      : [],
+    nextCursor: evidenceCursor(page.nextCursor),
+  };
+}
+
+/**
+ * What one provider's parser can record. Answered from RelayHistory's own
+ * capability tables, never from a database, so it does not depend on what has
+ * been synced: `evidenceKinds` is the `coverage` a hydration of this source
+ * reports, and `relationships` is what its records establish about delegation.
+ */
+export async function getSourceCapabilities(source: CatalogSource): Promise<SourceCapabilities> {
+  if (!isCatalogSource(source)) {
+    throw new InvalidArgumentError(
+      `invalid source: ${String(source)} (expected one of ${CATALOG_SOURCES.join(', ')})`,
+      'INVALID_ARGUMENT',
+    );
+  }
+  return sourceCapabilities(await sessionStoreCall(SESSION_STORE_OPS.capabilities, { source }));
 }
 
 /**

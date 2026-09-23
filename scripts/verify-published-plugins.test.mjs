@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import { packageName, platforms, plugins } from "./history-package-contract.mjs";
 import {
+  hostHelperInstallRejection,
   hostLibc,
   pluginInstallArgs,
   publicRegistryEnv,
@@ -138,6 +142,37 @@ test("process launch failures preserve the package context and original error", 
     assert.match(error.message, /@relayhistory\/capture@0\.19\.0.*ENOENT/);
     return true;
   });
+});
+
+test("a zero-exit install without the host helpers is a retryable miss", () => {
+  const project = mkdtempSync(join(tmpdir(), "relayhistory-verify-helpers-"));
+  try {
+    const platform = "linux-x64-gnu";
+    const absent = hostHelperInstallRejection(project, platform, "glibc");
+    assert.match(absent, /@relayhistory\/capture-linux-x64-gnu, @relayhistory\/provider-sources-linux-x64-gnu did not install/);
+    assert.match(absent, /npm libc=glibc/);
+    assert.match(absent, /installed @relayhistory\/\*: none/);
+
+    const scope = join(project, "node_modules", "@relayhistory");
+    mkdirSync(join(scope, "capture"), { recursive: true });
+    writeFileSync(join(scope, "capture", "package.json"), "{}\n");
+    const partial = hostHelperInstallRejection(project, platform, "glibc");
+    assert.match(partial, /capture-linux-x64-gnu/);
+    assert.match(partial, /installed @relayhistory\/\*: capture/);
+
+    for (const info of Object.values(plugins)) {
+      const helper = packageName(info, platform);
+      const dir = join(project, "node_modules", ...helper.split("/"));
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "package.json"), "{}\n");
+    }
+    assert.equal(hostHelperInstallRejection(project, platform, "glibc"), "");
+    rmSync(join(project, "node_modules"), { recursive: true, force: true });
+    const afterReset = hostHelperInstallRejection(project, platform, "glibc");
+    assert.match(afterReset, /capture-linux-x64-gnu, @relayhistory\/provider-sources-linux-x64-gnu did not install/);
+  } finally {
+    rmSync(project, { recursive: true, force: true });
+  }
 });
 
 test("verify project depends on both JS packages at the release version", () => {

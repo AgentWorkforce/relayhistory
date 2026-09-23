@@ -28,6 +28,7 @@
   "quirk": "a cumulative snapshot contains a negative input counter that must be preserved and refused",
   "session_events": [
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "3:user_message",
       "git_branch": null,
@@ -44,6 +45,7 @@
       "ts_ms": 1776661200300
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "4:agent_message",
       "git_branch": null,
@@ -58,6 +60,34 @@
       "text": "Answer.",
       "token_json": "{\"cached_input_tokens\":0,\"input_tokens\":-1,\"output_tokens\":120,\"reasoning_output_tokens\":10,\"total_tokens\":119}",
       "ts_ms": 1776661200900
+    }
+  ],
+  "session_markers": [
+    {
+      "kind": "task_started",
+      "marker_uid": "2:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_codex_negative",
+      "source": "codex",
+      "subkind": "task_started",
+      "text": null,
+      "ts_ms": 1776661200200,
+      "turn_id": "t1"
+    },
+    {
+      "kind": "task_complete",
+      "marker_uid": "6:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_codex_negative",
+      "source": "codex",
+      "subkind": "task_complete",
+      "text": null,
+      "ts_ms": 1776661202000,
+      "turn_id": "t1"
     }
   ],
   "session_relationships": [],

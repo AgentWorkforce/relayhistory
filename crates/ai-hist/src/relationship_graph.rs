@@ -120,7 +120,7 @@ impl RelationshipKinds {
     }
 }
 
-const RELATIONSHIP_COLUMNS: &str = "source, parent_session_id, child_session_id, relationship, \
+pub(crate) const RELATIONSHIP_COLUMNS: &str = "source, parent_session_id, child_session_id, relationship, \
      identity_status, child_agent_type, child_agent_name, child_model, spawn_depth, \
      evidence_kind, evidence_locator, evidence_ref, child_has_events, \
      spawned_at_ms, created_ms, relationship_uid, origin_session_id";
@@ -306,7 +306,7 @@ pub fn relationship_capabilities(source: &str) -> RelationshipCapabilities {
     }
 }
 
-fn map_relationship(row: &Row<'_>) -> rusqlite::Result<SessionRelationship> {
+pub(crate) fn map_relationship(row: &Row<'_>) -> rusqlite::Result<SessionRelationship> {
     Ok(SessionRelationship {
         source: row.get(0)?,
         parent_session_id: row.get(1)?,

@@ -91,6 +91,79 @@ async function setCrateVersion(directory, version) {
   return written;
 }
 
+/** The out-of-tree consumer that builds against the crates.io core crate. */
+export const consumerExample = "examples/rust-consumer";
+/** The consumer's registry dependency line on the core crate. */
+const consumerDependencyPattern = new RegExp(
+  `(^${coreCrate} = ")[^"]+(")`,
+  "m",
+);
+/**
+ * The consumer lock's `[[package]]` entry for the core crate: its version and,
+ * when the entry came from the registry, the checksum of that version.
+ */
+const consumerLockPattern = new RegExp(
+  `(\\[\\[package\\]\\]\\r?\\nname = "${coreCrate}"\\r?\\nversion = ")([^"]+)(")` +
+    `((?:\\r?\\nsource = "[^"]+")?)((?:\\r?\\nchecksum = "[^"]+")?)`,
+);
+
+/**
+ * Stamp `version` into the out-of-tree consumer example
+ * (`examples/rust-consumer`): its `ai-hist = "<version>"` dependency and the
+ * core crate's entry in the lockfile beside it. The example is not a
+ * workspace member on purpose — it resolves the crate from crates.io — and CI
+ * builds it twice: on every pull request with `[patch.crates-io]` pointing at
+ * `crates/ai-hist`, which Cargo only applies while the workspace version
+ * satisfies the example's requirement, and nightly against the published
+ * crate. A release that moved the crate without moving this requirement would
+ * turn the patch into a silent no-op and leave the nightly job on the previous
+ * release.
+ *
+ * The lock entry's checksum is the digest of the *previous* version's tarball.
+ * It is dropped when the version moves: Cargo fills a missing checksum in on
+ * the next resolve, but a stale one fails every build with a checksum
+ * mismatch. When the version is unchanged nothing is touched, so a re-run on
+ * an already-stamped checkout is byte-identical. Idempotent.
+ *
+ * @returns the paths written, in order.
+ */
+async function setConsumerExampleVersion(root, version) {
+  const written = [];
+  const manifestPath = resolve(root, consumerExample, "Cargo.toml");
+  const manifest = await readFile(manifestPath, "utf8");
+  assert.match(
+    manifest,
+    consumerDependencyPattern,
+    `${manifestPath} has no ${coreCrate} dependency to set`,
+  );
+  await writeFile(
+    manifestPath,
+    manifest.replace(
+      consumerDependencyPattern,
+      (_, prefix, suffix) => prefix + version + suffix,
+    ),
+  );
+  written.push(manifestPath);
+
+  const lockPath = resolve(root, consumerExample, "Cargo.lock");
+  const lock = await readFile(lockPath, "utf8");
+  assert.match(lock, consumerLockPattern, `${lockPath} has no ${coreCrate} entry`);
+  await writeFile(
+    lockPath,
+    lock.replace(
+      consumerLockPattern,
+      (_, prefix, current, suffix, source, checksum) =>
+        prefix +
+        version +
+        suffix +
+        source +
+        (current === version ? checksum : ""),
+    ),
+  );
+  written.push(lockPath);
+  return written;
+}
+
 /**
  * Stamp `version` into the core crate itself: `crates/ai-hist/Cargo.toml` and
  * its entry in the root `Cargo.lock`. Every plugin crate depends on it by path,
@@ -144,6 +217,7 @@ export async function setReleaseVersion(version, root = repositoryRoot) {
     `A release version must be stable semver, received ${version}`,
   );
   const written = await setCoreCrateVersion(root, version);
+  written.push(...(await setConsumerExampleVersion(root, version)));
   for (const [plugin, info] of Object.entries(plugins)) {
     const directory = resolve(root, "plugins", plugin, "sdk");
     const manifestPath = resolve(directory, "package.json");

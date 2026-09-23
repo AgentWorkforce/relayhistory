@@ -24,7 +24,7 @@ indexed session reads. Probe queue progress and subscription progress commit
 atomically. The storage schema contains no account, receiver or retry semantics.
 Local NDJSON export remains independent of the probe.
 
-Native contract 20 separates `historyExport` from obsolete upload entry points.
+Native contract 21 separates `historyExport` from obsolete upload entry points.
 Core SDK/CLI/MCP upload calls return `HISTORY_DELIVERY_MOVED` without loading
 credentials, receivers or creating a database. Control moves to the existing
 `@relayhistory/capture` helper API and probe commands. Generic JavaScript

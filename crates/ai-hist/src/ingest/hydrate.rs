@@ -85,7 +85,13 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 3;
 /// cursor, so the first hydration after upgrading re-parses that transcript
 /// once from offset 0 and writes the cursor; every hydration after that
 /// resumes from it.
-const HYDRATION_PARSER_VERSION: i64 = 10;
+///
+/// Version 11 is control rows as typed evidence (#180): `control_kind` on
+/// `session_events`, `<system-reminder>` blocks as rows of their own and the
+/// `slash_command` marker. A checkpoint at 10 has the column null on every
+/// row and the reminders folded into the prompt text, so every session
+/// re-parses once.
+const HYDRATION_PARSER_VERSION: i64 = 11;
 
 #[derive(Debug, Clone)]
 pub struct HydrateSessionOptions {
@@ -2220,6 +2226,13 @@ fn ingest_claude(
         meta.last_assistant_text.as_deref(),
         Some(&path.to_string_lossy()),
     )?;
+    // The fold above walked the whole transcript, so its first prompt is the
+    // catalog's, null included -- unless the file was rewritten under the
+    // walk, in which case the fold describes no generation that exists and
+    // the next pass, which rescans, settles it.
+    if !scan_superseded {
+        crate::ingest::set_claude_first_prompt(conn, &meta)?;
+    }
     let mut outcome = IngestOutcome {
         bytes_read: scanned_bytes as i64,
         validation_bytes: scan_validation as i64,
@@ -5675,6 +5688,92 @@ mod tests {
         );
     }
 
+    /// The `slash_command` marker's payload, per command, for one session.
+    fn slash_command_payloads(db: &Path, session_id: &str) -> Vec<Value> {
+        let conn = open_db(db).unwrap();
+        let mut statement = conn
+            .prepare(
+                "SELECT payload_json FROM session_markers \
+                 WHERE source = 'claude' AND session_id = ? AND kind = 'slash_command' \
+                 ORDER BY marker_uid",
+            )
+            .unwrap();
+        statement
+            .query_map([session_id], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|payload| serde_json::from_str(&payload.unwrap()).unwrap())
+            .collect()
+    }
+
+    /// A slash command's caveat and invocation can be the last records a
+    /// pass reads, with the output row arriving before the next one. The
+    /// pending invocation travels in the cursor, so the second pass chains
+    /// the output onto the marker the first pass wrote instead of leaving
+    /// the command without its output.
+    #[test]
+    fn a_slash_command_split_across_two_hydration_passes_is_still_one_marker() {
+        let bytes = fs::read(fixture("slash-command-triad.jsonl")).unwrap();
+        let session_id = "slash-session";
+        let line_starts: Vec<usize> = std::iter::once(0)
+            .chain(
+                bytes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, byte)| **byte == b'\n')
+                    .map(|(index, _)| index + 1),
+            )
+            .collect();
+        // Records 1-4: prompt, answer, caveat, invocation. The output row is
+        // record 5.
+        let cut = line_starts[4];
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("history.db");
+        let transcript = seed_claude_transcript(dir.path(), session_id, &bytes[..cut]);
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", session_id, Some(&transcript));
+        drop(conn);
+        hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        let opened = slash_command_payloads(&db, session_id);
+        assert_eq!(opened.len(), 1, "{opened:?}");
+        assert_eq!(opened[0]["command_name"], "/review");
+        assert_eq!(opened[0]["invocation_event_uid"], "u-inv-1:0");
+        assert!(
+            opened[0].get("output_event_uid").is_none(),
+            "no output has been read yet: {opened:?}"
+        );
+
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        file.write_all(&bytes[cut..]).unwrap();
+        drop(file);
+        hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        let closed = slash_command_payloads(&db, session_id);
+        assert_eq!(closed.len(), 2, "{closed:?}");
+        assert_eq!(closed[0]["command_name"], "/review");
+        assert_eq!(closed[0]["output_event_uid"], "u-out-1:0");
+        assert_eq!(closed[0]["stdout_bytes"], "review summary: no issues".len());
+        assert_eq!(closed[1]["command_name"], "/init");
+        assert_eq!(closed[1]["output_event_uid"], "u-out-2:0");
+
+        // And the split read agrees with a single read of the whole file.
+        let whole_dir = tempfile::tempdir().unwrap();
+        let whole_db = whole_dir.path().join("history.db");
+        let whole = seed_claude_transcript(whole_dir.path(), session_id, &bytes);
+        let conn = open_db(&whole_db).unwrap();
+        catalog_row(&conn, "claude", session_id, Some(&whole));
+        drop(conn);
+        hydrate_session_at_with_home(&whole_db, &options("claude", session_id), whole_dir.path())
+            .unwrap();
+        assert_eq!(slash_command_payloads(&whole_db, session_id), closed);
+        assert_eq!(
+            session_event_snapshot(&whole_db, session_id),
+            session_event_snapshot(&db, session_id)
+        );
+    }
+
     #[test]
     fn interleaved_turns_hydrate_identically_whole_or_in_three_appends() {
         assert_append_chunks_match_one_pass(
@@ -7996,6 +8095,124 @@ mod tests {
         let quiet =
             hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
         assert_eq!(quiet.status, "unchanged");
+    }
+
+    /// The title the metadata fold settles is only as good as the bytes the
+    /// fold read. A fold superseded by a rewrite under it must write no
+    /// title, and the next pass -- hydration, and the global sync whose fast
+    /// path consults only the record cursor -- must rescan and write the
+    /// real one.
+    #[test]
+    fn a_superseded_scan_writes_no_title_and_the_next_pass_settles_it() {
+        let session_id = "session-stale-title";
+        // The head is a control row, so the title is null until a prompt
+        // arrives.
+        let first = format!(
+            "{{\"sessionId\":\"{session_id}\",\"uuid\":\"u-1\",\"cwd\":\"/work/app\",\
+             \"type\":\"user\",\
+             \"message\":{{\"role\":\"user\",\"content\":\"/resume 11111111-1111-1111-1111-111111111111\"}},\
+             \"timestamp\":\"2026-08-31T10:00:00Z\"}}\n"
+        );
+        let appended = |prompt: &str| {
+            format!(
+                "{{\"sessionId\":\"{session_id}\",\"uuid\":\"u-2\",\"cwd\":\"/work/app\",\
+                 \"type\":\"user\",\
+                 \"message\":{{\"role\":\"user\",\"content\":\"{prompt}\"}},\
+                 \"timestamp\":\"2026-08-31T10:00:01Z\"}}\n"
+            )
+        };
+        let mid = appended("mid prompt");
+        let new = appended("new prompt");
+        assert_eq!(mid.len(), new.len());
+        let title = |db: &Path| -> Option<String> {
+            let conn = open_db(db).unwrap();
+            conn.query_row(
+                "SELECT first_prompt FROM sessions WHERE source = 'claude' AND session_id = ?",
+                [session_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        // The rewrite lands between the metadata read and its commit, keeps
+        // the size and restores the mtime, exactly as in
+        // `a_superseded_metadata_scan_is_read_again_rather_than_left_stale`.
+        let arm = |transcript: &Path, first: &str, new: &str| {
+            let stamped = fs::metadata(transcript).unwrap().modified().unwrap();
+            let target = transcript.to_path_buf();
+            let bytes = format!("{first}{new}");
+            let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let armed = std::sync::Arc::clone(&fired);
+            super::transcript_cursor::set_before_commit_hook_for_test(Some(Box::new(
+                move |committing| {
+                    if committing != target || armed.swap(true, std::sync::atomic::Ordering::SeqCst)
+                    {
+                        return;
+                    }
+                    fs::write(&target, &bytes).unwrap();
+                    fs::File::open(&target)
+                        .unwrap()
+                        .set_modified(stamped)
+                        .unwrap();
+                },
+            )));
+            fired
+        };
+
+        // Targeted hydration.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let transcript = seed_claude_transcript(dir.path(), session_id, first.as_bytes());
+            let db = dir.path().join("history.db");
+            let conn = open_db(&db).unwrap();
+            catalog_row(&conn, "claude", session_id, Some(&transcript));
+            drop(conn);
+            hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+            assert_eq!(title(&db), None);
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(&transcript)
+                .unwrap();
+            write!(file, "{mid}").unwrap();
+            drop(file);
+            let fired = arm(&transcript, &first, &new);
+            hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+            super::transcript_cursor::set_before_commit_hook_for_test(None);
+            assert!(fired.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(
+                title(&db),
+                None,
+                "a superseded fold's prompt must not become the title"
+            );
+            hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+            assert_eq!(title(&db).as_deref(), Some("new prompt"));
+        }
+
+        // The global sync walk, whose fast path consults the record cursor
+        // alone: without forgetting that cursor after a superseded scan, the
+        // second sync would skip the file and the title would stay null.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let transcript = seed_claude_transcript(dir.path(), session_id, first.as_bytes());
+            let root = dir.path().join(".claude/projects");
+            let db = dir.path().join("history.db");
+            let conn = open_db(&db).unwrap();
+            let mut state = Map::new();
+            super::sync_claude_session_metadata(&conn, &mut state, &root).unwrap();
+            assert_eq!(title(&db), None);
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(&transcript)
+                .unwrap();
+            write!(file, "{mid}").unwrap();
+            drop(file);
+            let fired = arm(&transcript, &first, &new);
+            super::sync_claude_session_metadata(&conn, &mut state, &root).unwrap();
+            super::transcript_cursor::set_before_commit_hook_for_test(None);
+            assert!(fired.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(title(&db), None);
+            super::sync_claude_session_metadata(&conn, &mut state, &root).unwrap();
+            assert_eq!(title(&db).as_deref(), Some("new prompt"));
+        }
     }
 
     /// Hashing a sidecar's metadata document is a provider read like any
@@ -10888,6 +11105,38 @@ mod tests {
         assert_eq!(edge.child_session_id.as_deref(), Some(resumed));
         assert_eq!(edge.origin_session_id.as_deref(), Some(prior));
         assert!(edge.child_has_events);
+    }
+
+    /// Targeted hydration walks the whole transcript too, so it settles the
+    /// same question the same way: a title an earlier scanner derived from a
+    /// row that is control now is replaced, with null when nothing else in
+    /// the file is a prompt.
+    #[test]
+    fn hydrating_a_control_only_transcript_clears_its_stale_first_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = claude_fixture(dir.path(), "resume-marker.jsonl");
+        let resumed = "99999999-9999-9999-9999-999999999999";
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", resumed, Some(&transcript));
+        conn.execute(
+            "UPDATE sessions SET first_prompt = '/resume 11111111-1111-1111-1111-111111111111' \
+             WHERE source = 'claude' AND session_id = ?",
+            [resumed],
+        )
+        .unwrap();
+        drop(conn);
+
+        hydrate_session_at_with_home(&db, &options("claude", resumed), dir.path()).unwrap();
+        let conn = open_db(&db).unwrap();
+        let first_prompt: Option<String> = conn
+            .query_row(
+                "SELECT first_prompt FROM sessions WHERE source = 'claude' AND session_id = ?",
+                [resumed],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(first_prompt, None, "a resume marker is not a title");
     }
 
     #[test]

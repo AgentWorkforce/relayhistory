@@ -51,6 +51,7 @@
   "quirk": "function calls and their outputs as `response_item` records",
   "session_events": [
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "3:function_call",
       "git_branch": null,
@@ -67,6 +68,7 @@
       "ts_ms": 1776646801000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "5:custom_tool_call",
       "git_branch": null,
@@ -83,6 +85,7 @@
       "ts_ms": 1776646802000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "7:custom_tool_call",
       "git_branch": null,
@@ -97,6 +100,34 @@
       "text": "apply_patch /tmp/project/NEW.md",
       "token_json": "{\"cache_write_input_tokens\":0,\"cached_input_tokens\":2000,\"input_tokens\":5000,\"output_tokens\":800,\"reasoning_output_tokens\":200,\"total_tokens\":5800}",
       "ts_ms": 1776646803000
+    }
+  ],
+  "session_markers": [
+    {
+      "kind": "task_started",
+      "marker_uid": "2:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_tools_1",
+      "source": "codex",
+      "subkind": "task_started",
+      "text": null,
+      "ts_ms": 1776646800200,
+      "turn_id": "turn_tools_1"
+    },
+    {
+      "kind": "task_complete",
+      "marker_uid": "10:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_tools_1",
+      "source": "codex",
+      "subkind": "task_complete",
+      "text": null,
+      "ts_ms": 1776646804100,
+      "turn_id": "turn_tools_1"
     }
   ],
   "session_relationships": [],

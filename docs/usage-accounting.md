@@ -320,7 +320,15 @@ const summary = await getSessionUsage('claude', sessionId);
 for await (const request of sessionRequests('claude', sessionId)) { /* ... */ }
 ```
 
-MCP: `get_session_usage` and `get_session_requests`.
+MCP: `get_session_usage` and `get_session_requests`. CLI: `ai-hist sessions
+usage SOURCE SESSION_ID [--json]` on both the Node and the Rust binary (the
+Rust binary's `--json` wraps the crate's camelCase `SessionUsageSummary` as
+`summary`; the Node CLI prints the SDK's snake_case wire form).
+
+The TypeScript reads cross the native boundary through the `sessionStoreCall`
+JSON dispatcher (`requests`, `usage_summary` ops) over the `SessionStore`
+facade; the typed `getSessionRequestsPage` / `getSessionUsage` native exports
+remain for older callers.
 
 Pages keyset on `(firstTsMs, id)`. The `id` tiebreak is load-bearing: requests
 inside one session routinely share a timestamp, and ordering on the timestamp

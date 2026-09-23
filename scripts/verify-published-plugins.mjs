@@ -24,13 +24,12 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
-import { createRequire } from "node:module";
 
 import { packageName, platforms, plugins } from "./history-package-contract.mjs";
 import { installWithRegistryRetry, isRegistryVisibilityFailure } from "./npm-install-with-registry-retry.mjs";
@@ -43,6 +42,38 @@ import {
 
 export { currentPlatform, hostLibc, publicRegistryEnv };
 export const pluginInstallArgs = hostInstallArgs;
+
+/**
+ * Why this runner's helpers are absent after npm exited 0.
+ *
+ * An optional dependency that the registry has not finished releasing is
+ * omitted, and npm still exits 0. The install retry treats a non-empty return
+ * as that miss. An empty string means every host helper is on disk.
+ */
+export function hostHelperInstallRejection(project, platform, libc) {
+  let installedScope = [];
+  try {
+    installedScope = readdirSync(join(project, "node_modules", "@relayhistory")).sort();
+  } catch {
+    installedScope = [];
+  }
+  const missing = [];
+  for (const info of Object.values(plugins)) {
+    const helper = packageName(info, platform);
+    // Stat the file. require.resolve caches a successful lookup for the
+    // process, and a retry deletes node_modules between attempts, so a helper
+    // that was present once would still look installed after a later install
+    // omitted it.
+    const packageJson = join(project, "node_modules", ...helper.split("/"), "package.json");
+    if (!existsSync(packageJson)) missing.push(helper);
+  }
+  if (missing.length === 0) return "";
+  return (
+    `${missing.join(", ")} did not install ` +
+    `(npm libc=${libc ?? "default"}; installed @relayhistory/*: ${installedScope.join(", ") || "none"}). ` +
+    "npm skips an unresolvable optional dependency silently"
+  );
+}
 
 /** Clean project that depends on the published JS packages the way a user does. */
 export function verifyPluginManifest(version) {
@@ -172,33 +203,22 @@ async function main(version) {
     // Resolves on success and throws on exhaustion — it returns no result to
     // inspect. Reading a `.status` off it crashed this step even when the
     // install had worked.
+    //
+    // A zero exit is not proof the helper landed. npm omits an optional
+    // dependency whose tarball is not fetchable yet and still exits 0, leaving
+    // the two JS packages installed and this runner's helpers absent. That is
+    // the same propagation window as ETARGET, so reject the exit and retry
+    // inside the same budget.
     await installWithRegistryRetry(installArgs, {
       attempts: 60,
       delayMs: 5_000,
       cwd: project,
       env: publicRegistryEnv(),
+      confirm: () => hostHelperInstallRejection(project, platform, libc),
     });
 
-    // npm skips an optionalDependency it cannot resolve and still exits 0, so a
-    // helper missing from the registry produces a silent half-install rather
-    // than a failure. Check this machine's helper actually landed.
-    const require_ = createRequire(join(project, "noop.js"));
-    let installedScope = [];
-    try {
-      installedScope = (await readdir(join(project, "node_modules", "@relayhistory"))).sort();
-    } catch {
-      installedScope = [];
-    }
     for (const info of Object.values(plugins)) {
-      const helper = packageName(info, platform);
-      try {
-        require_.resolve(`${helper}/package.json`);
-        console.log(`  installed ${helper}`);
-      } catch {
-        assert.fail(
-          `${helper} did not install (npm libc=${libc ?? "default"}; installed @relayhistory/*: ${installedScope.join(", ") || "none"}). npm skips an unresolvable optional dependency silently`,
-        );
-      }
+      console.log(`  installed ${packageName(info, platform)}`);
     }
 
     // Installable is not the same as loadable. Import each package and confirm
