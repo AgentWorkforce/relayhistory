@@ -713,6 +713,54 @@ fn devin_tree_rewrite_without_content_change_updates_links() {
 }
 
 #[test]
+fn devin_orphaned_history_and_markers_repair_without_catalog_or_events() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    stage_devin_db(home, BASE_SESSION_SQL);
+    let _env = EnvGuard::set(home);
+    let db = home.join("history.db");
+
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+    let conn = open_db(&db).unwrap();
+    conn.execute(
+        "DELETE FROM sessions WHERE source='devin' AND session_id='devin-test'",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "DELETE FROM session_events WHERE source='devin' AND session_id='devin-test'",
+        [],
+    )
+    .unwrap();
+    // Leave history and session_markers rows in place.
+    drop(conn);
+
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+    let conn = open_db(&db).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE source='devin' AND session_id='devin-test'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        1,
+        "a session known only by orphaned history/marker rows must still be repaired"
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM session_events WHERE source='devin' AND session_id='devin-test'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        2,
+        "events must be restored for the repaired session"
+    );
+}
+
+#[test]
 fn devin_shared_prompt_is_reassigned_not_dropped() {
     let _lock = ENV_LOCK.lock().unwrap();
     let dir = tempfile::tempdir().unwrap();

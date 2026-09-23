@@ -970,16 +970,24 @@ fn destination_shortfall(conn: &Connection, stored: &str) -> Result<SweepRepairs
     let current = session_holdings(conn)?;
     // Named from the *session* side rather than from the evidence, because a
     // session whose catalog row and events are both gone has no row left to be
-    // found by. The union of the two tables the sweep reaches it through is
-    // what keeps it nameable.
+    // found by. The union of the tables the sweep reaches it through is what
+    // keeps it nameable. `history` and `session_markers` are included for the
+    // replayable store-backed sources, so a session holding only those rows
+    // (e.g. an OpenCode prompt-only session) is still named as a repair target.
     let mut statement = conn.prepare(
         "SELECT source, session_id FROM sessions \
          WHERE source IN (SELECT value FROM json_each(?1)) \
          UNION \
          SELECT source, session_id FROM session_events \
-         WHERE source IN (SELECT value FROM json_each(?1))",
+         WHERE source IN (SELECT value FROM json_each(?1)) \
+         UNION \
+         SELECT source, session_id FROM history \
+         WHERE source IN (SELECT value FROM json_each(?2)) \
+         UNION \
+         SELECT source, session_id FROM session_markers \
+         WHERE source IN (SELECT value FROM json_each(?2))",
     )?;
-    let mut rows = statement.query([repairable_event_sources()])?;
+    let mut rows = statement.query([repairable_event_sources(), replayable_history_sources()])?;
     while let Some(row) = rows.next()? {
         let source: String = row.get(0)?;
         let session_id: String = row.get(1)?;
