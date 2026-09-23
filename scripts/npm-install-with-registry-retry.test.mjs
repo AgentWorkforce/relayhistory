@@ -97,6 +97,63 @@ test('supplied env is the child environment, not a patch on process.env', () => 
   }
 });
 
+test('a zero exit that did not land the required package is retried', async () => {
+  const results = [
+    { status: 0, stdout: 'added 99 packages\n', stderr: '' },
+    { status: 0, stdout: 'added 101 packages\n', stderr: '' },
+  ];
+  const waits = [];
+  let resets = 0;
+  let confirmCalls = 0;
+  const logged = [];
+
+  await installWithRegistryRetry(['--prefix', '/tmp/verify'], {
+    ...quiet,
+    attempts: 4,
+    delayMs: 3,
+    runInstall: () => results.shift(),
+    sleep: async (ms) => waits.push(ms),
+    reset: () => { resets += 1; },
+    log: (message) => logged.push(message),
+    confirm: () => {
+      confirmCalls += 1;
+      return confirmCalls === 1
+        ? '@relayhistory/capture-linux-x64-gnu did not install'
+        : '';
+    },
+  });
+
+  assert.equal(confirmCalls, 2);
+  assert.deepEqual(waits, [3]);
+  assert.equal(resets, 1);
+  assert.equal(results.length, 0);
+  assert.match(logged[0], /capture-linux-x64-gnu did not install \(attempt 1\/4\)/);
+});
+
+test('exhausting zero-exit misses reports the missing package', async () => {
+  let calls = 0;
+  await assert.rejects(
+    installWithRegistryRetry(['--prefix', '/tmp/verify'], {
+      ...quiet,
+      attempts: 2,
+      delayMs: 1,
+      runInstall: () => {
+        calls += 1;
+        return { status: 0, stdout: 'added 99 packages\n', stderr: '' };
+      },
+      sleep: async () => {},
+      confirm: () => '@relayhistory/capture-linux-x64-gnu did not install',
+    }),
+    (error) => {
+      assert.equal(error.exitCode, 1);
+      assert.match(error.message, /capture-linux-x64-gnu did not install/);
+      assert.match(error.message, /after 2 attempts/);
+      return true;
+    },
+  );
+  assert.equal(calls, 2);
+});
+
 test('retries clear node_modules under options.cwd, not process.cwd', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'ai-hist-retry-cwd-'));
   mkdirSync(join(dir, 'node_modules'));
