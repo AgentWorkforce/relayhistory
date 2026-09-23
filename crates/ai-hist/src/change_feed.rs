@@ -345,6 +345,9 @@ pub struct Changes {
     batch: usize,
     head: Watermark,
     position: Watermark,
+    /// The consumer's stored cursor when it stood past `head` at open: the
+    /// one value this drain's commit replaces rather than keeps.
+    stale_cursor: Option<Watermark>,
     buffer: VecDeque<Change>,
     exhausted: bool,
 }
@@ -381,8 +384,10 @@ impl Changes {
     /// an explicit `from` and does not commit. The one exception is a stored
     /// cursor ahead of the store's head, which a resume refuses with
     /// [`Error::WatermarkAheadOfStore`]: it names no revision of this
-    /// store, so the commit that follows the resync from
-    /// [`Watermark::START`] replaces it. A named cursor is bound to the
+    /// store, so a drain opened while the cursor stood past its head — the
+    /// resync from [`Watermark::START`] — replaces exactly that cursor when
+    /// it commits, however far the store has grown meanwhile. A named cursor
+    /// is bound to the
     /// kind set it was first committed for: a drain over other kinds cannot
     /// resume it or move it ([`Error::ConsumerKindsMismatch`]), because
     /// its position accounts for nothing outside its own kinds. Fails on a
@@ -405,6 +410,7 @@ impl Changes {
             &KindSet {
                 kinds: self.kinds.clone(),
             },
+            self.stale_cursor,
         )
     }
 
@@ -550,7 +556,7 @@ impl SessionStore {
                     .to_string(),
             ));
         }
-        let (start, head) =
+        let (start, head, stale_cursor) =
             resolve_start_and_head(&conn, from, query.consumer.as_deref(), &kind_set)?;
         if start > head {
             return Err(Error::WatermarkAheadOfStore(format!(
@@ -568,6 +574,7 @@ impl SessionStore {
             batch,
             head,
             position: start,
+            stale_cursor,
             buffer: VecDeque::new(),
             exhausted: false,
         })
@@ -597,34 +604,45 @@ pub(crate) fn head_revision_at(db_path: &Path) -> Result<Watermark, Error> {
 ///
 /// A named cursor is resumed only by a drain over the kind set it was
 /// committed for; see [`KindSet`].
+///
+/// The third value is the consumer's stored cursor when, in that same
+/// snapshot, it stood past the head -- the stale cursor this drain's commit
+/// replaces. It is decided here, against the head the drain is bounded to,
+/// because a writer growing the store while the drain runs changes nothing
+/// about what the drain has accounted for.
 fn resolve_start_and_head(
     conn: &Connection,
     from: Watermark,
     consumer: Option<&str>,
     kinds: &KindSet,
-) -> Result<(Watermark, Watermark), Error> {
+) -> Result<(Watermark, Watermark, Option<Watermark>), Error> {
     let snapshot = conn.unchecked_transaction().map_err(Error::sql)?;
+    let cursor = match consumer {
+        Some(name) => read_cursor(&snapshot, name).map_err(Error::query)?,
+        None => None,
+    };
     let start =
-        match (from == Watermark::CONSUMER, consumer) {
-            (true, Some(name)) => match read_cursor(&snapshot, name).map_err(Error::query)? {
-                Some((position, stored)) => {
-                    let offered = kinds.stored();
-                    if stored != offered {
-                        return Err(kinds_mismatch(name, &stored, &offered));
-                    }
-                    position
+        match (from == Watermark::CONSUMER, consumer, &cursor) {
+            (true, Some(name), Some((position, stored))) => {
+                let offered = kinds.stored();
+                if *stored != offered {
+                    return Err(kinds_mismatch(name, stored, &offered));
                 }
-                None => Watermark::START,
-            },
-            (true, None) => return Err(Error::InvalidArgument(
+                *position
+            }
+            (true, Some(_), None) => Watermark::START,
+            (true, None, _) => return Err(Error::InvalidArgument(
                 "changes_since: Watermark::CONSUMER needs ChangeQuery::consumer to name the cursor"
                     .to_string(),
             )),
-            (false, _) => from,
+            (false, _, _) => from,
         };
     let head = read_head(&snapshot).map_err(Error::query)?;
     snapshot.commit().map_err(Error::sql)?;
-    Ok((start, head))
+    let stale_cursor = cursor
+        .map(|(position, _)| position)
+        .filter(|position| *position > head);
+    Ok((start, head, stale_cursor))
 }
 
 /// The revision-only page query for one kind: a covering read of the
@@ -733,37 +751,44 @@ fn read_cursor(conn: &Connection, name: &str) -> Result<Option<(Watermark, Strin
 /// And bound: a cursor committed for one kind set is never moved by a drain
 /// over another. Both in one statement, so a sibling cannot slip between the
 /// check and the write.
+///
+/// `stale` is the cursor the drain saw standing past its head at open, if
+/// any. Such a cursor is not a position in this store's history -- every
+/// drain's position is at most its head and the clock never moves back, so
+/// only a reset or replaced clock puts one there -- and `changes_since`
+/// refuses to resume it, sending the consumer to `Watermark::START`. That
+/// resync's commit replaces it, where keeping the maximum would pin the
+/// consumer to a revision the resync never covered. The replacement is a
+/// compare-and-swap on the exact value seen at open: a commit that moved the
+/// cursor since is a real position, and the monotonic rule applies to it.
 fn commit_cursor(
     conn: &Connection,
     name: &str,
     position: Watermark,
     kinds: &KindSet,
+    stale: Option<Watermark>,
 ) -> Result<Watermark, Error> {
     let offered = kinds.stored();
-    // A stored cursor past the clock is not a position in this store's
-    // history: every drain's position is at most its head, and the clock
-    // never moves back, so only a reset or replaced clock puts one there.
-    // `changes_since` refuses to resume it and sends the consumer to
-    // `Watermark::START`; that resync's commit replaces it, where keeping
-    // the maximum would pin the consumer to a revision the store may never
-    // reach. The head is read in the same statement, so a cursor at or
-    // below it keeps the monotonic rule.
     let revision: Option<i64> = conn
         .query_row(
             &format!(
                 "INSERT INTO consumer_cursors (name, revision, updated_ms, {KINDS_COLUMN}) \
-                 VALUES (?, ?, ?, ?) \
+                 VALUES (?1, ?2, ?3, ?4) \
                  ON CONFLICT(name) DO UPDATE SET \
-                     revision = CASE \
-                         WHEN consumer_cursors.revision > COALESCE( \
-                             (SELECT version FROM observation_clock WHERE singleton = 1), 0) \
+                     revision = CASE WHEN consumer_cursors.revision = ?5 \
                          THEN excluded.revision \
                          ELSE MAX(consumer_cursors.revision, excluded.revision) END, \
                      updated_ms = excluded.updated_ms \
                      WHERE consumer_cursors.{KINDS_COLUMN} = excluded.{KINDS_COLUMN} \
                  RETURNING revision"
             ),
-            params![name, position.revision as i64, crate::now_ms(), offered],
+            params![
+                name,
+                position.revision as i64,
+                crate::now_ms(),
+                offered,
+                stale.map(|stale| stale.revision as i64)
+            ],
             |row| row.get(0),
         )
         .optional()
@@ -1691,6 +1716,42 @@ mod tests {
         assert!(drain(store.changes_since(Watermark::CONSUMER, query()).unwrap()).is_empty());
     }
 
+    /// Whether the resync replaces the stale cursor is decided against the
+    /// head it was bounded to, not the store's head at commit. Writers can
+    /// carry the clock past the stale value while the resync runs, and the
+    /// cursor must still land where the resync reached, so the revisions it
+    /// never covered are read next rather than skipped.
+    #[test]
+    fn a_resync_replaces_the_stale_cursor_after_the_store_grows_past_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, conn) = store(dir.path());
+        for index in 0..5 {
+            insert_event(&conn, "s1", &format!("e{index}"), "x");
+        }
+        conn.execute(
+            "INSERT INTO consumer_cursors (name, revision, updated_ms) VALUES ('c', 7, 0)",
+            [],
+        )
+        .unwrap();
+        let query = || ChangeQuery::default().consumer("c");
+        let mut resync = store.changes_since(Watermark::START, query()).unwrap();
+        assert_eq!(resync.head().revision, 5);
+        for index in 5..8 {
+            insert_event(&conn, "s1", &format!("e{index}"), "x");
+        }
+        assert_eq!(store.head_revision().unwrap().revision, 8);
+        while resync.next().is_some() {}
+        assert_eq!(resync.commit().unwrap().revision, 5);
+
+        let rest = drain(store.changes_since(Watermark::CONSUMER, query()).unwrap());
+        assert_eq!(
+            rest.iter()
+                .map(|change| change.revision)
+                .collect::<Vec<_>>(),
+            vec![6, 7, 8]
+        );
+    }
+
     #[test]
     fn pages_are_bounded_and_the_drain_is_bounded_to_the_head_at_open() {
         let dir = tempfile::tempdir().unwrap();
@@ -1967,6 +2028,7 @@ mod tests {
             "burn",
             Watermark { revision: 10 },
             &KindSet::normalize(None),
+            None,
         )
         .unwrap();
 
@@ -1987,13 +2049,14 @@ mod tests {
                         "burn",
                         Watermark { revision: 11 },
                         &KindSet::normalize(None),
+                        None,
                     )
                     .unwrap();
                 }
                 false
             }),
         );
-        let (start, head) = resolve_start_and_head(
+        let (start, head, _) = resolve_start_and_head(
             &reader,
             Watermark::CONSUMER,
             Some("burn"),
@@ -2073,6 +2136,7 @@ mod tests {
             batch: 3,
             head,
             position: Watermark::START,
+            stale_cursor: None,
             buffer: VecDeque::new(),
             exhausted: false,
         };
