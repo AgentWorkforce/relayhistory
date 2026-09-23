@@ -51,7 +51,8 @@ observed presences.
 
 The CLI equivalents are `sessions list`, `sessions discover`,
 `sessions hydrate`, `sessions relationships`, `sessions tree`,
-`sessions tools`, `sessions edits`, `search`, `recent`,
+`sessions tools`, `sessions edits`, `sessions markers`, `sessions usage`,
+`search`, `recent`,
 `session`, `events`, `stats`, and `sync`. See
 [Session catalog](session-catalog.md) for discovery and pagination contracts
 and [Architecture](architecture.md) for the process boundary.

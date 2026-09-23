@@ -28,6 +28,7 @@
   "quirk": "a rollout under `~/.codex/archived_sessions/`, the second codex discovery root",
   "session_events": [
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "2:user_message",
       "git_branch": null,
@@ -44,6 +45,7 @@
       "ts_ms": 1776643201000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "3:agent_message",
       "git_branch": null,
@@ -60,6 +62,7 @@
       "ts_ms": 1776643202000
     }
   ],
+  "session_markers": [],
   "session_relationships": [],
   "sessions": [
     {

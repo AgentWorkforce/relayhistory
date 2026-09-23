@@ -105,10 +105,48 @@ cargo add ai-hist
 ```
 
 ```rust
-use ai_hist::SessionStore;
+use ai_hist::{SessionQuery, SessionStore};
 let store = SessionStore::open(Default::default())?;
-store.sync(Default::default())?;
+let report = store.sync(Default::default())?;
+for changed in &report.changed {
+    let _evidence = store.session(changed, SessionQuery::default())?;
+}
 ```
+
+The full surface is documented in the embedder guide, [`sourcing-sdk.md`](sourcing-sdk.md).
+
+### Public API snapshot
+
+`crates/ai-hist/public-api.txt` is the crate's default-feature public API as
+`cargo public-api` lists it, with blanket, auto-trait and derived impls
+omitted. The `public-api` CI job regenerates the listing on a nightly toolchain
+and fails on any difference, and fails separately if any line names a
+`rusqlite` type. A change to the surface therefore ships with
+
+```bash
+cargo install cargo-public-api --locked   # once; needs a nightly toolchain for rustdoc JSON
+node scripts/check-public-api.mjs --update
+```
+
+and a `### Rust API` changelog entry in the same pull request. The snapshot is
+what a reviewer reads to see the contract move; the changelog entry is what an
+embedder reads before bumping.
+
+### The out-of-tree consumer
+
+`examples/rust-consumer` is a standalone Cargo project (its own lockfile,
+excluded from the workspace) that depends on `ai-hist` from crates.io. The
+`rust-consumer` CI job builds it on every pull request with `[patch.crates-io]`
+redirected at `crates/ai-hist` and asserts the patch was actually applied; the
+`Published crate consumer` workflow (`published-crate-consumer.yml`, nightly
+and on dispatch) builds it against the crate crates.io serves, which is the
+only check that sees a broken publish.
+
+`scripts/set-release-version.mjs` stamps the example's `ai-hist = "<version>"`
+requirement and its lock entry along with everything else, dropping the
+previous tarball's checksum for Cargo to refill. Without that, the first
+release after a minor bump would leave the pull-request patch silently unused
+and the nightly job on the previous release.
 
 ## Dry runs
 

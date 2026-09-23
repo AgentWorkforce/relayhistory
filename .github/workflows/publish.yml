@@ -653,6 +653,8 @@ jobs:
             plugins/provider-sources/rust/Cargo.lock \
             Cargo.lock \
             crates/ai-hist/Cargo.toml \
+            examples/rust-consumer/Cargo.toml \
+            examples/rust-consumer/Cargo.lock \
             crates/ai-hist-napi/Cargo.toml \
             crates/ai-hist-napi/package.json \
             crates/ai-hist-napi/package-lock.json \

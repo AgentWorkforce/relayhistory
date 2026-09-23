@@ -5,15 +5,7 @@
   "discovery_diagnostics": [],
   "file_edits": [],
   "fixture": "claude/resume-marker",
-  "history": [
-    {
-      "project": "/tmp/project",
-      "prompt": "/resume 11111111-1111-1111-1111-111111111111",
-      "session_id": "99999999-9999-9999-9999-999999999999",
-      "source": "claude",
-      "timestamp_ms": 1776729600000
-    }
-  ],
+  "history": [],
   "hydration": [
     {
       "related_session_ids": [],
@@ -28,6 +20,7 @@
   "quirk": "the first user record is a `/resume <sessionId>` marker naming the prior session",
   "session_events": [
     {
+      "control_kind": "resume_marker",
       "cwd": "/tmp/project",
       "event_uid": "u-resume-1:0",
       "git_branch": null,
@@ -44,6 +37,7 @@
       "ts_ms": 1776729600000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-asst-r:0",
       "git_branch": null,
@@ -60,6 +54,7 @@
       "ts_ms": 1776729601000
     }
   ],
+  "session_markers": [],
   "session_relationships": [
     {
       "child_agent_name": null,
@@ -85,7 +80,7 @@
       "cwd": "/tmp/project",
       "discovery_state": "full",
       "first_activity_ms": 1776729600000,
-      "first_prompt": "/resume 11111111-1111-1111-1111-111111111111",
+      "first_prompt": null,
       "git_branch": null,
       "initial_commit": null,
       "last_activity_ms": 1776729601000,

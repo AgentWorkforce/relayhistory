@@ -28,6 +28,7 @@
   "quirk": "a resumed rollout starts with an unreadable baseline, so carried-over totals cannot become one request's delta",
   "session_events": [
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "4:user_message",
       "git_branch": null,
@@ -44,6 +45,7 @@
       "ts_ms": 1776668400300
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "5:agent_message",
       "git_branch": null,
@@ -58,6 +60,34 @@
       "text": "Answer.",
       "token_json": null,
       "ts_ms": 1776668400900
+    }
+  ],
+  "session_markers": [
+    {
+      "kind": "task_started",
+      "marker_uid": "3:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_codex_resume_corrupt",
+      "source": "codex",
+      "subkind": "task_started",
+      "text": null,
+      "ts_ms": 1776668400200,
+      "turn_id": "t1"
+    },
+    {
+      "kind": "task_complete",
+      "marker_uid": "7:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_codex_resume_corrupt",
+      "source": "codex",
+      "subkind": "task_complete",
+      "text": null,
+      "ts_ms": 1776668402000,
+      "turn_id": "t1"
     }
   ],
   "session_relationships": [],

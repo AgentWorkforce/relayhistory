@@ -15,20 +15,6 @@
     },
     {
       "project": "/tmp/project",
-      "prompt": "<task-notification>background task bash_1 completed</task-notification>",
-      "session_id": "tn-session",
-      "source": "claude",
-      "timestamp_ms": 1779667202000
-    },
-    {
-      "project": "/tmp/project",
-      "prompt": "<task-notification>background task bash_2 completed</task-notification>",
-      "session_id": "tn-session",
-      "source": "claude",
-      "timestamp_ms": 1779667203000
-    },
-    {
-      "project": "/tmp/project",
       "prompt": "thanks, also add a changelog entry",
       "session_id": "tn-session",
       "source": "claude",
@@ -49,6 +35,7 @@
   "quirk": "Task tool notifications arrive as their own records",
   "session_events": [
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-user-1:0",
       "git_branch": null,
@@ -65,6 +52,7 @@
       "ts_ms": 1779667200000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-asst-1:0",
       "git_branch": null,
@@ -81,6 +69,7 @@
       "ts_ms": 1779667201000
     },
     {
+      "control_kind": "task_notification",
       "cwd": "/tmp/project",
       "event_uid": "u-tn-1:0",
       "git_branch": null,
@@ -97,6 +86,7 @@
       "ts_ms": 1779667202000
     },
     {
+      "control_kind": "task_notification",
       "cwd": "/tmp/project",
       "event_uid": "u-tn-2:0",
       "git_branch": null,
@@ -113,6 +103,7 @@
       "ts_ms": 1779667203000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-user-2:0",
       "git_branch": null,
@@ -129,6 +120,7 @@
       "ts_ms": 1779667204000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-asst-2:0",
       "git_branch": null,
@@ -145,6 +137,7 @@
       "ts_ms": 1779667205000
     }
   ],
+  "session_markers": [],
   "session_relationships": [],
   "sessions": [
     {

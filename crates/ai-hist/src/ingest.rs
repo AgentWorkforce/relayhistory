@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub(crate) mod codex;
+pub(crate) mod control;
 pub(crate) mod cursor;
 pub(crate) mod grok;
 pub(crate) mod hook;
@@ -251,10 +252,48 @@ fn capture_files(source: &'static str, files: Vec<PathBuf>) -> impl Iterator<Ite
 }
 
 /// Full local ingest using an explicit provider home instead of the process
-/// `HOME`. Used by [`crate::SessionStore`] when the embedder overrides home.
+/// `HOME`. The facade reads the richer [`sync_facade_tick`]; the boolean form
+/// remains for the in-module tests that predate it.
+#[cfg(test)]
 pub(crate) fn sync_local_at_with_home(db_path: &Path, home: &Path) -> Result<bool> {
+    let roots = crate::ProviderRoots::from_env(home.to_path_buf());
     SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
-    sync_exclusive_with_home(db_path, home, false).map(|tick| tick.attempted)
+    sync_exclusive_with_roots(db_path, &roots, false).map(|tick| tick.attempted)
+}
+
+/// One local sweep for [`crate::SessionStore`]: silent, against the store's
+/// resolved provider roots, forcing past the source fingerprint when asked,
+/// with two reads bracketing the sweep **inside the locked section**.
+///
+/// `before` runs once the `SyncRunLock` is held and before anything is
+/// written; `after` runs when the sweep has finished, on the same connection,
+/// still under the lock. That is what lets the facade say what *this* sweep
+/// changed: a baseline taken before the lock would also count whatever
+/// another sync wrote while this call waited for it. `None` means the lock
+/// was held elsewhere and nothing ran — the facade turns that into an error
+/// rather than a silent no-op.
+pub(crate) fn sync_facade_tick<B, R>(
+    db_path: &Path,
+    roots: &crate::ProviderRoots,
+    force: bool,
+    before: impl FnOnce(&Connection) -> Result<B>,
+    after: impl FnOnce(&Connection, B, SyncTick) -> Result<R>,
+) -> Result<Option<(SyncTick, R)>> {
+    SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
+    check_capture_cancelled()?;
+    let Some(_sync_lock) = try_acquire_sync_lock(db_path)? else {
+        return Ok(None);
+    };
+    let conn = open_db(db_path).map_err(|error| enrich_sync_error(db_path, error))?;
+    let baseline = before(&conn)?;
+    let swept = sync_basic(&conn, db_path, roots, force)
+        .map_err(|error| enrich_sync_error(db_path, error))?;
+    let tick = SyncTick {
+        attempted: true,
+        swept,
+    };
+    let outcome = after(&conn, baseline, tick)?;
+    Ok(Some((tick, outcome)))
 }
 
 /// One live-capture tick against an explicit provider home.
@@ -997,7 +1036,7 @@ fn sweep_only_fingerprint_inputs(roots: &crate::ProviderRoots) -> Vec<Candidate>
     // Errors here mean an unreadable directory, not "no trajectories". The
     // fold simply omits what it could not enumerate, which can only cause an
     // extra sweep, never a skipped one.
-    paths.extend(trajectory_files(&roots.home).unwrap_or_default());
+    paths.extend(trajectory_files(roots).unwrap_or_default());
     let mut candidates: Vec<Candidate> = Vec::new();
     // OpenCode's legacy layout is a *tree*, and the evidence a sweep reads
     // lives in the message and part files under it rather than in the session
@@ -1072,36 +1111,54 @@ pub fn sync_watch_roots(home: &Path, opencode_db: &Path) -> Vec<discover::WatchR
     sync_watch_roots_with_provider_roots(&provider_roots)
 }
 
-fn sync_watch_roots_with_provider_roots(
+pub(crate) fn sync_watch_roots_with_provider_roots(
     provider_roots: &crate::ProviderRoots,
 ) -> Vec<discover::WatchRoot> {
-    let home = &provider_roots.home;
-    let mut roots = discover::watch_roots(
-        &shallow_providers(),
-        &discover::ProviderRoots {
-            home,
-            claude: &provider_roots.claude,
-            codex: &provider_roots.codex,
-            grok: &provider_roots.grok,
-            opencode_db: &provider_roots.opencode_db,
-        },
-    );
-    // The flat logs, each as the one file it is. A `directory` root here would
-    // cover every entry beside them — `~/.claude/settings.json`, the
-    // credentials file, whatever a harness release adds next — and each of
-    // those writes would drive a *forced* sweep, the kind that bypasses the
-    // fingerprint. A file root registers the same parent (a watch on the file
-    // itself dies with the next atomic rewrite) and then filters back down to
-    // the one name, which is exactly the distinction it exists for.
-    roots.push(discover::WatchRoot::file(
-        provider_roots.claude.join("history.jsonl"),
-    ));
-    roots.push(discover::WatchRoot::file(
-        provider_roots.codex.join("history.jsonl"),
-    ));
-    for root in trajectory_roots(home).unwrap_or_default() {
-        roots.push(trajectory_watch_root(root));
+    // Per source, through the one builder `Source::capabilities()` also
+    // reads, so the roots the loop registers and the roots the facade
+    // advertises cannot drift apart.
+    let mut roots = Vec::new();
+    for source in crate::store::SOURCE_CHOICES {
+        roots.extend(source_watch_roots(source, provider_roots));
     }
+    merge_watch_roots(roots)
+}
+
+/// Everything the sweep reads for one source, as the watcher registers it:
+/// the adapter's transcript roots, plus the flat prompt log Claude and Codex
+/// keep beside them, plus the trajectory directories for that source.
+///
+/// The flat logs are watched each as the one file it is. A `directory` root
+/// would cover every entry beside them — `~/.claude/settings.json`, the
+/// credentials file, whatever a harness release adds next — and each of
+/// those writes would drive a *forced* sweep, the kind that bypasses the
+/// fingerprint. A file root registers the same parent (a watch on the file
+/// itself dies with the next atomic rewrite) and then filters back down to
+/// the one name, which is exactly the distinction it exists for.
+pub(crate) fn source_watch_roots(
+    source: &str,
+    provider_roots: &crate::ProviderRoots,
+) -> Vec<discover::WatchRoot> {
+    let mut roots = discover::provider_watch_roots(source, provider_roots);
+    match source {
+        "claude" => roots.push(discover::WatchRoot::file(
+            provider_roots.claude.join("history.jsonl"),
+        )),
+        "codex" => roots.push(discover::WatchRoot::file(
+            provider_roots.codex.join("history.jsonl"),
+        )),
+        "trajectory" => {
+            for root in trajectory_roots(provider_roots).unwrap_or_default() {
+                roots.push(trajectory_watch_root(root));
+            }
+        }
+        _ => {}
+    }
+    merge_watch_roots(roots)
+}
+
+/// One entry per path, at the widest depth any claim asked for.
+fn merge_watch_roots(mut roots: Vec<discover::WatchRoot>) -> Vec<discover::WatchRoot> {
     roots.sort();
     roots.dedup_by(|later, first| {
         if later.path != first.path {
@@ -1392,7 +1449,7 @@ fn sync_basic(
     check_capture_cancelled()?;
     if let Some(inserted) = report.capture(
         "trajectory",
-        sync_trajectories(conn, &mut state, home, &mut coverage),
+        sync_trajectories(conn, &mut state, roots, &mut coverage),
     ) {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);
@@ -1453,12 +1510,17 @@ fn sync_basic(
     capture_progress("catalog", 0, None);
     check_capture_cancelled()?;
     let discovery_env = DiscoveryEnv::with_provider_roots(conn, roots.clone());
+    // Coded like the hydration failures, so `SessionStore` can tell a sweep
+    // whose evidence landed but whose catalog pass did not from one that
+    // failed outright; the CLI prints the same chain it always did, behind
+    // the code.
     let discovered = discover::discover_sessions_with_providers(
         &discovery_env,
         &DiscoverOptions::default(),
         &providers,
         |_| {},
-    )?;
+    )
+    .context("DISCOVERY_FAILED: shallow discovery after the sweep")?;
     // After discovery, not before: shallow discovery is what fills in `cwd`
     // and `repo_url` for sessions a provider's history file mentions without
     // describing, and inheritance needs every relationship this run recorded
@@ -1995,7 +2057,7 @@ fn record_fidelity_backfill(state: &mut Map<String, Value>, key: &str) {
 /// repairing the rows the bump was for — a change that reads as done and does
 /// nothing, for exactly the installs that needed it.
 /// `the_raw_facts_version_and_generation_are_bumped_together` is the guard.
-const RAW_MESSAGE_FACTS_GENERATION: i64 = 2;
+const RAW_MESSAGE_FACTS_GENERATION: i64 = 3;
 const CLAUDE_RAW_MESSAGE_FACTS_KEY: &str = "claude_raw_message_facts";
 const CODEX_RAW_MESSAGE_FACTS_KEY: &str = "codex_raw_message_facts";
 
@@ -4324,28 +4386,52 @@ fn ingest_codex_rollout_incremental(
             };
             let uid = format!("{index}:{suffix}");
             let message_id = message.message_id.as_deref().unwrap_or(uid.as_str());
-            insert_codex_event(
+            insert_session_event(
                 conn,
+                "codex",
                 session_id,
                 cwd,
+                cwd,
                 branch,
+                message_id,
+                None,
                 ts_ms,
                 "user",
                 "text",
-                &message.text,
+                Some(&message.text),
+                None,
+                None,
+                RequestIdentity::none(),
                 &uid,
-                message_id,
                 None,
-                None,
-                None,
-                turn_id.as_deref(),
-                // A user turn is not a request, and the view does not read it.
-                None,
+                RawMessageFacts {
+                    turn_id: turn_id.as_deref(),
+                    // A user turn is not a request, and the view does not
+                    // read it.
+                    request_span: None,
+                    // App-injected context is stored, typed, and is a
+                    // prompt nowhere: not in `history`, not as
+                    // `first_prompt`, not as a prompt root.
+                    control_kind: message.control.map(control::ControlKind::as_str),
+                    ..RawMessageFacts::default()
+                },
             )?;
             outcome.events += 1;
+            if message.control.is_some() {
+                // Before wrappers were typed this line stored nothing and was
+                // recorded as an `unknown` marker. It writes a row now, so
+                // the marker an earlier parser left for it is retired rather
+                // than kept beside the row as a second account of one line.
+                conn.execute(
+                    "DELETE FROM session_markers \
+                     WHERE source = 'codex' AND session_id = ? AND marker_uid = ? \
+                       AND kind = 'unknown'",
+                    params![session_id, format!("{index}:marker")],
+                )?;
+            }
             // A subagent's "user" turns are the parent agent's task prompts;
             // only human threads feed prompt history and session discovery.
-            if !meta.is_subagent {
+            if !meta.is_subagent && message.control.is_none() {
                 outcome
                     .first_prompt
                     .get_or_insert_with(|| message.text.chars().take(4096).collect());
@@ -5442,7 +5528,21 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
                 meta.last_assistant_text.as_deref(),
                 Some(&path.to_string_lossy()),
             )?;
+            // A superseded fold read bytes that were rewritten under it, so
+            // its first prompt describes no generation of the file that
+            // exists; writing it would put a title on the row that nothing
+            // rereads. Skipped here, and the cursor the record walk publishes
+            // below is forgotten afterwards, because the fast path consults
+            // that cursor alone: left standing over the new bytes it would
+            // skip this file on every later sync and the stale fold would
+            // never be replaced.
+            if !scan_superseded {
+                set_claude_first_prompt(conn, &meta)?;
+            }
             incremental::ingest_claude_transcript_at_locator(conn, &path, None)?;
+            if scan_superseded {
+                transcript_cursor::forget_locator_cursor(conn, "claude", &path)?;
+            }
             // Global sync is not scoped to one thread, so it indexes the
             // materialization edge like every other kind.
             record_claude_remote_relationship(conn, &meta, true)?;
@@ -5827,6 +5927,11 @@ pub(crate) struct ClaudeSessionMeta {
     first_ts: i64,
     last_ts: i64,
     last_assistant_text: Option<String>,
+    /// The first substantive human turn, by the same classification the
+    /// shallow scan uses -- over the whole transcript rather than its head.
+    /// `None` is the whole file's answer, not a gap: a transcript of nothing
+    /// but control rows has no first prompt, and the catalog says so.
+    first_prompt: Option<String>,
     /// Every identified record is a sidechain row, so this file is a delegated
     /// sidecar rather than a session of its own — the same rule discovery uses
     /// to keep sidecars out of the catalog.
@@ -5864,6 +5969,9 @@ pub(crate) struct ClaudeMetaFold {
     pub last_ts: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_assistant_text: Option<String>,
+    /// First-wins, from the same classifier as discovery's `first_prompt`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_prompt: Option<String>,
     #[serde(default)]
     pub identified_records: usize,
     #[serde(default)]
@@ -5954,6 +6062,9 @@ impl ClaudeMetaFold {
         if self.cwd.is_none() {
             self.cwd = value.get("cwd").and_then(Value::as_str).map(str::to_string);
         }
+        if self.first_prompt.is_none() {
+            self.first_prompt = crate::discover::claude_substantive_prompt(value);
+        }
         if let Some(branch) = value.get("gitBranch").and_then(Value::as_str) {
             self.git_branch = Some(branch.to_string());
         }
@@ -5998,6 +6109,7 @@ impl ClaudeMetaFold {
             first_ts: first,
             last_ts: self.last_ts.unwrap_or(first),
             last_assistant_text: self.last_assistant_text.clone(),
+            first_prompt: self.first_prompt.clone(),
             subagent: self.identified_records > 0
                 && self.sidechain_records == self.identified_records,
             agent_id: self.agent_id.clone(),
@@ -6043,6 +6155,82 @@ impl ClaudeScanPass {
     }
 }
 
+/// Retire the history row the previous parser wrote for a record this
+/// session now stores differently, without erasing another session's prompt.
+///
+/// `history` is unique on `(source, timestamp_ms, prompt)` with no session in
+/// the key, so a task notification in one session and a human prompt with the
+/// same text at the same millisecond in another are one row, owned by
+/// whichever transcript was read first. Deleting that row outright when the
+/// owner turns out to be control would erase the other session's prompt --
+/// its own re-read had already been ignored by the unique key -- so before
+/// the delete, the row is handed to a session that has a substantive user
+/// text event at that instant with that text. Only when no such session
+/// exists is it deleted. The lookup runs only when this session actually owns
+/// such a row, which outside the one-time re-read is never.
+fn retire_claude_history_row(
+    conn: &Connection,
+    session_id: &str,
+    ts_ms: i64,
+    raw: &str,
+) -> Result<()> {
+    let owned: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM history \
+         WHERE source = 'claude' AND session_id = ?1 AND timestamp_ms = ?2 AND prompt = ?3)",
+        params![session_id, ts_ms, raw],
+        |row| row.get(0),
+    )?;
+    if !owned {
+        return Ok(());
+    }
+    let handed_over = conn.execute(
+        "UPDATE history SET session_id = ( \
+             SELECT e.session_id FROM session_events e \
+             WHERE e.source = 'claude' AND e.session_id <> ?1 AND e.ts_ms = ?2 \
+               AND e.role = 'user' AND e.kind = 'text' AND e.control_kind IS NULL \
+               AND TRIM(e.text) = ?3 \
+             ORDER BY e.session_id LIMIT 1), \
+           project = COALESCE(( \
+             SELECT e.project FROM session_events e \
+             WHERE e.source = 'claude' AND e.session_id <> ?1 AND e.ts_ms = ?2 \
+               AND e.role = 'user' AND e.kind = 'text' AND e.control_kind IS NULL \
+               AND TRIM(e.text) = ?3 \
+             ORDER BY e.session_id LIMIT 1), project) \
+         WHERE source = 'claude' AND session_id = ?1 AND timestamp_ms = ?2 AND prompt = ?3 \
+           AND EXISTS( \
+             SELECT 1 FROM session_events e \
+             WHERE e.source = 'claude' AND e.session_id <> ?1 AND e.ts_ms = ?2 \
+               AND e.role = 'user' AND e.kind = 'text' AND e.control_kind IS NULL \
+               AND TRIM(e.text) = ?3)",
+        params![session_id, ts_ms, raw],
+    )?;
+    if handed_over == 0 {
+        conn.execute(
+            "DELETE FROM history \
+             WHERE source = 'claude' AND session_id = ?1 AND timestamp_ms = ?2 AND prompt = ?3",
+            params![session_id, ts_ms, raw],
+        )?;
+    }
+    Ok(())
+}
+
+/// Record what the whole-transcript fold found as the session's first prompt.
+///
+/// The shallow catalog upsert coalesces a null `first_prompt` into whatever
+/// the row already holds, because a shallow or remote read may simply not
+/// have seen the prompt. The metadata fold has seen every record, so its
+/// answer replaces the row's -- including with null. Without that, a session
+/// whose stored title was a row the classifier now types as control (a bare
+/// `/resume <id>`, a task notification) would keep it for good on an upgraded
+/// install, while a fresh database stores nothing.
+pub(crate) fn set_claude_first_prompt(conn: &Connection, meta: &ClaudeSessionMeta) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions SET first_prompt = ?1 WHERE source = 'claude' AND session_id = ?2",
+        params![meta.first_prompt, meta.session_id],
+    )?;
+    Ok(())
+}
+
 /// The same metadata fold, over bytes the lifecycle hook already captured.
 ///
 /// The hook hands over what it read, so there is no file to walk and no
@@ -6082,6 +6270,7 @@ fn ingest_claude_transcript_text_as(
     });
     let mut indexer = tool_result_facts::ToolResultIndexer::default();
     let mut cache_reads: HashMap<String, i64> = HashMap::new();
+    let mut triads = control::SlashCommandTriads::default();
     for line in text.lines() {
         check_capture_cancelled()?;
         let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -6099,6 +6288,7 @@ fn ingest_claude_transcript_text_as(
             obj,
             &mut indexer,
             &mut cache_reads,
+            &mut triads,
         )?;
     }
     Ok(())
@@ -6642,6 +6832,7 @@ fn ingest_claude_transcript_as(
     // instead of advancing them.
     let mut indexer = tool_result_facts::ToolResultIndexer::default();
     let mut cache_reads: HashMap<String, i64> = HashMap::new();
+    let mut triads = control::SlashCommandTriads::default();
     loop {
         check_capture_cancelled()?;
         raw.clear();
@@ -6675,6 +6866,7 @@ fn ingest_claude_transcript_as(
             obj,
             &mut indexer,
             &mut cache_reads,
+            &mut triads,
         )?;
     }
     Ok(())
@@ -6733,6 +6925,7 @@ fn ingest_claude_record(
     obj: &Map<String, Value>,
     indexer: &mut tool_result_facts::ToolResultIndexer,
     last_assistant_cache_read: &mut HashMap<String, i64>,
+    triads: &mut control::SlashCommandTriads,
 ) -> Result<()> {
     let stem = path
         .file_stem()
@@ -6860,6 +7053,8 @@ fn ingest_claude_record(
         // Claude names its requests, so it groups on `request_id` and
         // needs no span.
         request_span: None,
+        // Decided per text row below, once the record is classified.
+        control_kind: None,
     };
     if message_role == "assistant" && !sidechain {
         match message
@@ -7019,6 +7214,23 @@ fn ingest_claude_record(
     if system_record {
         return Ok(());
     }
+    // Reminder rows carry derived identities, `{uid}:{block}:reminder:{n}`,
+    // that the upsert can only add to or overwrite, and a record Claude
+    // rewrites under the same uuid can lose the blocks that produced them --
+    // fewer reminders in a block, a block removed, its type changed, the
+    // content emptied. Every reminder row this record ever produced is
+    // therefore retired here, once per user record and before its current
+    // content is walked, so what the walk writes back is exactly the
+    // reminders the text has today. Keyed on the record's message id and the
+    // one kind the split writes, which is one probe on the message index.
+    if message_role == "user" && !sidechain {
+        conn.execute(
+            "DELETE FROM session_events \
+             WHERE source = 'claude' AND session_id = ?1 AND message_id = ?2 \
+               AND control_kind = 'system_reminder'",
+            params![session_id, message_uuid],
+        )?;
+    }
     let Some(content) = message.and_then(|m| m.get("content")) else {
         // Nothing below can run for this record, so whether it left a row
         // behind is already settled: it is the marker above, or nothing.
@@ -7034,22 +7246,42 @@ fn ingest_claude_record(
         }
         return Ok(());
     };
-    if !sidechain && message_role == "user" && is_meta != Some(true) {
-        let prompt = if let Some(text) = content.as_str() {
-            text.trim().to_string()
-        } else {
-            content
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
-                .filter_map(|block| block.get("text").and_then(Value::as_str))
-                .map(str::trim)
-                .filter(|text| !text.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        if !prompt.is_empty() && !discover::is_claude_control_prompt(&prompt) {
+    // Control classification. A user record's own text, with the
+    // `<system-reminder>` blocks Claude Code injects removed, decides whether
+    // the record is a prompt or one of the harness's own rows; the envelope
+    // (`origin.kind`, `attachment.commandMode`, `isMeta`) is read in the same
+    // call. Model output is never control, and a sidechain user row is the
+    // parent agent's, which the guard above already settled. The one answer
+    // is what `history`, the event rows and the triad walk all act on, so a
+    // row cannot be kept out of `history` and still read back as a prompt.
+    let user_record = message_role == "user" && !sidechain;
+    let raw_user_text = user_record.then(|| claude_user_text(content));
+    let user_split = raw_user_text
+        .as_deref()
+        .map(control::split_system_reminders);
+    let record_control = user_split
+        .as_ref()
+        .and_then(|split| control::claude_record_control_kind(obj, &split.prompt));
+    if let (Some(raw), Some(split)) = (raw_user_text.as_deref(), &user_split) {
+        // What this record contributes to `history` now: the human's text, or
+        // nothing for a control row.
+        let current =
+            (record_control.is_none() && !split.prompt.is_empty()).then_some(split.prompt.as_str());
+        // A parser before control rows were typed wrote this record's whole
+        // text -- reminders included, task notifications included -- as a
+        // history row, and nothing on the Claude path removes a history row on
+        // re-read: a re-read that stores a different prompt, or none, would
+        // leave the old one beside it as a second searchable prompt for the
+        // life of the database. So the row that parser would have written
+        // for this record is retired first, keyed exactly: this session, this
+        // record's timestamp, that text. A row another session shares the
+        // timestamp and text with is that session's and is left alone; a row
+        // this parser writes back unchanged is deleted and reinserted only
+        // when the text really did change.
+        if !raw.is_empty() && current != Some(raw) {
+            retire_claude_history_row(conn, session_id, ts_ms, raw)?;
+        }
+        if let Some(prompt) = current {
             insert_history(
                 conn,
                 &HistoryEntry {
@@ -7057,42 +7289,48 @@ fn ingest_claude_record(
                     source: "claude".into(),
                     session_id: Some(session_id.to_string()),
                     project: project.map(str::to_string),
-                    prompt_hash: Some(prompt_hash(&prompt)),
-                    prompt,
+                    prompt_hash: Some(prompt_hash(prompt)),
+                    prompt: prompt.to_string(),
                     timestamp_ms: ts_ms,
                 },
             )?;
         }
     }
+    let text_rows = ClaudeTextRows {
+        session_id,
+        project,
+        cwd,
+        git_branch,
+        message_uuid,
+        parent_id,
+        ts_ms,
+        role: if message_role == "assistant" {
+            "assistant"
+        } else {
+            "user"
+        },
+        model,
+        token_json: token_json.as_deref(),
+        identity,
+        raw_facts,
+        // Every text row a control record writes carries the record's kind,
+        // verbatim; only a prompt is split further, its reminders becoming
+        // `system_reminder` rows of their own so the prompt text is the
+        // human's and the overhead is still on the ledger.
+        control: record_control,
+        split_reminders: user_record && record_control.is_none(),
+    };
+    // The event uid of the record's first text row, which is what a
+    // slash-command marker names.
+    let mut first_text_event_uid: Option<String> = None;
     if let Some(s) = content.as_str() {
-        if !s.trim().is_empty() {
-            let role = if message_role == "assistant" {
-                "assistant"
-            } else {
-                "user"
-            };
-            insert_session_event(
-                conn,
-                "claude",
-                session_id,
-                project,
-                cwd,
-                git_branch,
-                message_uuid,
-                parent_id,
-                ts_ms,
-                role,
-                "text",
-                Some(s),
-                model,
-                token_json.as_deref(),
-                identity,
-                &format!("{message_uuid}:0"),
-                None,
-                raw_facts,
-            )?;
-            record_rows += 1;
-        }
+        text_rows.insert(
+            conn,
+            s,
+            &format!("{message_uuid}:0"),
+            &mut record_rows,
+            &mut first_text_event_uid,
+        )?;
     }
     for (block_index, block) in content.as_array().into_iter().flatten().enumerate() {
         let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
@@ -7124,34 +7362,13 @@ fn ingest_claude_record(
         match block_type {
             "text" => {
                 if let Some(text) = block.get("text").and_then(Value::as_str) {
-                    if !text.trim().is_empty() {
-                        let role = if message_role == "assistant" {
-                            "assistant"
-                        } else {
-                            "user"
-                        };
-                        insert_session_event(
-                            conn,
-                            "claude",
-                            session_id,
-                            project,
-                            cwd,
-                            git_branch,
-                            message_uuid,
-                            parent_id,
-                            ts_ms,
-                            role,
-                            "text",
-                            Some(text),
-                            model,
-                            token_json.as_deref(),
-                            identity,
-                            &event_uid,
-                            None,
-                            raw_facts,
-                        )?;
-                        record_rows += 1;
-                    }
+                    text_rows.insert(
+                        conn,
+                        text,
+                        &event_uid,
+                        &mut record_rows,
+                        &mut first_text_event_uid,
+                    )?;
                 }
             }
             "thinking" => {
@@ -7306,6 +7523,52 @@ fn ingest_claude_record(
             _ => {}
         }
     }
+    // A slash command's three records are grouped into one `slash_command`
+    // marker keyed on the invocation, written when the invocation is read
+    // and rewritten as each chained output row arrives. The rows themselves
+    // are already stored above with their own `control_kind`; the marker is
+    // the parsed command and the linkage, so a consumer reads neither from
+    // the transcript.
+    if let (Some(kind), Some(event_uid)) = (record_control, first_text_event_uid.as_deref()) {
+        if matches!(
+            kind,
+            control::ControlKind::SlashCommandCaveat
+                | control::ControlKind::SlashCommandInvocation
+                | control::ControlKind::SlashCommandOutput
+        ) {
+            let row = control::ControlRow {
+                session_id,
+                uuid: message_uuid,
+                parent_uuid: parent_id,
+                event_uid,
+                ts_ms,
+                kind,
+                text: raw_user_text.as_deref().unwrap_or(""),
+                origin_kind: control::origin_kind(obj),
+                command_mode: control::command_mode(obj),
+                attachment_type: control::attachment_type(obj),
+            };
+            if let Some(marker) = triads.observe(&row) {
+                let payload_json = marker_payload(marker.payload);
+                insert_session_marker(
+                    conn,
+                    "claude",
+                    session_id,
+                    &NewSessionMarker {
+                        marker_uid: &marker.marker_uid,
+                        ts_ms: (marker.ts_ms != 0).then_some(marker.ts_ms),
+                        message_id: Some(&marker.message_id),
+                        parent_id: marker.parent_id.as_deref(),
+                        turn_id: None,
+                        kind: control::SLASH_COMMAND_MARKER_KIND,
+                        subkind: None,
+                        text: None,
+                        payload_json: payload_json.as_deref(),
+                    },
+                )?;
+            }
+        }
+    }
     // The invariant: every record leaves a row. A record whose content was
     // present but empty -- `""`, `[]`, or blocks that are all blank --
     // reaches none of the inserts above, and without this it would be
@@ -7321,6 +7584,132 @@ fn ingest_claude_record(
         )?;
     }
     Ok(())
+}
+
+/// The per-record facts every text row of one Claude record shares, and the
+/// control decision that applies to all of them.
+struct ClaudeTextRows<'a> {
+    session_id: &'a str,
+    project: Option<&'a str>,
+    cwd: Option<&'a str>,
+    git_branch: Option<&'a str>,
+    message_uuid: &'a str,
+    parent_id: Option<&'a str>,
+    ts_ms: i64,
+    role: &'static str,
+    model: Option<&'a str>,
+    token_json: Option<&'a str>,
+    identity: RequestIdentity<'a>,
+    raw_facts: RawMessageFacts<'a>,
+    /// The record's own control kind, stamped on every text row it writes.
+    control: Option<control::ControlKind>,
+    /// Whether `<system-reminder>` blocks are separated into rows of their
+    /// own: true for a prompt, false for model output and for a control
+    /// record, whose text is kept exactly as the harness wrote it.
+    split_reminders: bool,
+}
+
+impl ClaudeTextRows<'_> {
+    /// Write the text rows for one string of user or assistant text.
+    ///
+    /// `event_uid` is the row's identity when the text is stored whole. A
+    /// prompt with reminders inside it stores the human's text under that
+    /// uid and each reminder under `{event_uid}:reminder:{n}`, in text
+    /// order, so the reminder rows share the prompt's `message_id` and sort
+    /// beside it. A prompt with no reminder in it is stored verbatim, as it
+    /// always was. `first_uid` receives the uid of the first row written.
+    fn insert(
+        &self,
+        conn: &Connection,
+        text: &str,
+        event_uid: &str,
+        record_rows: &mut usize,
+        first_uid: &mut Option<String>,
+    ) -> Result<()> {
+        let mut write = |text: &str, uid: &str, kind: Option<control::ControlKind>| -> Result<()> {
+            if text.trim().is_empty() {
+                return Ok(());
+            }
+            insert_session_event(
+                conn,
+                "claude",
+                self.session_id,
+                self.project,
+                self.cwd,
+                self.git_branch,
+                self.message_uuid,
+                self.parent_id,
+                self.ts_ms,
+                self.role,
+                "text",
+                Some(text),
+                self.model,
+                self.token_json,
+                self.identity,
+                uid,
+                None,
+                RawMessageFacts {
+                    control_kind: kind.map(control::ControlKind::as_str),
+                    ..self.raw_facts
+                },
+            )?;
+            *record_rows += 1;
+            first_uid.get_or_insert_with(|| uid.to_string());
+            Ok(())
+        };
+        if !self.split_reminders {
+            return write(text, event_uid, self.control);
+        }
+        // The reminder rows this record produced last time were retired by
+        // the record walk before any block was written, so the rows below
+        // are exactly the current text's.
+        let split = control::split_system_reminders(text);
+        if split.reminders.is_empty() {
+            return write(text, event_uid, None);
+        }
+        if split.prompt.trim().is_empty() {
+            // Nothing keeps `event_uid`. A parser before the split stored the
+            // whole reminder under it, untyped, and the upsert below writes
+            // only the suffixed rows -- so on an upgraded database that old
+            // row would stay beside them and read as a prompt for as long as
+            // the transcript stood still. Scoped to this one uid: every other
+            // row of the record keeps its identity and is upserted in place.
+            conn.execute(
+                "DELETE FROM session_events \
+                 WHERE source = 'claude' AND session_id = ? AND event_uid = ?",
+                params![self.session_id, event_uid],
+            )?;
+        }
+        write(&split.prompt, event_uid, None)?;
+        for (index, reminder) in split.reminders.iter().enumerate() {
+            write(
+                reminder,
+                &format!("{event_uid}:reminder:{index}"),
+                Some(control::ControlKind::SystemReminder),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// A Claude user record's own text: the string, or its text blocks joined.
+///
+/// The same join `history` has always used, and the one the shallow scan
+/// uses for `first_prompt`, so the two classify the same string.
+fn claude_user_text(content: &Value) -> String {
+    if let Some(text) = content.as_str() {
+        return text.trim().to_string();
+    }
+    content
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The identity the Claude record loop keys a record by.
@@ -7979,7 +8368,12 @@ fn opencode_step_finish_stop_reason(part: &Value) -> Option<&str> {
 /// later change adds facts that existing rows should be re-read for.
 /// 2 adds `request_span`: Codex rows indexed before it have none, so they
 /// would keep grouping one API call into a request per row until re-read.
-const RAW_MESSAGE_FACTS_VERSION: i64 = 2;
+/// Generation 3 adds `control_kind`. It is derived rather than copied off the
+/// envelope, but it is stamped by the same parser on the same rows, and a row
+/// indexed before it existed is indistinguishable from a prompt -- which is
+/// exactly the reading the column exists to prevent -- so the backfill this
+/// version drives is the one that repairs it.
+const RAW_MESSAGE_FACTS_VERSION: i64 = 3;
 
 #[derive(Debug, Default, Clone, Copy)]
 struct RawMessageFacts<'a> {
@@ -7993,6 +8387,11 @@ struct RawMessageFacts<'a> {
     /// its requests with usage snapshots instead of naming them. Numbered per
     /// session by the parser; see `codex_request_span` at its call site.
     request_span: Option<&'a str>,
+    /// Why this user-role row is not a human prompt, from
+    /// [`control::ControlKind`]; `None` for a prompt and for model output.
+    /// The one derived fact carried here, because every insert already
+    /// threads this struct and the column is stamped per row like the rest.
+    control_kind: Option<&'a str>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8179,7 +8578,8 @@ fn insert_session_event_with_provenance(
          (source, session_id, project, project_key, project_key_method, cwd, git_branch, message_id, parent_id, ts_ms, role, kind, text, model, token_json, provider, event_uid, \
           tool_use_id, payload_bytes, payload_truncated, payload_hash, call_index, event_index, result_status, event_source, \
           error_signal, subagent_session_id, agent_id, \
-          request_id, provider_message_id, stop_reason, agent_version, is_sidechain, is_meta, turn_id, request_span, raw_facts_version, raw_kind) \
+          request_id, provider_message_id, stop_reason, agent_version, is_sidechain, is_meta, turn_id, request_span, raw_facts_version, raw_kind, \
+          control_kind) \
          VALUES (?1, ?2, ?3, \
            COALESCE((SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2), ?16), \
            CASE WHEN (SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2) IS NOT NULL \
@@ -8187,7 +8587,7 @@ fn insert_session_event_with_provenance(
                 ELSE ?17 END, \
            ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
            ?14, ?15, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, \
-           ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38) \
+           ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39) \
          ON CONFLICT(source, session_id, event_uid) DO UPDATE SET \
          project=excluded.project, \
          project_key=COALESCE((SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2), session_events.project_key, ?16), \
@@ -8209,7 +8609,8 @@ fn insert_session_event_with_provenance(
          stop_reason=excluded.stop_reason, agent_version=excluded.agent_version, \
          is_sidechain=excluded.is_sidechain, is_meta=excluded.is_meta, turn_id=excluded.turn_id, \
          request_span=excluded.request_span, \
-         raw_facts_version=excluded.raw_facts_version, raw_kind=excluded.raw_kind",
+         raw_facts_version=excluded.raw_facts_version, raw_kind=excluded.raw_kind, \
+         control_kind=excluded.control_kind",
     )?.execute(
         params![
             source,
@@ -8250,6 +8651,7 @@ fn insert_session_event_with_provenance(
             raw_facts.request_span,
             RAW_MESSAGE_FACTS_VERSION,
             raw_kind,
+            raw_facts.control_kind,
         ],
     )?;
     Ok(())
@@ -11555,10 +11957,10 @@ pub(crate) fn grok_chat_text(value: &Value, role: &str) -> Option<String> {
 fn sync_trajectories(
     conn: &Connection,
     state: &mut Map<String, Value>,
-    home: &Path,
+    roots: &crate::ProviderRoots,
     coverage: &mut SweepCoverage,
 ) -> Result<usize> {
-    let files = trajectory_files(home)?;
+    let files = trajectory_files(roots)?;
     if files.is_empty() {
         return Ok(0);
     }
@@ -11662,28 +12064,32 @@ struct TrajectoryRow {
 /// all, contributes no files — but it is exactly what has to be watched, so
 /// the first trajectory written into it wakes live capture instead of waiting
 /// for the backstop.
-pub(crate) fn trajectory_roots(home: &Path) -> Result<Vec<PathBuf>> {
-    let mut roots = Vec::new();
-    if let Some(raw) = std::env::var_os("TRAJECTORY_ROOT") {
-        for part in std::env::split_paths(&raw) {
-            if !part.as_os_str().is_empty() {
-                roots.push(part);
+/// The trajectory roots these provider roots name: the explicit list when
+/// one was given (`TRAJECTORY_ROOT`, read once when the roots were built),
+/// otherwise every `.trajectories` directory under `<home>/Projects` as of
+/// now. The environment is not consulted here: an embedder that built its
+/// roots without it must not have a host's `TRAJECTORY_ROOT` redirect its
+/// sweep and its watcher outside the home it named.
+pub(crate) fn trajectory_roots(provider_roots: &crate::ProviderRoots) -> Result<Vec<PathBuf>> {
+    let mut roots = match &provider_roots.trajectory_roots {
+        Some(explicit) => explicit.clone(),
+        None => {
+            let mut derived = Vec::new();
+            let projects = provider_roots.home.join("Projects");
+            if projects.exists() {
+                collect_named_dirs(&projects, ".trajectories", &mut derived)?;
             }
+            derived
         }
-    } else {
-        let projects = home.join("Projects");
-        if projects.exists() {
-            collect_named_dirs(&projects, ".trajectories", &mut roots)?;
-        }
-    }
+    };
     roots.sort();
     roots.dedup();
     Ok(roots)
 }
 
-fn trajectory_files(home: &Path) -> Result<Vec<PathBuf>> {
+fn trajectory_files(provider_roots: &crate::ProviderRoots) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
-    for root in trajectory_roots(home)? {
+    for root in trajectory_roots(provider_roots)? {
         check_capture_cancelled()?;
         if root.is_file() && root.extension().and_then(|s| s.to_str()) == Some("json") {
             files.push(root);
@@ -21185,6 +21591,505 @@ mod tests {
         assert_eq!(prompts, vec!["real prompt"]);
     }
 
+    fn corpus_fixture(relative: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(relative)
+    }
+
+    fn typed_event_uids(
+        conn: &Connection,
+        session_id: &str,
+        message_id: &str,
+    ) -> Vec<(String, Option<String>)> {
+        conn.prepare(
+            "SELECT event_uid, control_kind FROM session_events \
+             WHERE source = 'claude' AND session_id = ? AND message_id = ? ORDER BY event_uid",
+        )
+        .unwrap()
+        .query_map([session_id, message_id], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    /// Before reminders were split out, a standalone `<system-reminder>` text
+    /// block was stored under the block's own uid, untyped. The split stores
+    /// it under a suffixed uid, so an upgraded database would otherwise keep
+    /// the old row beside the new one -- and usage attribution would go on
+    /// reading it as a prompt.
+    #[test]
+    fn a_reminder_row_the_previous_parser_stored_untyped_is_retired_on_reparse() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // The row shape the previous parser wrote for `u-rem-1`'s first block.
+        conn.execute(
+            "INSERT INTO session_events (source, session_id, message_id, ts_ms, role, kind, text, event_uid, raw_facts_version) \
+             VALUES ('claude', 'reminder-session', 'u-rem-1', 1779753600000, 'user', 'text', \
+                     '<system-reminder>\nThe user has enabled brief mode. Keep answers short.\n</system-reminder>', \
+                     'u-rem-1:0', 2)",
+            [],
+        )
+        .unwrap();
+
+        ingest_claude_transcript(&conn, &corpus_fixture("claude/system-reminder.jsonl")).unwrap();
+
+        assert_eq!(
+            typed_event_uids(&conn, "reminder-session", "u-rem-1"),
+            vec![
+                (
+                    "u-rem-1:0:reminder:0".to_string(),
+                    Some("system_reminder".to_string())
+                ),
+                ("u-rem-1:1".to_string(), None),
+            ],
+            "the untyped row under the old uid is gone, the typed one stands"
+        );
+        let events = crate::session_events(&conn, "reminder-session", Some("claude")).unwrap();
+        let attributed = crate::usage::attribute_usage_to_prompts(&events, "claude");
+        let prompts: Vec<&str> = attributed
+            .keys()
+            .map(|(_, prompt)| prompt.as_str())
+            .collect();
+        assert!(
+            prompts
+                .iter()
+                .all(|prompt| !prompt.contains("<system-reminder>")),
+            "no reminder text is a prompt: {prompts:?}"
+        );
+    }
+
+    /// Reminder rows have derived identities the upsert can only add to, so
+    /// a record Claude rewrites under the same uuid with fewer reminders has
+    /// to lose the rows the earlier text produced.
+    #[test]
+    fn a_rewritten_record_keeps_only_the_reminders_its_current_text_has() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rewritten.jsonl");
+        let record = |content: &str| {
+            format!(
+                "{{\"type\":\"user\",\"uuid\":\"u1\",\"sessionId\":\"rewrite-session\",\"cwd\":\"/tmp/project\",\"timestamp\":\"2026-04-21T00:00:00.000Z\",\"message\":{{\"role\":\"user\",\"content\":\"{content}\"}}}}\n"
+            )
+        };
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let rows = |conn: &Connection| typed_event_uids(conn, "rewrite-session", "u1");
+        let reminder = |n: usize| {
+            (
+                format!("u1:0:reminder:{n}"),
+                Some("system_reminder".to_string()),
+            )
+        };
+
+        fs::write(
+            &path,
+            record(
+                "<system-reminder>a</system-reminder>fix it<system-reminder>b</system-reminder>",
+            ),
+        )
+        .unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        assert_eq!(
+            rows(&conn),
+            vec![("u1:0".to_string(), None), reminder(0), reminder(1)]
+        );
+
+        fs::write(&path, record("<system-reminder>a</system-reminder>fix it")).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        assert_eq!(
+            rows(&conn),
+            vec![("u1:0".to_string(), None), reminder(0)],
+            "the second reminder is gone with the text that produced it"
+        );
+
+        fs::write(&path, record("fix it")).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        assert_eq!(
+            rows(&conn),
+            vec![("u1:0".to_string(), None)],
+            "no reminder in the text, no reminder row"
+        );
+
+        // And back up again: the derived rows are recreated from the text.
+        fs::write(
+            &path,
+            record(
+                "<system-reminder>a</system-reminder>fix it<system-reminder>b</system-reminder>",
+            ),
+        )
+        .unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        assert_eq!(rows(&conn).len(), 3);
+    }
+
+    /// The block that carried a reminder can itself disappear from a
+    /// rewritten record -- dropped, emptied out, or turned into another block
+    /// type -- and then no text block reaches the split at all. The record
+    /// walk retires the record's reminder rows before it looks at any block.
+    #[test]
+    fn a_rewritten_record_drops_the_reminder_rows_of_blocks_it_no_longer_has() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rewritten-blocks.jsonl");
+        let record = |content: &str| {
+            format!(
+                "{{\"type\":\"user\",\"uuid\":\"u1\",\"sessionId\":\"rewrite-blocks\",\"cwd\":\"/tmp/project\",\"timestamp\":\"2026-04-21T00:00:00.000Z\",\"message\":{{\"role\":\"user\",\"content\":{content}}}}}\n"
+            )
+        };
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let rows = |conn: &Connection| typed_event_uids(conn, "rewrite-blocks", "u1");
+        let reminders = |conn: &Connection| -> Vec<String> {
+            rows(conn)
+                .into_iter()
+                .filter(|(_, kind)| kind.as_deref() == Some("system_reminder"))
+                .map(|(uid, _)| uid)
+                .collect()
+        };
+        let two_blocks = r#"[{"type":"text","text":"fix it"},{"type":"text","text":"<system-reminder>b</system-reminder>"}]"#;
+
+        fs::write(&path, record(two_blocks)).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        assert_eq!(
+            rows(&conn),
+            vec![
+                ("u1:0".to_string(), None),
+                (
+                    "u1:1:reminder:0".to_string(),
+                    Some("system_reminder".to_string())
+                ),
+            ]
+        );
+
+        // The reminder's block is gone.
+        fs::write(&path, record(r#"[{"type":"text","text":"fix it"}]"#)).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        assert_eq!(rows(&conn), vec![("u1:0".to_string(), None)]);
+
+        // Back, then the whole content emptied.
+        fs::write(&path, record(two_blocks)).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        assert_eq!(reminders(&conn), vec!["u1:1:reminder:0".to_string()]);
+        fs::write(&path, record("[]")).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        assert!(reminders(&conn).is_empty(), "{:?}", rows(&conn));
+
+        // Back, then the block turned into something that is not text.
+        fs::write(&path, record(two_blocks)).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        assert_eq!(reminders(&conn), vec!["u1:1:reminder:0".to_string()]);
+        fs::write(
+            &path,
+            record(r#"[{"type":"text","text":"fix it"},{"type":"image","source":{"type":"base64","data":"AAAA"}}]"#),
+        )
+        .unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        assert!(reminders(&conn).is_empty(), "{:?}", rows(&conn));
+        assert_eq!(rows(&conn)[0], ("u1:0".to_string(), None));
+    }
+
+    /// The same shape for Codex: a context wrapper used to store nothing and
+    /// was recorded as an `unknown` marker. It stores a typed row now, so the
+    /// marker an earlier parser left for that line is retired.
+    #[test]
+    fn a_codex_wrapper_marker_the_previous_parser_left_is_retired() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-current.jsonl");
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n{}\n",
+                r#"{"timestamp":"2026-08-31T10:00:00.000Z","type":"session_meta","payload":{"id":"sess-wrapper","cwd":"/tmp/proj"}}"#,
+                response_user(
+                    "2026-08-31T10:00:01.000Z",
+                    "<environment_context>injected</environment_context>"
+                ),
+                response_user("2026-08-31T10:00:02.000Z", "fix the scanner"),
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // What the previous parser left for line 1.
+        crate::insert_session_marker(
+            &conn,
+            "codex",
+            "sess-wrapper",
+            &crate::NewSessionMarker {
+                marker_uid: "1:marker",
+                ts_ms: Some(1),
+                kind: "unknown",
+                subkind: Some("message"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        super::ingest_codex_rollout(&conn, &path, &codex_meta(&path)).unwrap();
+
+        assert!(
+            markers_of(&conn, "codex", "sess-wrapper").is_empty(),
+            "the wrapper is a row now, not a marker: {:?}",
+            markers_of(&conn, "codex", "sess-wrapper")
+        );
+        let control: Vec<Option<String>> = conn
+            .prepare("SELECT control_kind FROM session_events WHERE role = 'user' ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(control, vec![Some("codex_context_wrapper".into()), None]);
+    }
+
+    fn claude_history(conn: &Connection, session_id: &str) -> Vec<(i64, String)> {
+        conn.prepare(
+            "SELECT timestamp_ms, prompt FROM history \
+             WHERE source = 'claude' AND session_id = ? ORDER BY timestamp_ms, prompt",
+        )
+        .unwrap()
+        .query_map([session_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    /// The parser before control rows stored a record's whole text as its
+    /// history row: reminders folded into the prompt, task notifications as
+    /// prompts. Nothing on the Claude path removes a history row on re-read,
+    /// so the one-time re-read retires exactly the row that parser wrote for
+    /// each record it now stores differently -- and leaves a row another
+    /// session happens to share alone.
+    #[test]
+    fn a_reparse_retires_the_history_rows_the_previous_parser_wrote() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for (session_id, ts_ms, prompt) in [
+            // `u-rem-1`, with the reminder block folded into the prompt.
+            (
+                "reminder-session",
+                1_779_753_600_000_i64,
+                "<system-reminder>\nThe user has enabled brief mode. Keep answers short.\n</system-reminder>\ntighten the retry loop",
+            ),
+            // `u-rem-2`, the inline form.
+            (
+                "reminder-session",
+                1_779_753_602_000,
+                "now add a test for it\n<system-reminder>Remember to read AGENTS.md before editing.</system-reminder>",
+            ),
+            // `u-tn-1`, a task notification stored as a prompt.
+            (
+                "tn-session",
+                1_779_667_202_000,
+                "<task-notification>background task bash_1 completed</task-notification>",
+            ),
+            // Another session's row at the same instant and text as `u-tn-1`
+            // is not this transcript's to retire.
+            (
+                "elsewhere",
+                1_779_667_202_001,
+                "<task-notification>background task bash_1 completed</task-notification>",
+            ),
+        ] {
+            insert_history(
+                &conn,
+                &HistoryEntry {
+                    id: 0,
+                    source: "claude".into(),
+                    session_id: Some(session_id.into()),
+                    project: Some("/tmp/project".into()),
+                    prompt_hash: Some(prompt_hash(prompt)),
+                    prompt: prompt.into(),
+                    timestamp_ms: ts_ms,
+                },
+            )
+            .unwrap();
+        }
+
+        ingest_claude_transcript(&conn, &corpus_fixture("claude/system-reminder.jsonl")).unwrap();
+        ingest_claude_transcript(&conn, &corpus_fixture("claude/task-notification.jsonl")).unwrap();
+
+        assert_eq!(
+            claude_history(&conn, "reminder-session"),
+            vec![
+                (1_779_753_600_000, "tighten the retry loop".to_string()),
+                (1_779_753_602_000, "now add a test for it".to_string()),
+            ]
+        );
+        assert_eq!(
+            claude_history(&conn, "tn-session"),
+            vec![
+                (1_779_667_200_000, "please fix the build".to_string()),
+                (
+                    1_779_667_204_000,
+                    "thanks, also add a changelog entry".to_string()
+                ),
+            ]
+        );
+        assert_eq!(claude_history(&conn, "elsewhere").len(), 1);
+
+        // Idempotent: a second read changes nothing.
+        ingest_claude_transcript(&conn, &corpus_fixture("claude/system-reminder.jsonl")).unwrap();
+        assert_eq!(claude_history(&conn, "reminder-session").len(), 2);
+    }
+
+    /// `history` is unique on `(source, timestamp_ms, prompt)`, so a task
+    /// notification in one session and a human prompt with the same text at
+    /// the same millisecond in another are one row. Whichever order the
+    /// upgrade re-reads the two transcripts in, the human prompt has to be
+    /// the one left standing.
+    #[test]
+    fn retiring_a_control_row_hands_a_shared_history_row_to_the_human_session() {
+        let control = concat!(
+            r#"{"type":"user","uuid":"a1","sessionId":"sess-control","cwd":"/tmp/a","origin":{"kind":"task-notification"},"timestamp":"2026-04-21T00:00:01.000Z","message":{"role":"user","content":"fix it"}}"#,
+            "\n",
+        );
+        let human = concat!(
+            r#"{"type":"user","uuid":"b1","sessionId":"sess-human","cwd":"/tmp/b","timestamp":"2026-04-21T00:00:01.000Z","message":{"role":"user","content":"fix it"}}"#,
+            "\n",
+        );
+        let owners = |conn: &Connection| -> Vec<(String, String)> {
+            conn.prepare(
+                "SELECT session_id, prompt FROM history WHERE source = 'claude' ORDER BY session_id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        };
+        for human_first in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let control_path = dir.path().join("control.jsonl");
+            let human_path = dir.path().join("human.jsonl");
+            fs::write(&control_path, control).unwrap();
+            fs::write(&human_path, human).unwrap();
+            let conn = Connection::open_in_memory().unwrap();
+            init_db(&conn).unwrap();
+            // What the previous parser left: the control session owns the
+            // one row, and both sessions' events are stored untyped.
+            insert_history(
+                &conn,
+                &HistoryEntry {
+                    id: 0,
+                    source: "claude".into(),
+                    session_id: Some("sess-control".into()),
+                    project: Some("/tmp/a".into()),
+                    prompt_hash: Some(prompt_hash("fix it")),
+                    prompt: "fix it".into(),
+                    timestamp_ms: 1_776_729_601_000,
+                },
+            )
+            .unwrap();
+            for (session, project, uid) in [
+                ("sess-control", "/tmp/a", "a1:0"),
+                ("sess-human", "/tmp/b", "b1:0"),
+            ] {
+                conn.execute(
+                    "INSERT INTO session_events (source, session_id, project, message_id, ts_ms, role, kind, text, event_uid) \
+                     VALUES ('claude', ?1, ?2, ?3, 1776729601000, 'user', 'text', 'fix it', ?4)",
+                    params![session, project, &uid[..2], uid],
+                )
+                .unwrap();
+            }
+
+            let order: Vec<&Path> = if human_first {
+                vec![&human_path, &control_path]
+            } else {
+                vec![&control_path, &human_path]
+            };
+            for path in order {
+                ingest_claude_transcript(&conn, path).unwrap();
+            }
+            assert_eq!(
+                owners(&conn),
+                vec![("sess-human".to_string(), "fix it".to_string())],
+                "human first: {human_first}"
+            );
+            let project: Option<String> = conn
+                .query_row(
+                    "SELECT project FROM history WHERE source = 'claude' AND prompt = 'fix it'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                project.as_deref(),
+                Some("/tmp/b"),
+                "the row is the human session's now, project included: {human_first}"
+            );
+            // Idempotent: reading both again moves nothing.
+            ingest_claude_transcript(&conn, &control_path).unwrap();
+            ingest_claude_transcript(&conn, &human_path).unwrap();
+            assert_eq!(owners(&conn).len(), 1, "human first: {human_first}");
+        }
+    }
+
+    fn stored_first_prompt(conn: &Connection, session_id: &str) -> Option<String> {
+        conn.query_row(
+            "SELECT first_prompt FROM sessions WHERE source = 'claude' AND session_id = ?",
+            [session_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// The shallow catalog upsert coalesces a null `first_prompt` into the
+    /// stored one, so a title an earlier scanner derived from a row that is
+    /// control now -- a bare `/resume <id>` -- would survive every rescan of
+    /// an unchanged transcript. The full sync walks every record, so its
+    /// answer, null included, is the one the catalog keeps.
+    #[test]
+    fn a_full_claude_sync_replaces_a_control_only_first_prompt_with_null() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resume-only.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","uuid":"u1","sessionId":"resume-only","cwd":"/tmp/project","timestamp":"2026-04-21T00:00:00.000Z","message":{"role":"user","content":"/resume 11111111-1111-1111-1111-111111111111"}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"resume-only","cwd":"/tmp/project","timestamp":"2026-04-21T00:00:01.000Z","message":{"role":"assistant","model":"claude-test","content":[{"type":"text","text":"continuing"}]}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // The row an earlier scanner left: the marker text as the title.
+        conn.execute(
+            "INSERT INTO sessions (source, session_id, first_prompt, discovery_state) \
+             VALUES ('claude', 'resume-only', '/resume 11111111-1111-1111-1111-111111111111', 'shallow')",
+            [],
+        )
+        .unwrap();
+
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(stored_first_prompt(&conn, "resume-only"), None);
+
+        // And where a substantive prompt does follow a control row, the sync
+        // names it rather than the control row.
+        let path = dir.path().join("notified-first.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","uuid":"u1","sessionId":"notified-first","cwd":"/tmp/project","timestamp":"2026-04-21T00:00:00.000Z","message":{"role":"user","content":"<task-notification>bash_1 done</task-notification>"}}"#, "\n",
+                r#"{"type":"user","uuid":"u2","parentUuid":"u1","sessionId":"notified-first","cwd":"/tmp/project","timestamp":"2026-04-21T00:00:01.000Z","message":{"role":"user","content":"now ship it"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (source, session_id, first_prompt, discovery_state) \
+             VALUES ('claude', 'notified-first', '<task-notification>bash_1 done</task-notification>', 'shallow')",
+            [],
+        )
+        .unwrap();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(
+            stored_first_prompt(&conn, "notified-first").as_deref(),
+            Some("now ship it")
+        );
+    }
+
     fn write_rich_claude_transcript(path: &std::path::Path) {
         fs::write(
             path,
@@ -21389,8 +22294,10 @@ mod tests {
     /// `input_text` part (an image-only turn) is rejected, nothing is written,
     /// and the blanket exemption then swallowed the line.
     ///
-    /// The same holds for a blank `user_message` and for an
-    /// application-injected control wrapper: the deduplicator refuses both.
+    /// The same holds for a blank `user_message`: the deduplicator refuses
+    /// it. An application-injected control wrapper is different since #180:
+    /// it is stored as a `codex_context_wrapper` event, so it earns no
+    /// marker.
     ///
     /// The exemption now has to be earned: it holds for a mirrored duplicate,
     /// whose twin really did write, and not for a message the deduplicator
@@ -21410,9 +22317,8 @@ mod tests {
                 // Image-only user turn: no `input_text` part, so the
                 // deduplicator rejects it and nothing stores it.
                 r#"{"timestamp":"2026-09-13T00:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]}}"#, "\n",
-                // Blank text, and an application-injected control wrapper:
-                // the deduplicator refuses both, so nothing stores them
-                // either.
+                // Blank text: refused, so nothing stores it either. The
+                // control wrapper after it is stored, typed.
                 r#"{"timestamp":"2026-09-13T00:00:02.000Z","type":"event_msg","payload":{"type":"user_message","message":"   "}}"#, "\n",
                 r#"{"timestamp":"2026-09-13T00:00:03.000Z","type":"event_msg","payload":{"type":"user_message","message":"<environment_context>cwd=/tmp/proj</environment_context>"}}"#, "\n",
             ),
@@ -21423,14 +22329,24 @@ mod tests {
         init_db(&conn).unwrap();
         super::ingest_codex_rollout(&conn, &rollout, &codex_meta(&rollout)).unwrap();
 
-        let events: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM session_events WHERE source='codex' AND session_id='sess-image'",
-                [],
-                |row| row.get(0),
+        let events: Vec<(String, Option<String>)> = conn
+            .prepare(
+                "SELECT text, control_kind FROM session_events \
+                 WHERE source='codex' AND session_id='sess-image' ORDER BY id",
             )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(events, 0, "the image-only turn reaches no event");
+        assert_eq!(
+            events,
+            vec![(
+                "<environment_context>cwd=/tmp/proj</environment_context>".to_string(),
+                Some("codex_context_wrapper".to_string())
+            )],
+            "the image-only turn reaches no event; the wrapper is a typed row"
+        );
 
         let markers = markers_of(&conn, "codex", "sess-image");
         assert_eq!(
@@ -21438,11 +22354,7 @@ mod tests {
                 .iter()
                 .map(|(kind, subkind, _)| (kind.as_str(), subkind.as_str()))
                 .collect::<Vec<_>>(),
-            vec![
-                ("unknown", "message"),
-                ("unknown", "user_message"),
-                ("unknown", "user_message"),
-            ],
+            vec![("unknown", "message"), ("unknown", "user_message")],
             "every user line nothing stored must leave a row: {markers:?}"
         );
         // No marker payload carries the image or the wrapper text, only the
@@ -23125,24 +24037,42 @@ mod tests {
 
         let outcome = super::ingest_codex_rollout(&conn, &path, &codex_meta(&path)).unwrap();
         assert_eq!(outcome.prompts, 1);
-        assert_eq!(outcome.events, 2);
+        assert_eq!(outcome.events, 3);
         assert_eq!(outcome.first_prompt.as_deref(), Some("fix\nthe scanner"));
-        let rows: Vec<(String, String, String)> = conn
-            .prepare("SELECT role, text, message_id FROM session_events ORDER BY ts_ms")
+        let rows: Vec<(String, String, String, Option<String>)> = conn
+            .prepare(
+                "SELECT role, text, message_id, control_kind FROM session_events ORDER BY ts_ms",
+            )
             .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(
             rows,
             vec![
+                // The injected context is a typed row, and the first prompt
+                // is still the human's.
+                (
+                    "user".into(),
+                    "<environment_context>injected</environment_context>".into(),
+                    "1:response_item_user_message".into(),
+                    Some("codex_context_wrapper".into()),
+                ),
                 (
                     "user".into(),
                     "fix\nthe scanner".into(),
-                    "msg_user_1".into()
+                    "msg_user_1".into(),
+                    None,
                 ),
-                ("assistant".into(), "Done.".into(), "5:agent_message".into()),
+                (
+                    "assistant".into(),
+                    "Done.".into(),
+                    "5:agent_message".into(),
+                    None,
+                ),
             ]
         );
     }
@@ -23196,7 +24126,7 @@ mod tests {
 
         let outcome = super::ingest_codex_rollout(&conn, &path, &meta).unwrap();
         assert_eq!(outcome.prompts, 1);
-        assert_eq!(outcome.events, 6);
+        assert_eq!(outcome.events, 7);
         assert_eq!(
             outcome.last_assistant_text.as_deref(),
             Some("Done. The importer is fixed.")
@@ -23213,6 +24143,9 @@ mod tests {
         assert_eq!(
             kinds,
             vec![
+                ("user".into(), "text".into(), None),
+                // The `<environment_context>` wrapper: a typed row, not a
+                // prompt.
                 ("user".into(), "text".into(), None),
                 (
                     "assistant".into(),
@@ -23234,7 +24167,8 @@ mod tests {
             ]
         );
 
-        // The boilerplate user message is filtered from both stores.
+        // The boilerplate user message is kept out of `history`, and typed
+        // on the event it does leave.
         let prompt_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM history WHERE source='codex'",
@@ -23243,6 +24177,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(prompt_count, 1);
+        let control: Vec<Option<String>> = conn
+            .prepare("SELECT control_kind FROM session_events WHERE role='user' ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(control, vec![None, Some("codex_context_wrapper".into())]);
 
         // Request 1's cumulative snapshot lands on the tool_use event that
         // closed it; the duplicate snapshot adds nothing; request 2's delta
@@ -23346,7 +24288,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
-        assert_eq!(counts, (6, 2, 1, 1));
+        assert_eq!(counts, (7, 2, 1, 1));
     }
 
     #[test]

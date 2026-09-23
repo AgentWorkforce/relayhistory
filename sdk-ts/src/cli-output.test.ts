@@ -7,7 +7,7 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
-import { SESSION_EVIDENCE_CONTRACT_VERSION } from './index.js';
+import { SESSION_EVIDENCE_CONTRACT_VERSION, SESSION_USAGE_CONTRACT_VERSION } from './index.js';
 
 const run = promisify(execFile);
 const cli = join(dirname(fileURLToPath(import.meta.url)), 'cli.js');
@@ -447,6 +447,89 @@ test('sessions tools and edits page versioned JSON and continue from a cursor', 
     await assert.rejects(
       run(process.execPath, [cli, 'sessions', 'tools', 'claude', 'claude-evidence', '--remote', '--db', db, '--no-warning'], { env }),
       (error: unknown) => isUsageFailure(error, 'sessions tools does not accept --remote'),
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('sessions markers and sessions usage page versioned JSON and render human rows', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'relayhistory-cli-markers-'));
+  const home = join(root, 'home');
+  const claude = join(home, '.claude', 'projects', 'project');
+  const db = join(root, 'history.db');
+  await mkdir(claude, { recursive: true });
+  const usage = { input_tokens: 3, cache_creation_input_tokens: 40, cache_read_input_tokens: 100, output_tokens: 7 };
+  const transcript = [
+    { type: 'summary', summary: 'earlier work', leafUuid: 'leaf-1' },
+    { type: 'user', uuid: 'u1', sessionId: 'claude-markers', cwd: '/work/app', timestamp: '2026-08-30T10:00:00.000Z', message: { role: 'user', content: 'continue' } },
+    { type: 'system', subtype: 'compact_boundary', uuid: 's1', parentUuid: 'u1', sessionId: 'claude-markers', cwd: '/work/app', timestamp: '2026-08-30T10:00:01.000Z', compactMetadata: { trigger: 'manual', preTokens: 5 } },
+    { type: 'assistant', uuid: 'a1', parentUuid: 's1', requestId: 'req_1', sessionId: 'claude-markers', cwd: '/work/app', timestamp: '2026-08-30T10:00:02.000Z', message: { role: 'assistant', model: 'claude-test', id: 'msg_1', usage, content: [{ type: 'text', text: 'ok' }] } },
+  ];
+  await writeFile(join(claude, 'claude-markers.jsonl'), `${transcript.map((line) => JSON.stringify(line)).join('\n')}\n`);
+  const env = { ...process.env, HOME: home, USERPROFILE: home };
+  try {
+    await run(process.execPath, [cli, 'sync', '--db', db, '--no-warning'], { env });
+
+    const first = await run(process.execPath, [
+      cli, 'sessions', 'markers', 'claude', 'claude-markers', '--limit', '1', '--db', db, '--json', '--no-warning',
+    ], { env });
+    const page = JSON.parse(first.stdout) as Record<string, unknown>;
+    assert.equal(page.contract_version, SESSION_EVIDENCE_CONTRACT_VERSION);
+    assert.equal(page.source, 'claude');
+    assert.equal(page.session_id, 'claude-markers');
+    const markers = page.markers as Array<Record<string, unknown>>;
+    assert.equal(markers.length, 1);
+    assert.equal(markers[0].kind, 'compaction_boundary');
+    // Provider payload keys are data and survive the snake_case wire mapping.
+    assert.equal((markers[0].payload as Record<string, unknown>).trigger, 'manual');
+    const cursor = page.next_cursor as Record<string, unknown>;
+    assert.equal(typeof cursor.id, 'number');
+
+    // The printed cursor feeds straight back into --after, unedited, and the
+    // undated summary is reached through the null-timestamp tail.
+    const second = await run(process.execPath, [
+      cli, 'sessions', 'markers', 'claude', 'claude-markers', '--after', JSON.stringify(cursor),
+      '--db', db, '--json', '--no-warning',
+    ], { env });
+    const rest = JSON.parse(second.stdout) as Record<string, unknown>;
+    const restMarkers = rest.markers as Array<Record<string, unknown>>;
+    assert.ok(restMarkers.some((marker) => marker.kind === 'summary' && marker.ts_ms === null));
+    assert.equal(rest.next_cursor, null);
+
+    const human = await run(process.execPath, [
+      cli, 'sessions', 'markers', 'claude', 'claude-markers', '--db', db, '--no-warning',
+    ], { env });
+    assert.match(human.stdout, /compaction_boundary  compact_boundary/);
+    for (const line of human.stdout.trim().split('\n')) {
+      if (line.startsWith('more available')) continue;
+      assert.equal(line.split('  ').length, 6, `marker row keeps six columns: ${line}`);
+    }
+
+    const usageJson = await run(process.execPath, [
+      cli, 'sessions', 'usage', 'claude', 'claude-markers', '--db', db, '--json', '--no-warning',
+    ], { env });
+    const summary = JSON.parse(usageJson.stdout) as Record<string, unknown>;
+    assert.equal(summary.contract_version, SESSION_USAGE_CONTRACT_VERSION);
+    assert.equal(summary.request_count, 1);
+    assert.equal((summary.usage as Record<string, unknown>).input_tokens, 3);
+    assert.equal((summary.usage as Record<string, unknown>).cache_write_tokens, 40);
+    assert.equal((summary.usage as Record<string, unknown>).reported_cost_usd, null);
+
+    const usageHuman = await run(process.execPath, [
+      cli, 'sessions', 'usage', 'claude', 'claude-markers', '--db', db, '--no-warning',
+    ], { env });
+    assert.match(usageHuman.stdout, /1 of 1 request\(s\) with usage/);
+    assert.match(usageHuman.stdout, /input=3 output=7 cache_read=100 cache_write=40/);
+    assert.match(usageHuman.stdout, /reported cost: none/);
+
+    await assert.rejects(
+      run(process.execPath, [cli, 'sessions', 'usage', 'claude', '--db', db, '--no-warning'], { env }),
+      (error: unknown) => isUsageFailure(error, 'sessions usage requires SOURCE and SESSION_ID'),
+    );
+    await assert.rejects(
+      run(process.execPath, [cli, 'sessions', 'markers', 'claude', 'claude-markers', '--local', '--db', db, '--no-warning'], { env }),
+      (error: unknown) => isUsageFailure(error, 'sessions markers does not accept --local'),
     );
   } finally {
     await rm(root, { recursive: true, force: true });

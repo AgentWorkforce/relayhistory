@@ -7,8 +7,8 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import {
   discoverSessions, getSession, getSessionEventsPage, getSessionFileEditsPage,
-  getSessionRelationships, getSessionRequestsPage, getSessionToolCallsPage, getSessionTree,
-  getSessionUsage, hydrateSession,
+  getSessionMarkersPage, getSessionRelationships, getSessionRequestsPage, getSessionToolCallsPage,
+  getSessionTree, getSessionUsage, getSourceCapabilities, hydrateSession,
   listSessionCatalogPage, recent, search, stats, sync,
   historyDeliveryStatus, historyDeliveryRetention, controlHistoryDelivery,
 } from './index.js';
@@ -133,6 +133,16 @@ server.tool('get_session_file_edits', 'Get one bounded page of recorded file edi
   limit: z.number().int().min(1).max(1000).optional().default(200),
   after: EVIDENCE_CURSOR.optional(),
 }, READ, ({ source, session_id, limit, after }) => call(() => getSessionFileEditsPage(source, session_id, { limit, after })));
+
+server.tool('get_session_markers', 'Get one bounded page of a session\'s markers: the records a provider wrote that are not transcript events, such as compaction and summary boundaries, provider system rows, non-text content blocks and agent lifecycle events. `kind` is the classified vocabulary and `subkind` the provider-native type; an unclassified record is kind `unknown`. `payload_json` is a bounded projection, never an image or document\'s bytes. Undated markers page last.', {
+  source: SOURCE, session_id: z.string().min(1),
+  limit: z.number().int().min(1).max(1000).optional().default(200),
+  after: EVIDENCE_CURSOR.optional(),
+}, READ, ({ source, session_id, limit, after }) => call(() => getSessionMarkersPage(source, session_id, { limit, after })));
+
+server.tool('get_source_capabilities', 'What one provider\'s parser can record, from RelayHistory\'s own capability tables rather than any database: the evidence kinds a hydration of that source covers (and which of the full set it cannot), and what its records establish about delegation. Answers the same before a first sync.', {
+  source: CATALOG_SOURCE,
+}, READ, ({ source }) => call(() => getSourceCapabilities(source)));
 
 const REQUEST_CURSOR = z.object({ tsMs: z.number().int(), id: z.number().int() });
 

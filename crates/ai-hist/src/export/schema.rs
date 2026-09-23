@@ -172,7 +172,14 @@ impl Table {
             own
         }
     }
-    pub fn payload(&self, conn: &Connection, row: &str) -> Result<String> {
+    /// The columns a capture trigger carries, in table order.
+    ///
+    /// The change feed's `revision` stamp is excluded on purpose. It is this
+    /// database's bookkeeping, not a fact about the record, and it changes on
+    /// every write: carrying it would make the stamping `UPDATE` that follows
+    /// each insert read as a second change of the row, and journal every
+    /// record twice.
+    pub(crate) fn captured_columns(&self, conn: &Connection) -> Result<Vec<String>> {
         let columns = conn
             .prepare(&format!(
                 "SELECT name FROM pragma_table_info('{}')",
@@ -180,6 +187,14 @@ impl Table {
             ))?
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(columns
+            .into_iter()
+            .filter(|column| column != crate::change_feed::REVISION_COLUMN)
+            .collect())
+    }
+
+    pub fn payload(&self, conn: &Connection, row: &str) -> Result<String> {
+        let columns = self.captured_columns(conn)?;
         Ok(format!(
             "json_object({})",
             columns
@@ -226,10 +241,7 @@ fn drop_triggers_that_predate_a_column(conn: &Connection, table: &Table) -> Resu
     let Some(existing) = existing else {
         return Ok(());
     };
-    let columns = conn
-        .prepare(&format!("SELECT name FROM pragma_table_info('{name}')"))?
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let columns = table.captured_columns(conn)?;
     if columns
         .iter()
         .all(|column| existing.contains(&format!("'{column}',NEW.\"{column}\"")))
