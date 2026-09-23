@@ -271,7 +271,8 @@ Notable changes to the native `ai-hist` CLI are documented here.
   (`change_feed_store`), so a watermark from a replaced database fails with
   `ErrorKind::WatermarkAheadOfStore` even after the replacement has counted
   past its revision, as does one beyond the head, read through the new
-  `Error::kind()`; the commit that follows the resync from
+  `Error::kind()`, and `Changes::commit()` refuses the same way to write a
+  cursor into a database other than the one the drain read; the commit that follows the resync from
   `Watermark::START` replaces a named cursor stuck beyond the head. A
   re-parse re-stamps every row it upserts, so a consumer
   must treat a re-seen `record_key` as a replace, never a duplicate. A
