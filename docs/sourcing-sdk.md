@@ -262,7 +262,9 @@ commit cannot rewind it. A named cursor is bound to the kind set it was first
 committed for: draining or committing it under another filter is
 `Error::ConsumerKindsMismatch`. A watermark past the head is
 `Error::WatermarkAheadOfStore` — the database was reset or replaced, and the
-only recovery is a resync from `Watermark::START`. `head_revision()` reports
+only recovery is a resync from `Watermark::START`; a named cursor past the head
+names no revision of this store, so that resync's commit replaces it.
+`head_revision()` reports
 the head on its own, and `SyncReport::head_revision` reports it after a sweep.
 A read-only handle drains the feed but cannot commit a cursor.
 
