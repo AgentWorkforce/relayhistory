@@ -512,8 +512,10 @@ fn member_subscriptions_journal_their_own_sessions_and_relationships_between_mem
 #[test]
 fn upgrade_rebuilds_capture_triggers_that_journal_without_the_filter() {
     let conn = db();
+    // The columns a capture payload carries: every column but the change
+    // feed's `revision` stamp, which is this database's bookkeeping.
     let columns = conn
-        .prepare("SELECT name FROM pragma_table_info('sessions')")
+        .prepare("SELECT name FROM pragma_table_info('sessions') WHERE name <> 'revision'")
         .unwrap()
         .query_map([], |r| r.get::<_, String>(0))
         .unwrap()
