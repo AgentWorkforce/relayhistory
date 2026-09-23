@@ -787,13 +787,18 @@ fn a_finished_member_does_not_pin_the_consumed_floor() {
         )
         .unwrap();
     assert!(!finished.1);
-    // Unselected sessions keep journalling past the finished member's cursor.
+    // A legacy journal can still contain rows for sessions this scoped job
+    // does not select. They must not make a finished member pin the floor.
+    for n in 0..250 {
+        conn.execute(
+            "INSERT INTO delivery_journal(kind,source,session_id,record_key,operation,payload) VALUES ('session_event','claude','unselected',?,'upsert','{}')",
+            [format!("legacy-{n}")],
+        )
+        .unwrap();
+    }
     let append = |session: &str, uid: String| {
         conn.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude',?,?,42,'user','text','captured')", params![session, uid]).unwrap();
     };
-    for n in 0..250 {
-        append("unselected", format!("captured-{n}"));
-    }
     for n in 0..5 {
         append("active", format!("backlog-{n}"));
     }

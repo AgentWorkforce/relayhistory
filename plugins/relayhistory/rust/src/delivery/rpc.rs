@@ -1,5 +1,5 @@
 //! Probe-owned helper RPC; leases use the same clock rules as the old addon.
-use super as core;
+use crate::delivery as core;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::time::Instant;
