@@ -56,6 +56,7 @@ pub enum Source {
     Trajectory,
     #[serde(rename = "opencode")]
     OpenCode,
+    Devin,
 }
 
 impl Source {
@@ -69,6 +70,7 @@ impl Source {
             Self::Relay => "relay",
             Self::Trajectory => "trajectory",
             Self::OpenCode => "opencode",
+            Self::Devin => "devin",
         }
     }
 }

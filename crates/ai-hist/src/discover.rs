@@ -294,6 +294,8 @@ pub struct DiscoveryEnv<'a> {
     pub codex_home: PathBuf,
     /// Grok state root.
     pub grok_home: PathBuf,
+    /// Devin CLI data directory (`sessions.db` plus `transcripts/`).
+    pub devin_dir: PathBuf,
     /// Path to the opencode database.
     pub opencode_db: PathBuf,
     /// Root of OpenCode's legacy `storage/` JSON tree, read only when there
@@ -319,6 +321,7 @@ impl<'a> DiscoveryEnv<'a> {
             claude_config_dir: roots.claude,
             codex_home: roots.codex,
             grok_home: roots.grok,
+            devin_dir: roots.devin,
             opencode_db: roots.opencode_db,
             opencode_storage_dir: roots.opencode_storage_dir,
             conn,
@@ -349,15 +352,23 @@ impl<'a> DiscoveryEnv<'a> {
         Self::with_provider_roots(
             conn,
             crate::ProviderRoots {
-                home,
+                home: home.clone(),
                 claude: claude_config_dir,
                 codex: codex_home,
                 grok: grok_home,
+                devin: crate::paths::devin_cli_dir_under(&home),
                 opencode_db,
                 opencode_storage_dir,
                 use_env_roots: false,
             },
         )
+    }
+
+    /// Point the Devin CLI data directory somewhere other than the default.
+    #[must_use]
+    pub fn with_devin_dir(mut self, devin_dir: PathBuf) -> Self {
+        self.devin_dir = devin_dir;
+        self
     }
 
     /// Point the legacy JSON tree somewhere other than beside the database.
@@ -384,6 +395,7 @@ impl<'a> DiscoveryEnv<'a> {
             claude_config_dir: &self.claude_config_dir,
             codex_home: &self.codex_home,
             grok_home: &self.grok_home,
+            devin_dir: &self.devin_dir,
             opencode_db: &self.opencode_db,
             opencode_storage_dir: &self.opencode_storage_dir,
             counters: &self.counters,
@@ -425,6 +437,8 @@ pub struct ScanEnv<'a> {
     pub codex_home: &'a Path,
     /// Grok state root.
     pub grok_home: &'a Path,
+    /// Devin CLI data directory (`sessions.db` plus `transcripts/`).
+    pub devin_dir: &'a Path,
     /// Path to the opencode database.
     pub opencode_db: &'a Path,
     /// Root of OpenCode's legacy `storage/` JSON tree.
@@ -472,6 +486,8 @@ pub struct ProviderRoots<'a> {
     pub codex: &'a Path,
     /// Grok state root.
     pub grok: &'a Path,
+    /// Devin CLI data directory (`sessions.db` plus `transcripts/`).
+    pub devin: &'a Path,
     /// Path to the opencode database.
     pub opencode_db: &'a Path,
 }
@@ -982,6 +998,7 @@ pub fn shallow_providers() -> Vec<Box<dyn ShallowSessionProvider>> {
         Box::new(CursorProvider),
         Box::new(GrokProvider),
         Box::new(OpencodeProvider::default()),
+        Box::new(DevinProvider::default()),
         Box::new(RelayProvider),
     ]
 }
@@ -2108,7 +2125,7 @@ impl ScanEnv<'_> {
 /// SQLite opening the file and RelayHistory computing the source stamp.
 fn open_opencode_snapshot(scan: &ScanEnv<'_>) -> Result<OpencodeReadSnapshot> {
     for _ in 0..3 {
-        let generation_before = opencode_store_generation(scan.opencode_db)?;
+        let generation_before = sqlite_store_generation(scan.opencode_db)?;
         let conn = open_db_readonly(scan.opencode_db)?;
         scan.note_open();
         conn.execute_batch("PRAGMA query_only = ON; BEGIN DEFERRED")?;
@@ -2119,7 +2136,7 @@ fn open_opencode_snapshot(scan: &ScanEnv<'_>) -> Result<OpencodeReadSnapshot> {
         let part_by_session = has_leading_index(&conn, "part", "session_id")?;
         let part_by_message = has_leading_index(&conn, "part", "message_id")?;
         let schema_version: i64 = conn.query_row("PRAGMA schema_version", [], |row| row.get(0))?;
-        let generation_after = opencode_store_generation(scan.opencode_db)?;
+        let generation_after = sqlite_store_generation(scan.opencode_db)?;
         if generation_before != generation_after {
             continue;
         }
@@ -2197,6 +2214,19 @@ fn table_columns(conn: &Connection, table: &str) -> Result<BTreeSet<String>> {
         .collect::<rusqlite::Result<BTreeSet<String>>>()?)
 }
 
+/// Holds the pass lock and ends the retained read snapshot when the pass
+/// ends, so a WAL-mode provider database is not pinned open between passes.
+struct OpencodePassGuard<'a> {
+    _pass: MutexGuard<'a, ()>,
+    live: &'a Mutex<Option<OpencodeReadSnapshot>>,
+}
+
+impl Drop for OpencodePassGuard<'_> {
+    fn drop(&mut self) {
+        *self.live.lock().expect("opencode live snapshot lock") = None;
+    }
+}
+
 impl ShallowSessionProvider for OpencodeProvider {
     fn begin_discovery_pass(&self) -> Result<Option<Box<dyn DiscoveryPassGuard + '_>>> {
         let pass = self.pass.lock().expect("opencode discovery pass lock");
@@ -2205,7 +2235,10 @@ impl ShallowSessionProvider for OpencodeProvider {
         // the pass lock prevents a concurrent call from replacing the state
         // between enumeration and reads.
         *self.live.lock().expect("opencode live snapshot lock") = None;
-        Ok(Some(Box::new(pass)))
+        Ok(Some(Box::new(OpencodePassGuard {
+            _pass: pass,
+            live: &self.live,
+        })))
     }
 
     fn acquire(
@@ -2518,6 +2551,396 @@ impl ShallowSessionProvider for OpencodeProvider {
     }
 }
 
+/// Devin CLI's `sessions.db`, read through the same coherent-snapshot pattern
+/// as [`OpencodeProvider`]. Devin ids are stable strings (`curved-headlight`),
+/// so the id itself is the catalog locator; the store path rides in
+/// `raw_path` for hydration's provenance check.
+#[derive(Default)]
+struct DevinProvider {
+    pass: Mutex<()>,
+    live: Mutex<Option<DevinReadSnapshot>>,
+}
+
+#[derive(Clone)]
+struct DevinSessionSeed {
+    working_directory: Option<String>,
+    workspace_roots: Vec<String>,
+    created_ms: Option<i64>,
+    last_activity_ms: Option<i64>,
+    model: Option<String>,
+}
+
+/// One run's pinned read of `sessions.db` and the seeds enumeration filled.
+struct DevinReadSnapshot {
+    conn: Connection,
+    store_identity: String,
+    session_columns: BTreeSet<String>,
+    sessions: BTreeMap<String, DevinSessionSeed>,
+}
+
+impl DevinProvider {
+    fn snapshot(&self, scan: &ScanEnv<'_>) -> Result<MutexGuard<'_, Option<DevinReadSnapshot>>> {
+        let mut guard = self.live.lock().expect("devin live snapshot lock");
+        if guard.is_none() && crate::ingest::devin::sessions_db_path(scan.devin_dir).is_file() {
+            *guard = Some(open_devin_snapshot(scan)?);
+        }
+        Ok(guard)
+    }
+}
+
+/// Open `sessions.db` read-only under a deferred transaction whose filesystem
+/// generation was stable across the open — the WAL-safe read contract the
+/// ingest path uses as well.
+fn open_devin_snapshot(scan: &ScanEnv<'_>) -> Result<DevinReadSnapshot> {
+    let db = crate::ingest::devin::sessions_db_path(scan.devin_dir);
+    for _ in 0..3 {
+        let generation_before = sqlite_store_generation(&db)?;
+        let conn = open_db_readonly(&db)?;
+        scan.note_open();
+        conn.execute_batch("PRAGMA query_only = ON; BEGIN DEFERRED")?;
+        // The stamp function lives on the connection, so it must be
+        // registered on the retained snapshot too — candidates stamp from the
+        // same content-sensitive tuple sync and hydration use.
+        crate::ingest::devin::register_stamp_fn(&conn)?;
+        // An existing but partially initialized sessions.db is not a Devin
+        // store: sync returns empty for it, and discovery must too rather
+        // than failing the whole pass. Empty `session_columns` short-circuits
+        // `enumerate` before it can name a table that does not exist.
+        let session_columns = if crate::ingest::devin::is_devin_store(&conn) {
+            table_columns(&conn, "sessions")?
+        } else {
+            BTreeSet::new()
+        };
+        let schema_version: i64 = conn.query_row("PRAGMA schema_version", [], |row| row.get(0))?;
+        let generation_after = sqlite_store_generation(&db)?;
+        if generation_before != generation_after {
+            continue;
+        }
+        return Ok(DevinReadSnapshot {
+            conn,
+            store_identity: format!("{generation_before}:{schema_version}"),
+            session_columns,
+            sessions: BTreeMap::new(),
+        });
+    }
+    anyhow::bail!(
+        "Devin database {} was repeatedly replaced while discovery opened it",
+        db.display()
+    )
+}
+
+/// Holds the pass lock and ends the retained read snapshot when the pass
+/// ends. Without the drop a `BEGIN DEFERRED` reader stays open between
+/// passes, which pins a WAL-mode provider database and blocks checkpointing.
+struct DevinPassGuard<'a> {
+    _pass: MutexGuard<'a, ()>,
+    live: &'a Mutex<Option<DevinReadSnapshot>>,
+}
+
+impl Drop for DevinPassGuard<'_> {
+    fn drop(&mut self) {
+        *self.live.lock().expect("devin live snapshot lock") = None;
+    }
+}
+
+impl ShallowSessionProvider for DevinProvider {
+    fn begin_discovery_pass(&self) -> Result<Option<Box<dyn DiscoveryPassGuard + '_>>> {
+        let pass = self.pass.lock().expect("devin discovery pass lock");
+        *self.live.lock().expect("devin live snapshot lock") = None;
+        Ok(Some(Box::new(DevinPassGuard {
+            _pass: pass,
+            live: &self.live,
+        })))
+    }
+
+    fn acquire(
+        &self,
+        _home: &Path,
+        _observation: &crate::observations::SessionObservation,
+    ) -> Result<crate::sources::AcquiredEvidence> {
+        Ok(crate::sources::AcquiredEvidence::LocalFiles)
+    }
+
+    fn source(&self) -> &'static str {
+        "devin"
+    }
+
+    /// Devin produces history, events, tool calls, file edits and markers.
+    /// It records no parent/child session relationships, so `Relationship`
+    /// stays undeclared rather than claimed.
+    fn evidence_kinds(&self) -> &'static [EvidenceKind] {
+        &[
+            EvidenceKind::History,
+            EvidenceKind::SessionEvent,
+            EvidenceKind::ToolCall,
+            EvidenceKind::FileEdit,
+            EvidenceKind::SessionMarker,
+        ]
+    }
+
+    fn watch_roots(&self, roots: &ProviderRoots<'_>) -> Vec<WatchRoot> {
+        // `sessions.db` is rewritten in place and its -wal/-shm siblings sit
+        // beside it, so the directory sees every write. `transcripts/` is the
+        // one subdirectory whose files are evidence.
+        [
+            WatchRoot::directory(roots.devin),
+            WatchRoot::directory(crate::ingest::devin::transcripts_dir(roots.devin)),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    /// Enumeration is one SQL query; the watch fast path stats instead.
+    /// `sessions.db` and its WAL/SHM siblings move on every commit, and each
+    /// transcript file is stat-only — no transcript is opened here.
+    fn fingerprint_inputs(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
+        let db = crate::ingest::devin::sessions_db_path(&env.devin_dir);
+        let mut out = Vec::new();
+        for suffix in ["", "-wal", "-shm"] {
+            let mut path = db.clone().into_os_string();
+            path.push(suffix);
+            let path = PathBuf::from(path);
+            let Ok((stamp, recency_hint_ms)) = crate::file_stamp_and_modified(&path) else {
+                continue;
+            };
+            out.push(Candidate {
+                source: "devin",
+                locator: path.to_string_lossy().into_owned(),
+                session_id: None,
+                recency_hint_ms,
+                stamp,
+            });
+        }
+        let transcripts = crate::ingest::devin::transcripts_dir(&env.devin_dir);
+        if let Ok(entries) = std::fs::read_dir(&transcripts) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                let Ok((stamp, recency_hint_ms)) = crate::file_stamp_and_modified(&path) else {
+                    continue;
+                };
+                out.push(Candidate {
+                    source: "devin",
+                    locator: path.to_string_lossy().into_owned(),
+                    session_id: None,
+                    recency_hint_ms,
+                    stamp,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    fn enumerate(
+        &self,
+        env: &DiscoveryEnv<'_>,
+        requested_limit: Option<usize>,
+    ) -> Result<Vec<Candidate>> {
+        let scan = env.scan();
+        let mut guard = self.snapshot(&scan)?;
+        let Some(snapshot) = guard.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let columns = &snapshot.session_columns;
+        if !columns.contains("id") {
+            return Ok(Vec::new());
+        }
+        let column = |name: &str| {
+            if columns.contains(name) {
+                name.to_string()
+            } else {
+                "NULL".to_string()
+            }
+        };
+        let hidden_pred = if columns.contains("hidden") {
+            "COALESCE(hidden, 0) = 0"
+        } else {
+            "1=1"
+        };
+        let recency_order = if columns.contains("last_activity_at") {
+            "last_activity_at DESC, id ASC"
+        } else {
+            "id ASC"
+        };
+        let sqlite_limit = requested_limit
+            .map(i64::try_from)
+            .transpose()
+            .context("Devin discovery limit exceeds SQLite's signed 64-bit range")?;
+        let limit_sql = sqlite_limit.map(|_| " LIMIT ?").unwrap_or_default();
+        // Devin records timestamps in epoch seconds; the catalog stores
+        // milliseconds, so both bounds are converted in SQL.
+        let sql = format!(
+            "SELECT id, {}, {}, {}, {}, {} FROM sessions \
+             WHERE id IS NOT NULL AND id <> '' AND {hidden_pred} \
+             ORDER BY {recency_order}{limit_sql}",
+            column("working_directory"),
+            column("workspace_dirs"),
+            column("created_at"),
+            column("last_activity_at"),
+            column("model"),
+        );
+        let mut stmt = snapshot.conn.prepare(&sql)?;
+        scan.note_query();
+        let collect = |row: &rusqlite::Row<'_>| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        };
+        let rows = match sqlite_limit {
+            Some(limit) => stmt
+                .query_map([limit], collect)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            None => stmt
+                .query_map([], collect)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        };
+        scan.note_records(rows.len() as u64);
+        snapshot.sessions = rows
+            .iter()
+            .map(|(id, cwd, dirs, created, updated, model)| {
+                (
+                    id.clone(),
+                    DevinSessionSeed {
+                        working_directory: cwd.clone(),
+                        workspace_roots: dirs
+                            .as_deref()
+                            .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+                            .unwrap_or_default(),
+                        created_ms: created.map(|s| s.saturating_mul(1000)),
+                        last_activity_ms: updated.map(|s| s.saturating_mul(1000)),
+                        model: model.clone(),
+                    },
+                )
+            })
+            .collect();
+        // The stamp must be content-sensitive: `store_identity` only tracks
+        // database replacement and schema generation, and created/updated
+        // timestamps do not move on an in-place `chat_message` rewrite. Reuse
+        // the sync/hydration stamp so a cached first_prompt, model, workspace
+        // or cwd is refreshed whenever the evidence behind it changed.
+        let transcripts = crate::ingest::devin::transcripts_dir(scan.devin_dir);
+        Ok(rows
+            .into_iter()
+            .map(|(id, _cwd, _dirs, created, updated, _model)| {
+                let content_stamp = crate::ingest::devin::session_stamp(
+                    &snapshot.conn,
+                    &id,
+                    &transcripts,
+                )
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| {
+                    format!("{}:{}", created.unwrap_or(0), updated.unwrap_or(0))
+                });
+                Candidate {
+                    source: "devin",
+                    locator: id.clone(),
+                    session_id: Some(id),
+                    recency_hint_ms: updated
+                        .or(created)
+                        .map(|s| s.saturating_mul(1000)),
+                    stamp: format!("{}:{}", snapshot.store_identity, content_stamp),
+                }
+            })
+            .collect())
+    }
+
+    fn read_shallow(
+        &self,
+        scan: &ScanEnv<'_>,
+        _catalog: Option<&Connection>,
+        candidate: &Candidate,
+    ) -> Result<Option<ShallowSession>> {
+        let guard = self.live.lock().expect("devin live snapshot lock");
+        let Some(snapshot) = guard.as_ref() else {
+            return Ok(None);
+        };
+        let conn = &snapshot.conn;
+        let Some(seed) = snapshot.sessions.get(&candidate.locator).cloned() else {
+            return Ok(None);
+        };
+        // The excerpt is cut in SQL: `content` can hold a whole pasted file,
+        // and materializing it to take the first characters would break the
+        // bounded-read promise. `is_user_input <> 0` keeps the provider's own
+        // synthetic turns out of the catalog's first prompt.
+        let first_prompt = {
+            let sql = "SELECT substr(json_extract(chat_message, '$.content'), 1, ?) \
+                 FROM message_nodes \
+                 WHERE session_id = ? AND json_valid(chat_message) \
+                 AND json_extract(chat_message, '$.role') = 'user' \
+                 AND COALESCE(json_extract(chat_message, '$.metadata.is_user_input'), 1) <> 0 \
+                 AND json_type(chat_message, '$.content') = 'text' \
+                 AND trim(substr(json_extract(chat_message, '$.content'), 1, ?), ?) <> '' \
+                 ORDER BY node_id ASC LIMIT 1";
+            scan.note_query();
+            let prompt = {
+                let mut stmt = conn.prepare_cached(sql)?;
+                stmt.query_row(
+                    params![
+                        EXCERPT_MAX_CHARS as i64,
+                        &candidate.locator,
+                        EXCERPT_MAX_CHARS as i64,
+                        EXCERPT_TRIM_WHITESPACE
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+            };
+            scan.note_records(u64::from(prompt.is_some()));
+            prompt
+                .map(|text| excerpt(&text))
+                .filter(|text| !text.is_empty())
+        };
+        let mut models = Vec::new();
+        push_unique(&mut models, seed.model.as_deref());
+        {
+            // The first assistant `generation_model` is the model that
+            // actually answered, which can differ from the session's
+            // configured model.
+            scan.note_query();
+            let generated = {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT json_extract(chat_message, '$.metadata.generation_model') \
+                     FROM message_nodes \
+                     WHERE session_id = ? AND json_valid(chat_message) \
+                     AND json_extract(chat_message, '$.role') IN ('assistant', 'final_answer') \
+                     AND NULLIF(json_extract(chat_message, '$.metadata.generation_model'), '') IS NOT NULL \
+                     ORDER BY node_id ASC LIMIT 1",
+                )?;
+                stmt.query_row([&candidate.locator], |row| row.get::<_, String>(0))
+                    .optional()?
+            };
+            scan.note_records(u64::from(generated.is_some()));
+            push_unique(&mut models, generated.as_deref());
+        }
+        Ok(Some(ShallowSession {
+            source: "devin".into(),
+            session_id: candidate.locator.clone(),
+            cwd: seed.working_directory,
+            first_activity_ms: seed.created_ms,
+            last_activity_ms: seed.last_activity_ms.or(seed.created_ms),
+            first_prompt,
+            models,
+            workspace_roots: seed.workspace_roots,
+            // The concrete store that produced this identity; hydration
+            // verifies it before reading.
+            raw_path: Some(
+                crate::ingest::devin::sessions_db_path(scan.devin_dir)
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            ..Default::default()
+        }))
+    }
+}
+
 /// Enumerate the legacy tree's `session/<scope>/ses_*.json` files.
 ///
 /// The tree has no index, so both the stamp and the recency hint are computed
@@ -2717,7 +3140,7 @@ fn file_generation_time(metadata: &fs::Metadata) -> u128 {
 }
 
 #[cfg(unix)]
-fn opencode_store_generation(path: &Path) -> Result<String> {
+fn sqlite_store_generation(path: &Path) -> Result<String> {
     use std::os::unix::fs::MetadataExt;
     let metadata = fs::metadata(path)?;
     Ok(format!(
@@ -2729,7 +3152,7 @@ fn opencode_store_generation(path: &Path) -> Result<String> {
 }
 
 #[cfg(not(unix))]
-fn opencode_store_generation(path: &Path) -> Result<String> {
+fn sqlite_store_generation(path: &Path) -> Result<String> {
     let metadata = fs::metadata(path)?;
     Ok(format!(
         "{}:{}",
@@ -3412,14 +3835,17 @@ static UPSERT_SESSION_SQL: LazyLock<String> = LazyLock::new(|| {
 
 /// Write a shallow row into the catalog, returning the merged row as stored.
 ///
-/// Never nulls out a value the catalog already holds, never lowers
-/// `first_activity_ms` past what a fuller pass observed for append-only
-/// providers, and never downgrades a fully indexed row to `'shallow'` —
-/// including a row from a database that predates `discovery_state`, whose NULL
-/// readers deliberately interpret as `'full'`. Grok is the exception on the
-/// activity bounds: a session directory is a replacement snapshot, so a later
-/// compaction can move the start forward and the end backward. A shallow
-/// rescan of such a row still refreshes its metadata and stamp.
+/// Preview columns (`first_prompt`, `last_assistant_text`) are preserved when
+/// a shallow pass does not supply a value, because a shallow pass does not read
+/// the transcript and therefore cannot authoritatively clear one. Other values
+/// are merged defensively — never lowers `first_activity_ms` past what a fuller
+/// pass observed for append-only providers, and never downgrades a fully
+/// indexed row to `'shallow'` — including a row from a database that predates
+/// `discovery_state`, whose NULL readers deliberately interpret as `'full'`.
+/// Grok is the exception on the activity bounds: a session directory is a
+/// replacement snapshot, so a later compaction can move the start forward and the
+/// end backward. A shallow rescan of such a row still refreshes its metadata
+/// and stamp.
 ///
 /// The returned row is what the catalog now holds (including a preserved
 /// `full` state), read back through the write's own `RETURNING` clause so the
@@ -4208,6 +4634,12 @@ pub fn discover_sessions_with_provider_refs(
                     discovery_state: session.discovery_state.clone(),
                     access_state: "available".into(),
                     updated_ms: now_ms(),
+                    // The shared catalog row cannot say which location a
+                    // preview came from — each observation keeps its own, so
+                    // a location retiring later restores the survivor's text
+                    // instead of nulling it.
+                    first_prompt: session.first_prompt.clone(),
+                    last_assistant_text: session.last_assistant_text.clone(),
                 },
             ) {
                 window_error = Some(error);

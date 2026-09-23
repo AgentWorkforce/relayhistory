@@ -367,7 +367,7 @@ contract:
 
 | Field | Kind | Notes |
 |---|---|---|
-| `source` | observed | `claude`, `codex`, `cursor`, `grok`, `opencode`, `relay` |
+| `source` | observed | `claude`, `codex`, `cursor`, `grok`, `opencode`, `devin`, `relay` |
 | `session_id` | observed | provider-native; `(source, session_id)` is the primary key, so the same native id under two providers is two rows |
 | `cwd` | observed | working directory the provider recorded |
 | `git_branch` | observed | last branch the provider recorded |
@@ -464,6 +464,7 @@ which this table must stay consistent with.
 | **cursor** | ✓ (dir name) | ✓ (decoded path) | – (never) | ✓ (injected `<timestamp>`) | ✓ (injected `<timestamp>`, else mtime) | ✓ | ✓ (if a build writes `message.model`) | – | – | – | – | – |
 | **grok** | ✓ | ✓ | ✓ | ✓ (`updates.jsonl`, else `summary.json`) | ✓ (`updates.jsonl`, else `summary.json`) | ✓ | ✓ | – | – | – | – | – |
 | **opencode** | ✓ | ✓ (directory / message `path.cwd`) | – | ✓ | ✓ | ✓ | ✓ (`providerID/modelID`) | – | – | – | – | – |
+| **devin** | ✓ | ✓ (`working_directory`) | – | ✓ (`created_at`, seconds→ms) | ✓ (`last_activity_at`, seconds→ms) | ✓ | ✓ (`model` / `generation_model`) | – | – (transcript `agent.version` rides a marker) | – | – | ✓ (`workspace_dirs`) |
 | **relay** | ✓ | – (never) | – | ✓ (synced min ts) | ✓ (synced max ts) | ✓ (earliest synced prompt) | – | – | – | – | – | – |
 
 ### Session markers
@@ -491,25 +492,28 @@ keys would silently drop whatever it adds next, which is the failure this
 table exists to end. Either way the bound is the promise the column makes, and
 it holds for every kind.
 
-| `kind` | claude | codex | grok | `subkind` examples |
-|---|---|---|---|---|
-| `compaction_boundary` | ✓ `type:"system"`, `subtype:"compact_boundary"` | ✓ top-level `compacted`, `context_compacted` | ✓ | `compact_boundary`, `compacted` |
-| `summary` | ✓ `type:"summary"` | – | – | `summary` |
-| `subagent_notification` | ✓ system rows with `parent_tool_use_id`; tool results carrying `toolUseResult.agentId` | ✓ `subagent_*` | – | `subagent_completed`, `tool_use_result_agent_id`, `subagent_message_complete` |
-| `task_started` | – | ✓ | – | `task_started` |
-| `task_complete` | – | ✓ | – | `task_complete` |
-| `turn_diff` | – | ✓ | – | `turn_diff` |
-| `stream_error` | – | ✓ | – | `stream_error` |
-| `tool_begin` | – | ✓ any `*_begin` | – | `exec_command_begin`, `patch_apply_begin`, `mcp_tool_call_begin` |
-| `review_mode` | – | ✓ | – | `entered_review_mode`, `exited_review_mode` |
-| `unsupported_block` | ✓ any content block with no event `kind`, plus thinking signatures | – | – | `image`, `document`, `redacted_thinking`, `server_tool_use`, `thinking_signature` |
-| `encrypted_reasoning` | – | ✓ `response_item/reasoning` | ✓ an opaque reasoning trace with no summary | `reasoning` |
-| `tool_replacement` | ✓ `_meta.replaces` / `_meta.collapsedCalls` | – | – | `tool_result` |
-| `system` | – | – | ✓ a system preamble, in `text` | – |
-| `synthetic_turn` | – | – | ✓ a turn the harness wrote, in `text` | – |
-| `signals` | – | – | ✓ | – |
-| `prompt_context` | – | – | ✓ | – |
-| `unknown` | ✓ any unclassified record type, plus a `user`/`assistant` record that produced no event at all | ✓ any unclassified payload type, including `agent_reasoning_raw_content` and `agent_reasoning_section_break` | – | the provider type, verbatim |
+| `kind` | claude | codex | grok | devin | `subkind` examples |
+|---|---|---|---|---|---|
+| `compaction_boundary` | ✓ `type:"system"`, `subtype:"compact_boundary"` | ✓ top-level `compacted`, `context_compacted` | ✓ | ✓ node `metadata.summarized_from` | `compact_boundary`, `compacted` |
+| `summary` | ✓ `type:"summary"` | – | – | – | `summary` |
+| `subagent_notification` | ✓ system rows with `parent_tool_use_id`; tool results carrying `toolUseResult.agentId` | ✓ `subagent_*` | – | – | `subagent_completed`, `tool_use_result_agent_id`, `subagent_message_complete` |
+| `task_started` | – | ✓ | – | – | `task_started` |
+| `task_complete` | – | ✓ | – | – | `task_complete` |
+| `turn_diff` | – | ✓ | – | – | `turn_diff` |
+| `stream_error` | – | ✓ | – | – | `stream_error` |
+| `tool_begin` | – | ✓ any `*_begin` | – | – | `exec_command_begin`, `patch_apply_begin`, `mcp_tool_call_begin` |
+| `review_mode` | – | ✓ | – | – | `entered_review_mode`, `exited_review_mode` |
+| `unsupported_block` | ✓ any content block with no event `kind`, plus thinking signatures | – | – | – | `image`, `document`, `redacted_thinking`, `server_tool_use`, `thinking_signature` |
+| `encrypted_reasoning` | – | ✓ `response_item/reasoning` | ✓ an opaque reasoning trace with no summary | – | `reasoning` |
+| `tool_replacement` | ✓ `_meta.replaces` / `_meta.collapsedCalls` | – | – | – | `tool_result` |
+| `system` | – | – | ✓ a system preamble, in `text` | ✓ a `role:"system"` node, in `text` | – |
+| `synthetic_turn` | – | – | ✓ a turn the harness wrote, in `text` | ✓ a `user` node with `is_user_input: false`, in `text` | – |
+| `session_title` | – | – | – | ✓ the `sessions.title` the CLI recorded, in `text` | – |
+| `session_meta` | – | – | – | ✓ `backend_type`, `agent_mode`, `model`, `workspace_dirs` and numeric `metadata` in `payload_json` | – |
+| `agent_manifest` | – | – | – | ✓ transcript `agent` envelope and numeric `final_metrics` in `payload_json` | – |
+| `signals` | – | – | ✓ | – | – |
+| `prompt_context` | – | – | ✓ | – | – |
+| `unknown` | ✓ any unclassified record type, plus a `user`/`assistant` record that produced no event at all | ✓ any unclassified payload type, including `agent_reasoning_raw_content` and `agent_reasoning_section_break` | – | ✓ any `chat_message` role the parser does not know | the provider type, verbatim |
 
 `text` is the provider's own readable prose for a marker, and `payload_json`
 its structure; a marker may carry either, both or neither. Grok records a
@@ -663,6 +667,7 @@ follows.
 | **cursor** | ✓ | ✓ | ✓ | ✓ | – (never: a `Task` block names no child transcript) | `partial` |
 | **grok** | ✓ | ✓ | ✓ | ✓ | ✓ | `full` |
 | **opencode** | ✓ | ✓ | ✓ | ✓ | ✓ | `full` |
+| **devin** | ✓ | ✓ | ✓ | ✓ | – (the store records no parent/child session link) | `partial` |
 | **relay** | – | – | – | – | – | targeted hydration unsupported |
 
 ### Per-message raw facts on `session_events`
@@ -678,6 +683,7 @@ in flight.
 | **claude** | ✓ (`requestId`) | ✓ (`message.stop_reason`) | ✓ (`version` / `sourceVersion`) | ✓ (`isSidechain`) | ✓ (`isMeta`) | – |
 | **codex** | – | – | – | – | – | ✓ (`turn_context.turn_id`, carried to the next `turn_context`) |
 | **opencode** | – | ✓ (`step-finish.reason`, pending event-level parity) | – | – | – | – |
+| **devin** | ✓ (`metadata.request_id`) | ✓ (`metadata.finish_reason`) | ✓ (transcript `agent.version`) | – | – | – |
 | **cursor**, **grok**, **relay** | – | – | – | – | – | – |
 
 A null is "the provider did not record it", which is not the same as `false`
@@ -730,7 +736,7 @@ Delegation is a separate capability, reported on every relationship result as
 | **opencode** | always | – | ✓ | ✓ |
 | **claude** | sometimes | ✓ | ✓ | ✓ |
 | **grok** | sometimes | ✓ | ✓ | ✓ |
-| **cursor**, **relay** | never | – | – | – |
+| **cursor**, **devin**, **relay** | never | – | – | – |
 
 OpenCode is `always` because a subagent session is a session in its own right
 and its own record names the parent, in `session.parentID`. Nothing is
@@ -1502,6 +1508,68 @@ How each adapter works:
   sessions. The limitation is that a much older session resumed recently can
   be delayed until OpenCode provides the compound recency index; RelayHistory
   will not mutate the provider database to repair that gap.
+<a id="devin"></a>
+- **devin** — the Devin CLI's local store at
+  `$XDG_DATA_HOME/devin/cli/sessions.db` (default
+  `~/.local/share/devin/cli/sessions.db`), plus its per-session transcript
+  exports at `transcripts/<session-id>.json`. There is no provider-specific
+  override variable; `XDG_DATA_HOME` is the documented mechanism and moves the
+  whole data directory.
+
+  The database is the authoritative record. `sessions` carries the identity
+  (`id`, a stable string like `curved-headlight`), `working_directory`,
+  `workspace_dirs`, `backend_type`, `model`, `agent_mode`, `title` and two
+  timestamps in **epoch seconds**, which are converted to milliseconds on the
+  way in. `message_nodes` holds one `chat_message` JSON document per node
+  (`role` of `system`/`user`/`assistant`/`tool`/`final_answer`), and
+  `tool_call_state` holds the ACP-shaped call and its latest update
+  (`kind`, `title`, `rawInput`, `locations`, `status`).
+
+  A hydrated Devin session yields: a user/text event and `history` row for
+  each `user` node with `is_user_input` not false (an explicit
+  `is_user_input: false` records a `synthetic_turn` marker instead);
+  assistant/thinking and assistant/text events for `assistant` and
+  `final_answer` nodes; one assistant/tool_use event and `tool_calls` row per
+  `tool_calls[]` entry, keyed on the provider's call `id`; one
+  tool_result event per `tool` node, joined to its call by `tool_call_id` and
+  carrying `result_status` from `tool_call_state.status` (`completed`,
+  `failed`, `running`/in-progress); and a `file_edits` row only where the
+  provider exposes the file — `kind: "edit"` with a `locations`/`content`
+  path, or an edit-named tool carrying a path argument. `role:"system"` nodes
+  become `system` markers; node `metadata.summarized_from` becomes a
+  `compaction_boundary` marker; a `tool_call_state` row no message references
+  is still indexed as an orphan tool_use event and `tool_calls` row.
+
+  What the normalized schema has no column for rides along as bounded
+  markers: `sessions.title` becomes a `session_title` marker,
+  `backend_type`/`agent_mode`/`model`/`workspace_dirs` and the numeric fields
+  of `sessions.metadata` a `session_meta` marker, and the transcript's
+  `agent` envelope (`name`, `version`, `model_name`) plus numeric
+  `final_metrics` an `agent_manifest` marker. The transcript's `steps` are
+  never read — they duplicate `message_nodes` in poorer form.
+
+  Sessions the CLI marks `hidden` are never enumerated or ingested.
+  `chat_message` or tool-state JSON that does not parse is skipped per record
+  and counted, never fatal to the session or the sweep. `main_chain_id`,
+  `shell_last_seen_index`, `cogs_json`, `rendered_commits`, `app_state`,
+  `prompt_history` and `subagent_heads` are not read: they either duplicate
+  what `message_nodes` already says or carry UI state, not session evidence.
+  Devin records no parent/child session link, so `relationship` capability is
+  `never` rather than unwritten-this-time.
+
+  Discovery and sync share the OpenCode read contract for the provider's
+  WAL-mode database: a read-only, `query_only` connection under one deferred
+  transaction pins a coherent snapshot per run, the filesystem generation is
+  checked across the open so a replaced store is re-opened rather than
+  misread, and the busy handler follows the repository's bounded retry
+  policy. RelayHistory never writes to, backs up, or migrates the provider
+  database.
+
+  Incremental sync stamps each session on
+  `last_activity_at`, the message-node count and max row id, the tool-state
+  count and payload size, and the transcript file's own stamp — an unchanged
+  session is not re-read, and a session whose rows vanished underneath a
+  matching stamp is rebuilt rather than skipped.
 - **relay** — a **network** source with no local transcript, and discovery must
   work offline. The adapter therefore derives rows only from `history` rows a
   previous `ai-hist sync` already stored locally; it opens no socket. If nothing

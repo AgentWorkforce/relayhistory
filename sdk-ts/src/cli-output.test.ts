@@ -45,7 +45,7 @@ test('sessions discover preserves repeated sources and emits JSONL', async () =>
     const { stdout } = await run(process.execPath, [
       cli, 'sessions', 'discover', '--source', 'claude', '--source', 'codex',
       '--db', join(root, 'history.db'), '--json', '--no-warning',
-    ], { env: { ...process.env, HOME: home, USERPROFILE: home } });
+    ], { env: { ...process.env, HOME: home, USERPROFILE: home, XDG_DATA_HOME: join(home, 'share') } });
     const lines = stdout.trim().split('\n').map((line) => JSON.parse(line) as Record<string, unknown>);
     const sessions = lines.filter((line) => line.type === 'session');
     assert.deepEqual(sessions.map((line) => line.source).sort(), ['claude', 'codex']);
@@ -58,15 +58,15 @@ test('sessions discover preserves repeated sources and emits JSONL', async () =>
     const human = await run(process.execPath, [
       cli, 'sessions', 'discover', '--all', '--source', 'codex',
       '--db', join(root, 'history.db'), '--no-warning',
-    ], { env: { ...process.env, HOME: home, USERPROFILE: home } });
+    ], { env: { ...process.env, HOME: home, USERPROFILE: home, XDG_DATA_HOME: join(home, 'share') } });
     assert.match(human.stdout, /requested scope: all, connector locations run: local/);
 
     await run(process.execPath, [
       cli, 'sync', '--db', join(root, 'history.db'), '--json', '--no-warning',
-    ], { env: { ...process.env, HOME: home, USERPROFILE: home } });
+    ], { env: { ...process.env, HOME: home, USERPROFILE: home, XDG_DATA_HOME: join(home, 'share') } });
     const searched = await run(process.execPath, [
       cli, 'search', 'indexed prompt', '--db', join(root, 'history.db'), '--json', '--no-warning',
-    ], { env: { ...process.env, HOME: home, USERPROFILE: home } });
+    ], { env: { ...process.env, HOME: home, USERPROFILE: home, XDG_DATA_HOME: join(home, 'share') } });
     assert.deepEqual((JSON.parse(searched.stdout) as Array<Record<string, unknown>>)[0]?.locations, ['local']);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -77,7 +77,7 @@ test('the Node CLI filters by canonical project key and groups stats by it', asy
   const root = await mkdtemp(join(tmpdir(), 'relayhistory-cli-project-'));
   const home = join(root, 'home');
   const db = join(root, 'history.db');
-  const env = { ...process.env, HOME: home, USERPROFILE: home };
+  const env = { ...process.env, HOME: home, USERPROFILE: home, XDG_DATA_HOME: join(home, 'share') };
   // Two checkouts of one repository plus an unrelated directory. Under a
   // path-keyed filter the first two are different projects; the whole point of
   // the key is that they are not.
@@ -176,7 +176,7 @@ test('sessions hydrate uses the SDK contract and is idempotent', async () => {
     sessionId: 'claude-hydrate', uuid: 'user-1', cwd: '/work/claude', type: 'user',
     message: { role: 'user', content: 'hydrate this session' }, timestamp: '2026-08-30T10:00:00.000Z',
   })}\n`);
-  const env = { ...process.env, HOME: home, USERPROFILE: home };
+  const env = { ...process.env, HOME: home, USERPROFILE: home, XDG_DATA_HOME: join(home, 'share') };
   try {
     await run(process.execPath, [
       cli, 'sessions', 'discover', '--source', 'claude', '--db', db, '--no-warning',
@@ -230,7 +230,7 @@ test('sessions relationships and sessions tree render topology in both modes', a
   ].join('\n');
   await writeFile(join(day, 'rollout-topology-root.jsonl'), rollout('topology-root', '2026-08-31T10:00:00Z'));
   await writeFile(join(day, 'rollout-topology-child.jsonl'), rollout('topology-child', '2026-08-31T10:00:01Z', 'topology-root'));
-  const env = { ...process.env, HOME: home, USERPROFILE: home };
+  const env = { ...process.env, HOME: home, USERPROFILE: home, XDG_DATA_HOME: join(home, 'share') };
   try {
     await run(process.execPath, [cli, 'sessions', 'discover', '--source', 'codex', '--db', db, '--no-warning'], { env });
     await run(process.execPath, [cli, 'sessions', 'hydrate', 'codex', 'topology-root', '--db', db, '--no-warning'], { env });
@@ -320,7 +320,7 @@ test('sessions tools and edits page versioned JSON and continue from a cursor', 
     { type: 'assistant', uuid: 'a2', parentUuid: 'a1', sessionId: 'claude-evidence', cwd: '/work/app', gitBranch: 'main', timestamp: '2026-08-30T10:00:02.000Z', message: { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_2', name: 'Write', input: { file_path: '/work/app/b.ts', content: 'b' } }] } },
   ];
   await writeFile(join(claude, 'claude-evidence.jsonl'), `${transcript.map((line) => JSON.stringify(line)).join('\n')}\n`);
-  const env = { ...process.env, HOME: home, USERPROFILE: home };
+  const env = { ...process.env, HOME: home, USERPROFILE: home, XDG_DATA_HOME: join(home, 'share') };
   try {
     await run(process.execPath, [cli, 'sync', '--db', db, '--no-warning'], { env });
 
@@ -586,7 +586,7 @@ async function seedCodexSession(root: string, home: string, db: string): Promise
     timestamp: '2026-09-07T20:00:01.000Z', type: 'event_msg',
     payload: { type: 'user_message', message: 'fix the flaky auth refresh test in refresh.ts' },
   })}\n`);
-  const env = { ...process.env, HOME: home, USERPROFILE: home };
+  const env = { ...process.env, HOME: home, USERPROFILE: home, XDG_DATA_HOME: join(home, 'share') };
   await run(process.execPath, [cli, 'sessions', 'discover', '--source', 'codex', '--db', db, '--no-warning'], { env });
   await run(process.execPath, [cli, 'sync', '--db', db, '--no-warning'], { env });
 }
@@ -597,10 +597,11 @@ test('resume prints the best matching session\'s native resume command', async (
   const db = join(root, 'history.db');
   try {
     await seedCodexSession(root, home, db);
-    const human = await run(process.execPath, [cli, 'resume', 'auth refresh', '--db', db, '--no-warning']);
+    const env = { ...process.env, HOME: home, USERPROFILE: home, XDG_DATA_HOME: join(home, 'share') };
+    const human = await run(process.execPath, [cli, 'resume', 'auth refresh', '--db', db, '--no-warning'], { env });
     assert.equal(human.stdout.trim(), 'cd /work/demo && codex resume codex-demo-1');
 
-    const json = await run(process.execPath, [cli, 'resume', 'auth refresh', '--db', db, '--json', '--no-warning']);
+    const json = await run(process.execPath, [cli, 'resume', 'auth refresh', '--db', db, '--json', '--no-warning'], { env });
     const parsed = JSON.parse(json.stdout) as Record<string, unknown>;
     assert.equal(parsed.session_id, 'codex-demo-1');
     assert.equal(parsed.resume_cmd, 'cd /work/demo && codex resume codex-demo-1');
@@ -643,17 +644,18 @@ test('pack formats matching entries with resume commands and respects a token bu
   const db = join(root, 'history.db');
   try {
     await seedCodexSession(root, home, db);
-    const human = await run(process.execPath, [cli, 'pack', 'auth refresh', '--db', db, '--no-warning']);
+    const env = { ...process.env, HOME: home, USERPROFILE: home, XDG_DATA_HOME: join(home, 'share') };
+    const human = await run(process.execPath, [cli, 'pack', 'auth refresh', '--db', db, '--no-warning'], { env });
     assert.match(human.stdout, /^=== ai-hist pack: "auth refresh" \| .+ \| 1 entries ===/);
     assert.match(human.stdout, /\[1\/1\] #\d+ {2}.+ {2}codex {2}\/work\/demo/);
     assert.match(human.stdout, /Resume: cd \/work\/demo && codex resume codex-demo-1/);
 
     const truncated = await run(process.execPath, [
       cli, 'pack', 'auth refresh', '--db', db, '--tokens', '2', '--no-warning',
-    ]);
+    ], { env });
     assert.match(truncated.stdout, /fix the \.\.\.\n/);
 
-    const json = await run(process.execPath, [cli, 'pack', 'auth refresh', '--db', db, '--json', '--no-warning']);
+    const json = await run(process.execPath, [cli, 'pack', 'auth refresh', '--db', db, '--json', '--no-warning'], { env });
     const parsed = JSON.parse(json.stdout) as { entries: Array<Record<string, unknown>> };
     assert.equal(parsed.entries.length, 1);
     assert.equal(parsed.entries[0]?.resume_cmd, 'cd /work/demo && codex resume codex-demo-1');
@@ -680,17 +682,17 @@ test('pack defaults to the native command\'s 10-entry limit, not search\'s gener
       });
       await writeFile(join(codex, `rollout-codex-${i}.jsonl`), `${metaLine}\n${messageLine}\n`);
     }
-    const env = { ...process.env, HOME: home, USERPROFILE: home };
+    const env = { ...process.env, HOME: home, USERPROFILE: home, XDG_DATA_HOME: join(home, 'share') };
     await run(process.execPath, [cli, 'sessions', 'discover', '--source', 'codex', '--db', db, '--no-warning'], { env });
     await run(process.execPath, [cli, 'sync', '--db', db, '--no-warning'], { env });
 
-    const defaultLimit = await run(process.execPath, [cli, 'pack', 'shared-limit-keyword', '--db', db, '--json', '--no-warning']);
+    const defaultLimit = await run(process.execPath, [cli, 'pack', 'shared-limit-keyword', '--db', db, '--json', '--no-warning'], { env });
     const defaultParsed = JSON.parse(defaultLimit.stdout) as { entries: unknown[] };
     assert.equal(defaultParsed.entries.length, 10);
 
     const explicitLimit = await run(process.execPath, [
       cli, 'pack', 'shared-limit-keyword', '--db', db, '--limit', '3', '--json', '--no-warning',
-    ]);
+    ], { env });
     const explicitParsed = JSON.parse(explicitLimit.stdout) as { entries: unknown[] };
     assert.equal(explicitParsed.entries.length, 3);
   } finally {
@@ -715,13 +717,13 @@ test('pack truncates by Unicode code point, not UTF-16 code unit, so it never sp
       timestamp: '2026-09-07T20:00:01.000Z', type: 'event_msg',
       payload: { type: 'user_message', message },
     })}\n`);
-    const env = { ...process.env, HOME: home, USERPROFILE: home };
+    const env = { ...process.env, HOME: home, USERPROFILE: home, XDG_DATA_HOME: join(home, 'share') };
     await run(process.execPath, [cli, 'sessions', 'discover', '--source', 'codex', '--db', db, '--no-warning'], { env });
     await run(process.execPath, [cli, 'sync', '--db', db, '--no-warning'], { env });
 
     const json = await run(process.execPath, [
       cli, 'pack', 'emoji-unicode-keyword', '--db', db, '--tokens', '1', '--json', '--no-warning',
-    ]);
+    ], { env });
     const parsed = JSON.parse(json.stdout) as { entries: Array<{ prompt: string }> };
     // Every character of the truncated prefix must remain a well-formed
     // code point — no lone (unpaired) surrogate.
@@ -733,7 +735,7 @@ test('pack truncates by Unicode code point, not UTF-16 code unit, so it never sp
 
     const human = await run(process.execPath, [
       cli, 'pack', 'emoji-unicode-keyword', '--db', db, '--tokens', '1', '--no-warning',
-    ]);
+    ], { env });
     assert.match(human.stdout, /😀😀 e\.\.\./);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -837,7 +839,7 @@ test('sessions relationships names the other end of a continuity edge', async ()
     sessionId: 'continued', uuid: 'cont-u', parentUuid: 'origin-a', type: 'user', cwd: '/work/app',
     message: { role: 'user', content: 'carry on' }, timestamp: '2026-08-31T11:00:00Z',
   }));
-  const env = { ...process.env, HOME: home, USERPROFILE: home };
+  const env = { ...process.env, HOME: home, USERPROFILE: home, XDG_DATA_HOME: join(home, 'share') };
   try {
     await run(process.execPath, [cli, 'sync', '--db', db, '--no-warning'], { env });
 

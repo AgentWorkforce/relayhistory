@@ -257,6 +257,7 @@ fn temp_root(tag: &str) -> PathBuf {
 fn use_layout(home: &Path, db: Option<&Path>, storage: Option<&Path>) {
     std::env::set_var("HOME", home);
     std::env::set_var("USERPROFILE", home);
+    std::env::set_var("XDG_DATA_HOME", home.join("missing-xdg"));
     std::env::remove_var("AI_HIST_DB");
     std::env::set_var(
         "OPENCODE_DB",

@@ -22,7 +22,7 @@ test('bootstrap validates its work budget before loading native code', async () 
 
 test('SDK bootstrap retries an empty home, indexes native evidence, and skips a ready database', async () => {
   const home = await mkdtemp(join(tmpdir(), 'ai-hist-bootstrap-'));
-  const env = { ...process.env, HOME: home, USERPROFILE: home, AI_HIST_DB: join(home, 'history.db') };
+  const env = { ...process.env, HOME: home, USERPROFILE: home, XDG_DATA_HOME: join(home, 'share'), AI_HIST_DB: join(home, 'history.db') };
   const call = async () => JSON.parse((await run(process.execPath, ['--input-type=module', '-e',
     `import { bootstrapLocal } from ${JSON.stringify(sdk)}; console.log(JSON.stringify(await bootstrapLocal()));`,
   ], { env })).stdout);
@@ -63,7 +63,7 @@ test('SDK bootstrap retries an empty home, indexes native evidence, and skips a 
 // the complete normalized evidence shape, making it a useful regression case.
 test('bootstrap does not report declined evidence as a provider limitation', { skip: needsNodeSqlite }, async () => {
   const home = await mkdtemp(join(tmpdir(), 'ai-hist-bootstrap-coverage-'));
-  const env = { ...process.env, HOME: home, USERPROFILE: home, AI_HIST_DB: join(home, 'history.db') };
+  const env = { ...process.env, HOME: home, USERPROFILE: home, XDG_DATA_HOME: join(home, 'share'), AI_HIST_DB: join(home, 'history.db') };
   const call = async () => JSON.parse((await run(process.execPath, ['--input-type=module', '-e',
     `import { bootstrapLocal } from ${JSON.stringify(sdk)}; console.log(JSON.stringify(await bootstrapLocal()));`,
   ], { env })).stdout) as {
@@ -102,7 +102,7 @@ async function writeOpencodePrompt(home: string, sessionId: string, prompt: stri
 
 test('bare CLI discovers and indexes on first invocation with an explicit database', async () => {
   const home = await mkdtemp(join(tmpdir(), 'ai-hist-first-cli-'));
-  const env = { ...process.env, HOME: home, USERPROFILE: home };
+  const env = { ...process.env, HOME: home, USERPROFILE: home, XDG_DATA_HOME: join(home, 'share') };
   try {
     const folder = join(home, '.codex', 'sessions', '2026', '09', '08');
     await mkdir(folder, { recursive: true });

@@ -360,9 +360,10 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
     };
     let local_observation = observations::get(&conn, &local_key)?;
     if let Some(observation) = &local_observation {
-        // OpenCode enumerates by session id, while its local parser needs the
-        // separately recorded provider database path from the catalog.
-        if options.source != "opencode" {
+        // OpenCode and Devin enumerate by session id, while their local
+        // parsers need the separately recorded provider database path from
+        // the catalog.
+        if !matches!(options.source.as_str(), "opencode" | "devin") {
             target.locator = observation.raw_locator.clone();
         }
         target.discovery_state = Some(observation.discovery_state.clone());
@@ -554,7 +555,30 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
     // a resume position without the checkpoint it belongs to would describe
     // evidence nothing recorded.
     store_cursor(&tx, &cursor_key, &cursor)?;
-    let local_observation=local_observation.unwrap_or(SessionObservation{key:local_key,raw_locator:target.locator.clone(),source_stamp:tx.query_row("SELECT source_stamp FROM session_presences WHERE source=? AND session_id=? AND location='local'",params![options.source,options.session_id],|row|row.get(0)).optional()?.flatten(),discovery_state:"shallow".into(),access_state:"available".into(),updated_ms:now_ms()});
+    let local_observation = local_observation.unwrap_or_else(|| SessionObservation {
+        key: local_key,
+        raw_locator: target.locator.clone(),
+        source_stamp: tx
+            .query_row(
+                "SELECT source_stamp FROM session_presences \
+                 WHERE source=? AND session_id=? AND location='local'",
+                params![options.source, options.session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .flatten(),
+        // A newly created local observation must not inherit shared catalog
+        // previews. Those columns are location-agnostic; they may have come
+        // from a remote observation or another connector. Start with no local
+        // preview provenance unless local discovery itself supplied it later.
+        discovery_state: "shallow".into(),
+        access_state: "available".into(),
+        updated_ms: now_ms(),
+        first_prompt: None,
+        last_assistant_text: None,
+    });
     save_observation_progress(
         &tx,
         &local_observation,
@@ -1331,7 +1355,7 @@ fn validate_options(options: &HydrateSessionOptions) -> Result<()> {
     }
     if !matches!(
         options.source.as_str(),
-        "claude" | "codex" | "cursor" | "grok" | "relay" | "opencode"
+        "claude" | "codex" | "cursor" | "grok" | "relay" | "opencode" | "devin"
     ) {
         return Err(hydration_error(
             "INVALID_ARGUMENT",
@@ -1349,7 +1373,7 @@ fn catalog_target(conn: &Connection, options: &HydrateSessionOptions) -> Result<
     };
     let row = conn
         .query_row(
-            "SELECT CASE WHEN s.source='opencode' AND p.location='local' THEN s.raw_path ELSE p.raw_locator END, COALESCE(p.discovery_state, s.discovery_state) \
+            "SELECT CASE WHEN s.source IN ('opencode','devin') AND p.location='local' THEN s.raw_path ELSE p.raw_locator END, COALESCE(p.discovery_state, s.discovery_state) \
              FROM sessions s JOIN session_presences p \
                ON p.source = s.source AND p.session_id = s.session_id AND p.location = ? \
              WHERE s.source = ? AND s.session_id = ?",
@@ -1511,6 +1535,78 @@ fn source_snapshot(
             scanned_superseded: false,
             stamped_cursors: Vec::new(),
             opencode_layout: Some(OpencodeIngestLayout::Sqlite),
+            codex_relationship_complete: true,
+        });
+    }
+    if options.source == "devin" {
+        let configured_dir = &roots.devin;
+        let configured_path = crate::ingest::devin::sessions_db_path(configured_dir);
+        let locator = target.locator.as_deref().ok_or_else(|| {
+            hydration_error(
+                "SESSION_SOURCE_UNAVAILABLE",
+                "Devin catalog row has no store provenance; run discoverSessions() again",
+            )
+        })?;
+        let path = PathBuf::from(locator);
+        // The catalog locator is the store path itself, so a row can only
+        // name the configured `sessions.db` — anything else is provenance a
+        // rediscovery must re-establish, never a path to open.
+        let resolved = fs::canonicalize(&path).ok();
+        if resolved.is_none() || resolved != fs::canonicalize(&configured_path).ok() {
+            return Err(hydration_error(
+                "SESSION_SOURCE_MISMATCH",
+                format!(
+                    "Devin catalog store {} does not match configured store {}",
+                    path.display(),
+                    configured_path.display()
+                ),
+            ));
+        }
+        let src = crate::store::open_db_readonly(&path)?;
+        crate::ingest::devin::register_stamp_fn(&src)?;
+        let stamp = crate::ingest::devin::session_stamp(
+            &src,
+            &options.session_id,
+            &crate::ingest::devin::transcripts_dir(configured_dir),
+        )?
+        .ok_or_else(|| {
+            hydration_error(
+                "SESSION_SOURCE_UNAVAILABLE",
+                format!(
+                    "Devin session '{}' no longer exists or is hidden",
+                    options.session_id
+                ),
+            )
+        })?;
+        // records_parsed must reflect the provider rows the pass reads: the
+        // session row, its message_nodes, and whatever tool_call_state holds.
+        // `tool_call_state` predates nothing — an older store may lack it, so
+        // its count is best-effort like the stamp's.
+        let nodes: i64 = src
+            .query_row(
+                "SELECT COUNT(*) FROM message_nodes WHERE session_id = ?1",
+                params![options.session_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        let tools: i64 = src
+            .query_row(
+                "SELECT COUNT(*) FROM tool_call_state WHERE session_id = ?1",
+                params![options.session_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        return Ok(SourceSnapshot {
+            stamp,
+            bytes: 0,
+            records: SnapshotRecords::Counted(1 + nodes + tools),
+            path: Some(path),
+            claude_transcript: None,
+            claude_subagents: Vec::new(),
+            scanned_bytes: 0,
+            scanned_superseded: false,
+            stamped_cursors: Vec::new(),
+            opencode_layout: None,
             codex_relationship_complete: true,
         });
     }
@@ -2132,6 +2228,22 @@ fn ingest_selected(
             // Not `whole_file()`, which also reports the path's size as bytes
             // read: OpenCode's locator can be a directory, whose length is not
             // a count of anything.
+            Ok((
+                IngestOutcome {
+                    records,
+                    ..Default::default()
+                },
+                Vec::new(),
+                None,
+            ))
+        }
+        "devin" => {
+            // `path` is the `sessions.db` whose provenance `source_snapshot`
+            // verified; its parent is the Devin CLI data directory that also
+            // holds `transcripts/`.
+            let path = path.unwrap();
+            let cli_dir = path.parent().unwrap_or(path);
+            crate::ingest::devin::sync_devin_session(conn, cli_dir, &options.session_id)?;
             Ok((
                 IngestOutcome {
                     records,
@@ -3571,7 +3683,7 @@ pub(crate) fn save_observation_progress(
     if full {
         observation.discovery_state = "full".into();
     }
-    observations::upsert(conn, &observation)?;
+    observations::upsert_preserving_previews(conn, &observation)?;
     observations::write_checkpoint(
         conn,
         &observation.key,
@@ -10449,6 +10561,8 @@ mod tests {
             discovery_state: "shallow".into(),
             access_state: "available".into(),
             updated_ms: 1,
+            first_prompt: None,
+            last_assistant_text: None,
         };
         observations::upsert(&conn, &observed).unwrap();
         let options = HydrateSessionOptions {
@@ -10524,6 +10638,8 @@ mod tests {
             discovery_state: "shallow".into(),
             access_state: "available".into(),
             updated_ms: 1,
+            first_prompt: None,
+            last_assistant_text: None,
         };
         for location in [SessionLocation::Local, SessionLocation::Remote] {
             let observed = observation(location);

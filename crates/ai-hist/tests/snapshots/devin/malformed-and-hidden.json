@@ -1,0 +1,142 @@
+{
+  "corpus_files": [
+    "devin/malformed-and-hidden.sql"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [
+    {
+      "cwd": "/work/fixture-repo",
+      "file_path": "/work/fixture-repo/detached.rs",
+      "git_branch": null,
+      "lines_added": null,
+      "lines_removed": null,
+      "message_id": "tcs:call-detached-1",
+      "session_id": "fixture-devin-partial",
+      "source": "devin",
+      "structured_patch_json": null,
+      "tool_name": "edit",
+      "tool_use_id": "call-detached-1",
+      "ts_ms": 1776643310000,
+      "user_modified": null
+    }
+  ],
+  "fixture": "devin/malformed-and-hidden",
+  "history": [
+    {
+      "project": "/work/fixture-repo",
+      "prompt": "Fixture partial session prompt.",
+      "session_id": "fixture-devin-partial",
+      "source": "devin",
+      "timestamp_ms": 1776643301000
+    }
+  ],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "fixture-devin-partial",
+      "source": "devin",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "DevinSqlite",
+  "notes": [],
+  "origin": "relayhistory",
+  "quirk": "a `chat_message` that is not JSON is skipped per record, an in-progress tool call stays `running`, an orphan `tool_call_state` row is still indexed, and `hidden` sessions are excluded entirely",
+  "session_events": [
+    {
+      "cwd": "/work/fixture-repo",
+      "event_uid": "n1:text",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "p1",
+      "model": null,
+      "parent_id": "n0",
+      "project": "/work/fixture-repo",
+      "role": "user",
+      "session_id": "fixture-devin-partial",
+      "source": "devin",
+      "text": "Fixture partial session prompt.",
+      "token_json": null,
+      "ts_ms": 1776643301000
+    },
+    {
+      "cwd": "/work/fixture-repo",
+      "event_uid": "n2:tool:call-running-1",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "p2",
+      "model": "fixture-model-1",
+      "parent_id": "p1",
+      "project": "/work/fixture-repo",
+      "role": "assistant",
+      "session_id": "fixture-devin-partial",
+      "source": "devin",
+      "text": "execute fixture-run",
+      "token_json": null,
+      "ts_ms": 1776643302000
+    },
+    {
+      "cwd": "/work/fixture-repo",
+      "event_uid": "tcs:call-detached-1:tool",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "tcs:call-detached-1",
+      "model": "fixture-model-1",
+      "parent_id": null,
+      "project": "/work/fixture-repo",
+      "role": "assistant",
+      "session_id": "fixture-devin-partial",
+      "source": "devin",
+      "text": "edit /work/fixture-repo/detached.rs",
+      "token_json": null,
+      "ts_ms": 1776643310000
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": null,
+      "cwd": "/work/fixture-repo",
+      "discovery_state": "full",
+      "first_activity_ms": 1776643300000,
+      "first_prompt": "Fixture partial session prompt.",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776643310000,
+      "last_assistant_text": null,
+      "models_json": "[\"fixture-model-1\"]",
+      "originator": null,
+      "raw_path": "<home>/.local/share/devin/cli/sessions.db",
+      "repo_url": null,
+      "session_id": "fixture-devin-partial",
+      "source": "devin",
+      "source_stamp": "<n>:<n>:3:3:6:<n>:2:3:<n>|absent",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "devin",
+  "tool_calls": [
+    {
+      "args_json": "{\"command\":\"fixture-run\"}",
+      "is_error": null,
+      "message_id": "p2",
+      "name": "execute",
+      "session_id": "fixture-devin-partial",
+      "source": "devin",
+      "target": "fixture-run",
+      "tool_use_id": "call-running-1",
+      "ts_ms": 1776643302000
+    },
+    {
+      "args_json": "{\"file_path\":\"/work/fixture-repo/detached.rs\"}",
+      "is_error": 0,
+      "message_id": "tcs:call-detached-1",
+      "name": "edit",
+      "session_id": "fixture-devin-partial",
+      "source": "devin",
+      "target": "/work/fixture-repo/detached.rs",
+      "tool_use_id": "call-detached-1",
+      "ts_ms": 1776643310000
+    }
+  ]
+}

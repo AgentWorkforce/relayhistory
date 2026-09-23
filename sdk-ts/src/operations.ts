@@ -829,6 +829,7 @@ export function formatSessionRow(
     relay: '↔',
     opencode: '⌘',
     trajectory: '↗',
+    devin: '⬡',
   };
   const ageMs =
     session.lastActivityMs === null

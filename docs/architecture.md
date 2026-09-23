@@ -224,7 +224,9 @@ so every result reports it:
 |---|---|---|---|---|
 | `codex` | always | yes | yes | yes |
 | `claude` | sometimes (only versions that emit a per-child `agentId`) | yes | yes | yes |
-| `cursor`, `grok`, `opencode`, `relay` | never | no | no | no |
+| `grok` | sometimes (only `subagents/` entries carrying a session id) | yes | yes | yes |
+| `opencode` | always | no | yes | yes |
+| `cursor`, `devin`, `relay` | never | no | no | no |
 
 A linked child's events are stored under the child's own session id and are
 never flattened into the parent. The delegated instruction that started a

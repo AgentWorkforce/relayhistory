@@ -428,7 +428,7 @@ enum SessionsAction {
 enum LearnAction {
     /// Distill local session history into decision/finding/reflection events.
     Distill {
-        /// Only distill sessions from this source (claude, codex, cursor, grok, relay, opencode).
+        /// Only distill sessions from this source (claude, codex, cursor, grok, relay, opencode, devin).
         #[arg(long)]
         source: Option<String>,
         /// Distill one session id.

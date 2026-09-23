@@ -447,7 +447,8 @@ fn cloud_all_sources_fan_out_without_widening_source_choices() {
             "grok",
             "relay",
             "trajectory",
-            "opencode"
+            "opencode",
+            "devin"
         ]
     );
     assert!(

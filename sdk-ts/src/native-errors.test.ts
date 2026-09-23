@@ -76,9 +76,10 @@ test('unconfigured remote acquisition has one stable SDK error', async () => {
   const dbPath = join(root, 'history.db');
   // Connector detection reads the provider CLIs' stored sign-ins under HOME,
   // so point it at an empty home rather than the machine running the tests.
-  const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+  const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, XDG_DATA_HOME: process.env.XDG_DATA_HOME };
   process.env.HOME = root;
   process.env.USERPROFILE = root;
+  process.env.XDG_DATA_HOME = join(root, 'share');
   try {
     for (const operation of [
       () => discoverSessions({ dbPath, scope: 'remote' }),
@@ -94,6 +95,7 @@ test('unconfigured remote acquisition has one stable SDK error', async () => {
   } finally {
     if (saved.HOME === undefined) delete process.env.HOME; else process.env.HOME = saved.HOME;
     if (saved.USERPROFILE === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = saved.USERPROFILE;
+    if (saved.XDG_DATA_HOME === undefined) delete process.env.XDG_DATA_HOME; else process.env.XDG_DATA_HOME = saved.XDG_DATA_HOME;
     await rm(root, { recursive: true, force: true });
   }
 });

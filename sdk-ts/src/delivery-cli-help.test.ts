@@ -12,7 +12,7 @@ test('delivery group reports missing or unknown subcommands and supports help be
   const home = await mkdtemp(join(tmpdir(), 'delivery-help-'));
   t.after(() => rm(home, { recursive: true, force: true }));
   const db = join(home, 'never-created.db');
-  const env = { ...process.env, HOME: home, USERPROFILE: home, AI_HIST_DB: db };
+  const env = { ...process.env, HOME: home, USERPROFILE: home, XDG_DATA_HOME: join(home, 'share'), AI_HIST_DB: db };
   for (const flag of ['--help', '-h']) {
     const result = await run(process.execPath, [cli, 'delivery', flag, '--no-warning'], { env });
     assert.equal(result.stderr, '');

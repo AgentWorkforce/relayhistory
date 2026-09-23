@@ -50,6 +50,17 @@ pub struct SessionObservation {
     pub discovery_state: String,
     pub access_state: String,
     pub updated_ms: i64,
+    /// The preview text this observation contributed to the shared catalog
+    /// row. Preview provenance lives per observation because the catalog row
+    /// cannot say which location a `first_prompt` came from — and a retiring
+    /// location must restore the survivor's preview, not erase a valid one.
+    /// Rows that predate these columns carry NULL, which retires to NULL:
+    /// an unattributed preview is dropped rather than risk quoting a hidden
+    /// local transcript.
+    #[serde(default)]
+    pub first_prompt: Option<String>,
+    #[serde(default)]
+    pub last_assistant_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,7 +109,7 @@ pub(crate) fn schema_is_current(conn: &Connection) -> Result<bool> {
         }
     }
     for (table, required) in [
-        ("session_observations", "source,session_id,location,connector_id,connector_instance,raw_locator,source_stamp,discovery_state,access_state,updated_ms"),
+        ("session_observations", "source,session_id,location,connector_id,connector_instance,raw_locator,source_stamp,discovery_state,access_state,updated_ms,first_prompt,last_assistant_text"),
         ("observation_hydration_checkpoints", "source,session_id,location,connector_id,connector_instance,source_stamp,parser_version,last_event_at_ms,source_bytes,records_parsed,include_related,updated_ms,committed_offset,prefix_hash,dev_ino,parser_state_json"),
         ("observation_discovery_skips", "source,location,connector_id,connector_instance,locator,stamp,updated_ms"),
         ("observation_evidence", "source,session_id,location,connector_id,connector_instance,evidence_uid,payload_json"),
@@ -124,6 +135,7 @@ CREATE TABLE IF NOT EXISTS session_observations (
  raw_locator TEXT, source_stamp TEXT, discovery_state TEXT NOT NULL DEFAULT 'shallow' CHECK(discovery_state IN ('shallow','full')),
  access_state TEXT NOT NULL DEFAULT 'available' CHECK(access_state IN ('available','unavailable','withdrawn')),
  updated_ms INTEGER NOT NULL,
+ first_prompt TEXT, last_assistant_text TEXT,
  PRIMARY KEY(source,session_id,location,connector_id,connector_instance)
 );
 CREATE INDEX IF NOT EXISTS idx_observation_locator ON session_observations(source,location,connector_id,connector_instance,raw_locator);
@@ -193,6 +205,23 @@ UPDATE observation_clock SET version=MAX(version,COALESCE((SELECT MAX(version) F
             )?;
         }
     }
+    // Preview provenance post-dates the table the same way: a fresh database
+    // has the columns from the DDL above, an existing one gains them here.
+    // Rows predating them keep NULL previews, which a location retirement
+    // reads as "no surviving preview" — the non-leaking choice for text that
+    // cannot be attributed.
+    let existing: Vec<String> = conn
+        .prepare("PRAGMA table_info(session_observations)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for column in ["first_prompt", "last_assistant_text"] {
+        if !existing.iter().any(|present| present == column) {
+            conn.execute(
+                &format!("ALTER TABLE session_observations ADD COLUMN {column} TEXT"),
+                [],
+            )?;
+        }
+    }
     ensure!(
         schema_is_current(conn)?,
         "incomplete connector observation schema"
@@ -218,9 +247,11 @@ fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionObservation> {
         discovery_state: row.get(7)?,
         access_state: row.get(8)?,
         updated_ms: row.get(9)?,
+        first_prompt: row.get(10)?,
+        last_assistant_text: row.get(11)?,
     })
 }
-const COLUMNS: &str = "source,session_id,location,connector_id,connector_instance,raw_locator,source_stamp,discovery_state,access_state,updated_ms";
+const COLUMNS: &str = "source,session_id,location,connector_id,connector_instance,raw_locator,source_stamp,discovery_state,access_state,updated_ms,first_prompt,last_assistant_text";
 
 pub fn list(conn: &Connection, source: &str, session: &str) -> Result<Vec<SessionObservation>> {
     Ok(conn.prepare(&format!("SELECT {COLUMNS} FROM session_observations WHERE source=? AND session_id=? ORDER BY location,connector_id,connector_instance"))?.query_map(params![source,session],read_row)?.collect::<rusqlite::Result<_>>()?)
@@ -231,15 +262,51 @@ pub fn get(conn: &Connection, key: &ObservationKey) -> Result<Option<SessionObse
     Ok(conn.query_row(&format!("SELECT {COLUMNS} FROM session_observations WHERE source=? AND session_id=? AND location=? AND connector_id=? AND connector_instance=?"), params![key.source,key.session_id,key.location.as_str(),key.connector_id,key.connector_instance],read_row).optional()?)
 }
 
+/// How an upsert reconciles the preview columns it carries with those the
+/// row already holds. The shared `sessions` catalog cannot say which location
+/// produced a preview, so provenance is stored per observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviewWrite {
+    /// Authoritative discovery: replace the preview columns, NULL included.
+    /// A discovery pass that no longer sees the preview text must be able to
+    /// clear it, otherwise a retired location would keep quoting hidden content.
+    Replace,
+    /// Checkpoint/hydration progress: the preview values belong to whoever last
+    /// produced them, so preserve whatever the row already holds.
+    Preserve,
+}
+
 /// Persist one connector's observation and refresh only the aggregate projection.
 /// The caller's transaction includes the canonical session write and this state.
+///
+/// This is the *authoritative* write: every column is replaced, including the
+/// preview provenance — a discovery pass that no longer sees the preview text
+/// stores NULL, which is what a later location retirement must read.
 pub fn upsert(conn: &Connection, observation: &SessionObservation) -> Result<()> {
+    upsert_with(conn, observation, PreviewWrite::Replace)
+}
+
+/// Persist acquisition-progress state without taking ownership of the preview
+/// provenance. A checkpoint-only or hydration-only update moves locators, stamps
+/// and discovery/access state, but leaves the existing preview columns intact.
+pub(crate) fn upsert_preserving_previews(
+    conn: &Connection,
+    observation: &SessionObservation,
+) -> Result<()> {
+    upsert_with(conn, observation, PreviewWrite::Preserve)
+}
+
+fn upsert_with(
+    conn: &Connection,
+    observation: &SessionObservation,
+    previews: PreviewWrite,
+) -> Result<()> {
     let savepoint = if conn.is_autocommit() {
         Some(conn.unchecked_transaction()?)
     } else {
         None
     };
-    let result = upsert_inner(conn, observation);
+    let result = upsert_inner(conn, observation, previews);
     match (savepoint, result) {
         (Some(tx), Ok(())) => {
             tx.commit()?;
@@ -249,7 +316,11 @@ pub fn upsert(conn: &Connection, observation: &SessionObservation) -> Result<()>
     }
 }
 
-fn upsert_inner(conn: &Connection, observation: &SessionObservation) -> Result<()> {
+fn upsert_inner(
+    conn: &Connection,
+    observation: &SessionObservation,
+    previews: PreviewWrite,
+) -> Result<()> {
     let k = &observation.key;
     k.validate()?;
     ensure!(
@@ -260,7 +331,40 @@ fn upsert_inner(conn: &Connection, observation: &SessionObservation) -> Result<(
         ["shallow", "full"].contains(&observation.discovery_state.as_str()),
         "invalid observation discovery state"
     );
-    conn.execute("INSERT INTO session_observations(source,session_id,location,connector_id,connector_instance,raw_locator,source_stamp,discovery_state,access_state,updated_ms) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source,session_id,location,connector_id,connector_instance) DO UPDATE SET raw_locator=excluded.raw_locator,source_stamp=excluded.source_stamp,discovery_state=CASE WHEN session_observations.discovery_state='full' THEN 'full' ELSE excluded.discovery_state END,access_state=excluded.access_state,updated_ms=excluded.updated_ms",params![k.source,k.session_id,k.location.as_str(),k.connector_id,k.connector_instance,observation.raw_locator,observation.source_stamp,observation.discovery_state,observation.access_state,observation.updated_ms])?;
+    let preview_set = match previews {
+        PreviewWrite::Replace => {
+            "first_prompt=excluded.first_prompt,last_assistant_text=excluded.last_assistant_text"
+        }
+        PreviewWrite::Preserve => {
+            "first_prompt=session_observations.first_prompt,last_assistant_text=session_observations.last_assistant_text"
+        }
+    };
+    conn.execute(
+        &format!(
+            "INSERT INTO session_observations( \
+             source,session_id,location,connector_id,connector_instance,raw_locator,source_stamp, \
+             discovery_state,access_state,updated_ms,first_prompt,last_assistant_text) \
+             VALUES(?,?,?,?,?,?,?,?,?,?,?,?) \
+             ON CONFLICT(source,session_id,location,connector_id,connector_instance) DO UPDATE SET \
+             raw_locator=excluded.raw_locator,source_stamp=excluded.source_stamp, \
+             discovery_state=CASE WHEN session_observations.discovery_state='full' THEN 'full' ELSE excluded.discovery_state END, \
+             access_state=excluded.access_state,updated_ms=excluded.updated_ms,{preview_set}"
+        ),
+        params![
+            k.source,
+            k.session_id,
+            k.location.as_str(),
+            k.connector_id,
+            k.connector_instance,
+            observation.raw_locator,
+            observation.source_stamp,
+            observation.discovery_state,
+            observation.access_state,
+            observation.updated_ms,
+            observation.first_prompt,
+            observation.last_assistant_text
+        ],
+    )?;
     refresh_projection(conn, k)?;
     bump_revision(conn, k)
 }
@@ -272,7 +376,7 @@ pub fn set_access(conn: &Connection, key: &ObservationKey, state: &str) -> Resul
         observation.updated_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_millis() as i64;
-        upsert(conn, &observation)?;
+        upsert_preserving_previews(conn, &observation)?;
     }
     Ok(())
 }
@@ -553,6 +657,8 @@ mod tests {
             discovery_state: "shallow".into(),
             access_state: "available".into(),
             updated_ms: 1,
+            first_prompt: None,
+            last_assistant_text: None,
         }
     }
     #[test]
@@ -730,6 +836,50 @@ mod tests {
         assert!(list(&conn, "claude", "s")?.is_empty());
         assert!(checkpoint(&conn, &observation.key)?.is_none());
         assert!(evidence(&conn, &observation.key)?.is_none());
+        Ok(())
+    }
+    #[test]
+    fn discovery_upsert_replaces_previews_including_null() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        crate::init_db(&conn)?;
+        let mut first = observation("a", "default");
+        first.first_prompt = Some("first prompt".into());
+        first.last_assistant_text = Some("last text".into());
+        upsert(&conn, &first)?;
+
+        let mut cleared = first.clone();
+        cleared.first_prompt = None;
+        cleared.last_assistant_text = None;
+        cleared.source_stamp = Some("cleared".into());
+        upsert(&conn, &cleared)?;
+
+        let row = get(&conn, &first.key)?.expect("row exists");
+        assert_eq!(row.first_prompt, None);
+        assert_eq!(row.last_assistant_text, None);
+        assert_eq!(row.source_stamp.as_deref(), Some("cleared"));
+        Ok(())
+    }
+    #[test]
+    fn checkpoint_upsert_preserves_existing_preview_values() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        crate::init_db(&conn)?;
+        let mut first = observation("a", "default");
+        first.first_prompt = Some("first prompt".into());
+        first.last_assistant_text = Some("last text".into());
+        upsert(&conn, &first)?;
+
+        let mut checkpoint = first.clone();
+        checkpoint.first_prompt = None;
+        checkpoint.last_assistant_text = None;
+        checkpoint.raw_locator = Some("moved".into());
+        checkpoint.source_stamp = Some("checkpoint".into());
+        upsert_preserving_previews(&conn, &checkpoint)?;
+
+        let row = get(&conn, &first.key)?.expect("row exists");
+        assert_eq!(row.raw_locator.as_deref(), Some("moved"));
+        assert_eq!(row.source_stamp.as_deref(), Some("checkpoint"));
+        assert_eq!(row.first_prompt.as_deref(), Some("first prompt"));
+        assert_eq!(row.last_assistant_text.as_deref(), Some("last text"));
         Ok(())
     }
 }

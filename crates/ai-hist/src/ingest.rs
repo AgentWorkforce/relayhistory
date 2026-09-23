@@ -17,6 +17,7 @@ use std::time::Duration;
 
 pub(crate) mod codex;
 pub(crate) mod cursor;
+pub(crate) mod devin;
 pub(crate) mod grok;
 pub(crate) mod hook;
 pub(crate) mod hydrate;
@@ -639,25 +640,25 @@ fn sweep_generation() -> String {
 
 /// Version tag of the destination marker's encoding, so a marker written by a
 /// build with a different shape is rejected rather than misread.
-const DESTINATION_MARKER_VERSION: &str = "v4";
+const DESTINATION_MARKER_VERSION: &str = "v5";
 
-/// The sources whose evidence a *sweep* can put back.
+/// The sources whose events, tool calls, file edits and catalog row a *sweep*
+/// can put back.
 ///
 /// The marker is a repair guard, so it may only promise what the sweep can
 /// honour. Codex rollouts and Claude transcripts are re-read and re-ingested
 /// by this sweep, so a loss in one is repairable and belongs in the marker.
-/// Everything else does not: `history` rows come from cursor-backed flat logs
-/// that sit at EOF and cannot be safely rewound, and a provider with no sweep
-/// repair path would be a shortfall nothing could ever clear — a marker that
-/// counted them would disarm the fast path forever over a loss it could not
-/// undo, which is a worse failure than not guarding them. Adding a source here
-/// means adding its repair path in the same change.
+/// Adding a source here means adding its repair path in the same change.
+const REPAIRABLE_EVENT_SOURCES: &[&str] = &["claude", "codex", "opencode", "devin"];
+
+/// The sources whose `history` and `session_markers` rows a sweep can replay.
 ///
-/// OpenCode joined them when its sweep gained an event-level parser: a plain
-/// sync now re-reads a session indexed as prompts-only, so a loss in one is
-/// repairable on the same terms. Its rows do not come from a flat log, which
-/// is what kept it out before.
-const REPAIRABLE_EVENT_SOURCES: &[&str] = &["claude", "codex", "opencode"];
+/// Cursor-backed flat logs (`~/.claude/history.jsonl`, `~/.codex/history.jsonl`)
+/// sit at EOF and cannot be safely rewound, so counting them would disarm the
+/// fast path forever over a loss it could not undo. Store-backed providers
+/// re-read their own database on each sync, so their history and markers are
+/// as repairable as their events.
+const REPLAYABLE_HISTORY_SOURCES: &[&str] = &["devin", "opencode"];
 
 /// What one session is expected to hold.
 ///
@@ -677,6 +678,8 @@ struct SessionHoldings {
     events: u64,
     tool_calls: u64,
     file_edits: u64,
+    history: u64,
+    markers: u64,
     catalog: u64,
 }
 
@@ -685,6 +688,8 @@ impl SessionHoldings {
         self.events >= stored.events
             && self.tool_calls >= stored.tool_calls
             && self.file_edits >= stored.file_edits
+            && self.history >= stored.history
+            && self.markers >= stored.markers
             && self.catalog >= stored.catalog
     }
 }
@@ -707,8 +712,8 @@ impl SessionHoldings {
 /// and the catalog row are re-created by the same re-read that restores the
 /// events, so they are guarded by the same marker.
 ///
-/// Four grouped reads, each an index-ordered scan over a `(source,
-/// session_id)` key, merged in memory — not four correlated subqueries per
+/// Six grouped reads, each an index-ordered scan over a `(source,
+/// session_id)` key, merged in memory — not six correlated subqueries per
 /// session.
 fn destination_generation(conn: &Connection) -> Result<String> {
     let holdings = session_holdings(conn)?;
@@ -719,8 +724,8 @@ fn destination_generation(conn: &Connection) -> Result<String> {
     let mut marker = format!("{DESTINATION_MARKER_VERSION} n{}", holdings.len());
     for (session, held) in holdings {
         marker.push_str(&format!(
-            " {session:016x}={}.{}.{}.{}",
-            held.events, held.tool_calls, held.file_edits, held.catalog
+            " {session:016x}={}.{}.{}.{}.{}.{}",
+            held.events, held.tool_calls, held.file_edits, held.history, held.markers, held.catalog
         ));
     }
     Ok(marker)
@@ -733,33 +738,63 @@ type HoldingField = fn(&mut SessionHoldings) -> &mut u64;
 /// stores.
 fn session_holdings(conn: &Connection) -> Result<BTreeMap<u64, SessionHoldings>> {
     let mut holdings: BTreeMap<u64, SessionHoldings> = BTreeMap::new();
-    let counted: [(&str, HoldingField); 4] = [
+    let sources = repairable_event_sources();
+    let history_sources = replayable_history_sources();
+    let counted: [(&str, bool, HoldingField); 6] = [
         (
             "SELECT source, session_id, COUNT(*) FROM session_events",
+            false,
             |held| &mut held.events,
         ),
         (
             "SELECT source, session_id, COUNT(*) FROM tool_calls",
+            false,
             |held| &mut held.tool_calls,
         ),
         (
             "SELECT source, session_id, COUNT(*) FROM file_edits",
+            false,
             |held| &mut held.file_edits,
         ),
         (
+            "SELECT source, session_id, COUNT(*) FROM history",
+            true,
+            |held| &mut held.history,
+        ),
+        (
+            "SELECT source, session_id, COUNT(*) FROM session_markers",
+            true,
+            |held| &mut held.markers,
+        ),
+        (
             "SELECT source, session_id, COUNT(*) FROM sessions",
+            false,
             |held| &mut held.catalog,
         ),
     ];
-    for (select, field) in counted {
-        let mut statement = conn.prepare(&format!(
-            "{select} WHERE source IN (SELECT value FROM json_each(?)) \
+    for (select, is_history, field) in counted {
+        // `history.session_id` is nullable; per-session holdings and markers
+        // should only promise rows that are actually tied to a session.
+        let extra = if is_history {
+            "session_id IS NOT NULL AND "
+        } else {
+            ""
+        };
+        let sql = format!(
+            "{select} WHERE {extra}source IN (SELECT value FROM json_each(?)) \
              GROUP BY source, session_id"
-        ))?;
-        let mut rows = statement.query([repairable_event_sources()])?;
+        );
+        let bound = if is_history {
+            &history_sources
+        } else {
+            &sources
+        };
+        let mut statement = conn.prepare(&sql)?;
+        let mut rows = statement.query([bound.clone()])?;
         while let Some(row) = rows.next()? {
             let source: String = row.get(0)?;
-            let session_id: String = row.get(1)?;
+            let session_id: Option<String> = row.get(1)?;
+            let session_id = session_id.unwrap_or_default();
             // `COUNT(*)` is never negative; a driver that somehow produced
             // one must not become a marker entry that covers everything.
             let count = u64::try_from(row.get::<_, i64>(2)?).unwrap_or(0);
@@ -801,6 +836,8 @@ fn parse_destination_marker(value: &str) -> Option<DestinationMarker> {
             events: next()?,
             tool_calls: next()?,
             file_edits: next()?,
+            history: next()?,
+            markers: next()?,
             catalog: next()?,
         };
         if counts.next().is_some() {
@@ -827,6 +864,12 @@ struct DestinationMarker {
 fn repairable_event_sources() -> rusqlite::types::Value {
     rusqlite::types::Value::Text(
         serde_json::to_string(REPAIRABLE_EVENT_SOURCES).unwrap_or_else(|_| "[]".to_string()),
+    )
+}
+
+fn replayable_history_sources() -> rusqlite::types::Value {
+    rusqlite::types::Value::Text(
+        serde_json::to_string(REPLAYABLE_HISTORY_SOURCES).unwrap_or_else(|_| "[]".to_string()),
     )
 }
 
@@ -934,16 +977,24 @@ fn destination_shortfall(conn: &Connection, stored: &str) -> Result<SweepRepairs
     let current = session_holdings(conn)?;
     // Named from the *session* side rather than from the evidence, because a
     // session whose catalog row and events are both gone has no row left to be
-    // found by. The union of the two tables the sweep reaches it through is
-    // what keeps it nameable.
+    // found by. The union of the tables the sweep reaches it through is what
+    // keeps it nameable. `history` and `session_markers` are included for the
+    // replayable store-backed sources, so a session holding only those rows
+    // (e.g. an OpenCode prompt-only session) is still named as a repair target.
     let mut statement = conn.prepare(
         "SELECT source, session_id FROM sessions \
          WHERE source IN (SELECT value FROM json_each(?1)) \
          UNION \
          SELECT source, session_id FROM session_events \
-         WHERE source IN (SELECT value FROM json_each(?1))",
+         WHERE source IN (SELECT value FROM json_each(?1)) \
+         UNION \
+         SELECT source, session_id FROM history \
+         WHERE session_id IS NOT NULL AND source IN (SELECT value FROM json_each(?2)) \
+         UNION \
+         SELECT source, session_id FROM session_markers \
+         WHERE source IN (SELECT value FROM json_each(?2))",
     )?;
-    let mut rows = statement.query([repairable_event_sources()])?;
+    let mut rows = statement.query([repairable_event_sources(), replayable_history_sources()])?;
     while let Some(row) = rows.next()? {
         let source: String = row.get(0)?;
         let session_id: String = row.get(1)?;
@@ -966,6 +1017,8 @@ fn destination_shortfall(conn: &Connection, stored: &str) -> Result<SweepRepairs
         let covered = current.events >= before.events
             && current.tool_calls >= before.tool_calls
             && current.file_edits >= before.file_edits
+            && current.history >= before.history
+            && current.markers >= before.markers
             && (current.catalog >= before.catalog || expected_subagent_deregistration);
         if !covered {
             repairs.sessions.insert((source, session_id));
@@ -1083,6 +1136,7 @@ fn sync_watch_roots_with_provider_roots(
             claude: &provider_roots.claude,
             codex: &provider_roots.codex,
             grok: &provider_roots.grok,
+            devin: &provider_roots.devin,
             opencode_db: &provider_roots.opencode_db,
         },
     );
@@ -1431,6 +1485,18 @@ fn sync_basic(
             }
         }
         total_inserted += open_inserted;
+    }
+    capture_progress("devin", 0, None);
+    check_capture_cancelled()?;
+    if let Some(inserted) = report.capture(
+        "devin",
+        devin::sync_devin_db(conn, &mut state, &roots.devin, &repairs, &mut coverage),
+    ) {
+        total_inserted += inserted;
+        checkpoint_sync_state(&state_path, &state);
+        if inserted > 0 {
+            sync_note!("  [devin] +{inserted} rows");
+        }
     }
     check_capture_cancelled()?;
 

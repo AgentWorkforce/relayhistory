@@ -860,6 +860,8 @@ fn local_acquisition_after_remote_protects_changed_and_identical_canonical_recor
                 discovery_state: "full".into(),
                 access_state: "available".into(),
                 updated_ms: 1,
+                first_prompt: None,
+                last_assistant_text: None,
             },
         )?;
         apply(
@@ -1138,6 +1140,8 @@ fn ownership_revocation_does_not_mutate_sibling_acquisition_state() -> Result<()
             discovery_state: "full".into(),
             access_state: "available".into(),
             updated_ms: 1,
+            first_prompt: None,
+            last_assistant_text: None,
         },
     )?;
     // Stand in for bounded delivery capture: acquiring a must not recapture b.
