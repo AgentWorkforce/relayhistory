@@ -113,24 +113,40 @@ fn kinds_mismatch(name: &str, stored: &str, offered: &str) -> Error {
     )
 }
 
-/// A position in the feed: the revision of the last change accounted for.
+/// A position in the feed: the revision of the last change accounted for,
+/// in the store that issued it.
 ///
-/// Revisions are unique per row write, so a watermark is a complete position
-/// and `revision > watermark` is the whole resume predicate.
+/// Revisions are unique per row write, so within one store a watermark is a
+/// complete position and `revision > watermark` is the whole resume
+/// predicate. Across stores it is not: every database counts from zero, so a
+/// replacement database reuses the revisions of the one it replaced. `epoch`
+/// names the database -- a random identity drawn when its feed schema was
+/// created -- and [`SessionStore::changes_since`] refuses a watermark issued
+/// by another one, however far that store has since counted. A consumer
+/// persists both fields, as the store returned them.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
 )]
 pub struct Watermark {
     pub revision: u64,
+    /// The issuing store's identity; zero only in [`Watermark::START`] and
+    /// [`Watermark::CONSUMER`], which name no store.
+    pub epoch: u64,
 }
 
 impl Watermark {
-    /// Before the first stamped row: a full replay.
-    pub const START: Watermark = Watermark { revision: 0 };
+    /// Before the first stamped row: a full replay, valid in any store.
+    pub const START: Watermark = Watermark {
+        revision: 0,
+        epoch: 0,
+    };
 
     /// With [`ChangeQuery::consumer`] set: resume from that consumer's last
     /// committed position, or from [`Watermark::START`] when it has none.
-    pub const CONSUMER: Watermark = Watermark { revision: u64::MAX };
+    pub const CONSUMER: Watermark = Watermark {
+        revision: u64::MAX,
+        epoch: 0,
+    };
 }
 
 /// Which table a change is about.
@@ -469,7 +485,10 @@ impl Changes {
                 // Cannot happen within one snapshot; defended anyway: the
                 // window is known empty, so step past it and let the key
                 // pass decide what remains rather than declaring the head.
-                self.position = Watermark { revision: cut };
+                self.position = Watermark {
+                    revision: cut,
+                    epoch: self.head.epoch,
+                };
                 continue;
             }
             self.buffer.extend(rows);
@@ -488,6 +507,7 @@ impl Iterator for Changes {
             if let Some(change) = self.buffer.pop_front() {
                 self.position = Watermark {
                     revision: change.revision,
+                    epoch: self.head.epoch,
                 };
                 return Some(Ok(change));
             }
@@ -518,11 +538,13 @@ impl std::fmt::Debug for Changes {
 }
 
 impl SessionStore {
-    /// The store's change-feed head: the revision of the newest stamped row.
+    /// The store's change-feed head: the revision of the newest stamped row,
+    /// with this database's epoch.
     ///
-    /// A consumer holding a watermark above this is ahead of the store, which
-    /// means the database was reset or replaced under it; the only recovery
-    /// is a full resync from [`Watermark::START`].
+    /// A consumer holding a watermark above this, or one carrying another
+    /// epoch, holds a position this store never issued: the database was
+    /// reset or replaced under it, and the only recovery is a full resync
+    /// from [`Watermark::START`].
     pub fn head_revision(&self) -> Result<Watermark, Error> {
         head_revision_at(self.db_path())
     }
@@ -537,8 +559,12 @@ impl SessionStore {
     /// than one page. See [`Changes`] for what it yields and
     /// [`Changes::commit`] for how a named cursor advances.
     ///
-    /// Fails with [`ErrorKind::WatermarkAheadOfStore`] when the resolved start
-    /// exceeds the head. Like the marker page, the schema gate is here rather
+    /// Fails with [`ErrorKind::WatermarkAheadOfStore`] when `from` was issued
+    /// by another database -- its epoch is not this store's, which is what
+    /// catches a replacement database that has since counted past it -- or
+    /// when the resolved start exceeds the head. [`Watermark::START`] and
+    /// [`Watermark::CONSUMER`] name no store and pass the first check. Like
+    /// the marker page, the schema gate is here rather
     /// than at `open`: a read-only store over a database written before the
     /// feed existed is told to migrate rather than served `no such column`.
     pub fn changes_since(&self, from: Watermark, query: ChangeQuery) -> Result<Changes, Error> {
@@ -566,7 +592,18 @@ impl SessionStore {
         }
         let (start, head, stale_cursor) =
             resolve_start_and_head(&conn, from, query.consumer.as_deref(), &kind_set)?;
-        if start > head {
+        if from != Watermark::START && from != Watermark::CONSUMER && from.epoch != head.epoch {
+            return Err(Error::new(
+                ErrorKind::WatermarkAheadOfStore,
+                format!(
+                    "changes_since: watermark {} was not issued by this store (epoch {}, this \
+                     store's is {}); the database was reset or replaced, resync from \
+                     Watermark::START",
+                    from.revision, from.epoch, head.epoch
+                ),
+            ));
+        }
+        if start.revision > head.revision {
             return Err(Error::new(
                 ErrorKind::WatermarkAheadOfStore,
                 format!(
@@ -633,26 +670,33 @@ fn resolve_start_and_head(
     };
     let start =
         match (from == Watermark::CONSUMER, consumer, &cursor) {
-            (true, Some(name), Some((position, stored))) => {
+            (true, Some(name), Some((revision, stored))) => {
                 let offered = kinds.stored();
                 if *stored != offered {
                     return Err(kinds_mismatch(name, stored, &offered));
                 }
-                *position
+                *revision
             }
-            (true, Some(_), None) => Watermark::START,
+            (true, Some(_), None) => Watermark::START.revision,
             (true, None, _) => return Err(Error::new(
                 ErrorKind::Other,
                 "changes_since: Watermark::CONSUMER needs ChangeQuery::consumer to name the cursor",
             )),
-            (false, _, _) => from,
+            (false, _, _) => from.revision,
         };
     let head = read_head(&snapshot)?;
     snapshot.commit().map_err(anyhow::Error::from)?;
+    // A named cursor lives in the database it counts, so it is always in
+    // this store's epoch.
+    let in_store = |revision| Watermark {
+        revision,
+        epoch: head.epoch,
+    };
     let stale_cursor = cursor
-        .map(|(position, _)| position)
-        .filter(|position| *position > head);
-    Ok((start, head, stale_cursor))
+        .map(|(revision, _)| revision)
+        .filter(|revision| *revision > head.revision)
+        .map(in_store);
+    Ok((in_store(start), head, stale_cursor))
 }
 
 /// The revision-only page query for one kind: a covering read of the
@@ -725,20 +769,23 @@ fn page_cut(
 }
 
 fn read_head(conn: &Connection) -> Result<Watermark> {
-    let revision: Option<i64> = conn
+    let (revision, epoch): (Option<i64>, Option<i64>) = conn
         .query_row(
-            "SELECT version FROM observation_clock WHERE singleton = 1",
+            "SELECT (SELECT version FROM observation_clock WHERE singleton = 1), \
+                    (SELECT epoch FROM change_feed_store WHERE singleton = 1)",
             [],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .optional()
         .context("reading the change-feed head")?;
+    let epoch = epoch.context("the change-feed store has no epoch")?;
     Ok(Watermark {
         revision: revision.unwrap_or(0).max(0) as u64,
+        epoch: epoch as u64,
     })
 }
 
-fn read_cursor(conn: &Connection, name: &str) -> Result<Option<(Watermark, String)>> {
+/// A named cursor's revision and the kind set it is bound to.
+fn read_cursor(conn: &Connection, name: &str) -> Result<Option<(u64, String)>> {
     let row: Option<(i64, String)> = conn
         .query_row(
             &format!("SELECT revision, {KINDS_COLUMN} FROM consumer_cursors WHERE name = ?"),
@@ -746,14 +793,7 @@ fn read_cursor(conn: &Connection, name: &str) -> Result<Option<(Watermark, Strin
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    Ok(row.map(|(revision, kinds)| {
-        (
-            Watermark {
-                revision: revision.max(0) as u64,
-            },
-            kinds,
-        )
-    }))
+    Ok(row.map(|(revision, kinds)| (revision.max(0) as u64, kinds)))
 }
 
 /// Monotonic: the stored cursor is the greater of what it holds and what is
@@ -806,6 +846,7 @@ fn commit_cursor(
     match revision {
         Some(revision) => Ok(Watermark {
             revision: revision.max(0) as u64,
+            epoch: position.epoch,
         }),
         // The conflict clause declined: the row exists under another kind set.
         None => {
@@ -1006,10 +1047,19 @@ pub(crate) fn schema_is_current(conn: &Connection) -> Result<bool> {
         "consumer_cursors",
         "idx_evidence_tombstones_kind_revision",
         "observation_clock",
+        "change_feed_store",
     ] {
         if !object.exists([name])? {
             return Ok(false);
         }
+    }
+    let identified: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM change_feed_store WHERE singleton = 1)",
+        [],
+        |row| row.get(0),
+    )?;
+    if !identified {
+        return Ok(false);
     }
     for kind in ChangeKind::ALL {
         let table = kind.table();
@@ -1072,7 +1122,20 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
              revision INTEGER NOT NULL,
              updated_ms INTEGER NOT NULL,
              kinds TEXT NOT NULL DEFAULT '*'
+         );
+         CREATE TABLE IF NOT EXISTS change_feed_store (
+             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+             epoch INTEGER NOT NULL
          );",
+    )?;
+    // The database's identity in every watermark it issues; see
+    // `Watermark::epoch`. Drawn once, when the feed schema is first created,
+    // and never changed: a nonzero random value, so a fresh database -- which
+    // counts its revisions from zero again -- cannot pass for the one it
+    // replaced.
+    conn.execute(
+        "INSERT OR IGNORE INTO change_feed_store (singleton, epoch) VALUES (1, random() | 1)",
+        [],
     )?;
     // A cursor is a position in one kind set's stream; see `KindSet`. A
     // database that created the table before the column existed gains it
@@ -1254,7 +1317,7 @@ mod tests {
     fn every_write_takes_a_new_revision_and_replays_in_order() {
         let dir = tempfile::tempdir().unwrap();
         let (store, conn) = store(dir.path());
-        assert_eq!(store.head_revision().unwrap(), Watermark::START);
+        assert_eq!(store.head_revision().unwrap().revision, 0);
         assert!(all(&store).is_empty());
 
         conn.execute(
@@ -1338,7 +1401,13 @@ mod tests {
         insert_event(&conn, "s1", "e1", "one again");
         let after = drain(
             store
-                .changes_since(Watermark { revision: 7 }, ChangeQuery::default())
+                .changes_since(
+                    Watermark {
+                        revision: 7,
+                        ..store.head_revision().unwrap()
+                    },
+                    ChangeQuery::default(),
+                )
                 .unwrap(),
         );
         assert_eq!(after.len(), 1);
@@ -1452,7 +1521,7 @@ mod tests {
         let again = store
             .changes_since(Watermark::CONSUMER, query("a"))
             .unwrap();
-        assert_eq!(again.position(), Watermark::START);
+        assert_eq!(again.position().revision, 0);
         assert_eq!(drain(again).len(), 5);
 
         // Consumer a commits partway; consumer b is untouched by it.
@@ -1476,7 +1545,7 @@ mod tests {
         let b = store
             .changes_since(Watermark::CONSUMER, query("b"))
             .unwrap();
-        assert_eq!(b.position(), Watermark::START);
+        assert_eq!(b.position().revision, 0);
         let b_all = drain(b);
         assert_eq!(b_all.len(), 5);
 
@@ -1635,13 +1704,95 @@ mod tests {
         }
     }
 
+    /// Every database counts its revisions from zero, so a replacement that
+    /// has since counted past a consumer's persisted watermark would pass the
+    /// ahead-of-head check, resume after it, and skip everything the
+    /// replacement wrote below it. The epoch is what refuses it.
+    #[test]
+    fn a_watermark_from_a_replaced_store_is_refused_even_below_its_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let (replaced, conn) = store(dir.path());
+        for index in 0..3 {
+            insert_event(&conn, "s1", &format!("old{index}"), "x");
+        }
+        let mut drained = replaced
+            .changes_since(Watermark::START, ChangeQuery::default())
+            .unwrap();
+        while drained.next().is_some() {}
+        // Persisted the way a consumer keeps it, outside the store.
+        let persisted: Watermark =
+            serde_json::from_str(&serde_json::to_string(&drained.position()).unwrap()).unwrap();
+        assert_eq!(persisted.revision, 3);
+        drop(drained);
+        drop(conn);
+        drop(replaced);
+
+        // The database is deleted and rebuilt at the same path, and the
+        // rebuild writes more than the old one had.
+        for suffix in ["", "-wal", "-shm"] {
+            let path = dir.path().join(format!("ai-history.db{suffix}"));
+            if path.exists() {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        let (replacement, conn) = store(dir.path());
+        for index in 0..5 {
+            insert_event(&conn, "s1", &format!("new{index}"), "x");
+        }
+        let head = replacement.head_revision().unwrap();
+        assert_eq!(head.revision, 5);
+        assert_ne!(head.epoch, persisted.epoch);
+
+        let error = replacement
+            .changes_since(persisted, ChangeQuery::default())
+            .expect_err("a watermark from the replaced database cannot be resumed from");
+        assert_eq!(error.kind(), ErrorKind::WatermarkAheadOfStore);
+        assert!(error.to_string().contains("Watermark::START"), "{error}");
+        // So is one that names no store at all.
+        let unbound = Watermark {
+            revision: 3,
+            epoch: 0,
+        };
+        assert_eq!(
+            replacement
+                .changes_since(unbound, ChangeQuery::default())
+                .expect_err("a bare revision names no store")
+                .kind(),
+            ErrorKind::WatermarkAheadOfStore
+        );
+        // The recovery reads the replacement whole, and its own watermark
+        // resumes.
+        assert_eq!(all(&replacement).len(), 5);
+        let mid = Watermark {
+            revision: 3,
+            ..head
+        };
+        let rest = drain(
+            replacement
+                .changes_since(mid, ChangeQuery::default())
+                .unwrap(),
+        );
+        assert_eq!(
+            rest.iter()
+                .map(|change| change.record_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["new3", "new4"]
+        );
+    }
+
     #[test]
     fn a_watermark_ahead_of_the_store_is_a_named_error() {
         let dir = tempfile::tempdir().unwrap();
         let (store, conn) = store(dir.path());
         insert_event(&conn, "s1", "e1", "x");
         let error = store
-            .changes_since(Watermark { revision: 99 }, ChangeQuery::default())
+            .changes_since(
+                Watermark {
+                    revision: 99,
+                    ..store.head_revision().unwrap()
+                },
+                ChangeQuery::default(),
+            )
             .expect_err("a watermark past the head cannot be resumed from");
         assert_eq!(error.kind(), ErrorKind::WatermarkAheadOfStore);
         assert!(error.to_string().contains("Watermark::START"), "{error}");
@@ -1667,7 +1818,13 @@ mod tests {
         // Exactly at the head is fine: nothing new, no error.
         assert!(drain(
             store
-                .changes_since(Watermark { revision: 1 }, ChangeQuery::default())
+                .changes_since(
+                    Watermark {
+                        revision: 1,
+                        ..store.head_revision().unwrap()
+                    },
+                    ChangeQuery::default(),
+                )
                 .unwrap()
         )
         .is_empty());
@@ -1794,7 +1951,13 @@ mod tests {
         assert!(rest.iter().all(|change| change.record_key != "e6"));
         let newer = drain(
             store
-                .changes_since(Watermark { revision: 8 }, ChangeQuery::default())
+                .changes_since(
+                    Watermark {
+                        revision: 8,
+                        ..store.head_revision().unwrap()
+                    },
+                    ChangeQuery::default(),
+                )
                 .unwrap(),
         );
         assert_eq!(newer.len(), 1);
@@ -2026,7 +2189,10 @@ mod tests {
         commit_cursor(
             &writer,
             "burn",
-            Watermark { revision: 10 },
+            Watermark {
+                revision: 10,
+                ..Watermark::START
+            },
             &KindSet::normalize(None),
             None,
         )
@@ -2047,7 +2213,10 @@ mod tests {
                     commit_cursor(
                         &other,
                         "burn",
-                        Watermark { revision: 11 },
+                        Watermark {
+                            revision: 11,
+                            ..Watermark::START
+                        },
                         &KindSet::normalize(None),
                         None,
                     )

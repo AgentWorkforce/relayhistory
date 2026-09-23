@@ -19,15 +19,16 @@ use std::path::{Path, PathBuf};
 ///
 /// Most failures are `Other` and carry their explanation in the message. The
 /// named kinds exist where a consumer has a distinct recovery: a change-feed
-/// consumer whose stored watermark is ahead of the store cannot resume, it
+/// consumer whose stored watermark this store never issued cannot resume, it
 /// has to resync from [`crate::Watermark::START`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ErrorKind {
     Other,
-    /// A change-feed watermark names a revision this store has not reached:
-    /// the database was reset or replaced under a consumer that kept its
-    /// cursor elsewhere. See [`SessionStore::changes_since`].
+    /// A change-feed watermark names a position this store never issued: a
+    /// revision it has not reached, or an epoch that is not its own. The
+    /// database was reset or replaced under a consumer that kept its cursor
+    /// elsewhere. See [`SessionStore::changes_since`].
     WatermarkAheadOfStore,
     /// A named change-feed cursor was asked to serve, or be moved by, a drain
     /// over a different kind set than it was committed for. A cursor is a
@@ -134,8 +135,9 @@ pub enum SessionRef {
 pub struct SyncReport {
     pub changed: Vec<SessionRef>,
     /// The store's change-feed head after this sync: the revision of the
-    /// newest stamped row. A consumer compares its stored watermark against
-    /// it before resuming; see [`SessionStore::changes_since`].
+    /// newest stamped row. [`SessionStore::head_revision`] reports it with
+    /// the store's epoch, and [`SessionStore::changes_since`] is what judges
+    /// whether a stored watermark can resume.
     pub head_revision: u64,
 }
 

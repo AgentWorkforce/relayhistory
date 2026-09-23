@@ -411,12 +411,18 @@ Three rules a consumer must hold:
   `commit()` under a different kind set fails with
   `ErrorKind::ConsumerKindsMismatch` rather than silently skipping the other
   kinds. Use another consumer name for another filter.
-- **A watermark ahead of the head is a reset.** `SessionStore::head_revision`
-  and `SyncReport::head_revision` report the head; a stored watermark beyond it
-  fails with `ErrorKind::WatermarkAheadOfStore`, and the recovery is a full
-  resync from `Watermark::START`. A named cursor past the head names no
-  revision of this store, so the resync's commit replaces it: the one commit
-  that moves a cursor back.
+- **A watermark this store never issued is a reset.** Every database counts
+  revisions from zero, so a revision alone cannot tell a replacement database
+  from the one it replaced. A `Watermark` also carries the issuing database's
+  `epoch`, a random identity drawn once when its feed schema is created
+  (`change_feed_store`). `SessionStore::head_revision` reports the head with
+  it; a stored watermark with another epoch, or beyond the head, fails with
+  `ErrorKind::WatermarkAheadOfStore`, and the recovery is a full resync from
+  `Watermark::START`, which names no store. A copy of a database keeps its
+  epoch, so a restore from backup is caught by the revision check alone,
+  while the restored store is still behind the watermark. A named cursor
+  past the head names no revision of this store, so the resync's commit
+  replaces it: the one commit that moves a cursor back.
 
 An in-progress message is never in the feed. Incremental hydration holds a
 Claude message whose `stop_reason` is still `null` and writes nothing for it;
