@@ -760,6 +760,7 @@ pub fn ai_hist::WatchStop::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fm
 pub ai_hist::WatchedPath::path: std::path::PathBuf
 pub ai_hist::WatchedPath::scope: ai_hist::WatchScope
 pub struct ai_hist::Watermark
+pub ai_hist::Watermark::epoch: u64
 pub ai_hist::Watermark::revision: u64
 impl ai_hist::Watermark
 pub const ai_hist::Watermark::CONSUMER: ai_hist::Watermark

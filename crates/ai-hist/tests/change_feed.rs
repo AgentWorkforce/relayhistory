@@ -487,7 +487,7 @@ fn replaying_the_feed_reconstructs_the_tables_after_every_sync() {
             ChangeQuery::default().consumer("other"),
         )
         .unwrap();
-    assert_eq!(fresh.position(), Watermark::START);
+    assert_eq!(fresh.position().revision, 0);
     assert_eq!(
         replay(&fresh.map(|c| c.unwrap()).collect::<Vec<_>>()).len(),
         direct(&home.raw()).len()

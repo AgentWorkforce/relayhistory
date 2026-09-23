@@ -171,8 +171,8 @@ hydration writes the catalog outside it, so one that lands inside the window is
 included even when the sweep itself opened nothing. `watch` reports a
 hydration between ticks once, on the next tick; per-row attribution to one
 writer is what the change feed's `revision` stamp is for. `head_revision` is
-the feed head after the sweep, which a consumer compares against its stored
-watermark before resuming. Every catalog
+the feed head's revision after the sweep; `changes_since` is what judges a
+stored watermark, epoch and revision, when the consumer resumes. Every catalog
 column takes part except the two bounded text excerpts (`first_prompt`,
 `last_assistant_text`): a new session, new activity, a moved source stamp or
 discovery state, a re-resolved or inherited `project_key`, a metadata field the
@@ -329,13 +329,16 @@ inside the store. The cursor moves only on `Changes::commit()` and only
 forward, so a drain that fails mid-page re-reads rather than skips, and a stale
 commit cannot rewind it. A named cursor is bound to the kind set it was first
 committed for: draining or committing it under another filter is
-`Error::ConsumerKindsMismatch`. A watermark past the head is
+`Error::ConsumerKindsMismatch`. A `Watermark` carries the `epoch` of the
+database that issued it; one from another database, or one past the head, is
 `Error::WatermarkAheadOfStore` — the database was reset or replaced, and the
-only recovery is a resync from `Watermark::START`; a named cursor past the head
+only recovery is a resync from `Watermark::START`, which names no store; a named cursor past the head
 names no revision of this store, so that resync's commit replaces it.
 `head_revision()` reports
 the head on its own, and `SyncReport::head_revision` reports it after a sweep.
-A read-only handle drains the feed but cannot commit a cursor.
+A read-only handle drains the feed but cannot commit a cursor, and a commit
+writes only into the database the drain read: one whose path now holds another
+database is `Error::WatermarkAheadOfStore`.
 
 ### `Source::capabilities()`
 
@@ -377,7 +380,7 @@ codes where both sides have the failure; `Display` renders `CODE: message`.
 | `Discovery`                | `DISCOVERY_FAILED`           | shallow discovery failed during a sweep                                |
 | `SyncFailed`               | `SYNC_FAILED`                | a sweep failed with no narrower code                                   |
 | `SyncLocked`               | `SYNC_LOCKED`                | another process holds the `SyncRunLock` past the caller's timeout      |
-| `WatermarkAheadOfStore`    | `WATERMARK_AHEAD_OF_STORE`   | a `changes_since` watermark names a revision the store has not reached  |
+| `WatermarkAheadOfStore`    | `WATERMARK_AHEAD_OF_STORE`   | a `changes_since` watermark this store did not issue (epoch or revision) |
 | `ConsumerKindsMismatch`    | `CONSUMER_KINDS_MISMATCH`    | a named cursor was drained under a different kind set than it holds     |
 
 The four Node-only classes (`UNSUPPORTED_PLATFORM`, `NATIVE_PACKAGE_MISSING`,
