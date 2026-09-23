@@ -60,9 +60,11 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use crate::project_identity::ProjectKeyMethod;
+#[cfg(any(test, feature = "unstable-internal"))]
+use crate::SOURCE_CHOICES;
 use crate::{
     open_db_readonly, upsert_session_presence, EvidenceKind, SessionLocation, SessionScope,
-    FULL_SESSION_KINDS, SOURCE_CHOICES,
+    FULL_SESSION_KINDS,
 };
 use crate::ingest::opencode::OpencodeLayout;
 use anyhow::{Context, Result};
@@ -313,6 +315,7 @@ pub struct DiscoveryEnv<'a> {
 
 impl<'a> DiscoveryEnv<'a> {
     /// Build an environment from the process environment.
+    #[cfg(any(test, feature = "unstable-internal"))]
     pub fn new(conn: &'a Connection) -> Self {
         let roots = crate::ProviderRoots::from_env(crate::home_dir());
         Self::with_provider_roots(conn, roots)
@@ -337,11 +340,13 @@ impl<'a> DiscoveryEnv<'a> {
     /// Build an environment with explicit roots, for hosts that keep provider
     /// data somewhere other than `$HOME` (and for tests, which must not mutate
     /// process-wide environment variables).
+    #[cfg(feature = "unstable-internal")]
     pub fn with_roots(conn: &'a Connection, home: PathBuf, opencode_db: PathBuf) -> Self {
         Self::with_provider_roots(conn, crate::ProviderRoots::from_home(home, opencode_db))
     }
 
     /// Build an environment with every provider root supplied explicitly.
+    #[cfg(any(test, feature = "unstable-internal"))]
     pub fn with_all_roots(
         conn: &'a Connection,
         home: PathBuf,
@@ -372,6 +377,7 @@ impl<'a> DiscoveryEnv<'a> {
     /// Point the legacy JSON tree somewhere other than beside the database.
     /// Hosts that set `OPENCODE_STORAGE_DIR` independently of `OPENCODE_DB`
     /// need this; so do tests, which must not mutate process-wide variables.
+    #[cfg(any(test, feature = "unstable-internal"))]
     #[must_use]
     pub fn with_opencode_storage_dir(mut self, storage_dir: PathBuf) -> Self {
         self.opencode_storage_dir = storage_dir;
@@ -389,9 +395,13 @@ impl<'a> DiscoveryEnv<'a> {
     /// read receives, on whatever thread it runs.
     pub fn scan(&self) -> ScanEnv<'_> {
         ScanEnv {
+            #[cfg(feature = "unstable-internal")]
             home: &self.home,
+            #[cfg(feature = "unstable-internal")]
             claude_config_dir: &self.claude_config_dir,
+            #[cfg(feature = "unstable-internal")]
             codex_home: &self.codex_home,
+            #[cfg(feature = "unstable-internal")]
             grok_home: &self.grok_home,
             opencode_db: &self.opencode_db,
             opencode_storage_dir: &self.opencode_storage_dir,
@@ -427,12 +437,16 @@ impl<'a> DiscoveryEnv<'a> {
 #[derive(Clone, Copy)]
 pub struct ScanEnv<'a> {
     /// Home directory the file-backed providers are rooted at.
+    #[cfg(feature = "unstable-internal")]
     pub home: &'a Path,
     /// Claude Code configuration root.
+    #[cfg(feature = "unstable-internal")]
     pub claude_config_dir: &'a Path,
     /// Codex state root.
+    #[cfg(feature = "unstable-internal")]
     pub codex_home: &'a Path,
     /// Grok state root.
+    #[cfg(feature = "unstable-internal")]
     pub grok_home: &'a Path,
     /// Path to the opencode database.
     pub opencode_db: &'a Path,
@@ -596,6 +610,7 @@ impl WatchRoot {
     /// was built — so the parent is a real directory rather than the empty
     /// path a bare relative name would have yielded, and the backend reports
     /// events under it in the same spelling the root holds.
+    #[cfg(any(test, feature = "unstable-internal", feature = "fs-events"))]
     pub fn registered_path(&self) -> &Path {
         match self.depth {
             WatchDepth::File => self.path.parent().unwrap_or(self.path.as_path()),
@@ -618,6 +633,7 @@ impl WatchRoot {
     /// makes this work for a file that does not exist yet: the directory it
     /// will appear in does, so the canonical spelling is known before the
     /// first write. Called once per registration, never per event.
+    #[cfg(any(feature = "unstable-internal", feature = "fs-events"))]
     pub fn resolve(&mut self) {
         let Ok(directory) = std::fs::canonicalize(self.registered_path()) else {
             // Not there yet. The root stays pending and this is asked again
@@ -635,6 +651,7 @@ impl WatchRoot {
     }
 
     /// The registration path in its resolved spelling, when one is known.
+    #[cfg(any(feature = "unstable-internal", feature = "fs-events"))]
     pub fn canonical_registered_path(&self) -> Option<&Path> {
         let canonical = self.canonical.as_deref()?;
         Some(match self.depth {
@@ -655,17 +672,20 @@ impl WatchRoot {
     /// The resolved spelling once the filesystem has been asked, because that
     /// is what is registered; the lexical one until then, when there is
     /// nothing else to go on.
+    #[cfg(any(feature = "unstable-internal", feature = "fs-events"))]
     pub fn registration_key(&self) -> &Path {
         self.canonical_registered_path()
             .unwrap_or_else(|| self.registered_path())
     }
 
     /// Whether `path` is one of the spellings this root registers under.
+    #[cfg(any(feature = "unstable-internal", feature = "fs-events"))]
     pub fn registers_at(&self, path: &Path) -> bool {
         self.registered_path() == path || self.canonical_registered_path() == Some(path)
     }
 
     /// Whether an event on `path` is one this root asked for.
+    #[cfg(any(test, feature = "unstable-internal", feature = "fs-events"))]
     pub fn covers(&self, path: &Path) -> bool {
         // Either spelling. The lexical one is what inotify reports back, the
         // resolved one is what FSEvents reports, and a root is the same root
@@ -677,6 +697,7 @@ impl WatchRoot {
                 .is_some_and(|canonical| self.covers_as(canonical, path))
     }
 
+    #[cfg(any(test, feature = "unstable-internal", feature = "fs-events"))]
     fn covers_as(&self, root: &Path, path: &Path) -> bool {
         match self.depth {
             WatchDepth::Tree => path.starts_with(root),
@@ -738,6 +759,7 @@ pub fn watch_roots(
 /// guard that makes an accidental collision harder to hit, and the hash is the
 /// load-bearing part. Nothing here opens a file, so a tick over unchanged
 /// sources leaves [`DiscoveryCounters::files_opened`] at zero.
+#[cfg(feature = "unstable-internal")]
 pub fn source_fingerprint(
     env: &DiscoveryEnv<'_>,
     providers: &[&dyn ShallowSessionProvider],
@@ -780,6 +802,7 @@ pub fn source_fingerprint_with(
 }
 
 /// [`source_fingerprint`] over the built-in adapters.
+#[cfg(feature = "unstable-internal")]
 pub fn source_fingerprint_for(
     env: &DiscoveryEnv<'_>,
     providers: &[Box<dyn ShallowSessionProvider>],
@@ -868,11 +891,13 @@ pub trait ShallowSessionProvider: Sync {
     }
 
     /// Called only after the full explicit connector selection is validated.
+    #[cfg(feature = "unstable-internal")]
     fn check_available(&self, _home: &Path) -> Result<()> {
         Ok(())
     }
     /// Acquire exactly this observation's locator. Listing-only adapters keep
     /// the default capability response; adapters must not consult other locators.
+    #[cfg(feature = "unstable-internal")]
     fn acquire(
         &self,
         _home: &Path,
@@ -1307,6 +1332,7 @@ fn claude_timestamp(value: &Value) -> Option<i64> {
 }
 
 impl ShallowSessionProvider for ClaudeProvider {
+    #[cfg(feature = "unstable-internal")]
     fn acquire(
         &self,
         _home: &Path,
@@ -1510,6 +1536,7 @@ fn read_claude_shallow(
 struct CodexProvider;
 
 impl ShallowSessionProvider for CodexProvider {
+    #[cfg(feature = "unstable-internal")]
     fn acquire(
         &self,
         _home: &Path,
@@ -1673,6 +1700,7 @@ fn string_list(value: Option<&Value>) -> Vec<String> {
 struct CursorProvider;
 
 impl ShallowSessionProvider for CursorProvider {
+    #[cfg(feature = "unstable-internal")]
     fn acquire(
         &self,
         _home: &Path,
@@ -1860,6 +1888,7 @@ fn cursor_assistant_text(line: &[u8]) -> Option<String> {
 struct GrokProvider;
 
 impl ShallowSessionProvider for GrokProvider {
+    #[cfg(feature = "unstable-internal")]
     fn acquire(
         &self,
         _home: &Path,
@@ -2209,6 +2238,7 @@ impl ShallowSessionProvider for OpencodeProvider {
         Ok(Some(Box::new(pass)))
     }
 
+    #[cfg(feature = "unstable-internal")]
     fn acquire(
         &self,
         _home: &Path,
@@ -2995,6 +3025,7 @@ pub struct CatalogListOptions {
 #[derive(Debug, Clone, Default)]
 pub struct SessionCatalogPage {
     /// Scope applied to this cache-only page.
+    #[cfg(feature = "unstable-internal")]
     pub scope: SessionScope,
     /// The rows, newest first.
     pub sessions: Vec<ShallowSession>,
@@ -3120,6 +3151,7 @@ pub fn list_session_catalog_page(
             session_id: row.session_id.clone(),
         });
     Ok(SessionCatalogPage {
+        #[cfg(feature = "unstable-internal")]
         scope: options.scope,
         sessions,
         next_cursor,
@@ -3497,6 +3529,7 @@ static UPSERT_SESSION_SQL: LazyLock<String> = LazyLock::new(|| {
 /// The returned row is what the catalog now holds (including a preserved
 /// `full` state), read back through the write's own `RETURNING` clause so the
 /// merge costs no second lookup.
+#[cfg(feature = "unstable-internal")]
 pub fn upsert_shallow_session(
     conn: &Connection,
     session: &ShallowSession,
@@ -3633,6 +3666,7 @@ pub struct DiscoverOptions {
     /// Provider-presence scope. Defaults to local for compatibility.
     pub scope: SessionScope,
     /// Restrict to these sources. Empty means every adapter.
+    #[cfg(any(test, feature = "unstable-internal"))]
     pub sources: Vec<String>,
     /// Global cap on emitted rows, applied across providers by recency.
     /// `None` means no cap.
@@ -3739,19 +3773,7 @@ fn stored_stamp(raw: &str) -> String {
     format!("v{SHALLOW_SCANNER_VERSION}:{raw}")
 }
 
-/// Reject an acquisition scope for which no connector is configured.
-///
-/// Call this before opening the ledger so an unsupported remote-only request
-/// has no database side effects. `remote` requires at least one configured
-/// remote connector (see [`crate::remote`]); `all` runs whatever is available
-/// and is never rejected here.
-pub fn validate_discovery_scope(scope: SessionScope) -> Result<()> {
-    if scope == SessionScope::Remote {
-        crate::remote::ensure_remote_connectors_configured("discovery")?;
-    }
-    Ok(())
-}
-
+#[cfg(any(test, feature = "unstable-internal"))]
 fn select_providers(
     options: &DiscoverOptions,
     home: &Path,
@@ -3774,10 +3796,9 @@ fn select_providers(
             SOURCE_CHOICES.join(", ")
         );
     }
-    // Same loud refusal `validate_discovery_scope` gives before the ledger
-    // opens, re-checked here for callers that skip it — and source-aware: a
-    // filter that leaves a remote-only request with nothing configured is
-    // the same unsupported request, scoped down.
+    // A remote-only request with no connector configured is refused loudly,
+    // and source-aware: a filter that leaves a remote-only request with
+    // nothing configured is the same unsupported request, scoped down.
     if options.scope == SessionScope::Remote {
         crate::remote::ensure_selected_remote_connectors_configured_for_at(
             "discovery",
@@ -3816,6 +3837,7 @@ fn select_providers(
 /// else; the rest of the run continues. A malformed or unreadable individual
 /// session likewise yields a per-session diagnostic. The call only fails when
 /// *every* selected provider failed.
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn discover_sessions(
     conn: &Connection,
     options: &DiscoverOptions,
@@ -3826,6 +3848,7 @@ pub fn discover_sessions(
 }
 
 /// [`discover_sessions`] against an explicitly built [`DiscoveryEnv`].
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn discover_sessions_with_env(
     env: &DiscoveryEnv<'_>,
     options: &DiscoverOptions,
@@ -3840,6 +3863,7 @@ pub fn discover_sessions_with_env(
 }
 
 /// Discover using an explicit allowlist; an empty selection runs local adapters only.
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn discover_sessions_with_connectors(
     env: &DiscoveryEnv<'_>,
     options: &DiscoverOptions,
@@ -4421,6 +4445,7 @@ enum WindowEntry<'c> {
 }
 
 /// [`discover_sessions`] with the rows collected instead of streamed.
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn discover_sessions_collect(
     conn: &Connection,
     options: &DiscoverOptions,

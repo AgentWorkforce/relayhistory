@@ -322,11 +322,8 @@ pub(crate) fn fold_claude_record(
 /// session. So this reads the explicit fields when a producer writes them and
 /// records nothing when it does not — see
 /// `codex_resume_without_explicit_fields_records_no_continuity`.
-pub fn scan_codex_rollout(path: &Path) -> Result<Option<ContinuityEvidence>> {
-    Ok(scan_codex_rollout_counted(path)?.0)
-}
-
-/// The same scan, and the provider bytes it read.
+///
+/// Returns the evidence and the provider bytes it read.
 pub fn scan_codex_rollout_counted(path: &Path) -> Result<(Option<ContinuityEvidence>, u64)> {
     // As above: a read failure is an error, not an empty rollout.
     //
@@ -1634,7 +1631,7 @@ mod tests {
              \"continuedFromSessionId\":\"sess_previous\"}}\n",
         )
         .unwrap();
-        let evidence = scan_codex_rollout(&explicit).unwrap().unwrap();
+        let evidence = scan_codex_rollout_counted(&explicit).unwrap().0.unwrap();
         assert_eq!(evidence.session_id, "sess_meta_child");
         assert_eq!(
             evidence.explicit_continuation_targets,
@@ -1702,7 +1699,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let evidence = scan_codex_rollout(&resumed).unwrap().unwrap();
+        let evidence = scan_codex_rollout_counted(&resumed).unwrap().0.unwrap();
         assert_eq!(evidence.session_id, "sess-resumed");
         assert!(evidence.explicit_continuation_targets.is_empty());
         assert!(evidence.explicit_fork_targets.is_empty());
@@ -1976,7 +1973,7 @@ mod tests {
         let missing = dir.path().join("not-there.jsonl");
         assert!(scan_claude_transcript(&path).unwrap().is_some());
         assert!(scan_claude_transcript(&missing).is_err());
-        assert!(scan_codex_rollout(&missing).is_err());
+        assert!(scan_codex_rollout_counted(&missing).is_err());
 
         // And the error reaches the caller instead of retracting.
         assert!(capture_claude_transcript(&conn, &missing).is_err());

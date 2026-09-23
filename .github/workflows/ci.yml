@@ -36,6 +36,14 @@ jobs:
       - name: Rust lint
         run: cargo clippy --workspace --all-targets --all-features -- -A clippy::too_many_arguments -D warnings
 
+      # `--all-features` compiles every gated item and so cannot see code a
+      # narrower build carries but never calls. These lint the feature sets the
+      # published crate ships with.
+      - name: Rust lint without optional features
+        run: |
+          cargo clippy -p ai-hist --all-targets -- -A clippy::too_many_arguments -D warnings
+          cargo clippy -p ai-hist --all-targets --no-default-features -- -A clippy::too_many_arguments -D warnings
+
       - name: Rust tests
         run: cargo test --workspace --all-features
 

@@ -1,22 +1,29 @@
 //! Compatibility selectors for the local distribution. Source transports live
 //! in optional packages and are composed through [`crate::sources::SourceRegistry`]
 //! or the generic source intake API. This module never reads credentials.
+#[cfg(any(test, feature = "unstable-internal"))]
 use crate::ShallowSessionProvider;
 use crate::SOURCE_CHOICES;
 use anyhow::Result;
 use std::path::Path;
 
+#[cfg(any(test, feature = "unstable-internal"))]
 pub const CLAUDE_WEB_CONNECTOR: &str = "claude-web";
+#[cfg(any(test, feature = "unstable-internal"))]
 pub const CODEX_CLOUD_CONNECTOR: &str = "codex-cloud";
+#[cfg(any(test, feature = "unstable-internal"))]
 pub const CLOUD_CONNECTOR: &str = "cloud";
+#[cfg(any(test, feature = "unstable-internal"))]
 pub const RELAYCAST_CONNECTOR: &str = "relaycast";
 
 /// Legacy names remain accepted to provide a useful installed-plugin error.
 /// Omission selects no external adapters in the local distribution.
 #[derive(Debug, Clone, Default)]
 pub struct SourceConnectorSelection {
+    #[cfg(any(test, feature = "unstable-internal"))]
     ids: Vec<String>,
 }
+#[cfg(any(test, feature = "unstable-internal"))]
 impl SourceConnectorSelection {
     pub fn new(ids: Vec<String>) -> Result<Self> {
         let mut seen = std::collections::BTreeSet::new();
@@ -32,10 +39,8 @@ impl SourceConnectorSelection {
     pub fn contains(&self, id: &str) -> bool {
         self.ids.iter().any(|value| value == id)
     }
-    pub fn ids(&self) -> &[String] {
-        &self.ids
-    }
 }
+#[cfg(any(test, feature = "unstable-internal"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteConnectorStatus {
     pub connector: &'static str,
@@ -43,6 +48,7 @@ pub struct RemoteConnectorStatus {
     pub configured: bool,
     pub detail: String,
 }
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn selected_remote_connector_statuses_at(
     _home: &Path,
     selection: &SourceConnectorSelection,
@@ -67,21 +73,27 @@ pub fn selected_remote_connector_statuses_at(
     })
     .collect()
 }
+#[cfg(feature = "unstable-internal")]
 pub fn remote_connector_statuses_at(home: &Path) -> Vec<RemoteConnectorStatus> {
     selected_remote_connector_statuses_at(home, &SourceConnectorSelection::default(), &[])
 }
+#[cfg(feature = "unstable-internal")]
 pub fn remote_connector_statuses() -> Vec<RemoteConnectorStatus> {
     vec![]
 }
+#[cfg(feature = "unstable-internal")]
 pub fn ensure_remote_connectors_configured(operation: &str) -> Result<()> {
     ensure_remote_connectors_configured_at(operation, Path::new(""))
 }
+#[cfg(feature = "unstable-internal")]
 pub fn ensure_remote_connectors_configured_at(operation: &str, home: &Path) -> Result<()> {
     ensure_remote_connectors_configured_for_at(operation, home, &[])
 }
+#[cfg(feature = "unstable-internal")]
 pub fn ensure_remote_connectors_configured_for(operation: &str, sources: &[String]) -> Result<()> {
     ensure_remote_connectors_configured_for_at(operation, Path::new(""), sources)
 }
+#[cfg(feature = "unstable-internal")]
 pub fn ensure_remote_connectors_configured_for_at(
     operation: &str,
     home: &Path,
@@ -94,6 +106,7 @@ pub fn ensure_remote_connectors_configured_for_at(
         &SourceConnectorSelection::default(),
     )
 }
+#[cfg(feature = "unstable-internal")]
 pub fn ensure_selected_remote_connectors_configured_for(
     operation: &str,
     sources: &[String],
@@ -120,6 +133,7 @@ pub fn ensure_selected_remote_connectors_configured_for_at(
     }
     anyhow::bail!("no remote provider connectors are configured: remote session {operation} requires an installed source plugin and explicitly composed host")
 }
+#[cfg(any(test, feature = "unstable-internal"))]
 pub(crate) fn selected_remote_providers(
     _home: &Path,
     _limit: Option<usize>,

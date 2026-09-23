@@ -7,18 +7,26 @@
 //! child's events as its parent's.
 
 use anyhow::Result;
-use rusqlite::{params, Connection, Row};
+#[cfg(any(test, feature = "unstable-internal"))]
+use rusqlite::params;
+use rusqlite::{Connection, Row};
 use serde::{Deserialize, Serialize};
+#[cfg(any(test, feature = "unstable-internal"))]
 use std::collections::HashSet;
 
 /// Bump whenever relationship object shapes or semantics require an SDK change.
 pub const SESSION_RELATIONSHIP_CONTRACT_VERSION: u32 = 2;
 
+#[cfg(any(test, feature = "unstable-internal"))]
 pub const DEFAULT_TREE_MAX_DEPTH: u32 = 32;
 pub const MAX_TREE_MAX_DEPTH: u32 = 64;
+#[cfg(any(test, feature = "unstable-internal"))]
 pub const DEFAULT_TREE_MAX_NODES: u32 = 1_000;
+#[cfg(any(test, feature = "unstable-internal"))]
 pub const MAX_TREE_MAX_NODES: u32 = 10_000;
+#[cfg(feature = "unstable-internal")]
 pub const DEFAULT_CHILDREN_PAGE_LIMIT: i64 = 100;
+#[cfg(any(test, feature = "unstable-internal"))]
 pub const MAX_CHILDREN_PAGE_LIMIT: i64 = 1_000;
 
 /// A child observed with a provider-recorded identity of its own.
@@ -83,15 +91,6 @@ impl RelationshipKinds {
     /// Only the continuity kinds.
     pub fn continuity() -> Self {
         Self::only(CONTINUITY_RELATIONSHIPS.iter().copied())
-    }
-
-    /// Every recorded kind, delegation and continuity alike.
-    pub fn all() -> Self {
-        Self::only(
-            [RELATIONSHIP_DELEGATED, RELATIONSHIP_MATERIALIZED_LOCAL]
-                .into_iter()
-                .chain(CONTINUITY_RELATIONSHIPS.iter().copied()),
-        )
     }
 
     /// The `AND`-prefixed SQL fragment this selection contributes, with one
@@ -200,6 +199,7 @@ pub struct SessionRelationships {
     pub diagnostics: Vec<RelationshipDiagnostic>,
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionTreeNode {
     pub source: String,
@@ -216,6 +216,7 @@ pub struct SessionTreeNode {
     pub truncated: bool,
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 #[derive(Debug, Clone)]
 pub struct SessionTreeOptions {
     pub max_depth: u32,
@@ -225,6 +226,7 @@ pub struct SessionTreeOptions {
     pub relationship_kinds: RelationshipKinds,
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 impl Default for SessionTreeOptions {
     fn default() -> Self {
         Self {
@@ -235,6 +237,7 @@ impl Default for SessionTreeOptions {
     }
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionTree {
     pub contract_version: u32,
@@ -253,12 +256,14 @@ pub struct SessionTree {
     pub max_depth_reached: u32,
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RelationshipCursor {
     pub spawned_at_ms: Option<i64>,
     pub relationship_uid: String,
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionChildrenPage {
     pub children: Vec<SessionRelationship>,
@@ -423,6 +428,7 @@ pub fn session_children(
 }
 
 /// One bounded page of a parent's children, continuing the same total order.
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn session_children_page(
     conn: &Connection,
     source: &str,
@@ -511,6 +517,7 @@ pub fn session_parents(
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 fn has_events(conn: &Connection, source: &str, session_id: &str) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM session_events \
@@ -520,6 +527,7 @@ fn has_events(conn: &Connection, source: &str, session_id: &str) -> Result<bool>
     )?)
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 struct Pending {
     session_id: String,
     depth: u32,
@@ -533,6 +541,7 @@ struct Pending {
 /// Only an edge back into the current branch's own ancestry is a cycle. An
 /// edge into a node emitted on a different branch is a diamond in an acyclic
 /// graph, which must not be reported as one.
+#[cfg(any(test, feature = "unstable-internal"))]
 fn is_ancestor(
     nodes: &[SessionTreeNode],
     parents: &[Option<usize>],
@@ -556,6 +565,7 @@ fn is_ancestor(
 /// each emitted node costs exactly one indexed child query. A session appears
 /// exactly once, at the position pre-order first reaches it; later arrivals by
 /// another path are not expanded again.
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn session_tree(
     conn: &Connection,
     source: &str,

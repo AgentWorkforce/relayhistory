@@ -5,7 +5,9 @@
 //! recover overwritten provenance and are marked `legacy-unknown`; old hydration
 //! checkpoints are deliberately not assigned to a guessed connector.
 use crate::SessionLocation;
-use anyhow::{ensure, Context, Result};
+#[cfg(any(test, feature = "unstable-internal"))]
+use anyhow::Context;
+use anyhow::{ensure, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
@@ -266,6 +268,7 @@ fn upsert_inner(conn: &Connection, observation: &SessionObservation) -> Result<(
 }
 
 /// Withdrawal is an access change, not deletion of cached evidence or provenance.
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn set_access(conn: &Connection, key: &ObservationKey, state: &str) -> Result<()> {
     if let Some(mut observation) = get(conn, key)? {
         observation.access_state = state.into();
@@ -323,6 +326,7 @@ fn write_checkpoint_inner(
 /// transcripts do not become one oversized export record. An individual event
 /// can still exceed a destination's explicit record limit, just like its
 /// canonical session_event row; that failure never advances delivery progress.
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn save_evidence(
     conn: &Connection,
     key: &ObservationKey,
@@ -340,6 +344,7 @@ pub fn save_evidence(
     Ok(())
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 fn save_evidence_inner(
     conn: &Connection,
     key: &ObservationKey,
@@ -456,6 +461,7 @@ fn save_evidence_inner(
 }
 
 /// Reconstruct one connector's snapshot for canonical evidence reconciliation.
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn evidence(conn: &Connection, key: &ObservationKey) -> Result<Option<serde_json::Value>> {
     use serde_json::{json, Value};
     key.validate()?;
@@ -497,6 +503,7 @@ pub fn evidence(conn: &Connection, key: &ObservationKey) -> Result<Option<serde_
 /// Opaque persisted revision for optimistic acquisition outside the engine.
 /// The database-wide monotonic clock prevents ABA after delete/recreate and
 /// distinguishes updates sharing the same millisecond timestamp.
+#[cfg(feature = "unstable-internal")]
 pub fn revision(conn: &Connection, key: &ObservationKey) -> Result<Option<String>> {
     key.validate()?;
     let version:Option<i64>=conn.query_row("SELECT version FROM observation_versions WHERE source=? AND session_id=? AND location=? AND connector_id=? AND connector_instance=?",params![key.source,key.session_id,key.location.as_str(),key.connector_id,key.connector_instance],|row|row.get(0)).optional()?;
@@ -515,6 +522,7 @@ fn bump_revision(conn: &Connection, key: &ObservationKey) -> Result<()> {
 /// Canonical rows with local or unknown ownership cannot be changed by a remote
 /// projection. This local reconciliation state is not connector evidence and
 /// must not advance observation revisions or enter delivery capture.
+#[cfg(feature = "unstable-internal")]
 pub fn protected_canonical_evidence(
     conn: &Connection,
     key: &ObservationKey,
@@ -527,6 +535,7 @@ pub fn protected_canonical_evidence(
 }
 
 /// Persist protection independently of the lifetime of any source observation.
+#[cfg(feature = "unstable-internal")]
 pub fn protect_canonical_evidence(
     conn: &Connection,
     key: &ObservationKey,

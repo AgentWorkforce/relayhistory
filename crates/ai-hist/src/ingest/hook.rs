@@ -61,18 +61,6 @@ pub enum TranscriptStatus {
     Mismatched,
 }
 
-impl TranscriptStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            TranscriptStatus::Ingested => "ingested",
-            TranscriptStatus::Unchanged => "unchanged",
-            TranscriptStatus::Missing => "missing",
-            TranscriptStatus::Unidentified => "unidentified",
-            TranscriptStatus::Mismatched => "mismatched",
-        }
-    }
-}
-
 /// The result of ingesting one named transcript.
 #[derive(Debug, Clone, Serialize)]
 pub struct TranscriptIngest {
@@ -97,6 +85,7 @@ impl TranscriptIngest {
 }
 
 /// Ingest one provider transcript named by path, against the default home.
+#[cfg(feature = "unstable-internal")]
 pub fn ingest_transcript_at(
     db_path: &Path,
     source: &str,
@@ -121,6 +110,7 @@ pub fn ingest_transcript_at(
 /// `include_related` also hydrates the transcript's bounded sidecars — Claude
 /// subagent transcripts living beside it in the same project directory. It does
 /// not walk the rest of the provider root.
+#[cfg(feature = "unstable-internal")]
 pub fn ingest_transcript_at_with_home(
     db_path: &Path,
     home: &Path,
@@ -432,10 +422,12 @@ impl ShallowSessionProvider for SingleCandidate<'_> {
         self.inner.connector_instance()
     }
 
+    #[cfg(feature = "unstable-internal")]
     fn check_available(&self, home: &Path) -> Result<()> {
         self.inner.check_available(home)
     }
 
+    #[cfg(feature = "unstable-internal")]
     fn acquire(
         &self,
         home: &Path,

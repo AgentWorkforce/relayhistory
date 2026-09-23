@@ -47,6 +47,7 @@ pub(crate) fn free_bytes(path: &Path) -> Option<u64> {
 pub struct DbHolder {
     pub pid: String,
     pub state: String,
+    #[cfg(feature = "unstable-internal")]
     pub command: String,
 }
 
@@ -83,11 +84,12 @@ pub(crate) fn db_holders(db_path: &Path) -> Vec<DbHolder> {
         // Our own read-only handle is not a finding.
         .filter(|pid| *pid != own_pid)
         .filter_map(|pid| {
-            let (state, command) = process_status(pid)?;
+            let status = process_status(pid)?;
             Some(DbHolder {
                 pid: pid.to_string(),
-                state,
-                command,
+                state: status.0,
+                #[cfg(feature = "unstable-internal")]
+                command: status.1,
             })
         })
         .collect()
@@ -242,6 +244,7 @@ pub(crate) const FREE_SPACE_FLOOR_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Everything `doctor` measured about one database, before it is rendered as
 /// text or JSON. Split out from the printing so the report can be asserted on.
+#[cfg(feature = "unstable-internal")]
 pub struct DoctorReport {
     pub db_bytes: u64,
     pub wal_bytes: u64,
@@ -251,6 +254,7 @@ pub struct DoctorReport {
     pub problems: Vec<String>,
 }
 
+#[cfg(feature = "unstable-internal")]
 pub fn doctor_report(db_path: &Path) -> DoctorReport {
     let db_bytes = fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
     let wal_bytes = fs::metadata(wal_path(db_path))

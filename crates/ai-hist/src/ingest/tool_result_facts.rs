@@ -210,6 +210,7 @@ pub struct ToolResultIndexer {
 
 impl ToolResultIndexer {
     /// Continue a sequence that a previous parse left at `last_event_index`.
+    #[cfg(any(test, feature = "unstable-internal"))]
     pub fn resume_from(last_event_index: i64) -> Self {
         Self {
             next_event_index: last_event_index.saturating_add(1),
@@ -233,6 +234,7 @@ impl ToolResultIndexer {
     }
 
     /// The highest index this parse assigned, or `None` when it assigned none.
+    #[cfg(any(test, feature = "unstable-internal"))]
     pub fn last_event_index(&self) -> Option<i64> {
         (self.next_event_index > 0).then(|| self.next_event_index - 1)
     }

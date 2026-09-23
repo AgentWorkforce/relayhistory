@@ -34,15 +34,20 @@
 //! runtime and this does not need one: a tick is a blocking sweep, and the
 //! watcher backend already runs on its own thread.
 
+#[cfg(feature = "fs-events")]
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+#[cfg(feature = "fs-events")]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::discover::{self, WatchDepth, WatchRoot};
+#[cfg(feature = "fs-events")]
+use crate::discover::{self, WatchDepth};
+use crate::discover::WatchRoot;
 
 /// How often a registration that was *lost* is retried.
 ///
@@ -53,6 +58,7 @@ use crate::discover::{self, WatchDepth, WatchRoot};
 /// there, cleanup taking it away again — a retry on the 30 s backstop misses
 /// the whole of it. One `stat` per lost root, four times a second, and only
 /// until it is attached again.
+#[cfg(feature = "fs-events")]
 const LOST_REGISTRATION_RECHECK_MS: u64 = 250;
 
 /// How soon a forced sweep that could not take the store's lock is tried
@@ -228,6 +234,7 @@ pub type RootsFn = Arc<dyn Fn() -> Vec<WatchRoot> + Send + Sync>;
 /// those would become a *forced* sweep — the expensive kind that bypasses the
 /// fingerprint. Filtering by the depth the root asked for makes the two
 /// backends agree, and on inotify it is simply a no-op the kernel already did.
+#[cfg(feature = "fs-events")]
 fn event_matches_roots(path: &Path, roots: &[WatchRoot]) -> bool {
     // The event's own spelling is never compared. Roots are absolute from the
     // moment they are built, and a backend reports whatever it was registered
@@ -245,6 +252,7 @@ fn event_matches_roots(path: &Path, roots: &[WatchRoot]) -> bool {
 /// removal, and what comes back is the root's own key rather than the path
 /// that was reported. That is what keeps the recording side and the lookup
 /// side from drifting apart: there is one key, and it comes from here.
+#[cfg(feature = "fs-events")]
 fn removed_registration_keys(path: &Path, roots: &[WatchRoot]) -> Vec<PathBuf> {
     let path = discover::watch_path(path);
     roots
@@ -645,6 +653,7 @@ impl WatchLoop {
         self
     }
 
+    #[cfg(feature = "unstable-internal")]
     pub fn on_driver(mut self, sink: DriverSink) -> Self {
         self.on_driver = Some(sink);
         self
@@ -674,6 +683,7 @@ impl WatchLoop {
 
     /// Post a change signal by hand. The filesystem watcher calls this; hosts
     /// with their own change feed (an editor, an MCP server) can too.
+    #[cfg(feature = "unstable-internal")]
     pub fn notify_change(&self) {
         self.inner.signal_change();
     }
@@ -903,9 +913,7 @@ impl WatchLoop {
                 retry_backoff = CONTENDED_SWEEP_RETRY_MS;
             }
         }
-        let driver = self.current_driver();
-        drop(watcher);
-        Ok(driver)
+        Ok(self.current_driver())
     }
 
     /// How often the registrations are re-checked.
@@ -1475,15 +1483,7 @@ mod fs_events {
             0
         }
 
-        pub(super) fn recovering(&self) -> bool {
-            false
-        }
-
         pub(super) fn adopt(&mut self, _roots: Vec<WatchRoot>) -> usize {
-            0
-        }
-
-        pub(super) fn retry_pending(&mut self) -> usize {
             0
         }
     }
@@ -1767,6 +1767,7 @@ mod tests {
     /// end to end because the backend it defends against is macOS FSEvents,
     /// which has no non-recursive mode — on Linux the kernel filters first, so
     /// an integration test there would pass with the filter removed.
+    #[cfg(feature = "fs-events")]
     #[test]
     fn a_non_recursive_root_covers_its_own_entries_only() {
         let roots = vec![WatchRoot::directory("/home/u/.claude")];
@@ -1790,6 +1791,7 @@ mod tests {
         assert!(!event_matches_roots(Path::new("/home/u/.codex"), &roots));
     }
 
+    #[cfg(feature = "fs-events")]
     #[test]
     fn a_recursive_root_covers_its_whole_subtree() {
         let roots = vec![WatchRoot::tree("/home/u/.claude/projects")];
@@ -1809,6 +1811,7 @@ mod tests {
 
     /// The two depths coexist: a path below a non-recursive root is still
     /// covered when some other root is recursive over it.
+    #[cfg(feature = "fs-events")]
     #[test]
     fn the_widest_matching_root_decides() {
         let roots = vec![
