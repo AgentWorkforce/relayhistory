@@ -144,9 +144,10 @@ pub enum Error {
         /// How long this call waited before giving up.
         waited_ms: u64,
     },
-    /// A change-feed watermark names a revision this store has not reached:
-    /// the database was reset or replaced under a consumer that kept its
-    /// cursor elsewhere. Raised by [`SessionStore::changes_since`]; the only
+    /// A change-feed watermark names a position this store never issued: a
+    /// revision it has not reached, or an epoch that is not its own. The
+    /// database was reset or replaced under a consumer that kept its cursor
+    /// elsewhere. Raised by [`SessionStore::changes_since`]; the only
     /// recovery is a resync from [`crate::Watermark::START`].
     WatermarkAheadOfStore(String),
     /// A named change-feed cursor was asked to serve, or be moved by, a drain
@@ -1176,8 +1177,9 @@ pub struct SyncReport {
     /// summarise is not listed.
     pub changed: Vec<SessionRef>,
     /// The store's change-feed head after this sweep: the revision of the
-    /// newest stamped row. A consumer compares its stored watermark against
-    /// it before resuming; see [`SessionStore::changes_since`].
+    /// newest stamped row. [`SessionStore::head_revision`] reports it with
+    /// the store's epoch, and [`SessionStore::changes_since`] is what judges
+    /// whether a stored watermark can resume.
     pub head_revision: u64,
 }
 

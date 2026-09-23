@@ -260,9 +260,10 @@ inside the store. The cursor moves only on `Changes::commit()` and only
 forward, so a drain that fails mid-page re-reads rather than skips, and a stale
 commit cannot rewind it. A named cursor is bound to the kind set it was first
 committed for: draining or committing it under another filter is
-`Error::ConsumerKindsMismatch`. A watermark past the head is
+`Error::ConsumerKindsMismatch`. A `Watermark` carries the `epoch` of the
+database that issued it; one from another database, or one past the head, is
 `Error::WatermarkAheadOfStore` — the database was reset or replaced, and the
-only recovery is a resync from `Watermark::START`; a named cursor past the head
+only recovery is a resync from `Watermark::START`, which names no store; a named cursor past the head
 names no revision of this store, so that resync's commit replaces it.
 `head_revision()` reports
 the head on its own, and `SyncReport::head_revision` reports it after a sweep.
@@ -308,7 +309,7 @@ codes where both sides have the failure; `Display` renders `CODE: message`.
 | `Discovery`                | `DISCOVERY_FAILED`           | shallow discovery failed during a sweep                                |
 | `SyncFailed`               | `SYNC_FAILED`                | a sweep failed with no narrower code                                   |
 | `SyncLocked`               | `SYNC_LOCKED`                | another process holds the `SyncRunLock` past the caller's timeout      |
-| `WatermarkAheadOfStore`    | `WATERMARK_AHEAD_OF_STORE`   | a `changes_since` watermark names a revision the store has not reached  |
+| `WatermarkAheadOfStore`    | `WATERMARK_AHEAD_OF_STORE`   | a `changes_since` watermark this store did not issue (epoch or revision) |
 | `ConsumerKindsMismatch`    | `CONSUMER_KINDS_MISMATCH`    | a named cursor was drained under a different kind set than it holds     |
 
 The four Node-only classes (`UNSUPPORTED_PLATFORM`, `NATIVE_PACKAGE_MISSING`,
