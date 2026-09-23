@@ -761,6 +761,41 @@ fn devin_orphaned_history_and_markers_repair_without_catalog_or_events() {
 }
 
 #[test]
+fn devin_null_history_session_id_does_not_break_repair_planning() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    stage_devin_db(home, BASE_SESSION_SQL);
+    let _env = EnvGuard::set(home);
+    let db = home.join("history.db");
+
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+    let conn = open_db(&db).unwrap();
+    // A replayable-source history row with no session identity must not make
+    // destination_shortfall fail when it scans the history table for repair
+    // candidates.
+    conn.execute(
+        "INSERT INTO history (source, prompt, timestamp_ms) VALUES ('devin', 'orphan', 0)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+    let conn = open_db(&db).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM history WHERE source='devin' AND session_id IS NULL",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        1,
+        "the unscoped history row should survive unchanged"
+    );
+}
+
+#[test]
 fn devin_shared_prompt_is_reassigned_not_dropped() {
     let _lock = ENV_LOCK.lock().unwrap();
     let dir = tempfile::tempdir().unwrap();

@@ -773,8 +773,15 @@ fn session_holdings(conn: &Connection) -> Result<BTreeMap<u64, SessionHoldings>>
         ),
     ];
     for (select, is_history, field) in counted {
+        // `history.session_id` is nullable; per-session holdings and markers
+        // should only promise rows that are actually tied to a session.
+        let extra = if is_history {
+            "session_id IS NOT NULL AND "
+        } else {
+            ""
+        };
         let sql = format!(
-            "{select} WHERE source IN (SELECT value FROM json_each(?)) \
+            "{select} WHERE {extra}source IN (SELECT value FROM json_each(?)) \
              GROUP BY source, session_id"
         );
         let bound = if is_history {
@@ -982,7 +989,7 @@ fn destination_shortfall(conn: &Connection, stored: &str) -> Result<SweepRepairs
          WHERE source IN (SELECT value FROM json_each(?1)) \
          UNION \
          SELECT source, session_id FROM history \
-         WHERE source IN (SELECT value FROM json_each(?2)) \
+         WHERE session_id IS NOT NULL AND source IN (SELECT value FROM json_each(?2)) \
          UNION \
          SELECT source, session_id FROM session_markers \
          WHERE source IN (SELECT value FROM json_each(?2))",
