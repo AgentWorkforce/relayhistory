@@ -1090,8 +1090,8 @@ pub fn retry_job(conn: &Connection, job_id: &str) -> Result<DeliveryStatus> {
 }
 
 /// Retry a blocked verdict once per build, atomically recording the build with
-/// the job transition. An older probe's file marker seeds the first database
-/// record; after that, the database owns the retry history across processes.
+/// the job transition. History retains every build, including after rollbacks.
+/// A legacy file marker may be imported only when it explicitly names this job.
 /// Active, paused and cancelled jobs record the build without changing state.
 pub fn retry_job_for_build(
     conn: &Connection,
@@ -1106,14 +1106,23 @@ pub fn retry_job_for_build(
         [job_id],
         |row| row.get(0),
     )?;
-    if recorded.as_deref() == Some(build) {
-        return Ok(());
+    // Keep the former single-build column for older probes. Import it here as
+    // well as during migration in case an older probe has run since migration.
+    for previous in recorded.as_deref().into_iter().chain(legacy_build) {
+        tx.execute(
+            "INSERT OR IGNORE INTO delivery_job_builds(job_id,build) VALUES (?,?)",
+            params![job_id, previous],
+        )?;
     }
-    if recorded.as_deref().or(legacy_build) != Some(build) && current.state == "blocked" {
+    let first_run = tx.execute(
+        "INSERT OR IGNORE INTO delivery_job_builds(job_id,build) VALUES (?,?)",
+        params![job_id, build],
+    )? == 1;
+    if first_run && current.state == "blocked" {
         reset_job_retry(&tx, job_id)?;
     }
     tx.execute(
-        "UPDATE delivery_jobs SET retry_build=? WHERE id=?",
+        "UPDATE delivery_jobs SET retry_build=?1 WHERE id=?2 AND retry_build IS NOT ?1",
         params![build, job_id],
     )?;
     tx.commit()?;

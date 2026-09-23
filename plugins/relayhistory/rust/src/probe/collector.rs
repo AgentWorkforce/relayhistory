@@ -700,6 +700,9 @@ fn retry_verdict_of_another_build(directory: &Path, job_id: &str, version: &str)
     let retried = fs::read(&marker)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        // Unscoped files cannot prove which generation used the retry. In
+        // particular, disconnect/reconnect reuses this directory for a new job.
+        .filter(|value| value["job_id"].as_str() == Some(job_id))
         .and_then(|value| value["probe_version"].as_str().map(str::to_owned));
     let conn = delivery::open_db(&directory.join("history.db"))?;
     if delivery::retry_job_for_build(&conn, job_id, version, retried.as_deref()).is_err() {
@@ -712,7 +715,12 @@ fn retry_verdict_of_another_build(directory: &Path, job_id: &str, version: &str)
         return Ok(());
     }
     // Maintain the older marker for probes that do not yet read retry_build.
-    if save_json(&marker, &json!({ "probe_version": version })).is_err() {
+    if save_json(
+        &marker,
+        &json!({ "job_id": job_id, "probe_version": version }),
+    )
+    .is_err()
+    {
         // Keep diagnostics free of paths, credentials and raw filesystem errors.
         let _ = writeln!(
             std::io::stderr(),
@@ -1631,6 +1639,85 @@ mod tests {
         assert_eq!(
             delivery::status(&conn, &job.job_id).unwrap().state,
             "active"
+        );
+        block();
+        for build in ["0.26.1", "0.26.2"] {
+            run(build);
+            assert_eq!(
+                delivery::status(&conn, &job.job_id).unwrap().state,
+                "blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_file_from_a_disconnected_job_does_not_suppress_its_replacement() {
+        for scoped in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let conn = delivery::open_db(&dir.path().join("history.db")).unwrap();
+            let old = delivery::create_job(&conn, &job_config(true), now()).unwrap();
+            retry_verdict_of_another_build(dir.path(), &old.job_id, "0.26.1").unwrap();
+            delivery::cancel_job(&conn, &old.job_id).unwrap();
+            let mut marker = json!({ "probe_version": "0.26.1" });
+            if scoped {
+                marker["job_id"] = json!(old.job_id);
+            }
+            save_json(&dir.path().join("verdict-retry.json"), &marker).unwrap();
+
+            let new = delivery::create_job(&conn, &job_config(true), now()).unwrap();
+            assert_ne!(new.job_id, old.job_id);
+            let block = || {
+                conn.execute(
+                    "UPDATE delivery_jobs SET state='blocked',failure='invalid_payload' WHERE id=?",
+                    [&new.job_id],
+                )
+                .unwrap();
+            };
+            block();
+            retry_verdict_of_another_build(dir.path(), &new.job_id, "0.26.1").unwrap();
+            assert_eq!(
+                delivery::status(&conn, &new.job_id).unwrap().state,
+                "active"
+            );
+            let saved: serde_json::Value =
+                serde_json::from_slice(&fs::read(dir.path().join("verdict-retry.json")).unwrap())
+                    .unwrap();
+            assert_eq!(saved["job_id"], new.job_id);
+            block();
+            retry_verdict_of_another_build(dir.path(), &new.job_id, "0.26.1").unwrap();
+            assert_eq!(
+                delivery::status(&conn, &new.job_id).unwrap().state,
+                "blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_file_for_the_same_job_preserves_its_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = delivery::open_db(&dir.path().join("history.db")).unwrap();
+        let job = delivery::create_job(&conn, &job_config(true), now()).unwrap();
+        conn.execute(
+            "UPDATE delivery_jobs SET state='blocked',failure='invalid_payload' WHERE id=?",
+            [&job.job_id],
+        )
+        .unwrap();
+        let marker = dir.path().join("verdict-retry.json");
+        save_json(
+            &marker,
+            &json!({ "job_id": job.job_id, "probe_version": "0.26.1" }),
+        )
+        .unwrap();
+        retry_verdict_of_another_build(dir.path(), &job.job_id, "0.26.1").unwrap();
+        assert_eq!(
+            delivery::status(&conn, &job.job_id).unwrap().state,
+            "blocked"
+        );
+        fs::remove_file(marker).unwrap();
+        retry_verdict_of_another_build(dir.path(), &job.job_id, "0.26.1").unwrap();
+        assert_eq!(
+            delivery::status(&conn, &job.job_id).unwrap().state,
+            "blocked"
         );
     }
 

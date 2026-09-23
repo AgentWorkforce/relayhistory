@@ -45,6 +45,57 @@ fn legacy_marker_is_imported_during_schema_upgrade_without_repeating_retry() {
 }
 
 #[test]
+fn retry_history_survives_version_rollbacks() {
+    let (conn, id) = blocked_job();
+    for (build, expected) in [
+        ("0.26.1", "active"),
+        ("0.26.2", "active"),
+        ("0.26.1", "blocked"),
+        ("0.26.2", "blocked"),
+        ("0.26.3", "active"),
+    ] {
+        conn.execute(
+            "UPDATE delivery_jobs SET state='blocked',failure='invalid_payload' WHERE id=?",
+            [&id],
+        )
+        .unwrap();
+        delivery::retry_job_for_build(&conn, &id, build, None).unwrap();
+        assert_eq!(
+            delivery::status(&conn, &id).unwrap().state,
+            expected,
+            "build {build}"
+        );
+    }
+    let builds: usize = conn
+        .query_row(
+            "SELECT COUNT(*) FROM delivery_job_builds WHERE job_id=?",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(builds, 3);
+}
+
+#[test]
+fn migration_preserves_the_previous_single_build_record() {
+    let (conn, id) = blocked_job();
+    conn.execute_batch("DROP TABLE delivery_job_builds")
+        .unwrap();
+    conn.execute(
+        "UPDATE delivery_jobs SET retry_build='0.26.1' WHERE id=?",
+        [&id],
+    )
+    .unwrap();
+    delivery::init_db(&conn).unwrap();
+    delivery::retry_job_for_build(&conn, &id, "0.26.2", None).unwrap();
+    assert_eq!(delivery::status(&conn, &id).unwrap().state, "active");
+    conn.execute("UPDATE delivery_jobs SET state='blocked' WHERE id=?", [&id])
+        .unwrap();
+    delivery::retry_job_for_build(&conn, &id, "0.26.1", None).unwrap();
+    assert_eq!(delivery::status(&conn, &id).unwrap().state, "blocked");
+}
+
+#[test]
 fn build_record_failure_rolls_back_job_and_batch_retry() {
     let (conn, id) = blocked_job();
     conn.execute("INSERT INTO delivery_batches(id,job_id,state,records,bytes,journal_end,created_ms) VALUES('batch',?,'blocked',1,0,0,0)", [&id]).unwrap();
@@ -61,6 +112,17 @@ fn build_record_failure_rolls_back_job_and_batch_retry() {
         )
         .unwrap();
     assert_eq!(recorded, None);
+    let builds: usize = conn
+        .query_row(
+            "SELECT COUNT(*) FROM delivery_job_builds WHERE job_id=?",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        builds, 0,
+        "a failed transaction must not consume the build's retry"
+    );
     let batch_state: String = conn
         .query_row(
             "SELECT state FROM delivery_batches WHERE id='batch'",
