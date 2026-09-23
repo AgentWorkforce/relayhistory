@@ -61,19 +61,6 @@ pub enum TranscriptStatus {
     Mismatched,
 }
 
-impl TranscriptStatus {
-    #[cfg(feature = "unstable-internal")]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            TranscriptStatus::Ingested => "ingested",
-            TranscriptStatus::Unchanged => "unchanged",
-            TranscriptStatus::Missing => "missing",
-            TranscriptStatus::Unidentified => "unidentified",
-            TranscriptStatus::Mismatched => "mismatched",
-        }
-    }
-}
-
 /// The result of ingesting one named transcript.
 #[derive(Debug, Clone, Serialize)]
 pub struct TranscriptIngest {

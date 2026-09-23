@@ -37,7 +37,6 @@ pub const IDENTITY_UNLINKED: &str = "unlinked";
 /// One session delegated work to another thread.
 pub const RELATIONSHIP_DELEGATED: &str = "delegated";
 /// A remote session materialized locally under a second identity.
-#[cfg(feature = "unstable-internal")]
 pub const RELATIONSHIP_MATERIALIZED_LOCAL: &str = "materialized_local";
 /// A later session carries on the same conversation as a prior one.
 pub const RELATIONSHIP_CONTINUATION: &str = "continuation";
@@ -92,16 +91,6 @@ impl RelationshipKinds {
     /// Only the continuity kinds.
     pub fn continuity() -> Self {
         Self::only(CONTINUITY_RELATIONSHIPS.iter().copied())
-    }
-
-    /// Every recorded kind, delegation and continuity alike.
-    #[cfg(feature = "unstable-internal")]
-    pub fn all() -> Self {
-        Self::only(
-            [RELATIONSHIP_DELEGATED, RELATIONSHIP_MATERIALIZED_LOCAL]
-                .into_iter()
-                .chain(CONTINUITY_RELATIONSHIPS.iter().copied()),
-        )
     }
 
     /// The `AND`-prefixed SQL fragment this selection contributes, with one

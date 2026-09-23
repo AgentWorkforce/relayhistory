@@ -51,17 +51,6 @@ pub struct HistoryEntry {
 
 #[cfg(any(test, feature = "unstable-internal"))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Tag {
-    pub name: String,
-    pub display_name: String,
-    pub color: Option<String>,
-    pub session_count: i64,
-    pub first_tagged_ms: Option<i64>,
-    pub last_tagged_ms: Option<i64>,
-}
-
-#[cfg(any(test, feature = "unstable-internal"))]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaggedSession {
     pub source: String,
     pub session_id: String,
@@ -4256,7 +4245,7 @@ fn lendable_ancestor_key(
     Ok((None, closed_a_cycle))
 }
 
-#[cfg(any(test, feature = "unstable-internal"))]
+#[cfg(test)]
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -4264,7 +4253,7 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-#[cfg(any(test, feature = "unstable-internal"))]
+#[cfg(test)]
 fn ensure_tag(conn: &Connection, name: &str, color: Option<&str>) -> Result<i64> {
     let normalized = normalize_tag_name(name);
     anyhow::ensure!(!normalized.is_empty(), "tag name cannot be empty");
@@ -4308,7 +4297,7 @@ pub fn matching_sessions(
     Ok(rows)
 }
 
-#[cfg(any(test, feature = "unstable-internal"))]
+#[cfg(test)]
 pub fn tag_session(
     conn: &Connection,
     session_id: &str,
@@ -4348,26 +4337,6 @@ pub fn untag_session(
         )?;
     }
     Ok(removed)
-}
-
-#[cfg(any(test, feature = "unstable-internal"))]
-pub fn list_tags(conn: &Connection) -> Result<Vec<Tag>> {
-    let mut stmt = conn.prepare(
-        "SELECT t.name, t.display_name, t.color, COUNT(st.id), MIN(st.created_ms), MAX(st.created_ms) FROM tags t LEFT JOIN session_tags st ON st.tag_id = t.id GROUP BY t.id, t.name, t.display_name, t.color ORDER BY t.name",
-    )?;
-    let rows = stmt
-        .query_map([], |r| {
-            Ok(Tag {
-                name: r.get(0)?,
-                display_name: r.get(1)?,
-                color: r.get(2)?,
-                session_count: r.get(3)?,
-                first_tagged_ms: r.get(4)?,
-                last_tagged_ms: r.get(5)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
 }
 
 #[cfg(any(test, feature = "unstable-internal"))]
@@ -4644,15 +4613,6 @@ fn sync_opencode_session_from_connection(
         return Ok(0);
     };
     Ok(crate::ingest::opencode::normalize(conn, &loaded, &raw_path.to_string_lossy())?.prompts)
-}
-
-#[cfg(feature = "unstable-internal")]
-pub fn export_json(conn: &Connection) -> Result<Vec<HistoryEntry>> {
-    let mut stmt = conn.prepare("SELECT id, source, session_id, project, prompt, timestamp_ms FROM history ORDER BY timestamp_ms ASC")?;
-    let rows = stmt
-        .query_map([], row_to_entry)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
 }
 
 #[cfg(feature = "unstable-internal")]
@@ -5573,7 +5533,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(list_tags(&conn).unwrap()[0].name, "release");
         assert_eq!(
             untag_session(&conn, "s1", "release", Some("claude")).unwrap(),
             1

@@ -39,10 +39,6 @@ impl SourceConnectorSelection {
     pub fn contains(&self, id: &str) -> bool {
         self.ids.iter().any(|value| value == id)
     }
-    #[cfg(feature = "unstable-internal")]
-    pub fn ids(&self) -> &[String] {
-        &self.ids
-    }
 }
 #[cfg(any(test, feature = "unstable-internal"))]
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -3773,20 +3773,6 @@ fn stored_stamp(raw: &str) -> String {
     format!("v{SHALLOW_SCANNER_VERSION}:{raw}")
 }
 
-/// Reject an acquisition scope for which no connector is configured.
-///
-/// Call this before opening the ledger so an unsupported remote-only request
-/// has no database side effects. `remote` requires at least one configured
-/// remote connector (see [`crate::remote`]); `all` runs whatever is available
-/// and is never rejected here.
-#[cfg(feature = "unstable-internal")]
-pub fn validate_discovery_scope(scope: SessionScope) -> Result<()> {
-    if scope == SessionScope::Remote {
-        crate::remote::ensure_remote_connectors_configured("discovery")?;
-    }
-    Ok(())
-}
-
 #[cfg(any(test, feature = "unstable-internal"))]
 fn select_providers(
     options: &DiscoverOptions,
@@ -3810,10 +3796,9 @@ fn select_providers(
             SOURCE_CHOICES.join(", ")
         );
     }
-    // Same loud refusal `validate_discovery_scope` gives before the ledger
-    // opens, re-checked here for callers that skip it — and source-aware: a
-    // filter that leaves a remote-only request with nothing configured is
-    // the same unsupported request, scoped down.
+    // A remote-only request with no connector configured is refused loudly,
+    // and source-aware: a filter that leaves a remote-only request with
+    // nothing configured is the same unsupported request, scoped down.
     if options.scope == SessionScope::Remote {
         crate::remote::ensure_selected_remote_connectors_configured_for_at(
             "discovery",

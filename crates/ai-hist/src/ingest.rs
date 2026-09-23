@@ -48,9 +48,9 @@ use crate::remote;
 #[cfg(feature = "unstable-internal")]
 pub use crate::discover::{
     discover_sessions, discover_sessions_with_env, discover_sessions_with_providers,
-    list_session_catalog, validate_discovery_scope, AllProvidersFailed, CatalogCursor,
-    DiscoveryCounters, DiscoveryDiagnostic, ProviderSummary, ScanEnv, ShallowReadAccess,
-    SourceExemption, DEFAULT_CATALOG_LIMIT, DISCOVERY_EXEMPTIONS, SESSION_CATALOG_CONTRACT_VERSION,
+    list_session_catalog, AllProvidersFailed, CatalogCursor, DiscoveryCounters,
+    DiscoveryDiagnostic, ProviderSummary, ScanEnv, ShallowReadAccess, SourceExemption,
+    DEFAULT_CATALOG_LIMIT, DISCOVERY_EXEMPTIONS, SESSION_CATALOG_CONTRACT_VERSION,
     SHALLOW_SCANNER_VERSION,
 };
 #[cfg(any(test, feature = "unstable-internal"))]
@@ -371,12 +371,6 @@ pub fn sync_tick_at(
     Ok(tick)
 }
 
-/// Full ingestion for a selected scope into the default database.
-#[cfg(feature = "unstable-internal")]
-pub fn sync_scoped(scope: SessionScope) -> Result<bool> {
-    sync_scoped_at(&default_db_path(), scope)
-}
-
 /// Full ingestion for a selected session-presence scope.
 ///
 /// The local distribution ingests local providers for `local` and `all`.
@@ -484,17 +478,11 @@ fn sync_remote_connectors(
     anyhow::bail!("CONNECTOR_NOT_CONFIGURED: remote acquisition requires an explicitly registered source plugin")
 }
 
-/// Cache-only session catalog listing against the default database.
+/// Cache-only catalog listing against an explicitly selected database.
 ///
 /// The in-process equivalent of `ai-hist sessions list`: one indexed query
 /// over `sessions`, no provider I/O. A database that does not exist yet is an
 /// empty catalog, not an error — the caller is expected to run discovery next.
-#[cfg(feature = "unstable-internal")]
-pub fn list_sessions_local(options: &CatalogListOptions) -> Result<SessionCatalogPage> {
-    list_sessions_local_at(&default_db_path(), options)
-}
-
-/// Cache-only catalog listing against an explicitly selected database.
 #[cfg(any(test, feature = "unstable-internal"))]
 pub fn list_sessions_local_at(
     db_path: &Path,
@@ -505,12 +493,6 @@ pub fn list_sessions_local_at(
         "list_sessions_local_at only accepts local scope; use list_sessions_scoped_at for remote or all"
     );
     list_sessions_scoped_at(db_path, options)
-}
-
-/// Cache-only catalog listing for an explicit session-presence scope.
-#[cfg(feature = "unstable-internal")]
-pub fn list_sessions_scoped(options: &CatalogListOptions) -> Result<SessionCatalogPage> {
-    list_sessions_scoped_at(&default_db_path(), options)
 }
 
 /// Scoped cache-only catalog listing against an explicitly selected database.
@@ -535,19 +517,12 @@ pub fn list_sessions_scoped_at(
     list_session_catalog_page(&conn, options)
 }
 
-/// Shallow discovery against the default database, with the rows collected.
+/// Shallow discovery into an explicitly selected database, with the rows
+/// collected.
 ///
 /// The in-process equivalent of `ai-hist sessions discover`. Upsert-only and
 /// stamp-guarded, so it does not take the sync lock and is safe to run beside
 /// `sync_local`.
-#[cfg(feature = "unstable-internal")]
-pub fn discover_sessions_local(
-    options: &DiscoverOptions,
-) -> Result<(Vec<ShallowSession>, DiscoverySummary)> {
-    discover_sessions_local_at(&default_db_path(), options)
-}
-
-/// Shallow discovery into an explicitly selected database.
 #[cfg(any(test, feature = "unstable-internal"))]
 pub fn discover_sessions_local_at(
     db_path: &Path,
@@ -559,14 +534,6 @@ pub fn discover_sessions_local_at(
     );
     let conn = open_db(db_path)?;
     discover_sessions_collect(&conn, options)
-}
-
-/// Scoped discovery into the default database.
-#[cfg(feature = "unstable-internal")]
-pub fn discover_sessions_scoped(
-    options: &DiscoverOptions,
-) -> Result<(Vec<ShallowSession>, DiscoverySummary)> {
-    discover_sessions_scoped_at(&default_db_path(), options)
 }
 
 /// Scoped discovery into an explicitly selected database.
@@ -6506,7 +6473,7 @@ fn record_claude_materialized_relationship(
             source: "claude",
             parent_session_id: remote_id,
             child_session_id: Some(local_id),
-            relationship: "materialized_local",
+            relationship: crate::relationships::RELATIONSHIP_MATERIALIZED_LOCAL,
             child_agent_type: None,
             child_agent_name: None,
             child_model: None,
