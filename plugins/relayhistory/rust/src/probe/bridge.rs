@@ -3,6 +3,7 @@
 //! replacing a delivery generation. An interrupted change fences startup until
 //! recovery completes, so it cannot accidentally broaden sharing.
 use super::{collector, lock, read_config, save_json, user_error, Config, Target};
+use ai_hist::export::capture;
 use anyhow::{ensure, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use fs2::FileExt;
@@ -341,10 +342,10 @@ fn session_rows(directory: &Path, config: &Config, limit: usize) -> Result<Vec<V
     } else {
         HashSet::new()
     };
-    let mut query = conn.prepare("SELECT s.source,s.session_id,s.cwd,s.git_branch,s.first_activity_ms,s.last_activity_ms,
+    let mut query = conn.prepare(&format!("SELECT s.source,s.session_id,s.cwd,s.git_branch,s.first_activity_ms,s.last_activity_ms,
         COALESCE(NULLIF(trim(s.first_prompt),''),NULLIF(trim(s.last_assistant_text),''),s.session_id),
-        NOT EXISTS(SELECT 1 FROM delivery_exclusions e WHERE e.source=s.source AND e.session_id=s.session_id)
-        FROM sessions s ORDER BY s.last_activity_ms DESC,s.source,s.session_id LIMIT ?")?;
+        {shareable}
+        FROM sessions s ORDER BY s.last_activity_ms DESC,s.source,s.session_id LIMIT ?", shareable = capture::shareable("s.source", "s.session_id")))?;
     let rows = query.query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |r| {
         let source: String = r.get(0)?;
         let session_id: String = r.get(1)?;
@@ -431,8 +432,8 @@ fn change(
                 .iter()
                 .map(|id| {
                     let member = delivery::job_session_included(&conn, &config.job_id, id)?;
-                    let excluded: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM delivery_exclusions WHERE source=? AND session_id=?)", rusqlite::params![id.source,id.session_id], |r| r.get(0))?;
-                    Ok(member == include && (!include || !excluded))
+                    let shareable = capture::is_shareable(&conn, &id.source, &id.session_id)?;
+                    Ok(member == include && (!include || shareable))
                 })
                 .collect::<Result<Vec<_>>>()?
                 .into_iter()
