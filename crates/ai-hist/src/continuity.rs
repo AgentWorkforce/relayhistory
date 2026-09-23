@@ -322,6 +322,7 @@ pub(crate) fn fold_claude_record(
 /// session. So this reads the explicit fields when a producer writes them and
 /// records nothing when it does not — see
 /// `codex_resume_without_explicit_fields_records_no_continuity`.
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn scan_codex_rollout(path: &Path) -> Result<Option<ContinuityEvidence>> {
     Ok(scan_codex_rollout_counted(path)?.0)
 }

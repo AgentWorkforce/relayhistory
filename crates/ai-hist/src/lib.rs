@@ -14,30 +14,40 @@ macro_rules! workspace_mod {
     };
 }
 
+/// A module only the `unstable-internal` surface calls, so the default build
+/// leaves it out.
+macro_rules! internal_mod {
+    ($name:ident) => {
+        #[cfg(feature = "unstable-internal")]
+        pub mod $name;
+    };
+}
+
 /// Canonical project identity shared with burn. Always public: an embedder
 /// that groups by project needs the same rules the ingest path stamps with,
 /// and a second implementation is exactly the drift this module exists to
 /// prevent.
 pub mod project_identity;
 mod store;
-workspace_mod!(storage);
+internal_mod!(storage);
 workspace_mod!(observations);
-workspace_mod!(privacy);
+internal_mod!(privacy);
 workspace_mod!(source_evidence);
 workspace_mod!(relationship_graph);
 workspace_mod!(continuity);
 mod ingest;
 mod relationship_capture;
 workspace_mod!(diagnostics);
-workspace_mod!(history_search);
+internal_mod!(history_search);
 workspace_mod!(paths);
 workspace_mod!(discover);
 workspace_mod!(remote);
-workspace_mod!(source_intake);
-workspace_mod!(sources);
+internal_mod!(source_intake);
+internal_mod!(sources);
 workspace_mod!(watch);
 mod change_feed;
 mod file_lock;
+#[cfg(any(test, feature = "unstable-internal"))]
 mod jsonl_temp;
 mod session_store;
 mod session_usage;
@@ -45,13 +55,10 @@ mod usage;
 
 #[cfg(all(feature = "git-hooks", feature = "unstable-internal"))]
 pub mod git_helpers;
-#[cfg(all(feature = "git-hooks", not(feature = "unstable-internal")))]
-mod git_helpers;
 #[cfg(all(feature = "git-hooks", feature = "unstable-internal"))]
 pub mod git_sdk;
-#[cfg(all(feature = "git-hooks", not(feature = "unstable-internal")))]
-mod git_sdk;
 
+#[cfg(any(test, feature = "unstable-internal"))]
 pub(crate) use paths::home_dir;
 pub use paths::ProviderRoots;
 pub(crate) use relationship_capture::now_ms;

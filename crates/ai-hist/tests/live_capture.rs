@@ -130,6 +130,7 @@ impl RunningLoop {
     /// a trailing event has time to arrive and be swept, and the whole settle
     /// has a deadline, so a loop that never goes quiet fails the test rather
     /// than hanging it.
+    #[cfg(feature = "fs-events")]
     fn settle(&self, when: &str) {
         let deadline = std::time::Instant::now() + ARRIVES_WITHIN;
         while self.ticks.recv_timeout(Duration::from_millis(400)).is_ok() {

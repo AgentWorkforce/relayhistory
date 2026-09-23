@@ -127,10 +127,12 @@ fn trajectory_roots_from_env() -> Option<Vec<PathBuf>> {
     )
 }
 
+#[cfg(feature = "unstable-internal")]
 pub fn default_opencode_db_path() -> PathBuf {
     opencode_db_path(&home_dir())
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn default_opencode_storage_dir() -> PathBuf {
     opencode_storage_dir(&home_dir())
 }

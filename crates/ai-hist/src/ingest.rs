@@ -1,9 +1,12 @@
+#[cfg(feature = "unstable-internal")]
+use crate::default_db_path;
 use crate::{
-    default_db_path, insert_history, insert_session_marker, now_ms, open_db, open_db_readonly,
-    parse_cursor_text, prompt_hash, schema_is_catalog_read_current, sync_opencode_db,
-    sync_opencode_session, sync_opencode_storage_dir, HistoryEntry, NewSessionMarker,
-    SessionLocation, SessionScope,
+    insert_history, insert_session_marker, now_ms, open_db, parse_cursor_text, prompt_hash,
+    sync_opencode_db, sync_opencode_session, sync_opencode_storage_dir, HistoryEntry,
+    NewSessionMarker, SessionLocation, SessionScope,
 };
+#[cfg(any(test, feature = "unstable-internal"))]
+use crate::{open_db_readonly, schema_is_catalog_read_current};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -35,32 +38,45 @@ pub(crate) const OPENCODE_MARKER_COMPACTION_BOUNDARY: &str = "compaction_boundar
 
 use crate::diagnostics::*;
 use crate::discover;
-#[cfg(test)]
+#[cfg(all(test, feature = "unstable-internal"))]
 use crate::history_search::{search_all, SearchRole};
+#[cfg(any(test, feature = "unstable-internal"))]
 use crate::paths::{default_opencode_storage_dir, home_dir};
+#[cfg(any(test, feature = "unstable-internal"))]
 use crate::remote;
 
+#[cfg(feature = "unstable-internal")]
 pub use crate::discover::{
-    discover_sessions, discover_sessions_collect, discover_sessions_with_env,
-    discover_sessions_with_providers, list_session_catalog, list_session_catalog_page,
-    shallow_providers, validate_discovery_scope, AllProvidersFailed, Candidate, CatalogCursor,
-    CatalogListOptions, DiscoverOptions, DiscoveryCounters, DiscoveryDiagnostic, DiscoveryEnv,
-    DiscoverySummary, ProviderSummary, ScanEnv, SessionCatalogPage, ShallowReadAccess,
-    ShallowSession, ShallowSessionProvider, SourceExemption, DEFAULT_CATALOG_LIMIT,
-    DISCOVERY_EXEMPTIONS, SESSION_CATALOG_CONTRACT_VERSION, SHALLOW_SCANNER_VERSION,
+    discover_sessions, discover_sessions_with_env, discover_sessions_with_providers,
+    list_session_catalog, validate_discovery_scope, AllProvidersFailed, CatalogCursor,
+    DiscoveryCounters, DiscoveryDiagnostic, ProviderSummary, ScanEnv, ShallowReadAccess,
+    SourceExemption, DEFAULT_CATALOG_LIMIT, DISCOVERY_EXEMPTIONS, SESSION_CATALOG_CONTRACT_VERSION,
+    SHALLOW_SCANNER_VERSION,
+};
+#[cfg(any(test, feature = "unstable-internal"))]
+pub use crate::discover::{
+    discover_sessions_collect, list_session_catalog_page, CatalogListOptions, DiscoverySummary,
+    SessionCatalogPage, ShallowSession,
+};
+pub use crate::discover::{
+    shallow_providers, Candidate, DiscoverOptions, DiscoveryEnv, ShallowSessionProvider,
 };
 pub use crate::relationship_capture::{record_relationship, ObservedRelationship};
+pub use hook::HOOK_HARNESSES;
+#[cfg(feature = "unstable-internal")]
 pub use hook::{
     ingest_transcript_at, ingest_transcript_at_with_home, TranscriptIngest, TranscriptStatus,
-    HOOK_HARNESSES,
 };
+#[cfg(feature = "unstable-internal")]
 pub use hydrate::{
     hydrate_session, hydrate_session_at, hydrate_session_at_with_connectors,
     hydrate_session_at_with_home, HydrateSessionOptions, HydrateSessionResult, HydrationDiagnostic,
     HydrationEvidence, HydrationIndexedThrough, SESSION_HYDRATION_CONTRACT_VERSION,
 };
+pub use tool_result_facts::ToolResultFacts;
+#[cfg(feature = "unstable-internal")]
 pub use tool_result_facts::{
-    content_hash, stable_stringify, ToolResultFacts, ToolResultIndexer, ERROR_SIGNAL_EXIT_CODE,
+    content_hash, stable_stringify, ToolResultIndexer, ERROR_SIGNAL_EXIT_CODE,
     ERROR_SIGNAL_MCP_ERR, ERROR_SIGNAL_PATCH_APPLY, ERROR_SIGNAL_SUBAGENT_STATUS,
     ERROR_SIGNAL_TOOL_RESULT, EVENT_SOURCE_FUNCTION_CALL_OUTPUT,
     EVENT_SOURCE_SUBAGENT_NOTIFICATION, EVENT_SOURCE_TOOL_RESULT, STATUS_COMPLETED, STATUS_ERRORED,
@@ -99,6 +115,7 @@ macro_rules! sync_note {
 /// Embedding applications should use this before opening the local catalog.
 /// When another process owns the sync lock the refresh is skipped — the
 /// concurrent scan is already producing the fresh data this caller wants.
+#[cfg(feature = "unstable-internal")]
 pub fn sync_local() -> Result<()> {
     sync_local_at(&default_db_path()).map(|_| ())
 }
@@ -107,6 +124,7 @@ pub fn sync_local() -> Result<()> {
 ///
 /// This is the reusable engine entry point used by the N-API boundary. The
 /// command-line parser is intentionally not involved.
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn sync_local_at(db_path: &Path) -> Result<bool> {
     SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
     sync_exclusive(db_path)
@@ -140,6 +158,7 @@ thread_local! {
     static CAPTURE_STOP: std::cell::RefCell<Option<CaptureStop>> = std::cell::RefCell::new(None);
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 fn with_capture_stop<T>(
     cancelled: impl Fn() -> bool + 'static,
     run: impl FnOnce() -> Result<T>,
@@ -169,6 +188,7 @@ pub(crate) fn check_capture_cancelled() -> Result<()> {
 }
 
 /// Shallow local inventory with cooperative provider/file cancellation.
+#[cfg(feature = "unstable-internal")]
 pub fn discover_sessions_cancellable(
     conn: &Connection,
     options: &DiscoverOptions,
@@ -180,6 +200,7 @@ pub fn discover_sessions_cancellable(
 
 /// Targeted hydration with the same cooperative cancellation boundaries as
 /// sync. It retains the normal observation locks and checkpoint transaction.
+#[cfg(feature = "unstable-internal")]
 pub fn hydrate_session_at_cancellable(
     db_path: &Path,
     options: &HydrateSessionOptions,
@@ -192,6 +213,7 @@ pub fn hydrate_session_at_cancellable(
 /// Committed chunks remain durable; an unfinished transaction rolls back and
 /// its checkpoint is retried by the next capture. The callback is scoped to
 /// this thread and restored on return, error, or panic.
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn sync_local_at_cancellable(
     db_path: &Path,
     observer: impl Fn(CaptureProgress) + 'static,
@@ -201,6 +223,7 @@ pub fn sync_local_at_cancellable(
 }
 
 /// Observes this thread's capture only; no paths or session contents are exposed.
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn sync_local_at_with_progress(
     db_path: &Path,
     observer: impl Fn(CaptureProgress) + 'static,
@@ -301,6 +324,7 @@ pub(crate) fn sync_facade_tick<B, R>(
 /// `force` bypasses the stat-only source fingerprint. The watch loop sets it
 /// for filesystem-event ticks, where the event can arrive before the write
 /// flushes and the fingerprint is therefore not yet trustworthy.
+#[cfg(feature = "unstable-internal")]
 pub fn sync_tick_at_with_home(
     db_path: &Path,
     home: &Path,
@@ -317,6 +341,7 @@ pub fn sync_tick_at_with_home(
 /// One live-capture tick. Local scope only: remote connectors are not driven
 /// from watch mode, and a `remote`-only request is rejected the same way
 /// [`sync_scoped_at_with_connectors`] rejects it.
+#[cfg(feature = "unstable-internal")]
 pub fn sync_tick_at(
     db_path: &Path,
     scope: SessionScope,
@@ -347,6 +372,7 @@ pub fn sync_tick_at(
 }
 
 /// Full ingestion for a selected scope into the default database.
+#[cfg(feature = "unstable-internal")]
 pub fn sync_scoped(scope: SessionScope) -> Result<bool> {
     sync_scoped_at(&default_db_path(), scope)
 }
@@ -357,17 +383,20 @@ pub fn sync_scoped(scope: SessionScope) -> Result<bool> {
 /// Explicit `remote` acquisition requires an installed source plugin composed
 /// through [`sources::SourceRegistry`] or an SDK host. Credentials alone never
 /// add a data source. Cached remote catalog reads remain available.
+#[cfg(feature = "unstable-internal")]
 pub fn sync_scoped_at(db_path: &Path, scope: SessionScope) -> Result<bool> {
     SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
     sync_scope_exclusive(db_path, scope)
 }
 
+#[cfg(feature = "unstable-internal")]
 fn sync_scope_exclusive(db_path: &Path, scope: SessionScope) -> Result<bool> {
     sync_scope_with_connectors(db_path, scope, &remote::SourceConnectorSelection::default())
 }
 
 /// Full ingestion with an explicit remote connector allowlist. Local scope
 /// ignores all remote connectors and never probes their credentials.
+#[cfg(feature = "unstable-internal")]
 pub fn sync_scoped_at_with_connectors(
     db_path: &Path,
     scope: SessionScope,
@@ -378,6 +407,7 @@ pub fn sync_scoped_at_with_connectors(
 }
 
 /// Controls optional ingestion progress for command-line applications.
+#[cfg(feature = "unstable-internal")]
 #[derive(Debug, Clone, Copy)]
 pub enum SyncOutput {
     Silent,
@@ -386,6 +416,7 @@ pub enum SyncOutput {
 
 /// Scoped ingestion with an explicitly chosen progress destination. Embedded
 /// callers should use `sync_scoped_at_with_connectors`, which is always silent.
+#[cfg(feature = "unstable-internal")]
 pub fn sync_scoped_at_with_output(
     db_path: &Path,
     scope: SessionScope,
@@ -400,6 +431,7 @@ pub fn sync_scoped_at_with_output(
 }
 
 /// Import the selected OpenCode store with the same exclusive ingestion lock.
+#[cfg(feature = "unstable-internal")]
 pub fn sync_opencode_at(db_path: &Path, source_path: &Path, output: SyncOutput) -> Result<bool> {
     SYNC_QUIET.store(
         matches!(output, SyncOutput::Silent),
@@ -408,6 +440,7 @@ pub fn sync_opencode_at(db_path: &Path, source_path: &Path, output: SyncOutput) 
     sync_opencode_exclusive(db_path, source_path)
 }
 
+#[cfg(feature = "unstable-internal")]
 fn sync_scope_with_connectors(
     db_path: &Path,
     scope: SessionScope,
@@ -439,6 +472,7 @@ fn sync_scope_with_connectors(
 /// Under `all` scope a machine with no connector configured skips quietly —
 /// that is the documented "runs whatever is available" contract; a remote-only
 /// request was already rejected by [`sync_scoped_at_with_connectors`] before this point.
+#[cfg(feature = "unstable-internal")]
 fn sync_remote_connectors(
     _db_path: &Path,
     scope: SessionScope,
@@ -455,11 +489,13 @@ fn sync_remote_connectors(
 /// The in-process equivalent of `ai-hist sessions list`: one indexed query
 /// over `sessions`, no provider I/O. A database that does not exist yet is an
 /// empty catalog, not an error — the caller is expected to run discovery next.
+#[cfg(feature = "unstable-internal")]
 pub fn list_sessions_local(options: &CatalogListOptions) -> Result<SessionCatalogPage> {
     list_sessions_local_at(&default_db_path(), options)
 }
 
 /// Cache-only catalog listing against an explicitly selected database.
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn list_sessions_local_at(
     db_path: &Path,
     options: &CatalogListOptions,
@@ -472,17 +508,20 @@ pub fn list_sessions_local_at(
 }
 
 /// Cache-only catalog listing for an explicit session-presence scope.
+#[cfg(feature = "unstable-internal")]
 pub fn list_sessions_scoped(options: &CatalogListOptions) -> Result<SessionCatalogPage> {
     list_sessions_scoped_at(&default_db_path(), options)
 }
 
 /// Scoped cache-only catalog listing against an explicitly selected database.
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn list_sessions_scoped_at(
     db_path: &Path,
     options: &CatalogListOptions,
 ) -> Result<SessionCatalogPage> {
     if !db_path.exists() {
         return Ok(SessionCatalogPage {
+            #[cfg(feature = "unstable-internal")]
             scope: options.scope,
             ..Default::default()
         });
@@ -501,6 +540,7 @@ pub fn list_sessions_scoped_at(
 /// The in-process equivalent of `ai-hist sessions discover`. Upsert-only and
 /// stamp-guarded, so it does not take the sync lock and is safe to run beside
 /// `sync_local`.
+#[cfg(feature = "unstable-internal")]
 pub fn discover_sessions_local(
     options: &DiscoverOptions,
 ) -> Result<(Vec<ShallowSession>, DiscoverySummary)> {
@@ -508,6 +548,7 @@ pub fn discover_sessions_local(
 }
 
 /// Shallow discovery into an explicitly selected database.
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn discover_sessions_local_at(
     db_path: &Path,
     options: &DiscoverOptions,
@@ -521,6 +562,7 @@ pub fn discover_sessions_local_at(
 }
 
 /// Scoped discovery into the default database.
+#[cfg(feature = "unstable-internal")]
 pub fn discover_sessions_scoped(
     options: &DiscoverOptions,
 ) -> Result<(Vec<ShallowSession>, DiscoverySummary)> {
@@ -528,6 +570,7 @@ pub fn discover_sessions_scoped(
 }
 
 /// Scoped discovery into an explicitly selected database.
+#[cfg(feature = "unstable-internal")]
 pub fn discover_sessions_scoped_at(
     db_path: &Path,
     options: &DiscoverOptions,
@@ -539,6 +582,7 @@ pub fn discover_sessions_scoped_at(
     )
 }
 
+#[cfg(feature = "unstable-internal")]
 pub fn discover_sessions_scoped_at_with_connectors(
     db_path: &Path,
     options: &DiscoverOptions,
@@ -1105,6 +1149,7 @@ fn sweep_only_fingerprint_inputs(roots: &crate::ProviderRoots) -> Vec<Candidate>
 /// Call this again to pick up a `.trajectories` directory created after the
 /// loop started; [`crate::watch::WatchLoop::with_roots_refresh`] does exactly
 /// that on each backstop tick.
+#[cfg(feature = "unstable-internal")]
 pub fn sync_watch_roots(home: &Path, opencode_db: &Path) -> Vec<discover::WatchRoot> {
     let mut provider_roots = crate::ProviderRoots::from_env(home.to_path_buf());
     provider_roots.opencode_db = opencode_db.to_path_buf();
@@ -1715,6 +1760,7 @@ fn try_acquire_sync_lock(db_path: &Path) -> Result<Option<SyncRunLock>> {
     }
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 fn sync_exclusive(db_path: &Path) -> Result<bool> {
     let roots = crate::ProviderRoots::from_env(home_dir());
     sync_exclusive_with_roots(db_path, &roots, false).map(|tick| tick.attempted)
@@ -1753,6 +1799,7 @@ impl From<SyncTick> for crate::watch::TickOutcome {
     }
 }
 
+#[cfg(feature = "unstable-internal")]
 pub(crate) fn sync_exclusive_with_home(
     db_path: &Path,
     home: &Path,
@@ -1762,6 +1809,7 @@ pub(crate) fn sync_exclusive_with_home(
     sync_exclusive_with_roots(db_path, &roots, force)
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 fn sync_exclusive_with_roots(
     db_path: &Path,
     roots: &crate::ProviderRoots,
@@ -1781,6 +1829,7 @@ fn sync_exclusive_with_roots(
     })
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 fn sync_opencode_exclusive(db_path: &Path, opencode_path: &Path) -> Result<bool> {
     let Some(_sync_lock) = try_acquire_sync_lock(db_path)? else {
         sync_note!("  [sync-opencode] another sync is already running; skipped");
@@ -1854,6 +1903,7 @@ fn refresh_project_identity_after_sync(conn: &Connection) {
 
 /// Synchronize local providers, or read the current snapshot when another sync owns the lock.
 /// The boolean reports that synchronization was skipped. No destination or credentials are read.
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn prepare_local_sync_snapshot(db_path: &Path) -> Result<(Connection, bool)> {
     SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
     let Some(sync_lock) = try_acquire_sync_lock(db_path)? else {
@@ -6471,6 +6521,7 @@ fn record_claude_materialized_relationship(
     )
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 pub(crate) fn ingest_claude_transcript(conn: &Connection, path: &Path) -> Result<()> {
     ingest_claude_transcript_as(conn, path, None)
 }
@@ -6808,6 +6859,7 @@ fn heal_legacy_positional_rows(
 /// subagent transcripts carry the PARENT's sessionId plus a per-child
 /// `agentId`; when the provider records that agentId we store the child's
 /// events under it so the child is independently addressable.
+#[cfg(any(test, feature = "unstable-internal"))]
 fn ingest_claude_transcript_as(
     conn: &Connection,
     path: &Path,
@@ -6877,6 +6929,7 @@ fn ingest_claude_transcript_as(
 /// Read ahead of the record walk, and bounded in the case that matters: the
 /// id is normally on the first record, and this stops at the first one that
 /// has it.
+#[cfg(any(test, feature = "unstable-internal"))]
 fn claude_file_session_id(path: &Path) -> Result<Option<String>> {
     let file = fs::File::open(path)
         .with_context(|| format!("reading claude transcript {}", path.display()))?;
@@ -12409,7 +12462,9 @@ fn parse_codex_line(line: &str) -> Result<Option<HistoryEntry>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{init_db, open_db, HistoryEntry, QueryFilter, SourceDatabaseError};
+    #[cfg(feature = "unstable-internal")]
+    use crate::QueryFilter;
+    use crate::{init_db, open_db, HistoryEntry, SourceDatabaseError};
     use rusqlite::Connection;
     use serde_json::{json, Map, Value};
     use std::{fs, io::Write as _, time::Duration};
@@ -15370,6 +15425,7 @@ mod tests {
             super::DbHolder {
                 pid: "1".into(),
                 state: state.into(),
+                #[cfg(feature = "unstable-internal")]
                 command: "agent-relay".into(),
             }
             .is_wedged()
@@ -18348,6 +18404,7 @@ mod tests {
         assert_eq!(row.timestamp_ms, 1_782_036_000_000);
     }
 
+    #[cfg(feature = "unstable-internal")]
     #[test]
     fn ingests_claude_transcript_events_tools_edits_and_searches_agent_text() {
         let dir = tempfile::tempdir().unwrap();
@@ -18413,6 +18470,7 @@ mod tests {
         }));
     }
 
+    #[cfg(feature = "unstable-internal")]
     #[test]
     fn malformed_raw_fts_query_has_a_friendly_error() {
         let conn = Connection::open_in_memory().unwrap();
@@ -18459,6 +18517,7 @@ mod tests {
         assert_friendly_fts_error(&core_error.to_string());
     }
 
+    #[cfg(feature = "unstable-internal")]
     fn assert_friendly_fts_error(message: &str) {
         assert!(
             message.contains("Invalid raw FTS5 MATCH expression"),
@@ -26889,6 +26948,7 @@ mod capture_progress_tests {
 /// [`bound_marker_json`]: re-serialising can reorder keys or change spacing
 /// without exceeding anything, and a checker that failed on that would reject
 /// payloads that are perfectly within contract.
+#[cfg(any(test, feature = "unstable-internal"))]
 pub(crate) fn marker_payload_is_bounded(value: &Value) -> bool {
     match value {
         Value::String(text) => text.chars().count() <= MARKER_PAYLOAD_FIELD_LIMIT,

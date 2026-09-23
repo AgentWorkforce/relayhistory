@@ -1,7 +1,12 @@
 //! Validated canonical evidence records accepted from installed source adapters.
 //! Foreign database row ids are retained in observations but never assigned locally.
+#[cfg(any(test, feature = "unstable-internal"))]
 use crate::observations::ObservationKey;
-use anyhow::{ensure, Context, Result};
+#[cfg(feature = "unstable-internal")]
+use anyhow::Context;
+#[cfg(any(test, feature = "unstable-internal"))]
+use anyhow::{ensure, Result};
+#[cfg(feature = "unstable-internal")]
 use rusqlite::{params_from_iter, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -83,11 +88,26 @@ pub fn join_kinds(kinds: &[EvidenceKind]) -> String {
         .join(", ")
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 struct Spec {
     table: &'static str,
     columns: &'static str,
     required: &'static str,
-    key: &'static str,
+}
+impl EvidenceKind {
+    /// The comma-separated columns that identify one record of this kind.
+    fn key(self) -> &'static str {
+        match self {
+            Self::History => "source,timestamp_ms,prompt",
+            Self::SessionEvent => "source,session_id,event_uid",
+            Self::ToolCall => "source,session_id,tool_use_id",
+            Self::FileEdit => "source,session_id,tool_use_id",
+            Self::Relationship => "source,parent_session_id,relationship_uid",
+            Self::CommitLink => "source,session_id,commit_sha,match_method",
+            Self::SessionMarker => "source,session_id,marker_uid",
+        }
+    }
+
     /// Columns that travel with the record but are not the adapter's to
     /// vouch for: canonical state this database derives for itself.
     ///
@@ -97,12 +117,23 @@ struct Spec {
     /// answer is always yes, and the consequence is that the connector is
     /// protected against its own record. Ownership is about the fields the
     /// adapter reports, so only those are compared.
-    derived: &'static str,
-}
-impl EvidenceKind {
+    #[cfg(feature = "unstable-internal")]
+    fn derived(self) -> &'static str {
+        match self {
+            Self::SessionEvent => "project_key,project_key_method",
+            Self::History
+            | Self::ToolCall
+            | Self::FileEdit
+            | Self::Relationship
+            | Self::CommitLink
+            | Self::SessionMarker => "",
+        }
+    }
+
+    #[cfg(any(test, feature = "unstable-internal"))]
     fn spec(self) -> Spec {
         match self {
-        Self::History=>Spec{table:"history",columns:"source,session_id,project,prompt,prompt_hash,timestamp_ms,git_branch",required:"source,session_id,prompt,timestamp_ms",key:"source,timestamp_ms,prompt",derived:""},
+        Self::History=>Spec{table:"history",columns:"source,session_id,project,prompt,prompt_hash,timestamp_ms,git_branch",required:"source,session_id,prompt,timestamp_ms"},
         // `project_key` travels with the event so a snapshot round-trips the
         // canonical identity the emitting side resolved, and `project_key_method`
         // with it so the receiving side can tell a key the emitter resolved for
@@ -127,18 +158,19 @@ impl EvidenceKind {
         // travels for the same reason: a connector that classified a row is
         // reporting a fact about it, and a snapshot without the column would
         // read every control row back as a prompt.
-        Self::SessionEvent=>Spec{table:"session_events",columns:"source,session_id,project,project_key,project_key_method,cwd,git_branch,message_id,parent_id,ts_ms,role,kind,text,model,token_json,provider,event_uid,tool_use_id,payload_bytes,payload_truncated,payload_hash,call_index,event_index,result_status,event_source,error_signal,subagent_session_id,agent_id,request_id,provider_message_id,stop_reason,agent_version,is_sidechain,is_meta,turn_id,request_span,raw_kind,control_kind",required:"source,session_id,ts_ms,role,kind,event_uid",key:"source,session_id,event_uid",derived:"project_key,project_key_method"},
-        Self::ToolCall=>Spec{table:"tool_calls",columns:"source,session_id,message_id,tool_use_id,name,target,args_json,is_error,ts_ms",required:"source,session_id,tool_use_id,name",key:"source,session_id,tool_use_id",derived:""},
-        Self::FileEdit=>Spec{table:"file_edits",columns:"source,session_id,message_id,tool_use_id,file_path,tool_name,lines_added,lines_removed,structured_patch_json,user_modified,ts_ms,git_branch,cwd",required:"source,session_id,tool_use_id,file_path,tool_name",key:"source,session_id,tool_use_id",derived:""},
-        Self::Relationship=>Spec{table:"session_relationships",columns:"source,parent_session_id,relationship_uid,child_session_id,relationship,identity_status,child_agent_type,child_agent_name,child_model,spawn_depth,evidence_kind,evidence_locator,evidence_ref,child_has_events,spawned_at_ms,created_ms,updated_ms,origin_session_id",required:"source,parent_session_id,relationship_uid,relationship,identity_status,evidence_kind,created_ms,updated_ms",key:"source,parent_session_id,relationship_uid",derived:""},
-        Self::CommitLink=>Spec{table:"session_commit_links",columns:"source,session_id,repo,branch,commit_sha,note_ref,match_method,confidence,files_json,numstat_json,evidence_json,created_at_ms",required:"source,session_id,repo,commit_sha,match_method,confidence,created_at_ms",key:"source,session_id,commit_sha,match_method",derived:""},
+        Self::SessionEvent=>Spec{table:"session_events",columns:"source,session_id,project,project_key,project_key_method,cwd,git_branch,message_id,parent_id,ts_ms,role,kind,text,model,token_json,provider,event_uid,tool_use_id,payload_bytes,payload_truncated,payload_hash,call_index,event_index,result_status,event_source,error_signal,subagent_session_id,agent_id,request_id,provider_message_id,stop_reason,agent_version,is_sidechain,is_meta,turn_id,request_span,raw_kind,control_kind",required:"source,session_id,ts_ms,role,kind,event_uid"},
+        Self::ToolCall=>Spec{table:"tool_calls",columns:"source,session_id,message_id,tool_use_id,name,target,args_json,is_error,ts_ms",required:"source,session_id,tool_use_id,name"},
+        Self::FileEdit=>Spec{table:"file_edits",columns:"source,session_id,message_id,tool_use_id,file_path,tool_name,lines_added,lines_removed,structured_patch_json,user_modified,ts_ms,git_branch,cwd",required:"source,session_id,tool_use_id,file_path,tool_name"},
+        Self::Relationship=>Spec{table:"session_relationships",columns:"source,parent_session_id,relationship_uid,child_session_id,relationship,identity_status,child_agent_type,child_agent_name,child_model,spawn_depth,evidence_kind,evidence_locator,evidence_ref,child_has_events,spawned_at_ms,created_ms,updated_ms,origin_session_id",required:"source,parent_session_id,relationship_uid,relationship,identity_status,evidence_kind,created_ms,updated_ms"},
+        Self::CommitLink=>Spec{table:"session_commit_links",columns:"source,session_id,repo,branch,commit_sha,note_ref,match_method,confidence,files_json,numstat_json,evidence_json,created_at_ms",required:"source,session_id,repo,commit_sha,match_method,confidence,created_at_ms"},
         // The `kind` column here is the marker's own classification, not the
         // evidence kind. It is required because a marker without one is the
         // unclassified row this table exists to keep.
-        Self::SessionMarker=>Spec{table:"session_markers",columns:"source,session_id,marker_uid,ts_ms,message_id,parent_id,turn_id,kind,subkind,text,payload_json",required:"source,session_id,marker_uid,kind",key:"source,session_id,marker_uid",derived:""},
+        Self::SessionMarker=>Spec{table:"session_markers",columns:"source,session_id,marker_uid,ts_ms,message_id,parent_id,turn_id,kind,subkind,text,payload_json",required:"source,session_id,marker_uid,kind"},
     }
     }
 }
+#[cfg(any(test, feature = "unstable-internal"))]
 fn numeric(field: &str) -> bool {
     matches!(
         field,
@@ -165,6 +197,7 @@ fn numeric(field: &str) -> bool {
 /// an adapter put `"successful"` where every consumer has been told to expect
 /// `"completed"`, and the cast at the boundary would not notice -- a value
 /// that is well-formed and wrong, served beside measured ones.
+#[cfg(any(test, feature = "unstable-internal"))]
 const TOOL_RESULT_FIELDS: &[&str] = &[
     "tool_use_id",
     "payload_bytes",
@@ -178,12 +211,15 @@ const TOOL_RESULT_FIELDS: &[&str] = &[
     "subagent_session_id",
     "agent_id",
 ];
+#[cfg(any(test, feature = "unstable-internal"))]
 const RESULT_STATUSES: &[&str] = &["running", "completed", "errored", "cancelled", "unknown"];
+#[cfg(any(test, feature = "unstable-internal"))]
 const EVENT_SOURCES: &[&str] = &[
     "tool_result",
     "subagent_notification",
     "function_call_output",
 ];
+#[cfg(any(test, feature = "unstable-internal"))]
 const ERROR_SIGNALS: &[&str] = &[
     "tool_result.is_error",
     "exit_code",
@@ -194,8 +230,10 @@ const ERROR_SIGNALS: &[&str] = &[
 
 /// The fidelity counts that cannot be negative. A byte count of `-1` is not a
 /// small payload; it is a bug upstream, and ranking by it puts the row first.
+#[cfg(any(test, feature = "unstable-internal"))]
 const NON_NEGATIVE_FIELDS: &[&str] = &["payload_bytes", "call_index", "event_index"];
 
+#[cfg(any(test, feature = "unstable-internal"))]
 fn boolean(field: &str) -> bool {
     matches!(
         field,
@@ -209,6 +247,7 @@ fn boolean(field: &str) -> bool {
 }
 
 /// Validate the complete response before opening a database or mutating history.
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn validate_records(
     key: &ObservationKey,
     covered: &[EvidenceKind],
@@ -274,7 +313,7 @@ pub fn validate_records(
                     == Some(&key.session_id),
             "INVALID_ARGUMENT: evidence belongs to another source or session"
         );
-        for field in spec.key.split(',').filter(|field| !numeric(field)) {
+        for field in record.kind.key().split(',').filter(|field| !numeric(field)) {
             ensure!(
                 record
                     .payload
@@ -424,6 +463,7 @@ pub fn validate_records(
     }
     Ok(())
 }
+#[cfg(feature = "unstable-internal")]
 fn sql_value(value: &Value) -> rusqlite::types::Value {
     match value {
         Value::Null => rusqlite::types::Value::Null,
@@ -441,16 +481,16 @@ impl EvidenceRecord {
         serde_json::to_string(&json!([
             self.kind,
             self.kind
-                .spec()
-                .key
+                .key()
                 .split(',')
                 .map(|field| self.payload.get(field).cloned().unwrap_or(Value::Null))
                 .collect::<Vec<_>>()
         ]))
         .expect("JSON evidence identity")
     }
+    #[cfg(feature = "unstable-internal")]
     fn key_sql(&self) -> (String, Vec<rusqlite::types::Value>) {
-        let columns = self.kind.spec().key.split(',').collect::<Vec<_>>();
+        let columns = self.kind.key().split(',').collect::<Vec<_>>();
         (
             columns
                 .iter()
@@ -480,9 +520,10 @@ impl EvidenceRecord {
     /// row it no longer owns. The fields still travel in the record, because a
     /// snapshot should round-trip what the emitting side knew; they are simply
     /// not evidence about who owns the row.
+    #[cfg(feature = "unstable-internal")]
     pub(crate) fn matches_canonical(&self, conn: &Connection) -> Result<bool> {
         let spec = self.kind.spec();
-        let derived: Vec<&str> = spec.derived.split(',').filter(|c| !c.is_empty()).collect();
+        let derived: Vec<&str> = self.kind.derived().split(',').filter(|c| !c.is_empty()).collect();
         let mut clauses = vec![];
         let mut values = vec![];
         for column in spec.columns.split(',').filter(|c| !derived.contains(c)) {
@@ -499,6 +540,7 @@ impl EvidenceRecord {
             |row| row.get(0),
         )?)
     }
+    #[cfg(feature = "unstable-internal")]
     pub(crate) fn exists(&self, conn: &Connection) -> Result<bool> {
         let (condition, values) = self.key_sql();
         Ok(conn.query_row(
@@ -510,6 +552,7 @@ impl EvidenceRecord {
             |row| row.get(0),
         )?)
     }
+    #[cfg(feature = "unstable-internal")]
     pub(crate) fn remove(&self, conn: &Connection) -> Result<()> {
         let (condition, values) = self.key_sql();
         conn.execute(
@@ -518,6 +561,7 @@ impl EvidenceRecord {
         )?;
         Ok(())
     }
+    #[cfg(feature = "unstable-internal")]
     pub(crate) fn write(&self, conn: &Connection) -> Result<()> {
         let spec = self.kind.spec();
         let columns = spec.columns.split(',').collect::<Vec<_>>();
@@ -527,7 +571,7 @@ impl EvidenceRecord {
             .collect::<Vec<_>>();
         let updates = columns
             .iter()
-            .filter(|column| !spec.key.split(',').any(|key| key == **column))
+            .filter(|column| !self.kind.key().split(',').any(|key| key == **column))
             .map(|column| format!("{column}=excluded.{column}"))
             .collect::<Vec<_>>()
             .join(",");
@@ -537,7 +581,7 @@ impl EvidenceRecord {
                 spec.table,
                 spec.columns,
                 vec!["?"; columns.len()].join(","),
-                spec.key
+                self.kind.key()
             ),
             params_from_iter(values),
         )
@@ -547,6 +591,7 @@ impl EvidenceRecord {
 }
 
 /// Snapshot parser output through the same transport-neutral row contract.
+#[cfg(feature = "unstable-internal")]
 pub fn read_session(
     conn: &Connection,
     source: &str,
@@ -564,7 +609,7 @@ pub fn read_session(
         };
         let mut query = conn.prepare(&format!(
             "SELECT {} FROM {} WHERE source=? AND {session_field}=? ORDER BY {}",
-            spec.columns, spec.table, spec.key
+            spec.columns, spec.table, kind.key()
         ))?;
         let rows = query.query_map([source, session], |row| {
             let mut payload = Map::new();

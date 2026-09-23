@@ -247,10 +247,12 @@ fn hydration_error(code: &str, message: impl std::fmt::Display) -> anyhow::Error
     anyhow::anyhow!("{code}: {message}")
 }
 
+#[cfg(feature = "unstable-internal")]
 pub fn hydrate_session(options: &HydrateSessionOptions) -> Result<HydrateSessionResult> {
     hydrate_session_at(&default_db_path(), options)
 }
 
+#[cfg(feature = "unstable-internal")]
 pub fn hydrate_session_at(
     db_path: &Path,
     options: &HydrateSessionOptions,
@@ -262,6 +264,7 @@ pub fn hydrate_session_at(
     )
 }
 
+#[cfg(feature = "unstable-internal")]
 pub fn hydrate_session_at_with_connectors(
     db_path: &Path,
     options: &HydrateSessionOptions,
@@ -274,6 +277,7 @@ pub fn hydrate_session_at_with_connectors(
 /// Hydrate against an explicit provider home instead of the process `HOME`.
 /// The provider-root check that guards every locator resolves against it, so
 /// a host (or a test) with its own layout never has to mutate process state.
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn hydrate_session_at_with_home(
     db_path: &Path,
     options: &HydrateSessionOptions,
@@ -670,6 +674,7 @@ fn hydrate_remote_session(
     )
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 fn classify_remote_error(error: anyhow::Error) -> anyhow::Error {
     let message = redact_remote_diagnostic(&format!("{error:#}"));
     for code in [
@@ -687,6 +692,7 @@ fn classify_remote_error(error: anyhow::Error) -> anyhow::Error {
     hydration_error("CONNECTOR_FAILURE", message)
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 fn redact_remote_diagnostic(message: &str) -> String {
     let mut redacted = Vec::new();
     let parts = message.split_whitespace().collect::<Vec<_>>();
@@ -736,6 +742,7 @@ fn redact_remote_diagnostic(message: &str) -> String {
     redacted.join(" ")
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 fn probable_secret(part: &str) -> bool {
     let value =
         part.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && !matches!(ch, '-' | '_' | '.'));
@@ -1116,11 +1123,13 @@ fn hydrate_remote_codex_diff_observed(
     )
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 struct UnifiedPatch {
     path: String,
     text: String,
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 fn split_unified_diff(diff: &str) -> Vec<UnifiedPatch> {
     let mut patches = Vec::new();
     let mut current_path: Option<String> = None;
@@ -1155,6 +1164,7 @@ fn split_unified_diff(diff: &str) -> Vec<UnifiedPatch> {
     patches
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 fn git_diff_destination_path(line: &str) -> Option<String> {
     let mut rest = line.strip_prefix("diff --git ")?;
     let _source = take_git_path(&mut rest)?;
@@ -1162,6 +1172,7 @@ fn git_diff_destination_path(line: &str) -> Option<String> {
     destination.strip_prefix("b/").map(str::to_string)
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 fn take_git_path(input: &mut &str) -> Option<String> {
     *input = input.trim_start();
     if let Some(quoted) = input.strip_prefix('"') {
@@ -1264,6 +1275,7 @@ fn write_hydration_checkpoint(
     Ok(())
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_remote_result(
     conn: &Connection,
@@ -3492,6 +3504,7 @@ fn max_tool_result_index(conn: &Connection, source: &str, session_id: &str) -> R
     )?)
 }
 
+#[cfg(feature = "unstable-internal")]
 pub(crate) fn hydrate_with_provider(
     db_path: &Path,
     options: &HydrateSessionOptions,
@@ -3610,6 +3623,7 @@ pub(crate) fn save_observation_progress(
 
 /// Parse provider wire evidence in an isolated database. No managed catalog,
 /// credentials or transports are accessed by this normalization operation.
+#[cfg(feature = "unstable-internal")]
 pub fn normalize_source_evidence(
     source: &str,
     session_id: &str,

@@ -11,16 +11,18 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "unstable-internal")]
 pub use crate::relationship_graph::{
-    relationship_capabilities, session_children, session_children_page, session_continuity_edges,
-    session_parents, session_relationships, session_tree, RelationshipCapabilities,
-    RelationshipCursor, RelationshipDiagnostic, RelationshipKinds, SessionChildrenPage,
-    SessionRelationship, SessionRelationships, SessionTree, SessionTreeNode, SessionTreeOptions,
-    CONTINUITY_RELATIONSHIPS, DEFAULT_CHILDREN_PAGE_LIMIT, DEFAULT_TREE_MAX_DEPTH,
-    DEFAULT_TREE_MAX_NODES, MAX_CHILDREN_PAGE_LIMIT, MAX_TREE_MAX_DEPTH, MAX_TREE_MAX_NODES,
-    RELATIONSHIP_CONTINUATION, RELATIONSHIP_FORK, RELATIONSHIP_RESUME,
+    relationship_capabilities, session_children_page, session_continuity_edges, session_parents,
+    session_tree, RelationshipCapabilities, RelationshipCursor, RelationshipDiagnostic,
+    RelationshipKinds, SessionChildrenPage, SessionRelationship, SessionRelationships, SessionTree,
+    SessionTreeNode, SessionTreeOptions, CONTINUITY_RELATIONSHIPS, DEFAULT_CHILDREN_PAGE_LIMIT,
+    DEFAULT_TREE_MAX_DEPTH, DEFAULT_TREE_MAX_NODES, MAX_CHILDREN_PAGE_LIMIT, MAX_TREE_MAX_DEPTH,
+    MAX_TREE_MAX_NODES, RELATIONSHIP_CONTINUATION, RELATIONSHIP_FORK, RELATIONSHIP_RESUME,
     SESSION_RELATIONSHIP_CONTRACT_VERSION,
 };
+#[cfg(any(test, feature = "unstable-internal"))]
+pub use crate::relationship_graph::{session_children, session_relationships};
 
 pub const SOURCE_CHOICES: &[&str] = &[
     "claude",
@@ -47,6 +49,7 @@ pub struct HistoryEntry {
     pub timestamp_ms: i64,
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Tag {
     pub name: String,
@@ -57,6 +60,7 @@ pub struct Tag {
     pub last_tagged_ms: Option<i64>,
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaggedSession {
     pub source: String,
@@ -66,6 +70,7 @@ pub struct TaggedSession {
     pub last_activity_ms: Option<i64>,
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 #[derive(Debug, Clone, Default)]
 pub struct QueryFilter {
     pub source: Option<String>,
@@ -108,6 +113,7 @@ impl SessionLocation {
 }
 
 /// How [`stats_scoped_by`] buckets `by_project`.
+#[cfg(any(test, feature = "unstable-internal"))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectGrouping {
@@ -121,7 +127,9 @@ pub enum ProjectGrouping {
     Cwd,
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 impl ProjectGrouping {
+    #[cfg(feature = "unstable-internal")]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ProjectKey => "project_key",
@@ -148,6 +156,7 @@ impl ProjectGrouping {
     }
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Stats {
     pub total: i64,
@@ -476,6 +485,7 @@ pub struct SourceDatabaseError {
 }
 
 impl SourceDatabaseError {
+    #[cfg(any(test, feature = "opencode-backup"))]
     pub fn new(path: impl Into<PathBuf>, source: rusqlite::Error) -> Self {
         Self {
             path: path.into(),
@@ -734,6 +744,7 @@ const RETIRED_INDEXES: &[&str] = &[
     "idx_file_edits_page",
 ];
 
+#[cfg(any(test, feature = "unstable-internal"))]
 const REQUIRED_CATALOG_READ_INDEXES: &[&str] = &[
     "idx_sessions_recency",
     "idx_sessions_source_recency",
@@ -749,6 +760,7 @@ const REQUIRED_EVIDENCE_READ_INDEXES: &[&str] = &[
     "idx_file_edits_page_v2",
     "idx_session_markers_page",
 ];
+#[cfg(any(test, feature = "unstable-internal"))]
 const REQUIRED_SCOPE_READ_INDEXES: &[&str] = &["idx_session_presences_location"];
 const REQUIRED_RELATIONSHIP_READ_INDEXES: &[&str] = &[
     "idx_session_relationships_parent",
@@ -817,11 +829,13 @@ fn export_schema_is_current(_conn: &Connection) -> Result<bool> {
 }
 
 /// Whether read-only APIs can safely and efficiently query this database.
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn schema_is_read_current(conn: &Connection) -> Result<bool> {
     schema_has_required_indexes(conn, REQUIRED_SCOPE_READ_INDEXES)
 }
 
 /// Whether the cache-only catalog can use its sort-free query plans.
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn schema_is_catalog_read_current(conn: &Connection) -> Result<bool> {
     schema_has_required_indexes(conn, REQUIRED_CATALOG_READ_INDEXES)
 }
@@ -2030,6 +2044,7 @@ pub fn parse_cursor_text(line: &str) -> Result<Option<String>> {
     ))
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn build_fts_query(terms: &[String], raw: bool) -> String {
     if raw {
         return terms.join(" ");
@@ -2072,6 +2087,7 @@ pub fn build_fts_query(terms: &[String], raw: bool) -> String {
     query
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 fn quote_fts_term(term: &str) -> String {
     format!("\"{}\"", term.replace('"', "\"\""))
 }
@@ -2082,6 +2098,7 @@ fn quote_fts_term(term: &str) -> String {
 /// the fts5 parser, or -- when a bareword is parsed as a column reference -- as
 /// `no such column: <term>`. Anything else (I/O, decoding, a genuine schema
 /// mismatch) is a real failure and must not be relabelled.
+#[cfg(any(test, feature = "unstable-internal"))]
 fn is_fts5_syntax_error(error: &rusqlite::Error) -> bool {
     let rusqlite::Error::SqliteFailure(_, Some(message)) = error else {
         return false;
@@ -2096,6 +2113,7 @@ fn is_fts5_syntax_error(error: &rusqlite::Error) -> bool {
 /// Map an FTS5 expression error to actionable guidance, leaving every other
 /// error untouched. Only applies in raw mode, where the caller supplied the
 /// MATCH expression verbatim.
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn raw_fts_query_error(raw: bool, error: rusqlite::Error) -> anyhow::Error {
     if raw && is_fts5_syntax_error(&error) {
         anyhow::anyhow!(
@@ -2106,6 +2124,7 @@ pub fn raw_fts_query_error(raw: bool, error: rusqlite::Error) -> anyhow::Error {
     }
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEntry> {
     Ok(HistoryEntry {
         id: row.get(0)?,
@@ -2118,6 +2137,7 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEntry> {
     })
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn normalize_tag_name(name: &str) -> String {
     name.split_whitespace()
         .collect::<Vec<_>>()
@@ -2125,6 +2145,7 @@ pub fn normalize_tag_name(name: &str) -> String {
         .to_lowercase()
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 fn append_filters(sql: &mut String, params: &mut Vec<String>, filter: &QueryFilter, alias: &str) {
     if let Some(source) = &filter.source {
         sql.push_str(&format!(" AND {alias}.source = ?"));
@@ -2146,6 +2167,7 @@ fn append_filters(sql: &mut String, params: &mut Vec<String>, filter: &QueryFilt
     }
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 fn append_scope_filter(sql: &mut String, scope: SessionScope, alias: &str) {
     match scope {
         SessionScope::Local => {
@@ -2190,6 +2212,7 @@ pub fn mark_session_presence(
 ///
 /// An empty result is intentionally distinct from `local`: it means no
 /// provenance row was recorded (for example, by an older writer).
+#[cfg(feature = "unstable-internal")]
 pub fn session_locations(conn: &Connection, source: &str, session_id: &str) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(
         "SELECT location FROM session_presences \
@@ -2261,6 +2284,7 @@ pub fn upsert_session_presence(
 /// complete-looking answer computed over part of the data -- worse than an
 /// error, because the truncation is invisible and the cursor that would have
 /// reported it is discarded.
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn session_markers(
     conn: &Connection,
     source: &str,
@@ -2337,6 +2361,7 @@ pub fn insert_history_at_location(
     Ok(inserted)
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn search(
     conn: &Connection,
     terms: &[String],
@@ -2361,6 +2386,7 @@ pub fn search(
         .map_err(|error| raw_fts_query_error(raw_fts, error))
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn recent(conn: &Connection, filter: &QueryFilter) -> Result<Vec<HistoryEntry>> {
     let mut sql = "SELECT h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms FROM history h WHERE 1=1".to_string();
     let mut params_vec = Vec::new();
@@ -2373,6 +2399,7 @@ pub fn recent(conn: &Connection, filter: &QueryFilter) -> Result<Vec<HistoryEntr
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn session(
     conn: &Connection,
     session_id: &str,
@@ -2502,6 +2529,7 @@ pub struct SessionEventCursor {
     pub id: i64,
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionEventPage {
     pub events: Vec<SessionEvent>,
@@ -2548,6 +2576,7 @@ pub struct SessionFileEdit {
 ///
 /// 3: `session_events` rows carry `control_kind`, and the user-turn page
 /// leaves control rows out.
+#[cfg(feature = "unstable-internal")]
 pub const SESSION_EVIDENCE_CONTRACT_VERSION: u32 = 3;
 
 /// Stable continuation for tool calls and file edits.
@@ -2562,12 +2591,14 @@ pub struct SessionEvidenceCursor {
     pub id: i64,
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionToolCallPage {
     pub tool_calls: Vec<SessionToolCall>,
     pub next_cursor: Option<SessionEvidenceCursor>,
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionFileEditPage {
     pub file_edits: Vec<SessionFileEdit>,
@@ -2671,6 +2702,7 @@ pub(crate) fn row_to_session_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<
 
 /// All normalized events for one session, oldest first. Rows sharing a
 /// timestamp keep insertion order via the rowid tiebreaker.
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn session_events(
     conn: &Connection,
     session_id: &str,
@@ -2784,6 +2816,7 @@ pub(crate) fn session_markers_sized(
 }
 
 /// One bounded page of normalized events for a session, oldest first.
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn session_events_page(
     conn: &Connection,
     session_id: &str,
@@ -2897,6 +2930,7 @@ pub(crate) fn row_to_session_marker(row: &rusqlite::Row<'_>) -> rusqlite::Result
 /// timestamp at all must still be reachable, and it must sort after everything
 /// dated rather than in front of it. Scoped to one `source` because native
 /// session ids collide across providers.
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn session_markers_page(
     conn: &Connection,
     source: &str,
@@ -3049,6 +3083,7 @@ pub(crate) fn row_to_file_edit(row: &rusqlite::Row<'_>) -> rusqlite::Result<Sess
 ///
 /// Both page readers and the query-plan test build their SQL here, so a plan
 /// assertion cannot pass against a restated copy while the real query drifts.
+#[cfg(any(test, feature = "unstable-internal"))]
 fn evidence_page_query(
     columns: &str,
     table: &str,
@@ -3087,6 +3122,7 @@ fn evidence_page_query(
 /// Both `source` and `session_id` are required: native session ids collide
 /// across providers, and a page that filtered on the id alone would interleave
 /// two unrelated sessions.
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn session_tool_calls_page(
     conn: &Connection,
     source: &str,
@@ -3128,6 +3164,7 @@ pub fn session_tool_calls_page(
 ///
 /// Scoped to one `source` for the same reason as
 /// [`session_tool_calls_page`].
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn session_file_edits_page(
     conn: &Connection,
     source: &str,
@@ -3436,15 +3473,18 @@ pub fn session_user_turns_page(
     })
 }
 
+#[cfg(feature = "unstable-internal")]
 pub fn stats(conn: &Connection, tag: Option<&str>) -> Result<Stats> {
     stats_scoped(conn, tag, SessionScope::Local)
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn stats_scoped(conn: &Connection, tag: Option<&str>, scope: SessionScope) -> Result<Stats> {
     stats_scoped_by(conn, tag, scope, ProjectGrouping::default())
 }
 
 /// Statistics with an explicit `by_project` bucketing.
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn stats_scoped_by(
     conn: &Connection,
     tag: Option<&str>,
@@ -4216,6 +4256,7 @@ fn lendable_ancestor_key(
     Ok((None, closed_a_cycle))
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -4223,6 +4264,7 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 fn ensure_tag(conn: &Connection, name: &str, color: Option<&str>) -> Result<i64> {
     let normalized = normalize_tag_name(name);
     anyhow::ensure!(!normalized.is_empty(), "tag name cannot be empty");
@@ -4238,6 +4280,7 @@ fn ensure_tag(conn: &Connection, name: &str, color: Option<&str>) -> Result<i64>
     )
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn matching_sessions(
     conn: &Connection,
     session_id: &str,
@@ -4265,6 +4308,7 @@ pub fn matching_sessions(
     Ok(rows)
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn tag_session(
     conn: &Connection,
     session_id: &str,
@@ -4287,6 +4331,7 @@ pub fn tag_session(
     Ok(sessions)
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn untag_session(
     conn: &Connection,
     session_id: &str,
@@ -4305,6 +4350,7 @@ pub fn untag_session(
     Ok(removed)
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn list_tags(conn: &Connection) -> Result<Vec<Tag>> {
     let mut stmt = conn.prepare(
         "SELECT t.name, t.display_name, t.color, COUNT(st.id), MIN(st.created_ms), MAX(st.created_ms) FROM tags t LEFT JOIN session_tags st ON st.tag_id = t.id GROUP BY t.id, t.name, t.display_name, t.color ORDER BY t.name",
@@ -4324,6 +4370,7 @@ pub fn list_tags(conn: &Connection) -> Result<Vec<Tag>> {
     Ok(rows)
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn resume_command(entry: &HistoryEntry) -> Option<String> {
     let sid = entry.session_id.as_ref()?;
     match entry.source.as_str() {
@@ -4356,6 +4403,7 @@ pub fn resume_command(entry: &HistoryEntry) -> Option<String> {
     }
 }
 
+#[cfg(any(test, feature = "unstable-internal"))]
 pub fn shell_quote(value: &str) -> String {
     if !value.is_empty()
         && value
@@ -4598,6 +4646,7 @@ fn sync_opencode_session_from_connection(
     Ok(crate::ingest::opencode::normalize(conn, &loaded, &raw_path.to_string_lossy())?.prompts)
 }
 
+#[cfg(feature = "unstable-internal")]
 pub fn export_json(conn: &Connection) -> Result<Vec<HistoryEntry>> {
     let mut stmt = conn.prepare("SELECT id, source, session_id, project, prompt, timestamp_ms FROM history ORDER BY timestamp_ms ASC")?;
     let rows = stmt
@@ -4606,6 +4655,7 @@ pub fn export_json(conn: &Connection) -> Result<Vec<HistoryEntry>> {
     Ok(rows)
 }
 
+#[cfg(feature = "unstable-internal")]
 pub fn import_json(conn: &Connection, entries: &[HistoryEntry]) -> Result<usize> {
     let mut inserted = 0;
     for entry in entries {
