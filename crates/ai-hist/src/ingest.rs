@@ -113,7 +113,7 @@ pub fn sync_local_at(db_path: &Path) -> Result<bool> {
 }
 
 /// Content-free progress for hosts displaying a local capture operation.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CaptureProgress {
     pub source: String,
@@ -140,7 +140,7 @@ thread_local! {
     static CAPTURE_STOP: std::cell::RefCell<Option<CaptureStop>> = std::cell::RefCell::new(None);
 }
 
-fn with_capture_stop<T>(
+pub(crate) fn with_capture_stop<T>(
     cancelled: impl Fn() -> bool + 'static,
     run: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
@@ -205,6 +205,23 @@ pub fn sync_local_at_with_progress(
     db_path: &Path,
     observer: impl Fn(CaptureProgress) + 'static,
 ) -> Result<bool> {
+    with_capture_observer(observer, || {
+        capture_progress("initializing", 0, None);
+        let result = sync_local_at(db_path);
+        check_capture_cancelled()?;
+        if result.is_ok() {
+            capture_progress("complete", 0, None);
+        }
+        result
+    })
+}
+
+/// Route this thread's capture progress to `observer` for the duration of
+/// `run`, restoring the previous observer on return, error, or panic.
+pub(crate) fn with_capture_observer<T>(
+    observer: impl Fn(CaptureProgress) + 'static,
+    run: impl FnOnce() -> Result<T>,
+) -> Result<T> {
     struct Restore(Option<CaptureObserver>);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -213,13 +230,7 @@ pub fn sync_local_at_with_progress(
     }
     let _restore =
         Restore(CAPTURE_OBSERVER.with(|slot| slot.replace(Some(std::rc::Rc::new(observer)))));
-    capture_progress("initializing", 0, None);
-    let result = sync_local_at(db_path);
-    check_capture_cancelled()?;
-    if result.is_ok() {
-        capture_progress("complete", 0, None);
-    }
-    result
+    run()
 }
 
 fn capture_progress(source: &str, processed_files: usize, total_files: Option<usize>) {

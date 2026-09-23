@@ -5,11 +5,12 @@
 //! — stays behind the `unstable-internal` feature. Cargo semver is the
 //! contract; there is no separate Rust contract-version constant.
 //!
-//! Nine operations, one entry type:
+//! Ten operations, one entry type:
 //!
 //! | Method | What it does |
 //! |---|---|
 //! | [`SessionStore::open`] | open (and, unless read-only, create and migrate) `ai-history.db` |
+//! | [`SessionStore::discover`] | the shallow catalog sweep, hydrating nothing |
 //! | [`SessionStore::sync`] | one full local sweep under the crate's `SyncRunLock` |
 //! | [`SessionStore::hydrate`] | one session, by id or by transcript path, plus its bounded related transcripts |
 //! | [`SessionStore::watch`] | the live-capture loop, as an iterator of ticks |
@@ -37,7 +38,8 @@ use crate::ingest::hydrate::{
     hydrate_session_at_with_roots_and_connectors, HydrateSessionOptions, HydrateSessionResult,
 };
 use crate::ingest::{
-    source_watch_roots, sync_facade_tick, sync_watch_roots_with_provider_roots, SyncTick,
+    source_watch_roots, sync_facade_tick, sync_watch_roots_with_provider_roots,
+    with_capture_observer, with_capture_stop, CaptureCancelled, CaptureProgress, SyncTick,
     HOOK_HARNESSES,
 };
 use crate::paths::home_dir;
@@ -63,6 +65,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -75,8 +78,9 @@ use std::time::{Duration, Instant};
 ///
 /// The variants mirror the TypeScript SDK's native error classes
 /// (`docs/architecture.md`, "Native errors") minus the four that only a Node
-/// addon can raise, plus the three the Rust facade adds: [`Error::SyncLocked`],
-/// [`Error::SourceMismatch`] and [`Error::WatermarkAheadOfStore`].
+/// addon can raise, plus the four the Rust facade adds: [`Error::SyncLocked`],
+/// [`Error::SourceMismatch`], [`Error::WatermarkAheadOfStore`] and
+/// [`Error::Cancelled`].
 /// [`Error::code`] is the stable `SCREAMING_SNAKE_CASE` code a host can match
 /// on or forward; `Display` renders `CODE: message`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,8 +102,8 @@ pub enum Error {
     StaleSchema(String),
     /// A caller-supplied value was rejected before anything was read.
     InvalidArgument(String),
-    /// The operation is not available on this handle: `sync`, `hydrate` and
-    /// `watch` on a store opened with `read_only: true`.
+    /// The operation is not available on this handle: `discover`, `sync`,
+    /// `hydrate` and `watch` on a store opened with `read_only: true`.
     UnsupportedOperation(String),
     /// `hydrate` was asked for a session the catalog does not hold.
     SessionNotFound(String),
@@ -155,6 +159,10 @@ pub enum Error {
     /// position in one kind set's stream; use another consumer name for
     /// another filter. See [`SessionStore::changes_since`].
     ConsumerKindsMismatch(String),
+    /// The caller's [`StopToken`] stopped `discover`, `sync` or `hydrate`.
+    /// Work committed before the stop stays; the unfinished transaction rolls
+    /// back and the next call resumes from its checkpoint.
+    Cancelled(String),
 }
 
 impl Error {
@@ -180,6 +188,7 @@ impl Error {
             Self::SyncLocked { .. } => "SYNC_LOCKED",
             Self::WatermarkAheadOfStore(_) => "WATERMARK_AHEAD_OF_STORE",
             Self::ConsumerKindsMismatch(_) => "CONSUMER_KINDS_MISMATCH",
+            Self::Cancelled(_) => "CANCELLED",
         }
     }
 
@@ -203,7 +212,8 @@ impl Error {
             | Self::Discovery(m)
             | Self::SyncFailed(m)
             | Self::WatermarkAheadOfStore(m)
-            | Self::ConsumerKindsMismatch(m) => m.clone(),
+            | Self::ConsumerKindsMismatch(m)
+            | Self::Cancelled(m) => m.clone(),
             Self::SyncLocked { path, waited_ms } => format!(
                 "another sync holds the lock on {} (waited {waited_ms} ms); \
                  wait for it to finish or raise SyncOptions::lock_timeout_ms",
@@ -216,6 +226,9 @@ impl Error {
     /// puts on the errors it can name, falling back to `otherwise` for the
     /// rest. The napi layer does the same; the two must agree.
     fn classify(error: anyhow::Error, otherwise: fn(String) -> Self) -> Self {
+        if error.chain().any(|cause| cause.is::<CaptureCancelled>()) {
+            return Self::Cancelled(format!("{error:#}"));
+        }
         let message = format!("{error:#}");
         let coded: &[(&str, ErrorBuilder)] = &[
             ("SESSION_NOT_FOUND", Self::SessionNotFound),
@@ -531,7 +544,7 @@ pub struct StoreOptions {
     /// does. One resolution drives `sync`, `hydrate`, `watch` and
     /// [`SourceCapabilities::watch_roots`] alike.
     pub roots: Option<ProviderRoots>,
-    /// Never write. `sync`, `hydrate` and `watch` return
+    /// Never write. `discover`, `sync`, `hydrate` and `watch` return
     /// [`Error::UnsupportedOperation`]; a database older than the shape this
     /// version reads is refused at `open` rather than failing inside a query.
     pub read_only: bool,
@@ -656,7 +669,9 @@ impl SessionStore {
         if self.read_only {
             return Err(Error::read_only("sync"));
         }
-        let (tick, changed) = self.sync_tick(opts.force, opts.lock_timeout_ms)?;
+        let (tick, changed) = controlled(opts.stop.as_ref(), opts.progress.as_ref(), || {
+            self.sync_tick(opts.force, opts.lock_timeout_ms)
+        })?;
         Ok(SyncReport {
             swept: tick.swept,
             changed,
@@ -705,6 +720,56 @@ impl SessionStore {
         }
     }
 
+    // -- discover -----------------------------------------------------------
+
+    /// One shallow catalog sweep: every local provider's sessions, read from
+    /// metadata only and upserted as [`DiscoveryState::Shallow`] rows. A
+    /// session whose source stamp has not moved is served from the catalog
+    /// without being read. Nothing is hydrated; [`SessionStore::hydrate`]
+    /// fully indexes the sessions a caller picks.
+    ///
+    /// Takes no `SyncRunLock`, so it never waits behind a sweep; SQLite
+    /// serializes its writes. One provider failing is a
+    /// [`DiscoveryReport::diagnostics`] entry, never an error for the rest.
+    pub fn discover(&self, opts: DiscoveryOptions) -> Result<DiscoveryReport, Error> {
+        if self.read_only {
+            return Err(Error::read_only("discover"));
+        }
+        if opts.sources.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(DiscoveryReport::default());
+        }
+        let conn =
+            open_db(&self.db_path).map_err(|error| Error::DatabaseOpen(format!("{error:#}")))?;
+        let env = discover::DiscoveryEnv::with_provider_roots(&conn, self.roots.clone());
+        let options = discover::DiscoverOptions {
+            scope: SessionScope::Local,
+            sources: opts
+                .sources
+                .iter()
+                .flatten()
+                .map(|source| source.as_str().to_string())
+                .collect(),
+            limit: opts.limit,
+        };
+        let summary = controlled(opts.stop.as_ref(), None, || {
+            discover::discover_sessions_with_env(&env, &options, |_| {})
+                .map_err(|error| Error::classify(error, Error::Discovery))
+        })?;
+        Ok(DiscoveryReport {
+            discovered: summary.discovered,
+            skipped_unchanged: summary.skipped_unchanged,
+            diagnostics: summary
+                .diagnostics
+                .into_iter()
+                .map(|diagnostic| Diagnostic {
+                    code: "DISCOVERY_FAILED".into(),
+                    message: format!("{}: {}", diagnostic.source, diagnostic.error),
+                    subject: diagnostic.locator,
+                })
+                .collect(),
+        })
+    }
+
     // -- hydrate ------------------------------------------------------------
 
     /// Fully index one session without enumerating the rest of the provider.
@@ -719,6 +784,10 @@ impl SessionStore {
         if self.read_only {
             return Err(Error::read_only("hydrate"));
         }
+        controlled(opts.stop.as_ref(), None, || self.hydrate_now(r, &opts))
+    }
+
+    fn hydrate_now(&self, r: &SessionRef, opts: &HydrateOptions) -> Result<HydrateReport, Error> {
         match r {
             SessionRef::Id { source, session_id } => {
                 let options = HydrateSessionOptions {
@@ -1138,6 +1207,96 @@ fn resolve_db_path(opts: &StoreOptions) -> PathBuf {
 // sync
 // ---------------------------------------------------------------------------
 
+/// Cooperative stop for [`SessionStore::discover`], [`SessionStore::sync`]
+/// and [`SessionStore::hydrate`]. Clones share one flag, so a token handed to
+/// a call on one thread is stopped from another.
+///
+/// A stopped call returns [`Error::Cancelled`] at the next provider, file or
+/// record boundary. Committed chunks stay; the unfinished transaction rolls
+/// back and the next call resumes from its checkpoint.
+#[derive(Debug, Clone, Default)]
+pub struct StopToken(Arc<AtomicBool>);
+
+impl StopToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Stop every call holding this token or a clone of it. Idempotent.
+    pub fn stop(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// Receives content-free [`CaptureProgress`] — a source name and file
+/// counts, never paths or session contents — while a sweep reads files.
+/// Called on the thread running the sweep.
+#[derive(Clone)]
+pub struct ProgressObserver(Arc<dyn Fn(CaptureProgress) + Send + Sync>);
+
+impl ProgressObserver {
+    pub fn new(observer: impl Fn(CaptureProgress) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(observer))
+    }
+}
+
+impl fmt::Debug for ProgressObserver {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ProgressObserver")
+    }
+}
+
+/// Run `work` with the caller's stop and progress installed for this thread.
+fn controlled<T>(
+    stop: Option<&StopToken>,
+    progress: Option<&ProgressObserver>,
+    work: impl FnOnce() -> Result<T, Error>,
+) -> Result<T, Error> {
+    let stop = stop.cloned();
+    let stoppable = move || match stop {
+        Some(token) => with_capture_stop(move || token.is_stopped(), || Ok(work())),
+        None => Ok(work()),
+    };
+    let outcome = match progress.cloned() {
+        Some(observer) => with_capture_observer(move |value| (observer.0)(value), stoppable),
+        None => stoppable(),
+    };
+    outcome.map_err(Error::sync)?
+}
+
+/// How to run a shallow catalog sweep.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct DiscoveryOptions {
+    /// Restrict to these sources. `None` means every local source;
+    /// `Some(vec![])` admits none and reads nothing.
+    pub sources: Option<Vec<Source>>,
+    /// Cap on rows read, newest first across providers. `None` (the default)
+    /// reads the whole catalog; a caller repeating a capped sweep only ever
+    /// sees the same newest sessions.
+    pub limit: Option<usize>,
+    /// Stops the sweep at the next provider or file boundary. See
+    /// [`StopToken`].
+    #[serde(skip)]
+    pub stop: Option<StopToken>,
+}
+
+/// Result of [`SessionStore::discover`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct DiscoveryReport {
+    /// Sessions read from provider metadata and upserted.
+    pub discovered: usize,
+    /// Sessions whose source stamp had not moved, served from the catalog.
+    pub skipped_unchanged: usize,
+    /// Providers or sessions that could not be read.
+    pub diagnostics: Vec<Diagnostic>,
+}
+
 /// How to run a local sweep.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -1152,6 +1311,13 @@ pub struct SyncOptions {
     /// re-tried every 100 ms while the budget lasts; a budget above seven
     /// days is treated as seven days.
     pub lock_timeout_ms: u64,
+    /// Stops the sweep at the next provider, file or record boundary, and
+    /// ends a wait for the lock. See [`StopToken`].
+    #[serde(skip)]
+    pub stop: Option<StopToken>,
+    /// Receives [`CaptureProgress`] as the sweep reads each provider's files.
+    #[serde(skip)]
+    pub progress: Option<ProgressObserver>,
 }
 
 /// Result of [`SessionStore::sync`].
@@ -1274,12 +1440,17 @@ pub struct HydrateOptions {
     /// Also hydrate the session's bounded related transcripts — Claude
     /// subagent sidecars beside it, Codex child rollouts. Defaults to `true`.
     pub include_related: bool,
+    /// Stops the hydration at the next file or record boundary. See
+    /// [`StopToken`].
+    #[serde(skip)]
+    pub stop: Option<StopToken>,
 }
 
 impl Default for HydrateOptions {
     fn default() -> Self {
         Self {
             include_related: true,
+            stop: None,
         }
     }
 }
@@ -2554,6 +2725,7 @@ mod tests {
             .sync(SyncOptions {
                 force: false,
                 lock_timeout_ms: u64::MAX,
+                ..Default::default()
             })
             .expect("an unlocked store syncs");
         assert!(report.swept);
@@ -2677,6 +2849,7 @@ mod tests {
             .sync(SyncOptions {
                 force: true,
                 lock_timeout_ms: 0,
+                ..Default::default()
             })
             .unwrap();
         assert!(again.swept);
@@ -2710,6 +2883,7 @@ mod tests {
                 store.sync(SyncOptions {
                     force: false,
                     lock_timeout_ms: 10_000,
+                    ..Default::default()
                 })
             }
         });

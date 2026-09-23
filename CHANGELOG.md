@@ -184,8 +184,15 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Rust API
 
+- `SessionStore::discover(DiscoveryOptions)` is the shallow catalog sweep:
+  every local provider's sessions from metadata, as `Shallow` rows, hydrating
+  none and taking no `SyncRunLock`. `discover`, `sync` and `hydrate` take an
+  optional `StopToken` (`stop`), and a stopped call is `Error::Cancelled`
+  (`CANCELLED`) at the next provider, file or record boundary.
+  `SyncOptions::progress` takes a `ProgressObserver` receiving content-free
+  `CaptureProgress` per provider file.
 - `SessionStore` is now the whole default surface of the `ai-hist` crate:
-  nine operations, typed evidence, no raw connection, no contract constant
+  ten operations, typed evidence, no raw connection, no contract constant
   (`docs/sourcing-sdk.md`). `open` keeps its shape and `StoreOptions` gains
   `roots: Option<ProviderRoots>` (`ProviderRoots` is public: `from_env` is
   the CLI's resolution, `from_home` reads nothing from the environment); the
