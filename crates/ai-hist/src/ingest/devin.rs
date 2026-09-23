@@ -372,11 +372,11 @@ pub(crate) fn register_stamp_fn(src: &Connection) -> Result<()> {
 /// `None` means the session is absent or hidden. The stamp folds in the
 /// activity timestamp, a checksum of the session row's own fields (title,
 /// cwd, workspace, model, mode, metadata), the message-node count, max and
-/// sum of row ids, a content checksum of every `chat_message`/`metadata`,
-/// the tool-state count and a checksum of its payloads, and the transcript
-/// file's own stamp — discovery, sync and hydration all derive "did this
-/// change" from the same tuple so no surface can skip evidence the others
-/// would re-read.
+/// sum of row ids, a hash of each node's `row_id`, `node_id`, and NULL-safe
+/// `parent_node_id` together with its `chat_message`/`metadata`, the tool-state
+/// count and a checksum of its payloads, and the transcript file's own stamp —
+/// discovery, sync and hydration all derive "did this change" from the same tuple
+/// so no surface can skip evidence the others would re-read.
 ///
 /// Requires [`register_stamp_fn`] on `src`.
 pub(crate) fn session_stamp(
@@ -408,12 +408,16 @@ pub(crate) fn session_stamp(
     };
     // Each row's identity is folded into its own hash, so a rewrite that
     // swaps content between rows — the multiset stays identical — still
-    // changes the sum.
+    // changes the sum. The tree columns (`node_id`, `parent_node_id`) are
+    // part of that identity: a compaction rewrite can keep content and time
+    // unchanged but renumber the tree, and the canonical links must follow.
     let (node_count, node_max, node_rows, node_digest): (i64, i64, i64, i64) = src.query_row(
         "SELECT COUNT(*), COALESCE(MAX(row_id), 0), COALESCE(SUM(row_id), 0), \
          COALESCE(SUM(ai_hist_fnv(\
-             CAST(row_id AS TEXT) || '|' || COALESCE(chat_message, '') || '|' || \
-             COALESCE(metadata, '') || '|' || CAST(created_at AS TEXT))), 0) \
+             CAST(row_id AS TEXT) || '|' || CAST(node_id AS TEXT) || '|' || \
+             CAST(COALESCE(parent_node_id, -1) AS TEXT) || '|' || \
+             COALESCE(chat_message, '') || '|' || COALESCE(metadata, '') || '|' || \
+             CAST(created_at AS TEXT))), 0) \
          FROM message_nodes WHERE session_id = ?1",
         params![session_id],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),

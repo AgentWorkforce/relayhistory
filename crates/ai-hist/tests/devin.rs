@@ -556,6 +556,27 @@ fn devin_partial_evidence_loss_repairs_on_unchanged_stamp() {
     );
 }
 
+/// A fixture whose nodes carry no `message_id` in `chat_message`, so the
+/// canonical event identity falls back to `n{node_id}` and is sensitive to
+/// a pure tree-column rewrite.
+const TREE_REWRITE_SESSION_SQL: &str = r#"
+INSERT INTO sessions
+  (id, working_directory, backend_type, model, agent_mode, created_at,
+   last_activity_at, title, workspace_dirs, hidden, metadata)
+VALUES
+  ('devin-tree', '/work/repo', 'devin', 'test-model', 'normal',
+   1776643200, 1776643202, 'Tree rewrite test', '["/work/repo"]', 0, NULL);
+INSERT INTO message_nodes
+  (session_id, node_id, parent_node_id, chat_message, created_at, metadata)
+VALUES
+  ('devin-tree', 0, NULL,
+   '{"role":"user","content":"tree prompt","metadata":{"is_user_input":true}}',
+   1776643201, NULL),
+  ('devin-tree', 1, 0,
+   '{"role":"assistant","content":"tree answer","metadata":{"num_tokens":8}}',
+   1776643202, NULL);
+"#;
+
 #[test]
 fn devin_history_loss_repairs_on_unchanged_stamp() {
     let _lock = ENV_LOCK.lock().unwrap();
@@ -631,6 +652,63 @@ fn devin_marker_loss_repairs_on_unchanged_stamp() {
             .count(),
         1,
         "a deleted marker row must be restored even though the source stamp is unchanged"
+    );
+}
+
+#[test]
+fn devin_tree_rewrite_without_content_change_updates_links() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let store = stage_devin_db(home, TREE_REWRITE_SESSION_SQL);
+    let _env = EnvGuard::set(home);
+    let db = home.join("history.db");
+
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+    let conn = open_db(&db).unwrap();
+    let first: Vec<_> = ai_hist::session_events(&conn, "devin-tree", Some("devin"))
+        .unwrap()
+        .into_iter()
+        .map(|e| (e.message_id, e.parent_id, e.role))
+        .collect();
+    assert_eq!(
+        first,
+        vec![
+            (Some("n0".into()), None, "user".into()),
+            (Some("n1".into()), Some("n0".into()), "assistant".into()),
+        ],
+        "initial tree links follow node_id"
+    );
+    drop(conn);
+
+    // Rewrite only tree columns: no content, no timestamp change. This used
+    // to leave the old `n0`/`n1` canonical rows in place because the stamp did
+    // not hash node_id/parent_node_id.
+    let provider = Connection::open(&store).unwrap();
+    provider
+        .execute_batch(
+            "UPDATE message_nodes SET node_id = 10 \
+             WHERE session_id = 'devin-tree' AND node_id = 0; \
+             UPDATE message_nodes SET node_id = 11, parent_node_id = 10 \
+             WHERE session_id = 'devin-tree' AND node_id = 1;",
+        )
+        .unwrap();
+    drop(provider);
+
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+    let conn = open_db(&db).unwrap();
+    let second: Vec<_> = ai_hist::session_events(&conn, "devin-tree", Some("devin"))
+        .unwrap()
+        .into_iter()
+        .map(|e| (e.message_id, e.parent_id, e.role))
+        .collect();
+    assert_eq!(
+        second,
+        vec![
+            (Some("n10".into()), None, "user".into()),
+            (Some("n11".into()), Some("n10".into()), "assistant".into()),
+        ],
+        "a pure tree rewrite must re-index canonical identities and parent links"
     );
 }
 
