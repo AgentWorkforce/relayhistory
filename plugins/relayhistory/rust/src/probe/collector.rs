@@ -689,6 +689,26 @@ fn start_inventory(directory: &Path, cancelled: Arc<AtomicBool>) -> InventoryWor
 }
 
 /// Own the collector lock and retry capture/delivery until stopped; status writes are advisory.
+/// A blocked job holds the verdict of the probe build that reached it, and a
+/// different build can judge the same exchange differently — a receipt it now
+/// parses, say. The first run under each new build retries a blocked job once;
+/// later runs of that build leave its own verdicts alone.
+fn retry_verdict_of_another_build(directory: &Path, job_id: &str, version: &str) -> Result<()> {
+    let marker = directory.join("verdict-retry.json");
+    let retried = fs::read(&marker)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|value| value["probe_version"].as_str().map(str::to_owned));
+    if retried.as_deref() == Some(version) {
+        return Ok(());
+    }
+    let conn = relayhistory_plugin::delivery::open_db(&directory.join("history.db"))?;
+    if delivery::status(&conn, job_id)?.state == "blocked" {
+        delivery::retry_job(&conn, job_id)?;
+    }
+    save_json(&marker, &json!({ "probe_version": version }))
+}
+
 pub fn run_background(directory: &Path, startup_id: &str) -> Result<()> {
     let _lock = lock(directory)?;
     ensure!(
@@ -697,6 +717,7 @@ pub fn run_background(directory: &Path, startup_id: &str) -> Result<()> {
     );
     let config = read_config(directory)?;
     std::env::set_var("RELAYHISTORY_HOME", directory);
+    retry_verdict_of_another_build(directory, &config.job_id, env!("CARGO_PKG_VERSION"))?;
     #[cfg(unix)]
     unsafe {
         // Handlers only store an atomic flag. Network/capture cleanup happens in
@@ -1453,6 +1474,34 @@ mod tests {
         assert!(status.pending_records > 0);
         delivery::cancel_job(&conn, &config.job_id).unwrap();
         assert!(deliver_with_receiver(&db_path, &config, &receiver, &|| false).is_err());
+    }
+
+    #[test]
+    fn a_new_build_retries_a_blocked_job_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = relayhistory_plugin::delivery::open_db(&dir.path().join("history.db")).unwrap();
+        let job = delivery::create_job(&conn, &job_config(true), now()).unwrap();
+        let block = || {
+            conn.execute(
+                "UPDATE delivery_jobs SET state='blocked',failure='invalid_payload' WHERE id=?",
+                [&job.job_id],
+            )
+            .unwrap();
+        };
+        let state = || delivery::status(&conn, &job.job_id).unwrap();
+
+        block();
+        retry_verdict_of_another_build(dir.path(), &job.job_id, "1.0.0").unwrap();
+        assert_eq!(state().state, "active");
+        assert_eq!(state().failure, None);
+
+        // The same build reaching the same verdict keeps it.
+        block();
+        retry_verdict_of_another_build(dir.path(), &job.job_id, "1.0.0").unwrap();
+        assert_eq!(state().state, "blocked");
+
+        retry_verdict_of_another_build(dir.path(), &job.job_id, "1.0.1").unwrap();
+        assert_eq!(state().state, "active");
     }
 
     #[test]
