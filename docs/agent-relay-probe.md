@@ -112,11 +112,12 @@ implementation.
 
 Each new probe version retries a previously blocked job once, before setup
 delivery or background collection begins. Later starts of that version preserve
-its blocked verdicts. The `verdict-retry.json` marker is advisory: if it cannot
-be saved, collection continues and the process remembers the version to avoid
-repeating the retry during foreground startup. That fallback lasts only for the
-current process; a subsequent process can retry again until the marker is saved.
-Paused and cancelled jobs remain unchanged.
+its blocked verdicts. The job's `retry_build` in SQLite is committed atomically
+with the retry, so detached collectors and later restarts cannot retry it again.
+The older `verdict-retry.json` marker seeds an unrecorded build and is maintained
+for compatibility; failure to save that file does not stop collection. If the
+database transaction fails, automatic recovery is deferred without committing
+either the retry or its build record. Paused and cancelled jobs remain unchanged.
 
 Local capture progress is written to private `progress.json` and emitted as
 `event: "progress"` on the desktop install JSON stream every three seconds.
