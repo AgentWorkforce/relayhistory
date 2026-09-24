@@ -2,8 +2,15 @@
 use anyhow::Result;
 use rusqlite::Connection;
 pub(super) fn is_current(conn: &Connection) -> Result<bool> {
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('delivery_jobs') WHERE name='retry_build')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        return Ok(false);
+    }
     if !conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('delivery_session_jobs') WHERE name='last_member')", [], |r| r.get::<_,bool>(0))? { return Ok(false); }
-    Ok(conn.query_row("SELECT COUNT(*)=10 FROM sqlite_master WHERE (type='table' AND name IN ('delivery_jobs','delivery_batches','delivery_session_jobs','delivery_session_members')) OR (type='trigger' AND name IN ('delivery_session_ready','delivery_batches_cap_insert','delivery_batches_count_insert','delivery_batches_cap_update','delivery_batches_count_update','delivery_batches_count_delete'))", [], |r| r.get(0))?)
+    Ok(conn.query_row("SELECT COUNT(*)=11 FROM sqlite_master WHERE (type='table' AND name IN ('delivery_jobs','delivery_batches','delivery_session_jobs','delivery_session_members','delivery_job_builds')) OR (type='trigger' AND name IN ('delivery_session_ready','delivery_batches_cap_insert','delivery_batches_count_insert','delivery_batches_cap_update','delivery_batches_count_update','delivery_batches_count_delete'))", [], |r| r.get(0))?)
 }
 pub(super) fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(r#"CREATE TABLE IF NOT EXISTS delivery_jobs (
@@ -15,10 +22,13 @@ pub(super) fn init_schema(conn: &Connection) -> Result<()> {
     bootstrap_done INTEGER NOT NULL DEFAULT 0, acknowledged_cursor INTEGER NOT NULL DEFAULT 0,
     fence INTEGER NOT NULL DEFAULT 0, worker_id TEXT, lease_until_ms INTEGER,
     next_attempt_ms INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0,
-    last_attempt_ms INTEGER, last_acknowledged_ms INTEGER, acceptance_level TEXT, failure TEXT,
+    last_attempt_ms INTEGER, last_acknowledged_ms INTEGER, acceptance_level TEXT, failure TEXT, retry_build TEXT,
     suppressed_records INTEGER NOT NULL DEFAULT 0, acknowledged_records INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS delivery_active_instance ON delivery_jobs(destination_id,instance_id,account_id) WHERE state <> 'cancelled';
+CREATE TABLE IF NOT EXISTS delivery_job_builds (
+    job_id TEXT NOT NULL, build TEXT NOT NULL, PRIMARY KEY(job_id,build)
+);
 CREATE TABLE IF NOT EXISTS delivery_batches (
     seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, job_id TEXT NOT NULL,
     state TEXT NOT NULL CHECK(state IN ('pending','leased','retry_wait','blocked','acknowledged','suppressed','cancelled')),
@@ -42,6 +52,14 @@ CREATE TRIGGER IF NOT EXISTS delivery_session_ready AFTER INSERT ON delivery_jou
  UPDATE delivery_session_members SET ready=1 WHERE source=NEW.source AND session_id=NEW.session_id AND ready=0;
 END;
 "#)?;
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('delivery_jobs') WHERE name='retry_build')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        conn.execute_batch("ALTER TABLE delivery_jobs ADD COLUMN retry_build TEXT;")?;
+    }
+    conn.execute_batch("INSERT OR IGNORE INTO delivery_job_builds(job_id,build) SELECT id,retry_build FROM delivery_jobs WHERE retry_build IS NOT NULL;")?;
     if !conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('delivery_session_jobs') WHERE name='last_member')", [], |r| r.get::<_,bool>(0))? {
         conn.execute_batch("ALTER TABLE delivery_session_jobs ADD COLUMN last_member TEXT NOT NULL DEFAULT '';")?;
     }
