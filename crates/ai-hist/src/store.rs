@@ -30,6 +30,7 @@ pub const SOURCE_CHOICES: &[&str] = &[
     "relay",
     "trajectory",
     "opencode",
+    "muse",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -4351,6 +4352,12 @@ pub fn resume_command(entry: &HistoryEntry) -> Option<String> {
         "grok" => Some(entry.project.as_ref().map_or_else(
             || format!("grok resume {}", shell_quote(sid)),
             |p| format!("cd {} && grok resume {}", shell_quote(p), shell_quote(sid)),
+        )),
+        // `muse resume <id>` finds the session by id; the `cd` puts the
+        // resumed agent back in the workspace it recorded.
+        "muse" => Some(entry.project.as_ref().map_or_else(
+            || format!("muse resume {}", shell_quote(sid)),
+            |p| format!("cd {} && muse resume {}", shell_quote(p), shell_quote(sid)),
         )),
         _ => None,
     }

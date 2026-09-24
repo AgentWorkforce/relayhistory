@@ -167,6 +167,7 @@ pub ai_hist::Source::Claude
 pub ai_hist::Source::Codex
 pub ai_hist::Source::Cursor
 pub ai_hist::Source::Grok
+pub ai_hist::Source::Muse
 pub ai_hist::Source::OpenCode
 pub ai_hist::Source::Relay
 pub ai_hist::Source::Trajectory
@@ -440,6 +441,7 @@ pub ai_hist::ProviderRoots::claude: std::path::PathBuf
 pub ai_hist::ProviderRoots::codex: std::path::PathBuf
 pub ai_hist::ProviderRoots::grok: std::path::PathBuf
 pub ai_hist::ProviderRoots::home: std::path::PathBuf
+pub ai_hist::ProviderRoots::muse: std::path::PathBuf
 pub ai_hist::ProviderRoots::opencode_db: std::path::PathBuf
 pub ai_hist::ProviderRoots::opencode_storage_dir: std::path::PathBuf
 pub ai_hist::ProviderRoots::trajectory_roots: core::option::Option<alloc::vec::Vec<std::path::PathBuf>>

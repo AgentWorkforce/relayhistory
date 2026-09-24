@@ -23,6 +23,7 @@ pub(crate) mod hook;
 pub(crate) mod hydrate;
 pub(crate) mod incremental;
 pub(crate) mod jsonl;
+pub(crate) mod muse;
 pub(crate) mod opencode;
 pub(crate) mod tool_result_facts;
 pub(crate) mod transcript_cursor;
@@ -61,8 +62,8 @@ pub use hydrate::{
 };
 pub use tool_result_facts::{
     content_hash, stable_stringify, ToolResultFacts, ToolResultIndexer, ERROR_SIGNAL_EXIT_CODE,
-    ERROR_SIGNAL_MCP_ERR, ERROR_SIGNAL_PATCH_APPLY, ERROR_SIGNAL_SUBAGENT_STATUS,
-    ERROR_SIGNAL_TOOL_RESULT, EVENT_SOURCE_FUNCTION_CALL_OUTPUT,
+    ERROR_SIGNAL_MCP_ERR, ERROR_SIGNAL_MUSE_TOOL_OUTCOME, ERROR_SIGNAL_PATCH_APPLY,
+    ERROR_SIGNAL_SUBAGENT_STATUS, ERROR_SIGNAL_TOOL_RESULT, EVENT_SOURCE_FUNCTION_CALL_OUTPUT,
     EVENT_SOURCE_SUBAGENT_NOTIFICATION, EVENT_SOURCE_TOOL_RESULT, STATUS_COMPLETED, STATUS_ERRORED,
     STATUS_UNKNOWN,
 };
@@ -1476,6 +1477,15 @@ fn sync_basic(
             &roots.grok.join("sessions"),
             &mut coverage,
         ),
+    ) {
+        total_inserted += inserted;
+        checkpoint_sync_state(&state_path, &state);
+    }
+    capture_progress("muse", 0, None);
+    check_capture_cancelled()?;
+    if let Some(inserted) = report.capture(
+        "muse",
+        sync_muse_with_coverage(conn, &mut state, &roots.muse, &mut coverage),
     ) {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);
@@ -10372,6 +10382,690 @@ pub(crate) fn decode_cursor_project(name: &str) -> String {
     format!("/{}", name.replace('-', "/"))
 }
 
+/// Where plain `sync` remembers the change stamp of each Muse Code transcript
+/// it has already read. Renamed on a parser upgrade so unchanged transcripts
+/// are read again; see [`GROK_SYNC_STATE_KEY`].
+const MUSE_SYNC_STATE_KEY: &str = "muse_sessions_v1";
+
+/// Every top-level Muse Code transcript under `root`, sorted.
+///
+/// A transcript under a `subagent/` directory belongs to a subagent or
+/// reminder child of the session beside it, not to a session of its own, so
+/// it is never returned.
+pub(crate) fn collect_muse_transcripts(root: &Path) -> Result<Vec<PathBuf>> {
+    Ok(
+        collect_matching_files(root, muse::SESSION_FILE.trim_end_matches(".jsonl"), "jsonl")?
+            .into_iter()
+            .filter(|path| {
+                path.file_name().and_then(|name| name.to_str()) == Some(muse::SESSION_FILE)
+                    && !muse::is_child_transcript(path, root)
+            })
+            .collect(),
+    )
+}
+
+#[cfg(test)]
+fn sync_muse(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> Result<usize> {
+    sync_muse_with_coverage(conn, state, root, &mut SweepCoverage::default())
+}
+
+/// Index every Muse Code transcript whose stamp changed since the last run.
+///
+/// A transcript is append-only, but it is read whole: a session is one file,
+/// its records carry their own ids and times, and a whole read is what lets a
+/// re-read replace rather than merge. Same state-map discipline as Grok: a
+/// stamp is trusted only while the evidence it recorded is still stored, and
+/// an unreadable transcript keeps no stamp, so the next run retries it.
+fn sync_muse_with_coverage(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    root: &Path,
+    coverage: &mut SweepCoverage,
+) -> Result<usize> {
+    if !root.exists() {
+        sync_note!("  [muse] not found: {} (skipped)", root.display());
+        return Ok(0);
+    }
+    let mut muse_state = state
+        .get(MUSE_SYNC_STATE_KEY)
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut inserted = 0;
+    let mut scanned = 0;
+    let mut sessions = 0;
+    let mut errors = 0;
+    let mut accounted = 0;
+    for transcript in capture_files("muse", collect_muse_transcripts(root)?) {
+        check_capture_cancelled()?;
+        let key = transcript.to_string_lossy().to_string();
+        let stamp = match file_stamp(&transcript) {
+            Ok(stamp) => stamp,
+            Err(error) => {
+                scanned += 1;
+                errors += 1;
+                coverage.note_unread();
+                sync_note!(
+                    "  [muse] unreadable session {}: {error:#}",
+                    transcript.display()
+                );
+                continue;
+            }
+        };
+        let recorded = muse_state.get(&key);
+        if recorded.and_then(grok_state_stamp) == Some(stamp.as_str()) {
+            // The stamp says unchanged; the database has to agree before
+            // that is taken as "already indexed". Every Muse ingestion writes
+            // at least its catalog row, and one that wrote events is checked
+            // against those.
+            let still_there = match (
+                recorded.and_then(grok_state_session),
+                recorded.and_then(grok_state_had_evidence),
+            ) {
+                (None, _) => true,
+                (Some(id), Some(false)) => muse_catalog_row_exists(conn, id)?,
+                (Some(id), _) => muse_evidence_exists(conn, id)?,
+            };
+            if still_there {
+                accounted += 1;
+                continue;
+            }
+        }
+        scanned += 1;
+        match read_muse_transcript(&transcript) {
+            Ok(Some(parsed)) => {
+                let session_id = parsed.metadata.session_id.clone();
+                let tx = conn.unchecked_transaction()?;
+                // A re-read replaces the session's prompts wholesale, so what
+                // it added is the difference, not what it wrote.
+                let before = muse_history_rows(&tx, &session_id)?;
+                let outcome = ingest_muse_session(&tx, &parsed, &key)?;
+                inserted += muse_history_rows(&tx, &session_id)?.saturating_sub(before);
+                tx.commit()?;
+                sessions += 1;
+                accounted += 1;
+                muse_state.insert(
+                    key,
+                    json!({
+                        "stamp": stamp,
+                        "session": session_id,
+                        "evidence": outcome.events > 0 || outcome.markers > 0,
+                    }),
+                );
+            }
+            Ok(None) => {
+                accounted += 1;
+                muse_state.insert(key, json!({ "stamp": stamp }));
+            }
+            Err(error) => {
+                if error.is::<CaptureCancelled>() {
+                    return Err(error);
+                }
+                errors += 1;
+                coverage.note_unread();
+                sync_note!(
+                    "  [muse] unreadable session {}: {error:#}",
+                    transcript.display()
+                );
+            }
+        }
+    }
+    state.insert(MUSE_SYNC_STATE_KEY.to_string(), Value::Object(muse_state));
+    if scanned > 0 {
+        let suffix = if errors > 0 {
+            format!(" ({errors} errors)")
+        } else {
+            String::new()
+        };
+        sync_note!("  [muse] +{inserted} rows from {sessions} sessions{suffix}");
+    }
+    if errors > 0 && accounted == 0 {
+        anyhow::bail!(
+            "{errors} Muse Code session(s) could not be read and none were indexed; \
+             the unreadable transcripts are named above"
+        );
+    }
+    Ok(inserted)
+}
+
+fn muse_history_rows(conn: &Connection, session_id: &str) -> Result<usize> {
+    let rows: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM history WHERE source = 'muse' AND session_id = ?",
+        params![session_id],
+        |row| row.get(0),
+    )?;
+    Ok(rows as usize)
+}
+
+fn muse_evidence_exists(conn: &Connection, session_id: &str) -> Result<bool> {
+    if session_events_exist(conn, "muse", session_id)? {
+        return Ok(true);
+    }
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM session_markers \
+         WHERE source = 'muse' AND session_id = ? LIMIT 1)",
+        params![session_id],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
+}
+
+fn muse_catalog_row_exists(conn: &Connection, session_id: &str) -> Result<bool> {
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sessions \
+         WHERE source = 'muse' AND session_id = ? LIMIT 1)",
+        params![session_id],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
+}
+
+/// Read and interpret one transcript. `Ok(None)` when it names no session.
+pub(crate) fn read_muse_transcript(path: &Path) -> Result<Option<muse::MuseTranscript>> {
+    let bytes =
+        fs::read(path).with_context(|| format!("read Muse transcript {}", path.display()))?;
+    Ok(muse::parse_transcript(&String::from_utf8_lossy(&bytes)))
+}
+
+/// What indexing one Muse Code transcript produced, and what its records
+/// could not establish.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct MuseIngestOutcome {
+    pub prompts: usize,
+    pub events: usize,
+    pub tool_calls: usize,
+    pub file_edits: usize,
+    pub markers: usize,
+    /// Reasoning Muse kept only as an encrypted trace.
+    pub encrypted_reasoning: usize,
+    /// `model_completed` steps whose usage had no assistant record after them
+    /// in the same run to carry it.
+    pub unattached_usage: usize,
+    /// `subagent_spawn` calls. Muse's delegation is not linked yet.
+    pub subagent_calls: usize,
+    /// Tool results with no recorded outcome for their call.
+    pub results_without_outcome: usize,
+    /// Lines that did not parse, usually a live session's partial tail.
+    pub unparsed_lines: usize,
+}
+
+/// One model step's usage, waiting for the assistant record it produced.
+struct PendingMuseUsage {
+    run_id: Option<String>,
+    token_json: String,
+}
+
+/// The usage a model step reported rides on the first assistant row that step
+/// committed, in the same run. A step that committed nothing keeps its usage
+/// off every row rather than on a neighbour's, and is counted in `orphans`.
+fn take_muse_usage(
+    run_id: Option<&str>,
+    pending: &mut Option<PendingMuseUsage>,
+    orphans: &mut usize,
+) -> Option<String> {
+    match pending.take() {
+        Some(usage) if usage.run_id.as_deref() == run_id => Some(usage.token_json),
+        Some(_) => {
+            *orphans += 1;
+            None
+        }
+        None => None,
+    }
+}
+
+/// Index one Muse Code transcript: prompts, prose, thinking, tool calls and
+/// results, file edits, per-step token usage and lifecycle markers.
+///
+/// A whole-transcript read replaces the session's evidence rather than
+/// merging into it, so a re-read after the file grew never duplicates a row
+/// and one that dropped a record (a rewritten or truncated file) leaves no
+/// stale one behind.
+pub(crate) fn ingest_muse_session(
+    conn: &Connection,
+    transcript: &muse::MuseTranscript,
+    raw_path: &str,
+) -> Result<MuseIngestOutcome> {
+    const SOURCE: &str = "muse";
+    let sid = transcript.metadata.session_id.as_str();
+    let project = transcript.metadata.workspace_root.as_deref();
+    let version = transcript.metadata.cli_version.as_deref();
+    for statement in [
+        "DELETE FROM session_events WHERE source = 'muse' AND session_id = ?",
+        "DELETE FROM tool_calls WHERE source = 'muse' AND session_id = ?",
+        "DELETE FROM file_edits WHERE source = 'muse' AND session_id = ?",
+        "DELETE FROM session_markers WHERE source = 'muse' AND session_id = ?",
+    ] {
+        conn.execute(statement, params![sid])?;
+    }
+    replace_session_history(conn, SOURCE, sid)?;
+
+    let mut outcome = MuseIngestOutcome {
+        unparsed_lines: transcript.unparsed_lines,
+        ..Default::default()
+    };
+    let outcomes = muse::tool_outcomes(transcript);
+    let mut model = transcript.metadata.model_id.clone();
+    let mut finish_reason: Option<String> = None;
+    let mut pending_usage: Option<PendingMuseUsage> = None;
+    let mut first_prompt: Option<String> = None;
+    let mut last_assistant_text: Option<String> = None;
+    let mut results = ToolResultIndexer::default();
+
+    for (idx, record) in transcript.records.iter().enumerate() {
+        check_capture_cancelled()?;
+        let ts = record.ts_ms;
+        let run_id = record.run_id.as_deref();
+        let record_uid = record
+            .record_id
+            .clone()
+            .unwrap_or_else(|| format!("r{}", record.sequence.unwrap_or(idx as i64)));
+        let facts = RawMessageFacts {
+            agent_version: version,
+            turn_id: run_id,
+            ..Default::default()
+        };
+        match &record.event {
+            muse::MuseEvent::Prompt { text } => {
+                if pending_usage.take().is_some() {
+                    outcome.unattached_usage += 1;
+                }
+                if first_prompt.is_none() {
+                    first_prompt = Some(crate::discover::excerpt(text));
+                }
+                insert_session_event(
+                    conn,
+                    SOURCE,
+                    sid,
+                    project,
+                    project,
+                    None,
+                    &record_uid,
+                    None,
+                    ts,
+                    "user",
+                    "text",
+                    Some(text),
+                    None,
+                    None,
+                    RequestIdentity::none(),
+                    &record_uid,
+                    None,
+                    facts,
+                )?;
+                outcome.events += 1;
+                outcome.prompts += insert_history(
+                    conn,
+                    &HistoryEntry {
+                        id: 0,
+                        source: SOURCE.into(),
+                        session_id: Some(sid.to_string()),
+                        project: project.map(str::to_string),
+                        prompt_hash: Some(prompt_hash(text)),
+                        prompt: text.clone(),
+                        timestamp_ms: ts,
+                    },
+                )?;
+            }
+            muse::MuseEvent::ModelCompleted {
+                model: step_model,
+                usage,
+                finish_reason: step_finish,
+                ..
+            } => {
+                if pending_usage.is_some() {
+                    outcome.unattached_usage += 1;
+                }
+                if step_model.is_some() {
+                    model = step_model.clone();
+                }
+                finish_reason = step_finish.clone();
+                pending_usage = usage.as_ref().map(|usage| PendingMuseUsage {
+                    run_id: record.run_id.clone(),
+                    token_json: usage.to_string(),
+                });
+            }
+            muse::MuseEvent::Reasoning {
+                message_id,
+                text,
+                encrypted,
+            } => match text {
+                Some(text) => {
+                    let token_json =
+                        take_muse_usage(run_id, &mut pending_usage, &mut outcome.unattached_usage);
+                    let message_id = message_id.as_deref().unwrap_or(&record_uid);
+                    insert_session_event(
+                        conn,
+                        SOURCE,
+                        sid,
+                        project,
+                        project,
+                        None,
+                        message_id,
+                        None,
+                        ts,
+                        "assistant",
+                        "thinking",
+                        Some(text),
+                        model.as_deref(),
+                        token_json.as_deref(),
+                        RequestIdentity::none(),
+                        &record_uid,
+                        None,
+                        facts,
+                    )?;
+                    outcome.events += 1;
+                }
+                None if *encrypted => {
+                    // The trace exists but is opaque: record that Muse thought
+                    // here, never readable thinking for it.
+                    outcome.encrypted_reasoning += 1;
+                    outcome.markers += insert_session_marker(
+                        conn,
+                        SOURCE,
+                        sid,
+                        &NewSessionMarker {
+                            marker_uid: &record_uid,
+                            kind: "encrypted_reasoning",
+                            subkind: Some("reasoning_committed"),
+                            ts_ms: Some(ts),
+                            message_id: message_id.as_deref(),
+                            turn_id: run_id,
+                            ..Default::default()
+                        },
+                    )?;
+                }
+                None => {}
+            },
+            muse::MuseEvent::AssistantText {
+                message_id,
+                response_id,
+                text,
+            } => {
+                let token_json =
+                    take_muse_usage(run_id, &mut pending_usage, &mut outcome.unattached_usage);
+                let message_id = message_id.as_deref().unwrap_or(&record_uid);
+                insert_session_event(
+                    conn,
+                    SOURCE,
+                    sid,
+                    project,
+                    project,
+                    None,
+                    message_id,
+                    None,
+                    ts,
+                    "assistant",
+                    "text",
+                    Some(text),
+                    model.as_deref(),
+                    token_json.as_deref(),
+                    RequestIdentity {
+                        request_id: response_id.as_deref(),
+                        provider_message_id: Some(message_id),
+                    },
+                    &record_uid,
+                    None,
+                    RawMessageFacts {
+                        request_id: response_id.as_deref(),
+                        stop_reason: finish_reason.as_deref(),
+                        ..facts
+                    },
+                )?;
+                outcome.events += 1;
+                last_assistant_text = Some(text.clone());
+            }
+            muse::MuseEvent::ToolCalls {
+                message_id,
+                response_id,
+                calls,
+            } => {
+                let message_id = message_id.as_deref().unwrap_or(&record_uid);
+                for call in calls {
+                    let token_json =
+                        take_muse_usage(run_id, &mut pending_usage, &mut outcome.unattached_usage);
+                    let target = muse::pick_tool_target(&call.name, &call.arguments);
+                    let uid = format!("tool:{}", call.call_id);
+                    insert_session_event(
+                        conn,
+                        SOURCE,
+                        sid,
+                        project,
+                        project,
+                        None,
+                        message_id,
+                        None,
+                        ts,
+                        "assistant",
+                        "tool_use",
+                        Some(&format_tool_event_text(
+                            &call.name,
+                            target.as_deref(),
+                            &call.arguments,
+                        )),
+                        model.as_deref(),
+                        token_json.as_deref(),
+                        RequestIdentity {
+                            request_id: response_id.as_deref(),
+                            provider_message_id: Some(message_id),
+                        },
+                        &uid,
+                        None,
+                        RawMessageFacts {
+                            request_id: response_id.as_deref(),
+                            stop_reason: finish_reason.as_deref(),
+                            ..facts
+                        },
+                    )?;
+                    outcome.events += 1;
+                    insert_tool_call(
+                        conn,
+                        SOURCE,
+                        sid,
+                        message_id,
+                        &call.call_id,
+                        &call.name,
+                        target.as_deref(),
+                        &serde_json::to_string(&call.arguments).unwrap_or_default(),
+                        None,
+                        ts,
+                    )?;
+                    outcome.tool_calls += 1;
+                    if muse::is_subagent_tool(&call.name) {
+                        outcome.subagent_calls += 1;
+                    }
+                    if muse::is_file_edit_tool(&call.name) {
+                        if let Some(path) = target.as_deref() {
+                            upsert_file_edit_from_call(
+                                conn,
+                                SOURCE,
+                                sid,
+                                message_id,
+                                &call.call_id,
+                                path,
+                                &call.name,
+                                ts,
+                                None,
+                                project,
+                            )?;
+                            outcome.file_edits += 1;
+                        }
+                    }
+                }
+            }
+            muse::MuseEvent::ToolResults { results: batch } => {
+                for result in batch {
+                    let text = result.text.as_deref();
+                    let mut result_facts = tool_result_facts::muse_tool_result_facts(
+                        text,
+                        &result.call_id,
+                        outcomes.get(result.call_id.as_str()).copied(),
+                    );
+                    if result_facts.result_status.as_deref()
+                        == Some(tool_result_facts::STATUS_UNKNOWN)
+                    {
+                        outcome.results_without_outcome += 1;
+                    }
+                    let (call_index, event_index) = results.next(&result.call_id);
+                    result_facts = result_facts.with_ordering(call_index, event_index);
+                    let uid = format!("result:{}", result.call_id);
+                    insert_session_event(
+                        conn,
+                        SOURCE,
+                        sid,
+                        project,
+                        project,
+                        None,
+                        &uid,
+                        None,
+                        ts,
+                        "tool_result",
+                        "tool_result",
+                        text,
+                        None,
+                        None,
+                        RequestIdentity::none(),
+                        &uid,
+                        Some(&result_facts),
+                        facts,
+                    )?;
+                    outcome.events += 1;
+                    match result_facts.result_status.as_deref() {
+                        Some(tool_result_facts::STATUS_ERRORED)
+                        | Some(tool_result_facts::STATUS_CANCELLED) => {
+                            set_tool_call_error(conn, SOURCE, sid, &result.call_id, true)?
+                        }
+                        Some(tool_result_facts::STATUS_COMPLETED) => {
+                            set_tool_call_error(conn, SOURCE, sid, &result.call_id, false)?
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            muse::MuseEvent::RunTerminal { status, reason } => {
+                if pending_usage.take().is_some() {
+                    outcome.unattached_usage += 1;
+                }
+                let payload_json =
+                    marker_payload(vec![("terminal", json!(status)), ("reason", json!(reason))]);
+                outcome.markers += insert_session_marker(
+                    conn,
+                    SOURCE,
+                    sid,
+                    &NewSessionMarker {
+                        marker_uid: &record_uid,
+                        kind: "turn_end",
+                        subkind: Some("terminal"),
+                        ts_ms: Some(ts),
+                        turn_id: run_id,
+                        text: status.as_deref(),
+                        payload_json: payload_json.as_deref(),
+                        ..Default::default()
+                    },
+                )?;
+            }
+            muse::MuseEvent::SessionOpened { resume } => {
+                let payload_json = marker_payload(vec![("resume", json!(resume))]);
+                outcome.markers += insert_session_marker(
+                    conn,
+                    SOURCE,
+                    sid,
+                    &NewSessionMarker {
+                        marker_uid: &record_uid,
+                        kind: "session_start",
+                        subkind: Some("session.opened.observed"),
+                        ts_ms: Some(ts),
+                        payload_json: payload_json.as_deref(),
+                        ..Default::default()
+                    },
+                )?;
+            }
+            muse::MuseEvent::SessionResumed => {
+                outcome.markers += insert_session_marker(
+                    conn,
+                    SOURCE,
+                    sid,
+                    &NewSessionMarker {
+                        marker_uid: &record_uid,
+                        kind: "session_resumed",
+                        subkind: Some("session.resumed"),
+                        ts_ms: Some(ts),
+                        ..Default::default()
+                    },
+                )?;
+            }
+            muse::MuseEvent::SessionEnd { exit_reason } => {
+                outcome.markers += insert_session_marker(
+                    conn,
+                    SOURCE,
+                    sid,
+                    &NewSessionMarker {
+                        marker_uid: &record_uid,
+                        kind: "session_end",
+                        subkind: Some("session.end"),
+                        ts_ms: Some(ts),
+                        text: exit_reason.as_deref(),
+                        ..Default::default()
+                    },
+                )?;
+            }
+            muse::MuseEvent::Metadata(metadata) => {
+                if metadata.model_id.is_some() {
+                    model = metadata.model_id.clone();
+                }
+                outcome.markers += insert_session_marker(
+                    conn,
+                    SOURCE,
+                    sid,
+                    &NewSessionMarker {
+                        marker_uid: &record_uid,
+                        kind: "model_switch",
+                        subkind: Some(muse::METADATA_PAYLOAD_TYPE),
+                        ts_ms: Some(ts),
+                        text: metadata.model_id.as_deref(),
+                        ..Default::default()
+                    },
+                )?;
+            }
+            // Folded into the result rows above, by call id.
+            muse::MuseEvent::ToolOutcome { .. } => {}
+        }
+    }
+    if pending_usage.is_some() {
+        outcome.unattached_usage += 1;
+    }
+
+    let first_ts = transcript.first_ts().unwrap_or_default();
+    let last_ts = transcript.last_ts().unwrap_or(first_ts);
+    upsert_session(
+        conn,
+        sid,
+        SOURCE,
+        project,
+        None,
+        first_ts,
+        last_ts,
+        last_assistant_text.as_deref(),
+        Some(raw_path),
+    )?;
+    let models = transcript.models();
+    conn.execute(
+        "UPDATE sessions SET first_activity_ms = ?, last_activity_ms = ?, \
+         last_assistant_text = COALESCE(?, last_assistant_text), models_json = ?, \
+         first_prompt = COALESCE(?, first_prompt), agent_version = COALESCE(?, agent_version) \
+         WHERE source = 'muse' AND session_id = ?",
+        params![
+            first_ts,
+            last_ts,
+            last_assistant_text.as_deref(),
+            (!models.is_empty()).then(|| serde_json::to_string(&models).unwrap_or_default()),
+            first_prompt.as_deref(),
+            version,
+            sid,
+        ],
+    )?;
+    Ok(outcome)
+}
+
 #[cfg(test)]
 fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> Result<usize> {
     sync_grok_with_coverage(conn, state, root, &mut SweepCoverage::default())
@@ -11093,38 +11787,61 @@ fn replace_grok_session_evidence(conn: &Connection, session_id: &str) -> Result<
     ] {
         conn.execute(statement, params![session_id])?;
     }
-    // `history` is keyed `(source, timestamp_ms, prompt)` and inserted with
-    // `INSERT OR IGNORE`, so a prompt two sessions both contain is **one row**,
-    // attributed to whichever session was indexed first. Deleting this
-    // session's rows outright would therefore delete a prompt that another,
-    // unchanged session still has -- it would vanish from search with nothing
-    // to say it had ever been there, and nothing would ever put it back,
-    // because that session's own files never change again.
-    //
-    // So a row this session no longer owns is **re-attributed** rather than
-    // skipped. Skipping was the other option and is worse: it would leave the
-    // row filed under a session that no longer contains the prompt, which is
-    // a false statement about provenance, and would leave it undeletable --
-    // the only session that could ever clean it up is the one that no longer
-    // evidences it. Re-attribution moves the row to a session whose stored
-    // events actually carry that prompt at that moment, so the row stays true
-    // and stays owned.
+    // Every Grok prompt written before this parser carried a timestamp
+    // synthesized as `created_at + index`; merging would keep the fabricated
+    // ones forever, so history is replaced, not merged.
+    replace_session_history(conn, "grok", session_id)?;
     conn.execute(
-        "UPDATE history AS h SET            session_id = (SELECT e.session_id FROM session_events e                          WHERE e.source = 'grok' AND e.role = 'user' AND e.kind = 'text'                            AND e.session_id <> h.session_id                            AND e.ts_ms = h.timestamp_ms AND e.text = h.prompt                          ORDER BY e.session_id LIMIT 1),            project = (SELECT e.project FROM session_events e                       WHERE e.source = 'grok' AND e.role = 'user' AND e.kind = 'text'                         AND e.session_id <> h.session_id                         AND e.ts_ms = h.timestamp_ms AND e.text = h.prompt                       ORDER BY e.session_id LIMIT 1)          WHERE h.source = 'grok' AND h.session_id = ?            AND EXISTS(SELECT 1 FROM session_events e                       WHERE e.source = 'grok' AND e.role = 'user' AND e.kind = 'text'                         AND e.session_id <> h.session_id                         AND e.ts_ms = h.timestamp_ms AND e.text = h.prompt)",
-        params![session_id],
-    )?;
-    for statement in [
-        // What is left is this session's alone. A prompt's identity is
-        // `(source, timestamp_ms, prompt)`, and every Grok prompt written
-        // before this parser carried a timestamp synthesized as
-        // `created_at + index`; merging would keep the fabricated ones
-        // forever.
-        "DELETE FROM history WHERE source = 'grok' AND session_id = ?",
         "DELETE FROM session_relationships WHERE source = 'grok' \
          AND parent_session_id = ? AND evidence_kind = 'grok_subagent_dir'",
-    ] {
-        conn.execute(statement, params![session_id])?;
-    }
+        params![session_id],
+    )?;
+    Ok(())
+}
+
+/// Drop the `history` rows one session owns, ahead of a whole-session
+/// re-read that writes them again.
+///
+/// `history` is keyed `(source, timestamp_ms, prompt)` and inserted with
+/// `INSERT OR IGNORE`, so a prompt two sessions both contain is **one row**,
+/// attributed to whichever session was indexed first. Deleting this
+/// session's rows outright would therefore delete a prompt that another,
+/// unchanged session still has -- it would vanish from search with nothing
+/// to say it had ever been there, and nothing would ever put it back,
+/// because that session's own files never change again.
+///
+/// So a row this session no longer owns is **re-attributed** rather than
+/// skipped. Skipping was the other option and is worse: it would leave the
+/// row filed under a session that no longer contains the prompt, which is
+/// a false statement about provenance, and would leave it undeletable --
+/// the only session that could ever clean it up is the one that no longer
+/// evidences it. Re-attribution moves the row to a session whose stored
+/// events actually carry that prompt at that moment, so the row stays true
+/// and stays owned. What is left is this session's alone, and is deleted.
+fn replace_session_history(conn: &Connection, source: &str, session_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE history AS h SET \
+           session_id = (SELECT e.session_id FROM session_events e \
+                         WHERE e.source = h.source AND e.role = 'user' AND e.kind = 'text' \
+                           AND e.session_id <> h.session_id \
+                           AND e.ts_ms = h.timestamp_ms AND e.text = h.prompt \
+                         ORDER BY e.session_id LIMIT 1), \
+           project = (SELECT e.project FROM session_events e \
+                      WHERE e.source = h.source AND e.role = 'user' AND e.kind = 'text' \
+                        AND e.session_id <> h.session_id \
+                        AND e.ts_ms = h.timestamp_ms AND e.text = h.prompt \
+                      ORDER BY e.session_id LIMIT 1) \
+         WHERE h.source = ? AND h.session_id = ? \
+           AND EXISTS(SELECT 1 FROM session_events e \
+                      WHERE e.source = h.source AND e.role = 'user' AND e.kind = 'text' \
+                        AND e.session_id <> h.session_id \
+                        AND e.ts_ms = h.timestamp_ms AND e.text = h.prompt)",
+        params![source, session_id],
+    )?;
+    conn.execute(
+        "DELETE FROM history WHERE source = ? AND session_id = ?",
+        params![source, session_id],
+    )?;
     Ok(())
 }
 
@@ -13639,6 +14356,97 @@ mod tests {
         assert!(outcome.missing_updates);
         assert!(!outcome.updates_yielded_no_timing);
         assert_eq!(outcome.unread_update_rows, 0);
+    }
+
+    /// Copy the checked-in Muse fixture into `home` and answer with the
+    /// sessions root and the transcript.
+    fn muse_fixture(home: &Path) -> (PathBuf, PathBuf) {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/muse/tools-session/.local/share/muse/sessions");
+        let root = home.join(".local/share/muse/sessions");
+        let day = "2026/09/20/0199a1b2-0000-7000-8000-00000000a001";
+        let child = "subagent/0199a1b2-0000-7000-8000-00000000c001";
+        fs::create_dir_all(root.join(day).join(child)).unwrap();
+        for file in ["session.jsonl", &format!("{child}/session.jsonl")] {
+            fs::copy(fixture.join(day).join(file), root.join(day).join(file)).unwrap();
+        }
+        let transcript = root.join(day).join("session.jsonl");
+        (root, transcript)
+    }
+
+    fn muse_count(conn: &Connection, table: &str) -> i64 {
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE source = 'muse'"),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Plain `sync` indexes the transcript once, re-reads it only when it
+    /// changes, replaces rather than duplicates on that re-read, and never
+    /// turns the `subagent/` child into a session.
+    #[test]
+    fn muse_sync_is_idempotent_and_rereads_a_grown_transcript() {
+        let home = tempfile::tempdir().unwrap();
+        let (root, transcript) = muse_fixture(home.path());
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+
+        assert_eq!(super::sync_muse(&conn, &mut state, &root).unwrap(), 2);
+        assert_eq!(
+            muse_count(&conn, "sessions"),
+            1,
+            "the child is not a session"
+        );
+        let events = muse_count(&conn, "session_events");
+        assert_eq!(events, 13);
+
+        // Unchanged: nothing is read again and nothing is duplicated.
+        assert_eq!(super::sync_muse(&conn, &mut state, &root).unwrap(), 0);
+        assert_eq!(muse_count(&conn, "session_events"), events);
+
+        // The session grows by one turn: the re-read adds exactly that turn.
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        for (sequence, event) in [
+            (40, json!({"kind": "started", "prompt": "Fix the test."})),
+            (
+                41,
+                json!({"kind": "assistant_message_committed", "message_id": "msg-5", "text": "Done."}),
+            ),
+        ] {
+            let record = json!({
+                "id": format!("grown-{sequence}"),
+                "stream": {"kind": "session", "id": "0199a1b2-0000-7000-8000-00000000a001"},
+                "sequence": sequence,
+                "recorded_at": 1_790_337_700_000_000i64 + sequence,
+                "payload_type": "runtime.session",
+                "payload": {"kind": "run", "run_id": "run-c", "event": event},
+            });
+            writeln!(file, "{record}").unwrap();
+        }
+        drop(file);
+        assert_eq!(super::sync_muse(&conn, &mut state, &root).unwrap(), 1);
+        assert_eq!(muse_count(&conn, "session_events"), events + 2);
+        assert_eq!(muse_count(&conn, "history"), 3);
+    }
+
+    /// `.sync-state.json` outlives a rebuilt database. An unchanged stamp is
+    /// trusted only while the evidence it recorded is still there.
+    #[test]
+    fn muse_sync_reindexes_an_unchanged_transcript_whose_rows_are_gone() {
+        let home = tempfile::tempdir().unwrap();
+        let (root, _) = muse_fixture(home.path());
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+
+        let rebuilt = open_db(&home.path().join("rebuilt.db")).unwrap();
+        assert_eq!(super::sync_muse(&rebuilt, &mut state, &root).unwrap(), 2);
+        assert_eq!(muse_count(&rebuilt, "session_events"), 13);
     }
 
     /// A stamp that fails closed has to be *reported*. Round four stopped one

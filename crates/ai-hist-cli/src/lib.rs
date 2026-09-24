@@ -408,7 +408,7 @@ enum SessionsAction {
     /// content blocks, agent lifecycle events. Same `(ts_ms IS NULL, ts_ms,
     /// id)` keyset as tool calls and file edits; undated markers page last.
     Markers {
-        /// Coding-agent source (claude, codex, cursor, grok, relay, opencode).
+        /// Coding-agent source (claude, codex, cursor, grok, muse, relay, opencode).
         source: String,
         /// Native session identifier within that source.
         session_id: String,
@@ -432,7 +432,7 @@ enum SessionsAction {
     /// and cost is never computed: `reported_cost_usd` appears only when the
     /// source data carried one.
     Usage {
-        /// Coding-agent source (claude, codex, cursor, grok, relay, opencode).
+        /// Coding-agent source (claude, codex, cursor, grok, muse, relay, opencode).
         source: String,
         /// Native session identifier within that source.
         session_id: String,
@@ -470,7 +470,7 @@ enum SessionsAction {
 enum LearnAction {
     /// Distill local session history into decision/finding/reflection events.
     Distill {
-        /// Only distill sessions from this source (claude, codex, cursor, grok, relay, opencode).
+        /// Only distill sessions from this source (claude, codex, cursor, grok, muse, relay, opencode).
         #[arg(long)]
         source: Option<String>,
         /// Distill one session id.
@@ -2604,11 +2604,13 @@ fn service_command_args(spec: &ServiceSpec, args: &[String]) -> Vec<String> {
     command
 }
 
-const PROVIDER_ENV_VARS: [&str; 4] = [
+const PROVIDER_ENV_VARS: [&str; 5] = [
     "CLAUDE_CONFIG_DIR",
     "CODEX_HOME",
     "GROK_HOME",
     "OPENCODE_DB",
+    // Muse Code keeps its sessions under `$XDG_DATA_HOME/muse/sessions`.
+    "XDG_DATA_HOME",
 ];
 
 fn scheduler_environment_value(name: &str, value: std::ffi::OsString) -> Result<Option<String>> {

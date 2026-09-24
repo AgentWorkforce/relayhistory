@@ -550,6 +550,7 @@ handle.
 | codex | ✓ | ✓ | ✓ | ✓ | ✓ | cumulative-delta |
 | cursor | ✓ | ✓ | ✓ | ✓ | — | none |
 | grok | ✓ | ✓ | ✓ | ✓ | ✓ | none |
+| muse | ✓ | ✓ | ✓ | ✓ | — | per-request |
 | opencode | ✓ | ✓ | ✓ | ✓ | ✓ | none |
 | relay | — | — | — | — | — | none |
 | trajectory | — | — | — | — | — | none |

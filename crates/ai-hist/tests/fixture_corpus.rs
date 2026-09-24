@@ -63,6 +63,9 @@ enum Origin {
     Burn,
     /// Authored here, for a log shape burn's corpus does not cover.
     RelayHistory,
+    /// Derived from `xhluca/session-migrate`'s native corpus (MIT): a
+    /// transcript the real harness CLI wrote, kept verbatim line by line.
+    SessionMigrate,
 }
 
 struct Fixture {
@@ -637,6 +640,23 @@ const CORPUS: &[Fixture] = &[
         files: &["grok/events-session"],
         quirk: "documented Grok Build layout: `chat_history.jsonl` with `tool_calls[]`, ACP `updates.jsonl` with real `agentTimestampMs` times, `compaction_checkpoints/`, `subagents/`, `signals.json` and `prompt_context.json`",
     },
+    // -- muse --------------------------------------------------------------
+    Fixture {
+        source: "muse",
+        name: "cli-capture",
+        layout: Layout::HomeTree,
+        origin: Origin::SessionMigrate,
+        files: &["muse/cli-capture"],
+        quirk: "a transcript the real `muse` CLI (0.2.1) wrote, trimmed to its conversation, tool and lifecycle records: three runs across two resumes, `read_file` calls with one failed outcome, per-step `model_completed` usage, and mirrored reminder task records",
+    },
+    Fixture {
+        source: "muse",
+        name: "tools-session",
+        layout: Layout::HomeTree,
+        origin: Origin::RelayHistory,
+        files: &["muse/tools-session"],
+        quirk: "authored from the documented shape: a permission frame before the metadata, encrypted and readable reasoning, `edit_file`/`write_file` edits, a `bash` result that exits 101, a mirrored subagent task stream, a mid-session model switch, and a `subagent/` child transcript that must not become a session",
+    },
     // -- opencode ----------------------------------------------------------
     Fixture {
         source: "opencode",
@@ -854,6 +874,9 @@ fn capture(fixture: &Fixture, home: &Path) -> Value {
     std::env::set_var("USERPROFILE", home);
     std::env::set_var("OPENCODE_DB", &opencode_db);
     std::env::remove_var("AI_HIST_DB");
+    // Muse Code's root follows `XDG_DATA_HOME`; the fixture's own `HOME`
+    // layout has to win over whatever the machine running the tests sets.
+    std::env::remove_var("XDG_DATA_HOME");
 
     let db = home.join("ai-history.db");
     let mut notes: Vec<String> = Vec::new();
@@ -2296,5 +2319,67 @@ fn grok_events_and_real_timestamps_reach_session_events() {
             .iter()
             .all(|entry| field(entry, "timestamp_ms").as_i64() != Some(FIXTURE_MTIME_MS + 1)),
         "prompt timestamps come from the record, not from `created_at + index`: {prompts:?}"
+    );
+}
+
+/// A transcript the real Muse CLI wrote: every prompt is a history row at the
+/// microsecond time Muse recorded, every read is a tool call joined to its
+/// result by call id, and the one call whose `tool_batch.effect.terminal`
+/// failed is the one marked as an error.
+#[test]
+fn muse_cli_capture_reaches_history_tools_and_recorded_times() {
+    let prompts = rows("muse/cli-capture", "history");
+    assert_eq!(prompts.len(), 3, "{prompts:?}");
+    assert_eq!(
+        field(&prompts[0], "timestamp_ms").as_i64(),
+        Some(1_788_223_110_680),
+        "the prompt's own `recorded_at`, in milliseconds: {prompts:?}"
+    );
+    let calls = rows("muse/cli-capture", "tool_calls");
+    let failed: Vec<&str> = calls
+        .iter()
+        .filter(|call| field(call, "is_error").as_i64() == Some(1))
+        .map(|call| text(call, "tool_use_id"))
+        .collect();
+    assert_eq!(failed, vec!["call_muse_missing"], "{calls:?}");
+    let events = rows("muse/cli-capture", "session_events");
+    assert!(
+        events
+            .iter()
+            .filter(|event| text(event, "role") == "user")
+            .all(|event| !text(event, "text").starts_with("Role:")),
+        "a mirrored task stream is never a prompt: {events:?}"
+    );
+}
+
+/// The authored Muse session: edits reach `file_edits`, a completed `bash`
+/// call whose command exited non-zero is an error, usage lands once per model
+/// step, and the `subagent/` child transcript is not a session of its own.
+#[test]
+fn muse_tools_session_records_edits_errors_usage_and_no_child_session() {
+    let edits = rows("muse/tools-session", "file_edits");
+    let mut paths: Vec<&str> = edits.iter().map(|edit| text(edit, "file_path")).collect();
+    paths.sort_unstable();
+    assert_eq!(paths, vec!["src/http.rs", "tests/retry.rs"], "{edits:?}");
+    let calls = rows("muse/tools-session", "tool_calls");
+    let bash = calls
+        .iter()
+        .find(|call| text(call, "tool_use_id") == "call_bash")
+        .expect("bash call");
+    assert_eq!(field(bash, "is_error").as_i64(), Some(1), "{bash:?}");
+    let events = rows("muse/tools-session", "session_events");
+    let usage_rows = events
+        .iter()
+        .filter(|event| !field(event, "token_json").is_null())
+        .count();
+    assert_eq!(
+        usage_rows, 4,
+        "one row per model_completed step: {events:?}"
+    );
+    let sessions = rows("muse/tools-session", "sessions");
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+    assert_eq!(
+        text(&sessions[0], "models_json"),
+        r#"["meta/muse-spark-1.3","meta/muse-spark-1.3-contributor"]"#
     );
 }

@@ -317,6 +317,7 @@ pub enum Source {
     Trajectory,
     #[serde(rename = "opencode")]
     OpenCode,
+    Muse,
 }
 
 impl Source {
@@ -335,6 +336,7 @@ impl Source {
         Self::Relay,
         Self::Trajectory,
         Self::OpenCode,
+        Self::Muse,
     ];
 
     /// Canonical lowercase identifier stored in the ledger.
@@ -347,6 +349,7 @@ impl Source {
             Self::Relay => "relay",
             Self::Trajectory => "trajectory",
             Self::OpenCode => "opencode",
+            Self::Muse => "muse",
         }
     }
 
@@ -383,7 +386,7 @@ impl Source {
         // write them are the ones an embedder needs listed.
         if matches!(
             self,
-            Self::Claude | Self::Codex | Self::Grok | Self::OpenCode
+            Self::Claude | Self::Codex | Self::Grok | Self::OpenCode | Self::Muse
         ) && !evidence_kinds.contains(&EvidenceKind::SessionMarker)
         {
             evidence_kinds.push(EvidenceKind::SessionMarker);
@@ -403,6 +406,9 @@ impl Source {
                 // Cursor: the message `id` when the build wrote one, else
                 // `cursor:{record offset}`.
                 Self::Cursor => MessageIdOrigin::Mixed,
+                // Muse: the record's own envelope `id` for prose and
+                // lifecycle, `tool:{call id}` / `result:{call id}` for tools.
+                Self::Muse => MessageIdOrigin::Mixed,
                 Self::Relay | Self::Trajectory => MessageIdOrigin::None,
             },
             hydrates_by_path: HOOK_HARNESSES.contains(&name),
@@ -2689,7 +2695,8 @@ mod tests {
                 | Source::Grok
                 | Source::Relay
                 | Source::Trajectory
-                | Source::OpenCode => Source::ALL.contains(source),
+                | Source::OpenCode
+                | Source::Muse => Source::ALL.contains(source),
             };
             assert!(listed, "{source:?} is missing from Source::ALL");
         }

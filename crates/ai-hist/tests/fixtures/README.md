@@ -44,6 +44,15 @@ and the raw-fact assertions among them are ported into `fixture_corpus.rs`.
 Everything marked **relayhistory** was authored here, for a log shape burn's
 corpus does not cover.
 
+The fixture marked **sessionmigrate** is derived from the native corpus in
+[`xhluca/session-migrate`](https://github.com/xhluca/session-migrate)
+(`tests/native_corpus/v1/sources/muse/0.2.1/portable-rich`), licensed **MIT**.
+That transcript was written by the real Muse Code 0.2.1 CLI against a
+credential-free loopback provider and sanitized upstream (system
+instructions and capture paths). Here it is trimmed to the records a parser
+reads plus a sample of the rest; every kept line is byte-identical to the
+upstream file.
+
 ## Determinism
 
 Every staged file's mtime is pinned (base `2026-04-20T00:00:00Z`, plus one
@@ -166,6 +175,13 @@ source without deciding which one fails the test.
 | --- | --- | --- | --- |
 | `grok/full-session` | relayhistory | `grok/full-session` | older Claude-shaped grok directory: per-record timestamps, `tool_use` blocks in `content`, `updates.jsonl` as `file_changed` rows, plus `prompt_context.json`, `signals.json` and `subagents/` |
 | `grok/events-session` | relayhistory | `grok/events-session` | documented Grok Build layout: `chat_history.jsonl` with `tool_calls[]`, ACP `updates.jsonl` with real `agentTimestampMs` times, `compaction_checkpoints/`, `subagents/`, `signals.json` and `prompt_context.json` |
+
+### `muse`
+
+| Fixture | Origin | Corpus files | Quirk it encodes |
+| --- | --- | --- | --- |
+| `muse/cli-capture` | sessionmigrate | `muse/cli-capture` | a transcript the real `muse` CLI (0.2.1) wrote, trimmed to its conversation, tool and lifecycle records: three runs across two resumes, `read_file` calls with one failed outcome, per-step `model_completed` usage, and mirrored reminder task records |
+| `muse/tools-session` | relayhistory | `muse/tools-session` | authored from the documented shape: a permission frame before the metadata, encrypted and readable reasoning, `edit_file`/`write_file` edits, a `bash` result that exits 101, a mirrored subagent task stream, a mid-session model switch, and a `subagent/` child transcript that must not become a session |
 
 ### `opencode`
 

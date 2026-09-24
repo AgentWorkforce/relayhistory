@@ -356,7 +356,7 @@ impl std::error::Error for UsageError {}
 
 /// Sources this build can normalize. Anything else is an explicit
 /// [`UsageError::UnknownSource`] rather than a silent zero.
-pub const NORMALIZABLE_SOURCES: &[&str] = &["claude", "codex"];
+pub const NORMALIZABLE_SOURCES: &[&str] = &["claude", "codex", "muse"];
 
 /// Whether one model request can be spread across several stored records for
 /// this source.
@@ -380,6 +380,10 @@ pub fn source_accounting(source: &str) -> Option<UsageAccounting> {
         // Codex reports cumulative `token_count` snapshots, which the parser
         // differences into per-request deltas before storing them.
         "codex" => Some(UsageAccounting::CumulativeDelta),
+        // Muse writes one `model_completed` usage object per model step, and
+        // the parser stores it once, on the first assistant row that step
+        // committed.
+        "muse" => Some(UsageAccounting::PerRequest),
         _ => None,
     }
 }
@@ -420,7 +424,13 @@ pub fn normalize_usage(
 
     let mut usage = NormalizedUsage::empty(accounting);
     let output = counter("output_tokens")?;
-    let reasoning = counter("reasoning_output_tokens")?;
+    // Muse names the reasoning counter `reasoning_tokens`; Codex spells it
+    // `reasoning_output_tokens`. Either way it is a subset of output.
+    let reasoning = counter(if source == "muse" {
+        "reasoning_tokens"
+    } else {
+        "reasoning_output_tokens"
+    })?;
     usage.output_tokens = output.unwrap_or(0);
     usage.reasoning_tokens = reasoning;
     usage.coverage.has_output_tokens = output.is_some();
@@ -451,6 +461,34 @@ pub fn normalize_usage(
             usage.cache_write_tokens = cache_write.unwrap_or(0);
             usage.coverage.has_input_tokens = input.is_some();
             usage.coverage.has_cache_read_tokens = cached.is_some();
+            usage.coverage.has_cache_write_tokens = cache_write.is_some();
+        }
+        "muse" => {
+            // Responses-shaped: `input_tokens` includes the cached prefix,
+            // which Muse reports as `cache_read_tokens` (and again as
+            // `cached_tokens`, the same count). Input is emitted exclusive of
+            // it, as for Codex, so summing the categories counts each token
+            // once.
+            let input = counter("input_tokens")?;
+            let cache_read = match counter("cache_read_tokens")? {
+                Some(value) => Some(value),
+                None => counter("cached_tokens")?,
+            };
+            let cache_write = counter("cache_write_tokens")?;
+            let inclusive = input.unwrap_or(0);
+            let cached_value = cache_read.unwrap_or(0);
+            usage.input_tokens =
+                inclusive
+                    .checked_sub(cached_value)
+                    .ok_or(UsageError::CounterRegressed {
+                        field: "input_tokens",
+                        value: inclusive,
+                        subtracted: cached_value,
+                    })?;
+            usage.cache_read_tokens = cached_value;
+            usage.cache_write_tokens = cache_write.unwrap_or(0);
+            usage.coverage.has_input_tokens = input.is_some();
+            usage.coverage.has_cache_read_tokens = cache_read.is_some();
             usage.coverage.has_cache_write_tokens = cache_write.is_some();
         }
         "claude" => {
@@ -1023,6 +1061,41 @@ mod tests {
         assert_eq!(usage.reasoning_tokens, None);
         assert_eq!(usage.provider_total_tokens, None);
         assert_eq!(usage.reported_cost_usd, None);
+    }
+
+    /// Muse's `model_completed` usage, as the real CLI writes it: input
+    /// inclusive of the cached prefix, reported under two keys.
+    #[test]
+    fn muse_input_is_made_cache_exclusive_and_counted_once() {
+        let usage = normalize_usage(
+            "muse",
+            &json!({
+                "input_tokens": 26964,
+                "output_tokens": 379,
+                "cached_tokens": 5105,
+                "cache_read_tokens": 5105,
+                "cache_write_tokens": 0,
+                "reasoning_tokens": 278,
+            }),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(usage.input_tokens, 21859);
+        assert_eq!(usage.cache_read_tokens, 5105);
+        assert_eq!(usage.cache_write_tokens, 0);
+        assert_eq!(usage.output_tokens, 379);
+        assert_eq!(usage.reasoning_tokens, Some(278));
+        assert_eq!(usage.accounting, UsageAccounting::PerRequest);
+
+        // An older record that spells the cache read only as `cached_tokens`.
+        let legacy = normalize_usage(
+            "muse",
+            &json!({"input_tokens": 10, "output_tokens": 1, "cached_tokens": 4}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(legacy.input_tokens, 6);
+        assert_eq!(legacy.cache_read_tokens, 4);
     }
 
     #[test]

@@ -884,6 +884,7 @@ export function formatSessionRow(
     relay: '↔',
     opencode: '⌘',
     trajectory: '↗',
+    muse: '✧',
   };
   const ageMs =
     session.lastActivityMs === null
@@ -1073,6 +1074,7 @@ export function resumeCommand(
     if (entry.source === 'codex') return `codex resume ${shellQuote(entry.sessionId)}`;
     if (entry.source === 'cursor') return `cursor-agent --resume=${shellQuote(entry.sessionId)}`;
     if (entry.source === 'grok') return `grok resume ${shellQuote(entry.sessionId)}`;
+    if (entry.source === 'muse') return `muse resume ${shellQuote(entry.sessionId)}`;
     return null;
   })();
   return resume && entry.project ? `cd ${shellQuote(entry.project)} && ${resume}` : resume;

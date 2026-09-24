@@ -1340,7 +1340,7 @@ fn validate_options(options: &HydrateSessionOptions) -> Result<()> {
     }
     if !matches!(
         options.source.as_str(),
-        "claude" | "codex" | "cursor" | "grok" | "relay" | "opencode"
+        "claude" | "codex" | "cursor" | "grok" | "relay" | "opencode" | "muse"
     ) {
         return Err(hydration_error(
             "INVALID_ARGUMENT",
@@ -1889,6 +1889,7 @@ pub(crate) fn validate_provider_path(
         ],
         "cursor" => vec![provider_roots.home.join(".cursor/projects")],
         "grok" => vec![provider_roots.grok.join("sessions")],
+        "muse" => vec![provider_roots.muse.clone()],
         _ => Vec::new(),
     };
     let canonical = fs::canonicalize(path)?;
@@ -2114,6 +2115,8 @@ fn ingest_selected(
             Ok((whole_file(), diagnostics, Some(consumed)))
         }
         "grok" => ingest_grok(conn, options, path.unwrap())
+            .map(|diagnostics| (whole_file(), diagnostics, None)),
+        "muse" => ingest_muse(conn, options, path.unwrap())
             .map(|diagnostics| (whole_file(), diagnostics, None)),
         "opencode" => {
             let path = path.unwrap();
@@ -2938,6 +2941,91 @@ fn ingest_grok(
     }
     let outcome = ingest_grok_session(conn, &session, &path.to_string_lossy())?;
     Ok(grok_diagnostics(&outcome))
+}
+
+fn ingest_muse(
+    conn: &Connection,
+    options: &HydrateSessionOptions,
+    path: &Path,
+) -> Result<Vec<HydrationDiagnostic>> {
+    let transcript = read_muse_transcript(path)?.ok_or_else(|| {
+        hydration_error(
+            "SESSION_SOURCE_MISMATCH",
+            "Muse Code transcript has no session metadata",
+        )
+    })?;
+    if transcript.metadata.session_id != options.session_id {
+        return Err(hydration_error(
+            "SESSION_SOURCE_MISMATCH",
+            "Muse Code transcript identity does not match the catalog row",
+        ));
+    }
+    let outcome = ingest_muse_session(conn, &transcript, &path.to_string_lossy())?;
+    Ok(muse_diagnostics(&outcome))
+}
+
+/// What a Muse Code transcript could not establish on its own. Every code
+/// describes an absence in Muse's records, not a failure of this run.
+fn muse_diagnostics(outcome: &MuseIngestOutcome) -> Vec<HydrationDiagnostic> {
+    let diagnostic = |code: &str, message: String| HydrationDiagnostic {
+        code: code.to_string(),
+        message,
+        duration_ms: None,
+        source_bytes: None,
+        records_parsed: None,
+    };
+    let mut diagnostics = Vec::new();
+    if outcome.encrypted_reasoning > 0 {
+        diagnostics.push(diagnostic(
+            "MUSE_REASONING_ENCRYPTED",
+            format!(
+                "{} reasoning record(s) carried only an encrypted trace; each is recorded as \
+                 an encrypted_reasoning marker rather than as thinking text",
+                outcome.encrypted_reasoning
+            ),
+        ));
+    }
+    if outcome.unattached_usage > 0 {
+        diagnostics.push(diagnostic(
+            "MUSE_USAGE_UNATTACHED",
+            format!(
+                "{} model step(s) reported usage but committed no assistant record in the \
+                 same run to carry it; that usage is not stored on any event",
+                outcome.unattached_usage
+            ),
+        ));
+    }
+    if outcome.subagent_calls > 0 {
+        diagnostics.push(diagnostic(
+            "MUSE_SUBAGENT_SPAWN_UNLINKED",
+            format!(
+                "{} subagent_spawn call(s) are recorded as tool calls; Muse subagent \
+                 transcripts are not linked as child sessions yet",
+                outcome.subagent_calls
+            ),
+        ));
+    }
+    if outcome.results_without_outcome > 0 {
+        diagnostics.push(diagnostic(
+            "MUSE_TOOL_OUTCOME_MISSING",
+            format!(
+                "{} tool result(s) had no tool_batch.effect.terminal record for their call; \
+                 their status is unknown rather than assumed",
+                outcome.results_without_outcome
+            ),
+        ));
+    }
+    if outcome.unparsed_lines > 0 {
+        diagnostics.push(diagnostic(
+            "MUSE_LINES_UNPARSED",
+            format!(
+                "{} line(s) of session.jsonl were not JSON records and were skipped (a live \
+                 session's partial last line is one)",
+                outcome.unparsed_lines
+            ),
+        ));
+    }
+    diagnostics
 }
 
 /// What a Grok session directory could not establish on its own.

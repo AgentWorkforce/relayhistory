@@ -883,6 +883,7 @@ fn parse_source(name: &str) -> Result<Source> {
         "relay" => Ok(Source::Relay),
         "trajectory" => Ok(Source::Trajectory),
         "opencode" => Ok(Source::OpenCode),
+        "muse" => Ok(Source::Muse),
         other => anyhow::bail!("change feed: unknown source {other:?}"),
     }
 }

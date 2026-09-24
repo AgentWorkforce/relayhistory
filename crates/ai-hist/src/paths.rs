@@ -24,6 +24,21 @@ pub fn grok_home(home: &Path) -> PathBuf {
     env_dir("GROK_HOME").unwrap_or_else(|| home.join(".grok"))
 }
 
+/// Where Muse Code keeps its session logs: `$XDG_DATA_HOME/muse/sessions`,
+/// or `~/.local/share/muse/sessions` when `XDG_DATA_HOME` is unset. Muse uses
+/// the same XDG layout on every platform.
+pub fn muse_sessions_dir(home: &Path) -> PathBuf {
+    match env_dir("XDG_DATA_HOME") {
+        Some(data) => data.join("muse/sessions"),
+        None => default_muse_sessions_dir(home),
+    }
+}
+
+/// [`muse_sessions_dir`] with nothing read from the environment.
+pub(crate) fn default_muse_sessions_dir(home: &Path) -> PathBuf {
+    home.join(".local/share/muse/sessions")
+}
+
 pub fn opencode_db_path(home: &Path) -> PathBuf {
     env_dir("OPENCODE_DB")
         .unwrap_or_else(|| home.join(".local/share/opencode/opencode.db"))
@@ -43,7 +58,7 @@ pub fn opencode_storage_dir(home: &Path) -> PathBuf {
 /// watched, or a session the sweep catalogued cannot be hydrated afterwards.
 /// Build it with [`ProviderRoots::from_env`] (the CLI's rules: the process
 /// environment's `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME`,
-/// `OPENCODE_DB`, `OPENCODE_STORAGE_DIR` and `TRAJECTORY_ROOT` override the
+/// `XDG_DATA_HOME` (for Muse Code), `OPENCODE_DB`, `OPENCODE_STORAGE_DIR` and `TRAJECTORY_ROOT` override the
 /// defaults under `home`) or [`ProviderRoots::from_home`] (the defaults under
 /// `home`, with nothing read from the environment — what a test or an
 /// embedder with its own layout wants). The environment is read **once**,
@@ -59,6 +74,8 @@ pub struct ProviderRoots {
     pub codex: PathBuf,
     /// Grok state root (`~/.grok`).
     pub grok: PathBuf,
+    /// Muse Code session logs (`~/.local/share/muse/sessions`).
+    pub muse: PathBuf,
     /// The OpenCode SQLite store.
     pub opencode_db: PathBuf,
     /// OpenCode's legacy `storage/` JSON tree, read only when there is no
@@ -85,6 +102,7 @@ impl ProviderRoots {
             claude: claude_config_dir(&home),
             codex: codex_home(&home),
             grok: grok_home(&home),
+            muse: muse_sessions_dir(&home),
             opencode_db: opencode_db_path(&home),
             opencode_storage_dir: opencode_storage_dir(&home),
             trajectory_roots: trajectory_roots_from_env(),
@@ -104,6 +122,7 @@ impl ProviderRoots {
             claude: home.join(".claude"),
             codex: home.join(".codex"),
             grok: home.join(".grok"),
+            muse: default_muse_sessions_dir(&home),
             home,
             opencode_db,
             opencode_storage_dir,
@@ -152,7 +171,12 @@ mod tests {
             ("ingest/hydrate.rs", include_str!("ingest/hydrate.rs")),
         ] {
             let production = source.split("\n#[cfg(test)]").next().unwrap();
-            for literal in ["join(\".claude", "join(\".codex", "join(\".grok"] {
+            for literal in [
+                "join(\".claude",
+                "join(\".codex",
+                "join(\".grok",
+                "join(\".local/share/muse",
+            ] {
                 assert!(
                     !production.contains(literal),
                     "{name} builds a provider root directly with {literal}"

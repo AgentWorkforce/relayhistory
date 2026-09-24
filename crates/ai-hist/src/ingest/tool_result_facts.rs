@@ -52,6 +52,9 @@ pub const ERROR_SIGNAL_EXIT_CODE: &str = "exit_code";
 pub const ERROR_SIGNAL_PATCH_APPLY: &str = "patch_apply";
 /// A Codex `mcp_tool_call_end` whose `result` carries `Err`.
 pub const ERROR_SIGNAL_MCP_ERR: &str = "mcp_err";
+/// A Muse Code `tool_batch.effect.terminal` whose `outcome.kind` is not
+/// `completed`.
+pub const ERROR_SIGNAL_MUSE_TOOL_OUTCOME: &str = "tool_batch.effect";
 /// A harness subagent notification reporting a failed or cancelled child.
 pub const ERROR_SIGNAL_SUBAGENT_STATUS: &str = "subagent_status";
 
@@ -340,6 +343,46 @@ pub fn codex_output_facts(output: &Value, call_id: &str) -> ToolResultFacts {
     facts.event_source = Some(EVENT_SOURCE_FUNCTION_CALL_OUTPUT.to_string());
     facts.result_status = Some(STATUS_UNKNOWN.to_string());
     facts.tool_use_id = (!call_id.is_empty()).then(|| call_id.to_string());
+    facts
+}
+
+/// Facts for one Muse Code tool result.
+///
+/// Muse writes no error flag on the result itself. The call's outcome is a
+/// separate `tool_batch.effect.terminal` record, passed here as
+/// `(outcome.kind, reason)`; without one the status stays `unknown`. A `bash`
+/// result that completed as a call but whose command exited non-zero is an
+/// error too, the way Codex reads `exit_code`.
+pub fn muse_tool_result_facts(
+    text: Option<&str>,
+    call_id: &str,
+    outcome: Option<(&str, Option<&str>)>,
+) -> ToolResultFacts {
+    let payload = text.map_or(Value::Null, |text| Value::String(text.to_string()));
+    let mut facts = ToolResultFacts::from_payload(&payload);
+    facts.event_source = Some(EVENT_SOURCE_TOOL_RESULT.to_string());
+    facts.tool_use_id = (!call_id.is_empty()).then(|| call_id.to_string());
+    let status = match outcome.map(|(kind, _)| kind) {
+        Some("completed") => STATUS_COMPLETED,
+        Some("failed") => {
+            facts.error_signal = Some(ERROR_SIGNAL_MUSE_TOOL_OUTCOME.to_string());
+            STATUS_ERRORED
+        }
+        Some("cancelled" | "canceled" | "skipped") => {
+            facts.error_signal = Some(ERROR_SIGNAL_MUSE_TOOL_OUTCOME.to_string());
+            STATUS_CANCELLED
+        }
+        _ => STATUS_UNKNOWN,
+    };
+    facts.result_status = Some(status.to_string());
+    if status == STATUS_COMPLETED
+        && text
+            .and_then(crate::ingest::muse::bash_exit_code)
+            .is_some_and(|code| code != 0)
+    {
+        facts.result_status = Some(STATUS_ERRORED.to_string());
+        facts.error_signal = Some(ERROR_SIGNAL_EXIT_CODE.to_string());
+    }
     facts
 }
 
