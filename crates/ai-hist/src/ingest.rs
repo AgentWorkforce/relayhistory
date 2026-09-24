@@ -113,7 +113,7 @@ pub fn sync_local_at(db_path: &Path) -> Result<bool> {
 }
 
 /// Content-free progress for hosts displaying a local capture operation.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CaptureProgress {
     pub source: String,
@@ -140,7 +140,31 @@ thread_local! {
     static CAPTURE_STOP: std::cell::RefCell<Option<CaptureStop>> = std::cell::RefCell::new(None);
 }
 
-fn with_capture_stop<T>(
+// The public facade supplies a thread-safe token. Keep the legacy thread-local
+// callback API usable with non-Send closures while sharing this token with readers.
+thread_local! {
+    static SHARED_CAPTURE_STOP: std::cell::RefCell<Option<crate::StopToken>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn shared_capture_stop() -> Option<crate::StopToken> {
+    SHARED_CAPTURE_STOP.with(|slot| slot.borrow().clone())
+}
+
+pub(crate) fn with_capture_token<T>(
+    token: crate::StopToken,
+    run: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    struct Restore(Option<crate::StopToken>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SHARED_CAPTURE_STOP.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(SHARED_CAPTURE_STOP.with(|slot| slot.replace(Some(token.clone()))));
+    with_capture_stop(move || token.is_stopped(), run)
+}
+
+pub(crate) fn with_capture_stop<T>(
     cancelled: impl Fn() -> bool + 'static,
     run: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
@@ -205,6 +229,23 @@ pub fn sync_local_at_with_progress(
     db_path: &Path,
     observer: impl Fn(CaptureProgress) + 'static,
 ) -> Result<bool> {
+    with_capture_observer(observer, || {
+        capture_progress("initializing", 0, None);
+        let result = sync_local_at(db_path);
+        check_capture_cancelled()?;
+        if result.is_ok() {
+            capture_progress("complete", 0, None);
+        }
+        result
+    })
+}
+
+/// Route this thread's capture progress to `observer` for the duration of
+/// `run`, restoring the previous observer on return, error, or panic.
+pub(crate) fn with_capture_observer<T>(
+    observer: impl Fn(CaptureProgress) + 'static,
+    run: impl FnOnce() -> Result<T>,
+) -> Result<T> {
     struct Restore(Option<CaptureObserver>);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -213,13 +254,7 @@ pub fn sync_local_at_with_progress(
     }
     let _restore =
         Restore(CAPTURE_OBSERVER.with(|slot| slot.replace(Some(std::rc::Rc::new(observer)))));
-    capture_progress("initializing", 0, None);
-    let result = sync_local_at(db_path);
-    check_capture_cancelled()?;
-    if result.is_ok() {
-        capture_progress("complete", 0, None);
-    }
-    result
+    run()
 }
 
 fn capture_progress(source: &str, processed_files: usize, total_files: Option<usize>) {
@@ -237,7 +272,7 @@ fn capture_progress(source: &str, processed_files: usize, total_files: Option<us
 
 // Report before taking each file, including the final None. This counts completed
 // files even when the ingest loop continues early for an unchanged checkpoint.
-fn capture_files(source: &'static str, files: Vec<PathBuf>) -> impl Iterator<Item = PathBuf> {
+pub(crate) fn capture_files<T>(source: &'static str, files: Vec<T>) -> impl Iterator<Item = T> {
     let total = files.len();
     let mut files = files.into_iter();
     let mut processed = 0;
@@ -9671,6 +9706,7 @@ fn prepare_cursor_sync(
     let mut transcripts = Vec::new();
     let mut errors = 0;
     let mut files_seen = 0;
+    let mut files = Vec::new();
     for project_dir in sorted_dirs(root)? {
         check_capture_cancelled()?;
         let ts_root = project_dir.join("agent-transcripts");
@@ -9694,49 +9730,52 @@ fn prepare_cursor_sync(
             if !jsonl.exists() {
                 continue;
             }
-            before_transcript(&jsonl);
-            files_seen += 1;
-            let key = jsonl.to_string_lossy().to_string();
-            // Cursor rewrites and rotates transcripts underneath us, so a file can
-            // vanish or be replaced between enumeration and open. That race is
-            // per-file, not per-source: record it, leave this file's checkpoint
-            // untouched so the next sync retries it from the same offset, and keep
-            // preparing the remaining transcripts.
-            let scan = match scan_cursor_transcript_with(&jsonl, cursor_state.get(&key), after_read)
-            {
-                Ok(scan) => scan,
-                Err(error) => {
-                    if error.is::<CaptureCancelled>() {
-                        return Err(error);
-                    }
-                    sync_note!("  [cursor] skipping {}: {error:#}", jsonl.display());
-                    errors += 1;
-                    coverage.note_unread();
-                    continue;
+            files.push((jsonl, session_id, project_path.clone()));
+        }
+    }
+    for (jsonl, session_id, project_path) in capture_files("cursor", files) {
+        check_capture_cancelled()?;
+        before_transcript(&jsonl);
+        files_seen += 1;
+        let key = jsonl.to_string_lossy().to_string();
+        // Cursor rewrites and rotates transcripts underneath us, so a file can
+        // vanish or be replaced between enumeration and open. That race is
+        // per-file, not per-source: record it, leave this file's checkpoint
+        // untouched so the next sync retries it from the same offset, and keep
+        // preparing the remaining transcripts.
+        let scan = match scan_cursor_transcript_with(&jsonl, cursor_state.get(&key), after_read) {
+            Ok(scan) => scan,
+            Err(error) => {
+                if error.is::<CaptureCancelled>() {
+                    return Err(error);
                 }
-            };
-            errors += scan.parse_errors;
-            if let Some(checkpoint) = scan.checkpoint {
-                cursor_state.insert(key, checkpoint);
+                sync_note!("  [cursor] skipping {}: {error:#}", jsonl.display());
+                errors += 1;
+                coverage.note_unread();
+                continue;
             }
-            // The byte cursor is the change detector; the parser then reads the
-            // whole file. Cursor's records are id-less, so every event, tool
-            // call and file edit is keyed on the record's byte offset — which a
-            // full re-parse reproduces exactly, and a resumed partial read
-            // could not, because a window's records have no absolute position
-            // of their own.
-            if scan.advanced {
-                transcripts.push(PreparedCursorTranscript {
-                    path: jsonl,
-                    session_id,
-                    project: project_path.clone(),
-                    timestamp_ms: scan.timestamp_ms,
-                    restarted: scan.restarted,
-                    history_from_offset: scan.resumed_from,
-                    scanned_through: scan.consumed_through,
-                    generation: scan.generation,
-                });
-            }
+        };
+        errors += scan.parse_errors;
+        if let Some(checkpoint) = scan.checkpoint {
+            cursor_state.insert(key, checkpoint);
+        }
+        // The byte cursor is the change detector; the parser then reads the
+        // whole file. Cursor's records are id-less, so every event, tool
+        // call and file edit is keyed on the record's byte offset — which a
+        // full re-parse reproduces exactly, and a resumed partial read
+        // could not, because a window's records have no absolute position
+        // of their own.
+        if scan.advanced {
+            transcripts.push(PreparedCursorTranscript {
+                path: jsonl,
+                session_id,
+                project: project_path.clone(),
+                timestamp_ms: scan.timestamp_ms,
+                restarted: scan.restarted,
+                history_from_offset: scan.resumed_from,
+                scanned_through: scan.consumed_through,
+                generation: scan.generation,
+            });
         }
     }
     Ok(PreparedCursorSync {
@@ -26788,7 +26827,7 @@ mod capture_progress_tests {
         CAPTURE_OBSERVER.with(|slot| {
             *slot.borrow_mut() = Some(std::rc::Rc::new(move |p| observed.lock().unwrap().push(p)))
         });
-        let files: Vec<_> = capture_files("claude", vec!["a".into(), "b".into()]).collect();
+        let files: Vec<PathBuf> = capture_files("claude", vec!["a".into(), "b".into()]).collect();
         assert_eq!(files.len(), 2);
         let values = updates.lock().unwrap();
         assert_eq!(

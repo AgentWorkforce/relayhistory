@@ -75,14 +75,15 @@ pub use change_feed::{
     DEFAULT_CHANGE_BATCH, MAX_CHANGE_BATCH,
 };
 pub use discover::{declared_evidence_kinds, missing_evidence_kinds, ShallowSession};
+pub use ingest::CaptureProgress;
 pub use relationship_graph::{RelationshipCapabilities, SessionRelationship};
 pub use session_store::{
     Block, BlockKind, Capability, CatalogIter, CatalogQuery, CatalogSession, ControlKind,
-    Diagnostic, DiscoveryState, Error, FileEdit, HydrateOptions, HydrateReport, HydrateStatus,
-    Marker, Message, MessageIdOrigin, Prompt, Relationship, RelationshipSide, Role,
-    SessionEvidence, SessionQuery, SessionRef, SessionStore, Source, SourceCapabilities,
-    StoreOptions, SyncOptions, SyncReport, TickReport, ToolCall, ToolResult, WatchHandle,
-    WatchOptions, WatchScope, WatchStop, WatchedPath,
+    Diagnostic, DiscoveryOptions, DiscoveryReport, DiscoveryState, Error, FileEdit, HydrateOptions,
+    HydrateReport, HydrateStatus, Marker, Message, MessageIdOrigin, ProgressObserver, Prompt,
+    Relationship, RelationshipSide, Role, SessionEvidence, SessionQuery, SessionRef, SessionStore,
+    Source, SourceCapabilities, StopToken, StoreOptions, SyncOptions, SyncReport, TickReport,
+    ToolCall, ToolResult, WatchHandle, WatchOptions, WatchScope, WatchStop, WatchedPath,
 };
 /// The usage reads that take a raw connection. Embedders reach the same data
 /// through [`SessionStore::session`], whose `requests` and `usage` fields

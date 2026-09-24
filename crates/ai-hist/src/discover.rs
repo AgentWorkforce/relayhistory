@@ -3892,7 +3892,20 @@ pub fn discover_sessions_with_provider_refs(
     env: &DiscoveryEnv<'_>,
     options: &DiscoverOptions,
     providers: &[&dyn ShallowSessionProvider],
+    on_row: impl FnMut(&ShallowSession),
+) -> Result<DiscoverySummary> {
+    let worker_limit = std::thread::available_parallelism().map_or(1, |n| n.get());
+    discover_sessions_with_worker_limit(env, options, providers, on_row, worker_limit)
+}
+
+// An explicit limit lets regression tests exercise both read paths regardless
+// of the host's CPU quota; the public entry point uses available parallelism.
+fn discover_sessions_with_worker_limit(
+    env: &DiscoveryEnv<'_>,
+    options: &DiscoverOptions,
+    providers: &[&dyn ShallowSessionProvider],
     mut on_row: impl FnMut(&ShallowSession),
+    worker_limit: usize,
 ) -> Result<DiscoverySummary> {
     // A pass is the unit over which the filesystem is treated as fixed, so it
     // is also the unit the project-identity cache may span. A host that stays
@@ -4111,17 +4124,17 @@ pub fn discover_sessions_with_provider_refs(
             })
             .map(|(index, _)| index)
             .collect();
-        let workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .min(fs_reads.len())
-            .min(MAX_READ_WORKERS);
+        let workers = worker_limit.min(fs_reads.len()).min(MAX_READ_WORKERS);
         if workers > 1 {
+            let stop = crate::ingest::shared_capture_stop();
             let next = AtomicUsize::new(0);
             let results = Mutex::new(Vec::with_capacity(fs_reads.len()));
             std::thread::scope(|scope| {
                 for _ in 0..workers {
                     scope.spawn(|| loop {
+                        if stop.as_ref().is_some_and(crate::StopToken::is_stopped) {
+                            break;
+                        }
                         let slot = next.fetch_add(1, Ordering::Relaxed);
                         let Some(&entry_index) = fs_reads.get(slot) else {
                             break;
@@ -4186,6 +4199,10 @@ pub fn discover_sessions_with_provider_refs(
         let mut window_discovered = 0usize;
         let mut window_discovered_by_source: BTreeMap<String, usize> = BTreeMap::new();
         'apply: for entry in entries {
+            if let Err(error) = crate::ingest::check_capture_cancelled() {
+                window_error = Some(error);
+                break 'apply;
+            }
             let (candidate, provider, expected, result) = match entry {
                 WindowEntry::Cached(row) => {
                     let key = (row.source.clone(), row.session_id.clone());
@@ -4319,6 +4336,9 @@ pub fn discover_sessions_with_provider_refs(
                 }
             }
         }
+        if window_error.is_none() {
+            window_error = crate::ingest::check_capture_cancelled().err();
+        }
         if let Some(error) = window_error {
             if has_writes {
                 let _ = conn.execute_batch("ROLLBACK");
@@ -4344,10 +4364,13 @@ pub fn discover_sessions_with_provider_refs(
             }
         }
         for row in window_rows {
+            crate::ingest::check_capture_cancelled()?;
             emitted_sessions.insert((row.source.clone(), row.session_id.clone()));
             emitted += 1;
             on_row(&row);
         }
+        // The final callback can stop the pass with no next row to check.
+        crate::ingest::check_capture_cancelled()?;
     }
 
     // A candidate whose bytes have not changed is served from the catalog

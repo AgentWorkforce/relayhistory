@@ -331,6 +331,7 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
     connectors: &crate::remote::SourceConnectorSelection,
     claude_snapshot: Option<ClaudeTranscriptSnapshot>,
 ) -> Result<HydrateSessionResult> {
+    super::check_capture_cancelled()?;
     let home = &roots.home;
     validate_options(options)?;
     // One hydration is one acquisition pass; see `begin_acquisition_pass`.
@@ -476,6 +477,7 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
     // newline-terminated, and so is still being written -- and every evidence
     // table has a provider-native uniqueness key, so interruption followed by
     // retry is safe for both new and growing sessions.
+    super::check_capture_cancelled()?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let cursor_key = CursorKey::Session {
         source: &options.source,
@@ -577,6 +579,7 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
     // session has landed. Leaving it to the next sync would serve a hydrated
     // session with a null project key in between.
     crate::store::refresh_session_project_identity(&tx, &options.source, &options.session_id)?;
+    super::check_capture_cancelled()?;
     tx.commit()?;
     if let (Some(path), Some(consumed)) = (snapshot.path.as_deref(), cursor_consumed_through) {
         // Hydration rebuilt history from offset 0 and does not otherwise
@@ -1608,6 +1611,7 @@ fn source_snapshot(
         scanned_bytes += sidecar_bytes as i64;
         scanned_superseded |= sidecar_superseded;
         for evidence in &subagents {
+            super::check_capture_cancelled()?;
             stamp.push('|');
             stamp.push_str(&file_stamp(&evidence.path)?);
             bytes += evidence.path.metadata()?.len() as i64;
@@ -1642,6 +1646,7 @@ fn source_snapshot(
         let (children, enumeration_bytes) = codex_children_counted(&path, &options.session_id)?;
         scanned_bytes += enumeration_bytes as i64;
         for child in children {
+            super::check_capture_cancelled()?;
             stamp.push('|');
             stamp.push_str(&file_stamp(&child)?);
             bytes += child.metadata()?.len() as i64;
@@ -1752,6 +1757,7 @@ fn unchanged_cursor_check(
     // missing cursor does. Driving this from the stamp's own list is what
     // stops a provider being added to the stamp and forgotten here.
     for (source, file_path) in &snapshot.stamped_cursors {
+        super::check_capture_cancelled()?;
         let locator = file_path.to_string_lossy().to_string();
         let cursor = load_cursor(
             conn,
@@ -2293,6 +2299,7 @@ fn ingest_claude(
     // Each sidecar carries its own locator-keyed cursor, so one that grows
     // does not drag the parent transcript through a re-parse.
     for evidence in subagents {
+        super::check_capture_cancelled()?;
         outcome.absorb_outcome(ingest_claude_subagent(conn, &options.session_id, evidence)?);
     }
     Ok(outcome)
@@ -2521,6 +2528,7 @@ fn claude_subagents(
     let mut bytes_read = 0u64;
     let mut superseded = false;
     for candidate in collect_matching_files(directory, "agent-", "jsonl")? {
+        super::check_capture_cancelled()?;
         if candidate == transcript {
             continue;
         }
@@ -3732,6 +3740,75 @@ mod tests {
     use super::*;
     use crate::source_evidence::FULL_SESSION_KINDS;
     use std::io::Write;
+
+    #[test]
+    fn cancellation_inside_hydration_rolls_back_evidence_and_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("history.db");
+        let body: String = (0..100).map(|i| format!("{}\n", serde_json::json!({
+            "type": "user", "sessionId": "cancel-session", "uuid": format!("msg-{i}"),
+            "timestamp": "2026-09-20T00:00:00Z", "message": {"role":"user", "content": format!("prompt {i}")}
+        }))).collect();
+        let transcript = seed_claude_transcript(dir.path(), "cancel-session", body.as_bytes());
+        let conn = std::rc::Rc::new(open_db(&db).unwrap());
+        catalog_row(&conn, "claude", "cancel-session", Some(&transcript));
+        let probe = conn.clone();
+        let stopped_after_insert = std::rc::Rc::new(std::cell::Cell::new(false));
+        let observed = stopped_after_insert.clone();
+        let tx = conn.unchecked_transaction().unwrap();
+        let mut cursor = TranscriptCursorState::default();
+        let error = crate::ingest::with_capture_stop(
+            move || {
+                let stop =
+                    count_table(&probe, "session_events", "claude", "cancel-session").unwrap() > 0;
+                observed.set(observed.get() || stop);
+                stop
+            },
+            || {
+                ingest_claude(
+                    &tx,
+                    &options("claude", "cancel-session"),
+                    &transcript,
+                    &[],
+                    None,
+                    &mut cursor,
+                )
+            },
+        )
+        .unwrap_err();
+        assert!(error.is::<crate::ingest::CaptureCancelled>(), "{error:#}");
+        assert!(
+            stopped_after_insert.get(),
+            "the test must stop after an evidence write"
+        );
+        assert_eq!(
+            count_table(&tx, "session_events", "claude", "cancel-session").unwrap(),
+            1,
+            "cancellation must stop at the next record, before the rest are inserted"
+        );
+        drop(tx);
+        for table in ["session_events", "session_hydration_checkpoints"] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                    .get::<_, usize>(0))
+                    .unwrap(),
+                0,
+                "{table} survived rollback"
+            );
+        }
+        let resumed =
+            hydrate_session_at_with_home(&db, &options("claude", "cancel-session"), dir.path())
+                .unwrap();
+        assert_eq!(resumed.status, "hydrated");
+        assert_eq!(
+            count_table(&conn, "session_events", "claude", "cancel-session").unwrap(),
+            100
+        );
+        let repeated =
+            hydrate_session_at_with_home(&db, &options("claude", "cancel-session"), dir.path())
+                .unwrap();
+        assert_eq!(repeated.status, "unchanged");
+    }
 
     #[test]
     fn remote_diagnostics_redact_separated_inline_and_probable_secrets() {

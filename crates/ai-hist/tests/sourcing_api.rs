@@ -14,9 +14,10 @@
 //! the facade a projection of the store rather than a second reading of it.
 
 use ai_hist::{
-    CatalogQuery, DiscoveryState, EvidenceKind, HydrateOptions, HydrateStatus, ProviderRoots,
-    RelationshipSide, Role, SessionEvidence, SessionQuery, SessionRef, SessionStore, Source,
-    StoreOptions, SyncOptions, TickTrigger, WatchOptions,
+    CaptureProgress, CatalogQuery, DiscoveryOptions, DiscoveryState, Error, EvidenceKind,
+    HydrateOptions, HydrateStatus, ProgressObserver, ProviderRoots, RelationshipSide, Role,
+    SessionEvidence, SessionQuery, SessionRef, SessionStore, Source, StopToken, StoreOptions,
+    SyncOptions, TickTrigger, WatchOptions,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -1032,6 +1033,187 @@ fn the_first_sync_lists_every_new_session_as_changed() {
     assert_eq!(sources, vec![Source::Claude, Source::Codex]);
 }
 
+fn catalog(store: &SessionStore) -> Vec<(Source, DiscoveryState)> {
+    let mut rows: Vec<_> = store
+        .sessions(CatalogQuery::default())
+        .map(|row| {
+            let row = row.unwrap();
+            (row.source, row.discovery_state)
+        })
+        .collect();
+    rows.sort_by_key(|(source, _)| *source);
+    rows
+}
+
+#[test]
+fn discover_catalogs_every_session_shallow_and_hydrates_none() {
+    let dir = tempfile::tempdir().unwrap();
+    stage(&CORPUS[0], dir.path()); // claude/simple-turn
+    stage(&CORPUS[7], dir.path()); // codex/simple-turn
+    let store = open(dir.path());
+
+    let first = store
+        .discover(DiscoveryOptions::default())
+        .expect("discover");
+    assert_eq!(first.discovered, 2);
+    assert!(first.diagnostics.is_empty());
+    assert_eq!(
+        catalog(&store),
+        vec![
+            (Source::Claude, DiscoveryState::Shallow),
+            (Source::Codex, DiscoveryState::Shallow)
+        ]
+    );
+
+    let again = store.discover(DiscoveryOptions::default()).unwrap();
+    assert_eq!(again.discovered, 0, "unmoved source stamps are not re-read");
+    assert_eq!(again.skipped_unchanged, 2);
+
+    // Picking one session to index leaves the other shallow.
+    let codex = store
+        .sessions(CatalogQuery::default())
+        .map(Result::unwrap)
+        .find(|row| row.source == Source::Codex)
+        .unwrap();
+    store
+        .hydrate(&codex.session_ref(), HydrateOptions::default())
+        .expect("hydrate the picked session");
+    assert_eq!(
+        catalog(&store),
+        vec![
+            (Source::Claude, DiscoveryState::Shallow),
+            (Source::Codex, DiscoveryState::Full)
+        ]
+    );
+}
+
+#[test]
+#[allow(clippy::field_reassign_with_default)]
+fn discover_reads_only_the_allowed_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    stage(&CORPUS[0], dir.path()); // claude
+    stage(&CORPUS[7], dir.path()); // codex
+    let store = open(dir.path());
+
+    let mut none = DiscoveryOptions::default();
+    none.sources = Some(vec![]);
+    assert_eq!(store.discover(none).unwrap().discovered, 0);
+    assert!(catalog(&store).is_empty(), "an empty allowlist admits none");
+
+    let mut codex = DiscoveryOptions::default();
+    codex.sources = Some(vec![Source::Codex]);
+    assert_eq!(store.discover(codex).unwrap().discovered, 1);
+    assert_eq!(
+        catalog(&store),
+        vec![(Source::Codex, DiscoveryState::Shallow)]
+    );
+}
+
+#[test]
+#[allow(clippy::field_reassign_with_default)]
+fn a_stopped_token_cancels_discover_sync_and_hydrate() {
+    let dir = tempfile::tempdir().unwrap();
+    stage(&CORPUS[0], dir.path()); // claude/simple-turn
+    let store = open(dir.path());
+    let stop = StopToken::new();
+    stop.stop();
+
+    let mut discover = DiscoveryOptions::default();
+    discover.stop = Some(stop.clone());
+    let error = store.discover(discover).unwrap_err();
+    assert!(matches!(error, Error::Cancelled(_)), "{error}");
+    assert_eq!(error.code(), "CANCELLED");
+
+    let mut empty = DiscoveryOptions::default();
+    empty.sources = Some(vec![]);
+    empty.stop = Some(stop.clone());
+    assert!(matches!(store.discover(empty), Err(Error::Cancelled(_))));
+
+    let mut sync = SyncOptions::default();
+    sync.stop = Some(stop.clone());
+    let error = store.sync(sync).unwrap_err();
+    assert!(matches!(error, Error::Cancelled(_)), "{error}");
+    assert!(catalog(&store).is_empty(), "a stopped sweep read nothing");
+
+    store
+        .sync(SyncOptions::default())
+        .expect("an unstopped sweep");
+    let row = store
+        .sessions(CatalogQuery::default())
+        .next()
+        .unwrap()
+        .unwrap();
+    let mut hydrate = HydrateOptions::default();
+    hydrate.stop = Some(stop);
+    let error = store.hydrate(&row.session_ref(), hydrate).unwrap_err();
+    assert!(matches!(error, Error::Cancelled(_)), "{error}");
+}
+
+#[test]
+#[allow(clippy::field_reassign_with_default)]
+fn a_token_stopped_mid_sweep_cancels_at_the_next_file() {
+    let dir = tempfile::tempdir().unwrap();
+    stage(&CORPUS[0], dir.path()); // claude
+    stage(&CORPUS[1], dir.path()); // a second Claude file
+    let store = open(dir.path());
+    let stop = StopToken::new();
+    let stopper = stop.clone();
+
+    let mut sync = SyncOptions::default();
+    sync.stop = Some(stop);
+    sync.progress = Some(ProgressObserver::new(move |p| {
+        if p.source == "claude" && p.processed_files >= 1 {
+            stopper.stop();
+        }
+    }));
+    let error = store.sync(sync).unwrap_err();
+    assert!(matches!(error, Error::Cancelled(_)), "{error}");
+
+    let rows: Vec<_> = store
+        .sessions(CatalogQuery::default())
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "the first file committed before cancellation"
+    );
+    assert_eq!(rows[0].source, Source::Claude);
+    assert_eq!(rows[0].session_id, "22222222-2222-2222-2222-222222222222");
+
+    let resumed = store
+        .sync(SyncOptions::default())
+        .expect("the next sweep resumes");
+    assert!(resumed.swept);
+    assert_eq!(catalog(&store).len(), 2);
+}
+
+#[test]
+#[allow(clippy::field_reassign_with_default)]
+fn sync_reports_file_progress_to_the_observer() {
+    let dir = tempfile::tempdir().unwrap();
+    stage(&CORPUS[0], dir.path()); // claude/simple-turn
+    let store = open(dir.path());
+    let seen: std::sync::Arc<std::sync::Mutex<Vec<CaptureProgress>>> = Default::default();
+    let sink = seen.clone();
+
+    let mut sync = SyncOptions::default();
+    sync.progress = Some(ProgressObserver::new(move |progress| {
+        sink.lock().unwrap().push(progress)
+    }));
+    store.sync(sync).expect("sync");
+
+    let seen = seen.lock().unwrap();
+    let claude: Vec<_> = seen.iter().filter(|p| p.source == "claude").collect();
+    assert!(!claude.is_empty(), "claude files were reported: {seen:?}");
+    assert!(
+        claude
+            .iter()
+            .any(|p| p.total_files == Some(1) && p.processed_files == 1),
+        "the last report counts every file: {claude:?}"
+    );
+}
+
 #[test]
 fn source_capabilities_are_static_and_honest() {
     let claude = Source::Claude.capabilities();
@@ -1315,4 +1497,65 @@ fn watch_reports_the_startup_sweep_and_a_session_that_appears() {
         assert!(remaining < 1_000);
     }
     drop(watch);
+}
+
+#[test]
+fn cursor_and_both_opencode_layouts_report_completed_files_on_repeat_sweeps() {
+    fn copy_tree(from: &Path, to: &Path) {
+        fs::create_dir_all(to).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.path().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+    for sqlite in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        if sqlite {
+            stage(&CORPUS[11], dir.path());
+        } else {
+            copy_tree(
+                &fixtures_root().join("opencode/legacy-json-multi-turn/storage"),
+                &dir.path().join(".local/share/opencode/storage"),
+            );
+        }
+        for id in ["first", "second"] {
+            let folder = dir
+                .path()
+                .join(".cursor/projects/home-dev-demo/agent-transcripts")
+                .join(id);
+            fs::create_dir_all(&folder).unwrap();
+            fs::copy(
+                fixtures_root().join("cursor/observed-3.13.25.jsonl"),
+                folder.join(format!("{id}.jsonl")),
+            )
+            .unwrap();
+        }
+        let store = open(dir.path());
+        for _ in 0..2 {
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = seen.clone();
+            let mut opts = SyncOptions::default();
+            opts.force = true;
+            opts.progress = Some(ProgressObserver::new(move |p| sink.lock().unwrap().push(p)));
+            store.sync(opts).unwrap();
+            let seen = seen.lock().unwrap();
+            for (source, total) in [("cursor", 2), ("opencode", if sqlite { 1 } else { 2 })] {
+                let counts: Vec<_> = seen
+                    .iter()
+                    .filter(|p| p.source == source && p.total_files == Some(total))
+                    .map(|p| p.processed_files)
+                    .collect();
+                assert_eq!(
+                    counts,
+                    (0..=total).collect::<Vec<_>>(),
+                    "{source}: {seen:?}"
+                );
+            }
+        }
+    }
 }

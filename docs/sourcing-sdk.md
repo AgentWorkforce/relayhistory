@@ -5,7 +5,7 @@ coding-agent session evidence without parsing harness logs itself. This guide
 is for that program's author: the surface the crate exposes on its **default
 features**, and the rules that surface is governed by.
 
-Everything a consumer needs is one type, `ai_hist::SessionStore`, nine
+Everything a consumer needs is one type, `ai_hist::SessionStore`, ten
 operations, and the typed structs they return. Nothing on this surface names a
 `rusqlite` type, and no JSON column reaches a consumer as a string. This is the
 surface [`docs/sourcing-contract.md`](sourcing-contract.md) is delivered
@@ -85,11 +85,12 @@ What the facade owes you, and what it asks in return:
   `Error::UnsupportedOperation`, and a watermark the store cannot serve is
   `Error::WatermarkAheadOfStore`.
 
-## The nine operations
+## The ten operations
 
 | Method                                           | Provider I/O                                | Database work                                                             | Lock                                             |
 | ------------------------------------------------ | ------------------------------------------- | ------------------------------------------------------------------------- | ------------------------------------------------ |
 | `SessionStore::open(StoreOptions)`               | none                                        | creates and migrates the schema (writable); checks it (read-only)         | none                                             |
+| `discover(DiscoveryOptions)`                     | provider metadata only, stamp-gated         | shallow catalog upserts                                                   | none (SQLite serializes writes)                  |
 | `sync(SyncOptions)`                              | full local sweep, fingerprint-gated         | migrations + ingestion + shallow discovery                                | `SyncRunLock`, whole run                         |
 | `hydrate(&SessionRef, HydrateOptions)`           | one session and its bounded related files   | transactional evidence + checkpoint upsert                                | per-session hydration lock                       |
 | `watch(WatchOptions) -> WatchHandle`             | fs-event or polling driven sweeps           | the same as `sync`, per tick                                              | `SyncRunLock`, per tick                          |
@@ -120,7 +121,7 @@ and assign the fields you set, not with a struct literal.
 | `db_path: None`, `home: None` | The CLI's database: `$AI_HIST_DB` if set, else `$XDG_DATA_HOME/ai-hist/ai-history.db` if `XDG_DATA_HOME` is set, else `~/.local/share/ai-hist/ai-history.db` (`HOME`, or `USERPROFILE` on Windows). |
 | `home` | Also the directory the providers are rooted at when `roots` is `None`: `<home>/.claude`, `<home>/.codex`, `<home>/.grok`, `<home>/.local/share/opencode/`. `None` means the process `HOME`. Ignored when `roots` is set. |
 | `roots: Some(ProviderRoots)` | Exactly where each provider keeps its sessions, resolved by the caller. |
-| `read_only` | Open without creating or migrating. `sync`, `hydrate` and `watch` are `Error::UnsupportedOperation`. |
+| `read_only` | Open without creating or migrating. `discover`, `sync`, `hydrate` and `watch` are `Error::UnsupportedOperation`. |
 
 **Provider roots.** `ProviderRoots::from_env(home)` is the CLI's resolution —
 `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME`, `OPENCODE_DB`,
@@ -147,6 +148,37 @@ the wrong answer to every other failure, which is why it is its own variant. A
 read-only handle truly adds no writer to the machine — the integration the ADR
 prefers when freshness is somebody else's job. Migrations are forward-only: a
 database written by a newer crate is not guaranteed readable by an older one.
+
+### `discover`
+
+The shallow catalog sweep, without the full parse: every local provider's
+sessions read from metadata and upserted as `DiscoveryState::Shallow` rows. A
+session whose source stamp has not moved is served from the catalog unread.
+Nothing is hydrated; a caller that indexes only the sessions it picks runs
+`discover` for the catalog and `hydrate` for each pick. It takes no
+`SyncRunLock`, so it never waits behind a sweep.
+
+`DiscoveryOptions { sources, limit, stop }`: `sources: None` reads every local
+source and `Some(vec![])` reads none; `limit` caps the rows read, newest first
+across providers — leave it `None` for a catalog a caller repeats, or every run
+sees only the same newest sessions. `DiscoveryReport { discovered,
+skipped_unchanged, diagnostics }`: one provider failing is a
+`DISCOVERY_FAILED` diagnostic, never an error for the rest.
+
+### Stopping and progress
+
+`discover`, `sync` and `hydrate` each take an optional `StopToken` in their
+options (`stop`). Clones share one flag: stop it from any thread and the call
+returns `Error::Cancelled` at the next provider, file or record boundary. A
+`sync` waiting for the `SyncRunLock` stops waiting too. Committed chunks stay;
+the unfinished transaction rolls back and the next call resumes from its
+checkpoint.
+
+`SyncOptions::progress` takes a `ProgressObserver`, called on the sweeping
+thread with a content-free `CaptureProgress { source, processed_files,
+total_files }` as each provider's files are read — no paths, no session text.
+Unchanged files count as processed. OpenCode counts its SQLite database as
+one file, or one session file per session in the legacy JSON tree.
 
 ### `sync`
 
@@ -366,7 +398,7 @@ codes where both sides have the failure; `Display` renders `CODE: message`.
 | `DatabaseOpen`             | `DATABASE_OPEN_FAILED`       | cannot open, create or migrate                                         |
 | `StaleSchema`              | `DATABASE_STALE_SCHEMA`      | read-only open of a database older than the shape this version reads   |
 | `InvalidArgument`          | `INVALID_ARGUMENT`           | a caller value was rejected before anything was read                   |
-| `UnsupportedOperation`     | `UNSUPPORTED_OPERATION`      | `sync` / `hydrate` / `watch` on a read-only handle                     |
+| `UnsupportedOperation`     | `UNSUPPORTED_OPERATION`      | `discover` / `sync` / `hydrate` / `watch` on a read-only handle        |
 | `SessionNotFound`          | `SESSION_NOT_FOUND`          | `hydrate` of a session the catalog does not hold                       |
 | `SessionSourceUnavailable` | `SESSION_SOURCE_UNAVAILABLE` | catalogued, but the provider source is gone                            |
 | `SourceMismatch`           | `SESSION_SOURCE_MISMATCH`    | the provider data and the claimed session disagree                     |
@@ -382,6 +414,7 @@ codes where both sides have the failure; `Display` renders `CODE: message`.
 | `SyncLocked`               | `SYNC_LOCKED`                | another process holds the `SyncRunLock` past the caller's timeout      |
 | `WatermarkAheadOfStore`    | `WATERMARK_AHEAD_OF_STORE`   | a `changes_since` watermark this store did not issue (epoch or revision) |
 | `ConsumerKindsMismatch`    | `CONSUMER_KINDS_MISMATCH`    | a named cursor was drained under a different kind set than it holds     |
+| `Cancelled`                | `CANCELLED`                  | the caller's `StopToken` stopped `discover`, `sync` or `hydrate`       |
 
 The four Node-only classes (`UNSUPPORTED_PLATFORM`, `NATIVE_PACKAGE_MISSING`,
 `NATIVE_LOAD_FAILED`, `NATIVE_CONTRACT_MISMATCH`) have no Rust counterpart.
@@ -574,7 +607,7 @@ embedder reads before bumping.
 
 | Feature | Default | What it adds | For |
 | --- | --- | --- | --- |
-| *(none)* | ✓ | `SessionStore` and its nine operations, the change feed (`Change`, `ChangeQuery`, `Watermark`, `EvidenceRow`), `Source` and `SourceCapabilities`, `Error`, the evidence structs above, `NormalizedUsage` and the usage normalizers, `project_identity`, `declared_evidence_kinds` | Embedders |
+| *(none)* | ✓ | `SessionStore` and its ten operations, the change feed (`Change`, `ChangeQuery`, `Watermark`, `EvidenceRow`), `Source` and `SourceCapabilities`, `Error`, the evidence structs above, `NormalizedUsage` and the usage normalizers, `project_identity`, `declared_evidence_kinds` | Embedders |
 | `fs-events` | — | The `notify` backend behind `watch`; without it `watch` polls at `poll_interval_ms`. `WatchOptions::use_fs_events` selects it when it is compiled in | The CLI, and an embedder that wants event-driven ticks |
 | `delivery` | — | Durable delivery of captured evidence to a destination | The CLI, napi, the relayhistory plugin |
 | `opencode-backup` | — | Snapshot a live OpenCode SQLite store through `rusqlite`'s backup API before reading it | The CLI, napi |
