@@ -144,8 +144,9 @@ pub fn prepare(batch: HistoryExportBatch) -> Result<PreparedPayload> {
         body,
     })
 }
+/// The receiver may add receipt fields; only these decide acknowledgment.
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 struct Receipt {
     protocol_version: u32,
     batch_id: String,
@@ -425,8 +426,9 @@ pub struct ReadOptions {
     pub include_deleted: Option<bool>,
     pub limit: Option<usize>,
 }
+/// Parsed from the receiver, which may add page fields.
 #[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct ReadPage {
     pub protocol_version: u32,
     /// Live keyset listing. A later refresh starts from the beginning; this is not a change feed.
@@ -541,6 +543,27 @@ pub fn read_page(base_url: Option<&str>, options: &ReadOptions) -> Result<ReadPa
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_receipt_with_fields_this_probe_does_not_know_still_acknowledges() {
+        // A receiver that has already stored the batch answers the same way on
+        // every retry, so rejecting an additive field blocks delivery for good.
+        let batch: HistoryExportBatch = serde_json::from_value(serde_json::json!({
+            "schema_version": 1, "origin_id": "origin", "batch_id": "batch", "job_id": "job",
+            "generation": 1, "destination_id": "relayhistory", "instance_id": "teams-probe",
+            "account_id": "relayhistory:account", "mapping_version": MAPPING_VERSION, "records": []
+        }))
+        .unwrap();
+        let acknowledged = receipt(
+            serde_json::json!({
+                "protocolVersion": 1, "batchId": "batch", "acceptedRevisionIds": [],
+                "unsupportedRevisionIds": [], "acceptanceLevel": "durable",
+                "receiptId": "rhr_0000000000000000000000000000000000000000000000000000000000000000"
+            }),
+            &batch,
+        )
+        .unwrap();
+        assert_eq!(acknowledged.batch_id, "batch");
+    }
     #[test]
     fn only_a_transport_verdict_can_block_the_job() {
         // A lease, storage or consent-recheck error must not be recorded as a

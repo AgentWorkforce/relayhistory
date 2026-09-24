@@ -443,3 +443,38 @@ fn batch_cap_triggers_are_replaced_by_the_reserve_on_reopen() {
             .is_some()
     );
 }
+
+#[test]
+fn reopening_a_reserve_schema_restores_missing_build_retry_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("reserve-without-build-history.db");
+    {
+        let conn = open_db(&path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO delivery_jobs
+             (id,destination_id,instance_id,account_id,generation,config_json,state,
+              created_ms,cutoff,journal_cursor,retry_build)
+             VALUES ('legacy','destination','instance','account',1,'{}','blocked',1,0,0,'0.26.1');
+             DROP TABLE delivery_job_builds;",
+        )
+        .unwrap();
+    }
+    let conn = open_db(&path).unwrap();
+    let restored: String = conn
+        .query_row(
+            "SELECT build FROM delivery_job_builds WHERE job_id='legacy'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(restored, "0.26.1");
+    let reserve_triggers: usize = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger'
+             AND name IN ('delivery_batches_reserve_insert','delivery_batches_reserve_update')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(reserve_triggers, 2);
+}

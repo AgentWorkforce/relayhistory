@@ -4389,6 +4389,20 @@ fn opencode_backup_requested() -> bool {
 /// cost is proportional to the history actually read rather than to the size
 /// of the provider's database.
 pub fn sync_opencode_db(conn: &Connection, opencode_db: &Path) -> Result<usize> {
+    let files = if opencode_db.is_file() {
+        vec![opencode_db]
+    } else {
+        vec![]
+    };
+    let mut inserted = 0;
+    for path in crate::ingest::capture_files("opencode", files) {
+        inserted += sync_opencode_db_file(conn, path)?;
+    }
+    crate::ingest::check_capture_cancelled()?;
+    Ok(inserted)
+}
+
+fn sync_opencode_db_file(conn: &Connection, opencode_db: &Path) -> Result<usize> {
     crate::ingest::check_capture_cancelled()?;
     // `is_file`, the same question `OpencodeLayout::detect` asks. `exists` is
     // true for a directory, and `OPENCODE_DB` is an arbitrary path, so the
@@ -4451,7 +4465,7 @@ pub fn sync_opencode_storage_dir(conn: &Connection, storage_dir: &Path) -> Resul
         .iter()
         .map(|dir| format!("{}: {}", dir.path.display(), dir.error))
         .collect();
-    for session_file in listing.sessions {
+    for session_file in crate::ingest::capture_files("opencode", listing.sessions) {
         crate::ingest::check_capture_cancelled()?;
         crate::ingest::ensure_capture_headroom(conn)?;
         let indexed =
