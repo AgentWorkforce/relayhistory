@@ -172,7 +172,8 @@ impl Table {
             own
         }
     }
-    /// The columns a capture trigger carries, in table order.
+    /// The columns a capture trigger carries, in table order: the change
+    /// feed's stored row, so the two cannot disagree about a record's shape.
     ///
     /// The change feed's `revision` stamp is excluded on purpose. It is this
     /// database's bookkeeping, not a fact about the record, and it changes on
@@ -180,17 +181,7 @@ impl Table {
     /// each insert read as a second change of the row, and journal every
     /// record twice.
     pub(crate) fn captured_columns(&self, conn: &Connection) -> Result<Vec<String>> {
-        let columns = conn
-            .prepare(&format!(
-                "SELECT name FROM pragma_table_info('{}')",
-                self.name
-            ))?
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(columns
-            .into_iter()
-            .filter(|column| column != crate::change_feed::REVISION_COLUMN)
-            .collect())
+        crate::change_feed::stored_columns(conn, self.name)
     }
 
     pub fn payload(&self, conn: &Connection, row: &str) -> Result<String> {

@@ -22,7 +22,7 @@ fn main() -> Result<(), ai_hist::Error> {
     let query = ai_hist::ChangeQuery::default().consumer("my-ingest");
     let mut changes = store.changes_since(ai_hist::Watermark::CONSUMER, query)?;
     for change in changes.by_ref() {
-        let _change = change?; // `Upsert(EvidenceRow)` or `Delete`, keyed by kind + record_key
+        let _change = change?; // `Upsert` or `Delete` of `change.key`; `columns` is the stored row
     }
     changes.commit()?; // the cursor moves only here
     Ok(())

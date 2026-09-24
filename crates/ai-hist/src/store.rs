@@ -334,7 +334,10 @@ CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
     INSERT INTO history_fts(rowid, prompt, project)
     VALUES (new.id, new.prompt, new.project);
 END;
-CREATE TRIGGER IF NOT EXISTS history_au AFTER UPDATE ON history BEGIN
+-- `UPDATE OF`, for the same reason as `session_events_au` below: the
+-- change feed re-stamps `revision` after each insert, and that touches
+-- nothing the index holds.
+CREATE TRIGGER IF NOT EXISTS history_au AFTER UPDATE OF id, prompt, project ON history BEGIN
     INSERT INTO history_fts(history_fts, rowid, prompt, project)
     VALUES('delete', old.id, old.prompt, old.project);
     INSERT INTO history_fts(rowid, prompt, project)
@@ -786,6 +789,7 @@ const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &[
     // TRIGGER IF NOT EXISTS` keeps an existing database's unconditional body,
     // so the marker is what makes the rebuild happen exactly once.
     "session_events_fts_update_of_v1",
+    "history_fts_update_of_v1",
 ];
 #[cfg(feature = "export")]
 const REQUIRED_EXPORT_MIGRATIONS: &[&str] = &["delivery_v1"];
@@ -1097,6 +1101,9 @@ fn init_db_locked(conn: &Connection) -> Result<()> {
     if !migration_applied(conn, "session_events_fts_update_of_v1")? {
         conn.execute_batch("DROP TRIGGER IF EXISTS session_events_au;")?;
     }
+    if !migration_applied(conn, "history_fts_update_of_v1")? {
+        conn.execute_batch("DROP TRIGGER IF EXISTS history_au;")?;
+    }
     conn.execute_batch(SCHEMA)?;
     // Before the trigger below, whose body deletes from these tables.
     conn.execute_batch(SESSION_RELATIONSHIPS_DDL)?;
@@ -1257,7 +1264,8 @@ END;
     conn.execute_batch(
         "INSERT OR IGNORE INTO schema_migrations (name) \
          VALUES ('session_delete_continuity_reopen_v1'), \
-                ('session_events_fts_update_of_v1');",
+                ('session_events_fts_update_of_v1'), \
+                ('history_fts_update_of_v1');",
     )?;
     migrate_session_relationships_v2(conn)?;
     migrate_tool_result_fidelity_v1(conn)?;

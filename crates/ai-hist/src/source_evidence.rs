@@ -842,6 +842,8 @@ mod tests {
             ("file_edits", "revision"),
             ("session_relationships", "revision"),
             ("session_markers", "revision"),
+            ("history", "revision"),
+            ("session_commit_links", "revision"),
         ];
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         crate::init_db(&conn).unwrap();

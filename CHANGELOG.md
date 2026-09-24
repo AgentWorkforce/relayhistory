@@ -184,6 +184,23 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Rust API
 
+- The change feed reports every evidence table and each row exactly as
+  stored. `ChangeKind` gains `History`, `Presence`, `CommitLink`,
+  `Trajectory`, `SourceObservation` and `ObservationEvidence` (`ALL` lists
+  twelve kinds); their rows are stamped and tombstoned by the same triggers,
+  and a database the six-kind feed reached stamps them once on open, above its
+  head, so a cursor bound to every kind resumes into all of them.
+  `EvidenceRow::History(HistoryEntry)` is the typed prompt row and
+  `EvidenceRow::Untyped` marks a kind with none. `Change` gains `columns:
+  Option<StoredRow>` — every column but `revision`, in table order, values as
+  SQLite holds them, read from the live table so a new column is carried
+  without a code change; the export journal's payload is built from the same
+  column list — and `key: Vec<serde_json::Value>`, the record's identity as
+  the journal keys it (`["history", source, timestamp_ms, prompt]`), on
+  upserts and tombstones alike. `Change::source` is `Option<Source>` and
+  `Change::source_name` holds the stored name, so a row from a source this
+  build does not know is carried instead of failing the drain. The `history`
+  FTS update trigger fires only on the columns it indexes.
 - `SessionStore::discover(DiscoveryOptions)` is the shallow catalog sweep:
   every local provider's sessions from metadata, as `Shallow` rows, hydrating
   none and taking no `SyncRunLock`. `discover`, `sync` and `hydrate` take an
