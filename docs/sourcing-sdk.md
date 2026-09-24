@@ -177,6 +177,8 @@ checkpoint.
 `SyncOptions::progress` takes a `ProgressObserver`, called on the sweeping
 thread with a content-free `CaptureProgress { source, processed_files,
 total_files }` as each provider's files are read — no paths, no session text.
+Unchanged files count as processed. OpenCode counts its SQLite database as
+one file, or one session file per session in the legacy JSON tree.
 
 ### `sync`
 

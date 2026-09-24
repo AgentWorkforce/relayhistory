@@ -84,6 +84,7 @@ pub(crate) fn rows(contents: &str) -> impl Iterator<Item = JsonlRow<'_>> {
 /// provider did write, and save a change stamp that stops the next run from
 /// ever looking again.
 pub(crate) fn parse_row(row: JsonlRow<'_>, path: &Path, number: usize) -> Result<Option<Value>> {
+    super::check_capture_cancelled()?;
     match classify(row.text, row.complete) {
         Row::Record(value) => Ok(Some(value)),
         Row::Skip => Ok(None),
@@ -102,6 +103,7 @@ pub(crate) fn count_records(path: &Path) -> Result<i64> {
     let mut records = 0;
     let mut line = String::new();
     loop {
+        super::check_capture_cancelled()?;
         line.clear();
         if reader.read_line(&mut line)? == 0 {
             break;

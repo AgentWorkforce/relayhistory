@@ -1124,6 +1124,11 @@ fn a_stopped_token_cancels_discover_sync_and_hydrate() {
     assert!(matches!(error, Error::Cancelled(_)), "{error}");
     assert_eq!(error.code(), "CANCELLED");
 
+    let mut empty = DiscoveryOptions::default();
+    empty.sources = Some(vec![]);
+    empty.stop = Some(stop.clone());
+    assert!(matches!(store.discover(empty), Err(Error::Cancelled(_))));
+
     let mut sync = SyncOptions::default();
     sync.stop = Some(stop.clone());
     let error = store.sync(sync).unwrap_err();
@@ -1149,16 +1154,32 @@ fn a_stopped_token_cancels_discover_sync_and_hydrate() {
 fn a_token_stopped_mid_sweep_cancels_at_the_next_file() {
     let dir = tempfile::tempdir().unwrap();
     stage(&CORPUS[0], dir.path()); // claude
-    stage(&CORPUS[7], dir.path()); // codex
+    stage(&CORPUS[1], dir.path()); // a second Claude file
     let store = open(dir.path());
     let stop = StopToken::new();
     let stopper = stop.clone();
 
     let mut sync = SyncOptions::default();
     sync.stop = Some(stop);
-    sync.progress = Some(ProgressObserver::new(move |_| stopper.stop()));
+    sync.progress = Some(ProgressObserver::new(move |p| {
+        if p.source == "claude" && p.processed_files >= 1 {
+            stopper.stop();
+        }
+    }));
     let error = store.sync(sync).unwrap_err();
     assert!(matches!(error, Error::Cancelled(_)), "{error}");
+
+    let rows: Vec<_> = store
+        .sessions(CatalogQuery::default())
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "the first file committed before cancellation"
+    );
+    assert_eq!(rows[0].source, Source::Claude);
+    assert_eq!(rows[0].session_id, "22222222-2222-2222-2222-222222222222");
 
     let resumed = store
         .sync(SyncOptions::default())
@@ -1476,4 +1497,65 @@ fn watch_reports_the_startup_sweep_and_a_session_that_appears() {
         assert!(remaining < 1_000);
     }
     drop(watch);
+}
+
+#[test]
+fn cursor_and_both_opencode_layouts_report_completed_files_on_repeat_sweeps() {
+    fn copy_tree(from: &Path, to: &Path) {
+        fs::create_dir_all(to).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.path().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+    for sqlite in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        if sqlite {
+            stage(&CORPUS[11], dir.path());
+        } else {
+            copy_tree(
+                &fixtures_root().join("opencode/legacy-json-multi-turn/storage"),
+                &dir.path().join(".local/share/opencode/storage"),
+            );
+        }
+        for id in ["first", "second"] {
+            let folder = dir
+                .path()
+                .join(".cursor/projects/home-dev-demo/agent-transcripts")
+                .join(id);
+            fs::create_dir_all(&folder).unwrap();
+            fs::copy(
+                fixtures_root().join("cursor/observed-3.13.25.jsonl"),
+                folder.join(format!("{id}.jsonl")),
+            )
+            .unwrap();
+        }
+        let store = open(dir.path());
+        for _ in 0..2 {
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = seen.clone();
+            let mut opts = SyncOptions::default();
+            opts.force = true;
+            opts.progress = Some(ProgressObserver::new(move |p| sink.lock().unwrap().push(p)));
+            store.sync(opts).unwrap();
+            let seen = seen.lock().unwrap();
+            for (source, total) in [("cursor", 2), ("opencode", if sqlite { 1 } else { 2 })] {
+                let counts: Vec<_> = seen
+                    .iter()
+                    .filter(|p| p.source == source && p.total_files == Some(total))
+                    .map(|p| p.processed_files)
+                    .collect();
+                assert_eq!(
+                    counts,
+                    (0..=total).collect::<Vec<_>>(),
+                    "{source}: {seen:?}"
+                );
+            }
+        }
+    }
 }

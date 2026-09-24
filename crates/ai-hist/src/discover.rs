@@ -4117,11 +4117,15 @@ pub fn discover_sessions_with_provider_refs(
             .min(fs_reads.len())
             .min(MAX_READ_WORKERS);
         if workers > 1 {
+            let stop = crate::ingest::shared_capture_stop();
             let next = AtomicUsize::new(0);
             let results = Mutex::new(Vec::with_capacity(fs_reads.len()));
             std::thread::scope(|scope| {
                 for _ in 0..workers {
                     scope.spawn(|| loop {
+                        if stop.as_ref().is_some_and(crate::StopToken::is_stopped) {
+                            break;
+                        }
                         let slot = next.fetch_add(1, Ordering::Relaxed);
                         let Some(&entry_index) = fs_reads.get(slot) else {
                             break;
@@ -4186,6 +4190,10 @@ pub fn discover_sessions_with_provider_refs(
         let mut window_discovered = 0usize;
         let mut window_discovered_by_source: BTreeMap<String, usize> = BTreeMap::new();
         'apply: for entry in entries {
+            if let Err(error) = crate::ingest::check_capture_cancelled() {
+                window_error = Some(error);
+                break 'apply;
+            }
             let (candidate, provider, expected, result) = match entry {
                 WindowEntry::Cached(row) => {
                     let key = (row.source.clone(), row.session_id.clone());
@@ -4318,6 +4326,9 @@ pub fn discover_sessions_with_provider_refs(
                     }
                 }
             }
+        }
+        if window_error.is_none() {
+            window_error = crate::ingest::check_capture_cancelled().err();
         }
         if let Some(error) = window_error {
             if has_writes {

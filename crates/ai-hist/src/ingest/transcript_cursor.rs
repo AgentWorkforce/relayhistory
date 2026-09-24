@@ -1023,6 +1023,7 @@ impl TranscriptReader {
     /// indexed. The position does not advance over it, so the caller decides
     /// what to commit.
     pub(crate) fn next_line(&mut self, line: &mut String) -> Result<Option<ReadRecord>> {
+        super::check_capture_cancelled()?;
         line.clear();
         let mut raw = Vec::new();
         // The cap is on the reader, not on a check around it: `read_until`

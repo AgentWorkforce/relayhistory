@@ -39,7 +39,7 @@ use crate::ingest::hydrate::{
 };
 use crate::ingest::{
     source_watch_roots, sync_facade_tick, sync_watch_roots_with_provider_roots,
-    with_capture_observer, with_capture_stop, CaptureCancelled, CaptureProgress, SyncTick,
+    with_capture_observer, with_capture_token, CaptureCancelled, CaptureProgress, SyncTick,
     HOOK_HARNESSES,
 };
 use crate::paths::home_dir;
@@ -735,6 +735,10 @@ impl SessionStore {
         if self.read_only {
             return Err(Error::read_only("discover"));
         }
+        controlled(opts.stop.as_ref(), None, || self.discover_now(&opts))
+    }
+
+    fn discover_now(&self, opts: &DiscoveryOptions) -> Result<DiscoveryReport, Error> {
         if opts.sources.as_ref().is_some_and(Vec::is_empty) {
             return Ok(DiscoveryReport::default());
         }
@@ -751,10 +755,8 @@ impl SessionStore {
                 .collect(),
             limit: opts.limit,
         };
-        let summary = controlled(opts.stop.as_ref(), None, || {
-            discover::discover_sessions_with_env(&env, &options, |_| {})
-                .map_err(|error| Error::classify(error, Error::Discovery))
-        })?;
+        let summary = discover::discover_sessions_with_env(&env, &options, |_| {})
+            .map_err(|error| Error::classify(error, Error::Discovery))?;
         Ok(DiscoveryReport {
             discovered: summary.discovered,
             skipped_unchanged: summary.skipped_unchanged,
@@ -1258,7 +1260,7 @@ fn controlled<T>(
 ) -> Result<T, Error> {
     let stop = stop.cloned();
     let stoppable = move || match stop {
-        Some(token) => with_capture_stop(move || token.is_stopped(), || Ok(work())),
+        Some(token) => with_capture_token(token, || Ok(work())),
         None => Ok(work()),
     };
     let outcome = match progress.cloned() {
@@ -1316,6 +1318,8 @@ pub struct SyncOptions {
     #[serde(skip)]
     pub stop: Option<StopToken>,
     /// Receives [`CaptureProgress`] as the sweep reads each provider's files.
+    /// OpenCode counts its SQLite database as one file, or one session file
+    /// per session in the legacy JSON tree. Unchanged files count as processed.
     #[serde(skip)]
     pub progress: Option<ProgressObserver>,
 }

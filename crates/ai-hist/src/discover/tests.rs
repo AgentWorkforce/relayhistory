@@ -3738,3 +3738,68 @@ fn a_cached_grandchild_is_streamed_the_key_the_refresh_lends_across_a_gap() {
         "the grandparent was not promoted, so nothing above was actually tested"
     );
 }
+
+#[test]
+fn stopped_parallel_discovery_does_not_claim_the_rest_of_the_window() {
+    struct StoppingProvider {
+        stop: crate::StopToken,
+        reads: AtomicUsize,
+    }
+    impl ShallowSessionProvider for StoppingProvider {
+        fn source(&self) -> &'static str {
+            "codex"
+        }
+        fn enumerate(
+            &self,
+            env: &DiscoveryEnv<'_>,
+            limit: Option<usize>,
+        ) -> Result<Vec<Candidate>> {
+            CodexProvider.enumerate(env, limit)
+        }
+        fn read_shallow(
+            &self,
+            _: &ScanEnv<'_>,
+            _: Option<&Connection>,
+            _: &Candidate,
+        ) -> Result<Option<ShallowSession>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.stop.stop();
+            Ok(None)
+        }
+    }
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    for i in 0..MAX_READ_WINDOW {
+        let id = format!("session-{i}");
+        codex_rollout(
+            home.path(),
+            &id,
+            &CODEX_BODY.replace("codex-1", &id),
+            1_750_000_000_000,
+        );
+    }
+    let stop = crate::StopToken::new();
+    let provider = StoppingProvider {
+        stop: stop.clone(),
+        reads: AtomicUsize::new(0),
+    };
+    let env = env_at(&conn, home.path());
+    let error = crate::ingest::with_capture_token(stop, || {
+        discover_sessions_with_provider_refs(&env, &only(&["codex"]), &[&provider], |_| {
+            panic!("cancelled window emitted a row")
+        })
+    })
+    .unwrap_err();
+    assert!(error.is::<crate::ingest::CaptureCancelled>());
+    let reads = provider.reads.load(Ordering::SeqCst);
+    assert!(
+        (1..=MAX_READ_WORKERS).contains(&reads),
+        "read {reads} files after stop"
+    );
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM discovery_skips", [], |row| row
+            .get::<_, usize>(0))
+            .unwrap(),
+        0
+    );
+}
