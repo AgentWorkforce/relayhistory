@@ -3803,3 +3803,45 @@ fn stopped_parallel_discovery_does_not_claim_the_rest_of_the_window() {
         0
     );
 }
+
+#[test]
+fn cancellation_during_row_emission_preserves_the_committed_window() {
+    for cached in [false, true] {
+        let conn = catalog();
+        let home = tempfile::tempdir().unwrap();
+        for id in ["first", "second", "third"] {
+            codex_rollout(
+                home.path(),
+                id,
+                &CODEX_BODY.replace("codex-1", id),
+                1_750_000_000_000,
+            );
+        }
+        if cached {
+            discover(&conn, home.path(), &only(&["codex"]));
+        }
+        let env = env_at(&conn, home.path());
+        let stop = crate::StopToken::new();
+        let stopper = stop.clone();
+        let mut emitted = 0;
+        let error = crate::ingest::with_capture_token(stop, || {
+            discover_sessions_with_env(&env, &only(&["codex"]), |_| {
+                emitted += 1;
+                stopper.stop();
+            })
+        })
+        .unwrap_err();
+        assert!(error.is::<crate::ingest::CaptureCancelled>());
+        assert_eq!(emitted, 1, "rows were emitted after cancellation");
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| row
+                .get::<_, usize>(0))
+                .unwrap(),
+            3
+        );
+        let resumed = discover(&conn, home.path(), &only(&["codex"]));
+        assert_eq!(resumed.rows.len(), 3);
+        assert_eq!(resumed.summary.skipped_unchanged, 3);
+        assert_eq!(resumed.summary.discovered, 0);
+    }
+}

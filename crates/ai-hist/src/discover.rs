@@ -4355,6 +4355,7 @@ pub fn discover_sessions_with_provider_refs(
             }
         }
         for row in window_rows {
+            crate::ingest::check_capture_cancelled()?;
             emitted_sessions.insert((row.source.clone(), row.session_id.clone()));
             emitted += 1;
             on_row(&row);

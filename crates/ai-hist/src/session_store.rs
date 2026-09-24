@@ -709,6 +709,7 @@ impl SessionStore {
             if let Some(outcome) = outcome {
                 return Ok(outcome);
             }
+            crate::ingest::check_capture_cancelled().map_err(Error::sync)?;
             let now = Instant::now();
             if now >= deadline {
                 return Err(Error::SyncLocked {
@@ -2858,6 +2859,43 @@ mod tests {
             .unwrap();
         assert!(again.swept);
         assert!(again.changed.is_empty(), "{:?}", again.changed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_after_lock_contention_precedes_the_retry_deadline() {
+        use std::os::unix::io::AsRawFd;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_at(&dir.path().join("ai-history.db"));
+        let holder = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.path().join("ai-history.db.sync.lock"))
+            .unwrap();
+        // SAFETY: holder owns the descriptor until the test finishes.
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let checks = std::cell::Cell::new(0);
+        let error = crate::ingest::with_capture_stop(
+            move || {
+                checks.set(checks.get() + 1);
+                // Enter the scope, attempt the lock, then stop before retrying.
+                checks.get() >= 3
+            },
+            || {
+                // Assert inside the scope so its final check cannot mask an
+                // incorrectly classified SyncLocked from the retry path.
+                assert!(matches!(
+                    store.sync_tick(false, 0),
+                    Err(Error::Cancelled(_))
+                ));
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.is::<CaptureCancelled>());
     }
 
     /// A catalog write that lands while `sync` is still waiting for another

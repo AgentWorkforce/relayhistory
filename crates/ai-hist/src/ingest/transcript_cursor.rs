@@ -1099,6 +1099,7 @@ impl TranscriptReader {
         let mut chunk = vec![0u8; 64 * 1024];
         let mut drained = MAX_RECORD_BYTES;
         loop {
+            super::check_capture_cancelled()?;
             let read = self.reader.read(&mut chunk)?;
             if read == 0 {
                 // The file ends inside the record. Nothing is committed — a
@@ -1392,6 +1393,42 @@ pub(crate) struct IncrementalPass {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancellation_interrupts_an_oversized_record_between_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized.jsonl");
+        let mut bytes = vec![b'x'; MAX_RECORD_BYTES as usize + 256 * 1024];
+        bytes.extend_from_slice(b"\n{}\n");
+        fs::write(&path, &bytes).unwrap();
+        let mut reader = TranscriptReader::open(&path, None, None).unwrap();
+        // A cloned file shares its seek position, so the stop follows actual
+        // I/O rather than timing or an implementation-specific check count.
+        let probe = std::cell::RefCell::new(reader.reader.get_ref().try_clone().unwrap());
+        let error = crate::ingest::with_capture_stop(
+            move || probe.borrow_mut().stream_position().unwrap() >= MAX_RECORD_BYTES + 64 * 1024,
+            || reader.next_line(&mut String::new()),
+        )
+        .unwrap_err();
+        assert!(error.is::<crate::ingest::CaptureCancelled>());
+        assert_eq!(reader.position(), 0, "an unfinished record was consumed");
+        assert!(
+            reader.reader.get_mut().stream_position().unwrap() < bytes.len() as u64,
+            "the cancelled drain still read the rest of the file"
+        );
+
+        let mut retry = TranscriptReader::open(&path, None, None).unwrap();
+        let mut line = String::new();
+        assert_eq!(
+            retry.next_line(&mut line).unwrap(),
+            Some(ReadRecord::Oversized { terminated: true })
+        );
+        assert_eq!(
+            retry.next_line(&mut line).unwrap(),
+            Some(ReadRecord::Terminated)
+        );
+        assert_eq!(line, "{}\n");
+    }
 
     fn digest_of(bytes: &[u8], offset: u64) -> (String, u64) {
         let dir = tempfile::tempdir().unwrap();
