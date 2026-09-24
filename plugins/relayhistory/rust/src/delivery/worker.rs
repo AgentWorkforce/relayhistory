@@ -8,9 +8,10 @@
 //! classified failure afterwards. No network, credential or environment access
 //! happens here; receivers never see this module's database connections.
 //!
-//! A drain is bounded: it attempts at most `max_batches` batches, never waits
-//! for a retry deadline and never enables, pauses or resumes a job. Delivery
-//! stays at least once, so receivers must remain idempotent per revision.
+//! A drain is bounded: it attempts at most `max_batches` batches, starts no
+//! further step once `max_elapsed` has passed, never waits for a retry deadline
+//! and never enables, pauses or resumes a job. Delivery stays at least once, so
+//! receivers must remain idempotent per revision.
 //!
 //! The core cannot forcibly interrupt a receiver: Rust has no way to cancel a
 //! synchronous call. [`ReceiverContext::timeout_ms`] is the deadline a receiver
@@ -21,11 +22,12 @@
 //! was lost, and nothing is acknowledged.
 
 use super::{
-    acknowledge, claim_batch, compact_journal, compact_receipts, expire_exports,
-    is_retention_limit, list_jobs, prepare_batch, record_failure, release_stopped_claim,
-    renew_lease, retained_bytes, status, store_prepared_payload, validate_dispatch, ClaimedBatch,
-    DeliveryAcknowledgment, DeliveryFailure, DeliveryJobConfig, DeliveryStatus, HistoryExportBatch,
-    PreparedPayload,
+    acknowledge, claim_batch, compact_journal_pass, compact_journal_while, compact_receipts,
+    compact_to_low_water, compact_to_low_water_while, expire_exports, is_retention_limit,
+    list_jobs, prepare_batch, record_failure, release_stopped_claim, renew_lease, retained_bytes,
+    status, store_prepared_payload, validate_dispatch, ClaimedBatch, DeliveryAcknowledgment,
+    DeliveryFailure, DeliveryJobConfig, DeliveryStatus, HistoryExportBatch, PreparedPayload,
+    MAX_COMPACTION_PAGE,
 };
 use anyhow::{anyhow, bail, Result};
 use rusqlite::Connection;
@@ -136,6 +138,14 @@ pub struct DrainOptions {
     pub worker_id: String,
     pub max_batches: usize,
     pub max_prepare_steps: usize,
+    /// Wall-clock budget for the drain's delivery work, measured from the end
+    /// of its own maintenance. Once it passes no further prepare step or
+    /// attempt starts, and an attempt already under way runs to its receiver's
+    /// own timeout. The budget bounds how long a drain keeps going, not whether
+    /// it goes at all: its first step, and the first attempt that step
+    /// prepares, always run, so however short the budget the queue still moves.
+    /// `None` bounds the drain by counts alone.
+    pub max_elapsed: Option<Duration>,
     pub lease_ms: i64,
     pub request_timeout_ms: i64,
 }
@@ -146,6 +156,7 @@ impl DrainOptions {
             worker_id: worker_id.into(),
             max_batches: 100,
             max_prepare_steps: 100,
+            max_elapsed: None,
             lease_ms: 30_000,
             request_timeout_ms: 30_000,
         }
@@ -234,11 +245,48 @@ fn range(value: i64, name: &str, minimum: i64, maximum: i64) -> Result<()> {
     }
     Ok(())
 }
-fn compact(conn: &Connection, now_ms: i64) -> Result<()> {
+/// Maintenance proportional to what is reclaimable: expire abandoned
+/// snapshots, release every settled receipt and reclaim every consumed
+/// journal row. At the start of a drain that is all, so the wall-clock budget
+/// goes to delivery; at the end, complete passes keep running while retained
+/// bytes exceed three quarters of the cap, once the drain's acknowledgments
+/// have released their bodies.
+///
+/// Every transaction is bounded, and `more` is consulted between them: a host
+/// stop or a spent drain budget ends maintenance where it stands rather than
+/// holding the collector for as long as the backlog takes.
+fn compact(conn: &Connection, now_ms: i64, more: &dyn Fn() -> bool, recover: bool) -> Result<()> {
+    if !more() {
+        return Ok(());
+    }
     expire_exports(conn, now_ms, 32)?;
-    compact_journal(conn, 1_000)?;
-    compact_receipts(conn, 1_000)?;
+    while more() && compact_receipts(conn, MAX_COMPACTION_PAGE)? == MAX_COMPACTION_PAGE {}
+    compact_journal_while(conn, MAX_COMPACTION_PAGE, more)?;
+    if recover {
+        compact_to_low_water_while(conn, MAX_COMPACTION_PAGE, more)?;
+    }
     Ok(())
+}
+/// Run one local state write; when the retention cap refuses it, run one
+/// complete compaction pass, recover to the low-water mark and retry the
+/// write once. The refusal escapes only when nothing was reclaimable or the
+/// retry is refused again. Batch writes have their own reserve above the
+/// cap, so this fires only if that reserve is exhausted.
+fn with_retention_recovery<T>(
+    conn: &Connection,
+    mut operation: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    match operation() {
+        Err(error) if is_retention_limit(&error) => {
+            let reclaimed = compact_journal_pass(conn, MAX_COMPACTION_PAGE)?
+                + compact_to_low_water(conn, MAX_COMPACTION_PAGE)?;
+            if reclaimed == 0 {
+                return Err(error);
+            }
+            operation()
+        }
+        result => result,
+    }
 }
 fn chosen(selection: Option<&[String]>, job_id: &str) -> bool {
     match selection {
@@ -275,6 +323,14 @@ pub fn drain(
         1,
         3_600_000,
     )?;
+    if let Some(limit) = options.max_elapsed {
+        range(
+            i64::try_from(limit.as_millis()).unwrap_or(i64::MAX),
+            "max_elapsed_ms",
+            1,
+            86_400_000,
+        )?;
+    }
     let keepalive = super::open_db(db_path)?;
     // The shared busy policy retries for about thirty seconds, which is right
     // for a sync that must not give up and exactly wrong for a keepalive: a
@@ -285,19 +341,13 @@ pub fn drain(
     keepalive.busy_timeout(Duration::from_millis(keepalive_busy_timeout_ms(
         options.lease_ms,
     )))?;
-    let mut worker = Worker {
-        conn: super::open_db(db_path)?,
-        keepalive: Mutex::new(keepalive),
-        receivers,
-        options,
-        clock,
-        cancelled,
-        attempts: 0,
-        prepare_steps: 0,
-        issues: Vec::new(),
-    };
-    compact(&worker.conn, clock())?;
-    let listed = list_jobs(&worker.conn)?;
+    let conn = super::open_db(db_path)?;
+    // Startup maintenance frees the room the first batch needs and stops on a
+    // host stop, but it runs before the budget's clock: on a loaded host it can
+    // outlast a short budget, and a drain that spent its time on maintenance
+    // would deliver nothing. Anything left is the end's to finish.
+    compact(&conn, clock(), &|| !cancelled(), false)?;
+    let listed = list_jobs(&conn)?;
     let selection = options.job_ids.as_deref();
     if let Some(ids) = selection {
         if ids
@@ -312,6 +362,21 @@ pub fn drain(
         .filter(|job| chosen(selection, &job.job_id))
         .map(|job| job.job_id)
         .collect();
+    // The budget covers delivery, so the clock starts once the drain's own
+    // maintenance is done: on a loaded host, setup alone can outlast a short
+    // budget and leave the drain no time to deliver anything.
+    let mut worker = Worker {
+        conn,
+        keepalive: Mutex::new(keepalive),
+        receivers,
+        options,
+        clock,
+        cancelled,
+        started: Instant::now(),
+        attempts: 0,
+        prepare_steps: 0,
+        issues: Vec::new(),
+    };
     // Round-robin jobs: one failed destination never consumes another's cursor.
     let mut progressed = true;
     while progressed && worker.budget() && !cancelled() {
@@ -349,7 +414,10 @@ pub fn drain(
         .into_iter()
         .filter(|job| chosen(selection, &job.job_id))
         .collect();
-    compact(&worker.conn, clock())?;
+    // Closing maintenance is the drain's own completion work, so a spent
+    // batch budget does not skip the recovery that frees capture; only a host
+    // stop ends it early.
+    compact(&worker.conn, clock(), &|| !cancelled(), true)?;
     let (used_bytes, limit_bytes) = retained_bytes(&worker.conn)?;
     Ok(DrainResult {
         attempts: worker.attempts,
@@ -375,15 +443,32 @@ struct Worker<'a> {
     options: &'a DrainOptions,
     clock: &'a (dyn Fn() -> i64 + Sync),
     cancelled: &'a (dyn Fn() -> bool + Sync),
+    started: Instant,
     attempts: usize,
     prepare_steps: usize,
     issues: Vec<DrainIssue>,
 }
 
 impl Worker<'_> {
+    /// Whether the drain may start another step. The count ceilings are
+    /// absolute; the elapsed budget bounds every step after the first, so a
+    /// drain always does one unit of work however little budget is left, and
+    /// scanning that produces no batch cannot run on past the deadline either.
     fn budget(&self) -> bool {
         self.attempts < self.options.max_batches
             && self.prepare_steps < self.options.max_prepare_steps
+            && (self.prepare_steps == 0 || self.within_budget())
+    }
+    /// Whether an attempt may start. The first attempt of a drain always runs,
+    /// so a batch is never left undelivered by a budget that expired while that
+    /// same step was preparing it.
+    fn may_attempt(&self) -> bool {
+        self.attempts == 0 || self.within_budget()
+    }
+    fn within_budget(&self) -> bool {
+        self.options
+            .max_elapsed
+            .is_none_or(|limit| self.started.elapsed() < limit)
     }
     /// At most one issue per job, whatever its cause, exactly as the host SDK.
     fn issue(&mut self, job_id: &str, code: DrainIssueCode, detail: Option<String>) {
@@ -408,7 +493,9 @@ impl Worker<'_> {
         else {
             return Ok(Step::Unregistered);
         };
-        let prepared = prepare_batch(&self.conn, job_id, (self.clock)())?;
+        let prepared = with_retention_recovery(&self.conn, || {
+            prepare_batch(&self.conn, job_id, (self.clock)())
+        })?;
         self.prepare_steps += 1;
         if prepared.batch_id.is_none() {
             // Scanning only excluded or unselected rows still moves a cursor.
@@ -420,13 +507,22 @@ impl Worker<'_> {
                 },
             );
         }
-        let Some(claim) = claim_batch(
-            &self.conn,
-            job_id,
-            &self.options.worker_id,
-            self.options.lease_ms,
-            self.clock,
-        )?
+        // Preparing a batch can wait on the busy handler for longer than the
+        // budget that remains. The batch stays pending for the next drain
+        // rather than starting a network attempt past the deadline the host's
+        // stop request and heartbeat depend on.
+        if !self.may_attempt() {
+            return Ok(Step::Progressed);
+        }
+        let Some(claim) = with_retention_recovery(&self.conn, || {
+            claim_batch(
+                &self.conn,
+                job_id,
+                &self.options.worker_id,
+                self.options.lease_ms,
+                self.clock,
+            )
+        })?
         else {
             // A privacy recheck can suppress the obsolete pending batch. If
             // re-inclusion has a fresh baseline ready, continue this bounded
@@ -459,6 +555,10 @@ impl Worker<'_> {
     ) -> Result<()> {
         let lost = AtomicBool::new(false);
         let stop = AtomicBool::new(false);
+        // A cap refusal that recovery could not clear is recorded as a
+        // transient failure like any other local error, and then reported at
+        // the job boundary so the host sees the cap rather than a retry.
+        let mut retention_refusal = None;
         let host = self.cancelled;
         let stopping = || host() || lost.load(Ordering::SeqCst);
         let outcome = {
@@ -532,7 +632,7 @@ impl Worker<'_> {
                 // so one misbehaving destination cannot take the host down.
                 let guard = StopOnDrop(&stop);
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    self.dispatch(receiver, claim, config, &stopping)
+                    self.dispatch(receiver, claim, config, &stopping, &mut retention_refusal)
                 }))
                 .unwrap_or_else(|_| Err(DeliveryFailure::Transient.into()));
                 drop(guard);
@@ -579,7 +679,10 @@ impl Worker<'_> {
                 self.clock,
             )?;
         }
-        Ok(())
+        match retention_refusal {
+            Some(refusal) => Err(refusal),
+            None => Ok(()),
+        }
     }
 
     /// Mapping, payload persistence, the eligibility recheck and transport.
@@ -591,6 +694,7 @@ impl Worker<'_> {
         claim: &ClaimedBatch,
         config: &DeliveryJobConfig,
         stopping: &dyn Fn() -> bool,
+        retention_refusal: &mut Option<anyhow::Error>,
     ) -> Result<DeliveryAcknowledgment, ReceiverFailure> {
         let transient = || ReceiverFailure::from(DeliveryFailure::Transient);
         let context = ReceiverContext {
@@ -616,22 +720,36 @@ impl Worker<'_> {
             if stopping() {
                 return Err(transient());
             }
-            if prepared.content_type.is_empty()
-                || prepared.content_type.len() > 200
-                || prepared.content_type.contains(['\r', '\n'])
-                || prepared.body.len() > config.limits.max_prepared_bytes
-            {
-                return Err(DeliveryFailure::InvalidPayload.into());
-            }
-            store_prepared_payload(
-                &self.conn,
-                &claim.lease,
+            let retained = PreparedPayload::stored(
                 receiver.mapping_version(),
                 &prepared.content_type,
                 &prepared.body,
-                self.clock,
             )
+            .retained_bytes()
             .map_err(|_| transient())?;
+            if prepared.content_type.is_empty()
+                || prepared.content_type.len() > 200
+                || prepared.content_type.contains(['\r', '\n'])
+                || retained > config.limits.max_prepared_bytes
+            {
+                return Err(DeliveryFailure::InvalidPayload.into());
+            }
+            with_retention_recovery(&self.conn, || {
+                store_prepared_payload(
+                    &self.conn,
+                    &claim.lease,
+                    receiver.mapping_version(),
+                    &prepared.content_type,
+                    &prepared.body,
+                    self.clock,
+                )
+            })
+            .map_err(|error| {
+                if is_retention_limit(&error) {
+                    *retention_refusal = Some(error);
+                }
+                transient()
+            })?;
         }
         if stopping() {
             return Err(transient());

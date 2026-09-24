@@ -540,9 +540,141 @@ fn invalid_selections_and_bounds_are_invalid_arguments() {
             request_timeout_ms: 0,
             ..options()
         },
+        DrainOptions {
+            max_elapsed: Some(Duration::ZERO),
+            ..options()
+        },
+        DrainOptions {
+            max_elapsed: Some(Duration::from_millis(86_400_001)),
+            ..options()
+        },
     ] {
         assert!(failure(invalid).starts_with("INVALID_ARGUMENT:"));
     }
+}
+
+/// A time-bounded drain against a large backlog keeps attempting batches for
+/// as long as its wall-clock budget lasts, so throughput follows the backlog
+/// instead of a fixed batch count; the count bounds stay as ceilings.
+#[test]
+fn a_time_bounded_drain_delivers_a_backlog_beyond_a_fixed_batch_count() {
+    let fixture = fixture();
+    for n in 0..3_000 {
+        fixture.conn.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude','both',?1,43,'user','text','backlog')",params![format!("backlog-{n}")]).unwrap();
+    }
+    let job = create_job(&fixture.conn, &config("one"), 0).unwrap();
+    let receiver = Fake::default();
+    let started = Instant::now();
+    let result = run(
+        &fixture.path(),
+        &one(&receiver),
+        &DrainOptions {
+            max_elapsed: Some(Duration::from_secs(15)),
+            max_batches: 1_000,
+            max_prepare_steps: 1_000,
+            ..options()
+        },
+    );
+    assert!(started.elapsed() < Duration::from_secs(15));
+    assert!(result.attempts > 8, "attempts: {}", result.attempts);
+    assert_eq!(result.issues, vec![]);
+    assert_eq!(result.statuses[0].job_id, job.job_id);
+    assert_eq!(result.statuses[0].pending_records, 0);
+    assert_eq!(result.statuses[0].unqueued_changes, 0);
+    assert_eq!(result.statuses[0].acknowledged_records, 3_003);
+}
+
+/// The budget bounds how long a drain keeps going, not whether it goes at all.
+/// Whatever the host and the clock are doing, a drain with deliverable work
+/// makes at least one attempt and records it normally, and a budget already
+/// spent stops the next one: nothing acknowledged is lost either way.
+#[test]
+fn a_drain_stops_starting_attempts_once_its_time_budget_has_passed() {
+    // A budget the first attempt alone outlasts, and one that admits a few.
+    for budget in [Duration::from_millis(1), Duration::from_millis(100)] {
+        let fixture = fixture();
+        for n in 0..500 {
+            fixture.conn.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude','both',?1,43,'user','text','backlog')",params![format!("backlog-{n}")]).unwrap();
+        }
+        create_job(&fixture.conn, &config("one"), 0).unwrap();
+        let receiver = Fake {
+            send: Box::new(|_payload, batch| {
+                std::thread::sleep(Duration::from_millis(40));
+                Ok(ack(batch))
+            }),
+            ..Fake::default()
+        };
+        let result = run(
+            &fixture.path(),
+            &one(&receiver),
+            &DrainOptions {
+                max_elapsed: Some(budget),
+                max_batches: 1_000,
+                max_prepare_steps: 1_000,
+                ..options()
+            },
+        );
+        assert!(
+            result.attempts >= 1 && result.attempts < 6,
+            "attempts: {} on a {budget:?} budget",
+            result.attempts
+        );
+        assert_eq!(result.issues, vec![]);
+        assert_eq!(
+            result.statuses[0].acknowledged_records,
+            result.attempts as i64 * 100
+        );
+        // Unscanned bootstrap rows remain: the budget, not the backlog, ended it.
+        assert!(!result.statuses[0].bootstrap_complete);
+        assert!(result.statuses[0].failure.is_none());
+    }
+}
+
+/// Scanning is bounded by the same budget as delivery. A job whose rows are
+/// all withheld produces no batch and no attempt, so nothing but the clock
+/// stops it walking its whole journal a prepare step at a time.
+#[test]
+fn a_drain_stops_scanning_once_its_time_budget_has_passed() {
+    let fixture = fixture();
+    let mut job_config = config("one");
+    job_config.limits.max_scan_records = 5;
+    let job = create_job(&fixture.conn, &job_config, 0).unwrap();
+    for n in 0..2_000 {
+        fixture.conn.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude','both',?1,43,'user','text','withheld')",params![format!("withheld-{n}")]).unwrap();
+    }
+    for session in SESSIONS {
+        set_session_excluded(
+            &fixture.conn,
+            &SessionIdentity {
+                source: "claude".into(),
+                session_id: (*session).into(),
+            },
+            true,
+        )
+        .unwrap();
+    }
+    let receiver = Fake::default();
+    let result = run(
+        &fixture.path(),
+        &one(&receiver),
+        &DrainOptions {
+            max_elapsed: Some(Duration::from_millis(1)),
+            max_batches: 1_000,
+            max_prepare_steps: 1_000,
+            ..options()
+        },
+    );
+    assert_eq!(result.attempts, 0);
+    assert_eq!(result.issues, vec![]);
+    assert_eq!(result.statuses[0].job_id, job.job_id);
+    assert_eq!(result.statuses[0].acknowledged_records, 0);
+    // Five rows a step: the deadline stopped the scan long before the steps
+    // that would walk the journal, and after at least one of them.
+    let scanned = 2_000 - result.statuses[0].unqueued_changes;
+    assert!(
+        (1..=1_000).contains(&scanned),
+        "scanned: {scanned} of 2 000 withheld rows"
+    );
 }
 
 /// Prepare and claim one batch, the way the drain loop does. `create_job`
@@ -1292,4 +1424,350 @@ fn reinclusion_filters_old_batch_then_sends_fresh_snapshot_in_the_same_drain() {
     assert_eq!(delivered.attempts, 1);
     assert!(delivered.issues.is_empty());
     assert_eq!(delivered.statuses[0].acknowledged_records, 1);
+}
+
+fn journal_events(conn: &Connection) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM delivery_journal WHERE kind='session_event'",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+fn journal_tail(conn: &Connection) -> i64 {
+    conn.query_row(
+        "SELECT COALESCE(MAX(seq),0) FROM delivery_journal",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+fn capture(conn: &Connection, session: &str, uid: &str) -> Result<usize, rusqlite::Error> {
+    conn.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude',?1,?2,42,'user','text',?2)",params![session, uid])
+}
+/// Materialize and acknowledge every revision through the core API alone, so
+/// the job's cursor reaches the tail while no compaction runs.
+fn consume(conn: &Connection, job_id: &str) {
+    for _ in 0..100 {
+        let now = system_clock();
+        let prepared = prepare_batch(conn, job_id, now).unwrap();
+        if prepared.batch_id.is_some() {
+            let claim = claim_batch(conn, job_id, "worker", 60_000, &|| now)
+                .unwrap()
+                .unwrap();
+            let prepared = body(&claim.batch);
+            store_prepared_payload(
+                conn,
+                &claim.lease,
+                "1",
+                &prepared.content_type,
+                &prepared.body,
+                &|| now,
+            )
+            .unwrap();
+            acknowledge(conn, &claim.lease, &ack(&claim.batch), &|| now).unwrap();
+        } else if prepared.bootstrap_complete && prepared.scanned_records == 0 {
+            return;
+        }
+    }
+    panic!("bounded fixture failed to converge")
+}
+
+/// A journal at the cap whose every row the job has consumed is freed by the
+/// drain's own maintenance, and capture succeeds again afterwards.
+#[test]
+fn a_full_and_fully_consumed_journal_is_freed_by_one_drain() {
+    let fixture = fixture();
+    let job = create_job(&fixture.conn, &config("one"), 0).unwrap();
+    assert!(run(&fixture.path(), &one(&Fake::default()), &options())
+        .issues
+        .is_empty());
+    for index in 0..200 {
+        capture(&fixture.conn, "both", &format!("later-{index}")).unwrap();
+    }
+    consume(&fixture.conn, &job.job_id);
+    assert_eq!(journal_events(&fixture.conn), 200);
+    assert_eq!(
+        status(&fixture.conn, &job.job_id).unwrap().journal_cursor,
+        journal_tail(&fixture.conn)
+    );
+    let (used, _) = retained_bytes(&fixture.conn).unwrap();
+    set_retention_limit(&fixture.conn, used).unwrap();
+    let refused = capture(&fixture.conn, "both", "refused").unwrap_err();
+    assert!(is_retention_limit(&anyhow::Error::from(refused)));
+
+    let result = run(&fixture.path(), &one(&Fake::default()), &options());
+    assert!(result.issues.is_empty());
+    assert_eq!(journal_events(&fixture.conn), 0);
+    assert_eq!(result.retention.used_bytes, 0);
+    assert_eq!(result.retention.limit_bytes, used);
+    capture(&fixture.conn, "both", "accepted").unwrap();
+    let delivered = run(&fixture.path(), &one(&Fake::default()), &options());
+    assert!(delivered.issues.is_empty());
+    assert_eq!(delivered.statuses[0].acknowledged_records, 204);
+}
+
+/// A journal at the cap holding only unconsumed backlog is not a deadlock:
+/// batch materialization has its own reserve above the cap, so the drain
+/// prepares, sends and acknowledges the backlog, compaction frees it, and
+/// capture succeeds again.
+#[test]
+fn a_journal_full_of_unconsumed_backlog_is_delivered_through_the_reserve() {
+    let fixture = fixture();
+    let job = create_job(&fixture.conn, &config("one"), 0).unwrap();
+    assert!(run(&fixture.path(), &one(&Fake::default()), &options())
+        .issues
+        .is_empty());
+    for index in 0..50 {
+        capture(&fixture.conn, "both", &format!("backlog-{index}")).unwrap();
+    }
+    let (used, _) = retained_bytes(&fixture.conn).unwrap();
+    set_retention_limit(&fixture.conn, used).unwrap();
+    let refused = capture(&fixture.conn, "both", "refused").unwrap_err();
+    assert!(is_retention_limit(&anyhow::Error::from(refused)));
+
+    let result = run(&fixture.path(), &one(&Fake::default()), &options());
+    assert!(result.issues.is_empty());
+    assert_eq!(result.attempts, 1);
+    assert_eq!(result.statuses[0].job_id, job.job_id);
+    assert_eq!(result.statuses[0].acknowledged_records, 53);
+    assert_eq!(result.statuses[0].pending_records, 0);
+    assert_eq!(journal_events(&fixture.conn), 0);
+    assert!(result.retention.used_bytes < used);
+    assert_eq!(result.retention.limit_bytes, used);
+    capture(&fixture.conn, "both", "accepted").unwrap();
+}
+
+/// Backlog the destination cannot take is never deleted: at the cap the batch
+/// holds every record the journal handed it, nothing is acknowledged, the
+/// failure is the destination's rather than the cap's, and the next drain
+/// delivers the same records.
+#[test]
+fn an_undeliverable_backlog_survives_a_drain_at_the_cap() {
+    let fixture = fixture();
+    let job = create_job(&fixture.conn, &config("one"), 0).unwrap();
+    assert!(run(&fixture.path(), &one(&Fake::default()), &options())
+        .issues
+        .is_empty());
+    for index in 0..50 {
+        capture(&fixture.conn, "both", &format!("backlog-{index}")).unwrap();
+    }
+    let before = status(&fixture.conn, &job.job_id).unwrap();
+    let (used, _) = retained_bytes(&fixture.conn).unwrap();
+    set_retention_limit(&fixture.conn, used).unwrap();
+    let offline = Fake {
+        send: Box::new(|_, _| Err(DeliveryFailure::Transient.into())),
+        ..Fake::default()
+    };
+    let result = run(&fixture.path(), &one(&offline), &options());
+    assert_eq!(result.attempts, 1);
+    assert!(result.issues.is_empty());
+    let after = &result.statuses[0];
+    assert_eq!(after.failure.as_deref(), Some("transient"));
+    assert_eq!(after.pending_records, 50);
+    assert_eq!(after.acknowledged_cursor, before.acknowledged_cursor);
+    assert_eq!(after.acknowledged_records, before.acknowledged_records);
+    assert_eq!(result.retention.limit_bytes, used);
+
+    fixture
+        .conn
+        .execute("UPDATE delivery_jobs SET next_attempt_ms=0", [])
+        .unwrap();
+    let delivered = run(&fixture.path(), &one(&Fake::default()), &options());
+    assert!(delivered.issues.is_empty());
+    assert_eq!(delivered.statuses[0].acknowledged_records, 53);
+    assert_eq!(delivered.statuses[0].pending_records, 0);
+    assert_eq!(journal_events(&fixture.conn), 0);
+}
+
+/// A cap refusal of a batch write is recovered by reclaiming consumed rows and
+/// retrying once; with nothing reclaimable it is recorded as a transient
+/// failure and reported as the cap. The reserve makes such a refusal
+/// unreachable by construction, so a trigger stands in for an exhausted
+/// reserve: it refuses the prepared body while retained bytes are above the
+/// low-water mark, exactly the condition recovery clears.
+#[test]
+fn a_cap_refusal_of_a_batch_write_is_recovered_or_reported() {
+    let fixture = fixture();
+    let job = create_job(&fixture.conn, &config("one"), 0).unwrap();
+    assert!(run(&fixture.path(), &one(&Fake::default()), &options())
+        .issues
+        .is_empty());
+    fixture.conn.execute_batch(
+        "CREATE TRIGGER synthetic_reserve_exhausted BEFORE UPDATE OF prepared ON delivery_batches
+         WHEN NEW.prepared IS NOT NULL AND (SELECT retained_bytes*4>max_retained_bytes*3 FROM delivery_state WHERE singleton=1)
+         BEGIN SELECT RAISE(ABORT,'delivery retention limit exceeded; synthetic reserve exhausted'); END;",
+    ).unwrap();
+    for index in 0..3 {
+        capture(&fixture.conn, "both", &format!("batch-{index}")).unwrap();
+    }
+    // While the receiver maps the batch, capture appends rows the job then
+    // consumes, and the cap closes on exactly the bytes in use.
+    let path = fixture.path();
+    let recoverable = Fake {
+        prepare: Box::new(move |batch| {
+            let conn = open_db(&path).unwrap();
+            for index in 0..100 {
+                capture(&conn, "remote-only", &format!("consumed-{index}")).unwrap();
+            }
+            let tail = journal_tail(&conn);
+            conn.execute("UPDATE delivery_jobs SET journal_cursor=?", [tail])
+                .unwrap();
+            conn.execute("UPDATE history_subscriptions SET journal_cursor=?", [tail])
+                .unwrap();
+            set_retention_limit(&conn, retained_bytes(&conn).unwrap().0).unwrap();
+            Ok(body(batch))
+        }),
+        ..Fake::default()
+    };
+    let recovered = run(&fixture.path(), &one(&recoverable), &options());
+    assert_eq!(recovered.attempts, 1);
+    assert!(recovered.issues.is_empty());
+    assert_eq!(recovered.statuses[0].acknowledged_records, 6);
+    assert_eq!(journal_events(&fixture.conn), 0);
+
+    // The same refusal with nothing reclaimable: a reader at the journal's
+    // start pins every row.
+    let tx = fixture.conn.unchecked_transaction().unwrap();
+    ai_hist::export::capture::save_subscription(
+        &tx,
+        &ai_hist::export::capture::Subscription {
+            id: "pinned-reader",
+            session: None,
+            cursor: 0,
+            kind: 0,
+            rowid: 0,
+            complete: true,
+        },
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    capture(&fixture.conn, "both", "pinned").unwrap();
+    let path = fixture.path();
+    let exhausted = Fake {
+        prepare: Box::new(move |batch| {
+            let conn = open_db(&path).unwrap();
+            set_retention_limit(&conn, retained_bytes(&conn).unwrap().0).unwrap();
+            Ok(body(batch))
+        }),
+        send: Box::new(|_, _| panic!("a body the cap refused is never sent")),
+        ..Fake::default()
+    };
+    let reported = run(&fixture.path(), &one(&exhausted), &options());
+    assert_eq!(reported.attempts, 1);
+    assert_eq!(reported.issues.len(), 1);
+    assert_eq!(reported.issues[0].job_id, job.job_id);
+    assert_eq!(
+        reported.issues[0].code,
+        DrainIssueCode::DeliveryRetentionLimit
+    );
+    assert_eq!(reported.statuses[0].failure.as_deref(), Some("transient"));
+    assert_eq!(reported.statuses[0].pending_records, 1);
+    assert_eq!(reported.statuses[0].acknowledged_records, 6);
+    assert_eq!(journal_events(&fixture.conn), 1);
+}
+
+/// The prepared limit bounds the destination body as retained, so a body that
+/// serializes past it is the receiver's invalid payload rather than a capacity
+/// failure: nothing is stored and the job blocks. A body whose retained size
+/// is exactly the limit is delivered, and every stored row stays inside the
+/// share the reserve gives it.
+#[test]
+fn a_body_that_exceeds_the_stored_prepared_limit_is_the_receivers_invalid_payload() {
+    let fixture = fixture();
+    let limits = DeliveryLimits {
+        max_prepared_bytes: 4_096,
+        ..DeliveryLimits::default()
+    };
+    let job = create_job(
+        &fixture.conn,
+        &DeliveryJobConfig {
+            limits: limits.clone(),
+            ..config("one")
+        },
+        0,
+    )
+    .unwrap();
+    let escaped = |len: usize| {
+        Box::new(move |_: &HistoryExportBatch| {
+            Ok(PreparedBody {
+                content_type: "application/json".into(),
+                body: "\"".repeat(len),
+            })
+        })
+    };
+
+    // Under the limit as a body, over it once escaped and enveloped.
+    let oversized = Fake {
+        prepare: escaped(4_096),
+        send: Box::new(|_, _| panic!("a payload the limit refused is never sent")),
+        ..Fake::default()
+    };
+    let refused = run(&fixture.path(), &one(&oversized), &options());
+    assert!(refused.issues.is_empty(), "not a capacity failure");
+    assert_eq!(refused.statuses[0].state, "blocked");
+    assert_eq!(
+        refused.statuses[0].failure.as_deref(),
+        Some("invalid_payload")
+    );
+    assert_eq!(refused.statuses[0].acknowledged_records, 0);
+    assert!(fixture
+        .conn
+        .query_row("SELECT prepared IS NULL FROM delivery_batches", [], |r| {
+            r.get::<_, bool>(0)
+        })
+        .unwrap());
+
+    // The same body one escaped character shorter fits exactly.
+    retry_job(&fixture.conn, &job.job_id).unwrap();
+    let envelope = PreparedPayload::stored("1", "application/json", "")
+        .retained_bytes()
+        .unwrap();
+    let fitting = Fake {
+        prepare: escaped((4_096 - envelope) / 2),
+        ..Fake::default()
+    };
+    let delivered = run(&fixture.path(), &one(&fitting), &options());
+    assert!(delivered.issues.is_empty());
+    assert_eq!(delivered.statuses[0].acknowledged_records, 3);
+    // Both stored columns stay within the per-row share the reserve assumes.
+    let (payload, prepared): (i64, i64) = fixture.conn.query_row(
+        "SELECT COALESCE(MAX(length(CAST(payload AS BLOB))),0),COALESCE(MAX(length(CAST(prepared AS BLOB))),0) FROM delivery_batches",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ).unwrap();
+    assert!(payload <= limits.max_batch_bytes as i64);
+    assert!(prepared <= limits.max_prepared_bytes as i64);
+}
+
+/// Closing maintenance is the drain's own completion work: a drain that spent
+/// its batch budget still reclaims what its own acknowledgments consumed, so
+/// capture is not left blocked until the next drain.
+#[test]
+fn a_drain_that_spends_its_batch_budget_still_reclaims_what_it_consumed() {
+    let fixture = fixture();
+    let job = create_job(&fixture.conn, &config("one"), 0).unwrap();
+    assert!(run(&fixture.path(), &one(&Fake::default()), &options())
+        .issues
+        .is_empty());
+    for index in 0..200 {
+        capture(&fixture.conn, "both", &format!("backlog-{index}")).unwrap();
+    }
+    assert_eq!(journal_events(&fixture.conn), 200);
+
+    let result = run(
+        &fixture.path(),
+        &one(&Fake::default()),
+        &DrainOptions {
+            max_batches: 1,
+            ..options()
+        },
+    );
+    assert_eq!(result.attempts, 1);
+    assert!(result.issues.is_empty());
+    assert_eq!(result.statuses[0].job_id, job.job_id);
+    assert_eq!(result.statuses[0].acknowledged_records, 103);
+    // The hundred rows this drain scanned and acknowledged are gone; the rest
+    // are still backlog.
+    assert_eq!(journal_events(&fixture.conn), 100);
 }

@@ -9,12 +9,31 @@
 //! are necessary to prevent duplicate effects after uncertain outcomes.
 //!
 //! The retention cap bounds logical retained bytes, not physical database pages.
-//! Capture fails the affected SQLite statement visibly when full. Callers that
-//! transact ingestion and provider checkpoints must roll back that transaction
-//! on error. Materializing a batch needs headroom in this same cap; if retained
-//! journal data fills it, compact already-consumed journal/receipts or explicitly
-//! raise the cap with `set_retention_limit` before draining. No checkpoint moves
-//! on a capacity failure. Pausing preserves capture; cancellation is an explicit discard.
+//! Capture applies backpressure against it: before each source pass and each
+//! session transaction it reclaims consumed rows above 90% of the cap and, if
+//! still above, stops the pass with a typed `RetentionLimitReached` carrying
+//! the usage. A write that still reaches the cap fails its SQLite statement
+//! visibly and ends the pass the same way. Callers that transact ingestion and
+//! provider checkpoints must roll back that transaction on error. Batch
+//! materialization always has room: batch rows are checked
+//! against the cap plus a reserve bounded by design, the sum over
+//! non-cancelled jobs of one batch's configured payload and prepared bytes
+//! plus the settled receipts compaction has not released, so retained bytes
+//! exceed the cap by at most that reserve while batches are in flight and a
+//! journal full of unconsumed backlog is always deliverable. Compaction
+//! reclaims only journal rows every subscription has consumed: everything at
+//! or below the lowest cursor of a subscription that still pins something by
+//! indexed range, and above it exactly the rows no subscription reading their
+//! session still needs. A drain reclaims the consumed floor in full at its
+//! start and runs complete passes at its end while retained bytes are at or
+//! above three quarters of the cap; if the cap refuses a batch write
+//! mid-drain, the worker runs that recovery and retries the write once,
+//! reporting `DELIVERY_RETENTION_LIMIT` only when nothing was reclaimable or
+//! the retry is refused again. Un-uploaded backlog is never deleted: a full
+//! cap of unconsumed rows keeps stopping capture visibly until a drain delivers
+//! them or the cap is raised with `set_retention_limit`. No checkpoint moves
+//! on a capacity failure. Pausing preserves capture; cancellation is an
+//! explicit discard.
 //! Deletes are exported as tombstones, but remote deletion requires a destination
 //! that supports them. Presence is its own revisioned provenance evidence kind.
 
@@ -35,8 +54,8 @@ use std::collections::HashSet;
 
 use ai_hist::export::capture::{self, make_record, snapshot_record, RawRecord};
 pub use ai_hist::export::{
-    ExportSelection, HistoryExportRecord, SessionIdentity, DEFAULT_RETENTION_LIMIT_BYTES,
-    EXPORT_SCHEMA_VERSION, SUPPORTED_KINDS,
+    above_high_water, ExportSelection, HistoryExportRecord, SessionIdentity,
+    DEFAULT_RETENTION_LIMIT_BYTES, EXPORT_SCHEMA_VERSION, SUPPORTED_KINDS,
 };
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeliveryLimits {
@@ -44,6 +63,8 @@ pub struct DeliveryLimits {
     pub max_batch_bytes: usize,
     /// Bounds both bootstrap and journal scans, including excluded rows.
     pub max_scan_records: usize,
+    /// Bounds the destination body as retained: the JSON envelope around it,
+    /// not the body's own length.
     pub max_prepared_bytes: usize,
 }
 impl Default for DeliveryLimits {
@@ -100,6 +121,23 @@ pub struct PreparedPayload {
     pub content_type: String,
     pub body: String,
     pub sha256: String,
+}
+impl PreparedPayload {
+    /// The destination body as it is retained: a JSON envelope whose escaping
+    /// of the body can far exceed the body's own length.
+    pub fn stored(mapping_version: &str, content_type: &str, body: &str) -> Self {
+        Self {
+            mapping_version: mapping_version.into(),
+            content_type: content_type.into(),
+            body: body.into(),
+            sha256: hash(body),
+        }
+    }
+    /// The exact bytes the batch row holds for this payload, which is what
+    /// `max_prepared_bytes` bounds and what the retention cap accounts for.
+    pub fn retained_bytes(&self) -> Result<usize> {
+        Ok(serde_json::to_vec(self)?.len())
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ClaimedBatch {
@@ -861,8 +899,10 @@ pub fn store_prepared_payload(
         mapping_version == job.config.mapping_version,
         "destination mapping version mismatch"
     );
+    let payload = PreparedPayload::stored(mapping_version, content_type, body);
+    let retained = serde_json::to_string(&payload)?;
     ensure!(
-        body.len() <= job.config.limits.max_prepared_bytes,
+        retained.len() <= job.config.limits.max_prepared_bytes,
         "prepared delivery payload too large"
     );
     let (batch, stored, _) =
@@ -874,12 +914,6 @@ pub fn store_prepared_payload(
             "delivery batch is now excluded"
         );
     }
-    let payload = PreparedPayload {
-        mapping_version: mapping_version.into(),
-        content_type: content_type.into(),
-        body: body.into(),
-        sha256: hash(body),
-    };
     if let Some(stored) = stored {
         ensure!(
             stored == payload,
@@ -889,7 +923,7 @@ pub fn store_prepared_payload(
     }
     tx.execute(
         "UPDATE delivery_batches SET prepared=? WHERE id=?",
-        params![serde_json::to_string(&payload)?, lease.batch_id],
+        params![retained, lease.batch_id],
     )?;
     tx.commit()?;
     Ok(payload)
@@ -1153,10 +1187,13 @@ pub fn cancel_job(conn: &Connection, job_id: &str) -> Result<DeliveryStatus> {
 
 /// Explicit retained-byte cap. Exceeding it aborts capture rather than silently
 /// dropping revisions or advancing ingestion. Raising it can unblock ingestion.
+/// The cap bounds what capture retains; batches in flight live in their own
+/// reserve above it, so it may be set down to the bytes retained outside
+/// `delivery_batches` and no lower.
 pub fn set_retention_limit(conn: &Connection, max_bytes: i64) -> Result<()> {
     let tx = write_transaction(conn)?;
     let used: i64 = tx.query_row(
-        "SELECT retained_bytes FROM delivery_state WHERE singleton=1",
+        &format!("SELECT retained_bytes-(SELECT COALESCE(SUM({}),0) FROM delivery_batches) FROM delivery_state WHERE singleton=1", schema::BATCH_ROW_BYTES),
         [],
         |row| row.get(0),
     )?;
@@ -1178,13 +1215,19 @@ pub fn retained_bytes(conn: &Connection) -> Result<(i64, i64)> {
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?)
 }
-/// Remove a bounded number of journal rows already copied into every active
-/// job's immutable queue. Bootstrap preimages live separately until scanned.
-/// Acknowledged batch bodies are released at acknowledgment; small receipts
-/// and job generations remain for audit and safe generation numbering.
+/// Reclaim journal rows already copied into every active job's immutable
+/// queue: everything at or below the consumed floor, then one examined page
+/// above it, in transactions of at most `limit` rows. Bootstrap preimages live
+/// separately until scanned. Acknowledged batch bodies are released at
+/// acknowledgment; small receipts and job generations remain for audit and
+/// safe generation numbering.
 pub fn compact_journal(conn: &Connection, limit: usize) -> Result<usize> {
     ai_hist::export::compact_journal(conn, limit)
 }
+pub use ai_hist::export::{
+    compact_journal_pass, compact_journal_while, compact_to_low_water, compact_to_low_water_while,
+    MAX_COMPACTION_PAGE,
+};
 
 /// Recheck immediately before dispatch, after async mapping or lease renewal.
 /// Returns only the exact persisted body. Local fencing cannot retract a socket
@@ -1262,13 +1305,15 @@ pub fn compact_receipts(conn: &Connection, limit: usize) -> Result<usize> {
     Ok(removed)
 }
 
-/// Recognize the coordinator's trigger-originated capacity error without
-/// forwarding arbitrary SQLite/provider error text to a host or plugin.
-/// Hosts should expose a stable DELIVERY_RETENTION_LIMIT code and offer
-/// compact_journal/compact_receipts or an explicit set_retention_limit action.
+/// Recognize a capacity failure — the capture trigger's abort or the typed
+/// high-water stop — without forwarding arbitrary SQLite/provider error text
+/// to a host or plugin. Hosts should expose a stable DELIVERY_RETENTION_LIMIT
+/// code and offer compact_journal_pass/compact_receipts or an explicit
+/// set_retention_limit action.
 pub fn is_retention_limit(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause|matches!(cause.downcast_ref::<rusqlite::Error>(),Some(rusqlite::Error::SqliteFailure(_,Some(message))) if message.starts_with("delivery retention limit exceeded;")))
+    ai_hist::export::is_retention_limit(error)
 }
+pub use ai_hist::export::{retention_limit_usage, RetentionLimitReached};
 
 /// Open evidence and upload state. Ordinary ai-hist opens never initialize jobs.
 pub fn open_db(path: &std::path::Path) -> Result<Connection> {

@@ -85,6 +85,10 @@ name = "opencode_parity"
 required-features = ["export", "unstable-internal"]
 
 [[test]]
+name = "capture_retention_backpressure"
+required-features = ["export", "unstable-internal"]
+
+[[test]]
 name = "session_continuity"
 required-features = ["unstable-internal"]
 

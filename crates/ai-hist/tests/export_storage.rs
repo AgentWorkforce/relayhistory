@@ -327,6 +327,253 @@ fn cached_ingest_statements_observe_subscription_changes() {
     );
 }
 
+fn global_reader(cursor: i64) -> capture::Subscription<'static> {
+    capture::Subscription {
+        id: "reader",
+        session: None,
+        cursor,
+        kind: 0,
+        rowid: 0,
+        complete: true,
+    }
+}
+fn journal_rows(conn: &Connection) -> usize {
+    conn.query_row("SELECT COUNT(*) FROM delivery_journal", [], |r| r.get(0))
+        .unwrap()
+}
+fn journal_seq_at(conn: &Connection, offset: usize) -> i64 {
+    conn.query_row(
+        "SELECT seq FROM delivery_journal ORDER BY seq LIMIT 1 OFFSET ?",
+        [offset as i64],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// Rows every subscription has consumed are reclaimed by their range, not by
+/// the sweep cursor reaching them again after a wrap.
+#[test]
+fn consumed_rows_behind_the_sweep_cursor_are_reclaimed_without_a_wrap() {
+    let conn = db();
+    let tx = conn.unchecked_transaction().unwrap();
+    capture::save_subscription(&tx, &global_reader(0)).unwrap();
+    for id in 0..30 {
+        tx.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude','one',?,1,'user','text','retained')", [id.to_string()]).unwrap();
+    }
+    tx.commit().unwrap();
+    // The reader consumed the first twenty rows after the sweep cursor had
+    // already passed them, and rows remain above the cursor so it does not
+    // wrap.
+    let consumed = journal_seq_at(&conn, 19);
+    let tx = conn.unchecked_transaction().unwrap();
+    capture::save_subscription(&tx, &global_reader(consumed)).unwrap();
+    tx.execute(
+        "UPDATE history_compaction SET cursor=?",
+        [journal_seq_at(&conn, 24)],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    assert_eq!(export::compact_journal(&conn, 1000).unwrap(), 20);
+    assert_eq!(journal_rows(&conn), 10);
+    assert!(journal_seq_at(&conn, 0) > consumed);
+    assert_eq!(export::compact_journal(&conn, 1000).unwrap(), 0);
+    assert_eq!(journal_rows(&conn), 10);
+}
+
+/// The steady-state step reclaims the whole consumed range in one call, in
+/// transactions no larger than its limit.
+#[test]
+fn a_fully_consumed_journal_is_reclaimed_by_one_bounded_step() {
+    let conn = db();
+    let tx = conn.unchecked_transaction().unwrap();
+    capture::save_subscription(&tx, &global_reader(0)).unwrap();
+    for id in 0..2_500 {
+        tx.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude','one',?,1,'user','text','consumed')", [id.to_string()]).unwrap();
+    }
+    tx.commit().unwrap();
+    let tail = journal_seq_at(&conn, 2_499);
+    let tx = conn.unchecked_transaction().unwrap();
+    capture::save_subscription(&tx, &global_reader(tail)).unwrap();
+    tx.commit().unwrap();
+    assert_eq!(export::compact_journal(&conn, 1000).unwrap(), 2_500);
+    assert_eq!(journal_rows(&conn), 0);
+}
+
+/// Recovery spends passes only while retained bytes exceed three quarters of
+/// the cap, and a pass that reclaims nothing ends it with every row intact.
+#[test]
+fn recovery_stops_below_the_low_water_mark_or_when_nothing_is_reclaimable() {
+    let conn = db();
+    let tx = conn.unchecked_transaction().unwrap();
+    capture::save_subscription(&tx, &global_reader(0)).unwrap();
+    for id in 0..100 {
+        tx.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude','one',?,1,'user','text','backlog')", [id.to_string()]).unwrap();
+    }
+    tx.commit().unwrap();
+    let (used, _) = export::retained_bytes(&conn).unwrap();
+    export::set_retention_limit(&conn, used).unwrap();
+    // Nothing consumed: one pass, nothing reclaimed, nothing deleted.
+    assert_eq!(export::compact_to_low_water(&conn, 10).unwrap(), 0);
+    assert_eq!(journal_rows(&conn), 100);
+    // Half consumed: one pass takes the journal under the low-water mark.
+    let tx = conn.unchecked_transaction().unwrap();
+    capture::save_subscription(&tx, &global_reader(journal_seq_at(&conn, 49))).unwrap();
+    tx.commit().unwrap();
+    assert_eq!(export::compact_to_low_water(&conn, 10).unwrap(), 50);
+    assert_eq!(journal_rows(&conn), 50);
+    let (after, cap) = export::retained_bytes(&conn).unwrap();
+    assert!(after * 4 < cap * 3);
+    // Under the low-water mark recovery does no work; the steady-state step
+    // still reclaims what is consumed.
+    let tx = conn.unchecked_transaction().unwrap();
+    capture::save_subscription(&tx, &global_reader(journal_seq_at(&conn, 49))).unwrap();
+    tx.commit().unwrap();
+    assert_eq!(export::compact_to_low_water(&conn, 10).unwrap(), 0);
+    assert_eq!(journal_rows(&conn), 50);
+    assert_eq!(export::compact_journal(&conn, 10).unwrap(), 50);
+    assert_eq!(journal_rows(&conn), 0);
+    assert!(export::compact_to_low_water(&conn, 0).is_err());
+    assert!(export::compact_to_low_water(&conn, 10_001).is_err());
+}
+
+fn session_reader<'a>(
+    id: &'a str,
+    identity: &'a SessionIdentity,
+    cursor: i64,
+) -> capture::Subscription<'a> {
+    capture::Subscription {
+        id,
+        session: Some(identity),
+        cursor,
+        kind: 0,
+        rowid: 0,
+        complete: true,
+    }
+}
+fn sweep_cursor(conn: &Connection) -> i64 {
+    conn.query_row("SELECT cursor FROM history_compaction", [], |r| r.get(0))
+        .unwrap()
+}
+
+/// A session subscription whose session has nothing past its cursor pins
+/// nothing, so its stale cursor does not hold the consumed floor down: rows
+/// every other subscription has consumed go by range, not by the sweep.
+#[test]
+fn an_idle_session_subscription_does_not_pin_the_consumed_floor() {
+    let conn = db();
+    let idle = SessionIdentity {
+        source: "claude".into(),
+        session_id: "idle".into(),
+    };
+    let tx = conn.unchecked_transaction().unwrap();
+    capture::save_subscription(&tx, &global_reader(0)).unwrap();
+    for id in 0..5 {
+        tx.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude','idle',?,1,'user','text','finished')", [id.to_string()]).unwrap();
+    }
+    tx.commit().unwrap();
+    let finished = journal_seq_at(&conn, 4);
+    let tx = conn.unchecked_transaction().unwrap();
+    capture::save_subscription(&tx, &session_reader("idle-reader", &idle, finished)).unwrap();
+    for id in 0..35 {
+        tx.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude','busy',?,1,'user','text','consumed')", [id.to_string()]).unwrap();
+    }
+    tx.commit().unwrap();
+    let consumed = journal_seq_at(&conn, 29);
+    let tx = conn.unchecked_transaction().unwrap();
+    capture::save_subscription(&tx, &global_reader(consumed)).unwrap();
+    tx.commit().unwrap();
+    // Everything through the global reader goes in one step, not one page.
+    assert_eq!(export::compact_journal(&conn, 10).unwrap(), 30);
+    assert_eq!(journal_rows(&conn), 10);
+    // A new row for the idle session pins from its cursor again until it is
+    // read; rows behind it were already reclaimed, so nothing is lost.
+    conn.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude','idle','again',1,'user','text','pinned')", []).unwrap();
+    let tx = conn.unchecked_transaction().unwrap();
+    capture::save_subscription(&tx, &global_reader(journal_seq_at(&conn, 10))).unwrap();
+    tx.commit().unwrap();
+    assert_eq!(export::compact_journal(&conn, 10).unwrap(), 10);
+    assert_eq!(journal_rows(&conn), 1);
+}
+
+/// The sweep examines only rows below the lowest cursor of a subscription
+/// reading every session, since everything past it is retained, and its
+/// cursor wraps back to the floor whenever a page is short.
+#[test]
+fn the_sweep_stops_at_the_lowest_global_cursor_and_wraps_on_a_short_page() {
+    let conn = db();
+    let lagging = SessionIdentity {
+        source: "claude".into(),
+        session_id: "lagging".into(),
+    };
+    let tx = conn.unchecked_transaction().unwrap();
+    capture::save_subscription(&tx, &global_reader(0)).unwrap();
+    for id in 0..40 {
+        let session = if id % 2 == 0 { "lagging" } else { "other" };
+        tx.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude',?,?,1,'user','text','mixed')", [session, &id.to_string()]).unwrap();
+    }
+    tx.commit().unwrap();
+    let floor = journal_seq_at(&conn, 4);
+    let ceiling = journal_seq_at(&conn, 19);
+    let tx = conn.unchecked_transaction().unwrap();
+    capture::save_subscription(&tx, &session_reader("lagging-reader", &lagging, floor)).unwrap();
+    capture::save_subscription(&tx, &global_reader(ceiling)).unwrap();
+    tx.commit().unwrap();
+    // Five rows by range; in (floor, ceiling] the eight "other" rows by sweep;
+    // the twenty rows past the global cursor are not examined.
+    assert_eq!(export::compact_journal(&conn, 1000).unwrap(), 13);
+    assert_eq!(journal_rows(&conn), 27);
+    assert!(journal_seq_at(&conn, 0) > floor);
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM delivery_journal WHERE seq>? AND session_id='other'",
+            [ceiling],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        10
+    );
+    assert_eq!(sweep_cursor(&conn), floor);
+    // A full page leaves the cursor at its end; the short page after it wraps.
+    assert_eq!(export::compact_journal(&conn, 4).unwrap(), 0);
+    assert!(sweep_cursor(&conn) > floor);
+    assert_eq!(export::compact_journal(&conn, 4).unwrap(), 0);
+    assert_eq!(sweep_cursor(&conn), floor);
+}
+
+/// A stop that arrives while the floor is being reclaimed ends the call there.
+/// The sweep is a transaction of its own, and the cursor it would advance stays
+/// where the stopped call left it.
+#[test]
+fn a_stop_during_reclamation_leaves_the_sweep_for_the_next_call() {
+    let conn = db();
+    let lagging = SessionIdentity {
+        source: "claude".into(),
+        session_id: "lagging".into(),
+    };
+    let tx = conn.unchecked_transaction().unwrap();
+    capture::save_subscription(&tx, &global_reader(0)).unwrap();
+    for id in 0..40 {
+        let session = if id % 2 == 0 { "lagging" } else { "other" };
+        tx.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude',?,?,1,'user','text','mixed')", [session, &id.to_string()]).unwrap();
+    }
+    tx.commit().unwrap();
+    let floor = journal_seq_at(&conn, 4);
+    let ceiling = journal_seq_at(&conn, 19);
+    let tx = conn.unchecked_transaction().unwrap();
+    capture::save_subscription(&tx, &session_reader("lagging-reader", &lagging, floor)).unwrap();
+    capture::save_subscription(&tx, &global_reader(ceiling)).unwrap();
+    tx.commit().unwrap();
+    let before = sweep_cursor(&conn);
+    // Reclaiming the floor is one bounded transaction that completes before the
+    // stop is consulted, so its five rows go; the sweep that would have removed
+    // the eight "other" rows above the floor is left for a later call.
+    let removed = export::compact_journal_while(&conn, 1000, &|| false).unwrap();
+    assert_eq!(removed, 5);
+    assert_eq!(sweep_cursor(&conn), before);
+    // The next call, unstopped, does the sweep the stop deferred.
+    assert_eq!(export::compact_journal(&conn, 1000).unwrap(), 8);
+}
+
 fn journal_sessions(conn: &Connection) -> Vec<(String, Option<String>, String)> {
     conn.prepare("SELECT kind,session_id,operation FROM delivery_journal WHERE kind <> '__cutoff' ORDER BY seq")
         .unwrap()

@@ -1,5 +1,5 @@
 //! Probe-owned helper RPC; leases use the same clock rules as the old addon.
-use super as core;
+use crate::delivery as core;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::time::Instant;
@@ -73,6 +73,9 @@ enum Request {
     RetainedBytes,
     CompactJournal {
         limit: usize,
+    },
+    CompactJournalPass {
+        page_size: usize,
     },
     CompactReceipts {
         limit: usize,
@@ -192,6 +195,9 @@ pub fn request(path: &std::path::Path, value: serde_json::Value) -> Result<serde
             Request::CompactJournal { limit } => {
                 serde_json::to_value(core::compact_journal(&conn, limit)?)?
             }
+            Request::CompactJournalPass { page_size } => {
+                serde_json::to_value(core::compact_journal_pass(&conn, page_size)?)?
+            }
             Request::CompactReceipts { limit } => {
                 serde_json::to_value(core::compact_receipts(&conn, limit)?)?
             }
@@ -227,9 +233,46 @@ fn request_clock(now_ms: i64, received: Instant) -> anyhow::Result<impl Fn() -> 
 
 #[cfg(test)]
 mod tests {
-    use super::request_clock;
+    use super::{request, request_clock};
+    use serde_json::json;
     use std::thread::sleep;
     use std::time::{Duration, Instant};
+
+    /// A host reclaims every consumed journal row through one request, in
+    /// transactions no larger than the page it names.
+    #[test]
+    fn a_compaction_pass_is_one_bounded_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("delivery.db");
+        let conn = crate::delivery::open_db(&path).unwrap();
+        conn.execute(
+            "INSERT INTO history_subscriptions(id,journal_cursor) VALUES ('reader',0)",
+            [],
+        )
+        .unwrap();
+        for n in 0..30 {
+            conn.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude','one',?,1,'user','text','consumed')", [n.to_string()]).unwrap();
+        }
+        conn.execute(
+            "UPDATE history_subscriptions SET journal_cursor=(SELECT MAX(seq) FROM delivery_journal)",
+            [],
+        )
+        .unwrap();
+        let pass = |page_size: u64| {
+            request(
+                &path,
+                json!({"operation":"compact_journal_pass","page_size":page_size}),
+            )
+        };
+        assert!(pass(0).is_err());
+        assert!(pass(crate::delivery::MAX_COMPACTION_PAGE as u64 + 1).is_err());
+        assert_eq!(pass(7).unwrap(), json!(30));
+        assert_eq!(pass(7).unwrap(), json!(0));
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM delivery_journal", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
 
     #[test]
     fn a_renewal_dated_after_a_wait_is_not_dated_from_before_it() {

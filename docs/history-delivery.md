@@ -116,5 +116,80 @@ never send, until it is adopted as a session job.
 Pausing preserves capture and queued work. Bounded maintenance expires exports,
 compacts consumed changes and releases completed bodies. An idle session
 subscription does not retain unrelated revisions. The evidence and upload queues
-share a retention budget; a full budget fails capture visibly and rolls back
-rather than silently dropping evidence. No parser or ingestion path uploads.
+share a retention budget. No evidence is silently dropped and no parser or
+ingestion path uploads.
+
+## Journal compaction
+
+The journal keeps a captured revision until every subscription that reads its
+session has consumed it. Compaction reclaims consumed rows only, so un-uploaded
+backlog is never deleted:
+
+- Every row at or below the consumed floor is reclaimed by an indexed range
+  delete, in transactions of at most 10,000 rows. The floor is the lowest
+  cursor of any subscription that still pins something: one reading every
+  session always does; one reading a single session only while that session
+  has a row past its cursor, so a finished session's cursor does not hold the
+  floor down. The work is proportional to the rows reclaimed, not to the
+  journal's length, and a consumed row never waits on a sweep cursor.
+- Above the floor, where a lagging session subscription pins its own rows
+  among other sessions' reclaimable ones, a persistent sweep cursor examines
+  one bounded page per drain with the exact per-session predicate. The sweep
+  reaches only as far as the lowest cursor of a subscription reading every
+  session, since everything past it is retained; the cursor never sits below
+  the floor and wraps back to it whenever a page is short.
+- A drain starts by reclaiming the consumed floor in full, so its wall-clock
+  budget goes to delivery. It ends, once its acknowledgments have released
+  their bodies, by running complete passes (floor plus a sweep from the floor
+  to that ceiling) while retained bytes are at or above three quarters of the
+  cap and the last pass reclaimed a full page; a pass that reclaimed less has
+  caught up with whatever other consumers freed meanwhile.
+- If the cap refuses a batch write during a drain, the worker runs one
+  complete pass, recovers to the low-water mark and retries the write once.
+  The drain reports `DELIVERY_RETENTION_LIMIT` only when nothing was
+  reclaimable or the retry is refused again; no cursor moves on a refused
+  write.
+
+## Batch materialization reserve
+
+A batch is the deliverable form of journal rows the cap already holds, and the
+only way a journal full of unconsumed backlog ever drains. Batch rows are
+therefore checked against the cap plus a reserve that is bounded by design:
+every non-cancelled job holds at most one unresolved batch of at most its
+configured `max_batch_bytes` plus `max_prepared_bytes` (plus 512 bytes of row
+accounting), and settled receipts keep their 512 bytes until compaction
+releases them. The journal, bootstrap preimages and export pages are checked
+against the plain cap, and the low-water mark is three quarters of the plain
+cap. `historyDeliveryRetention` therefore reports `usedBytes` above
+`limitBytes` by at most the reserve while batches are in flight; the cap
+itself never moves, and `setHistoryDeliveryRetention` accepts any value down
+to the bytes retained outside batches.
+
+While a pending batch keeps retained bytes above the cap, capture stays
+refused for the life of that batch: the drain acknowledges it, which releases
+its bodies, and its end-of-drain compaction then frees the rows it carried. A
+journal of unconsumed rows at the cap keeps stopping capture until that
+happens, the job is cancelled, or the cap is raised with
+`setHistoryDeliveryRetention`. Backlog a destination cannot take stays in its
+batch, unacknowledged, until it can. Hosts run the same complete compaction
+pass on demand through `compactHistoryDelivery` (the `compact_journal_pass`
+delivery request).
+
+## Capture backpressure
+
+Capture applies backpressure against the shared budget instead of discovering
+the cap inside a session transaction. Before each source pass and each session
+transaction it reads the retained bytes; above 90% of the cap it runs the
+low-water recovery above, then reads them again. If the budget is still above
+90% the pass stops with a typed `retention_limit` failure carrying `used_bytes`
+and `limit_bytes` instead of attempting the remaining sessions. A write the
+capture trigger refuses inside the pass ends it the same way, with the usage
+attached. What that refusal leaves behind is the provider's write granularity:
+targeted hydration, OpenCode, Grok and the Claude history log write a session
+(or a log chunk) in one transaction, so the refused session rolls back; Codex
+rollouts, the Claude transcript walk and trajectories commit statement by
+statement, so a refused rollout keeps the rows it wrote before the refusal and
+the next pass rewrites them idempotently, because no cursor or stamp is
+recorded for it. Sessions committed earlier in the pass stay persisted. The
+carried `used_bytes` is the retained total, so while batches are in flight it
+can exceed `limit_bytes` by at most the materialization reserve.
