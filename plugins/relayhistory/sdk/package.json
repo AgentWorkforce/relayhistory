@@ -1,6 +1,6 @@
 {
   "name": "@relayhistory/capture",
-  "version": "0.26.0",
+  "version": "0.27.0",
   "description": "Optional RelayHistory destination, auth, sharing and recall plugin for ai-hist.",
   "repository": {
     "type": "git",
@@ -33,7 +33,7 @@
     "test": "npm run build && node --test dist/*.test.js"
   },
   "peerDependencies": {
-    "ai-hist": "^0.26.0"
+    "ai-hist": "^0.27.0"
   },
   "devDependencies": {
     "ai-hist": "file:../../../sdk-ts",
@@ -48,13 +48,13 @@
     "relayhistory-plugin": "./dist/cli.js"
   },
   "optionalDependencies": {
-    "@relayhistory/capture-darwin-arm64": "0.26.0",
-    "@relayhistory/capture-darwin-x64": "0.26.0",
-    "@relayhistory/capture-linux-x64-gnu": "0.26.0",
-    "@relayhistory/capture-linux-arm64-gnu": "0.26.0",
-    "@relayhistory/capture-linux-x64-musl": "0.26.0",
-    "@relayhistory/capture-linux-arm64-musl": "0.26.0",
-    "@relayhistory/capture-win32-x64-msvc": "0.26.0"
+    "@relayhistory/capture-darwin-arm64": "0.27.0",
+    "@relayhistory/capture-darwin-x64": "0.27.0",
+    "@relayhistory/capture-linux-x64-gnu": "0.27.0",
+    "@relayhistory/capture-linux-arm64-gnu": "0.27.0",
+    "@relayhistory/capture-linux-x64-musl": "0.27.0",
+    "@relayhistory/capture-linux-arm64-musl": "0.27.0",
+    "@relayhistory/capture-win32-x64-msvc": "0.27.0"
   },
   "publishConfig": {
     "access": "public"
