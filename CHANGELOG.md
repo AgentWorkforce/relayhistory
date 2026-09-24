@@ -189,7 +189,12 @@ Notable changes to the native `ai-hist` CLI are documented here.
   `Trajectory`, `SourceObservation` and `ObservationEvidence` (`ALL` lists
   twelve kinds); their rows are stamped and tombstoned by the same triggers,
   and a database the six-kind feed reached stamps them once on open, above its
-  head, so a cursor bound to every kind resumes into all of them.
+  head, so a cursor bound to every kind resumes into all of them. A named
+  cursor stored as `*` now spans all twelve kinds. A consumer that passed the
+  six original kinds as an explicit list was stored as `*` too; that list no
+  longer equals `ChangeKind::ALL`, so its resume fails with
+  `ConsumerKindsMismatch` — drain it under a new consumer name, or resync from
+  `Watermark::START`.
   `EvidenceRow::History(HistoryEntry)` is the typed prompt row and
   `EvidenceRow::Untyped` marks a kind with none. `Change` gains `columns:
   Option<StoredRow>` — every column but `revision`, in table order, values as
@@ -197,7 +202,8 @@ Notable changes to the native `ai-hist` CLI are documented here.
   without a code change; the export journal's payload is built from the same
   column list — and `key: Vec<serde_json::Value>`, the record's identity as
   the journal keys it (`["history", source, timestamp_ms, prompt]`), on
-  upserts and tombstones alike. `Change::source` is `Option<Source>` and
+  upserts and tombstones alike; a prompt's session is not part of its key, so
+  a prompt gaining one is an upsert, never a delete. `Change::source` is `Option<Source>` and
   `Change::source_name` holds the stored name, so a row from a source this
   build does not know is carried instead of failing the drain. The `history`
   FTS update trigger fires only on the columns it indexes.

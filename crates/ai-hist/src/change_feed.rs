@@ -409,7 +409,7 @@ struct FedTable {
     /// A column, or a quoted literal for a table that stores no source.
     source: &'static str,
     session: &'static str,
-    /// Whether `session` may be NULL; a tombstone stores it as `''`.
+    /// Whether `session` may be NULL; a change reports NULL as `''`.
     optional_session: bool,
     key: &'static [&'static str],
     record: &'static [&'static str],
@@ -429,12 +429,31 @@ impl FedTable {
         }
     }
 
-    /// The session as SQL over `row`, as a tombstone stores it.
+    /// The session as SQL over `row`, as an upsert reports it.
     fn session_sql(&self, row: &str) -> String {
         if self.optional_session {
             format!("COALESCE({row}.{}, '')", self.session)
         } else {
             format!("{row}.{}", self.session)
+        }
+    }
+
+    /// Whether the session is part of the record's identity. A prompt's is
+    /// not: `history` is unique on source, time and text, and a prompt that
+    /// gains or changes its session is the same record.
+    fn session_keyed(&self) -> bool {
+        self.key.contains(&self.session)
+    }
+
+    /// The session as a tombstone stores it: the row's, when the session is
+    /// part of the identity, else `''`, so a tombstone names exactly the
+    /// record's key and a later insert of that key clears it whatever
+    /// session it carries.
+    fn tombstone_session_sql(&self, row: &str) -> String {
+        if self.session_keyed() {
+            format!("{row}.{}", self.session)
+        } else {
+            "''".to_string()
         }
     }
 
@@ -459,7 +478,9 @@ impl FedTable {
         if !self.source.starts_with('\'') {
             changed.push(format!("OLD.{0} IS NOT NEW.{0}", self.source));
         }
-        changed.push(format!("OLD.{0} IS NOT NEW.{0}", self.session));
+        if self.session_keyed() {
+            changed.push(format!("OLD.{0} IS NOT NEW.{0}", self.session));
+        }
         changed.push(format!(
             "{} IS NOT {}",
             self.record_key_sql("OLD"),
@@ -666,7 +687,9 @@ pub struct Change {
     #[serde(default)]
     pub source_name: String,
     /// For a relationship, the parent session; for a trajectory, its id; for
-    /// a prompt that names no session, empty.
+    /// a prompt that names no session, empty. A prompt's session is not part
+    /// of its identity, so a prompt's delete carries it empty too, and a
+    /// prompt gaining a session is an upsert, never a delete.
     pub session_id: String,
     /// The record's identity within its source, session and kind: the one
     /// identity column's text (`event_uid`, `tool_use_id`, `marker_uid`,
@@ -1603,8 +1626,8 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
         let kind = kind.as_str();
         let new_source = table.source_sql("NEW");
         let old_source = table.source_sql("OLD");
-        let new_session = table.session_sql("NEW");
-        let old_session = table.session_sql("OLD");
+        let new_session = table.tombstone_session_sql("NEW");
+        let old_session = table.tombstone_session_sql("OLD");
         let new_record = table.record_key_sql("NEW");
         let old_record = table.record_key_sql("OLD");
         let moved = table.identity_changed_sql();
@@ -3403,6 +3426,12 @@ UPDATE observation_evidence SET payload_json = '{"a":2}';
         )
         .unwrap();
         assert_parity(&store, &conn, "updates");
+        assert!(
+            !all(&store)
+                .iter()
+                .any(|change| change.kind == ChangeKind::History && change.op == ChangeOp::Delete),
+            "a prompt gaining a session is an upsert of the same record, never a delete"
+        );
 
         conn.execute_batch(
             "DELETE FROM history WHERE prompt = 'hello';

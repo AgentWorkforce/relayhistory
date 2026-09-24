@@ -384,7 +384,9 @@ upsert and on the delete that retracts it — `["history", "claude",
 the part of `key` inside a session: the one identity column's text, or a JSON
 array of several (`[1756634400000,"ship the feed"]` for a prompt).
 `session_id` is the parent session for a relationship, the id for a trajectory
-and empty for a prompt that names no session. `source` is `None` for a source
+and empty for a prompt that names no session; a prompt's session is not part of
+its key, so its delete carries it empty and a prompt gaining a session is an
+upsert, never a delete. `source` is `None` for a source
 this build does not know — a row written by a newer release — and
 `source_name` is the stored name either way, so such a row is carried rather
 than failing the drain. The feed applies no consent or exclusion rule: an
