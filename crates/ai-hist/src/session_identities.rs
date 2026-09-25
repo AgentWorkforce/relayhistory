@@ -127,6 +127,18 @@ impl SessionStore {
             })
             .collect())
     }
+
+    /// Whether the store holds anything under `identity`: exactly when
+    /// [`SessionStore::session_identities`] would list it, by the same tables
+    /// and rule -- so every identity an embedder counts is one it can select,
+    /// and one [`crate::ChangeQuery::session`] accepts. An empty source or
+    /// session id is never a session. Each table is one indexed existence
+    /// probe, all read on one snapshot; no payload is read.
+    pub fn has_session(&self, identity: &SessionIdentity) -> std::result::Result<bool, Error> {
+        let conn = open_db_readonly(self.db_path())
+            .map_err(|error| Error::DatabaseOpen(format!("{error:#}")))?;
+        identity_exists(&conn, &identity.source_name, &identity.session_id).map_err(Error::query)
+    }
 }
 
 /// Every table a session identity can be stored in: its name and the column
@@ -207,10 +219,24 @@ fn next_in(
 /// Whether the store holds anything under one identity: the same tables and
 /// the same rule for what names a session as [`identities_after`], each an
 /// indexed existence probe. An empty source or session id is never one.
+///
+/// The probes read one snapshot, by the same rule as a page: the caller's
+/// transaction, or their own on an autocommit connection, so a session whose
+/// only row moves between tables mid-check is still found.
 pub(crate) fn identity_exists(conn: &Connection, source: &str, session_id: &str) -> Result<bool> {
     if source.is_empty() || session_id.is_empty() {
         return Ok(false);
     }
+    if conn.is_autocommit() {
+        let snapshot = conn.unchecked_transaction()?;
+        let found = probe_identity(&snapshot, source, session_id)?;
+        snapshot.commit()?;
+        return Ok(found);
+    }
+    probe_identity(conn, source, session_id)
+}
+
+fn probe_identity(conn: &Connection, source: &str, session_id: &str) -> Result<bool> {
     if source == TRAJECTORY_SOURCE {
         let found: bool = conn
             .prepare_cached("SELECT EXISTS(SELECT 1 FROM trajectories WHERE id = ?1)")?
@@ -441,6 +467,75 @@ mod tests {
                 "{table}: {plan}"
             );
         }
+    }
+
+    /// The existence check reads one snapshot like a page: a session whose
+    /// only row moves from a table not yet probed to one already probed,
+    /// committed between the two probes, is still found.
+    #[test]
+    fn an_existence_check_reads_one_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(dir.path());
+        open_db(&db)
+            .unwrap()
+            .execute(
+                "INSERT INTO session_events (source, session_id, message_id, ts_ms, role, kind, \
+                 text, event_uid) VALUES ('claude', 'moving', 'm', 1, 'user', 'text', 'x', 'e1')",
+                [],
+            )
+            .unwrap();
+        let reader = open_db_readonly(&db).unwrap();
+        // Prepare every probe first, so the count below is the catalog
+        // probe's own work.
+        assert!(identity_exists(&reader, "claude", "moving").unwrap());
+        let counted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&counted);
+        reader.progress_handler(
+            1,
+            Some(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                false
+            }),
+        );
+        reader
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE source = ?1 AND session_id = ?2)",
+            )
+            .unwrap()
+            .query_row(["claude", "moving"], |row| row.get::<_, bool>(0))
+            .unwrap();
+        let catalog_probe = counted.load(Ordering::SeqCst);
+        let fired = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&fired);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let db_for_hook = db.clone();
+        reader.progress_handler(
+            1,
+            Some(move || {
+                if seen.fetch_add(1, Ordering::SeqCst) == catalog_probe
+                    && !flag.swap(true, Ordering::SeqCst)
+                {
+                    open_db(&db_for_hook)
+                        .unwrap()
+                        .execute_batch(
+                            "BEGIN IMMEDIATE; \
+                             DELETE FROM session_events WHERE session_id = 'moving'; \
+                             INSERT INTO sessions (session_id, source) VALUES ('moving', 'claude'); \
+                             COMMIT;",
+                        )
+                        .unwrap();
+                }
+                false
+            }),
+        );
+        let found = identity_exists(&reader, "claude", "moving").unwrap();
+        reader.progress_handler(0, None::<fn() -> bool>);
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "the move must have interleaved"
+        );
+        assert!(found, "the session existed throughout");
     }
 
     /// A store from before the identity index gains it on its first writable

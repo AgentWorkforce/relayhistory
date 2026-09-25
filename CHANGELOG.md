@@ -184,6 +184,13 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Rust API
 
+- `SessionStore::has_session(&SessionIdentity)` answers whether the store
+  holds anything under one identity, by the same tables and rule as
+  `session_identities`: true exactly when the listing would name it, false for
+  an empty source or session id. It is one indexed existence probe per table,
+  on one snapshot. `storage::session_identity_exists` is the same check, and the
+  listing skips an empty source as it skips an empty session id, so every
+  session an embedder counts is one it can select and drain.
 - `ChangeQuery::session(source, session_id)` restricts a change-feed drain
   to one session: the same `Change` values the unfiltered drain reports for
   that session, tombstones included, read through each table's
@@ -203,9 +210,7 @@ Notable changes to the native `ai-hist` CLI are documented here.
   `ChangeQuery::session` holds. `storage::session_identities_after` is the
   same read, and now covers every one of those tables rather than the catalog,
   prompts and events alone, and reads each page on one snapshot even on an
-  autocommit connection; `storage::session_identity_exists` answers by the
-  same tables and rule, so the probe can select every session it counts.
-  `sessions` gains `idx_sessions_identity` on
+  autocommit connection. `sessions` gains `idx_sessions_identity` on
   `(source, session_id)`, added by the first writable open; until then a
   read-only store answers `session_identities` with `StaleSchema`.
 - The change feed reports every evidence table and each row exactly as
