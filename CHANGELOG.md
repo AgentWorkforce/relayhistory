@@ -28,6 +28,34 @@ Notable changes to the native `ai-hist` CLI are documented here.
 - `HistoryPlugin` loses `commands` and `tools`; `HistoryPluginRegistry` loses
   `command()` and `registeredTools()`. A plugin contributes `sources` and
   `destinations`. The history config file loses its `job` field.
+- `ai-hist` keeps no upload capture journal. A store has no per-table capture
+  triggers, no journal, preimage, bootstrap-bound, subscription or exclusion
+  tables, and no retention budget: an evidence write is never refused with
+  "delivery retention limit exceeded", and sync, hydration and discovery run
+  no retention check. An uploader reads the change feed
+  (`SessionStore::changes_since`). The first writable open of an existing
+  store drops the capture triggers, the `*_cap_*` / `*_count_*` retention
+  triggers and the `delivery_identity_*` indexes (marker
+  `export_capture_retired_v1`), and drops them again whenever an earlier
+  release has re-created one. Every table of that era — `delivery_state`,
+  `delivery_journal` and its `sqlite_sequence` row, `delivery_shadow`,
+  `delivery_bootstrap_bounds`, `delivery_exclusions`, `history_subscriptions`,
+  `history_compaction` — stays as it is, for the upload daemon that reads its
+  origin and revision floor from them.
+- Local export snapshots read live rows. `create_export` records each table's
+  largest rowid and `export_page` reads the rows at or below it as they stand
+  when their page is read; a row deleted before its page is not exported.
+  Records are `schema_version` 2: `origin_id` is the store's change-feed epoch
+  (16 hex digits) and `revision` is the row's change-feed revision, so
+  `record_id` (the SHA-256 of the feed's compact-JSON key) and `revision`
+  match the feed for the same row. Exclusions come from the selection's
+  `excluded_sessions` alone. A snapshot an earlier release opened is refused
+  by `export_page` and released by `close_export` or `expire_exports`.
+- The native `historyExport` bridge accepts `create_export`, `export_page`,
+  `close_export` and `expire_exports`; `retained_bytes`,
+  `set_retention_limit` and `compact_journal` are gone, and so are the
+  `EXPORT_RETENTION_LIMIT` and `DELIVERY_RETENTION_LIMIT` error codes.
+
 - Native contract 19 -> 21. The `ai-hist-native` addon gains
   `historyExport(requestJson, dbPath)`, which separates snapshot export from
   the upload entry points the probe now owns, and
@@ -205,6 +233,24 @@ Notable changes to the native `ai-hist` CLI are documented here.
   missing a field, for the life of the database.
 
 ### Rust API
+
+- The `export` feature is local export alone. It keeps `create_export`,
+  `export_page`, `close_export`, `expire_exports`, `ExportSelection`,
+  `ExportLimits`, `ExportHandle`, `HistoryExportPage`, `HistoryExportRecord`,
+  `SessionIdentity`, `SUPPORTED_KINDS` and `EXPORT_SCHEMA_VERSION` (now 2).
+  Removed: the `export::capture` module (subscriptions, `reserve_revision`,
+  cutoffs, `next_change`, `append_revision`, preimages, `is_shareable`,
+  `shareable` and the rest), `RawRecord`, `make_record`, `snapshot_record`,
+  `DEFAULT_RETENTION_LIMIT_BYTES`, `set_retention_limit`, `retained_bytes`,
+  `RETENTION_HIGH_WATER_PERCENT`, `above_high_water`,
+  `ensure_capture_headroom`, `RetentionLimitReached`,
+  `retention_limit_usage`, `annotate_retention_limit`, `is_retention_limit`,
+  `MAX_COMPACTION_PAGE` and the `compact_journal*` / `compact_to_low_water*`
+  functions. The `delivery` feature alias is gone. Under
+  `unstable-internal`, `storage::session_identities_after` and
+  `storage::session_identity_exists` are gone; `SessionStore::session_identities`
+  and `SessionStore::has_session` are the identity reads. The default-feature
+  surface is unchanged.
 
 - `SessionStore::has_session(&SessionIdentity)` answers whether the store
   holds anything under one identity, by the same tables and rule as

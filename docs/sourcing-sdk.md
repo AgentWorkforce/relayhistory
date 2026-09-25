@@ -52,8 +52,8 @@ RelayHistory is the single owner of acquiring, parsing and storing session
 evidence for every harness ([ADR](decisions/2026-09-19-relayhistory-owns-session-sourcing.md)).
 `SessionStore` is the one public entry point to that store from Rust: it opens
 `ai-history.db`, runs the local sweep that fills it, and reads evidence back as
-typed rows. Everything else the crate can do — search, statistics, delivery,
-remote connectors — is workspace surface behind the `unstable-internal` feature
+typed rows. Everything else the crate can do — search, statistics, local
+export, remote connectors — is workspace surface behind the `unstable-internal` feature
 and is not part of the contract.
 
 The store is an **in-process** library, not a daemon. A handle you open
@@ -424,8 +424,7 @@ replace, never a duplicate.
 but `revision`, in table order, each value as SQLite holds it — JSON text stays
 text, integers stay integers, NULL stays `null` — read from the live table, so
 a column a migration adds is carried without a code change. It serializes as a
-JSON object in column order, the same object the export journal records for the
-row. `key` is the record's identity as that journal keys it: the kind's wire
+JSON object in column order. `key` is the record's identity: the kind's wire
 name, then the stored values of the table's uniqueness columns, identical on an
 upsert and on the delete that retracts it — `["history", "claude",
 1756634400000, "ship the feed"]`, `["trajectory", "traj-1"]`. `record_key` is
@@ -720,8 +719,7 @@ embedder reads before bumping.
 | --- | --- | --- | --- |
 | *(none)* | ✓ | `SessionStore` and its twelve operations, the change feed (`Change`, `ChangeQuery`, `Watermark`, `EvidenceRow`, `StoredRow`), `SessionIdentity` and `IdentityQuery`, `Source` and `SourceCapabilities`, `Error`, the evidence structs above, `NormalizedUsage` and the usage normalizers, `project_identity`, `declared_evidence_kinds` | Embedders |
 | `fs-events` | — | The `notify` backend behind `watch`; without it `watch` polls at `poll_interval_ms`. `WatchOptions::use_fs_events` selects it when it is compiled in | The CLI, and an embedder that wants event-driven ticks |
-| `export` | — | Consistent evidence snapshots and change capture (`ai_hist::export`) | The CLI, napi |
-| `delivery` | — | Legacy alias for `export`; adds nothing of its own | Existing manifests |
+| `export` | — | `ai_hist::export`: bounded, resumable NDJSON snapshots of the store's evidence, keyed like the change feed | napi (the SDK's `exportHistory`) |
 | `opencode-backup` | — | Snapshot a live OpenCode SQLite store through `rusqlite`'s backup API before reading it | The CLI, napi |
 | `git-hooks` | — | Git helpers and hook installation (`url`) | The CLI, napi |
 | `unstable-internal` | — | Every workspace module, public: raw-connection APIs, the parsers, discovery, search, statistics, remote connectors, the connection-level sync and watch entry points. **Not covered by semver.** | This workspace and its plugins only |
@@ -783,7 +781,7 @@ repository should — each entry is a facade gap or a deliberate non-goal.
 | | `discover`, `diagnostics::doctor_report`, `paths::*`, `git_helpers::*`, tags, `resume_command` | Operator tooling: doctor, discovery diagnostics, resume commands, tagging |
 | `crates/ai-hist-napi` | `open_db*`, `schema_is_*_read_current`, `default_db_path` | Node holds one long-lived connection per addon and answers a schema mismatch by reopening writable |
 | | connection-taking `session_*_page`, `session_relationships`, `session_tree`, `session_children_page`, `stats_scoped_by`, `search`, `recent`, `session_locations` | The TypeScript SDK exposes relationships, trees, statistics and search the Rust facade does not; typed facade exposure to TypeScript is [#181](https://github.com/AgentWorkforce/relayhistory/issues/181) |
-| | `SESSION_*_CONTRACT_VERSION` constants, `export` | The native contract is versioned separately from Cargo semver; `export` backs the `historyExport` bridge |
+| | `SESSION_*_CONTRACT_VERSION` constants, `export` | The native contract is versioned separately from Cargo semver; `export` backs the SDK's local `exportHistory` |
 | `plugins/provider-sources/rust` | `discover::DiscoveryEnv`, `ShallowSessionProvider`, `sources::NormalizedSourceEvidence`, `observations::SessionObservation`, `EvidenceKind`, `SOURCE_CHOICES` | Remote connectors supply normalized evidence into the store; the intake contract is internal |
 
 The rule that follows: a new in-tree call site that reaches past the facade

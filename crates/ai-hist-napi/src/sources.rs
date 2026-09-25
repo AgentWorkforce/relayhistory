@@ -15,7 +15,6 @@ fn execute<T: DeserializeOwned, R: Serialize>(
             "INVALID_ARGUMENT",
             "SESSION_NOT_FOUND",
             "CONNECTOR_NOT_CONFIGURED",
-            "DELIVERY_RETENTION_LIMIT",
         ]
         .into_iter()
         .find(|code| message.contains(code))

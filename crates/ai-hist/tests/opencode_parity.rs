@@ -296,7 +296,6 @@ fn opencode_reaches_event_level_parity_across_both_storage_layouts() {
     an_unindexed_store_syncs_to_the_same_evidence_as_an_indexed_one();
     an_unindexed_store_is_not_read_once_per_session();
     a_sqlite_store_inside_the_storage_dir_still_hydrates();
-    an_upgraded_database_delivers_the_new_event_columns();
     #[cfg(unix)]
     {
         an_unreadable_part_does_not_checkpoint_a_session_without_it();
@@ -1681,121 +1680,6 @@ fn a_sqlite_store_inside_the_storage_dir_still_hydrates() {
         hydrated.evidence.events > 0,
         "a store that happens to live under the storage dir must still hydrate, got {:?}",
         hydrated.evidence
-    );
-
-    fs::remove_dir_all(&root).ok();
-}
-
-/// A delivery capture trigger writes the column list it was created with into
-/// its own SQL. `CREATE TRIGGER IF NOT EXISTS` will not replace it, so a
-/// database that already existed before this PR added `provider` and
-/// `stop_reason` keeps capturing the old shape: delivery goes on reporting
-/// success while neither field ever reaches the destination, and an upgraded
-/// installation's incremental exports quietly differ from a fresh one's.
-fn an_upgraded_database_delivers_the_new_event_columns() {
-    use ai_hist::export::capture;
-
-    let root = temp_root("upgraded-capture");
-    let db_path = root.join("history.db");
-    let stripped = {
-        let conn = open_db(&db_path).unwrap();
-        let tx = conn.unchecked_transaction().unwrap();
-        capture::save_subscription(
-            &tx,
-            &capture::Subscription {
-                id: "fixture",
-                session: None,
-                cursor: 0,
-                kind: 0,
-                rowid: 0,
-                complete: true,
-            },
-        )
-        .unwrap();
-        tx.commit().unwrap();
-
-        // Rewind the store to what an installation from before this PR has on
-        // disk: `session_events` without the two new columns, and capture
-        // triggers whose SQL never mentioned them.
-        let mut stripped = Vec::new();
-        for operation in ["insert", "update", "delete"] {
-            let sql: String = conn
-                .query_row(
-                    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
-                    [format!("delivery_session_events_{operation}")],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            let mut old_shape = sql;
-            for row in ["NEW", "OLD"] {
-                for column in ["provider", "stop_reason"] {
-                    old_shape = old_shape.replace(&format!(",'{column}',{row}.\"{column}\""), "");
-                }
-            }
-            assert!(
-                !old_shape.contains("'provider'") && !old_shape.contains("'stop_reason'"),
-                "the pre-upgrade trigger must not mention the new columns: {old_shape}"
-            );
-            conn.execute_batch(&format!(
-                "DROP TRIGGER delivery_session_events_{operation};"
-            ))
-            .unwrap();
-            stripped.push(old_shape);
-        }
-        // The current derived request view reads provider. A pre-provider
-        // database did not have that view shape, and SQLite will not drop a
-        // column while a view still references it. Writable reopen rebuilds
-        // the view after restoring the column below.
-        conn.execute_batch("DROP VIEW IF EXISTS session_requests;")
-            .unwrap();
-        for column in ["provider", "stop_reason"] {
-            conn.execute_batch(&format!("ALTER TABLE session_events DROP COLUMN {column};"))
-                .unwrap();
-        }
-        for sql in &stripped {
-            conn.execute_batch(&format!("{sql};")).unwrap();
-        }
-        stripped
-    };
-
-    // Opening the database again is the upgrade: it re-adds the columns.
-    let conn = open_db(&db_path).unwrap();
-    conn.execute(
-        "INSERT INTO session_events(source,session_id,ts_ms,role,kind,event_uid,text,provider,stop_reason) \
-         VALUES('opencode','ses_upgrade',1000,'assistant','text','evt_upgrade','hi','anthropic','stop')",
-        [],
-    )
-    .unwrap();
-    let payload: String = conn
-        .query_row(
-            "SELECT payload FROM delivery_journal WHERE kind='session_event' ORDER BY seq DESC LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let captured: serde_json::Value = serde_json::from_str(&payload).unwrap();
-    assert_eq!(
-        (
-            captured.get("provider").and_then(|v| v.as_str()),
-            captured.get("stop_reason").and_then(|v| v.as_str())
-        ),
-        (Some("anthropic"), Some("stop")),
-        "an upgraded database must capture the new columns, got {payload}"
-    );
-
-    // And the reason it captured them: the trigger itself was replaced, not
-    // merely written around.
-    let rebuilt: String = conn
-        .query_row(
-            "SELECT sql FROM sqlite_master WHERE type='trigger' \
-             AND name='delivery_session_events_insert'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert!(
-        !stripped.iter().any(|sql| rebuilt.contains(sql.as_str())),
-        "the pre-upgrade trigger must not have survived the upgrade"
     );
 
     fs::remove_dir_all(&root).ok();

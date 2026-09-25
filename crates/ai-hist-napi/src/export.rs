@@ -23,13 +23,6 @@ enum Request {
         now_ms: i64,
         limit: usize,
     },
-    RetainedBytes,
-    SetRetentionLimit {
-        max_bytes: i64,
-    },
-    CompactJournal {
-        limit: usize,
-    },
 }
 // Core caps the decoded selection at 64 KiB. The wire envelope also carries
 // metadata and may encode each ASCII character as a six-byte Unicode escape.
@@ -46,9 +39,6 @@ pub async fn history_export(request_json: String, db_path: Option<String>) -> na
         .map_err(|_| crate::native_error("INVALID_ARGUMENT", "invalid export request"))?;
     let path = crate::db_path(db_path);
     napi::tokio::task::spawn_blocking(move || {
-        if !path.exists() && matches!(request, Request::RetainedBytes) {
-            return Ok(format!("[0,{}]", core::DEFAULT_RETENTION_LIMIT_BYTES));
-        }
         let conn = ai_hist::open_db(&path).map_err(|e| crate::database_error(&path, e))?;
         let value = (|| -> anyhow::Result<serde_json::Value> {
             Ok(match request {
@@ -70,26 +60,9 @@ pub async fn history_export(request_json: String, db_path: Option<String>) -> na
                 Request::ExpireExports { now_ms, limit } => {
                     serde_json::to_value(core::expire_exports(&conn, now_ms, limit)?)?
                 }
-                Request::RetainedBytes => serde_json::to_value(core::retained_bytes(&conn)?)?,
-                Request::SetRetentionLimit { max_bytes } => {
-                    core::set_retention_limit(&conn, max_bytes)?;
-                    serde_json::Value::Null
-                }
-                Request::CompactJournal { limit } => {
-                    serde_json::to_value(core::compact_journal(&conn, limit)?)?
-                }
             })
         })()
-        .map_err(|e| {
-            crate::native_error(
-                if core::is_retention_limit(&e) {
-                    "EXPORT_RETENTION_LIMIT"
-                } else {
-                    "HISTORY_EXPORT_FAILED"
-                },
-                e,
-            )
-        })?;
+        .map_err(|e| crate::native_error("HISTORY_EXPORT_FAILED", e))?;
         serde_json::to_string(&value).map_err(|e| crate::native_error("HISTORY_EXPORT_FAILED", e))
     })
     .await

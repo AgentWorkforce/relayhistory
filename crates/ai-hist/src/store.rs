@@ -536,15 +536,7 @@ const REQUIRED_TABLES: &[&str] = &[
     "discovery_skips",
 ];
 #[cfg(feature = "export")]
-const REQUIRED_EXPORT_TABLES: &[&str] = &[
-    "delivery_state",
-    "delivery_journal",
-    "delivery_shadow",
-    "delivery_bootstrap_bounds",
-    "delivery_exclusions",
-    "history_exports",
-    "history_export_pages",
-];
+const REQUIRED_EXPORT_TABLES: &[&str] = crate::export::REQUIRED_TABLES;
 #[cfg(not(feature = "export"))]
 const REQUIRED_EXPORT_TABLES: &[&str] = &[];
 const REQUIRED_HISTORY_COLUMNS: &[&str] = &["prompt_hash", "git_branch"];
@@ -740,6 +732,111 @@ const RETIRED_INDEXES: &[&str] = &[
     "idx_file_edits_page",
 ];
 
+/// Tables an earlier release's export capture watched, each with
+/// `delivery_<table>_{insert,update,delete}` triggers and a
+/// `delivery_identity_<table>` index.
+const CAPTURED_TABLES: &[&str] = &[
+    "history",
+    "session_events",
+    "tool_calls",
+    "file_edits",
+    "sessions",
+    "session_presences",
+    "session_relationships",
+    "session_commit_links",
+    "trajectories",
+    "session_observations",
+    "observation_evidence",
+    "session_markers",
+];
+
+/// Tables whose writes an earlier release charged to a retention budget, each
+/// with `<table>_{cap,count}_*` triggers.
+const RETENTION_ACCOUNTED_TABLES: &[&str] = &[
+    "delivery_journal",
+    "delivery_shadow",
+    "history_export_pages",
+];
+
+/// Every trigger and index an earlier release's export capture created, as
+/// `(type, name)`.
+///
+/// None of them holds state. A capture trigger that outlives its release
+/// still journals every evidence write for any subscription left in the
+/// database, and a cap trigger still aborts that write once the retention
+/// budget is spent, so ingest would fail on a budget nothing reclaims. The
+/// identity indexes only served capture's session seeks and cost every
+/// evidence insert a b-tree write. All of them are dropped.
+///
+/// The capture *tables* are not: `delivery_state`, `delivery_journal`,
+/// `delivery_shadow`, `delivery_bootstrap_bounds`, `history_subscriptions`,
+/// `delivery_exclusions` and the rest stay exactly as they are. Their owner
+/// is the upload daemon that created the subscriptions, and it reads two
+/// facts from them to rebuild an install: `delivery_state.origin_id`, and its
+/// revision floor from `sqlite_sequence` where `name = 'delivery_journal'`.
+/// SQLite deletes a table's `sqlite_sequence` row when the table is dropped,
+/// so dropping the journal would silently reset that floor and every
+/// re-upload would read as already seen. This crate never drops or alters
+/// them.
+fn retired_capture_objects() -> Vec<(&'static str, String)> {
+    let mut objects = Vec::new();
+    for table in CAPTURED_TABLES {
+        for operation in ["insert", "update", "delete"] {
+            objects.push(("trigger", format!("delivery_{table}_{operation}")));
+        }
+        objects.push(("index", format!("delivery_identity_{table}")));
+    }
+    for table in RETENTION_ACCOUNTED_TABLES {
+        for suffix in [
+            "cap_insert",
+            "count_insert",
+            "cap_update",
+            "count_update",
+            "count_delete",
+        ] {
+            objects.push(("trigger", format!("{table}_{suffix}")));
+        }
+    }
+    objects
+}
+
+/// The marker [`retire_export_capture`] records.
+const EXPORT_CAPTURE_RETIRED: &str = "export_capture_retired_v1";
+
+/// Whether any [`retired_capture_objects`] entry still exists: a database an
+/// earlier release opened, before or after this one retired its capture.
+fn retired_capture_present(conn: &Connection) -> Result<bool> {
+    let mut object =
+        conn.prepare_cached("SELECT 1 FROM sqlite_master WHERE type = ? AND name = ? LIMIT 1")?;
+    for (kind, name) in retired_capture_objects() {
+        if object.exists(params![kind, name])? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Drop every [`retired_capture_objects`] entry and record
+/// [`EXPORT_CAPTURE_RETIRED`]. Idempotent: it drops only what exists, so a
+/// database an earlier release re-armed is retired again on its next
+/// writable open. Runs ahead of every other migration, so no migration's
+/// writes reach a capture trigger.
+fn retire_export_capture(conn: &Connection) -> Result<()> {
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY);")?;
+    for (kind, name) in retired_capture_objects() {
+        let statement = match kind {
+            "trigger" => "TRIGGER",
+            _ => "INDEX",
+        };
+        conn.execute_batch(&format!("DROP {statement} IF EXISTS \"{name}\";"))?;
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations (name) VALUES (?1)",
+        [EXPORT_CAPTURE_RETIRED],
+    )?;
+    Ok(())
+}
+
 const REQUIRED_CATALOG_READ_INDEXES: &[&str] = &[
     "idx_sessions_recency",
     "idx_sessions_source_recency",
@@ -796,11 +893,8 @@ const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &[
     // so the marker is what makes the rebuild happen exactly once.
     "session_events_fts_update_of_v1",
     "history_fts_update_of_v1",
+    EXPORT_CAPTURE_RETIRED,
 ];
-#[cfg(feature = "export")]
-const REQUIRED_EXPORT_MIGRATIONS: &[&str] = &["delivery_v1"];
-#[cfg(not(feature = "export"))]
-const REQUIRED_EXPORT_MIGRATIONS: &[&str] = &[];
 
 /// Whether this database already has everything [`init_db`] would add.
 ///
@@ -811,19 +905,8 @@ const REQUIRED_EXPORT_MIGRATIONS: &[&str] = &[];
 /// open (which migrates) when this returns false.
 pub fn schema_is_current(conn: &Connection) -> Result<bool> {
     Ok(schema_has_required_indexes(conn, REQUIRED_INDEXES)?
-        && export_schema_is_current(conn)?
         && crate::observations::schema_is_current(conn)?
         && crate::change_feed::schema_is_current(conn)?)
-}
-
-#[cfg(feature = "export")]
-fn export_schema_is_current(conn: &Connection) -> Result<bool> {
-    crate::export::schema_is_current(conn)
-}
-
-#[cfg(not(feature = "export"))]
-fn export_schema_is_current(_conn: &Connection) -> Result<bool> {
-    Ok(true)
 }
 
 /// Whether read-only APIs can safely and efficiently query this database.
@@ -885,10 +968,7 @@ fn schema_has_required_indexes(conn: &Connection, required_indexes: &[&str]) -> 
         return Ok(false);
     }
     let mut migration = conn.prepare("SELECT 1 FROM schema_migrations WHERE name = ? LIMIT 1")?;
-    for name in REQUIRED_SCHEMA_MIGRATIONS
-        .iter()
-        .chain(REQUIRED_EXPORT_MIGRATIONS.iter())
-    {
+    for name in REQUIRED_SCHEMA_MIGRATIONS {
         if !migration.exists([*name])? {
             return Ok(false);
         }
@@ -1018,7 +1098,8 @@ pub fn open_db_readonly(path: &Path) -> Result<Connection> {
 }
 
 pub fn init_db(conn: &Connection) -> Result<()> {
-    // REPLACE must fire delete triggers so enabled delivery retains preimages.
+    // REPLACE must fire delete triggers so the change feed tombstones the
+    // row it replaces.
     conn.pragma_update(None, "recursive_triggers", true)?;
     init_db_once(conn)
 }
@@ -1029,7 +1110,10 @@ fn init_db_once(conn: &Connection) -> Result<()> {
     // different writer already owns the ledger lock. A leftover retired index
     // counts as outstanding migration work: its DROP is a real write, so it
     // routes through the serialized pass below instead of this lock-free path.
-    if schema_is_current(conn)? && !retired_indexes_present(conn)? {
+    if schema_is_current(conn)?
+        && !retired_indexes_present(conn)?
+        && !retired_capture_present(conn)?
+    {
         return Ok(());
     }
     enable_wal_for_migration(conn)?;
@@ -1040,7 +1124,10 @@ fn init_db_once(conn: &Connection) -> Result<()> {
     let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     // Another first opener may have completed the migration while this
     // connection waited for the lock.
-    if !schema_is_current(&transaction)? || retired_indexes_present(&transaction)? {
+    if !schema_is_current(&transaction)?
+        || retired_indexes_present(&transaction)?
+        || retired_capture_present(&transaction)?
+    {
         init_db_locked(&transaction)?;
     }
     transaction.commit()?;
@@ -1108,6 +1195,7 @@ CREATE TABLE IF NOT EXISTS session_continuity_evidence (
 "#;
 
 fn init_db_locked(conn: &Connection) -> Result<()> {
+    retire_export_capture(conn)?;
     // Same shape as the hydration-state trigger below: a body change has to
     // drop the old trigger before the `IF NOT EXISTS` in SCHEMA re-creates it.
     if !migration_applied(conn, "session_events_fts_update_of_v1")? {
@@ -1534,13 +1622,8 @@ VALUES ('session_presences_local_backfill_v1');
     crate::session_usage::ensure_session_requests_view(conn)?;
     crate::observations::init_schema(conn)?;
     // After the observation schema: the stamping triggers draw on its clock.
-    // Before the export schema: its capture triggers are built from the tables'
-    // column lists and leave the stamp out, so the order is only about the clock.
     crate::change_feed::init_schema(conn)?;
     init_export_schema(conn)?;
-    // Only now, with the capture triggers rebuilt and the journal certain to
-    // exist, is the debt the marker migration recorded payable.
-    resolve_marker_journal_backfill(conn)?;
     Ok(())
 }
 
@@ -1551,113 +1634,6 @@ fn init_export_schema(conn: &Connection) -> Result<()> {
 
 #[cfg(not(feature = "export"))]
 fn init_export_schema(_conn: &Connection) -> Result<()> {
-    Ok(())
-}
-
-/// Preserve the pre-migration marker rows for consumers mid-snapshot.
-#[cfg(feature = "export")]
-fn shadow_marker_preimages(conn: &Connection) -> Result<()> {
-    crate::export::shadow_preimages(conn, "session_markers")
-}
-
-/// Without the delivery feature there is no `delivery_shadow` to write to and
-/// no way to build the payload, so a database with a consumer mid-snapshot is
-/// refused rather than migrated.
-///
-/// This is the one place the migration stops instead of deferring, and the
-/// asymmetry is the point. Everywhere else the rows survive, so the work can
-/// wait for a build that can do it. A preimage cannot wait: proceeding would
-/// drop the only copy of a shape a consumer was promised, and no later open
-/// could put it back. A failed open naming the remedy is recoverable; silent
-/// destruction is not.
-///
-/// Only an *unfinished* consumer is owed anything, so an ordinary install --
-/// no delivery tables at all, or no snapshot in flight -- migrates normally.
-#[cfg(not(feature = "export"))]
-fn shadow_marker_preimages(conn: &Connection) -> Result<()> {
-    let subscriptions: bool=conn.query_row("SELECT count(*)=2 FROM sqlite_master WHERE type='table' AND name IN ('history_subscriptions','delivery_bootstrap_bounds')",[],|r|r.get(0))?;
-    if subscriptions {
-        let unread:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM history_subscriptions s JOIN delivery_bootstrap_bounds b ON b.job_id=s.id WHERE s.bootstrap_done=0 AND b.kind='session_marker')",[],|r|r.get(0))?;
-        anyhow::ensure!(!unread,"session_markers migration requires an export-enabled build while an evidence snapshot is in flight; open with the probe or export-enabled ai-hist first");
-    }
-
-    let ready: bool = conn
-        .prepare(
-            "SELECT count(*) = 3 FROM sqlite_master WHERE type = 'table' \
-             AND name IN ('delivery_bootstrap_bounds','delivery_jobs','history_exports')",
-        )?
-        .query_row([], |row| row.get(0))?;
-    if !ready {
-        return Ok(());
-    }
-    // The same union the capture triggers serve: live delivery jobs *and*
-    // unexpired file exports. Asking only about jobs let a database whose only
-    // in-flight consumer was an export migrate and drop the column with no
-    // preimage taken -- the identical unrecoverable loss, reached through the
-    // other half of the set. Spelled out here rather than reusing `CONSUMERS`
-    // because that constant lives in the module this build compiles out.
-    let unfinished: bool = conn
-        .prepare(
-            "SELECT 1 FROM delivery_bootstrap_bounds b \
-             WHERE b.kind = 'session_marker' AND ( \
-               EXISTS(SELECT 1 FROM delivery_jobs j \
-                      WHERE j.id = b.job_id AND j.state <> 'cancelled' \
-                        AND j.bootstrap_done = 0) \
-               OR EXISTS(SELECT 1 FROM history_exports e \
-                         WHERE e.id = b.job_id AND e.bootstrap_done = 0 \
-                           AND e.expires_at_ms > CAST(unixepoch('subsec')*1000 AS INTEGER)) \
-             )",
-        )?
-        .exists([])?;
-    anyhow::ensure!(
-        !unfinished,
-        "session_markers cannot be migrated by a build without the delivery feature while a \
-         delivery snapshot is still in flight: the pre-migration rows would be lost for it \
-         and cannot be recovered afterwards. Open this database once with a delivery-enabled \
-         build, or let the snapshot finish, and retry."
-    );
-    Ok(())
-}
-
-/// Pay off what the marker migration recorded, once the schema can take it.
-///
-/// The migration has to retire the capture triggers -- SQLite validates them
-/// when a column is dropped -- so every write it makes is invisible to
-/// delivery, and so is every marker written afterwards until the triggers come
-/// back. Rebuilt triggers only ever see future writes, and a no-op touch
-/// cannot wake them either: their `WHEN old_payload <> new_payload` guard is
-/// false for a row whose values did not change.
-///
-/// So the gap is closed by journalling the marker table once, here, after
-/// `init_export_schema` has rebuilt the triggers. Every row rather than the
-/// migrated ones, because the gap covers both: in a build without the delivery
-/// feature the migration runs, the triggers stay down for the rest of that
-/// process, and the markers a sync writes in the meantime are captured by
-/// nothing. That build leaves the flag set and the next delivery-enabled open
-/// settles all of it.
-///
-/// The upserts are idempotent at the destination -- they carry the same record
-/// key capture would -- so paying a little more than is strictly owed is the
-/// safe direction, and the alternative is a revision that exists nowhere.
-#[cfg(feature = "export")]
-fn resolve_marker_journal_backfill(conn: &Connection) -> Result<()> {
-    if !migration_applied(conn, "session_markers_v2_journal_pending")? {
-        return Ok(());
-    }
-    crate::export::journal_migrated_rows(conn, "session_markers")?;
-    conn.execute(
-        "DELETE FROM schema_migrations WHERE name = 'session_markers_v2_journal_pending'",
-        [],
-    )?;
-    Ok(())
-}
-
-/// Without the delivery feature there is no journal to write to and no trigger
-/// DDL reachable to rebuild, so the flag is left standing for a build that has
-/// both. Doing nothing is the point: clearing it here would retire a debt
-/// nobody paid.
-#[cfg(not(feature = "export"))]
-fn resolve_marker_journal_backfill(_conn: &Connection) -> Result<()> {
     Ok(())
 }
 
@@ -1872,17 +1848,6 @@ fn migrate_session_markers_v2(conn: &Connection) -> Result<()> {
     let has_detail_json: bool = conn
         .prepare("SELECT 1 FROM pragma_table_info('session_markers') WHERE name = 'detail_json'")?
         .exists([])?;
-    if has_detail_json {
-        // Freeze the old shape for anyone mid-snapshot, before anything at all
-        // happens to the table -- ahead of the added columns as well as the
-        // writes, so the preimage is the shape their snapshot was promised
-        // rather than that shape plus some nulls.
-        //
-        // This one is not recoverable later: the journal backfill can be
-        // deferred because the rows survive, but a preimage cannot be
-        // reconstructed once the column it holds is gone.
-        shadow_marker_preimages(conn)?;
-    }
     ensure_columns(
         conn,
         "session_markers",
@@ -1896,27 +1861,6 @@ fn migrate_session_markers_v2(conn: &Connection) -> Result<()> {
         ],
     )?;
     if has_detail_json {
-        // Retire the capture triggers *before* touching a row, not merely
-        // before the column drop.
-        //
-        // They are built from the column list they were created with, so on a
-        // v1 database they know nothing of `payload_json`: the copy below
-        // would run under triggers whose `WHEN old_payload <> new_payload`
-        // guard compares two `json_object`s that both omit the column being
-        // written, so it is false and nothing is journalled at all. A
-        // destination with an active job would never be told that any marker
-        // predating the upgrade had gained a payload, and no part of the
-        // delivery would look wrong. Dropping them first makes that explicit
-        // rather than incidental, and it is required anyway for the column
-        // drop, which SQLite refuses while a dependent trigger names it.
-        //
-        // `IF EXISTS` because a database opened by a build without the
-        // delivery feature has none of them.
-        conn.execute_batch(
-            "DROP TRIGGER IF EXISTS delivery_session_markers_insert; \
-             DROP TRIGGER IF EXISTS delivery_session_markers_update; \
-             DROP TRIGGER IF EXISTS delivery_session_markers_delete;",
-        )?;
         // Bounded on the way across, not copied verbatim. `payload_json` is
         // documented as a projection whose strings and containers are bounded,
         // and every kind the parsers write goes through that bounder -- so a
@@ -1931,7 +1875,6 @@ fn migrate_session_markers_v2(conn: &Connection) -> Result<()> {
             )?
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
-        let mut migrated = Vec::new();
         for (id, detail_json) in legacy {
             // A legacy value that does not parse is dropped rather than stored
             // raw: unparsed text is exactly what the bound exists to keep out.
@@ -1942,35 +1885,8 @@ fn migrate_session_markers_v2(conn: &Connection) -> Result<()> {
                 "UPDATE session_markers SET payload_json = ? WHERE id = ?",
                 params![bounded, id],
             )?;
-            migrated.push(id);
         }
         conn.execute("ALTER TABLE session_markers DROP COLUMN detail_json", [])?;
-        // Record that these rows still owe delivery a revision; do not pay it
-        // here. Two reasons, and each on its own is fatal:
-        //
-        // This runs *before* `init_export_schema`, so `delivery_journal` may
-        // not exist yet -- delivery is opt-in, and a database only ever opened
-        // by builds without the feature has none of its tables. A statement
-        // naming a missing table fails when it is prepared, before any `WHERE`
-        // clause can spare it, so journalling inline turns the most ordinary
-        // upgrade into a failed open.
-        //
-        // And this migration is not feature-gated while the journal is, so a
-        // build without delivery gets here, drops the capture triggers it
-        // cannot rebuild, and can neither journal now nor be made to later.
-        // A flag it leaves set is the one thing that survives it.
-        //
-        // `migrated` is deliberately not recorded with the flag. What is owed
-        // is not "these rows" but "every marker row", because capture is off
-        // from here until the triggers come back -- in a no-delivery process
-        // that is the rest of the run, including markers a sync writes after
-        // this point.
-        let _ = migrated;
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_migrations (name) \
-             VALUES ('session_markers_v2_journal_pending')",
-            [],
-        )?;
     }
     conn.execute(
         "INSERT OR IGNORE INTO schema_migrations (name) VALUES ('session_markers_v2')",
@@ -4494,7 +4410,6 @@ pub fn sync_opencode_storage_dir(conn: &Connection, storage_dir: &Path) -> Resul
         .collect();
     for session_file in crate::ingest::capture_files("opencode", listing.sessions) {
         crate::ingest::check_capture_cancelled()?;
-        crate::ingest::ensure_capture_headroom(conn)?;
         let indexed =
             crate::ingest::opencode::load_from_json_tree(&session_file).and_then(|loaded| {
                 match loaded {
@@ -4509,9 +4424,7 @@ pub fn sync_opencode_storage_dir(conn: &Connection, storage_dir: &Path) -> Resul
             });
         match indexed {
             Ok(prompts) => inserted += prompts,
-            Err(error) => {
-                opencode_session_failed(conn, &mut failures, &session_file.display(), error)?
-            }
+            Err(error) => failures.push(format!("{}: {error:#}", session_file.display())),
         }
     }
     if !failures.is_empty() {
@@ -4523,22 +4436,6 @@ pub fn sync_opencode_storage_dir(conn: &Connection, storage_dir: &Path) -> Resul
         );
     }
     Ok(inserted)
-}
-
-/// One OpenCode session's failure is that session's failure, except at the
-/// retention cap: the session has rolled back, every later session would meet
-/// the same budget, and the typed cause ends the pass.
-fn opencode_session_failed(
-    conn: &Connection,
-    failures: &mut Vec<String>,
-    session: &dyn std::fmt::Display,
-    error: anyhow::Error,
-) -> Result<()> {
-    if crate::ingest::is_delivery_retention_limit(&error) {
-        return Err(crate::ingest::annotate_retention_limit(conn, error));
-    }
-    failures.push(format!("{session}: {error:#}"));
-    Ok(())
 }
 
 fn sync_opencode_sessions_from_source(
@@ -4563,7 +4460,6 @@ fn sync_opencode_sessions_from_source(
         crate::ingest::opencode::OpencodeSyncPlan::PerSession => {
             for session_id in crate::ingest::opencode::list_sqlite_session_ids(src)? {
                 crate::ingest::check_capture_cancelled()?;
-                crate::ingest::ensure_capture_headroom(conn)?;
                 let indexed = crate::ingest::opencode::load_from_sqlite(src, &session_id).and_then(
                     |loaded| match loaded {
                         Some(loaded) => {
@@ -4575,7 +4471,7 @@ fn sync_opencode_sessions_from_source(
                 );
                 match indexed {
                     Ok(prompts) => inserted += prompts,
-                    Err(error) => opencode_session_failed(conn, &mut failures, &session_id, error)?,
+                    Err(error) => failures.push(format!("{session_id}: {error:#}")),
                 }
             }
         }
@@ -4589,12 +4485,9 @@ fn sync_opencode_sessions_from_source(
             );
             for loaded in load.sessions {
                 crate::ingest::check_capture_cancelled()?;
-                crate::ingest::ensure_capture_headroom(conn)?;
                 match crate::ingest::opencode::normalize(conn, &loaded, &raw_path) {
                     Ok(counts) => inserted += counts.prompts,
-                    Err(error) => {
-                        opencode_session_failed(conn, &mut failures, &loaded.session.id, error)?
-                    }
+                    Err(error) => failures.push(format!("{}: {error:#}", loaded.session.id)),
                 }
             }
         }
@@ -6698,92 +6591,6 @@ mod tests {
         );
     }
 
-    /// The same v1 migration, on a database whose delivery capture is live.
-    ///
-    /// The delivery triggers build their payload with a `json_object` over the
-    /// column list as it stood when they were created, so on a v1 database all
-    /// three name `detail_json`. SQLite validates dependent triggers when a
-    /// column is dropped, so `ALTER TABLE ... DROP COLUMN detail_json` fails
-    /// against them -- and it fails inside `open_db`, which means every open of
-    /// that database errors, not just the first. The migration therefore
-    /// retires the three triggers itself; `init_export_schema` recreates them
-    /// over the new column list later in the same open.
-    ///
-    /// The plain v1 test above cannot catch this: it opens a database whose
-    /// delivery schema was never initialised, so there are no triggers to
-    /// validate against and the drop succeeds.
-    #[cfg(feature = "export")]
-    #[test]
-    fn v1_markers_migrate_forward_on_a_database_with_live_delivery_capture() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("v1-delivery.db");
-        {
-            let conn = open_db(&db_path).unwrap();
-            // Rebuild the v1 table, then let the delivery schema build its
-            // triggers over that shape -- which is what a real v1 database has.
-            conn.execute_batch(
-                "DROP TRIGGER IF EXISTS delivery_session_markers_insert;
-                 DROP TRIGGER IF EXISTS delivery_session_markers_update;
-                 DROP TRIGGER IF EXISTS delivery_session_markers_delete;
-                 DROP TABLE session_markers;
-                 CREATE TABLE session_markers (
-                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                     source TEXT NOT NULL,
-                     session_id TEXT NOT NULL,
-                     marker_uid TEXT NOT NULL,
-                     kind TEXT NOT NULL,
-                     ts_ms INTEGER,
-                     text TEXT,
-                     detail_json TEXT,
-                     UNIQUE(source, session_id, marker_uid)
-                 );
-                 INSERT INTO session_markers
-                     (source, session_id, marker_uid, kind, ts_ms, text, detail_json)
-                 VALUES ('grok', 'v1-d', 'c1', 'compaction_boundary', 11, 'compacted',
-                         '{\"checkpoint\":1}');
-                 DELETE FROM schema_migrations WHERE name = 'session_markers_v2';",
-            )
-            .unwrap();
-            init_export_schema(&conn).unwrap();
-            let trigger: String = conn
-                .query_row(
-                    "SELECT sql FROM sqlite_master WHERE type = 'trigger' \
-                     AND name = 'delivery_session_markers_insert'",
-                    [],
-                    |row| row.get(0),
-                )
-                .expect("the v1 database must really have the trigger this test is about");
-            assert!(
-                trigger.contains("detail_json"),
-                "the setup is only a control if the trigger names the dropped column: {trigger}"
-            );
-        }
-
-        // The whole finding: without the trigger drop this `open_db` fails, and
-        // fails again on every retry, because nothing about it is one-shot.
-        let conn = open_db(&db_path).unwrap();
-        assert!(schema_is_current(&conn).unwrap());
-        let markers = session_markers(&conn, "grok", "v1-d").unwrap();
-        assert_eq!(markers.len(), 1);
-        assert_eq!(
-            markers[0].payload_json.as_deref(),
-            Some("{\"checkpoint\":1}")
-        );
-        // The triggers came back over the new shape, not the old one. A
-        // recreated trigger still naming `detail_json` would deliver a column
-        // that no longer exists.
-        let trigger: String = conn
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE type = 'trigger' \
-                 AND name = 'delivery_session_markers_insert'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("delivery capture must be restored, not left dropped");
-        assert!(trigger.contains("payload_json"), "{trigger}");
-        assert!(!trigger.contains("detail_json"), "{trigger}");
-    }
-
     /// Every marker for a session, not the first page of them.
     ///
     /// This wrapper's contract is "every marker recorded for one session", and
@@ -6844,10 +6651,7 @@ mod tests {
         {
             let conn = open_db(&db_path).unwrap();
             conn.execute_batch(
-                "DROP TRIGGER IF EXISTS delivery_session_markers_insert;
-                 DROP TRIGGER IF EXISTS delivery_session_markers_update;
-                 DROP TRIGGER IF EXISTS delivery_session_markers_delete;
-                 DROP TABLE session_markers;
+                "DROP TABLE session_markers;
                  CREATE TABLE session_markers (
                      id INTEGER PRIMARY KEY AUTOINCREMENT,
                      source TEXT NOT NULL,
@@ -6898,126 +6702,6 @@ mod tests {
         assert_eq!(big.text.as_deref(), Some("prose"));
     }
 
-    /// The common upgrade: a v1 database that has never had delivery at all.
-    ///
-    /// Delivery is opt-in, so its tables exist only if a delivery-enabled build
-    /// has opened this database. The migration runs inside `init_db` *before*
-    /// `init_export_schema`, so anything it writes to `delivery_journal`
-    /// names a table that may not exist yet -- and a statement against a
-    /// missing table fails when it is prepared, whatever its `WHERE` clause
-    /// says. That is a hard failure on open, for the most ordinary install
-    /// there is.
-    #[test]
-    fn a_v1_database_that_never_had_delivery_still_opens() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("v1-no-delivery.db");
-        {
-            let conn = open_db(&db_path).unwrap();
-            conn.execute_batch(
-                "DROP TRIGGER IF EXISTS delivery_session_markers_insert;
-                 DROP TRIGGER IF EXISTS delivery_session_markers_update;
-                 DROP TRIGGER IF EXISTS delivery_session_markers_delete;
-                 DROP TABLE session_markers;
-                 CREATE TABLE session_markers (
-                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                     source TEXT NOT NULL, session_id TEXT NOT NULL,
-                     marker_uid TEXT NOT NULL, kind TEXT NOT NULL,
-                     ts_ms INTEGER, text TEXT, detail_json TEXT,
-                     UNIQUE(source, session_id, marker_uid)
-                 );
-                 INSERT INTO session_markers
-                     (source, session_id, marker_uid, kind, ts_ms, text, detail_json)
-                 VALUES ('grok','v1-nd','c1','compaction_boundary',11,'compacted','{\"c\":1}');
-                 DELETE FROM schema_migrations WHERE name = 'session_markers_v2';",
-            )
-            .unwrap();
-            // Everything the delivery schema creates is removed, so the state
-            // is the self-consistent one a database only ever opened by builds
-            // without the delivery feature is in -- no journal, no jobs, no
-            // capture triggers. Enumerated rather than listed by hand, so this
-            // keeps matching the schema as it grows.
-            let objects: Vec<(String, String)> = conn
-                .prepare(
-                    "SELECT type, name FROM sqlite_master \
-                     WHERE name LIKE 'delivery%' OR name LIKE 'history_export%'",
-                )
-                .unwrap()
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-                .unwrap()
-                .collect::<rusqlite::Result<_>>()
-                .unwrap();
-            for (kind, name) in objects {
-                if kind == "trigger" || kind == "table" || kind == "index" {
-                    conn.execute_batch(&format!("DROP {kind} IF EXISTS \"{name}\";"))
-                        .unwrap();
-                }
-            }
-            // The premise, asserted rather than assumed, and non-vacuous in
-            // both feature configurations: a build without delivery never
-            // creates these, and one with delivery has just had them removed.
-            let left: i64 = conn
-                .query_row(
-                    "SELECT count(*) FROM sqlite_master \
-                     WHERE name LIKE 'delivery%' OR name LIKE 'history_export%'",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(left, 0, "the premise: nothing of delivery is present");
-        }
-
-        let conn = open_db(&db_path).expect("a v1 database without delivery must still open");
-        let markers = session_markers(&conn, "grok", "v1-nd").unwrap();
-        assert_eq!(markers.len(), 1);
-        assert_eq!(markers[0].payload_json.as_deref(), Some("{\"c\":1}"));
-    }
-
-    /// A build without the delivery feature must not silently swallow the debt.
-    ///
-    /// It runs this migration too -- the migration is not feature-gated, and
-    /// cannot be, since the column shape is not optional. It therefore drops
-    /// capture triggers it has no way to rebuild: the trigger DDL lives in the
-    /// delivery module, which is compiled out. Everything it writes afterwards,
-    /// including markers a sync adds later in the same process, is captured by
-    /// nothing.
-    ///
-    /// The flag is what survives that process. This build's whole job is to
-    /// leave it standing.
-    #[cfg(not(feature = "export"))]
-    #[test]
-    fn a_no_delivery_build_leaves_the_marker_journal_debt_for_a_build_that_can_pay_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("v1-nodelivery-build.db");
-        {
-            let conn = open_db(&db_path).unwrap();
-            conn.execute_batch(
-                "DROP TABLE session_markers;
-                 CREATE TABLE session_markers (
-                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                     source TEXT NOT NULL, session_id TEXT NOT NULL,
-                     marker_uid TEXT NOT NULL, kind TEXT NOT NULL,
-                     ts_ms INTEGER, text TEXT, detail_json TEXT,
-                     UNIQUE(source, session_id, marker_uid)
-                 );
-                 INSERT INTO session_markers
-                     (source, session_id, marker_uid, kind, ts_ms, text, detail_json)
-                 VALUES ('grok','v1-nb','c1','compaction_boundary',11,'compacted','{\"c\":1}');
-                 DELETE FROM schema_migrations WHERE name = 'session_markers_v2';",
-            )
-            .unwrap();
-        }
-
-        let conn = open_db(&db_path).unwrap();
-        // The migration ran, so the rows are readable in the new shape...
-        assert!(schema_is_current(&conn).unwrap());
-        assert_eq!(session_markers(&conn, "grok", "v1-nb").unwrap().len(), 1);
-        // ...and the debt is still on the books for a build that can settle it.
-        assert!(
-            migration_applied(&conn, "session_markers_v2_journal_pending").unwrap(),
-            "a build that cannot journal must leave the flag standing"
-        );
-    }
-
     /// The shape every upgraded install actually has.
     ///
     /// The v1 marker table this migration was written against was the one this
@@ -7037,10 +6721,7 @@ mod tests {
         {
             let conn = open_db(&db_path).unwrap();
             conn.execute_batch(
-                "DROP TRIGGER IF EXISTS delivery_session_markers_insert;
-                 DROP TRIGGER IF EXISTS delivery_session_markers_update;
-                 DROP TRIGGER IF EXISTS delivery_session_markers_delete;
-                 DROP TABLE session_markers;
+                "DROP TABLE session_markers;
                  -- main's DDL after #199, column for column.
                  CREATE TABLE session_markers (
                      id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -7096,135 +6777,6 @@ mod tests {
                 .len(),
             1
         );
-    }
-
-    #[cfg(not(feature = "export"))]
-    #[test]
-    fn a_no_export_build_refuses_unread_generic_subscriptions() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE history_subscriptions(id TEXT PRIMARY KEY,bootstrap_done INTEGER); CREATE TABLE delivery_bootstrap_bounds(job_id TEXT,kind TEXT,max_rowid INTEGER); INSERT INTO history_subscriptions VALUES('reader',0); INSERT INTO delivery_bootstrap_bounds VALUES('reader','session_marker',1);").unwrap();
-        let error = shadow_marker_preimages(&conn).unwrap_err();
-        assert!(error.to_string().contains("export-enabled"));
-        conn.execute("UPDATE history_subscriptions SET bootstrap_done=1", [])
-            .unwrap();
-        shadow_marker_preimages(&conn).unwrap();
-    }
-
-    /// An export is a consumer too, and a build that cannot shadow must say so.
-    ///
-    /// `CONSUMERS` -- the set every capture trigger serves -- is live delivery
-    /// jobs **union** unexpired file exports. The refusal in a build without
-    /// the delivery feature asked only about jobs, so a database whose only
-    /// in-flight consumer was an export migrated happily and dropped
-    /// `detail_json` with no preimage taken. The export then resumes and reads
-    /// v2 payloads where its cutoff promised v1 -- the same unrecoverable loss
-    /// the refusal exists to prevent, reached by the other half of the union.
-    #[cfg(not(feature = "export"))]
-    #[test]
-    fn a_no_delivery_build_refuses_to_migrate_under_an_unfinished_export() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("export-consumer.db");
-        let v1 = |conn: &Connection| {
-            conn.execute_batch(
-                "DROP TABLE IF EXISTS session_markers;
-                 CREATE TABLE session_markers (
-                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                     source TEXT NOT NULL, session_id TEXT NOT NULL,
-                     marker_uid TEXT NOT NULL, kind TEXT NOT NULL,
-                     ts_ms INTEGER, text TEXT, detail_json TEXT,
-                     UNIQUE(source, session_id, marker_uid)
-                 );
-                 INSERT INTO session_markers
-                     (source, session_id, marker_uid, kind, ts_ms, text, detail_json)
-                 VALUES ('grok','exp','c1','compaction_boundary',11,'compacted','{\"c\":1}');
-                 DELETE FROM schema_migrations WHERE name = 'session_markers_v2';",
-            )
-            .unwrap();
-        };
-        // The delivery tables as a delivery-enabled build would have left them,
-        // built here by hand because this build cannot create them.
-        let delivery_tables = "
-            CREATE TABLE IF NOT EXISTS delivery_jobs (
-                id TEXT PRIMARY KEY, state TEXT NOT NULL,
-                bootstrap_done INTEGER NOT NULL DEFAULT 0,
-                bootstrap_kind INTEGER NOT NULL DEFAULT 0,
-                bootstrap_rowid INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS history_exports (
-                id TEXT PRIMARY KEY, bootstrap_kind INTEGER NOT NULL DEFAULT 0,
-                bootstrap_rowid INTEGER NOT NULL DEFAULT 0,
-                bootstrap_done INTEGER NOT NULL DEFAULT 0,
-                expires_at_ms INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS delivery_bootstrap_bounds (
-                job_id TEXT NOT NULL, kind TEXT NOT NULL, max_rowid INTEGER NOT NULL,
-                PRIMARY KEY(job_id,kind)
-            );";
-
-        {
-            let conn = open_db(&db_path).unwrap();
-            v1(&conn);
-            conn.execute_batch(delivery_tables).unwrap();
-            let rowid: i64 = conn
-                .query_row("SELECT rowid FROM session_markers", [], |row| row.get(0))
-                .unwrap();
-            // No delivery job at all -- only an unexpired export still reading.
-            conn.execute(
-                "INSERT INTO history_exports \
-                 (id, bootstrap_kind, bootstrap_rowid, bootstrap_done, expires_at_ms) \
-                 VALUES ('e1', 0, 0, 0, ?)",
-                params![now_ms() + 3_600_000],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO delivery_bootstrap_bounds(job_id, kind, max_rowid) \
-                 VALUES ('e1','session_marker',?)",
-                params![rowid],
-            )
-            .unwrap();
-        }
-        let refused =
-            open_db(&db_path).expect_err("an in-flight export must not be migrated out from under");
-        let message = format!("{refused:#}");
-        assert!(
-            message.contains("delivery"),
-            "the refusal must name the remedy: {message}"
-        );
-        // And it must not have destroyed anything on the way to refusing.
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        let kept: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM pragma_table_info('session_markers') \
-                 WHERE name = 'detail_json'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(kept, 1, "refusing must leave the old column in place");
-
-        // Positive control: the same build, the same tables, but the export has
-        // expired -- nobody is owed a preimage, so it migrates normally.
-        let other = dir.path().join("expired-export.db");
-        {
-            let conn = open_db(&other).unwrap();
-            v1(&conn);
-            conn.execute_batch(delivery_tables).unwrap();
-            conn.execute(
-                "INSERT INTO history_exports \
-                 (id, bootstrap_kind, bootstrap_rowid, bootstrap_done, expires_at_ms) \
-                 VALUES ('e1', 0, 0, 0, 1)",
-                [],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO delivery_bootstrap_bounds(job_id, kind, max_rowid) \
-                 VALUES ('e1','session_marker',1)",
-                [],
-            )
-            .unwrap();
-        }
-        let conn = open_db(&other).expect("an expired export owes nothing");
-        assert_eq!(session_markers(&conn, "grok", "exp").unwrap().len(), 1);
     }
 
     /// The unpaged marker read is one snapshot, not one per page.
@@ -7665,63 +7217,6 @@ mod tests {
         }
     }
 
-    /// Delivery is an optional feature, and that is what opens the hole. A
-    /// database can carry delivery tables and capture triggers from a
-    /// delivery-enabled build, then be opened by a `--no-default-features`
-    /// build: that build adds the new `session_events` columns, because the
-    /// migration is not delivery-gated, but it never rebuilds the triggers,
-    /// because `init_export_schema` is compiled out. On the next
-    /// delivery-enabled open the trigger names are all still present, so a
-    /// read-only fast path that checks names alone is satisfied, `init_db`
-    /// never reaches the rebuild, and delivery goes on reporting success while
-    /// the new fields never leave the machine.
-    ///
-    /// So a name is not enough: the payload has to be checked too.
-    ///
-    #[cfg(feature = "export")]
-    #[test]
-    fn a_capture_trigger_missing_provider_is_not_current() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("stale-trigger.db");
-        let conn = open_db(&db_path).unwrap();
-        assert!(schema_is_current(&conn).unwrap());
-
-        let capture_sql = |conn: &Connection| -> String {
-            conn.query_row(
-                "SELECT sql FROM sqlite_master \
-                 WHERE type='trigger' AND name='delivery_session_events_insert'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap()
-        };
-
-        // Rewrite the trigger to the shape a build before these columns left
-        // behind: same name, payload one column short.
-        let omitted = "'provider',NEW.\"provider\"";
-        let sql = capture_sql(&conn);
-        assert!(
-            sql.contains(omitted),
-            "the payload must carry {omitted} before removing it, or this test proves nothing"
-        );
-        let stale_sql = sql.replace(&format!(",{omitted}"), "");
-        assert_ne!(stale_sql, sql);
-        conn.execute_batch("DROP TRIGGER delivery_session_events_insert;")
-            .unwrap();
-        conn.execute_batch(&stale_sql).unwrap();
-
-        assert!(
-            !schema_is_current(&conn).unwrap(),
-            "a trigger whose payload predates a column its table has is not current"
-        );
-
-        // And the writable open repairs it, which is the point of saying so.
-        drop(conn);
-        let conn = open_db(&db_path).unwrap();
-        assert!(capture_sql(&conn).contains(omitted));
-        assert!(schema_is_current(&conn).unwrap());
-    }
-
     #[test]
     fn read_schema_does_not_require_the_discovery_only_raw_path_index() {
         let conn = Connection::open_in_memory().unwrap();
@@ -7939,7 +7434,7 @@ mod tests {
                     [],
                 )
                 .unwrap();
-            drop_session_event_capture_triggers(&legacy);
+            drop_session_requests_view(&legacy);
             for (column, _) in REQUIRED_SESSION_EVENT_COLUMNS {
                 legacy
                     .execute_batch(&format!("ALTER TABLE session_events DROP COLUMN {column};"))
@@ -7980,107 +7475,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(row, ("kept".to_string(), None, None, None));
-        // A capture trigger created before the migration would go on emitting
-        // the old column list, so delivery would keep succeeding while these
-        // facts never left the machine. Rebuilding it is part of the upgrade.
-        let capture_sql = conn
-            .query_row(
-                "SELECT sql FROM sqlite_master \
-                 WHERE type='trigger' AND name='delivery_session_events_insert'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .ok();
-        if let Some(sql) = capture_sql {
-            for (column, _) in REQUIRED_SESSION_EVENT_COLUMNS {
-                assert!(
-                    sql.contains(*column),
-                    "the rebuilt capture trigger still omits {column}"
-                );
-            }
-        }
     }
 
-    /// Delivery is an optional feature, and that is what opens the hole. A
-    /// database can carry delivery tables and capture triggers from a
-    /// delivery-enabled build, then be opened by a `--no-default-features`
-    /// build: that build adds the new `session_events` columns, because the
-    /// migration is not delivery-gated, but it never rebuilds the triggers,
-    /// because `init_export_schema` is compiled out. On the next
-    /// delivery-enabled open the trigger names are all still present, so a
-    /// read-only fast path that checks names alone is satisfied, `init_db`
-    /// never reaches the rebuild, and delivery goes on reporting success while
-    /// the new fields never leave the machine.
-    ///
-    /// So a name is not enough: the payload has to be checked too.
-    #[cfg(feature = "export")]
-    #[test]
-    fn a_capture_trigger_with_an_outdated_payload_is_not_current() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("stale-trigger.db");
-        let conn = open_db(&db_path).unwrap();
-        assert!(schema_is_current(&conn).unwrap());
-
-        let capture_sql = |conn: &Connection| -> String {
-            conn.query_row(
-                "SELECT sql FROM sqlite_master \
-                 WHERE type='trigger' AND name='delivery_session_events_insert'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap()
-        };
-
-        // Rewrite the trigger to the shape a build before the raw facts left
-        // behind: same name, payload one column short.
-        let omitted = "'turn_id',NEW.\"turn_id\"";
-        let sql = capture_sql(&conn);
-        assert!(
-            sql.contains(omitted),
-            "the payload must carry {omitted} before removing it, or this test proves nothing"
-        );
-        let stale_sql = sql.replace(&format!(",{omitted}"), "");
-        assert_ne!(stale_sql, sql);
-        conn.execute_batch("DROP TRIGGER delivery_session_events_insert;")
-            .unwrap();
-        conn.execute_batch(&stale_sql).unwrap();
-
-        assert!(
-            !schema_is_current(&conn).unwrap(),
-            "a trigger whose payload predates a column its table has is not current"
-        );
-
-        // And the writable open repairs it, which is the point of saying so.
-        drop(conn);
-        let conn = open_db(&db_path).unwrap();
-        assert!(capture_sql(&conn).contains(omitted));
-        assert!(schema_is_current(&conn).unwrap());
-    }
-
-    /// A legacy database predates the raw-fact columns, so its capture triggers
-    /// never referenced them either; SQLite refuses to drop a column a trigger
-    /// still names.
-    fn drop_session_event_capture_triggers(conn: &Connection) {
-        // A pre-usage database also predates the derived request view. Current
-        // SQLite correctly refuses to drop one of its source columns while
-        // that view still references it, so remove the view while recreating
-        // the legacy shape this helper models.
+    /// A pre-usage database also predates the derived request view. SQLite
+    /// refuses to drop one of the view's source columns while the view still
+    /// references it, so the legacy shape is modelled without it.
+    fn drop_session_requests_view(conn: &Connection) {
         conn.execute_batch("DROP VIEW IF EXISTS session_requests;")
             .unwrap();
-        let names = conn
-            .prepare(
-                "SELECT name FROM sqlite_master \
-                 WHERE type='trigger' AND tbl_name='session_events' AND name LIKE 'delivery_%'",
-            )
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(0))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<String>>>()
-            .unwrap();
-        for name in names {
-            conn.execute_batch(&format!("DROP TRIGGER {name};"))
-                .unwrap();
-        }
     }
 
     /// A fresh database and a migrated one must end up with the same
@@ -8093,7 +7495,7 @@ mod tests {
         let legacy_path = dir.path().join("legacy-events.db");
         {
             let legacy = open_db(&legacy_path).unwrap();
-            drop_session_event_capture_triggers(&legacy);
+            drop_session_requests_view(&legacy);
             for (column, _) in REQUIRED_SESSION_EVENT_COLUMNS {
                 legacy
                     .execute_batch(&format!("ALTER TABLE session_events DROP COLUMN {column};"))

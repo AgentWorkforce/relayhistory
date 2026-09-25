@@ -465,10 +465,6 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
         );
     }
 
-    // Retention backpressure before the content pass: a session that cannot
-    // be written at the cap is not worth re-reading, and the typed stop is
-    // what the caller reports instead of attempting the next session.
-    super::ensure_capture_headroom(&conn)?;
     // The content pass, on the one path that has already read every one of
     // these files anyway. Taken *before* the writer lock: it re-reads every
     // byte of the session's files, and doing that inside the transaction
@@ -480,8 +476,7 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
     // JSONL readers ignore an incomplete final record -- one that is not
     // newline-terminated, and so is still being written -- and every evidence
     // table has a provider-native uniqueness key, so interruption followed by
-    // retry is safe for both new and growing sessions. A retention abort
-    // inside it rolls the session back and reports its usage.
+    // retry is safe for both new and growing sessions.
     let hydrated = || -> Result<_> {
         super::check_capture_cancelled()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -595,8 +590,7 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
             records_parsed,
         ))
     };
-    let (indexed, source_diagnostics, cursor_consumed_through, records_parsed) =
-        hydrated().map_err(|error| super::annotate_retention_limit(&conn, error))?;
+    let (indexed, source_diagnostics, cursor_consumed_through, records_parsed) = hydrated()?;
     if let (Some(path), Some(consumed)) = (snapshot.path.as_deref(), cursor_consumed_through) {
         // Hydration rebuilt history from offset 0 and does not otherwise
         // move the Cursor byte cursor. A later incremental sync would
@@ -4734,24 +4728,11 @@ mod tests {
         assert!(tree_child_has_events(&conn, "grok-a"));
     }
 
-    /// A marker is evidence, so a marker has to be deliverable.
-    ///
-    /// `session_markers` is where a Grok session's compaction boundaries,
-    /// system lines, synthetic turns and encrypted-reasoning traces are
-    /// stored -- for some sessions it is the *only* place anything is stored.
-    /// Durable delivery captures a table only if it is in
-    /// `delivery::schema::TABLES`, and the new table was not, so an export of
-    /// a Grok session carried its events and relationships and silently
-    /// dropped every marker. Nothing failed; the export was simply missing
-    /// evidence, which is the worst shape this repository's failures take.
-    ///
-    /// The entry is **appended**, never inserted: `delivery_jobs.bootstrap_kind`
-    /// is a persisted index into `TABLES`, so putting a row anywhere but the
-    /// end would silently re-point every in-flight job's bootstrap cursor at a
-    /// different table.
+    /// A marker is evidence, so a local export carries it: for some Grok
+    /// sessions `session_markers` is the only place anything is stored.
     #[cfg(feature = "export")]
     #[test]
-    fn a_hydrated_grok_marker_reaches_a_delivery_export() {
+    fn a_hydrated_grok_marker_reaches_a_local_export() {
         use crate::export::{create_export, export_page, ExportLimits, ExportSelection};
 
         let dir = tempfile::tempdir().unwrap();
@@ -4796,15 +4777,14 @@ mod tests {
             cursor = page.next_cursor;
         }
 
-        let delivered = |kind: &str| kinds.iter().filter(|seen| *seen == kind).count();
-        // The positive control, which passed before the fix and still does:
-        // the session's events are exported.
+        let exported = |kind: &str| kinds.iter().filter(|seen| *seen == kind).count();
+        // The positive control: the session's events are exported.
         assert!(
-            delivered("session_event") > 0,
+            exported("session_event") > 0,
             "the export carried no events at all, so it proves nothing: {kinds:?}"
         );
         assert_eq!(
-            delivered("session_marker") as i64,
+            exported("session_marker") as i64,
             markers,
             "every stored marker has to reach the export: {kinds:?}"
         );

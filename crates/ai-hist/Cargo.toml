@@ -17,8 +17,6 @@ path = "src/lib.rs"
 
 [features]
 default = []
-# Legacy feature alias for `export`.
-delivery = ["export"]
 export = []
 # Filesystem-event driver for the live-capture watch loop. Optional so the
 # crate still builds with --no-default-features on a host with no watcher
@@ -82,11 +80,7 @@ required-features = ["unstable-internal"]
 
 [[test]]
 name = "opencode_parity"
-required-features = ["export", "unstable-internal"]
-
-[[test]]
-name = "capture_retention_backpressure"
-required-features = ["export", "unstable-internal"]
+required-features = ["unstable-internal"]
 
 [[test]]
 name = "session_continuity"
