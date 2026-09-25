@@ -90,8 +90,8 @@ impl SessionStore {
     ///
     /// Continue with the last identity returned; an empty page is the end.
     /// Each page is read on one snapshot, so identities written between
-    /// pages are seen only if they sort after the cursor. A session id that
-    /// is empty names no session, and is not an identity. No payload is read:
+    /// pages are seen only if they sort after the cursor. An empty source or
+    /// session id names no session, and is not an identity. No payload is read:
     /// every step is a seek in an index that leads with the source and
     /// session.
     pub fn session_identities(
@@ -149,8 +149,8 @@ const IDENTITY_TABLES: &[(&str, &str)] = &[
 const TRAJECTORY_SOURCE: &str = "trajectory";
 
 /// The first identity in one table, or the first after a cursor. An empty
-/// session id names no session -- `ChangeQuery::session` refuses one -- so
-/// it is skipped like NULL.
+/// source or session id names no session -- `ChangeQuery::session` refuses
+/// either -- so it is skipped like NULL.
 fn seek_sql(table: &str, session: &str, after: bool) -> String {
     let range = if after {
         format!(" AND (source, {session}) > (?1, ?2)")
@@ -159,7 +159,7 @@ fn seek_sql(table: &str, session: &str, after: bool) -> String {
     };
     format!(
         "SELECT source, {session} FROM {table} \
-         WHERE {session} IS NOT NULL AND {session} <> ''{range} \
+         WHERE {session} IS NOT NULL AND {session} <> '' AND source <> ''{range} \
          ORDER BY source, {session} LIMIT 1"
     )
 }
@@ -202,6 +202,34 @@ fn next_in(
         Some((source, id)) => statement.query_row([source, id], read).optional()?,
         None => statement.query_row([], read).optional()?,
     })
+}
+
+/// Whether the store holds anything under one identity: the same tables and
+/// the same rule for what names a session as [`identities_after`], each an
+/// indexed existence probe. An empty source or session id is never one.
+pub(crate) fn identity_exists(conn: &Connection, source: &str, session_id: &str) -> Result<bool> {
+    if source.is_empty() || session_id.is_empty() {
+        return Ok(false);
+    }
+    if source == TRAJECTORY_SOURCE {
+        let found: bool = conn
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM trajectories WHERE id = ?1)")?
+            .query_row([session_id], |row| row.get(0))?;
+        if found {
+            return Ok(true);
+        }
+    }
+    for (table, session) in IDENTITY_TABLES {
+        let found: bool = conn
+            .prepare_cached(&format!(
+                "SELECT EXISTS(SELECT 1 FROM {table} WHERE source = ?1 AND {session} = ?2)"
+            ))?
+            .query_row([source, session_id], |row| row.get(0))?;
+        if found {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Up to `limit` distinct identities after `after`, in order: the merge of
@@ -351,6 +379,68 @@ mod tests {
             "the session existed throughout, so the page names it"
         );
         assert!(reader.is_autocommit(), "the page's own snapshot is closed");
+    }
+
+    /// An identity exists exactly when the listing names it, in every table,
+    /// and never for an empty source or session id; each probe is an index
+    /// search.
+    #[test]
+    fn an_identity_exists_exactly_when_it_is_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(dir.path());
+        let conn = open_db(&db).unwrap();
+        conn.execute_batch(
+            "INSERT INTO tool_calls (source, session_id, tool_use_id, name) \
+                 VALUES ('claude', 'tool-only', 't1', 'Bash'), ('', 'blank-source', 't1', 'Bash'); \
+             INSERT INTO session_observations (source, session_id, location, connector_id, \
+                 connector_instance, updated_ms) \
+                 VALUES ('some-new-agent', 'observed-only', 'remote', 'conn', 'default', 1); \
+             INSERT INTO history (source, session_id, prompt, timestamp_ms) \
+                 VALUES ('codex', '', 'no session', 1); \
+             INSERT INTO trajectories (id, decisions_json, retrospective_json, search_text, \
+                 updated_ms, timestamp_ms) VALUES ('traj-1', '[]', '{}', 'x', 1, 1);",
+        )
+        .unwrap();
+        let listed = identities_after(&conn, None, 100).unwrap();
+        assert_eq!(
+            listed,
+            [
+                ("claude", "tool-only"),
+                ("some-new-agent", "observed-only"),
+                ("trajectory", "traj-1")
+            ]
+            .map(|(source, id)| (source.to_string(), id.to_string()))
+        );
+        for (source, id) in &listed {
+            assert!(identity_exists(&conn, source, id).unwrap(), "{source} {id}");
+        }
+        for (source, id) in [
+            ("", "blank-source"),
+            ("codex", ""),
+            ("claude", "missing"),
+            ("trajectory", "missing"),
+        ] {
+            assert!(
+                !identity_exists(&conn, source, id).unwrap(),
+                "{source:?} {id:?}"
+            );
+        }
+        for (table, session) in IDENTITY_TABLES {
+            let plan: String = conn
+                .query_row(
+                    &format!(
+                        "EXPLAIN QUERY PLAN SELECT 1 FROM {table} \
+                         WHERE source = ?1 AND {session} = ?2"
+                    ),
+                    ["a", "b"],
+                    |row| row.get(3),
+                )
+                .unwrap();
+            assert!(
+                plan.starts_with(&format!("SEARCH {table}")),
+                "{table}: {plan}"
+            );
+        }
     }
 
     /// A store from before the identity index gains it on its first writable

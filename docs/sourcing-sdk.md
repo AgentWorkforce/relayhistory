@@ -288,7 +288,7 @@ id). The catalog alone misses evidence that arrives without a catalog row — a
 subagent sidechain's events, a prompt-log entry, a connector's observation — so
 this is the read for anything that decides which sessions exist, such as a
 consent baseline. A prompt that names no session is under none, an empty
-session id names no session, and a child session that only a relationship
+source or session id names no session, and a child session that only a relationship
 names is not an identity until something is stored under it; every identity
 listed is one `ChangeQuery::session` accepts. These are exactly the non-empty `(source_name, session_id)`
 pairs the change feed reports. `source_name` is the stored text;

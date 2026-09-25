@@ -551,8 +551,9 @@ fn prepare_restart(directory: &Path) -> Result<bool> {
 fn validate_identities(conn: &Connection, identities_requested: &[SessionIdentity]) -> Result<()> {
     let mut known_requested = true;
     for id in identities_requested {
-        let exists: bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sessions WHERE source=?1 AND session_id=?2) OR EXISTS(SELECT 1 FROM history WHERE source=?1 AND session_id=?2) OR EXISTS(SELECT 1 FROM session_events WHERE source=?1 AND session_id=?2)",rusqlite::params![id.source,id.session_id],|r|r.get(0))?;
-        known_requested &= exists;
+        // The identity listing's own rule, so every session status counts is
+        // one a selection can name.
+        known_requested &= ai_hist::storage::session_identity_exists(conn, id)?;
     }
     ensure!(
         known_requested,
@@ -1131,6 +1132,44 @@ mod tests {
             delivery::status(&conn, &config.job_id).unwrap().state,
             "paused"
         );
+    }
+
+    /// A session whose only evidence is a tool call or a connector
+    /// observation is one the identity listing counts, so a selection can
+    /// name it.
+    #[test]
+    fn a_session_with_only_evidence_rows_can_be_selected() {
+        let (dir, config) = fixture(SharingMode::Selected);
+        db(dir.path())
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO tool_calls (source, session_id, tool_use_id, name) \
+                     VALUES ('claude', 'tool-only', 't1', 'Bash'); \
+                 INSERT INTO session_observations (source, session_id, location, \
+                     connector_id, connector_instance, updated_ms) \
+                     VALUES ('codex', 'observed-only', 'remote', 'conn', 'default', 1);",
+            )
+            .unwrap();
+        let listed = identities(&db(dir.path()).unwrap()).unwrap();
+        for key in ["claude:tool-only", "codex:observed-only"] {
+            let identity = parse_key(key).unwrap();
+            assert!(listed.contains(&identity), "{key} is counted");
+        }
+        let config = apply(
+            dir.path(),
+            config,
+            None,
+            &["claude:tool-only", "codex:observed-only"],
+            true,
+        );
+        assert_eq!(mode(&config), SharingMode::Selected);
+        let selected = selected(dir.path()).unwrap();
+        for key in ["claude:tool-only", "codex:observed-only"] {
+            assert!(
+                selected.contains(&parse_key(key).unwrap()),
+                "{key} is selected"
+            );
+        }
     }
 
     #[test]
