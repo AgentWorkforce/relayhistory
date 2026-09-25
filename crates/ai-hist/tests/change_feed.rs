@@ -769,3 +769,340 @@ fn a_row_from_an_unknown_source_is_carried() {
     assert_eq!(changes[0].op, ChangeOp::Delete);
     assert_eq!(changes[0].source_name, "some-new-agent");
 }
+
+fn session_drain(
+    store: &SessionStore,
+    from: Watermark,
+    source: &str,
+    session: &str,
+) -> Vec<Change> {
+    store
+        .changes_since(from, ChangeQuery::default().session(source, session))
+        .unwrap()
+        .map(|change| change.unwrap())
+        .collect()
+}
+
+/// Every session the unfiltered drain names.
+fn sessions_in(changes: &[Change]) -> BTreeSet<(String, String)> {
+    changes
+        .iter()
+        .filter(|change| !change.session_id.is_empty())
+        .map(|change| (change.source_name.clone(), change.session_id.clone()))
+        .collect()
+}
+
+fn assert_session_drains_match(store: &SessionStore, from: Watermark, step: &str) {
+    let everything = drain(store, from);
+    let sessions = sessions_in(&everything);
+    assert!(sessions.len() > 1, "{step}: several sessions to tell apart");
+    for (source, session) in &sessions {
+        let expected: Vec<&Change> = everything
+            .iter()
+            .filter(|change| &change.source_name == source && &change.session_id == session)
+            .collect();
+        let filtered = session_drain(store, from, source, session);
+        assert_eq!(
+            filtered.iter().collect::<Vec<_>>(),
+            expected,
+            "{step}: {source} {session} is the whole feed restricted to that session"
+        );
+        assert!(!filtered.is_empty());
+    }
+}
+
+/// A drain restricted to one session is the unfiltered drain restricted to
+/// that session -- the same changes, rows, keys and revisions, tombstones
+/// included -- and names no other session, after syncs, updates and deletes.
+#[test]
+fn a_session_drain_is_the_feed_restricted_to_that_session() {
+    let home = Home::new();
+    for fixture in [
+        "simple-turn.jsonl",
+        "multi-block-turn.jsonl",
+        "edit-revert.jsonl",
+        "compact-boundary.jsonl",
+        "resume-marker.jsonl",
+    ] {
+        home.stage_claude(fixture);
+    }
+    home.stage_codex("compaction.jsonl");
+    home.stage_codex("with-tool-call.jsonl");
+    fs::write(
+        home.path().join(".claude/history.jsonl"),
+        "{\"display\":\"a prompt with a session\",\"timestamp\":5,\
+         \"sessionId\":\"11111111-1111-1111-1111-111111111111\"}\n\
+         {\"display\":\"a prompt without one\",\"timestamp\":6}\n",
+    )
+    .unwrap();
+    let store = home.store();
+    store.sync(Default::default()).unwrap();
+    assert_session_drains_match(&store, Watermark::START, "after a sync");
+
+    // Updates, a deleted row, and a whole session deleted with its cascade.
+    let head = store.head_revision().unwrap();
+    let writer = home.raw_writer();
+    let doomed: String = writer
+        .query_row(
+            "SELECT session_id FROM sessions WHERE source = 'claude' \
+             AND session_id <> '11111111-1111-1111-1111-111111111111' LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    writer
+        .execute_batch(&format!(
+            "UPDATE session_events SET text = 'edited' \
+                 WHERE rowid = (SELECT MIN(rowid) FROM session_events); \
+             DELETE FROM tool_calls WHERE rowid = (SELECT MIN(rowid) FROM tool_calls); \
+             UPDATE history SET project = '/elsewhere' WHERE timestamp_ms = 5; \
+             DELETE FROM sessions WHERE source = 'claude' AND session_id = '{doomed}';"
+        ))
+        .unwrap();
+    assert_session_drains_match(&store, Watermark::START, "after updates and deletes");
+    assert_session_drains_match(&store, head, "from a watermark");
+    let gone = session_drain(&store, head, "claude", &doomed);
+    assert!(
+        gone.iter()
+            .any(|change| change.kind == ChangeKind::Session && change.op == ChangeOp::Delete),
+        "the deleted session's own tombstones reach its drain: {gone:?}"
+    );
+
+    // The drain is bounded to the head at open, like the unfiltered one.
+    let changes = store
+        .changes_since(
+            Watermark::START,
+            ChangeQuery::default().session("claude", "11111111-1111-1111-1111-111111111111"),
+        )
+        .unwrap();
+    assert_eq!(changes.head(), store.head_revision().unwrap());
+
+    // A prompt that names no session is in the feed, and in no session's
+    // drain.
+    let prompts = only(&store, Watermark::START, ChangeKind::History);
+    assert!(prompts.iter().any(|change| change.session_id.is_empty()));
+    for (source, session) in sessions_in(&drain(&store, Watermark::START)) {
+        assert!(session_drain(&store, Watermark::START, &source, &session)
+            .iter()
+            .all(|change| !change.session_id.is_empty()));
+    }
+}
+
+/// A session under a source this build does not know drains like any other,
+/// and a trajectory is the session its id names.
+#[test]
+fn a_session_drain_takes_any_stored_source() {
+    let home = Home::new();
+    let store = home.store();
+    home.raw_writer()
+        .execute_batch(
+            "INSERT INTO sessions (session_id, source) VALUES ('n1', 'some-new-agent'); \
+             INSERT INTO sessions (session_id, source) VALUES ('n2', 'some-new-agent'); \
+             INSERT INTO history (source, session_id, prompt, timestamp_ms) \
+                 VALUES ('some-new-agent', 'n1', 'hi', 7); \
+             INSERT INTO trajectories (id, decisions_json, retrospective_json, search_text, \
+                 updated_ms, timestamp_ms) VALUES ('traj-1', '[]', '{}', 'x', 1, 1);",
+        )
+        .unwrap();
+    let changes = session_drain(&store, Watermark::START, "some-new-agent", "n1");
+    let kinds: Vec<ChangeKind> = changes.iter().map(|change| change.kind).collect();
+    assert_eq!(kinds, vec![ChangeKind::Session, ChangeKind::History]);
+    assert!(changes.iter().all(|change| change.source.is_none()));
+
+    let trajectory = session_drain(&store, Watermark::START, "trajectory", "traj-1");
+    assert_eq!(trajectory.len(), 1);
+    assert_eq!(trajectory[0].kind, ChangeKind::Trajectory);
+    assert!(session_drain(&store, Watermark::START, "claude", "traj-1").is_empty());
+}
+
+/// A session drain is a one-shot read: it cannot name a consumer, so it
+/// can never move one, and an empty identity is refused rather than read.
+#[test]
+fn a_session_drain_refuses_a_consumer() {
+    let home = Home::new();
+    let store = home.store();
+    for (from, query) in [
+        (
+            Watermark::CONSUMER,
+            ChangeQuery::default()
+                .consumer("probe")
+                .session("claude", "s1"),
+        ),
+        (
+            Watermark::START,
+            ChangeQuery::default()
+                .consumer("probe")
+                .session("claude", "s1"),
+        ),
+        (
+            Watermark::START,
+            ChangeQuery::default().session("claude", ""),
+        ),
+        (Watermark::START, ChangeQuery::default().session("", "s1")),
+    ] {
+        let error = store.changes_since(from, query).unwrap_err();
+        assert_eq!(error.code(), "INVALID_ARGUMENT", "{error}");
+    }
+    let changes = store
+        .changes_since(
+            Watermark::START,
+            ChangeQuery::default().session("claude", "s1"),
+        )
+        .unwrap();
+    assert_eq!(changes.commit().unwrap_err().code(), "INVALID_ARGUMENT");
+}
+
+/// One session's backfill against a store of many: run with `--ignored
+/// --nocapture` in release to print the timing.
+#[test]
+#[ignore]
+fn a_session_drain_reads_one_session_of_many() {
+    const SESSIONS: usize = 2_000;
+    const EVENTS: usize = 50;
+    let home = Home::new();
+    let store = home.store();
+    let mut writer = home.raw_writer();
+    let tx = writer.transaction().unwrap();
+    for session in 0..SESSIONS {
+        let id = format!("s{session:05}");
+        tx.execute(
+            "INSERT INTO sessions (session_id, source) VALUES (?, 'claude')",
+            [&id],
+        )
+        .unwrap();
+        for event in 0..EVENTS {
+            tx.execute(
+                "INSERT INTO session_events (source, session_id, message_id, ts_ms, role, \
+                 kind, text, event_uid) VALUES ('claude', ?1, 'm', ?2, 'assistant', 'text', \
+                 'some text', ?3)",
+                rusqlite::params![id, event as i64, format!("e{event}")],
+            )
+            .unwrap();
+        }
+        tx.execute(
+            "INSERT INTO tool_calls (source, session_id, tool_use_id, name) \
+             VALUES ('claude', ?, 't1', 'Bash')",
+            [&id],
+        )
+        .unwrap();
+    }
+    // And one long session, whose backfill pages many times over.
+    const LONG: usize = 50_000;
+    tx.execute(
+        "INSERT INTO sessions (session_id, source) VALUES ('long', 'claude')",
+        [],
+    )
+    .unwrap();
+    for event in 0..LONG {
+        tx.execute(
+            "INSERT INTO session_events (source, session_id, message_id, ts_ms, role, kind, \
+             text, event_uid) VALUES ('claude', 'long', 'm', ?1, 'assistant', 'text', \
+             'some text', ?2)",
+            rusqlite::params![event as i64, format!("e{event}")],
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
+    let rows = SESSIONS * (EVENTS + 2) + LONG + 1;
+
+    let started = std::time::Instant::now();
+    let everything = drain(&store, Watermark::START).len();
+    let full = started.elapsed();
+    let started = std::time::Instant::now();
+    let one = session_drain(&store, Watermark::START, "claude", "s01000").len();
+    let filtered = started.elapsed();
+    let started = std::time::Instant::now();
+    let unfiltered_one = drain(&store, Watermark::START)
+        .into_iter()
+        .filter(|change| change.session_id == "s01000")
+        .count();
+    let replay = started.elapsed();
+    assert_eq!(everything, rows);
+    assert_eq!(one, EVENTS + 2);
+    assert_eq!(unfiltered_one, one);
+    eprintln!(
+        "{SESSIONS} sessions, {rows} rows: one-session drain {one} changes in {filtered:?}; \
+         full drain {everything} changes in {full:?}; full replay filtered to the session \
+         in {replay:?}"
+    );
+    assert!(filtered * 20 < full, "{filtered:?} vs {full:?}");
+
+    let started = std::time::Instant::now();
+    let long = session_drain(&store, Watermark::START, "claude", "long").len();
+    let long_elapsed = started.elapsed();
+    assert_eq!(long, LONG + 1);
+    eprintln!("one session of {long} changes, default batch: {long_elapsed:?}");
+    let started = std::time::Instant::now();
+    let long = store
+        .changes_since(
+            Watermark::START,
+            ChangeQuery::default()
+                .session("claude", "long")
+                .batch(ai_hist::MAX_CHANGE_BATCH),
+        )
+        .unwrap()
+        .count();
+    eprintln!(
+        "one session of {long} changes, batch {}: {:?}",
+        ai_hist::MAX_CHANGE_BATCH,
+        started.elapsed()
+    );
+
+    // Every identity, paged at the default size.
+    let started = std::time::Instant::now();
+    let mut identities: Vec<ai_hist::SessionIdentity> = Vec::new();
+    loop {
+        let mut query = ai_hist::IdentityQuery::default();
+        if let Some(last) = identities.last() {
+            query = query.after(last.clone());
+        }
+        let page = store.session_identities(query).unwrap();
+        if page.is_empty() {
+            break;
+        }
+        identities.extend(page);
+    }
+    assert_eq!(identities.len(), SESSIONS + 1);
+    eprintln!(
+        "{} identities over {rows} rows, paged at 1,000: {:?}",
+        identities.len(),
+        started.elapsed()
+    );
+
+    // The same pages as a three-table UNION over the whole tables, for scale.
+    let started = std::time::Instant::now();
+    let reader = home.raw();
+    let mut union: Vec<(String, String)> = Vec::new();
+    loop {
+        let last = union.last().cloned();
+        let page: Vec<(String, String)> = reader
+            .prepare(
+                "SELECT source, session_id FROM (
+                    SELECT source, session_id FROM sessions
+                    UNION SELECT source, session_id FROM history WHERE session_id IS NOT NULL
+                    UNION SELECT source, session_id FROM session_events
+                ) WHERE ?1 IS NULL OR (source, session_id) > (?1, ?2)
+                ORDER BY source, session_id LIMIT 1000",
+            )
+            .unwrap()
+            .query_map(
+                rusqlite::params![
+                    last.as_ref().map(|(source, _)| source.clone()),
+                    last.as_ref().map(|(_, session)| session.clone())
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        if page.is_empty() {
+            break;
+        }
+        union.extend(page);
+    }
+    assert_eq!(union.len(), identities.len());
+    eprintln!(
+        "the same identities as a three-table UNION: {:?}",
+        started.elapsed()
+    );
+}

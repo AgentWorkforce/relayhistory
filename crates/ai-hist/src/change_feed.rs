@@ -44,6 +44,7 @@
 
 use crate::discover::{row_to_session, ShallowSession, SESSION_COLUMNS};
 use crate::relationship_graph::{map_relationship, SessionRelationship, RELATIONSHIP_COLUMNS};
+use crate::session_identities::SessionIdentity;
 use crate::session_store::{Error, SessionStore, Source};
 use crate::store::{
     ensure_columns, migration_applied, open_db, open_db_readonly, row_to_file_edit,
@@ -724,6 +725,8 @@ pub struct ChangeQuery {
     /// Rows per page, clamped to `1..=`[`MAX_CHANGE_BATCH`]; zero means
     /// [`DEFAULT_CHANGE_BATCH`].
     pub batch: usize,
+    /// Report only this session's changes; see [`ChangeQuery::session`].
+    pub session: Option<SessionIdentity>,
 }
 
 impl ChangeQuery {
@@ -744,6 +747,32 @@ impl ChangeQuery {
         self.batch = batch;
         self
     }
+
+    /// Report only one session's changes: exactly those whose
+    /// [`Change::source_name`] and [`Change::session_id`] are these, read
+    /// through each table's session index rather than the whole revision
+    /// range. `source` is the stored name; one this build does not know is
+    /// accepted.
+    ///
+    /// That is every kind that stores a session -- the catalog row, events,
+    /// tool calls, file edits, markers, relationships (under their parent
+    /// session), prompts, presences, commit links and connector
+    /// observations -- plus a trajectory, whose session is its own id under
+    /// the `trajectory` source. A prompt that names no session belongs to no
+    /// session's drain, and nor does a prompt's delete: a prompt's session is
+    /// not part of its identity, so its tombstone carries none. Both still
+    /// reach the unfiltered feed.
+    ///
+    /// A session drain is a one-shot read -- the backfill of a session an
+    /// embedder has just started following -- and cannot name a consumer
+    /// ([`Error::InvalidArgument`]): a cursor is a position in one stream,
+    /// and a position reached reading one session accounts for nothing
+    /// about the others. Each page re-seeks the session, so a long session
+    /// drains fastest with a large [`ChangeQuery::batch`].
+    pub fn session(mut self, source: impl Into<String>, session_id: impl Into<String>) -> Self {
+        self.session = Some(SessionIdentity::new(source, session_id));
+        self
+    }
 }
 
 /// The drain [`SessionStore::changes_since`] hands back.
@@ -761,6 +790,7 @@ pub struct Changes {
     conn: Connection,
     kinds: Vec<ChangeKind>,
     consumer: Option<String>,
+    session: Option<SessionIdentity>,
     batch: usize,
     head: Watermark,
     position: Watermark,
@@ -859,7 +889,8 @@ impl Changes {
             // did, and therefore above the cut. The second pass fetches the
             // rows in `(lo, cut]`, which is exactly the page, because
             // revisions are unique per write.
-            let Some(cut) = page_cut(&snapshot, &self.kinds, lo, hi, self.batch)? else {
+            let session = self.session.as_ref();
+            let Some(cut) = page_cut(&snapshot, &self.kinds, session, lo, hi, self.batch)? else {
                 // The key pass itself found nothing left: that, and only
                 // that, is exhaustion.
                 self.exhausted = true;
@@ -868,11 +899,14 @@ impl Changes {
             };
             let mut rows: Vec<Change> = Vec::with_capacity(self.batch);
             for kind in &self.kinds {
-                rows.extend(read_upserts(&snapshot, *kind, lo, cut, self.batch)?);
+                rows.extend(read_upserts(
+                    &snapshot, *kind, session, lo, cut, self.batch,
+                )?);
             }
             rows.extend(read_tombstones(
                 &snapshot,
                 &self.kinds,
+                session,
                 lo,
                 cut,
                 self.batch,
@@ -929,6 +963,7 @@ impl std::fmt::Debug for Changes {
             .field("db_path", &self.db_path)
             .field("kinds", &self.kinds)
             .field("consumer", &self.consumer)
+            .field("session", &self.session)
             .field("batch", &self.batch)
             .field("head", &self.head)
             .field("position", &self.position)
@@ -988,6 +1023,23 @@ impl SessionStore {
                     .to_string(),
             ));
         }
+        if let Some(session) = &query.session {
+            if query.consumer.is_some() {
+                return Err(Error::InvalidArgument(
+                    "changes_since: ChangeQuery::session is a one-shot read and cannot name a \
+                     consumer; a cursor committed from one session's changes would skip every \
+                     other session's. Drain the session from Watermark::START without a \
+                     consumer, and keep the named cursor for the whole feed"
+                        .to_string(),
+                ));
+            }
+            if session.source_name.is_empty() || session.session_id.is_empty() {
+                return Err(Error::InvalidArgument(
+                    "changes_since: ChangeQuery::session needs a nonempty source and session id"
+                        .to_string(),
+                ));
+            }
+        }
         let (start, head, stale_cursor) =
             resolve_start_and_head(&conn, from, query.consumer.as_deref(), &kind_set)?;
         if from != Watermark::START && from != Watermark::CONSUMER && from.epoch != head.epoch {
@@ -1011,6 +1063,7 @@ impl SessionStore {
             conn,
             kinds: kind_set.kinds,
             consumer: query.consumer,
+            session: query.session,
             batch,
             head,
             position: start,
@@ -1092,23 +1145,92 @@ fn resolve_start_and_head(
     Ok((in_store(start), head, stale_cursor))
 }
 
-/// The revision-only page query for one kind: a covering read of the
-/// revision index.
-fn upsert_key_sql(kind: ChangeKind) -> String {
-    format!(
-        "SELECT {REVISION_COLUMN} FROM {name} \
-         WHERE {REVISION_COLUMN} > ?1 AND {REVISION_COLUMN} <= ?2 \
-         ORDER BY {REVISION_COLUMN} ASC LIMIT ?3",
-        name = kind.table().name,
+/// The revision range, and its order, for one page read.
+///
+/// Unfiltered, it reads the revision index. Restricted to one session, the
+/// session's own `(source, session_id, ...)` index is the narrow one: the
+/// range is written `+revision`, which no index can serve, so the planner
+/// seeks the session and sorts only that session's rows, rather than walking
+/// the whole revision range to discard every other session's.
+fn revision_range(first: usize, filtered: bool) -> (String, String) {
+    let column = if filtered {
+        format!("+{REVISION_COLUMN}")
+    } else {
+        REVISION_COLUMN.to_string()
+    };
+    (
+        format!("{column} > ?{first} AND {column} <= ?{}", first + 1),
+        format!("ORDER BY {column} ASC LIMIT ?{}", first + 2),
     )
 }
 
-fn tombstone_key_sql() -> String {
+/// The session predicate for one kind's upsert reads, over parameters
+/// `?4` (source) and `?5` (session id), or nothing when unfiltered.
+fn upsert_session_sql(kind: ChangeKind, filtered: bool) -> String {
+    if !filtered {
+        return String::new();
+    }
+    let table = kind.table();
+    format!(
+        " AND {} = ?4 AND {}.{} = ?5",
+        table.source_sql(table.name),
+        table.name,
+        table.session
+    )
+}
+
+/// The session predicate for tombstone reads, over `?5` and `?6`.
+fn tombstone_session_sql(filtered: bool) -> &'static str {
+    if filtered {
+        " AND source = ?5 AND session_id = ?6"
+    } else {
+        ""
+    }
+}
+
+/// The revision-only page query for one kind: a covering read of the
+/// revision index, or of the session index when restricted to one session.
+fn upsert_key_sql(kind: ChangeKind, filtered: bool) -> String {
+    let (range, order) = revision_range(1, filtered);
+    format!(
+        "SELECT {REVISION_COLUMN} FROM {name} WHERE {range}{session} {order}",
+        name = kind.table().name,
+        session = upsert_session_sql(kind, filtered),
+    )
+}
+
+fn tombstone_key_sql(filtered: bool) -> String {
+    let (range, order) = revision_range(2, filtered);
     format!(
         "SELECT {REVISION_COLUMN} FROM evidence_tombstones \
-         WHERE kind = ?1 AND {REVISION_COLUMN} > ?2 AND {REVISION_COLUMN} <= ?3 \
-         ORDER BY {REVISION_COLUMN} ASC LIMIT ?4"
+         WHERE kind = ?1 AND {range}{session} {order}",
+        session = tombstone_session_sql(filtered),
     )
+}
+
+/// The parameters a page read binds: the range and limit, then the session
+/// when the drain is restricted to one.
+fn page_params(
+    kind: Option<ChangeKind>,
+    session: Option<&SessionIdentity>,
+    lo: u64,
+    hi: u64,
+    batch: usize,
+) -> Vec<rusqlite::types::Value> {
+    let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(6);
+    if let Some(kind) = kind {
+        values.push(kind.as_str().to_string().into());
+    }
+    values.extend([
+        (lo as i64).into(),
+        (hi as i64).into(),
+        (batch as i64).into(),
+    ]);
+    if let Some(session) = session {
+        values.push(session.source_name.clone().into());
+        values.push(session.session_id.clone().into());
+    }
+    values
 }
 
 /// The highest revision of the next page: the `batch`-th smallest revision
@@ -1117,6 +1239,7 @@ fn tombstone_key_sql() -> String {
 fn page_cut(
     conn: &Connection,
     kinds: &[ChangeKind],
+    session: Option<&SessionIdentity>,
     lo: u64,
     hi: u64,
     batch: usize,
@@ -1133,20 +1256,18 @@ fn page_cut(
         }
         Ok(())
     };
-    let range: [rusqlite::types::Value; 3] = [
-        (lo as i64).into(),
-        (hi as i64).into(),
-        (batch as i64).into(),
-    ];
+    let filtered = session.is_some();
+    let range = page_params(None, session, lo, hi, batch);
     for kind in kinds {
-        let mut statement = conn.prepare_cached(&upsert_key_sql(*kind))?;
+        let mut statement = conn.prepare_cached(&upsert_key_sql(*kind, filtered))?;
         collect(&mut statement, &range)?;
     }
-    let mut tombstones = conn.prepare_cached(&tombstone_key_sql())?;
+    let mut tombstones = conn.prepare_cached(&tombstone_key_sql(filtered))?;
     for kind in kinds {
-        let mut values: Vec<rusqlite::types::Value> = vec![kind.as_str().to_string().into()];
-        values.extend(range.iter().cloned());
-        collect(&mut tombstones, &values)?;
+        collect(
+            &mut tombstones,
+            &page_params(Some(*kind), session, lo, hi, batch),
+        )?;
     }
     if revisions.is_empty() {
         return Ok(None);
@@ -1284,7 +1405,7 @@ fn commit_cursor(
 /// source, session, record key -- computed by the same SQL the triggers use,
 /// so an upsert and a delete of one record name it identically; the stored
 /// columns; and the revision.
-fn upsert_sql(kind: ChangeKind, stored: &[String]) -> String {
+fn upsert_sql(kind: ChangeKind, stored: &[String], filtered: bool) -> String {
     let table = kind.table();
     let name = table.name;
     let mut select = Vec::new();
@@ -1299,17 +1420,19 @@ fn upsert_sql(kind: ChangeKind, stored: &[String]) -> String {
             .iter()
             .map(|column| format!("{name}.\"{}\"", column.replace('"', "\"\""))),
     );
+    let (range, order) = revision_range(1, filtered);
     format!(
         "SELECT {select}, {name}.{REVISION_COLUMN} FROM {name} \
-         WHERE {REVISION_COLUMN} > ?1 AND {REVISION_COLUMN} <= ?2 \
-         ORDER BY {REVISION_COLUMN} ASC LIMIT ?3",
+         WHERE {range}{session} {order}",
         select = select.join(", "),
+        session = upsert_session_sql(kind, filtered),
     )
 }
 
 fn read_upserts(
     conn: &Connection,
     kind: ChangeKind,
+    session: Option<&SessionIdentity>,
     lo: u64,
     hi: u64,
     batch: usize,
@@ -1320,10 +1443,11 @@ fn read_upserts(
         .iter()
         .map(|column| Arc::from(column.as_str()))
         .collect();
-    let mut statement = conn.prepare_cached(&upsert_sql(kind, &stored))?;
+    let mut statement = conn.prepare_cached(&upsert_sql(kind, &stored, session.is_some()))?;
     // Everything before the identity is the typed row.
     let identity = statement.column_count() - stored.len() - 4;
-    let rows = statement.query_map(params![lo as i64, hi as i64, batch as i64], |row| {
+    let values = page_params(None, session, lo, hi, batch);
+    let rows = statement.query_map(rusqlite::params_from_iter(values), |row| {
         let evidence = match kind {
             ChangeKind::Session => EvidenceRow::Session(row_to_session(row)?),
             ChangeKind::SessionEvent => EvidenceRow::SessionEvent(row_to_session_event(row)?),
@@ -1380,27 +1504,29 @@ fn read_upserts(
 /// list: the tombstone index is `(kind, revision)`, and a single-kind
 /// equality is what lets the range come back in revision order without a
 /// temporary sort.
-fn tombstone_sql() -> String {
+fn tombstone_sql(filtered: bool) -> String {
+    let (range, order) = revision_range(2, filtered);
     format!(
         "SELECT source, session_id, record_key, {REVISION_COLUMN} FROM evidence_tombstones \
-         WHERE kind = ?1 AND {REVISION_COLUMN} > ?2 AND {REVISION_COLUMN} <= ?3 \
-         ORDER BY {REVISION_COLUMN} ASC LIMIT ?4"
+         WHERE kind = ?1 AND {range}{session} {order}",
+        session = tombstone_session_sql(filtered),
     )
 }
 
 fn read_tombstones(
     conn: &Connection,
     kinds: &[ChangeKind],
+    session: Option<&SessionIdentity>,
     lo: u64,
     hi: u64,
     batch: usize,
 ) -> Result<Vec<Change>> {
     let mut changes = Vec::new();
-    let mut statement = conn.prepare_cached(&tombstone_sql())?;
+    let mut statement = conn.prepare_cached(&tombstone_sql(session.is_some()))?;
     for kind in kinds {
         let table = kind.table();
         let rows = statement.query_map(
-            params![kind.as_str(), lo as i64, hi as i64, batch as i64],
+            rusqlite::params_from_iter(page_params(Some(*kind), session, lo, hi, batch)),
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -2563,21 +2689,33 @@ mod tests {
         let mut plans = Vec::new();
         for kind in ChangeKind::ALL {
             let stored = stored_columns(&conn, kind.table().name).unwrap();
-            plans.push((kind.table().name, upsert_sql(*kind, &stored), page.clone()));
+            plans.push((
+                kind.table().name,
+                upsert_sql(*kind, &stored, false),
+                page.clone(),
+            ));
         }
         let mut tombstone_page = vec![rusqlite::types::Value::from("session_event".to_string())];
         tombstone_page.extend(page.iter().cloned());
         plans.push((
             "evidence_tombstones",
-            tombstone_sql(),
+            tombstone_sql(false),
             tombstone_page.clone(),
         ));
         // The revision-only first pass must be a covering read of the same
         // index, with no table access at all.
         for kind in ChangeKind::ALL {
-            plans.push((kind.table().name, upsert_key_sql(*kind), page.clone()));
+            plans.push((
+                kind.table().name,
+                upsert_key_sql(*kind, false),
+                page.clone(),
+            ));
         }
-        plans.push(("evidence_tombstones", tombstone_key_sql(), tombstone_page));
+        plans.push((
+            "evidence_tombstones",
+            tombstone_key_sql(false),
+            tombstone_page,
+        ));
         for (table, sql, values) in plans {
             let details: Vec<String> = conn
                 .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
@@ -2598,6 +2736,63 @@ mod tests {
             if sql.starts_with(&format!("SELECT {REVISION_COLUMN} FROM")) {
                 assert!(plan.contains("COVERING INDEX"), "{table}: {plan}");
             }
+        }
+    }
+
+    /// Restricted to one session, every page read seeks that session through
+    /// its table's session index -- never the revision index, never a scan of
+    /// the table -- and sorts only that session's rows.
+    #[test]
+    fn a_session_page_reads_the_session_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_store, conn) = store(dir.path());
+        let filter = SessionIdentity::new("claude", "s1");
+        let mut plans = Vec::new();
+        for kind in ChangeKind::ALL {
+            let stored = stored_columns(&conn, kind.table().name).unwrap();
+            let page = page_params(None, Some(&filter), 0, 1_000, 100);
+            plans.push((
+                kind.table().name,
+                upsert_sql(*kind, &stored, true),
+                page.clone(),
+            ));
+            plans.push((kind.table().name, upsert_key_sql(*kind, true), page));
+        }
+        for sql in [tombstone_sql(true), tombstone_key_sql(true)] {
+            plans.push((
+                "evidence_tombstones",
+                sql,
+                page_params(Some(ChangeKind::SessionEvent), Some(&filter), 0, 1_000, 100),
+            ));
+        }
+        for (table, sql, values) in plans {
+            let plan = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map(rusqlite::params_from_iter(values), |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .join("\n");
+            assert!(
+                plan.contains(&format!("SEARCH {table} USING")),
+                "{table}: {plan}"
+            );
+            assert!(!plan.contains(&format!("SCAN {table}")), "{table}: {plan}");
+            assert!(!plan.contains("_revision"), "{table}: {plan}");
+            // The trajectory's session is its primary key; every other
+            // table's seek binds both the source and the session.
+            if table == "trajectories" {
+                assert!(plan.contains("(id=?)"), "{table}: {plan}");
+            } else {
+                assert!(
+                    plan.contains("source=?") && plan.contains("session_id=?"),
+                    "{table}: {plan}"
+                );
+            }
+            eprintln!("{table}: {}", plan.replace('\n', " | "));
         }
     }
 
@@ -2655,24 +2850,24 @@ mod tests {
         // round wrote revisions 7k+1..7k+7, and the marker at 7k+5 is gone
         // (its tombstone sits at 7k+7), so the fifth smallest is 6.
         assert_eq!(
-            page_cut(&conn, ChangeKind::ALL, 0, head, 5).unwrap(),
+            page_cut(&conn, ChangeKind::ALL, None, 0, head, 5).unwrap(),
             Some(6)
         );
         assert_eq!(
-            page_cut(&conn, ChangeKind::ALL, 20, head, 100).unwrap(),
+            page_cut(&conn, ChangeKind::ALL, None, 20, head, 100).unwrap(),
             Some(head),
             "fewer than a page left: the cut is the head"
         );
         assert_eq!(
-            page_cut(&conn, ChangeKind::ALL, head, head, 5).unwrap(),
+            page_cut(&conn, ChangeKind::ALL, None, head, head, 5).unwrap(),
             None
         );
         // Only the rows below the cut are fetched, across every kind.
         let fetched: usize = ChangeKind::ALL
             .iter()
-            .map(|kind| read_upserts(&conn, *kind, 0, 6, 5).unwrap().len())
+            .map(|kind| read_upserts(&conn, *kind, None, 0, 6, 5).unwrap().len())
             .sum::<usize>()
-            + read_tombstones(&conn, ChangeKind::ALL, 0, 6, 5)
+            + read_tombstones(&conn, ChangeKind::ALL, None, 0, 6, 5)
                 .unwrap()
                 .len();
         assert_eq!(fetched, 5);
@@ -2835,6 +3030,7 @@ mod tests {
             conn: reader,
             kinds: ChangeKind::ALL.to_vec(),
             consumer: None,
+            session: None,
             batch: 3,
             head,
             position: Watermark::START,

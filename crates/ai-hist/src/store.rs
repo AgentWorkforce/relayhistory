@@ -712,6 +712,9 @@ const REQUIRED_INDEXES: &[&str] = &[
     "idx_session_continuity_parent_uuid",
     "idx_session_continuity_pending",
     "idx_sessions_project_key",
+    // The identity listing merges every table in `(source, session_id)`
+    // order; the catalog's primary key leads with `session_id`.
+    "idx_sessions_identity",
 ];
 
 /// Indexes no longer created: nothing queries them, or a replacement covers
@@ -754,6 +757,9 @@ const REQUIRED_EVIDENCE_READ_INDEXES: &[&str] = &[
     "idx_session_markers_page",
 ];
 const REQUIRED_SCOPE_READ_INDEXES: &[&str] = &["idx_session_presences_location"];
+/// The catalog's arm of the identity listing. Every other table's arm rides
+/// an index its own reads already require, or its primary key.
+const REQUIRED_IDENTITY_READ_INDEXES: &[&str] = &["idx_sessions_identity"];
 const REQUIRED_RELATIONSHIP_READ_INDEXES: &[&str] = &[
     "idx_session_relationships_parent",
     "idx_session_relationships_child",
@@ -829,6 +835,12 @@ pub fn schema_is_read_current(conn: &Connection) -> Result<bool> {
 /// Whether the cache-only catalog can use its sort-free query plans.
 pub fn schema_is_catalog_read_current(conn: &Connection) -> Result<bool> {
     schema_has_required_indexes(conn, REQUIRED_CATALOG_READ_INDEXES)
+}
+
+/// Whether the identity listing can seek the catalog in `(source,
+/// session_id)` order.
+pub fn schema_is_identity_read_current(conn: &Connection) -> Result<bool> {
+    schema_has_required_indexes(conn, REQUIRED_IDENTITY_READ_INDEXES)
 }
 
 /// Whether bounded event pagination has both source-scoped and source-less indexes.
@@ -1393,6 +1405,13 @@ VALUES ('session_presences_local_backfill_v1');
     )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_sessions_source_recency ON sessions(source, last_activity_ms DESC, session_id)",
+        [],
+    )?;
+    // The primary key leads with `session_id`; the identity listing merges
+    // every table's identities in `(source, session_id)` order, and needs the
+    // catalog in that order too.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_identity ON sessions(source, session_id)",
         [],
     )?;
     // Shallow discovery keys its "has this file changed?" lookup on the raw

@@ -316,10 +316,12 @@ pub ai_hist::Change::source_name: alloc::string::String
 pub ai_hist::ChangeQuery::batch: usize
 pub ai_hist::ChangeQuery::consumer: core::option::Option<alloc::string::String>
 pub ai_hist::ChangeQuery::kinds: core::option::Option<alloc::vec::Vec<ai_hist::ChangeKind>>
+pub ai_hist::ChangeQuery::session: core::option::Option<ai_hist::SessionIdentity>
 impl ai_hist::ChangeQuery
 pub fn ai_hist::ChangeQuery::batch(self, usize) -> Self
 pub fn ai_hist::ChangeQuery::consumer(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn ai_hist::ChangeQuery::kinds(self, impl core::iter::traits::collect::IntoIterator<Item = ai_hist::ChangeKind>) -> Self
+pub fn ai_hist::ChangeQuery::session(self, impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
 pub struct ai_hist::Changes
 impl ai_hist::Changes
 pub fn ai_hist::Changes::commit(&self) -> anyhow::Result<ai_hist::Watermark, ai_hist::Error>
@@ -385,6 +387,12 @@ pub ai_hist::HydrateReport::diagnostics: alloc::vec::Vec<ai_hist::Diagnostic>
 pub ai_hist::HydrateReport::related: alloc::vec::Vec<ai_hist::SessionRef>
 pub ai_hist::HydrateReport::session: ai_hist::SessionRef
 pub ai_hist::HydrateReport::status: ai_hist::HydrateStatus
+#[non_exhaustive] pub struct ai_hist::IdentityQuery
+pub ai_hist::IdentityQuery::after: core::option::Option<ai_hist::SessionIdentity>
+pub ai_hist::IdentityQuery::limit: usize
+impl ai_hist::IdentityQuery
+pub fn ai_hist::IdentityQuery::after(self, ai_hist::SessionIdentity) -> Self
+pub fn ai_hist::IdentityQuery::limit(self, usize) -> Self
 #[non_exhaustive] pub struct ai_hist::Marker
 pub ai_hist::Marker::kind: alloc::string::String
 pub ai_hist::Marker::marker_uid: alloc::string::String
@@ -560,6 +568,12 @@ pub ai_hist::SessionFileEdit::tool_name: core::option::Option<alloc::string::Str
 pub ai_hist::SessionFileEdit::tool_use_id: alloc::string::String
 pub ai_hist::SessionFileEdit::ts_ms: core::option::Option<i64>
 pub ai_hist::SessionFileEdit::user_modified: core::option::Option<i64>
+#[non_exhaustive] pub struct ai_hist::SessionIdentity
+pub ai_hist::SessionIdentity::session_id: alloc::string::String
+pub ai_hist::SessionIdentity::source_name: alloc::string::String
+impl ai_hist::SessionIdentity
+pub fn ai_hist::SessionIdentity::new(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn ai_hist::SessionIdentity::source(&self) -> core::option::Option<ai_hist::Source>
 pub struct ai_hist::SessionMarker
 pub ai_hist::SessionMarker::id: i64
 pub ai_hist::SessionMarker::kind: alloc::string::String
@@ -637,6 +651,8 @@ pub fn ai_hist::SessionStore::session(&self, &ai_hist::SessionRef, ai_hist::Sess
 pub fn ai_hist::SessionStore::sessions(&self, ai_hist::CatalogQuery) -> ai_hist::CatalogIter
 pub fn ai_hist::SessionStore::sync(&self, ai_hist::SyncOptions) -> core::result::Result<ai_hist::SyncReport, ai_hist::Error>
 pub fn ai_hist::SessionStore::watch(&self, ai_hist::WatchOptions) -> core::result::Result<ai_hist::WatchHandle, ai_hist::Error>
+impl ai_hist::SessionStore
+pub fn ai_hist::SessionStore::session_identities(&self, ai_hist::IdentityQuery) -> core::result::Result<alloc::vec::Vec<ai_hist::SessionIdentity>, ai_hist::Error>
 pub struct ai_hist::SessionToolCall
 pub ai_hist::SessionToolCall::args_json: core::option::Option<alloc::string::String>
 pub ai_hist::SessionToolCall::id: i64
