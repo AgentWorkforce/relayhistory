@@ -268,7 +268,7 @@ impl Error {
 
     /// A read-only store refusing a database written before the `what`
     /// schema this version reads.
-    fn stale_schema(db_path: &Path, what: &str) -> Self {
+    pub(crate) fn stale_schema(db_path: &Path, what: &str) -> Self {
         Self::StaleSchema(format!(
             "{} predates the {what} schema this version reads; \
              open it writable once (or run a sync) to migrate it",

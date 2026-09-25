@@ -85,7 +85,7 @@ What the facade owes you, and what it asks in return:
   `Error::UnsupportedOperation`, and a watermark the store cannot serve is
   `Error::WatermarkAheadOfStore`.
 
-## The ten operations
+## The eleven operations
 
 | Method                                           | Provider I/O                                | Database work                                                             | Lock                                             |
 | ------------------------------------------------ | ------------------------------------------- | ------------------------------------------------------------------------- | ------------------------------------------------ |
@@ -96,7 +96,8 @@ What the facade owes you, and what it asks in return:
 | `watch(WatchOptions) -> WatchHandle`             | fs-event or polling driven sweeps           | the same as `sync`, per tick                                              | `SyncRunLock`, per tick                          |
 | `sessions(CatalogQuery) -> CatalogIter`          | none                                        | keyset-paged reads over `sessions`                                        | none (WAL reader)                                |
 | `session(&SessionRef, SessionQuery)`             | none                                        | every table for one session, on one snapshot                              | none (one deferred read transaction)             |
-| `changes_since(Watermark, ChangeQuery)`          | none                                        | one indexed revision-range read per kind per page, plus tombstones        | none (one read snapshot per page)                |
+| `session_identities(IdentityQuery)`              | none                                        | one covering index seek per identity per table that holds it              | none (one read snapshot per page)                |
+| `changes_since(Watermark, ChangeQuery)`          | none                                        | one indexed revision-range read per kind per page, plus tombstones; a session drain seeks that session's index instead | none (one read snapshot per page) |
 | `head_revision() -> Watermark`                   | none                                        | one read of the feed head                                                 | none                                             |
 | `Source::capabilities() -> SourceCapabilities`   | none                                        | none — static                                                             | none                                             |
 
@@ -271,6 +272,46 @@ catalog row — `source: Source`, `project_key`, `discovery_state`, the
 provider-observed metadata — and `session_ref()` turns it into the reference
 `session` takes.
 
+### `session_identities`
+
+Every session the store holds evidence for, catalogued or not:
+`session_identities(IdentityQuery { after, limit })` returns up to `limit`
+distinct `SessionIdentity { source_name, session_id }` after `after`, in
+`(source_name, session_id)` byte order; continue with the last one returned,
+and an empty page is the end. `limit` is clamped to `1..=10_000`, and zero
+means 1,000. A session counts when any evidence table stores a row under it:
+`sessions`, `history`, `session_events`, `tool_calls`, `file_edits`,
+`session_markers`, `session_relationships` (under the parent),
+`session_presences`, `session_commit_links`, `session_observations`,
+`observation_evidence`, and `trajectories` (under the `trajectory` source, by
+id). The catalog alone misses evidence that arrives without a catalog row — a
+subagent sidechain's events, a prompt-log entry, a connector's observation — so
+this is the read for anything that decides which sessions exist, such as a
+consent baseline. A prompt that names no session is under none, an empty
+session id names no session, and a child session that only a relationship
+names is not an identity until something is stored under it; every identity
+listed is one `ChangeQuery::session` accepts. These are exactly the non-empty `(source_name, session_id)`
+pairs the change feed reports. `source_name` is the stored text;
+`SessionIdentity::source()` parses it, and is `None` for a source this build
+does not know.
+
+No payload is read. Each table offers its next identity after the cursor
+through a covering index that leads with `(source, session)`, one seek
+however many rows the session holds, and the smallest offer is the next
+identity:
+
+```text
+SEARCH session_events USING COVERING INDEX idx_session_events_session ((source,session_id)>(?,?))
+SEARCH sessions USING COVERING INDEX idx_sessions_identity ((source,session_id)>(?,?))
+SEARCH trajectories USING COVERING INDEX sqlite_autoindex_trajectories_1 (id>?)
+```
+
+Every seek of a page reads one snapshot, so a page is the store at one
+moment; an identity written between pages is seen only if it sorts after the
+cursor. The catalog's arm needs `idx_sessions_identity`, which a writable open
+adds; a read-only store over a database without it answers
+`session_identities` with `StaleSchema`, and keeps every other read.
+
 ### `session`
 
 Everything the store holds about one session, on one SQLite snapshot:
@@ -391,6 +432,30 @@ this build does not know — a row written by a newer release — and
 `source_name` is the stored name either way, so such a row is carried rather
 than failing the drain. The feed applies no consent or exclusion rule: an
 embedder that uploads applies its own selection.
+
+`ChangeQuery::session(source, session_id)` restricts a drain to one session:
+exactly the changes whose `source_name` and `session_id` are those, with the
+same rows, keys, revisions and tombstones the unfiltered drain reports for it,
+bounded to the head at open. `source` is the stored name, so a source this
+build does not know works. It covers every kind that stores a session,
+relationships under their parent, and a trajectory under the `trajectory`
+source by its id. A prompt that names no session is in no session's drain, and
+nor is a prompt's delete, whose tombstone carries no session because a
+prompt's session is not part of its key. A session drain is a one-shot read,
+such as the backfill of a session an embedder has just started following. It
+cannot name a consumer, and it has nothing to commit; either is
+`Error::InvalidArgument`, as is an empty source or session id. Keep the named
+cursor for the whole feed and drain an added session from `Watermark::START`.
+Each page reads through the table's session index, never the revision index,
+and sorts only that session's rows:
+
+```text
+SEARCH session_events USING INDEX idx_session_events_source_page (source=? AND session_id=?)
+USE TEMP B-TREE FOR ORDER BY
+```
+
+Each page seeks the session again, so a long session drains fastest with a
+large `batch`.
 
 `from` is `Watermark::START` to replay everything, an explicit watermark to
 resume from one a consumer stored itself, or `Watermark::CONSUMER` with
@@ -646,7 +711,7 @@ embedder reads before bumping.
 
 | Feature | Default | What it adds | For |
 | --- | --- | --- | --- |
-| *(none)* | ✓ | `SessionStore` and its ten operations, the change feed (`Change`, `ChangeQuery`, `Watermark`, `EvidenceRow`, `StoredRow`), `Source` and `SourceCapabilities`, `Error`, the evidence structs above, `NormalizedUsage` and the usage normalizers, `project_identity`, `declared_evidence_kinds` | Embedders |
+| *(none)* | ✓ | `SessionStore` and its eleven operations, the change feed (`Change`, `ChangeQuery`, `Watermark`, `EvidenceRow`, `StoredRow`), `SessionIdentity` and `IdentityQuery`, `Source` and `SourceCapabilities`, `Error`, the evidence structs above, `NormalizedUsage` and the usage normalizers, `project_identity`, `declared_evidence_kinds` | Embedders |
 | `fs-events` | — | The `notify` backend behind `watch`; without it `watch` polls at `poll_interval_ms`. `WatchOptions::use_fs_events` selects it when it is compiled in | The CLI, and an embedder that wants event-driven ticks |
 | `delivery` | — | Durable delivery of captured evidence to a destination | The CLI, napi, the relayhistory plugin |
 | `opencode-backup` | — | Snapshot a live OpenCode SQLite store through `rusqlite`'s backup API before reading it | The CLI, napi |
