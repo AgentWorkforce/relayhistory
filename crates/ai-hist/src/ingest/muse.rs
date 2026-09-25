@@ -625,6 +625,16 @@ pub(crate) fn normalize_link_path(path: &str) -> String {
     path.replace('\\', "/").trim_start_matches("./").to_string()
 }
 
+/// Whether a transcript is a subagent's own log by where it sits:
+/// `…/subagent/<id>/session.jsonl`. A session's transcript sits under its
+/// date directories (`…/YYYY/MM/DD/<id>/session.jsonl`), never there.
+pub(crate) fn is_subagent_log(path: &Path) -> bool {
+    path.parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == SUBAGENT_DIR)
+}
+
 /// Tools that write a file.
 pub(crate) fn is_file_edit_tool(name: &str) -> bool {
     matches!(name, "write_file" | "edit_file")
@@ -875,6 +885,14 @@ mod tests {
             &root.join("2026/09/09/p/session.jsonl"),
             root
         ));
+    }
+
+    #[test]
+    fn a_subagent_log_is_recognized_by_where_it_sits() {
+        assert!(is_subagent_log(Path::new(
+            "/s/2026/09/09/p/subagent/c/session.jsonl"
+        )));
+        assert!(!is_subagent_log(Path::new("/s/2026/09/09/p/session.jsonl")));
     }
 
     #[test]

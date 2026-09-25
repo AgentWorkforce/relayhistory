@@ -1094,12 +1094,20 @@ fn destination_shortfall(conn: &Connection, stored: &str) -> Result<SweepRepairs
     // session whose catalog row and events are both gone has no row left to be
     // found by. The union of the two tables the sweep reaches it through is
     // what keeps it nameable.
+    // A Muse subagent has no catalog row of its own, so once every event of
+    // it is gone neither table above can name it; the edge its parent's log
+    // recorded still does, and naming it is what sends the parent back to
+    // re-read the tree.
     let mut statement = conn.prepare(
         "SELECT source, session_id FROM sessions \
          WHERE source IN (SELECT value FROM json_each(?1)) \
          UNION \
          SELECT source, session_id FROM session_events \
-         WHERE source IN (SELECT value FROM json_each(?1))",
+         WHERE source IN (SELECT value FROM json_each(?1)) \
+         UNION \
+         SELECT source, child_session_id FROM session_relationships \
+         WHERE source = 'muse' AND evidence_kind = 'muse_subagent_log' \
+           AND child_session_id IS NOT NULL",
     )?;
     let mut rows = statement.query([repairable_event_sources()])?;
     while let Some(row) = rows.next()? {
@@ -10860,8 +10868,16 @@ pub(crate) fn ingest_muse_session_tree(
     path: &Path,
     children: Option<&[MuseChildLog]>,
 ) -> Result<MuseIngestOutcome> {
-    let mut outcome =
-        ingest_muse_session(conn, transcript, &path.to_string_lossy(), MuseRole::Session)?;
+    // A subagent's log is read as one wherever the read starts — a child
+    // also known remotely keeps a catalog row, and hydrating it directly must
+    // not turn its objective into a typed prompt that the parent's next sweep
+    // would take back out.
+    let role = if muse::is_subagent_log(path) {
+        MuseRole::Subagent
+    } else {
+        MuseRole::Session
+    };
+    let mut outcome = ingest_muse_session(conn, transcript, &path.to_string_lossy(), role)?;
     if let (Some(dir), Some(children)) = (path.parent(), children) {
         let mut visited = HashSet::from([transcript.metadata.session_id.clone()]);
         link_muse_subagents(
@@ -11053,6 +11069,13 @@ fn forget_muse_subagent(conn: &Connection, child_id: &str) -> Result<()> {
         params![child_id],
     )?;
     if session_has_remote_presence(conn, "muse", child_id)? {
+        // Its log is gone, so it is no longer present locally; the remote
+        // presence, and the catalog row that stands on it, stay.
+        conn.execute(
+            "DELETE FROM session_presences \
+             WHERE source = 'muse' AND session_id = ? AND location = 'local'",
+            params![child_id],
+        )?;
         return Ok(());
     }
     for statement in [
@@ -11162,18 +11185,12 @@ pub(crate) fn ingest_muse_session(
     // transcript wrote last time — the ones its stored prompt events name —
     // are removed; replacing the whole identity would delete prompts it never
     // wrote. Either way this runs before the events it reads are replaced.
-    if session_has_remote_presence(conn, SOURCE, sid)? {
-        conn.execute(
-            "DELETE FROM history WHERE source = 'muse' AND session_id = ?1 \
-               AND EXISTS (SELECT 1 FROM session_events e \
-                           WHERE e.source = 'muse' AND e.session_id = ?1 \
-                             AND e.role = 'user' AND e.kind = 'text' \
-                             AND e.ts_ms = history.timestamp_ms AND e.text = history.prompt)",
-            params![sid],
-        )?;
+    let scope = if session_has_remote_presence(conn, SOURCE, sid)? {
+        HistoryScope::OwnPromptEvents
     } else {
-        replace_session_history(conn, SOURCE, sid)?;
-    }
+        HistoryScope::Session
+    };
+    replace_session_history_scoped(conn, SOURCE, sid, scope)?;
     for statement in [
         "DELETE FROM session_events WHERE source = 'muse' AND session_id = ?",
         "DELETE FROM tool_calls WHERE source = 'muse' AND session_id = ?",
@@ -12390,7 +12407,39 @@ fn replace_grok_session_evidence(conn: &Connection, session_id: &str) -> Result<
 /// events actually carry that prompt at that moment, so the row stays true
 /// and stays owned. What is left is this session's alone, and is deleted.
 fn replace_session_history(conn: &Connection, source: &str, session_id: &str) -> Result<()> {
-    conn.execute(
+    replace_session_history_scoped(conn, source, session_id, HistoryScope::Session)
+}
+
+/// Which of a session's `history` rows a re-read owns.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HistoryScope {
+    /// Every row filed under the session.
+    Session,
+    /// Only the rows its own stored prompt events name — what the previous
+    /// read of the same transcript wrote. For a session whose identity it
+    /// shares with remote evidence, whose rows it did not write. Must run
+    /// before those events are replaced.
+    OwnPromptEvents,
+}
+
+/// [`replace_session_history`] over the rows `scope` names: each is
+/// re-attributed to another session that still evidences it, or deleted.
+fn replace_session_history_scoped(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+    scope: HistoryScope,
+) -> Result<()> {
+    let owned = match scope {
+        HistoryScope::Session => "",
+        HistoryScope::OwnPromptEvents => {
+            " AND EXISTS(SELECT 1 FROM session_events own \
+                         WHERE own.source = h.source AND own.session_id = h.session_id \
+                           AND own.role = 'user' AND own.kind = 'text' \
+                           AND own.ts_ms = h.timestamp_ms AND own.text = h.prompt)"
+        }
+    };
+    let update = format!(
         "UPDATE history AS h SET \
            session_id = (SELECT e.session_id FROM session_events e \
                          WHERE e.source = h.source AND e.role = 'user' AND e.kind = 'text' \
@@ -12406,13 +12455,11 @@ fn replace_session_history(conn: &Connection, source: &str, session_id: &str) ->
            AND EXISTS(SELECT 1 FROM session_events e \
                       WHERE e.source = h.source AND e.role = 'user' AND e.kind = 'text' \
                         AND e.session_id <> h.session_id \
-                        AND e.ts_ms = h.timestamp_ms AND e.text = h.prompt)",
-        params![source, session_id],
-    )?;
-    conn.execute(
-        "DELETE FROM history WHERE source = ? AND session_id = ?",
-        params![source, session_id],
-    )?;
+                        AND e.ts_ms = h.timestamp_ms AND e.text = h.prompt){owned}",
+    );
+    conn.execute(&update, params![source, session_id])?;
+    let delete = format!("DELETE FROM history AS h WHERE h.source = ? AND h.session_id = ?{owned}");
+    conn.execute(&delete, params![source, session_id])?;
     Ok(())
 }
 
@@ -15400,6 +15447,102 @@ mod tests {
             )
             .unwrap();
         assert_eq!(edges_from_worker, 0);
+        let local: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_presences \
+                 WHERE source = 'muse' AND session_id = ? AND location = 'local'",
+                [MUSE_WORKER],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(local, 0, "a child whose log is gone is not present locally");
+    }
+
+    /// A subagent with no catalog row and no events left can still be named
+    /// for repair — by its parent's edge — so the next plain `sync` re-reads
+    /// the parent's tree and restores it.
+    #[test]
+    fn a_muse_subagent_that_lost_every_event_is_repaired() {
+        let home = tempfile::tempdir().unwrap();
+        let _ = muse_fixture(home.path());
+        let db = home.path().join("history.db");
+        let roots = muse_roots(home.path());
+        super::sync_exclusive_with_roots(&db, &roots, false).unwrap();
+        let conn = open_db(&db).unwrap();
+        let worker_events = muse_session_count(&conn, "session_events", MUSE_WORKER);
+        conn.execute(
+            "DELETE FROM session_events WHERE source = 'muse' AND session_id = ?",
+            [MUSE_WORKER],
+        )
+        .unwrap();
+        super::sync_exclusive_with_roots(&db, &roots, false).unwrap();
+        assert_eq!(
+            muse_session_count(&conn, "session_events", MUSE_WORKER),
+            worker_events
+        );
+    }
+
+    /// Hydrating a subagent's log directly reads it as a subagent: its
+    /// objective is an event, never history.
+    #[test]
+    fn a_muse_subagent_log_read_directly_writes_no_history() {
+        let home = tempfile::tempdir().unwrap();
+        let (_, transcript) = muse_fixture(home.path());
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let log = transcript
+            .parent()
+            .unwrap()
+            .join(format!("subagent/{MUSE_WORKER}/session.jsonl"));
+        let child = super::read_muse_transcript(&log).unwrap().unwrap();
+        super::ingest_muse_session_tree(&conn, &child, &log, None).unwrap();
+        assert!(muse_session_count(&conn, "session_events", MUSE_WORKER) > 0);
+        assert_eq!(muse_session_count(&conn, "history", MUSE_WORKER), 0);
+    }
+
+    /// Scoped to its own prompt events, a remote session's history cleanup
+    /// still re-attributes a row another session evidences rather than
+    /// deleting it, and leaves rows it never wrote alone.
+    #[test]
+    fn scoped_history_cleanup_reattributes_shared_prompts() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for (session, text) in [("a", "shared"), ("b", "shared"), ("a", "only a")] {
+            conn.execute(
+                "INSERT INTO session_events (source, session_id, ts_ms, role, kind, text, event_uid) \
+                 VALUES ('muse', ?, 7, 'user', 'text', ?, ?)",
+                params![session, text, format!("{session}:{text}")],
+            )
+            .unwrap();
+        }
+        for (session, text) in [("a", "shared"), ("a", "only a"), ("a", "remote")] {
+            conn.execute(
+                "INSERT INTO history (source, session_id, prompt, timestamp_ms) \
+                 VALUES ('muse', ?, ?, 7)",
+                params![session, text],
+            )
+            .unwrap();
+        }
+        super::replace_session_history_scoped(
+            &conn,
+            "muse",
+            "a",
+            super::HistoryScope::OwnPromptEvents,
+        )
+        .unwrap();
+        let rows: Vec<(String, String)> = conn
+            .prepare("SELECT session_id, prompt FROM history ORDER BY prompt")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("a".to_string(), "remote".to_string()),
+                ("b".to_string(), "shared".to_string()),
+            ]
+        );
     }
 
     /// A rewritten transcript that no longer has a reply or a prompt does not
