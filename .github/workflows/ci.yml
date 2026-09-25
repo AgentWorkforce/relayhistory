@@ -6,6 +6,15 @@ on:
   push:
     branches:
       - main
+    # A marker-only commit immediately dispatches the release workflow, whose
+    # platform matrices otherwise compete with this entire suite for macOS and
+    # Windows runners. The code at that commit was already checked by its PR.
+    paths-ignore:
+      - '.release/dispatch-patch-*'
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -18,11 +27,19 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # This is the critical-path job. Keep its cache separate from the much
+      # larger release matrix so a PR does not evict every release target.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-verify
+
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
           cache: npm
-          cache-dependency-path: sdk-ts/package-lock.json
+          cache-dependency-path: |
+            crates/ai-hist-napi/package-lock.json
+            sdk-ts/package-lock.json
 
       - name: Physically remove optional cloud and provider packages
         run: rm -rf plugins
@@ -95,8 +112,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+      - uses: actions/cache@v4
+        id: cargo-public-api-cache
+        with:
+          path: ~/.cargo/bin/cargo-public-api
+          key: cargo-public-api-${{ runner.os }}-0.52.0
       - name: Install cargo-public-api
-        run: cargo install cargo-public-api --locked
+        if: steps.cargo-public-api-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-public-api --version 0.52.0 --locked
       - name: Public API matches the checked-in snapshot
         run: node scripts/check-public-api.mjs
 
@@ -178,6 +201,19 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+          cache: npm
+          cache-dependency-path: |
+            crates/ai-hist-napi/package-lock.json
+            sdk-ts/package-lock.json
+            plugins/relayhistory/sdk/package-lock.json
+            plugins/provider-sources/sdk/package-lock.json
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            plugins/relayhistory/rust -> target
+            plugins/provider-sources/rust -> target
+          key: ci-optional-history-plugins
       - name: Optional helper packaging contracts
         run: node --test scripts/history-helper-packaging.composed.mjs
       - name: Build composed distribution
