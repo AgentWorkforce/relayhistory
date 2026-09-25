@@ -75,7 +75,12 @@ INSERT INTO session_events (source, session_id, message_id, ts_ms, role, kind, t
            ('claude', 'catalogued', 'm', 1, 'user', 'text', 'z', 'e1');
 INSERT INTO history (source, session_id, prompt, timestamp_ms)
     VALUES ('codex', 'history-only', 'a prompt', 1),
-           ('codex', NULL, 'a prompt with no session', 2);
+           ('codex', NULL, 'a prompt with no session', 2),
+           ('claude', '', 'a prompt with an empty session', 3);
+INSERT INTO session_events (source, session_id, message_id, ts_ms, role, kind, text, event_uid)
+    VALUES ('grok', '', 'm', 1, 'user', 'text', 'no session', 'e1');
+INSERT INTO trajectories (id, decisions_json, retrospective_json, search_text, updated_ms,
+    timestamp_ms) VALUES ('', '[]', '{}', 'x', 1, 1);
 INSERT INTO tool_calls (source, session_id, tool_use_id, name)
     VALUES ('claude', 'tool-only', 't1', 'Bash');
 INSERT INTO file_edits (source, session_id, tool_use_id, file_path, tool_name)
@@ -103,8 +108,9 @@ INSERT INTO trajectories (id, decisions_json, retrospective_json, search_text, u
 
 /// A session counts when any table stores a row under it: an events-only
 /// sidechain and a history-only prompt log appear beside the catalog, each
-/// once, in order, while a prompt with no session and a child only an edge
-/// names do not.
+/// once, in order, while a prompt with no session, rows under an empty
+/// session id, and a child only an edge names do not. Every identity listed
+/// is one `ChangeQuery::session` accepts.
 #[test]
 fn every_stored_session_is_an_identity_once() {
     let store = store();
@@ -127,6 +133,15 @@ fn every_stored_session_is_an_identity_once() {
             ("trajectory", "traj-1"),
         ]
     );
+    for identity in &identities {
+        assert!(store
+            .store
+            .changes_since(
+                Watermark::START,
+                ChangeQuery::default().session(&identity.source_name, &identity.session_id),
+            )
+            .is_ok());
+    }
     assert_eq!(identities[0].source(), Some(Source::Claude));
     assert_eq!(identities[9].source(), None, "an unknown source is carried");
     assert_eq!(identities[10].source(), Some(Source::Trajectory));

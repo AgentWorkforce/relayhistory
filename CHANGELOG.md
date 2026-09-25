@@ -197,12 +197,15 @@ Notable changes to the native `ai-hist` CLI are documented here.
   or not: the union of the catalog, prompts, events, tool calls, file edits,
   markers, relationships (by parent), presences, commit links, connector
   observations and trajectories. It is a merge of covering index seeks, so no
-  payload is read. `SessionIdentity` names a stored session, including one
+  payload is read; each page reads one snapshot, and an empty session id is
+  no session. `SessionIdentity` names a stored session, including one
   under a source this build does not know, and is the type
   `ChangeQuery::session` holds. `storage::session_identities_after` is the
   same read, and now covers every one of those tables rather than the catalog,
-  prompts and events alone. `sessions` gains an index on
-  `(source, session_id)`.
+  prompts and events alone, and reads each page on one snapshot even on an
+  autocommit connection. `sessions` gains `idx_sessions_identity` on
+  `(source, session_id)`, added by the first writable open; until then a
+  read-only store answers `session_identities` with `StaleSchema`.
 - The change feed reports every evidence table and each row exactly as
   stored. `ChangeKind` gains `History`, `Presence`, `CommitLink`,
   `Trajectory`, `SourceObservation` and `ObservationEvidence` (`ALL` lists

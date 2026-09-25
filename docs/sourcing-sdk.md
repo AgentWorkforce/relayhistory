@@ -287,9 +287,10 @@ means 1,000. A session counts when any evidence table stores a row under it:
 id). The catalog alone misses evidence that arrives without a catalog row — a
 subagent sidechain's events, a prompt-log entry, a connector's observation — so
 this is the read for anything that decides which sessions exist, such as a
-consent baseline. A prompt that names no session is under none, and a child
-session that only a relationship names is not an identity until something is
-stored under it. These are exactly the non-empty `(source_name, session_id)`
+consent baseline. A prompt that names no session is under none, an empty
+session id names no session, and a child session that only a relationship
+names is not an identity until something is stored under it; every identity
+listed is one `ChangeQuery::session` accepts. These are exactly the non-empty `(source_name, session_id)`
 pairs the change feed reports. `source_name` is the stored text;
 `SessionIdentity::source()` parses it, and is `None` for a source this build
 does not know.
@@ -305,8 +306,11 @@ SEARCH sessions USING COVERING INDEX idx_sessions_identity ((source,session_id)>
 SEARCH trajectories USING COVERING INDEX sqlite_autoindex_trajectories_1 (id>?)
 ```
 
-Each page is read on its own snapshot, so an identity written between pages
-is seen only if it sorts after the cursor.
+Every seek of a page reads one snapshot, so a page is the store at one
+moment; an identity written between pages is seen only if it sorts after the
+cursor. The catalog's arm needs `idx_sessions_identity`, which a writable open
+adds; a read-only store over a database without it answers
+`session_identities` with `StaleSchema`, and keeps every other read.
 
 ### `session`
 

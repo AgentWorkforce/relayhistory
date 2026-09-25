@@ -13,7 +13,7 @@
 //! a seek per identity per table that holds it, never a scan.
 
 use crate::session_store::{Error, SessionStore, Source};
-use crate::store::open_db_readonly;
+use crate::store::{open_db_readonly, schema_is_identity_read_current};
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension};
 
@@ -89,8 +89,9 @@ impl SessionStore {
     /// reports in [`crate::Change::session_id`].
     ///
     /// Continue with the last identity returned; an empty page is the end.
-    /// Each page is read in its own snapshot, so identities written between
-    /// pages are seen only if they sort after the cursor. No payload is read:
+    /// Each page is read on one snapshot, so identities written between
+    /// pages are seen only if they sort after the cursor. A session id that
+    /// is empty names no session, and is not an identity. No payload is read:
     /// every step is a seek in an index that leads with the source and
     /// session.
     pub fn session_identities(
@@ -103,9 +104,14 @@ impl SessionStore {
         };
         let conn = open_db_readonly(self.db_path())
             .map_err(|error| Error::DatabaseOpen(format!("{error:#}")))?;
-        let snapshot = conn.unchecked_transaction().map_err(Error::sql)?;
+        // The gate is here rather than at `open`, like the change feed's: a
+        // read-only store over a database without the catalog's identity
+        // index keeps every other read, and is told how to get this one.
+        if !schema_is_identity_read_current(&conn).map_err(Error::query)? {
+            return Err(Error::stale_schema(self.db_path(), "session-identity"));
+        }
         let page = identities_after(
-            &snapshot,
+            &conn,
             query
                 .after
                 .as_ref()
@@ -113,7 +119,6 @@ impl SessionStore {
             limit,
         )
         .map_err(Error::query)?;
-        snapshot.commit().map_err(Error::sql)?;
         Ok(page
             .into_iter()
             .map(|(source_name, session_id)| SessionIdentity {
@@ -143,7 +148,9 @@ const IDENTITY_TABLES: &[(&str, &str)] = &[
 /// A trajectory is a session of its own, under a source it does not store.
 const TRAJECTORY_SOURCE: &str = "trajectory";
 
-/// The first identity in one table, or the first after a cursor.
+/// The first identity in one table, or the first after a cursor. An empty
+/// session id names no session -- `ChangeQuery::session` refuses one -- so
+/// it is skipped like NULL.
 fn seek_sql(table: &str, session: &str, after: bool) -> String {
     let range = if after {
         format!(" AND (source, {session}) > (?1, ?2)")
@@ -151,7 +158,8 @@ fn seek_sql(table: &str, session: &str, after: bool) -> String {
         String::new()
     };
     format!(
-        "SELECT source, {session} FROM {table} WHERE {session} IS NOT NULL{range} \
+        "SELECT source, {session} FROM {table} \
+         WHERE {session} IS NOT NULL AND {session} <> ''{range} \
          ORDER BY source, {session} LIMIT 1"
     )
 }
@@ -160,7 +168,7 @@ fn trajectory_sql(after: bool) -> &'static str {
     if after {
         "SELECT id FROM trajectories WHERE id > ?1 ORDER BY id LIMIT 1"
     } else {
-        "SELECT id FROM trajectories ORDER BY id LIMIT 1"
+        "SELECT id FROM trajectories WHERE id > '' ORDER BY id LIMIT 1"
     }
 }
 
@@ -198,7 +206,29 @@ fn next_in(
 
 /// Up to `limit` distinct identities after `after`, in order: the merge of
 /// every table's ordered identities, each advanced only past what it offered.
+///
+/// Every seek of a page reads one snapshot: the caller's transaction when it
+/// holds one -- a consent baseline spanning many pages -- and otherwise one
+/// deferred read transaction per page. Each seek is its own statement, and on
+/// an autocommit connection each would see its own moment: an identity whose
+/// only row moves from a table not yet sought to one already sought -- a
+/// sidechain's events adopted into the catalog, say -- would be in the store
+/// throughout and in no arm's answer.
 pub(crate) fn identities_after(
+    conn: &Connection,
+    after: Option<(&str, &str)>,
+    limit: usize,
+) -> Result<Vec<Identity>> {
+    if conn.is_autocommit() {
+        let snapshot = conn.unchecked_transaction()?;
+        let page = merge_page(&snapshot, after, limit)?;
+        snapshot.commit()?;
+        return Ok(page);
+    }
+    merge_page(conn, after, limit)
+}
+
+fn merge_page(
     conn: &Connection,
     after: Option<(&str, &str)>,
     limit: usize,
@@ -231,6 +261,154 @@ pub(crate) fn identities_after(
 mod tests {
     use super::*;
     use crate::session_store::StoreOptions;
+    use crate::store::open_db;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    fn open(dir: &std::path::Path) -> std::path::PathBuf {
+        let db = dir.join("ai-history.db");
+        SessionStore::open(StoreOptions {
+            db_path: Some(db.clone()),
+            ..StoreOptions::default()
+        })
+        .unwrap();
+        db
+    }
+
+    /// A page is one snapshot even on an autocommit connection. An identity
+    /// whose only row moves from a table the page has not sought yet to one
+    /// it already has -- committed by another connection between the two
+    /// seeks -- is still in the page, because every seek reads the store as
+    /// it stood when the page began.
+    #[test]
+    fn a_page_reads_one_snapshot_on_an_autocommit_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(dir.path());
+        open_db(&db)
+            .unwrap()
+            .execute(
+                "INSERT INTO session_events (source, session_id, message_id, ts_ms, role, kind, \
+                 text, event_uid) VALUES ('claude', 'moving', 'm', 1, 'user', 'text', 'x', 'e1')",
+                [],
+            )
+            .unwrap();
+
+        let reader = open_db_readonly(&db).unwrap();
+        assert!(reader.is_autocommit());
+        // A page with no hook first, so every statement is prepared and the
+        // schema parsed: what remains to count is each seek's own work.
+        assert_eq!(identities_after(&reader, None, 10).unwrap().len(), 1);
+        // How many progress callbacks the catalog's arm -- the first seek a
+        // page runs -- takes on its own. The move fires just past them: after
+        // that seek has read the catalog, before the events arm reads.
+        let counted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&counted);
+        reader.progress_handler(
+            1,
+            Some(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                false
+            }),
+        );
+        assert_eq!(
+            next_in(&reader, Some(("sessions", "session_id")), None).unwrap(),
+            None
+        );
+        let first_arm = counted.load(Ordering::SeqCst);
+        let fired = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&fired);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let db_for_hook = db.clone();
+        // The move lands in one transaction, so at every moment the session
+        // is in exactly one of the two tables.
+        reader.progress_handler(
+            1,
+            Some(move || {
+                if seen.fetch_add(1, Ordering::SeqCst) == first_arm && !flag.swap(true, Ordering::SeqCst) {
+                    open_db(&db_for_hook)
+                        .unwrap()
+                        .execute_batch(
+                            "BEGIN IMMEDIATE; \
+                             DELETE FROM session_events WHERE session_id = 'moving'; \
+                             INSERT INTO sessions (session_id, source) VALUES ('moving', 'claude'); \
+                             COMMIT;",
+                        )
+                        .unwrap();
+                }
+                false
+            }),
+        );
+        let page = identities_after(&reader, None, 10).unwrap();
+        reader.progress_handler(0, None::<fn() -> bool>);
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "the move must have interleaved"
+        );
+        assert_eq!(
+            page,
+            vec![("claude".to_string(), "moving".to_string())],
+            "the session existed throughout, so the page names it"
+        );
+        assert!(reader.is_autocommit(), "the page's own snapshot is closed");
+    }
+
+    /// A store from before the identity index gains it on its first writable
+    /// open, and the catalog's arm then seeks it; until then a read-only
+    /// store refuses the listing and names the remedy.
+    #[test]
+    fn an_older_store_gains_the_identity_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(dir.path());
+        open_db(&db)
+            .unwrap()
+            .execute_batch("DROP INDEX idx_sessions_identity;")
+            .unwrap();
+        let read_only = SessionStore::open(StoreOptions {
+            db_path: Some(db.clone()),
+            read_only: true,
+            ..StoreOptions::default()
+        })
+        .unwrap();
+        let error = read_only
+            .session_identities(IdentityQuery::default())
+            .unwrap_err();
+        assert!(error.is_stale_schema(), "{error}");
+
+        let store = SessionStore::open(StoreOptions {
+            db_path: Some(db.clone()),
+            ..StoreOptions::default()
+        })
+        .unwrap();
+        let conn = open_db(&db).unwrap();
+        let present: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'idx_sessions_identity')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(present, "the writable open migrated the index");
+        let plan: String = conn
+            .query_row(
+                &format!(
+                    "EXPLAIN QUERY PLAN {}",
+                    seek_sql("sessions", "session_id", true)
+                ),
+                ["a", "b"],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            plan.contains("COVERING INDEX idx_sessions_identity")
+                || plan.contains("COVERING INDEX delivery_identity_sessions"),
+            "{plan}"
+        );
+        assert!(store.session_identities(IdentityQuery::default()).is_ok());
+        assert!(read_only
+            .session_identities(IdentityQuery::default())
+            .is_ok());
+    }
 
     /// Every seek is an index search on `(source, session)` -- a covering
     /// read that never touches a payload -- and none scans its table.

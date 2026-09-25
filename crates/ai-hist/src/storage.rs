@@ -221,9 +221,10 @@ pub fn latest_history_for_session(
 
 /// Bounded, deduplicated identities across every table that stores a
 /// session, the same read as [`crate::SessionStore::session_identities`], so
-/// an export exclusion cannot miss partially read data. Continue with the
-/// last returned identity; hold a read transaction when a consistent
-/// multi-page baseline is required.
+/// an export exclusion cannot miss partially read data. Each page reads one
+/// snapshot -- the caller's transaction, or its own on an autocommit
+/// connection. Continue with the last returned identity; hold a read
+/// transaction when a consistent multi-page baseline is required.
 #[cfg(feature = "export")]
 pub fn session_identities_after(
     conn: &Connection,
