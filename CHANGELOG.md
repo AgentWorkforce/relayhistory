@@ -22,6 +22,23 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Added
 
+- Muse Code (Meta's `muse` CLI) is a first-class source, `muse`. Sessions are
+  read from `$XDG_DATA_HOME/muse/sessions/YYYY/MM/DD/<id>/session.jsonl`
+  (`~/.local/share/muse/sessions` by default) by discovery, `sync`,
+  targeted hydration and live capture: typed prompts become `history` rows at
+  the microsecond time Muse recorded them, and each session gets its prose,
+  readable thinking, tool calls and results (status from Muse's own
+  `tool_batch.effect.terminal` outcome, and a non-zero `bash` exit code),
+  `write_file` / `edit_file` edits, per-model-step token usage (normalized as
+  `per-request`), models, CLI version and lifecycle markers (`turn_end`,
+  `session_start`, `session_resumed`, `session_end`, `model_switch`,
+  `encrypted_reasoning`). Subagent and reminder logs
+  (`subagent/<id>/session.jsonl`, at any depth) are indexed under the child's
+  own session id and linked to their parent as `delegated` children, typed
+  from the parent's `task_stream_linked` record; they are not catalogued as
+  sessions and their objectives are not history rows. A Muse hydration
+  reports `full`. `ai-hist resume` prints `muse resume <id>`, and the sync
+  service forwards `XDG_DATA_HOME`.
 - Markers reach the SDK, MCP and both CLIs. `getSessionMarkersPage(source,
   sessionId, {limit, after})`, the `sessionMarkers()` iterator and
   `getSessionMarkers()` read one source's session on the evidence keyset
@@ -184,6 +201,9 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Rust API
 
+- `Source::Muse` and `ProviderRoots::muse` (the Muse Code sessions directory;
+  `from_env` honours `XDG_DATA_HOME`). Both types are `#[non_exhaustive]`, so
+  this is additive.
 - `SessionStore::has_session(&SessionIdentity)` answers whether the store
   holds anything under one identity, by the same tables and rule as
   `session_identities`: true exactly when the listing would name it, false for

@@ -302,6 +302,8 @@ pub struct DiscoveryEnv<'a> {
     pub codex_home: PathBuf,
     /// Grok state root.
     pub grok_home: PathBuf,
+    /// Muse Code session logs.
+    pub muse_sessions: PathBuf,
     /// Path to the opencode database.
     pub opencode_db: PathBuf,
     /// Root of OpenCode's legacy `storage/` JSON tree, read only when there
@@ -327,6 +329,7 @@ impl<'a> DiscoveryEnv<'a> {
             claude_config_dir: roots.claude,
             codex_home: roots.codex,
             grok_home: roots.grok,
+            muse_sessions: roots.muse,
             opencode_db: roots.opencode_db,
             opencode_storage_dir: roots.opencode_storage_dir,
             conn,
@@ -354,9 +357,11 @@ impl<'a> DiscoveryEnv<'a> {
             .parent()
             .map(|parent| parent.join("storage"))
             .unwrap_or_else(|| home.join(".local/share/opencode/storage"));
+        let muse = crate::paths::default_muse_sessions_dir(&home);
         Self::with_provider_roots(
             conn,
             crate::ProviderRoots {
+                muse,
                 home,
                 claude: claude_config_dir,
                 codex: codex_home,
@@ -393,6 +398,7 @@ impl<'a> DiscoveryEnv<'a> {
             claude_config_dir: &self.claude_config_dir,
             codex_home: &self.codex_home,
             grok_home: &self.grok_home,
+            muse_sessions: &self.muse_sessions,
             opencode_db: &self.opencode_db,
             opencode_storage_dir: &self.opencode_storage_dir,
             counters: &self.counters,
@@ -434,6 +440,8 @@ pub struct ScanEnv<'a> {
     pub codex_home: &'a Path,
     /// Grok state root.
     pub grok_home: &'a Path,
+    /// Muse Code session logs.
+    pub muse_sessions: &'a Path,
     /// Path to the opencode database.
     pub opencode_db: &'a Path,
     /// Root of OpenCode's legacy `storage/` JSON tree.
@@ -481,6 +489,8 @@ pub struct ProviderRoots<'a> {
     pub codex: &'a Path,
     /// Grok state root.
     pub grok: &'a Path,
+    /// Muse Code session logs.
+    pub muse: &'a Path,
     /// Path to the opencode database.
     pub opencode_db: &'a Path,
 }
@@ -990,6 +1000,7 @@ pub fn shallow_providers() -> Vec<Box<dyn ShallowSessionProvider>> {
         Box::new(CodexProvider),
         Box::new(CursorProvider),
         Box::new(GrokProvider),
+        Box::new(MuseProvider),
         Box::new(OpencodeProvider::default()),
         Box::new(RelayProvider),
     ]
@@ -2037,6 +2048,133 @@ fn grok_update_bounds(
         .filter_map(parse_record)
         .find_map(|record| crate::ingest::grok::line_timestamp_ms(&record));
     Ok((first, last))
+}
+
+// ---------------------------------------------------------------------------
+// muse
+// ---------------------------------------------------------------------------
+
+/// Muse Code: one append-only `session.jsonl` per session under
+/// `muse/sessions/YYYY/MM/DD/<session-id>/`. Subagent and reminder children
+/// write their own transcripts under `subagent/` beside the parent; those are
+/// not sessions of their own and are never enumerated.
+struct MuseProvider;
+
+impl ShallowSessionProvider for MuseProvider {
+    fn acquire(
+        &self,
+        _home: &Path,
+        _observation: &crate::observations::SessionObservation,
+    ) -> Result<crate::sources::AcquiredEvidence> {
+        Ok(crate::sources::AcquiredEvidence::LocalFiles)
+    }
+    fn source(&self) -> &'static str {
+        "muse"
+    }
+    /// The transcript parser writes prompts, events, tool calls, file edits
+    /// and `delegated` edges to the subagent logs beside the session: every
+    /// kind a full session is made of.
+    fn evidence_kinds(&self) -> &'static [EvidenceKind] {
+        FULL_SESSION_KINDS
+    }
+
+    fn watch_roots(&self, roots: &ProviderRoots<'_>) -> Vec<WatchRoot> {
+        vec![WatchRoot::tree(roots.muse.to_path_buf())]
+    }
+
+    fn enumerate(
+        &self,
+        env: &DiscoveryEnv<'_>,
+        _requested_limit: Option<usize>,
+    ) -> Result<Vec<Candidate>> {
+        file_candidates(
+            "muse",
+            crate::collect_muse_transcripts(&env.muse_sessions)?,
+            crate::file_stamp_and_modified,
+        )
+    }
+
+    /// Enumeration is top-level transcripts only, but a subagent log is
+    /// evidence too: sync stamps it, and a background subagent keeps writing
+    /// after its parent has stopped. Left out of the fold, a tick whose only
+    /// change was a child log would sit behind an unchanged fingerprint and
+    /// never reach the sweep that reads it.
+    fn fingerprint_inputs(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
+        let mut files = Vec::new();
+        for transcript in crate::collect_muse_transcripts(&env.muse_sessions)? {
+            files.extend(crate::muse_session_files(&transcript)?);
+        }
+        file_candidates("muse", files, crate::file_stamp_and_modified)
+    }
+
+    fn read_shallow(
+        &self,
+        scan: &ScanEnv<'_>,
+        _catalog: Option<&Connection>,
+        candidate: &Candidate,
+    ) -> Result<Option<ShallowSession>> {
+        use crate::ingest::muse;
+        let path = PathBuf::from(&candidate.locator);
+        // A subagent's log is never a session of its own, however the
+        // candidate arrived — enumeration skips them, a watch hit or a
+        // by-path read need not.
+        if muse::is_subagent_log(&path) {
+            return Ok(None);
+        }
+        let bounded = read_bounded_jsonl(scan, &path)?;
+        // A permission frame can precede the metadata record, so the header
+        // is looked for rather than assumed to be the first line.
+        let Some(metadata) = bounded
+            .head_records()
+            .filter_map(parse_record)
+            .find_map(|record| muse::parse_metadata(&record))
+        else {
+            return Ok(None);
+        };
+        let own_stream = |record: &Value| {
+            record.pointer("/stream/id").and_then(Value::as_str)
+                == Some(metadata.session_id.as_str())
+        };
+        let mut models = Vec::new();
+        push_unique(&mut models, metadata.model_id.as_deref());
+        let mut first_prompt = None;
+        for record in bounded.head_records().filter_map(parse_record) {
+            if !own_stream(&record) {
+                continue;
+            }
+            match muse::parse_event(&record) {
+                Some(muse::MuseEvent::Prompt { text }) if first_prompt.is_none() => {
+                    first_prompt = Some(excerpt(&text));
+                }
+                Some(muse::MuseEvent::ModelCompleted { model, .. }) => {
+                    push_unique(&mut models, model.as_deref());
+                }
+                _ => {}
+            }
+            if first_prompt.is_some() && models.len() > 1 {
+                break;
+            }
+        }
+        let last_activity_ms = bounded
+            .tail_records_rev()
+            .filter_map(parse_record)
+            .filter(own_stream)
+            .find_map(|record| muse::recorded_ms(&record));
+        Ok(Some(ShallowSession {
+            source: "muse".into(),
+            session_id: metadata.session_id,
+            cwd: metadata.workspace_root,
+            first_activity_ms: metadata.recorded_ms,
+            last_activity_ms: last_activity_ms
+                .or(metadata.recorded_ms)
+                .or_else(|| crate::file_modified_ms(&path)),
+            first_prompt,
+            models,
+            agent_version: metadata.cli_version,
+            raw_path: Some(candidate.locator.clone()),
+            ..Default::default()
+        }))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3210,6 +3348,7 @@ pub(crate) fn provider_watch_roots(source: &str, roots: &crate::ProviderRoots) -
             claude: &roots.claude,
             codex: &roots.codex,
             grok: &roots.grok,
+            muse: &roots.muse,
             opencode_db: &roots.opencode_db,
         },
     )

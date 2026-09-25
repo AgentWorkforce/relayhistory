@@ -247,6 +247,7 @@ so every result reports it:
 |---|---|---|---|---|
 | `codex` | always | yes | yes | yes |
 | `claude` | sometimes (only versions that emit a per-child `agentId`) | yes | yes | yes |
+| `muse` | always | yes | yes | yes |
 | `cursor`, `grok`, `opencode`, `relay` | never | no | no | no |
 
 A linked child's events are stored under the child's own session id and are

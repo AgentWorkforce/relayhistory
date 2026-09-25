@@ -3866,3 +3866,42 @@ fn cancellation_during_row_emission_preserves_the_committed_window() {
         assert_eq!(resumed.summary.discovered, 0);
     }
 }
+
+/// A Muse subagent's log is never a session of its own, however it reaches
+/// the shallow reader — enumeration skips it, a by-path read must too.
+#[test]
+fn muse_shallow_read_refuses_a_subagent_log() {
+    let home = tempfile::tempdir().unwrap();
+    let conn = catalog();
+    let session = home
+        .path()
+        .join(".local/share/muse/sessions/2026/09/20/parent");
+    let header = |id: &str| {
+        format!(
+            "{{\"id\":\"r1\",\"stream\":{{\"kind\":\"session\",\"id\":\"{id}\"}},\
+             \"recorded_at\":1790337600000000,\"payload_type\":\"runtime.session.metadata\",\
+             \"payload\":{{\"kind\":\"metadata\",\"record\":{{\"workspace_root\":\"/w\"}}}}}}\n"
+        )
+    };
+    write(&session.join("session.jsonl"), &header("parent"));
+    let child = session.join("subagent/child/session.jsonl");
+    write(&child, &header("child"));
+
+    let env = env_at(&conn, home.path());
+    let candidates = MuseProvider.enumerate(&env, None).unwrap();
+    assert_eq!(candidates.len(), 1, "only the parent is enumerated");
+    let mut by_path = candidates[0].clone();
+    by_path.locator = child.to_string_lossy().into_owned();
+    assert!(MuseProvider
+        .read_shallow(&env.scan(), None, &by_path)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        MuseProvider
+            .read_shallow(&env.scan(), None, &candidates[0])
+            .unwrap()
+            .unwrap()
+            .session_id,
+        "parent"
+    );
+}

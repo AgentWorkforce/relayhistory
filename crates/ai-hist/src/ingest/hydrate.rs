@@ -1356,7 +1356,7 @@ fn validate_options(options: &HydrateSessionOptions) -> Result<()> {
     }
     if !matches!(
         options.source.as_str(),
-        "claude" | "codex" | "cursor" | "grok" | "relay" | "opencode"
+        "claude" | "codex" | "cursor" | "grok" | "relay" | "opencode" | "muse"
     ) {
         return Err(hydration_error(
             "INVALID_ARGUMENT",
@@ -1588,6 +1588,22 @@ fn source_snapshot(
             inventory.bytes,
             SnapshotRecords::DeferredGrok(path.clone()),
             inventory.stamp,
+        )
+    } else if options.source == "muse" && options.include_related {
+        // With related evidence, a Muse session is its transcript plus the
+        // subagent logs beside it; the stamp and the counts cover all of them,
+        // so a child that grew after the parent's last record is still a
+        // change. Without it, the transcript alone, like any other file.
+        let mut bytes = 0i64;
+        let mut records = 0i64;
+        for file in muse_session_files(&path)? {
+            bytes += file.metadata()?.len() as i64;
+            records += complete_jsonl_records(&file)?;
+        }
+        (
+            bytes,
+            SnapshotRecords::Counted(records),
+            muse_session_stamp(&path)?,
         )
     } else if let Some(snapshot) = captured_claude.as_ref() {
         // The hook already read these bytes; nothing here opens the file.
@@ -1905,6 +1921,7 @@ pub(crate) fn validate_provider_path(
         ],
         "cursor" => vec![provider_roots.home.join(".cursor/projects")],
         "grok" => vec![provider_roots.grok.join("sessions")],
+        "muse" => vec![provider_roots.muse.clone()],
         _ => Vec::new(),
     };
     let canonical = fs::canonicalize(path)?;
@@ -2131,6 +2148,20 @@ fn ingest_selected(
         }
         "grok" => ingest_grok(conn, options, path.unwrap())
             .map(|diagnostics| (whole_file(), diagnostics, None)),
+        "muse" => {
+            let path = path.unwrap();
+            let diagnostics = ingest_muse(conn, options, path)?;
+            let mut outcome = whole_file();
+            // With related evidence the read covers every subagent log too.
+            if options.include_related {
+                outcome.bytes_read = muse_session_files(path)?
+                    .iter()
+                    .filter_map(|file| file.metadata().ok())
+                    .map(|metadata| metadata.len() as i64)
+                    .sum();
+            }
+            Ok((outcome, diagnostics, None))
+        }
         "opencode" => {
             let path = path.unwrap();
             // Whichever layout `source_snapshot` validated this locator
@@ -2954,6 +2985,114 @@ fn ingest_grok(
     }
     let outcome = ingest_grok_session(conn, &session, &path.to_string_lossy())?;
     Ok(grok_diagnostics(&outcome))
+}
+
+fn ingest_muse(
+    conn: &Connection,
+    options: &HydrateSessionOptions,
+    path: &Path,
+) -> Result<Vec<HydrationDiagnostic>> {
+    // Subagent logs are related evidence: read and linked only when the
+    // caller asked for it, and otherwise left exactly as they are.
+    let tree = if options.include_related {
+        read_muse_tree(path)?
+    } else {
+        read_muse_transcript(path)?.map(|transcript| (transcript, Vec::new()))
+    };
+    let (transcript, children) = tree.ok_or_else(|| {
+        hydration_error(
+            "SESSION_SOURCE_MISMATCH",
+            "Muse Code transcript has no session metadata",
+        )
+    })?;
+    if transcript.metadata.session_id != options.session_id {
+        return Err(hydration_error(
+            "SESSION_SOURCE_MISMATCH",
+            "Muse Code transcript identity does not match the catalog row",
+        ));
+    }
+    let outcome = ingest_muse_session_tree(
+        conn,
+        &transcript,
+        path,
+        options.include_related.then_some(children.as_slice()),
+    )?;
+    Ok(muse_diagnostics(&outcome))
+}
+
+/// What a Muse Code transcript could not establish on its own. Every code
+/// describes an absence in Muse's records, not a failure of this run.
+fn muse_diagnostics(outcome: &MuseIngestOutcome) -> Vec<HydrationDiagnostic> {
+    let diagnostic = |code: &str, message: String| HydrationDiagnostic {
+        code: code.to_string(),
+        message,
+        duration_ms: None,
+        source_bytes: None,
+        records_parsed: None,
+    };
+    let mut diagnostics = Vec::new();
+    if outcome.encrypted_reasoning > 0 {
+        diagnostics.push(diagnostic(
+            "MUSE_REASONING_ENCRYPTED",
+            format!(
+                "{} reasoning record(s) carried only an encrypted trace; each is recorded as \
+                 an encrypted_reasoning marker rather than as thinking text",
+                outcome.encrypted_reasoning
+            ),
+        ));
+    }
+    if outcome.unattached_usage > 0 {
+        diagnostics.push(diagnostic(
+            "MUSE_USAGE_UNATTACHED",
+            format!(
+                "{} model step(s) reported usage but committed no assistant record in the \
+                 same run to carry it; that usage is not stored on any event",
+                outcome.unattached_usage
+            ),
+        ));
+    }
+    if outcome.subagent_calls > outcome.worker_children {
+        diagnostics.push(diagnostic(
+            "MUSE_SUBAGENT_LOG_MISSING",
+            format!(
+                "{} subagent_spawn call(s) but {} subagent log(s) beside the session; a \
+                 spawn with no log is visible as a tool call and has no child to link",
+                outcome.subagent_calls, outcome.worker_children
+            ),
+        ));
+    }
+    if outcome.unidentified_children > 0 {
+        diagnostics.push(diagnostic(
+            "MUSE_SUBAGENT_LOG_UNIDENTIFIED",
+            format!(
+                "{} subagent log(s) carried no session metadata, so there is no child \
+                 session id to link them under",
+                outcome.unidentified_children
+            ),
+        ));
+    }
+    if outcome.results_without_outcome > 0 {
+        diagnostics.push(diagnostic(
+            "MUSE_TOOL_OUTCOME_MISSING",
+            format!(
+                "{} tool result(s) had no tool_batch.effect.terminal record for their call; \
+                 their status is unknown rather than assumed",
+                outcome.results_without_outcome
+            ),
+        ));
+    }
+    if outcome.unparsed_lines > 0 {
+        diagnostics.push(diagnostic(
+            "MUSE_LINES_UNPARSED",
+            format!(
+                "{} complete line(s) of session.jsonl were not JSON records and were \
+                 skipped; a live session's unterminated last line is not counted, it is \
+                 read once Muse finishes it",
+                outcome.unparsed_lines
+            ),
+        ));
+    }
+    diagnostics
 }
 
 /// What a Grok session directory could not establish on its own.
@@ -3998,6 +4137,46 @@ mod tests {
         collect_chat_history(home, &mut found);
         found.sort();
         found.pop().expect("a staged chat_history.jsonl")
+    }
+
+    /// A hydration that did not ask for related evidence indexes the session
+    /// and leaves its subagent logs alone; asking for it links them.
+    #[test]
+    fn muse_hydration_links_subagents_only_when_related_evidence_is_asked_for() {
+        let dir = tempfile::tempdir().unwrap();
+        copy_tree(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/muse/tools-session"),
+            dir.path(),
+        );
+        let transcript = dir
+            .path()
+            .join(".local/share/muse/sessions/2026/09/20/muse-a001/session.jsonl");
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "muse", "muse-a001", Some(&transcript));
+        let counts = |conn: &Connection| -> (i64, i64) {
+            conn.query_row(
+                "SELECT (SELECT COUNT(*) FROM session_relationships WHERE source = 'muse'), \
+                        (SELECT COUNT(*) FROM session_events \
+                         WHERE source = 'muse' AND session_id <> 'muse-a001')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+
+        let mut without = options("muse", "muse-a001");
+        without.include_related = false;
+        let result = hydrate_session_at_with_home(&db, &without, dir.path()).unwrap();
+        assert!(result.related_session_ids.is_empty());
+        assert_eq!(counts(&conn), (0, 0), "no child evidence was written");
+
+        let result =
+            hydrate_session_at_with_home(&db, &options("muse", "muse-a001"), dir.path()).unwrap();
+        assert_eq!(result.related_session_ids.len(), 3);
+        let (edges, child_events) = counts(&conn);
+        assert_eq!(edges, 3);
+        assert!(child_events > 0);
     }
 
     fn copy_tree(from: &Path, to: &Path) {

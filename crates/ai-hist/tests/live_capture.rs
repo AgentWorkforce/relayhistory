@@ -32,6 +32,7 @@ struct HomeLayout {
     claude: PathBuf,
     codex: PathBuf,
     grok: PathBuf,
+    muse: PathBuf,
     opencode_db: PathBuf,
 }
 
@@ -43,6 +44,7 @@ impl HomeLayout {
             claude: home.join(".claude"),
             codex: home.join(".codex"),
             grok: home.join(".grok"),
+            muse: home.join(".local/share/muse/sessions"),
             opencode_db: home.join(".local/share/opencode/opencode.db"),
         }
     }
@@ -53,6 +55,7 @@ impl HomeLayout {
             claude: &self.claude,
             codex: &self.codex,
             grok: &self.grok,
+            muse: &self.muse,
             opencode_db: &self.opencode_db,
         }
     }
@@ -535,7 +538,8 @@ fn every_file_backed_provider_contributes_a_watch_root() {
 
 /// A relocated provider root moves the watch with it.
 ///
-/// `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `GROK_HOME` already move what a sweep
+/// `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME` and (for Muse Code)
+/// `XDG_DATA_HOME` already move what a sweep
 /// reads. A watch root rebuilt from `$HOME` instead would leave live capture
 /// staring at a directory the provider never writes to: every sweep correct,
 /// every one of them waiting out the backstop.
@@ -547,6 +551,7 @@ fn configured_provider_roots_move_the_watch_roots() {
         claude: PathBuf::from("/tmp/relayhistory-relocated/claude"),
         codex: PathBuf::from("/tmp/relayhistory-relocated/codex"),
         grok: PathBuf::from("/tmp/relayhistory-relocated/grok"),
+        muse: PathBuf::from("/tmp/relayhistory-relocated/xdg-data/muse/sessions"),
         opencode_db: PathBuf::from("/tmp/relayhistory-relocated/opencode/opencode.db"),
     };
     let roots = ai_hist::discover::watch_roots(&shallow_providers(), &layout.roots());
@@ -556,6 +561,7 @@ fn configured_provider_roots_move_the_watch_roots() {
         layout.codex.join("sessions"),
         layout.codex.join("archived_sessions"),
         layout.grok.join("sessions"),
+        layout.muse.clone(),
         layout
             .opencode_db
             .parent()
@@ -572,7 +578,8 @@ fn configured_provider_roots_move_the_watch_roots() {
             .iter()
             .any(|root| root.path.starts_with(home.join(".claude"))
                 || root.path.starts_with(home.join(".codex"))
-                || root.path.starts_with(home.join(".grok"))),
+                || root.path.starts_with(home.join(".grok"))
+                || root.path.starts_with(home.join(".local/share/muse"))),
         "a configured root must not leave a $HOME-relative watch behind: {roots:?}"
     );
 }

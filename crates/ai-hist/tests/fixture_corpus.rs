@@ -63,6 +63,9 @@ enum Origin {
     Burn,
     /// Authored here, for a log shape burn's corpus does not cover.
     RelayHistory,
+    /// Derived from `xhluca/session-migrate`'s native corpus (MIT): a
+    /// transcript the real harness CLI wrote, kept verbatim line by line.
+    SessionMigrate,
 }
 
 struct Fixture {
@@ -637,6 +640,23 @@ const CORPUS: &[Fixture] = &[
         files: &["grok/events-session"],
         quirk: "documented Grok Build layout: `chat_history.jsonl` with `tool_calls[]`, ACP `updates.jsonl` with real `agentTimestampMs` times, `compaction_checkpoints/`, `subagents/`, `signals.json` and `prompt_context.json`",
     },
+    // -- muse --------------------------------------------------------------
+    Fixture {
+        source: "muse",
+        name: "cli-capture",
+        layout: Layout::HomeTree,
+        origin: Origin::SessionMigrate,
+        files: &["muse/cli-capture"],
+        quirk: "a transcript the real `muse` CLI (0.2.1) wrote, trimmed to its conversation, tool and lifecycle records: three runs across two resumes, `read_file` calls with one failed outcome, per-step `model_completed` usage, and mirrored reminder task records",
+    },
+    Fixture {
+        source: "muse",
+        name: "tools-session",
+        layout: Layout::HomeTree,
+        origin: Origin::RelayHistory,
+        files: &["muse/tools-session"],
+        quirk: "authored from the documented shape: a permission frame before the metadata, encrypted and readable reasoning, `edit_file`/`write_file` edits, a `bash` result that exits 101, a mirrored subagent task stream, a mid-session model switch, and `subagent/` logs — a worker with its own nested child, and a reminder — linked as delegated children rather than catalogued as sessions",
+    },
     // -- opencode ----------------------------------------------------------
     Fixture {
         source: "opencode",
@@ -854,6 +874,9 @@ fn capture(fixture: &Fixture, home: &Path) -> Value {
     std::env::set_var("USERPROFILE", home);
     std::env::set_var("OPENCODE_DB", &opencode_db);
     std::env::remove_var("AI_HIST_DB");
+    // Muse Code's root follows `XDG_DATA_HOME`; the fixture's own `HOME`
+    // layout has to win over whatever the machine running the tests sets.
+    std::env::remove_var("XDG_DATA_HOME");
 
     let db = home.join("ai-history.db");
     let mut notes: Vec<String> = Vec::new();
@@ -2297,4 +2320,151 @@ fn grok_events_and_real_timestamps_reach_session_events() {
             .all(|entry| field(entry, "timestamp_ms").as_i64() != Some(FIXTURE_MTIME_MS + 1)),
         "prompt timestamps come from the record, not from `created_at + index`: {prompts:?}"
     );
+}
+
+/// A transcript the real Muse CLI wrote: every prompt is a history row at the
+/// microsecond time Muse recorded, every read is a tool call joined to its
+/// result by call id, and the one call whose `tool_batch.effect.terminal`
+/// failed is the one marked as an error.
+#[test]
+fn muse_cli_capture_reaches_history_tools_and_recorded_times() {
+    let prompts = rows("muse/cli-capture", "history");
+    assert_eq!(prompts.len(), 3, "{prompts:?}");
+    assert_eq!(
+        field(&prompts[0], "timestamp_ms").as_i64(),
+        Some(1_788_223_110_680),
+        "the prompt's own `recorded_at`, in milliseconds: {prompts:?}"
+    );
+    let calls = rows("muse/cli-capture", "tool_calls");
+    let failed: Vec<&str> = calls
+        .iter()
+        .filter(|call| field(call, "is_error").as_i64() == Some(1))
+        .map(|call| text(call, "tool_use_id"))
+        .collect();
+    assert_eq!(failed, vec!["call_muse_missing"], "{calls:?}");
+    let events = rows("muse/cli-capture", "session_events");
+    assert!(
+        events
+            .iter()
+            .filter(|event| text(event, "role") == "user")
+            .all(|event| !text(event, "text").starts_with("Role:")),
+        "a mirrored task stream is never a prompt: {events:?}"
+    );
+    // Tool steps log `model_completed` before their calls and prose steps
+    // after their reply; every one of the six steps keeps its usage.
+    let with_usage: Vec<&str> = events
+        .iter()
+        .filter(|event| !field(event, "token_json").is_null())
+        .map(|event| text(event, "kind"))
+        .collect();
+    assert_eq!(
+        with_usage,
+        vec!["tool_use", "tool_use", "tool_use", "text", "text", "text"],
+        "{events:?}"
+    );
+}
+
+/// The authored Muse session: edits reach `file_edits`, a completed `bash`
+/// call whose command exited non-zero is an error, usage lands once per model
+/// step, and every `subagent/` log — a worker, the worker's own child and a
+/// reminder — is linked as a `delegated` child under the id its own metadata
+/// names, without becoming a catalog row or a typed prompt.
+#[test]
+fn muse_tools_session_records_edits_errors_usage_and_linked_subagents() {
+    const PARENT: &str = "muse-a001";
+    const WORKER: &str = "muse-c001";
+    const NESTED: &str = "muse-c002";
+    const REMINDER: &str = "muse-e001";
+    let edits = rows("muse/tools-session", "file_edits");
+    let mut paths: Vec<&str> = edits.iter().map(|edit| text(edit, "file_path")).collect();
+    paths.sort_unstable();
+    assert_eq!(paths, vec!["src/http.rs", "tests/retry.rs"], "{edits:?}");
+    let calls = rows("muse/tools-session", "tool_calls");
+    let bash = calls
+        .iter()
+        .find(|call| text(call, "tool_use_id") == "call_bash")
+        .expect("bash call");
+    assert_eq!(field(bash, "is_error").as_i64(), Some(1), "{bash:?}");
+    let events = rows("muse/tools-session", "session_events");
+    let parent_usage_rows = events
+        .iter()
+        .filter(|event| text(event, "session_id") == PARENT)
+        .filter(|event| !field(event, "token_json").is_null())
+        .count();
+    assert_eq!(
+        parent_usage_rows, 4,
+        "one row per model_completed step: {events:?}"
+    );
+    // Each step's usage sits on that step's first record: step 1's on its
+    // readable reasoning (not on the tool calls the same step committed),
+    // step 2's on its first call, the replies' on the replies.
+    let owners: Vec<(String, i64)> = events
+        .iter()
+        .filter(|event| text(event, "session_id") == PARENT)
+        .filter_map(|event| {
+            let usage: serde_json::Value =
+                serde_json::from_str(field(event, "token_json").as_str()?).ok()?;
+            Some((
+                text(event, "event_uid").to_string(),
+                usage["input_tokens"].as_i64()?,
+            ))
+        })
+        .collect();
+    assert_eq!(
+        owners,
+        vec![
+            ("a001-rec-006".to_string(), 1200),
+            ("tool:call_edit".to_string(), 1500),
+            ("a001-rec-020".to_string(), 1800),
+            ("a001-rec-029".to_string(), 2000),
+        ]
+    );
+
+    let sessions = rows("muse/tools-session", "sessions");
+    assert_eq!(
+        sessions.len(),
+        1,
+        "children are not catalog rows: {sessions:?}"
+    );
+    assert_eq!(
+        text(&sessions[0], "models_json"),
+        r#"["meta/muse-spark-1.3","meta/muse-spark-1.3-contributor"]"#
+    );
+    let history = rows("muse/tools-session", "history");
+    assert!(
+        history.iter().all(|row| text(row, "session_id") == PARENT),
+        "a child's objective is not a typed prompt: {history:?}"
+    );
+
+    let edges = rows("muse/tools-session", "session_relationships");
+    let edge = |child: &str| {
+        edges
+            .iter()
+            .find(|edge| text(edge, "child_session_id") == child)
+            .unwrap_or_else(|| panic!("no edge to {child}: {edges:?}"))
+    };
+    for (child, parent, agent_type, depth) in [
+        (WORKER, PARENT, "worker", 1),
+        (REMINDER, PARENT, "reminder", 1),
+        (NESTED, WORKER, "worker", 2),
+    ] {
+        let edge = edge(child);
+        assert_eq!(text(edge, "parent_session_id"), parent, "{edge:?}");
+        assert_eq!(text(edge, "relationship"), "delegated", "{edge:?}");
+        assert_eq!(text(edge, "child_agent_type"), agent_type, "{edge:?}");
+        assert_eq!(field(edge, "spawn_depth").as_i64(), Some(depth), "{edge:?}");
+        assert_eq!(
+            field(edge, "child_has_events").as_i64(),
+            Some(1),
+            "{edge:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| text(event, "session_id") == child),
+            "the child's events are stored under its own id: {child}"
+        );
+    }
+    assert_eq!(text(edge(NESTED), "child_model"), "meta/muse-glimmer-30b");
+    assert_eq!(text(edge(WORKER), "child_agent_name"), "reviewer");
 }
