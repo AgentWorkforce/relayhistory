@@ -10821,8 +10821,21 @@ fn direct_muse_child_logs(session_dir: &Path) -> Result<Vec<PathBuf>> {
     for entry in entries {
         let entry = entry.with_context(|| format!("list Muse subagents {}", children.display()))?;
         let log = entry.path().join(muse::SESSION_FILE);
-        if log.is_file() {
-            logs.push(log);
+        // Only "not there" means absent. A log that cannot be statted is
+        // still there, and treating it as gone would forget its evidence;
+        // the error fails this session's read instead, so it is retried.
+        match fs::metadata(&log) {
+            Ok(metadata) if metadata.is_file() => logs.push(log),
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("stat Muse subagent log {}", log.display()))
+            }
         }
     }
     logs.sort();
@@ -15488,6 +15501,47 @@ mod tests {
             muse_session_count(&conn, "session_events", MUSE_WORKER),
             worker_events
         );
+    }
+
+    /// A subagent log that is there but cannot be read is not a log that is
+    /// gone: the session's read fails and is retried, and the child keeps
+    /// its evidence and its edge.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_muse_subagent_log_is_not_forgotten() {
+        use std::os::unix::fs::PermissionsExt;
+        const REMINDER: &str = "muse-e001";
+        let home = tempfile::tempdir().unwrap();
+        let (root, transcript) = muse_fixture(home.path());
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        let reminder_events = muse_session_count(&conn, "session_events", REMINDER);
+        assert!(reminder_events > 0);
+
+        // The parent changes, so its tree is read again; the reminder's
+        // directory stays listable but its log can no longer be statted.
+        append_muse_record(&transcript, MUSE_PARENT, "parent-late", "More.");
+        let reminder_dir = transcript
+            .parent()
+            .unwrap()
+            .join(format!("subagent/{REMINDER}"));
+        fs::set_permissions(&reminder_dir, fs::Permissions::from_mode(0o644)).unwrap();
+        let stat_blocked = fs::metadata(reminder_dir.join("session.jsonl")).is_err();
+        let result = super::sync_muse(&conn, &mut state, &root);
+        fs::set_permissions(&reminder_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        if !stat_blocked {
+            // Running as a user permissions do not bind (root in a
+            // container): there is nothing unreadable to test.
+            return;
+        }
+        assert!(result.is_err(), "the only session could not be read");
+        assert_eq!(
+            muse_session_count(&conn, "session_events", REMINDER),
+            reminder_events,
+            "an unreadable log is not a deleted one"
+        );
+        assert_eq!(muse_count(&conn, "session_relationships"), 3);
     }
 
     /// A removed child's leftover history — filed under it before it was
