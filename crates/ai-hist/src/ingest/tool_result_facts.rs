@@ -352,10 +352,13 @@ pub fn codex_output_facts(output: &Value, call_id: &str) -> ToolResultFacts {
 /// separate `tool_batch.effect.terminal` record, passed here as
 /// `(outcome.kind, reason)`; without one the status stays `unknown`. A `bash`
 /// result that completed as a call but whose command exited non-zero is an
-/// error too, the way Codex reads `exit_code`.
+/// error too, the way Codex reads `exit_code`. Only a `bash` result: any
+/// other tool's output is the tool's data, and a file that happens to hold
+/// `{"exit_code": 1}` is not a failed read.
 pub fn muse_tool_result_facts(
     text: Option<&str>,
     call_id: &str,
+    tool_name: Option<&str>,
     outcome: Option<(&str, Option<&str>)>,
 ) -> ToolResultFacts {
     let payload = text.map_or(Value::Null, |text| Value::String(text.to_string()));
@@ -376,6 +379,7 @@ pub fn muse_tool_result_facts(
     };
     facts.result_status = Some(status.to_string());
     if status == STATUS_COMPLETED
+        && tool_name == Some("bash")
         && text
             .and_then(crate::ingest::muse::bash_exit_code)
             .is_some_and(|code| code != 0)
@@ -399,6 +403,20 @@ fn first_str(line: &Map<String, Value>, keys: &[&str]) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Only a `bash` result's `exit_code` is a failure signal; any other
+    /// tool's output is data that may happen to contain the same key.
+    #[test]
+    fn muse_exit_codes_fail_only_bash_results() {
+        let text = Some(r#"{"exit_code":101}"#);
+        let completed = Some(("completed", None));
+        let bash = muse_tool_result_facts(text, "c1", Some("bash"), completed);
+        assert_eq!(bash.result_status.as_deref(), Some(STATUS_ERRORED));
+        assert_eq!(bash.error_signal.as_deref(), Some(ERROR_SIGNAL_EXIT_CODE));
+        let read = muse_tool_result_facts(text, "c2", Some("read_file"), completed);
+        assert_eq!(read.result_status.as_deref(), Some(STATUS_COMPLETED));
+        assert_eq!(read.error_signal, None);
+    }
 
     #[test]
     fn stable_stringify_sorts_object_keys_and_keeps_array_order() {

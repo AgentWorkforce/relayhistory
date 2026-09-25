@@ -423,7 +423,14 @@ fn parse_tool_call(call: &Value) -> Option<MuseToolCall> {
 pub(crate) fn parse_transcript(contents: &str) -> Option<MuseTranscript> {
     let mut values = Vec::new();
     let mut unparsed_lines = 0;
-    for line in contents.lines() {
+    // Only newline-terminated records are committed. A live session's last
+    // line may still be mid-write, and a prefix of a record can itself be
+    // valid JSON, so the unterminated tail is left for the next read.
+    let complete = match contents.rfind('\n') {
+        Some(end) => &contents[..=end],
+        None => "",
+    };
+    for line in complete.lines() {
         if line.trim().is_empty() {
             continue;
         }
@@ -470,6 +477,91 @@ pub(crate) fn parse_transcript(contents: &str) -> Option<MuseTranscript> {
         });
     }
     Some(transcript)
+}
+
+/// Which assistant record each model step's `model_completed` belongs to.
+///
+/// Muse does not write the two in one order. A step that calls tools logs
+/// `model_completed` *before* `assistant_tool_calls_committed`; a step that
+/// answers in prose logs `assistant_message_committed` *before* its
+/// `model_completed` (both are in the real 0.2.1 capture). So a step's usage
+/// is paired, within one run, with the first assistant record committed since
+/// the previous step closed — earlier or later, whichever the step wrote —
+/// and never carried across a prompt or a run's `terminal`.
+///
+/// Returns `(owners, orphans)`: `owners` maps an assistant record's index to
+/// its step's `model_completed` index, and `orphans` counts steps that
+/// reported usage but committed no assistant record to carry it.
+pub(crate) fn pair_model_steps(transcript: &MuseTranscript) -> (HashMap<usize, usize>, usize) {
+    #[derive(Default)]
+    struct Run {
+        /// A step's first commit, not yet paired with its `model_completed`.
+        open_commit: Option<usize>,
+        /// A `model_completed` waiting for the commit its step writes next.
+        pending: Option<usize>,
+    }
+    let has_usage = |index: usize| {
+        matches!(
+            &transcript.records[index].event,
+            MuseEvent::ModelCompleted { usage: Some(_), .. }
+        )
+    };
+    let mut owners = HashMap::new();
+    let mut orphans = 0;
+    let mut runs: HashMap<Option<&str>, Run> = HashMap::new();
+    for (index, record) in transcript.records.iter().enumerate() {
+        let run = runs.entry(record.run_id.as_deref()).or_default();
+        match &record.event {
+            MuseEvent::AssistantText { .. }
+            | MuseEvent::ToolCalls { .. }
+            | MuseEvent::Reasoning { text: Some(_), .. } => {
+                if let Some(step) = run.pending.take() {
+                    owners.insert(index, step);
+                    run.open_commit = None;
+                } else if run.open_commit.is_none() {
+                    run.open_commit = Some(index);
+                }
+            }
+            MuseEvent::ModelCompleted { .. } => {
+                if let Some(step) = run.pending.take() {
+                    orphans += usize::from(has_usage(step));
+                }
+                match run.open_commit.take() {
+                    Some(commit) => {
+                        owners.insert(commit, index);
+                    }
+                    None => run.pending = Some(index),
+                }
+            }
+            MuseEvent::Prompt { .. } | MuseEvent::RunTerminal { .. } => {
+                if let Some(step) = run.pending.take() {
+                    orphans += usize::from(has_usage(step));
+                }
+                run.open_commit = None;
+            }
+            _ => {}
+        }
+    }
+    orphans += runs
+        .values()
+        .filter_map(|run| run.pending)
+        .filter(|step| has_usage(*step))
+        .count();
+    (owners, orphans)
+}
+
+/// Every call's tool name, by call id.
+pub(crate) fn tool_names(transcript: &MuseTranscript) -> HashMap<&str, &str> {
+    transcript
+        .records
+        .iter()
+        .filter_map(|record| match &record.event {
+            MuseEvent::ToolCalls { calls, .. } => Some(calls),
+            _ => None,
+        })
+        .flatten()
+        .map(|call| (call.call_id.as_str(), call.name.as_str()))
+        .collect()
 }
 
 /// Every call's authoritative outcome, by call id.
@@ -671,7 +763,8 @@ mod tests {
             ),
             run(8, json!({"kind": "terminal", "terminal": "completed"})),
         ]
-        .join("\n");
+        .join("\n")
+            + "\n";
         let transcript = parse_transcript(&contents).unwrap();
         let kinds: Vec<_> = transcript
             .records
@@ -701,6 +794,54 @@ mod tests {
             Some(&("failed", Some("denied")))
         );
         assert_eq!(transcript.models(), vec!["meta/muse-spark".to_string()]);
+    }
+
+    /// Tool steps log usage before their calls; prose steps after their
+    /// reply. Both pair with the right record, and neither leaks into the
+    /// next step or the next run.
+    #[test]
+    fn model_steps_pair_with_their_commit_in_either_order() {
+        let usage = json!({"input_tokens": 1, "output_tokens": 1});
+        let contents = [
+            metadata(),
+            run(2, json!({"kind": "started", "prompt": "go"})),
+            run(3, json!({"kind": "model_completed", "usage": usage})),
+            run(
+                4,
+                json!({"kind": "assistant_tool_calls_committed",
+                       "tool_calls": [{"call_id": "c", "name": "bash", "args": "{}"}]}),
+            ),
+            run(
+                5,
+                json!({"kind": "assistant_message_committed", "text": "done"}),
+            ),
+            run(6, json!({"kind": "model_completed", "usage": usage})),
+            run(7, json!({"kind": "model_completed", "usage": usage})),
+            run(8, json!({"kind": "terminal", "terminal": "completed"})),
+        ]
+        .join("\n")
+            + "\n";
+        let transcript = parse_transcript(&contents).unwrap();
+        let (owners, orphans) = pair_model_steps(&transcript);
+        // Record indexes: 0 prompt, 1 usage, 2 calls, 3 reply, 4 usage,
+        // 5 usage with nothing to carry it, 6 terminal.
+        assert_eq!(owners.get(&2), Some(&1));
+        assert_eq!(owners.get(&3), Some(&4));
+        assert_eq!(owners.len(), 2);
+        assert_eq!(orphans, 1);
+    }
+
+    #[test]
+    fn an_unterminated_last_line_is_not_read_yet() {
+        let contents = format!(
+            "{}\n{}",
+            metadata(),
+            run(2, json!({"kind": "started", "prompt": "hi"}))
+        );
+        let transcript = parse_transcript(&contents).unwrap();
+        assert!(transcript.records.is_empty(), "{:?}", transcript.records);
+        let transcript = parse_transcript(&format!("{contents}\n")).unwrap();
+        assert_eq!(transcript.records.len(), 1);
     }
 
     #[test]

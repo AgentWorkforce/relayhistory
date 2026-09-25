@@ -811,7 +811,11 @@ const DESTINATION_MARKER_VERSION: &str = "v4";
 /// sync now re-reads a session indexed as prompts-only, so a loss in one is
 /// repairable on the same terms. Its rows do not come from a flat log, which
 /// is what kept it out before.
-const REPAIRABLE_EVENT_SOURCES: &[&str] = &["claude", "codex", "opencode"];
+///
+/// Muse Code joined with its parser: every session is a whole-transcript
+/// read, and a sweep re-reads a session this marker names short, or the
+/// parent whose tree holds a short subagent.
+const REPAIRABLE_EVENT_SOURCES: &[&str] = &["claude", "codex", "opencode", "muse"];
 
 /// What one session is expected to hold.
 ///
@@ -1112,11 +1116,18 @@ fn destination_shortfall(conn: &Connection, stored: &str) -> Result<SweepRepairs
         // expected evidence reclassification rather than destination loss.
         // A remote presence keeps the canonical catalog row and must retain
         // the ordinary catalog guard.
-        let expected_subagent_deregistration = source == "codex"
-            && before.catalog > 0
+        let expected_subagent_deregistration = before.catalog > 0
             && current.catalog == 0
-            && codex_delegation_recorded(conn, &session_id)?
-            && !codex_session_has_remote_presence(conn, &session_id)?;
+            && match source.as_str() {
+                "codex" => {
+                    codex_delegation_recorded(conn, &session_id)?
+                        && !codex_session_has_remote_presence(conn, &session_id)?
+                }
+                // A Muse subagent is deregistered the same way once its log
+                // is linked to its parent.
+                "muse" => muse_delegation_recorded(conn, &session_id)?,
+                _ => false,
+            };
         let covered = current.events >= before.events
             && current.tool_calls >= before.tool_calls
             && current.file_edits >= before.file_edits
@@ -1576,7 +1587,7 @@ fn sync_basic(
     if let Some(inserted) = report.capture(
         conn,
         "muse",
-        sync_muse_with_coverage(conn, &mut state, &roots.muse, &mut coverage),
+        sync_muse_with_coverage(conn, &mut state, &roots.muse, &repairs, &mut coverage),
     )? {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);
@@ -10514,7 +10525,13 @@ pub(crate) fn collect_muse_transcripts(root: &Path) -> Result<Vec<PathBuf>> {
 
 #[cfg(test)]
 fn sync_muse(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> Result<usize> {
-    sync_muse_with_coverage(conn, state, root, &mut SweepCoverage::default())
+    sync_muse_with_coverage(
+        conn,
+        state,
+        root,
+        &SweepRepairs::default(),
+        &mut SweepCoverage::default(),
+    )
 }
 
 /// Index every Muse Code transcript whose stamp changed since the last run.
@@ -10528,6 +10545,7 @@ fn sync_muse_with_coverage(
     conn: &Connection,
     state: &mut Map<String, Value>,
     root: &Path,
+    repairs: &SweepRepairs,
     coverage: &mut SweepCoverage,
 ) -> Result<usize> {
     if !root.exists() {
@@ -10550,6 +10568,9 @@ fn sync_muse_with_coverage(
         let stamp = match muse_session_stamp(&transcript) {
             Ok(stamp) => stamp,
             Err(error) => {
+                if error.is::<CaptureCancelled>() {
+                    return Err(error);
+                }
                 scanned += 1;
                 errors += 1;
                 coverage.note_unread();
@@ -10571,6 +10592,10 @@ fn sync_muse_with_coverage(
                 recorded.and_then(grok_state_had_evidence),
             ) {
                 (None, _) => true,
+                // The destination marker says rows were lost under this
+                // unchanged stamp — in the session or in a subagent it links.
+                // Existence cannot see a partial loss; re-reading repairs it.
+                (Some(id), _) if muse_tree_needs_repair(conn, repairs, id)? => false,
                 (Some(id), Some(false)) => muse_catalog_row_exists(conn, id)?,
                 (Some(id), _) => muse_evidence_exists(conn, id)?,
             };
@@ -10580,15 +10605,33 @@ fn sync_muse_with_coverage(
             }
         }
         scanned += 1;
-        match read_muse_transcript(&transcript) {
-            Ok(Some(parsed)) => {
+        ensure_capture_headroom(conn)?;
+        // Everything is read before anything is written. A transcript or a
+        // subagent log that cannot be read is this session's failure alone:
+        // it keeps no stamp, so the next run retries it, and the pass goes on.
+        // A write that fails once the transaction is open is not per-session —
+        // a retention abort meets every later session too — so it ends the
+        // pass, as it does for Grok.
+        match read_muse_tree(&transcript) {
+            Ok(Some((parsed, children))) => {
                 let session_id = parsed.metadata.session_id.clone();
                 let tx = conn.unchecked_transaction()?;
+                let written = muse_history_rows(&tx, &session_id).and_then(|before| {
+                    let outcome =
+                        ingest_muse_session_tree(&tx, &parsed, &transcript, Some(&children))?;
+                    let after = muse_history_rows(&tx, &session_id)?;
+                    Ok((outcome, after.saturating_sub(before)))
+                });
+                let (outcome, added) = match written {
+                    Ok(written) => written,
+                    Err(error) => {
+                        drop(tx);
+                        return Err(annotate_retention_limit(conn, error));
+                    }
+                };
                 // A re-read replaces the session's prompts wholesale, so what
                 // it added is the difference, not what it wrote.
-                let before = muse_history_rows(&tx, &session_id)?;
-                let outcome = ingest_muse_session_tree(&tx, &parsed, &transcript)?;
-                inserted += muse_history_rows(&tx, &session_id)?.saturating_sub(before);
+                inserted += added;
                 tx.commit()?;
                 sessions += 1;
                 accounted += 1;
@@ -10636,6 +10679,51 @@ fn sync_muse_with_coverage(
         );
     }
     Ok(inserted)
+}
+
+/// Whether the destination marker names this session, or any subagent its
+/// logs link, as having lost rows.
+fn muse_tree_needs_repair(
+    conn: &Connection,
+    repairs: &SweepRepairs,
+    session_id: &str,
+) -> Result<bool> {
+    if repairs.is_empty() {
+        return Ok(false);
+    }
+    if repairs.contains("muse", session_id) {
+        return Ok(true);
+    }
+    let descendants: Vec<String> = conn
+        .prepare(
+            "WITH RECURSIVE tree(id) AS ( \
+               SELECT child_session_id FROM session_relationships \
+               WHERE source = 'muse' AND parent_session_id = ?1 \
+                 AND evidence_kind = 'muse_subagent_log' AND child_session_id IS NOT NULL \
+               UNION \
+               SELECT r.child_session_id FROM session_relationships r JOIN tree \
+                 ON r.parent_session_id = tree.id \
+               WHERE r.source = 'muse' AND r.evidence_kind = 'muse_subagent_log' \
+                 AND r.child_session_id IS NOT NULL \
+             ) SELECT id FROM tree",
+        )?
+        .query_map(params![session_id], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(descendants
+        .iter()
+        .any(|child| repairs.contains("muse", child)))
+}
+
+/// Whether a Muse session is a subagent some parent's log links.
+fn muse_delegation_recorded(conn: &Connection, child_session_id: &str) -> Result<bool> {
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM session_relationships \
+         WHERE source = 'muse' AND child_session_id = ? \
+           AND evidence_kind = 'muse_subagent_log' LIMIT 1)",
+        params![child_session_id],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
 }
 
 fn muse_history_rows(conn: &Connection, session_id: &str) -> Result<usize> {
@@ -10752,23 +10840,80 @@ pub(crate) fn muse_session_stamp(transcript: &Path) -> Result<String> {
 /// prompt, and it is not a catalog row of its own. So, as for a Codex
 /// subagent rollout, its `history` rows and catalog registration are removed
 /// and its events stay addressable through the relationship.
+///
+/// `children` is the tree [`read_muse_children`] read, or `None` to leave the
+/// session's children and edges exactly as they are — a hydration that did
+/// not ask for related evidence must not rewrite it.
 pub(crate) fn ingest_muse_session_tree(
     conn: &Connection,
     transcript: &muse::MuseTranscript,
     path: &Path,
+    children: Option<&[MuseChildLog]>,
 ) -> Result<MuseIngestOutcome> {
     let mut outcome = ingest_muse_session(conn, transcript, &path.to_string_lossy())?;
-    if let Some(dir) = path.parent() {
+    if let (Some(dir), Some(children)) = (path.parent(), children) {
         let mut visited = HashSet::from([transcript.metadata.session_id.clone()]);
-        link_muse_subagents(conn, transcript, dir, 1, &mut visited, &mut outcome)?;
+        link_muse_subagents(
+            conn,
+            transcript,
+            dir,
+            children,
+            1,
+            &mut visited,
+            &mut outcome,
+        )?;
     }
     Ok(outcome)
+}
+
+/// One subagent log beneath a session, read, with its own children.
+pub(crate) struct MuseChildLog {
+    path: PathBuf,
+    /// `None` when the log names no session.
+    transcript: Option<muse::MuseTranscript>,
+    children: Vec<MuseChildLog>,
+}
+
+/// Read a transcript and every subagent log beneath it. `Ok(None)` when the
+/// transcript names no session.
+pub(crate) fn read_muse_tree(
+    transcript: &Path,
+) -> Result<Option<(muse::MuseTranscript, Vec<MuseChildLog>)>> {
+    let Some(parsed) = read_muse_transcript(transcript)? else {
+        return Ok(None);
+    };
+    let children = match transcript.parent() {
+        Some(dir) => read_muse_children(dir)?,
+        None => Vec::new(),
+    };
+    Ok(Some((parsed, children)))
+}
+
+/// The subagent logs directly beneath one session directory, each read along
+/// with its own children.
+pub(crate) fn read_muse_children(session_dir: &Path) -> Result<Vec<MuseChildLog>> {
+    let mut out = Vec::new();
+    for path in direct_muse_child_logs(session_dir)? {
+        check_capture_cancelled()?;
+        let transcript = read_muse_transcript(&path)?;
+        let children = match path.parent() {
+            Some(dir) => read_muse_children(dir)?,
+            None => Vec::new(),
+        };
+        out.push(MuseChildLog {
+            path,
+            transcript,
+            children,
+        });
+    }
+    Ok(out)
 }
 
 fn link_muse_subagents(
     conn: &Connection,
     parent: &muse::MuseTranscript,
     parent_dir: &Path,
+    children: &[MuseChildLog],
     depth: i64,
     visited: &mut HashSet<String>,
     outcome: &mut MuseIngestOutcome,
@@ -10783,9 +10928,10 @@ fn link_muse_subagents(
         params![parent_id],
     )?;
     let links = muse::subagent_links(parent);
-    for log in direct_muse_child_logs(parent_dir)? {
+    for entry in children {
         check_capture_cancelled()?;
-        let Some(child) = read_muse_transcript(&log)? else {
+        let log = &entry.path;
+        let Some(child) = entry.transcript.as_ref() else {
             outcome.unidentified_children += 1;
             continue;
         };
@@ -10796,14 +10942,22 @@ fn link_muse_subagents(
         }
         linked.insert(child_id.clone());
         let locator = log.to_string_lossy().to_string();
-        ingest_muse_session(conn, &child, &locator)?;
+        ingest_muse_session(conn, child, &locator)?;
         conn.execute(
             "DELETE FROM history WHERE source = 'muse' AND session_id = ?",
             params![child_id],
         )?;
         cleanup_subagent_registration(conn, "muse", &child_id)?;
         if let Some(child_dir) = log.parent() {
-            link_muse_subagents(conn, &child, child_dir, depth + 1, visited, outcome)?;
+            link_muse_subagents(
+                conn,
+                child,
+                child_dir,
+                &entry.children,
+                depth + 1,
+                visited,
+                outcome,
+            )?;
         }
         let relative = log
             .strip_prefix(parent_dir)
@@ -10912,27 +11066,33 @@ pub(crate) struct MuseIngestOutcome {
     pub unparsed_lines: usize,
 }
 
-/// One model step's usage, waiting for the assistant record it produced.
-struct PendingMuseUsage {
-    run_id: Option<String>,
-    token_json: String,
+/// What one model step reported, for the assistant record that step owns:
+/// its usage verbatim, its model and its `finish_reason`.
+struct MuseStep<'a> {
+    token_json: Option<String>,
+    model: Option<&'a str>,
+    finish_reason: Option<&'a str>,
 }
 
-/// The usage a model step reported rides on the first assistant row that step
-/// committed, in the same run. A step that committed nothing keeps its usage
-/// off every row rather than on a neighbour's, and is counted in `orphans`.
-fn take_muse_usage(
-    run_id: Option<&str>,
-    pending: &mut Option<PendingMuseUsage>,
-    orphans: &mut usize,
-) -> Option<String> {
-    match pending.take() {
-        Some(usage) if usage.run_id.as_deref() == run_id => Some(usage.token_json),
-        Some(_) => {
-            *orphans += 1;
-            None
+impl<'a> MuseStep<'a> {
+    fn of(transcript: &'a muse::MuseTranscript, index: usize) -> Self {
+        match &transcript.records[index].event {
+            muse::MuseEvent::ModelCompleted {
+                model,
+                usage,
+                finish_reason,
+                ..
+            } => Self {
+                token_json: usage.as_ref().map(Value::to_string),
+                model: model.as_deref(),
+                finish_reason: finish_reason.as_deref(),
+            },
+            _ => Self {
+                token_json: None,
+                model: None,
+                finish_reason: None,
+            },
         }
-        None => None,
     }
 }
 
@@ -10967,9 +11127,18 @@ pub(crate) fn ingest_muse_session(
         ..Default::default()
     };
     let outcomes = muse::tool_outcomes(transcript);
+    let tool_names = muse::tool_names(transcript);
+    let (step_owners, orphan_steps) = muse::pair_model_steps(transcript);
+    outcome.unattached_usage = orphan_steps;
+    // The step a record owns, or none: usage, model and finish reason belong
+    // to that one record, never to its neighbours.
+    let step_of = |index: usize| {
+        step_owners
+            .get(&index)
+            .map(|step| MuseStep::of(transcript, *step))
+    };
+    // The model a record ran under when its own step does not name one.
     let mut model = transcript.metadata.model_id.clone();
-    let mut finish_reason: Option<String> = None;
-    let mut pending_usage: Option<PendingMuseUsage> = None;
     let mut first_prompt: Option<String> = None;
     let mut last_assistant_text: Option<String> = None;
     let mut results = ToolResultIndexer::default();
@@ -10989,9 +11158,6 @@ pub(crate) fn ingest_muse_session(
         };
         match &record.event {
             muse::MuseEvent::Prompt { text } => {
-                if pending_usage.take().is_some() {
-                    outcome.unattached_usage += 1;
-                }
                 if first_prompt.is_none() {
                     first_prompt = Some(crate::discover::excerpt(text));
                 }
@@ -11029,23 +11195,14 @@ pub(crate) fn ingest_muse_session(
                     },
                 )?;
             }
+            // Paired with its assistant record up front; only the running
+            // model is tracked here.
             muse::MuseEvent::ModelCompleted {
-                model: step_model,
-                usage,
-                finish_reason: step_finish,
-                ..
+                model: step_model, ..
             } => {
-                if pending_usage.is_some() {
-                    outcome.unattached_usage += 1;
-                }
                 if step_model.is_some() {
                     model = step_model.clone();
                 }
-                finish_reason = step_finish.clone();
-                pending_usage = usage.as_ref().map(|usage| PendingMuseUsage {
-                    run_id: record.run_id.clone(),
-                    token_json: usage.to_string(),
-                });
             }
             muse::MuseEvent::Reasoning {
                 message_id,
@@ -11053,8 +11210,12 @@ pub(crate) fn ingest_muse_session(
                 encrypted,
             } => match text {
                 Some(text) => {
-                    let token_json =
-                        take_muse_usage(run_id, &mut pending_usage, &mut outcome.unattached_usage);
+                    let step = step_of(idx);
+                    let token_json = step.as_ref().and_then(|step| step.token_json.clone());
+                    let row_model = step
+                        .as_ref()
+                        .and_then(|step| step.model)
+                        .or(model.as_deref());
                     let message_id = message_id.as_deref().unwrap_or(&record_uid);
                     insert_session_event(
                         conn,
@@ -11069,7 +11230,7 @@ pub(crate) fn ingest_muse_session(
                         "assistant",
                         "thinking",
                         Some(text),
-                        model.as_deref(),
+                        row_model,
                         token_json.as_deref(),
                         RequestIdentity::none(),
                         &record_uid,
@@ -11104,8 +11265,13 @@ pub(crate) fn ingest_muse_session(
                 response_id,
                 text,
             } => {
-                let token_json =
-                    take_muse_usage(run_id, &mut pending_usage, &mut outcome.unattached_usage);
+                let step = step_of(idx);
+                let token_json = step.as_ref().and_then(|step| step.token_json.clone());
+                let row_model = step
+                    .as_ref()
+                    .and_then(|step| step.model)
+                    .or(model.as_deref());
+                let finish_reason = step.as_ref().and_then(|step| step.finish_reason);
                 let message_id = message_id.as_deref().unwrap_or(&record_uid);
                 insert_session_event(
                     conn,
@@ -11120,7 +11286,7 @@ pub(crate) fn ingest_muse_session(
                     "assistant",
                     "text",
                     Some(text),
-                    model.as_deref(),
+                    row_model,
                     token_json.as_deref(),
                     RequestIdentity {
                         request_id: response_id.as_deref(),
@@ -11130,7 +11296,7 @@ pub(crate) fn ingest_muse_session(
                     None,
                     RawMessageFacts {
                         request_id: response_id.as_deref(),
-                        stop_reason: finish_reason.as_deref(),
+                        stop_reason: finish_reason,
                         ..facts
                     },
                 )?;
@@ -11143,9 +11309,17 @@ pub(crate) fn ingest_muse_session(
                 calls,
             } => {
                 let message_id = message_id.as_deref().unwrap_or(&record_uid);
+                let step = step_of(idx);
+                let row_model = step
+                    .as_ref()
+                    .and_then(|step| step.model)
+                    .or(model.as_deref());
+                let finish_reason = step.as_ref().and_then(|step| step.finish_reason);
+                // One request, several calls: its usage is stored once, on
+                // the first call's row.
+                let mut step_usage = step.as_ref().and_then(|step| step.token_json.clone());
                 for call in calls {
-                    let token_json =
-                        take_muse_usage(run_id, &mut pending_usage, &mut outcome.unattached_usage);
+                    let token_json = step_usage.take();
                     let target = muse::pick_tool_target(&call.name, &call.arguments);
                     let uid = format!("tool:{}", call.call_id);
                     insert_session_event(
@@ -11165,7 +11339,7 @@ pub(crate) fn ingest_muse_session(
                             target.as_deref(),
                             &call.arguments,
                         )),
-                        model.as_deref(),
+                        row_model,
                         token_json.as_deref(),
                         RequestIdentity {
                             request_id: response_id.as_deref(),
@@ -11175,7 +11349,7 @@ pub(crate) fn ingest_muse_session(
                         None,
                         RawMessageFacts {
                             request_id: response_id.as_deref(),
-                            stop_reason: finish_reason.as_deref(),
+                            stop_reason: finish_reason,
                             ..facts
                         },
                     )?;
@@ -11221,6 +11395,7 @@ pub(crate) fn ingest_muse_session(
                     let mut result_facts = tool_result_facts::muse_tool_result_facts(
                         text,
                         &result.call_id,
+                        tool_names.get(result.call_id.as_str()).copied(),
                         outcomes.get(result.call_id.as_str()).copied(),
                     );
                     if result_facts.result_status.as_deref()
@@ -11265,9 +11440,6 @@ pub(crate) fn ingest_muse_session(
                 }
             }
             muse::MuseEvent::RunTerminal { status, reason } => {
-                if pending_usage.take().is_some() {
-                    outcome.unattached_usage += 1;
-                }
                 let payload_json =
                     marker_payload(vec![("terminal", json!(status)), ("reason", json!(reason))]);
                 outcome.markers += insert_session_marker(
@@ -11355,9 +11527,6 @@ pub(crate) fn ingest_muse_session(
             muse::MuseEvent::SubagentLinked(_) => {}
         }
     }
-    if pending_usage.is_some() {
-        outcome.unattached_usage += 1;
-    }
 
     let first_ts = transcript.first_ts().unwrap_or_default();
     let last_ts = transcript.last_ts().unwrap_or(first_ts);
@@ -11372,11 +11541,15 @@ pub(crate) fn ingest_muse_session(
         last_assistant_text.as_deref(),
         Some(raw_path),
     )?;
+    // `upsert_session` merges, which suits an append-only log read in pieces.
+    // This read is the whole transcript, so the fields it owns are assigned
+    // from it, empty values included: a rewritten file that no longer has a
+    // reply or a prompt must not keep quoting the old one.
     let models = transcript.models();
     conn.execute(
         "UPDATE sessions SET first_activity_ms = ?, last_activity_ms = ?, \
-         last_assistant_text = COALESCE(?, last_assistant_text), models_json = ?, \
-         first_prompt = COALESCE(?, first_prompt), agent_version = COALESCE(?, agent_version) \
+         last_assistant_text = ?, models_json = ?, \
+         first_prompt = ?, agent_version = COALESCE(?, agent_version) \
          WHERE source = 'muse' AND session_id = ?",
         params![
             first_ts,
@@ -14764,7 +14937,7 @@ mod tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/muse/tools-session/.local/share/muse/sessions");
         let root = home.join(".local/share/muse/sessions");
-        let day = "2026/09/20/0199a1b2-0000-7000-8000-00000000a001";
+        let day = "2026/09/20/muse-a001";
         for file in super::muse_session_files(&fixture.join(day).join("session.jsonl")).unwrap() {
             let target = root.join(file.strip_prefix(&fixture).unwrap());
             fs::create_dir_all(target.parent().unwrap()).unwrap();
@@ -14784,8 +14957,8 @@ mod tests {
         .unwrap()
     }
 
-    const MUSE_PARENT: &str = "0199a1b2-0000-7000-8000-00000000a001";
-    const MUSE_WORKER: &str = "0199a1b2-0000-7000-8000-00000000c001";
+    const MUSE_PARENT: &str = "muse-a001";
+    const MUSE_WORKER: &str = "muse-c001";
 
     fn muse_count(conn: &Connection, table: &str) -> i64 {
         conn.query_row(
@@ -14830,7 +15003,7 @@ mod tests {
         ] {
             let record = json!({
                 "id": format!("grown-{sequence}"),
-                "stream": {"kind": "session", "id": "0199a1b2-0000-7000-8000-00000000a001"},
+                "stream": {"kind": "session", "id": "muse-a001"},
                 "sequence": sequence,
                 "recorded_at": 1_790_337_700_000_000i64 + sequence,
                 "payload_type": "runtime.session",
@@ -14909,6 +15082,136 @@ mod tests {
         );
     }
 
+    /// Roots under `home` with nothing read from the environment, for the
+    /// fingerprint-gated sync path.
+    fn muse_roots(home: &Path) -> crate::ProviderRoots {
+        crate::ProviderRoots::from_home(home.to_path_buf(), home.join("opencode.db"))
+    }
+
+    fn append_muse_record(log: &Path, session_id: &str, uid: &str, text: &str) {
+        let record = json!({
+            "id": uid,
+            "stream": {"kind": "session", "id": session_id},
+            "sequence": 99,
+            "recorded_at": 1_790_337_700_000_000i64,
+            "payload_type": "runtime.session",
+            "payload": {"kind": "run", "run_id": "late", "event": {
+                "kind": "assistant_message_committed", "message_id": uid, "text": text
+            }},
+        });
+        let mut file = fs::OpenOptions::new().append(true).open(log).unwrap();
+        writeln!(file, "{record}").unwrap();
+    }
+
+    /// A subagent that keeps writing after its parent has stopped changes
+    /// only its own log. That has to move the source fingerprint, or a
+    /// plain `sync` takes the fast path and never reads it.
+    #[test]
+    fn a_growing_muse_subagent_log_moves_the_sync_fast_path() {
+        let home = tempfile::tempdir().unwrap();
+        let (_, transcript) = muse_fixture(home.path());
+        let db = home.path().join("history.db");
+        let roots = muse_roots(home.path());
+        assert!(
+            super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept
+        );
+        assert!(
+            !super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept,
+            "an unchanged store takes the fast path"
+        );
+        let conn = open_db(&db).unwrap();
+        let before = muse_session_count(&conn, "session_events", MUSE_WORKER);
+
+        let child_log = transcript
+            .parent()
+            .unwrap()
+            .join(format!("subagent/{MUSE_WORKER}/session.jsonl"));
+        append_muse_record(&child_log, MUSE_WORKER, "worker-late", "Also: no docs.");
+        assert!(
+            super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept
+        );
+        assert_eq!(
+            muse_session_count(&conn, "session_events", MUSE_WORKER),
+            before + 1
+        );
+    }
+
+    /// Rows lost under an unchanged stamp — in a session, or in a subagent
+    /// it links — are put back by the next plain `sync`, not only by a forced
+    /// one: Muse is a source the destination marker guards.
+    #[test]
+    fn lost_muse_evidence_is_repaired_by_the_next_sync() {
+        let home = tempfile::tempdir().unwrap();
+        let _ = muse_fixture(home.path());
+        let db = home.path().join("history.db");
+        let roots = muse_roots(home.path());
+        super::sync_exclusive_with_roots(&db, &roots, false).unwrap();
+        let conn = open_db(&db).unwrap();
+        let parent_events = muse_session_count(&conn, "session_events", MUSE_PARENT);
+        let worker_events = muse_session_count(&conn, "session_events", MUSE_WORKER);
+
+        conn.execute(
+            "DELETE FROM session_events WHERE source = 'muse' AND session_id = ? \
+               AND event_uid = 'tool:call_read'",
+            [MUSE_PARENT],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM session_events WHERE source = 'muse' AND session_id = ? \
+               AND role = 'assistant'",
+            [MUSE_WORKER],
+        )
+        .unwrap();
+        super::sync_exclusive_with_roots(&db, &roots, false).unwrap();
+        assert_eq!(
+            muse_session_count(&conn, "session_events", MUSE_PARENT),
+            parent_events
+        );
+        assert_eq!(
+            muse_session_count(&conn, "session_events", MUSE_WORKER),
+            worker_events
+        );
+    }
+
+    /// A rewritten transcript that no longer has a reply or a prompt does not
+    /// keep quoting the old ones in the catalog.
+    #[test]
+    fn a_rewritten_muse_transcript_replaces_its_catalog_text() {
+        let home = tempfile::tempdir().unwrap();
+        let (root, transcript) = muse_fixture(home.path());
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        let catalog = |conn: &Connection| -> (Option<String>, Option<String>) {
+            conn.query_row(
+                "SELECT first_prompt, last_assistant_text FROM sessions \
+                 WHERE source = 'muse' AND session_id = ?",
+                [MUSE_PARENT],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        let (prompt, reply) = catalog(&conn);
+        assert!(prompt.is_some() && reply.is_some());
+
+        // Keep only the permission frame, metadata and the open record.
+        let head: String = fs::read_to_string(&transcript)
+            .unwrap()
+            .lines()
+            .take(3)
+            .map(|line| format!("{line}\n"))
+            .collect();
+        fs::write(&transcript, head).unwrap();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        assert_eq!(catalog(&conn), (None, None));
+    }
+
     /// A child whose log is gone is no longer evidenced: the edge and the
     /// child's events go with it.
     #[test]
@@ -14918,13 +15221,7 @@ mod tests {
         let conn = open_db(&home.path().join("history.db")).unwrap();
         let mut state = Map::new();
         super::sync_muse(&conn, &mut state, &root).unwrap();
-        fs::remove_dir_all(
-            transcript
-                .parent()
-                .unwrap()
-                .join("subagent/0199a1b2-0000-7000-8000-00000000e001"),
-        )
-        .unwrap();
+        fs::remove_dir_all(transcript.parent().unwrap().join("subagent/muse-e001")).unwrap();
         super::sync_muse(&conn, &mut state, &root).unwrap();
         let children: Vec<String> = conn
             .prepare(
@@ -14938,17 +15235,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             children,
-            vec![
-                MUSE_WORKER.to_string(),
-                "0199a1b2-0000-7000-8000-00000000c002".to_string()
-            ]
+            vec![MUSE_WORKER.to_string(), "muse-c002".to_string()]
         );
         assert_eq!(
-            muse_session_count(
-                &conn,
-                "session_events",
-                "0199a1b2-0000-7000-8000-00000000e001"
-            ),
+            muse_session_count(&conn, "session_events", "muse-e001"),
             0,
             "the removed child's events go with its edge"
         );

@@ -1589,10 +1589,11 @@ fn source_snapshot(
             SnapshotRecords::DeferredGrok(path.clone()),
             inventory.stamp,
         )
-    } else if options.source == "muse" {
-        // A Muse session is its transcript plus the subagent logs beside it;
-        // the stamp and the counts cover all of them, so a child that grew
-        // after the parent's last record is still a change.
+    } else if options.source == "muse" && options.include_related {
+        // With related evidence, a Muse session is its transcript plus the
+        // subagent logs beside it; the stamp and the counts cover all of them,
+        // so a child that grew after the parent's last record is still a
+        // change. Without it, the transcript alone, like any other file.
         let mut bytes = 0i64;
         let mut records = 0i64;
         for file in muse_session_files(&path)? {
@@ -2979,7 +2980,14 @@ fn ingest_muse(
     options: &HydrateSessionOptions,
     path: &Path,
 ) -> Result<Vec<HydrationDiagnostic>> {
-    let transcript = read_muse_transcript(path)?.ok_or_else(|| {
+    // Subagent logs are related evidence: read and linked only when the
+    // caller asked for it, and otherwise left exactly as they are.
+    let tree = if options.include_related {
+        read_muse_tree(path)?
+    } else {
+        read_muse_transcript(path)?.map(|transcript| (transcript, Vec::new()))
+    };
+    let (transcript, children) = tree.ok_or_else(|| {
         hydration_error(
             "SESSION_SOURCE_MISMATCH",
             "Muse Code transcript has no session metadata",
@@ -2991,7 +2999,12 @@ fn ingest_muse(
             "Muse Code transcript identity does not match the catalog row",
         ));
     }
-    let outcome = ingest_muse_session_tree(conn, &transcript, path)?;
+    let outcome = ingest_muse_session_tree(
+        conn,
+        &transcript,
+        path,
+        options.include_related.then_some(children.as_slice()),
+    )?;
     Ok(muse_diagnostics(&outcome))
 }
 
@@ -3060,8 +3073,9 @@ fn muse_diagnostics(outcome: &MuseIngestOutcome) -> Vec<HydrationDiagnostic> {
         diagnostics.push(diagnostic(
             "MUSE_LINES_UNPARSED",
             format!(
-                "{} line(s) of session.jsonl were not JSON records and were skipped (a live \
-                 session's partial last line is one)",
+                "{} complete line(s) of session.jsonl were not JSON records and were \
+                 skipped; a live session's unterminated last line is not counted, it is \
+                 read once Muse finishes it",
                 outcome.unparsed_lines
             ),
         ));
@@ -4111,6 +4125,46 @@ mod tests {
         collect_chat_history(home, &mut found);
         found.sort();
         found.pop().expect("a staged chat_history.jsonl")
+    }
+
+    /// A hydration that did not ask for related evidence indexes the session
+    /// and leaves its subagent logs alone; asking for it links them.
+    #[test]
+    fn muse_hydration_links_subagents_only_when_related_evidence_is_asked_for() {
+        let dir = tempfile::tempdir().unwrap();
+        copy_tree(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/muse/tools-session"),
+            dir.path(),
+        );
+        let transcript = dir
+            .path()
+            .join(".local/share/muse/sessions/2026/09/20/muse-a001/session.jsonl");
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "muse", "muse-a001", Some(&transcript));
+        let counts = |conn: &Connection| -> (i64, i64) {
+            conn.query_row(
+                "SELECT (SELECT COUNT(*) FROM session_relationships WHERE source = 'muse'), \
+                        (SELECT COUNT(*) FROM session_events \
+                         WHERE source = 'muse' AND session_id <> 'muse-a001')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+
+        let mut without = options("muse", "muse-a001");
+        without.include_related = false;
+        let result = hydrate_session_at_with_home(&db, &without, dir.path()).unwrap();
+        assert!(result.related_session_ids.is_empty());
+        assert_eq!(counts(&conn), (0, 0), "no child evidence was written");
+
+        let result =
+            hydrate_session_at_with_home(&db, &options("muse", "muse-a001"), dir.path()).unwrap();
+        assert_eq!(result.related_session_ids.len(), 3);
+        let (edges, child_events) = counts(&conn);
+        assert_eq!(edges, 3);
+        assert!(child_events > 0);
     }
 
     fn copy_tree(from: &Path, to: &Path) {

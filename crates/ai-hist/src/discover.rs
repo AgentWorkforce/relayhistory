@@ -2094,6 +2094,19 @@ impl ShallowSessionProvider for MuseProvider {
         )
     }
 
+    /// Enumeration is top-level transcripts only, but a subagent log is
+    /// evidence too: sync stamps it, and a background subagent keeps writing
+    /// after its parent has stopped. Left out of the fold, a tick whose only
+    /// change was a child log would sit behind an unchanged fingerprint and
+    /// never reach the sweep that reads it.
+    fn fingerprint_inputs(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
+        let mut files = Vec::new();
+        for transcript in crate::collect_muse_transcripts(&env.muse_sessions)? {
+            files.extend(crate::muse_session_files(&transcript)?);
+        }
+        file_candidates("muse", files, crate::file_stamp_and_modified)
+    }
+
     fn read_shallow(
         &self,
         scan: &ScanEnv<'_>,

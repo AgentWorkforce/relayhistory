@@ -193,9 +193,10 @@ every record carries its own `recorded_at` in microseconds, so no timestamp is
 inferred. `thinking` is `◐` because Muse usually keeps reasoning only as
 `encrypted_content`; that becomes an `encrypted_reasoning` marker, never
 thinking text. Token usage is one `model_completed` object per model step,
-stored once on the first assistant row the step committed (`per-request`);
-a step that committed nothing is reported as `MUSE_USAGE_UNATTACHED`, not
-attached to a neighbour. `request_id` is Muse's `response_id` and
+stored once on the assistant row that step committed (`per-request`). Tool
+steps log it before their calls and prose steps after their reply, so the
+pairing works in both directions within a run; a step that committed nothing
+is reported as `MUSE_USAGE_UNATTACHED`, not attached to a neighbour. `request_id` is Muse's `response_id` and
 `stop_reason` its `finish_reason`. A tool call's status comes from the
 separate `tool_batch.effect.terminal` record, joined by call id, and a
 `bash` call that completed with a non-zero `exit_code` is an error. Session

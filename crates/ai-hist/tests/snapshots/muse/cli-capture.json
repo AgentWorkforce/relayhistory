@@ -174,7 +174,7 @@
       "session_id": "74747474-7474-4747-8747-747474747474",
       "source": "muse",
       "text": "The boundary comparison is strict, the note marker is COPPER_4821, and the missing-file failure was retained.",
-      "token_json": null,
+      "token_json": "{\"cache_read_tokens\":0,\"cache_write_tokens\":0,\"cached_tokens\":0,\"input_tokens\":32,\"output_tokens\":8,\"reasoning_tokens\":0}",
       "ts_ms": 1788223110828
     },
     {
@@ -208,7 +208,7 @@
       "session_id": "74747474-7474-4747-8747-747474747474",
       "source": "muse",
       "text": "The image contains a blue triangle labeled BLUE_TRIANGLE_7319.",
-      "token_json": null,
+      "token_json": "{\"cache_read_tokens\":0,\"cache_write_tokens\":0,\"cached_tokens\":0,\"input_tokens\":32,\"output_tokens\":8,\"reasoning_tokens\":0}",
       "ts_ms": 1788223111332
     },
     {
@@ -242,7 +242,7 @@
       "session_id": "74747474-7474-4747-8747-747474747474",
       "source": "muse",
       "text": "Recall: SM_CORPUS_7319, COPPER_4821, BLUE_TRIANGLE_7319, and missing-corpus-file.txt.",
-      "token_json": null,
+      "token_json": "{\"cache_read_tokens\":0,\"cache_write_tokens\":0,\"cached_tokens\":0,\"input_tokens\":32,\"output_tokens\":8,\"reasoning_tokens\":0}",
       "ts_ms": 1788223111916
     }
   ],

@@ -1489,9 +1489,17 @@ How each adapter works:
   Usage is recorded as Muse wrote it: each `model_completed.usage` object
   (`input_tokens` inclusive of the cached prefix, `cache_read_tokens` /
   `cached_tokens`, `cache_write_tokens`, `output_tokens`, `reasoning_tokens`)
-  goes verbatim into `token_json` on the first assistant row that step
-  committed, and normalizes as `per-request`. A step that committed nothing
-  keeps its usage off every row and is reported as `MUSE_USAGE_UNATTACHED`.
+  goes verbatim into `token_json` on the assistant row that step committed,
+  with its `model` and `finish_reason`, and normalizes as `per-request`. Muse
+  does not write the two in one order — a step that calls tools logs
+  `model_completed` *before* its calls, a step that answers in prose logs it
+  *after* the reply — so each step is paired, within its run, with its first
+  commit in whichever direction the step wrote it. A step that committed
+  nothing keeps its usage off every row and is reported as
+  `MUSE_USAGE_UNATTACHED`. Only newline-terminated records are read, so a
+  live session's half-written last line waits for the next read, and Muse is
+  one of the sources the sweep's destination marker guards: rows lost under
+  an unchanged stamp are restored by the next `sync`.
   Reasoning Muse kept only encrypted is an `encrypted_reasoning` marker
   (`MUSE_REASONING_ENCRYPTED`).
 

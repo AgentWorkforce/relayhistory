@@ -2350,6 +2350,18 @@ fn muse_cli_capture_reaches_history_tools_and_recorded_times() {
             .all(|event| !text(event, "text").starts_with("Role:")),
         "a mirrored task stream is never a prompt: {events:?}"
     );
+    // Tool steps log `model_completed` before their calls and prose steps
+    // after their reply; every one of the six steps keeps its usage.
+    let with_usage: Vec<&str> = events
+        .iter()
+        .filter(|event| !field(event, "token_json").is_null())
+        .map(|event| text(event, "kind"))
+        .collect();
+    assert_eq!(
+        with_usage,
+        vec!["tool_use", "tool_use", "tool_use", "text", "text", "text"],
+        "{events:?}"
+    );
 }
 
 /// The authored Muse session: edits reach `file_edits`, a completed `bash`
@@ -2359,10 +2371,10 @@ fn muse_cli_capture_reaches_history_tools_and_recorded_times() {
 /// names, without becoming a catalog row or a typed prompt.
 #[test]
 fn muse_tools_session_records_edits_errors_usage_and_linked_subagents() {
-    const PARENT: &str = "0199a1b2-0000-7000-8000-00000000a001";
-    const WORKER: &str = "0199a1b2-0000-7000-8000-00000000c001";
-    const NESTED: &str = "0199a1b2-0000-7000-8000-00000000c002";
-    const REMINDER: &str = "0199a1b2-0000-7000-8000-00000000e001";
+    const PARENT: &str = "muse-a001";
+    const WORKER: &str = "muse-c001";
+    const NESTED: &str = "muse-c002";
+    const REMINDER: &str = "muse-e001";
     let edits = rows("muse/tools-session", "file_edits");
     let mut paths: Vec<&str> = edits.iter().map(|edit| text(edit, "file_path")).collect();
     paths.sort_unstable();
