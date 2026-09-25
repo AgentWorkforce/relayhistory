@@ -2395,6 +2395,30 @@ fn muse_tools_session_records_edits_errors_usage_and_linked_subagents() {
         parent_usage_rows, 4,
         "one row per model_completed step: {events:?}"
     );
+    // Each step's usage sits on that step's first record: step 1's on its
+    // readable reasoning (not on the tool calls the same step committed),
+    // step 2's on its first call, the replies' on the replies.
+    let owners: Vec<(String, i64)> = events
+        .iter()
+        .filter(|event| text(event, "session_id") == PARENT)
+        .filter_map(|event| {
+            let usage: serde_json::Value =
+                serde_json::from_str(field(event, "token_json").as_str()?).ok()?;
+            Some((
+                text(event, "event_uid").to_string(),
+                usage["input_tokens"].as_i64()?,
+            ))
+        })
+        .collect();
+    assert_eq!(
+        owners,
+        vec![
+            ("a001-rec-006".to_string(), 1200),
+            ("tool:call_edit".to_string(), 1500),
+            ("a001-rec-020".to_string(), 1800),
+            ("a001-rec-029".to_string(), 2000),
+        ]
+    );
 
     let sessions = rows("muse/tools-session", "sessions");
     assert_eq!(

@@ -2148,8 +2148,20 @@ fn ingest_selected(
         }
         "grok" => ingest_grok(conn, options, path.unwrap())
             .map(|diagnostics| (whole_file(), diagnostics, None)),
-        "muse" => ingest_muse(conn, options, path.unwrap())
-            .map(|diagnostics| (whole_file(), diagnostics, None)),
+        "muse" => {
+            let path = path.unwrap();
+            let diagnostics = ingest_muse(conn, options, path)?;
+            let mut outcome = whole_file();
+            // With related evidence the read covers every subagent log too.
+            if options.include_related {
+                outcome.bytes_read = muse_session_files(path)?
+                    .iter()
+                    .filter_map(|file| file.metadata().ok())
+                    .map(|metadata| metadata.len() as i64)
+                    .sum();
+            }
+            Ok((outcome, diagnostics, None))
+        }
         "opencode" => {
             let path = path.unwrap();
             // Whichever layout `source_snapshot` validated this locator

@@ -1493,8 +1493,11 @@ How each adapter works:
   with its `model` and `finish_reason`, and normalizes as `per-request`. Muse
   does not write the two in one order — a step that calls tools logs
   `model_completed` *before* its calls, a step that answers in prose logs it
-  *after* the reply — so each step is paired, within its run, with its first
-  commit in whichever direction the step wrote it. A step that committed
+  *after* the reply, and one step can commit readable reasoning and then its
+  tool calls. A step is what lies between the model being called and the
+  next `started`, `tool_result_batch_committed` or `terminal` in its run; its
+  first assistant record owns its usage, in whichever direction the step
+  wrote the two. A step that committed
   nothing keeps its usage off every row and is reported as
   `MUSE_USAGE_UNATTACHED`. Only newline-terminated records are read, so a
   live session's half-written last line waits for the next read, and Muse is

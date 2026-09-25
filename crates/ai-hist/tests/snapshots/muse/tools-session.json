@@ -117,7 +117,7 @@
       "session_id": "muse-a001",
       "source": "muse",
       "text": "read_file src/http.rs",
-      "token_json": "{\"cache_read_tokens\":1100,\"cache_write_tokens\":0,\"cached_tokens\":1100,\"input_tokens\":1500,\"output_tokens\":210,\"reasoning_tokens\":0}",
+      "token_json": null,
       "ts_ms": 1790337601750
     },
     {
@@ -168,7 +168,7 @@
       "session_id": "muse-a001",
       "source": "muse",
       "text": "edit_file src/http.rs",
-      "token_json": "{\"cache_read_tokens\":1500,\"cache_write_tokens\":0,\"cached_tokens\":1500,\"input_tokens\":1800,\"output_tokens\":35,\"reasoning_tokens\":0}",
+      "token_json": "{\"cache_read_tokens\":1100,\"cache_write_tokens\":0,\"cached_tokens\":1100,\"input_tokens\":1500,\"output_tokens\":210,\"reasoning_tokens\":0}",
       "ts_ms": 1790337602750
     },
     {
@@ -287,7 +287,7 @@
       "session_id": "muse-a001",
       "source": "muse",
       "text": "Added `retry` and a test; `cargo test` fails with exit code 101.",
-      "token_json": null,
+      "token_json": "{\"cache_read_tokens\":1500,\"cache_write_tokens\":0,\"cached_tokens\":1500,\"input_tokens\":1800,\"output_tokens\":35,\"reasoning_tokens\":0}",
       "ts_ms": 1790337605000
     },
     {

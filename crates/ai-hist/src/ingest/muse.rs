@@ -484,21 +484,27 @@ pub(crate) fn parse_transcript(contents: &str) -> Option<MuseTranscript> {
 /// Muse does not write the two in one order. A step that calls tools logs
 /// `model_completed` *before* `assistant_tool_calls_committed`; a step that
 /// answers in prose logs `assistant_message_committed` *before* its
-/// `model_completed` (both are in the real 0.2.1 capture). So a step's usage
-/// is paired, within one run, with the first assistant record committed since
-/// the previous step closed — earlier or later, whichever the step wrote —
-/// and never carried across a prompt or a run's `terminal`.
+/// `model_completed` (both are in the real 0.2.1 capture). A step can also
+/// commit several records — readable reasoning and then its tool calls.
+///
+/// What does delimit a step is what the model is called *after*: a typed
+/// prompt, or the tool results it asked for. So each run is cut into
+/// segments at `started`, `tool_result_batch_committed` and `terminal`. A
+/// segment is one model call: its first assistant record owns that call's
+/// `model_completed`, whichever of the two came first, and every other
+/// record of the step is part of it and owns no usage of its own. A second
+/// usage-bearing `model_completed` in one segment (a retried call) has no
+/// record of its own to carry it, and is counted rather than attached to a
+/// neighbour.
 ///
 /// Returns `(owners, orphans)`: `owners` maps an assistant record's index to
 /// its step's `model_completed` index, and `orphans` counts steps that
 /// reported usage but committed no assistant record to carry it.
 pub(crate) fn pair_model_steps(transcript: &MuseTranscript) -> (HashMap<usize, usize>, usize) {
     #[derive(Default)]
-    struct Run {
-        /// A step's first commit, not yet paired with its `model_completed`.
-        open_commit: Option<usize>,
-        /// A `model_completed` waiting for the commit its step writes next.
-        pending: Option<usize>,
+    struct Segment {
+        first_commit: Option<usize>,
+        steps: Vec<usize>,
     }
     let has_usage = |index: usize| {
         matches!(
@@ -508,45 +514,57 @@ pub(crate) fn pair_model_steps(transcript: &MuseTranscript) -> (HashMap<usize, u
     };
     let mut owners = HashMap::new();
     let mut orphans = 0;
-    let mut runs: HashMap<Option<&str>, Run> = HashMap::new();
+    let mut close = |segment: Segment| {
+        let owner = segment
+            .steps
+            .iter()
+            .copied()
+            .find(|step| has_usage(*step))
+            .or_else(|| segment.steps.first().copied());
+        match (segment.first_commit, owner) {
+            (Some(commit), Some(step)) => {
+                owners.insert(commit, step);
+                orphans += segment
+                    .steps
+                    .iter()
+                    .filter(|other| **other != step && has_usage(**other))
+                    .count();
+            }
+            _ => {
+                orphans += segment
+                    .steps
+                    .iter()
+                    .filter(|step| has_usage(**step))
+                    .count();
+            }
+        }
+    };
+    let mut runs: HashMap<Option<&str>, Segment> = HashMap::new();
     for (index, record) in transcript.records.iter().enumerate() {
-        let run = runs.entry(record.run_id.as_deref()).or_default();
+        let run = record.run_id.as_deref();
         match &record.event {
             MuseEvent::AssistantText { .. }
             | MuseEvent::ToolCalls { .. }
             | MuseEvent::Reasoning { text: Some(_), .. } => {
-                if let Some(step) = run.pending.take() {
-                    owners.insert(index, step);
-                    run.open_commit = None;
-                } else if run.open_commit.is_none() {
-                    run.open_commit = Some(index);
-                }
+                runs.entry(run)
+                    .or_default()
+                    .first_commit
+                    .get_or_insert(index);
             }
-            MuseEvent::ModelCompleted { .. } => {
-                if let Some(step) = run.pending.take() {
-                    orphans += usize::from(has_usage(step));
+            MuseEvent::ModelCompleted { .. } => runs.entry(run).or_default().steps.push(index),
+            MuseEvent::Prompt { .. }
+            | MuseEvent::ToolResults { .. }
+            | MuseEvent::RunTerminal { .. } => {
+                if let Some(segment) = runs.remove(&run) {
+                    close(segment);
                 }
-                match run.open_commit.take() {
-                    Some(commit) => {
-                        owners.insert(commit, index);
-                    }
-                    None => run.pending = Some(index),
-                }
-            }
-            MuseEvent::Prompt { .. } | MuseEvent::RunTerminal { .. } => {
-                if let Some(step) = run.pending.take() {
-                    orphans += usize::from(has_usage(step));
-                }
-                run.open_commit = None;
             }
             _ => {}
         }
     }
-    orphans += runs
-        .values()
-        .filter_map(|run| run.pending)
-        .filter(|step| has_usage(*step))
-        .count();
+    for (_, segment) in runs.drain() {
+        close(segment);
+    }
     (owners, orphans)
 }
 
@@ -812,32 +830,51 @@ mod tests {
     #[test]
     fn model_steps_pair_with_their_commit_in_either_order() {
         let usage = json!({"input_tokens": 1, "output_tokens": 1});
+        let calls = |id: &str| {
+            json!({"kind": "assistant_tool_calls_committed",
+                   "tool_calls": [{"call_id": id, "name": "bash", "args": "{}"}]})
+        };
+        let results = |id: &str| {
+            json!({"kind": "tool_result_batch_committed",
+                   "results": [{"tool_call_id": id, "text": "ok"}]})
+        };
         let contents = [
             metadata(),
             run(2, json!({"kind": "started", "prompt": "go"})),
+            // Step 1: usage first, then readable reasoning *and* tool calls.
             run(3, json!({"kind": "model_completed", "usage": usage})),
+            run(4, json!({"kind": "reasoning_committed", "text": "think"})),
+            run(5, calls("c1")),
+            run(6, results("c1")),
+            // Step 2: usage first, tool calls.
+            run(7, json!({"kind": "model_completed", "usage": usage})),
+            run(8, calls("c2")),
+            run(9, results("c2")),
+            // Step 3: the reply first, then its usage.
             run(
-                4,
-                json!({"kind": "assistant_tool_calls_committed",
-                       "tool_calls": [{"call_id": "c", "name": "bash", "args": "{}"}]}),
-            ),
-            run(
-                5,
+                10,
                 json!({"kind": "assistant_message_committed", "text": "done"}),
             ),
-            run(6, json!({"kind": "model_completed", "usage": usage})),
-            run(7, json!({"kind": "model_completed", "usage": usage})),
-            run(8, json!({"kind": "terminal", "terminal": "completed"})),
+            run(11, json!({"kind": "model_completed", "usage": usage})),
+            // A second usage in the same step has no record to carry it.
+            run(12, json!({"kind": "model_completed", "usage": usage})),
+            run(13, json!({"kind": "terminal", "terminal": "completed"})),
         ]
         .join("\n")
             + "\n";
         let transcript = parse_transcript(&contents).unwrap();
         let (owners, orphans) = pair_model_steps(&transcript);
-        // Record indexes: 0 prompt, 1 usage, 2 calls, 3 reply, 4 usage,
-        // 5 usage with nothing to carry it, 6 terminal.
-        assert_eq!(owners.get(&2), Some(&1));
-        assert_eq!(owners.get(&3), Some(&4));
-        assert_eq!(owners.len(), 2);
+        // Record indexes: 0 prompt, 1 usage, 2 reasoning, 3 calls, 4 results,
+        // 5 usage, 6 calls, 7 results, 8 reply, 9 usage, 10 usage, 11 terminal.
+        assert_eq!(
+            owners.get(&2),
+            Some(&1),
+            "step 1 is owned by its first commit"
+        );
+        assert_eq!(owners.get(&3), None, "the rest of step 1 owns nothing");
+        assert_eq!(owners.get(&6), Some(&5));
+        assert_eq!(owners.get(&8), Some(&9));
+        assert_eq!(owners.len(), 3);
         assert_eq!(orphans, 1);
     }
 
