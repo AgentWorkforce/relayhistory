@@ -219,38 +219,26 @@ pub fn latest_history_for_session(
     Ok(rows.next().transpose()?)
 }
 
-/// Bounded, deduplicated identities across catalog, prompts and events. Includes
-/// uncatalogued sessions so an export exclusion cannot miss partially read data.
-/// Continue with the last returned identity; hold a read transaction when a
-/// consistent multi-page baseline is required.
+/// Bounded, deduplicated identities across every table that stores a
+/// session, the same read as [`crate::SessionStore::session_identities`], so
+/// an export exclusion cannot miss partially read data. Continue with the
+/// last returned identity; hold a read transaction when a consistent
+/// multi-page baseline is required.
 #[cfg(feature = "export")]
 pub fn session_identities_after(
     conn: &Connection,
     after: Option<&crate::export::SessionIdentity>,
     limit: usize,
 ) -> Result<Vec<crate::export::SessionIdentity>> {
-    let mut query = conn.prepare(
-        "SELECT source, session_id FROM (
-            SELECT source, session_id FROM sessions
-            UNION SELECT source, session_id FROM history WHERE session_id IS NOT NULL
-            UNION SELECT source, session_id FROM session_events
-        ) WHERE ?1 IS NULL OR (source, session_id) > (?1, ?2)
-        ORDER BY source, session_id LIMIT ?3",
+    let page = crate::session_identities::identities_after(
+        conn,
+        after.map(|after| (after.source.as_str(), after.session_id.as_str())),
+        bounded(limit) as usize,
     )?;
-    let rows = query.query_map(
-        rusqlite::params![
-            after.map(|v| v.source.as_str()),
-            after.map(|v| v.session_id.as_str()),
-            bounded(limit)
-        ],
-        |row| {
-            Ok(crate::export::SessionIdentity {
-                source: row.get(0)?,
-                session_id: row.get(1)?,
-            })
-        },
-    )?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    Ok(page
+        .into_iter()
+        .map(|(source, session_id)| crate::export::SessionIdentity { source, session_id })
+        .collect())
 }
 
 #[cfg(all(test, feature = "export"))]

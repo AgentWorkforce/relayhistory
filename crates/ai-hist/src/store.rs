@@ -1394,6 +1394,13 @@ VALUES ('session_presences_local_backfill_v1');
         "CREATE INDEX IF NOT EXISTS idx_sessions_source_recency ON sessions(source, last_activity_ms DESC, session_id)",
         [],
     )?;
+    // The primary key leads with `session_id`; the identity listing merges
+    // every table's identities in `(source, session_id)` order, and needs the
+    // catalog in that order too.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_identity ON sessions(source, session_id)",
+        [],
+    )?;
     // Shallow discovery keys its "has this file changed?" lookup on the raw
     // path, because a transcript's session id is not known until it is read.
     conn.execute(

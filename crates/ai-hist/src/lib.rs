@@ -39,6 +39,7 @@ workspace_mod!(watch);
 mod change_feed;
 mod file_lock;
 mod jsonl_temp;
+mod session_identities;
 mod session_store;
 mod session_usage;
 mod usage;
@@ -77,6 +78,7 @@ pub use change_feed::{
 pub use discover::{declared_evidence_kinds, missing_evidence_kinds, ShallowSession};
 pub use ingest::CaptureProgress;
 pub use relationship_graph::{RelationshipCapabilities, SessionRelationship};
+pub use session_identities::{IdentityQuery, SessionIdentity};
 pub use session_store::{
     Block, BlockKind, Capability, CatalogIter, CatalogQuery, CatalogSession, ControlKind,
     Diagnostic, DiscoveryOptions, DiscoveryReport, DiscoveryState, Error, FileEdit, HydrateOptions,
