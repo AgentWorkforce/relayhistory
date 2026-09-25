@@ -652,6 +652,7 @@ pub fn ai_hist::SessionStore::sessions(&self, ai_hist::CatalogQuery) -> ai_hist:
 pub fn ai_hist::SessionStore::sync(&self, ai_hist::SyncOptions) -> core::result::Result<ai_hist::SyncReport, ai_hist::Error>
 pub fn ai_hist::SessionStore::watch(&self, ai_hist::WatchOptions) -> core::result::Result<ai_hist::WatchHandle, ai_hist::Error>
 impl ai_hist::SessionStore
+pub fn ai_hist::SessionStore::has_session(&self, &ai_hist::SessionIdentity) -> core::result::Result<bool, ai_hist::Error>
 pub fn ai_hist::SessionStore::session_identities(&self, ai_hist::IdentityQuery) -> core::result::Result<alloc::vec::Vec<ai_hist::SessionIdentity>, ai_hist::Error>
 pub struct ai_hist::SessionToolCall
 pub ai_hist::SessionToolCall::args_json: core::option::Option<alloc::string::String>

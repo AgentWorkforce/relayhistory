@@ -204,6 +204,13 @@ Notable changes to the native `ai-hist` CLI are documented here.
 - `Source::Muse` and `ProviderRoots::muse` (the Muse Code sessions directory;
   `from_env` honours `XDG_DATA_HOME`). Both types are `#[non_exhaustive]`, so
   this is additive.
+- `SessionStore::has_session(&SessionIdentity)` answers whether the store
+  holds anything under one identity, by the same tables and rule as
+  `session_identities`: true exactly when the listing would name it, false for
+  an empty source or session id. It is one indexed existence probe per table,
+  on one snapshot. `storage::session_identity_exists` is the same check, and the
+  listing skips an empty source as it skips an empty session id, so every
+  session an embedder counts is one it can select and drain.
 - `ChangeQuery::session(source, session_id)` restricts a change-feed drain
   to one session: the same `Change` values the unfiltered drain reports for
   that session, tombstones included, read through each table's
@@ -217,8 +224,8 @@ Notable changes to the native `ai-hist` CLI are documented here.
   or not: the union of the catalog, prompts, events, tool calls, file edits,
   markers, relationships (by parent), presences, commit links, connector
   observations and trajectories. It is a merge of covering index seeks, so no
-  payload is read; each page reads one snapshot, and an empty session id is
-  no session. `SessionIdentity` names a stored session, including one
+  payload is read; each page reads one snapshot, and an empty source or
+  session id is no session. `SessionIdentity` names a stored session, including one
   under a source this build does not know, and is the type
   `ChangeQuery::session` holds. `storage::session_identities_after` is the
   same read, and now covers every one of those tables rather than the catalog,

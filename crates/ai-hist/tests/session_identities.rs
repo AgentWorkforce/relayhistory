@@ -225,3 +225,37 @@ fn identities_are_the_sessions_the_feed_names() {
         assert!(drained > 0, "{source} {session}");
     }
 }
+
+/// `has_session` answers exactly as the listing does: every listed identity
+/// exists, and an empty source or session id, or one nothing is stored
+/// under, does not.
+#[test]
+fn has_session_is_true_exactly_for_listed_identities() {
+    let store = store();
+    store.write(EVIDENCE);
+    store.write(
+        "INSERT INTO tool_calls (source, session_id, tool_use_id, name) \
+         VALUES ('', 'blank-source', 't1', 'Bash');",
+    );
+    let identities = store.all(1_000);
+    assert_eq!(identities.len(), 11);
+    for identity in &identities {
+        assert!(store.store.has_session(identity).unwrap(), "{identity:?}");
+    }
+    for (source, session) in [
+        ("", "blank-source"),
+        ("claude", ""),
+        ("grok", ""),
+        ("codex", "missing"),
+        ("trajectory", "missing"),
+        ("claude", "child-named-by-an-edge"),
+    ] {
+        assert!(
+            !store
+                .store
+                .has_session(&SessionIdentity::new(source, session))
+                .unwrap(),
+            "{source:?} {session:?}"
+        );
+    }
+}

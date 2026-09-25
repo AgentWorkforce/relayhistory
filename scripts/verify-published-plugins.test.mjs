@@ -58,6 +58,23 @@ test("checks every published name at the exact release version", async () => {
   assert.deepEqual(calls, expected.map((name) => [name, version]));
 });
 
+test("bounds concurrent registry lookups", async () => {
+  let inFlight = 0;
+  let maximum = 0;
+  await waitForPublishedPackages(version, {
+    ...quiet,
+    concurrency: 3,
+    runView: async () => {
+      inFlight += 1;
+      maximum = Math.max(maximum, inFlight);
+      await new Promise((resolve) => setImmediate(resolve));
+      inFlight -= 1;
+      return available;
+    },
+  });
+  assert.equal(maximum, 3);
+});
+
 test("accepts npm's singleton-array metadata format", async () => {
   await waitForPublishedPackages(version, {
     ...quiet,
@@ -128,7 +145,9 @@ test("authentication and network errors fail immediately with npm diagnostics", 
         return { status: 1, stdout: "", stderr: `npm error code ${code}` };
       },
     }), new RegExp(`npm view @relayhistory/capture@0\\.19\\.0 failed.*\\n.*${code}`));
-    assert.equal(calls, 1);
+    // The first bounded batch is already in flight when its first fatal
+    // result is inspected; no later batch is started.
+    assert.equal(calls, 4);
   }
 });
 

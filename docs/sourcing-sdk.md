@@ -85,7 +85,7 @@ What the facade owes you, and what it asks in return:
   `Error::UnsupportedOperation`, and a watermark the store cannot serve is
   `Error::WatermarkAheadOfStore`.
 
-## The eleven operations
+## The twelve operations
 
 | Method                                           | Provider I/O                                | Database work                                                             | Lock                                             |
 | ------------------------------------------------ | ------------------------------------------- | ------------------------------------------------------------------------- | ------------------------------------------------ |
@@ -97,6 +97,7 @@ What the facade owes you, and what it asks in return:
 | `sessions(CatalogQuery) -> CatalogIter`          | none                                        | keyset-paged reads over `sessions`                                        | none (WAL reader)                                |
 | `session(&SessionRef, SessionQuery)`             | none                                        | every table for one session, on one snapshot                              | none (one deferred read transaction)             |
 | `session_identities(IdentityQuery)`              | none                                        | one covering index seek per identity per table that holds it              | none (one read snapshot per page)                |
+| `has_session(&SessionIdentity)`                  | none                                        | one indexed existence probe per table                                     | none (one read snapshot)                         |
 | `changes_since(Watermark, ChangeQuery)`          | none                                        | one indexed revision-range read per kind per page, plus tombstones; a session drain seeks that session's index instead | none (one read snapshot per page) |
 | `head_revision() -> Watermark`                   | none                                        | one read of the feed head                                                 | none                                             |
 | `Source::capabilities() -> SourceCapabilities`   | none                                        | none — static                                                             | none                                             |
@@ -288,7 +289,7 @@ id). The catalog alone misses evidence that arrives without a catalog row — a
 subagent sidechain's events, a prompt-log entry, a connector's observation — so
 this is the read for anything that decides which sessions exist, such as a
 consent baseline. A prompt that names no session is under none, an empty
-session id names no session, and a child session that only a relationship
+source or session id names no session, and a child session that only a relationship
 names is not an identity until something is stored under it; every identity
 listed is one `ChangeQuery::session` accepts. These are exactly the non-empty `(source_name, session_id)`
 pairs the change feed reports. `source_name` is the stored text;
@@ -305,6 +306,12 @@ SEARCH session_events USING COVERING INDEX idx_session_events_session ((source,s
 SEARCH sessions USING COVERING INDEX idx_sessions_identity ((source,session_id)>(?,?))
 SEARCH trajectories USING COVERING INDEX sqlite_autoindex_trajectories_1 (id>?)
 ```
+
+`has_session(&SessionIdentity)` answers whether one identity exists, by the
+same tables and rule: true exactly when the listing would name it, so every
+session an embedder counts is one it can select, and false for an empty source
+or session id. It is one indexed existence probe per table, all on one
+snapshot.
 
 Every seek of a page reads one snapshot, so a page is the store at one
 moment; an identity written between pages is seen only if it sorts after the
@@ -712,7 +719,7 @@ embedder reads before bumping.
 
 | Feature | Default | What it adds | For |
 | --- | --- | --- | --- |
-| *(none)* | ✓ | `SessionStore` and its eleven operations, the change feed (`Change`, `ChangeQuery`, `Watermark`, `EvidenceRow`, `StoredRow`), `SessionIdentity` and `IdentityQuery`, `Source` and `SourceCapabilities`, `Error`, the evidence structs above, `NormalizedUsage` and the usage normalizers, `project_identity`, `declared_evidence_kinds` | Embedders |
+| *(none)* | ✓ | `SessionStore` and its twelve operations, the change feed (`Change`, `ChangeQuery`, `Watermark`, `EvidenceRow`, `StoredRow`), `SessionIdentity` and `IdentityQuery`, `Source` and `SourceCapabilities`, `Error`, the evidence structs above, `NormalizedUsage` and the usage normalizers, `project_identity`, `declared_evidence_kinds` | Embedders |
 | `fs-events` | — | The `notify` backend behind `watch`; without it `watch` polls at `poll_interval_ms`. `WatchOptions::use_fs_events` selects it when it is compiled in | The CLI, and an embedder that wants event-driven ticks |
 | `delivery` | — | Durable delivery of captured evidence to a destination | The CLI, napi, the relayhistory plugin |
 | `opencode-backup` | — | Snapshot a live OpenCode SQLite store through `rusqlite`'s backup API before reading it | The CLI, napi |

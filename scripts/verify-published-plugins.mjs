@@ -29,7 +29,8 @@ import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawnSync } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
+import { promisify } from "node:util";
 
 import { packageName, platforms, plugins } from "./history-package-contract.mjs";
 import { installWithRegistryRetry, isRegistryVisibilityFailure } from "./npm-install-with-registry-retry.mjs";
@@ -39,6 +40,8 @@ import {
   hostLibc,
   publicRegistryEnv,
 } from "./npm-host-install.mjs";
+
+const execFileAsync = promisify(execFile);
 
 export { currentPlatform, hostLibc, publicRegistryEnv };
 export const pluginInstallArgs = hostInstallArgs;
@@ -100,16 +103,39 @@ function expectedNames() {
 }
 
 /** Read one exact manifest using a fresh cache on every attempt. */
-function viewed(name, version) {
-  const cache = mkdtempSync(join(tmpdir(), "relayhistory-view-cache-"));
+async function viewed(name, version) {
+  const cache = await mkdtemp(join(tmpdir(), "relayhistory-view-cache-"));
   try {
-    return spawnSync(
-      "npm",
-      ["view", "--prefer-online", "--json", `${name}@${version}`],
-      { encoding: "utf8", env: { ...process.env, npm_config_cache: cache } },
-    );
+    try {
+      const { stdout, stderr } = await execFileAsync(
+        "npm",
+        ["view", "--prefer-online", "--json", `${name}@${version}`],
+        {
+          encoding: "utf8",
+          env: { ...process.env, npm_config_cache: cache },
+          maxBuffer: 4 * 1024 * 1024,
+        },
+      );
+      return { status: 0, signal: null, stdout, stderr };
+    } catch (error) {
+      if (typeof error.code === "number") {
+        return {
+          status: error.code,
+          signal: error.signal ?? null,
+          stdout: error.stdout ?? "",
+          stderr: error.stderr ?? "",
+        };
+      }
+      return {
+        status: null,
+        signal: error.signal ?? null,
+        stdout: error.stdout ?? "",
+        stderr: error.stderr ?? "",
+        error,
+      };
+    }
   } finally {
-    rmSync(cache, { recursive: true, force: true });
+    await rm(cache, { recursive: true, force: true });
   }
 }
 
@@ -117,39 +143,50 @@ function viewed(name, version) {
 export async function waitForPublishedPackages(version, {
   attempts = 60,
   delayMs = 5_000,
+  concurrency = 4,
   runView = viewed,
   sleep = (ms) => new Promise((resolveDelay) => setTimeout(resolveDelay, ms)),
   log = (message) => console.error(message),
 } = {}) {
+  assert.ok(
+    Number.isSafeInteger(concurrency) && concurrency > 0,
+    "concurrency must be positive",
+  );
   const pending = new Set(expectedNames());
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     const missing = [];
-    for (const name of pending) {
-      const result = runView(name, version);
-      const context = `npm view ${name}@${version}`;
-      if (result.error) throw new Error(`${context}: ${result.error.message}`, { cause: result.error });
-      if (result.status !== 0) {
-        const output = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
-        const diagnostic = `${context} failed (exit ${result.status}, signal ${result.signal ?? "none"}):\n${output}`;
-        if (!isRegistryVisibilityFailure(output)) throw new Error(diagnostic);
-        missing.push(diagnostic);
-        continue;
+    const names = [...pending];
+    for (let offset = 0; offset < names.length; offset += concurrency) {
+      const batch = names.slice(offset, offset + concurrency);
+      const results = await Promise.all(
+        batch.map(async (name) => [name, await runView(name, version)]),
+      );
+      for (const [name, result] of results) {
+        const context = `npm view ${name}@${version}`;
+        if (result.error) throw new Error(`${context}: ${result.error.message}`, { cause: result.error });
+        if (result.status !== 0) {
+          const output = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
+          const diagnostic = `${context} failed (exit ${result.status}, signal ${result.signal ?? "none"}):\n${output}`;
+          if (!isRegistryVisibilityFailure(output)) throw new Error(diagnostic);
+          missing.push(diagnostic);
+          continue;
+        }
+        let metadata;
+        try {
+          metadata = JSON.parse(result.stdout);
+        } catch (error) {
+          throw new Error(`${context}: invalid JSON: ${error.message}`, { cause: error });
+        }
+        // npm versions differ: an exact-version view can return an object or a
+        // singleton array. Never accept multiple versions from an exact lookup.
+        const manifests = Array.isArray(metadata) ? metadata : [metadata];
+        assert.equal(manifests.length, 1, `${context}: expected exactly one manifest`);
+        const [manifest] = manifests;
+        assert.ok(manifest && typeof manifest === "object", `${context}: invalid manifest`);
+        assert.equal(manifest.version, version, `${name}: registry returned the wrong version`);
+        assert.ok(manifest.repository?.url, `${name}@${version}: published without repository.url`);
+        pending.delete(name);
       }
-      let metadata;
-      try {
-        metadata = JSON.parse(result.stdout);
-      } catch (error) {
-        throw new Error(`${context}: invalid JSON: ${error.message}`, { cause: error });
-      }
-      // npm versions differ: an exact-version view can return an object or a
-      // singleton array. Never accept multiple versions from an exact lookup.
-      const manifests = Array.isArray(metadata) ? metadata : [metadata];
-      assert.equal(manifests.length, 1, `${context}: expected exactly one manifest`);
-      const [manifest] = manifests;
-      assert.ok(manifest && typeof manifest === "object", `${context}: invalid manifest`);
-      assert.equal(manifest.version, version, `${name}: registry returned the wrong version`);
-      assert.ok(manifest.repository?.url, `${name}@${version}: published without repository.url`);
-      pending.delete(name);
     }
     if (pending.size === 0) return;
     if (attempt === attempts) {
