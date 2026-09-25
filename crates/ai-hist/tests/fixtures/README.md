@@ -181,7 +181,7 @@ source without deciding which one fails the test.
 | Fixture | Origin | Corpus files | Quirk it encodes |
 | --- | --- | --- | --- |
 | `muse/cli-capture` | sessionmigrate | `muse/cli-capture` | a transcript the real `muse` CLI (0.2.1) wrote, trimmed to its conversation, tool and lifecycle records: three runs across two resumes, `read_file` calls with one failed outcome, per-step `model_completed` usage, and mirrored reminder task records |
-| `muse/tools-session` | relayhistory | `muse/tools-session` | authored from the documented shape: a permission frame before the metadata, encrypted and readable reasoning, `edit_file`/`write_file` edits, a `bash` result that exits 101, a mirrored subagent task stream, a mid-session model switch, and a `subagent/` child transcript that must not become a session |
+| `muse/tools-session` | relayhistory | `muse/tools-session` | authored from the documented shape: a permission frame before the metadata, encrypted and readable reasoning, `edit_file`/`write_file` edits, a `bash` result that exits 101, a mirrored subagent task stream, a mid-session model switch, and `subagent/` logs — a worker with its own nested child, and a reminder — linked as delegated children rather than catalogued as sessions |
 
 ### `opencode`
 

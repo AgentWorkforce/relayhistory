@@ -146,7 +146,7 @@ of `sessions list`. It is listed for completeness; every session-evidence row is
 | File edits (`file_edits`)                                          | ✓      | ✓     | ✓      | ✗    | ✓    | ✓        | ✗     | —          | [#166](https://github.com/AgentWorkforce/relayhistory/issues/166) / [#167](https://github.com/AgentWorkforce/relayhistory/issues/167) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                     |
 | Compaction / summary markers                                       | ✗      | ✗     | ✗      | ✗    | ✗    | ✓        | ✗     | —          | [#165](https://github.com/AgentWorkforce/relayhistory/issues/165) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                                                                                          |
 | Control / lifecycle rows                                           | ✓      | ✓     | ✗      | ✗    | ✓    | ✗        | ✗     | —          | [#165](https://github.com/AgentWorkforce/relayhistory/issues/165), [#180](https://github.com/AgentWorkforce/relayhistory/issues/180)                                                                                                                                          |
-| Relationship — delegated                                           | ◐      | ✓     | —      | —    | ✗    | ✓        | —     | —          | [#170](https://github.com/AgentWorkforce/relayhistory/issues/170) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                                                                                          |
+| Relationship — delegated                                           | ◐      | ✓     | —      | —    | ✓    | ✓        | —     | —          | [#170](https://github.com/AgentWorkforce/relayhistory/issues/170) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                                                                                          |
 | Relationship — fork / resume / continuation                        | ✗      | ✗     | ✗      | ✗    | ✗    | ✗        | ✗     | —          | [#170](https://github.com/AgentWorkforce/relayhistory/issues/170)                                                                                                                                                                                                             |
 | Session metadata (cwd, branch, versions)                           | ◐      | ✓     | ◐      | ◐    | ◐    | ◐        | ✗     | —          | [#164](https://github.com/AgentWorkforce/relayhistory/issues/164), [#177](https://github.com/AgentWorkforce/relayhistory/issues/177)                                                                                                                                          |
 | Canonical `project_key`                                            | ✗      | ✗     | ✗      | ✗    | ✗    | ✗        | ✗     | —          | [#175](https://github.com/AgentWorkforce/relayhistory/issues/175)                                                                                                                                                                                                             |
@@ -200,9 +200,10 @@ attached to a neighbour. `request_id` is Muse's `response_id` and
 separate `tool_batch.effect.terminal` record, joined by call id, and a
 `bash` call that completed with a non-zero `exit_code` is an error. Session
 metadata is `◐`: `workspace_root`, model and CLI version, but Muse records no
-branch. Delegation is `✗`: `subagent_spawn` is an ordinary `tool_calls` row,
-and the `subagent/<id>/session.jsonl` children beside a session are neither
-catalogued nor linked yet. The fixtures include a transcript the real CLI
+branch. Delegation is `✓`: each `subagent/<id>/session.jsonl` beside a
+session is indexed under the id its own metadata names and linked as
+`delegated` (`evidence_kind = "muse_subagent_log"`), typed from the parent's
+`task_stream_linked` record, at any nesting depth. The fixtures include a transcript the real CLI
 wrote (`tests/fixtures/muse/cli-capture`).
 
 **Token usage.** Claude is `◐`: `ingest_claude_transcript_as` serializes

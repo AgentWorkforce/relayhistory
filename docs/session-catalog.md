@@ -670,7 +670,7 @@ follows.
 | **codex** | ✓ | ✓ | ✓ | ✓ | ✓ when the bounded child search is complete | `full` or `partial` |
 | **cursor** | ✓ | ✓ | ✓ | ✓ | – (never: a `Task` block names no child transcript) | `partial` |
 | **grok** | ✓ | ✓ | ✓ | ✓ | ✓ | `full` |
-| **muse** | ✓ | ✓ | ✓ | ✓ | – (not linked yet: `subagent/` children are neither catalogued nor linked) | `partial` |
+| **muse** | ✓ | ✓ | ✓ | ✓ | ✓ | `full` |
 | **opencode** | ✓ | ✓ | ✓ | ✓ | ✓ | `full` |
 | **relay** | – | – | – | – | – | targeted hydration unsupported |
 
@@ -740,7 +740,8 @@ Delegation is a separate capability, reported on every relationship result as
 | **opencode** | always | – | ✓ | ✓ |
 | **claude** | sometimes | ✓ | ✓ | ✓ |
 | **grok** | sometimes | ✓ | ✓ | ✓ |
-| **cursor**, **muse**, **relay** | never | – | – | – |
+| **muse** | always | ✓ | ✓ | ✓ |
+| **cursor**, **relay** | never | – | – | – |
 
 OpenCode is `always` because a subagent session is a session in its own right
 and its own record names the parent, in `session.parentID`. Nothing is
@@ -758,6 +759,13 @@ entry that records a child session id links to a child session in the normal
 sessions tree, and one that does not is stored as unlinked evidence. The id is
 never taken from the entry's file name. A `Task` call inside the transcript
 names no child at all. See ["grok"](#grok).
+
+Muse is `always` because every subagent writes its own
+`subagent/<id>/session.jsonl` beside the parent, and that log's metadata
+record names the child session. The edge is recorded with `evidence_kind =
+"muse_subagent_log"`; the agent type, name and model come from the parent's
+`task_stream_linked` (or `memory_reminder_child_session_linked`) record for
+that log. See ["muse"](#muse).
 
 Cursor is `never` for a different reason from grok, opencode and relay: it does
 record the spawn — a `Task` / `functions.Subagent` tool call, preserved as a
@@ -1489,10 +1497,29 @@ How each adapter works:
 
   A sync or hydration reads the whole file and **replaces** the session's
   evidence, so a re-read after the log grew adds exactly the new turns and
-  duplicates nothing. `subagent/<child-id>/session.jsonl` transcripts beside a
-  session are not sessions of their own and are never enumerated; linking them
-  as delegated children is not done yet (`MUSE_SUBAGENT_SPAWN_UNLINKED` counts
-  the `subagent_spawn` calls). The shapes were characterized from a transcript
+  duplicates nothing.
+
+  **Subagents.** Every child agent — a `subagent_spawn` worker, or a reminder
+  child when Muse is set to save those — writes
+  `subagent/<child-dir>/session.jsonl` beside its parent, and may nest its own
+  `subagent/` below that. These are never enumerated as sessions. Reading a
+  session reads its whole tree: each child is indexed under the session id
+  its **own** metadata record names (never the directory name) and linked to
+  its parent as `delegated`, with `spawn_depth`, the parent's
+  `task_stream_linked` `display.role` (`worker`, `reminder`, …) as
+  `child_agent_type`, its `display.label` as `child_agent_name`, a concrete
+  `display.model` (else the child's own `model_id`) as `child_model`, and the
+  task id as `evidence_ref`. As for a Codex subagent rollout, a child's
+  `history` rows and catalog row are removed — its objective is not a prompt
+  anybody typed — and its events stay addressable through the edge
+  (`sessions tree`, `related_session_ids`). The change stamp covers every
+  child log, so a background subagent that keeps writing after the parent's
+  last record is still re-read; a child whose log disappears loses its edge
+  and its evidence. A reminder linked by `memory_reminder_child_session_linked`
+  but saved only in memory (Muse's default for reminders) has no log and no
+  edge. `MUSE_SUBAGENT_LOG_MISSING` reports `subagent_spawn` calls with no log
+  to link, and `MUSE_SUBAGENT_LOG_UNIDENTIFIED` a log with no session
+  metadata. The shapes were characterized from a transcript
   the real CLI wrote (`tests/fixtures/muse/cli-capture`, from
   [xhluca/session-migrate](https://github.com/xhluca/session-migrate)) and
   cross-checked against the published [Muse Code

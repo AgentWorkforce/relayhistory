@@ -49,12 +49,16 @@
       "prompt": "Why did it fail?",
       "session_id": "0199a1b2-0000-7000-8000-00000000a001",
       "source": "muse",
-      "timestamp_ms": 1790337606250
+      "timestamp_ms": 1790337606750
     }
   ],
   "hydration": [
     {
-      "related_session_ids": [],
+      "related_session_ids": [
+        "0199a1b2-0000-7000-8000-00000000c001",
+        "0199a1b2-0000-7000-8000-00000000c002",
+        "0199a1b2-0000-7000-8000-00000000e001"
+      ],
       "session_id": "0199a1b2-0000-7000-8000-00000000a001",
       "source": "muse",
       "status": "hydrated"
@@ -63,15 +67,15 @@
   "layout": "HomeTree",
   "notes": [],
   "origin": "relayhistory",
-  "quirk": "authored from the documented shape: a permission frame before the metadata, encrypted and readable reasoning, `edit_file`/`write_file` edits, a `bash` result that exits 101, a mirrored subagent task stream, a mid-session model switch, and a `subagent/` child transcript that must not become a session",
+  "quirk": "authored from the documented shape: a permission frame before the metadata, encrypted and readable reasoning, `edit_file`/`write_file` edits, a `bash` result that exits 101, a mirrored subagent task stream, a mid-session model switch, and `subagent/` logs — a worker with its own nested child, and a reminder — linked as delegated children rather than catalogued as sessions",
   "session_events": [
     {
       "control_kind": null,
       "cwd": "/tmp/muse-demo",
-      "event_uid": "0199a1b2-rec-003",
+      "event_uid": "a001-rec-003",
       "git_branch": null,
       "kind": "text",
-      "message_id": "0199a1b2-rec-003",
+      "message_id": "a001-rec-003",
       "model": null,
       "parent_id": null,
       "project": "/tmp/muse-demo",
@@ -85,7 +89,7 @@
     {
       "control_kind": null,
       "cwd": "/tmp/muse-demo",
-      "event_uid": "0199a1b2-rec-006",
+      "event_uid": "a001-rec-006",
       "git_branch": null,
       "kind": "thinking",
       "message_id": "msg-r2",
@@ -170,6 +174,23 @@
     {
       "control_kind": null,
       "cwd": "/tmp/muse-demo",
+      "event_uid": "tool:call_spawn",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "msg-2",
+      "model": "meta/muse-spark-1.3",
+      "parent_id": null,
+      "project": "/tmp/muse-demo",
+      "role": "assistant",
+      "session_id": "0199a1b2-0000-7000-8000-00000000a001",
+      "source": "muse",
+      "text": "subagent_spawn reviewer",
+      "token_json": null,
+      "ts_ms": 1790337602750
+    },
+    {
+      "control_kind": null,
+      "cwd": "/tmp/muse-demo",
       "event_uid": "tool:call_write",
       "git_branch": null,
       "kind": "tool_use",
@@ -199,7 +220,7 @@
       "source": "muse",
       "text": "{\"command\": \"cargo test\", \"description\": null, \"exit_code\": 101, \"terminal_status\": \"exited\", \"output\": \"test retries ... FAILED\", \"truncated\": false}",
       "token_json": null,
-      "ts_ms": 1790337603750
+      "ts_ms": 1790337604500
     },
     {
       "control_kind": null,
@@ -216,7 +237,24 @@
       "source": "muse",
       "text": "edited — diff: -pub fn get() {} +pub fn retry() {}",
       "token_json": null,
-      "ts_ms": 1790337603750
+      "ts_ms": 1790337604500
+    },
+    {
+      "control_kind": null,
+      "cwd": "/tmp/muse-demo",
+      "event_uid": "result:call_spawn",
+      "git_branch": null,
+      "kind": "tool_result",
+      "message_id": "result:call_spawn",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/muse-demo",
+      "role": "tool_result",
+      "session_id": "0199a1b2-0000-7000-8000-00000000a001",
+      "source": "muse",
+      "text": "{\"ok\": true, \"task_id\": \"0199a1b2-0000-7000-8000-00000000d001\", \"status\": \"running\"}",
+      "token_json": null,
+      "ts_ms": 1790337604500
     },
     {
       "control_kind": null,
@@ -233,12 +271,12 @@
       "source": "muse",
       "text": "wrote 22 bytes to tests/retry.rs",
       "token_json": null,
-      "ts_ms": 1790337603750
+      "ts_ms": 1790337604500
     },
     {
       "control_kind": null,
       "cwd": "/tmp/muse-demo",
-      "event_uid": "0199a1b2-rec-019",
+      "event_uid": "a001-rec-020",
       "git_branch": null,
       "kind": "text",
       "message_id": "msg-3",
@@ -250,15 +288,15 @@
       "source": "muse",
       "text": "Added `retry` and a test; `cargo test` fails with exit code 101.",
       "token_json": "{\"cache_read_tokens\":1500,\"cache_write_tokens\":0,\"cached_tokens\":1500,\"input_tokens\":1800,\"output_tokens\":35,\"reasoning_tokens\":0}",
-      "ts_ms": 1790337604750
+      "ts_ms": 1790337605000
     },
     {
       "control_kind": null,
       "cwd": "/tmp/muse-demo",
-      "event_uid": "0199a1b2-rec-025",
+      "event_uid": "a001-rec-027",
       "git_branch": null,
       "kind": "text",
-      "message_id": "0199a1b2-rec-025",
+      "message_id": "a001-rec-027",
       "model": null,
       "parent_id": null,
       "project": "/tmp/muse-demo",
@@ -267,12 +305,12 @@
       "source": "muse",
       "text": "Why did it fail?",
       "token_json": null,
-      "ts_ms": 1790337606250
+      "ts_ms": 1790337606750
     },
     {
       "control_kind": null,
       "cwd": "/tmp/muse-demo",
-      "event_uid": "0199a1b2-rec-027",
+      "event_uid": "a001-rec-029",
       "git_branch": null,
       "kind": "text",
       "message_id": "msg-4",
@@ -284,13 +322,115 @@
       "source": "muse",
       "text": "`retry` is declared but the test expects it to return a value.",
       "token_json": "{\"cache_read_tokens\":1800,\"cache_write_tokens\":0,\"cached_tokens\":1800,\"input_tokens\":2000,\"output_tokens\":20,\"reasoning_tokens\":0}",
-      "ts_ms": 1790337606750
+      "ts_ms": 1790337607250
+    },
+    {
+      "control_kind": null,
+      "cwd": "/tmp/muse-demo",
+      "event_uid": "c001-rec-002",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "c001-rec-002",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/muse-demo",
+      "role": "user",
+      "session_id": "0199a1b2-0000-7000-8000-00000000c001",
+      "source": "muse",
+      "text": "Role: reviewer Objective: review src/http.rs",
+      "token_json": null,
+      "ts_ms": 1790337604600
+    },
+    {
+      "control_kind": null,
+      "cwd": "/tmp/muse-demo",
+      "event_uid": "c001-rec-004",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "child-msg-1",
+      "model": "meta/muse-spark-1.3",
+      "parent_id": null,
+      "project": "/tmp/muse-demo",
+      "role": "assistant",
+      "session_id": "0199a1b2-0000-7000-8000-00000000c001",
+      "source": "muse",
+      "text": "`retry` has no body; the test cannot pass.",
+      "token_json": "{\"cache_read_tokens\":0,\"cache_write_tokens\":0,\"cached_tokens\":0,\"input_tokens\":600,\"output_tokens\":25,\"reasoning_tokens\":0}",
+      "ts_ms": 1790337605100
+    },
+    {
+      "control_kind": null,
+      "cwd": "/tmp/muse-demo",
+      "event_uid": "c002-rec-002",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "c002-rec-002",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/muse-demo",
+      "role": "user",
+      "session_id": "0199a1b2-0000-7000-8000-00000000c002",
+      "source": "muse",
+      "text": "Role: linter Objective: lint src/http.rs",
+      "token_json": null,
+      "ts_ms": 1790337606100
+    },
+    {
+      "control_kind": null,
+      "cwd": "/tmp/muse-demo",
+      "event_uid": "c002-rec-003",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "grand-msg-1",
+      "model": "meta/muse-glimmer-30b",
+      "parent_id": null,
+      "project": "/tmp/muse-demo",
+      "role": "assistant",
+      "session_id": "0199a1b2-0000-7000-8000-00000000c002",
+      "source": "muse",
+      "text": "No lint findings.",
+      "token_json": null,
+      "ts_ms": 1790337606350
+    },
+    {
+      "control_kind": null,
+      "cwd": "/tmp/muse-demo",
+      "event_uid": "e001-rec-002",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "e001-rec-002",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/muse-demo",
+      "role": "user",
+      "session_id": "0199a1b2-0000-7000-8000-00000000e001",
+      "source": "muse",
+      "text": "Is the user's task finished?",
+      "token_json": null,
+      "ts_ms": 1790337605900
+    },
+    {
+      "control_kind": null,
+      "cwd": "/tmp/muse-demo",
+      "event_uid": "e001-rec-003",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "remind-msg-1",
+      "model": "meta/muse-spark-1.3",
+      "parent_id": null,
+      "project": "/tmp/muse-demo",
+      "role": "assistant",
+      "session_id": "0199a1b2-0000-7000-8000-00000000e001",
+      "source": "muse",
+      "text": "No: the test still fails.",
+      "token_json": null,
+      "ts_ms": 1790337606150
     }
   ],
   "session_markers": [
     {
       "kind": "session_start",
-      "marker_uid": "0199a1b2-rec-002",
+      "marker_uid": "a001-rec-002",
       "message_id": null,
       "parent_id": null,
       "payload_json": "{\"resume\":false}",
@@ -303,7 +443,7 @@
     },
     {
       "kind": "encrypted_reasoning",
-      "marker_uid": "0199a1b2-rec-005",
+      "marker_uid": "a001-rec-005",
       "message_id": "msg-r1",
       "parent_id": null,
       "payload_json": null,
@@ -316,7 +456,7 @@
     },
     {
       "kind": "turn_end",
-      "marker_uid": "0199a1b2-rec-020",
+      "marker_uid": "a001-rec-022",
       "message_id": null,
       "parent_id": null,
       "payload_json": "{\"terminal\":\"completed\"}",
@@ -324,12 +464,12 @@
       "source": "muse",
       "subkind": "terminal",
       "text": "completed",
-      "ts_ms": 1790337605000,
+      "ts_ms": 1790337605500,
       "turn_id": "run-a"
     },
     {
       "kind": "session_end",
-      "marker_uid": "0199a1b2-rec-021",
+      "marker_uid": "a001-rec-023",
       "message_id": null,
       "parent_id": null,
       "payload_json": null,
@@ -337,12 +477,12 @@
       "source": "muse",
       "subkind": "session.end",
       "text": "clean",
-      "ts_ms": 1790337605250,
+      "ts_ms": 1790337605750,
       "turn_id": null
     },
     {
       "kind": "session_start",
-      "marker_uid": "0199a1b2-rec-022",
+      "marker_uid": "a001-rec-024",
       "message_id": null,
       "parent_id": null,
       "payload_json": "{\"resume\":true}",
@@ -350,12 +490,12 @@
       "source": "muse",
       "subkind": "session.opened.observed",
       "text": null,
-      "ts_ms": 1790337605500,
+      "ts_ms": 1790337606000,
       "turn_id": null
     },
     {
       "kind": "session_resumed",
-      "marker_uid": "0199a1b2-rec-023",
+      "marker_uid": "a001-rec-025",
       "message_id": null,
       "parent_id": null,
       "payload_json": null,
@@ -363,12 +503,12 @@
       "source": "muse",
       "subkind": "session.resumed",
       "text": null,
-      "ts_ms": 1790337605750,
+      "ts_ms": 1790337606250,
       "turn_id": null
     },
     {
       "kind": "model_switch",
-      "marker_uid": "0199a1b2-rec-024",
+      "marker_uid": "a001-rec-026",
       "message_id": null,
       "parent_id": null,
       "payload_json": null,
@@ -376,12 +516,12 @@
       "source": "muse",
       "subkind": "runtime.session.metadata",
       "text": "meta/muse-spark-1.3-contributor",
-      "ts_ms": 1790337606000,
+      "ts_ms": 1790337606500,
       "turn_id": null
     },
     {
       "kind": "turn_end",
-      "marker_uid": "0199a1b2-rec-028",
+      "marker_uid": "a001-rec-030",
       "message_id": null,
       "parent_id": null,
       "payload_json": "{\"reason\":\"user_cancelled\",\"terminal\":\"interrupted\"}",
@@ -389,11 +529,63 @@
       "source": "muse",
       "subkind": "terminal",
       "text": "interrupted",
-      "ts_ms": 1790337607000,
+      "ts_ms": 1790337607500,
       "turn_id": "run-b"
     }
   ],
-  "session_relationships": [],
+  "session_relationships": [
+    {
+      "child_agent_name": "reviewer",
+      "child_agent_type": "worker",
+      "child_has_events": 1,
+      "child_model": "meta/muse-spark-1.3",
+      "child_session_id": "0199a1b2-0000-7000-8000-00000000c001",
+      "evidence_kind": "muse_subagent_log",
+      "evidence_locator": "<home>/.local/share/muse/sessions/2026/09/20/0199a1b2-0000-7000-8000-00000000a001/subagent/0199a1b2-0000-7000-8000-00000000c001/session.jsonl",
+      "evidence_ref": "0199a1b2-0000-7000-8000-00000000d001",
+      "identity_status": "observed",
+      "parent_session_id": "0199a1b2-0000-7000-8000-00000000a001",
+      "relationship": "delegated",
+      "relationship_uid": "child:0199a1b2-0000-7000-8000-00000000c001",
+      "source": "muse",
+      "spawn_depth": 1,
+      "spawned_at_ms": 1790337604000
+    },
+    {
+      "child_agent_name": "plugin:tbh-reminders:goal-reminder",
+      "child_agent_type": "reminder",
+      "child_has_events": 1,
+      "child_model": "meta/muse-spark-1.3",
+      "child_session_id": "0199a1b2-0000-7000-8000-00000000e001",
+      "evidence_kind": "muse_subagent_log",
+      "evidence_locator": "<home>/.local/share/muse/sessions/2026/09/20/0199a1b2-0000-7000-8000-00000000a001/subagent/0199a1b2-0000-7000-8000-00000000e001/session.jsonl",
+      "evidence_ref": "0199a1b2-0000-7000-8000-00000000d002",
+      "identity_status": "observed",
+      "parent_session_id": "0199a1b2-0000-7000-8000-00000000a001",
+      "relationship": "delegated",
+      "relationship_uid": "child:0199a1b2-0000-7000-8000-00000000e001",
+      "source": "muse",
+      "spawn_depth": 1,
+      "spawned_at_ms": 1790337605250
+    },
+    {
+      "child_agent_name": "linter",
+      "child_agent_type": "worker",
+      "child_has_events": 1,
+      "child_model": "meta/muse-glimmer-30b",
+      "child_session_id": "0199a1b2-0000-7000-8000-00000000c002",
+      "evidence_kind": "muse_subagent_log",
+      "evidence_locator": "<home>/.local/share/muse/sessions/2026/09/20/0199a1b2-0000-7000-8000-00000000a001/subagent/0199a1b2-0000-7000-8000-00000000c001/subagent/0199a1b2-0000-7000-8000-00000000c002/session.jsonl",
+      "evidence_ref": "0199a1b2-0000-7000-8000-00000000d003",
+      "identity_status": "observed",
+      "parent_session_id": "0199a1b2-0000-7000-8000-00000000c001",
+      "relationship": "delegated",
+      "relationship_uid": "child:0199a1b2-0000-7000-8000-00000000c002",
+      "source": "muse",
+      "spawn_depth": 2,
+      "spawned_at_ms": 1790337605350
+    }
+  ],
   "sessions": [
     {
       "agent_version": "1.3.0",
@@ -403,7 +595,7 @@
       "first_prompt": "Add a retry helper to src/http.rs and run the tests.",
       "git_branch": null,
       "initial_commit": null,
-      "last_activity_ms": 1790337607000,
+      "last_activity_ms": 1790337607500,
       "last_assistant_text": "`retry` is declared but the test expects it to return a value.",
       "models_json": "[\"meta/muse-spark-1.3\",\"meta/muse-spark-1.3-contributor\"]",
       "originator": null,
@@ -411,7 +603,7 @@
       "repo_url": null,
       "session_id": "0199a1b2-0000-7000-8000-00000000a001",
       "source": "muse",
-      "source_stamp": "<n>:15194",
+      "source_stamp": "<n>:16712|subagent/0199a1b2-0000-7000-8000-00000000c001/session.jsonl=<n>:3091|subagent/0199a1b2-0000-7000-8000-00000000c001/subagent/0199a1b2-0000-7000-8000-00000000c002/session.jsonl=<n>:1436|subagent/0199a1b2-0000-7000-8000-00000000e001/session.jsonl=<n>:1433",
       "workspace_roots_json": null
     }
   ],
@@ -448,6 +640,17 @@
       "source": "muse",
       "target": "src/http.rs",
       "tool_use_id": "call_edit",
+      "ts_ms": 1790337602750
+    },
+    {
+      "args_json": "{\"objective\":\"review src/http.rs\",\"role\":\"reviewer\"}",
+      "is_error": 0,
+      "message_id": "msg-2",
+      "name": "subagent_spawn",
+      "session_id": "0199a1b2-0000-7000-8000-00000000a001",
+      "source": "muse",
+      "target": "reviewer",
+      "tool_use_id": "call_spawn",
       "ts_ms": 1790337602750
     },
     {

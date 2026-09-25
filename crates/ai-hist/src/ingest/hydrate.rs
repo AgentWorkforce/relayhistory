@@ -1573,6 +1573,21 @@ fn source_snapshot(
             SnapshotRecords::DeferredGrok(path.clone()),
             inventory.stamp,
         )
+    } else if options.source == "muse" {
+        // A Muse session is its transcript plus the subagent logs beside it;
+        // the stamp and the counts cover all of them, so a child that grew
+        // after the parent's last record is still a change.
+        let mut bytes = 0i64;
+        let mut records = 0i64;
+        for file in muse_session_files(&path)? {
+            bytes += file.metadata()?.len() as i64;
+            records += complete_jsonl_records(&file)?;
+        }
+        (
+            bytes,
+            SnapshotRecords::Counted(records),
+            muse_session_stamp(&path)?,
+        )
     } else if let Some(snapshot) = captured_claude.as_ref() {
         // The hook already read these bytes; nothing here opens the file.
         (
@@ -2960,7 +2975,7 @@ fn ingest_muse(
             "Muse Code transcript identity does not match the catalog row",
         ));
     }
-    let outcome = ingest_muse_session(conn, &transcript, &path.to_string_lossy())?;
+    let outcome = ingest_muse_session_tree(conn, &transcript, path)?;
     Ok(muse_diagnostics(&outcome))
 }
 
@@ -2995,13 +3010,23 @@ fn muse_diagnostics(outcome: &MuseIngestOutcome) -> Vec<HydrationDiagnostic> {
             ),
         ));
     }
-    if outcome.subagent_calls > 0 {
+    if outcome.subagent_calls > outcome.worker_children {
         diagnostics.push(diagnostic(
-            "MUSE_SUBAGENT_SPAWN_UNLINKED",
+            "MUSE_SUBAGENT_LOG_MISSING",
             format!(
-                "{} subagent_spawn call(s) are recorded as tool calls; Muse subagent \
-                 transcripts are not linked as child sessions yet",
-                outcome.subagent_calls
+                "{} subagent_spawn call(s) but {} subagent log(s) beside the session; a \
+                 spawn with no log is visible as a tool call and has no child to link",
+                outcome.subagent_calls, outcome.worker_children
+            ),
+        ));
+    }
+    if outcome.unidentified_children > 0 {
+        diagnostics.push(diagnostic(
+            "MUSE_SUBAGENT_LOG_UNIDENTIFIED",
+            format!(
+                "{} subagent log(s) carried no session metadata, so there is no child \
+                 session id to link them under",
+                outcome.unidentified_children
             ),
         ));
     }

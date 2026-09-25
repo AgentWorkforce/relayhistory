@@ -32,9 +32,12 @@ Notable changes to the native `ai-hist` CLI are documented here.
   `write_file` / `edit_file` edits, per-model-step token usage (normalized as
   `per-request`), models, CLI version and lifecycle markers (`turn_end`,
   `session_start`, `session_resumed`, `session_end`, `model_switch`,
-  `encrypted_reasoning`). `subagent/` child transcripts are not catalogued as
-  sessions, and delegation to them is not linked yet, so a Muse hydration
-  reports `partial`. `ai-hist resume` prints `muse resume <id>`, and the sync
+  `encrypted_reasoning`). Subagent and reminder logs
+  (`subagent/<id>/session.jsonl`, at any depth) are indexed under the child's
+  own session id and linked to their parent as `delegated` children, typed
+  from the parent's `task_stream_linked` record; they are not catalogued as
+  sessions and their objectives are not history rows. A Muse hydration
+  reports `full`. `ai-hist resume` prints `muse resume <id>`, and the sync
   service forwards `XDG_DATA_HOME`.
 - Markers reach the SDK, MCP and both CLIs. `getSessionMarkersPage(source,
   sessionId, {limit, after})`, the `sessionMarkers()` iterator and

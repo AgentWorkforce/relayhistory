@@ -141,6 +141,28 @@ pub(crate) enum MuseEvent {
     },
     /// A metadata record after the first: a model or provider switch.
     Metadata(MuseMetadata),
+    /// The parent linked a child agent's log: a subagent's task stream
+    /// (`task_stream_linked`) or a reminder child
+    /// (`memory_reminder_child_session_linked`). Describes the child; its
+    /// identity is always read from the child's own transcript.
+    SubagentLinked(MuseSubagentLink),
+}
+
+/// What a parent records about one child agent it started.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct MuseSubagentLink {
+    /// The child's log, relative to the parent's session directory:
+    /// `subagent/<dir>/session.jsonl`.
+    pub path: Option<String>,
+    /// `worker`, `reminder`, …: what kind of child this is.
+    pub role: Option<String>,
+    /// The display label the parent gave it.
+    pub label: Option<String>,
+    /// The child's model, when the parent named a concrete one.
+    pub model: Option<String>,
+    pub task_id: Option<String>,
+    /// The child's session id, where the parent states it outright.
+    pub child_session_id: Option<String>,
 }
 
 /// One interpreted record, with the envelope facts every event carries.
@@ -347,6 +369,28 @@ fn parse_run_event(event: &Value) -> Option<MuseEvent> {
             finish_reason: text_field(event, "finish_reason"),
             duration_ms: event.get("duration_ms").and_then(Value::as_i64),
         }),
+        "task_stream_linked" => {
+            let display = event.get("display").unwrap_or(&Value::Null);
+            Some(MuseEvent::SubagentLinked(MuseSubagentLink {
+                path: text_field(display, "path"),
+                role: text_field(display, "role"),
+                label: text_field(display, "label"),
+                // `same-as-main` is a policy, not a model name.
+                model: text_field(display, "model").filter(|model| model != "same-as-main"),
+                task_id: text_field(event, "task_id"),
+                child_session_id: None,
+            }))
+        }
+        "memory_reminder_child_session_linked" => {
+            Some(MuseEvent::SubagentLinked(MuseSubagentLink {
+                path: text_field(event, "child_session_log_path"),
+                role: Some("reminder".to_string()),
+                label: text_field(event, "reminder_agent_id"),
+                model: None,
+                task_id: text_field(event, "task_id"),
+                child_session_id: text_field(event, "child_session_id"),
+            }))
+        }
         "terminal" => Some(MuseEvent::RunTerminal {
             status: text_field(event, "terminal"),
             reason: text_field(event, "reason"),
@@ -451,6 +495,42 @@ pub(crate) fn is_child_transcript(path: &Path, root: &Path) -> bool {
         .unwrap_or(path)
         .components()
         .any(|component| component.as_os_str() == SUBAGENT_DIR)
+}
+
+/// Everything the parent recorded about its children, keyed by the child
+/// log's path relative to the parent's session directory. A child linked by
+/// both a task stream and a reminder event keeps every field either named.
+pub(crate) fn subagent_links(
+    transcript: &MuseTranscript,
+) -> HashMap<String, (i64, MuseSubagentLink)> {
+    let mut links: HashMap<String, (i64, MuseSubagentLink)> = HashMap::new();
+    for record in &transcript.records {
+        let MuseEvent::SubagentLinked(link) = &record.event else {
+            continue;
+        };
+        let Some(path) = link.path.as_deref() else {
+            continue;
+        };
+        let entry = links
+            .entry(normalize_link_path(path))
+            .or_insert_with(|| (record.ts_ms, MuseSubagentLink::default()));
+        let merged = &mut entry.1;
+        merged.path = merged.path.take().or_else(|| link.path.clone());
+        merged.role = merged.role.take().or_else(|| link.role.clone());
+        merged.label = merged.label.take().or_else(|| link.label.clone());
+        merged.model = merged.model.take().or_else(|| link.model.clone());
+        merged.task_id = merged.task_id.take().or_else(|| link.task_id.clone());
+        merged.child_session_id = merged
+            .child_session_id
+            .take()
+            .or_else(|| link.child_session_id.clone());
+    }
+    links
+}
+
+/// A child log path as a lookup key: `/`-separated, no leading `./`.
+pub(crate) fn normalize_link_path(path: &str) -> String {
+    path.replace('\\', "/").trim_start_matches("./").to_string()
 }
 
 /// Tools that write a file.

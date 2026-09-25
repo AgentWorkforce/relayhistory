@@ -2071,16 +2071,11 @@ impl ShallowSessionProvider for MuseProvider {
     fn source(&self) -> &'static str {
         "muse"
     }
-    /// The transcript parser writes prompts, events, tool calls and file
-    /// edits. Delegation is not captured yet, so relationships are not
-    /// declared and a hydration reports partial rather than claiming them.
+    /// The transcript parser writes prompts, events, tool calls, file edits
+    /// and `delegated` edges to the subagent logs beside the session: every
+    /// kind a full session is made of.
     fn evidence_kinds(&self) -> &'static [EvidenceKind] {
-        &[
-            EvidenceKind::History,
-            EvidenceKind::SessionEvent,
-            EvidenceKind::ToolCall,
-            EvidenceKind::FileEdit,
-        ]
+        FULL_SESSION_KINDS
     }
 
     fn watch_roots(&self, roots: &ProviderRoots<'_>) -> Vec<WatchRoot> {
