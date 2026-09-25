@@ -10878,6 +10878,11 @@ pub(crate) fn ingest_muse_session_tree(
         MuseRole::Session
     };
     let mut outcome = ingest_muse_session(conn, transcript, &path.to_string_lossy(), role)?;
+    if role == MuseRole::Subagent {
+        // Not a catalog row of its own either, unless a remote presence
+        // stands behind it.
+        cleanup_subagent_registration(conn, "muse", &transcript.metadata.session_id)?;
+    }
     if let (Some(dir), Some(children)) = (path.parent(), children) {
         let mut visited = HashSet::from([transcript.metadata.session_id.clone()]);
         link_muse_subagents(
@@ -11070,7 +11075,7 @@ fn forget_muse_subagent(conn: &Connection, child_id: &str) -> Result<()> {
     )?;
     if session_has_remote_presence(conn, "muse", child_id)? {
         // Its log is gone, so it is no longer present locally; the remote
-        // presence, and the catalog row that stands on it, stay.
+        // presence, the catalog row that stands on it and its history stay.
         conn.execute(
             "DELETE FROM session_presences \
              WHERE source = 'muse' AND session_id = ? AND location = 'local'",
@@ -11078,6 +11083,9 @@ fn forget_muse_subagent(conn: &Connection, child_id: &str) -> Result<()> {
         )?;
         return Ok(());
     }
+    // Any history still filed under it — from before it was linked as a
+    // subagent — goes too, or moves to a session that still evidences it.
+    replace_session_history(conn, "muse", child_id)?;
     for statement in [
         "DELETE FROM session_events WHERE source = 'muse' AND session_id = ?",
         "DELETE FROM tool_calls WHERE source = 'muse' AND session_id = ?",
@@ -15482,6 +15490,39 @@ mod tests {
         );
     }
 
+    /// A removed child's leftover history — filed under it before it was
+    /// linked as a subagent — goes with the rest of its evidence.
+    #[test]
+    fn a_removed_muse_child_takes_its_leftover_history_with_it() {
+        let home = tempfile::tempdir().unwrap();
+        let (root, transcript) = muse_fixture(home.path());
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        insert_history(
+            &conn,
+            &HistoryEntry {
+                id: 0,
+                source: "muse".into(),
+                session_id: Some(MUSE_WORKER.to_string()),
+                project: None,
+                prompt: "indexed as a session once".into(),
+                prompt_hash: Some(prompt_hash("indexed as a session once")),
+                timestamp_ms: 42,
+            },
+        )
+        .unwrap();
+        fs::remove_dir_all(
+            transcript
+                .parent()
+                .unwrap()
+                .join(format!("subagent/{MUSE_WORKER}")),
+        )
+        .unwrap();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        assert_eq!(muse_session_count(&conn, "history", MUSE_WORKER), 0);
+    }
+
     /// Hydrating a subagent's log directly reads it as a subagent: its
     /// objective is an event, never history.
     #[test]
@@ -15497,6 +15538,11 @@ mod tests {
         super::ingest_muse_session_tree(&conn, &child, &log, None).unwrap();
         assert!(muse_session_count(&conn, "session_events", MUSE_WORKER) > 0);
         assert_eq!(muse_session_count(&conn, "history", MUSE_WORKER), 0);
+        assert_eq!(
+            muse_session_count(&conn, "sessions", MUSE_WORKER),
+            0,
+            "nor a catalog row of its own"
+        );
     }
 
     /// Scoped to its own prompt events, a remote session's history cleanup

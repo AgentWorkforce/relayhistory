@@ -2115,6 +2115,12 @@ impl ShallowSessionProvider for MuseProvider {
     ) -> Result<Option<ShallowSession>> {
         use crate::ingest::muse;
         let path = PathBuf::from(&candidate.locator);
+        // A subagent's log is never a session of its own, however the
+        // candidate arrived — enumeration skips them, a watch hit or a
+        // by-path read need not.
+        if muse::is_subagent_log(&path) {
+            return Ok(None);
+        }
         let bounded = read_bounded_jsonl(scan, &path)?;
         // A permission frame can precede the metadata record, so the header
         // is looked for rather than assumed to be the first line.
