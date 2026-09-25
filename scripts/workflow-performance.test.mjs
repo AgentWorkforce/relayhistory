@@ -46,13 +46,28 @@ test("plugin families publish in parallel and verify afterwards", () => {
 });
 
 test("full core smoke checks gate release finalization and downstream publication", () => {
-  const corePublish = jobBlock(publish, "publish", "persist-version");
+  const corePublish = jobBlock(publish, "publish", "verify-core");
   assert.match(corePublish, /name: Registry visibility gate/);
-  assert.match(corePublish, /name: Registry clean-install smoke test/);
-  assert.match(corePublish, /name: Registry CLI smoke test on older glibc/);
   assert.match(corePublish, /name: Tag the published tree/);
-  assert.match(corePublish, /name: Create GitHub Release/);
+  assert.doesNotMatch(corePublish, /name: Registry clean-install smoke test/);
+  assert.doesNotMatch(corePublish, /name: Create GitHub Release/);
+
+  const verification = jobBlock(publish, "verify-core", "finalize-core");
+  assert.match(verification, /needs: \[version, publish\]/);
+  assert.match(verification, /inputs\.skip_core \|\| needs\.publish\.result == 'success'/);
+  assert.match(verification, /name: Registry clean-install smoke test/);
+  assert.match(verification, /name: Registry CLI smoke test on older glibc/);
+
+  const finalization = jobBlock(publish, "finalize-core", "persist-version");
+  assert.match(finalization, /needs: \[version, publish, verify-core\]/);
+  assert.match(finalization, /needs\.verify-core\.result == 'success'/);
+  assert.match(finalization, /name: Create GitHub Release after runtime verification/);
 
   const plugins = jobBlock(publish, "plugins", "verify-plugins");
-  assert.match(plugins, /needs: \[version, publish, package-plugins\]/);
+  assert.match(
+    plugins,
+    /needs: \[version, publish, verify-core, finalize-core, package-plugins\]/,
+  );
+  assert.match(plugins, /needs\.verify-core\.result == 'success'/);
+  assert.match(plugins, /needs\.finalize-core\.result == 'success'/);
 });

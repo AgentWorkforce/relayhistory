@@ -49,7 +49,7 @@ on:
         default: true
         type: boolean
       skip_core:
-        description: 'Re-run plugins/probe/crates.io for an already published core version; requires custom_version'
+        description: 'Verify and finish plugins/probe/crates.io for an already published core version; requires custom_version'
         required: false
         default: false
         type: boolean
@@ -775,27 +775,9 @@ jobs:
           await waitForRegistryPackages(process.argv[2], { attempts, delayMs });
           NODE
 
-      - name: Registry clean-install smoke test
-        if: ${{ !inputs.dry_run }}
-        working-directory: .
-        env:
-          REGISTRY_VISIBILITY_ATTEMPTS: 36
-          REGISTRY_VISIBILITY_DELAY_MS: 10000
-          NPM_REGISTRY_RETRY_ATTEMPTS: 36
-          NPM_REGISTRY_RETRY_DELAY_MS: 10000
-        run: node scripts/registry-clean-install-smoke.mjs
-      - name: Registry CLI smoke test on older glibc
-        if: ${{ !inputs.dry_run }}
-        working-directory: .
-        run: |
-          set -euo pipefail
-          for image in node:22-bookworm-slim ubuntu:22.04; do
-            bash scripts/smoke-linux-native.sh "$image" registry "$VERSION"
-          done
-
-      # Only finalize the release after the published packages pass the full
-      # clean-install and older-glibc runtime gates. Downstream publication
-      # depends on this job, so it cannot outrun those checks either.
+      # Push the immutable recovery point as soon as npm confirms visibility.
+      # If a later runtime gate fails, skip_core can verify this exact tree and
+      # finish the release without trying to republish immutable npm versions.
       - name: Tag the published tree
         id: tag-published-tree
         if: ${{ !inputs.dry_run }}
@@ -811,24 +793,81 @@ jobs:
           git tag -a "sdk-ts-v$VERSION" HEAD -m "ai-hist@$VERSION"
           git push origin "refs/tags/sdk-ts-v$VERSION"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      - name: Create GitHub Release
-        if: ${{ !inputs.dry_run }}
+
+  verify-core:
+    name: Verify published core
+    needs: [version, publish]
+    # A normal run verifies after npm publication. A skip_core retry verifies
+    # the existing tagged release before resuming any downstream mutation.
+    if: ${{ !cancelled() && !inputs.dry_run && needs.version.result == 'success' && (inputs.skip_core || needs.publish.result == 'success') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: .
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ format('refs/tags/sdk-ts-v{0}', needs.version.outputs.version) }}
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22.14.0'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Match release npm version
+        run: npm install -g npm@11.19.1
+      - name: Registry clean-install smoke test
         env:
-          GH_TOKEN: ${{ github.token }}
+          REGISTRY_VISIBILITY_ATTEMPTS: 36
+          REGISTRY_VISIBILITY_DELAY_MS: 10000
+          NPM_REGISTRY_RETRY_ATTEMPTS: 36
+          NPM_REGISTRY_RETRY_DELAY_MS: 10000
+        run: node scripts/registry-clean-install-smoke.mjs
+      - name: Registry CLI smoke test on older glibc
         run: |
           set -euo pipefail
-          gh release create "sdk-ts-v$VERSION" \
-            --target "${{ steps.tag-published-tree.outputs.sha }}" \
-            --title "ai-hist@$VERSION" \
-            --generate-notes
+          for image in node:22-bookworm-slim ubuntu:22.04; do
+            bash scripts/smoke-linux-native.sh "$image" registry "$VERSION"
+          done
+
+  finalize-core:
+    name: Finalize verified core release
+    needs: [version, publish, verify-core]
+    if: ${{ !cancelled() && !inputs.dry_run && needs.verify-core.result == 'success' && (inputs.skip_core || needs.publish.result == 'success') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: .
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Create GitHub Release after runtime verification
+        run: |
+          set -euo pipefail
+          tag="sdk-ts-v$VERSION"
+          gh api "repos/${GH_REPO}/git/ref/tags/$tag" >/dev/null
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "GitHub Release $tag already exists; leave it unchanged"
+          else
+            gh release create "$tag" \
+              --title "ai-hist@$VERSION" \
+              --generate-notes
+          fi
 
   persist-version:
     name: Persist release version
-    needs: [version, publish]
+    needs: [version, publish, finalize-core]
     # Bookkeeping only: npm, the tag and the GitHub Release already exist.
-    # Crate, plugins and probe depend on `publish`, not this job, so a rebase
+    # Crate, plugins and probe depend on `finalize-core`, not this job, so a rebase
     # conflict cannot drop a version that is already on the registry.
-    if: ${{ !cancelled() && !inputs.dry_run && !inputs.skip_core && needs.publish.result == 'success' }}
+    if: ${{ !cancelled() && !inputs.dry_run && !inputs.skip_core && needs.finalize-core.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -854,10 +893,10 @@ jobs:
 
   publish-crate:
     name: Publish crate to crates.io
-    needs: [version, publish]
+    needs: [version, publish, verify-core, finalize-core]
     # skip_core is the crates.io-only retry: npm already published this version
     # and tagged it, so this job checks out that tag instead of the dispatch SHA.
-    if: ${{ !cancelled() && needs.version.result == 'success' && (inputs.skip_core || needs.publish.result == 'success') }}
+    if: ${{ !cancelled() && needs.version.result == 'success' && ((inputs.dry_run && (inputs.skip_core || needs.publish.result == 'success')) || (!inputs.dry_run && needs.verify-core.result == 'success' && needs.finalize-core.result == 'success')) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -1040,10 +1079,10 @@ jobs:
 
   plugins:
     name: Publish optional plugin ${{ matrix.plugin }}
-    needs: [version, publish, package-plugins]
+    needs: [version, publish, verify-core, finalize-core, package-plugins]
     # `publish` is deliberately skipped by a skip_core re-run, so it is only
     # required when this run is actually releasing the core.
-    if: ${{ !cancelled() && inputs.plugins && needs.version.result == 'success' && needs.package-plugins.result == 'success' && (inputs.skip_core || needs.publish.result == 'success') }}
+    if: ${{ !cancelled() && inputs.plugins && needs.version.result == 'success' && needs.package-plugins.result == 'success' && ((inputs.dry_run && (inputs.skip_core || needs.publish.result == 'success')) || (!inputs.dry_run && needs.verify-core.result == 'success' && needs.finalize-core.result == 'success')) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -1102,7 +1141,7 @@ jobs:
             esac
           done
       # Each row checks the oldest core admitted by the plugin it is about to
-      # publish. The new core has already passed the visibility gate.
+      # publish. The new core has already passed its full runtime gate.
       - name: Verify actual published core compatibility before publication
         if: ${{ !inputs.dry_run }}
         run: node scripts/verify-published-history-core.mjs "$PLUGIN"
@@ -1192,8 +1231,8 @@ jobs:
 
   probe:
     name: Attach agent-relay-probe binaries
-    needs: [version, publish, helpers]
-    if: ${{ !cancelled() && inputs.probe && needs.version.result == 'success' && needs.helpers.result == 'success' && (inputs.skip_core || needs.publish.result == 'success') }}
+    needs: [version, publish, verify-core, finalize-core, helpers]
+    if: ${{ !cancelled() && inputs.probe && needs.version.result == 'success' && needs.helpers.result == 'success' && ((inputs.dry_run && (inputs.skip_core || needs.publish.result == 'success')) || (!inputs.dry_run && needs.verify-core.result == 'success' && needs.finalize-core.result == 'success')) }}
     runs-on: ubuntu-latest
     # Release assets only; no checkout and no registry credentials.
     permissions:
