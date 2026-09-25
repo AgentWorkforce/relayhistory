@@ -10860,7 +10860,8 @@ pub(crate) fn ingest_muse_session_tree(
     path: &Path,
     children: Option<&[MuseChildLog]>,
 ) -> Result<MuseIngestOutcome> {
-    let mut outcome = ingest_muse_session(conn, transcript, &path.to_string_lossy())?;
+    let mut outcome =
+        ingest_muse_session(conn, transcript, &path.to_string_lossy(), MuseRole::Session)?;
     if let (Some(dir), Some(children)) = (path.parent(), children) {
         let mut visited = HashSet::from([transcript.metadata.session_id.clone()]);
         link_muse_subagents(
@@ -10874,6 +10875,15 @@ pub(crate) fn ingest_muse_session_tree(
         )?;
     }
     Ok(outcome)
+}
+
+/// Whose transcript an ingestion is reading.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MuseRole {
+    /// A session someone started: its prompts were typed.
+    Session,
+    /// A subagent's log: its prompt is the objective its parent assigned.
+    Subagent,
 }
 
 /// One subagent log beneath a session, read, with its own children.
@@ -10952,16 +10962,11 @@ fn link_muse_subagents(
         }
         linked.insert(child_id.clone());
         let locator = log.to_string_lossy().to_string();
-        ingest_muse_session(conn, child, &locator)?;
-        // A child's objective is not a typed prompt — unless the child is also
-        // known remotely, whose history is shared evidence and stays, as for
-        // a Codex subagent.
-        if !session_has_remote_presence(conn, "muse", &child_id)? {
-            conn.execute(
-                "DELETE FROM history WHERE source = 'muse' AND session_id = ?",
-                params![child_id],
-            )?;
-        }
+        // Read as a subagent: its objective is an event, never `history`, and
+        // any history it held before is cleared the same way a session's is
+        // — all of it, or only this log's own rows where the child is also
+        // known remotely.
+        ingest_muse_session(conn, child, &locator, MuseRole::Subagent)?;
         cleanup_subagent_registration(conn, "muse", &child_id)?;
         if let Some(child_dir) = log.parent() {
             link_muse_subagents(
@@ -11033,14 +11038,22 @@ fn muse_linked_children(conn: &Connection, parent_id: &str) -> Result<HashSet<St
 /// Drop the evidence of a child whose log is gone, and of its own children.
 /// It was only ever addressable through the edge that no longer exists.
 ///
-/// A child also known remotely keeps its evidence: the rows under its id are
-/// not only this log's.
+/// A child also known remotely keeps its own events and markers — the rows
+/// under its id are not only this log's — but the children it linked from the
+/// missing directory, and its edges to them, go all the same.
 fn forget_muse_subagent(conn: &Connection, child_id: &str) -> Result<()> {
-    if session_has_remote_presence(conn, "muse", child_id)? {
-        return Ok(());
-    }
+    // Its own children were linked from the same, now missing, directory,
+    // whatever the child itself is.
     for grandchild in muse_linked_children(conn, child_id)? {
         forget_muse_subagent(conn, &grandchild)?;
+    }
+    conn.execute(
+        "DELETE FROM session_relationships WHERE source = 'muse' \
+         AND parent_session_id = ? AND evidence_kind = 'muse_subagent_log'",
+        params![child_id],
+    )?;
+    if session_has_remote_presence(conn, "muse", child_id)? {
+        return Ok(());
     }
     for statement in [
         "DELETE FROM session_events WHERE source = 'muse' AND session_id = ?",
@@ -11128,15 +11141,39 @@ impl<'a> MuseStep<'a> {
 /// merging into it, so a re-read after the file grew never duplicates a row
 /// and one that dropped a record (a rewritten or truncated file) leaves no
 /// stale one behind.
+///
+/// `role` says whose transcript this is. A [`MuseRole::Session`]'s prompts
+/// were typed and become `history`; a [`MuseRole::Subagent`]'s run-start
+/// prompt is the objective its parent assigned, which is an event but never
+/// a prompt anybody typed.
 pub(crate) fn ingest_muse_session(
     conn: &Connection,
     transcript: &muse::MuseTranscript,
     raw_path: &str,
+    role: MuseRole,
 ) -> Result<MuseIngestOutcome> {
     const SOURCE: &str = "muse";
     let sid = transcript.metadata.session_id.as_str();
     let project = transcript.metadata.workspace_root.as_deref();
     let version = transcript.metadata.cli_version.as_deref();
+    // History is replaced, not merged, so a prompt the transcript no longer
+    // has stops being searchable. A session also known remotely shares its
+    // `history` identity with that evidence, so there only the rows this
+    // transcript wrote last time — the ones its stored prompt events name —
+    // are removed; replacing the whole identity would delete prompts it never
+    // wrote. Either way this runs before the events it reads are replaced.
+    if session_has_remote_presence(conn, SOURCE, sid)? {
+        conn.execute(
+            "DELETE FROM history WHERE source = 'muse' AND session_id = ?1 \
+               AND EXISTS (SELECT 1 FROM session_events e \
+                           WHERE e.source = 'muse' AND e.session_id = ?1 \
+                             AND e.role = 'user' AND e.kind = 'text' \
+                             AND e.ts_ms = history.timestamp_ms AND e.text = history.prompt)",
+            params![sid],
+        )?;
+    } else {
+        replace_session_history(conn, SOURCE, sid)?;
+    }
     for statement in [
         "DELETE FROM session_events WHERE source = 'muse' AND session_id = ?",
         "DELETE FROM tool_calls WHERE source = 'muse' AND session_id = ?",
@@ -11144,12 +11181,6 @@ pub(crate) fn ingest_muse_session(
         "DELETE FROM session_markers WHERE source = 'muse' AND session_id = ?",
     ] {
         conn.execute(statement, params![sid])?;
-    }
-    // A session also known remotely shares its `history` identity with that
-    // evidence; replacing it here would delete prompts this transcript never
-    // wrote. Its local prompts are merged in instead (`INSERT OR IGNORE`).
-    if !session_has_remote_presence(conn, SOURCE, sid)? {
-        replace_session_history(conn, SOURCE, sid)?;
     }
 
     let mut outcome = MuseIngestOutcome {
@@ -11212,18 +11243,20 @@ pub(crate) fn ingest_muse_session(
                     facts,
                 )?;
                 outcome.events += 1;
-                outcome.prompts += insert_history(
-                    conn,
-                    &HistoryEntry {
-                        id: 0,
-                        source: SOURCE.into(),
-                        session_id: Some(sid.to_string()),
-                        project: project.map(str::to_string),
-                        prompt_hash: Some(prompt_hash(text)),
-                        prompt: text.clone(),
-                        timestamp_ms: ts,
-                    },
-                )?;
+                if role == MuseRole::Session {
+                    outcome.prompts += insert_history(
+                        conn,
+                        &HistoryEntry {
+                            id: 0,
+                            source: SOURCE.into(),
+                            session_id: Some(sid.to_string()),
+                            project: project.map(str::to_string),
+                            prompt_hash: Some(prompt_hash(text)),
+                            prompt: text.clone(),
+                            timestamp_ms: ts,
+                        },
+                    )?;
+                }
             }
             // Paired with its assistant record up front; only the running
             // model is tracked here.
@@ -15265,6 +15298,108 @@ mod tests {
             )
             .unwrap();
         assert_eq!(remote, 1, "a local re-read does not erase remote history");
+        let objectives: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM history WHERE source = 'muse' AND session_id = ? \
+                   AND prompt LIKE 'Role:%'",
+                [MUSE_WORKER],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            objectives, 0,
+            "a subagent's objective is never a typed prompt"
+        );
+    }
+
+    /// A remotely known session whose transcript drops a prompt stops
+    /// offering it, while the prompts only the remote side holds stay.
+    #[test]
+    fn a_remote_muse_session_drops_prompts_its_transcript_no_longer_has() {
+        let home = tempfile::tempdir().unwrap();
+        let (root, transcript) = muse_fixture(home.path());
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        crate::mark_session_presence(&conn, "muse", MUSE_PARENT, super::SessionLocation::Remote)
+            .unwrap();
+        insert_history(
+            &conn,
+            &HistoryEntry {
+                id: 0,
+                source: "muse".into(),
+                session_id: Some(MUSE_PARENT.to_string()),
+                project: None,
+                prompt: "remote prompt".into(),
+                prompt_hash: Some(prompt_hash("remote prompt")),
+                timestamp_ms: 42,
+            },
+        )
+        .unwrap();
+
+        // Drop the second typed prompt from the transcript.
+        let kept: String = fs::read_to_string(&transcript)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.contains("Why did it fail?"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        fs::write(&transcript, kept).unwrap();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        let prompts: Vec<String> = conn
+            .prepare(
+                "SELECT prompt FROM history WHERE source = 'muse' AND session_id = ? \
+                 ORDER BY timestamp_ms",
+            )
+            .unwrap()
+            .query_map([MUSE_PARENT], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            prompts,
+            vec![
+                "remote prompt".to_string(),
+                "Add a retry helper to src/http.rs and run the tests.".to_string()
+            ]
+        );
+    }
+
+    /// A removed child that is also known remotely keeps its own evidence,
+    /// but the local-only children it linked from the missing directory do
+    /// not linger, and neither do its edges to them.
+    #[test]
+    fn a_removed_remote_muse_child_still_forgets_its_local_children() {
+        let home = tempfile::tempdir().unwrap();
+        let (root, transcript) = muse_fixture(home.path());
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        crate::mark_session_presence(&conn, "muse", MUSE_WORKER, super::SessionLocation::Remote)
+            .unwrap();
+        let worker_events = muse_session_count(&conn, "session_events", MUSE_WORKER);
+        fs::remove_dir_all(
+            transcript
+                .parent()
+                .unwrap()
+                .join(format!("subagent/{MUSE_WORKER}")),
+        )
+        .unwrap();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        assert_eq!(
+            muse_session_count(&conn, "session_events", MUSE_WORKER),
+            worker_events
+        );
+        assert_eq!(muse_session_count(&conn, "session_events", "muse-c002"), 0);
+        let edges_from_worker: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_relationships \
+                 WHERE source = 'muse' AND parent_session_id = ?",
+                [MUSE_WORKER],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(edges_from_worker, 0);
     }
 
     /// A rewritten transcript that no longer has a reply or a prompt does not
