@@ -242,6 +242,17 @@ pub fn session_identities_after(
         .collect())
 }
 
+/// Whether the store holds anything under one identity, by the same tables
+/// and rule as [`session_identities_after`]: a session that listing names is
+/// one this accepts.
+#[cfg(feature = "export")]
+pub fn session_identity_exists(
+    conn: &Connection,
+    identity: &crate::export::SessionIdentity,
+) -> Result<bool> {
+    crate::session_identities::identity_exists(conn, &identity.source, &identity.session_id)
+}
+
 #[cfg(all(test, feature = "export"))]
 mod identity_tests {
     use super::*;
