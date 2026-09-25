@@ -42,15 +42,19 @@ Notable changes to the native `ai-hist` CLI are documented here.
   `delivery_bootstrap_bounds`, `delivery_exclusions`, `history_subscriptions`,
   `history_compaction` — stays as it is, for the upload daemon that reads its
   origin and revision floor from them.
-- Local export snapshots read live rows. `create_export` records each table's
-  largest rowid and `export_page` reads the rows at or below it as they stand
-  when their page is read; a row deleted before its page is not exported.
-  Records are `schema_version` 2: `origin_id` is the store's change-feed epoch
-  (16 hex digits) and `revision` is the row's change-feed revision, so
-  `record_id` (the SHA-256 of the feed's compact-JSON key) and `revision`
-  match the feed for the same row. Exclusions come from the selection's
-  `excluded_sessions` alone. A snapshot an earlier release opened is refused
-  by `export_page` and released by `close_export` or `expire_exports`.
+- A local export snapshot is one read transaction. `ExportSnapshot` owns a
+  connection and holds a read transaction over the store until it is dropped,
+  so every page reads the store as it stood when the snapshot opened: rows
+  written, rewritten or deleted meanwhile, a new row reusing a deleted rowid
+  included, never change the export. It stores nothing: no
+  `history_exports`, `history_export_pages` or preimage rows. An open snapshot
+  lives in the process that opened it, so `beginHistoryExport` cursors resume
+  within that process until they expire, not across processes. Records are
+  `schema_version` 2: `origin_id` is the store's change-feed epoch (16 hex
+  digits) and `revision` is the row's change-feed revision, so `record_id`
+  (the SHA-256 of the feed's compact-JSON key) and `revision` match the feed
+  for the same row. Exclusions come from the selection's `excluded_sessions`
+  alone.
 - The native `historyExport` bridge accepts `create_export`, `export_page`,
   `close_export` and `expire_exports`; `retained_bytes`,
   `set_retention_limit` and `compact_journal` are gone, and so are the
@@ -234,11 +238,13 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Rust API
 
-- The `export` feature is local export alone. It keeps `create_export`,
-  `export_page`, `close_export`, `expire_exports`, `ExportSelection`,
-  `ExportLimits`, `ExportHandle`, `HistoryExportPage`, `HistoryExportRecord`,
-  `SessionIdentity`, `SUPPORTED_KINDS` and `EXPORT_SCHEMA_VERSION` (now 2).
-  Removed: the `export::capture` module (subscriptions, `reserve_revision`,
+- The `export` feature is local export alone: `ExportSnapshot` (`open`,
+  `handle`, `page`, `owns_cursor`, `expired`, `snapshot_id`),
+  `ExportSelection`, `ExportLimits`, `ExportHandle`, `HistoryExportPage`,
+  `HistoryExportRecord`, `SessionIdentity`, `SUPPORTED_KINDS`,
+  `MAX_EXPORT_TTL_MS` and `EXPORT_SCHEMA_VERSION` (now 2). `create_export`,
+  `export_page`, `close_export` and `expire_exports` are replaced by
+  `ExportSnapshot`. Removed: the `export::capture` module (subscriptions, `reserve_revision`,
   cutoffs, `next_change`, `append_revision`, preimages, `is_shareable`,
   `shareable` and the rest), `RawRecord`, `make_record`, `snapshot_record`,
   `DEFAULT_RETENTION_LIMIT_BYTES`, `set_retention_limit`, `retained_bytes`,

@@ -1,18 +1,20 @@
-//! Local evidence export: bounded, resumable snapshots a user writes to a
-//! file or a pipe, one NDJSON record at a time.
+//! Local evidence export: a consistent snapshot of the store a user writes to
+//! a file or a pipe, one NDJSON record at a time, in bounded pages.
 //!
-//! A snapshot covers the rows every selected table holds when it is created:
-//! [`create_export`] records each table's largest rowid, and [`export_page`]
-//! reads the live rows at or below it in rowid order, a bounded page per
-//! call. A row written after creation is outside the snapshot; a row
-//! rewritten before its page is read is exported as it then stands, at its
-//! new revision; a row deleted before its page is read is not exported.
+//! An [`ExportSnapshot`] owns a connection holding one read transaction for
+//! its whole life. Every page it serves reads that transaction's view, so the
+//! export is the store exactly as it stood when the snapshot opened: a row
+//! written, rewritten or deleted afterwards -- including a new row that
+//! reuses a deleted row's rowid -- does not change what the export contains.
+//! The store is in WAL mode, so the open transaction never blocks a writer;
+//! it holds back checkpointing past its view until the snapshot is dropped,
+//! which ends the transaction.
 //!
 //! A record carries the same identity and revision the change feed reports
 //! for the row ([`crate::Change::key`], [`crate::Change::revision`]), so an
 //! embedder can merge an export with the feed.
 use anyhow::{ensure, Context, Result};
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -38,8 +40,8 @@ pub const SUPPORTED_KINDS: &[&str] = &[
     "session_marker",
 ];
 
-/// Most snapshots a store keeps open at once.
-const MAX_OPEN_EXPORTS: i64 = 32;
+/// Longest a snapshot may stay open: one day.
+pub const MAX_EXPORT_TTL_MS: i64 = 86_400_000;
 
 /// One session in a selection: the stored source name and session id.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -62,6 +64,7 @@ pub struct ExportSelection {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExportLimits {
     pub max_batch_records: usize,
+    /// Most bytes one page serializes to, envelope included.
     pub max_batch_bytes: usize,
     /// Rows one page examines, including rows the selection leaves out.
     pub max_scan_records: usize,
@@ -109,52 +112,6 @@ pub struct HistoryExportPage {
     pub origin_id: String,
     pub records: Vec<HistoryExportRecord>,
     pub next_cursor: Option<String>,
-}
-
-/// Tables [`init_schema`] creates, for the store's schema check.
-pub(crate) const REQUIRED_TABLES: &[&str] = &[
-    "history_exports",
-    "history_export_pages",
-    "history_export_bounds",
-];
-
-/// Create the snapshot tables inside the caller's schema transaction.
-///
-/// `history_exports` and `history_export_pages` keep the shape an earlier
-/// release created them with. A snapshot that release opened has no
-/// `history_export_bounds` rows, so [`export_page`] refuses it and
-/// [`expire_exports`] or [`close_export`] releases it.
-pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        r#"
-CREATE TABLE IF NOT EXISTS history_exports (
- id TEXT PRIMARY KEY, selection_json TEXT NOT NULL, limits_json TEXT NOT NULL,
- cutoff INTEGER NOT NULL, bootstrap_kind INTEGER NOT NULL DEFAULT 0,
- bootstrap_rowid INTEGER NOT NULL DEFAULT 0, bootstrap_done INTEGER NOT NULL DEFAULT 0,
- expires_at_ms INTEGER NOT NULL, cursor TEXT NOT NULL UNIQUE
-);
-CREATE TABLE IF NOT EXISTS history_export_pages (
- cursor TEXT PRIMARY KEY, export_id TEXT NOT NULL, payload TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS history_export_page_owner ON history_export_pages(export_id);
-CREATE TABLE IF NOT EXISTS history_export_bounds (
- export_id TEXT NOT NULL, kind TEXT NOT NULL, max_rowid INTEGER NOT NULL,
- PRIMARY KEY (export_id, kind)
-);
-"#,
-    )?;
-    Ok(())
-}
-
-fn write_transaction(conn: &Connection) -> Result<Transaction<'_>> {
-    ensure!(
-        conn.is_autocommit(),
-        "export operations require their own short transaction"
-    );
-    Ok(Transaction::new_unchecked(
-        conn,
-        TransactionBehavior::Immediate,
-    )?)
 }
 
 fn hash(value: impl AsRef<[u8]>) -> String {
@@ -254,219 +211,196 @@ fn make_record(
     })
 }
 
-/// Open a snapshot. TTL is bounded to one day; an expired snapshot can no
-/// longer be read and [`expire_exports`] releases it. `now_ms` is a real Unix
-/// millisecond clock.
-pub fn create_export(
-    conn: &Connection,
-    selection: &ExportSelection,
-    limits: &ExportLimits,
-    ttl_ms: i64,
-    now_ms: i64,
-) -> Result<ExportHandle> {
-    validate_export(selection, limits)?;
-    ensure!(
-        (1..=86_400_000).contains(&ttl_ms) && now_ms >= 0,
-        "invalid export TTL/clock"
-    );
-    let expires_at_ms = now_ms
-        .checked_add(ttl_ms)
-        .context("export clock overflow")?;
-    let tx = write_transaction(conn)?;
-    let count: i64 = tx.query_row("SELECT COUNT(*) FROM history_exports", [], |row| row.get(0))?;
-    ensure!(
-        count < MAX_OPEN_EXPORTS,
-        "maximum retained exports reached; close or expire old snapshots"
-    );
-    let (snapshot_id, cursor): (String, String) = tx.query_row(
-        "SELECT lower(hex(randomblob(16))),lower(hex(randomblob(16)))",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    let head = change_feed::read_head(&tx)?;
-    tx.execute(
-        "INSERT INTO history_exports(id,selection_json,limits_json,cutoff,expires_at_ms,cursor) \
-         VALUES (?,?,?,?,?,?)",
-        params![
-            snapshot_id,
-            serde_json::to_string(selection)?,
-            serde_json::to_string(limits)?,
-            i64::try_from(head.revision).context("revision out of range")?,
-            expires_at_ms,
-            cursor
-        ],
-    )?;
-    for name in SUPPORTED_KINDS {
-        let max_rowid = change_feed::max_rowid(&tx, change_kind(name)?)?;
-        tx.execute(
-            "INSERT INTO history_export_bounds(export_id,kind,max_rowid) VALUES (?,?,?)",
-            params![snapshot_id, name, max_rowid],
-        )?;
-    }
-    tx.commit()?;
-    Ok(ExportHandle {
-        snapshot_id,
-        cursor,
-        expires_at_ms,
-    })
+fn token(conn: &Connection) -> Result<String> {
+    Ok(conn.query_row("SELECT lower(hex(randomblob(16)))", [], |r| r.get(0))?)
 }
 
-/// The next page of a snapshot, from an opaque cursor. Retrying a cursor
-/// returns the page it returned before, so a client advances only after it
-/// has written the page.
-pub fn export_page(conn: &Connection, cursor: &str, now_ms: i64) -> Result<HistoryExportPage> {
-    let tx = write_transaction(conn)?;
-    if let Some(payload) = tx
-        .query_row(
-            "SELECT payload FROM history_export_pages WHERE cursor=?",
-            [cursor],
-            |r| r.get::<_, String>(0),
-        )
-        .optional()?
-    {
-        return Ok(serde_json::from_str(&payload)?);
+/// One open export: a read transaction over the store, and the position of
+/// the next page within it.
+///
+/// Pages are named by opaque cursors. Each page names the cursor of the next,
+/// and the cursor of the page just served serves that page again, so a client
+/// that failed to write a page retries it and advances only once it has.
+/// Dropping the snapshot ends its transaction.
+pub struct ExportSnapshot {
+    conn: Connection,
+    selection: ExportSelection,
+    limits: ExportLimits,
+    snapshot_id: String,
+    origin_id: String,
+    expires_at_ms: i64,
+    /// The cursor of the next page, or `None` once the last page is served.
+    cursor: Option<String>,
+    /// The page served last, under the cursor that asked for it.
+    served: Option<(String, HistoryExportPage)>,
+    kind_index: usize,
+    after: i64,
+}
+
+impl std::fmt::Debug for ExportSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExportSnapshot")
+            .field("snapshot_id", &self.snapshot_id)
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish_non_exhaustive()
     }
-    let (id, selection_json, limits_json, kind_index, after, expires) = tx
-        .query_row(
-            "SELECT id,selection_json,limits_json,bootstrap_kind,bootstrap_rowid,expires_at_ms \
-             FROM history_exports WHERE cursor=?",
-            [cursor],
-            |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, i64>(3)?,
-                    r.get::<_, i64>(4)?,
-                    r.get::<_, i64>(5)?,
-                ))
-            },
-        )
-        .optional()?
-        .context("export cursor not found")?;
-    ensure!(expires > now_ms, "export snapshot expired");
-    let selection: ExportSelection = serde_json::from_str(&selection_json)?;
-    let limits: ExportLimits = serde_json::from_str(&limits_json)?;
-    let origin_id = format!("{:016x}", change_feed::read_head(&tx)?.epoch);
-    let next: String = tx.query_row("SELECT lower(hex(randomblob(16)))", [], |r| r.get(0))?;
-    let mut page = HistoryExportPage {
-        schema_version: EXPORT_SCHEMA_VERSION,
-        origin_id,
-        records: Vec::new(),
-        next_cursor: Some(next.clone()),
-    };
-    // The page's serialized size, kept as records are added: the empty page,
-    // plus each record and the comma before every record but the first.
-    let mut bytes = serde_json::to_vec(&page)?.len();
-    let mut kind_index = usize::try_from(kind_index).context("invalid export position")?;
-    let mut after = after;
-    let mut scanned = 0;
-    'kinds: while kind_index < SUPPORTED_KINDS.len()
-        && scanned < limits.max_scan_records
-        && page.records.len() < limits.max_batch_records
-    {
-        let name = SUPPORTED_KINDS[kind_index];
-        let rows = if selection.kinds.iter().any(|kind| kind == name) {
-            let through: i64 = tx
-                .query_row(
-                    "SELECT max_rowid FROM history_export_bounds WHERE export_id=? AND kind=?",
-                    params![id, name],
-                    |r| r.get(0),
-                )
-                .optional()?
-                .context(
-                    "export snapshot was opened by an earlier release and cannot be read; \
-                     close it and start a new one",
-                )?;
-            change_feed::rows_by_rowid(
-                &tx,
-                change_kind(name)?,
-                after,
-                through,
-                limits.max_scan_records - scanned,
-            )?
-        } else {
-            Vec::new()
-        };
-        if rows.is_empty() {
-            kind_index += 1;
-            after = 0;
-            continue;
+}
+
+impl ExportSnapshot {
+    /// Open a snapshot over `conn`, which it owns from here on and holds in
+    /// one read transaction until dropped. `conn` must be a store connection
+    /// with no transaction open. `ttl_ms` is at most [`MAX_EXPORT_TTL_MS`];
+    /// `now_ms` is a real Unix millisecond clock.
+    pub fn open(
+        conn: Connection,
+        selection: &ExportSelection,
+        limits: &ExportLimits,
+        ttl_ms: i64,
+        now_ms: i64,
+    ) -> Result<Self> {
+        validate_export(selection, limits)?;
+        ensure!(
+            (1..=MAX_EXPORT_TTL_MS).contains(&ttl_ms) && now_ms >= 0,
+            "invalid export TTL/clock"
+        );
+        let expires_at_ms = now_ms
+            .checked_add(ttl_ms)
+            .context("export clock overflow")?;
+        ensure!(
+            conn.is_autocommit(),
+            "an export snapshot needs a connection with no open transaction"
+        );
+        let (snapshot_id, cursor) = (token(&conn)?, token(&conn)?);
+        // A deferred transaction takes its snapshot at its first read, which
+        // is the head read below: from here every page sees this view.
+        conn.execute_batch("BEGIN DEFERRED")?;
+        let head = change_feed::read_head(&conn)?;
+        Ok(Self {
+            conn,
+            selection: selection.clone(),
+            limits: limits.clone(),
+            snapshot_id,
+            origin_id: format!("{:016x}", head.epoch),
+            expires_at_ms,
+            cursor: Some(cursor),
+            served: None,
+            kind_index: 0,
+            after: 0,
+        })
+    }
+
+    /// The snapshot's id, its first cursor and its expiry.
+    pub fn handle(&self) -> ExportHandle {
+        ExportHandle {
+            snapshot_id: self.snapshot_id.clone(),
+            cursor: self
+                .served
+                .as_ref()
+                .map(|(cursor, _)| cursor.clone())
+                .or_else(|| self.cursor.clone())
+                .unwrap_or_default(),
+            expires_at_ms: self.expires_at_ms,
         }
-        for row in rows {
-            let rowid = row.rowid;
-            if selected(&selection, &row.source, row.session.as_deref())
-                && !row_excluded(&selection, &row)
-            {
-                let record = make_record(&page.origin_id, change_kind(name)?, row)?;
-                let size =
-                    serde_json::to_vec(&record)?.len() + usize::from(!page.records.is_empty());
-                if bytes + size > limits.max_batch_bytes {
-                    ensure!(
-                        !page.records.is_empty(),
-                        "export record exceeds configured page byte limit"
-                    );
+    }
+
+    pub fn snapshot_id(&self) -> &str {
+        &self.snapshot_id
+    }
+
+    /// Whether the snapshot has expired at `now_ms`.
+    pub fn expired(&self, now_ms: i64) -> bool {
+        self.expires_at_ms <= now_ms
+    }
+
+    /// Whether `cursor` names a page of this snapshot: the next one, or the
+    /// one served last.
+    pub fn owns_cursor(&self, cursor: &str) -> bool {
+        self.cursor.as_deref() == Some(cursor)
+            || self
+                .served
+                .as_ref()
+                .is_some_and(|(served, _)| served == cursor)
+    }
+
+    /// The page `cursor` names. An expired snapshot serves nothing.
+    pub fn page(&mut self, cursor: &str, now_ms: i64) -> Result<HistoryExportPage> {
+        ensure!(!self.expired(now_ms), "export snapshot expired");
+        if let Some((served, page)) = &self.served {
+            if served == cursor {
+                return Ok(page.clone());
+            }
+        }
+        ensure!(
+            self.cursor.as_deref() == Some(cursor),
+            "export cursor not found"
+        );
+        let next = token(&self.conn)?;
+        let mut page = HistoryExportPage {
+            schema_version: EXPORT_SCHEMA_VERSION,
+            origin_id: self.origin_id.clone(),
+            records: Vec::new(),
+            next_cursor: Some(next.clone()),
+        };
+        // The page's serialized size, kept exactly as records are added: the
+        // empty page with a cursor (the longest its envelope can be), plus
+        // each record and the comma before every record but the first.
+        let mut bytes = serde_json::to_vec(&page)?.len();
+        ensure!(
+            bytes < self.limits.max_batch_bytes,
+            "export page envelope exceeds configured page byte limit"
+        );
+        let mut scanned = 0;
+        'kinds: while self.kind_index < SUPPORTED_KINDS.len()
+            && scanned < self.limits.max_scan_records
+            && page.records.len() < self.limits.max_batch_records
+        {
+            let name = SUPPORTED_KINDS[self.kind_index];
+            let rows = if self.selection.kinds.iter().any(|kind| kind == name) {
+                change_feed::rows_by_rowid(
+                    &self.conn,
+                    change_kind(name)?,
+                    self.after,
+                    self.limits.max_scan_records - scanned,
+                )?
+            } else {
+                Vec::new()
+            };
+            if rows.is_empty() {
+                self.kind_index += 1;
+                self.after = 0;
+                continue;
+            }
+            for row in rows {
+                let rowid = row.rowid;
+                if selected(&self.selection, &row.source, row.session.as_deref())
+                    && !row_excluded(&self.selection, &row)
+                {
+                    let record = make_record(&self.origin_id, change_kind(name)?, row)?;
+                    let size =
+                        serde_json::to_vec(&record)?.len() + usize::from(!page.records.is_empty());
+                    if bytes + size > self.limits.max_batch_bytes {
+                        ensure!(
+                            !page.records.is_empty(),
+                            "export record exceeds configured page byte limit"
+                        );
+                        break 'kinds;
+                    }
+                    bytes += size;
+                    page.records.push(record);
+                }
+                scanned += 1;
+                self.after = rowid;
+                if page.records.len() >= self.limits.max_batch_records {
                     break 'kinds;
                 }
-                bytes += size;
-                page.records.push(record);
-            }
-            scanned += 1;
-            after = rowid;
-            if page.records.len() >= limits.max_batch_records {
-                break 'kinds;
             }
         }
+        if self.kind_index >= SUPPORTED_KINDS.len() {
+            page.next_cursor = None;
+        }
+        self.cursor = page.next_cursor.clone();
+        self.served = Some((cursor.to_string(), page.clone()));
+        Ok(page)
     }
-    let complete = kind_index >= SUPPORTED_KINDS.len();
-    if complete {
-        page.next_cursor = None;
-    }
-    tx.execute(
-        "UPDATE history_exports SET bootstrap_kind=?,bootstrap_rowid=?,bootstrap_done=?,cursor=? \
-         WHERE id=?",
-        params![kind_index as i64, after, complete, next, id],
-    )?;
-    tx.execute(
-        "INSERT INTO history_export_pages(cursor,export_id,payload) VALUES (?,?,?)",
-        params![cursor, id, serde_json::to_string(&page)?],
-    )?;
-    tx.commit()?;
-    Ok(page)
-}
-
-fn close(conn: &Connection, id: &str) -> Result<()> {
-    conn.execute("DELETE FROM history_export_bounds WHERE export_id=?", [id])?;
-    conn.execute("DELETE FROM history_export_pages WHERE export_id=?", [id])?;
-    conn.execute("DELETE FROM history_exports WHERE id=?", [id])?;
-    Ok(())
-}
-
-/// Release a snapshot and every page it served.
-pub fn close_export(conn: &Connection, snapshot_id: &str) -> Result<()> {
-    let tx = write_transaction(conn)?;
-    close(&tx, snapshot_id)?;
-    tx.commit()?;
-    Ok(())
-}
-
-/// Release up to `limit` snapshots that expired at or before `now_ms`, the
-/// oldest first. Returns how many were released.
-pub fn expire_exports(conn: &Connection, now_ms: i64, limit: usize) -> Result<usize> {
-    ensure!(
-        (1..=MAX_OPEN_EXPORTS as usize).contains(&limit),
-        "invalid export cleanup limit"
-    );
-    let tx = write_transaction(conn)?;
-    let ids = tx
-        .prepare(
-            "SELECT id FROM history_exports WHERE expires_at_ms<=? ORDER BY expires_at_ms LIMIT ?",
-        )?
-        .query_map(params![now_ms, limit as i64], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    for id in &ids {
-        close(&tx, id)?;
-    }
-    tx.commit()?;
-    Ok(ids.len())
 }

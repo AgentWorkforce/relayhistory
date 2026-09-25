@@ -4733,7 +4733,7 @@ mod tests {
     #[cfg(feature = "export")]
     #[test]
     fn a_hydrated_grok_marker_reaches_a_local_export() {
-        use crate::export::{create_export, export_page, ExportLimits, ExportSelection};
+        use crate::export::{ExportLimits, ExportSelection, ExportSnapshot};
 
         let dir = tempfile::tempdir().unwrap();
         let chat = grok_fixture_home(dir.path(), "events-session");
@@ -4757,8 +4757,8 @@ mod tests {
             .unwrap();
         assert!(markers > 0, "the fixture has to write markers to test this");
 
-        let snapshot = create_export(
-            &conn,
+        let mut snapshot = ExportSnapshot::open(
+            conn,
             &ExportSelection {
                 all_sources: true,
                 kinds: vec!["session_marker".into(), "session_event".into()],
@@ -4770,9 +4770,9 @@ mod tests {
         )
         .unwrap();
         let mut kinds = Vec::new();
-        let mut cursor = Some(snapshot.cursor);
+        let mut cursor = Some(snapshot.handle().cursor);
         while let Some(value) = cursor {
-            let page = export_page(&conn, &value, now_ms()).unwrap();
+            let page = snapshot.page(&value, now_ms()).unwrap();
             kinds.extend(page.records.into_iter().map(|r| r.kind));
             cursor = page.next_cursor;
         }

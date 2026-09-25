@@ -1,21 +1,23 @@
 #![cfg(feature = "export")]
 //! Local export snapshots over a store opened the way an embedder opens one.
 use ai_hist::export::{
-    self, ExportLimits, ExportSelection, HistoryExportPage, HistoryExportRecord, SessionIdentity,
+    self, ExportLimits, ExportSelection, ExportSnapshot, HistoryExportPage, HistoryExportRecord,
+    SessionIdentity,
 };
 use ai_hist::{ChangeOp, ChangeQuery, SessionStore, StoreOptions, Watermark};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[allow(clippy::field_reassign_with_default)]
-fn store(dir: &Path) -> (SessionStore, Connection) {
+fn store(dir: &Path) -> (SessionStore, Connection, PathBuf) {
+    let db = dir.join("ai-history.db");
     let mut options = StoreOptions::default();
-    options.db_path = Some(dir.join("ai-history.db"));
+    options.db_path = Some(db.clone());
     let store = SessionStore::open(options).unwrap();
-    let conn = Connection::open(dir.join("ai-history.db")).unwrap();
-    (store, conn)
+    let conn = Connection::open(&db).unwrap();
+    (store, conn, db)
 }
 
 fn now() -> i64 {
@@ -30,29 +32,46 @@ fn all_sessions(kinds: &[&str]) -> ExportSelection {
     }
 }
 
-fn pages(conn: &Connection, cursor: String) -> Vec<HistoryExportPage> {
+fn open(
+    db: &Path,
+    selection: &ExportSelection,
+    limits: &ExportLimits,
+    ttl_ms: i64,
+) -> ExportSnapshot {
+    ExportSnapshot::open(
+        Connection::open(db).unwrap(),
+        selection,
+        limits,
+        ttl_ms,
+        now(),
+    )
+    .unwrap()
+}
+
+fn pages(snapshot: &mut ExportSnapshot) -> Vec<HistoryExportPage> {
     let mut pages = Vec::new();
-    let mut cursor = Some(cursor);
+    let mut cursor = Some(snapshot.handle().cursor);
     while let Some(value) = cursor {
-        let page = export::export_page(conn, &value, now()).unwrap();
+        let page = snapshot.page(&value, now()).unwrap();
         cursor = page.next_cursor.clone();
         pages.push(page);
     }
     pages
 }
 
+fn records(snapshot: &mut ExportSnapshot) -> Vec<HistoryExportRecord> {
+    pages(snapshot)
+        .into_iter()
+        .flat_map(|page| page.records)
+        .collect()
+}
+
 fn export_all(
-    conn: &Connection,
+    db: &Path,
     selection: &ExportSelection,
     limits: &ExportLimits,
 ) -> Vec<HistoryExportRecord> {
-    let handle = export::create_export(conn, selection, limits, 60_000, now()).unwrap();
-    let records = pages(conn, handle.cursor)
-        .into_iter()
-        .flat_map(|page| page.records)
-        .collect();
-    export::close_export(conn, &handle.snapshot_id).unwrap();
-    records
+    records(&mut open(db, selection, limits, 60_000))
 }
 
 fn seed(conn: &Connection) {
@@ -73,32 +92,8 @@ INSERT INTO session_relationships (source, parent_session_id, relationship_uid,
     .unwrap();
 }
 
-/// A snapshot covers the rows present when it was created, read as they
-/// stand when their page is read.
-#[test]
-fn a_snapshot_covers_the_rows_present_at_creation() {
-    let dir = tempfile::tempdir().unwrap();
-    let (_store, conn) = store(dir.path());
-    seed(&conn);
-    let handle = export::create_export(
-        &conn,
-        &all_sessions(&["session"]),
-        &ExportLimits::default(),
-        60_000,
-        now(),
-    )
-    .unwrap();
-    conn.execute_batch(
-        "INSERT INTO sessions (source, session_id) VALUES ('claude', 'later');
-         UPDATE sessions SET first_prompt = 'rewritten' WHERE session_id = 'one';
-         DELETE FROM sessions WHERE session_id = 'two';",
-    )
-    .unwrap();
-    let records: Vec<_> = pages(&conn, handle.cursor)
-        .into_iter()
-        .flat_map(|page| page.records)
-        .collect();
-    let prompts: BTreeMap<_, _> = records
+fn prompts(records: &[HistoryExportRecord]) -> BTreeMap<String, serde_json::Value> {
+    records
         .iter()
         .map(|record| {
             (
@@ -106,12 +101,69 @@ fn a_snapshot_covers_the_rows_present_at_creation() {
                 record.payload["first_prompt"].clone(),
             )
         })
-        .collect();
+        .collect()
+}
+
+/// The export is the store as it stood when the snapshot opened, whatever
+/// is written while it is read: a row rewritten keeps its old values, a row
+/// deleted is still exported, a row added is not -- including one that takes
+/// the rowid of the deleted row at the top of `sessions`, a table without
+/// `AUTOINCREMENT` -- and no row is exported twice.
+#[test]
+fn writes_after_opening_do_not_change_the_export() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_store, conn, db) = store(dir.path());
+    seed(&conn);
+    let top: i64 = conn
+        .query_row("SELECT MAX(rowid) FROM sessions", [], |row| row.get(0))
+        .unwrap();
+    let limits = ExportLimits {
+        max_batch_records: 1,
+        ..ExportLimits::default()
+    };
+    let mut snapshot = open(&db, &all_sessions(&["session"]), &limits, 60_000);
+    // One page read before the writes, the rest after.
+    let first = snapshot.page(&snapshot.handle().cursor, now()).unwrap();
+    conn.execute_batch(
+        "UPDATE sessions SET first_prompt = 'rewritten' WHERE session_id = 'three';
+         DELETE FROM sessions WHERE session_id = 'three';
+         INSERT INTO sessions (source, session_id, first_prompt) VALUES ('claude', 'later', 'new');
+         UPDATE sessions SET first_prompt = 'rewritten' WHERE session_id = 'two';",
+    )
+    .unwrap();
+    let reused: i64 = conn
+        .query_row(
+            "SELECT rowid FROM sessions WHERE session_id = 'later'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(reused, top, "the new row took the deleted row's rowid");
+    let mut exported = first.records.clone();
+    let mut cursor = first.next_cursor.clone();
+    while let Some(value) = cursor {
+        let page = snapshot.page(&value, now()).unwrap();
+        cursor = page.next_cursor.clone();
+        exported.extend(page.records);
+    }
+    assert_eq!(exported.len(), 3, "each row once: {exported:?}");
     assert_eq!(
-        prompts,
+        prompts(&exported),
         BTreeMap::from([
-            ("one".to_string(), "rewritten".into()),
+            ("one".to_string(), "first".into()),
+            ("two".to_string(), "second".into()),
             ("three".to_string(), "third".into()),
+        ])
+    );
+    drop(snapshot);
+    // A snapshot opened now sees the writes.
+    let now_records = export_all(&db, &all_sessions(&["session"]), &ExportLimits::default());
+    assert_eq!(
+        prompts(&now_records),
+        BTreeMap::from([
+            ("one".to_string(), "first".into()),
+            ("two".to_string(), "rewritten".into()),
+            ("later".to_string(), "new".into()),
         ])
     );
 }
@@ -122,10 +174,10 @@ fn a_snapshot_covers_the_rows_present_at_creation() {
 #[test]
 fn a_record_carries_the_change_feeds_identity_and_revision() {
     let dir = tempfile::tempdir().unwrap();
-    let (store, conn) = store(dir.path());
+    let (store, conn, db) = store(dir.path());
     seed(&conn);
     let records = export_all(
-        &conn,
+        &db,
         &all_sessions(&["session", "session_event", "relationship"]),
         &ExportLimits::default(),
     );
@@ -161,48 +213,61 @@ fn a_record_carries_the_change_feeds_identity_and_revision() {
     }
 }
 
-/// Pages are bounded, and a retried cursor returns the page it returned
-/// before rather than the next one.
+/// Pages are bounded by record count and by serialized size, envelope
+/// included, and the cursor of the page just served serves it again rather
+/// than the next one. A cursor already advanced past is refused.
 #[test]
 fn pages_are_bounded_and_a_retried_cursor_repeats_its_page() {
     let dir = tempfile::tempdir().unwrap();
-    let (_store, conn) = store(dir.path());
+    let (_store, conn, db) = store(dir.path());
     seed(&conn);
     let limits = ExportLimits {
         max_batch_records: 2,
         ..ExportLimits::default()
     };
-    let handle = export::create_export(
-        &conn,
+    let mut snapshot = open(
+        &db,
         &all_sessions(&["session", "session_event"]),
         &limits,
         60_000,
-        now(),
-    )
-    .unwrap();
-    let first = export::export_page(&conn, &handle.cursor, now()).unwrap();
-    assert_eq!(first.records.len(), 2);
-    assert_eq!(
-        export::export_page(&conn, &handle.cursor, now()).unwrap(),
-        first
     );
-    let rest: Vec<_> = pages(&conn, first.next_cursor.clone().unwrap());
-    assert!(rest.iter().all(|page| page.records.len() <= 2));
-    let total = first.records.len() + rest.iter().map(|p| p.records.len()).sum::<usize>();
+    let start = snapshot.handle().cursor;
+    let first = snapshot.page(&start, now()).unwrap();
+    assert_eq!(first.records.len(), 2);
+    assert_eq!(snapshot.page(&start, now()).unwrap(), first);
+    let second_cursor = first.next_cursor.clone().unwrap();
+    let second = snapshot.page(&second_cursor, now()).unwrap();
+    assert!(
+        snapshot.page(&start, now()).is_err(),
+        "a cursor advanced past"
+    );
+    assert_eq!(snapshot.page(&second_cursor, now()).unwrap(), second);
+    let mut total = first.records.len() + second.records.len();
+    let mut cursor = second.next_cursor.clone();
+    while let Some(value) = cursor {
+        let page = snapshot.page(&value, now()).unwrap();
+        assert!(page.records.len() <= 2);
+        total += page.records.len();
+        cursor = page.next_cursor.clone();
+    }
     assert_eq!(total, 6);
 
+    let record_bytes = serde_json::to_vec(
+        &export_all(&db, &all_sessions(&["session"]), &ExportLimits::default())[0],
+    )
+    .unwrap()
+    .len();
     let tight = ExportLimits {
-        max_batch_bytes: 4096,
+        // Room for the envelope and one record, not two.
+        max_batch_bytes: record_bytes + 200,
         ..ExportLimits::default()
     };
-    for page in pages(
-        &conn,
-        export::create_export(&conn, &all_sessions(&["session"]), &tight, 60_000, now())
-            .unwrap()
-            .cursor,
-    ) {
-        assert!(serde_json::to_vec(&page).unwrap().len() <= 4096);
+    let pages = pages(&mut open(&db, &all_sessions(&["session"]), &tight, 60_000));
+    assert!(pages.iter().all(|page| page.records.len() <= 1));
+    for page in &pages {
+        assert!(serde_json::to_vec(page).unwrap().len() <= tight.max_batch_bytes);
     }
+    assert_eq!(pages.iter().map(|p| p.records.len()).sum::<usize>(), 3);
 }
 
 /// Sources and sessions select; an excluded session leaves the snapshot,
@@ -210,7 +275,7 @@ fn pages_are_bounded_and_a_retried_cursor_repeats_its_page() {
 #[test]
 fn a_selection_includes_and_excludes_sessions() {
     let dir = tempfile::tempdir().unwrap();
-    let (_store, conn) = store(dir.path());
+    let (_store, conn, db) = store(dir.path());
     seed(&conn);
     let identity = |source: &str, session: &str| SessionIdentity {
         source: source.into(),
@@ -222,6 +287,7 @@ fn a_selection_includes_and_excludes_sessions() {
             .map(|record| (record.kind, record.session_id.unwrap()))
             .collect::<Vec<_>>()
     };
+    let pair = |kind: &str, session: &str| (kind.to_string(), session.to_string());
 
     let by_source = ExportSelection {
         sources: vec!["codex".into()],
@@ -229,11 +295,8 @@ fn a_selection_includes_and_excludes_sessions() {
         ..Default::default()
     };
     assert_eq!(
-        sessions(export_all(&conn, &by_source, &ExportLimits::default())),
-        [
-            ("session_event".to_string(), "three".to_string()),
-            ("session".to_string(), "three".to_string())
-        ]
+        sessions(export_all(&db, &by_source, &ExportLimits::default())),
+        [pair("session_event", "three"), pair("session", "three")]
     );
 
     let by_session = ExportSelection {
@@ -242,11 +305,8 @@ fn a_selection_includes_and_excludes_sessions() {
         ..Default::default()
     };
     assert_eq!(
-        sessions(export_all(&conn, &by_session, &ExportLimits::default())),
-        [
-            ("session".to_string(), "one".to_string()),
-            ("relationship".to_string(), "one".to_string())
-        ]
+        sessions(export_all(&db, &by_session, &ExportLimits::default())),
+        [pair("session", "one"), pair("relationship", "one")]
     );
 
     let excluding_child = ExportSelection {
@@ -254,91 +314,78 @@ fn a_selection_includes_and_excludes_sessions() {
         ..all_sessions(&["session", "relationship"])
     };
     assert_eq!(
-        sessions(export_all(
-            &conn,
-            &excluding_child,
-            &ExportLimits::default()
-        )),
-        [
-            ("session".to_string(), "one".to_string()),
-            ("session".to_string(), "three".to_string())
-        ],
+        sessions(export_all(&db, &excluding_child, &ExportLimits::default())),
+        [pair("session", "one"), pair("session", "three")],
         "the relationship names the excluded child, so it leaves with it"
     );
 }
 
-/// A snapshot opened by an earlier release has no bounds to read by: it is
-/// refused, and closing it releases it.
+/// An expired snapshot serves nothing, not even the page it served last.
 #[test]
-fn a_snapshot_without_bounds_is_refused_and_can_be_closed() {
+fn an_expired_snapshot_serves_no_page() {
     let dir = tempfile::tempdir().unwrap();
-    let (_store, conn) = store(dir.path());
-    conn.execute(
-        "INSERT INTO history_exports(id,selection_json,limits_json,cutoff,expires_at_ms,cursor) \
-         VALUES ('old', ?1, ?2, 7, ?3, 'old-cursor')",
-        rusqlite::params![
-            serde_json::to_string(&all_sessions(&["session"])).unwrap(),
-            serde_json::to_string(&ExportLimits::default()).unwrap(),
-            now() + 60_000
-        ],
-    )
-    .unwrap();
-    let error = export::export_page(&conn, "old-cursor", now()).unwrap_err();
-    assert!(error.to_string().contains("earlier release"), "{error:#}");
-    export::close_export(&conn, "old").unwrap();
-    assert!(export::export_page(&conn, "old-cursor", now()).is_err());
-}
-
-/// Expired snapshots stop serving pages and are released oldest first.
-#[test]
-fn expired_snapshots_are_refused_and_released() {
-    let dir = tempfile::tempdir().unwrap();
-    let (_store, conn) = store(dir.path());
+    let (_store, conn, db) = store(dir.path());
     seed(&conn);
-    let handle = export::create_export(
-        &conn,
+    let mut snapshot = open(
+        &db,
         &all_sessions(&["session"]),
         &ExportLimits::default(),
         1_000,
-        now(),
-    )
-    .unwrap();
+    );
+    let handle = snapshot.handle();
+    snapshot.page(&handle.cursor, now()).unwrap();
     let later = handle.expires_at_ms + 1;
-    assert!(export::export_page(&conn, &handle.cursor, later).is_err());
-    assert_eq!(export::expire_exports(&conn, later, 32).unwrap(), 1);
-    let left: i64 = conn
-        .query_row(
-            "SELECT (SELECT COUNT(*) FROM history_exports) \
-                  + (SELECT COUNT(*) FROM history_export_bounds) \
-                  + (SELECT COUNT(*) FROM history_export_pages)",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(left, 0);
+    assert!(snapshot.expired(later));
+    let error = snapshot.page(&handle.cursor, later).unwrap_err();
+    assert!(error.to_string().contains("expired"), "{error:#}");
 }
 
-/// Exporting needs nothing the upload journal kept: a new store has none of
-/// its tables, triggers or indexes.
+/// An open snapshot does not hold up the writer, and dropping it ends its
+/// transaction.
 #[test]
-fn a_new_store_exports_without_any_upload_state() {
+fn an_open_snapshot_never_blocks_a_writer() {
     let dir = tempfile::tempdir().unwrap();
-    let (_store, conn) = store(dir.path());
+    let (_store, conn, db) = store(dir.path());
+    seed(&conn);
+    let mut snapshot = open(
+        &db,
+        &all_sessions(&["session"]),
+        &ExportLimits::default(),
+        60_000,
+    );
+    snapshot.page(&snapshot.handle().cursor, now()).unwrap();
+    conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+    conn.execute(
+        "INSERT INTO sessions (source, session_id) VALUES ('claude', 'during')",
+        [],
+    )
+    .expect("the writer is not blocked by the open snapshot");
+    drop(snapshot);
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
+}
+
+/// Exporting needs nothing stored: a new store has no export or upload
+/// table, trigger or index.
+#[test]
+fn a_new_store_exports_without_any_stored_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_store, conn, db) = store(dir.path());
     seed(&conn);
     assert_eq!(
-        export_all(&conn, &all_sessions(&["session"]), &ExportLimits::default()).len(),
+        export_all(&db, &all_sessions(&["session"]), &ExportLimits::default()).len(),
         3
     );
-    let upload_objects: Vec<String> = conn
+    let stored: Vec<String> = conn
         .prepare(
             "SELECT name FROM sqlite_master \
-             WHERE name LIKE 'delivery%' OR name LIKE 'history_subscription%' \
-                OR name = 'history_compaction'",
+             WHERE name LIKE 'delivery%' OR name LIKE 'history_export%' \
+                OR name LIKE 'history_subscription%' OR name = 'history_compaction'",
         )
         .unwrap()
         .query_map([], |row| row.get(0))
         .unwrap()
         .collect::<rusqlite::Result<_>>()
         .unwrap();
-    assert_eq!(upload_objects, Vec::<String>::new());
+    assert_eq!(stored, Vec::<String>::new());
 }

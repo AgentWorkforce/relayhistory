@@ -639,7 +639,7 @@ fn stored_value(value: ValueRef<'_>) -> Value {
 }
 
 #[cfg(feature = "export")]
-/// One live row of a fed table, as a local export snapshot reads it.
+/// One row of a fed table, as a local export snapshot reads it.
 pub(crate) struct LiveRow {
     pub rowid: i64,
     pub source: String,
@@ -652,24 +652,12 @@ pub(crate) struct LiveRow {
 }
 
 #[cfg(feature = "export")]
-/// The largest rowid `kind`'s table holds, or zero when it is empty.
-pub(crate) fn max_rowid(conn: &Connection, kind: ChangeKind) -> Result<i64> {
-    let table = kind.table();
-    Ok(conn.query_row(
-        &format!("SELECT COALESCE(MAX(rowid), 0) FROM {}", table.name),
-        [],
-        |row| row.get(0),
-    )?)
-}
-
-#[cfg(feature = "export")]
-/// At most `limit` rows of `kind`'s table with `after < rowid <= through`, in
-/// rowid order: one indexed range of the table's own b-tree.
+/// At most `limit` rows of `kind`'s table past rowid `after`, in rowid order:
+/// one range of the table's own b-tree.
 pub(crate) fn rows_by_rowid(
     conn: &Connection,
     kind: ChangeKind,
     after: i64,
-    through: i64,
     limit: usize,
 ) -> Result<Vec<LiveRow>> {
     let table = kind.table();
@@ -680,7 +668,7 @@ pub(crate) fn rows_by_rowid(
         .collect();
     let sql = format!(
         "SELECT r.rowid, {source}, r.{session}, r.{REVISION_COLUMN}, {columns} FROM {name} r \
-         WHERE r.rowid > ?1 AND r.rowid <= ?2 ORDER BY r.rowid LIMIT ?3",
+         WHERE r.rowid > ?1 ORDER BY r.rowid LIMIT ?2",
         source = table.source_sql("r"),
         session = table.session,
         name = table.name,
@@ -692,7 +680,7 @@ pub(crate) fn rows_by_rowid(
     );
     let mut statement = conn.prepare_cached(&sql)?;
     let rows = statement.query_map(
-        rusqlite::params![after, through, limit.min(i64::MAX as usize) as i64],
+        rusqlite::params![after, limit.min(i64::MAX as usize) as i64],
         |row| {
             let mut columns = Vec::with_capacity(names.len());
             for (offset, name) in names.iter().enumerate() {

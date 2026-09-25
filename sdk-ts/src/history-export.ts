@@ -14,7 +14,7 @@ export interface HistoryExportPage {
 export interface HistoryExportOptions extends HistoryExportStorageOptions {
   limits?: HistoryExportLimits; ttlMs?: number; signal?: AbortSignal;
 }
-/** A bounded snapshot of the rows the store holds now. */
+/** A consistent snapshot of the store as it stands now. */
 export function beginHistoryExport(selection: HistoryExportSelection, options: HistoryExportOptions = {}): Promise<HistoryExportHandle> {
   return exportRequest({ operation: 'create_export', selection, limits: options.limits ?? DEFAULT_EXPORT_LIMITS,
     ttl_ms: options.ttlMs ?? 3_600_000, now_ms: Date.now() }, options);
@@ -27,8 +27,9 @@ export function closeHistoryExport(snapshotId: string, options: HistoryExportSto
 }
 /** Records carry the change feed's identity and revision for each row, its
  * provenance, and the row as stored. Closing/breaking the iterator releases its
- * snapshot. Explicit handles support durable cursor resume until expiry; a
- * snapshot covers the rows present when it was created. */
+ * snapshot. A snapshot is the store as it stood when it began, and lives in
+ * this process until closed or expired; the cursor of the page just read
+ * serves that page again. */
 export async function* exportHistory(selection: HistoryExportSelection, options: HistoryExportOptions = {}): AsyncGenerator<HistoryExportRecord> {
   options.signal?.throwIfAborted();
   const snapshot = await beginHistoryExport(selection, options);

@@ -462,13 +462,14 @@ There is no alternate runtime after any native-load error.
 
 ## Snapshot export and upload state
 
-`ai-hist::export` (the `export` feature) is local export: bounded, resumable
-NDJSON snapshots a user writes to a file or a pipe through the SDK's
-`exportHistory`. A snapshot records each table's largest rowid when it is
-created and reads the live rows at or below it, a bounded page per call; each
-record carries the change feed's key and revision for its row. Its state is
-`history_exports`, `history_export_pages` and `history_export_bounds`, and
-nothing else.
+`ai-hist::export` (the `export` feature) is local export: NDJSON a user
+writes to a file or a pipe through the SDK's `exportHistory`, in bounded
+pages. An `ExportSnapshot` owns a connection holding one read transaction, so
+every page reads the store as it stood when the snapshot opened, whatever is
+written meanwhile; in WAL mode the transaction never blocks the writer. Each
+record carries the change feed's key and revision for its row. Nothing is
+stored: an open snapshot lives in the addon process until it is closed or
+expires.
 
 The crate keeps no upload state. An uploader reads the change feed
 (`SessionStore::changes_since`), which carries every row in full, and keeps

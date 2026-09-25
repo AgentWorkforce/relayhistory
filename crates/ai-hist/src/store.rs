@@ -535,10 +535,6 @@ const REQUIRED_TABLES: &[&str] = &[
     "schema_migrations",
     "discovery_skips",
 ];
-#[cfg(feature = "export")]
-const REQUIRED_EXPORT_TABLES: &[&str] = crate::export::REQUIRED_TABLES;
-#[cfg(not(feature = "export"))]
-const REQUIRED_EXPORT_TABLES: &[&str] = &[];
 const REQUIRED_HISTORY_COLUMNS: &[&str] = &["prompt_hash", "git_branch"];
 /// Columns [`init_db`] adds to `sessions` after the original DDL. The shallow
 /// session catalog (`ai-hist sessions list` / `discover`) reads every one of
@@ -951,7 +947,7 @@ pub fn schema_is_usage_read_current(conn: &Connection) -> Result<bool> {
 
 fn schema_has_required_indexes(conn: &Connection, required_indexes: &[&str]) -> Result<bool> {
     let mut table = conn.prepare("SELECT 1 FROM sqlite_master WHERE name = ? LIMIT 1")?;
-    for name in REQUIRED_TABLES.iter().chain(REQUIRED_EXPORT_TABLES.iter()) {
+    for name in REQUIRED_TABLES {
         if !table.exists([*name])? {
             return Ok(false);
         }
@@ -1623,17 +1619,6 @@ VALUES ('session_presences_local_backfill_v1');
     crate::observations::init_schema(conn)?;
     // After the observation schema: the stamping triggers draw on its clock.
     crate::change_feed::init_schema(conn)?;
-    init_export_schema(conn)?;
-    Ok(())
-}
-
-#[cfg(feature = "export")]
-fn init_export_schema(conn: &Connection) -> Result<()> {
-    crate::export::init_schema(conn)
-}
-
-#[cfg(not(feature = "export"))]
-fn init_export_schema(_conn: &Connection) -> Result<()> {
     Ok(())
 }
 

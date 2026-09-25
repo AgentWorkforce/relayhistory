@@ -39,10 +39,11 @@ for await (const record of exportHistory(selection, { dbPath })) {
 }
 ```
 
-The iterator reads a snapshot of the rows present when it began, not a live
-change feed: a row added later is outside it, a row rewritten meanwhile is
-exported as it then stands, and a row deleted before its page is not exported.
-It closes the snapshot when finished or stopped. For resumable paging, use
-`beginHistoryExport`, `readHistoryExportPage`, and `closeHistoryExport`. Opaque
-cursors can be replayed until the snapshot expires (one hour by default).
+The iterator reads one consistent snapshot: the store exactly as it stood when
+the export began, whatever is written, rewritten or deleted while it runs. It
+closes the snapshot when finished or stopped. For paging, use
+`beginHistoryExport`, `readHistoryExportPage`, and `closeHistoryExport`. The
+cursor of the page just read serves that page again until the next page is
+read, and a snapshot lives in the process that began it until it is closed or
+expires (one hour by default).
 Abandoned snapshots expire.
