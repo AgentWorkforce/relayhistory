@@ -71,7 +71,7 @@ pub use store::*;
 pub(crate) use store::*;
 
 pub use change_feed::{
-    Change, ChangeKind, ChangeOp, ChangeQuery, Changes, EvidenceRow, Watermark,
+    Change, ChangeKind, ChangeOp, ChangeQuery, Changes, EvidenceRow, StoredRow, Watermark,
     DEFAULT_CHANGE_BATCH, MAX_CHANGE_BATCH,
 };
 pub use discover::{declared_evidence_kinds, missing_evidence_kinds, ShallowSession};

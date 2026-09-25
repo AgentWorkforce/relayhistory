@@ -343,16 +343,54 @@ Two facts about identity a consumer must not paper over:
 ### `changes_since`
 
 The revision-stamped change feed: every row of `sessions`, `session_events`,
-`tool_calls`, `file_edits`, `session_markers` and `session_relationships`
-carries a `revision` drawn from the database-wide `observation_clock` and
-stamped by a trigger on every insert and update, so no write site can forget
-one; a deleted row leaves a tombstone at its own revision, which a later insert
-of the same key clears. `changes_since(from, ChangeQuery)` drains
-`Change { kind, source, session_id, record_key, revision, op }` in
-`(revision, kind, record_key)` order, bounded to the head at open, in
+`tool_calls`, `file_edits`, `session_markers`, `session_relationships`,
+`history`, `session_presences`, `session_commit_links`, `trajectories`,
+`session_observations` and `observation_evidence` carries a `revision` drawn
+from the database-wide `observation_clock` and stamped by a trigger on every
+insert and update, so no write site can forget one; a deleted row leaves a
+tombstone at its own revision, which a later insert of the same key clears.
+`changes_since(from, ChangeQuery)` drains
+`Change { kind, source, source_name, session_id, record_key, key, revision, op, columns }`
+in `(revision, kind, record_key)` order, bounded to the head at open, in
 `batch`-sized indexed reads of at most `MAX_CHANGE_BATCH`; `op` is
-`Upsert(EvidenceRow)` — the typed row, so no second read is needed — or
-`Delete`. A re-seen `record_key` is a replace, never a duplicate.
+`Upsert(EvidenceRow)` — the typed row, so no second read is needed, or
+`EvidenceRow::Untyped` for a kind with none — or `Delete`. A re-seen key is a
+replace, never a duplicate.
+
+| `ChangeKind`          | Table                   | `key` after the kind                                                  | Typed row             |
+| --------------------- | ----------------------- | --------------------------------------------------------------------- | --------------------- |
+| `Session`             | `sessions`              | `source, session_id`                                                  | `ShallowSession`      |
+| `SessionEvent`        | `session_events`        | `source, session_id, event_uid`                                       | `SessionEvent`        |
+| `ToolCall`            | `tool_calls`            | `source, session_id, tool_use_id`                                     | `SessionToolCall`     |
+| `FileEdit`            | `file_edits`            | `source, session_id, tool_use_id`                                     | `SessionFileEdit`     |
+| `SessionMarker`       | `session_markers`       | `source, session_id, marker_uid`                                      | `SessionMarker`       |
+| `Relationship`        | `session_relationships` | `source, parent_session_id, relationship_uid`                         | `SessionRelationship` |
+| `History`             | `history`               | `source, timestamp_ms, prompt`                                        | `HistoryEntry`        |
+| `Presence`            | `session_presences`     | `source, session_id, location`                                        | —                     |
+| `CommitLink`          | `session_commit_links`  | `source, session_id, commit_sha, match_method`                        | —                     |
+| `Trajectory`          | `trajectories`          | `id`                                                                  | —                     |
+| `SourceObservation`   | `session_observations`  | `source, session_id, location, connector_id, connector_instance`      | —                     |
+| `ObservationEvidence` | `observation_evidence`  | `source, session_id, location, connector_id, connector_instance, evidence_uid` | —            |
+
+`columns` is the row as stored, on every upsert: a `StoredRow` of every column
+but `revision`, in table order, each value as SQLite holds it — JSON text stays
+text, integers stay integers, NULL stays `null` — read from the live table, so
+a column a migration adds is carried without a code change. It serializes as a
+JSON object in column order, the same object the export journal records for the
+row. `key` is the record's identity as that journal keys it: the kind's wire
+name, then the stored values of the table's uniqueness columns, identical on an
+upsert and on the delete that retracts it — `["history", "claude",
+1756634400000, "ship the feed"]`, `["trajectory", "traj-1"]`. `record_key` is
+the part of `key` inside a session: the one identity column's text, or a JSON
+array of several (`[1756634400000,"ship the feed"]` for a prompt).
+`session_id` is the parent session for a relationship, the id for a trajectory
+and empty for a prompt that names no session; a prompt's session is not part of
+its key, so its delete carries it empty and a prompt gaining a session is an
+upsert, never a delete. `source` is `None` for a source
+this build does not know — a row written by a newer release — and
+`source_name` is the stored name either way, so such a row is carried rather
+than failing the drain. The feed applies no consent or exclusion rule: an
+embedder that uploads applies its own selection.
 
 `from` is `Watermark::START` to replay everything, an explicit watermark to
 resume from one a consumer stored itself, or `Watermark::CONSUMER` with
@@ -526,7 +564,8 @@ it to fold requests by model.
 `ShallowSession`, `SessionRelationship`, `SessionLocation` and `SessionScope`
 are re-exported on the default features because the change feed's
 `EvidenceRow` carries them: a `Change` hands back the typed row it is about,
-so a consumer needs no second read. `session()` returns the facade's own
+so a consumer needs no second read. `StoredRow` carries every kind's row as
+stored. `session()` returns the facade's own
 structs (`Prompt`, `Message` and its `Block`s, `ToolCall`, `ToolResult`,
 `FileEdit`, `Marker`, `Relationship`) — those are the read-side shapes, with
 JSON columns parsed. `CommitLink` is carried by neither.
@@ -607,7 +646,7 @@ embedder reads before bumping.
 
 | Feature | Default | What it adds | For |
 | --- | --- | --- | --- |
-| *(none)* | ✓ | `SessionStore` and its ten operations, the change feed (`Change`, `ChangeQuery`, `Watermark`, `EvidenceRow`), `Source` and `SourceCapabilities`, `Error`, the evidence structs above, `NormalizedUsage` and the usage normalizers, `project_identity`, `declared_evidence_kinds` | Embedders |
+| *(none)* | ✓ | `SessionStore` and its ten operations, the change feed (`Change`, `ChangeQuery`, `Watermark`, `EvidenceRow`, `StoredRow`), `Source` and `SourceCapabilities`, `Error`, the evidence structs above, `NormalizedUsage` and the usage normalizers, `project_identity`, `declared_evidence_kinds` | Embedders |
 | `fs-events` | — | The `notify` backend behind `watch`; without it `watch` polls at `poll_interval_ms`. `WatchOptions::use_fs_events` selects it when it is compiled in | The CLI, and an embedder that wants event-driven ticks |
 | `delivery` | — | Durable delivery of captured evidence to a destination | The CLI, napi, the relayhistory plugin |
 | `opencode-backup` | — | Snapshot a live OpenCode SQLite store through `rusqlite`'s backup API before reading it | The CLI, napi |
