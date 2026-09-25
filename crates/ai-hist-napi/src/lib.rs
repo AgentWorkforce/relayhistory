@@ -57,7 +57,7 @@ use serde::Serialize;
 /// per-request usage surface. The merged addon exposes both shapes, so it is
 /// 19 rather than identifying itself as either incompatible contract 18.
 /// 20 was claimed independently by the `historyExport` bridge, which moved
-/// the upload lifecycle into the probe package, and by the `sessionStoreCall`
+/// the upload lifecycle out of the addon, and by the `sessionStoreCall`
 /// dispatcher below. The merged addon exposes both, so it is 21 rather than
 /// answering with a number either incompatible contract 20 already used.
 /// 21 adds the `sessionStoreCall` JSON dispatcher over the `SessionStore`

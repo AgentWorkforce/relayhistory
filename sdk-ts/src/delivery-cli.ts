@@ -5,12 +5,12 @@ import { randomUUID } from 'node:crypto';
 import { finished } from 'node:stream/promises';
 import type { Writable } from 'node:stream';
 import {
-  deliveryRequest, defaultDbPath, exportHistoryNdjson,
+  defaultDbPath, exportHistoryNdjson,
   loadHistoryPlugins, InvalidArgumentError,
-  type DeliveryJobConfig, type HistoryExportSelection, type HistoryPluginModule,
+  type HistoryExportSelection, type HistoryPluginModule,
 } from './index.js';
 
-export interface HistoryApplicationConfig { plugins: HistoryPluginModule[]; job?: DeliveryJobConfig }
+export interface HistoryApplicationConfig { plugins: HistoryPluginModule[] }
 export async function loadHistoryApplicationConfig(path: string) {
   const absolute = resolve(path);
   let config: HistoryApplicationConfig;
@@ -18,21 +18,6 @@ export async function loadHistoryApplicationConfig(path: string) {
   catch { throw new InvalidArgumentError('history config could not be read as JSON', 'INVALID_ARGUMENT'); }
   if (!config || !Array.isArray(config.plugins)) throw new InvalidArgumentError('history config requires an explicit plugins array', 'INVALID_ARGUMENT');
   return { config, registry: await loadHistoryPlugins(config.plugins, { baseDirectory: dirname(absolute) }) };
-}
-
-/** Where a delivery run's output goes. Structurally the CLI's own `CliIo`. */
-export interface DeliveryIo {
-  stdout(chunk: string): void;
-  stderr(chunk: string): void;
-}
-
-/** Legacy CLI entry point: explicit migration error, with no receiver or DB access. */
-export async function runDeliveryCommand(action: string, io: DeliveryIo, options: {
-  dbPath?: string; configPath?: string; jobId?: string; pollIntervalMs?: number; requestTimeoutMs?: number;
-  signal?: AbortSignal;
-}): Promise<number> {
-  void action; void io;
-  return deliveryRequest<number>({ operation: 'moved_to_probe' }, options);
 }
 
 async function write(stream: Writable, chunk: string): Promise<void> {

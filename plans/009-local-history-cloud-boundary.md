@@ -85,7 +85,7 @@ destination. RelayHistory is one destination implementation, not the cloud model
   `npm run clean && tsc -p tsconfig.json && node scripts/build-cloud-auth.mjs`.
   That script resolves and bundles `@agent-relay/cloud`; the broad tsconfig
   includes its source. A type-only reference can retain this dependency too.
-- `mcp-server.ts:13` imports cloud and registers `get_session_thread` in the
+- `mcp-server.ts:13` imports cloud and registers a cloud thread tool in the
   ordinary server. N-API cloud methods begin around `lib.rs:1574`.
 
 ## Product model and target dependency direction
@@ -472,8 +472,8 @@ for that bridge choice, rather than mandating a second general-purpose addon.
 If core native contract 11 changes, bump its version and regenerate declarations.
 
 The existing CLI/MCP loads explicitly configured plugins. Core commands/tools
-remain available with no plugins. Plugin-specific commands/tools such as
-`get_session_thread` register only when their plugin is enabled. Reject duplicate
+remain available with no plugins. Plugin-specific commands/tools
+register only when their plugin is enabled. Reject duplicate
 command/tool identifiers deterministically. Loading a configured module must not
 start login or upload; credentials/transports are touched only by an explicit
 operation or a previously enabled delivery job.
@@ -613,7 +613,7 @@ transport in a release.
 
 The local workspace contains `ai-hist-core`, `ai-hist-engine`, `ai-hist-cli`, and
 `ai-hist-napi`; the npm SDK remains `ai-hist`. Optional composition lives in
-`plugins/relayhistory` (`@relayhistory/capture`) and
+an optional RelayHistory cloud package and
 `plugins/provider-sources` (`@relayhistory/provider-sources`). Each optional
 package uses a platform-specific Rust executable and the one local native addon.
 These concrete package names replace the provisional names used in earlier steps.

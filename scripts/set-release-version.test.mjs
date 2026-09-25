@@ -66,7 +66,7 @@ function fixture(info) {
   };
 }
 
-/** The crate each plugin's helper (and, for relayhistory, the probe) builds
+/** The crate each plugin's helper builds
  * from. Its own Cargo workspace, so the lock beside it names it too. */
 function crateFixture(info) {
   return {
@@ -284,7 +284,7 @@ test("the release version reaches every manifest, peer range and lock coordinate
   for (const [plugin, info] of Object.entries(plugins)) {
     const manifest = JSON.parse(await read(root, plugin, "package.json"));
     const lock = JSON.parse(await read(root, plugin, "package-lock.json"));
-    // The helper and the probe report CARGO_PKG_VERSION, so the crate and the
+    // The helper reports CARGO_PKG_VERSION, so the crate and the
     // lock beside it carry the release version too — and nothing else does.
     const crate = await readCrate(root, plugin, "Cargo.toml");
     const crateLock = await readCrate(root, plugin, "Cargo.lock");

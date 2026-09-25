@@ -61,7 +61,6 @@ class CloudUsageError extends Error {
 /** Headings for the two-level groups, which have no row of their own in `COMMANDS`. */
 const GROUP_DESCRIPTIONS: Record<string, string> = {
   cloud: 'Read session history from Relayhistory cloud.',
-  delivery: 'Manage history delivery jobs.',
 };
 
 // ---------------------------------------------------------------------------
@@ -471,8 +470,7 @@ export interface RelayhistorySurfaceOptions {
    */
   cloud?: RelayhistoryCloudClient;
   /**
-   * Cancels a mounted long-running command — `delivery run`, which by design
-   * loops until it is stopped.
+   * Cancels a mounted command whose spec is `cancellable`.
    *
    * The contract forbids a surface from installing signal handlers, because
    * the process's signals belong to the host. It also gives `run` no way to
@@ -517,8 +515,8 @@ export function createRelayCliSurface(options: RelayhistorySurfaceOptions = {}):
         // The bin's own options stay with the bin: no registry check, and
         // colour is the host's to decide. What a mounted command genuinely
         // needs does cross: somewhere to stream `export` to when no `--out`
-        // was given, and the host's cancellation for `delivery run`. Without
-        // both, a command that works as `ai-hist <cmd>` fails as
+        // was given, and the host's cancellation signal. Without both, a
+        // command that works as `ai-hist <cmd>` fails as
         // `agent-relay sessions <cmd>`.
         return runCli([...resolved.route.words, ...resolved.rest], io, {
           stdoutStream: hostStdoutStream(hostIo),

@@ -83,10 +83,4 @@ export interface HistoryDestination {
 export interface HistoryPlugin {
   sources?: readonly HistorySource[];
   destinations?: ReadonlyArray<{ instanceId: string; destination: HistoryDestination }>;
-  /** Optional host integrations, registered only for explicitly loaded plugins. */
-  commands?: ReadonlyArray<{ name: string; run(args: readonly string[]): Promise<unknown> }>;
-  tools?: ReadonlyArray<{
-    name: string; description: string;
-    run(input: Record<string, unknown>): Promise<unknown>;
-  }>;
 }

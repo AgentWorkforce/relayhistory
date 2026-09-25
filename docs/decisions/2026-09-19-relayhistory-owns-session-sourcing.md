@@ -20,12 +20,12 @@ Two repositories parse the same harness logs today, with no shared code.
 | Grok        | `ingest_grok_session` (`src/ingest.rs`)         | not supported                                                                                 |
 
 burn has no dependency on relayhistory. relayhistory already defers cost to
-burn by name (`plugins/relayhistory/rust/src/convergence.rs` — "Input excludes
+burn by name (the upload plugin's `convergence.rs` — "Input excludes
 cache reads; cost is owned by burn", and a reserved `lens: "burn"`). The result
 is that every harness change is paid for twice and the two parsers disagree:
 burn merges Claude's per-block `usage` copies at parse time, while relayhistory
 copies `message.usage` onto every block (`src/ingest.rs`) and de-duplicates them
-later in plugin-private code (`plugins/relayhistory/rust/src/outbox.rs`, "Claude
+later in plugin-private code (the upload plugin's `outbox.rs`, "Claude
 copies message.usage onto every content block").
 
 ## Decision
@@ -96,7 +96,7 @@ delivery layers that a parser-only crate would still need a home for. Rejected.
 
 **Two published crates (`ai-hist-core` + `ai-hist-engine`).** Every consumer
 already depended on both — `crates/ai-hist-cli`, `crates/ai-hist-napi`,
-`plugins/provider-sources/rust`, `plugins/relayhistory/rust` — and the layering
+`plugins/provider-sources/rust`, the upload plugin — and the layering
 was not real: "core" contained `parse_claude`, `parse_codex`,
 `parse_cursor_text` and the OpenCode sync, while the main Claude and Codex
 parsers lived in "engine". It was not storage versus parsing; it was two halves
@@ -190,7 +190,7 @@ to write a relationship to.
 `message.usage` once and passes the same `token_json` to every block of the
 message, so one model request is written N times, once per content block.
 Nothing in the crate corrects it — de-duplication lives in plugin-private code
-(`plugins/relayhistory/rust/src/outbox.rs`). Codex is `◐` for a different
+(the upload plugin's `outbox.rs`). Codex is `◐` for a different
 reason: `token_count` events carry _cumulative_ totals, and the parser derives a
 delta against the previous snapshot and attaches it to one assistant event,
 holding a `pending_delta` when no event is available yet. Both are usable, both

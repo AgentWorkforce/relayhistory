@@ -6,6 +6,28 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Breaking
 
+- Uploads are not part of `ai-hist`; team uploads come from the Agent Relay
+  desktop app. The `@relayhistory/capture` package, its seven platform helper
+  packages, the `relayhistory-plugin` crate and the `agent-relay-probe`
+  release assets are no longer built or published from this repository.
+- Removed from the SDK: `deliveryRequest`, `createHistoryDelivery`,
+  `historyDeliveryStatus`, `controlHistoryDelivery`,
+  `historyDeliveryRetention`, `setHistoryDeliveryRetention`,
+  `compactHistoryDelivery`, `drainHistoryDelivery`, `runHistoryDelivery`,
+  `runDeliveryCommand`, and the `HistoryDeliveryOptions`,
+  `DeliveryDrainOptions`, `DeliveryDrainResult` and `DeliveryIo` types. Each
+  function only raised `HISTORY_DELIVERY_MOVED`, which no longer exists.
+- Removed from the native addon: `historyDelivery` and `historyDeliveryDrain`.
+  The native contract version is unchanged; the SDK never called either.
+- Removed from the CLI: `ai-hist delivery enable|drain|run|status|pause|resume|retry|cancel`,
+  `ai-hist plugin COMMAND`, and the `--job`, `--poll-ms`, `--timeout-ms`,
+  `--base-url`, `--label`, `--max-content` and `--token` flags.
+- Removed from the MCP server: `delivery_status`, `delivery_pause`,
+  `delivery_resume` and `delivery_retry`. `AI_HIST_PLUGIN_CONFIG` loads source
+  connectors only; plugins no longer register MCP tools.
+- `HistoryPlugin` loses `commands` and `tools`; `HistoryPluginRegistry` loses
+  `command()` and `registeredTools()`. A plugin contributes `sources` and
+  `destinations`. The history config file loses its `job` field.
 - Native contract 19 -> 21. The `ai-hist-native` addon gains
   `historyExport(requestJson, dbPath)`, which separates snapshot export from
   the upload entry points the probe now owns, and

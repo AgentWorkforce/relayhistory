@@ -72,12 +72,9 @@ npx -y ai-hist-mcp
 
 Exposes `search_history`, `list_sessions`, `get_session_events`, `get_session_tool_calls`, `get_session_file_edits`, `get_session_tree`, `history_stats`, and more as MCP tools. Wire it into any MCP-capable agent so it can query its own history mid-session.
 
-The optional `@relayhistory/capture` plugin adds `get_session_thread` and durable evidence readback when explicitly configured. The default MCP server contains only local history and generic delivery operations.
+The MCP server reads local history only, plus any source plugins named by `AI_HIST_PLUGIN_CONFIG`.
 
-The optional plugin owns stage credentials and token rotation through its Rust
-helper. The default MCP server does not load that helper or read its auth store.
-
-## Team + Cloud
+## Local and remote history
 
 Cached reads such as `search`, `recent`, `sessions list`, `resume`, `pack`, and `stats`,
 and acquisition commands such as discovery, hydration, and sync, take a location scope: `--local` (the default), `--remote`, or `--all`.
@@ -98,34 +95,21 @@ ai-hist events SESSION_ID [--source SOURCE]    # --source only narrows a reused 
 
 `sessions tree`, `sessions relationships`, `sessions tools`, `sessions edits`, `sessions markers` and `sessions usage` require both positionals and fail without `SOURCE`. `session` and `events` take `SESSION_ID` on its own and reject a `SOURCE` positional; pass `--source` only to disambiguate an id two harnesses happen to share. (`sessions hydrate` also takes `SOURCE SESSION_ID`, but it is an acquisition command and does accept a scope.)
 
-Optional: install `@relayhistory/capture` to add authentication, durable delivery, readback, sharing and replay. Other services can implement the same public destination/source interfaces. See [optional cloud setup](docs/enable-cloud.md).
-
 Install `@relayhistory/provider-sources` and configure it explicitly for
 remote provider acquisition. Its connectors reuse sign-ins you already have: `claude-web` lists your claude.ai/code sessions from the Claude Code CLI's stored OAuth token, and `codex-cloud` lists Codex cloud tasks through `codex cloud list --json`. With no connector configured, `--remote` fails loudly rather than silently falling back to local. See [remote connectors](docs/remote-connectors.md).
 
-The optional compatibility CLI reads sessions available through the legacy cloud API:
+`ai-hist export --selection FILE` writes a selected slice of history as NDJSON for your own tooling. See [export](docs/export.md).
 
-```sh
-relayhistory-plugin replay <session-id>                 # print a cloud session's events, oldest first
-relayhistory-plugin replay <session-id> --out log.txt   # write that transcript to a file instead
-relayhistory-plugin token                               # print a cloud API token for your own tooling
-```
-
-`replay` prints the whole transcript. `--limit` is the per-request page size, not a cap: `replay` follows the server's cursor until the session is exhausted, so a 5-event session under `--limit 1` still prints all 5, one request at a time. `--max-content` truncates long events, and truncated ones are marked in the output; `--json` emits the raw event array. (`events --limit N` does cap, because it prints one page and a `nextCursor`.) Without a stored cloud session it stops and names what is missing rather than printing a partial transcript, and `--out` is written atomically only after the whole fetch succeeds, so an interrupted replay never truncates a transcript you already had.
-
-`relayhistory-plugin token` prints a live credential to stdout — treat it like a password, and don't paste its output into a terminal you are sharing or a log.
-
-RelayHistory is one optional cloud integration. See [cloud setup](docs/enable-cloud.md)
-for authentication, durable delivery, readback, and the legacy sharing API.
+Team uploads come from the [Agent Relay desktop app](https://agentrelay.com), not from this repository.
 
 ## Why `ai-hist`
 
 - **Every harness, one search.** Claude Code, Codex, Cursor, Grok, OpenCode, Agent Relay — indexed side-by-side. No per-harness silo.
 - **Provider-aware evidence.** Prompts, tool calls, and edits are preserved as raw evidence, not summarized away — as much of it as each harness actually exposes. Hydration reports `full`, `partial`, or `shallow_only` per session, so you can tell thin coverage from a thing that never happened. Where a harness records less than the others, the gap is named. Cursor transcripts carry the assistant's prose and every tool call, but no tool output, model id, token usage or timestamp field — those are reported as unavailable, and a turn whose injected `<timestamp>` tag cannot be read is stamped from the file mtime with `CURSOR_TIMESTAMP_FROM_MTIME`. Grok logs no per-turn billing tokens, so its only token fact is a context-window proxy, and its hydration says so every time. The per-field detail is in [the session catalog](docs/session-catalog.md).
-- **Local by default.** SQLite on your machine. Export and delivery require an explicit selection; remote acquisition requires an installed source plugin.
+- **Local by default.** SQLite on your machine. Export requires an explicit selection; remote acquisition requires an installed source plugin.
 - **Handoff-native.** `pack` and `resume` are first-class commands, not afterthoughts.
 - **MCP-native.** Your agent queries its own memory the same way you do.
 
 ---
 
-Docs: [getting started](docs/getting-started.md) · [architecture](docs/architecture.md) · [remote connectors](docs/remote-connectors.md) · [migration](docs/native-sdk-migration.md)
+Docs: [getting started](docs/getting-started.md) · [architecture](docs/architecture.md) · [remote connectors](docs/remote-connectors.md) · [export](docs/export.md) · [migration](docs/native-sdk-migration.md)

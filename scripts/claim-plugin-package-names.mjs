@@ -7,14 +7,14 @@
  * tokenless, so a name's first publish fails:
  *
  *   npm error code E404
- *   npm error 404 Not Found - PUT https://registry.npmjs.org/@relayhistory%2fcapture-darwin-arm64
- *   npm error 404 The requested resource '@relayhistory/capture-darwin-arm64@0.18.3'
+ *   npm error 404 Not Found - PUT https://registry.npmjs.org/@relayhistory%2fprovider-sources-darwin-arm64
+ *   npm error 404 The requested resource '@relayhistory/provider-sources-darwin-arm64@0.18.3'
  *                 could not be found or you do not have permission to access it.
  *
  * Each name has to exist once, published by a human account; CI owns it from
  * then on. This publishes a placeholder for every name that is still missing.
  *
- * A placeholder rather than the real package because the fourteen platform
+ * A placeholder rather than the real package because the seven platform
  * packages each carry a cross-compiled binary for their target: no single
  * machine can build all of them. The real artifacts come from the release.
  *
@@ -118,7 +118,7 @@ function otpFromArgv(argv) {
 async function main() {
   const dryRun = process.argv.includes("--dry-run");
 
-  // Fail once, before touching the registry, rather than fifteen times.
+  // Fail once, before touching the registry, rather than once per name.
   if (!dryRun) {
     try {
       const who = execFileSync("npm", ["whoami"], { stdio: "pipe" }).toString().trim();
@@ -162,7 +162,7 @@ async function main() {
       //
       // Do NOT confirm by reading the registry back here. A newly created name
       // serves 404 for roughly two minutes, so an immediate read reports every
-      // successful claim as a failure — which it did, for all fifteen, while
+      // successful claim as a failure — which it did, for every one, while
       // npm had printed `+ name@0.0.0` for each one.
       claim(entry, otp);
       console.log(`  claimed ${entry.name}`);
