@@ -50,27 +50,23 @@ function manifest(plugin, version) {
     ),
   };
 }
-test("independent optional versions choose their own artifacts and require matching helper pins", () => {
-  const relay = manifest("relayhistory", "0.16.2");
+test("an optional plugin chooses its own artifacts and requires matching helper pins", () => {
   const provider = manifest("provider-sources", "0.17.0");
-  assert.equal(
-    helperTarball("relayhistory", "linux-x64-gnu", relay),
-    "relayhistory-capture-linux-x64-gnu-0.16.2.tgz",
-  );
   assert.equal(
     helperTarball("provider-sources", "linux-x64-gnu", provider),
     "relayhistory-provider-sources-linux-x64-gnu-0.17.0.tgz",
   );
-  provider.optionalDependencies[
+  const mismatched = manifest("provider-sources", "0.17.0");
+  mismatched.optionalDependencies[
     "@relayhistory/provider-sources-win32-x64-msvc"
   ] = "0.16.0";
   assert.throws(
-    () => validatePluginManifest("provider-sources", provider),
+    () => validatePluginManifest("provider-sources", mismatched),
     /own version/,
   );
-  relay.peerDependencies["ai-hist"] = "file:../../../sdk-ts";
+  provider.peerDependencies["ai-hist"] = "file:../../../sdk-ts";
   assert.throws(
-    () => validatePluginManifest("relayhistory", relay),
+    () => validatePluginManifest("provider-sources", provider),
     /registry version/,
   );
 });

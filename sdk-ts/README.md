@@ -76,8 +76,7 @@ Cached reads preserve the requested scope and never consult commercial auth.
 Stored remote history can be queried with absent, malformed, expired, or
 ambiguous credentials. Remote acquisition requires an explicitly loaded plugin
 registry. Install `@relayhistory/provider-sources` for Claude web/Codex
-cloud, or `@relayhistory/capture` for RelayHistory. Installing a package does
-not register it, inspect auth or start delivery.
+cloud. Installing a package does not register it or inspect auth.
 
 ```ts
 import { HistoryPluginRegistry } from 'ai-hist';
@@ -238,23 +237,15 @@ evidence, and connector/parser failures with dedicated error subclasses.
 The old synchronous `AiHist` class and `openAiHist()` API were removed in 1.0.
 See [the migration guide](https://github.com/AgentWorkforce/relayhistory/blob/main/docs/native-sdk-migration.md).
 
-## Optional cloud services
+## Export
 
-Use a `HistoryDestination` plugin for any service or pipe the public NDJSON
-export to your own program. The local package has no cloud exports, login CLI,
-or default cloud MCP tool. RelayHistory's auth, sharing, replay, durable upload
-and readback live in [`@relayhistory/capture`](../plugins/relayhistory/sdk/README.md).
-Move imports from `ai-hist/cloud` to that package. Git hooks and commit linking
-remain local SDK operations.
-
-## Export and durable delivery
+The local package has no cloud exports, login CLI or cloud MCP tool. Team
+uploads come from the [Agent Relay desktop app](https://agentrelay.com). Git
+hooks and commit linking remain local SDK operations.
 
 Use `exportHistory(selection)` for a bounded historical snapshot or
-`ai-hist export --selection selection.json` for NDJSON stdout. Explicitly enabled
-delivery jobs use `createHistoryDelivery`, `HistoryPluginRegistry`, and
-`drainHistoryDelivery`/`runHistoryDelivery`. The same Rust queue handles one-shot
-and background runs, immutable retries, exact acknowledgments, and worker leases.
-Native contract 14 is required. See [delivery setup and contracts](../docs/history-delivery.md).
+`ai-hist export --selection selection.json` for NDJSON stdout. See
+[export](../docs/export.md).
 
 Source discovery and hydration accept `acquisitionTimeoutMs` for each selected
 connector operation, including a complete paginated snapshot. The default is
@@ -265,9 +256,3 @@ Timeouts return `SOURCE_ACQUISITION_TIMEOUT`, cancellation returns
 `SOURCE_ACQUISITION_CANCELLED`, and neither commits a partial snapshot. Typed
 source failures such as `AUTHENTICATION_EXPIRED` and `SESSION_NOT_FOUND` retain
 their public classes/codes with sanitized messages.
-
-To remove a persistent delivery exclusion, cancel affected delivery jobs first,
-clear the exclusion, then create new jobs to backfill the skipped history. A
-running or paused generation cannot rewind revisions it already skipped;
-attempting this returns `DELIVERY_GENERATION_REQUIRED`. Jobs whose selection
-permanently excludes that session or cannot include it may continue.

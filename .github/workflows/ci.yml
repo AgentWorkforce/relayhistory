@@ -41,7 +41,7 @@ jobs:
             crates/ai-hist-napi/package-lock.json
             sdk-ts/package-lock.json
 
-      - name: Physically remove optional cloud and provider packages
+      - name: Physically remove the optional provider-sources plugin
         run: rm -rf plugins
 
       - name: Rust formatting
@@ -183,16 +183,6 @@ jobs:
         working-directory: sdk-ts
         run: npm ci && npm test
 
-  windows-state-replacement:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Verify repeated private-state replacement
-        run: cargo test --manifest-path plugins/relayhistory/rust/Cargo.toml write_private_replaces_existing_state
-
   optional-history-plugins:
     runs-on: ubuntu-latest
     steps:
@@ -205,56 +195,40 @@ jobs:
           cache-dependency-path: |
             crates/ai-hist-napi/package-lock.json
             sdk-ts/package-lock.json
-            plugins/relayhistory/sdk/package-lock.json
             plugins/provider-sources/sdk/package-lock.json
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
             . -> target
-            plugins/relayhistory/rust -> target
             plugins/provider-sources/rust -> target
           key: ci-optional-history-plugins
       - name: Optional helper packaging contracts
         run: node --test scripts/history-helper-packaging.composed.mjs
       - name: Build composed distribution
         run: |
-          cargo build --manifest-path plugins/relayhistory/rust/Cargo.toml --locked
           cargo build --manifest-path plugins/provider-sources/rust/Cargo.toml --locked
           npm --prefix crates/ai-hist-napi ci
           npm --prefix crates/ai-hist-napi run build:debug
           npm --prefix sdk-ts ci
-          for plugin in relayhistory provider-sources; do
-            npm --prefix "plugins/$plugin/sdk" ci --ignore-scripts
-            npm --prefix "plugins/$plugin/sdk" run build
-          done
-      # Neither plugin is a workspace member, and each declares its own
-      # [workspace], so `cargo test --workspace` in `verify` cannot reach them —
-      # that job deletes `plugins/` first in any case. The build above compiles
-      # only the bin and lib targets, never `#[cfg(test)]` code, and
-      # `native-cloud-probe` tests the probe binary alone. Without this step the
-      # crates' own test suites never run anywhere, which is how a test calling
-      # a private function reached main with every check green.
+          npm --prefix plugins/provider-sources/sdk ci --ignore-scripts
+          npm --prefix plugins/provider-sources/sdk run build
+      # The plugin is not a workspace member and declares its own [workspace],
+      # so `cargo test --workspace` in `verify` cannot reach it -- that job
+      # deletes `plugins/` first in any case. The build above compiles only the
+      # bin and lib targets, never `#[cfg(test)]` code. Without this step the
+      # crate's own test suite never runs anywhere.
       - name: Optional plugin Rust tests
-        run: |
-          cargo test --manifest-path plugins/relayhistory/rust/Cargo.toml --locked
-          cargo test --manifest-path plugins/provider-sources/rust/Cargo.toml --locked
+        run: cargo test --manifest-path plugins/provider-sources/rust/Cargo.toml --locked
       - name: Optional plugin SDK tests
         env:
-          RELAYHISTORY_PLUGIN_BIN: ${{ github.workspace }}/plugins/relayhistory/rust/target/debug/relayhistory-plugin
           HISTORY_PROVIDER_SOURCES_BIN: ${{ github.workspace }}/plugins/provider-sources/rust/target/debug/history-provider-sources
-        run: |
-          npm --prefix plugins/relayhistory/sdk test
-          npm --prefix plugins/provider-sources/sdk test
+        run: npm --prefix plugins/provider-sources/sdk test
       - name: Installed composed tarballs
         run: |
           mkdir -p helper-packs
-          for plugin in relayhistory provider-sources; do
-            binary=history-provider-sources
-            if [ "$plugin" = relayhistory ]; then binary=relayhistory-plugin; fi
-            version=$(node -p "require('./plugins/$plugin/sdk/package.json').version")
-            node scripts/package-history-helper.mjs "$plugin" linux-x64-gnu "$version" "plugins/$plugin/rust/target/debug/$binary" "helper-stage/$plugin"
-            (cd "helper-stage/$plugin" && npm pack --ignore-scripts --pack-destination ../../helper-packs)
-          done
+          version=$(node -p "require('./plugins/provider-sources/sdk/package.json').version")
+          node scripts/package-history-helper.mjs provider-sources linux-x64-gnu "$version" plugins/provider-sources/rust/target/debug/history-provider-sources helper-stage/provider-sources
+          (cd helper-stage/provider-sources && npm pack --ignore-scripts --pack-destination ../../helper-packs)
           node scripts/smoke-history-packages.mjs --helpers helper-packs
 
   windows-helper-cancellation:
@@ -274,29 +248,11 @@ jobs:
           npm --prefix crates/ai-hist-napi ci
           npm --prefix crates/ai-hist-napi run build:debug
           npm --prefix sdk-ts ci
-          for plugin in relayhistory provider-sources; do
-            npm --prefix "plugins/$plugin/sdk" ci --ignore-scripts
-            npm --prefix "plugins/$plugin/sdk" run build
-          done
+          npm --prefix plugins/provider-sources/sdk ci --ignore-scripts
+          npm --prefix plugins/provider-sources/sdk run build
       - name: Verify actual Windows descendant cleanup and missing executable errors
-        run: node --test plugins/relayhistory/sdk/dist/helper-runtime.test.js plugins/provider-sources/sdk/dist/helper-runtime.test.js
+        run: node --test plugins/provider-sources/sdk/dist/helper-runtime.test.js
       - name: Verify shell-free packaging contracts
         run: node --test scripts/history-helper-packaging.composed.mjs
       - name: Verify installed local SDK on Windows
         run: node scripts/smoke-history-packages.mjs
-
-  native-cloud-probe:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Probe regression tests
-        run: cargo test --manifest-path plugins/relayhistory/rust/Cargo.toml --bin agent-relay-probe --locked
-      - name: Native release build
-        run: cargo build --manifest-path plugins/relayhistory/rust/Cargo.toml --release --bin agent-relay-probe --locked
-      - name: Executable smoke check
-        run: plugins/relayhistory/rust/target/release/agent-relay-probe --version

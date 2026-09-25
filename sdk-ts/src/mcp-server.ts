@@ -10,7 +10,6 @@ import {
   getSessionMarkersPage, getSessionRelationships, getSessionRequestsPage, getSessionToolCallsPage,
   getSessionTree, getSessionUsage, getSourceCapabilities, hydrateSession,
   listSessionCatalogPage, recent, search, stats, sync,
-  historyDeliveryStatus, historyDeliveryRetention, controlHistoryDelivery,
 } from './index.js';
 
 import type { HistoryPluginRegistry } from './index.js';
@@ -167,22 +166,9 @@ server.tool('sync', 'Explicit full provider ingestion into RelayHistory.', {
   acquisition_timeout_ms: z.number().int().min(1).max(3600000).optional(),
 }, ACQUIRE, ({ scope, source_connectors, acquisition_timeout_ms }) => call(() => sync({ scope, sourceConnectors: source_connectors, acquisitionTimeoutMs: acquisition_timeout_ms, plugins: configuredSources })));
 
-server.tool('delivery_status', 'Read durable delivery progress, backlog, failures, and retention usage.', {
-  job_id: z.string().optional(),
-}, READ, ({ job_id }) => call(async () => ({ jobs: await historyDeliveryStatus(job_id), retention: await historyDeliveryRetention() })));
-for (const action of ['pause', 'resume', 'retry'] as const) {
-  server.tool(`delivery_${action}`, `${action} an already enabled delivery job.`, {
-    job_id: z.string().min(1),
-  }, { readOnlyHint: false, idempotentHint: true, openWorldHint: false }, ({ job_id }) => call(() => controlHistoryDelivery(job_id, action)));
-}
-// Only an explicitly named config may load installed modules. No package scan,
-// implicit enablement, credential probing, or background delivery at startup.
+// Only an explicitly named config may load installed modules, and only their
+// source connectors are used. No package scan or implicit enablement at startup.
 if (process.env.AI_HIST_PLUGIN_CONFIG) {
-  const { registry } = await loadHistoryApplicationConfig(process.env.AI_HIST_PLUGIN_CONFIG);
-  configuredSources = registry;
-  for (const tool of registry.registeredTools()) {
-    server.tool(tool.name, tool.description, { input: z.record(z.string(), z.unknown()) }, { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
-      ({ input }) => call(() => tool.run(input)));
-  }
+  configuredSources = (await loadHistoryApplicationConfig(process.env.AI_HIST_PLUGIN_CONFIG)).registry;
 }
 await server.connect(new StdioServerTransport());

@@ -12,10 +12,10 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { gunzipSync } from 'node:zlib';
 import {
-  beginHistoryExport, closeHistoryExport, controlHistoryDelivery, createHistoryDelivery,
-  DEFAULT_DELIVERY_LIMITS, deliveryRequest, drainHistoryDelivery, exportHistory, historyDeliveryStatus,
-  historyDeliveryRetention, HistoryDeliveryError, HistoryPluginRegistry, loadHistoryPlugins, readHistoryExportPage, runHistoryDelivery,
-  type DeliveryJobConfig, type HistoryDestination, type HistoryExportBatch, type HistoryExportSelection,
+  beginHistoryExport, closeHistoryExport,
+  DEFAULT_DELIVERY_LIMITS, exportHistory,
+  HistoryDeliveryError, HistoryPluginRegistry, loadHistoryPlugins, readHistoryExportPage,
+  type HistoryDestination, type HistoryExportBatch, type HistoryExportSelection,
 } from './index.js';
 
 const run = promisify(execFile);
@@ -31,10 +31,6 @@ async function fixture(body: (dbPath: string, root: string) => Promise<void>) {
     await writeFile(dbPath, gunzipSync(await readFile(new URL('../fixtures/offline-history.db.gz', import.meta.url))));
     await body(dbPath, root);
   } finally { await rm(root, { recursive: true, force: true }); }
-}
-function config(instance = 'one'): DeliveryJobConfig {
-  return { destination_id: 'fixture', instance_id: instance, account_id: 'fixture-account', mapping_version: '1',
-    selection, limits: { ...DEFAULT_DELIVERY_LIMITS } };
 }
 function ack(batch: Readonly<HistoryExportBatch>) {
   return { batch_id: batch.batch_id, accepted_revision_ids: batch.records.map((record) => record.revision_id),
@@ -52,23 +48,23 @@ function registry(value: HistoryDestination, instanceId = 'one'): HistoryPluginR
   return result;
 }
 
-// Upload state-machine regressions now run in probe Rust delivery_worker and durable_delivery tests.
 test('plugin registration is inert, per-client, and rejects collisions atomically', async () => {
-  await fixture(async (dbPath) => {
+  await fixture(async () => {
     let calls = 0;
     const one = registry(destination({ prepare: async () => { calls++; throw new Error('should not execute'); } }));
     assert.equal(calls, 0);
-    await assert.rejects(historyDeliveryStatus(undefined, { dbPath }), { code: 'HISTORY_DELIVERY_MOVED' });
     assert.equal(new HistoryPluginRegistry().destination('fixture', 'one'), undefined);
-    assert.throws(() => one.register({ destinations: [{ instanceId: 'two', destination: destination() }], commands: [{ name: 'sync', run: async () => null }] }), /duplicate command/);
+    assert.throws(() => one.register({ destinations: [
+      { instanceId: 'two', destination: destination() },
+      { instanceId: 'one', destination: destination() },
+    ] }), /duplicate destination/);
     assert.equal(one.destination('fixture', 'two'), undefined);
-    assert.throws(() => one.register({ tools: [{ name: 'delivery_status', description: 'duplicate', run: async () => null }] }), /duplicate tool/);
     await assert.rejects(loadHistoryPlugins([{ module: 'missing-explicit-history-plugin' }]), /configured history plugin 1/);
     assert.ok(await loadHistoryPlugins([]));
   });
 });
 
-test('standalone export has replayable bounded cursors and creates no delivery job', async () => {
+test('standalone export has replayable bounded cursors', async () => {
   await fixture(async (dbPath) => {
     const snapshot = await beginHistoryExport(selection, { dbPath, limits: { ...DEFAULT_DELIVERY_LIMITS, max_batch_records: 1 } });
     try {
@@ -82,7 +78,6 @@ test('standalone export has replayable bounded cursors and creates no delivery j
     assert.equal(rows.length, 3);
     assert.deepEqual(rows.map((row) => row.session_id).sort(), ['both', 'local-only', 'remote-only']);
     assert.ok(rows.every((row) => row.origin_id && row.record_id && row.revision_id));
-    await assert.rejects(historyDeliveryStatus(undefined, { dbPath }), { code: 'HISTORY_DELIVERY_MOVED' });
   });
 });
 
@@ -94,10 +89,8 @@ test('NDJSON CLI emits only complete records and no remote acceptance claims', a
     const records = stdout.trim().split('\n').map((line) => JSON.parse(line) as { revision_id: string });
     assert.equal(records.length, 3);
     assert.ok(records.every((record) => record.revision_id));
-    await assert.rejects(historyDeliveryStatus(undefined, { dbPath }), { code: 'HISTORY_DELIVERY_MOVED' });
   });
 });
-
 
 test('NDJSON output cannot replace the active database through its path, symlink, or hard link', async () => {
   await fixture(async (dbPath, root) => {
@@ -117,20 +110,6 @@ test('NDJSON output cannot replace the active database through its path, symlink
   });
 });
 
-
-test('plugin CLI passes arguments after its explicit separator verbatim', async () => {
-  await fixture(async (_dbPath, root) => {
-    await writeFile(join(root, 'plugin.mjs'), `export function createHistoryPlugin() { return { commands: [{ name: 'echo-args', run: async args => args }] }; }`);
-    const configPath = join(root, 'config.json');
-    await writeFile(configPath, JSON.stringify({ plugins: [{ module: './plugin.mjs' }] }));
-    const pluginArgs = ['--base-url', 'https://example.invalid', '--key=value', '', '-h', '--', '--config', 'plugin-value'];
-    const result = await run(process.execPath, [join(sdkRoot, 'dist/cli.js'), '--no-warning', 'plugin', 'echo-args', '--config', configPath, '--', ...pluginArgs]);
-    assert.deepEqual(JSON.parse(result.stdout), pluginArgs);
-    await assert.rejects(run(process.execPath, [join(sdkRoot, 'dist/cli.js'), 'plugin', 'echo-args', '--unknown', 'value', '--config', configPath, '--', '-h']));
-  });
-});
-
-
 test('export rejects aliases through symlinked parents before creating a new database', async () => {
   await fixture(async (_dbPath, root) => {
     const real = join(root, 'real'); const alias = join(root, 'alias');
@@ -141,51 +120,6 @@ test('export rejects aliases through symlinked parents before creating a new dat
     await assert.rejects(runHistoryExportCommand({dbPath:join(real,'new.db'),outputPath:join(alias,'new.db'),selectionPath}), /active history database/);
     await assert.rejects(readFile(join(real,'new.db')), {code:'ENOENT'});
   });
-});
-
-test('arbitrary plugin MCP tools have conservative side-effect annotations', async () => {
-  await fixture(async (dbPath, root) => {
-    const plugin = join(root,'tool.mjs');
-    await writeFile(plugin, `export function createHistoryPlugin() { return {tools:[{name:'write_fixture',description:'Arbitrary fixture action',run:async()=>({ok:true})}]}; }`);
-    const configPath=join(root,'tools.json'); await writeFile(configPath,JSON.stringify({plugins:[{module:plugin}]}));
-    const env = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string,string]=>entry[1]!==undefined));
-    Object.assign(env,{HOME:root,USERPROFILE:root,AI_HIST_DB:dbPath,AI_HIST_PLUGIN_CONFIG:configPath});
-    const transport = new StdioClientTransport({command:process.execPath,args:[join(sdkRoot,'dist/mcp-server.js')],env,stderr:'pipe'});
-    const client = new Client({name:'plugin-annotations-test',version:'1'});
-    try {
-      await client.connect(transport);
-      const tool=(await client.listTools()).tools.find(item=>item.name==='write_fixture');
-      assert.deepEqual(tool?.annotations,{readOnlyHint:false,destructiveHint:true,idempotentHint:false,openWorldHint:true});
-    } finally {await client.close();await transport.close();}
-  });
-});
-
-
-
-test('SDK, CLI and MCP report migration without creating a store or invoking receivers', async t => {
-  const root=await mkdtemp(join(tmpdir(),'upload-migration-'));
-  t.after(()=>rm(root,{recursive:true,force:true}));
-  const dbPath=join(root,'absent','history.db');
-  let called=false;
-  const receivers=registry(destination({prepare:async()=>{called=true;throw new Error('must not run');}}));
-  for (const operation of [
-    ()=>createHistoryDelivery(config(),{dbPath}),
-    ()=>historyDeliveryStatus(undefined,{dbPath}),
-    ()=>historyDeliveryRetention({dbPath}),
-    ()=>controlHistoryDelivery('job','pause',{dbPath}),
-    ()=>drainHistoryDelivery(receivers,{dbPath}),
-    ()=>runHistoryDelivery(receivers,{dbPath}),
-    ()=>deliveryRequest({operation:'create_job',config:config()},{dbPath}),
-  ]) await assert.rejects(operation,{code:'HISTORY_DELIVERY_MOVED'});
-  assert.equal(called,false);
-  await assert.rejects(run(process.execPath,[join(sdkRoot,'dist/cli.js'),'delivery','status','--db',dbPath]),error=>String((error as {stderr?:string}).stderr).includes('agent-relay-probe'));
-  const env=Object.fromEntries(Object.entries(process.env).filter((entry):entry is [string,string]=>entry[1]!==undefined));
-  env.AI_HIST_DB=dbPath;delete env.AI_HIST_PLUGIN_CONFIG;
-  const transport=new StdioClientTransport({command:process.execPath,args:[join(sdkRoot,'dist/mcp-server.js')],env,stderr:'pipe'});
-  const client=new Client({name:'migration',version:'1'});
-  try { await client.connect(transport);const result=await client.callTool({name:'delivery_status',arguments:{}});assert.equal(result.isError,true);assert.match(JSON.stringify(result),/agent-relay-probe/); }
-  finally { await client.close(); }
-  await assert.rejects(access(join(root,'absent')),{code:'ENOENT'});
 });
 
 test('native export accepts the full decoded selection budget and bounds the wire envelope separately', async () => {

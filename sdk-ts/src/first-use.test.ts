@@ -120,10 +120,10 @@ test('--no-bootstrap reports an unbuilt store instead of building or lying', asy
 
 // The usage block is what tells a user bootstrap is the default. Whatever it
 // documents as reading local history must actually accept the opt-out.
-test('the local CLI requires explicit plugin configuration for cloud commands', async () => {
+test('the local CLI has no cloud login command', async () => {
   const shipped = await readFile(fileURLToPath(new URL('../dist/cli.js', import.meta.url)), 'utf8');
   assert.doesNotMatch(shipped, /cloudLoadAuth|enableCloud|cloud-preflight/);
-  const result = await run(['login', '--token', 'fixture-token'], process.env);
+  const result = await run(['login'], process.env);
   assert.equal(result.code, 2);
   assert.match(result.stderr, /unknown command 'login'/);
 });

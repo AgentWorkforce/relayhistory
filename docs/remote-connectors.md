@@ -2,12 +2,11 @@
 
 Local provider files, storage and cached queries live in the local history
 packages. Remote provider acquisition is optional and explicitly composed.
-Neither commercial login nor installing a package changes local data sources.
+Installing a package does not change local data sources.
 
 | Optional package | Connector IDs | Evidence |
 |---|---|---|
 | `@relayhistory/provider-sources` | `claude-web`, `codex-cloud` | Claude teleport events; Codex supported task diff |
-| `@relayhistory/capture` | `cloud` | Fresh readback of durably delivered normalized evidence |
 
 ```json
 {"plugins":[{"module":"@relayhistory/provider-sources","options":{"connectors":["claude-web"],"instanceId":"personal"}}]}
@@ -51,10 +50,8 @@ Provider limits and authentication stay in the
 [optional provider helper](../plugins/provider-sources/rust/README.md).
 Claude uses an observed private teleport interface which can change. Codex's
 supported diff does not imply a full transcript, token log or tool history.
-Partial evidence is reported as partial capability. For RelayHistory account,
-stage, migration and durable readback semantics see the
-[optional RelayHistory package](../plugins/relayhistory/sdk/README.md).
+Partial evidence is reported as partial capability.
 
-Generic destination plugins are separate from source plugins: a custom service
-can receive history without providing remote discovery, or expose a source
-without implementing delivery. See [delivery](history-delivery.md).
+A plugin may also register destinations (`HistoryDestination`), separately from
+sources: a custom service can receive history without providing remote
+discovery, or expose a source without accepting history.

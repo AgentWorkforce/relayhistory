@@ -478,10 +478,3 @@ test('mounted export with no --out streams NDJSON to the host, as bytes', async 
   // which is the whole reason `RelayCliIo` carries `string | Uint8Array`.
   assert.ok(io.bytes > 0, 'streamed output must reach the host as Uint8Array chunks, not a decoded string');
 });
-
-test('mounted legacy delivery command reports the probe migration', async () => {
-  const io = capture();
-  const code = await createRelayCliSurface().run(['delivery', 'run'], io);
-  assert.equal(code, 1);
-  assert.match(io.err, /HISTORY_DELIVERY_MOVED/);
-});
