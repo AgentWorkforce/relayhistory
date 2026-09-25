@@ -759,9 +759,8 @@ jobs:
           set -euo pipefail
           if [ "$DRY_RUN" != "true" ]; then npm publish --access public; fi
 
-      # Wait only for registry visibility on the publication critical path.
-      # The slower clean installs and runtime probes run in verify-core while
-      # plugin publication proceeds in parallel.
+      # Confirm all packages are visible before the compatibility gates. This
+      # gives the registry time to converge without retrying every install.
       - name: Registry visibility gate
         if: ${{ !inputs.dry_run }}
         working-directory: .
@@ -776,12 +775,27 @@ jobs:
           await waitForRegistryPackages(process.argv[2], { attempts, delayMs });
           NODE
 
-      # Tag the tree that was published, then create the GitHub Release,
-      # before pushing the version commit. skip_core rebuilds from this tag,
-      # so a later persist failure (or a merge that lands during smoke)
-      # cannot leave npm at a version that has no tag.
-      # The commit itself was prepared before the publish-only
-      # sdk-ts/package.json rewrite, so the tag stays version-only.
+      - name: Registry clean-install smoke test
+        if: ${{ !inputs.dry_run }}
+        working-directory: .
+        env:
+          REGISTRY_VISIBILITY_ATTEMPTS: 36
+          REGISTRY_VISIBILITY_DELAY_MS: 10000
+          NPM_REGISTRY_RETRY_ATTEMPTS: 36
+          NPM_REGISTRY_RETRY_DELAY_MS: 10000
+        run: node scripts/registry-clean-install-smoke.mjs
+      - name: Registry CLI smoke test on older glibc
+        if: ${{ !inputs.dry_run }}
+        working-directory: .
+        run: |
+          set -euo pipefail
+          for image in node:22-bookworm-slim ubuntu:22.04; do
+            bash scripts/smoke-linux-native.sh "$image" registry "$VERSION"
+          done
+
+      # Only finalize the release after the published packages pass the full
+      # clean-install and older-glibc runtime gates. Downstream publication
+      # depends on this job, so it cannot outrun those checks either.
       - name: Tag the published tree
         id: tag-published-tree
         if: ${{ !inputs.dry_run }}
@@ -807,45 +821,6 @@ jobs:
             --target "${{ steps.tag-published-tree.outputs.sha }}" \
             --title "ai-hist@$VERSION" \
             --generate-notes
-
-  verify-core:
-    name: Verify published core
-    needs: [version, publish]
-    # Publishing and the visibility gate have completed. These slower clean
-    # installs remain a release check but no longer serialize plugins/crate.
-    if: ${{ !cancelled() && !inputs.dry_run && !inputs.skip_core && needs.publish.result == 'success' }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    defaults:
-      run:
-        working-directory: .
-    env:
-      VERSION: ${{ needs.version.outputs.version }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.publish.outputs.release_sha }}
-          persist-credentials: false
-      - uses: actions/setup-node@v6
-        with:
-          node-version: '22.14.0'
-          registry-url: 'https://registry.npmjs.org'
-      - name: Match release npm version
-        run: npm install -g npm@11.19.1
-      - name: Registry clean-install smoke test
-        env:
-          REGISTRY_VISIBILITY_ATTEMPTS: 36
-          REGISTRY_VISIBILITY_DELAY_MS: 10000
-          NPM_REGISTRY_RETRY_ATTEMPTS: 36
-          NPM_REGISTRY_RETRY_DELAY_MS: 10000
-        run: node scripts/registry-clean-install-smoke.mjs
-      - name: Registry CLI smoke test on older glibc
-        run: |
-          set -euo pipefail
-          for image in node:22-bookworm-slim ubuntu:22.04; do
-            bash scripts/smoke-linux-native.sh "$image" registry "$VERSION"
-          done
 
   persist-version:
     name: Persist release version

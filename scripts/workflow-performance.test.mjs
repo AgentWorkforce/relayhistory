@@ -45,13 +45,14 @@ test("plugin families publish in parallel and verify afterwards", () => {
   assert.match(verification, /verify-published-plugins\.mjs "\$VERSION"/);
 });
 
-test("full core smoke checks are required but off the publish critical path", () => {
-  const corePublish = jobBlock(publish, "publish", "verify-core");
+test("full core smoke checks gate release finalization and downstream publication", () => {
+  const corePublish = jobBlock(publish, "publish", "persist-version");
   assert.match(corePublish, /name: Registry visibility gate/);
-  assert.doesNotMatch(corePublish, /name: Registry clean-install smoke test/);
+  assert.match(corePublish, /name: Registry clean-install smoke test/);
+  assert.match(corePublish, /name: Registry CLI smoke test on older glibc/);
+  assert.match(corePublish, /name: Tag the published tree/);
+  assert.match(corePublish, /name: Create GitHub Release/);
 
-  const verification = jobBlock(publish, "verify-core", "persist-version");
-  assert.match(verification, /needs: \[version, publish\]/);
-  assert.match(verification, /name: Registry clean-install smoke test/);
-  assert.match(verification, /name: Registry CLI smoke test on older glibc/);
+  const plugins = jobBlock(publish, "plugins", "verify-plugins");
+  assert.match(plugins, /needs: \[version, publish, package-plugins\]/);
 });
