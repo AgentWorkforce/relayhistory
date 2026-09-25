@@ -10,7 +10,9 @@ use ai_hist::{
     Change, ChangeKind, ChangeOp, ChangeQuery, EvidenceRow, SessionQuery, SessionRef, SessionStore,
     Source, StoreOptions, Watermark,
 };
+use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags};
+use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -106,6 +108,12 @@ impl Home {
     fn raw(&self) -> Connection {
         Connection::open_with_flags(self.db(), OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap()
     }
+
+    /// A raw write, standing in for a migration or a writer this crate does
+    /// not own.
+    fn raw_writer(&self) -> Connection {
+        Connection::open(self.db()).unwrap()
+    }
 }
 
 fn drain(store: &SessionStore, from: Watermark) -> Vec<Change> {
@@ -182,7 +190,7 @@ fn an_in_progress_message_reaches_the_feed_only_once_complete() {
     );
     assert!(tick
         .iter()
-        .all(|change| change.source == Source::Claude && change.session_id == SESSION));
+        .all(|change| change.source == Some(Source::Claude) && change.session_id == SESSION));
 
     // Nothing changed: a tick is empty, and the head stays put.
     let head = store.head_revision().unwrap();
@@ -249,10 +257,14 @@ fn filetime_now_plus(seconds: u64) -> std::time::SystemTime {
     std::time::SystemTime::now() + std::time::Duration::from_secs(seconds)
 }
 
-type Key = (ChangeKind, String, String, String);
+/// A record as the feed and the tables both name it: its kind and
+/// [`Change::key`], serialized.
+type Key = (ChangeKind, String);
+/// A stored row: every column but `revision`, in table order.
+type Row = Vec<(String, Value)>;
 
 /// Apply a feed in order: an upsert replaces, a delete removes.
-fn replay(changes: &[Change]) -> BTreeMap<Key, EvidenceRow> {
+fn replay(changes: &[Change]) -> BTreeMap<Key, Row> {
     let mut state = BTreeMap::new();
     let mut last = 0;
     for change in changes {
@@ -261,15 +273,17 @@ fn replay(changes: &[Change]) -> BTreeMap<Key, EvidenceRow> {
             "the feed is strictly ordered by revision: {change:?}"
         );
         last = change.revision;
-        let key = (
-            change.kind,
-            change.source.as_str().to_string(),
-            change.session_id.clone(),
-            change.record_key.clone(),
-        );
+        let key = (change.kind, serde_json::to_string(&change.key).unwrap());
         match &change.op {
-            ChangeOp::Upsert(row) => {
-                state.insert(key, row.clone());
+            ChangeOp::Upsert(_) => {
+                let columns = change.columns.as_ref().expect("an upsert carries its row");
+                state.insert(
+                    key,
+                    columns
+                        .iter()
+                        .map(|(name, value)| (name.to_string(), value.clone()))
+                        .collect(),
+                );
             }
             ChangeOp::Delete => {
                 state.remove(&key);
@@ -280,69 +294,141 @@ fn replay(changes: &[Change]) -> BTreeMap<Key, EvidenceRow> {
     state
 }
 
-/// The tables as they stand, keyed the way the feed keys them.
-fn direct(conn: &Connection) -> BTreeMap<Key, Option<String>> {
-    let mut rows = BTreeMap::new();
-    let reads: [(ChangeKind, &str); 6] = [
-        (
-            ChangeKind::Session,
-            "SELECT source, session_id, session_id, cwd FROM sessions",
-        ),
-        (
-            ChangeKind::SessionEvent,
-            "SELECT source, session_id, event_uid, text FROM session_events",
-        ),
-        (
-            ChangeKind::ToolCall,
-            "SELECT source, session_id, tool_use_id, name FROM tool_calls",
-        ),
-        (
-            ChangeKind::FileEdit,
-            "SELECT source, session_id, tool_use_id, file_path FROM file_edits",
-        ),
-        (
-            ChangeKind::SessionMarker,
-            "SELECT source, session_id, marker_uid, kind FROM session_markers",
-        ),
-        (
-            ChangeKind::Relationship,
-            "SELECT source, parent_session_id, relationship_uid, relationship \
-             FROM session_relationships",
-        ),
-    ];
-    for (kind, sql) in reads {
-        let mut statement = conn.prepare(sql).unwrap();
-        let read = statement
-            .query_map([], |row| {
-                Ok((
-                    (
-                        kind,
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ),
-                    row.get::<_, Option<String>>(3)?,
-                ))
-            })
-            .unwrap();
-        for entry in read {
-            let (key, value) = entry.unwrap();
-            rows.insert(key, value);
-        }
+/// Each kind's table, its source (a column, or the literal a table without
+/// one shares) and the columns of its identity after the source.
+const TABLES: &[(ChangeKind, &str, Option<&str>, &[&str])] = &[
+    (ChangeKind::Session, "sessions", None, &["session_id"]),
+    (
+        ChangeKind::SessionEvent,
+        "session_events",
+        None,
+        &["session_id", "event_uid"],
+    ),
+    (
+        ChangeKind::ToolCall,
+        "tool_calls",
+        None,
+        &["session_id", "tool_use_id"],
+    ),
+    (
+        ChangeKind::FileEdit,
+        "file_edits",
+        None,
+        &["session_id", "tool_use_id"],
+    ),
+    (
+        ChangeKind::SessionMarker,
+        "session_markers",
+        None,
+        &["session_id", "marker_uid"],
+    ),
+    (
+        ChangeKind::Relationship,
+        "session_relationships",
+        None,
+        &["parent_session_id", "relationship_uid"],
+    ),
+    (
+        ChangeKind::History,
+        "history",
+        None,
+        &["timestamp_ms", "prompt"],
+    ),
+    (
+        ChangeKind::Presence,
+        "session_presences",
+        None,
+        &["session_id", "location"],
+    ),
+    (
+        ChangeKind::CommitLink,
+        "session_commit_links",
+        None,
+        &["session_id", "commit_sha", "match_method"],
+    ),
+    (
+        ChangeKind::Trajectory,
+        "trajectories",
+        Some("trajectory"),
+        &["id"],
+    ),
+    (
+        ChangeKind::SourceObservation,
+        "session_observations",
+        None,
+        &[
+            "session_id",
+            "location",
+            "connector_id",
+            "connector_instance",
+        ],
+    ),
+    (
+        ChangeKind::ObservationEvidence,
+        "observation_evidence",
+        None,
+        &[
+            "session_id",
+            "location",
+            "connector_id",
+            "connector_instance",
+            "evidence_uid",
+        ],
+    ),
+];
+
+fn sqlite_value(value: ValueRef<'_>) -> Value {
+    match value {
+        ValueRef::Null => Value::Null,
+        ValueRef::Integer(integer) => Value::from(integer),
+        ValueRef::Real(real) => Value::from(real),
+        ValueRef::Text(text) => Value::from(String::from_utf8(text.to_vec()).unwrap()),
+        ValueRef::Blob(bytes) => Value::from(bytes.to_vec()),
     }
-    rows
 }
 
-fn value_of(row: &EvidenceRow) -> Option<String> {
-    match row {
-        EvidenceRow::Session(session) => session.cwd.clone(),
-        EvidenceRow::SessionEvent(event) => event.text.clone(),
-        EvidenceRow::ToolCall(call) => Some(call.name.clone()),
-        EvidenceRow::FileEdit(edit) => Some(edit.file_path.clone()),
-        EvidenceRow::SessionMarker(marker) => Some(marker.kind.clone()),
-        EvidenceRow::Relationship(relationship) => Some(relationship.relationship.clone()),
-        other => panic!("a row this consumer does not know: {other:?}"),
+/// Every row of one table as stored, every column but `revision`.
+fn stored_rows(conn: &Connection, table: &str) -> Vec<Row> {
+    let mut statement = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
+    let names: Vec<String> = statement
+        .column_names()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let rows = statement
+        .query_map([], |row| {
+            let mut stored = Row::new();
+            for (index, name) in names.iter().enumerate() {
+                if name != "revision" {
+                    stored.push((name.clone(), sqlite_value(row.get_ref(index)?)));
+                }
+            }
+            Ok(stored)
+        })
+        .unwrap();
+    rows.collect::<rusqlite::Result<_>>().unwrap()
+}
+
+/// Every fed table as it stands, keyed the way the feed keys it.
+fn direct(conn: &Connection) -> BTreeMap<Key, Row> {
+    let mut state = BTreeMap::new();
+    for (kind, table, literal_source, identity) in TABLES {
+        for row in stored_rows(conn, table) {
+            let value = |column: &str| {
+                row.iter()
+                    .find(|(name, _)| name == column)
+                    .map(|(_, value)| value.clone())
+                    .unwrap()
+            };
+            let mut key = vec![Value::from(kind.as_str())];
+            if literal_source.is_none() {
+                key.push(value("source"));
+            }
+            key.extend(identity.iter().map(|column| value(column)));
+            state.insert((*kind, serde_json::to_string(&key).unwrap()), row);
+        }
     }
+    state
 }
 
 fn assert_replay_matches_tables(home: &Home, store: &SessionStore, step: &str) {
@@ -356,9 +442,8 @@ fn assert_replay_matches_tables(home: &Home, store: &SessionStore, step: &str) {
     );
     for (key, row) in &replayed {
         assert_eq!(
-            &value_of(row),
-            &tables[key],
-            "{step}: the replayed row for {key:?} is the row the table holds"
+            row, &tables[key],
+            "{step}: the replayed row for {key:?} is the row the table holds, column for column"
         );
     }
     assert!(
@@ -458,7 +543,7 @@ fn replaying_the_feed_reconstructs_the_tables_after_every_sync() {
     assert_replay_matches_tables(&home, &store, "a second provider");
     let codex: Vec<Change> = drain(&store, Watermark::START)
         .into_iter()
-        .filter(|change| change.source == Source::Codex)
+        .filter(|change| change.source == Some(Source::Codex))
         .collect();
     assert!(!codex.is_empty());
     kinds_seen.extend(codex.iter().map(|change| change.kind));
@@ -474,10 +559,21 @@ fn replaying_the_feed_reconstructs_the_tables_after_every_sync() {
     assert!(drain(&store, head).is_empty());
     assert_replay_matches_tables(&home, &store, "an idle sync");
 
-    // The corpus exercised every kind the feed reports, so the replay check
-    // above covered every table rather than only the easy ones.
-    let expected: BTreeSet<ChangeKind> = ChangeKind::ALL.iter().copied().collect();
-    assert_eq!(kinds_seen, expected, "every kind was fed by the corpus");
+    // The corpus exercised every kind it writes, so the replay check above
+    // covered every table the syncs filled rather than only the easy ones.
+    let filled: BTreeSet<ChangeKind> = direct(&home.raw()).keys().map(|(kind, _)| *kind).collect();
+    assert_eq!(kinds_seen, filled, "every kind the corpus wrote was fed");
+    for kind in [
+        ChangeKind::Session,
+        ChangeKind::SessionEvent,
+        ChangeKind::ToolCall,
+        ChangeKind::FileEdit,
+        ChangeKind::SessionMarker,
+        ChangeKind::Relationship,
+        ChangeKind::Presence,
+    ] {
+        assert!(filled.contains(&kind), "the corpus writes {kind:?}");
+    }
 
     // A second consumer, starting now, replays everything independently of
     // the first one's commit.
@@ -492,4 +588,184 @@ fn replaying_the_feed_reconstructs_the_tables_after_every_sync() {
         replay(&fresh.map(|c| c.unwrap()).collect::<Vec<_>>()).len(),
         direct(&home.raw()).len()
     );
+}
+
+fn only(store: &SessionStore, from: Watermark, kind: ChangeKind) -> Vec<Change> {
+    store
+        .changes_since(from, ChangeQuery::default().kinds([kind]))
+        .unwrap()
+        .map(|change| change.unwrap())
+        .collect()
+}
+
+/// A prompt from a provider's prompt log is a `history` change, keyed the
+/// way the prompt log is unique, with its typed entry and its stored row.
+#[test]
+fn a_history_prompt_reaches_the_feed_with_its_stored_row() {
+    let home = Home::new();
+    fs::create_dir_all(home.path().join(".claude")).unwrap();
+    fs::write(
+        home.path().join(".claude/history.jsonl"),
+        "{\"display\":\"ship the feed\",\"timestamp\":1756634400000,\
+         \"project\":\"/tmp/project\",\"sessionId\":\"history-session\"}\n",
+    )
+    .unwrap();
+    let store = home.store();
+    store.sync(Default::default()).unwrap();
+
+    let history = only(&store, Watermark::START, ChangeKind::History);
+    assert_eq!(history.len(), 1, "{history:?}");
+    let change = &history[0];
+    assert_eq!(change.source, Some(Source::Claude));
+    assert_eq!(change.source_name, "claude");
+    assert_eq!(change.session_id, "history-session");
+    assert_eq!(
+        change.key,
+        vec![
+            Value::from("history"),
+            Value::from("claude"),
+            Value::from(1_756_634_400_000i64),
+            Value::from("ship the feed"),
+        ]
+    );
+    match &change.op {
+        ChangeOp::Upsert(EvidenceRow::History(entry)) => {
+            assert_eq!(entry.prompt, "ship the feed");
+            assert_eq!(entry.timestamp_ms, 1_756_634_400_000);
+        }
+        other => panic!("a typed history row: {other:?}"),
+    }
+    let columns = change.columns.as_ref().unwrap();
+    let stored = stored_rows(&home.raw(), "history");
+    let row: Row = columns
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.clone()))
+        .collect();
+    assert_eq!(vec![row], stored, "the stored row, column for column");
+    assert_eq!(columns.get("project"), Some(&Value::from("/tmp/project")));
+    assert!(columns.get("revision").is_none());
+}
+
+/// A column a table gains after the feed was built is carried as soon as it
+/// exists, with every other column exactly as stored: JSON text stays text,
+/// integers stay integers, NULL stays null.
+#[test]
+fn a_column_a_table_gains_is_carried_verbatim() {
+    let home = Home::new();
+    home.stage_claude("multi-block-turn.jsonl");
+    let store = home.store();
+    store.sync(Default::default()).unwrap();
+
+    let head = store.head_revision().unwrap();
+    let writer = home.raw_writer();
+    writer
+        .execute_batch(
+            "ALTER TABLE tool_calls ADD COLUMN review_note TEXT; \
+             UPDATE tool_calls SET review_note = 'looked fine' \
+                 WHERE rowid = (SELECT MIN(rowid) FROM tool_calls);",
+        )
+        .unwrap();
+    let changes = only(&store, head, ChangeKind::ToolCall);
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    let columns = changes[0].columns.as_ref().unwrap();
+    assert_eq!(
+        columns.get("review_note"),
+        Some(&Value::from("looked fine"))
+    );
+    let names: Vec<&str> = columns.iter().map(|(name, _)| name).collect();
+    assert_eq!(names.last(), Some(&"review_note"), "in table order");
+    let row: Row = columns
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.clone()))
+        .collect();
+    let stored = stored_rows(&home.raw(), "tool_calls");
+    assert!(stored.contains(&row), "the stored row, column for column");
+    assert!(
+        columns.get("args_json").is_some_and(Value::is_string),
+        "JSON text stays text"
+    );
+    assert!(columns.get("id").is_some_and(Value::is_i64));
+
+    // The session row carries every catalog column, `parser_version`
+    // included, and its JSON columns unparsed.
+    let sessions = only(&store, Watermark::START, ChangeKind::Session);
+    let catalog = sessions[0].columns.as_ref().unwrap();
+    assert!(catalog.get("parser_version").is_some_and(Value::is_i64));
+    assert!(catalog
+        .get("models_json")
+        .is_some_and(|models| models.is_string() || models.is_null()));
+    assert!(catalog.get("locations").is_none(), "no derived column");
+}
+
+/// A delete carries the key the record's upserts carried, including for a
+/// kind whose identity spans several columns of different types.
+#[test]
+fn a_tombstone_carries_the_record_key() {
+    let home = Home::new();
+    home.stage_claude("multi-block-turn.jsonl");
+    fs::write(
+        home.path().join(".claude/history.jsonl"),
+        "{\"display\":\"to be removed\",\"timestamp\":42,\"sessionId\":\"gone\"}\n",
+    )
+    .unwrap();
+    let store = home.store();
+    store.sync(Default::default()).unwrap();
+    let upserts: Vec<Change> = drain(&store, Watermark::START);
+    let call = upserts
+        .iter()
+        .find(|change| change.kind == ChangeKind::ToolCall)
+        .unwrap();
+    let prompt = upserts
+        .iter()
+        .find(|change| change.kind == ChangeKind::History)
+        .unwrap();
+
+    let head = store.head_revision().unwrap();
+    let writer = home.raw_writer();
+    writer
+        .execute(
+            "DELETE FROM tool_calls WHERE tool_use_id = ?",
+            [&call.record_key],
+        )
+        .unwrap();
+    writer
+        .execute("DELETE FROM history WHERE timestamp_ms = 42", [])
+        .unwrap();
+    let deletes = drain(&store, head);
+    assert_eq!(deletes.len(), 2, "{deletes:?}");
+    for (delete, upsert) in deletes.iter().zip([call, prompt]) {
+        assert_eq!(delete.op, ChangeOp::Delete);
+        assert!(delete.columns.is_none());
+        assert_eq!(delete.kind, upsert.kind);
+        assert_eq!(delete.key, upsert.key, "the same identity");
+        assert_eq!(delete.record_key, upsert.record_key);
+        assert_eq!(delete.source_name, upsert.source_name);
+    }
+    assert_eq!(deletes[1].key[2], Value::from(42), "an integer stays one");
+}
+
+/// A row from a source this build does not know is carried, not a failed
+/// drain: `source` is `None` and `source_name` names it.
+#[test]
+fn a_row_from_an_unknown_source_is_carried() {
+    let home = Home::new();
+    let store = home.store();
+    home.raw_writer()
+        .execute(
+            "INSERT INTO history (source, session_id, prompt, timestamp_ms) \
+             VALUES ('some-new-agent', 's1', 'hi', 7)",
+            [],
+        )
+        .unwrap();
+    let changes = drain(&store, Watermark::START);
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    assert_eq!(changes[0].source, None);
+    assert_eq!(changes[0].source_name, "some-new-agent");
+    assert_eq!(changes[0].key[1], Value::from("some-new-agent"));
+    home.raw_writer()
+        .execute("DELETE FROM history", [])
+        .unwrap();
+    let changes = drain(&store, Watermark::START);
+    assert_eq!(changes[0].op, ChangeOp::Delete);
+    assert_eq!(changes[0].source_name, "some-new-agent");
 }

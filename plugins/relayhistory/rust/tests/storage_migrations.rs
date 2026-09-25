@@ -365,3 +365,116 @@ fn a_delivery_database_missing_history_exports_still_opens() {
     let preimage = preimage.expect("an unexpired export is still owed its preimage");
     assert!(preimage.contains("detail_json"), "{preimage}");
 }
+
+/// A delivery database whose batch triggers check the plain cap is upgraded
+/// in place: reopening replaces them with the reserve triggers, and a batch
+/// materializes at the cap.
+#[test]
+fn batch_cap_triggers_are_replaced_by_the_reserve_on_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plain-cap.db");
+    {
+        let conn = open_db(&path).unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER delivery_batches_reserve_insert;
+             DROP TRIGGER delivery_batches_reserve_update;
+             CREATE TRIGGER delivery_batches_cap_insert BEFORE INSERT ON delivery_batches BEGIN
+              SELECT RAISE(ABORT,'delivery retention limit exceeded; plain cap');
+             END;
+             CREATE TRIGGER delivery_batches_cap_update BEFORE UPDATE ON delivery_batches BEGIN
+              SELECT RAISE(ABORT,'delivery retention limit exceeded; plain cap');
+             END;",
+        )
+        .unwrap();
+    }
+    // A rollback to a build that predates the reserve recreates its own cap
+    // triggers beside the reserve ones; both must be gone after this open.
+    {
+        let conn = open_db(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER delivery_batches_cap_insert BEFORE INSERT ON delivery_batches BEGIN
+              SELECT RAISE(ABORT,'delivery retention limit exceeded; plain cap');
+             END;",
+        )
+        .unwrap();
+    }
+    let conn = open_db(&path).unwrap();
+    let triggers: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='delivery_batches' ORDER BY name")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        triggers,
+        [
+            "delivery_batches_count_delete",
+            "delivery_batches_count_insert",
+            "delivery_batches_count_update",
+            "delivery_batches_reserve_insert",
+            "delivery_batches_reserve_update",
+        ]
+    );
+    let job = relayhistory_plugin::delivery::create_job(
+        &conn,
+        &relayhistory_plugin::delivery::DeliveryJobConfig {
+            destination_id: "fixture".into(),
+            instance_id: "one".into(),
+            account_id: "account".into(),
+            mapping_version: "1".into(),
+            selection: ai_hist::export::ExportSelection {
+                all_sources: true,
+                kinds: vec!["session_event".into()],
+                ..Default::default()
+            },
+            limits: relayhistory_plugin::delivery::DeliveryLimits::default(),
+        },
+        now_ms(),
+    )
+    .unwrap();
+    conn.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude','s','e',1,'user','text','backlog')", []).unwrap();
+    let (used, _) = relayhistory_plugin::delivery::retained_bytes(&conn).unwrap();
+    relayhistory_plugin::delivery::set_retention_limit(&conn, used).unwrap();
+    assert!(
+        relayhistory_plugin::delivery::prepare_batch(&conn, &job.job_id, now_ms())
+            .unwrap()
+            .batch_id
+            .is_some()
+    );
+}
+
+#[test]
+fn reopening_a_reserve_schema_restores_missing_build_retry_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("reserve-without-build-history.db");
+    {
+        let conn = open_db(&path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO delivery_jobs
+             (id,destination_id,instance_id,account_id,generation,config_json,state,
+              created_ms,cutoff,journal_cursor,retry_build)
+             VALUES ('legacy','destination','instance','account',1,'{}','blocked',1,0,0,'0.26.1');
+             DROP TABLE delivery_job_builds;",
+        )
+        .unwrap();
+    }
+    let conn = open_db(&path).unwrap();
+    let restored: String = conn
+        .query_row(
+            "SELECT build FROM delivery_job_builds WHERE job_id='legacy'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(restored, "0.26.1");
+    let reserve_triggers: usize = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger'
+             AND name IN ('delivery_batches_reserve_insert','delivery_batches_reserve_update')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(reserve_triggers, 2);
+}

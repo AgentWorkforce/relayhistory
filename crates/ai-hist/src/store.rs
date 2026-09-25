@@ -335,7 +335,10 @@ CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
     INSERT INTO history_fts(rowid, prompt, project)
     VALUES (new.id, new.prompt, new.project);
 END;
-CREATE TRIGGER IF NOT EXISTS history_au AFTER UPDATE ON history BEGIN
+-- `UPDATE OF`, for the same reason as `session_events_au` below: the
+-- change feed re-stamps `revision` after each insert, and that touches
+-- nothing the index holds.
+CREATE TRIGGER IF NOT EXISTS history_au AFTER UPDATE OF id, prompt, project ON history BEGIN
     INSERT INTO history_fts(history_fts, rowid, prompt, project)
     VALUES('delete', old.id, old.prompt, old.project);
     INSERT INTO history_fts(rowid, prompt, project)
@@ -787,6 +790,7 @@ const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &[
     // TRIGGER IF NOT EXISTS` keeps an existing database's unconditional body,
     // so the marker is what makes the rebuild happen exactly once.
     "session_events_fts_update_of_v1",
+    "history_fts_update_of_v1",
 ];
 #[cfg(feature = "export")]
 const REQUIRED_EXPORT_MIGRATIONS: &[&str] = &["delivery_v1"];
@@ -1098,6 +1102,9 @@ fn init_db_locked(conn: &Connection) -> Result<()> {
     if !migration_applied(conn, "session_events_fts_update_of_v1")? {
         conn.execute_batch("DROP TRIGGER IF EXISTS session_events_au;")?;
     }
+    if !migration_applied(conn, "history_fts_update_of_v1")? {
+        conn.execute_batch("DROP TRIGGER IF EXISTS history_au;")?;
+    }
     conn.execute_batch(SCHEMA)?;
     // Before the trigger below, whose body deletes from these tables.
     conn.execute_batch(SESSION_RELATIONSHIPS_DDL)?;
@@ -1258,7 +1265,8 @@ END;
     conn.execute_batch(
         "INSERT OR IGNORE INTO schema_migrations (name) \
          VALUES ('session_delete_continuity_reopen_v1'), \
-                ('session_events_fts_update_of_v1');",
+                ('session_events_fts_update_of_v1'), \
+                ('history_fts_update_of_v1');",
     )?;
     migrate_session_relationships_v2(conn)?;
     migrate_tool_result_fidelity_v1(conn)?;
@@ -4474,6 +4482,7 @@ pub fn sync_opencode_storage_dir(conn: &Connection, storage_dir: &Path) -> Resul
         .collect();
     for session_file in crate::ingest::capture_files("opencode", listing.sessions) {
         crate::ingest::check_capture_cancelled()?;
+        crate::ingest::ensure_capture_headroom(conn)?;
         let indexed =
             crate::ingest::opencode::load_from_json_tree(&session_file).and_then(|loaded| {
                 match loaded {
@@ -4488,7 +4497,9 @@ pub fn sync_opencode_storage_dir(conn: &Connection, storage_dir: &Path) -> Resul
             });
         match indexed {
             Ok(prompts) => inserted += prompts,
-            Err(error) => failures.push(format!("{}: {error:#}", session_file.display())),
+            Err(error) => {
+                opencode_session_failed(conn, &mut failures, &session_file.display(), error)?
+            }
         }
     }
     if !failures.is_empty() {
@@ -4500,6 +4511,22 @@ pub fn sync_opencode_storage_dir(conn: &Connection, storage_dir: &Path) -> Resul
         );
     }
     Ok(inserted)
+}
+
+/// One OpenCode session's failure is that session's failure, except at the
+/// retention cap: the session has rolled back, every later session would meet
+/// the same budget, and the typed cause ends the pass.
+fn opencode_session_failed(
+    conn: &Connection,
+    failures: &mut Vec<String>,
+    session: &dyn std::fmt::Display,
+    error: anyhow::Error,
+) -> Result<()> {
+    if crate::ingest::is_delivery_retention_limit(&error) {
+        return Err(crate::ingest::annotate_retention_limit(conn, error));
+    }
+    failures.push(format!("{session}: {error:#}"));
+    Ok(())
 }
 
 fn sync_opencode_sessions_from_source(
@@ -4524,6 +4551,7 @@ fn sync_opencode_sessions_from_source(
         crate::ingest::opencode::OpencodeSyncPlan::PerSession => {
             for session_id in crate::ingest::opencode::list_sqlite_session_ids(src)? {
                 crate::ingest::check_capture_cancelled()?;
+                crate::ingest::ensure_capture_headroom(conn)?;
                 let indexed = crate::ingest::opencode::load_from_sqlite(src, &session_id).and_then(
                     |loaded| match loaded {
                         Some(loaded) => {
@@ -4535,7 +4563,7 @@ fn sync_opencode_sessions_from_source(
                 );
                 match indexed {
                     Ok(prompts) => inserted += prompts,
-                    Err(error) => failures.push(format!("{session_id}: {error:#}")),
+                    Err(error) => opencode_session_failed(conn, &mut failures, &session_id, error)?,
                 }
             }
         }
@@ -4549,9 +4577,12 @@ fn sync_opencode_sessions_from_source(
             );
             for loaded in load.sessions {
                 crate::ingest::check_capture_cancelled()?;
+                crate::ingest::ensure_capture_headroom(conn)?;
                 match crate::ingest::opencode::normalize(conn, &loaded, &raw_path) {
                     Ok(counts) => inserted += counts.prompts,
-                    Err(error) => failures.push(format!("{}: {error:#}", loaded.session.id)),
+                    Err(error) => {
+                        opencode_session_failed(conn, &mut failures, &loaded.session.id, error)?
+                    }
                 }
             }
         }

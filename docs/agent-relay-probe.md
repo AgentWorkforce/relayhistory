@@ -88,7 +88,22 @@ The desktop status `last_cycle` includes an optional, allowlisted `error_class`
 and a safe message for local retention, database corruption, disk-space,
 contention, and permission failures. These also cover failures before capture
 starts. No raw SQLite/provider error, transcript, credential, or path is
-included. Database corruption requires separate recovery from a preserved copy;
+included. Capture and delivery are reported separately in `last_cycle.capture`
+and `last_cycle.delivery`, each with its own `ok`, `error_class` and message: a
+pass that only delivered reports its own delivery outcome and leaves the last
+capture verdict standing, so a condition the capture cycle measured stays
+visible between those cycles. The top-level `ok`, `error_class` and `message`
+are the effective verdict — the capture fault when there is one, otherwise the
+delivery fault — and messages are rendered at report time, so a retention
+`retention_limit` verdict also
+carries that usage as `used_bytes` and `limit_bytes`; the
+`capture-diagnostic.json` of the pass that stopped carries the retained budget
+it stopped at after compacting consumed changes. Capture stops such a pass after
+at most one session attempt rather than trying every remaining session. A
+compaction that reports while a pass is running has re-measured the cap that
+pass observed, so the pass does not report the older reading over it, and the
+collector and a compaction serialize their updates to the report so neither
+replaces an answer it never read. Database corruption requires separate recovery from a preserved copy;
 the collector does not delete or recreate a damaged queue automatically.
 
 Each `(site origin, user, workspace)` has an independent SHA-256-named directory
@@ -99,7 +114,12 @@ No Cloud bearer credential is persisted by the probe. Tokens are never command
 arguments, and provider errors, response bodies and session content are not logged.
 The device approval URL is intentionally displayed in the interactive terminal.
 
-Each cycle delivers through the probe-owned Rust worker. The plugin helper
+Each pass delivers through the probe-owned Rust worker. A pass is bounded by
+wall time (15 s), so it moves as many batches as the destination accepts in
+that window and the next pass continues the backlog; the collector runs passes
+2 s apart while the active job has queued, unqueued or unscanned records it can
+attempt now, and 20 s apart once it is caught up, paused, or waiting out a
+retry deadline. Stop requests are polled between batches. The plugin helper
 uses that same bounded drain and RelayHistory receiver. The worker owns
 immutable batches, leases and their keepalive, prepared-byte persistence, the
 eligibility recheck immediately before dispatch, retry/backoff, acknowledgment
@@ -236,8 +256,43 @@ human-readable install/status/stop commands remain available.
   login boundary before the probe provisions RelayHistory upload credentials.
   `connected` confirms those upload credentials are stored. JSON setup requires
   one explicit sharing choice and runs in the background.
-- `start`, `status`, `pause`, `resume`, `disconnect`: pass `--account ID`,
-  `--workspace ID`, and optionally `--site-url URL`, plus `--json`.
+- `start`, `status`, `pause`, `resume`, `disconnect`, `compact`: pass
+  `--account ID`, `--workspace ID`, and optionally `--site-url URL`, plus
+  `--json`.
+- `status --json` includes the upload journal's usage against its cap:
+
+  ```json
+  { "retention": { "used_bytes": 268433716, "limit_bytes": 268435456 } }
+  ```
+
+  `used_bytes` is everything retained, including a batch in flight, which
+  lives in its own reserve above the cap; it can exceed `limit_bytes` by that
+  reserve until the batch is acknowledged. When a cycle stops on that cap,
+  `last_cycle.error_class` is `retention_limit`, `last_cycle.used_bytes` and
+  `last_cycle.limit_bytes` carry the journal's usage when the report is
+  written, and the message shows the same figures: `Upload journal full (251
+  MB of 256 MB). Compacting consumed records; queued sessions are preserved.`
+  The sentence is the same for a pass stopped at the cap and one stopped over
+  the 90% high-water mark: the verdict names the condition, and the figures
+  are the reading.
+- `compact <target> --json`: reclaims every journal record already consumed by
+  all subscriptions and every settled batch receipt, under the desktop control
+  lock. Queued and unacknowledged records are untouched, so it is safe while
+  the collector runs. It returns the journal rows removed and the usage left:
+
+  ```json
+  { "removed_records": 114490, "retention": { "used_bytes": 1048576, "limit_bytes": 268435456 } }
+  ```
+
+  Compaction reclaims consumed records only: a cap filled by un-uploaded
+  backlog frees as those uploads are acknowledged. A `retention_limit` verdict
+  in `last_cycle` is re-measured as part of the pass: a pass that reclaims
+  space and leaves the journal under its cap clears the verdict without waiting
+  for the next capture cycle, and a pass that reclaims nothing leaves it
+  standing. The cap rejects the record that would exceed it without recording
+  it, so a journal that is full for the next record still reads below its cap;
+  reclaimed space, not usage, is what resolves the condition.
+
 - `sessions list <target> --json --limit 500`: newest sessions with title,
   source, project path, activity and upload status. `uploading` means a record
   from the session is in the currently leased batch; `queued` means a pending

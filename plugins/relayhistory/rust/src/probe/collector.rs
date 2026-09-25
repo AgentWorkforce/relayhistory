@@ -1,6 +1,6 @@
 use super::{lock, read_config, save_json, user_error, Config};
 use anyhow::{ensure, Context, Result};
-use relayhistory_plugin::delivery::{self, worker, ExportSelection};
+use relayhistory_plugin::delivery::{self, retention_limit_usage, worker, ExportSelection};
 use relayhistory_plugin::destination;
 use rusqlite::Connection;
 use serde_json::json;
@@ -20,6 +20,31 @@ use std::{
 /// saved job configuration, so they cannot change for an existing install.
 const DESTINATION: &str = "relayhistory";
 const INSTANCE: &str = "teams-probe";
+/// Wall-clock budget of one delivery pass. A pass runs as many batches as the
+/// destination accepts within it, so throughput follows the backlog, while a
+/// stop request and the heartbeat still get the thread back promptly.
+const DRAIN_TIME_BUDGET: Duration = Duration::from_secs(15);
+/// Safety ceiling on attempts and prepare steps within one pass, well above
+/// what the time budget admits against a live destination.
+const DRAIN_STEP_CEILING: usize = 1_000;
+/// Gap between passes while the job still has queued, unqueued or unscanned work.
+const BACKLOG_PASS_INTERVAL: Duration = Duration::from_secs(2);
+/// Gap between passes once the job is caught up.
+const IDLE_PASS_INTERVAL: Duration = Duration::from_secs(20);
+/// The retention sentence without a usage reading; the cycle report adds one.
+const RETENTION_LIMIT_MESSAGE: &str =
+    "Upload journal full. Compacting consumed records; queued sessions are preserved.";
+/// The upload journal is at its retention cap, as reported by the delivery
+/// drain rather than by a capture write. Typed so the cycle report classifies
+/// it as the retention condition instead of a generic delivery fault.
+#[derive(Debug)]
+struct RetentionLimitReached;
+impl std::fmt::Display for RetentionLimitReached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(RETENTION_LIMIT_MESSAGE)
+    }
+}
+impl std::error::Error for RetentionLimitReached {}
 static STOP: AtomicBool = AtomicBool::new(false);
 /// Poll the generation-scoped stop file independently of a long capture. The
 /// hot record loops read an atomic flag rather than opening a file per record.
@@ -148,9 +173,12 @@ fn deliver_with_receiver(
 ) -> Result<delivery::DeliveryStatus> {
     let options = worker::DrainOptions {
         job_ids: Some(vec![config.job_id.clone()]),
-        // A cycle stays bounded so a stop request and the heartbeat are never
-        // starved by an unbounded backlog; the next cycle continues it.
-        max_batches: 8,
+        // A pass is bounded by wall time so a stop request and the heartbeat
+        // are never starved by an unbounded backlog; the next pass continues
+        // it. The count bounds are ceilings the time budget rarely reaches.
+        max_elapsed: Some(DRAIN_TIME_BUDGET),
+        max_batches: DRAIN_STEP_CEILING,
+        max_prepare_steps: DRAIN_STEP_CEILING,
         ..worker::DrainOptions::new(format!("probe-{}", std::process::id()))
     };
     let result = worker::drain(
@@ -178,6 +206,17 @@ fn deliver_with_receiver(
     // A recorded transport failure is not an issue: the job stays active and
     // the worker owns its backoff. Only an unusable local state is reported,
     // and waiting for a retry deadline is normal operation, not a fault.
+    //
+    // A full journal is the one delivery fault with a user action behind it,
+    // so it keeps its own condition: the report then names the usage and the
+    // desktop offers compaction instead of showing a generic queued sentence.
+    if result
+        .issues
+        .iter()
+        .any(|issue| matches!(issue.code, worker::DrainIssueCode::DeliveryRetentionLimit))
+    {
+        return Err(RetentionLimitReached.into());
+    }
     if !result.issues.is_empty() {
         return Err(user_error(
             "Session delivery is queued or needs attention. No unacknowledged data was discarded.",
@@ -224,7 +263,8 @@ fn capture_with_stop(
             .map(|v| v.source.as_str())
             .filter(|s| ai_hist::SOURCE_CHOICES.contains(s))
             .unwrap_or("unknown");
-        let value = json!({"operation":"capture","stage":"broad_capture","source":source,"processed_files":last.as_ref().map(|v|v.processed_files).unwrap_or(0),"elapsed_ms":started.elapsed().as_millis(),"error_class":capture_error_class(error)});
+        let retention = retention_for(directory, error);
+        let value = json!({"operation":"capture","stage":"broad_capture","source":source,"processed_files":last.as_ref().map(|v|v.processed_files).unwrap_or(0),"elapsed_ms":started.elapsed().as_millis(),"error_class":capture_error_class(error),"used_bytes":retention.map(|(used, _)| used),"limit_bytes":retention.map(|(_, limit)| limit)});
         save_json(&directory.join("capture-diagnostic.json"), &value)?;
         eprintln!("{value}");
     }
@@ -240,7 +280,31 @@ fn capture_with_stop(
 
 #[cfg(test)]
 pub fn cycle(directory: &Path, config: &Config) -> Result<()> {
-    cycle_with_stop(directory, config, Arc::new(AtomicBool::new(false)), false)
+    cycle_with_stop(directory, config, Arc::new(AtomicBool::new(false)), false)?.result()
+}
+
+/// What one pass established. Capture and delivery fail independently and are
+/// observed at different cadences, so a pass reports them apart: a pass that
+/// only delivered leaves `capture` unset and the last capture verdict stands.
+struct PassOutcome {
+    capture: Option<Result<()>>,
+    delivery: Result<()>,
+}
+impl PassOutcome {
+    fn delivery_only(delivery: Result<()>) -> Self {
+        Self {
+            capture: None,
+            delivery,
+        }
+    }
+    /// One result for callers that report a single outcome. A capture fault
+    /// names a local condition to act on, so it outranks a delivery fault.
+    fn result(self) -> Result<()> {
+        match self.capture {
+            Some(Err(error)) => Err(error),
+            _ => self.delivery,
+        }
+    }
 }
 
 fn cycle_with_stop(
@@ -248,30 +312,37 @@ fn cycle_with_stop(
     config: &Config,
     cancelled: Arc<AtomicBool>,
     before_exit: bool,
-) -> Result<()> {
+) -> Result<PassOutcome> {
     super::bridge::enforce_selection(directory, config)?;
     let conn = relayhistory_plugin::delivery::open_db(&directory.join("history.db"))?;
     let status = delivery::status(&conn, &config.job_id)?;
     let selected = super::bridge::mode(config) == super::bridge::SharingMode::Selected;
     if status.state == "paused" {
-        if !selected {
-            let stop = cancelled.clone();
-            ai_hist::sync_local_at_cancellable(
-                &directory.join("history.db"),
-                |_| {},
-                move || stopping(&stop),
-            )?;
+        // A paused job delivers nothing. Broad capture still runs, so its
+        // outcome is this pass's capture verdict; a selected pass observes
+        // nothing about capture and leaves the last verdict standing.
+        if selected {
+            return Ok(PassOutcome::delivery_only(Ok(())));
         }
-        return Ok(());
+        let stop = cancelled.clone();
+        let captured = ai_hist::sync_local_at_cancellable(
+            &directory.join("history.db"),
+            |_| {},
+            move || stopping(&stop),
+        );
+        return Ok(PassOutcome {
+            capture: Some(captured.map(|_| ())),
+            delivery: Ok(()),
+        });
     }
-    run_capture_cycle(
+    Ok(run_capture_cycle(
         selected,
         || deliver_captured_with_stop(directory, config, before_exit, &cancelled),
         || ready_to_capture(&conn, &config.job_id),
         || capture_selected(directory, config, &cancelled),
         || capture_with_stop(directory, &config.history_url, cancelled.clone()),
         || stopping(&cancelled),
-    )
+    ))
 }
 
 fn ready_to_capture(conn: &Connection, job_id: &str) -> Result<bool> {
@@ -293,19 +364,34 @@ fn run_capture_cycle(
     targeted: impl Fn() -> Result<()>,
     broad: impl Fn() -> Result<()>,
     stopped: impl Fn() -> bool,
-) -> Result<()> {
+) -> PassOutcome {
     let delivered = deliver();
-    if stopped() || (delivered.is_ok() && selected && !capture_ready()?) {
-        return delivered;
+    if stopped() {
+        return PassOutcome::delivery_only(delivered);
+    }
+    if delivered.is_ok() && selected {
+        match capture_ready() {
+            // Readiness reads delivery state, so a failed read is delivery's
+            // own outcome; capture simply does not run this pass.
+            Err(error) => return PassOutcome::delivery_only(Err(error)),
+            Ok(false) => return PassOutcome::delivery_only(delivered),
+            Ok(true) => {}
+        }
     }
     // Delivery errors must remain visible, but must not prevent acquiring
     // local evidence while credentials, transport or receiver state recover.
     let capture = if selected { targeted() } else { broad() };
     if stopped() {
-        return delivered.and(capture);
+        return PassOutcome {
+            capture: Some(capture),
+            delivery: delivered,
+        };
     }
     let drained = deliver();
-    delivered.and(capture).and(drained)
+    PassOutcome {
+        capture: Some(capture),
+        delivery: delivered.and(drained),
+    }
 }
 
 /// Hydrate only authorized members using core observation locks and cancellation.
@@ -335,7 +421,10 @@ fn capture_selected(directory: &Path, config: &Config, cancelled: &Arc<AtomicBoo
     )
 }
 
-/// Continue across member failures while retaining the first typed cause for safe reporting.
+/// Continue across member failures while retaining the first typed cause for
+/// safe reporting. A member that stopped at the retention cap ends the pass:
+/// every remaining member would meet the same budget, and the members captured
+/// before it stay committed.
 fn capture_members(
     directory: &Path,
     members: Vec<delivery::SessionIdentity>,
@@ -362,6 +451,13 @@ fn capture_members(
                     failed,
                     Some(&error),
                 )?;
+                // The retention stop is why the pass ended and is the only
+                // cause carrying the budget, so it replaces an earlier
+                // member's failure; ordinary failures keep the first.
+                if delivery::is_retention_limit(&error) {
+                    first_error = Some(error);
+                    break;
+                }
                 if first_error.is_none() {
                     first_error = Some(error);
                 }
@@ -382,7 +478,9 @@ fn capture_error_class(error: &anyhow::Error) -> &'static str {
     if error.downcast_ref::<ai_hist::CaptureCancelled>().is_some() {
         return "cancelled";
     }
-    if delivery::is_retention_limit(error) {
+    if error.downcast_ref::<RetentionLimitReached>().is_some()
+        || delivery::is_retention_limit(error)
+    {
         return "retention_limit";
     }
     for cause in error.chain() {
@@ -417,8 +515,14 @@ fn capture_error_class(error: &anyhow::Error) -> &'static str {
 
 /// Return actionable, allowlisted storage guidance suitable for desktop status and stderr.
 pub(super) fn local_failure_message(error: &anyhow::Error) -> Option<&'static str> {
-    match capture_error_class(error) {
-        "retention_limit" => Some("The local upload journal is full. Uploads will retry after consumed records can be compacted; queued sessions are preserved."),
+    class_failure_message(capture_error_class(error))
+}
+
+/// The guidance for a class, so a verdict read back from a report renders the
+/// same sentence as the error it came from.
+fn class_failure_message(class: &str) -> Option<&'static str> {
+    match class {
+        "retention_limit" => Some(RETENTION_LIMIT_MESSAGE),
         "database_corrupt" => Some("The local history database needs repair. Preserve the database before recovery; reconnecting will not repair it."),
         "disk_full" => Some("The local disk is full. Free disk space to resume session uploads."),
         "database_busy" => Some("Local history is busy. Agent Relay will retry when the other operation finishes."),
@@ -428,21 +532,173 @@ pub(super) fn local_failure_message(error: &anyhow::Error) -> Option<&'static st
     }
 }
 
-/// Build the advisory cycle status from typed errors without including provider data.
-fn cycle_report(result: &Result<()>) -> serde_json::Value {
-    let error = result.as_ref().err();
+/// The retention sentence with the measured usage, so the desktop can show the
+/// number and offer compaction. The verdict alone names the condition: the cap
+/// refuses the write that would exceed it without recording it, and a pass
+/// stops above the high-water mark before reaching the cap, so usage never
+/// separates a journal that is full for the next record from one that is not.
+/// Without a reading it names the condition alone.
+fn retention_limit_message(retention: Option<(i64, i64)>) -> String {
+    let megabytes = |bytes: i64| (bytes + 524_288) / 1_048_576;
+    match retention {
+        Some((used, limit)) => format!(
+            "Upload journal full ({} MB of {} MB). Compacting consumed records; queued sessions are preserved.",
+            megabytes(used),
+            megabytes(limit)
+        ),
+        None => RETENTION_LIMIT_MESSAGE.to_owned(),
+    }
+}
+
+/// Current journal usage against its cap, for reports; `None` when the
+/// database cannot be read, which the report tolerates.
+fn read_retention(directory: &Path) -> Option<(i64, i64)> {
+    let conn = ai_hist::open_db_readonly(&directory.join("history.db")).ok()?;
+    delivery::retained_bytes(&conn).ok()
+}
+
+/// The last verdict on each side of a pass: the stable class of that outcome,
+/// `None` where it succeeded. Only the class is carried, so a verdict renders
+/// its sentence from the current reading rather than a stale byte count.
+#[derive(Default, Clone)]
+struct Verdicts {
+    capture: Option<String>,
+    delivery: Option<String>,
+}
+impl Verdicts {
+    #[cfg(test)]
+    fn capture(result: &Result<()>) -> Self {
+        Self {
+            capture: verdict(result),
+            delivery: None,
+        }
+    }
+    /// The one class the desktop acts on: a capture fault first, because it
+    /// names a local condition, then a delivery fault.
+    fn effective(&self) -> Option<&str> {
+        self.capture.as_deref().or(self.delivery.as_deref())
+    }
+    fn retention_limited(&self) -> bool {
+        [&self.capture, &self.delivery]
+            .iter()
+            .any(|class| class.as_deref() == Some("retention_limit"))
+    }
+}
+
+/// Classify one side's result into its public label.
+fn verdict(result: &Result<()>) -> Option<String> {
+    result
+        .as_ref()
+        .err()
+        .map(|error| capture_error_class(error).to_owned())
+}
+
+/// The sentence for a class; the retention one carries the measured usage.
+fn class_message(class: Option<&str>, retention: Option<(i64, i64)>) -> Option<String> {
+    match class {
+        None => None,
+        Some("retention_limit") => Some(retention_limit_message(retention)),
+        Some(class) => Some(
+            class_failure_message(class)
+                .unwrap_or("Sync paused or offline. Retrying; local data remains queued.")
+                .to_owned(),
+        ),
+    }
+}
+
+/// The `(used_bytes, limit_bytes)` a failure is reported with: the budget the
+/// pass stopped at when the failure carries it, otherwise the current budget
+/// when the cap caused the failure. `None` for every other failure.
+fn retention_for(directory: &Path, error: &anyhow::Error) -> Option<(i64, i64)> {
+    if capture_error_class(error) != "retention_limit" {
+        return None;
+    }
+    retention_limit_usage(error)
+        .map(|usage| (usage.used_bytes, usage.limit_bytes))
+        .or_else(|| read_retention(directory))
+}
+
+/// Build the advisory cycle status from typed classes without including
+/// provider data. `capture` and `delivery` carry each side; the top-level
+/// fields are the effective verdict, which is what the desktop shows.
+fn cycle_report(verdicts: &Verdicts, retention: Option<(i64, i64)>) -> serde_json::Value {
+    let side = |class: Option<&str>| json!({"ok": class.is_none(), "error_class": class, "message": class_message(class, retention)});
+    let effective = verdicts.effective();
     json!({
-        "at_ms": now(), "ok": result.is_ok(),
-        "error_class": error.map(capture_error_class),
-        "message": error.map(|error| local_failure_message(error).unwrap_or(
-            "Sync paused or offline. Retrying; local data remains queued."
-        )),
+        "at_ms": now(), "ok": effective.is_none(),
+        "error_class": effective,
+        "message": class_message(effective, retention),
+        "capture": side(verdicts.capture.as_deref()),
+        "delivery": side(verdicts.delivery.as_deref()),
+        "used_bytes": retention.map(|(used, _)| used),
+        "limit_bytes": retention.map(|(_, limit)| limit),
     })
 }
 
+/// The persisted report: when it was written, and the verdict it holds on each
+/// side. A report that cannot be read carries nothing, and the next pass of
+/// each kind re-establishes its side.
+#[derive(Default)]
+struct SavedReport {
+    at_ms: i64,
+    verdicts: Verdicts,
+}
+fn saved_report(directory: &Path) -> SavedReport {
+    let side = |report: &serde_json::Value, name: &str| {
+        report[name]["error_class"].as_str().map(str::to_owned)
+    };
+    fs::read(directory.join("cycle.json"))
+        .ok()
+        .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok())
+        .map(|report| SavedReport {
+            at_ms: report["at_ms"].as_i64().unwrap_or_default(),
+            verdicts: Verdicts {
+                capture: side(&report, "capture"),
+                delivery: side(&report, "delivery"),
+            },
+        })
+        .unwrap_or_default()
+}
+
+/// Serialize one report's read-modify-write against the other writer's. The
+/// collector reports every pass and a desktop compaction re-measures the cap
+/// between them, so without this the later write of two overlapping sequences
+/// silently replaces the other's answer. The guard is advisory: a report that
+/// cannot take it is still written, because status must never hold up a retry.
+fn cycle_guard(directory: &Path) -> Option<fs::File> {
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(directory.join("cycle.lock"))
+        .ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .ok()?;
+    }
+    fs2::FileExt::lock_exclusive(&file).ok()?;
+    Some(file)
+}
+
 /// Persist advisory status without interrupting retries when either status or logs cannot be written.
-fn persist_cycle_report(directory: &Path, result: &Result<()>, mut diagnostics: impl Write) {
-    let report = cycle_report(result);
+///
+/// A retention verdict renders with the current reading of the journal; the
+/// usage a failure of this pass `observed` stands in only when the journal
+/// cannot be read.
+fn write_cycle_report(
+    directory: &Path,
+    verdicts: &Verdicts,
+    observed: Option<(i64, i64)>,
+    mut diagnostics: impl Write,
+) {
+    let retention = verdicts
+        .retention_limited()
+        .then(|| read_retention(directory).or(observed))
+        .flatten();
+    let report = cycle_report(verdicts, retention);
     if let Err(error) = save_json(&directory.join("cycle.json"), &report) {
         let message = local_failure_message(&error)
             .unwrap_or("Sync status could not be saved. Retrying; local data remains queued.");
@@ -455,6 +711,88 @@ fn persist_cycle_report(directory: &Path, result: &Result<()>, mut diagnostics: 
     }
 }
 
+/// Report one pass, which began at `started_ms`. A pass that only delivered
+/// observed nothing about capture, so the last capture verdict stands: a full
+/// journal stays visible, with its numbers, between the capture cycles that
+/// measure it.
+///
+/// A compaction that reported while this pass ran has re-measured the cap the
+/// pass observed, and its answer is the current one. The older reading is
+/// dropped rather than putting a resolved condition back on screen until
+/// another pass measures it again.
+fn persist_cycle_report(
+    directory: &Path,
+    outcome: &PassOutcome,
+    started_ms: i64,
+    diagnostics: impl Write,
+) {
+    let _guard = cycle_guard(directory);
+    let saved = saved_report(directory);
+    let recompacted = saved.at_ms > started_ms;
+    let current = |observed: Option<String>, saved: &Option<String>| match (&observed, saved) {
+        (Some(class), None) if recompacted && class == "retention_limit" => None,
+        _ => observed,
+    };
+    let verdicts = Verdicts {
+        capture: match &outcome.capture {
+            Some(result) => current(verdict(result), &saved.verdicts.capture),
+            None => saved.verdicts.capture.clone(),
+        },
+        delivery: current(verdict(&outcome.delivery), &saved.verdicts.delivery),
+    };
+    write_cycle_report(directory, &verdicts, observed_usage(outcome), diagnostics);
+}
+
+/// The usage a retention failure of this pass carries, capture side first.
+fn observed_usage(outcome: &PassOutcome) -> Option<(i64, i64)> {
+    outcome
+        .capture
+        .iter()
+        .chain(std::iter::once(&outcome.delivery))
+        .filter_map(|result| result.as_ref().err())
+        .find_map(retention_limit_usage)
+        .map(|usage| (usage.used_bytes, usage.limit_bytes))
+}
+
+/// Re-measure a retention verdict after a compaction pass that reclaimed
+/// `reclaimed_bytes`.
+///
+/// The cap rejects the write that would exceed it without recording it, so a
+/// journal that is full for the next record still reads below its cap: usage
+/// alone never shows the condition, and only reclaiming space changes it. A
+/// pass that freed space clears a verdict whose condition the reading no
+/// longer meets: capture's once the journal is back under the high-water mark
+/// at which capture stops, delivery's once it is under the cap. One that freed
+/// nothing — a cap held by un-uploaded backlog — leaves both standing with the
+/// current reading. Either way the next capture or delivery pass measures the
+/// condition itself.
+pub(super) fn refresh_retention_verdict(
+    directory: &Path,
+    reclaimed_bytes: i64,
+    diagnostics: impl Write,
+) {
+    let _guard = cycle_guard(directory);
+    let mut verdicts = saved_report(directory).verdicts;
+    if !verdicts.retention_limited() {
+        return;
+    }
+    let reading = (reclaimed_bytes > 0)
+        .then(|| read_retention(directory))
+        .flatten();
+    let capture_room =
+        reading.is_some_and(|(used, limit)| !delivery::above_high_water(used, limit));
+    let delivery_room = reading.is_some_and(|(used, limit)| used < limit);
+    for (class, room) in [
+        (&mut verdicts.capture, capture_room),
+        (&mut verdicts.delivery, delivery_room),
+    ] {
+        if room && class.as_deref() == Some("retention_limit") {
+            *class = None;
+        }
+    }
+    write_cycle_report(directory, &verdicts, None, diagnostics);
+}
+
 fn capture_diagnostic(
     directory: &Path,
     stage: &str,
@@ -463,7 +801,8 @@ fn capture_diagnostic(
     failed: usize,
     error: Option<&anyhow::Error>,
 ) -> Result<()> {
-    let diagnostic = json!({"operation":"capture","stage":stage,"elapsed_ms":started.elapsed().as_millis(),"sessions_captured":captured,"failures":failed,"error_class":error.map(capture_error_class)});
+    let retention = error.and_then(|error| retention_for(directory, error));
+    let diagnostic = json!({"operation":"capture","stage":stage,"elapsed_ms":started.elapsed().as_millis(),"sessions_captured":captured,"failures":failed,"error_class":error.map(capture_error_class),"used_bytes":retention.map(|(used, _)| used),"limit_bytes":retention.map(|(_, limit)| limit)});
     let filename = if stage == "shallow_inventory" {
         "inventory-diagnostic.json"
     } else {
@@ -481,7 +820,7 @@ fn capture_diagnostic(
 pub fn finish_setup(directory: &Path, config: &Config, once: bool) -> Result<()> {
     retry_verdict_of_another_build(directory, &config.job_id, env!("CARGO_PKG_VERSION"))?;
     if once && super::bridge::mode(config) == super::bridge::SharingMode::Selected {
-        cycle_with_stop(directory, config, Arc::new(AtomicBool::new(false)), true)
+        cycle_with_stop(directory, config, Arc::new(AtomicBool::new(false)), true)?.result()
     } else {
         deliver_captured(directory, config, true)
     }
@@ -767,21 +1106,28 @@ pub fn run_background(directory: &Path, startup_id: &str) -> Result<()> {
     };
     let mut capture_due = Instant::now();
     while !stopping(&stop.cancelled) {
-        let result = if Instant::now() >= capture_due {
+        let started_ms = now();
+        let outcome = if Instant::now() >= capture_due {
             capture_due = Instant::now() + Duration::from_secs(60);
+            // A pass that cannot start reports one local fault on the delivery
+            // side, where its causes live; the last capture verdict stands.
             cycle_with_stop(directory, &config, stop.cancelled.clone(), false)
+                .unwrap_or_else(|error| PassOutcome::delivery_only(Err(error)))
         } else {
-            deliver_captured_with_stop(directory, &config, false, &stop.cancelled)
+            PassOutcome::delivery_only(deliver_captured_with_stop(
+                directory,
+                &config,
+                false,
+                &stop.cancelled,
+            ))
         };
         // A user stop is not a failed/offline cycle and must not start delivery.
         if stopping(&stop.cancelled) {
             break;
         }
-        persist_cycle_report(directory, &result, std::io::stderr());
-        for _ in 0..200 {
-            if stopping(&stop.cancelled) {
-                break;
-            }
+        persist_cycle_report(directory, &outcome, started_ms, std::io::stderr());
+        let deadline = Instant::now() + pass_interval(backlog_pending(directory, &config));
+        while !stopping(&stop.cancelled) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
@@ -790,6 +1136,31 @@ pub fn run_background(directory: &Path, startup_id: &str) -> Result<()> {
         &json!({"startup_id":startup_id,"pid":std::process::id(),"ready":false}),
     )?;
     Ok(())
+}
+/// Whether the active job still has work a further pass can move: batches
+/// queued for delivery, journal changes not yet queued, or an unfinished
+/// historical snapshot. A paused job has nothing to move, whatever it holds,
+/// and neither has one waiting out a retry deadline: the next pass before that
+/// deadline does the same round of local work and reaches the same idle drain.
+fn backlog_pending(directory: &Path, config: &Config) -> bool {
+    let status = ai_hist::open_db_readonly(&directory.join("history.db"))
+        .and_then(|conn| delivery::status(&conn, &config.job_id));
+    status.is_ok_and(|status| {
+        status.state == "active"
+            && status.next_attempt_ms <= now()
+            && (status.pending_records > 0
+                || status.unqueued_changes > 0
+                || !status.bootstrap_complete)
+    })
+}
+/// The gap between two delivery passes: short while there is backlog, so
+/// throughput follows capture, and long once caught up.
+fn pass_interval(backlog: bool) -> Duration {
+    if backlog {
+        BACKLOG_PASS_INTERVAL
+    } else {
+        IDLE_PASS_INTERVAL
+    }
 }
 pub fn start_background(directory: &Path) -> Result<()> {
     let executable = std::env::current_exe()?;
@@ -1155,6 +1526,7 @@ mod tests {
                 },
                 || false,
             )
+            .result()
             .unwrap_err();
             assert_eq!(
                 calls.into_inner(),
@@ -1213,6 +1585,7 @@ mod tests {
                 || panic!("selected mode must not use broad capture"),
                 || false,
             )
+            .result()
             .unwrap();
         }
         assert_eq!(
@@ -1238,6 +1611,7 @@ mod tests {
                 || panic!("blocked unrelated provider entered"),
                 || false,
             )
+            .result()
             .unwrap();
         }
         assert_eq!(delivered.get(), 3);
@@ -1252,6 +1626,7 @@ mod tests {
             || panic!("failing unrelated provider entered"),
             || false,
         )
+        .result()
         .unwrap_err();
         assert_eq!(delivered.get(), 5);
     }
@@ -1279,27 +1654,29 @@ mod tests {
         }
     }
 
+    fn members(ids: &[&str]) -> Vec<delivery::SessionIdentity> {
+        ids.iter()
+            .map(|id| delivery::SessionIdentity {
+                source: "codex".into(),
+                session_id: (*id).into(),
+            })
+            .collect()
+    }
+
     /// Verify failed members retain their typed cause while healthy members are captured.
     #[test]
     fn targeted_storage_failure_keeps_its_class_and_other_members_still_capture() {
         let dir = tempfile::tempdir().unwrap();
         let captured = std::cell::Cell::new(0);
-        let members = ["full", "healthy"]
-            .iter()
-            .map(|id| delivery::SessionIdentity {
-                source: "codex".into(),
-                session_id: (*id).into(),
-            })
-            .collect();
         let result = capture_members(
             dir.path(),
-            members,
+            members(&["corrupt", "healthy"]),
             || false,
             |member| {
-                if member.session_id == "full" {
+                if member.session_id == "corrupt" {
                     Err(anyhow::Error::new(rusqlite::Error::SqliteFailure(
-                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER),
-                        Some("delivery retention limit exceeded; secret transcript".into()),
+                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+                        Some("secret transcript".into()),
                     )))
                 } else {
                     captured.set(captured.get() + 1);
@@ -1308,10 +1685,118 @@ mod tests {
             },
         );
         assert_eq!(captured.get(), 1);
-        let report = cycle_report(&result);
-        assert_eq!(report["error_class"], "retention_limit");
+        let report = cycle_report(&Verdicts::capture(&result), None);
+        assert_eq!(report["error_class"], "database_corrupt");
         assert!(!report.to_string().contains("secret"));
         assert!(!report["message"].as_str().unwrap().contains("offline"));
+    }
+
+    /// A retention stop after an ordinary member failure is still what the
+    /// cycle reports: it ended the pass and carries the budget.
+    #[test]
+    fn a_retention_stop_outranks_an_earlier_members_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let attempted = std::cell::Cell::new(0);
+        let result = capture_members(
+            dir.path(),
+            members(&["corrupt", "full", "never"]),
+            || false,
+            |member| {
+                attempted.set(attempted.get() + 1);
+                if member.session_id == "corrupt" {
+                    return Err(anyhow::Error::new(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+                        Some("secret transcript".into()),
+                    )));
+                }
+                Err(anyhow::Error::new(delivery::RetentionLimitReached {
+                    used_bytes: 9_000,
+                    limit_bytes: 10_000,
+                }))
+            },
+        );
+        assert_eq!(attempted.get(), 2, "the member after the stop is not tried");
+        let outcome = PassOutcome {
+            capture: Some(result),
+            delivery: Ok(()),
+        };
+        persist_cycle_report(dir.path(), &outcome, now(), Vec::new());
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.path().join("cycle.json")).unwrap()).unwrap();
+        assert_eq!(report["error_class"], "retention_limit");
+        assert_eq!(report["used_bytes"], 9_000);
+        assert_eq!(report["limit_bytes"], 10_000);
+        assert!(!report.to_string().contains("secret"));
+    }
+
+    /// A member that stops at the retention cap ends the pass after at most
+    /// one attempt; the report carries the budget the pass stopped at.
+    #[test]
+    fn targeted_retention_stop_ends_the_pass_and_reports_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let attempted = std::cell::Cell::new(0);
+        let result = capture_members(
+            dir.path(),
+            members(&["full", "next", "another"]),
+            || false,
+            |_| {
+                attempted.set(attempted.get() + 1);
+                Err(anyhow::Error::new(delivery::RetentionLimitReached {
+                    used_bytes: 9_000,
+                    limit_bytes: 10_000,
+                })
+                .context("secret transcript"))
+            },
+        );
+        assert_eq!(attempted.get(), 1);
+        let outcome = PassOutcome {
+            capture: Some(result),
+            delivery: Ok(()),
+        };
+        persist_cycle_report(dir.path(), &outcome, now(), Vec::new());
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.path().join("cycle.json")).unwrap()).unwrap();
+        assert_eq!(report["error_class"], "retention_limit");
+        assert_eq!(report["used_bytes"], 9_000);
+        assert_eq!(report["limit_bytes"], 10_000);
+        assert!(!report.to_string().contains("secret"));
+        assert!(!report["message"].as_str().unwrap().contains("offline"));
+        let diagnostic: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("capture-diagnostic.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(diagnostic["error_class"], "retention_limit");
+        assert_eq!(diagnostic["used_bytes"], 9_000);
+        assert_eq!(diagnostic["limit_bytes"], 10_000);
+        assert_eq!(diagnostic["sessions_captured"], 0);
+    }
+
+    /// A retention report names the budget the pass stopped at when the
+    /// failure carries it, and the current budget for a capture trigger abort
+    /// that reached the collector without one. Other failures carry nothing.
+    #[test]
+    fn retention_usage_comes_from_the_failure_before_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = relayhistory_plugin::delivery::open_db(&dir.path().join("history.db")).unwrap();
+        delivery::set_retention_limit(&conn, 10 * 1_048_576).unwrap();
+        let current = delivery::retained_bytes(&conn).unwrap();
+        drop(conn);
+        let trigger_abort = anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER),
+            Some("delivery retention limit exceeded; secret transcript".into()),
+        ));
+        assert_eq!(retention_for(dir.path(), &trigger_abort), Some(current));
+        let stopped = anyhow::Error::new(delivery::RetentionLimitReached {
+            used_bytes: 9_000,
+            limit_bytes: 10_000,
+        })
+        .context("codex history delivery capture stopped at the retention cap");
+        assert_eq!(retention_for(dir.path(), &stopped), Some((9_000, 10_000)));
+        let corrupt = anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+            None,
+        ));
+        assert_eq!(retention_for(dir.path(), &corrupt), None);
     }
 
     /// Verify SQLite failure guidance and cycle reports never reveal raw sensitive details.
@@ -1333,7 +1818,7 @@ mod tests {
                 rusqlite::ffi::Error::new(code),
                 Some("secret prompt https://token:secret@example.invalid".into()),
             ));
-            let report = cycle_report(&Err(error));
+            let report = cycle_report(&Verdicts::capture(&Err(error)), None);
             assert_eq!(report["error_class"], class);
             assert_eq!(report["ok"], false);
             assert!(!report["message"].as_str().unwrap().contains("offline"));
@@ -1345,8 +1830,11 @@ mod tests {
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER),
             Some("delivery retention limit exceeded; secret".into()),
         ));
-        assert_eq!(cycle_report(&Err(error))["error_class"], "retention_limit");
-        let healthy = cycle_report(&Ok(()));
+        assert_eq!(
+            cycle_report(&Verdicts::capture(&Err(error)), None)["error_class"],
+            "retention_limit"
+        );
+        let healthy = cycle_report(&Verdicts::default(), None);
         assert_eq!(healthy["ok"], true);
         assert!(healthy["message"].is_null());
         assert!(healthy["error_class"].is_null());
@@ -1370,7 +1858,7 @@ mod tests {
             assert!(local_failure_message(&error)
                 .unwrap()
                 .contains("Free disk space"));
-            let report = cycle_report(&Err(error));
+            let report = cycle_report(&Verdicts::capture(&Err(error)), None);
             assert_eq!(report["error_class"], "disk_full");
             assert_eq!(report["ok"], false);
             assert!(!report.to_string().contains("secret"));
@@ -1397,17 +1885,531 @@ mod tests {
             std::io::ErrorKind::StorageFull,
             "secret runtime path",
         )));
-        persist_cycle_report(directory.path(), &result, FullDisk);
+        write_cycle_report(
+            directory.path(),
+            &Verdicts::capture(&result),
+            None,
+            FullDisk,
+        );
         let mut output = Vec::new();
-        persist_cycle_report(directory.path(), &result, &mut output);
+        write_cycle_report(
+            directory.path(),
+            &Verdicts::capture(&result),
+            None,
+            &mut output,
+        );
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("Sync status could not be saved"));
         assert!(output.contains("Free disk space"));
         assert!(!output.contains("secret"));
         fs::remove_dir(&path).unwrap();
-        persist_cycle_report(directory.path(), &Ok(()), FullDisk);
+        write_cycle_report(directory.path(), &Verdicts::default(), None, FullDisk);
         let saved: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         assert_eq!(saved["ok"], true);
+    }
+
+    /// A pass stopped over the high-water mark reports the journal as full,
+    /// like one stopped at the cap, with the figures of its reading.
+    #[test]
+    fn a_high_water_stop_reports_the_journal_as_full() {
+        let stopped = anyhow::Error::new(delivery::RetentionLimitReached {
+            used_bytes: 231 * 1_048_576,
+            limit_bytes: 256 * 1_048_576,
+        });
+        let report = cycle_report(
+            &Verdicts::capture(&Err(stopped)),
+            Some((231 * 1_048_576, 256 * 1_048_576)),
+        );
+        assert_eq!(report["error_class"], "retention_limit");
+        assert_eq!(
+            report["message"],
+            "Upload journal full (231 MB of 256 MB). Compacting consumed records; queued sessions are preserved."
+        );
+        assert_eq!(report["used_bytes"], 231 * 1_048_576);
+        assert_eq!(report["limit_bytes"], 256 * 1_048_576);
+    }
+
+    /// The retention sentence carries the measured usage when the database is
+    /// readable and still names the condition when it is not.
+    #[test]
+    fn retention_limit_report_carries_usage_in_megabytes() {
+        let error = anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER),
+            Some("delivery retention limit exceeded; secret transcript".into()),
+        ));
+        let report = cycle_report(
+            &Verdicts::capture(&Err(error)),
+            Some((268_433_716, 268_435_456)),
+        );
+        assert_eq!(report["error_class"], "retention_limit");
+        assert_eq!(
+            report["message"],
+            "Upload journal full (256 MB of 256 MB). Compacting consumed records; queued sessions are preserved."
+        );
+        assert!(!report.to_string().contains("secret"));
+
+        let directory = tempfile::tempdir().unwrap();
+        let conn =
+            relayhistory_plugin::delivery::open_db(&directory.path().join("history.db")).unwrap();
+        delivery::set_retention_limit(&conn, 10 * 1_048_576).unwrap();
+        drop(conn);
+        let result = Err(anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER),
+            Some("delivery retention limit exceeded; secret".into()),
+        )));
+        let mut output = Vec::new();
+        write_cycle_report(
+            directory.path(),
+            &Verdicts::capture(&result),
+            None,
+            &mut output,
+        );
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(directory.path().join("cycle.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            saved["message"],
+            "Upload journal full (0 MB of 10 MB). Compacting consumed records; queued sessions are preserved."
+        );
+        assert!(String::from_utf8(output).unwrap().contains("0 MB of 10 MB"));
+
+        let unreadable = tempfile::tempdir().unwrap();
+        fs::create_dir(unreadable.path().join("history.db")).unwrap();
+        write_cycle_report(
+            unreadable.path(),
+            &Verdicts::capture(&result),
+            None,
+            Vec::new(),
+        );
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(unreadable.path().join("cycle.json")).unwrap())
+                .unwrap();
+        assert_eq!(saved["message"], RETENTION_LIMIT_MESSAGE);
+    }
+
+    /// Passes follow the backlog: two seconds apart while the active job has
+    /// queued or unqueued work, twenty once caught up or paused.
+    #[test]
+    fn pass_interval_follows_the_active_jobs_backlog() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = relayhistory_plugin::delivery::open_db(&dir.path().join("history.db")).unwrap();
+        let job = delivery::create_job(&conn, &job_config(true), now()).unwrap();
+        let config = Config {
+            version: 1,
+            site_url: "https://agentrelay.com".into(),
+            account_id: "account".into(),
+            account_email: None,
+            account_name: None,
+            account_avatar_url: None,
+            org_id: "org".into(),
+            workspace_id: "workspace".into(),
+            history_url: "https://history.agentrelay.com".into(),
+            delivery_account: job.config.account_id,
+            job_id: job.job_id,
+            include_existing: true,
+            sharing_mode: None,
+            acknowledge_uninspected_schedules: false,
+        };
+        // An empty database still owes one bootstrap scan before it is caught up.
+        assert!(backlog_pending(dir.path(), &config));
+        let prepared = delivery::prepare_batch(&conn, &config.job_id, now()).unwrap();
+        assert!(prepared.bootstrap_complete && prepared.batch_id.is_none());
+        assert!(!backlog_pending(dir.path(), &config));
+        assert_eq!(pass_interval(false), Duration::from_secs(20));
+        conn.execute(
+            "INSERT INTO sessions(source,session_id) VALUES ('claude','queued')",
+            [],
+        )
+        .unwrap();
+        assert!(backlog_pending(dir.path(), &config));
+        assert_eq!(pass_interval(true), Duration::from_secs(2));
+        // A job in receiver backoff cannot attempt anything yet: passes two
+        // seconds apart would repeat the same local work for an idle drain.
+        conn.execute(
+            "UPDATE delivery_jobs SET next_attempt_ms=? WHERE id=?",
+            rusqlite::params![now() + 60_000, config.job_id],
+        )
+        .unwrap();
+        assert!(!backlog_pending(dir.path(), &config));
+        conn.execute(
+            "UPDATE delivery_jobs SET next_attempt_ms=0 WHERE id=?",
+            [&config.job_id],
+        )
+        .unwrap();
+        assert!(backlog_pending(dir.path(), &config));
+        delivery::pause_job(&conn, &config.job_id).unwrap();
+        assert!(!backlog_pending(dir.path(), &config));
+        assert!(!backlog_pending(
+            tempfile::tempdir().unwrap().path(),
+            &config
+        ));
+    }
+
+    fn retention_error() -> anyhow::Error {
+        anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER),
+            Some("delivery retention limit exceeded; secret".into()),
+        ))
+    }
+    fn saved_cycle(directory: &Path) -> serde_json::Value {
+        serde_json::from_slice(&fs::read(directory.join("cycle.json")).unwrap()).unwrap()
+    }
+    fn capped_directory(limit_bytes: i64) -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        let conn =
+            relayhistory_plugin::delivery::open_db(&directory.path().join("history.db")).unwrap();
+        delivery::set_retention_limit(&conn, limit_bytes).unwrap();
+        directory
+    }
+
+    /// A retention report carries the journal's current reading, not the
+    /// usage the stopped pass measured before compacting.
+    #[test]
+    fn a_retention_report_carries_the_current_reading_over_the_stopped_usage() {
+        let directory = capped_directory(10 * 1_048_576);
+        let current = read_retention(directory.path()).unwrap();
+        let stopped = PassOutcome {
+            capture: Some(Err(anyhow::Error::new(delivery::RetentionLimitReached {
+                used_bytes: 9_500_000,
+                limit_bytes: 10 * 1_048_576,
+            }))),
+            delivery: Ok(()),
+        };
+        persist_cycle_report(directory.path(), &stopped, now(), Vec::new());
+        let report = saved_cycle(directory.path());
+        assert_eq!(report["error_class"], "retention_limit");
+        assert_eq!(report["used_bytes"], current.0);
+        assert_eq!(report["limit_bytes"], current.1);
+        assert!(report["message"]
+            .as_str()
+            .unwrap()
+            .contains("(0 MB of 10 MB)"));
+    }
+
+    /// Capture and delivery are observed at different cadences: a pass that
+    /// only delivered leaves the capture verdict, and the desktop banner it
+    /// drives, exactly where the capture cycle put it.
+    #[test]
+    fn a_delivery_only_pass_keeps_the_last_capture_verdict() {
+        let directory = capped_directory(10 * 1_048_576);
+        let full = PassOutcome {
+            capture: Some(Err(retention_error())),
+            delivery: Ok(()),
+        };
+        persist_cycle_report(directory.path(), &full, now(), Vec::new());
+        assert_eq!(
+            saved_cycle(directory.path())["error_class"],
+            "retention_limit"
+        );
+
+        for _ in 0..20 {
+            persist_cycle_report(
+                directory.path(),
+                &PassOutcome::delivery_only(Ok(())),
+                now(),
+                Vec::new(),
+            );
+        }
+        let report = saved_cycle(directory.path());
+        assert_eq!(report["ok"], false);
+        assert_eq!(report["error_class"], "retention_limit");
+        assert_eq!(
+            report["message"],
+            "Upload journal full (0 MB of 10 MB). Compacting consumed records; queued sessions are preserved."
+        );
+        assert_eq!(report["capture"]["error_class"], "retention_limit");
+        assert_eq!(report["delivery"]["ok"], true);
+        assert!(report["delivery"]["message"].is_null());
+
+        // A capture pass is what rewrites the capture verdict.
+        persist_cycle_report(
+            directory.path(),
+            &PassOutcome {
+                capture: Some(Ok(())),
+                delivery: Ok(()),
+            },
+            now(),
+            Vec::new(),
+        );
+        let report = saved_cycle(directory.path());
+        assert_eq!(report["ok"], true);
+        assert!(report["error_class"].is_null());
+        assert!(report["message"].is_null());
+    }
+
+    /// A delivery fault of its own is reported while the capture verdict is
+    /// healthy, and never outranks a capture fault the user can act on.
+    #[test]
+    fn a_delivery_fault_reports_under_a_healthy_capture_verdict() {
+        let directory = capped_directory(10 * 1_048_576);
+        persist_cycle_report(
+            directory.path(),
+            &PassOutcome {
+                capture: Some(Ok(())),
+                delivery: Err(anyhow::anyhow!("synthetic transport failure")),
+            },
+            now(),
+            Vec::new(),
+        );
+        let report = saved_cycle(directory.path());
+        assert_eq!(report["ok"], false);
+        assert_eq!(report["error_class"], "capture_error");
+        assert_eq!(
+            report["message"],
+            "Sync paused or offline. Retrying; local data remains queued."
+        );
+        assert!(!report.to_string().contains("synthetic"));
+
+        persist_cycle_report(
+            directory.path(),
+            &PassOutcome {
+                capture: Some(Err(retention_error())),
+                delivery: Err(anyhow::anyhow!("synthetic transport failure")),
+            },
+            now(),
+            Vec::new(),
+        );
+        let report = saved_cycle(directory.path());
+        assert_eq!(report["error_class"], "retention_limit");
+        assert_eq!(report["delivery"]["error_class"], "capture_error");
+    }
+
+    /// Compaction re-measures the verdict it just changed, so a resolved cap
+    /// stops being reported before the next capture cycle measures it again.
+    #[test]
+    fn compaction_refreshes_the_retention_verdict_it_resolved() {
+        let directory = capped_directory(10 * 1_048_576);
+        // Without a persisted verdict there is nothing to refresh.
+        refresh_retention_verdict(directory.path(), 4_096, Vec::new());
+        assert!(!directory.path().join("cycle.json").exists());
+
+        persist_cycle_report(
+            directory.path(),
+            &PassOutcome {
+                capture: Some(Err(retention_error())),
+                delivery: Err(retention_error()),
+            },
+            now(),
+            Vec::new(),
+        );
+        // A pass that reclaimed nothing leaves the verdict standing: the cap
+        // is held by records compaction cannot touch.
+        refresh_retention_verdict(directory.path(), 0, Vec::new());
+        assert_eq!(
+            saved_cycle(directory.path())["error_class"],
+            "retention_limit"
+        );
+        refresh_retention_verdict(directory.path(), 4_096, Vec::new());
+        let report = saved_cycle(directory.path());
+        assert_eq!(report["ok"], true);
+        assert!(report["capture"]["error_class"].is_null());
+        assert!(report["delivery"]["error_class"].is_null());
+
+        // A journal still at its cap keeps the verdict and reports the reading.
+        let directory = tempfile::tempdir().unwrap();
+        let conn =
+            relayhistory_plugin::delivery::open_db(&directory.path().join("history.db")).unwrap();
+        delivery::create_job(&conn, &job_config(true), now()).unwrap();
+        delivery::set_retention_limit(&conn, delivery::retained_bytes(&conn).unwrap().0.max(1))
+            .unwrap();
+        persist_cycle_report(
+            directory.path(),
+            &PassOutcome {
+                capture: Some(Err(retention_error())),
+                delivery: Ok(()),
+            },
+            now(),
+            Vec::new(),
+        );
+        refresh_retention_verdict(directory.path(), 4_096, Vec::new());
+        assert_eq!(
+            saved_cycle(directory.path())["error_class"],
+            "retention_limit"
+        );
+    }
+
+    /// A compaction that leaves the journal over the high-water mark leaves
+    /// capture stopped, so the capture verdict stands; the journal is under
+    /// its cap, so a delivery verdict clears.
+    #[test]
+    fn compaction_above_the_high_water_mark_keeps_the_capture_verdict() {
+        let directory = capped_directory(10 * 1_048_576);
+        persist_cycle_report(
+            directory.path(),
+            &PassOutcome {
+                capture: Some(Err(retention_error())),
+                delivery: Err(retention_error()),
+            },
+            now(),
+            Vec::new(),
+        );
+        Connection::open(directory.path().join("history.db"))
+            .unwrap()
+            .execute(
+                "UPDATE delivery_state SET retained_bytes=95, max_retained_bytes=100 WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+        refresh_retention_verdict(directory.path(), 4_096, Vec::new());
+        let report = saved_cycle(directory.path());
+        assert_eq!(report["error_class"], "retention_limit");
+        assert_eq!(report["capture"]["error_class"], "retention_limit");
+        assert!(report["delivery"]["error_class"].is_null());
+        assert_eq!(report["used_bytes"], 95);
+        assert_eq!(report["limit_bytes"], 100);
+    }
+
+    /// Two writers update one report, so each one's read-modify-write waits
+    /// for the other: neither replaces an answer it never read.
+    #[test]
+    fn a_cycle_report_waits_for_the_other_writer() {
+        let directory = capped_directory(10 * 1_048_576);
+        let guard = cycle_guard(directory.path()).expect("the guard is available");
+        let path = directory.path().to_owned();
+        let writing = std::thread::spawn(move || {
+            persist_cycle_report(
+                &path,
+                &PassOutcome::delivery_only(Ok(())),
+                now(),
+                Vec::new(),
+            );
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !directory.path().join("cycle.json").exists(),
+            "a report was written while another writer held the guard"
+        );
+        drop(guard);
+        writing.join().unwrap();
+        assert_eq!(saved_cycle(directory.path())["ok"], true);
+    }
+
+    /// A pass reports what it observed, and a compaction that reported while
+    /// it ran has since re-measured the same cap: the banner the user cleared
+    /// does not come back for a pass interval.
+    #[test]
+    fn a_compaction_during_a_pass_outranks_the_reading_it_invalidated() {
+        let directory = capped_directory(10 * 1_048_576);
+        persist_cycle_report(
+            directory.path(),
+            &PassOutcome {
+                capture: Some(Err(retention_error())),
+                delivery: Ok(()),
+            },
+            now(),
+            Vec::new(),
+        );
+        // A pass starts, observes the cap, and a compaction resolves it while
+        // that pass is still running.
+        let pass_started = now();
+        std::thread::sleep(Duration::from_millis(2));
+        refresh_retention_verdict(directory.path(), 4_096, Vec::new());
+        assert_eq!(saved_cycle(directory.path())["ok"], true);
+
+        persist_cycle_report(
+            directory.path(),
+            &PassOutcome {
+                capture: Some(Err(retention_error())),
+                delivery: Err(retention_error()),
+            },
+            pass_started,
+            Vec::new(),
+        );
+        let report = saved_cycle(directory.path());
+        assert_eq!(report["ok"], true);
+        assert!(report["capture"]["error_class"].is_null());
+        assert!(report["delivery"]["error_class"].is_null());
+
+        // A pass that starts after the compaction reports what it measured.
+        persist_cycle_report(
+            directory.path(),
+            &PassOutcome {
+                capture: Some(Err(retention_error())),
+                delivery: Ok(()),
+            },
+            now(),
+            Vec::new(),
+        );
+        assert_eq!(
+            saved_cycle(directory.path())["error_class"],
+            "retention_limit"
+        );
+    }
+
+    /// A drain that cannot materialize a batch because the journal is at its
+    /// cap reports the retention condition: the desktop names the usage and
+    /// offers compaction instead of showing a generic queued sentence.
+    #[test]
+    fn a_full_journal_during_delivery_reports_the_retention_condition() {
+        struct Unreached;
+        impl worker::Receiver for Unreached {
+            fn mapping_version(&self) -> &str {
+                destination::MAPPING_VERSION
+            }
+            fn supported_kinds(&self) -> &[&str] {
+                &["history", "session_event", "session"]
+            }
+            fn supports_tombstones(&self) -> bool {
+                true
+            }
+            fn prepare(
+                &self,
+                _: &delivery::HistoryExportBatch,
+                _: &worker::ReceiverContext<'_>,
+            ) -> std::result::Result<worker::PreparedBody, worker::ReceiverFailure> {
+                panic!("a batch cannot be prepared while the journal is full")
+            }
+            fn send(
+                &self,
+                _: &delivery::PreparedPayload,
+                _: &delivery::HistoryExportBatch,
+                _: &worker::ReceiverContext<'_>,
+            ) -> std::result::Result<delivery::DeliveryAcknowledgment, worker::ReceiverFailure>
+            {
+                panic!("nothing is dispatched while the journal is full")
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        let conn = relayhistory_plugin::delivery::open_db(&path).unwrap();
+        conn.execute(
+            "INSERT INTO sessions(source,session_id) VALUES ('claude','queued')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES('claude','queued','one',1,'user','text','synthetic')",[]).unwrap();
+        let job = delivery::create_job(&conn, &job_config(true), now()).unwrap();
+        delivery::set_retention_limit(&conn, delivery::retained_bytes(&conn).unwrap().0.max(1))
+            .unwrap();
+        // Batch materialization has its own reserve above the cap, so a full
+        // journal alone no longer refuses a batch: the drain is meant to
+        // deliver its way out of one. This stands in for the exhausted reserve,
+        // which is the only state that still refuses the write.
+        conn.execute_batch(
+            "CREATE TRIGGER synthetic_reserve_exhausted BEFORE INSERT ON delivery_batches
+             BEGIN SELECT RAISE(ABORT,'delivery retention limit exceeded; synthetic reserve exhausted'); END;",
+        )
+        .unwrap();
+        let config = Config {
+            version: 1,
+            site_url: "https://agentrelay.com".into(),
+            account_id: "account".into(),
+            account_email: None,
+            account_name: None,
+            account_avatar_url: None,
+            org_id: "org".into(),
+            workspace_id: "workspace".into(),
+            history_url: "https://history.agentrelay.com".into(),
+            delivery_account: job.config.account_id,
+            job_id: job.job_id,
+            include_existing: true,
+            sharing_mode: None,
+            acknowledge_uninspected_schedules: false,
+        };
+        let error = deliver_with_receiver(&path, &config, &Unreached, &|| false).unwrap_err();
+        assert_eq!(capture_error_class(&error), "retention_limit");
+        assert_eq!(local_failure_message(&error), Some(RETENTION_LIMIT_MESSAGE));
+        assert!(!error.to_string().contains("queued or needs attention"));
     }
 
     fn job_config(include_existing: bool) -> delivery::DeliveryJobConfig {

@@ -465,6 +465,10 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
         );
     }
 
+    // Retention backpressure before the content pass: a session that cannot
+    // be written at the cap is not worth re-reading, and the typed stop is
+    // what the caller reports instead of attempting the next session.
+    super::ensure_capture_headroom(&conn)?;
     // The content pass, on the one path that has already read every one of
     // these files anyway. Taken *before* the writer lock: it re-reads every
     // byte of the session's files, and doing that inside the transaction
@@ -476,64 +480,67 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
     // JSONL readers ignore an incomplete final record -- one that is not
     // newline-terminated, and so is still being written -- and every evidence
     // table has a provider-native uniqueness key, so interruption followed by
-    // retry is safe for both new and growing sessions.
-    super::check_capture_cancelled()?;
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let cursor_key = CursorKey::Session {
-        source: &options.source,
-        session_id: &options.session_id,
-        location: "local",
-    };
-    // A parser generation change invalidates every position recorded by the
-    // generation before it: the same bytes now mean something else. Starting
-    // from an empty cursor is what makes the first sync after an upgrade a
-    // single full re-parse per transcript, after which cursors take over.
-    let mut cursor = if previous
-        .as_ref()
-        .is_some_and(|(_, parser_version, _)| *parser_version == HYDRATION_PARSER_VERSION)
-    {
-        load_cursor(&tx, &cursor_key)?
-    } else {
-        TranscriptCursorState::default()
-    };
-    let (indexed, source_diagnostics, cursor_consumed_through) = ingest_selected(
-        &tx,
-        options,
-        &target,
-        snapshot.path.as_deref(),
-        &snapshot.claude_subagents,
-        snapshot.claude_transcript.as_ref(),
-        &mut cursor,
-        records_parsed,
-        snapshot.opencode_layout,
-    )?;
-    let mut indexed = indexed;
-    // What the pass actually parsed. For a provider whose reader re-reads the
-    // whole file this is the count above; for an incremental one the snapshot
-    // deliberately counted nothing, and reporting its zero would claim the
-    // pass read no records at all.
-    let records_parsed = indexed.records;
-    // Stamping and identifying the source is work this hydration did.
-    indexed.bytes_read += provider_bytes;
-    indexed.superseded |= snapshot.scanned_superseded;
-    tx.execute(
-        "UPDATE sessions SET discovery_state = 'full', source_stamp = ?, parser_version = ? \
+    // retry is safe for both new and growing sessions. A retention abort
+    // inside it rolls the session back and reports its usage.
+    let hydrated = || -> Result<_> {
+        super::check_capture_cancelled()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let cursor_key = CursorKey::Session {
+            source: &options.source,
+            session_id: &options.session_id,
+            location: "local",
+        };
+        // A parser generation change invalidates every position recorded by the
+        // generation before it: the same bytes now mean something else. Starting
+        // from an empty cursor is what makes the first sync after an upgrade a
+        // single full re-parse per transcript, after which cursors take over.
+        let mut cursor = if previous
+            .as_ref()
+            .is_some_and(|(_, parser_version, _)| *parser_version == HYDRATION_PARSER_VERSION)
+        {
+            load_cursor(&tx, &cursor_key)?
+        } else {
+            TranscriptCursorState::default()
+        };
+        let (indexed, source_diagnostics, cursor_consumed_through) = ingest_selected(
+            &tx,
+            options,
+            &target,
+            snapshot.path.as_deref(),
+            &snapshot.claude_subagents,
+            snapshot.claude_transcript.as_ref(),
+            &mut cursor,
+            records_parsed,
+            snapshot.opencode_layout,
+        )?;
+        let mut indexed = indexed;
+        // What the pass actually parsed. For a provider whose reader re-reads the
+        // whole file this is the count above; for an incremental one the snapshot
+        // deliberately counted nothing, and reporting its zero would claim the
+        // pass read no records at all.
+        let records_parsed = indexed.records;
+        // Stamping and identifying the source is work this hydration did.
+        indexed.bytes_read += provider_bytes;
+        indexed.superseded |= snapshot.scanned_superseded;
+        tx.execute(
+            "UPDATE sessions SET discovery_state = 'full', source_stamp = ?, parser_version = ? \
          WHERE source = ? AND session_id = ?",
-        params![
-            snapshot.stamp,
-            HYDRATION_PARSER_VERSION,
-            options.source,
-            options.session_id
-        ],
-    )?;
-    tx.execute(
-        "UPDATE session_presences SET discovery_state = 'full' \
+            params![
+                snapshot.stamp,
+                HYDRATION_PARSER_VERSION,
+                options.source,
+                options.session_id
+            ],
+        )?;
+        tx.execute(
+            "UPDATE session_presences SET discovery_state = 'full' \
          WHERE source = ? AND session_id = ? AND location = 'local'",
-        params![options.source, options.session_id],
-    )?;
-    let last_event_at_ms = max_event_time(&tx, &options.source, &options.session_id)?;
-    let last_tool_result_index = max_tool_result_index(&tx, &options.source, &options.session_id)?;
-    tx.execute(
+            params![options.source, options.session_id],
+        )?;
+        let last_event_at_ms = max_event_time(&tx, &options.source, &options.session_id)?;
+        let last_tool_result_index =
+            max_tool_result_index(&tx, &options.source, &options.session_id)?;
+        tx.execute(
         "INSERT INTO session_hydration_checkpoints \
          (source, session_id, location, source_stamp, parser_version, last_event_at_ms, source_bytes, records_parsed, include_related, last_tool_result_index, updated_ms, source_diagnostics_json) \
          VALUES (?, ?, 'local', ?, ?, ?, ?, ?, ?, ?, ?, ?) \
@@ -558,29 +565,38 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
             serde_json::to_string(&source_diagnostics).ok(),
         ],
     )?;
-    // The checkpoint row has to exist before its cursor columns are written:
-    // a resume position without the checkpoint it belongs to would describe
-    // evidence nothing recorded.
-    store_cursor(&tx, &cursor_key, &cursor)?;
-    let local_observation=local_observation.unwrap_or(SessionObservation{key:local_key,raw_locator:target.locator.clone(),source_stamp:tx.query_row("SELECT source_stamp FROM session_presences WHERE source=? AND session_id=? AND location='local'",params![options.source,options.session_id],|row|row.get(0)).optional()?.flatten(),discovery_state:"shallow".into(),access_state:"available".into(),updated_ms:now_ms()});
-    save_observation_progress(
-        &tx,
-        &local_observation,
-        &snapshot.stamp,
-        snapshot.bytes,
-        records_parsed,
-        options.include_related,
-        true,
-        Some(&cursor),
-    )?;
-    // Inside the transaction and after every relationship this hydration
-    // recorded: a subagent transcript is routinely read before its parent, so
-    // the child's inheritance can only be settled once the whole selected
-    // session has landed. Leaving it to the next sync would serve a hydrated
-    // session with a null project key in between.
-    crate::store::refresh_session_project_identity(&tx, &options.source, &options.session_id)?;
-    super::check_capture_cancelled()?;
-    tx.commit()?;
+        // The checkpoint row has to exist before its cursor columns are written:
+        // a resume position without the checkpoint it belongs to would describe
+        // evidence nothing recorded.
+        store_cursor(&tx, &cursor_key, &cursor)?;
+        let local_observation=local_observation.unwrap_or(SessionObservation{key:local_key,raw_locator:target.locator.clone(),source_stamp:tx.query_row("SELECT source_stamp FROM session_presences WHERE source=? AND session_id=? AND location='local'",params![options.source,options.session_id],|row|row.get(0)).optional()?.flatten(),discovery_state:"shallow".into(),access_state:"available".into(),updated_ms:now_ms()});
+        save_observation_progress(
+            &tx,
+            &local_observation,
+            &snapshot.stamp,
+            snapshot.bytes,
+            records_parsed,
+            options.include_related,
+            true,
+            Some(&cursor),
+        )?;
+        // Inside the transaction and after every relationship this hydration
+        // recorded: a subagent transcript is routinely read before its parent, so
+        // the child's inheritance can only be settled once the whole selected
+        // session has landed. Leaving it to the next sync would serve a hydrated
+        // session with a null project key in between.
+        crate::store::refresh_session_project_identity(&tx, &options.source, &options.session_id)?;
+        super::check_capture_cancelled()?;
+        tx.commit()?;
+        Ok((
+            indexed,
+            source_diagnostics,
+            cursor_consumed_through,
+            records_parsed,
+        ))
+    };
+    let (indexed, source_diagnostics, cursor_consumed_through, records_parsed) =
+        hydrated().map_err(|error| super::annotate_retention_limit(&conn, error))?;
     if let (Some(path), Some(consumed)) = (snapshot.path.as_deref(), cursor_consumed_through) {
         // Hydration rebuilt history from offset 0 and does not otherwise
         // move the Cursor byte cursor. A later incremental sync would

@@ -226,11 +226,44 @@ fn status_value(directory: &Path) -> Result<Value> {
             json!("Upload failed. The probe will retry; check your connection.");
     }
     result["sessions"] = json!({"total":rows.len(), "shared":shared, "excluded":rows.len()-shared});
+    result["retention"] = retention(&conn)?;
     result["last_cycle"] = fs::read(directory.join("cycle.json"))
         .ok()
         .and_then(|data| serde_json::from_slice::<Value>(&data).ok())
         .unwrap_or(Value::Null);
     Ok(result)
+}
+fn retention(conn: &Connection) -> Result<Value> {
+    let (used_bytes, limit_bytes) = delivery::retained_bytes(conn)?;
+    Ok(json!({"used_bytes":used_bytes, "limit_bytes":limit_bytes}))
+}
+/// Reclaim every journal record already consumed by all subscriptions and
+/// every settled batch receipt. Queued and unacknowledged data is untouched,
+/// so this is safe while the collector runs; it serializes only with other
+/// desktop control actions.
+pub fn compact(directory: &Path) -> Result<()> {
+    emit(compact_value(directory)?);
+    Ok(())
+}
+fn compact_value(directory: &Path) -> Result<Value> {
+    let _control = control_lock(directory)?;
+    read_config(directory)?;
+    // Each page is its own write transaction against the database capture and
+    // delivery also write, so compaction takes the shared busy policy's full
+    // grace rather than the short interactive one: a source ingest holding the
+    // write lock for several seconds delays a page, it does not abandon a pass
+    // the user asked for and leave its count unreported.
+    let conn = relayhistory_plugin::delivery::open_db(&directory.join("history.db"))?;
+    let (used_before, _) = delivery::retained_bytes(&conn)?;
+    let removed_records = delivery::compact_journal_pass(&conn, delivery::MAX_COMPACTION_PAGE)?;
+    while delivery::compact_receipts(&conn, delivery::MAX_COMPACTION_PAGE)?
+        == delivery::MAX_COMPACTION_PAGE
+    {}
+    let retention = retention(&conn)?;
+    // The persisted verdict measured a journal this pass has just changed.
+    let reclaimed = used_before - retention["used_bytes"].as_i64().unwrap_or(used_before);
+    collector::refresh_retention_verdict(directory, reclaimed, std::io::stderr());
+    Ok(json!({"removed_records":removed_records, "retention":retention}))
 }
 pub fn pause(directory: &Path, paused: bool) -> Result<()> {
     let _control = control_lock(directory)?;
@@ -754,6 +787,153 @@ mod tests {
         read_config(dir).unwrap()
     }
 
+    /// Deliver every prepared batch through the core API alone, so consumed
+    /// journal rows stay in place for the compaction under test.
+    fn acknowledge_everything(conn: &Connection, job_id: &str) {
+        for _ in 0..100 {
+            let now = collector::now();
+            let prepared = delivery::prepare_batch(conn, job_id, now).unwrap();
+            if prepared.batch_id.is_none() {
+                if prepared.bootstrap_complete && prepared.scanned_records == 0 {
+                    return;
+                }
+                continue;
+            }
+            let claim = delivery::claim_batch(conn, job_id, "test", 30_000, &|| now)
+                .unwrap()
+                .unwrap();
+            delivery::store_prepared_payload(
+                conn,
+                &claim.lease,
+                &claim.batch.mapping_version,
+                "application/json",
+                "{}",
+                &|| now,
+            )
+            .unwrap();
+            let ack = delivery::DeliveryAcknowledgment {
+                batch_id: claim.batch.batch_id.clone(),
+                accepted_revision_ids: claim
+                    .batch
+                    .records
+                    .iter()
+                    .map(|record| record.revision_id.clone())
+                    .collect(),
+                unsupported_revision_ids: vec![],
+                acceptance_level: delivery::AcceptanceLevel::Durable,
+            };
+            delivery::acknowledge(conn, &claim.lease, &ack, &|| now).unwrap();
+        }
+        panic!("bounded fixture failed to drain");
+    }
+
+    /// Status reports journal usage against its cap, and compaction reclaims
+    /// consumed journal rows, lowering that usage while queued data survives.
+    #[test]
+    fn status_reports_retention_and_compact_reclaims_consumed_journal_rows() {
+        let (dir, config) = fixture(SharingMode::All);
+        let conn = db(dir.path()).unwrap();
+        acknowledge_everything(&conn, &config.job_id);
+        for n in 0..50 {
+            conn.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES('claude','old',?,1,'user','text','synthetic transcript line')",[n.to_string()]).unwrap();
+        }
+        let before = status_value(dir.path()).unwrap();
+        let (used, limit) = delivery::retained_bytes(&conn).unwrap();
+        assert_eq!(before["retention"]["used_bytes"], used);
+        assert_eq!(before["retention"]["limit_bytes"], limit);
+        assert_eq!(limit, delivery::DEFAULT_RETENTION_LIMIT_BYTES);
+        assert!(used > 0);
+
+        // Only the generation's consumed cutoff marker is reclaimable: every
+        // queued event row survives compaction.
+        let untouched = compact_value(dir.path()).unwrap();
+        assert_eq!(untouched["removed_records"], 1);
+        let marker_freed = used - untouched["retention"]["used_bytes"].as_i64().unwrap();
+        assert!(
+            marker_freed > 0 && marker_freed < 2_048,
+            "freed {marker_freed}"
+        );
+        assert_eq!(
+            delivery::status(&conn, &config.job_id)
+                .unwrap()
+                .unqueued_changes,
+            50
+        );
+
+        acknowledge_everything(&conn, &config.job_id);
+        let compacted = compact_value(dir.path()).unwrap();
+        assert_eq!(compacted["removed_records"], 50);
+        let after = compacted["retention"]["used_bytes"].as_i64().unwrap();
+        assert!(after < used - 50 * 512);
+        assert_eq!(compacted["retention"]["limit_bytes"], limit);
+        let receipts: i64 = conn
+            .query_row("SELECT COUNT(*) FROM delivery_batches", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(receipts, 0);
+        assert_eq!(
+            status_value(dir.path()).unwrap()["retention"]["used_bytes"],
+            after
+        );
+        assert_eq!(
+            delivery::status(&conn, &config.job_id)
+                .unwrap()
+                .acknowledged_records,
+            52
+        );
+    }
+
+    /// Compaction answers the verdict the desktop is showing: a journal back
+    /// under its cap is no longer reported full, without waiting for the next
+    /// capture cycle to measure it.
+    #[test]
+    fn compact_clears_the_retention_verdict_the_desktop_is_showing() {
+        let (dir, config) = fixture(SharingMode::All);
+        let conn = db(dir.path()).unwrap();
+        acknowledge_everything(&conn, &config.job_id);
+        let full = "Upload journal full (1 MB of 1 MB). Compacting consumed records; queued sessions are preserved.";
+        save_json(
+            &dir.path().join("cycle.json"),
+            &json!({"at_ms":1,"ok":false,"error_class":"retention_limit","message":full,
+                "capture":{"ok":false,"error_class":"retention_limit","message":full},
+                "delivery":{"ok":true,"error_class":null,"message":null}}),
+        )
+        .unwrap();
+        assert_eq!(
+            status_value(dir.path()).unwrap()["last_cycle"]["error_class"],
+            "retention_limit"
+        );
+        compact_value(dir.path()).unwrap();
+        let cycle = status_value(dir.path()).unwrap()["last_cycle"].clone();
+        assert_eq!(cycle["ok"], true);
+        assert!(cycle["error_class"].is_null());
+        assert!(cycle["capture"]["error_class"].is_null());
+    }
+
+    /// Compaction is a user action against the database capture also writes.
+    /// A source ingest holding the write lock for several seconds delays a
+    /// page; it does not abandon the pass with no count reported.
+    #[test]
+    fn compact_waits_out_a_writer_holding_the_lock_past_the_interactive_timeout() {
+        let (dir, config) = fixture(SharingMode::All);
+        let conn = db(dir.path()).unwrap();
+        acknowledge_everything(&conn, &config.job_id);
+        let path = dir.path().join("history.db");
+        let (locked, taken) = std::sync::mpsc::channel();
+        let holding = std::thread::spawn(move || {
+            let blocker = relayhistory_plugin::delivery::open_db(&path).unwrap();
+            blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+            locked.send(()).unwrap();
+            // Longer than the interactive timeout, well inside the shared
+            // busy policy's grace.
+            std::thread::sleep(Duration::from_secs(6));
+            blocker.execute_batch("ROLLBACK").unwrap();
+        });
+        taken.recv().unwrap();
+        let compacted = compact_value(dir.path()).unwrap();
+        holding.join().unwrap();
+        assert_eq!(compacted["removed_records"], 1);
+    }
+
     #[test]
     fn desktop_summary_includes_the_signed_in_profile() {
         let (dir, config) = fixture(SharingMode::Selected);
@@ -978,7 +1158,14 @@ mod tests {
     #[test]
     fn every_desktop_command_accepts_json_and_target_flags() {
         let target = ["--account", "account", "--workspace", "workspace", "--json"];
-        for name in ["start", "status", "pause", "resume", "disconnect"] {
+        for name in [
+            "start",
+            "status",
+            "pause",
+            "resume",
+            "disconnect",
+            "compact",
+        ] {
             assert!(
                 super::super::Cli::try_parse_from([vec!["probe", name], target.to_vec()].concat())
                     .is_ok(),

@@ -51,6 +51,8 @@ enum Commands {
     Pause(Target),
     Resume(Target),
     Disconnect(Target),
+    /// Reclaim consumed upload-journal records and settled receipts.
+    Compact(Target),
     Sessions {
         #[command(subcommand)]
         command: bridge::SessionCommand,
@@ -164,6 +166,7 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Pause(target) => bridge::pause(&target.directory()?, true),
         Commands::Resume(target) => bridge::pause(&target.directory()?, false),
         Commands::Disconnect(target) => bridge::disconnect(&target.directory()?),
+        Commands::Compact(target) => bridge::compact(&target.directory()?),
         Commands::Sessions { command } => bridge::sessions(command),
         Commands::Sharing { command } => bridge::sharing(command),
     }

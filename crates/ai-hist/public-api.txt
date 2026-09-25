@@ -35,12 +35,18 @@ pub ai_hist::Capability::Full
 pub ai_hist::Capability::Partial
 pub ai_hist::Capability::ShallowOnly
 #[non_exhaustive] pub enum ai_hist::ChangeKind
+pub ai_hist::ChangeKind::CommitLink
 pub ai_hist::ChangeKind::FileEdit
+pub ai_hist::ChangeKind::History
+pub ai_hist::ChangeKind::ObservationEvidence
+pub ai_hist::ChangeKind::Presence
 pub ai_hist::ChangeKind::Relationship
 pub ai_hist::ChangeKind::Session
 pub ai_hist::ChangeKind::SessionEvent
 pub ai_hist::ChangeKind::SessionMarker
+pub ai_hist::ChangeKind::SourceObservation
 pub ai_hist::ChangeKind::ToolCall
+pub ai_hist::ChangeKind::Trajectory
 impl ai_hist::ChangeKind
 pub const ai_hist::ChangeKind::ALL: &'static [ai_hist::ChangeKind]
 pub fn ai_hist::ChangeKind::as_str(self) -> &'static str
@@ -107,11 +113,13 @@ impl ai_hist::EvidenceKind
 pub fn ai_hist::EvidenceKind::as_str(self) -> &'static str
 #[non_exhaustive] pub enum ai_hist::EvidenceRow
 pub ai_hist::EvidenceRow::FileEdit(ai_hist::SessionFileEdit)
+pub ai_hist::EvidenceRow::History(ai_hist::HistoryEntry)
 pub ai_hist::EvidenceRow::Relationship(ai_hist::SessionRelationship)
 pub ai_hist::EvidenceRow::Session(ai_hist::ShallowSession)
 pub ai_hist::EvidenceRow::SessionEvent(ai_hist::SessionEvent)
 pub ai_hist::EvidenceRow::SessionMarker(ai_hist::SessionMarker)
 pub ai_hist::EvidenceRow::ToolCall(ai_hist::SessionToolCall)
+pub ai_hist::EvidenceRow::Untyped
 #[non_exhaustive] pub enum ai_hist::HydrateStatus
 pub ai_hist::HydrateStatus::CapabilityLimited
 pub ai_hist::HydrateStatus::Hydrated
@@ -295,12 +303,15 @@ pub ai_hist::CatalogSession::workspace_roots: alloc::vec::Vec<alloc::string::Str
 impl ai_hist::CatalogSession
 pub fn ai_hist::CatalogSession::session_ref(&self) -> ai_hist::SessionRef
 #[non_exhaustive] pub struct ai_hist::Change
+pub ai_hist::Change::columns: core::option::Option<ai_hist::StoredRow>
+pub ai_hist::Change::key: alloc::vec::Vec<serde_json::value::Value>
 pub ai_hist::Change::kind: ai_hist::ChangeKind
 pub ai_hist::Change::op: ai_hist::ChangeOp
 pub ai_hist::Change::record_key: alloc::string::String
 pub ai_hist::Change::revision: u64
 pub ai_hist::Change::session_id: alloc::string::String
-pub ai_hist::Change::source: ai_hist::Source
+pub ai_hist::Change::source: core::option::Option<ai_hist::Source>
+pub ai_hist::Change::source_name: alloc::string::String
 #[non_exhaustive] pub struct ai_hist::ChangeQuery
 pub ai_hist::ChangeQuery::batch: usize
 pub ai_hist::ChangeQuery::consumer: core::option::Option<alloc::string::String>
@@ -707,6 +718,16 @@ pub ai_hist::StoreOptions::db_path: core::option::Option<std::path::PathBuf>
 pub ai_hist::StoreOptions::home: core::option::Option<std::path::PathBuf>
 pub ai_hist::StoreOptions::read_only: bool
 pub ai_hist::StoreOptions::roots: core::option::Option<ai_hist::ProviderRoots>
+pub struct ai_hist::StoredRow
+impl ai_hist::StoredRow
+pub fn ai_hist::StoredRow::get(&self, &str) -> core::option::Option<&serde_json::value::Value>
+pub fn ai_hist::StoredRow::is_empty(&self) -> bool
+pub fn ai_hist::StoredRow::iter(&self) -> impl core::iter::traits::iterator::Iterator<Item = (&str, &serde_json::value::Value)> + '_
+pub fn ai_hist::StoredRow::len(&self) -> usize
+impl serde_core::ser::Serialize for ai_hist::StoredRow
+pub fn ai_hist::StoredRow::serialize<S: serde_core::ser::Serializer>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error>
+impl<'de> serde_core::de::Deserialize<'de> for ai_hist::StoredRow
+pub fn ai_hist::StoredRow::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
 #[non_exhaustive] pub struct ai_hist::SyncOptions
 pub ai_hist::SyncOptions::force: bool
 pub ai_hist::SyncOptions::lock_timeout_ms: u64

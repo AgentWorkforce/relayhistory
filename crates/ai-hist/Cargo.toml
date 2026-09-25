@@ -1,6 +1,6 @@
 [package]
 name = "ai-hist"
-version = "0.26.0"
+version = "0.27.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -82,6 +82,10 @@ required-features = ["unstable-internal"]
 
 [[test]]
 name = "opencode_parity"
+required-features = ["export", "unstable-internal"]
+
+[[test]]
+name = "capture_retention_backpressure"
 required-features = ["export", "unstable-internal"]
 
 [[test]]
