@@ -350,25 +350,30 @@ impl ExportSnapshot {
             bytes < self.limits.max_batch_bytes,
             "export page envelope exceeds configured page byte limit"
         );
+        // The position advances on copies and is kept only once the page is
+        // whole, so a failed read leaves the cursor where it was and a retry
+        // serves every record.
+        let mut kind_index = self.kind_index;
+        let mut after = self.after;
         let mut scanned = 0;
-        'kinds: while self.kind_index < SUPPORTED_KINDS.len()
+        'kinds: while kind_index < SUPPORTED_KINDS.len()
             && scanned < self.limits.max_scan_records
             && page.records.len() < self.limits.max_batch_records
         {
-            let name = SUPPORTED_KINDS[self.kind_index];
+            let name = SUPPORTED_KINDS[kind_index];
             let rows = if self.selection.kinds.iter().any(|kind| kind == name) {
                 change_feed::rows_by_rowid(
                     &self.conn,
                     change_kind(name)?,
-                    self.after,
+                    after,
                     self.limits.max_scan_records - scanned,
                 )?
             } else {
                 Vec::new()
             };
             if rows.is_empty() {
-                self.kind_index += 1;
-                self.after = 0;
+                kind_index += 1;
+                after = 0;
                 continue;
             }
             for row in rows {
@@ -390,15 +395,17 @@ impl ExportSnapshot {
                     page.records.push(record);
                 }
                 scanned += 1;
-                self.after = rowid;
+                after = rowid;
                 if page.records.len() >= self.limits.max_batch_records {
                     break 'kinds;
                 }
             }
         }
-        if self.kind_index >= SUPPORTED_KINDS.len() {
+        if kind_index >= SUPPORTED_KINDS.len() {
             page.next_cursor = None;
         }
+        self.kind_index = kind_index;
+        self.after = after;
         self.cursor = page.next_cursor.clone();
         self.served = Some((cursor.to_string(), page.clone()));
         Ok(page)
