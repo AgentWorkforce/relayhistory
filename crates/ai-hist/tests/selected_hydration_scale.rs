@@ -1,4 +1,4 @@
-#![cfg(all(feature = "delivery", feature = "unstable-internal"))]
+#![cfg(feature = "unstable-internal")]
 //! Isolated provider roots; synthetic evidence only, no receiver/network.
 use ai_hist::{
     discover_sessions_scoped_at, hydrate_session_at, open_db, DiscoverOptions,

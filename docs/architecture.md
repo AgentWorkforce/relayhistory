@@ -460,21 +460,33 @@ missing, addon load failure, native/SDK contract mismatch, database-open
 failure, invalid argument, query failure, discovery failure, and sync failure.
 There is no alternate runtime after any native-load error.
 
-## Durable delivery and snapshot export
+## Snapshot export and upload state
 
-`ai-hist::export` owns evidence records, bounded snapshots, preimages, tombstones
-and durable change subscriptions. These storage primitives know no destination,
-account, upload acknowledgment or retry state. File/NDJSON exports remain in the
-local SDK through native contract 21's `historyExport` bridge. Ordinary core
-opens create no upload job, batch or membership tables.
+`ai-hist::export` (the `export` feature) is local export: NDJSON a user
+writes to a file or a pipe through the SDK's `exportHistory`, in bounded
+pages. An `ExportSnapshot` owns a connection holding one read transaction, so
+every page reads the store as it stood when the snapshot opened, whatever is
+written meanwhile; in WAL mode the transaction never blocks the writer. Each
+record carries the change feed's key and revision for its row. Nothing is
+stored: an open snapshot lives in the addon process until it is closed or
+expires.
 
-Upload state machines live outside this repository. Indexed session
-snapshot/change APIs keep provider traversal in core. See [export](export.md)
-for the NDJSON snapshot surface.
+The crate keeps no upload state. An uploader reads the change feed
+(`SessionStore::changes_since`), which carries every row in full, and keeps
+its own cursor and consent. A write to the store is never refused on an
+uploader's behalf.
 
-Storage and uploads still share a retention budget in an enabled database.
-An unread durable subscription can therefore hold evidence and exhaust capacity;
-capture checks the budget before each source pass and each session's write,
-compacts consumed changes above 90% of the cap, and stops the pass with a typed
-`retention_limit` failure instead of losing records or attempting every
-remaining session. Moving code ownership does not provide resource isolation.
+A store an earlier release armed for upload capture has capture triggers on
+every evidence table, retention triggers that abort a write once the capture
+budget is spent, and `delivery_identity_*` indexes. The first writable open
+drops them (marker `export_capture_retired_v1`), and any later open that finds
+one again drops it again. It leaves every table of that era —
+`delivery_state`, `delivery_journal`, `delivery_shadow`,
+`delivery_bootstrap_bounds`, `delivery_exclusions`, `history_subscriptions`,
+`history_compaction` — exactly as it is. Their owner is the upload daemon that
+created them, and it rebuilds an old install from two of their facts:
+`delivery_state.origin_id`, and its revision floor from `sqlite_sequence` where
+`name = 'delivery_journal'`. SQLite deletes a table's `sqlite_sequence` row
+when the table is dropped, so this crate never drops or alters them.
+
+See [export](export.md) for the NDJSON snapshot surface.

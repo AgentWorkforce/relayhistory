@@ -64,7 +64,10 @@ use serde::Serialize;
 /// facade (markers, requests, usage summary, user turns, source
 /// capabilities) and moves the SDK's request, usage and user-turn reads onto
 /// it, alongside contract 20's `historyExport` bridge.
-pub const NATIVE_CONTRACT_VERSION: u32 = 21;
+/// 22: `historyExport` serves snapshots that each hold one read transaction,
+/// emits schema-version-2 records, and no longer accepts the upload-journal
+/// operations (retention and compaction).
+pub const NATIVE_CONTRACT_VERSION: u32 = 22;
 const DEFAULT_LIMIT: i64 = 50;
 const DEFAULT_EVENT_LIMIT: i64 = 200;
 

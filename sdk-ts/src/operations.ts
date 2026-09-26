@@ -1087,7 +1087,6 @@ function preserveStorageFailure(error: unknown): void {
     error instanceof RelayHistoryError &&
     [
       'SOURCE_REVISION_CONFLICT',
-      'DELIVERY_RETENTION_LIMIT',
       'SOURCE_INTAKE_FAILED',
       'DATABASE_OPEN_FAILED',
       'NATIVE_CALL_FAILED',

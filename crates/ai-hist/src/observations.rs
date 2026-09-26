@@ -319,10 +319,8 @@ fn write_checkpoint_inner(
     bump_revision(conn, key)
 }
 
-/// Replace one successful snapshot as independently deliverable records. Long
-/// transcripts do not become one oversized export record. An individual event
-/// can still exceed a destination's explicit record limit, just like its
-/// canonical session_event row; that failure never advances delivery progress.
+/// Replace one successful snapshot as independent records, so a long
+/// transcript is many evidence rows rather than one oversized one.
 pub fn save_evidence(
     conn: &Connection,
     key: &ObservationKey,
@@ -514,7 +512,7 @@ fn bump_revision(conn: &Connection, key: &ObservationKey) -> Result<()> {
 
 /// Canonical rows with local or unknown ownership cannot be changed by a remote
 /// projection. This local reconciliation state is not connector evidence and
-/// must not advance observation revisions or enter delivery capture.
+/// must not advance observation revisions.
 pub fn protected_canonical_evidence(
     conn: &Connection,
     key: &ObservationKey,

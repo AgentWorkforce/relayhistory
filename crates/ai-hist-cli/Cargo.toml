@@ -12,7 +12,6 @@ path = "src/main.rs"
 
 [dependencies]
 ai-hist = { path = "../ai-hist", features = [
-    "export",
     "fs-events",
     "opencode-backup",
     "git-hooks",
