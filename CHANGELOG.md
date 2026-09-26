@@ -6,6 +6,11 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Breaking
 
+- Native contract 21 -> 22. `historyExport` serves snapshots that each hold
+  one read transaction, emits schema-version-2 records, and no longer accepts
+  the upload-journal operations. An SDK paired with an addon of the other
+  contract fails at load with `NATIVE_CONTRACT_MISMATCH` instead of at the
+  first export call.
 - Uploads are not part of `ai-hist`; team uploads come from the Agent Relay
   desktop app. The `@relayhistory/capture` package, its seven platform helper
   packages, the `relayhistory-plugin` crate and the `agent-relay-probe`
