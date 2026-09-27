@@ -224,11 +224,6 @@ export async function createHandoff(
     session.sessionId,
     normalizedIntent,
   );
-  if (Array.from(intentWithResumeInstruction).length > MAX_HANDOFF_INTENT_CHARS)
-    throw new InvalidArgumentError(
-      `handoff intent including its resume instruction must not exceed ${MAX_HANDOFF_INTENT_CHARS} characters`,
-      'INVALID_ARGUMENT',
-    );
   return {
     source: session.source,
     session_id: session.sessionId,
@@ -288,20 +283,24 @@ export async function resumeHandoff(
       let refreshed = false;
       let discoveryFailure: RelayHistoryError | undefined;
       for (let attempt = 0; attempt < HANDOFF_DISCOVERY_ATTEMPTS; attempt += 1) {
-        let attemptFailure: RelayHistoryError | undefined;
+        const attemptFailures: RelayHistoryError[] = [];
         const refresh = await discoverSourcePlugins(options.plugins, {
           dbPath: options.dbPath,
           sourceConnectors,
           sources: [source],
           sessionId,
           acquisitionTimeoutMs: options.acquisitionTimeoutMs,
-          onUnavailable: (_connector, error) => { attemptFailure ??= error; },
+          onUnavailable: (_connector, error) => { attemptFailures.push(error); },
         });
         refreshed = refresh.some((run) => run.observations.some(
           (observation) => observation.source === source && observation.session_id === sessionId,
         ));
         if (refreshed) break;
-        if (!attemptFailure) {
+        const terminalFailure = attemptFailures.find(
+          (error) => !['CONNECTOR_FAILURE', 'SOURCE_ACQUISITION_TIMEOUT'].includes(error.code),
+        );
+        if (terminalFailure) throw terminalFailure;
+        if (!attemptFailures.length) {
           // A complete targeted refresh is authoritative. It also prevents
           // hydrateSession from reusing an observation cached for an older
           // authenticated workspace.
@@ -310,9 +309,7 @@ export async function resumeHandoff(
             'SESSION_NOT_FOUND',
           );
         }
-        if (!['CONNECTOR_FAILURE', 'SOURCE_ACQUISITION_TIMEOUT'].includes(attemptFailure.code))
-          throw attemptFailure;
-        discoveryFailure = attemptFailure;
+        discoveryFailure = attemptFailures[0];
       }
       if (!refreshed) {
         // A partial refresh cannot prove either presence or absence. Do not

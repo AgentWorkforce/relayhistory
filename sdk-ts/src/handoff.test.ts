@@ -24,6 +24,41 @@ test('createHandoff keeps the pointer intent bounded', async () => {
   );
 });
 
+test('createHandoff preserves the published input allowance when adding its resume prompt', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'relayhistory-long-handoff-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, 'home');
+  const sessionId = 'long-handoff';
+  const directory = join(home, '.codex', 'sessions', '2026', '09', '27');
+  await mkdir(directory, { recursive: true });
+  await writeFile(join(directory, `rollout-${sessionId}.jsonl`), [
+    JSON.stringify({
+      timestamp: '2026-09-27T10:00:00.000Z',
+      type: 'session_meta',
+      payload: { id: sessionId, cwd: '/work/handoff' },
+    }),
+    JSON.stringify({
+      timestamp: '2026-09-27T10:00:01.000Z',
+      type: 'event_msg',
+      payload: { type: 'user_message', message: 'long handoff' },
+    }),
+  ].join('\n') + '\n');
+  const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  t.after(() => {
+    if (saved.HOME === undefined) delete process.env.HOME; else process.env.HOME = saved.HOME;
+    if (saved.USERPROFILE === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = saved.USERPROFILE;
+  });
+  const originalIntent = 'x'.repeat(MAX_HANDOFF_INTENT_CHARS);
+  const pointer = await createHandoff(originalIntent, {
+    dbPath: join(root, 'history.db'),
+    env: { CODEX_THREAD_ID: sessionId },
+  });
+  assert.ok(pointer.intent.endsWith(originalIntent));
+});
+
 test('createHandoff resolves the invoking harness session through the local catalog', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'relayhistory-create-handoff-'));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -361,6 +396,37 @@ test('resumeHandoff preserves terminal discovery errors', async (t) => {
       && error.code === 'AUTHENTICATION_EXPIRED',
   );
   assert.equal(discoverCalls, 1);
+});
+
+test('resumeHandoff gives terminal failures precedence across cloud instances', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'relayhistory-mixed-failure-handoff-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  let timeoutCalls = 0;
+  let authCalls = 0;
+  const timeoutSource = teammateSource();
+  timeoutSource.instanceId = 'workspace-timeout';
+  timeoutSource.discover = async () => {
+    timeoutCalls += 1;
+    throw new RelayHistoryError('timeout', 'SOURCE_ACQUISITION_TIMEOUT');
+  };
+  const authSource = teammateSource();
+  authSource.instanceId = 'workspace-expired';
+  authSource.discover = async () => {
+    authCalls += 1;
+    throw new AuthenticationExpiredError('expired', 'AUTHENTICATION_EXPIRED');
+  };
+  const plugins = new HistoryPluginRegistry();
+  plugins.register({ sources: [timeoutSource, authSource] });
+  await assert.rejects(
+    resumeHandoff('claude', 'teammate-session', {
+      dbPath: join(root, 'history.db'),
+      plugins,
+    }),
+    (error: unknown) => error instanceof RelayHistoryError
+      && error.code === 'AUTHENTICATION_EXPIRED',
+  );
+  assert.equal(timeoutCalls, 1);
+  assert.equal(authCalls, 1);
 });
 
 test('resumeHandoff returns independent bounded cursors for every evidence class', async (t) => {
