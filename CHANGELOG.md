@@ -72,6 +72,13 @@ Notable changes to the native `ai-hist` CLI are documented here.
   sessions and their objectives are not history rows. A Muse hydration
   reports `full`. `ai-hist resume` prints `muse resume <id>`, and the sync
   service forwards `XDG_DATA_HOME`.
+- Add workspace-scoped agent handoffs through `create_handoff(intent)` and
+  `resume_handoff(source, session_id)`. The sender emits only a session pointer
+  plus intent and origin identity; the receiver refreshes the configured
+  workspace `cloud` source and returns bounded prompts, normalized events, tool
+  calls, and file edits with independent continuation cursors. The installable
+  Agent Relay auto-resume skill lives under `skills/agent-relay-handoff`.
+
 - Markers reach the SDK, MCP and both CLIs. `getSessionMarkersPage(source,
   sessionId, {limit, after})`, the `sessionMarkers()` iterator and
   `getSessionMarkers()` read one source's session on the evidence keyset

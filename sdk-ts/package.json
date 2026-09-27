@@ -62,6 +62,7 @@
     "dist/pagination.*",
     "dist/git.*",
     "dist/operations.*",
+    "dist/handoff.*",
     "dist/source-contracts.*",
     "dist/source-plugins.*",
     "!dist/*.test.*"
