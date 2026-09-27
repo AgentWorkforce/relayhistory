@@ -31,6 +31,7 @@ import { discoverSourcePlugins } from './source-plugins.js';
 
 export const HANDOFF_CONTRACT_VERSION = 1;
 export const MAX_HANDOFF_INTENT_CHARS = 4000;
+const HANDOFF_DISCOVERY_ATTEMPTS = 2;
 
 /** The exact pointer carried in a Relaycast delivery whose metadata kind is `handoff`. */
 export interface HandoffPointer {
@@ -266,22 +267,41 @@ export async function resumeHandoff(
       // observation may belong to the account that was authenticated before a
       // workspace switch, and hydrateSession otherwise reuses it without
       // rediscovery.
-      const refresh = await discoverSourcePlugins(options.plugins, {
-        dbPath: options.dbPath,
-        sourceConnectors,
-        sources: [source],
-        sessionId,
-        acquisitionTimeoutMs: options.acquisitionTimeoutMs,
-      });
-      if (!refresh.some((run) => run.observations.some(
-        (observation) => observation.source === source && observation.session_id === sessionId,
-      ))) {
-        // A targeted empty discovery does not retract an older observation in
-        // the native catalog. Fail before hydrateSession can reuse that stale
-        // row from the previously authenticated workspace.
-        throw new SessionNotFoundError(
-          'Source session was not found in the authenticated workspace',
-          'SESSION_NOT_FOUND',
+      let refreshed = false;
+      let discoveryFailure: RelayHistoryError | undefined;
+      for (let attempt = 0; attempt < HANDOFF_DISCOVERY_ATTEMPTS; attempt += 1) {
+        let attemptFailure: RelayHistoryError | undefined;
+        const refresh = await discoverSourcePlugins(options.plugins, {
+          dbPath: options.dbPath,
+          sourceConnectors,
+          sources: [source],
+          sessionId,
+          acquisitionTimeoutMs: options.acquisitionTimeoutMs,
+          onUnavailable: (_connector, error) => { attemptFailure ??= error; },
+        });
+        refreshed = refresh.some((run) => run.observations.some(
+          (observation) => observation.source === source && observation.session_id === sessionId,
+        ));
+        if (refreshed) break;
+        if (!attemptFailure) {
+          // A complete targeted refresh is authoritative. It also prevents
+          // hydrateSession from reusing an observation cached for an older
+          // authenticated workspace.
+          throw new SessionNotFoundError(
+            'Source session was not found in the authenticated workspace',
+            'SESSION_NOT_FOUND',
+          );
+        }
+        discoveryFailure = attemptFailure;
+      }
+      if (!refreshed) {
+        // A partial refresh cannot prove either presence or absence. Do not
+        // fall back to cached authorization from a connector that failed;
+        // surface a retryable acquisition error instead.
+        throw new RelayHistoryError(
+          'The authenticated workspace could not be checked for the handoff session',
+          'HANDOFF_SOURCE_UNAVAILABLE',
+          { cause: discoveryFailure },
         );
       }
     }
