@@ -122,6 +122,16 @@ test('export rejects aliases through symlinked parents before creating a new dat
   });
 });
 
+test('an expired export snapshot is released when its cursor returns', async () => {
+  await fixture(async dbPath => {
+    const snapshot = await beginHistoryExport(selection, { dbPath });
+    const page = (now_ms: number) => nativeCall(native => native.historyExport(
+      JSON.stringify({ operation: 'export_page', cursor: snapshot.cursor, now_ms }), dbPath));
+    await assert.rejects(page(snapshot.expires_at_ms), /export snapshot expired/);
+    await assert.rejects(page(snapshot.expires_at_ms), /export cursor not found/);
+  });
+});
+
 test('native export accepts the full decoded selection budget and bounds the wire envelope separately', async () => {
   await fixture(async dbPath => {
     const large: HistoryExportSelection = { ...selection, sources: [], sessions: [{ source: 'claude', session_id: '' }] };

@@ -1300,14 +1300,11 @@ How each adapter works:
   prompt, which is untrue and also undeletable, since the only session that
   could clean it up is the one that no longer evidences it.
 
-  **Markers are delivered like any other evidence.** `session_markers` is in
-  `delivery::schema::TABLES`, so durable delivery bootstraps and journals it
-  and an export of a Grok session carries its compaction boundaries alongside
-  its events. The entry is **appended** to that list and must stay last:
-  `delivery_jobs.bootstrap_kind` is a persisted index into it, so inserting a
-  row anywhere else silently re-points every in-flight job's bootstrap cursor
-  at a different table. The delivery kind is `session_marker`, in
-  `SUPPORTED_KINDS` and in the TypeScript `HistoryEvidenceKind`.
+  **Markers are exported like any other evidence.** `session_markers` is a
+  change-feed kind and an export kind, so the feed and a local export of a
+  Grok session carry its compaction boundaries alongside its events. The kind
+  is `session_marker`, in `SUPPORTED_KINDS` and in the TypeScript
+  `HistoryEvidenceKind`.
 
   **One rule decides what a JSONL row is, in `ingest::jsonl`.** Two passes read
   the same files — the parse, which turns rows into evidence, and the count,

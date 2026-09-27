@@ -65,7 +65,7 @@ jobs:
       # `test`, not `build`: it compiles everything `build` did and then runs
       # what only exists in this configuration. Two whole classes of test are
       # invisible to the `--all-features` run above -- the `#[cfg(not(feature
-      # = "delivery"))]` ones, and the integration tests that exercise the
+      # = "export"))]` ones, and the integration tests that exercise the
       # public surface an embedder actually gets, where `unstable-internal`
       # is not there to re-export the internals. Both were passing locally
       # and gated by nothing.
