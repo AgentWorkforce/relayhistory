@@ -11043,17 +11043,9 @@ fn link_muse_subagents(
             .model
             .clone()
             .or_else(|| child.metadata.model_id.clone());
-        // Rebuilt, not merged: `record_relationship` keeps an optional field
-        // the new observation leaves empty, so a label, model or task the
-        // parent no longer records would otherwise stay on the edge. This one
-        // child's edge is replaced in place, in the same transaction, so it is
-        // never missing in between.
-        conn.execute(
-            "DELETE FROM session_relationships WHERE source = 'muse' \
-             AND parent_session_id = ? AND child_session_id = ? \
-             AND evidence_kind = 'muse_subagent_log'",
-            params![parent_id, child_id],
-        )?;
+        let spawned_at_ms = (linked_at > 0)
+            .then_some(linked_at)
+            .or_else(|| child.first_ts());
         record_relationship(
             conn,
             &ObservedRelationship {
@@ -11068,11 +11060,32 @@ fn link_muse_subagents(
                 evidence_locator: Some(&locator),
                 evidence_ref: link.task_id.as_deref(),
                 child_has_events: session_events_exist(conn, "muse", &child_id)?,
-                spawned_at_ms: (linked_at > 0)
-                    .then_some(linked_at)
-                    .or_else(|| child.first_ts()),
+                spawned_at_ms,
                 ..ObservedRelationship::default()
             },
+        )?;
+        // The upsert keeps an optional field the new observation leaves empty,
+        // so a label, model or task the parent no longer records would stay
+        // on the edge. What the parent's record owns is assigned from it,
+        // empty values included; the edge itself — and its first-seen
+        // `created_ms` — stays in place.
+        conn.execute(
+            "UPDATE session_relationships SET child_agent_type = ?, child_agent_name = ?, \
+               child_model = ?, evidence_ref = ?, evidence_locator = ?, spawn_depth = ?, \
+               spawned_at_ms = ? \
+             WHERE source = 'muse' AND parent_session_id = ? AND child_session_id = ? \
+               AND evidence_kind = 'muse_subagent_log'",
+            params![
+                link.role.as_deref(),
+                link.label.as_deref(),
+                child_model.as_deref(),
+                link.task_id.as_deref(),
+                locator,
+                depth,
+                spawned_at_ms,
+                parent_id,
+                child_id,
+            ],
         )?;
         outcome.relationships += 1;
     }
@@ -15663,8 +15676,9 @@ mod tests {
         assert_eq!(status("call_edit"), Some(0), "completed without a result");
     }
 
-    /// An edge is rebuilt from what the parent records now: a label the
-    /// parent no longer gives its child does not linger on the delegation.
+    /// An edge reflects what the parent records now — a label the parent no
+    /// longer gives its child does not linger — while keeping the time it
+    /// was first observed.
     #[test]
     fn a_muse_delegation_drops_details_the_parent_no_longer_records() {
         let home = tempfile::tempdir().unwrap();
@@ -15686,9 +15700,25 @@ mod tests {
         let rewritten = fs::read_to_string(&transcript)
             .unwrap()
             .replace("\"label\": \"reviewer\", ", "");
+        let created = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT created_ms FROM session_relationships \
+                 WHERE source = 'muse' AND child_session_id = ?",
+                [MUSE_WORKER],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let first_seen = created(&conn);
+        std::thread::sleep(std::time::Duration::from_millis(5));
         fs::write(&transcript, rewritten).unwrap();
         super::sync_muse(&conn, &mut state, &root).unwrap();
         assert_eq!(label(&conn), None);
+        assert_eq!(
+            created(&conn),
+            first_seen,
+            "the edge keeps the time it was first observed"
+        );
     }
 
     /// A child log that names no session yet — Muse is still writing its
