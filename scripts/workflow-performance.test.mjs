@@ -33,14 +33,14 @@ test("plugin packaging overlaps core publication", () => {
   assert.match(packaging, /name: plugin-packages/);
 });
 
-test("plugin families publish in parallel and verify afterwards", () => {
+test("plugins publish from a matrix and verify afterwards", () => {
   const plugins = jobBlock(publish, "plugins", "verify-plugins");
-  assert.match(plugins, /plugin: \[relayhistory, provider-sources\]/);
+  assert.match(plugins, /plugin: \[provider-sources\]/);
   assert.match(plugins, /name: plugin-packages/);
   assert.match(plugins, /verify-published-history-core\.mjs "\$PLUGIN"/);
   assert.doesNotMatch(plugins, /verify-published-plugins\.mjs/);
 
-  const verification = jobBlock(publish, "verify-plugins", "probe");
+  const verification = jobBlock(publish, "verify-plugins");
   assert.match(verification, /needs: \[version, publish, plugins\]/);
   assert.match(verification, /verify-published-plugins\.mjs "\$VERSION"/);
 });
