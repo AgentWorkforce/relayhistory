@@ -10974,19 +10974,21 @@ fn link_muse_subagents(
 ) -> Result<()> {
     let parent_id = parent.metadata.session_id.as_str();
     // Replaced, not merged: a child whose log is gone is no longer evidenced.
-    let previous = muse_linked_children(conn, parent_id)?;
+    // The edges are upserted as the children are linked and only the ones
+    // left over are retired afterwards, so a child whose log is still there
+    // is never dropped in between.
+    let previous = muse_child_locators(conn, parent_id)?;
     let mut linked = HashSet::new();
-    conn.execute(
-        "DELETE FROM session_relationships WHERE source = 'muse' \
-         AND parent_session_id = ? AND evidence_kind = 'muse_subagent_log'",
-        params![parent_id],
-    )?;
+    let mut unidentified_logs = HashSet::new();
     let links = muse::subagent_links(parent);
     for entry in children {
         check_capture_cancelled()?;
         let log = &entry.path;
         let Some(child) = entry.transcript.as_ref() else {
+            // A log that names no session yet — Muse is still writing its
+            // header — is not a log that is gone.
             outcome.unidentified_children += 1;
+            unidentified_logs.insert(log.to_string_lossy().to_string());
             continue;
         };
         let child_id = child.metadata.session_id.clone();
@@ -11051,10 +11053,42 @@ fn link_muse_subagents(
         )?;
         outcome.relationships += 1;
     }
-    for gone in previous.difference(&linked) {
-        forget_muse_subagent(conn, gone)?;
+    for (child, locator) in &previous {
+        if linked.contains(child) {
+            continue;
+        }
+        // Still on disk, just not identifiable yet: keep what it had.
+        if locator
+            .as_deref()
+            .is_some_and(|locator| unidentified_logs.contains(locator))
+        {
+            continue;
+        }
+        conn.execute(
+            "DELETE FROM session_relationships WHERE source = 'muse' \
+             AND parent_session_id = ? AND child_session_id = ? \
+             AND evidence_kind = 'muse_subagent_log'",
+            params![parent_id, child],
+        )?;
+        forget_muse_subagent(conn, child)?;
     }
     Ok(())
+}
+
+/// The children a parent's subagent logs linked on the last read, with the
+/// log each was read from.
+fn muse_child_locators(
+    conn: &Connection,
+    parent_id: &str,
+) -> Result<HashMap<String, Option<String>>> {
+    Ok(conn
+        .prepare(
+            "SELECT child_session_id, evidence_locator FROM session_relationships \
+             WHERE source = 'muse' AND parent_session_id = ? \
+               AND evidence_kind = 'muse_subagent_log' AND child_session_id IS NOT NULL",
+        )?
+        .query_map(params![parent_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?)
 }
 
 /// The children a parent's subagent logs linked on the last read.
@@ -11227,14 +11261,19 @@ pub(crate) fn ingest_muse_session(
     };
     let outcomes = muse::tool_outcomes(transcript);
     let tool_names = muse::tool_names(transcript);
-    let (step_owners, orphan_steps) = muse::pair_model_steps(transcript);
-    outcome.unattached_usage = orphan_steps;
-    // The step a record owns, or none: usage, model and finish reason belong
-    // to that one record, never to its neighbours.
+    let steps = muse::pair_model_steps(transcript);
+    outcome.unattached_usage = steps.orphans;
+    // The step a record belongs to: its model and finish reason are every one
+    // of its records', and its usage is its first record's alone, never a
+    // neighbour's.
     let step_of = |index: usize| {
-        step_owners
-            .get(&index)
-            .map(|step| MuseStep::of(transcript, *step))
+        steps.members.get(&index).map(|step| {
+            let mut step_facts = MuseStep::of(transcript, *step);
+            if !steps.owners.contains_key(&index) {
+                step_facts.token_json = None;
+            }
+            step_facts
+        })
     };
     // The model a record ran under when its own step does not name one.
     let mut model = transcript.metadata.model_id.clone();
@@ -11336,7 +11375,10 @@ pub(crate) fn ingest_muse_session(
                         RequestIdentity::none(),
                         &record_uid,
                         None,
-                        facts,
+                        RawMessageFacts {
+                            stop_reason: step.as_ref().and_then(|step| step.finish_reason),
+                            ..facts
+                        },
                     )?;
                     outcome.events += 1;
                 }
@@ -15501,6 +15543,74 @@ mod tests {
             muse_session_count(&conn, "session_events", MUSE_WORKER),
             worker_events
         );
+    }
+
+    /// A child log that names no session yet — Muse is still writing its
+    /// header — is not a child that is gone: its evidence and edge stay, and
+    /// it is linked again once it can be read.
+    #[test]
+    fn an_unidentified_muse_child_log_keeps_its_evidence() {
+        const REMINDER: &str = "muse-e001";
+        let home = tempfile::tempdir().unwrap();
+        let (root, transcript) = muse_fixture(home.path());
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        let reminder_events = muse_session_count(&conn, "session_events", REMINDER);
+        assert!(reminder_events > 0);
+
+        let log = transcript
+            .parent()
+            .unwrap()
+            .join(format!("subagent/{REMINDER}/session.jsonl"));
+        let complete = fs::read_to_string(&log).unwrap();
+        // Mid-write: the header record is not finished.
+        fs::write(&log, &complete[..complete.find('\n').unwrap() / 2]).unwrap();
+        append_muse_record(&transcript, MUSE_PARENT, "parent-late", "More.");
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        assert_eq!(
+            muse_session_count(&conn, "session_events", REMINDER),
+            reminder_events
+        );
+        assert_eq!(muse_count(&conn, "session_relationships"), 3);
+
+        fs::write(&log, &complete).unwrap();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        assert_eq!(
+            muse_session_count(&conn, "session_events", REMINDER),
+            reminder_events
+        );
+        assert_eq!(muse_count(&conn, "session_relationships"), 3);
+    }
+
+    /// Every record of a model step shares its model and finish reason; only
+    /// its usage is the first record's alone. A step that thinks before it
+    /// calls tools keeps `finish_reason` on the thinking row and on the calls.
+    #[test]
+    fn every_record_of_a_muse_step_carries_its_finish_reason() {
+        let home = tempfile::tempdir().unwrap();
+        let (root, _) = muse_fixture(home.path());
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        let row = |uid: &str| -> (Option<String>, Option<String>) {
+            conn.query_row(
+                "SELECT stop_reason, token_json FROM session_events \
+                 WHERE source = 'muse' AND session_id = ? AND event_uid = ?",
+                params![MUSE_PARENT, uid],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        let (thinking_stop, thinking_usage) = row("a001-rec-006");
+        assert_eq!(thinking_stop.as_deref(), Some("tool_calls"));
+        assert!(
+            thinking_usage.is_some(),
+            "the step's first record owns its usage"
+        );
+        let (call_stop, call_usage) = row("tool:call_read");
+        assert_eq!(call_stop.as_deref(), Some("tool_calls"));
+        assert!(call_usage.is_none(), "…and only the first");
     }
 
     /// A subagent log that is there but cannot be read is not a log that is

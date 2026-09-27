@@ -2102,7 +2102,15 @@ impl ShallowSessionProvider for MuseProvider {
     fn fingerprint_inputs(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
         let mut files = Vec::new();
         for transcript in crate::collect_muse_transcripts(&env.muse_sessions)? {
-            files.extend(crate::muse_session_files(&transcript)?);
+            match crate::muse_session_files(&transcript) {
+                Ok(tree) => files.extend(tree),
+                Err(error) if error.is::<crate::CaptureCancelled>() => return Err(error),
+                // One session's child log that cannot be statted must not fail
+                // the whole fold. Its transcript still counts; the sweep reads
+                // that session, fails it alone, and — having left a source
+                // unread — does not cache this fingerprint, so it is retried.
+                Err(_) => files.push(transcript),
+            }
         }
         file_candidates("muse", files, crate::file_stamp_and_modified)
     }

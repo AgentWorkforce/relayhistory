@@ -497,13 +497,11 @@ pub(crate) fn parse_transcript(contents: &str) -> Option<MuseTranscript> {
 /// record of its own to carry it, and is counted rather than attached to a
 /// neighbour.
 ///
-/// Returns `(owners, orphans)`: `owners` maps an assistant record's index to
-/// its step's `model_completed` index, and `orphans` counts steps that
-/// reported usage but committed no assistant record to carry it.
-pub(crate) fn pair_model_steps(transcript: &MuseTranscript) -> (HashMap<usize, usize>, usize) {
+/// Indexes are into `transcript.records`.
+pub(crate) fn pair_model_steps(transcript: &MuseTranscript) -> ModelSteps {
     #[derive(Default)]
     struct Segment {
-        first_commit: Option<usize>,
+        commits: Vec<usize>,
         steps: Vec<usize>,
     }
     let has_usage = |index: usize| {
@@ -512,8 +510,7 @@ pub(crate) fn pair_model_steps(transcript: &MuseTranscript) -> (HashMap<usize, u
             MuseEvent::ModelCompleted { usage: Some(_), .. }
         )
     };
-    let mut owners = HashMap::new();
-    let mut orphans = 0;
+    let mut paired = ModelSteps::default();
     let mut close = |segment: Segment| {
         let owner = segment
             .steps
@@ -521,17 +518,20 @@ pub(crate) fn pair_model_steps(transcript: &MuseTranscript) -> (HashMap<usize, u
             .copied()
             .find(|step| has_usage(*step))
             .or_else(|| segment.steps.first().copied());
-        match (segment.first_commit, owner) {
+        match (segment.commits.first().copied(), owner) {
             (Some(commit), Some(step)) => {
-                owners.insert(commit, step);
-                orphans += segment
+                paired.owners.insert(commit, step);
+                for member in &segment.commits {
+                    paired.members.insert(*member, step);
+                }
+                paired.orphans += segment
                     .steps
                     .iter()
                     .filter(|other| **other != step && has_usage(**other))
                     .count();
             }
             _ => {
-                orphans += segment
+                paired.orphans += segment
                     .steps
                     .iter()
                     .filter(|step| has_usage(**step))
@@ -546,10 +546,7 @@ pub(crate) fn pair_model_steps(transcript: &MuseTranscript) -> (HashMap<usize, u
             MuseEvent::AssistantText { .. }
             | MuseEvent::ToolCalls { .. }
             | MuseEvent::Reasoning { text: Some(_), .. } => {
-                runs.entry(run)
-                    .or_default()
-                    .first_commit
-                    .get_or_insert(index);
+                runs.entry(run).or_default().commits.push(index);
             }
             MuseEvent::ModelCompleted { .. } => runs.entry(run).or_default().steps.push(index),
             MuseEvent::Prompt { .. }
@@ -565,7 +562,22 @@ pub(crate) fn pair_model_steps(transcript: &MuseTranscript) -> (HashMap<usize, u
     for (_, segment) in runs.drain() {
         close(segment);
     }
-    (owners, orphans)
+    paired
+}
+
+/// How [`pair_model_steps`] assigned each model step.
+#[derive(Debug, Default)]
+pub(crate) struct ModelSteps {
+    /// The one assistant record that carries each step's usage, mapped to
+    /// that step's `model_completed`.
+    pub owners: HashMap<usize, usize>,
+    /// Every assistant record of a step — its owner and the rest (reasoning
+    /// before tool calls) — mapped to the step's `model_completed`, whose
+    /// model and `finish_reason` all of them share.
+    pub members: HashMap<usize, usize>,
+    /// Steps that reported usage but committed no assistant record to carry
+    /// it.
+    pub orphans: usize,
 }
 
 /// Every call's tool name, by call id.
@@ -863,7 +875,8 @@ mod tests {
         .join("\n")
             + "\n";
         let transcript = parse_transcript(&contents).unwrap();
-        let (owners, orphans) = pair_model_steps(&transcript);
+        let steps = pair_model_steps(&transcript);
+        let (owners, orphans) = (&steps.owners, steps.orphans);
         // Record indexes: 0 prompt, 1 usage, 2 reasoning, 3 calls, 4 results,
         // 5 usage, 6 calls, 7 results, 8 reply, 9 usage, 10 usage, 11 terminal.
         assert_eq!(
@@ -872,6 +885,11 @@ mod tests {
             "step 1 is owned by its first commit"
         );
         assert_eq!(owners.get(&3), None, "the rest of step 1 owns nothing");
+        assert_eq!(
+            steps.members.get(&3),
+            Some(&1),
+            "…but still belongs to step 1, whose model and finish reason it shares"
+        );
         assert_eq!(owners.get(&6), Some(&5));
         assert_eq!(owners.get(&8), Some(&9));
         assert_eq!(owners.len(), 3);
