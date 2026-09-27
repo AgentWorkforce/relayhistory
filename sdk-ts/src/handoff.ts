@@ -33,6 +33,14 @@ export const HANDOFF_CONTRACT_VERSION = 1;
 export const MAX_HANDOFF_INTENT_CHARS = 4000;
 const HANDOFF_DISCOVERY_ATTEMPTS = 2;
 
+function continuationIntent(
+  source: CatalogSource,
+  sessionId: string,
+  originalIntent: string,
+): string {
+  return `Resume this handoff: call resume_handoff(source=${source}, session_id=${sessionId}) via the ai-hist MCP, then continue: ${originalIntent}`;
+}
+
 /** The exact pointer carried in a Relaycast delivery whose metadata kind is `handoff`. */
 export interface HandoffPointer {
   source: CatalogSource;
@@ -211,10 +219,20 @@ export async function createHandoff(
       'CURRENT_SESSION_NOT_FOUND',
     );
   }
+  const intentWithResumeInstruction = continuationIntent(
+    session.source,
+    session.sessionId,
+    normalizedIntent,
+  );
+  if (Array.from(intentWithResumeInstruction).length > MAX_HANDOFF_INTENT_CHARS)
+    throw new InvalidArgumentError(
+      `handoff intent including its resume instruction must not exceed ${MAX_HANDOFF_INTENT_CHARS} characters`,
+      'INVALID_ARGUMENT',
+    );
   return {
     source: session.source,
     session_id: session.sessionId,
-    intent: normalizedIntent,
+    intent: intentWithResumeInstruction,
     origin_agent:
       nonempty(env.AI_HIST_ORIGIN_AGENT) ??
       nonempty(env.AGENT_RELAY_AGENT_NAME) ??
@@ -292,6 +310,8 @@ export async function resumeHandoff(
             'SESSION_NOT_FOUND',
           );
         }
+        if (!['CONNECTOR_FAILURE', 'SOURCE_ACQUISITION_TIMEOUT'].includes(attemptFailure.code))
+          throw attemptFailure;
         discoveryFailure = attemptFailure;
       }
       if (!refreshed) {
