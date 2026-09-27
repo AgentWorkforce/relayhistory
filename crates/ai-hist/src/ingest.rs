@@ -11284,6 +11284,8 @@ pub(crate) fn ingest_muse_session(
     };
     let outcomes = muse::tool_outcomes(transcript);
     let tool_names = muse::tool_names(transcript);
+    // Calls whose result this transcript recorded.
+    let mut answered: HashSet<String> = HashSet::new();
     let steps = muse::pair_model_steps(transcript);
     outcome.unattached_usage = steps.orphans;
     // The step a record belongs to: its model and finish reason are every one
@@ -11559,6 +11561,7 @@ pub(crate) fn ingest_muse_session(
             }
             muse::MuseEvent::ToolResults { results: batch } => {
                 for result in batch {
+                    answered.insert(result.call_id.clone());
                     let text = result.text.as_deref();
                     let mut result_facts = tool_result_facts::muse_tool_result_facts(
                         text,
@@ -11694,6 +11697,21 @@ pub(crate) fn ingest_muse_session(
             // Read by `link_muse_subagents`, which owns the edges.
             muse::MuseEvent::SubagentLinked(_) => {}
         }
+    }
+    // A call can end without a result record — cancelled, or failed before
+    // producing output. Its outcome is still Muse's word on how it ended, so
+    // it sets the call's status; a call that has a result was settled above,
+    // where the result's own evidence (a `bash` exit code) is weighed too.
+    for (call_id, (status, _)) in &outcomes {
+        if answered.contains(*call_id) {
+            continue;
+        }
+        let failed = match *status {
+            "completed" => false,
+            "failed" | "cancelled" | "canceled" | "skipped" => true,
+            _ => continue,
+        };
+        set_tool_call_error(conn, SOURCE, sid, call_id, failed)?;
     }
 
     let first_ts = transcript.first_ts().unwrap_or_default();
@@ -15605,6 +15623,44 @@ mod tests {
         super::sync_muse(&conn, &mut state, &root).unwrap();
         assert_eq!(muse_session_count(&conn, "session_events", "escaped"), 0);
         assert_eq!(muse_count(&conn, "session_relationships"), 3);
+    }
+
+    /// A call that failed or was cancelled before any result was recorded
+    /// still takes its status from Muse's recorded outcome.
+    #[test]
+    fn a_muse_call_that_ended_without_a_result_keeps_its_outcome() {
+        let home = tempfile::tempdir().unwrap();
+        let (root, transcript) = muse_fixture(home.path());
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        // Drop the result record that answered the four calls of step 2,
+        // keeping their `tool_batch.effect.terminal` outcomes; make the
+        // write call's outcome a cancellation.
+        let rewritten: String = fs::read_to_string(&transcript)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.contains("\"batch_id\": \"msg-2\""))
+            .map(|line| {
+                if line.contains("\"call_id\": \"call_write\"") && line.contains("tool_batch") {
+                    line.replace("\"kind\": \"completed\"", "\"kind\": \"cancelled\"")
+                } else {
+                    line.to_string()
+                }
+            })
+            .map(|line| format!("{line}\n"))
+            .collect();
+        fs::write(&transcript, rewritten).unwrap();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        let status = |call: &str| -> Option<i64> {
+            conn.query_row(
+                "SELECT is_error FROM tool_calls WHERE source = 'muse' AND tool_use_id = ?",
+                [call],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(status("call_write"), Some(1), "cancelled without a result");
+        assert_eq!(status("call_edit"), Some(0), "completed without a result");
     }
 
     /// An edge is rebuilt from what the parent records now: a label the
