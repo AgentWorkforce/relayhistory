@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add `createHandoff()` / `resumeHandoff()` and their default MCP tools. Handoff
+  pointers carry only session identity, intent, and origin identity; resume
+  performs same-workspace acquisition and composes bounded prompt, event,
+  tool-call, and file-edit pages with independent continuation cursors.
+
 - Add the `./relay-cli` subpath export: `createRelayCliSurface()` returns a
   `RelayCliSurface` (contract v1, id `relayhistory`) that a host such as
   `agent-relay sessions` mounts. Its command tree and its dispatch are both

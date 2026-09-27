@@ -6,6 +6,7 @@ import {
   HistoryDeliveryError,
   InvalidArgumentError,
   RelayHistoryError,
+  SessionNotFoundError,
   type DeliveryAcknowledgment,
   type DeliveryFailure,
   type HistoryDestination,
@@ -324,26 +325,27 @@ export function canonicalDeliveredEvidence(
   return [...selected.values()];
 }
 export function relayHistorySource(options: RelayHistoryPluginOptions = {}): HistorySource {
-  const pinned = () => {
-    if (!options.expectedAccount)
-      throw new InvalidArgumentError(
-        'Configure expectedAccount before acquiring cloud history',
-        'INVALID_ARGUMENT',
-      );
-    return options.expectedAccount;
-  };
+  const dynamicAccount = !options.expectedAccount;
+  const accountLocator = (account: string) =>
+    `relayhistory-account:${createHash('sha256').update(account).digest('hex')}`;
+  // When an account is not pinned explicitly, derive it from the authenticated
+  // workspace for each acquisition. The server still authorizes the read; this
+  // value only prevents evidence from another workspace being combined locally.
+  const pinned = () => options.expectedAccount
+    ? Promise.resolve(options.expectedAccount)
+    : deliveryAccount(options);
   const instanceId =
     relayHistoryInstance(options) +
     (options.expectedAccount
       ? ':' + createHash('sha256').update(options.expectedAccount).digest('hex').slice(0, 16)
-      : '');
+      : ':workspace-auth-v1');
   return {
     id: 'cloud',
     instanceId,
     location: 'remote',
     supportedSources: CATALOG_SOURCES,
     discover: async (query) => {
-      const expectedAccount = pinned();
+      const expectedAccount = await pinned();
       const sessions = new Map<
         string,
         {
@@ -411,15 +413,27 @@ export function relayHistorySource(options: RelayHistoryPluginOptions = {}): His
           .slice(0, query.limit)
           .map(({ revisions, ...row }) => ({
             ...row,
-            source_stamp: createHash('sha256').update(revisions.sort().join('\n')).digest('hex'),
+            ...(dynamicAccount ? { raw_locator: accountLocator(expectedAccount) } : {}),
+            source_stamp: createHash('sha256')
+              .update([expectedAccount, ...revisions.sort()].join('\n'))
+              .digest('hex'),
           })),
       };
     },
     hydrate: async (observation, context) => {
       const rows: HistoryExportRecord[] = [];
+      const expectedAccount = await pinned();
+      if (
+        dynamicAccount &&
+        observation.raw_locator !== accountLocator(expectedAccount)
+      )
+        throw new SessionNotFoundError(
+          'Session observation belongs to another authenticated workspace',
+          'SESSION_NOT_FOUND',
+        );
       for await (const row of deliveredHistory(
         {
-          expectedAccount: pinned(),
+          expectedAccount,
           source: observation.key.source,
           sessionId: observation.key.session_id,
           includeDeleted: true,
@@ -427,6 +441,11 @@ export function relayHistorySource(options: RelayHistoryPluginOptions = {}): His
         { ...options, signal: context.signal, timeoutMs: context.acquisitionTimeoutMs ?? options.timeoutMs },
       ))
         rows.push(row);
+      if (!rows.length)
+        throw new SessionNotFoundError(
+          'Session is not available in the authenticated workspace',
+          'SESSION_NOT_FOUND',
+        );
       const allowed = [
         'history',
         'session_event',
@@ -452,11 +471,11 @@ export function relayHistorySource(options: RelayHistoryPluginOptions = {}): His
       return {
         source_stamp: createHash('sha256')
           .update(
-            rows
+            [expectedAccount, ...rows
               .map((row) =>
                 JSON.stringify([row.origin_id, row.record_id, row.revision_id, row.operation]),
               )
-              .sort()
+              .sort()]
               .join('\n'),
           )
           .digest('hex'),

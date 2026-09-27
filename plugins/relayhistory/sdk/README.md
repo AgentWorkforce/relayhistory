@@ -32,7 +32,7 @@ functions stay in `ai-hist`.
 Create an explicit plugin config, located beside the application's node_modules:
 
 ```json
-{"plugins":[{"module":"@relayhistory/capture","options":{"baseUrl":"https://history.agentrelay.com","instanceId":"personal"}}]}
+{"plugins":[{"module":"@relayhistory/capture"}]}
 ```
 
 Create a selection file before enabling delivery:
@@ -67,8 +67,10 @@ transaction and fences older revisions. No legacy `/ingest` fallback exists.
 Durable acceptance does not promise search indexing. Inspect status for blocked
 jobs, pending bytes and last acknowledgment; fix auth/config then retry explicitly.
 
-`deliveryAccount({baseUrl})` resolves the account label. Pin that result as
-`expectedAccount` in plugin options before cloud source acquisition. Remote
+`deliveryAccount({baseUrl})` resolves the account label. Cloud source acquisition
+derives that label from the authenticated organization/workspace when
+`expectedAccount` is omitted; set `expectedAccount` to retain a static deployment
+pin. Remote
 acquisition is selected with `--source-connector cloud --config history.json`.
 The source adapter uses a fresh complete live readback traversal per acquisition;
 cursors are not incremental checkpoints. Normalized evidence enters the local

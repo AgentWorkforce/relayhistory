@@ -8,7 +8,8 @@ import { z } from 'zod';
 import {
   discoverSessions, getSession, getSessionEventsPage, getSessionFileEditsPage,
   getSessionRelationships, getSessionToolCallsPage, getSessionTree, hydrateSession,
-  listSessionCatalogPage, recent, search, stats, sync,
+  listSessionCatalogPage, recent, search, stats, sync, createHandoff, resumeHandoff,
+  MAX_HANDOFF_INTENT_CHARS,
   historyDeliveryStatus, historyDeliveryRetention, controlHistoryDelivery,
 } from './index.js';
 
@@ -19,6 +20,7 @@ const READ = { readOnlyHint: true, idempotentHint: true, openWorldHint: false } 
 // Acquisition can reach provider services when a remote scope is requested
 // (claude.ai/code web sessions, Codex cloud tasks), so it is open-world.
 const ACQUIRE = { readOnlyHint: false, idempotentHint: true, openWorldHint: true } as const;
+const LOCAL_ACQUIRE = { readOnlyHint: false, idempotentHint: true, openWorldHint: false } as const;
 const SOURCE = z.enum(['claude', 'codex', 'cursor', 'grok', 'relay', 'trajectory', 'opencode']);
 const CATALOG_SOURCE = z.enum(['claude', 'codex', 'cursor', 'grok', 'relay', 'opencode']);
 const SESSION_SCOPE = z.enum(['local', 'remote', 'all']);
@@ -124,6 +126,39 @@ server.tool('get_session_file_edits', 'Get one bounded page of recorded file edi
   limit: z.number().int().min(1).max(1000).optional().default(200),
   after: EVIDENCE_CURSOR.optional(),
 }, READ, ({ source, session_id, limit, after }) => call(() => getSessionFileEditsPage(source, session_id, { limit, after })));
+
+server.tool('create_handoff', 'Create a Relaycast handoff pointer for the caller\'s current session. Send it as metadata kind="handoff"; never inline the transcript.', {
+  intent: z.string().min(1).max(MAX_HANDOFF_INTENT_CHARS),
+}, LOCAL_ACQUIRE, ({ intent }) => call(() => createHandoff(intent)));
+
+const HANDOFF_CURSOR = z.object({
+  prompt: z.object({ timestampMs: z.number().int(), id: z.number().int() }).optional(),
+  events: z.object({ tsMs: z.number().int(), id: z.number().int() }).optional(),
+  tool_calls: EVIDENCE_CURSOR.optional(),
+  file_edits: EVIDENCE_CURSOR.optional(),
+});
+
+server.tool('resume_handoff', 'Auto-resume a same-workspace handoff in one call: acquire the session and compose prompts, normalized events, tool calls, and file edits. Cross-workspace and cross-organization handoffs are rejected.', {
+  source: CATALOG_SOURCE,
+  session_id: z.string().min(1),
+  limit: z.number().int().min(1).max(1000).optional().default(200),
+  cursor: HANDOFF_CURSOR.optional(),
+  acquisition_timeout_ms: z.number().int().min(1).max(3600000).optional(),
+}, ACQUIRE, ({ source, session_id, limit, cursor, acquisition_timeout_ms }) => call(() => resumeHandoff(
+  source,
+  session_id,
+  {
+    limit,
+    cursor: cursor ? {
+      prompt: cursor.prompt,
+      events: cursor.events,
+      toolCalls: cursor.tool_calls,
+      fileEdits: cursor.file_edits,
+    } : undefined,
+    acquisitionTimeoutMs: acquisition_timeout_ms,
+    plugins: configuredSources,
+  },
+)));
 
 server.tool('history_stats', 'Statistics for already-indexed RelayHistory data.', {
   scope: SESSION_SCOPE.optional().default('local'),

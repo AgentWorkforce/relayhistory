@@ -4,6 +4,17 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ## [Unreleased]
 
+- Add agent-initiated live session handoff under the workspace-scoped pointer
+  contract. The default MCP inventory now includes `create_handoff(intent)` and
+  `resume_handoff(source, session_id)`: the sender emits only
+  `{source,session_id,intent,origin_agent,origin_user}`, while the receiver
+  hydrates through configured same-workspace sources and returns bounded prompts,
+  normalized events, tool calls, and file edits with continuation cursors.
+  RelayHistory cloud acquisition now derives the authenticated workspace account
+  when no static account pin is configured, rejects unavailable cross-workspace /
+  cross-organization sessions, and ships an installable Agent Relay auto-resume
+  skill under `skills/agent-relay-handoff`.
+
 - Add `ai-hist resume <query>` (prints the native resume command for the
   best-matching session) and `ai-hist pack <query>` (a compact, token-budgeted
   context block for handing a session to a different agent/tool) to the

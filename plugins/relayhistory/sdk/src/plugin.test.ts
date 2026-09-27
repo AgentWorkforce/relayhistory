@@ -75,7 +75,7 @@ async function fixtureHelper(
   const path = join(dir, 'helper');
   await writeFile(
     path,
-    `#!${process.execPath}\nlet input='';process.stdin.on('data',chunk=>input+=chunk);process.stdin.on('end',()=>{const request=JSON.parse(input);let value;switch(request.operation){case 'deliveryMigrationStatus':value={state:${JSON.stringify(state)},jobs:[]};break;case 'deliveryRead':if(request.args.readOptions.expectedAccount!==${JSON.stringify(account)}){process.stdout.write(JSON.stringify({version:1,ok:false,error:{code:'DELIVERY_PERMISSION_DENIED'}}));return;}value={protocolVersion:1,listing:'live',records:${recordsPath ? `JSON.parse(require('node:fs').readFileSync(${JSON.stringify(recordsPath)},'utf8'))` : JSON.stringify(records)},nextCursor:null};break;case 'deliveryPrepare':case 'deliverySend':{const state=${JSON.stringify(state)};if(state==='active'||(state==='unknown'&&request.args.acknowledgeUninspectedSchedules!==true)){process.stdout.write(JSON.stringify({version:1,ok:false,error:{code:'DELIVERY_PERMISSION_DENIED'}}));return;}if(request.args.expectedAccount&&request.args.batch.account_id!==request.args.expectedAccount){process.stdout.write(JSON.stringify({version:1,ok:false,error:{code:'DELIVERY_PERMISSION_DENIED'}}));return;}if(request.args.instanceId&&request.args.batch.instance_id!==request.args.instanceId){process.stdout.write(JSON.stringify({version:1,ok:false,error:{code:'DELIVERY_MAPPING_VERSION_MISMATCH'}}));return;}process.stdout.write(JSON.stringify({version:1,ok:false,error:{code:'INVALID_ARGUMENT'}}));return;}case 'cloudResolveSession':value={auth:{baseUrl:'https://fixture.invalid',accessToken:'fixture-token',orgId:'org-fixture',workspaceId:'workspace-fixture'}};break;default:process.stdout.write(JSON.stringify({version:1,ok:false,error:{code:'INVALID_ARGUMENT'}}));return;}process.stdout.write(JSON.stringify({version:1,ok:true,value}));});\n`,
+    `#!${process.execPath}\nlet input='';process.stdin.on('data',chunk=>input+=chunk);process.stdin.on('end',()=>{const request=JSON.parse(input);let value;switch(request.operation){case 'deliveryMigrationStatus':value={state:${JSON.stringify(state)},jobs:[]};break;case 'deliveryAccount':value=${JSON.stringify(account)};break;case 'deliveryRead':if(request.args.readOptions.expectedAccount!==${JSON.stringify(account)}){process.stdout.write(JSON.stringify({version:1,ok:false,error:{code:'DELIVERY_PERMISSION_DENIED'}}));return;}value={protocolVersion:1,listing:'live',records:${recordsPath ? `JSON.parse(require('node:fs').readFileSync(${JSON.stringify(recordsPath)},'utf8'))` : JSON.stringify(records)},nextCursor:null};break;case 'deliveryPrepare':case 'deliverySend':{const state=${JSON.stringify(state)};if(state==='active'||(state==='unknown'&&request.args.acknowledgeUninspectedSchedules!==true)){process.stdout.write(JSON.stringify({version:1,ok:false,error:{code:'DELIVERY_PERMISSION_DENIED'}}));return;}if(request.args.expectedAccount&&request.args.batch.account_id!==request.args.expectedAccount){process.stdout.write(JSON.stringify({version:1,ok:false,error:{code:'DELIVERY_PERMISSION_DENIED'}}));return;}if(request.args.instanceId&&request.args.batch.instance_id!==request.args.instanceId){process.stdout.write(JSON.stringify({version:1,ok:false,error:{code:'DELIVERY_MAPPING_VERSION_MISMATCH'}}));return;}process.stdout.write(JSON.stringify({version:1,ok:false,error:{code:'INVALID_ARGUMENT'}}));return;}case 'cloudResolveSession':value={auth:{baseUrl:'https://fixture.invalid',accessToken:'fixture-token',orgId:'org-fixture',workspaceId:'workspace-fixture'}};break;default:process.stdout.write(JSON.stringify({version:1,ok:false,error:{code:'INVALID_ARGUMENT'}}));return;}process.stdout.write(JSON.stringify({version:1,ok:true,value}));});\n`,
   );
   await chmod(path, 0o700);
   return path;
@@ -170,6 +170,37 @@ test('loading and registering optional plugin is inert with unavailable auth hel
     createHistoryPlugin({ binaryPath: '/fixture/never-execute', expectedAccount: account }),
   );
   assert.equal(registry.sourceConnectors(['cloud']).length, 1);
+});
+test('cloud source derives the authenticated workspace account when no manual pin is configured', async (t) => {
+  const binaryPath = await fixtureHelper(t);
+  const source = relayHistorySource({ binaryPath });
+  const discovered = await source.discover({
+    sources: ['claude'],
+    sessionId: 'session-fixture',
+  });
+  assert.equal(discovered.observations.length, 1);
+  assert.match(discovered.observations[0]!.raw_locator ?? '', /^relayhistory-account:/);
+  const observation = {
+    key: {
+      source: 'claude',
+      session_id: 'session-fixture',
+      location: 'remote',
+      connector_id: source.id,
+      connector_instance: source.instanceId,
+    },
+    raw_locator: discovered.observations[0]!.raw_locator ?? null,
+    source_stamp: discovered.observations[0]!.source_stamp ?? null,
+    discovery_state: 'shallow',
+    access_state: 'available',
+    updated_ms: Date.now(),
+  } as const;
+  await assert.rejects(
+    source.hydrate({ ...observation, raw_locator: 'relayhistory-account:other' }, {}),
+    (error: unknown) => error instanceof RelayHistoryError && error.code === 'SESSION_NOT_FOUND',
+  );
+  const snapshot = await source.hydrate(observation, {});
+  assert.deepEqual(snapshot.covered_kinds, ['history', 'session_event', 'tool_call', 'file_edit']);
+  assert.equal(snapshot.records.length, 5);
 });
 test('pending batches cannot follow changed endpoint even when account and user label match', async (t) => {
   const binaryPath = await fixtureHelper(t);

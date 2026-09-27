@@ -6,7 +6,7 @@ import { InvalidArgumentError, RelayHistoryError } from './sdk-common.js';
 import type { HistoryDestination, HistoryPlugin } from './delivery-contracts.js';
 
 const CORE_COMMANDS = ['sessions', 'search', 'recent', 'session', 'events', 'resume', 'pack', 'stats', 'sync', 'export', 'delivery', 'plugin'];
-const CORE_TOOLS = ['search_history', 'recent_history', 'list_sessions', 'discover_sessions', 'hydrate_session', 'get_session', 'get_session_events', 'get_session_relationships', 'get_session_tree', 'get_session_tool_calls', 'get_session_file_edits', 'history_stats', 'sync', 'delivery_status', 'delivery_pause', 'delivery_resume', 'delivery_retry'];
+const CORE_TOOLS = ['search_history', 'recent_history', 'list_sessions', 'discover_sessions', 'hydrate_session', 'get_session', 'get_session_events', 'get_session_relationships', 'get_session_tree', 'get_session_tool_calls', 'get_session_file_edits', 'create_handoff', 'resume_handoff', 'history_stats', 'sync', 'delivery_status', 'delivery_pause', 'delivery_resume', 'delivery_retry'];
 function label(value: string): void {
   if (typeof value !== 'string' || !/^[A-Za-z0-9_.:/@-]{1,200}$/.test(value)) {
     throw new InvalidArgumentError('plugin identifiers must be nonempty non-secret labels', 'INVALID_ARGUMENT');
