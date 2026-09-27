@@ -29,6 +29,8 @@ Use these public operations:
   edits. Both name a session by `source` **and** `sessionId`; provider session
   ids collide, and these pages never merge two providers' records.
 - `sync()` / MCP `sync` for explicit full local ingestion.
+- `createHandoff()` / MCP `create_handoff` and `resumeHandoff()` / MCP
+  `resume_handoff` for workspace-scoped agent handoffs.
 
 Pass `scope` to collection operations when the default local view is not
 enough. The CLI spelling is the mutually exclusive `--local`, `--remote`, and
@@ -60,6 +62,31 @@ and [Architecture](architecture.md) for the process boundary.
 The old cloud push, login, Pair, hook installer, tag, and trajectory convenience
 commands were removed in 1.0. They are not available through subprocess or
 JavaScript fallbacks; see the [migration guide](native-sdk-migration.md).
+
+## Agent handoffs
+
+`create_handoff(intent)` returns a pointer rather than transcript content. Its
+single `intent` field is a complete receiver prompt of this form:
+
+```text
+Resume this handoff: call resume_handoff(source=codex, session_id=abc) via the ai-hist MCP, then continue: continue the fix
+```
+
+Send that exact value as the Agent Relay DM text and the full pointer as
+structured `kind="handoff"` metadata. Do not add a separate message or text
+field: the cloud validator requires the DM text to equal the pointer's
+`intent`. The receiving agent needs only the prompt and the ai-hist MCP; there
+is no handoff skill to install. It calls `resume_handoff` with the embedded
+identity and continues the original request using the returned prompts,
+events, tool calls, and file edits. If a bounded result has `next_cursor`, pass
+that cursor back unchanged for the next page.
+
+Before sending the pointer, call `resume_handoff` once yourself as a readiness
+check. Agent Relay desktop owns team upload, so this proves the current
+workspace can already acquire the session rather than sending a pointer ahead
+of its evidence. Resume refreshes the `cloud` connector under the currently
+authenticated workspace and rejects cross-workspace or cross-organization
+sessions.
 
 ## Live capture
 

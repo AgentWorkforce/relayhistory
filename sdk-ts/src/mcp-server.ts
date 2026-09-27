@@ -135,7 +135,7 @@ server.tool('get_session_file_edits', 'Get one bounded page of recorded file edi
   after: EVIDENCE_CURSOR.optional(),
 }, READ, ({ source, session_id, limit, after }) => call(() => getSessionFileEditsPage(source, session_id, { limit, after })));
 
-server.tool('create_handoff', 'Create a Relaycast handoff pointer for the caller\'s current session. Send it as metadata kind="handoff"; never inline the transcript.', {
+server.tool('create_handoff', 'Create a Relaycast handoff pointer for the caller\'s current session. Its single intent field is a self-describing resume prompt; send that exact intent as the delivery text and the pointer as metadata kind="handoff". Never inline the transcript.', {
   intent: z.string().min(1).max(MAX_HANDOFF_INTENT_CHARS),
 }, LOCAL_ACQUIRE, ({ intent }) => call(() => createHandoff(intent)));
 

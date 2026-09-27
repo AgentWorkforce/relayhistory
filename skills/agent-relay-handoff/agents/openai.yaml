@@ -1,4 +1,0 @@
-interface:
-  display_name: "Agent Relay Handoff"
-  short_description: "Auto-resume same-workspace agent session handoffs"
-  default_prompt: "Handle an incoming Agent Relay handoff."
