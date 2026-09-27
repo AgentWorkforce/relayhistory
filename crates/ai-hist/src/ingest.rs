@@ -10794,32 +10794,24 @@ pub(crate) fn muse_session_files(transcript: &Path) -> Result<Vec<PathBuf>> {
 
 /// The `subagent/<id>/session.jsonl` logs under one session directory, and
 /// theirs in turn.
+///
+/// No depth limit is needed, and none is imposed — a limit would silently drop
+/// the logs beneath it. [`direct_muse_child_logs`] accepts a child only where
+/// it resolves beneath the session's *real* directory plus a literal
+/// `subagent/` component, so each level is strictly deeper in the real
+/// filesystem than the one before and adds at least `/subagent/<id>` to its
+/// path; the operating system's own path-length limit therefore bounds every
+/// walk, symlinks and all.
 fn collect_muse_child_logs(session_dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    collect_muse_child_logs_at(session_dir, 0, out)
-}
-
-fn collect_muse_child_logs_at(
-    session_dir: &Path,
-    depth: usize,
-    out: &mut Vec<PathBuf>,
-) -> Result<()> {
-    if depth >= MAX_MUSE_SUBAGENT_DEPTH {
-        return Ok(());
-    }
     for log in direct_muse_child_logs(session_dir)? {
         check_capture_cancelled()?;
         out.push(log.clone());
         if let Some(child_dir) = log.parent() {
-            collect_muse_child_logs_at(child_dir, depth + 1, out)?;
+            collect_muse_child_logs(child_dir, out)?;
         }
     }
     Ok(())
 }
-
-/// How deep subagent logs are followed. The containment rule in
-/// [`direct_muse_child_logs`] already makes every level strictly deeper in the
-/// real filesystem, so a walk always ends; this bounds it regardless.
-const MAX_MUSE_SUBAGENT_DEPTH: usize = 32;
 
 /// The immediate `subagent/<id>/session.jsonl` logs of one session
 /// directory, sorted.
@@ -10833,16 +10825,19 @@ fn direct_muse_child_logs(session_dir: &Path) -> Result<Vec<PathBuf>> {
                 .with_context(|| format!("list Muse subagents {}", children.display()))
         }
     };
-    // A child log is read only where it resolves inside this session's own
-    // `subagent/` directory. A `subagent/<dir>` or `session.jsonl` that is a
-    // symlink pointing anywhere else is not this session's evidence:
-    // outside the Muse root it would index a stranger's file, and back up
-    // into the session (`subagent/loop -> ..`) it would read the parent's own
-    // transcript as its child and recurse forever. Requiring each level to
-    // resolve strictly beneath the previous one's `subagent/` is what makes
-    // every walk of the tree finite.
-    let within = fs::canonicalize(&children)
-        .with_context(|| format!("resolve Muse subagents {}", children.display()))?;
+    // A child log is read only where it resolves beneath the session's real
+    // directory plus a literal `subagent/` component. The session directory
+    // is resolved first and `subagent` joined after, so a `subagent/` that is
+    // itself a symlink is measured against where it *should* be, not where
+    // it points. Anything else is not this session's evidence: outside the
+    // Muse root it would index a stranger's file, and back up into the
+    // session (`subagent -> .`, `subagent/loop -> ..`) it would read the
+    // parent's own transcript as its child and recurse. Requiring each level
+    // to resolve strictly beneath the previous one's real `subagent/` is what
+    // makes every walk of the tree finite.
+    let within = fs::canonicalize(session_dir)
+        .with_context(|| format!("resolve Muse session {}", session_dir.display()))?
+        .join(muse::SUBAGENT_DIR);
     let mut logs = Vec::new();
     for entry in entries {
         let entry = entry.with_context(|| format!("list Muse subagents {}", children.display()))?;
@@ -10977,20 +10972,14 @@ pub(crate) fn read_muse_tree(
 
 /// The subagent logs directly beneath one session directory, each read along
 /// with its own children.
+/// Finite for the reason [`collect_muse_child_logs`] is.
 pub(crate) fn read_muse_children(session_dir: &Path) -> Result<Vec<MuseChildLog>> {
-    read_muse_children_at(session_dir, 0)
-}
-
-fn read_muse_children_at(session_dir: &Path, depth: usize) -> Result<Vec<MuseChildLog>> {
-    if depth >= MAX_MUSE_SUBAGENT_DEPTH {
-        return Ok(Vec::new());
-    }
     let mut out = Vec::new();
     for path in direct_muse_child_logs(session_dir)? {
         check_capture_cancelled()?;
         let transcript = read_muse_transcript(&path)?;
         let children = match path.parent() {
-            Some(dir) => read_muse_children_at(dir, depth + 1)?,
+            Some(dir) => read_muse_children(dir)?,
             None => Vec::new(),
         };
         out.push(MuseChildLog {
@@ -15778,6 +15767,37 @@ mod tests {
             )
             .unwrap();
         assert_eq!(self_edges, 0, "the parent is never its own child");
+    }
+
+    /// A `subagent/` directory that is itself a symlink — back into its own
+    /// session, or out of it — is not the session's subagents: nothing under
+    /// it is read, and the walk ends.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_muse_subagent_directory_is_not_followed() {
+        let home = tempfile::tempdir().unwrap();
+        let (_, transcript) = muse_fixture(home.path());
+        let session_dir = transcript.parent().unwrap();
+
+        // Back into the session.
+        let real = session_dir.join("subagent");
+        let moved = session_dir.join("subagent-real");
+        fs::rename(&real, &moved).unwrap();
+        std::os::unix::fs::symlink(".", &real).unwrap();
+        assert_eq!(
+            super::muse_session_files(&transcript).unwrap(),
+            vec![transcript.clone()]
+        );
+
+        // Out of the session, to a real subagent tree somewhere else.
+        fs::remove_file(&real).unwrap();
+        let elsewhere = home.path().join("elsewhere");
+        fs::rename(&moved, &elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &real).unwrap();
+        assert_eq!(
+            super::muse_session_files(&transcript).unwrap(),
+            vec![transcript.clone()]
+        );
     }
 
     /// A child log that names no session yet — Muse is still writing its
