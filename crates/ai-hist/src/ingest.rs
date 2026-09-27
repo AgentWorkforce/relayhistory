@@ -11079,6 +11079,17 @@ fn link_muse_subagents(
             .model
             .clone()
             .or_else(|| child.metadata.model_id.clone());
+        // Rebuilt, not merged: `record_relationship` keeps an optional field
+        // the new observation leaves empty, so a label, model or task the
+        // parent no longer records would otherwise stay on the edge. This one
+        // child's edge is replaced in place, in the same transaction, so it is
+        // never missing in between.
+        conn.execute(
+            "DELETE FROM session_relationships WHERE source = 'muse' \
+             AND parent_session_id = ? AND child_session_id = ? \
+             AND evidence_kind = 'muse_subagent_log'",
+            params![parent_id, child_id],
+        )?;
         record_relationship(
             conn,
             &ObservedRelationship {
@@ -15684,6 +15695,34 @@ mod tests {
         super::sync_muse(&conn, &mut state, &root).unwrap();
         assert_eq!(muse_session_count(&conn, "session_events", "escaped"), 0);
         assert_eq!(muse_count(&conn, "session_relationships"), 3);
+    }
+
+    /// An edge is rebuilt from what the parent records now: a label the
+    /// parent no longer gives its child does not linger on the delegation.
+    #[test]
+    fn a_muse_delegation_drops_details_the_parent_no_longer_records() {
+        let home = tempfile::tempdir().unwrap();
+        let (root, transcript) = muse_fixture(home.path());
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        let label = |conn: &Connection| -> Option<String> {
+            conn.query_row(
+                "SELECT child_agent_name FROM session_relationships \
+                 WHERE source = 'muse' AND child_session_id = ?",
+                [MUSE_WORKER],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(label(&conn).as_deref(), Some("reviewer"));
+
+        let rewritten = fs::read_to_string(&transcript)
+            .unwrap()
+            .replace("\"label\": \"reviewer\", ", "");
+        fs::write(&transcript, rewritten).unwrap();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        assert_eq!(label(&conn), None);
     }
 
     /// A child log that names no session yet — Muse is still writing its
