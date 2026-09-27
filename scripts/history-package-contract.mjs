@@ -75,7 +75,6 @@ export const SCOPE = "@relayhistory";
 const TARBALL_SCOPE = SCOPE.replace(/^@/, "");
 
 export const plugins = {
-  relayhistory: { name: "capture", binary: "relayhistory-plugin" },
   "provider-sources": {
     name: "provider-sources",
     binary: "history-provider-sources",

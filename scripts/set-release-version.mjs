@@ -2,7 +2,7 @@
  *
  * The release workflow runs this three times: in the publish job, so the version
  * commit carries the plugin manifests and crates; in the helper matrix, before
- * the Rust executables are built, so `agent-relay-probe --version` reports the
+ * the Rust executables are built, so each helper's `CARGO_PKG_VERSION` is the
  * release it ships under; and in the plugin job on its own checkout (dry runs
  * included). Every run must produce byte-identical files, so this script is the
  * single deterministic place that knows what a plugin release version touches.
@@ -62,9 +62,8 @@ const crateVersionPatterns = (crate) => [
  * plugin `rust` directory is its own Cargo workspace with its own lock, so the
  * rewritten pair stays consistent and `cargo build --locked` still resolves.
  *
- * The binaries read `CARGO_PKG_VERSION` — that is what `agent-relay-probe
- * --version` and the `cli_version` it reports print — so the release version
- * has to reach the crate before anything is compiled. Idempotent.
+ * The binaries read `CARGO_PKG_VERSION`, so the release version has to reach
+ * the crate before anything is compiled. Idempotent.
  *
  * @returns the paths written, in order.
  */
@@ -276,7 +275,7 @@ export async function setReleaseVersion(version, root = repositoryRoot) {
     await writeFile(lockPath, JSON.stringify(lock, null, 2) + "\n");
     written.push(lockPath);
 
-    // The helper and probe executables ship under this same release version.
+    // The helper executable ships under this same release version.
     written.push(
       ...(await setCrateVersion(
         resolve(root, "plugins", plugin, "rust"),

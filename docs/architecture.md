@@ -77,20 +77,15 @@ The SDK separates contracts, native loading, normalization, pagination, local
 operations and generic plugin orchestration. Core, native, SDK and MCP build
 without the `plugins/` tree; CI physically removes it before local checks.
 
-`plugins/relayhistory` owns commercial auth, convergence/outbox mapping, legacy
-push/replay/share and the entire probe upload lifecycle: sharing consent,
-queues, prepared payloads, leases, acknowledgments, retries and transport.
-These are required parts of the probe, not optional delivery services within it. `plugins/provider-sources`
-owns remote provider credentials/transports. Their Rust helpers depend on
-public local-history APIs and ship in optional platform packages. Their JS
-packages share the installed SDK's public error classes. No second addon or
-implicit plugin discovery is involved. Explicit registration is inert until an
-operation selects the plugin; normal local operations do not read its auth.
+`plugins/provider-sources` owns remote provider credentials/transports. Its
+Rust helper depends on public local-history APIs and ships in optional platform
+packages. Its JS package shares the installed SDK's public error classes. No
+second addon or implicit plugin discovery is involved. Explicit registration is
+inert until an operation selects the plugin; normal local operations do not
+read its auth.
 
-RelayHistory retains its stage files, rotation locks and legacy cursor format.
-New delivery jobs require explicit selection/generation and a checked legacy
-scheduler transition; no positional cursor becomes an acknowledgment. See the
-[optional package](../plugins/relayhistory/sdk/README.md).
+Uploads are not part of this repository. Team uploads come from the Agent Relay
+desktop app, which consumes the published `ai-hist` crate.
 
 ## Session ledger and location scope
 
@@ -456,8 +451,7 @@ usage they ended with. `session_requests` is a view over `session_events`, so
 a request is not fed as a row of its own: the events that make it up are, and
 `session_requests_page` reads the grouped result.
 
-Push or subscription callbacks and the cloud delivery coordinator are
-unchanged; the feed is a pull cursor for an in-process consumer.
+The feed is a pull cursor for an in-process consumer.
 
 ## Native errors
 
@@ -474,20 +468,9 @@ account, upload acknowledgment or retry state. File/NDJSON exports remain in the
 local SDK through native contract 21's `historyExport` bridge. Ordinary core
 opens create no upload job, batch or membership tables.
 
-`plugins/relayhistory/rust::delivery` owns the probe's upload state machine and
-worker. The probe manages sharing consent and advances storage subscriptions in
-the same SQLite transaction as its queue. Indexed session snapshot/change APIs
-keep provider traversal in core. The worker retains immutable payloads, renews
-leases, checks consent/account fences before dispatch, and validates exact
-acknowledgments. The plugin SDK is a cancellable bridge to that Rust helper;
-there is no JavaScript upload coordinator and no new generic delivery crate.
-
-Existing databases retain their disk table names. Core imports live legacy
-capture subscriptions transactionally before its next write, leaving upload
-state untouched even if the probe has not restarted. The probe reuses jobs,
-batch IDs, prepared bytes, leases, retries and selected membership in place.
-See the [ownership ADR](decisions/2026-09-21-probe-owns-uploads.md) and
-[delivery guide](history-delivery.md) for compatibility and operation.
+Upload state machines live outside this repository. Indexed session
+snapshot/change APIs keep provider traversal in core. See [export](export.md)
+for the NDJSON snapshot surface.
 
 Storage and uploads still share a retention budget in an enabled database.
 An unread durable subscription can therefore hold evidence and exhaust capacity;

@@ -17,7 +17,7 @@ path = "src/lib.rs"
 
 [features]
 default = []
-# Legacy feature alias; upload APIs now belong to relayhistory-plugin.
+# Legacy feature alias for `export`.
 delivery = ["export"]
 export = []
 # Filesystem-event driver for the live-capture watch loop. Optional so the
