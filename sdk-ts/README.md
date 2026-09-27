@@ -76,8 +76,7 @@ Cached reads preserve the requested scope and never consult commercial auth.
 Stored remote history can be queried with absent, malformed, expired, or
 ambiguous credentials. Remote acquisition requires an explicitly loaded plugin
 registry. Install `@relayhistory/provider-sources` for Claude web/Codex
-cloud, or `@relayhistory/capture` for RelayHistory. Installing a package does
-not register it, inspect auth or start delivery.
+cloud. Installing a package does not register it or inspect auth.
 
 ```ts
 import { HistoryPluginRegistry } from 'ai-hist';
@@ -127,7 +126,7 @@ becomes `null` while the raw string stays available as `argsJson` and
 stored string of their own: it returns the parsed value, or `null` for anything
 that is not a parseable string.
 
-## Delegation topology
+## Session topology
 
 Sessions that delegate to subagents form a tree, and it is queryable:
 
@@ -138,7 +137,7 @@ import {
   sessionEventsIncludingDescendants,
 } from 'ai-hist';
 
-const { asParent, asChild, capabilities } = await getSessionRelationships({
+const { asParent, asChild, continuity, capabilities } = await getSessionRelationships({
   source: 'codex',
   sessionId: rootId,
 });
@@ -195,6 +194,39 @@ consumer that depends on either the root node or `getSessionTree`'s ordering
 has to account for that. `sessionEventsIncludingDescendants` applies its
 `limit` to each session it reads, not to the iteration as a whole.
 
+### Continuity
+
+Resumed, forked and continued sessions are a second kind of relationship:
+`continuation`, `fork` and `resume`, reported on `getSessionRelationships`'s
+own `continuity` array rather than mixed into `asParent` / `asChild`. Each row
+carries `originSessionId` — the conversation it branched from, when the
+provider named one distinct from the parent — and an `evidenceRef` naming the
+signal that produced it: the provider field (`continuedFromSessionId`,
+`forkSessionId`), `resume-marker` for a `/resume` the human typed,
+`sharedSessionId` for two transcripts carrying one provider session id, or the
+record uuid that linked two files.
+
+`getSessionTree` and `getSessionChildrenPage` take `relationshipKinds`.
+Omitting it follows delegation edges only, so existing calls answer exactly as
+before; naming the continuity kinds expands from an origin to its resumed,
+continued, or forked descendants:
+
+```ts
+const lineage = await getSessionTree({
+  source: 'claude',
+  sessionId: originId,
+  relationshipKinds: ['continuation', 'fork', 'resume'],
+});
+```
+
+Two transcripts carrying the same provider session id are branches with no
+identity of their own, so each is an `unlinked` row keyed on its transcript: a
+branch's identity is never taken from its file name. Evidence that cannot
+resolve yet — a parent record no session has indexed, a lone branch with no
+sibling — is reported as a `RELATIONSHIP_CONTINUITY_UNRESOLVED` diagnostic on
+both `hydrateSession` and `getSessionRelationships`, and resolves on its own
+once the session holding the missing record is hydrated.
+
 Native loading failures distinguish unsupported platforms, missing optional
 platform packages, addon load failures, SDK/native contract mismatches, and
 database open failures through stable `RelayHistoryError` subclasses. Provider
@@ -205,23 +237,15 @@ evidence, and connector/parser failures with dedicated error subclasses.
 The old synchronous `AiHist` class and `openAiHist()` API were removed in 1.0.
 See [the migration guide](https://github.com/AgentWorkforce/relayhistory/blob/main/docs/native-sdk-migration.md).
 
-## Optional cloud services
+## Export
 
-Use a `HistoryDestination` plugin for any service or pipe the public NDJSON
-export to your own program. The local package has no cloud exports, login CLI,
-or default cloud MCP tool. RelayHistory's auth, sharing, replay, durable upload
-and readback live in [`@relayhistory/capture`](../plugins/relayhistory/sdk/README.md).
-Move imports from `ai-hist/cloud` to that package. Git hooks and commit linking
-remain local SDK operations.
-
-## Export and durable delivery
+The local package has no cloud exports, login CLI or cloud MCP tool. Team
+uploads come from the [Agent Relay desktop app](https://agentrelay.com). Git
+hooks and commit linking remain local SDK operations.
 
 Use `exportHistory(selection)` for a bounded historical snapshot or
-`ai-hist export --selection selection.json` for NDJSON stdout. Explicitly enabled
-delivery jobs use `createHistoryDelivery`, `HistoryPluginRegistry`, and
-`drainHistoryDelivery`/`runHistoryDelivery`. The same Rust queue handles one-shot
-and background runs, immutable retries, exact acknowledgments, and worker leases.
-Native contract 14 is required. See [delivery setup and contracts](../docs/history-delivery.md).
+`ai-hist export --selection selection.json` for NDJSON stdout. See
+[export](../docs/export.md).
 
 Source discovery and hydration accept `acquisitionTimeoutMs` for each selected
 connector operation, including a complete paginated snapshot. The default is
@@ -232,9 +256,3 @@ Timeouts return `SOURCE_ACQUISITION_TIMEOUT`, cancellation returns
 `SOURCE_ACQUISITION_CANCELLED`, and neither commits a partial snapshot. Typed
 source failures such as `AUTHENTICATION_EXPIRED` and `SESSION_NOT_FOUND` retain
 their public classes/codes with sanitized messages.
-
-To remove a persistent delivery exclusion, cancel affected delivery jobs first,
-clear the exclusion, then create new jobs to backfill the skipped history. A
-running or paused generation cannot rewind revisions it already skipped;
-attempting this returns `DELIVERY_GENERATION_REQUIRED`. Jobs whose selection
-permanently excludes that session or cannot include it may continue.

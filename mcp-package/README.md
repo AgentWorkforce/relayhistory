@@ -3,66 +3,40 @@
 Thin `npx -y ai-hist-mcp` wrapper for the local `ai-hist` MCP server.
 It calls public SDK operations; it never opens SQLite or loads cloud auth.
 
-Default tools cover cached search/recent/catalog/statistics, discovery/sync,
-identity-addressed events/tool calls/file edits/relationships/session trees, and
-generic durable delivery status/control. `create_handoff` and `resume_handoff`
-are also enabled by default: the former returns the caller's current-session
-pointer and the latter composes one bounded continuation page containing prompts,
-normalized events, tool calls, and file edits. Cached scopes local/remote/all do not
+Default tools cover cached search/recent/catalog/statistics, discovery/sync, and
+identity-addressed events/tool calls/file edits/markers/requests/usage/
+relationships/session trees. `create_handoff` and `resume_handoff` are also
+enabled by default: the former returns the caller's current-session pointer and
+the latter composes a bounded continuation page containing prompts, normalized
+events, tool calls, and file edits. Cached scopes local/remote/all do not
 read credentials; acquisition defaults to local. Tool and file edit pages require
 both source and session ID and use bounded deterministic cursors.
 
 A Relaycast handoff is a pointer, never an inlined transcript. Send the
-`create_handoff` result as the payload of structured delivery metadata
-`kind="handoff"`:
+`create_handoff` result as structured delivery metadata with `kind="handoff"`:
 
 ```json
 {"source":"codex","session_id":"…","intent":"continue the fix","origin_agent":"sender","origin_user":"user-id"}
 ```
 
-On receipt, call `resume_handoff(source, session_id)` immediately. Its initial
-response is directly usable continuation context; `next_cursor` is only needed
-when an agent requires an older page. Handoffs are workspace-scoped. The
-authenticated source connector can acquire a teammate's session in the same
-workspace, while cross-workspace and cross-organization loads are rejected.
+Before sending, call `resume_handoff` once with the new pointer and send only
+after that workspace read succeeds. This prevents a live pointer from racing
+ahead of Agent Relay desktop's team upload.
 
-Remote acquisition and commercial tools are optional. Install a source or
-destination package and set `AI_HIST_PLUGIN_CONFIG` to its explicit module config.
-Loading a configured plugin is inert. `source_connectors` selects configured
-source IDs; an empty array disables remote acquisition. Acquisition tools declare
-open-world writes. Arbitrary plugin callbacks receive conservative annotations,
-and duplicate/reserved tool names are rejected before registration.
+On receipt, call `resume_handoff(source, session_id)` immediately. Its response
+is continuation context; pass the returned `next_cursor` back unchanged when an
+additional page is needed. Handoffs are workspace-scoped: resume selects only the
+configured `cloud` connector, refreshes its session observation under the
+currently authenticated workspace, and rejects unavailable cross-workspace or
+cross-organization sessions.
 
-For teammate handoffs, install `ai-hist`, `ai-hist-mcp`, and
-`@relayhistory/capture` together, sign in once, and point the MCP process at this
-minimal config (resolved beside that installation's `node_modules`):
+Remote acquisition is optional. Install a source plugin such as
+`@relayhistory/provider-sources` and set `AI_HIST_PLUGIN_CONFIG` to its explicit
+module config. Loading a configured plugin is inert and adds no tools.
+`source_connectors` selects configured source IDs; an empty array disables
+remote acquisition. Acquisition tools declare open-world writes.
 
-```json
-{"plugins":[{"module":"@relayhistory/capture"}]}
-```
-
-```sh
-AI_HIST_PLUGIN_CONFIG=/absolute/path/history.json npx ai-hist-mcp
-```
-
-No manual account hash is required: the `cloud` source derives and pins the
-authenticated organization/workspace account for each acquisition. An explicit
-`expectedAccount` remains available for deployments that want a static pin.
-
-The installable auto-resume instructions live in
-`skills/agent-relay-handoff`. Install the directory as a skill:
-
-```sh
-# Codex
-cp -R skills/agent-relay-handoff ~/.codex/skills/
-
-# Claude Code
-cp -R skills/agent-relay-handoff ~/.claude/skills/
-```
-
-The optional `@relayhistory/capture` package registers `get_session_thread`
-and `read_delivered_history`. The former composes freshly delivered evidence
-with legacy lifecycle links under one pinned account and reports each outcome;
-the latter is an explicit live listing, not an incremental feed. Neither tool
-is shipped in the default inventory. See the repository's optional package README
-for auth, account pinning and stage selection.
+Agent Relay desktop owns team upload and supplies the workspace-authenticated
+`cloud` source configuration used by `resume_handoff`; the retired
+`@relayhistory/capture` package is not required. Auto-resume instructions live
+in `skills/agent-relay-handoff`.

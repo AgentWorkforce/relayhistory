@@ -1,0 +1,8 @@
+{
+  "id": "ses_multi",
+  "version": "1.0.0",
+  "projectID": "global",
+  "directory": "/tmp/project",
+  "title": "multi turn",
+  "time": { "created": 1776988820000, "updated": 1776988825000 }
+}

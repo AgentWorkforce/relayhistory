@@ -13,14 +13,14 @@ calls the **`ai-hist-native`** napi addon's `syncAndPush()`:
 agent-relay up  ──(every few minutes, if reflex.json.enabled)──▶  require('ai-hist-native').syncAndPush()
                                                                         │  (in-process, worker thread)
                                                                         ▼
-                                              ai_hist_engine::sync_and_push()  (Rust)
+                                              ai_hist::sync_and_push()  (Rust)
                                                 sync local history → push new records → POST /v1/ingest
 ```
 
 - **No subprocess:** `ai-hist-native` is a native (napi) Node addon. Relay loads
   it and calls the Rust `sync_and_push` directly via FFI; the blocking work runs
   on a worker thread so the event loop isn't blocked.
-- **Single source of truth:** the Rust `ai_hist_engine` library does the sync +
+- **Single source of truth:** the Rust `ai_hist` library does the sync +
   push. The CLI binary and the addon call the same code.
 - **Auth:** the `rth_at_` token written by `reflex on` (in the stage-scoped
   `~/.agentworkforce/relayhistory/stages/` store). `syncAndPush()` returns
@@ -40,7 +40,7 @@ agent-relay up  ──(every few minutes, if reflex.json.enabled)──▶  requ
 - Per-platform **`ai-hist-native-<platform>-<arch>`** packages carry the
   prebuilt `.node`; the loader picks the right one. Same distribution model as
   `@agent-relay/broker-*`, except the addon is *loaded in-process*, not spawned.
-- `.github/workflows/publish-napi.yml` builds the six targets — darwin
+- `.github/workflows/publish.yml` builds the six targets — darwin
   arm64/x64 and linux x64/arm64 in **both** glibc (gnu) and musl — and publishes
   via napi's tooling. (Linux needs both: the loader resolves `-gnu` on
   Ubuntu/Debian and `-musl` on Alpine.)
@@ -49,7 +49,7 @@ agent-relay up  ──(every few minutes, if reflex.json.enabled)──▶  requ
 
 1. **One-time — register OIDC trusted publishers** on npmjs for `ai-hist-native`
    and the six `ai-hist-native-*-*` package names (repo
-   `AgentWorkforce/relayhistory` + `publish-napi.yml`). (First publish may need
+   `AgentWorkforce/relayhistory` + `publish.yml`). (First publish may need
    an `NPM_TOKEN` if npm won't pre-configure a nonexistent package.)
 
 2. **Per release — publish the addon.** Run the **Publish ai-hist-native (napi)**

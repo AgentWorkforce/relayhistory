@@ -1,0 +1,7 @@
+{
+  "id": "prt_a1_1_step_start",
+  "sessionID": "ses_utb",
+  "messageID": "msg_utb_a1",
+  "type": "step-start",
+  "snapshot": "abc"
+}

@@ -1,0 +1,13 @@
+{
+  "id": "prt_tool_5",
+  "sessionID": "ses_tool",
+  "messageID": "msg_tool_asst",
+  "type": "step-finish",
+  "reason": "tool-calls",
+  "tokens": {
+    "input": 6,
+    "output": 100,
+    "reasoning": 0,
+    "cache": { "read": 0, "write": 20000 }
+  }
+}

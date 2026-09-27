@@ -1,5 +1,5 @@
 //! Database health inspection and ingestion failure diagnostics.
-use ai_hist_core::SourceDatabaseError;
+use crate::SourceDatabaseError;
 use rusqlite::{Connection, ErrorCode};
 use std::{
     fs,

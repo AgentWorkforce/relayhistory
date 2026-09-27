@@ -1,14 +1,17 @@
 [workspace]
 members = [
-    "crates/ai-hist-core",
     "crates/ai-hist",
     "crates/ai-hist-cli",
     "crates/ai-hist-napi",
 ]
+# The out-of-tree consumer builds against the crates.io `ai-hist` on its own
+# lockfile; a workspace member would resolve the path crate instead and prove
+# nothing about the published artefact. See docs/sourcing-sdk.md.
+exclude = ["examples/rust-consumer"]
 resolver = "2"
 
 [workspace.package]
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/AgentWorkforce/relayhistory"
-
+rust-version = "1.88"

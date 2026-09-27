@@ -1,0 +1,13 @@
+{
+  "id": "prt_a2_2",
+  "sessionID": "ses_multi",
+  "messageID": "msg_multi_a2",
+  "type": "step-finish",
+  "reason": "tool-calls",
+  "tokens": {
+    "input": 5,
+    "output": 200,
+    "reasoning": 50,
+    "cache": { "read": 15000, "write": 3000 }
+  }
+}

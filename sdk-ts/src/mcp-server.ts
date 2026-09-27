@@ -7,10 +7,10 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import {
   discoverSessions, getSession, getSessionEventsPage, getSessionFileEditsPage,
-  getSessionRelationships, getSessionToolCallsPage, getSessionTree, hydrateSession,
+  getSessionMarkersPage, getSessionRelationships, getSessionRequestsPage, getSessionToolCallsPage,
+  getSessionTree, getSessionUsage, getSourceCapabilities, hydrateSession,
   listSessionCatalogPage, recent, search, stats, sync, createHandoff, resumeHandoff,
   MAX_HANDOFF_INTENT_CHARS,
-  historyDeliveryStatus, historyDeliveryRetention, controlHistoryDelivery,
 } from './index.js';
 
 import type { HistoryPluginRegistry } from './index.js';
@@ -77,7 +77,11 @@ server.tool('discover_sessions', 'Explicit shallow provider discovery. Updates o
   acquisition_timeout_ms: z.number().int().min(1).max(3600000).optional(),
 }, ACQUIRE, ({ sources, scope, limit, source_connectors, acquisition_timeout_ms }) => call(() => discoverSessions({ sources, scope, limit, sourceConnectors: source_connectors, acquisitionTimeoutMs: acquisition_timeout_ms, plugins: configuredSources })));
 
-server.tool('hydrate_session', 'Fully index one cataloged session without global sync.', {
+server.tool('hydrate_session',
+  'Index one cataloged session as fully as its provider allows, without global sync. '
+  + '`capability` is computed from `coverage`, the evidence kinds that provider\'s parser produces: '
+  + 'prompt-only providers return `partial` with a HYDRATION_PARTIAL_COVERAGE diagnostic naming what is absent, '
+  + 'never `full`.', {
   source: CATALOG_SOURCE,
   session_id: z.string().min(1),
   scope: SESSION_SCOPE.optional().default('local'),
@@ -97,20 +101,24 @@ server.tool('get_session_events', 'Get one bounded page of normalized events.', 
   after: z.object({ tsMs: z.number().int(), id: z.number().int() }).optional(),
 }, READ, ({ session_id, source, limit, after }) => call(() => getSessionEventsPage(session_id, { source, limit, after })));
 
+const RELATIONSHIP_KIND = z.enum(['delegated', 'materialized_local', 'continuation', 'fork', 'resume']);
+
 server.tool('get_session_relationships',
-  'Direct delegation relationships for one session, in both directions (as parent and as child).', {
+  'Direct relationships for one session: delegation in both directions (as parent and as child), plus the continuity edges (resume, fork, continuation) that connect it to the conversation it came from.', {
   source: CATALOG_SOURCE,
   session_id: z.string().min(1),
 }, READ, ({ source, session_id }) => call(() => getSessionRelationships({ source, sessionId: session_id })));
 
 server.tool('get_session_tree',
-  'Complete descendant delegation tree for one session, with cycle protection and deterministic ordering. Child events are not flattened into the parent.', {
+  'Complete descendant tree for one session, with cycle protection and deterministic ordering. Follows delegation edges by default; pass relationship_kinds to also include resumed, continued, or forked descendants of the root. Child events are not flattened into the parent.', {
   source: CATALOG_SOURCE,
   session_id: z.string().min(1),
   max_depth: z.number().int().min(1).max(64).optional(),
   max_nodes: z.number().int().min(1).max(10000).optional(),
-}, READ, ({ source, session_id, max_depth, max_nodes }) => call(() => getSessionTree({
+  relationship_kinds: z.array(RELATIONSHIP_KIND).min(1).optional(),
+}, READ, ({ source, session_id, max_depth, max_nodes, relationship_kinds }) => call(() => getSessionTree({
   source, sessionId: session_id, maxDepth: max_depth, maxNodes: max_nodes,
+  relationshipKinds: relationship_kinds,
 })));
 
 const EVIDENCE_CURSOR = z.object({ tsMs: z.number().int().nullable().optional(), id: z.number().int() });
@@ -144,10 +152,8 @@ server.tool('resume_handoff', 'Auto-resume a same-workspace handoff in one call:
   limit: z.number().int().min(1).max(1000).optional().default(200),
   cursor: HANDOFF_CURSOR.optional(),
   acquisition_timeout_ms: z.number().int().min(1).max(3600000).optional(),
-}, ACQUIRE, ({ source, session_id, limit, cursor, acquisition_timeout_ms }) => call(() => resumeHandoff(
-  source,
-  session_id,
-  {
+}, ACQUIRE, ({ source, session_id, limit, cursor, acquisition_timeout_ms }) => call(async () => {
+  const resumed = await resumeHandoff(source, session_id, {
     limit,
     cursor: cursor ? {
       prompt: cursor.prompt,
@@ -157,8 +163,40 @@ server.tool('resume_handoff', 'Auto-resume a same-workspace handoff in one call:
     } : undefined,
     acquisitionTimeoutMs: acquisition_timeout_ms,
     plugins: configuredSources,
-  },
-)));
+  });
+  const next = resumed.next_cursor;
+  return {
+    ...resumed,
+    next_cursor: next ? {
+      ...(next.prompt ? { prompt: next.prompt } : {}),
+      ...(next.events ? { events: next.events } : {}),
+      ...(next.toolCalls ? { tool_calls: next.toolCalls } : {}),
+      ...(next.fileEdits ? { file_edits: next.fileEdits } : {}),
+    } : null,
+  };
+}));
+
+server.tool('get_session_markers', 'Get one bounded page of a session\'s markers: the records a provider wrote that are not transcript events, such as compaction and summary boundaries, provider system rows, non-text content blocks and agent lifecycle events. `kind` is the classified vocabulary and `subkind` the provider-native type; an unclassified record is kind `unknown`. `payload_json` is a bounded projection, never an image or document\'s bytes. Undated markers page last.', {
+  source: SOURCE, session_id: z.string().min(1),
+  limit: z.number().int().min(1).max(1000).optional().default(200),
+  after: EVIDENCE_CURSOR.optional(),
+}, READ, ({ source, session_id, limit, after }) => call(() => getSessionMarkersPage(source, session_id, { limit, after })));
+
+server.tool('get_source_capabilities', 'What one provider\'s parser can record, from RelayHistory\'s own capability tables rather than any database: the evidence kinds a hydration of that source covers (and which of the full set it cannot), and what its records establish about delegation. Answers the same before a first sync.', {
+  source: CATALOG_SOURCE,
+}, READ, ({ source }) => call(() => getSourceCapabilities(source)));
+
+const REQUEST_CURSOR = z.object({ tsMs: z.number().int(), id: z.number().int() });
+
+server.tool('get_session_requests', 'Get one bounded page of a session\'s model requests, with usage normalized. One row per API request: Claude\'s per-content-block copies of message.usage are collapsed, so these can be summed where raw events cannot.', {
+  source: SOURCE, session_id: z.string().min(1),
+  limit: z.number().int().min(1).max(1000).optional().default(200),
+  after: REQUEST_CURSOR.optional(),
+}, READ, ({ source, session_id, limit, after }) => call(() => getSessionRequestsPage(source, session_id, { limit, after })));
+
+server.tool('get_session_usage', 'Provider-neutral token usage rollup for one session. Null usage means no usage evidence, never an assumed zero; cost appears only when the source data carried one.', {
+  source: SOURCE, session_id: z.string().min(1),
+}, READ, ({ source, session_id }) => call(() => getSessionUsage(source, session_id)));
 
 server.tool('history_stats', 'Statistics for already-indexed RelayHistory data.', {
   scope: SESSION_SCOPE.optional().default('local'),
@@ -171,22 +209,9 @@ server.tool('sync', 'Explicit full provider ingestion into RelayHistory.', {
   acquisition_timeout_ms: z.number().int().min(1).max(3600000).optional(),
 }, ACQUIRE, ({ scope, source_connectors, acquisition_timeout_ms }) => call(() => sync({ scope, sourceConnectors: source_connectors, acquisitionTimeoutMs: acquisition_timeout_ms, plugins: configuredSources })));
 
-server.tool('delivery_status', 'Read durable delivery progress, backlog, failures, and retention usage.', {
-  job_id: z.string().optional(),
-}, READ, ({ job_id }) => call(async () => ({ jobs: await historyDeliveryStatus(job_id), retention: await historyDeliveryRetention() })));
-for (const action of ['pause', 'resume', 'retry'] as const) {
-  server.tool(`delivery_${action}`, `${action} an already enabled delivery job.`, {
-    job_id: z.string().min(1),
-  }, { readOnlyHint: false, idempotentHint: true, openWorldHint: false }, ({ job_id }) => call(() => controlHistoryDelivery(job_id, action)));
-}
-// Only an explicitly named config may load installed modules. No package scan,
-// implicit enablement, credential probing, or background delivery at startup.
+// Only an explicitly named config may load installed modules, and only their
+// source connectors are used. No package scan or implicit enablement at startup.
 if (process.env.AI_HIST_PLUGIN_CONFIG) {
-  const { registry } = await loadHistoryApplicationConfig(process.env.AI_HIST_PLUGIN_CONFIG);
-  configuredSources = registry;
-  for (const tool of registry.registeredTools()) {
-    server.tool(tool.name, tool.description, { input: z.record(z.string(), z.unknown()) }, { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
-      ({ input }) => call(() => tool.run(input)));
-  }
+  configuredSources = (await loadHistoryApplicationConfig(process.env.AI_HIST_PLUGIN_CONFIG)).registry;
 }
 await server.connect(new StdioServerTransport());

@@ -6,6 +6,11 @@ __pycache__/
 *.pyc
 /tmp/
 .claude/
+# The harness fixture corpus stages provider `HOME` trees verbatim, so the
+# dotted provider directories inside it ARE the fixture. Without this a Claude
+# fixture is silently absent from the repo and the corpus test fails in CI
+# with the file missing rather than with a parser change.
+!crates/ai-hist/tests/fixtures/**/.claude/
 target/
 .tmp/
 .npm-cache/

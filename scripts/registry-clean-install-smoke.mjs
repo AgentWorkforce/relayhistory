@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { installWithRegistryRetry } from './npm-install-with-registry-retry.mjs';
+import { hostInstallArgs, hostLibc, publicRegistryEnv } from './npm-host-install.mjs';
 
 export const REGISTRY_RELEASE_PACKAGES = Object.freeze([
   'ai-hist',
@@ -102,7 +103,23 @@ function assertMcpStartup(mcpBin) {
   console.error(`PASS: ai-hist-mcp startup (exit ${code})`);
 }
 
-function assertNativePackageMissing(version) {
+export function coreSmokeManifest(version) {
+  return {
+    name: 'ai-hist-registry-smoke',
+    private: true,
+    version: '0.0.0',
+    dependencies: {
+      'ai-hist': version,
+      'ai-hist-mcp': version,
+    },
+  };
+}
+
+function writeManifest(directory, manifest) {
+  writeFileSync(join(directory, 'package.json'), `${JSON.stringify(manifest, null, 2)}\n`);
+}
+
+function assertNativePackageMissing(version, cwd) {
   const result = spawnSync(process.execPath, ['--input-type=module', '-e', `
     import("ai-hist").then((sdk) => sdk.recent()).then(
       () => process.exit(1),
@@ -114,7 +131,7 @@ function assertNativePackageMissing(version) {
         console.log(error.message);
       },
     );
-  `], { encoding: 'utf8', cwd: process.cwd(), env: process.env });
+  `], { encoding: 'utf8', cwd, env: process.env });
   if ((result.status ?? 1) !== 0) {
     const error = new Error(
       `omit=optional install must fail with NATIVE_PACKAGE_MISSING:\n${result.stdout ?? ''}${result.stderr ?? ''}`,
@@ -145,13 +162,19 @@ export async function registryCleanInstallSmoke(options) {
     log: options.log,
   });
 
+  const libc = hostLibc();
+  const publicEnv = publicRegistryEnv();
   const smoke = mkdtempSync(join(tmpdir(), 'ai-hist-registry-smoke-'));
   try {
-    process.chdir(smoke);
-    runOrThrow('npm', ['init', '-y'], { stdio: 'ignore' });
-    await installWithRegistryRetry([`ai-hist@${version}`, `ai-hist-mcp@${version}`], {
+    writeManifest(smoke, coreSmokeManifest(version));
+    // `--libc` is the family `ai-hist-native-*-gnu` / `*-musl` declare.
+    // npm-install-checks skips those optional packages when host libc is
+    // undetected (`if (target.libc && !libc)`).
+    await installWithRegistryRetry(hostInstallArgs(smoke, libc), {
       attempts: installAttempts,
       delayMs: installDelayMs,
+      cwd: smoke,
+      env: publicEnv,
       runInstall: options.runInstall,
       sleep: options.sleep,
       reset: options.reset,
@@ -161,7 +184,7 @@ export async function registryCleanInstallSmoke(options) {
       join(repoRoot, 'scripts/smoke-native-cli.mjs'),
       join(smoke, 'node_modules/ai-hist/dist/cli.js'),
       '--prove-rejection',
-    ], { stdio: 'inherit' });
+    ], { stdio: 'inherit', cwd: smoke });
     assertMcpStartup(join(smoke, 'node_modules/.bin/ai-hist-mcp'));
   } finally {
     rmSync(smoke, { recursive: true, force: true });
@@ -169,17 +192,23 @@ export async function registryCleanInstallSmoke(options) {
 
   const noOptional = mkdtempSync(join(tmpdir(), 'ai-hist-registry-no-optional-'));
   try {
-    process.chdir(noOptional);
-    runOrThrow('npm', ['init', '-y'], { stdio: 'ignore' });
-    await installWithRegistryRetry(['--omit=optional', `ai-hist@${version}`], {
+    writeManifest(noOptional, {
+      name: 'ai-hist-registry-no-optional',
+      private: true,
+      version: '0.0.0',
+      dependencies: { 'ai-hist': version },
+    });
+    await installWithRegistryRetry(['--prefix', noOptional, '--omit=optional'], {
       attempts: installAttempts,
       delayMs: installDelayMs,
+      cwd: noOptional,
+      env: publicEnv,
       runInstall: options.runInstall,
       sleep: options.sleep,
       reset: options.reset,
       log: options.log,
     });
-    assertNativePackageMissing(version);
+    assertNativePackageMissing(version, noOptional);
   } finally {
     rmSync(noOptional, { recursive: true, force: true });
   }

@@ -13,12 +13,18 @@ export function isRegistryVisibilityFailure(output) {
   return /\b(?:ETARGET|E404)\b/.test(output);
 }
 
-function runNpmInstall(args) {
+/** Child env for npm install. `extra.env`, when present, is the whole env — not a patch. */
+export function installChildEnv(extra = {}, cache) {
+  return { ...(extra.env ?? process.env), npm_config_cache: cache };
+}
+
+function runNpmInstall(args, extra = {}) {
   const cache = mkdtempSync(join(tmpdir(), 'ai-hist-npm-cache-'));
   try {
     const result = spawnSync('npm', ['install', '--prefer-online', ...args], {
       encoding: 'utf8',
-      env: { ...process.env, npm_config_cache: cache },
+      cwd: extra.cwd,
+      env: installChildEnv(extra, cache),
     });
     if (result.error) throw result.error;
     return {
@@ -54,9 +60,11 @@ export async function installWithRegistryRetry(args, options = {}) {
 
   const attempts = options.attempts ?? DEFAULT_ATTEMPTS;
   const delayMs = options.delayMs ?? DEFAULT_DELAY_MS;
-  const runInstall = options.runInstall ?? runNpmInstall;
+  const cwd = options.cwd;
+  const env = options.env;
+  const runInstall = options.runInstall ?? ((installArgs) => runNpmInstall(installArgs, { cwd, env }));
   const sleep = options.sleep ?? delay;
-  const reset = options.reset ?? clearPartialInstall;
+  const reset = options.reset ?? (() => clearPartialInstall(cwd ?? process.cwd()));
   const emit = options.emit ?? ((stream, output) => stream.write(output));
   const log = options.log ?? ((message) => console.error(message));
 
@@ -64,22 +72,35 @@ export async function installWithRegistryRetry(args, options = {}) {
     const result = runInstall(args);
     emit(process.stdout, result.stdout);
     emit(process.stderr, result.stderr);
-    if (result.status === 0) return;
 
-    const output = `${result.stdout}\n${result.stderr}`;
-    const retryable = isRegistryVisibilityFailure(output);
+    // npm exits 0 when an optional dependency cannot be fetched yet. Callers
+    // that require that package to actually land pass `confirm`, which returns
+    // a non-empty reason to reject the exit. That miss is the same registry
+    // lag as ETARGET: retry it instead of accepting the half-install.
+    const rejection = result.status === 0 && options.confirm
+      ? options.confirm() || ''
+      : '';
+    if (rejection) emit(process.stderr, `${rejection}\n`);
+    if (result.status === 0 && !rejection) return;
+
+    const output = `${result.stdout}\n${result.stderr}\n${rejection}`;
+    const retryable = Boolean(rejection) || isRegistryVisibilityFailure(output);
     if (!retryable || attempt === attempts) {
-      const reason = retryable
-        ? `npm registry did not expose the requested packages after ${attempts} attempts`
-        : 'npm install failed with a non-registry-visibility error';
+      const reason = rejection
+        ? `${rejection}\nnpm install exited 0 without the required package after ${attempts} attempts`
+        : retryable
+          ? `npm registry did not expose the requested packages after ${attempts} attempts`
+          : 'npm install failed with a non-registry-visibility error';
       const error = new Error(reason);
       error.exitCode = result.status || 1;
       throw error;
     }
 
     log(
-      `npm registry has not exposed all requested packages `
-        + `(attempt ${attempt}/${attempts}); retrying in ${delayMs}ms`,
+      rejection
+        ? `${rejection} (attempt ${attempt}/${attempts}); retrying in ${delayMs}ms`
+        : `npm registry has not exposed all requested packages `
+          + `(attempt ${attempt}/${attempts}); retrying in ${delayMs}ms`,
     );
     reset();
     await sleep(delayMs);

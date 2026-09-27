@@ -6,6 +6,15 @@ on:
   push:
     branches:
       - main
+    # A marker-only commit immediately dispatches the release workflow, whose
+    # platform matrices otherwise compete with this entire suite for macOS and
+    # Windows runners. The code at that commit was already checked by its PR.
+    paths-ignore:
+      - '.release/dispatch-patch-*'
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -18,13 +27,21 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # This is the critical-path job. Keep its cache separate from the much
+      # larger release matrix so a PR does not evict every release target.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-verify
+
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
           cache: npm
-          cache-dependency-path: sdk-ts/package-lock.json
+          cache-dependency-path: |
+            crates/ai-hist-napi/package-lock.json
+            sdk-ts/package-lock.json
 
-      - name: Physically remove optional cloud and provider packages
+      - name: Physically remove the optional provider-sources plugin
         run: rm -rf plugins
 
       - name: Rust formatting
@@ -34,10 +51,29 @@ jobs:
         run: node --test scripts/*.test.mjs
 
       - name: Rust lint
-        run: cargo clippy --workspace --all-targets -- -A clippy::too_many_arguments -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -A clippy::too_many_arguments -D warnings
 
       - name: Rust tests
-        run: cargo test --workspace
+        run: cargo test --workspace --all-features
+
+      # Runs after "Rust tests" on purpose: that step has already compiled the
+      # sync_bench target in this profile, so the gate spends its time
+      # measuring rather than building. See docs/benchmarks.md.
+      - name: Sync and hydration throughput gate
+        run: node scripts/benchmark-sync.mjs --gate
+
+      # `test`, not `build`: it compiles everything `build` did and then runs
+      # what only exists in this configuration. Two whole classes of test are
+      # invisible to the `--all-features` run above -- the `#[cfg(not(feature
+      # = "delivery"))]` ones, and the integration tests that exercise the
+      # public surface an embedder actually gets, where `unstable-internal`
+      # is not there to re-export the internals. Both were passing locally
+      # and gated by nothing.
+      - name: Published crate builds and tests without optional features
+        run: cargo test -p ai-hist --no-default-features
+
+      - name: Crate publish dry-run
+        run: cargo publish --dry-run -p ai-hist --allow-dirty
 
       - name: Native binding contract
         working-directory: crates/ai-hist-napi
@@ -56,6 +92,77 @@ jobs:
 
       - name: Installed local SDK and CLI smoke test
         run: node scripts/smoke-history-packages.mjs
+
+  # The crate's default-feature surface is what an embedder gets, and Cargo
+  # semver is the only contract it has. The listing is regenerated here and
+  # diffed against crates/ai-hist/public-api.txt, so a change to the surface
+  # is visible in the pull request that makes it, and must come with an
+  # updated snapshot and a `### Rust API` changelog entry. The check also
+  # fails on any `rusqlite` type in the listing: an embedder never holds a
+  # raw connection. See docs/sourcing-sdk.md.
+  public-api:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rustdoc's JSON output, which cargo-public-api reads, is nightly-only;
+      # the tool itself is built and run on stable and invokes `+nightly` for
+      # the rustdoc step. Nightly first so stable stays the default.
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: actions/cache@v4
+        id: cargo-public-api-cache
+        with:
+          path: ~/.cargo/bin/cargo-public-api
+          key: cargo-public-api-${{ runner.os }}-0.52.0
+      - name: Install cargo-public-api
+        if: steps.cargo-public-api-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-public-api --version 0.52.0 --locked
+      - name: Public API matches the checked-in snapshot
+        run: node scripts/check-public-api.mjs
+
+  # Nothing in the workspace proves that a crate outside it can consume
+  # ai-hist. examples/rust-consumer is that crate: not a workspace member, its
+  # own lockfile, a crates.io dependency on the default features. Here the
+  # dependency is redirected at this checkout with `[patch.crates-io]`, so a
+  # pull request is checked before the crate is published; the nightly
+  # published-crate-consumer workflow builds the same example against the
+  # crate crates.io actually serves.
+  rust-consumer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Redirect the example's crates.io dependency at this checkout
+        working-directory: examples/rust-consumer
+        run: |
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<EOF
+          [patch.crates-io]
+          ai-hist = { path = "${{ github.workspace }}/crates/ai-hist" }
+          EOF
+      - name: Build and run the consumer against the workspace crate
+        working-directory: examples/rust-consumer
+        run: cargo run
+      # A patch Cargo cannot apply is a warning, not an error, and the run
+      # above would then have tested the published crate. The version in
+      # crates/ai-hist must satisfy the example's requirement; the release
+      # script moves the two together.
+      - name: The workspace crate was the one built
+        working-directory: examples/rust-consumer
+        run: |
+          cargo tree --prefix none --depth 1 -e normal | tee /dev/stderr \
+            | grep -qE '^ai-hist v[0-9.]+ \(.*/crates/ai-hist\)$'
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - name: MSRV check
+        run: cargo check -p ai-hist --all-features --locked
 
   node-22-sdk:
     runs-on: ubuntu-latest
@@ -76,16 +183,6 @@ jobs:
         working-directory: sdk-ts
         run: npm ci && npm test
 
-  windows-state-replacement:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Verify repeated private-state replacement
-        run: cargo test -p ai-hist-engine write_private_replaces_existing_state
-
   optional-history-plugins:
     runs-on: ubuntu-latest
     steps:
@@ -94,36 +191,44 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+          cache: npm
+          cache-dependency-path: |
+            crates/ai-hist-napi/package-lock.json
+            sdk-ts/package-lock.json
+            plugins/provider-sources/sdk/package-lock.json
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            plugins/provider-sources/rust -> target
+          key: ci-optional-history-plugins
       - name: Optional helper packaging contracts
         run: node --test scripts/history-helper-packaging.composed.mjs
       - name: Build composed distribution
         run: |
-          cargo build --manifest-path plugins/relayhistory/rust/Cargo.toml --locked
           cargo build --manifest-path plugins/provider-sources/rust/Cargo.toml --locked
           npm --prefix crates/ai-hist-napi ci
           npm --prefix crates/ai-hist-napi run build:debug
           npm --prefix sdk-ts ci
-          for plugin in relayhistory provider-sources; do
-            npm --prefix "plugins/$plugin/sdk" ci --ignore-scripts
-            npm --prefix "plugins/$plugin/sdk" run build
-          done
-      - name: Optional plugin tests
+          npm --prefix plugins/provider-sources/sdk ci --ignore-scripts
+          npm --prefix plugins/provider-sources/sdk run build
+      # The plugin is not a workspace member and declares its own [workspace],
+      # so `cargo test --workspace` in `verify` cannot reach it -- that job
+      # deletes `plugins/` first in any case. The build above compiles only the
+      # bin and lib targets, never `#[cfg(test)]` code. Without this step the
+      # crate's own test suite never runs anywhere.
+      - name: Optional plugin Rust tests
+        run: cargo test --manifest-path plugins/provider-sources/rust/Cargo.toml --locked
+      - name: Optional plugin SDK tests
         env:
-          RELAYHISTORY_PLUGIN_BIN: ${{ github.workspace }}/plugins/relayhistory/rust/target/debug/relayhistory-plugin
           HISTORY_PROVIDER_SOURCES_BIN: ${{ github.workspace }}/plugins/provider-sources/rust/target/debug/history-provider-sources
-        run: |
-          npm --prefix plugins/relayhistory/sdk test
-          npm --prefix plugins/provider-sources/sdk test
+        run: npm --prefix plugins/provider-sources/sdk test
       - name: Installed composed tarballs
         run: |
           mkdir -p helper-packs
-          for plugin in relayhistory provider-sources; do
-            binary=history-provider-sources
-            if [ "$plugin" = relayhistory ]; then binary=relayhistory-plugin; fi
-            version=$(node -p "require('./plugins/$plugin/sdk/package.json').version")
-            node scripts/package-history-helper.mjs "$plugin" linux-x64-gnu "$version" "plugins/$plugin/rust/target/debug/$binary" "helper-stage/$plugin"
-            (cd "helper-stage/$plugin" && npm pack --ignore-scripts --pack-destination ../../helper-packs)
-          done
+          version=$(node -p "require('./plugins/provider-sources/sdk/package.json').version")
+          node scripts/package-history-helper.mjs provider-sources linux-x64-gnu "$version" plugins/provider-sources/rust/target/debug/history-provider-sources helper-stage/provider-sources
+          (cd helper-stage/provider-sources && npm pack --ignore-scripts --pack-destination ../../helper-packs)
           node scripts/smoke-history-packages.mjs --helpers helper-packs
 
   windows-helper-cancellation:
@@ -143,29 +248,11 @@ jobs:
           npm --prefix crates/ai-hist-napi ci
           npm --prefix crates/ai-hist-napi run build:debug
           npm --prefix sdk-ts ci
-          for plugin in relayhistory provider-sources; do
-            npm --prefix "plugins/$plugin/sdk" ci --ignore-scripts
-            npm --prefix "plugins/$plugin/sdk" run build
-          done
+          npm --prefix plugins/provider-sources/sdk ci --ignore-scripts
+          npm --prefix plugins/provider-sources/sdk run build
       - name: Verify actual Windows descendant cleanup and missing executable errors
-        run: node --test plugins/relayhistory/sdk/dist/helper-runtime.test.js plugins/provider-sources/sdk/dist/helper-runtime.test.js
+        run: node --test plugins/provider-sources/sdk/dist/helper-runtime.test.js
       - name: Verify shell-free packaging contracts
         run: node --test scripts/history-helper-packaging.composed.mjs
       - name: Verify installed local SDK on Windows
         run: node scripts/smoke-history-packages.mjs
-
-  native-cloud-probe:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Probe regression tests
-        run: cargo test --manifest-path plugins/relayhistory/rust/Cargo.toml --bin agent-relay-probe --locked
-      - name: Native release build
-        run: cargo build --manifest-path plugins/relayhistory/rust/Cargo.toml --release --bin agent-relay-probe --locked
-      - name: Executable smoke check
-        run: plugins/relayhistory/rust/target/release/agent-relay-probe --version

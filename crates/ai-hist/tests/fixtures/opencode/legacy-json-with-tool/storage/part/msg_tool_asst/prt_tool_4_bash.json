@@ -1,0 +1,13 @@
+{
+  "id": "prt_tool_4_bash",
+  "sessionID": "ses_tool",
+  "messageID": "msg_tool_asst",
+  "type": "tool",
+  "callID": "toolu_bash_1",
+  "tool": "bash",
+  "state": {
+    "status": "completed",
+    "input": { "command": "ls -la" },
+    "output": "file listing"
+  }
+}

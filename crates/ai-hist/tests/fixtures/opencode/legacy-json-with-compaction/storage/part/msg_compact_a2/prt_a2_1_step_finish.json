@@ -1,0 +1,13 @@
+{
+  "id": "prt_a2_1_step_finish",
+  "sessionID": "ses_compact",
+  "messageID": "msg_compact_a2",
+  "type": "step-finish",
+  "reason": "end_turn",
+  "tokens": {
+    "input": 12,
+    "output": 80,
+    "reasoning": 0,
+    "cache": { "read": 950, "write": 400 }
+  }
+}

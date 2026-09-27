@@ -1,0 +1,9 @@
+{
+  "id": "ses_child",
+  "version": "1.0.0",
+  "projectID": "global",
+  "parentID": "ses_multi",
+  "directory": "/tmp/project",
+  "title": "subagent child",
+  "time": { "created": 1776988822500, "updated": 1776988823700 }
+}

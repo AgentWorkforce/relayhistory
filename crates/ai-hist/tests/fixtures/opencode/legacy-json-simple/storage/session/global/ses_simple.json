@@ -1,0 +1,9 @@
+{
+  "id": "ses_simple",
+  "version": "1.0.0",
+  "projectID": "global",
+  "directory": "/tmp/project",
+  "title": "simple turn",
+  "time": { "created": 1776988800000, "updated": 1776988803000 },
+  "summary": { "additions": 0, "deletions": 0, "files": 0 }
+}

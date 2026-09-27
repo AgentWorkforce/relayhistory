@@ -1,0 +1,12 @@
+{
+  "info": {
+    "id": "grok-00000001",
+    "cwd": "/tmp/project",
+    "model": "grok-code-fast-1"
+  },
+  "git_root_dir": "/tmp/project",
+  "head_branch": "main",
+  "created_at": "2026-04-20T00:00:00.000Z",
+  "updated_at": "2026-04-20T00:04:00.000Z",
+  "title": "add a retry to the client"
+}

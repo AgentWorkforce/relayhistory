@@ -1,0 +1,170 @@
+{
+  "comment": [
+    "Regression bounds for scripts/benchmark-sync.mjs. A baseline is the number a",
+    "clean run produced on the machine named in `measuredOn`; the policy factors turn",
+    "each one into a floor (throughput) or a ceiling (time, memory). Re-measure with",
+    "`node scripts/benchmark-sync.mjs --profile <name> --update-baselines` and justify",
+    "the move in the pull request -- these are not knobs to turn until CI is green.",
+    "The published baseline table lives in docs/benchmarks.md."
+  ],
+  "policy": {
+    "minRecordsPerSecondFactor": 0.5,
+    "maxElapsedMsFactor": 2,
+    "maxPeakRssFactor": 1.5,
+    "calibrationComment": [
+      "\"applied\" scales throughput and elapsed checks by the reference workload;",
+      "\"diagnostic\" measures and reports it but does not let it decide. It is",
+      "diagnostic because two ubuntu-latest runners disagreed about which of them was",
+      "faster depending on the phase -- the reference said the 6973P-C was 1.29x",
+      "quicker while cold_sync said the 8573C was 1.32x quicker -- so no single scalar",
+      "can normalize all five phases. Scaling by it failed an entirely healthy run",
+      "(PR #202, job 106023782674). The 2x and 1.5x margins are the contention",
+      "allowance; a second, sometimes anti-correlated corrector on top made the gate",
+      "worse. Flip this to \"applied\" to restore the previous behaviour."
+    ],
+    "calibration": "diagnostic",
+    "calibrationWarnBand": {
+      "min": 0.7,
+      "max": 1.4
+    },
+    "offClassComment": [
+      "What happens on a runner whose CPU is not in `measuredOn.cpusSeen`. The bounds",
+      "are widened -- never tightened, never past `offClassCalibrationCap`. A bound",
+      "derived from a stored baseline is widened by the calibration ratio clamped to",
+      "[1, cap]; an elapsed ceiling that comes from an absolute floor is widened by the",
+      "full cap and a breach inside that widening is advisory rather than fatal, because",
+      "such a floor is a runner-noise allowance measured on the baseline class and the",
+      "calibration is a CPU-speed reading that does not describe walk-and-stat jitter.",
+      "peakRssBytes is never widened. On the baseline class none of this applies. See",
+      "docs/benchmarks.md, 'A runner the baselines were never measured on'."
+    ],
+    "offClassCalibrationCap": 2,
+    "absoluteFloorsComment": [
+      "A ceiling derived from a very small baseline measures the runner, not the",
+      "code. These floors raise such a ceiling and never lower one. On the tiny PR",
+      "store the peak-RSS check is therefore a blow-up guard -- it catches 'the whole",
+      "store is now buffered in memory', not a 1.5x drift. The proportional rule",
+      "bites on the `full` profile, whose store is two orders of magnitude larger."
+    ],
+    "absoluteFloors": {
+      "elapsedMs": 40,
+      "peakRssBytes": 67108864
+    },
+    "absoluteFloorsByPhaseComment": [
+      "Some tiny elapsed-time phases need a higher final ceiling than the metric-wide",
+      "floor because observed runner jitter on github-hosted ubuntu-latest is already",
+      "above 2x their stored baseline. Keep these phase-scoped so other elapsed checks",
+      "do not silently become weaker.",
+      "",
+      "unchanged_sync went 120 -> 140 in #198, which makes Cursor an event-level",
+      "source. The phase got slower because the store got bigger, not because a no-op",
+      "tick got worse: the synthetic store's Cursor transcripts now yield 192",
+      "session_events rows that no release before it stored, so the database grows",
+      "~0.3 MiB and an unchanged tick reads ~0.4 MiB more of it. Measured on one",
+      "machine across four commits -- old main ~100ms, main+#196 ~102ms, #198 ~112ms --",
+      "and on a github-hosted ubuntu-latest (AMD EPYC 7763) the PR head measured",
+      "125.3ms against the old 120 ceiling. 120 was itself set against ~113ms of",
+      "healthy observed runs, about 6% of headroom; 140 keeps ~12% over the 125.3ms",
+      "worst case seen on the slowest CPU in the pool. The stored ci-debug baseline",
+      "(51ms) is untouched and still needs a re-measure on the gate's machine class."
+    ],
+    "absoluteFloorsByPhase": {
+      "unchanged_sync": {
+        "elapsedMs": 140
+      }
+    }
+  },
+  "profiles": {
+    "ci-debug": {
+      "description": "Fast PR gate: an unoptimized build against a small synthetic store, sized to keep the whole gate inside 60 s on a 4-core runner. Baselines are the worst value each metric took across the observed ubuntu-latest CPUs, so both pass with the issue's 2x/1.5x factors and neither CPU sets a bar the other cannot clear.",
+      "cargoProfile": "debug",
+      "store": {
+        "seed": 176,
+        "sources": [
+          "claude",
+          "codex",
+          "cursor",
+          "grok"
+        ],
+        "targetBytes": 1310720,
+        "largeSessionBytes": 393216,
+        "turns": 12,
+        "toolResults": 2,
+        "toolResultBytes": 1024
+      },
+      "measuredOn": {
+        "machineClass": "github-hosted ubuntu-latest, 4 cores, 15.6 GiB, Node 20, debug build",
+        "cpusSeen": [
+          "Intel(R) Xeon(R) 6973P-C",
+          "INTEL(R) XEON(R) PLATINUM 8573C"
+        ],
+        "runs": [
+          {
+            "cpu": "Intel(R) Xeon(R) 6973P-C",
+            "run": "35490225839",
+            "job": "106023782674",
+            "commit": "a898c7a",
+            "calibrationMs": 129
+          },
+          {
+            "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+            "run": "35489681478",
+            "job": "106022358292",
+            "commit": "7fa7690",
+            "calibrationMs": 166.8
+          }
+        ],
+        "rule": "each baseline is the worse of the two runs -- lowest throughput, longest time, largest RSS -- rounded away from the bound (floors down, ceilings up) so that rounding cannot make a limit stricter than the run it came from, and a bound set by one CPU cannot fail the other",
+        "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+        "cargoProfile": "debug",
+        "at": "2026-09-20",
+        "supersedes": "baselines measured on an Intel Xeon 2.80GHz development box at 2a1e81a. They failed the gate on a healthy runner because that machine is not in the pool the gate runs on, and the calibration factor that was supposed to bridge the difference is anti-correlated with cold_sync across these CPUs."
+      },
+      "phases": {
+        "cold_sync": {
+          "recordsPerSecond": 478,
+          "peakRssBytes": 12644352
+        },
+        "incremental_sync": {
+          "elapsedMs": 424,
+          "peakRssBytes": 10395648
+        },
+        "unchanged_sync": {
+          "elapsedMs": 51,
+          "peakRssBytes": 9687040
+        },
+        "hydrate_cold": {
+          "recordsPerSecond": 296,
+          "peakRssBytes": 10936320
+        },
+        "hydrate_unchanged": {
+          "elapsedMs": 15,
+          "peakRssBytes": 8708096
+        }
+      },
+      "repeat": 2,
+      "calibrationMs": 147.9
+    },
+    "full": {
+      "description": "Release-build matrix run by .github/workflows/benchmark-sync.yml on workflow_dispatch. Not a PR gate: it has no stored baselines, it publishes numbers.",
+      "cargoProfile": "release",
+      "store": {
+        "seed": 176,
+        "sources": [
+          "claude",
+          "codex",
+          "cursor",
+          "grok"
+        ],
+        "targetBytes": 104857600,
+        "largeSessionBytes": 52428800,
+        "turns": 12,
+        "toolResults": 2,
+        "toolResultBytes": 1024
+      },
+      "measuredOn": null,
+      "phases": {},
+      "repeat": 1
+    }
+  }
+}

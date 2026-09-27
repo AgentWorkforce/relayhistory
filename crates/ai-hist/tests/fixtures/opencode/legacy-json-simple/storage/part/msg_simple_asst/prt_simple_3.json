@@ -1,0 +1,13 @@
+{
+  "id": "prt_simple_3",
+  "sessionID": "ses_simple",
+  "messageID": "msg_simple_asst",
+  "type": "step-finish",
+  "reason": "end_turn",
+  "tokens": {
+    "input": 10,
+    "output": 5,
+    "reasoning": 0,
+    "cache": { "read": 500, "write": 80 }
+  }
+}

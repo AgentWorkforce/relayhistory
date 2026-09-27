@@ -1,0 +1,14 @@
+{
+  "id": "prt_tool_3_edit",
+  "sessionID": "ses_tool",
+  "messageID": "msg_tool_asst",
+  "type": "tool",
+  "callID": "toolu_edit_1",
+  "tool": "edit",
+  "state": {
+    "status": "completed",
+    "input": { "filePath": "/src/b.ts", "oldString": "a", "newString": "b" },
+    "output": "edited",
+    "title": "src/b.ts"
+  }
+}

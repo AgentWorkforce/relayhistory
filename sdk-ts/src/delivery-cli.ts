@@ -5,12 +5,12 @@ import { randomUUID } from 'node:crypto';
 import { finished } from 'node:stream/promises';
 import type { Writable } from 'node:stream';
 import {
-  controlHistoryDelivery, createHistoryDelivery, defaultDbPath, drainHistoryDelivery, exportHistoryNdjson,
-  historyDeliveryStatus, historyDeliveryRetention, loadHistoryPlugins, runHistoryDelivery, InvalidArgumentError,
-  type DeliveryJobConfig, type HistoryExportSelection, type HistoryPluginModule,
+  defaultDbPath, exportHistoryNdjson,
+  loadHistoryPlugins, InvalidArgumentError,
+  type HistoryExportSelection, type HistoryPluginModule,
 } from './index.js';
 
-export interface HistoryApplicationConfig { plugins: HistoryPluginModule[]; job?: DeliveryJobConfig }
+export interface HistoryApplicationConfig { plugins: HistoryPluginModule[] }
 export async function loadHistoryApplicationConfig(path: string) {
   const absolute = resolve(path);
   let config: HistoryApplicationConfig;
@@ -18,54 +18,6 @@ export async function loadHistoryApplicationConfig(path: string) {
   catch { throw new InvalidArgumentError('history config could not be read as JSON', 'INVALID_ARGUMENT'); }
   if (!config || !Array.isArray(config.plugins)) throw new InvalidArgumentError('history config requires an explicit plugins array', 'INVALID_ARGUMENT');
   return { config, registry: await loadHistoryPlugins(config.plugins, { baseDirectory: dirname(absolute) }) };
-}
-
-/** Where a delivery run's output goes. Structurally the CLI's own `CliIo`. */
-export interface DeliveryIo {
-  stdout(chunk: string): void;
-  stderr(chunk: string): void;
-}
-
-/**
- * Run one `ai-hist delivery <action>` and resolve to its exit code.
- *
- * Cancellation arrives as `options.signal` rather than a `SIGINT`/`SIGTERM`
- * handler installed here: this runs inside a mounted CLI surface as well as the
- * `ai-hist` bin, and only the process's owner may claim its signals.
- */
-export async function runDeliveryCommand(action: string, io: DeliveryIo, options: {
-  dbPath?: string; configPath?: string; jobId?: string; pollIntervalMs?: number; requestTimeoutMs?: number;
-  signal?: AbortSignal;
-}): Promise<number> {
-  const output = (value: unknown) => io.stdout(`${JSON.stringify(value)}\n`);
-  if (action === 'status') { output({ jobs: await historyDeliveryStatus(options.jobId, options), retention: await historyDeliveryRetention(options) }); return 0; }
-  if (['pause', 'resume', 'retry', 'cancel'].includes(action)) {
-    if (!options.jobId) throw new InvalidArgumentError('delivery control requires a job ID', 'INVALID_ARGUMENT');
-    output(await controlHistoryDelivery(options.jobId, action as 'pause' | 'resume' | 'retry' | 'cancel', options));
-    return 0;
-  }
-  if (!options.configPath) throw new InvalidArgumentError('delivery enable/drain/run requires --config', 'INVALID_ARGUMENT');
-  const { config, registry } = await loadHistoryApplicationConfig(options.configPath);
-  if (action === 'enable') {
-    if (!config.job) throw new InvalidArgumentError('delivery enable requires a job in the config', 'INVALID_ARGUMENT');
-    const destination = registry.destination(config.job.destination_id, config.job.instance_id);
-    if (!destination || destination.mappingVersion !== config.job.mapping_version) throw new InvalidArgumentError('job requires its configured destination and mapping version', 'INVALID_ARGUMENT');
-    output(await createHistoryDelivery(config.job, options));
-    return 0;
-  }
-  const runOptions = { ...options, jobIds: options.jobId ? [options.jobId] : undefined };
-  if (action === 'drain') {
-    const result = await drainHistoryDelivery(registry, runOptions);
-    output(result);
-    return result.issues.length || result.statuses.some((job) => job.state === 'blocked' || job.failure) ? 1 : 0;
-  }
-  if (action === 'run') {
-    await runHistoryDelivery(registry, { ...runOptions, onProgress: (value) => {
-      io.stderr(`${JSON.stringify(value)}\n`);
-    } });
-    return 0;
-  }
-  throw new InvalidArgumentError('unknown delivery command', 'INVALID_ARGUMENT');
 }
 
 async function write(stream: Writable, chunk: string): Promise<void> {

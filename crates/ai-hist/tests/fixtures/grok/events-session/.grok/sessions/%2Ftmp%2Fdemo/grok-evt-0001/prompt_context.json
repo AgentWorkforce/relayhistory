@@ -1,0 +1,5 @@
+{
+  "system_prompt_tokens": 1820,
+  "files": ["/tmp/demo/AGENTS.md"],
+  "rules": ["/tmp/demo/.grok/rules.md"]
+}

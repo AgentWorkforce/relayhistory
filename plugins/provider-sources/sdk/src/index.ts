@@ -40,7 +40,10 @@ export function createHistoryPlugin(options: ProviderSourceOptions = {}): Histor
       hydrate: async (observation, context) =>
         helperRequest<SourceEvidenceSnapshot>(
           'hydrate',
-          { connectorId, connectorInstance, observation },
+          // The helper derives relationship evidence from the transcript it
+          // already fetched, so honouring this is a matter of not reporting or
+          // returning it rather than of skipping a separate request.
+          { connectorId, connectorInstance, observation, includeRelated: context.includeRelated },
           { ...options, signal: context.signal, timeoutMs: context.acquisitionTimeoutMs ?? options.timeoutMs },
         ),
     };

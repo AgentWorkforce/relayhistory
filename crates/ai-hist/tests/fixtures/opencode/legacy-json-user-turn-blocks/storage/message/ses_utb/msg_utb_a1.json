@@ -1,0 +1,17 @@
+{
+  "id": "msg_utb_a1",
+  "sessionID": "ses_utb",
+  "role": "assistant",
+  "time": { "created": 1776990001000 },
+  "parentID": "msg_utb_u1",
+  "providerID": "anthropic",
+  "modelID": "claude-sonnet-4-6",
+  "path": { "cwd": "/tmp/project", "root": "/tmp/project" },
+  "cost": 0,
+  "tokens": {
+    "input": 10,
+    "output": 20,
+    "reasoning": 0,
+    "cache": { "read": 0, "write": 5 }
+  }
+}

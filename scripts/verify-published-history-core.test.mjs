@@ -19,10 +19,10 @@ function compatible() {
       },
       ...Object.fromEntries(
         [
-          "createHistoryDelivery",
-          "historyDeliveryStatus",
-          "drainHistoryDelivery",
-          "controlHistoryDelivery",
+          "beginHistoryExport",
+          "readHistoryExportPage",
+          "exportHistory",
+          "closeHistoryExport",
           "discoverSourcePlugins",
           "hydrateSourcePlugin",
           "getSourceObservation",
@@ -31,8 +31,7 @@ function compatible() {
     },
     native: {
       nativeContractVersion: () => required,
-      historyDelivery() {},
-      historyDeliveryDrain() {},
+      historyExport() {},
       applySourceEvidence() {},
       getSourceObservation() {},
     },
@@ -67,11 +66,11 @@ test("published version satisfying semver still fails without the required nativ
     () =>
       assertPublishedContract(
         sdk,
-        { ...native, historyDeliveryDrain: undefined },
+        { ...native, historyExport: undefined },
         "0.16.0",
         "0.16.0",
       ),
-    /historyDeliveryDrain/,
+    /historyExport/,
   );
   assert.throws(
     () =>

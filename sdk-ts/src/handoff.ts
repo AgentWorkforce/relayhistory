@@ -1,6 +1,7 @@
 import type { HistoryPluginRegistry } from './delivery-plugins.js';
 import type {
   CatalogSession,
+  CatalogCursor,
   EventCursor,
   EvidenceCursorInput,
   HistoryEntry,
@@ -26,6 +27,7 @@ import {
   hydrateSession,
   listSessionCatalogPage,
 } from './operations.js';
+import { discoverSourcePlugins } from './source-plugins.js';
 
 export const HANDOFF_CONTRACT_VERSION = 1;
 export const MAX_HANDOFF_INTENT_CHARS = 4000;
@@ -60,7 +62,6 @@ export interface ResumeHandoffCursor {
 export interface ResumeHandoffOptions {
   dbPath?: string;
   plugins?: HistoryPluginRegistry;
-  sourceConnectors?: string[];
   acquisitionTimeoutMs?: number;
   /** Per-evidence-kind page size. Default 200, maximum 1000. */
   limit?: number;
@@ -134,18 +135,40 @@ export function currentSessionCandidates(env: NodeJS.ProcessEnv = process.env): 
 async function catalogMatches(
   candidates: readonly SessionCandidate[],
   dbPath?: string,
+  scope: 'local' | 'all' = 'local',
 ): Promise<CatalogSession[]> {
   if (!candidates.length) return [];
-  const page = await listSessionCatalogPage({
-    dbPath,
-    scope: 'local',
-    sources: [...new Set(candidates.map((candidate) => candidate.source))],
-    limit: 1000,
-  });
+  const candidateKeys = new Set(
+    candidates.map((candidate) => `${candidate.source}\0${candidate.sessionId}`),
+  );
+  const matches = new Map<string, CatalogSession>();
+  const seenCursors = new Set<string>();
+  let after: CatalogCursor | undefined;
+  do {
+    const page = await listSessionCatalogPage({
+      dbPath,
+      scope,
+      sources: [...new Set(candidates.map((candidate) => candidate.source))],
+      limit: 1000,
+      after,
+    });
+    for (const session of page.sessions) {
+      const key = `${session.source}\0${session.sessionId}`;
+      if (candidateKeys.has(key)) matches.set(key, session);
+    }
+    if (matches.size === candidateKeys.size || !page.nextCursor) break;
+    const cursorKey = JSON.stringify(page.nextCursor);
+    if (seenCursors.has(cursorKey)) {
+      throw new RelayHistoryError(
+        'Session catalog pagination repeated a cursor',
+        'CATALOG_CURSOR_REPEATED',
+      );
+    }
+    seenCursors.add(cursorKey);
+    after = page.nextCursor;
+  } while (after);
   return candidates.flatMap((candidate) => {
-    const match = page.sessions.find(
-      (session) => session.source === candidate.source && session.sessionId === candidate.sessionId,
-    );
+    const match = matches.get(`${candidate.source}\0${candidate.sessionId}`);
     return match ? [match] : [];
   });
 }
@@ -237,6 +260,20 @@ export async function resumeHandoff(
   const limit = validateLimit(options.limit);
   let hydration: Awaited<ReturnType<typeof hydrateSession>>;
   try {
+    const sourceConnectors = ['cloud'];
+    if (options.plugins) {
+      // Refresh the identity-addressed observation on every resume. A cached
+      // observation may belong to the account that was authenticated before a
+      // workspace switch, and hydrateSession otherwise reuses it without
+      // rediscovery.
+      await discoverSourcePlugins(options.plugins, {
+        dbPath: options.dbPath,
+        sourceConnectors,
+        sources: [source],
+        sessionId,
+        acquisitionTimeoutMs: options.acquisitionTimeoutMs,
+      });
+    }
     hydration = await hydrateSession({
       source,
       sessionId,
@@ -249,7 +286,7 @@ export async function resumeHandoff(
       // The standard connector is the workspace-scoped RelayHistory source.
       // Other provider connectors represent personal accounts and cannot
       // authorize a teammate handoff.
-      sourceConnectors: options.sourceConnectors ?? ['cloud'],
+      sourceConnectors,
       acquisitionTimeoutMs: options.acquisitionTimeoutMs,
     });
   } catch (error) {
@@ -273,7 +310,7 @@ export async function resumeHandoff(
     throw error;
   }
 
-  const [allPrompts, eventsPage, toolCallsPage, fileEditsPage, catalog] = await Promise.all([
+  const [allPrompts, eventsPage, toolCallsPage, fileEditsPage, catalogMatchesResult] = await Promise.all([
     getSession(sessionId, { source, dbPath: options.dbPath }),
     getSessionEventsPage(sessionId, {
       source,
@@ -291,7 +328,7 @@ export async function resumeHandoff(
       limit,
       after: options.cursor?.fileEdits,
     }),
-    listSessionCatalogPage({ dbPath: options.dbPath, scope: 'all', sources: [source], limit: 1000 }),
+    catalogMatches([{ source, sessionId }], options.dbPath, 'all'),
   ]);
   const promptCandidates = allPrompts
     .filter((entry) => afterPrompt(entry, options.cursor?.prompt))
@@ -324,9 +361,7 @@ export async function resumeHandoff(
     contract_version: HANDOFF_CONTRACT_VERSION,
     source,
     session_id: sessionId,
-    session: catalog.sessions.find(
-      (candidate) => candidate.source === source && candidate.sessionId === sessionId,
-    ) ?? null,
+    session: catalogMatchesResult[0] ?? null,
     hydration,
     prompts,
     events: eventsPage.events,

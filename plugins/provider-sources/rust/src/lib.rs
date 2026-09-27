@@ -1,6 +1,6 @@
 //! Optional provider-native source adapters; explicitly compose them with local history.
-pub use ai_hist_engine::discover;
-pub use ai_hist_engine::sources;
+pub use ai_hist::discover;
+pub use ai_hist::sources;
 pub mod helper;
 pub mod remote;
 fn home_dir() -> std::path::PathBuf {

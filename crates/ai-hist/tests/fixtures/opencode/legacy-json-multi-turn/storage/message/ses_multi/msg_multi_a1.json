@@ -1,0 +1,17 @@
+{
+  "id": "msg_multi_a1",
+  "sessionID": "ses_multi",
+  "role": "assistant",
+  "time": { "created": 1776988822000 },
+  "parentID": "msg_multi_u1",
+  "providerID": "anthropic",
+  "modelID": "claude-sonnet-4-5",
+  "path": { "cwd": "/tmp/project", "root": "/tmp/project" },
+  "cost": 0,
+  "tokens": {
+    "input": 5,
+    "output": 100,
+    "reasoning": 0,
+    "cache": { "read": 0, "write": 15000 }
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "id": "prt_a2_1",
+  "sessionID": "ses_multi",
+  "messageID": "msg_multi_a2",
+  "type": "tool",
+  "callID": "toolu_bash_multi",
+  "tool": "bash",
+  "state": {
+    "status": "completed",
+    "input": { "command": "git status" },
+    "output": "clean"
+  }
+}

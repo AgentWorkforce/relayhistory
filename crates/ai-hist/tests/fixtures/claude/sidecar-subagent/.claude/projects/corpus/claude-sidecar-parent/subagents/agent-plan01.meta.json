@@ -1,0 +1,7 @@
+{
+  "agentType": "Plan",
+  "description": "plan the work",
+  "toolUseId": "toolu_task_1",
+  "spawnDepth": 1,
+  "model": "claude-sonnet-4-6"
+}

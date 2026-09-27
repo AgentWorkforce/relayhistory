@@ -66,6 +66,12 @@ import type {
   EvidencePageOptions,
   SessionToolCallsPage,
   SessionFileEditsPage,
+  SessionRequest,
+  RequestCursor,
+  RequestPageOptions,
+  UserTurnsPageOptions,
+  SessionUserTurn,
+  SessionMarker,
   Stats,
   StatsOptions,
   SyncOptions,
@@ -113,6 +119,9 @@ import {
   getSessionEventsPage,
   getSessionToolCallsPage,
   getSessionFileEditsPage,
+  getSessionRequestsPage,
+  getSessionUserTurnsPage,
+  getSessionMarkersPage,
   getSessionChildrenPage,
 } from './operations.js';
 
@@ -137,6 +146,29 @@ export async function getSessionEvents(
   return events;
 }
 
+export async function* sessionUserTurns(
+  source: Source,
+  sessionId: string,
+  options: Omit<UserTurnsPageOptions, 'after'> = {},
+): AsyncGenerator<SessionUserTurn> {
+  let after: EventCursor | undefined;
+  do {
+    const page = await getSessionUserTurnsPage(source, sessionId, { ...options, after });
+    for (const turn of page.userTurns) yield turn;
+    after = page.nextCursor ?? undefined;
+  } while (after);
+}
+
+export async function getSessionUserTurns(
+  source: Source,
+  sessionId: string,
+  options: Omit<UserTurnsPageOptions, 'after'> = {},
+): Promise<SessionUserTurn[]> {
+  const turns: SessionUserTurn[] = [];
+  for await (const turn of sessionUserTurns(source, sessionId, options)) turns.push(turn);
+  return turns;
+}
+
 export async function* sessionToolCalls(
   source: Source,
   sessionId: string,
@@ -158,6 +190,33 @@ export async function getSessionToolCalls(
   const calls: SessionToolCall[] = [];
   for await (const call of sessionToolCalls(source, sessionId, options)) calls.push(call);
   return calls;
+}
+
+/**
+ * Lazily walks a session's model requests, oldest first, one bounded page at
+ * a time.
+ */
+export async function* sessionRequests(
+  source: Source,
+  sessionId: string,
+  options: Omit<RequestPageOptions, 'after'> = {},
+): AsyncGenerator<SessionRequest> {
+  let after: RequestCursor | undefined;
+  do {
+    const page = await getSessionRequestsPage(source, sessionId, { ...options, after });
+    for (const request of page.requests) yield request;
+    after = page.nextCursor ?? undefined;
+  } while (after);
+}
+
+export async function getSessionRequests(
+  source: Source,
+  sessionId: string,
+  options: Omit<RequestPageOptions, 'after'> = {},
+): Promise<SessionRequest[]> {
+  const requests: SessionRequest[] = [];
+  for await (const request of sessionRequests(source, sessionId, options)) requests.push(request);
+  return requests;
 }
 
 /**
@@ -275,6 +334,33 @@ export async function* sessionEventsIncludingDescendants(
     if (!node.hasEvents) continue;
     yield* sessionEvents(node.sessionId, events);
   }
+}
+
+/**
+ * Lazily walks a session's markers, oldest first, one bounded page at a time.
+ * Undated markers arrive last.
+ */
+export async function* sessionMarkers(
+  source: Source,
+  sessionId: string,
+  options: Omit<EvidencePageOptions, 'after'> = {},
+): AsyncGenerator<SessionMarker> {
+  let after: EvidenceCursor | undefined;
+  do {
+    const page = await getSessionMarkersPage(source, sessionId, { ...options, after });
+    for (const marker of page.markers) yield marker;
+    after = page.nextCursor ?? undefined;
+  } while (after);
+}
+
+export async function getSessionMarkers(
+  source: Source,
+  sessionId: string,
+  options: Omit<EvidencePageOptions, 'after'> = {},
+): Promise<SessionMarker[]> {
+  const markers: SessionMarker[] = [];
+  for await (const marker of sessionMarkers(source, sessionId, options)) markers.push(marker);
+  return markers;
 }
 
 export async function* sessionFileEdits(

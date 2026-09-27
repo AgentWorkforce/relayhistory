@@ -1,0 +1,70 @@
+name: Sync and hydration benchmark
+
+# The full matrix. The fast subset that gates every pull request lives in the
+# `verify` job of ci.yml; this workflow is the one that produces publishable
+# numbers, and it is manual because a release build plus a 100 MB synthetic
+# store costs far more than a pull request should pay.
+#
+# Peak RSS comes from `getrusage(RUSAGE_SELF)` inside the harness, which is why
+# both runners can report it: Linux gives kibibytes and macOS gives bytes, and
+# `crates/ai-hist-cli/tests/sync_bench.rs` normalizes the difference. `bytesRead`
+# is read from `/proc/self/io` and is therefore Linux-only; the macOS rows leave
+# that column empty rather than guessing.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_bytes:
+        description: "Synthetic store size in bytes"
+        required: false
+        default: "104857600"
+      large_session_bytes:
+        description: "Size of the single transcript the hydration phases target"
+        required: false
+        default: "52428800"
+      repeat:
+        description: "Rounds per phase; the fastest round of each is reported"
+        required: false
+        default: "1"
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    # A 100 MB cold sync is minutes of work, and the point of this run is to
+    # find out how many.
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Build the benchmark harness
+        run: cargo test --workspace --all-features --test sync_bench --release --no-run
+
+      - name: Run the full matrix
+        run: |
+          node scripts/benchmark-sync.mjs \
+            --profile full \
+            --target-bytes "${{ inputs.target_bytes }}" \
+            --large-session-bytes "${{ inputs.large_session_bytes }}" \
+            --repeat "${{ inputs.repeat }}" \
+            --output "sync-benchmark-${{ matrix.os }}.json"
+
+      - name: Summarize
+        run: node scripts/benchmark-sync.mjs --profile full --report-only "sync-benchmark-${{ matrix.os }}.json" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sync-benchmark-${{ matrix.os }}
+          path: sync-benchmark-${{ matrix.os }}.json

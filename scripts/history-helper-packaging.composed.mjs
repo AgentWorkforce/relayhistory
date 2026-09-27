@@ -11,6 +11,8 @@ import {
   packageName,
   platforms,
   plugins,
+  REPOSITORY_URL,
+  repositoryField,
   validatePluginManifest,
 } from "./history-package-contract.mjs";
 import { verifyHelperResult } from "./verify-history-helper.mjs";
@@ -36,6 +38,9 @@ function manifest(plugin, version) {
   return {
     name: packageName(plugins[plugin]),
     version,
+    // Required by --provenance and asserted by the contract; see the platform
+    // package test below.
+    repository: repositoryField(`plugins/${plugin}/sdk`),
     peerDependencies: { "ai-hist": "^0.16.0" },
     optionalDependencies: Object.fromEntries(
       Object.keys(platforms).map((platform) => [
@@ -45,27 +50,23 @@ function manifest(plugin, version) {
     ),
   };
 }
-test("independent optional versions choose their own artifacts and require matching helper pins", () => {
-  const relay = manifest("relayhistory", "0.16.2");
+test("an optional plugin chooses its own artifacts and requires matching helper pins", () => {
   const provider = manifest("provider-sources", "0.17.0");
-  assert.equal(
-    helperTarball("relayhistory", "linux-x64-gnu", relay),
-    "relayhistory-capture-linux-x64-gnu-0.16.2.tgz",
-  );
   assert.equal(
     helperTarball("provider-sources", "linux-x64-gnu", provider),
     "relayhistory-provider-sources-linux-x64-gnu-0.17.0.tgz",
   );
-  provider.optionalDependencies[
+  const mismatched = manifest("provider-sources", "0.17.0");
+  mismatched.optionalDependencies[
     "@relayhistory/provider-sources-win32-x64-msvc"
   ] = "0.16.0";
   assert.throws(
-    () => validatePluginManifest("provider-sources", provider),
+    () => validatePluginManifest("provider-sources", mismatched),
     /own version/,
   );
-  relay.peerDependencies["ai-hist"] = "file:../../../sdk-ts";
+  provider.peerDependencies["ai-hist"] = "file:../../../sdk-ts";
   assert.throws(
-    () => validatePluginManifest("relayhistory", relay),
+    () => validatePluginManifest("provider-sources", provider),
     /registry version/,
   );
 });
@@ -123,6 +124,11 @@ test("every platform package includes the selected executable and correct platfo
           await readFile(join(output, "package.json"), "utf8"),
         );
         const binary = plugins[plugin].binary + (os === "win32" ? ".exe" : "");
+        // `npm publish --provenance` verifies this against the repository in
+        // the sigstore bundle. An absent or mismatched value fails the publish
+        // with E422 after the tarball has already been built and signed, so it
+        // is only ever discovered during a release.
+        assert.equal(pkg.repository?.url, REPOSITORY_URL);
         assert.deepEqual(pkg.files, [binary]);
         assert.deepEqual(pkg.os, [os]);
         assert.deepEqual(pkg.cpu, [cpu]);

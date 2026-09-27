@@ -1,0 +1,17 @@
+{
+  "id": "msg_multi_a2",
+  "sessionID": "ses_multi",
+  "role": "assistant",
+  "time": { "created": 1776988824000 },
+  "parentID": "msg_multi_u2",
+  "providerID": "anthropic",
+  "modelID": "claude-opus-4-5",
+  "path": { "cwd": "/tmp/project", "root": "/tmp/project" },
+  "cost": 0,
+  "tokens": {
+    "input": 5,
+    "output": 200,
+    "reasoning": 50,
+    "cache": { "read": 15000, "write": 3000 }
+  }
+}

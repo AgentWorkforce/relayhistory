@@ -1,0 +1,14 @@
+{
+  "id": "prt_a1_3_bash_fail",
+  "sessionID": "ses_utb",
+  "messageID": "msg_utb_a1",
+  "type": "tool",
+  "callID": "call_fail",
+  "tool": "bash",
+  "state": {
+    "status": "completed",
+    "input": { "command": "test" },
+    "output": "ERROR: tests failed",
+    "metadata": { "exit": 1 }
+  }
+}

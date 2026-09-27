@@ -1,5 +1,5 @@
 //! Typed history and event search, independent of command-line formatting.
-use ai_hist_core::{normalize_tag_name, raw_fts_query_error, QueryFilter, SessionScope};
+use crate::{normalize_tag_name, raw_fts_query_error, QueryFilter, SessionScope};
 use anyhow::Result;
 use rusqlite::Connection;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,7 +56,7 @@ fn search_history_rows(
          FROM history h WHERE 1=1"
             .to_string()
     } else {
-        params_vec.push(ai_hist_core::build_fts_query(terms, raw_fts));
+        params_vec.push(crate::build_fts_query(terms, raw_fts));
         "SELECT h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms \
          FROM history_fts f JOIN history h ON f.rowid = h.id WHERE history_fts MATCH ?"
             .to_string()
@@ -98,7 +98,7 @@ fn search_event_rows(
          FROM session_events e WHERE 1=1"
             .to_string()
     } else {
-        params_vec.push(ai_hist_core::build_fts_query(terms, raw_fts));
+        params_vec.push(crate::build_fts_query(terms, raw_fts));
         "SELECT e.id, e.source, e.session_id, e.project, COALESCE(e.text, ''), e.ts_ms, e.role, e.kind \
          FROM session_events_fts f JOIN session_events e ON f.rowid = e.id WHERE session_events_fts MATCH ?"
             .to_string()

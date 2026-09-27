@@ -1,0 +1,13 @@
+{
+  "id": "prt_a1_4_step_finish",
+  "sessionID": "ses_utb",
+  "messageID": "msg_utb_a1",
+  "type": "step-finish",
+  "reason": "tool-calls",
+  "tokens": {
+    "input": 10,
+    "output": 20,
+    "reasoning": 0,
+    "cache": { "read": 0, "write": 5 }
+  }
+}

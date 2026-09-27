@@ -42,9 +42,9 @@
 //! 4. **A bounded request does not parse the archive.** `--limit 5` reads the
 //!    same bytes from a 5x larger archive.
 
-use ai_hist_core::open_db;
-use ai_hist_engine::discover::{EXCERPT_TRIM_WHITESPACE, HEAD_SCAN_MAX_BYTES, TAIL_SCAN_MAX_BYTES};
-use ai_hist_engine::{
+use ai_hist::discover::{EXCERPT_TRIM_WHITESPACE, HEAD_SCAN_MAX_BYTES, TAIL_SCAN_MAX_BYTES};
+use ai_hist::open_db;
+use ai_hist::{
     discover_sessions_with_env, list_session_catalog, CatalogListOptions, DiscoverOptions,
     DiscoveryEnv, DiscoverySummary,
 };

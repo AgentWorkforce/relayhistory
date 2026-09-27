@@ -1,0 +1,13 @@
+{"timestamp":"2026-04-20T12:00:00.000Z","type":"session_meta","payload":{"id":"sess_codex_overwrite","cwd":"/tmp/project","timestamp":"2026-04-20T12:00:00.000Z"}}
+{"timestamp":"2026-04-20T12:00:00.100Z","type":"turn_context","payload":{"turn_id":"t1","cwd":"/tmp/project","model":"gpt-5.4"}}
+{"timestamp":"2026-04-20T12:00:00.150Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":-1,"cached_input_tokens":0,"output_tokens":9000,"reasoning_output_tokens":0,"total_tokens":8999}}}}
+{"timestamp":"2026-04-20T12:00:00.200Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}
+{"timestamp":"2026-04-20T12:00:00.300Z","type":"event_msg","payload":{"type":"user_message","message":"first"}}
+{"timestamp":"2026-04-20T12:00:00.900Z","type":"event_msg","payload":{"type":"agent_message","message":"First answer."}}
+{"timestamp":"2026-04-20T12:00:01.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":900,"cached_input_tokens":0,"output_tokens":55.5,"reasoning_output_tokens":0,"total_tokens":955}}}}
+{"timestamp":"2026-04-20T12:00:01.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":0,"output_tokens":300,"reasoning_output_tokens":0,"total_tokens":1300}}}}
+{"timestamp":"2026-04-20T12:00:01.800Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":-7,"cached_input_tokens":0,"output_tokens":310,"reasoning_output_tokens":0,"total_tokens":303}}}}
+{"timestamp":"2026-04-20T12:00:02.000Z","type":"event_msg","payload":{"type":"user_message","message":"second"}}
+{"timestamp":"2026-04-20T12:00:02.900Z","type":"event_msg","payload":{"type":"agent_message","message":"Second answer."}}
+{"timestamp":"2026-04-20T12:00:03.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1400,"cached_input_tokens":0,"output_tokens":440,"reasoning_output_tokens":0,"total_tokens":1840}}}}
+{"timestamp":"2026-04-20T12:00:04.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1"}}

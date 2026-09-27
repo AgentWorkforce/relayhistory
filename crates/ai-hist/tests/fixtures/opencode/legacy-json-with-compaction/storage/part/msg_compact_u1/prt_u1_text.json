@@ -1,0 +1,7 @@
+{
+  "id": "prt_u1_text",
+  "sessionID": "ses_compact",
+  "messageID": "msg_compact_u1",
+  "type": "text",
+  "text": "do some long work that fills the cache"
+}

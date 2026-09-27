@@ -4,14 +4,20 @@ version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false
 
 [[bin]]
 name = "ai-hist"
 path = "src/main.rs"
 
 [dependencies]
-ai-hist-core = { path = "../ai-hist-core" }
-ai-hist-engine = { path = "../ai-hist" }
+ai-hist = { path = "../ai-hist", features = [
+    "export",
+    "fs-events",
+    "opencode-backup",
+    "git-hooks",
+    "unstable-internal",
+] }
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive", "env"] }
@@ -23,5 +29,6 @@ ureq = { version = "2", features = ["json"] }
 
 [dev-dependencies]
 fs2 = "0.4"
+libc = "0.2"
 tempfile = "3"
 url = "2"
