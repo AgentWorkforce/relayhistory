@@ -7,6 +7,7 @@ import test from 'node:test';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import {
+  AuthenticationExpiredError,
   HistoryPluginRegistry,
   MAX_HANDOFF_INTENT_CHARS,
   RelayHistoryError,
@@ -21,6 +22,46 @@ test('createHandoff keeps the pointer intent bounded', async () => {
     createHandoff('x'.repeat(MAX_HANDOFF_INTENT_CHARS + 1), { env: {} }),
     (error: unknown) => error instanceof RelayHistoryError && error.code === 'INVALID_ARGUMENT',
   );
+});
+
+test('createHandoff bounds the composed pointer by truncating the intent suffix', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'relayhistory-long-handoff-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, 'home');
+  const sessionId = 'long-handoff';
+  const directory = join(home, '.codex', 'sessions', '2026', '09', '27');
+  await mkdir(directory, { recursive: true });
+  await writeFile(join(directory, `rollout-${sessionId}.jsonl`), [
+    JSON.stringify({
+      timestamp: '2026-09-27T10:00:00.000Z',
+      type: 'session_meta',
+      payload: { id: sessionId, cwd: '/work/handoff' },
+    }),
+    JSON.stringify({
+      timestamp: '2026-09-27T10:00:01.000Z',
+      type: 'event_msg',
+      payload: { type: 'user_message', message: 'long handoff' },
+    }),
+  ].join('\n') + '\n');
+  const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  t.after(() => {
+    if (saved.HOME === undefined) delete process.env.HOME; else process.env.HOME = saved.HOME;
+    if (saved.USERPROFILE === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = saved.USERPROFILE;
+  });
+  const originalIntent = 'x'.repeat(MAX_HANDOFF_INTENT_CHARS);
+  const pointer = await createHandoff(originalIntent, {
+    dbPath: join(root, 'history.db'),
+    env: { CODEX_THREAD_ID: sessionId },
+  });
+  assert.equal(Array.from(pointer.intent).length, MAX_HANDOFF_INTENT_CHARS);
+  assert.ok(pointer.intent.startsWith(
+    `Resume this handoff: call resume_handoff(source=codex, session_id=${sessionId}) via the ai-hist MCP, then continue: `,
+  ));
+  assert.ok(pointer.intent.endsWith('…'));
+  assert.ok(!pointer.intent.endsWith(originalIntent));
 });
 
 test('createHandoff resolves the invoking harness session through the local catalog', async (t) => {
@@ -61,10 +102,55 @@ test('createHandoff resolves the invoking harness session through the local cata
   assert.deepEqual(pointer, {
     source: 'codex',
     session_id: sessionId,
-    intent: 'continue the implementation',
+    intent: 'Resume this handoff: call resume_handoff(source=codex, session_id=codex-current-handoff) via the ai-hist MCP, then continue: continue the implementation',
     origin_agent: 'sender-agent',
     origin_user: 'user-sender',
   });
+});
+
+test('createHandoff finds the current session beyond the first catalog page', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'relayhistory-paged-create-handoff-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, 'home');
+  const directory = join(home, '.codex', 'sessions', '2026', '09', '27');
+  await mkdir(directory, { recursive: true });
+  const targetSessionId = 'catalog-oldest-session';
+  const session = (sessionId: string, timestamp: string) => [
+    JSON.stringify({
+      timestamp,
+      type: 'session_meta',
+      payload: { id: sessionId, cwd: '/work/handoff' },
+    }),
+    JSON.stringify({
+      timestamp,
+      type: 'event_msg',
+      payload: { type: 'user_message', message: sessionId },
+    }),
+  ].join('\n') + '\n';
+  await writeFile(
+    join(directory, `rollout-${targetSessionId}.jsonl`),
+    session(targetSessionId, '2025-01-01T00:00:00.000Z'),
+  );
+  await Promise.all(Array.from({ length: 1000 }, (_, index) => {
+    const sessionId = `catalog-newer-${String(index).padStart(4, '0')}`;
+    return writeFile(
+      join(directory, `rollout-${sessionId}.jsonl`),
+      session(sessionId, `2026-09-27T10:${String(Math.floor(index / 60) % 60).padStart(2, '0')}:${String(index % 60).padStart(2, '0')}.000Z`),
+    );
+  }));
+  const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  t.after(() => {
+    if (saved.HOME === undefined) delete process.env.HOME; else process.env.HOME = saved.HOME;
+    if (saved.USERPROFILE === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = saved.USERPROFILE;
+  });
+  const pointer = await createHandoff('continue the old session', {
+    dbPath: join(root, 'history.db'),
+    env: { CODEX_THREAD_ID: targetSessionId },
+  });
+  assert.equal(pointer.session_id, targetSessionId);
 });
 
 test('handoff tools are in the default MCP inventory', async (t) => {
@@ -90,6 +176,72 @@ test('handoff tools are in the default MCP inventory', async (t) => {
   const names = (await client.listTools()).tools.map((tool) => tool.name);
   assert.ok(names.includes('create_handoff'));
   assert.ok(names.includes('resume_handoff'));
+});
+
+test('resume_handoff returns cursor field names accepted by its MCP schema', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'relayhistory-mcp-handoff-cursor-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const pluginPath = join(root, 'handoff-source.mjs');
+  const configPath = join(root, 'history.json');
+  await writeFile(pluginPath, `
+export function createHistoryPlugin() {
+  return { sources: [{
+    id: 'cloud', instanceId: 'workspace-fixture', location: 'remote',
+    supportedSources: ['claude'],
+    async discover() {
+      return { observations: [{ source: 'claude', session_id: 'teammate-session', source_stamp: 'listing-1' }] };
+    },
+    async hydrate() {
+      return {
+        source_stamp: 'snapshot-1', source_bytes: 512,
+        covered_kinds: ['history', 'session_event', 'tool_call', 'file_edit'],
+        records: [
+          { kind: 'history', payload: { source: 'claude', session_id: 'teammate-session', timestamp_ms: 10, prompt: 'continue' } },
+          { kind: 'session_event', payload: { source: 'claude', session_id: 'teammate-session', event_uid: 'event-1', ts_ms: 10, role: 'user', kind: 'text', text: 'continue' } },
+          { kind: 'session_event', payload: { source: 'claude', session_id: 'teammate-session', event_uid: 'event-2', ts_ms: 20, role: 'assistant', kind: 'text', text: 'done' } },
+          { kind: 'tool_call', payload: { source: 'claude', session_id: 'teammate-session', tool_use_id: 'tool-1', name: 'Edit', ts_ms: 15 } },
+          { kind: 'file_edit', payload: { source: 'claude', session_id: 'teammate-session', tool_use_id: 'tool-1', file_path: 'handoff.ts', tool_name: 'Edit', ts_ms: 16 } }
+        ]
+      };
+    }
+  }] };
+}
+`);
+  await writeFile(configPath, JSON.stringify({ plugins: [{ module: './handoff-source.mjs' }] }));
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [fileURLToPath(new URL('./mcp-server.js', import.meta.url))],
+    env: {
+      ...Object.fromEntries(Object.entries(process.env).filter(
+        (entry): entry is [string, string] => entry[1] !== undefined,
+      )),
+      HOME: root,
+      USERPROFILE: root,
+      XDG_DATA_HOME: join(root, 'share'),
+      AI_HIST_DB: join(root, 'history.db'),
+      AI_HIST_PLUGIN_CONFIG: configPath,
+    },
+    stderr: 'pipe',
+  });
+  const client = new Client({ name: 'handoff-cursor-test', version: '1' });
+  t.after(() => client.close());
+  await client.connect(transport);
+  const response = await client.callTool({
+    name: 'resume_handoff',
+    arguments: { source: 'claude', session_id: 'teammate-session', limit: 1 },
+  });
+  const content = (response as { content: Array<{ type: string; text?: string }> }).content[0];
+  assert.equal(content?.type, 'text');
+  if (!content || content.type !== 'text' || content.text === undefined)
+    throw new Error('missing MCP text result');
+  const result = JSON.parse(content.text) as {
+    next_cursor: Record<string, unknown> | null;
+  };
+  assert.ok(result.next_cursor);
+  assert.ok('tool_calls' in result.next_cursor);
+  assert.ok('file_edits' in result.next_cursor);
+  assert.ok(!('toolCalls' in result.next_cursor));
+  assert.ok(!('fileEdits' in result.next_cursor));
 });
 
 function teammateSource(options: { missing?: boolean } = {}): HistorySource {
@@ -195,6 +347,91 @@ test('resumeHandoff explicitly rejects a session outside the authenticated works
       && error.code === 'HANDOFF_WORKSPACE_MISMATCH'
       && error.message.includes('cross-organization'),
   );
+});
+
+test('resumeHandoff does not reuse a stale observation after a workspace refresh', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'relayhistory-stale-handoff-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  let visible = true;
+  let hydrateCalls = 0;
+  const source = teammateSource();
+  source.discover = async () => ({
+    observations: visible ? [{
+      source: 'claude',
+      session_id: 'teammate-session',
+      source_stamp: 'workspace-listing-1',
+      first_prompt: 'ship handoff support',
+    }] : [],
+  });
+  const hydrate = source.hydrate;
+  source.hydrate = async (...args) => {
+    hydrateCalls += 1;
+    return hydrate(...args);
+  };
+  const plugins = new HistoryPluginRegistry();
+  plugins.register({ sources: [source] });
+  const dbPath = join(root, 'history.db');
+  await resumeHandoff('claude', 'teammate-session', { dbPath, plugins });
+  visible = false;
+  await assert.rejects(
+    resumeHandoff('claude', 'teammate-session', { dbPath, plugins }),
+    (error: unknown) => error instanceof RelayHistoryError
+      && error.code === 'HANDOFF_WORKSPACE_MISMATCH',
+  );
+  assert.equal(hydrateCalls, 1);
+});
+
+test('resumeHandoff preserves terminal discovery errors', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'relayhistory-terminal-handoff-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  let discoverCalls = 0;
+  const source = teammateSource();
+  source.discover = async () => {
+    discoverCalls += 1;
+    throw new AuthenticationExpiredError('expired', 'AUTHENTICATION_EXPIRED');
+  };
+  const plugins = new HistoryPluginRegistry();
+  plugins.register({ sources: [source] });
+  await assert.rejects(
+    resumeHandoff('claude', 'teammate-session', {
+      dbPath: join(root, 'history.db'),
+      plugins,
+    }),
+    (error: unknown) => error instanceof RelayHistoryError
+      && error.code === 'AUTHENTICATION_EXPIRED',
+  );
+  assert.equal(discoverCalls, 1);
+});
+
+test('resumeHandoff gives terminal failures precedence across cloud instances', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'relayhistory-mixed-failure-handoff-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  let timeoutCalls = 0;
+  let authCalls = 0;
+  const timeoutSource = teammateSource();
+  timeoutSource.instanceId = 'workspace-timeout';
+  timeoutSource.discover = async () => {
+    timeoutCalls += 1;
+    throw new RelayHistoryError('timeout', 'SOURCE_ACQUISITION_TIMEOUT');
+  };
+  const authSource = teammateSource();
+  authSource.instanceId = 'workspace-expired';
+  authSource.discover = async () => {
+    authCalls += 1;
+    throw new AuthenticationExpiredError('expired', 'AUTHENTICATION_EXPIRED');
+  };
+  const plugins = new HistoryPluginRegistry();
+  plugins.register({ sources: [timeoutSource, authSource] });
+  await assert.rejects(
+    resumeHandoff('claude', 'teammate-session', {
+      dbPath: join(root, 'history.db'),
+      plugins,
+    }),
+    (error: unknown) => error instanceof RelayHistoryError
+      && error.code === 'AUTHENTICATION_EXPIRED',
+  );
+  assert.equal(timeoutCalls, 1);
+  assert.equal(authCalls, 1);
 });
 
 test('resumeHandoff returns independent bounded cursors for every evidence class', async (t) => {

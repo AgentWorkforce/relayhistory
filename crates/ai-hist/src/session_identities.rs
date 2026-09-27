@@ -585,8 +585,7 @@ mod tests {
             )
             .unwrap();
         assert!(
-            plan.contains("COVERING INDEX idx_sessions_identity")
-                || plan.contains("COVERING INDEX delivery_identity_sessions"),
+            plan.contains("COVERING INDEX idx_sessions_identity"),
             "{plan}"
         );
         assert!(store.session_identities(IdentityQuery::default()).is_ok());

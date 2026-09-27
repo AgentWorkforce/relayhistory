@@ -32,6 +32,28 @@ import { discoverSourcePlugins } from './source-plugins.js';
 export const HANDOFF_CONTRACT_VERSION = 1;
 export const MAX_HANDOFF_INTENT_CHARS = 4000;
 const HANDOFF_DISCOVERY_ATTEMPTS = 2;
+const HANDOFF_INTENT_TRUNCATION_MARKER = '…';
+
+function continuationIntent(
+  source: CatalogSource,
+  sessionId: string,
+  originalIntent: string,
+): string {
+  const prefix = `Resume this handoff: call resume_handoff(source=${source}, session_id=${sessionId}) via the ai-hist MCP, then continue: `;
+  const prefixLength = Array.from(prefix).length;
+  if (prefixLength >= MAX_HANDOFF_INTENT_CHARS) {
+    throw new InvalidArgumentError(
+      `handoff resume instruction must be shorter than ${MAX_HANDOFF_INTENT_CHARS} characters`,
+      'INVALID_ARGUMENT',
+    );
+  }
+  const originalCharacters = Array.from(originalIntent);
+  const availableCharacters = MAX_HANDOFF_INTENT_CHARS - prefixLength;
+  if (originalCharacters.length <= availableCharacters) return prefix + originalIntent;
+  return prefix + originalCharacters
+    .slice(0, availableCharacters - 1)
+    .join('') + HANDOFF_INTENT_TRUNCATION_MARKER;
+}
 
 /** The exact pointer carried in a Relaycast delivery whose metadata kind is `handoff`. */
 export interface HandoffPointer {
@@ -211,10 +233,15 @@ export async function createHandoff(
       'CURRENT_SESSION_NOT_FOUND',
     );
   }
+  const intentWithResumeInstruction = continuationIntent(
+    session.source,
+    session.sessionId,
+    normalizedIntent,
+  );
   return {
     source: session.source,
     session_id: session.sessionId,
-    intent: normalizedIntent,
+    intent: intentWithResumeInstruction,
     origin_agent:
       nonempty(env.AI_HIST_ORIGIN_AGENT) ??
       nonempty(env.AGENT_RELAY_AGENT_NAME) ??
@@ -270,20 +297,24 @@ export async function resumeHandoff(
       let refreshed = false;
       let discoveryFailure: RelayHistoryError | undefined;
       for (let attempt = 0; attempt < HANDOFF_DISCOVERY_ATTEMPTS; attempt += 1) {
-        let attemptFailure: RelayHistoryError | undefined;
+        const attemptFailures: RelayHistoryError[] = [];
         const refresh = await discoverSourcePlugins(options.plugins, {
           dbPath: options.dbPath,
           sourceConnectors,
           sources: [source],
           sessionId,
           acquisitionTimeoutMs: options.acquisitionTimeoutMs,
-          onUnavailable: (_connector, error) => { attemptFailure ??= error; },
+          onUnavailable: (_connector, error) => { attemptFailures.push(error); },
         });
         refreshed = refresh.some((run) => run.observations.some(
           (observation) => observation.source === source && observation.session_id === sessionId,
         ));
         if (refreshed) break;
-        if (!attemptFailure) {
+        const terminalFailure = attemptFailures.find(
+          (error) => !['CONNECTOR_FAILURE', 'SOURCE_ACQUISITION_TIMEOUT'].includes(error.code),
+        );
+        if (terminalFailure) throw terminalFailure;
+        if (!attemptFailures.length) {
           // A complete targeted refresh is authoritative. It also prevents
           // hydrateSession from reusing an observation cached for an older
           // authenticated workspace.
@@ -292,7 +323,7 @@ export async function resumeHandoff(
             'SESSION_NOT_FOUND',
           );
         }
-        discoveryFailure = attemptFailure;
+        discoveryFailure = attemptFailures[0];
       }
       if (!refreshed) {
         // A partial refresh cannot prove either presence or absence. Do not

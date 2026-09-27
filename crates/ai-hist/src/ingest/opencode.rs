@@ -1621,10 +1621,10 @@ fn normalize_session(
 ///
 /// Deleted by absence from the new snapshot rather than by clearing the
 /// session first, which matters beyond elegance: every unchanged row keeps its
-/// rowid, so a resync of an unchanged session writes nothing, and the delivery
-/// capture triggers emit nothing. OpenCode's global sync re-reads every session
-/// every run, so clear-and-rewrite would churn the outbox for the whole store
-/// on every sync.
+/// rowid, so a resync of an unchanged session writes nothing and the change
+/// feed reports nothing. OpenCode's global sync re-reads every session every
+/// run, so clear-and-rewrite would churn the feed for the whole store on every
+/// sync.
 ///
 /// Scope is narrow. Only `source = 'opencode'` rows belonging to this session,
 /// by each table's own stable key. The relationship is keyed on the **child**,

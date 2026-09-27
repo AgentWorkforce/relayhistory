@@ -12,22 +12,29 @@ events, tool calls, and file edits. Cached scopes local/remote/all do not
 read credentials; acquisition defaults to local. Tool and file edit pages require
 both source and session ID and use bounded deterministic cursors.
 
-A Relaycast handoff is a pointer, never an inlined transcript. Send the
-`create_handoff` result as structured delivery metadata with `kind="handoff"`:
+A Relaycast handoff is a pointer, never an inlined transcript. `create_handoff`
+turns the caller's continuation request into the pointer's single,
+self-describing `intent` field:
 
 ```json
-{"source":"codex","session_id":"…","intent":"continue the fix","origin_agent":"sender","origin_user":"user-id"}
+{"source":"codex","session_id":"abc","intent":"Resume this handoff: call resume_handoff(source=codex, session_id=abc) via the ai-hist MCP, then continue: continue the fix","origin_agent":"sender","origin_user":"user-id"}
 ```
+
+Send the full result as structured delivery metadata with `kind="handoff"`, and
+send its `intent` value unchanged as the DM text. Do not add a second text field:
+the cloud handoff contract requires the delivery text to equal `intent`.
 
 Before sending, call `resume_handoff` once with the new pointer and send only
 after that workspace read succeeds. This prevents a live pointer from racing
 ahead of Agent Relay desktop's team upload.
 
-On receipt, call `resume_handoff(source, session_id)` immediately. Its response
-is continuation context; pass the returned `next_cursor` back unchanged when an
-additional page is needed. Handoffs are workspace-scoped: resume selects only the
-configured `cloud` connector, refreshes its session observation under the
-currently authenticated workspace, and rejects unavailable cross-workspace or
+On receipt, the normal agent prompt is sufficient: follow the instruction in
+`intent`, call `resume_handoff(source, session_id)` immediately, and continue
+the original request with the returned context. Pass `next_cursor` back
+unchanged when an additional page is needed. No installed handoff skill is
+required. Handoffs are workspace-scoped: resume selects only the configured
+`cloud` connector, refreshes its session observation under the currently
+authenticated workspace, and rejects unavailable cross-workspace or
 cross-organization sessions.
 
 Remote acquisition is optional. Install a source plugin such as
@@ -38,5 +45,5 @@ remote acquisition. Acquisition tools declare open-world writes.
 
 Agent Relay desktop owns team upload and supplies the workspace-authenticated
 `cloud` source configuration used by `resume_handoff`; the retired
-`@relayhistory/capture` package is not required. Auto-resume instructions live
-in `skills/agent-relay-handoff`.
+`@relayhistory/capture` package is not required. Auto-resume is prompt-driven by
+the self-describing `intent`; there is no handoff skill to install.
