@@ -266,13 +266,24 @@ export async function resumeHandoff(
       // observation may belong to the account that was authenticated before a
       // workspace switch, and hydrateSession otherwise reuses it without
       // rediscovery.
-      await discoverSourcePlugins(options.plugins, {
+      const refresh = await discoverSourcePlugins(options.plugins, {
         dbPath: options.dbPath,
         sourceConnectors,
         sources: [source],
         sessionId,
         acquisitionTimeoutMs: options.acquisitionTimeoutMs,
       });
+      if (!refresh.some((run) => run.observations.some(
+        (observation) => observation.source === source && observation.session_id === sessionId,
+      ))) {
+        // A targeted empty discovery does not retract an older observation in
+        // the native catalog. Fail before hydrateSession can reuse that stale
+        // row from the previously authenticated workspace.
+        throw new SessionNotFoundError(
+          'Source session was not found in the authenticated workspace',
+          'SESSION_NOT_FOUND',
+        );
+      }
     }
     hydration = await hydrateSession({
       source,
