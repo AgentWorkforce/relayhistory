@@ -13,7 +13,7 @@ import {
   type SessionFileEditsPage, type SessionMarkersPage, type SessionRelationship, type SessionScope,
   type SessionToolCallsPage, type SessionUsage,
 } from './index.js';
-import { runDeliveryCommand, runHistoryExportCommand, loadHistoryApplicationConfig } from './delivery-cli.js';
+import { runHistoryExportCommand, loadHistoryApplicationConfig } from './delivery-cli.js';
 
 type Parsed = { positional: string[]; flags: Map<string, Array<string | true>> };
 
@@ -49,8 +49,8 @@ type PackageMetadata = { version?: string };
 
 export const BOOLEAN_FLAGS = new Set(['all', 'by-cwd', 'fts', 'help', 'json', 'local', 'no-bootstrap', 'no-related', 'no-source-connectors', 'no-warning', 'once', 'pretty', 'remote', 'version']);
 export const VALUE_FLAGS = new Set([
-  'config', 'job', 'selection', 'poll-ms', 'timeout-ms', 'base-url', 'interval', 'label', 'max-content', 'out', 'after', 'after-ms', 'after-session-id', 'after-source', 'before-ms', 'db', 'limit',
-  'max-depth', 'max-nodes', 'config', 'source-connector', 'project', 'source', 'tag', 'token', 'tokens',
+  'config', 'selection', 'interval', 'out', 'after', 'after-ms', 'after-session-id', 'after-source', 'before-ms', 'db', 'limit',
+  'max-depth', 'max-nodes', 'config', 'source-connector', 'project', 'source', 'tag', 'tokens',
   // Documented in the usage text and read by `sessions discover`, `sessions
   // hydrate` and `sync`, but absent here, so `parse` rejected it as unknown.
   'acquisition-timeout-ms',
@@ -272,9 +272,6 @@ const USAGE_TEXT = `Usage:
   ai-hist pack QUERY... [--local | --remote | --all] [--source SOURCE] [--project PATH] [--tag TAG] [--limit N] [--tokens N] [--db PATH] [--fts] [--json]
   ai-hist stats [--local | --remote | --all] [--json]
   ai-hist export --selection FILE [--out FILE] [--db PATH]
-  ai-hist delivery enable|drain|run --config FILE [--job ID] [--db PATH]
-  ai-hist delivery status|pause|resume|retry|cancel [--job ID] [--db PATH]
-  ai-hist plugin COMMAND --config FILE -- [ARGS...]
   ai-hist sync [--local | --remote | --all] [--source-connector ID | --no-source-connectors] [--acquisition-timeout-ms N] [--db PATH] [--json]
 
 Every command that reads local history indexes it on first use; pass
@@ -723,7 +720,6 @@ export const FLAG_SPECS: Record<string, { flags: string; description: string }> 
   config: { flags: '--config <file>', description: 'History application config file.' },
   db: { flags: '--db <path>', description: 'History database to read or write.' },
   fts: { flags: '--fts', description: 'Treat the query as raw SQLite full-text syntax.' },
-  job: { flags: '--job <id>', description: 'Act on one delivery job.' },
   json: { flags: '--json', description: 'Emit JSON instead of human-readable text.' },
   limit: { flags: '--limit <n>', description: 'Maximum rows to return.' },
   local: { flags: '--local', description: 'Read only local history (the default).' },
@@ -733,7 +729,6 @@ export const FLAG_SPECS: Record<string, { flags: string; description: string }> 
   'no-related': { flags: '--no-related', description: 'Do not hydrate related sessions.' },
   'no-source-connectors': { flags: '--no-source-connectors', description: 'Disable remote acquisition entirely.' },
   out: { flags: '--out <file>', description: 'Write to this file instead of standard output.' },
-  'poll-ms': { flags: '--poll-ms <ms>', description: 'Delivery poll interval, in milliseconds.' },
   pretty: { flags: '--pretty', description: 'Render aligned, colourized rows.' },
   'by-cwd': { flags: '--by-cwd', description: 'Group projects by working directory instead of canonical project key.' },
   project: { flags: '--project <value>', description: 'Restrict to one project: a canonical project key for `sessions list`, a project path elsewhere.' },
@@ -742,7 +737,6 @@ export const FLAG_SPECS: Record<string, { flags: string; description: string }> 
   source: { flags: '--source <source>', description: 'Restrict to one coding-agent source.' },
   'source-connector': { flags: '--source-connector <id>', description: 'Run this remote connector; repeatable.' },
   tag: { flags: '--tag <tag>', description: 'Restrict to entries carrying this tag.' },
-  'timeout-ms': { flags: '--timeout-ms <ms>', description: 'Per-request delivery timeout, in milliseconds.' },
   tokens: { flags: '--tokens <n>', description: 'Approximate token budget for the packed output.' },
 };
 
@@ -759,23 +753,6 @@ export const COMMANDS = new Map<string, CommandSpec>([
     positionals: [0, 0], allowed: ['db', 'json', 'help'], readsLocalStore: true }],
   ['export', { name: 'export', description: 'Export selected history as NDJSON.', surface: ['export'],
     positionals: [0, 0], allowed: ['db', 'selection', 'out'] }],
-  // A config-driven extension hook that needs `-- ARGS` passthrough, not a
-  // user-facing verb: it stays on the bin and off the mounted tree.
-  ['plugin', { name: 'plugin', description: 'Run a configured history plugin command.', surface: null,
-    positionals: [1, null], allowed: ['config'], requires: 'plugin requires a command name' }],
-  ...(Object.entries({
-    enable: 'Create the delivery job declared in the config file.',
-    status: 'Report delivery job status and retention.',
-    drain: 'Deliver everything currently queued, then stop.',
-    run: 'Run the delivery loop until it is cancelled.',
-    pause: 'Stop a delivery job from making progress.',
-    resume: 'Let a paused delivery job make progress again.',
-    retry: 'Clear a delivery job\'s failure and try it again.',
-    cancel: 'Abandon a delivery job.',
-  }) as Array<[string, string]>).map(([action, description]): [string, CommandSpec] => [`delivery ${action}`, {
-    name: `delivery ${action}`, description: `${description} Moved to agent-relay-probe / @relayhistory/capture.`, surface: ['delivery', action],
-    positionals: [0, 0], allowed: ['db', 'config', 'job', 'poll-ms', 'timeout-ms'],
-  }]),
   ['sessions list', { name: 'sessions list', description: 'List indexed sessions from the catalogue.',
     surface: ['list'], positionals: [0, 0], readsLocalStore: true,
     validate: (args) => {
@@ -861,12 +838,12 @@ export const COMMANDS = new Map<string, CommandSpec>([
 /** Command words consumed before the positional arguments start. */
 function commandWords(command: string | undefined): number {
   if (command === undefined) return 0;
-  return command === 'sessions' || command === 'delivery' ? 2 : 1;
+  return command === 'sessions' ? 2 : 1;
 }
 
 function commandSpec(command: string | undefined, subcommand: string | undefined): CommandSpec | undefined {
   if (command === undefined) return COMMANDS.get('');
-  if (command === 'sessions' || command === 'delivery') return subcommand ? COMMANDS.get(`${command} ${subcommand}`) : undefined;
+  if (command === 'sessions') return subcommand ? COMMANDS.get(`${command} ${subcommand}`) : undefined;
   return COMMANDS.get(command);
 }
 
@@ -882,12 +859,8 @@ function commandSpec(command: string | undefined, subcommand: string | undefined
  * about which commands those are.
  */
 export function usesCancellation(argv: readonly string[]): boolean {
-  // `plugin -- ARGS` passes its tail to a plugin verbatim, and `plugin` is not
-  // cancellable, so stopping at the separator can only ever read less.
-  const boundary = argv.indexOf('--');
-  const core = [...(boundary < 0 ? argv : argv.slice(0, boundary))];
   try {
-    const { positional } = parse(core.map((arg) => arg === '-h' ? '--help' : arg));
+    const { positional } = parse(argv.map((arg) => arg === '-h' ? '--help' : arg));
     return commandSpec(positional[0], positional[1])?.cancellable === true;
   } catch {
     // An argv `parse` refuses is a usage error `dispatch` is about to report.
@@ -898,7 +871,7 @@ export function usesCancellation(argv: readonly string[]): boolean {
 
 function unknownCommandMessage(command: string | undefined, subcommand: string | undefined): string {
   if (command === undefined) return 'invalid usage';
-  if (command === 'sessions' || command === 'delivery') {
+  if (command === 'sessions') {
     if (subcommand === undefined) return `${command} requires a subcommand`;
     return `unknown ${command} subcommand '${subcommand}'`;
   }
@@ -945,12 +918,7 @@ async function dispatch(argv: readonly string[], io: CliIo, options: RunCliOptio
     if (options.updateNotice) await maybePrintUpdateNotice(io, version, rawArgs);
     return 0;
   }
-  const boundary = rawArgs.indexOf('--');
-  const beforeBoundary = boundary < 0 ? rawArgs : rawArgs.slice(0, boundary);
-  const separator = boundary >= 0 && parse(beforeBoundary).positional[0] === 'plugin' ? boundary : -1;
-  const pluginArgs = separator < 0 ? [] : rawArgs.slice(separator + 1);
-  const coreArgs = separator < 0 ? rawArgs : rawArgs.slice(0, separator);
-  const args = parse(coreArgs.map((arg) => arg === '-h' ? '--help' : arg));
+  const args = parse(rawArgs.map((arg) => arg === '-h' ? '--help' : arg));
   const [command, subcommand, ...rest] = args.positional;
   const json = args.flags.has('json');
 
@@ -961,7 +929,7 @@ async function dispatch(argv: readonly string[], io: CliIo, options: RunCliOptio
   if (command === 'help' && subcommand === undefined && rest.length === 0) {
     showHelp();
   }
-  if ((command === 'sessions' || command === 'delivery') && subcommand === undefined && args.flags.has('help')) {
+  if (command === 'sessions' && subcommand === undefined && args.flags.has('help')) {
     showHelp();
   }
 
@@ -986,25 +954,11 @@ async function dispatch(argv: readonly string[], io: CliIo, options: RunCliOptio
   const sessionId = command === 'sessions' ? tail[1] : undefined;
   const recentFallback = command === 'recent' && tail.length > 0 ? Number(tail[0]) : undefined;
   const scope = scopeFlag(args);
-  if (command === 'delivery') {
-    return runDeliveryCommand(subcommand!, io, { dbPath: textFlag(args, 'db'), configPath: textFlag(args, 'config'),
-      jobId: textFlag(args, 'job'), pollIntervalMs: numberFlag(args, 'poll-ms'), requestTimeoutMs: numberFlag(args, 'timeout-ms'),
-      signal: options.signal });
-  }
   if (command === 'export') {
     const selectionPath = textFlag(args, 'selection');
     if (!selectionPath) usage('export requires --selection FILE');
     await runHistoryExportCommand({ dbPath: textFlag(args, 'db'), selectionPath, outputPath: textFlag(args, 'out') },
       options.stdoutStream);
-    return 0;
-  }
-  if (command === 'plugin') {
-    const configPath = textFlag(args, 'config');
-    if (!configPath) usage('plugin requires --config FILE');
-    const { registry } = await loadHistoryApplicationConfig(configPath);
-    const operation = registry.command(tail[0]);
-    if (!operation) usage('configured plugin command not found');
-    output(io, await operation.run([...tail.slice(1), ...pluginArgs]), true);
     return 0;
   }
   const acquisitionPlugins = ['sync','sessions'].includes(command ?? '') && textFlag(args,'config') ? (await loadHistoryApplicationConfig(textFlag(args,'config')!)).registry : undefined;
@@ -1149,7 +1103,7 @@ async function dispatch(argv: readonly string[], io: CliIo, options: RunCliOptio
 /** Knobs the bin owns and a mounted host does not. */
 export interface RunCliOptions {
   /**
-   * Cancels a long-running `delivery drain`/`delivery run`.
+   * Cancels a command whose spec is `cancellable`.
    *
    * The signal handlers that produce it belong to whoever owns the process:
    * the bin installs them, a host passes its own, and `dispatch` installs none.
@@ -1193,7 +1147,7 @@ export async function runCli(argv: readonly string[], io: CliIo, options: RunCli
 /**
  * The `ai-hist` binary: the only place that owns process state.
  *
- * Signal handling lives here rather than in the delivery command so that
+ * Signal handling lives here rather than in a command so that
  * `runCli` stays free of global handlers for hosts that mount it. It is also
  * claimed only for the commands that read it: every other invocation keeps
  * Node's default `SIGINT`/`SIGTERM` behaviour, so Ctrl-C ends it the first

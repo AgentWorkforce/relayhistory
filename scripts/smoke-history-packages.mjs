@@ -38,7 +38,6 @@ const env = {
   XDG_DATA_HOME: join(project, "share"),
 };
 for (const key of [
-  "RELAYHISTORY_PLUGIN_BIN",
   "HISTORY_PROVIDER_SOURCES_BIN",
   "RELAYHISTORY_HOME",
   "AI_HIST_DB",
@@ -164,8 +163,6 @@ try {
     [
       join(project, "node_modules/ai-hist/dist/cli.js"),
       "login",
-      "--token",
-      "fixture",
     ],
     { cwd: project, env, encoding: "utf8", timeout: 10000 },
   );
@@ -174,7 +171,6 @@ try {
     const files = await readdir(helpers);
     const installs = [];
     for (const [directory, prefix] of [
-      ["relayhistory", "relayhistory"],
       ["provider-sources", "history-provider-sources"],
     ]) {
       const manifest = JSON.parse(
@@ -205,7 +201,7 @@ try {
     ]);
     await writeFile(
       script,
-      `import assert from 'node:assert/strict';import * as sdk from 'ai-hist';import * as cloud from '@relayhistory/capture';import * as provider from '@relayhistory/provider-sources';\nassert.equal(cloud.RelayHistoryError,sdk.RelayHistoryError);const registry=new sdk.HistoryPluginRegistry();registry.register(cloud.createHistoryPlugin({binaryPath:'/never-read-during-registration'}));registry.register(provider.createHistoryPlugin({binaryPath:'/never-read-during-registration'}));assert.equal(registry.sourceConnectors().length,3);\nfor(const name of ['capture','provider-sources']){const {helperRequest}=await import('./node_modules/@relayhistory/'+name+'/dist/helper.js');await assert.rejects(helperRequest('fixtureUnsupported'),error=>error instanceof sdk.RelayHistoryError&&error.code!=='HISTORY_PLUGIN_BINARY_MISSING');}\n`,
+      `import assert from 'node:assert/strict';import * as sdk from 'ai-hist';import * as provider from '@relayhistory/provider-sources';\nconst registry=new sdk.HistoryPluginRegistry();registry.register(provider.createHistoryPlugin({binaryPath:'/never-read-during-registration'}));assert.equal(registry.sourceConnectors().length,2);\nconst {helperRequest}=await import('./node_modules/@relayhistory/provider-sources/dist/helper.js');await assert.rejects(helperRequest('fixtureUnsupported'),error=>error instanceof sdk.RelayHistoryError&&error.code!=='HISTORY_PLUGIN_BINARY_MISSING');\n`,
     );
     run(process.execPath, [script]);
   }
