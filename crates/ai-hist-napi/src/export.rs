@@ -91,11 +91,20 @@ pub async fn history_export(request_json: String, db_path: Option<String>) -> na
                 }
                 Request::ExportPage { cursor, now_ms } => {
                     let mut open = open_snapshots();
-                    let snapshot = open
-                        .iter_mut()
-                        .find(|snapshot| snapshot.owns_cursor(&cursor))
+                    let index = open
+                        .iter()
+                        .position(|snapshot| snapshot.owns_cursor(&cursor))
                         .ok_or_else(|| anyhow::anyhow!("export cursor not found"))?;
-                    serde_json::to_value(snapshot.page(&cursor, now_ms)?)?
+                    // An expired snapshot is released as soon as its cursor
+                    // comes back, so its read transaction never outlives it
+                    // and holds back WAL checkpoints.
+                    if open[index].expired(now_ms) {
+                        open.remove(index);
+                        anyhow::bail!("export snapshot expired");
+                    }
+                    let page = open[index].page(&cursor, now_ms)?;
+                    expire(&mut open, now_ms, MAX_OPEN_EXPORTS);
+                    serde_json::to_value(page)?
                 }
                 Request::CloseExport { snapshot_id } => {
                     open_snapshots().retain(|snapshot| snapshot.snapshot_id() != snapshot_id);

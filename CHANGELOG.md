@@ -33,9 +33,9 @@ Notable changes to the native `ai-hist` CLI are documented here.
 - `HistoryPlugin` loses `commands` and `tools`; `HistoryPluginRegistry` loses
   `command()` and `registeredTools()`. A plugin contributes `sources` and
   `destinations`. The history config file loses its `job` field.
-- `ai-hist` keeps no upload capture journal. A store has no per-table capture
-  triggers, no journal, preimage, bootstrap-bound, subscription or exclusion
-  tables, and no retention budget: an evidence write is never refused with
+- `ai-hist` keeps no upload capture journal. It creates and maintains no
+  per-table capture triggers, no journal, preimage, bootstrap-bound,
+  subscription or exclusion tables, and no retention budget: an evidence write is never refused with
   "delivery retention limit exceeded", and sync, hydration and discovery run
   no retention check. An uploader reads the change feed
   (`SessionStore::changes_since`). The first writable open of an existing
