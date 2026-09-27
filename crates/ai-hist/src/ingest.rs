@@ -10831,15 +10831,31 @@ pub(crate) fn muse_session_files(transcript: &Path) -> Result<Vec<PathBuf>> {
 /// The `subagent/<id>/session.jsonl` logs under one session directory, and
 /// theirs in turn.
 fn collect_muse_child_logs(session_dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    collect_muse_child_logs_at(session_dir, 0, out)
+}
+
+fn collect_muse_child_logs_at(
+    session_dir: &Path,
+    depth: usize,
+    out: &mut Vec<PathBuf>,
+) -> Result<()> {
+    if depth >= MAX_MUSE_SUBAGENT_DEPTH {
+        return Ok(());
+    }
     for log in direct_muse_child_logs(session_dir)? {
         check_capture_cancelled()?;
         out.push(log.clone());
         if let Some(child_dir) = log.parent() {
-            collect_muse_child_logs(child_dir, out)?;
+            collect_muse_child_logs_at(child_dir, depth + 1, out)?;
         }
     }
     Ok(())
 }
+
+/// How deep subagent logs are followed. The containment rule in
+/// [`direct_muse_child_logs`] already makes every level strictly deeper in the
+/// real filesystem, so a walk always ends; this bounds it regardless.
+const MAX_MUSE_SUBAGENT_DEPTH: usize = 32;
 
 /// The immediate `subagent/<id>/session.jsonl` logs of one session
 /// directory, sorted.
@@ -10853,12 +10869,16 @@ fn direct_muse_child_logs(session_dir: &Path) -> Result<Vec<PathBuf>> {
                 .with_context(|| format!("list Muse subagents {}", children.display()))
         }
     };
-    // A child log is read only where it resolves inside its parent's own
-    // session directory. A `subagent/<dir>` or `session.jsonl` that is a
-    // symlink pointing anywhere else is not this session's evidence, and
-    // following it would index a file outside the Muse root.
-    let within = fs::canonicalize(session_dir)
-        .with_context(|| format!("resolve Muse session {}", session_dir.display()))?;
+    // A child log is read only where it resolves inside this session's own
+    // `subagent/` directory. A `subagent/<dir>` or `session.jsonl` that is a
+    // symlink pointing anywhere else is not this session's evidence:
+    // outside the Muse root it would index a stranger's file, and back up
+    // into the session (`subagent/loop -> ..`) it would read the parent's own
+    // transcript as its child and recurse forever. Requiring each level to
+    // resolve strictly beneath the previous one's `subagent/` is what makes
+    // every walk of the tree finite.
+    let within = fs::canonicalize(&children)
+        .with_context(|| format!("resolve Muse subagents {}", children.display()))?;
     let mut logs = Vec::new();
     for entry in entries {
         let entry = entry.with_context(|| format!("list Muse subagents {}", children.display()))?;
@@ -10994,12 +11014,19 @@ pub(crate) fn read_muse_tree(
 /// The subagent logs directly beneath one session directory, each read along
 /// with its own children.
 pub(crate) fn read_muse_children(session_dir: &Path) -> Result<Vec<MuseChildLog>> {
+    read_muse_children_at(session_dir, 0)
+}
+
+fn read_muse_children_at(session_dir: &Path, depth: usize) -> Result<Vec<MuseChildLog>> {
+    if depth >= MAX_MUSE_SUBAGENT_DEPTH {
+        return Ok(Vec::new());
+    }
     let mut out = Vec::new();
     for path in direct_muse_child_logs(session_dir)? {
         check_capture_cancelled()?;
         let transcript = read_muse_transcript(&path)?;
         let children = match path.parent() {
-            Some(dir) => read_muse_children(dir)?,
+            Some(dir) => read_muse_children_at(dir, depth + 1)?,
             None => Vec::new(),
         };
         out.push(MuseChildLog {
@@ -15809,6 +15836,38 @@ mod tests {
             first_seen,
             "the edge keeps the time it was first observed"
         );
+    }
+
+    /// A `subagent/` entry that points back up into its own session is not a
+    /// child: it is never read as one, and the walk ends rather than
+    /// recursing through it forever.
+    #[cfg(unix)]
+    #[test]
+    fn a_muse_subagent_symlink_back_into_its_session_is_not_followed() {
+        let home = tempfile::tempdir().unwrap();
+        let (root, transcript) = muse_fixture(home.path());
+        let session_dir = transcript.parent().unwrap();
+        std::os::unix::fs::symlink("..", session_dir.join("subagent/loop")).unwrap();
+
+        let files = super::muse_session_files(&transcript).unwrap();
+        assert_eq!(
+            files.len(),
+            4,
+            "the parent and its three real child logs: {files:?}"
+        );
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        assert_eq!(muse_count(&conn, "session_relationships"), 3);
+        let self_edges: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_relationships \
+                 WHERE source = 'muse' AND child_session_id = ?",
+                [MUSE_PARENT],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(self_edges, 0, "the parent is never its own child");
     }
 
     /// A child log that names no session yet — Muse is still writing its
