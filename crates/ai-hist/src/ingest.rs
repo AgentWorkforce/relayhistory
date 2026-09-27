@@ -1513,12 +1513,10 @@ fn sync_basic(
     }
     capture_progress("muse", 0, None);
     check_capture_cancelled()?;
-    report.ensure_headroom(conn, "muse")?;
     if let Some(inserted) = report.capture(
-        conn,
         "muse",
         sync_muse_with_coverage(conn, &mut state, &roots.muse, &repairs, &mut coverage),
-    )? {
+    ) {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);
     }
@@ -10523,13 +10521,12 @@ fn sync_muse_with_coverage(
             }
         }
         scanned += 1;
-        ensure_capture_headroom(conn)?;
         // Everything is read before anything is written. A transcript or a
         // subagent log that cannot be read is this session's failure alone:
         // it keeps no stamp, so the next run retries it, and the pass goes on.
-        // A write that fails once the transaction is open is not per-session —
-        // a retention abort meets every later session too — so it ends the
-        // pass, as it does for Grok.
+        // A write that fails once the transaction is open is a database
+        // failure, not this session's, so it ends the pass, as it does for
+        // Grok.
         match read_muse_tree(&transcript) {
             Ok(Some((parsed, children))) => {
                 let session_id = parsed.metadata.session_id.clone();
@@ -10544,7 +10541,7 @@ fn sync_muse_with_coverage(
                     Ok(written) => written,
                     Err(error) => {
                         drop(tx);
-                        return Err(annotate_retention_limit(conn, error));
+                        return Err(error);
                     }
                 };
                 // A re-read replaces the session's prompts wholesale, so what
