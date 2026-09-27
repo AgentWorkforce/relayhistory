@@ -13,7 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pointers carry only session identity, one self-describing resume intent, and
   origin identity; no installed receiver skill is required. Resume performs
   same-workspace acquisition and composes bounded prompt, event, tool-call,
-  and file-edit pages with independent continuation cursors.
+  and file-edit pages with independent continuation cursors. The composed
+  intent stays within 4,000 characters by truncating an overflowing caller
+  suffix with `…`.
 
 - Add the `./relay-cli` subpath export: `createRelayCliSurface()` returns a
   `RelayCliSurface` (contract v1, id `relayhistory`) that a host such as

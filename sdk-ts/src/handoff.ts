@@ -32,13 +32,27 @@ import { discoverSourcePlugins } from './source-plugins.js';
 export const HANDOFF_CONTRACT_VERSION = 1;
 export const MAX_HANDOFF_INTENT_CHARS = 4000;
 const HANDOFF_DISCOVERY_ATTEMPTS = 2;
+const HANDOFF_INTENT_TRUNCATION_MARKER = '…';
 
 function continuationIntent(
   source: CatalogSource,
   sessionId: string,
   originalIntent: string,
 ): string {
-  return `Resume this handoff: call resume_handoff(source=${source}, session_id=${sessionId}) via the ai-hist MCP, then continue: ${originalIntent}`;
+  const prefix = `Resume this handoff: call resume_handoff(source=${source}, session_id=${sessionId}) via the ai-hist MCP, then continue: `;
+  const prefixLength = Array.from(prefix).length;
+  if (prefixLength >= MAX_HANDOFF_INTENT_CHARS) {
+    throw new InvalidArgumentError(
+      `handoff resume instruction must be shorter than ${MAX_HANDOFF_INTENT_CHARS} characters`,
+      'INVALID_ARGUMENT',
+    );
+  }
+  const originalCharacters = Array.from(originalIntent);
+  const availableCharacters = MAX_HANDOFF_INTENT_CHARS - prefixLength;
+  if (originalCharacters.length <= availableCharacters) return prefix + originalIntent;
+  return prefix + originalCharacters
+    .slice(0, availableCharacters - 1)
+    .join('') + HANDOFF_INTENT_TRUNCATION_MARKER;
 }
 
 /** The exact pointer carried in a Relaycast delivery whose metadata kind is `handoff`. */

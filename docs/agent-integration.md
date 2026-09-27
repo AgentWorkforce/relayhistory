@@ -81,6 +81,10 @@ identity and continues the original request using the returned prompts,
 events, tool calls, and file edits. If a bounded result has `next_cursor`, pass
 that cursor back unchanged for the next page.
 
+Caller intent accepts up to 4,000 characters. Because the generated resume
+instruction shares that bound, `create_handoff` keeps the instruction intact
+and truncates only an overflowing caller-intent suffix, ending it with `…`.
+
 Before sending the pointer, call `resume_handoff` once yourself as a readiness
 check. Agent Relay desktop owns team upload, so this proves the current
 workspace can already acquire the session rather than sending a pointer ahead

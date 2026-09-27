@@ -48,7 +48,8 @@ Notable changes to the native `ai-hist` CLI are documented here.
   `resume_handoff(source, session_id)`. The sender emits only a session pointer
   plus one self-describing intent and origin identity; the intent tells the
   receiving agent to call `resume_handoff` before continuing, with no installed
-  skill required. The receiver refreshes the configured
+  skill required. The final intent stays within 4,000 characters by truncating
+  an overflowing caller-intent suffix with `…`. The receiver refreshes the configured
   workspace `cloud` source and returns bounded prompts, normalized events, tool
   calls, and file edits with independent continuation cursors.
 

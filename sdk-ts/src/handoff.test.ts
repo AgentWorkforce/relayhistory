@@ -24,7 +24,7 @@ test('createHandoff keeps the pointer intent bounded', async () => {
   );
 });
 
-test('createHandoff preserves the published input allowance when adding its resume prompt', async (t) => {
+test('createHandoff bounds the composed pointer by truncating the intent suffix', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'relayhistory-long-handoff-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const home = join(root, 'home');
@@ -56,7 +56,12 @@ test('createHandoff preserves the published input allowance when adding its resu
     dbPath: join(root, 'history.db'),
     env: { CODEX_THREAD_ID: sessionId },
   });
-  assert.ok(pointer.intent.endsWith(originalIntent));
+  assert.equal(Array.from(pointer.intent).length, MAX_HANDOFF_INTENT_CHARS);
+  assert.ok(pointer.intent.startsWith(
+    `Resume this handoff: call resume_handoff(source=codex, session_id=${sessionId}) via the ai-hist MCP, then continue: `,
+  ));
+  assert.ok(pointer.intent.endsWith('…'));
+  assert.ok(!pointer.intent.endsWith(originalIntent));
 });
 
 test('createHandoff resolves the invoking harness session through the local catalog', async (t) => {
