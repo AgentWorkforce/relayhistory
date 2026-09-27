@@ -10853,6 +10853,12 @@ fn direct_muse_child_logs(session_dir: &Path) -> Result<Vec<PathBuf>> {
                 .with_context(|| format!("list Muse subagents {}", children.display()))
         }
     };
+    // A child log is read only where it resolves inside its parent's own
+    // session directory. A `subagent/<dir>` or `session.jsonl` that is a
+    // symlink pointing anywhere else is not this session's evidence, and
+    // following it would index a file outside the Muse root.
+    let within = fs::canonicalize(session_dir)
+        .with_context(|| format!("resolve Muse session {}", session_dir.display()))?;
     let mut logs = Vec::new();
     for entry in entries {
         let entry = entry.with_context(|| format!("list Muse subagents {}", children.display()))?;
@@ -10861,7 +10867,13 @@ fn direct_muse_child_logs(session_dir: &Path) -> Result<Vec<PathBuf>> {
         // still there, and treating it as gone would forget its evidence;
         // the error fails this session's read instead, so it is retried.
         match fs::metadata(&log) {
-            Ok(metadata) if metadata.is_file() => logs.push(log),
+            Ok(metadata) if metadata.is_file() => {
+                let resolved = fs::canonicalize(&log)
+                    .with_context(|| format!("resolve Muse subagent log {}", log.display()))?;
+                if resolved.starts_with(&within) {
+                    logs.push(log);
+                }
+            }
             Ok(_) => {}
             Err(error)
                 if matches!(
@@ -15639,6 +15651,39 @@ mod tests {
             muse_session_count(&conn, "session_events", MUSE_WORKER),
             worker_events
         );
+    }
+
+    /// A `subagent/` entry that is a symlink out of the session directory is
+    /// not the session's evidence: it is never read, stamped or linked.
+    #[cfg(unix)]
+    #[test]
+    fn a_muse_child_log_symlinked_outside_its_session_is_not_read() {
+        let home = tempfile::tempdir().unwrap();
+        let (root, transcript) = muse_fixture(home.path());
+        let outside = home.path().join("elsewhere/secret");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(
+            outside.join("session.jsonl"),
+            "{\"id\":\"x\",\"stream\":{\"kind\":\"session\",\"id\":\"escaped\"},\
+             \"recorded_at\":1790337600000000,\"payload_type\":\"runtime.session.metadata\",\
+             \"payload\":{\"kind\":\"metadata\",\"record\":{\"workspace_root\":\"/w\"}}}\n",
+        )
+        .unwrap();
+        let session_dir = transcript.parent().unwrap();
+        std::os::unix::fs::symlink(&outside, session_dir.join("subagent/escaped")).unwrap();
+
+        let files = super::muse_session_files(&transcript).unwrap();
+        assert!(
+            files
+                .iter()
+                .all(|file| !file.to_string_lossy().contains("escaped")),
+            "{files:?}"
+        );
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        assert_eq!(muse_session_count(&conn, "session_events", "escaped"), 0);
+        assert_eq!(muse_count(&conn, "session_relationships"), 3);
     }
 
     /// A child log that names no session yet — Muse is still writing its
