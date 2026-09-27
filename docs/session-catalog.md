@@ -1206,7 +1206,9 @@ How each adapter works:
   identity shifted when the file was rewritten, sitting in the database
   forever with nothing to distinguish them from live evidence. A relationship
   another session recorded about *this* one is not this session's to delete,
-  and is left alone.
+  and is left alone. "Clears" means the local share only: a row a remote
+  observation also supplied stays, as the remote side's (see
+  [evidence location](#evidence-location)).
 
   The change stamp covers **every file the read consumes**: the transcript, the
   summary and the update stream each keep a readable marker, and
@@ -1507,8 +1509,9 @@ How each adapter works:
   (`MUSE_REASONING_ENCRYPTED`).
 
   A sync or hydration reads the whole file and **replaces** the session's
-  evidence, so a re-read after the log grew adds exactly the new turns and
-  duplicates nothing.
+  local evidence, so a re-read after the log grew adds exactly the new turns
+  and duplicates nothing, while a row a remote observation also supplied is
+  left to the remote side (see [evidence location](#evidence-location)).
 
   **Subagents.** Every child agent — a `subagent_spawn` worker, or a reminder
   child when Muse is set to save those — writes
@@ -2041,6 +2044,24 @@ Databases created by an older release are migrated in place by a serialized
 missing-column check in `init_db`, and `schema_is_current` knows about the new
 columns, so a read-only handle over an old database is upgraded instead of
 failing with `no such column`.
+
+<a id="evidence-location"></a>
+
+**Evidence location.** Local and remote evidence for one session share its
+`(source, session_id)` identity and each table's unique key, so one record is
+one row whichever side supplied it. `session_events`, `tool_calls`,
+`file_edits` and `session_markers` therefore carry a per-row `location`:
+`local`, `remote`, or `both`. A local parser's rows default to `local`, remote
+intake (`EvidenceRecord::write`) stamps the observation's location, and an
+upsert that meets the other side's row makes it `both`. A side that retires
+its evidence — a local whole-session re-read, a remote observation dropping a
+record — deletes only the rows it alone backs and hands `both` rows to the
+other side, so neither side can remove what the other still evidences. The
+column is this database's own bookkeeping: it is not part of any adapter
+projection, and is ensured on every open. The `evidence_location_v1` migration
+backfills rows written before it existed: a session known *only* remotely was
+supplied by remote intake and its rows become `remote`; every other row stays
+`local`, which is what a local re-read already assumed of it.
 
 `session_presences` is the location child table. It is keyed by
 `(source, session_id, location)`, where `location` is `local` or `remote`, and

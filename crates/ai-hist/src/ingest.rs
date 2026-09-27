@@ -4302,10 +4302,12 @@ fn repair_codex_rollout_user_messages(
     // leave either the old user rows or the fully rebuilt ones. Assistant,
     // tool, and file-edit evidence is retained and idempotently upserted.
     let tx = conn.unchecked_transaction()?;
-    tx.execute(
-        "DELETE FROM session_events \
-         WHERE source = 'codex' AND session_id = ? AND role = 'user'",
-        [meta.session_id.as_str()],
+    crate::store::retire_evidence_share(
+        &tx,
+        "session_events",
+        "source = 'codex' AND session_id = ? AND role = 'user'",
+        params![meta.session_id.as_str()],
+        SessionLocation::Local,
     )?;
     if meta.is_subagent {
         cleanup_codex_subagent_history(&tx, &meta.session_id)?;
@@ -4599,11 +4601,13 @@ fn ingest_codex_rollout_incremental(
                 // recorded as an `unknown` marker. It writes a row now, so
                 // the marker an earlier parser left for it is retired rather
                 // than kept beside the row as a second account of one line.
-                conn.execute(
-                    "DELETE FROM session_markers \
-                     WHERE source = 'codex' AND session_id = ? AND marker_uid = ? \
+                crate::store::retire_evidence_share(
+                    conn,
+                    "session_markers",
+                    "source = 'codex' AND session_id = ? AND marker_uid = ? \
                        AND kind = 'unknown'",
                     params![session_id, format!("{index}:marker")],
+                    SessionLocation::Local,
                 )?;
             }
             // A subagent's "user" turns are the parent agent's task prompts;
@@ -6671,25 +6675,37 @@ fn delete_claude_record_rows(
     session_id: &str,
     message_uuid: &str,
 ) -> Result<()> {
-    conn.execute(
-        "DELETE FROM session_events WHERE source = 'claude' AND session_id = ? \
+    crate::store::retire_evidence_share(
+        conn,
+        "session_events",
+        "source = 'claude' AND session_id = ? \
          AND substr(event_uid, 1, length(?) + 1) = ? || ':'",
         params![session_id, message_uuid, message_uuid],
+        SessionLocation::Local,
     )?;
-    conn.execute(
-        "DELETE FROM tool_calls WHERE source = 'claude' AND session_id = ? AND message_id = ?",
+    crate::store::retire_evidence_share(
+        conn,
+        "tool_calls",
+        "source = 'claude' AND session_id = ? AND message_id = ?",
         params![session_id, message_uuid],
+        SessionLocation::Local,
     )?;
-    conn.execute(
-        "DELETE FROM file_edits WHERE source = 'claude' AND session_id = ? AND message_id = ?",
+    crate::store::retire_evidence_share(
+        conn,
+        "file_edits",
+        "source = 'claude' AND session_id = ? AND message_id = ?",
         params![session_id, message_uuid],
+        SessionLocation::Local,
     )?;
     // Markers are derived from the same record and keyed on the same prefix,
     // so they move with it rather than outliving it under the old identity.
-    conn.execute(
-        "DELETE FROM session_markers WHERE source = 'claude' AND session_id = ? \
+    crate::store::retire_evidence_share(
+        conn,
+        "session_markers",
+        "source = 'claude' AND session_id = ? \
          AND substr(marker_uid, 1, length(?) + 1) = ? || ':'",
         params![session_id, message_uuid, message_uuid],
+        SessionLocation::Local,
     )?;
     Ok(())
 }
@@ -6948,9 +6964,12 @@ fn heal_legacy_positional_rows(
         }
     }
     for message_id in &heal_messages {
-        conn.execute(
-            "DELETE FROM session_events WHERE source = 'claude' AND session_id = ? AND message_id = ?",
+        crate::store::retire_evidence_share(
+            conn,
+            "session_events",
+            "source = 'claude' AND session_id = ? AND message_id = ?",
             params![session_id, message_id],
+            SessionLocation::Local,
         )?;
     }
     // A tool use id names its own call and edit rows even when the record's
@@ -7405,11 +7424,13 @@ fn ingest_claude_record(
     // reminders the text has today. Keyed on the record's message id and the
     // one kind the split writes, which is one probe on the message index.
     if message_role == "user" && !sidechain {
-        conn.execute(
-            "DELETE FROM session_events \
-             WHERE source = 'claude' AND session_id = ?1 AND message_id = ?2 \
+        crate::store::retire_evidence_share(
+            conn,
+            "session_events",
+            "source = 'claude' AND session_id = ?1 AND message_id = ?2 \
                AND control_kind = 'system_reminder'",
             params![session_id, message_uuid],
+            SessionLocation::Local,
         )?;
     }
     let Some(content) = message.and_then(|m| m.get("content")) else {
@@ -7855,10 +7876,12 @@ impl ClaudeTextRows<'_> {
             // row would stay beside them and read as a prompt for as long as
             // the transcript stood still. Scoped to this one uid: every other
             // row of the record keeps its identity and is upserted in place.
-            conn.execute(
-                "DELETE FROM session_events \
-                 WHERE source = 'claude' AND session_id = ? AND event_uid = ?",
+            crate::store::retire_evidence_share(
+                conn,
+                "session_events",
+                "source = 'claude' AND session_id = ? AND event_uid = ?",
                 params![self.session_id, event_uid],
+                SessionLocation::Local,
             )?;
         }
         write(&split.prompt, event_uid, None)?;
@@ -8791,7 +8814,9 @@ fn insert_session_event_with_provenance(
          is_sidechain=excluded.is_sidechain, is_meta=excluded.is_meta, turn_id=excluded.turn_id, \
          request_span=excluded.request_span, \
          raw_facts_version=excluded.raw_facts_version, raw_kind=excluded.raw_kind, \
-         control_kind=excluded.control_kind",
+         control_kind=excluded.control_kind, \
+         location=CASE WHEN session_events.location = excluded.location \
+           THEN session_events.location ELSE 'both' END",
     )?.execute(
         params![
             source,
@@ -8858,7 +8883,9 @@ fn insert_tool_call(
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(source, session_id, tool_use_id) DO UPDATE SET \
          message_id=excluded.message_id, name=excluded.name, target=excluded.target, args_json=excluded.args_json, \
-         is_error=COALESCE(excluded.is_error, tool_calls.is_error), ts_ms=excluded.ts_ms",
+         is_error=COALESCE(excluded.is_error, tool_calls.is_error), ts_ms=excluded.ts_ms, \
+         location=CASE WHEN tool_calls.location = excluded.location \
+           THEN tool_calls.location ELSE 'both' END",
     )?.execute(
         params![
             source,
@@ -8910,7 +8937,9 @@ fn upsert_file_edit_from_call(
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(source, session_id, tool_use_id) DO UPDATE SET \
          message_id=excluded.message_id, file_path=excluded.file_path, tool_name=excluded.tool_name, \
-         ts_ms=excluded.ts_ms, git_branch=COALESCE(excluded.git_branch, file_edits.git_branch), cwd=COALESCE(excluded.cwd, file_edits.cwd)",
+         ts_ms=excluded.ts_ms, git_branch=COALESCE(excluded.git_branch, file_edits.git_branch), cwd=COALESCE(excluded.cwd, file_edits.cwd), \
+         location=CASE WHEN file_edits.location = excluded.location \
+           THEN file_edits.location ELSE 'both' END",
     )?.execute(
         params![
             source,
@@ -9972,10 +10001,17 @@ fn stored_cursor_record_timestamps(
 /// edits it never made. Clearing all four tables together, inside the caller's
 /// transaction, is what makes a rebuild a rebuild.
 pub(crate) fn clear_cursor_session_evidence(conn: &Connection, session_id: &str) -> Result<()> {
-    for table in ["history", "session_events", "tool_calls", "file_edits"] {
-        conn.execute(
-            &format!("DELETE FROM {table} WHERE source = 'cursor' AND session_id = ?"),
-            [session_id],
+    conn.execute(
+        "DELETE FROM history WHERE source = 'cursor' AND session_id = ?",
+        [session_id],
+    )?;
+    for table in ["session_events", "tool_calls", "file_edits"] {
+        crate::store::retire_evidence_share(
+            conn,
+            table,
+            "source = 'cursor' AND session_id = ?",
+            params![session_id],
+            SessionLocation::Local,
         )?;
     }
     Ok(())
@@ -11072,9 +11108,9 @@ fn muse_linked_children(conn: &Connection, parent_id: &str) -> Result<HashSet<St
 /// Drop the evidence of a child whose log is gone, and of its own children.
 /// It was only ever addressable through the edge that no longer exists.
 ///
-/// A child also known remotely keeps its own events and markers — the rows
-/// under its id are not only this log's — but the children it linked from the
-/// missing directory, and its edges to them, go all the same.
+/// Only the local share goes: a row remote evidence also backs stays, as the
+/// remote side's, and so do a remote presence, the catalog row standing on it,
+/// and the history it shares.
 fn forget_muse_subagent(conn: &Connection, child_id: &str) -> Result<()> {
     // Its own children were linked from the same, now missing, directory,
     // whatever the child itself is.
@@ -11086,28 +11122,38 @@ fn forget_muse_subagent(conn: &Connection, child_id: &str) -> Result<()> {
          AND parent_session_id = ? AND evidence_kind = 'muse_subagent_log'",
         params![child_id],
     )?;
-    if session_has_remote_presence(conn, "muse", child_id)? {
-        // Its log is gone, so it is no longer present locally; the remote
-        // presence, the catalog row that stands on it and its history stay.
-        conn.execute(
-            "DELETE FROM session_presences \
-             WHERE source = 'muse' AND session_id = ? AND location = 'local'",
-            params![child_id],
-        )?;
-        return Ok(());
+    retire_local_session_evidence(conn, "muse", child_id)?;
+    // Its log is gone, so it is no longer present locally.
+    conn.execute(
+        "DELETE FROM session_presences \
+         WHERE source = 'muse' AND session_id = ? AND location = 'local'",
+        params![child_id],
+    )?;
+    if !session_has_remote_presence(conn, "muse", child_id)? {
+        // Any history still filed under it — from before it was linked as a
+        // subagent — goes too, or moves to a session that still evidences it.
+        replace_session_history(conn, "muse", child_id)?;
     }
-    // Any history still filed under it — from before it was linked as a
-    // subagent — goes too, or moves to a session that still evidences it.
-    replace_session_history(conn, "muse", child_id)?;
-    for statement in [
-        "DELETE FROM session_events WHERE source = 'muse' AND session_id = ?",
-        "DELETE FROM tool_calls WHERE source = 'muse' AND session_id = ?",
-        "DELETE FROM file_edits WHERE source = 'muse' AND session_id = ?",
-        "DELETE FROM session_markers WHERE source = 'muse' AND session_id = ?",
-        "DELETE FROM session_relationships WHERE source = 'muse' \
-         AND parent_session_id = ? AND evidence_kind = 'muse_subagent_log'",
-    ] {
-        conn.execute(statement, params![child_id])?;
+    Ok(())
+}
+
+/// Retire a local parser's share of one session's evidence ahead of a
+/// whole-session re-read: every row only local evidence backs is deleted, and
+/// every row remote evidence also backs is left as the remote side's. See
+/// [`crate::store::EVIDENCE_LOCATION_TABLES`].
+pub(crate) fn retire_local_session_evidence(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+) -> Result<()> {
+    for table in crate::store::EVIDENCE_LOCATION_TABLES {
+        crate::store::retire_evidence_share(
+            conn,
+            table,
+            "source = ? AND session_id = ?",
+            params![source, session_id],
+            SessionLocation::Local,
+        )?;
     }
     Ok(())
 }
@@ -11212,14 +11258,7 @@ pub(crate) fn ingest_muse_session(
         HistoryScope::Session
     };
     replace_session_history_scoped(conn, SOURCE, sid, scope)?;
-    for statement in [
-        "DELETE FROM session_events WHERE source = 'muse' AND session_id = ?",
-        "DELETE FROM tool_calls WHERE source = 'muse' AND session_id = ?",
-        "DELETE FROM file_edits WHERE source = 'muse' AND session_id = ?",
-        "DELETE FROM session_markers WHERE source = 'muse' AND session_id = ?",
-    ] {
-        conn.execute(statement, params![sid])?;
-    }
+    retire_local_session_evidence(conn, SOURCE, sid)?;
 
     let mut outcome = MuseIngestOutcome {
         unparsed_lines: transcript.unparsed_lines,
@@ -12388,14 +12427,7 @@ fn ingest_grok_session(
 /// child is untouched. The caller runs inside a transaction, so the window
 /// where the evidence is missing is never observable.
 fn replace_grok_session_evidence(conn: &Connection, session_id: &str) -> Result<()> {
-    for statement in [
-        "DELETE FROM session_events WHERE source = 'grok' AND session_id = ?",
-        "DELETE FROM tool_calls WHERE source = 'grok' AND session_id = ?",
-        "DELETE FROM file_edits WHERE source = 'grok' AND session_id = ?",
-        "DELETE FROM session_markers WHERE source = 'grok' AND session_id = ?",
-    ] {
-        conn.execute(statement, params![session_id])?;
-    }
+    retire_local_session_evidence(conn, "grok", session_id)?;
     // Every Grok prompt written before this parser carried a timestamp
     // synthesized as `created_at + index`; merging would keep the fabricated
     // ones forever, so history is replaced, not merged.
@@ -15433,11 +15465,52 @@ mod tests {
         );
     }
 
-    /// A removed child that is also known remotely keeps its own evidence,
-    /// but the local-only children it linked from the missing directory do
-    /// not linger, and neither do its edges to them.
+    /// A local re-read of a session replaces only the evidence its transcript
+    /// backs: an event a remote observation supplied under the same session
+    /// survives it, and one both sides supplied stays with the remote side
+    /// when the transcript no longer has it.
     #[test]
-    fn a_removed_remote_muse_child_still_forgets_its_local_children() {
+    fn a_muse_reread_keeps_evidence_a_remote_observation_supplied() {
+        let home = tempfile::tempdir().unwrap();
+        let (root, transcript) = muse_fixture(home.path());
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, ts_ms, role, kind, text, event_uid, location) \
+             VALUES ('muse', ?, 1, 'assistant', 'text', 'from the remote side', 'remote:1', 'remote')",
+            [MUSE_PARENT],
+        )
+        .unwrap();
+        let local_before = muse_session_count(&conn, "session_events", MUSE_PARENT);
+
+        append_muse_record(&transcript, MUSE_PARENT, "parent-late", "More.");
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        let remote: Vec<String> = conn
+            .prepare(
+                "SELECT location FROM session_events \
+                 WHERE source = 'muse' AND session_id = ? AND event_uid = 'remote:1'",
+            )
+            .unwrap()
+            .query_map([MUSE_PARENT], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(remote, vec!["remote".to_string()]);
+        assert_eq!(
+            muse_session_count(&conn, "session_events", MUSE_PARENT),
+            local_before + 1,
+            "the re-read added its one new record and removed nothing remote"
+        );
+    }
+
+    /// A removed child's log takes the evidence only it backed with it: a row
+    /// remote evidence also backs stays, as the remote side's, and the
+    /// local-only children it linked, its edges to them and its local
+    /// presence go.
+    #[test]
+    fn a_removed_remote_muse_child_keeps_only_what_remote_evidence_backs() {
         let home = tempfile::tempdir().unwrap();
         let (root, transcript) = muse_fixture(home.path());
         let conn = open_db(&home.path().join("history.db")).unwrap();
@@ -15445,7 +15518,13 @@ mod tests {
         super::sync_muse(&conn, &mut state, &root).unwrap();
         crate::mark_session_presence(&conn, "muse", MUSE_WORKER, super::SessionLocation::Remote)
             .unwrap();
-        let worker_events = muse_session_count(&conn, "session_events", MUSE_WORKER);
+        // A remote observation supplied the worker's reply as well.
+        conn.execute(
+            "UPDATE session_events SET location = 'both' \
+             WHERE source = 'muse' AND session_id = ? AND role = 'assistant'",
+            [MUSE_WORKER],
+        )
+        .unwrap();
         fs::remove_dir_all(
             transcript
                 .parent()
@@ -15454,9 +15533,20 @@ mod tests {
         )
         .unwrap();
         super::sync_muse(&conn, &mut state, &root).unwrap();
+        let left: Vec<(String, String)> = conn
+            .prepare(
+                "SELECT role, location FROM session_events \
+                 WHERE source = 'muse' AND session_id = ? ORDER BY id",
+            )
+            .unwrap()
+            .query_map([MUSE_WORKER], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
         assert_eq!(
-            muse_session_count(&conn, "session_events", MUSE_WORKER),
-            worker_events
+            left,
+            vec![("assistant".to_string(), "remote".to_string())],
+            "only the remote-backed row stays, now the remote side's alone"
         );
         assert_eq!(muse_session_count(&conn, "session_events", "muse-c002"), 0);
         let edges_from_worker: i64 = conn

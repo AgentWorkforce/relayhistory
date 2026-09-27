@@ -22,6 +22,17 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Added
 
+- Evidence rows record which side backs them. `session_events`,
+  `tool_calls`, `file_edits` and `session_markers` gain `location`
+  (`local` / `remote` / `both`). Local parsers stamp `local`, remote intake
+  stamps the observation's location, and meeting the other side's row makes
+  it `both`. A local whole-session re-read (Muse, Grok, Cursor, OpenCode, and
+  the per-record Claude and Codex rewrites) now retires only local rows and
+  leaves remote-supplied evidence under the same session id, which it used to
+  delete; a remote observation retiring a record likewise leaves the local
+  share. The `evidence_location_v1` migration adds the column and marks rows
+  of sessions known only remotely as `remote`. The change feed's
+  `Change.columns` and the export journal payload carry the new column.
 - Muse Code (Meta's `muse` CLI) is a first-class source, `muse`. Sessions are
   read from `$XDG_DATA_HOME/muse/sessions/YYYY/MM/DD/<id>/session.jsonl`
   (`~/.local/share/muse/sessions` by default) by discovery, `sync`,

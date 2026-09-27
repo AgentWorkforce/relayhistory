@@ -332,12 +332,12 @@ pub(crate) fn apply_normalized(
     }
     for (identity, record) in &previously_managed {
         if !union.contains_key(identity) {
-            record.remove(&tx)?;
+            record.remove(&tx, key.location)?;
         }
     }
     for (identity, record) in union {
         if managed.contains(&identity) {
-            record.write(&tx)?;
+            record.write(&tx, key.location)?;
         }
     }
     crate::hydrate::save_observation_progress(
