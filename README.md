@@ -72,6 +72,16 @@ npx -y ai-hist-mcp
 
 Exposes `search_history`, `list_sessions`, `get_session_events`, `get_session_tool_calls`, `get_session_file_edits`, `get_session_tree`, `history_stats`, and more as MCP tools. Wire it into any MCP-capable agent so it can query its own history mid-session.
 
+Workspace handoffs need no installed receiver skill. `create_handoff(intent)`
+returns one pointer whose existing `intent` field is itself the continuation
+prompt: it tells the receiving agent to call
+`resume_handoff(source=..., session_id=...)` through the ai-hist MCP and then
+continue the original intent. Send that exact `intent` as the Agent Relay DM
+text and the full pointer as `kind="handoff"` metadata; do not add a second text
+field or inline the transcript. Before sending, call `resume_handoff` once with
+the pointer to verify that Agent Relay desktop has uploaded the session to the
+current workspace.
+
 The MCP server reads local history only, plus any source plugins named by `AI_HIST_PLUGIN_CONFIG`.
 
 ## Local and remote history

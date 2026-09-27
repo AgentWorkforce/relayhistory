@@ -17,8 +17,9 @@
 //!   row, and as stored ([`StoredRow`]) -- every column but `revision`, read
 //!   from the live table, values as SQLite holds them -- so an embedder can
 //!   rebuild the row exactly without knowing the table's shape in advance.
-//!   Every change, a delete included, carries the record's identity as the
-//!   export journal keys it ([`Change::key`]).
+//!   Every change, a delete included, carries the record's identity: its
+//!   kind and the columns of its table's uniqueness constraint
+//!   ([`Change::key`]).
 //! - A deleted row — a sidechain heal moving records onto the child, a session
 //!   dropped from the catalog — leaves a tombstone in `evidence_tombstones`
 //!   carrying its own revision, so a consumer learns about the removal in the
@@ -62,8 +63,8 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// The column every fed table carries. Named once so the delivery capture
-/// triggers can leave it out of their payloads.
+/// The column every fed table carries. Named once so a stored row can leave
+/// it out: it is this database's bookkeeping, not a fact about the record.
 pub(crate) const REVISION_COLUMN: &str = "revision";
 
 /// Largest page one [`Changes`] fill reads per kind.
@@ -167,8 +168,8 @@ impl Watermark {
 /// adapter can supply, and the feed also reports tables no adapter writes --
 /// the catalog row, where a session was seen, what a connector observed.
 /// [`ChangeKind::evidence_kind`] maps the overlap. The wire names are the
-/// export journal's kinds, so a record keeps one kind name whichever of the
-/// two an embedder read it from.
+/// kinds a local export's records carry, so a record keeps one kind name
+/// whichever of the two an embedder read it from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -399,8 +400,8 @@ fn row_to_history(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEntry> {
 
 /// One stamped table: where a record's source, session and identity live.
 ///
-/// A record is named two ways. `key` is its identity as the export journal
-/// keys it -- the columns of the table's own uniqueness constraint -- and is
+/// A record is named two ways. `key` is its identity -- the columns of the
+/// table's own uniqueness constraint -- and is
 /// what [`Change::key`] carries. `record` is the part of that identity the
 /// tombstone's `record_key` holds beside the source and session: one column's
 /// text, or a JSON array of several, so a tombstone keeps every key column's
@@ -537,8 +538,6 @@ impl FedTable {
 /// The columns of `table` a stored row carries: every column but the feed's
 /// own [`REVISION_COLUMN`], in table order, read from the live schema so a
 /// column a migration adds is carried without a code change.
-///
-/// The export journal's capture payload is built from the same list.
 pub(crate) fn stored_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
     let columns = conn
         .prepare_cached("SELECT name FROM pragma_table_info(?1) ORDER BY cid")?
@@ -639,6 +638,78 @@ fn stored_value(value: ValueRef<'_>) -> Value {
     }
 }
 
+#[cfg(feature = "export")]
+/// One row of a fed table, as a local export snapshot reads it.
+pub(crate) struct LiveRow {
+    pub rowid: i64,
+    pub source: String,
+    /// The stored session, `None` for a prompt that names none.
+    pub session: Option<String>,
+    /// [`Change::key`] for this row.
+    pub key: Vec<Value>,
+    pub revision: u64,
+    pub columns: StoredRow,
+}
+
+#[cfg(feature = "export")]
+/// At most `limit` rows of `kind`'s table past rowid `after`, in rowid order:
+/// one range of the table's own b-tree.
+pub(crate) fn rows_by_rowid(
+    conn: &Connection,
+    kind: ChangeKind,
+    after: i64,
+    limit: usize,
+) -> Result<Vec<LiveRow>> {
+    let table = kind.table();
+    let stored = stored_columns(conn, table.name)?;
+    let names: Vec<Arc<str>> = stored
+        .iter()
+        .map(|column| Arc::from(column.as_str()))
+        .collect();
+    let sql = format!(
+        "SELECT r.rowid, {source}, r.{session}, r.{REVISION_COLUMN}, {columns} FROM {name} r \
+         WHERE r.rowid > ?1 ORDER BY r.rowid LIMIT ?2",
+        source = table.source_sql("r"),
+        session = table.session,
+        name = table.name,
+        columns = stored
+            .iter()
+            .map(|column| format!("r.\"{column}\""))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    let mut statement = conn.prepare_cached(&sql)?;
+    let rows = statement.query_map(
+        rusqlite::params![after, limit.min(i64::MAX as usize) as i64],
+        |row| {
+            let mut columns = Vec::with_capacity(names.len());
+            for (offset, name) in names.iter().enumerate() {
+                columns.push((Arc::clone(name), stored_value(row.get_ref(4 + offset)?)));
+            }
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                StoredRow { columns },
+            ))
+        },
+    )?;
+    let mut live = Vec::new();
+    for row in rows {
+        let (rowid, source, session, revision, columns) = row?;
+        live.push(LiveRow {
+            rowid,
+            source,
+            session,
+            key: table.key_from_row(kind, &columns),
+            revision: revision.unwrap_or(0).max(0) as u64,
+            columns,
+        });
+    }
+    Ok(live)
+}
+
 /// The typed row an upsert carries, per kind, so no second read is needed.
 ///
 /// The variants differ in size because the rows do; an event row is several
@@ -698,8 +769,7 @@ pub struct Change {
     /// itself for a catalog row), or for a kind whose identity spans several
     /// columns, those columns' stored values as a JSON array.
     pub record_key: String,
-    /// The record's identity as the export journal keys it: the kind's wire
-    /// name, then the stored value of each column of the table's uniqueness
+    /// The record's identity: the kind's wire name, then the stored value of each column of the table's uniqueness
     /// constraint, in order -- `["history", source, timestamp_ms, prompt]`,
     /// `["trajectory", id]`. An upsert and a delete of one record carry the
     /// same key.
@@ -1282,7 +1352,7 @@ fn page_cut(
     ))
 }
 
-fn read_head(conn: &Connection) -> Result<Watermark> {
+pub(crate) fn read_head(conn: &Connection) -> Result<Watermark> {
     let (revision, epoch): (Option<i64>, Option<i64>) = conn
         .query_row(
             "SELECT (SELECT version FROM observation_clock WHERE singleton = 1), \
@@ -3469,97 +3539,138 @@ mod tests {
         assert_eq!(drain(changes).len(), 1);
     }
 
-    /// Every kind's stored row and key, as the feed reports them, are what
-    /// the export journal records for the same writes -- inserts, updates
-    /// that change a value, one that moves a row to another identity, and
-    /// deletes, direct and cascaded. Compared as the state each stream
-    /// replays to, so the feed's netting of a re-stamped row is not a
-    /// difference, and column order is part of the comparison.
-    #[cfg(feature = "export")]
+    /// Every kind's stored row and key, as the feed reports them, are the
+    /// live table's: every column but `revision`, in table order, each value
+    /// as SQLite holds it, and the key is the kind's wire name followed by
+    /// the columns of the table's uniqueness constraint. The key columns are
+    /// spelled out here rather than read from the feed's own table map, so a
+    /// change to either is a failing test: an embedder derives a record's
+    /// identity from this key, and a different key is a different record.
     #[test]
-    fn every_kind_matches_the_export_journal_for_the_same_writes() {
-        use crate::export::capture;
+    fn every_kind_reports_the_live_row_and_its_uniqueness_key() {
         use std::collections::{BTreeMap, BTreeSet};
 
-        type State = BTreeMap<String, Option<StoredRow>>;
-
-        fn journal(conn: &Connection) -> State {
-            let mut state = State::new();
-            let mut position = 0;
-            while let Some(record) = capture::next_change(conn, position, None).unwrap() {
-                position = record.position;
-                let key: Vec<Value> = serde_json::from_str(&record.key).unwrap();
-                let row = match record.operation.as_str() {
-                    "upsert" => Some(serde_json::from_str::<StoredRow>(&record.payload).unwrap()),
-                    "delete" => None,
-                    other => panic!("journal operation {other}"),
-                };
-                state.insert(serde_json::to_string(&key).unwrap(), row);
-            }
-            state
-        }
-
-        fn feed(store: &SessionStore) -> (State, BTreeSet<ChangeKind>) {
-            let mut state = State::new();
-            let mut kinds = BTreeSet::new();
-            for change in all(store) {
-                kinds.insert(change.kind);
-                assert_eq!(change.key[0], Value::from(change.kind.as_str()));
-                match &change.op {
-                    ChangeOp::Upsert(_) => {
-                        let columns = change.columns.clone().expect("an upsert carries its row");
-                        assert!(columns.get(REVISION_COLUMN).is_none());
-                        assert_eq!(
-                            change.kind.table().key_from_row(change.kind, &columns),
-                            change.key
-                        );
-                        state.insert(serde_json::to_string(&change.key).unwrap(), Some(columns));
-                    }
-                    ChangeOp::Delete => {
-                        assert!(change.columns.is_none());
-                        state.insert(serde_json::to_string(&change.key).unwrap(), None);
-                    }
+        fn key_columns(kind: ChangeKind) -> (&'static str, &'static [&'static str]) {
+            match kind {
+                ChangeKind::Session => ("sessions", &["source", "session_id"]),
+                ChangeKind::SessionEvent => {
+                    ("session_events", &["source", "session_id", "event_uid"])
                 }
+                ChangeKind::ToolCall => ("tool_calls", &["source", "session_id", "tool_use_id"]),
+                ChangeKind::FileEdit => ("file_edits", &["source", "session_id", "tool_use_id"]),
+                ChangeKind::SessionMarker => {
+                    ("session_markers", &["source", "session_id", "marker_uid"])
+                }
+                ChangeKind::Relationship => (
+                    "session_relationships",
+                    &["source", "parent_session_id", "relationship_uid"],
+                ),
+                ChangeKind::History => ("history", &["source", "timestamp_ms", "prompt"]),
+                ChangeKind::Presence => {
+                    ("session_presences", &["source", "session_id", "location"])
+                }
+                ChangeKind::CommitLink => (
+                    "session_commit_links",
+                    &["source", "session_id", "commit_sha", "match_method"],
+                ),
+                ChangeKind::Trajectory => ("trajectories", &["id"]),
+                ChangeKind::SourceObservation => (
+                    "session_observations",
+                    &[
+                        "source",
+                        "session_id",
+                        "location",
+                        "connector_id",
+                        "connector_instance",
+                    ],
+                ),
+                ChangeKind::ObservationEvidence => (
+                    "observation_evidence",
+                    &[
+                        "source",
+                        "session_id",
+                        "location",
+                        "connector_id",
+                        "connector_instance",
+                        "evidence_uid",
+                    ],
+                ),
             }
-            (state, kinds)
         }
 
-        fn assert_parity(
+        /// The row as the table holds it, found by the revision the feed
+        /// reported: revisions are unique per write, so this is exactly the
+        /// row the change describes.
+        fn live_row(conn: &Connection, table: &str, revision: u64) -> Vec<(String, Value)> {
+            let mut statement = conn
+                .prepare(&format!(
+                    "SELECT * FROM {table} WHERE {REVISION_COLUMN} = ?1"
+                ))
+                .unwrap();
+            let names: Vec<String> = statement
+                .column_names()
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            statement
+                .query_row([revision as i64], |row| {
+                    Ok(names
+                        .iter()
+                        .enumerate()
+                        .map(|(index, name)| {
+                            (name.clone(), stored_value(row.get_ref(index).unwrap()))
+                        })
+                        .collect::<Vec<_>>())
+                })
+                .unwrap()
+        }
+
+        /// Checks every upsert against its live row and returns the keys seen,
+        /// by kind.
+        fn check(
             store: &SessionStore,
             conn: &Connection,
             step: &str,
-        ) -> BTreeSet<ChangeKind> {
-            let journal = journal(conn);
-            let (feed, kinds) = feed(store);
-            let keys = |state: &State| state.keys().cloned().collect::<Vec<_>>();
-            assert_eq!(keys(&feed), keys(&journal), "{step}: the same records");
-            for (key, row) in &journal {
-                assert_eq!(&feed[key], row, "{step}: {key}");
+        ) -> BTreeMap<ChangeKind, BTreeSet<String>> {
+            let mut upserts: BTreeMap<ChangeKind, BTreeSet<String>> = BTreeMap::new();
+            for change in all(store) {
+                let ChangeOp::Upsert(_) = &change.op else {
+                    assert!(change.columns.is_none(), "{step}: a delete carries no row");
+                    continue;
+                };
+                let (table, keyed_by) = key_columns(change.kind);
+                let live = live_row(conn, table, change.revision);
+                let expected: Vec<(String, Value)> = live
+                    .iter()
+                    .filter(|(name, _)| name != REVISION_COLUMN)
+                    .cloned()
+                    .collect();
+                let columns = change.columns.clone().expect("an upsert carries its row");
+                let reported: Vec<(String, Value)> = columns
+                    .iter()
+                    .map(|(name, value)| (name.to_string(), value.clone()))
+                    .collect();
+                assert_eq!(reported, expected, "{step}: {} row", change.kind.as_str());
+                let mut key = vec![Value::from(change.kind.as_str())];
+                for column in keyed_by {
+                    let value = live
+                        .iter()
+                        .find(|(name, _)| name == column)
+                        .map(|(_, value)| value.clone())
+                        .unwrap_or_else(|| panic!("{table} has no key column {column}"));
+                    key.push(value);
+                }
+                assert_eq!(change.key, key, "{step}: {} key", change.kind.as_str());
+                upserts
+                    .entry(change.kind)
+                    .or_default()
+                    .insert(serde_json::to_string(&change.key).unwrap());
             }
-            kinds
+            upserts
         }
 
         let dir = tempfile::tempdir().unwrap();
         let (store, conn) = store(dir.path());
-        // One subscription over everything, its snapshot already read: every
-        // write from here on is journaled.
-        {
-            let tx = conn.unchecked_transaction().unwrap();
-            capture::save_subscription(
-                &tx,
-                &capture::Subscription {
-                    id: "parity",
-                    session: None,
-                    cursor: 0,
-                    kind: capture::kind_count(),
-                    rowid: 0,
-                    complete: true,
-                },
-            )
-            .unwrap();
-            tx.commit().unwrap();
-        }
-
         conn.execute_batch(
             r#"
 INSERT INTO sessions (session_id, source, cwd, models_json, workspace_roots_json)
@@ -3599,9 +3710,26 @@ INSERT INTO observation_evidence (source, session_id, location, connector_id,
 "#,
         )
         .unwrap();
-        let kinds = assert_parity(&store, &conn, "inserts");
+        let inserted = check(&store, &conn, "inserts");
         let every: BTreeSet<ChangeKind> = ChangeKind::ALL.iter().copied().collect();
-        assert_eq!(kinds, every, "the writes cover every kind");
+        assert_eq!(
+            inserted.keys().copied().collect::<BTreeSet<_>>(),
+            every,
+            "the writes cover every kind"
+        );
+        // The serialized key is what an embedder hashes into a record id, so
+        // its exact text is part of the contract: compact JSON, raw values.
+        assert!(
+            inserted[&ChangeKind::SessionEvent].contains(r#"["session_event","claude","s1","e1"]"#),
+            "{:?}",
+            inserted[&ChangeKind::SessionEvent]
+        );
+        assert!(
+            inserted[&ChangeKind::History].contains(r#"["history","codex",2000,"no session yet"]"#),
+            "{:?}",
+            inserted[&ChangeKind::History]
+        );
+        assert!(inserted[&ChangeKind::Trajectory].contains(r#"["trajectory","traj-1"]"#));
 
         conn.execute_batch(
             r#"
@@ -3621,7 +3749,7 @@ UPDATE observation_evidence SET payload_json = '{"a":2}';
 "#,
         )
         .unwrap();
-        assert_parity(&store, &conn, "updates");
+        let updated = check(&store, &conn, "updates");
         assert!(
             !all(&store)
                 .iter()
@@ -3637,12 +3765,25 @@ UPDATE observation_evidence SET payload_json = '{"a":2}';
              DELETE FROM sessions WHERE session_id = 's1';",
         )
         .unwrap();
-        assert_parity(&store, &conn, "deletes");
-        let tombstoned: BTreeSet<ChangeKind> = all(&store)
-            .into_iter()
-            .filter(|change| change.op == ChangeOp::Delete)
-            .map(|change| change.kind)
-            .collect();
+        check(&store, &conn, "deletes");
+        // A delete names the record by the key its upsert carried.
+        let mut tombstoned = BTreeSet::new();
+        for change in all(&store) {
+            if change.op != ChangeOp::Delete {
+                continue;
+            }
+            tombstoned.insert(change.kind);
+            let key = serde_json::to_string(&change.key).unwrap();
+            assert!(
+                inserted
+                    .get(&change.kind)
+                    .is_some_and(|keys| keys.contains(&key))
+                    || updated
+                        .get(&change.kind)
+                        .is_some_and(|keys| keys.contains(&key)),
+                "{key} was never upserted"
+            );
+        }
         for kind in [
             ChangeKind::Session,
             ChangeKind::ToolCall,
