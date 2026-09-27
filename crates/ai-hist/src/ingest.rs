@@ -11335,7 +11335,9 @@ pub(crate) fn ingest_muse_session(
         };
         match &record.event {
             muse::MuseEvent::Prompt { text } => {
-                if first_prompt.is_none() {
+                // A subagent's run-start prompt is its assigned objective,
+                // not a title anybody typed.
+                if role == MuseRole::Session && first_prompt.is_none() {
                     first_prompt = Some(crate::discover::excerpt(text));
                 }
                 insert_session_event(
@@ -11726,18 +11728,22 @@ pub(crate) fn ingest_muse_session(
     // `upsert_session` merges, which suits an append-only log read in pieces.
     // This read is the whole transcript, so the fields it owns are assigned
     // from it, empty values included: a rewritten file that no longer has a
-    // reply or a prompt must not keep quoting the old one.
+    // reply or a prompt must not keep quoting the old one. A subagent has no
+    // typed prompt to own, so its read leaves `first_prompt` as it is — a
+    // remotely known child keeps the title the remote side gave it.
     let models = transcript.models();
     conn.execute(
         "UPDATE sessions SET first_activity_ms = ?, last_activity_ms = ?, \
          last_assistant_text = ?, models_json = ?, \
-         first_prompt = ?, agent_version = COALESCE(?, agent_version) \
+         first_prompt = CASE WHEN ? THEN ? ELSE first_prompt END, \
+         agent_version = COALESCE(?, agent_version) \
          WHERE source = 'muse' AND session_id = ?",
         params![
             first_ts,
             last_ts,
             last_assistant_text.as_deref(),
             (!models.is_empty()).then(|| serde_json::to_string(&models).unwrap_or_default()),
+            role == MuseRole::Session,
             first_prompt.as_deref(),
             version,
             sid,
@@ -15671,6 +15677,44 @@ mod tests {
             reminder_events
         );
         assert_eq!(muse_count(&conn, "session_relationships"), 3);
+    }
+
+    /// A remotely known subagent keeps its catalog row; a local read of its
+    /// log must not turn its assigned objective into that row's typed title,
+    /// nor clear the title the remote side gave it.
+    #[test]
+    fn a_muse_subagent_read_leaves_its_catalog_title_alone() {
+        let home = tempfile::tempdir().unwrap();
+        let (_, transcript) = muse_fixture(home.path());
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        crate::mark_session_presence(&conn, "muse", MUSE_WORKER, super::SessionLocation::Remote)
+            .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO sessions (source, session_id, first_prompt) \
+             VALUES ('muse', ?, 'remote title')",
+            [MUSE_WORKER],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sessions SET first_prompt = 'remote title' \
+             WHERE source = 'muse' AND session_id = ?",
+            [MUSE_WORKER],
+        )
+        .unwrap();
+        let log = transcript
+            .parent()
+            .unwrap()
+            .join(format!("subagent/{MUSE_WORKER}/session.jsonl"));
+        let child = super::read_muse_transcript(&log).unwrap().unwrap();
+        super::ingest_muse_session_tree(&conn, &child, &log, None).unwrap();
+        let title: Option<String> = conn
+            .query_row(
+                "SELECT first_prompt FROM sessions WHERE source = 'muse' AND session_id = ?",
+                [MUSE_WORKER],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(title.as_deref(), Some("remote title"));
     }
 
     /// Every record of a model step shares its model and finish reason; only
