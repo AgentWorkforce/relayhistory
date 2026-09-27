@@ -46,10 +46,12 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 - Add workspace-scoped agent handoffs through `create_handoff(intent)` and
   `resume_handoff(source, session_id)`. The sender emits only a session pointer
-  plus intent and origin identity; the receiver refreshes the configured
+  plus one self-describing intent and origin identity; the intent tells the
+  receiving agent to call `resume_handoff` before continuing, with no installed
+  skill required. The final intent stays within 4,000 characters by truncating
+  an overflowing caller-intent suffix with `…`. The receiver refreshes the configured
   workspace `cloud` source and returns bounded prompts, normalized events, tool
-  calls, and file edits with independent continuation cursors. The installable
-  Agent Relay auto-resume skill lives under `skills/agent-relay-handoff`.
+  calls, and file edits with independent continuation cursors.
 
 - Markers reach the SDK, MCP and both CLIs. `getSessionMarkersPage(source,
   sessionId, {limit, after})`, the `sessionMarkers()` iterator and
