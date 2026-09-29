@@ -16770,6 +16770,37 @@ mod tests {
         assert_eq!(muse_count(&conn, "session_relationships"), 3);
     }
 
+    /// Muse commits tool results in their own records, not inside a user
+    /// message, so a user turn is the typed prompt alone: no tool output is
+    /// counted among its blocks.
+    #[test]
+    fn muse_user_turns_are_the_prompts_alone() {
+        let home = tempfile::tempdir().unwrap();
+        let (root, _) = muse_fixture(home.path());
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        let page = crate::session_user_turns_page(&conn, "muse", MUSE_PARENT, 100, None).unwrap();
+        assert_eq!(page.user_turns.len(), 2, "{:?}", page.user_turns);
+        for turn in &page.user_turns {
+            assert!(
+                turn.blocks.iter().all(|block| block.kind != "tool_result"),
+                "{turn:?}"
+            );
+        }
+        let sources: Vec<String> = conn
+            .prepare(
+                "SELECT DISTINCT event_source FROM session_events \
+                 WHERE source = 'muse' AND role = 'tool_result'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(sources, vec!["function_call_output".to_string()]);
+    }
+
     /// A call that failed or was cancelled before any result was recorded
     /// still takes its status from Muse's recorded outcome.
     #[test]
