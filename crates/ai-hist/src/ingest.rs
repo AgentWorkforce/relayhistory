@@ -5418,16 +5418,19 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
         // that vanished and came back is not something this process watched,
         // and resuming from the stale cursor is exactly how its rows would
         // keep null facts after the archive returns.
-        transcript_cursor::forget_locator(conn, "claude", &missing)?;
+        //
         // A workflow journal an earlier build walked as a transcript is
         // excluded now, not missing: its coverage is complete, but the rows
-        // that build derived from it are still standing and are retracted
-        // here, once — the cursor that brought it here is gone after this.
+        // that build derived from it are still standing. They are retracted
+        // before the cursor is forgotten, because that cursor is the only
+        // thing that brings the journal here: a retraction that fails leaves
+        // it in place, and the next sync tries again.
         if is_claude_workflow_journal(root, Path::new(&missing)) {
             retract_claude_workflow_journal(conn, Path::new(&missing))?;
         } else {
             walked_every_known_root = false;
         }
+        transcript_cursor::forget_locator(conn, "claude", &missing)?;
     }
     let mut scanned = 0;
     let mut upserted = 0;
@@ -9112,14 +9115,18 @@ pub(crate) fn is_claude_workflow_journal(root: &Path, path: &Path) -> bool {
 /// Only rows whose ownership by the journal can be established are touched:
 ///
 /// - continuity evidence is keyed on the journal's own locator;
-/// - markers are keyed on the identity each journal line derives (its `uuid`,
-///   or the same fallback the transcript parser used), so a marker a real
-///   transcript line wrote under another identity is never matched. The
-///   journal has to still be readable for this; one that is gone leaves
-///   nothing to prove ownership with, and its markers are left alone;
-/// - a session row whose `raw_path` the journal overwrote is pointed back at
-///   the session's own transcript beside the `subagents` directory, or
-///   cleared when that transcript does not exist.
+/// - a marker is deleted only when it has exactly the shape the old walk gave
+///   that journal line: the session the line was attributed to (its own
+///   `sessionId`, else the file's), the identity the line derives, and an
+///   `unknown` kind whose subkind is the line's record type. A marker any
+///   transcript wrote differs in at least one of those. The journal has to
+///   still be readable for this; lines that are gone or were rewritten leave
+///   nothing to prove ownership with, and their markers are left alone;
+/// - a session locator the journal overwrote — the catalog `raw_path`, the
+///   local presence, and every local observation — is pointed back at the
+///   session's own transcript beside the `subagents` directory, or cleared
+///   when that transcript does not exist, so hydration cannot reopen the
+///   journal through any of them.
 fn retract_claude_workflow_journal(conn: &Connection, journal: &Path) -> Result<()> {
     let locator = journal.to_string_lossy().to_string();
     crate::continuity::clear_evidence(conn, "claude", &locator)?;
@@ -9128,15 +9135,37 @@ fn retract_claude_workflow_journal(conn: &Connection, journal: &Path) -> Result<
             .file_stem()
             .and_then(|stem| stem.to_str())
             .unwrap_or("journal");
-        for line in BufReader::new(file).lines() {
-            let Ok(line) = line else { break };
-            let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(&line) else {
+        let records: Vec<(Map<String, Value>, String)> = BufReader::new(file)
+            .lines()
+            .map_while(Result::ok)
+            .filter_map(|line| match serde_json::from_str::<Value>(&line) {
+                Ok(Value::Object(obj)) => Some((obj, line)),
+                _ => None,
+            })
+            .collect();
+        let file_session_id = records
+            .iter()
+            .find_map(|(obj, _)| obj.get("sessionId").and_then(Value::as_str))
+            .map(str::to_owned);
+        for (obj, line) in &records {
+            let Some(session_id) = obj
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .or(file_session_id.as_deref())
+            else {
                 continue;
             };
-            let identity = claude_record_identity(&obj, &line, stem);
+            let record_type = obj.get("type").and_then(Value::as_str).unwrap_or("");
+            let subkind = if record_type.is_empty() {
+                "record"
+            } else {
+                record_type
+            };
+            let identity = claude_record_identity(obj, line, stem);
             conn.execute(
-                "DELETE FROM session_markers WHERE source = 'claude' AND marker_uid = ?",
-                [format!("{identity}:marker")],
+                "DELETE FROM session_markers WHERE source = 'claude' AND session_id = ?1 \
+                   AND marker_uid = ?2 AND kind = 'unknown' AND subkind = ?3",
+                params![session_id, format!("{identity}:marker"), subkind],
             )?;
         }
     }
@@ -9149,6 +9178,40 @@ fn retract_claude_workflow_journal(conn: &Connection, journal: &Path) -> Result<
         .map(|transcript| transcript.to_string_lossy().to_string());
     conn.execute(
         "UPDATE sessions SET raw_path = ?1 WHERE source = 'claude' AND raw_path = ?2",
+        params![own_transcript, locator],
+    )?;
+    // Observations first: an upsert refreshes the presence projection from
+    // them. The direct presence update then covers a presence no observation
+    // backs.
+    let observed: Vec<crate::observations::SessionObservation> = {
+        let mut statement = conn.prepare(
+            "SELECT DISTINCT session_id FROM session_observations \
+             WHERE source = 'claude' AND location = 'local' AND raw_locator = ?1",
+        )?;
+        let sessions: Vec<String> = statement
+            .query_map([&locator], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut observed = Vec::new();
+        for session_id in sessions {
+            observed.extend(
+                crate::observations::list(conn, "claude", &session_id)?
+                    .into_iter()
+                    .filter(|observation| {
+                        observation.key.location == SessionLocation::Local
+                            && observation.raw_locator.as_deref() == Some(locator.as_str())
+                    }),
+            );
+        }
+        observed
+    };
+    for mut observation in observed {
+        observation.raw_locator = own_transcript.clone();
+        observation.updated_ms = now_ms();
+        crate::observations::upsert(conn, &observation)?;
+    }
+    conn.execute(
+        "UPDATE session_presences SET raw_locator = ?1 \
+         WHERE source = 'claude' AND location = 'local' AND raw_locator = ?2",
         params![own_transcript, locator],
     )?;
     Ok(())
@@ -14187,15 +14250,85 @@ mod tests {
             [&journal_locator],
         )
         .unwrap();
+        // ...and hydration's locators: the local presence and observation.
+        crate::observations::upsert(
+            &conn,
+            &crate::observations::SessionObservation {
+                key: crate::observations::ObservationKey {
+                    source: "claude".into(),
+                    session_id: "s1".into(),
+                    location: SessionLocation::Local,
+                    connector_id: "claude".into(),
+                    connector_instance: "default".into(),
+                },
+                raw_locator: Some(journal_locator.clone()),
+                source_stamp: None,
+                discovery_state: "full".into(),
+                access_state: "available".into(),
+                updated_ms: 1,
+            },
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE session_presences SET raw_locator = ?1 \
+             WHERE source = 'claude' AND session_id = 's1' AND location = 'local'",
+            [&journal_locator],
+        )
+        .unwrap();
+        // A real transcript's marker in another session that happens to share
+        // a journal line's identity is not the journal's to retract.
+        conn.execute(
+            "INSERT INTO session_markers (source, session_id, marker_uid, kind, subkind) \
+             VALUES ('claude', 's2', 'j1:marker', 'unknown', 'started')",
+            [],
+        )
+        .unwrap();
         assert_eq!(
             journal_rows(&conn),
-            (2, 1, 1),
+            (3, 1, 1),
             "the old walk must have derived rows from the journal, or nothing is tested"
         );
 
+        // A retraction that fails keeps the cursor that brings the journal
+        // back, so the next sync retries instead of forgetting the work.
+        conn.execute_batch(
+            "CREATE TRIGGER fail_retraction BEFORE DELETE ON session_continuity_evidence \
+             BEGIN SELECT RAISE(ABORT, 'retraction interrupted'); END;",
+        )
+        .unwrap();
+        assert!(super::sync_claude_session_metadata(&conn, &mut state, &root).is_err());
+        assert!(transcript_cursor::known_locators(&conn, "claude")
+            .unwrap()
+            .contains(&journal_locator));
+        conn.execute_batch("DROP TRIGGER fail_retraction;").unwrap();
+
         super::sync_claude_session_metadata(&conn, &mut state, &root).unwrap();
 
-        assert_eq!(journal_rows(&conn), (0, 0, 0));
+        assert_eq!(journal_rows(&conn), (1, 0, 0));
+        let survivor: String = conn
+            .query_row(
+                "SELECT session_id FROM session_markers WHERE marker_uid = 'j1:marker'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(survivor, "s2", "only the journal's own marker is retracted");
+        let locators: (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT (SELECT raw_locator FROM session_presences \
+                          WHERE source = 'claude' AND session_id = 's1' AND location = 'local'), \
+                        (SELECT raw_locator FROM session_observations \
+                          WHERE source = 'claude' AND session_id = 's1' AND location = 'local')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let own = Some(transcript.to_string_lossy().to_string());
+        assert_eq!(
+            locators,
+            (own.clone(), own),
+            "hydration must not reopen the journal"
+        );
         assert!(!transcript_cursor::known_locators(&conn, "claude")
             .unwrap()
             .contains(&journal_locator));

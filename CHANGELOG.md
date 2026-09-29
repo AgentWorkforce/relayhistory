@@ -274,9 +274,12 @@ Notable changes to the native `ai-hist` CLI are documented here.
   that shares the `.jsonl` extension; it is no longer listed as a discovery
   candidate, opened, or tracked with a transcript cursor. On the first sync
   after upgrading, what an earlier build derived from a journal is retracted:
-  its cursor and continuity evidence, the `unknown` markers its lines were
-  stored as (matched by each line's identity, so a transcript's own markers
-  are untouched), and a session `raw_path` left pointing at it.
+  its continuity evidence, the `unknown` markers its lines were stored as
+  (matched by session, line identity and record type, so a transcript's own
+  markers are untouched; lines no longer in the journal cannot be matched and
+  are left), and a session `raw_path`, local presence or local observation
+  left pointing at it. The journal's cursor is dropped only after that
+  succeeds, so an interrupted retraction is retried by the next sync.
   ([#208](https://github.com/AgentWorkforce/relayhistory/issues/208))
 
 ### Rust API
