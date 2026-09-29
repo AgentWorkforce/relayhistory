@@ -132,6 +132,14 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Added
 
+- The JS boundaries are now tested against the Rust fixture corpus itself
+  (#181). `sdk-ts/src/corpus-acceptance.test.ts` syncs the corpus's Claude
+  `multi-block-turn` and `slash-command-triad` transcripts and asserts that
+  MCP `get_session_usage` answers the numbers the Rust
+  `session_usage_summary` test asserts (one request; input 3, output 43,
+  cache read 11496, cache write 4773, all in the 1h bucket), and that
+  `ai-hist events --json` carries `control_kind` on every slash-command
+  caveat, invocation and output row. No contract changes.
 - Evidence rows record which side backs them. `session_events`,
   `tool_calls`, `file_edits` and `session_markers` gain `location`
   (`local` / `remote` / `both`). Local parsers stamp `local`, remote intake
