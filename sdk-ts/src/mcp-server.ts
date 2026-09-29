@@ -22,6 +22,9 @@ const READ = { readOnlyHint: true, idempotentHint: true, openWorldHint: false } 
 // (claude.ai/code web sessions, Codex cloud tasks), so it is open-world.
 const ACQUIRE = { readOnlyHint: false, idempotentHint: true, openWorldHint: true } as const;
 const LOCAL_ACQUIRE = { readOnlyHint: false, idempotentHint: true, openWorldHint: false } as const;
+// Transport is local, but joining and leaving change externally visible Relay
+// presence, so approval-aware MCP hosts must treat them as open-world.
+const RELAY_MUTATION = { readOnlyHint: false, idempotentHint: true, openWorldHint: true } as const;
 const SOURCE = z.enum(['claude', 'codex', 'cursor', 'grok', 'relay', 'trajectory', 'opencode', 'muse']);
 const CATALOG_SOURCE = z.enum(['claude', 'codex', 'cursor', 'grok', 'relay', 'opencode', 'muse']);
 const SESSION_SCOPE = z.enum(['local', 'remote', 'all']);
@@ -179,9 +182,9 @@ server.tool('relay_status', 'Report whether the local session hosting this MCP s
 server.tool('join_relay', 'Put the local session hosting this MCP server on Agent Relay so teammates and agents can reach it. Uses only the local Agent Relay desktop socket; optional name and description are public relay metadata.', {
   name: z.string().min(1).optional(),
   description: z.string().optional(),
-}, LOCAL_ACQUIRE, ({ name, description }) => call(() => joinRelay({ name, description })));
+}, RELAY_MUTATION, ({ name, description }) => call(() => joinRelay({ name, description })));
 
-server.tool('leave_relay', 'Remove the local session hosting this MCP server from Agent Relay. Uses only the local Agent Relay desktop socket.', {}, LOCAL_ACQUIRE, () => call(() => leaveRelay()));
+server.tool('leave_relay', 'Remove the local session hosting this MCP server from Agent Relay. Uses only the local Agent Relay desktop socket.', {}, RELAY_MUTATION, () => call(() => leaveRelay()));
 
 const HANDOFF_CURSOR = z.object({
   prompt: z.object({ timestampMs: z.number().int(), id: z.number().int() }).optional(),

@@ -161,9 +161,10 @@ test('relay registration and status remain local socket MCP operations', async (
     assert.notEqual(start, -1, `${tool} is registered`);
     const end = mcp.indexOf("server.tool('", start + 13);
     const registration = mcp.slice(start, end === -1 ? undefined : end);
-    assert.match(registration, /LOCAL_ACQUIRE/);
+    assert.match(registration, /RELAY_MUTATION/);
     assert.doesNotMatch(registration, /SESSION_SCOPE/);
   }
+  assert.match(mcp, /const RELAY_MUTATION = \{ readOnlyHint: false, idempotentHint: true, openWorldHint: true \}/);
   const statusStart = mcp.indexOf("server.tool('relay_status'");
   assert.notEqual(statusStart, -1, 'relay_status is registered');
   const statusEnd = mcp.indexOf("server.tool('", statusStart + 13);

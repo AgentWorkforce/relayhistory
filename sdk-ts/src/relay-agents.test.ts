@@ -635,6 +635,12 @@ test('relay roster, status, join and leave are in the MCP inventory and call the
   for (const name of ['list_relay_agents', 'relay_status', 'join_relay', 'leave_relay']) {
     assert.ok(tools.tools.some((tool) => tool.name === name), `${name} is registered`);
   }
+  for (const name of ['join_relay', 'leave_relay']) {
+    const tool = tools.tools.find((candidate) => candidate.name === name);
+    assert.equal(tool?.annotations?.readOnlyHint, false, `${name} is a mutation`);
+    assert.equal(tool?.annotations?.idempotentHint, true, `${name} is idempotent`);
+    assert.equal(tool?.annotations?.openWorldHint, true, `${name} changes Relay presence`);
+  }
 
   const response = await client.callTool({
     name: 'list_relay_agents',
