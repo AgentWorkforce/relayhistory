@@ -374,7 +374,10 @@ pub fn muse_tool_result_facts(
 ) -> ToolResultFacts {
     let payload = text.map_or(Value::Null, |text| Value::String(text.to_string()));
     let mut facts = ToolResultFacts::from_payload(&payload);
-    facts.event_source = Some(EVENT_SOURCE_TOOL_RESULT.to_string());
+    // Muse commits results in their own `tool_result_batch_committed`
+    // record, not inside a user message, so they are standalone outputs — a
+    // user turn is the prompt alone, as for Grok and OpenCode.
+    facts.event_source = Some(EVENT_SOURCE_FUNCTION_CALL_OUTPUT.to_string());
     facts.tool_use_id = (!call_id.is_empty()).then(|| call_id.to_string());
     let status = match outcome.map(|(kind, _)| kind) {
         Some("completed") => STATUS_COMPLETED,

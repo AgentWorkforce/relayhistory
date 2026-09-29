@@ -602,7 +602,7 @@ status, because a fabricated measurement reads exactly like a real one:
 | **cursor** | ✓ (raw block `content`) | ✓ (harness markers) | ✓ | ✓ | `tool_result` | `tool_result.is_error` | – (no notification rail) |
 | **grok** | ✓ (raw line `content`) | ✓ (harness markers) | ✓ | ✓ (`unknown` with neither signal) | `function_call_output` | `tool_result.is_error`, `tool_status` | – (no notification rail) |
 | **opencode** | ✓ (raw part `output`) | ✓ (harness markers) | ✓ | ✓ | `function_call_output` | `exit_code`, `tool_status` | – (no notification rail) |
-| **muse** | ✓ (result `text`) | ✓ (harness markers) | ✓ | ✓ (`tool_batch.effect.terminal`, joined by call id) | `tool_result` | `tool_batch.effect`, `exit_code` (`bash`) | – |
+| **muse** | ✓ (result `text`) | ✓ (harness markers) | ✓ | ✓ (`tool_batch.effect.terminal`, joined by call id) | `function_call_output` | `tool_batch.effect`, `exit_code` (`bash`) | – |
 | **relay** | – | – | – | – | – | – | – |
 
 `payload_bytes` is the raw UTF-8 length of what the provider handed back —
