@@ -15,6 +15,7 @@ import {
 
 import type { HistoryCursor, HistoryPluginRegistry } from './index.js';
 import { loadHistoryApplicationConfig } from './delivery-cli.js';
+import { listRelayAgents } from './relay-agents.js';
 
 const READ = { readOnlyHint: true, idempotentHint: true, openWorldHint: false } as const;
 // Acquisition can reach provider services when a remote scope is requested
@@ -166,6 +167,12 @@ server.tool('get_session_file_edits', 'Get one bounded page of recorded file edi
 server.tool('create_handoff', 'Create a Relaycast handoff pointer for the caller\'s current session. Its single intent field is a self-describing resume prompt; send that exact intent as the delivery text and the pointer as metadata kind="handoff". Never inline the transcript.', {
   intent: z.string().min(1).max(MAX_HANDOFF_INTENT_CHARS),
 }, LOCAL_ACQUIRE, ({ intent }) => call(() => createHandoff(intent)));
+
+server.tool('list_relay_agents', 'List live participants currently on Agent Relay, not session history. Reads only the local Agent Relay desktop socket; it uses no cloud client or credential.', {
+  query: z.string().optional(),
+  where: z.enum(['this_computer', 'cloud', 'other_desktop']).optional(),
+  include_idle: z.boolean().optional().default(false),
+}, READ, ({ query, where, include_idle }) => call(() => listRelayAgents({ query, where, includeIdle: include_idle })));
 
 const HANDOFF_CURSOR = z.object({
   prompt: z.object({ timestampMs: z.number().int(), id: z.number().int() }).optional(),
