@@ -308,10 +308,12 @@ function historyCursorFlag(args: Parsed): HistoryCursor | undefined {
   if (!Number.isInteger(timestampMs) || !Number.isInteger(raw.id)) {
     throw new Error('--after must be a JSON cursor with integer timestamp_ms (or timestampMs) and id');
   }
-  if (matchSource !== undefined && matchSource !== 'history' && matchSource !== 'session_event') {
-    throw new Error('--after match_source must be history or session_event');
+  // Any string is passed on: the native cursor validation rejects an unknown
+  // source with the same INVALID_ARGUMENT the SDK and MCP report.
+  if (matchSource != null && typeof matchSource !== 'string') {
+    throw new Error('--after match_source must be a string');
   }
-  return { timestampMs: timestampMs as number, id: raw.id as number, ...(matchSource ? { matchSource } : {}) } as HistoryCursor;
+  return { timestampMs: timestampMs as number, id: raw.id as number, ...(matchSource != null ? { matchSource } : {}) } as HistoryCursor;
 }
 
 function catalogCursorFlag(args: Parsed): CatalogCursor | undefined {
