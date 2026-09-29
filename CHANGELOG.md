@@ -431,7 +431,14 @@ Notable changes to the native `ai-hist` CLI are documented here.
   Rollouts indexed before this are repaired once: `SHALLOW_SCANNER_VERSION`
   7 -> 8 moves the sweep generation, and the first `sync` re-reads every
   unchanged fork rollout (`codex_fork_replay_gate` in the sync state),
-  retiring the rows it had indexed for the replayed lines.
+  retiring the rows it had indexed for the replayed lines and rewriting the
+  fork's `first_prompt` (cleared when the fork has no prompt of its own).
+  That cleanup is one-time and runs in `sync` only: hydration does not repeat
+  it, and an older build still writing to the same database can reinsert the
+  duplicates. Whether the inherited baseline was applied or dropped is
+  decided from the child's first `last_token_usage` and recorded on the
+  marker; a replayed legacy turn that cannot be ordered ends the gate early
+  and the rest of that replay is indexed as before.
 
 - Record fork, resume and continuation relationships, not delegation alone.
   `session_relationships.relationship` now takes `continuation | fork | resume`
