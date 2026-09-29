@@ -403,23 +403,48 @@ into the child's file. The rollout walk gates that copy (`ForkReplaySpan` in
   child's: a UUIDv7 `turn_id` at or after the child thread's own UUIDv7
   timestamp (else its `session_meta` timestamp), or, for a legacy turn id,
   `started_at` at or after the fork's second. A turn nothing orders against the
-  fork also closes it — undecided is indexed rather than dropped. The presence
-  of `task_started` is not used: Codex 0.155 replays the parent's
-  `task_started` records too.
+  fork also closes it — undecided is indexed rather than dropped. A
+  `turn_context` with no `turn_id` takes the verdict of the `task_started`
+  before it, since it describes the turn that record opened. The presence of
+  `task_started` is not used: Codex 0.155 replays the parent's `task_started`
+  records too.
+
+Two limits follow from gating on explicit evidence only. A replayed legacy
+turn with no UUIDv7 id and no `started_at` closes the span early, and the rest
+of that replay is indexed under the child as before. And a record the child
+writes before its first `task_started` / `turn_context` falls inside the span:
+nothing in it tells it from the parent's copy (codex-rs appends a
+`thread_settings_applied` after the copied prefix, the same shape as the
+parent's own). Every observed build opens a turn with `task_started` before any
+prompt or model output, so what that drops is settings state the child's own
+`turn_context` restates.
 
 Lines inside the span write nothing under the child. One
 `fork_replay_boundary` marker, keyed by the replayed `session_meta`'s line,
 accounts for them (`first_line`, `last_line`, `replayed_lines`, the closing
 turn and the rule that closed it). The last readable `token_count` inside the
 span becomes the child's inherited baseline, so the child's first request is
-charged only what it spent beyond the parent's total — unless the child's own
-first snapshot is below it, which means its counter restarted, and it is
-differenced from zero instead. The cursor never commits inside a span, so a
-live fork read before its first own turn re-reads the replay on the next pass.
+charged only what it spent beyond the parent's total. codex-rs seeds a fork's
+usage from the copied history (`record_initial_history` on
+`InitialHistory::Forked` calls `last_token_info_from_rollout`), and each request
+then grows `total_token_usage` by exactly `last_token_usage`; the child's first
+readable snapshot is checked against that: `total == last` means its counter
+restarted and the baseline is dropped, `total == inherited + last` confirms it,
+and without `last_token_usage` only a total below the inherited one drops it.
+The marker records the outcome in `inherited_baseline` (`pending`, `applied`,
+`dropped`) and `inherited_baseline_basis`, and a pending decision rides on the
+cursor. The cursor never commits inside a span, so a live fork read before its
+first own turn re-reads the replay on the next pass; once the child's first
+turn completes it commits past it.
+
 Rows an earlier parser indexed under the child for the replayed lines are
 retired when the span is read, and sync re-reads every unchanged fork rollout
 once (`codex_fork_replay_gate` in the sync state) so an existing install loses
-its duplicates too.
+its duplicates too; that walk also rewrites the fork's `first_prompt`, clearing
+a replayed parent prompt when the fork has none of its own, because the
+shallow writer only fills a missing value. The cleanup is one pass, run by
+`sync` only: an older build still writing to the same database can put the
+duplicates back.
 
 Events use `(ts_ms, id)` keyset pagination. Tool calls and file edits use the
 same keyset shape over `(ts_ms IS NULL, ts_ms, id)`: both tables allow a null
