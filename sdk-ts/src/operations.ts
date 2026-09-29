@@ -111,6 +111,11 @@ import type {
   SessionUserTurnsPage,
   SessionMarkersPage,
   SourceCapabilities,
+  ChangesPage,
+  ChangesPageOptions,
+  CommitChangesOptions,
+  CommittedCursor,
+  Watermark,
   Stats,
   StatsOptions,
   SyncOptions,
@@ -154,6 +159,8 @@ import {
   requestCursor,
   sessionMarker,
   sourceCapabilities,
+  changesPage,
+  committedCursor,
   catalogSource,
   relationshipType,
   identityStatus,
@@ -699,6 +706,47 @@ export async function getSessionMarkersPage(
       : [],
     nextCursor: evidenceCursor(page.nextCursor),
   };
+}
+
+/**
+ * One bounded page of the revision-stamped change feed
+ * (`SessionStore::changes_since`): every row write and delete across the
+ * store, in `(revision, kind, recordKey)` order, each with the row as stored.
+ * Pass the page's `position` back as `from` for the next page. A named
+ * `consumer` resumes from its cursor inside the store, which moves only on
+ * `commitChanges`, so a page that was read but not applied is served again.
+ * A missing database is an empty, finished feed and is not created.
+ */
+export async function getChangesPage(options: ChangesPageOptions = {}): Promise<ChangesPage> {
+  return changesPage(await sessionStoreCall(SESSION_STORE_OPS.changes, {
+    dbPath: options.dbPath,
+    from: options.from === undefined || typeof options.from === 'string'
+      ? options.from
+      : { epoch: options.from.epoch, revision: options.from.revision },
+    consumer: options.consumer,
+    kinds: options.kinds ? [...options.kinds] : undefined,
+    session: options.session ? { source: options.session.source, sessionId: options.session.sessionId } : undefined,
+    limit: options.limit,
+  }));
+}
+
+/**
+ * Acknowledge everything up to `position` for a named cursor. Forward-only: a
+ * commit behind the stored cursor leaves it where it is, and the answer says
+ * where that is. The kind set must be the one the cursor was first committed
+ * for (`CONSUMER_KINDS_MISMATCH` otherwise). Needs a writable database.
+ */
+export async function commitChanges(
+  consumer: string,
+  position: Watermark,
+  options: CommitChangesOptions = {},
+): Promise<CommittedCursor> {
+  return committedCursor(await sessionStoreCall(SESSION_STORE_OPS.commitChanges, {
+    dbPath: options.dbPath,
+    consumer,
+    kinds: options.kinds ? [...options.kinds] : undefined,
+    position: { epoch: position.epoch, revision: position.revision },
+  }));
 }
 
 /**

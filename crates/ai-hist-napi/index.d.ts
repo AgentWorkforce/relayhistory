@@ -9,7 +9,9 @@ export declare function historyExport(requestJson: string, dbPath?: string | und
  *
  * `op` names the read (`markers`, `requests`, `usage_summary`, `user_turns`,
  * `capabilities`) and `args_json` carries `{dbPath?, source, sessionId?,
- * limit?, after?}`. The answer is the same camelCase document the matching
+ * limit?, after?}`; the change feed's `changes` and `commit_changes` read
+ * `{dbPath?, from?, consumer?, kinds?, session?, limit?}` and
+ * `{dbPath?, consumer, kinds?, position}` (see `change_feed.rs`). The answer is the same camelCase document the matching
  * typed function returns. A missing database answers an empty page, never an
  * error, and never creates the file.
  */

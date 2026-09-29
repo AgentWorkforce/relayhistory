@@ -45,6 +45,9 @@ Notable changes to the native `ai-hist` CLI are documented here.
     `INVALID_ARGUMENT`, with the same message on every surface.
   - `beforeMs`/`before_ms`/`--before-ms` keep their exclusive semantics but
     are deprecated: they skip rows tied on the boundary timestamp.
+- Native contract 24 -> 25. The `sessionStoreCall` dispatcher gains the
+  change feed ops `changes` and `commit_changes`. An SDK paired with an addon
+  of the other contract fails at load with `NATIVE_CONTRACT_MISMATCH`.
 - Native contract 21 -> 22. `historyExport` serves snapshots that each hold
   one read transaction, emits schema-version-2 records, and no longer accepts
   the upload-journal operations. An SDK paired with an addon of the other
@@ -175,6 +178,17 @@ Notable changes to the native `ai-hist` CLI are documented here.
 - `ai-hist doctor` reports `reclaimable` (`reclaimable_bytes` under `--json`),
   the freelist bytes a `compact` would return. It points at `compact` when at
   least 64 MiB and a quarter of the file are free pages.
+
+- The SDK reads the revision-stamped change feed (`SessionStore::changes_since`):
+  `getChangesPage` returns one bounded page (`changes`, `position`, `head`,
+  `done`) from `'start'`, a named `consumer` cursor or a kept `Watermark`, with
+  `kinds` and single-`session` filters; `changesSince` iterates it page by
+  page; `commitChanges(consumer, position)` acknowledges a page, forward-only
+  and bound to the cursor's kind set. Each `FeedChange` carries `kind`,
+  `source`/`sourceName`, `sessionId`, `recordKey`, `key`, `revision`, `op` and
+  the row as stored in `columns`. Exported with `CHANGE_KINDS` and the
+  `ChangeKind`, `Watermark`, `FeedChange`, `ChangesPage` and `CommittedCursor`
+  types.
 - Add workspace-scoped agent handoffs through `create_handoff(intent)` and
   `resume_handoff(source, session_id)`. The sender emits only a session pointer
   plus one self-describing intent and origin identity; the intent tells the

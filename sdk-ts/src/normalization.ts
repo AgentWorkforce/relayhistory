@@ -22,7 +22,13 @@ import {
   HydrationFailedError,
 } from './sdk-common.js';
 
+import { CHANGE_KINDS } from './contracts.js';
 import type {
+  ChangeKind,
+  ChangesPage,
+  CommittedCursor,
+  FeedChange,
+  Watermark,
   HistoryEntry,
   HistoryCursor,
   SearchMatch,
@@ -960,4 +966,60 @@ export function normalizeHydration(value: UnknownRecord): HydrateSessionResult {
         }))
       : [],
   };
+}
+
+function feedMismatch(what: string, value: unknown): NativeContractMismatchError {
+  return new NativeContractMismatchError(
+    `ai-hist-native returned an invalid change-feed ${what}: ${JSON.stringify(value)}. Reinstall matching ai-hist packages.`,
+    'NATIVE_CONTRACT_MISMATCH',
+  );
+}
+
+/** A feed position, validated: the epoch stays a hex string, never a number. */
+export function watermark(value: unknown): Watermark {
+  const row = (value ?? {}) as UnknownRecord;
+  if (typeof row.epoch !== 'string' || !/^[0-9a-f]{16}$/.test(row.epoch) || !Number.isSafeInteger(row.revision)) {
+    throw feedMismatch('watermark', value);
+  }
+  return { epoch: row.epoch, revision: row.revision as number };
+}
+
+export function changeKind(value: unknown): ChangeKind {
+  if (typeof value === 'string' && (CHANGE_KINDS as readonly string[]).includes(value)) return value as ChangeKind;
+  throw feedMismatch('kind', value);
+}
+
+export function feedChange(value: UnknownRecord): FeedChange {
+  const op = value.op;
+  if (op !== 'upsert' && op !== 'delete') throw feedMismatch('op', op);
+  const columns = value.columns;
+  return {
+    kind: changeKind(value.kind),
+    // The feed carries a row a newer release wrote rather than failing on it;
+    // `sourceName` names a source this SDK does not know.
+    source: isCatalogSource(value.source) ? value.source : null,
+    sourceName: String(value.sourceName),
+    sessionId: String(value.sessionId),
+    recordKey: String(value.recordKey),
+    key: Array.isArray(value.key) ? value.key : [],
+    revision: Number(value.revision),
+    op,
+    columns: columns && typeof columns === 'object' && !Array.isArray(columns)
+      ? (columns as Record<string, unknown>)
+      : null,
+  };
+}
+
+export function changesPage(value: UnknownRecord): ChangesPage {
+  return {
+    changes: Array.isArray(value.changes) ? (value.changes as UnknownRecord[]).map(feedChange) : [],
+    position: watermark(value.position),
+    head: watermark(value.head),
+    done: value.done === true,
+    consumer: nullableString(value.consumer),
+  };
+}
+
+export function committedCursor(value: UnknownRecord): CommittedCursor {
+  return { consumer: String(value.consumer), cursor: watermark(value.cursor) };
 }

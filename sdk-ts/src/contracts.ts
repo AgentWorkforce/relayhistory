@@ -693,6 +693,98 @@ export interface SessionMarkersPage {
 }
 
 /**
+ * The tables the change feed reports, by wire name — the `ChangeKind`
+ * vocabulary of the Rust `SessionStore::changes_since`, and the `kind` a local
+ * export's records carry.
+ */
+export const CHANGE_KINDS = Object.freeze([
+  'session',
+  'session_event',
+  'tool_call',
+  'file_edit',
+  'session_marker',
+  'relationship',
+  'history',
+  'presence',
+  'commit_link',
+  'trajectory',
+  'source_observation',
+  'observation_evidence',
+] as const);
+export type ChangeKind = (typeof CHANGE_KINDS)[number];
+
+/**
+ * A change-feed position. `epoch` is the issuing store's identity as 16 hex
+ * digits (a random 64-bit value, which a number cannot hold exactly); a
+ * watermark from another database is refused with `WATERMARK_AHEAD_OF_STORE`.
+ */
+export interface Watermark {
+  epoch: string;
+  revision: number;
+}
+
+/** One row write or delete, in `(revision, kind, recordKey)` order. */
+export interface FeedChange {
+  kind: ChangeKind;
+  /** Null for a source this build does not know; `sourceName` still names it. */
+  source: CatalogSource | null;
+  sourceName: string;
+  /** The parent for a relationship, the id for a trajectory, empty for a prompt with no session. */
+  sessionId: string;
+  recordKey: string;
+  /** The kind's wire name, then the table's uniqueness columns as stored. */
+  key: unknown[];
+  revision: number;
+  op: 'upsert' | 'delete';
+  /** Every stored column but `revision`, in table order; null on a delete. */
+  columns: Record<string, unknown> | null;
+}
+
+/** One bounded page of the change feed. */
+export interface ChangesPage {
+  changes: FeedChange[];
+  /** Where the next page starts; commit it to acknowledge this page. */
+  position: Watermark;
+  /** The store head this page was bounded to. */
+  head: Watermark;
+  /** Nothing at or below `head` is left after `position`. */
+  done: boolean;
+  /** The named cursor the page was read for, if any. */
+  consumer: string | null;
+}
+
+export interface ChangesPageOptions {
+  dbPath?: string;
+  /**
+   * `'start'` replays everything, `'consumer'` resumes the named cursor, a
+   * watermark resumes a position the caller kept. Defaults to `'consumer'`
+   * when `consumer` is set, else `'start'`.
+   */
+  from?: 'start' | 'consumer' | Watermark;
+  /** A named cursor kept inside the store; it moves only on `commitChanges`. */
+  consumer?: string;
+  /** Which kinds to report; every kind when omitted. A named cursor is bound to its kind set. */
+  kinds?: readonly ChangeKind[];
+  /** Restrict to one session. A one-shot read: it cannot name a consumer. */
+  session?: { source: string; sessionId: string };
+  /** Changes per page, 1..10000. */
+  limit?: number;
+}
+
+export interface CommitChangesOptions {
+  dbPath?: string;
+  /** The kind set the cursor is bound to; must match the pages it acknowledges. */
+  kinds?: readonly ChangeKind[];
+}
+
+/** A named cursor as stored after a commit. */
+export interface CommittedCursor {
+  consumer: string;
+  /** Never behind the committed position: a stale commit leaves the cursor where it was. */
+  cursor: Watermark;
+}
+
+/**
  * What one provider's local parser can record, answered from RelayHistory's
  * own capability tables rather than from any database — so it is correct
  * before a first sync and for a database that does not exist yet.

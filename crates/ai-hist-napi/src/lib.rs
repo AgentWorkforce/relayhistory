@@ -4,6 +4,7 @@
 //! contains no SQL, provider parsing, migration, or query semantics of its own.
 #![deny(clippy::all)]
 
+pub mod change_feed;
 pub mod export;
 pub mod session_store;
 pub mod sources;
@@ -76,7 +77,10 @@ use serde::Serialize;
 /// 24: `search` and `recent` take inclusive `sinceMs`/`untilMs` and a keyset
 /// `after` cursor, and `searchPage`/`recentPage` return a page with a
 /// `nextCursor` computed by over-fetching one row.
-pub const NATIVE_CONTRACT_VERSION: u32 = 24;
+/// 25 adds the change feed to `sessionStoreCall`: `changes` pages
+/// `SessionStore::changes_since` and `commit_changes` moves a named consumer
+/// cursor.
+pub const NATIVE_CONTRACT_VERSION: u32 = 25;
 const DEFAULT_LIMIT: i64 = 50;
 const DEFAULT_EVENT_LIMIT: i64 = 200;
 

@@ -38,7 +38,12 @@ added since the `SessionStore` facade go through one JSON dispatcher instead:
 after?}` and answers with the same camelCase document the typed function for
 that read returns, so the SDK normalizes both with one set of functions. The
 ops are `markers`, `requests`, `usage_summary`, `user_turns` and
-`capabilities`; `sdk-ts/src/native.ts` (`SESSION_STORE_OPS`) is the only place
+`capabilities`, plus the store-wide change feed: `changes` (`{dbPath?, from?,
+consumer?, kinds?, session?, limit?}`, one bounded page of
+`SessionStore::changes_since`) and `commit_changes` (`{dbPath?, consumer,
+kinds?, position}`, which moves a named consumer cursor). A feed watermark
+crosses as `{epoch, revision}` with the epoch as 16 hex digits, because it is a
+random 64-bit store identity a JavaScript number cannot hold. `sdk-ts/src/native.ts` (`SESSION_STORE_OPS`) is the only place
 in the SDK that spells them, and the SDK's request, usage and user-turn reads
 use the dispatcher. The dispatcher calls only the facade and the crate's pure
 capability tables — no connection, no SQL — and a new facade read is one new
@@ -176,6 +181,8 @@ archive relocation.
 | `getSessionMarkersPage`, `session_markers_page` (`SessionStore::session` carries the same markers untruncated) | none | bounded keyset page over one source's session | empty page; a read-only `SessionStore::open` over a database older than the marker page index is refused, naming the remedy (the native dispatcher then reopens writable and migrates, as the typed reads do) |
 | `getSessionRequestsPage`, `getSessionUsage` | none | bounded keyset page / streamed rollup over the derived request view | empty page / summary with no requests |
 | `getSourceCapabilities` | none | none: answered from the provider capability tables | the same answer |
+| `getChangesPage`, `changesSince`, `SessionStore::changes_since` | none | one bounded page per call: indexed revision-range reads per kind, plus tombstones; a session filter seeks that session's index | empty, finished feed; the file is not created |
+| `commitChanges`, `Changes::commit` | named consumer cursor in `consumer_cursors` (forward-only, bound to its kind set) | none | `WATERMARK_AHEAD_OF_STORE`: the position names no store |
 | `SessionStore::changes_since` (no SDK/MCP surface yet) | none | one indexed revision-range read per kind per page, plus one for tombstones; `commit` writes one cursor row | not reached: `SessionStore::open` created the database (writable) or already failed (read-only); a read-only store over a database older than the change-feed schema is refused, naming the remedy |
 | `sync` (`local`, default) | full explicit scan | migrations + ingestion | creates DB |
 | `sync` (`remote`) | explicitly selected source plugins (error when none) | observations, normalized evidence, checkpoints | creates DB |
