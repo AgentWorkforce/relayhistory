@@ -3732,10 +3732,15 @@ fn codex_parent_session_id(
 /// `source.subagent` is treated as a child only when an explicit parent is
 /// present, so a standalone guardian remains discoverable under `payload.id`.
 pub(crate) fn codex_is_subagent(payload: Option<&Value>, session_id: &str) -> bool {
-    let thread_source_is_subagent = payload
+    let thread_source = payload
         .and_then(|p| p.get("thread_source"))
-        .and_then(Value::as_str)
-        == Some("subagent");
+        .and_then(Value::as_str);
+    let thread_source_is_subagent = thread_source == Some("subagent");
+    // Codex 0.150 renamed the guardian's `thread_source` from `subagent` to
+    // `guardian_review`. It is a child only when it names its parent, like the
+    // `source.subagent` marker below: a standalone guardian stays a root.
+    let guardian_review_with_parent = thread_source == Some("guardian_review")
+        && codex_parent_session_id(payload.and_then(Value::as_object), session_id).is_some();
     let source_marks_subagent = payload
         .and_then(|p| p.get("source"))
         .and_then(Value::as_object)
@@ -3746,6 +3751,7 @@ pub(crate) fn codex_is_subagent(payload: Option<&Value>, session_id: &str) -> bo
     // carry that marker while keeping their own identity, so they stay
     // discoverable under `payload.id`.
     thread_source_is_subagent
+        || guardian_review_with_parent
         || (source_marks_subagent
             && codex_parent_session_id(payload.and_then(Value::as_object), session_id).is_some())
 }
@@ -5815,20 +5821,17 @@ fn tool_results_lack_fidelity(conn: &Connection, source: &str, session_id: &str)
     Ok(lacking != 0)
 }
 
-/// Whether this rollout's continuity evidence has ever been banked.
+/// Whether this rollout's continuity evidence has been banked by the current
+/// scanner.
 ///
 /// Keyed on the locator, like the Claude probe below and for the same reason:
 /// the stamp map would otherwise skip exactly the rollouts that an upgrade
-/// into continuity needs to read.
+/// into continuity needs to read. A row banked before Codex's own fork fields
+/// (`forked_from_id`, `thread_spawn.parent_thread_id`) were read counts as
+/// missing, so a fork synced before that upgrade gains its edge on one
+/// `session_meta` re-read.
 fn codex_continuity_evidence_exists(conn: &Connection, path: &Path) -> Result<bool> {
-    let locator = path.to_string_lossy();
-    let exists: i64 = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM session_continuity_evidence \
-         WHERE source = 'codex' AND locator = ? LIMIT 1)",
-        [locator.as_ref()],
-        |row| row.get(0),
-    )?;
-    Ok(exists != 0)
+    crate::continuity::codex_evidence_is_current(conn, &path.to_string_lossy())
 }
 
 /// Whether an unchanged transcript still owes the continuity index one read.
@@ -24504,6 +24507,56 @@ mod tests {
             let meta = codex_meta(&path);
             assert!(meta.is_subagent, "{name} guardian must remain a child");
             assert_eq!(meta.parent_session_id.as_deref(), Some("root"), "{name}");
+        }
+    }
+
+    /// Codex 0.150 writes a guardian's `thread_source` as `guardian_review`
+    /// where earlier builds wrote `subagent`. With a parent it is a child under
+    /// either spelling — including when `source` is the plain string form and
+    /// carries no `subagent` marker — and without one it stays a root, like
+    /// the marker-only guardian above.
+    #[test]
+    fn codex_guardian_review_thread_source_is_classified_like_subagent() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, payload, is_subagent) in [
+            (
+                "guardian-review-marker",
+                r#"{"id":"guardian-thread","cwd":"/tmp/proj","parent_thread_id":"parent-thread","source":{"subagent":{"other":"guardian"}},"thread_source":"guardian_review"}"#,
+                true,
+            ),
+            (
+                "pre-0150-subagent",
+                r#"{"id":"guardian-thread","cwd":"/tmp/proj","parent_thread_id":"parent-thread","source":{"subagent":{"other":"guardian"}},"thread_source":"subagent"}"#,
+                true,
+            ),
+            (
+                "guardian-review-string-source",
+                r#"{"id":"guardian-thread","cwd":"/tmp/proj","parent_thread_id":"parent-thread","source":"vscode","thread_source":"guardian_review"}"#,
+                true,
+            ),
+            (
+                "guardian-review-no-parent",
+                r#"{"id":"guardian-thread","cwd":"/tmp/proj","source":"vscode","thread_source":"guardian_review"}"#,
+                false,
+            ),
+        ] {
+            let path = dir.path().join(format!("rollout-{name}.jsonl"));
+            fs::write(
+                &path,
+                format!(
+                    "{{\"timestamp\":\"2026-08-31T10:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{payload}}}\n"
+                ),
+            )
+            .unwrap();
+            let meta = codex_meta(&path);
+            assert_eq!(meta.is_subagent, is_subagent, "{name}");
+            if is_subagent {
+                assert_eq!(
+                    meta.parent_session_id.as_deref(),
+                    Some("parent-thread"),
+                    "{name}"
+                );
+            }
         }
     }
 

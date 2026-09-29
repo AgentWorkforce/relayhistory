@@ -228,6 +228,17 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Session topology
 
+- Record Codex forks from the fields Codex actually writes. A rollout whose
+  `session_meta` carries `forked_from_id` (a human "fork conversation") or
+  `source.subagent.thread_spawn.parent_thread_id` (a spawned subagent) now
+  gets a `fork` edge to that thread, with the field name as `evidence_ref`; a
+  subagent keeps its `delegated` row beside it and a human fork stays a
+  top-level session. A rollout indexed before this re-reads its `session_meta`
+  line once on the next `sync`. A `thread_source: "guardian_review"` rollout
+  (Codex 0.150+) that names a parent is hidden from the root catalog like any
+  other subagent. The replay of the parent's history inside a forked rollout
+  is not gated yet (#210).
+
 - Record fork, resume and continuation relationships, not delegation alone.
   `session_relationships.relationship` now takes `continuation | fork | resume`
   beside `delegated | materialized_local`, and carries `origin_session_id` —
