@@ -821,14 +821,21 @@ How each adapter works:
   no session, event, marker, cursor or continuity row is derived from it.
   `$CLAUDE_CONFIG_DIR/transcripts/` is deliberately **not** a Claude root —
   not enumerated, synced, hydrated or watched. Claude Code does not write
-  there; oh-my-opencode's Claude-hook compatibility layer does, one
-  `<OpenCode ses_* id>.jsonl` per *OpenCode* session, as `user` / `tool_use` /
-  `tool_result` lines with top-level `content` and `tool_name` / `tool_input`
-  / `tool_output`, and no `sessionId`, `uuid`, `cwd`, model, usage or
-  assistant turn. That session is already indexed, with full evidence, by the
-  **opencode** adapter from OpenCode's own store; reading the copy as `claude`
-  would publish each one twice under two sources with no project identity
-  ([#208](https://github.com/AgentWorkforce/relayhistory/issues/208)).
+  there; oh-my-opencode's Claude-hook compatibility layer does
+  ([`transcript.ts`](https://github.com/code-yeongyu/oh-my-openagent/blob/dev/packages/omo-opencode/src/hooks/claude-code-hooks/transcript.ts)),
+  one `<OpenCode ses_* id>.jsonl` per *OpenCode* session, as `user` /
+  `tool_use` / `tool_result` lines with top-level `content` and `tool_name` /
+  `tool_input` / `tool_output`, and no `sessionId`, `uuid`, `cwd`, model or
+  usage. A user's census of 5,004 such files in
+  [tokscale#487](https://github.com/junhoyeo/tokscale/issues/487) found no
+  `assistant` line and `usage` in only 15. This is characterized from those
+  sources, not from a local copy of the directory. The session is already
+  indexed, with full evidence, by the **opencode** adapter from OpenCode's own
+  store; reading the copy as `claude` would publish each one twice under two
+  sources with no project identity
+  ([#208](https://github.com/AgentWorkforce/relayhistory/issues/208)). The
+  accepted residual: a user who deletes their OpenCode store but keeps the
+  wrapper transcripts gets those sessions indexed from neither.
 - **codex** — `rollout-*.jsonl` under `$CODEX_HOME/sessions` and
   `$CODEX_HOME/archived_sessions` (defaulting under `~/.codex`). The first line
   is a `session_meta` record, which
