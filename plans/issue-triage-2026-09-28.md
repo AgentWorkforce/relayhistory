@@ -47,11 +47,13 @@ comment linking its replacement and is left open for a maintainer to close.
 
 ## Merge order
 
-#274 and #277 both take native contract 23, and #282 is stacked on #277.
-Merge #277, then #282, then rebase #274 onto contract 25. #276 raises the
-hydration parser version to 12; any other parser bump rebases after it.
-Most PRs add `CHANGELOG.md` entries at the same spot and will need a trivial
-rebase as they land.
+The PRs are stacked, each based on the one before it, so they merge bottom-up
+without conflicts:
+
+#270 → #275 → #272 → #280 → #278 → #279 → #273 → #284 → #276 → #271 → #283 →
+#285 → #277 → #282 → #274 → #281
+
+The native contract is 23 at #277, 24 at #282 and 25 at #274.
 
 ## Labelled `needs-investigation`
 
