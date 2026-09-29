@@ -94,7 +94,9 @@ pub fn search_page(
     filter: &QueryFilter,
     role: SearchRole,
 ) -> Result<HistoryPage<SearchRow>> {
-    let limit = filter.limit.max(1);
+    // One row past the page shows whether another follows; a limit no table
+    // can reach is clamped so that over-fetch cannot overflow.
+    let limit = filter.limit.clamp(1, i64::MAX - 1);
     let mut rows = search_all(
         conn,
         terms,
@@ -602,6 +604,18 @@ mod tests {
             }
             assert_eq!(ids, vec![3, 2, 1, 4], "page size {page_size}");
         }
+    }
+
+    #[test]
+    fn the_largest_limit_returns_every_row_without_overflowing() {
+        let conn = fixture();
+        let terms = ["needle".to_string()];
+        let search = search_page(&conn, &terms, false, &filter(i64::MAX), SearchRole::All).unwrap();
+        assert_eq!(search.rows.len(), 7);
+        assert!(search.next_cursor.is_none());
+        let recent = crate::recent_page(&conn, &filter(i64::MAX)).unwrap();
+        assert_eq!(recent.rows.len(), 4);
+        assert!(recent.next_cursor.is_none());
     }
 
     #[test]

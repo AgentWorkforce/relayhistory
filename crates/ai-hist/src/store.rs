@@ -2451,7 +2451,9 @@ pub fn recent(conn: &Connection, filter: &QueryFilter) -> Result<Vec<HistoryEntr
 /// One page of [`recent`], newest first, with a cursor to the next page when
 /// one exists.
 pub fn recent_page(conn: &Connection, filter: &QueryFilter) -> Result<HistoryPage<HistoryEntry>> {
-    let limit = filter.limit.max(1);
+    // One row past the page shows whether another follows; a limit no table
+    // can reach is clamped so that over-fetch cannot overflow.
+    let limit = filter.limit.clamp(1, i64::MAX - 1);
     let mut rows = recent(
         conn,
         &QueryFilter {
