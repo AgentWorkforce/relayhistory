@@ -160,6 +160,12 @@ Notable changes to the native `ai-hist` CLI are documented here.
   sessions and their objectives are not history rows. A Muse hydration
   reports `full`. `ai-hist resume` prints `muse resume <id>`, and the sync
   service forwards `XDG_DATA_HOME`.
+- Add MCP `list_relay_agents` for live Agent Relay participants. It reads only
+  the local desktop Unix socket, discovers it from `AGENT_RELAY_SOCKET`, the
+  private desktop pointer file, then platform defaults, and reports a missing
+  desktop app as a non-fatal result instead of requiring Relaycast credentials.
+  A connected desktop gets a 15-second response deadline, with an honest
+  `timeout` error rather than the missing-app result if it does not answer.
 - Read every OpenCode channel database. OpenCode keeps one SQLite store per
   release channel — `opencode.db` for `latest`/`beta`, and
   `opencode-stable.db`, `opencode-nightly.db`, ... beside it — and only

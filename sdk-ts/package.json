@@ -55,6 +55,7 @@
     "dist/relay-cli.*",
     "dist/cloud-contract.*",
     "dist/mcp-server.*",
+    "dist/relay-agents.*",
     "README.md",
     "package.json",
     "dist/contracts.*",
