@@ -41,7 +41,8 @@ Notable changes to the native `ai-hist` CLI are documented here.
     `after` cursor `{ timestampMs, id, matchSource? }` on every surface: SDK
     options, MCP `search_history`/`recent_history` (`since_ms`, `until_ms`,
     `after`), `--since-ms`/`--until-ms`/`--after` on the TS CLI, and
-    `--since-ms`/`--until-ms` on the native CLI.
+    `--since-ms`/`--until-ms`/`--after-ms`/`--after-id` (and
+    `--after-match-source` on `search`) on the native CLI.
   - New SDK `searchPage()`/`recentPage()` (napi `searchPage`/`recentPage`)
     return `{ matches | entries, nextCursor }`. `nextCursor` comes from
     over-fetching one row, and is `null` when nothing further exists.
