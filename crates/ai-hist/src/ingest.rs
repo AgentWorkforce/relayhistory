@@ -8722,9 +8722,9 @@ pub(crate) fn heal_claude_request_evidence(conn: &Connection) -> Result<()> {
             None,
         )?;
     }
-    // The notice's text is joined in block order, as a fresh parse writes it:
-    // a Claude text row's uid is `{message_id}:{block_index}`, and
-    // `group_concat` alone promises no order, so the rows' storage order
+    // The notice's text is its text rows joined in block order, as a fresh
+    // parse writes it: a Claude row's uid is `{message_id}:{block_index}`,
+    // and `group_concat` alone promises no order, so the rows' storage order
     // could otherwise reorder a multi-block notice.
     conn.execute_batch(
         "INSERT INTO session_markers \
@@ -8733,6 +8733,7 @@ pub(crate) fn heal_claude_request_evidence(conn: &Connection) -> Result<()> {
                 message_id, MIN(parent_id), 'local_notice', 'synthetic', \
                 group_concat(text, char(10) \
                   ORDER BY CAST(substr(event_uid, length(message_id) + 2) AS INTEGER), id) \
+                  FILTER (WHERE kind = 'text') \
          FROM session_events \
          WHERE source = 'claude' AND role = 'assistant' \
            AND lower(trim(model)) = '<synthetic>' \
@@ -27741,9 +27742,10 @@ mod tests {
         assert_eq!(last.as_deref(), Some("Login"));
     }
 
-    /// A multi-block notice is migrated in block order, not in the order its
-    /// rows happen to be stored: here the later block was stored first, and
-    /// its index sorts first as text.
+    /// A multi-block notice is migrated as its text blocks in block order,
+    /// not in the order its rows happen to be stored: here the later block was
+    /// stored first, its index sorts first as text, and a non-text row of the
+    /// same message is not part of the notice.
     #[test]
     fn the_notice_migration_joins_blocks_in_block_order() {
         let conn = Connection::open_in_memory().unwrap();
@@ -27751,6 +27753,7 @@ mod tests {
         conn.execute_batch(
             "INSERT INTO session_events (source, session_id, message_id, ts_ms, role, kind, text, model, event_uid) \
              VALUES ('claude', 's', 'n', 5, 'assistant', 'text', 'Run /login', '<synthetic>', 'n:10'), \
+                    ('claude', 's', 'n', 5, 'assistant', 'thinking', 'not the notice', '<synthetic>', 'n:1'), \
                     ('claude', 's', 'n', 5, 'assistant', 'text', 'Login expired', '<synthetic>', 'n:2');",
         )
         .unwrap();
