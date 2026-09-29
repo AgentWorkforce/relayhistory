@@ -726,7 +726,11 @@ const DESTINATION_GENERATION_KEY: &str = "destination_generation";
 /// Add the new key here in the same change that introduces it; the old one
 /// stays in [`RETIRED_SYNC_STATE_KEYS`] for the migration, but only live
 /// generations belong in the stamp.
-const SWEEP_PARSER_GENERATIONS: &[&str] = &["claude_sessions_v3", "codex_rollouts_v5"];
+const SWEEP_PARSER_GENERATIONS: &[&str] = &[
+    "claude_sessions_v3",
+    "codex_rollouts_v5",
+    GROK_SYNC_STATE_KEY,
+];
 
 /// The generation half of a stored fingerprint: what this build of the sweep
 /// would produce from a given tree, independent of the tree itself.
@@ -2303,6 +2307,7 @@ const RETIRED_SYNC_STATE_KEYS: &[(&str, &str)] = &[
     ("cursor", CURSOR_SYNC_STATE_KEY),
     ("cursor_events_v1", CURSOR_SYNC_STATE_KEY),
     ("grok_sessions", GROK_SYNC_STATE_KEY),
+    ("grok_events_v1", GROK_SYNC_STATE_KEY),
 ];
 
 /// Where plain `sync` remembers how far it has read each Cursor transcript.
@@ -2379,7 +2384,12 @@ pub(crate) fn record_cursor_hydrate_checkpoint(
 /// `updates.jsonl` recorded, in place of the synthesized ones the previous
 /// parser wrote. Bumping `HYDRATION_PARSER_VERSION` alone only repairs
 /// sessions somebody hydrates by name.
-const GROK_SYNC_STATE_KEY: &str = "grok_events_v1";
+///
+/// `grok_events_v2` does it again for the per-turn `turn_completed.usage`
+/// breakdown and the per-turn request span on assistant rows: both live only
+/// in `updates.jsonl`, so a session indexed before them keeps proxy-only
+/// token facts and one request per assistant row until it is read again.
+const GROK_SYNC_STATE_KEY: &str = "grok_events_v2";
 
 fn merged_sync_state(path: &Path, ours: &Map<String, Value>) -> Result<Option<Map<String, Value>>> {
     let mut merged = load_sync_state(path)?;
@@ -10966,6 +10976,19 @@ pub(crate) struct GrokIngestOutcome {
     pub turns: usize,
 }
 
+/// The request span of a Grok assistant row: the `updates.jsonl` turn it
+/// belongs to.
+///
+/// Grok names none of its API calls, and the only usage it reports is one
+/// `turn_completed.usage` per turn, so the turn is the finest unit a request
+/// can be measured at. Without a shared span each assistant row of a turn —
+/// its thinking, every tool call, its prose — grouped as a request of its
+/// own, and a turn that called a tool read as several requests, all but one
+/// unmeasured.
+fn grok_turn_span(turn: Option<usize>) -> Option<String> {
+    turn.map(|turn| turn.to_string())
+}
+
 /// Index one Grok session directory: prompts, events, tools, edits, markers
 /// and subagent delegations.
 fn ingest_grok_session(
@@ -11201,7 +11224,10 @@ fn ingest_grok_session(
                     RequestIdentity::none(),
                     &uid,
                     None,
-                    RawMessageFacts::default(),
+                    RawMessageFacts {
+                        request_span: grok_turn_span(turn).as_deref(),
+                        ..RawMessageFacts::default()
+                    },
                 )?;
                 outcome.events += 1;
             }
@@ -11241,7 +11267,10 @@ fn ingest_grok_session(
                         RequestIdentity::none(),
                         &uid,
                         None,
-                        RawMessageFacts::default(),
+                        RawMessageFacts {
+                            request_span: grok_turn_span(turn).as_deref(),
+                            ..RawMessageFacts::default()
+                        },
                     )?;
                     outcome.events += 1;
                     if let Some(turn) = turn {
@@ -11288,7 +11317,10 @@ fn ingest_grok_session(
                         RequestIdentity::none(),
                         &uid,
                         None,
-                        RawMessageFacts::default(),
+                        RawMessageFacts {
+                            request_span: grok_turn_span(call_turn).as_deref(),
+                            ..RawMessageFacts::default()
+                        },
                     )?;
                     outcome.events += 1;
                     // `updates.jsonl` knows which turn the call belongs to even
@@ -13960,6 +13992,69 @@ mod tests {
         )
         .unwrap();
         (dir.join("chat_history.jsonl"), dir)
+    }
+
+    /// A Grok session indexed by a build that stored no `turn_completed.usage`
+    /// has not changed on disk, so only the retired `grok_events_v1` key can
+    /// send plain `sync` back over it. With that key the unchanged directory
+    /// is re-read and gains the breakdown and its turn's request span.
+    #[test]
+    fn an_upgraded_sync_rereads_unchanged_grok_sessions_for_turn_usage() {
+        let home = tempfile::tempdir().unwrap();
+        let (chat, dir) = grok_stream_fixture(home.path(), "grok-upg-0001");
+        fs::write(
+            &chat,
+            concat!(
+                r#"{"type":"user","content":"<user_query>hi</user_query>"}"#,
+                "\n",
+                r#"{"type":"assistant","content":"hello","model_id":"grok-4-build"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("updates.jsonl"),
+            concat!(
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"eventId":"u1","agentTimestampMs":1789560000000,"turnStartMs":1789560000000}}}"#,
+                "\n",
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"eventId":"a1","agentTimestampMs":1789560001000,"turnStartMs":1789560000000}}}"#,
+                "\n",
+                r#"{"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"turn_completed","totalTokens":1800,"usage":{"inputTokens":1000,"outputTokens":100}},"_meta":{"agentTimestampMs":1789560002000,"turnStartMs":1789560000000}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let root = home.path().join(".grok/sessions");
+        let mut state = Map::new();
+        assert_eq!(super::sync_grok(&conn, &mut state, &root).unwrap(), 1);
+        let stamps = state[super::GROK_SYNC_STATE_KEY].clone();
+
+        // What the previous build left: proxy-only token facts, no span, and
+        // its stamps under the key it used.
+        conn.execute_batch(
+            "UPDATE session_events SET request_span = NULL, \
+               token_json = json_remove(token_json, '$.usage') WHERE source = 'grok';",
+        )
+        .unwrap();
+        let mut old = Map::new();
+        old.insert("grok_events_v1".into(), stamps.clone());
+        let mut current = Map::new();
+        current.insert(super::GROK_SYNC_STATE_KEY.into(), stamps);
+        // The positive control: under the current key an unchanged session is
+        // skipped, which is exactly why the key had to move.
+        assert_eq!(super::sync_grok(&conn, &mut current, &root).unwrap(), 0);
+
+        assert_eq!(super::sync_grok(&conn, &mut old, &root).unwrap(), 1);
+        let (usage, span): (Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT json_extract(token_json, '$.usage.inputTokens'), request_span \
+                 FROM session_events WHERE source = 'grok' AND token_json IS NOT NULL",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((usage, span.as_deref()), (Some(1000), Some("0")));
     }
 
     /// An `updates.jsonl` that exists and cannot be read is a failure, not an

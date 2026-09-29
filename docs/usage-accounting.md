@@ -82,6 +82,13 @@ counter follow tokscale's reader (`promptTokens`/`input_tokens`,
 `completionTokens`/`output_tokens`, `cacheReadTokens`/`cache_read_input_tokens`,
 ...). `costUsdTicks` is kept in the stored object but not read as a cost.
 
+Grok names none of its API calls, and the breakdown is one per turn, so the
+turn is the request: every assistant row of a turn — thinking, each tool call,
+the prose — carries the turn's index as its `request_span`, and
+`session_requests` groups them as one `request-span` request. A session
+indexed before this is re-read once, by `sync` (the `grok_events_v2` state
+key) and by hydration (parser version 12).
+
 ### Codex
 
 `token_count` events carry cumulative `total_token_usage` snapshots. The parser

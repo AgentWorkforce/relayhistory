@@ -102,7 +102,12 @@ Notable changes to the native `ai-hist` CLI are documented here.
   `USAGE_UNKNOWN_SOURCE`. Hydration reports `GROK_USAGE_CONTEXT_PROXY_ONLY` only
   when no turn carried a breakdown, `GROK_USAGE_PARTIAL` when some did. A
   `usage` holding only `totalTokens` is still read as the context snapshot.
-  `~/.grok/logs/unified.jsonl` is not read yet (#212).
+  Every assistant row of a Grok turn now carries the turn index as its
+  `request_span`, so `session_requests` reports one request per turn instead
+  of one per row. Already indexed Grok sessions are re-read once, by `sync`
+  (state key `grok_events_v2`) and by hydration (parser version 12). A cached
+  hydration whose checkpoint predates stored diagnostics never claims full
+  usage coverage. `~/.grok/logs/unified.jsonl` is not read yet (#212).
 
 - Add workspace-scoped agent handoffs through `create_handoff(intent)` and
   `resume_handoff(source, session_id)`. The sender emits only a session pointer
