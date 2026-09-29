@@ -164,6 +164,8 @@ Notable changes to the native `ai-hist` CLI are documented here.
   the local desktop Unix socket, discovers it from `AGENT_RELAY_SOCKET`, the
   private desktop pointer file, then platform defaults, and reports a missing
   desktop app as a non-fatal result instead of requiring Relaycast credentials.
+  A connected desktop gets a 15-second response deadline, with an honest
+  `timeout` error rather than the missing-app result if it does not answer.
 - Read every OpenCode channel database. OpenCode keeps one SQLite store per
   release channel — `opencode.db` for `latest`/`beta`, and
   `opencode-stable.db`, `opencode-nightly.db`, ... beside it — and only

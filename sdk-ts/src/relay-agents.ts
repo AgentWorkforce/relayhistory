@@ -4,6 +4,8 @@ import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const NOT_RUNNING = "Agent Relay desktop isn't running on this machine; open it, or use the Agent Relay MCP";
+const DESKTOP_TIMEOUT = "Agent Relay desktop didn't answer in time";
+const DEFAULT_TIMEOUT_MS = 15_000;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 
 export type RelayAgentWhere = 'this_computer' | 'cloud' | 'other_desktop';
@@ -68,7 +70,7 @@ export async function listRelayAgents(
   let permissionError: SocketPermissionDenied | undefined;
   for (const path of paths) {
     try {
-      return parseRoster(await requestRoster(path, target, runtime.timeoutMs ?? 1_500));
+      return parseRoster(await requestRoster(path, target, runtime.timeoutMs ?? DEFAULT_TIMEOUT_MS));
     } catch (error) {
       if (error instanceof SocketUnavailable) continue;
       if (error instanceof SocketPermissionDenied) {
@@ -163,7 +165,7 @@ function requestRoster(path: string, target: string, timeoutMs: number): Promise
       )));
     });
     deadline = setTimeout(() => {
-      finish(() => reject(new SocketUnavailable('socket timed out')));
+      finish(() => reject(new RelayAgentsError('timeout', DESKTOP_TIMEOUT)));
       clientRequest.destroy();
     }, timeoutMs);
     clientRequest.once('error', (error: NodeJS.ErrnoException) => {

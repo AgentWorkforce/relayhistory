@@ -79,7 +79,7 @@ test('decodes chunked desktop responses', async (t) => {
   assert.deepEqual(result, { agents: [], fetched_at_ms: 1_790_683_200_123 });
 });
 
-test('enforces a total request deadline even while the peer sends data', async (t) => {
+test('reports a slow desktop as a timeout instead of claiming it is absent', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'relay-agents-deadline-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const socket = join(root, 'relay.sock');
@@ -101,12 +101,46 @@ test('enforces a total request deadline even while the peer sends data', async (
   });
 
   const started = Date.now();
+  await assert.rejects(
+    listRelayAgents({}, {
+      env: { AGENT_RELAY_SOCKET: socket }, home: root, platform: 'linux', temporaryDirectory: root, uid: 501,
+      timeoutMs: 60,
+    }),
+    (error: unknown) => error instanceof Error
+      && (error as { code?: string }).code === 'timeout'
+      && error.message === "Agent Relay desktop didn't answer in time",
+  );
+  assert.ok(Date.now() - started < 500);
+});
+
+test('allows a slow first roster response within the default local deadline', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'relay-agents-slow-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const socket = join(root, 'relay.sock');
+  const server = createServer((connection) => {
+    connection.once('data', () => {
+      setTimeout(() => {
+        const body = JSON.stringify({
+          ok: true,
+          data: { agents: [], fetched_at_ms: 1_790_683_200_123 },
+        });
+        connection.end(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`);
+      }, 1_600);
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(socket, resolve);
+  });
+  t.after(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(socket, { force: true });
+  });
+
   const result = await listRelayAgents({}, {
     env: { AGENT_RELAY_SOCKET: socket }, home: root, platform: 'linux', temporaryDirectory: root, uid: 501,
-    timeoutMs: 60,
   });
-  assert.deepEqual(result, { available: false, message: NOT_RUNNING });
-  assert.ok(Date.now() - started < 500);
+  assert.deepEqual(result, { agents: [], fetched_at_ms: 1_790_683_200_123 });
 });
 
 test('reports inaccessible sockets instead of claiming the desktop is absent', async (t) => {

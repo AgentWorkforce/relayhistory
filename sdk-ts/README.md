@@ -250,6 +250,8 @@ accepts optional `query`, `where` (`this_computer`, `cloud`, or
 `AGENT_RELAY_SOCKET`, then `~/.agentworkforce/desktop/relay-socket`, then the
 macOS/Linux defaults. No Relaycast client or cloud credential is part of
 ai-hist; when the desktop is absent the tool returns a clear non-fatal result.
+A connected desktop has a 15-second response deadline. If it does not answer in
+that time, the tool reports `timeout` distinctly from an absent app.
 
 Use `exportHistory(selection)` for a bounded historical snapshot or
 `ai-hist export --selection selection.json` for NDJSON stdout. See

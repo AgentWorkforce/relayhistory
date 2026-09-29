@@ -82,7 +82,7 @@ field or inline the transcript. Before sending, call `resume_handoff` once with
 the pointer to verify that Agent Relay desktop has uploaded the session to the
 current workspace.
 
-The MCP server reads local history only, plus any source plugins named by `AI_HIST_PLUGIN_CONFIG`. `list_relay_agents` is also local: it uses `AGENT_RELAY_SOCKET`, then `~/.agentworkforce/desktop/relay-socket`, then the platform socket defaults. It never loads cloud credentials. If the desktop app is absent, the tool returns a non-fatal instruction to open it or use the Agent Relay MCP.
+The MCP server reads local history only, plus any source plugins named by `AI_HIST_PLUGIN_CONFIG`. `list_relay_agents` is also local: it uses `AGENT_RELAY_SOCKET`, then `~/.agentworkforce/desktop/relay-socket`, then the platform socket defaults. It never loads cloud credentials. If the desktop app is absent, the tool returns a non-fatal instruction to open it or use the Agent Relay MCP. A connected desktop gets a 15-second local response deadline; exceeding it reports `timeout` instead of claiming the app is absent.
 
 ## Local and remote history
 
