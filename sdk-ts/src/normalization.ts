@@ -138,13 +138,17 @@ export function historyCursor(value: unknown): HistoryCursor | null {
   return cursor;
 }
 
-/** The native boundary takes an absent `matchSource`, not an explicit null. */
+/**
+ * The native boundary takes an absent `matchSource`, not an explicit null. Any
+ * other value, an empty string included, goes through so native validation
+ * rejects it instead of it silently paging as `history`.
+ */
 export function nativeHistoryCursor(after: HistoryCursor | undefined): object | undefined {
   if (!after) return undefined;
   return {
     timestampMs: after.timestampMs,
     id: after.id,
-    ...(after.matchSource ? { matchSource: after.matchSource } : {}),
+    ...(after.matchSource != null ? { matchSource: after.matchSource } : {}),
   };
 }
 

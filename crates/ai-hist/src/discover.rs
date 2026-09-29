@@ -84,7 +84,7 @@ pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 4;
 /// invalidates every stored stamp, so a scanner that learns to extract a new
 /// field re-reads sources whose bytes never changed. `parser_version` keeps its
 /// existing meaning (full-ingest parser generation) and is untouched.
-pub const SHALLOW_SCANNER_VERSION: u32 = 6;
+pub const SHALLOW_SCANNER_VERSION: u32 = 7;
 
 /// Version 2 shipped the classification that hid standalone guardians (see
 /// [`crate::codex_is_subagent`]). Their rollouts never change on disk, so the
@@ -116,6 +116,16 @@ const _: () = assert!(SHALLOW_SCANNER_VERSION > 4);
 /// used to be never change -- so only this bump sends the cached row through
 /// the current classifier once.
 const _: () = assert!(SHALLOW_SCANNER_VERSION > 5);
+
+/// Version 7 classifies a Codex 0.150+ `thread_source: "guardian_review"`
+/// rollout that names its parent as a subagent. Such a rollout never changes
+/// on disk, so without this bump an install that catalogued it as a root would
+/// keep serving that cached row. The bump also moves the sweep generation, so
+/// the first `sync` after the upgrade runs instead of matching the stored
+/// source fingerprint, and its rollout walk re-reads each rollout's
+/// `session_meta` line once (see `codex_evidence_is_current`), which is what
+/// banks Codex fork lineage and reclassifies those guardians.
+const _: () = assert!(SHALLOW_SCANNER_VERSION > 6);
 
 /// Most bytes a shallow head read may consume from one transcript.
 pub const HEAD_SCAN_MAX_BYTES: u64 = 256 * 1024;
@@ -2077,7 +2087,23 @@ fn grok_update_bounds(
 #[derive(Default)]
 struct OpencodeProvider {
     pass: Mutex<()>,
-    live: Mutex<Option<Vec<OpencodeReadSnapshot>>>,
+    live: Mutex<Option<OpencodeLive>>,
+}
+
+/// One run's OpenCode stores: those that opened, in
+/// [`crate::paths::opencode_db_files`] order, and those that could not be read.
+///
+/// One broken channel database is that store's failure, not the provider's:
+/// the healthy stores are still enumerated, and each unreadable one is emitted
+/// as a candidate of its own (see [`unreadable_opencode_candidate`]) so the
+/// engine reports it against its path and the sweep does not checkpoint a
+/// fingerprint over a store it never read. Only when no store opened at all
+/// does the provider fail as a whole, as it did with a single store.
+struct OpencodeLive {
+    stores: Vec<OpencodeReadSnapshot>,
+    /// `(locator, error)` for each store that failed to open, and for a
+    /// channel directory that could not be listed.
+    unreadable: Vec<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -2108,20 +2134,44 @@ impl OpencodeProvider {
     /// the run's SQLite snapshot. `None` means this host is not on the SQLite
     /// layout — either it has the legacy JSON tree, or it has no OpenCode
     /// store at all.
-    fn snapshot(
-        &self,
-        scan: &ScanEnv<'_>,
-    ) -> Result<MutexGuard<'_, Option<Vec<OpencodeReadSnapshot>>>> {
+    fn snapshot(&self, scan: &ScanEnv<'_>) -> Result<MutexGuard<'_, Option<OpencodeLive>>> {
         let mut guard = self.live.lock().expect("opencode live snapshot lock");
         if guard.is_none() {
-            if let Some(OpencodeLayout::Sqlite(stores)) = scan.opencode_layout() {
-                *guard = Some(
-                    stores
-                        .iter()
-                        .map(|store| open_opencode_snapshot(scan, store))
-                        .collect::<Result<Vec<_>>>()?,
-                );
+            let listing =
+                crate::paths::list_opencode_db_files(scan.opencode_db, scan.opencode_db_pinned);
+            let mut live = OpencodeLive {
+                stores: Vec::new(),
+                unreadable: Vec::new(),
+            };
+            let mut first_error = None;
+            for store in &listing.stores {
+                match open_opencode_snapshot(scan, store) {
+                    Ok(snapshot) => live.stores.push(snapshot),
+                    Err(error) => {
+                        live.unreadable
+                            .push((store.to_string_lossy().into_owned(), format!("{error:#}")));
+                        first_error.get_or_insert(error);
+                    }
+                }
             }
+            if let Some((dir, error)) = listing.unlisted {
+                live.unreadable.push((
+                    dir.to_string_lossy().into_owned(),
+                    format!(
+                        "could not list OpenCode channel databases in {}: {error}",
+                        dir.display()
+                    ),
+                ));
+            }
+            if live.stores.is_empty() {
+                if let Some(error) = first_error {
+                    return Err(error);
+                }
+                if live.unreadable.is_empty() {
+                    return Ok(guard);
+                }
+            }
+            *guard = Some(live);
         }
         Ok(guard)
     }
@@ -2285,7 +2335,20 @@ impl ShallowSessionProvider for OpencodeProvider {
         // fingerprint as surely as one to `opencode.db` — and a channel store
         // that appears adds a candidate, which moves it too.
         let mut out = Vec::new();
-        for db in crate::paths::opencode_db_files(&env.opencode_db, env.opencode_db_pinned) {
+        let listing =
+            crate::paths::list_opencode_db_files(&env.opencode_db, env.opencode_db_pinned);
+        // A directory that could not be listed may hold channel stores this
+        // fingerprint cannot see. No fingerprint, then: a sweep that cannot
+        // say what it would read must not record what it read as complete.
+        if let Some((dir, error)) = listing.unlisted {
+            return Err(error).with_context(|| {
+                format!(
+                    "listing OpenCode channel databases in {}",
+                    dir.display()
+                )
+            });
+        }
+        for db in listing.stores {
             for suffix in ["", "-wal", "-shm"] {
                 let mut path = db.clone().into_os_string();
                 path.push(suffix);
@@ -2315,30 +2378,35 @@ impl ShallowSessionProvider for OpencodeProvider {
             return enumerate_opencode_json_tree(&scan, &root);
         }
         let mut guard = self.snapshot(&scan)?;
-        let Some(snapshots) = guard.as_mut() else {
+        let Some(live) = guard.as_mut() else {
             return Ok(Vec::new());
         };
         let mut out = Vec::new();
         let mut claimed = BTreeSet::new();
-        for snapshot in snapshots.iter_mut() {
-            for candidate in enumerate_opencode_snapshot(&scan, snapshot, requested_limit)? {
-                if claimed.insert(candidate.locator.clone()) {
-                    out.push(candidate);
-                } else {
-                    // An earlier store already holds this session. Forget the
-                    // seed here too, so the shallow read finds one owner.
-                    snapshot.sessions.remove(&candidate.locator);
-                }
-            }
+        for index in 0..live.stores.len() {
+            let (earlier, rest) = live.stores.split_at_mut(index);
+            let found =
+                enumerate_opencode_snapshot(&scan, &mut rest[0], earlier, &claimed, requested_limit)?;
+            claimed.extend(found.iter().map(|candidate| candidate.locator.clone()));
+            out.extend(found);
         }
-        if snapshots.len() > 1 {
-            // Each store answered with its own newest; the run's newest are
-            // the merge of those lists, cut back to the limit asked for.
-            out.sort_by_key(|candidate| std::cmp::Reverse(candidate.recency_hint_ms));
+        if live.stores.len() > 1 {
+            // Each store answered with the newest sessions it owns; the run's
+            // newest are the merge of those lists, cut back to the limit.
+            out.sort_by(|a, b| {
+                b.recency_hint_ms
+                    .cmp(&a.recency_hint_ms)
+                    .then_with(|| a.locator.cmp(&b.locator))
+            });
             if let Some(limit) = requested_limit {
                 out.truncate(limit);
             }
         }
+        out.extend(
+            live.unreadable
+                .iter()
+                .map(|(locator, _)| unreadable_opencode_candidate(locator)),
+        );
         Ok(out)
     }
 
@@ -2354,12 +2422,24 @@ impl ShallowSessionProvider for OpencodeProvider {
         // directory). Do not re-detect the host here: OpenCode can create its
         // SQLite store after JSON enumeration, and those locators must still
         // be read by the layout that produced them.
+        let guard = self.live.lock().expect("opencode live snapshot lock");
+        if candidate.session_id.is_none() {
+            // A store this run could not open: the engine reports the
+            // failure against its path.
+            if let Some((_, error)) = guard.as_ref().and_then(|live| {
+                live.unreadable
+                    .iter()
+                    .find(|(locator, _)| *locator == candidate.locator)
+            }) {
+                anyhow::bail!("{error}");
+            }
+        }
         if candidate.session_id.as_deref() != Some(candidate.locator.as_str()) {
+            drop(guard);
             return read_shallow_opencode_json_tree(scan, candidate);
         }
-        let guard = self.live.lock().expect("opencode live snapshot lock");
-        let Some(snapshot) = guard.as_ref().and_then(|snapshots| {
-            snapshots
+        let Some(snapshot) = guard.as_ref().and_then(|live| {
+            live.stores
                 .iter()
                 .find(|snapshot| snapshot.sessions.contains_key(&candidate.locator))
         }) else {
@@ -2495,13 +2575,62 @@ impl ShallowSessionProvider for OpencodeProvider {
     }
 }
 
-/// One OpenCode store's session candidates, newest first, and the seeds the
-/// shallow read needs for them.
+/// The candidate standing in for an OpenCode store (or channel directory)
+/// this run could not read. Like the JSON tree's unreadable directories, it
+/// carries a stamp unique to this run, so no cached row can match it, and
+/// `read_shallow` turns it back into the failure.
+///
+/// It sorts ahead of every session: the engine stops reading id-less
+/// candidates once a limited page is full, and a failure that sorted last
+/// would go unreported by exactly the bounded runs most likely to hit it. It
+/// never emits a row, so it costs a page no session.
+fn unreadable_opencode_candidate(locator: &str) -> Candidate {
+    Candidate {
+        source: "opencode",
+        locator: locator.to_string(),
+        session_id: None,
+        recency_hint_ms: Some(i64::MAX),
+        stamp: format!(
+            "unreadable:{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or_default()
+        ),
+    }
+}
+
+/// Whether an earlier OpenCode store holds `session_id`, and so owns it.
+fn opencode_store_holds(snapshot: &OpencodeReadSnapshot, session_id: &str) -> Result<bool> {
+    if !snapshot.session_columns.contains("id") {
+        return Ok(false);
+    }
+    Ok(snapshot
+        .conn
+        .prepare_cached("SELECT 1 FROM session WHERE id = ?")?
+        .exists([session_id])?)
+}
+
+/// The newest sessions this OpenCode store *owns*, and the seeds the shallow
+/// read needs for them.
+///
+/// A session an earlier store also holds belongs to that store, so it is
+/// skipped here — and skipped *before* the limit, not after: a duplicate that
+/// took one of this store's `requested_limit` slots would push out a session
+/// only this store holds, which then never reaches the run's merged page.
+/// `claimed` is what the earlier stores returned; a session they hold beyond
+/// their own limited page is found by a primary-key lookup, so a store never
+/// claims a session merely because the owner's copy fell outside its page.
+/// With no limit every earlier store was enumerated whole, and `claimed`
+/// alone decides.
 fn enumerate_opencode_snapshot(
     scan: &ScanEnv<'_>,
     snapshot: &mut OpencodeReadSnapshot,
+    earlier: &[OpencodeReadSnapshot],
+    claimed: &BTreeSet<String>,
     requested_limit: Option<usize>,
 ) -> Result<Vec<Candidate>> {
+    snapshot.sessions.clear();
     let columns = &snapshot.session_columns;
     if !columns.contains("id") {
         return Ok(Vec::new());
@@ -2541,13 +2670,14 @@ fn enumerate_opencode_snapshot(
         .map(i64::try_from)
         .transpose()
         .context("OpenCode discovery limit exceeds SQLite's signed 64-bit range")?;
-    let limit_sql = sqlite_limit.map(|_| " LIMIT ?").unwrap_or_default();
+    let limit_sql = sqlite_limit
+        .map(|_| " LIMIT ? OFFSET ?")
+        .unwrap_or_default();
     let sql = format!(
         "SELECT id, {directory}, {created}, {updated} FROM session \
          WHERE id IS NOT NULL AND id <> '' ORDER BY {recency_order}{limit_sql}"
     );
     let mut stmt = snapshot.conn.prepare(&sql)?;
-    scan.note_query();
     let collect = |row: &rusqlite::Row<'_>| {
         Ok((
             row.get::<_, String>(0)?,
@@ -2556,15 +2686,57 @@ fn enumerate_opencode_snapshot(
             row.get::<_, Option<i64>>(3)?,
         ))
     };
-    let rows = match sqlite_limit {
-        Some(limit) => stmt
-            .query_map([limit], collect)?
-            .collect::<rusqlite::Result<Vec<_>>>()?,
-        None => stmt
-            .query_map([], collect)?
-            .collect::<rusqlite::Result<Vec<_>>>()?,
-    };
-    scan.note_records(rows.len() as u64);
+    let mut rows = Vec::new();
+    match sqlite_limit {
+        None => {
+            scan.note_query();
+            let page = stmt
+                .query_map([], collect)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            scan.note_records(page.len() as u64);
+            rows.extend(page.into_iter().filter(|(id, ..)| !claimed.contains(id)));
+        }
+        Some(limit) => {
+            // The first page is exactly the limit, so a store that owns all
+            // of its newest sessions costs the one query it always did. Only
+            // a store whose page lost slots to an earlier store's sessions
+            // reads on, in wider pages.
+            let mut page_size = limit;
+            let mut offset: i64 = 0;
+            while (rows.len() as i64) < limit && page_size > 0 {
+                scan.note_query();
+                let page = stmt
+                    .query_map([page_size, offset], collect)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                scan.note_records(page.len() as u64);
+                let exhausted = (page.len() as i64) < page_size;
+                offset += page.len() as i64;
+                for row in page {
+                    if (rows.len() as i64) == limit {
+                        break;
+                    }
+                    if claimed.contains(&row.0) {
+                        continue;
+                    }
+                    let mut owned_earlier = false;
+                    for store in earlier {
+                        scan.note_query();
+                        if opencode_store_holds(store, &row.0)? {
+                            owned_earlier = true;
+                            break;
+                        }
+                    }
+                    if !owned_earlier {
+                        rows.push(row);
+                    }
+                }
+                if exhausted {
+                    break;
+                }
+                page_size = page_size.max(256);
+            }
+        }
+    }
     snapshot.sessions = rows
         .iter()
         .map(|(id, directory, created, updated)| {

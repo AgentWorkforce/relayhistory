@@ -28,7 +28,7 @@ comment linking its replacement and is left open for a maintainer to close.
 | #208 | #280 | Part of: skip subagent `journal.jsonl`; `~/.claude/transcripts/` still to characterize |
 | #66 | #277 | napi/SDK/MCP search share the CLI's Rust query; native contract 23 |
 | #67 | #282 | Keyset cursors and inclusive time windows; stacked on #277; native contract 24 |
-| #171 | #276 | Tool-result fidelity for Cursor, Grok and OpenCode; hydration parser version 12 |
+| #171 | #276 | Tool-result fidelity for Cursor, Grok and OpenCode; hydration parser version 13 (12 is #284's) |
 | #177 | #281 | Part of: local JS source plugins; registry consolidation and collector issues remain |
 | #210 | #273 | Part of: Codex fork edges from `session_meta`; replay gate remains |
 | #209 | #279 | OpenCode channel-suffixed databases; `ProviderRoots::opencode_db_pinned` |
