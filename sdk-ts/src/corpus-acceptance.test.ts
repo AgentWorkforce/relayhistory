@@ -9,6 +9,7 @@ import { promisify } from 'node:util';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { SESSION_USAGE_CONTRACT_VERSION, getSessionUsage, sync, type SessionUsage } from './index.js';
+import { scrubHistoryEnv } from './test-env.js';
 
 // The acceptance checks of #181, run against the Rust fixture corpus itself
 // rather than a TypeScript restatement of it, so the JS boundaries (native
@@ -25,10 +26,7 @@ const SLASH_SESSION = 'slash-session';
 
 async function withCorpus(body: (dbPath: string, env: Record<string, string>) => Promise<void>): Promise<void> {
   const home = await mkdtemp(join(tmpdir(), 'relayhistory-corpus-'));
-  const saved = { ...process.env };
-  for (const key of Object.keys(process.env)) {
-    if (/^(HOME|USERPROFILE|XDG_|OPENCODE_|TRAJECTORY_|AI_HIST_|RELAYHISTORY_|RELAYCAST_)/.test(key)) delete process.env[key];
-  }
+  const restoreEnv = scrubHistoryEnv();
   const dbPath = join(home, 'history.db');
   process.env.HOME = home;
   process.env.USERPROFILE = home;
@@ -44,8 +42,7 @@ async function withCorpus(body: (dbPath: string, env: Record<string, string>) =>
     const env = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined));
     await body(dbPath, env);
   } finally {
-    for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
-    Object.assign(process.env, saved);
+    restoreEnv();
     await rm(home, { recursive: true, force: true });
   }
 }
@@ -54,6 +51,8 @@ test('MCP get_session_usage on the corpus multi-block-turn matches the Rust sess
   await withCorpus(async (dbPath, env) => {
     const client = new Client({ name: 'corpus-acceptance', version: '1' });
     const transport = new StdioClientTransport({ command: process.execPath, args: [mcp], env, stderr: 'pipe' });
+    // Drain the server's stderr so a chatty server can never block on a full pipe.
+    transport.stderr?.on('data', () => {});
     let viaMcp: SessionUsage;
     try {
       await client.connect(transport);
@@ -69,6 +68,8 @@ test('MCP get_session_usage on the corpus multi-block-turn matches the Rust sess
     // four content-block records of one request collapse to one request.
     assert.equal(viaMcp.contractVersion, SESSION_USAGE_CONTRACT_VERSION);
     assert.equal(viaMcp.requestCount, 1);
+    assert.equal(viaMcp.totalRequestCount, 1);
+    assert.deepEqual(viaMcp.models, ['claude-opus-4-7']);
     assert.deepEqual(viaMcp.accounting, ['per-message']);
     assert.deepEqual(viaMcp.diagnostics, []);
     assert.equal(viaMcp.overflowed, false);
@@ -80,6 +81,13 @@ test('MCP get_session_usage on the corpus multi-block-turn matches the Rust sess
     assert.equal(usage.cacheWriteTokens, 4773);
     assert.equal(usage.cacheWrite5mTokens, 0);
     assert.equal(usage.cacheWrite1hTokens, 4773);
+    // `usage.coverage.is_complete()` in Rust: every counter Claude reports is
+    // present, none defaulted to zero. Claude reports no reasoning count.
+    assert.equal(usage.hasInputTokens, true);
+    assert.equal(usage.hasOutputTokens, true);
+    assert.equal(usage.hasCacheReadTokens, true);
+    assert.equal(usage.hasCacheWriteTokens, true);
+    assert.equal(usage.reasoningTokens, null);
     // No cost is computed; the corpus carries none.
     assert.equal(usage.reportedCostUsd, null);
 
@@ -90,7 +98,7 @@ test('MCP get_session_usage on the corpus multi-block-turn matches the Rust sess
 
 test('ai-hist events --json on the corpus slash-command-triad shows control_kind on the triad rows', async () => {
   await withCorpus(async (dbPath, env) => {
-    const { stdout } = await run(process.execPath, [cli, 'events', SLASH_SESSION, '--source', 'claude', '--db', dbPath, '--json', '--no-warning'], { env });
+    const { stdout } = await run(process.execPath, [cli, 'events', SLASH_SESSION, '--source', 'claude', '--db', dbPath, '--json', '--no-warning'], { env, timeout: 60_000 });
     // `--json` answers in snake_case, so the field is `control_kind` here.
     const page = JSON.parse(stdout) as { events: Array<{ event_uid: string; control_kind: string | null }> };
     const kinds = new Map(page.events.map((event) => [event.event_uid, event.control_kind]));
