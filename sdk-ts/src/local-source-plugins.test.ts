@@ -203,3 +203,100 @@ test('a local source must declare absolute roots and stay inside them', async (t
   const catalog = await listSessionCatalog({ scope: 'local', dbPath });
   assert.ok(!catalog.some((session) => session.sessionId === 'escaped'));
 });
+
+test('a source filter the local plugin does not cover leaves the native pass answering', async (t) => {
+  const { dbPath, root } = await isolatedHome(t, 'rh-local-plugin-filter-');
+  await writeSession(root, 'host-session-4');
+  const plugins = await loadHistoryPlugins(
+    [{ module: './fixtures/local-source-plugin/index.mjs', options: { root } }],
+    { baseDirectory: SDK_ROOT },
+  );
+  const [local] = plugins.sourceConnectors();
+  let calls = 0;
+  const discover = local.discover.bind(local);
+  local.discover = async (options) => {
+    calls++;
+    return discover(options);
+  };
+  // The fixture reads only Claude sessions; a Codex-only request is not its.
+  const discovery = await discoverSessions({ sources: ['codex'], plugins, dbPath });
+  assert.equal(discovery.scope, 'local');
+  const synced = await discoverSessions({ scope: 'all', sources: ['codex'], plugins, dbPath });
+  assert.equal(synced.scope, 'all');
+  assert.equal(calls, 0, 'a plugin that covers none of the requested sources is not run');
+
+  await discoverSessions({ sources: ['claude'], plugins, dbPath });
+  assert.equal(calls, 1);
+});
+
+test('a relay session a local plugin holds hydrates even after the built-in adapter catalogues it', async (t) => {
+  const { dbPath, root } = await isolatedHome(t, 'rh-local-plugin-relay-');
+  const registry = new HistoryPluginRegistry();
+  let hydrations = 0;
+  registry.register({
+    sources: [{
+      id: 'relay-local',
+      instanceId: 'one',
+      location: 'local',
+      roots: [root],
+      supportedSources: ['relay'],
+      discover: async () => ({
+        observations: [{ source: 'relay', session_id: 'host-1', raw_locator: 'host-1', source_stamp: '1' }],
+      }),
+      hydrate: async () => {
+        hydrations++;
+        return {
+          source_stamp: '1',
+          source_bytes: 10,
+          covered_kinds: ['history'],
+          records: [{
+            kind: 'history',
+            payload: { source: 'relay', session_id: 'host-1', prompt: 'deploy it', timestamp_ms: 1_789_000_000_000 },
+          }],
+        };
+      },
+    }],
+  });
+  await discoverSessions({ plugins: registry, dbPath });
+  const first = await hydrateSession({ source: 'relay', sessionId: 'host-1', plugins: registry, dbPath });
+  assert.equal(first.evidence.prompts, 1);
+  // The stored relay history is now what the built-in relay adapter
+  // enumerates, so it observes the session too and refuses to hydrate it.
+  await discoverSessions({ plugins: registry, dbPath });
+  const again = await hydrateSession({ source: 'relay', sessionId: 'host-1', plugins: registry, dbPath });
+  assert.equal(again.evidence.prompts, 1);
+  assert.equal(hydrations, 2);
+});
+
+test('the roots check rejects only real escapes, for raw_path and an absolute raw_locator', async (t) => {
+  const { dbPath, dir, root } = await isolatedHome(t, 'rh-local-plugin-dotted-');
+  let next = 0;
+  const accept = async (row: Record<string, unknown>, expected: number) => {
+    const sessionId = `dotted-${next++}`;
+    const registry = new HistoryPluginRegistry();
+    registry.register({
+      sources: [{
+        id: 'dotted-local',
+        instanceId: 'one',
+        location: 'local',
+        roots: [root],
+        supportedSources: ['claude'],
+        discover: async () => ({
+          observations: [{ source: 'claude', session_id: sessionId, source_stamp: '1', ...row }],
+        }),
+        hydrate: async () => ({ source_stamp: 's', source_bytes: 0, covered_kinds: [], records: [] }),
+      }],
+    });
+    const discovery = await discoverSessions({ scope: 'local', plugins: registry, dbPath });
+    assert.equal(discovery.discovered, expected, JSON.stringify({ row, diagnostics: discovery.diagnostics }));
+  };
+  // Children whose names merely begin with `..` are inside the root.
+  await accept({ raw_path: join(root, '..archive', 'old.jsonl') }, 1);
+  await accept({ raw_path: join(root, '...') }, 1);
+  // An opaque, relative locator names no file.
+  await accept({ raw_locator: 'handle-42' }, 1);
+  await accept({ raw_locator: join(root, 'inside.jsonl') }, 1);
+  // An absolute locator is presented as the session's path: held to the roots.
+  await accept({ raw_locator: join(dir, 'elsewhere', 'stolen.jsonl') }, 0);
+  await accept({ raw_path: join(root, '..', 'sibling.jsonl') }, 0);
+});

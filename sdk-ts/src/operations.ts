@@ -21,21 +21,32 @@ import type { HistorySource } from './source-contracts.js';
  * plugin keeps the pure native path, and a remote connector is never invoked
  * for a local request. Deselection here never throws for an unknown id,
  * because local scope ignored `sourceConnectors` before local plugins existed.
+ *
+ * A local connector that supports none of the requested `sources` is not
+ * selected either: it has nothing to add, and selecting it would turn a
+ * source filter it does not cover into a request that fails after the native
+ * pass already answered. Remote connectors keep their existing selection.
  */
 function pluginScope(
   plugins: HistoryPluginRegistry | undefined,
   scope: SessionScope | undefined,
   ids: readonly string[] | undefined,
+  sources?: readonly CatalogSource[],
 ): { scope: SessionScope; selected: HistorySource[] } | null {
   if (!plugins) return null;
+  const covers = (connector: HistorySource) =>
+    connector.location !== 'local' ||
+    sources === undefined ||
+    connector.supportedSources.some((source) => sources.includes(source));
   if (scope === 'remote' || scope === 'all') {
-    return { scope, selected: sourceConnectorsInScope(plugins, ids, scope) };
+    return { scope, selected: sourceConnectorsInScope(plugins, ids, scope).filter(covers) };
   }
   const selected = plugins
     .sourceConnectors()
     .filter(
       (connector) =>
         connector.location === 'local' &&
+        covers(connector) &&
         (ids === undefined ||
           ids.includes(connector.id) ||
           ids.includes(`${connector.id}:${connector.instanceId}`)),
@@ -322,7 +333,12 @@ export async function discoverSessions(
 ): Promise<DiscoverResult> {
   validateAcquisition(options);
   const sourceConnectors = validateSourceConnectors(options.sourceConnectors);
-  const plugins = pluginScope(options.plugins, options.scope, options.sourceConnectors);
+  const plugins = pluginScope(
+    options.plugins,
+    options.scope,
+    options.sourceConnectors,
+    options.sources,
+  );
   if (options.plugins && plugins) {
     const { scope, selected } = plugins;
     const local =
@@ -446,7 +462,7 @@ export async function hydrateSession(
   }
   validateAcquisition(options);
   const sourceConnectors = validateSourceConnectors(options.sourceConnectors);
-  const plugins = pluginScope(options.plugins, options.scope, sourceConnectors);
+  const plugins = pluginScope(options.plugins, options.scope, sourceConnectors, [options.source]);
   if (options.plugins && plugins) {
     const selected = plugins.selected.filter((source) =>
       source.supportedSources.includes(options.source),
@@ -473,7 +489,11 @@ export async function hydrateSession(
           !(
             error instanceof SessionNotFoundError ||
             error instanceof SessionSourceUnavailableError ||
-            (error instanceof ConnectorNotConfiguredError && selected.length > 0)
+            ((error instanceof ConnectorNotConfiguredError ||
+              // The built-in adapter has no full-evidence parser for this
+              // source (relay); a plugin that supports it may still have one.
+              error instanceof HydrationUnsupportedError) &&
+              selected.length > 0)
           )
         )
           throw error;

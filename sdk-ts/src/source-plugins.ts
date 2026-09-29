@@ -12,7 +12,7 @@ import {
   type CatalogSource,
   type SessionScope,
 } from './sdk-common.js';
-import { isAbsolute, relative, resolve } from 'node:path';
+import { isAbsolute, relative, resolve, sep } from 'node:path';
 import type {
   HistorySource,
   SourceObservationKey,
@@ -108,17 +108,34 @@ export function sourceConnectorsInScope(
  * check is lexical, on the resolved path: it keeps a plugin from pointing the
  * catalog at files it never said it reads, which is the same promise the
  * built-in parsers keep by resolving every path under their provider root.
+ * It is an integrity check on what the plugin reports, not a sandbox: the
+ * plugin is in-process code that can read any file it likes.
+ *
+ * `raw_path` must be absolute and inside a root. `raw_locator` is an opaque
+ * handle the connector gets back at hydration, but the catalog presents it
+ * as the session's path, so an absolute one is held to the same rule; a
+ * relative one names no file and passes.
  */
 function insideDeclaredRoots(connector: HistorySource, row: ShallowSourceSession): boolean {
   if (connector.location !== 'local') return true;
+  const within = (path: string) => {
+    const target = resolve(path);
+    return (connector.roots ?? []).some((root) => {
+      const rel = relative(resolve(root), target);
+      // Only a `..` path component escapes: `..archive` is a child named so.
+      return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+    });
+  };
   const path = row.raw_path;
-  if (path === undefined || path === null) return true;
-  if (typeof path !== 'string' || !isAbsolute(path)) return false;
-  const target = resolve(path);
-  return (connector.roots ?? []).some((root) => {
-    const within = relative(resolve(root), target);
-    return within === '' || (!within.startsWith('..') && !isAbsolute(within));
-  });
+  if (path !== undefined && path !== null) {
+    if (typeof path !== 'string' || !isAbsolute(path) || !within(path)) return false;
+  }
+  const locator = row.raw_locator;
+  if (locator !== undefined && locator !== null) {
+    if (typeof locator !== 'string') return false;
+    if (isAbsolute(locator) && !within(locator)) return false;
+  }
+  return true;
 }
 export function getSourceObservation(
   key: SourceObservationKey,

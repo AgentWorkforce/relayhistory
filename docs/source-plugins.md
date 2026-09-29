@@ -82,18 +82,23 @@ export function createHistoryPlugin({ root }) {
   registers no local source keeps the native-only path. `sourceConnectors: []`
   opts out of local sources the same way it opts out of remotes.
 - **Roots.** Registration refuses a local source without a nonempty `roots`
-  list of absolute paths. Every `raw_path` its discovery reports must resolve
-  inside one of them; a discovery that names any other path is rejected whole
-  and reported as that connector's diagnostic, so a plugin cannot point the
-  catalog at files it did not declare.
+  list of absolute paths. Every `raw_path` its discovery reports, and every
+  `raw_locator` that is an absolute path, must resolve inside one of them; a
+  discovery that names any other path is rejected whole and reported as that
+  connector's diagnostic, so a plugin cannot point the catalog at files it did
+  not declare. The check is lexical: it is an integrity check on what the
+  plugin reports, not a sandbox around in-process plugin code.
+- **Source filters.** A local source that supports none of a request's
+  `sources` is not run for it, and the native pass answers alone.
 - **Identity.** Sessions are keyed by an existing source (`supportedSources`
   is a `CatalogSource`) and are presented with `locations: ['local']`. The
   evidence goes through the same intake as a remote snapshot — the same
   validation, revision fence and per-connector provenance — so a session seen
   by both a local plugin and the built-in parser is still one session.
 - **Hydration.** The built-in parser is asked first; the plugin then adds what
-  it holds for the same identity. A session only the plugin observed hydrates
-  from the plugin alone.
+  it holds for the same identity. A session only the plugin observed, or one
+  the built-in adapter cannot hydrate (`relay`), hydrates from the plugin
+  alone.
 
 `sdk-ts/fixtures/local-source-plugin` is a complete, dependency-free example,
 and `sdk-ts/src/local-source-plugins.test.ts` runs it end to end.

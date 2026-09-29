@@ -196,8 +196,11 @@ Notable changes to the native `ai-hist` CLI are documented here.
   `remote`, and its sessions are catalogued with `locations: ['local']`
   through the same normalized evidence intake as a remote snapshot.
   Registration refuses a local source without absolute roots, and a discovery
-  that reports a `raw_path` outside them is rejected as that connector's
-  diagnostic. Remote sources are unchanged and still never run for local or
+  that reports a `raw_path` (or an absolute `raw_locator`) outside them is
+  rejected as that connector's diagnostic. A local source that supports none
+  of a request's `sources` is not run for it, and a `relay` session a local
+  source holds hydrates from it even when the built-in adapter has catalogued
+  it too. Remote sources are unchanged and still never run for local or
   default scope; a request that registers no local source keeps the
   native-only path. A plugin-backed `sync` at `all` scope now reports the
   native local pass's diagnostics and completion with its own.
