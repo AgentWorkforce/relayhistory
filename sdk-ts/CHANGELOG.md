@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `kind`. A new `role` option takes `all` (default), `user`, `assistant`
   or `prompt`, where `prompt` restores the prompts-only result. `beforeMs` now
   bounds event matches too, and ties order by `(timestampMs, id)`. Requires
-  native contract 23.
+  native contract 23. MCP `search_history` accepts `before_ms`.
 
 ### Added
 
