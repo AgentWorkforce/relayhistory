@@ -305,6 +305,12 @@ pub(crate) struct CodexCursorState {
     /// `(is_response_item, text)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_human_message: Option<(bool, String)>,
+    /// The `fork_replay_boundary` marker whose inherited token baseline the
+    /// child's first readable snapshot has not yet confirmed or dropped.
+    /// Carried so a pass can commit before that snapshot arrives instead of
+    /// re-reading the whole replay until it does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherited_baseline_marker: Option<String>,
 }
 
 /// One transcript's complete resume state.

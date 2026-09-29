@@ -3628,11 +3628,15 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                         outcome.last_assistant_text.as_deref(),
                         Some(&rollout.to_string_lossy()),
                     )?;
-                    if let Some(first_prompt) = outcome.first_prompt.as_deref() {
+                    // A fork's walk is authoritative even with no prompt of
+                    // its own: an earlier build may have stored the parent's
+                    // replayed prompt, and the shallow writer only ever
+                    // fills a missing value, so this is where it is cleared.
+                    if outcome.first_prompt.is_some() || outcome.saw_fork_replay {
                         conn.execute(
                             "UPDATE sessions SET first_prompt = ? \
                              WHERE source = 'codex' AND session_id = ?",
-                            params![first_prompt, meta.session_id],
+                            params![outcome.first_prompt, meta.session_id],
                         )?;
                     }
                 }
@@ -4152,6 +4156,11 @@ pub(crate) struct CodexIngestOutcome {
     last_ts: Option<i64>,
     first_prompt: Option<String>,
     last_assistant_text: Option<String>,
+    /// Whether this pass read a forked rollout's replayed parent history.
+    /// `first_prompt` is then authoritative even when it is `None`: whatever
+    /// the catalog holds may be the parent's prompt an earlier build took
+    /// from the replay.
+    saw_fork_replay: bool,
 }
 
 /// Cumulative token totals from a Codex `token_count` event
@@ -4574,12 +4583,11 @@ fn ingest_codex_rollout_incremental(
     let mut fork_replay: Option<ForkReplaySpan> = None;
     let mut replay_gate =
         codex::ForkReplayGate::new(meta.fork_parent_id.clone(), meta.fork_origin_ms);
-    // Set when the baseline was inherited from a replay and no child snapshot
-    // has confirmed it yet. If the child's first readable snapshot is *below*
-    // it, the child's counter started from zero rather than from the parent's
-    // total, and the inherited baseline is dropped instead of swallowing every
-    // delta until the child caught up with its parent.
-    let mut inherited_baseline_unconfirmed = false;
+    // The replay marker whose inherited baseline no child snapshot has
+    // confirmed yet (see `inherited_baseline_verdict`). Carried across passes
+    // on the cursor, so a pass may commit before the child's first snapshot
+    // without re-reading the replay on every later pass.
+    let mut inherited_baseline_marker: Option<String> = resume.inherited_baseline_marker.clone();
     loop {
         check_capture_cancelled()?;
         // A line without its newline is the half-written tail of a live
@@ -4643,15 +4651,21 @@ fn ingest_codex_rollout_incremental(
             }
             codex::ReplayStep::Closed { turn_id, basis } => {
                 if let Some(span) = fork_replay.take() {
-                    record_codex_fork_replay(conn, meta, &span, Some((turn_id.as_deref(), basis)))?;
+                    outcome.saw_fork_replay = true;
+                    let seeded = prev_totals.is_none() && span.inherited.is_some();
+                    record_codex_fork_replay(
+                        conn,
+                        meta,
+                        &span,
+                        Some((turn_id.as_deref(), basis)),
+                        seeded.then_some("pending"),
+                    )?;
                     human_messages = codex::HumanMessageDeduper::default();
-                    if prev_totals.is_none() {
-                        if let Some(inherited) = span.inherited {
-                            prev_totals = Some(inherited);
-                            baseline_generation += 1;
-                            span_run_start = request_span;
-                            inherited_baseline_unconfirmed = true;
-                        }
+                    if let (true, Some(inherited)) = (seeded, span.inherited) {
+                        prev_totals = Some(inherited);
+                        baseline_generation += 1;
+                        span_run_start = request_span;
+                        inherited_baseline_marker = Some(span.marker_uid());
                     }
                     // The marker and retirements above are the span's, not
                     // this line's: measure this line from here.
@@ -4901,14 +4915,31 @@ fn ingest_codex_rollout_incremental(
                         }
                         continue;
                     };
-                    // A child whose counter restarted below the baseline it
-                    // inherited from its fork's replay: that total was never
-                    // this thread's, so difference from zero as a fresh
-                    // thread would.
-                    if std::mem::take(&mut inherited_baseline_unconfirmed)
-                        && prev_totals.is_some_and(|prev| totals.regressed_from(&prev))
+                    // The child's first snapshot after a replay says whether
+                    // the total it inherited is really its baseline.
+                    if let (Some(marker_uid), Some(inherited)) =
+                        (inherited_baseline_marker.take(), prev_totals)
                     {
-                        prev_totals = None;
+                        let last = payload
+                            .get("info")
+                            .and_then(|info| info.get("last_token_usage"))
+                            .and_then(CodexTokenTotals::from_usage);
+                        let (kept, basis) = inherited_baseline_verdict(inherited, totals, last);
+                        if !kept {
+                            prev_totals = None;
+                        }
+                        conn.execute(
+                            "UPDATE session_markers SET payload_json = json_set(payload_json, \
+                               '$.inherited_baseline', ?1, '$.inherited_baseline_basis', ?2) \
+                             WHERE source = 'codex' AND session_id = ?3 AND marker_uid = ?4 \
+                               AND json_valid(payload_json)",
+                            params![
+                                if kept { "applied" } else { "dropped" },
+                                basis,
+                                session_id,
+                                marker_uid
+                            ],
+                        )?;
                     }
                     match prev_totals {
                         // The first snapshot before any model output is the
@@ -5011,7 +5042,6 @@ fn ingest_codex_rollout_incremental(
                     let usage_settled = pending_usage.is_none()
                         && span_run_start == request_span
                         && !baseline_unknown
-                        && !inherited_baseline_unconfirmed
                         && surviving_refusals(&unreadable_snapshots, &measured_generations)
                             .is_empty();
                     if usage_settled {
@@ -5028,6 +5058,7 @@ fn ingest_codex_rollout_incremental(
                                 turn_id: turn_id.clone(),
                                 saw_model_output,
                                 previous_human_message: human_messages.remembered(),
+                                inherited_baseline_marker: inherited_baseline_marker.clone(),
                             },
                         );
                     }
@@ -5291,7 +5322,8 @@ fn ingest_codex_rollout_incremental(
     // not written yet. The span is still accounted for, and the next pass,
     // which re-reads it, closes it.
     if let Some(span) = fork_replay.take() {
-        record_codex_fork_replay(conn, meta, &span, None)?;
+        outcome.saw_fork_replay = true;
+        record_codex_fork_replay(conn, meta, &span, None, None)?;
     }
     // Collapse each measured run onto its first span, so the rows a single
     // delta accounted for read as the one request it measured rather than as
@@ -5414,6 +5446,11 @@ impl ForkReplaySpan {
         }
     }
 
+    /// The marker that stands for this span, keyed by its first line.
+    fn marker_uid(&self) -> String {
+        format!("{}:fork_replay", self.first_line)
+    }
+
     /// Remember what a replayed line would have written.
     fn absorb(&mut self, index: usize, value: &Value, payload: &Map<String, Value>) {
         self.last_line = index;
@@ -5446,6 +5483,44 @@ impl ForkReplaySpan {
     }
 }
 
+/// Whether the cumulative total a fork inherited from its replay is the
+/// baseline of the child's own counter, decided at the child's first readable
+/// snapshot. Returns `(kept, basis)`.
+///
+/// codex-rs seeds a fork's usage from the replay: `record_initial_history`
+/// handles `InitialHistory::Forked` by passing the copied items to
+/// `last_token_info_from_rollout` and the result to `set_token_info`
+/// (`codex-rs/core/src/session/mod.rs`, openai/codex@d5e6526), and each later
+/// request adds its usage to that total, so `total_token_usage` grows by
+/// exactly `last_token_usage`. A child written that way continues from its
+/// parent's total. A build that did not seed it starts from zero, and then
+/// its first snapshot's total *is* its last request.
+///
+/// So `last_token_usage` decides when the snapshot carries it: `total ==
+/// last` is a restart and the inherited baseline is dropped; `total ==
+/// inherited + last` is a continuation and it is kept. Without that evidence
+/// a total below the inherited one can only be a restart, and anything else
+/// keeps the baseline. Comparing magnitudes alone misfires when a restarted
+/// child's first request exceeds a small parent total.
+fn inherited_baseline_verdict(
+    inherited: CodexTokenTotals,
+    total: CodexTokenTotals,
+    last: Option<CodexTokenTotals>,
+) -> (bool, &'static str) {
+    if let Some(last) = last {
+        if total == last {
+            return (false, "last_token_usage");
+        }
+        if inherited.plus(&last) == Some(total) {
+            return (true, "last_token_usage");
+        }
+    }
+    if total.regressed_from(&inherited) {
+        return (false, "regression");
+    }
+    (true, "no_evidence")
+}
+
 /// Write the one marker that stands for a replayed span, and retire whatever
 /// an earlier parser indexed under the child for the lines inside it.
 ///
@@ -5459,9 +5534,10 @@ fn record_codex_fork_replay(
     meta: &CodexSessionMeta,
     span: &ForkReplaySpan,
     closed_by: Option<(Option<&str>, &str)>,
+    inherited_baseline: Option<&str>,
 ) -> Result<()> {
     let session_id = meta.session_id.as_str();
-    let marker_uid = format!("{}:fork_replay", span.first_line);
+    let marker_uid = span.marker_uid();
     let payload_json = json!({
         "parent_session_id": meta.fork_parent_id,
         "first_line": span.first_line,
@@ -5470,6 +5546,11 @@ fn record_codex_fork_replay(
         "closed_by_turn_id": closed_by.and_then(|(turn, _)| turn),
         "closed_by": closed_by.map(|(_, basis)| basis),
         "inherited_total_tokens": span.inherited.map(|totals| totals.total),
+        // `pending` until the child's first readable snapshot, then
+        // `applied` or `dropped` with `inherited_baseline_basis` (see
+        // `inherited_baseline_verdict`); null when nothing was inherited or
+        // the span is still open.
+        "inherited_baseline": inherited_baseline,
     })
     .to_string();
     insert_session_marker(
@@ -32437,5 +32518,142 @@ mod codex_fork_replay_tests {
             state.get(CODEX_FORK_REPLAY_KEY),
             Some(&json!(CODEX_FORK_REPLAY_GENERATION))
         );
+    }
+
+    /// A child turn whose snapshot carries `last_token_usage`, as codex-rs
+    /// writes it.
+    fn child_turn_with_last(turn: &str, total: u64, last: u64) -> String {
+        let usage = json!({"type": "token_count", "info": {
+            "total_token_usage": {"input_tokens": total, "total_tokens": total},
+            "last_token_usage": {"input_tokens": last, "total_tokens": last}}});
+        child_turn(turn, 0).replace(
+            &line("2026-04-20T00:01:08.001Z", "event_msg", self::usage(0)),
+            &line("2026-04-20T00:01:08.001Z", "event_msg", usage),
+        )
+    }
+
+    /// A restarted child whose first request (1100) is larger than its small
+    /// inherited total (1000): magnitude alone would call that a continuation
+    /// and charge 100. `total == last_token_usage` says it restarted.
+    #[test]
+    fn last_token_usage_decides_a_restart_above_the_inherited_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-child.jsonl");
+        fs::write(
+            &rollout,
+            forked_prefix(human_fork_meta(), PARENT_TURN)
+                + &child_turn_with_last(CHILD_TURN, 1100, 1100),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let meta = read_codex_session_meta(&rollout).unwrap().unwrap();
+        ingest_codex_rollout(&conn, &rollout, &meta).unwrap();
+        assert_eq!(token_totals(&conn, CHILD), vec![1100]);
+        let marker = replay_marker(&conn, CHILD).unwrap();
+        assert_eq!(marker["inherited_baseline"], "dropped");
+        assert_eq!(marker["inherited_baseline_basis"], "last_token_usage");
+    }
+
+    /// `total == inherited + last` is the continuation codex-rs writes.
+    #[test]
+    fn last_token_usage_confirms_a_continued_counter() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-child.jsonl");
+        fs::write(
+            &rollout,
+            forked_prefix(human_fork_meta(), PARENT_TURN)
+                + &child_turn_with_last(CHILD_TURN, 1100, 100),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let meta = read_codex_session_meta(&rollout).unwrap().unwrap();
+        ingest_codex_rollout(&conn, &rollout, &meta).unwrap();
+        assert_eq!(token_totals(&conn, CHILD), vec![100]);
+        let marker = replay_marker(&conn, CHILD).unwrap();
+        assert_eq!(marker["inherited_baseline"], "applied");
+        assert_eq!(marker["inherited_baseline_basis"], "last_token_usage");
+    }
+
+    /// A child turn that closes without a snapshot still commits the cursor
+    /// past the replay; the pending baseline rides on the cursor, and the
+    /// next pass settles it without re-reading the replay.
+    #[test]
+    fn a_pending_inherited_baseline_does_not_pin_the_cursor_before_the_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-child.jsonl");
+        let unmeasured_turn = child_turn(CHILD_TURN, 0)
+            .replace(&line("2026-04-20T00:01:08.001Z", "event_msg", usage(0)), "");
+        fs::write(
+            &rollout,
+            forked_prefix(human_fork_meta(), PARENT_TURN) + &unmeasured_turn,
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let meta = read_codex_session_meta(&rollout).unwrap().unwrap();
+        let mut cursor = transcript_cursor::TranscriptCursorState::default();
+        ingest_codex_rollout_incremental(&conn, &rollout, &meta, &mut cursor).unwrap();
+        let committed = cursor.file.as_ref().map(|file| file.offset).unwrap_or(0);
+        assert_eq!(committed, fs::metadata(&rollout).unwrap().len());
+        assert_eq!(
+            cursor
+                .codex
+                .as_ref()
+                .and_then(|codex| codex.inherited_baseline_marker.as_deref()),
+            Some("1:fork_replay")
+        );
+        assert_eq!(
+            replay_marker(&conn, CHILD).unwrap()["inherited_baseline"],
+            "pending"
+        );
+
+        let second_turn = "019da830-f000-7000-8000-0000000000c2";
+        let mut file = fs::OpenOptions::new().append(true).open(&rollout).unwrap();
+        std::io::Write::write_all(
+            &mut file,
+            child_turn_with_last(second_turn, 1250, 250).as_bytes(),
+        )
+        .unwrap();
+        drop(file);
+        ingest_codex_rollout_incremental(&conn, &rollout, &meta, &mut cursor).unwrap();
+        let marker = replay_marker(&conn, CHILD).unwrap();
+        assert_eq!(marker["inherited_baseline"], "applied");
+        assert_eq!(token_totals(&conn, CHILD), vec![250]);
+    }
+
+    /// A fork that never ran a turn of its own has no first prompt. The walk
+    /// clears the parent's prompt an earlier build stored from the replay;
+    /// the shallow writer never nulls a value, so it cannot.
+    #[test]
+    fn the_walk_clears_a_replayed_first_prompt_on_a_fork_with_no_prompt_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(
+            day.join("rollout-child.jsonl"),
+            forked_prefix(human_fork_meta(), PARENT_TURN),
+        )
+        .unwrap();
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+        conn.execute(
+            "UPDATE sessions SET first_prompt = 'parent prompt' \
+             WHERE source = 'codex' AND session_id = ?",
+            [CHILD],
+        )
+        .unwrap();
+        state.remove(CODEX_FORK_REPLAY_KEY);
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+        let first_prompt: Option<String> = conn
+            .query_row(
+                "SELECT first_prompt FROM sessions WHERE source = 'codex' AND session_id = ?",
+                [CHILD],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(first_prompt, None);
     }
 }

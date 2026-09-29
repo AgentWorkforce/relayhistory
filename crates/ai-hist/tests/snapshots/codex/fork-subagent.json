@@ -343,7 +343,7 @@
       "marker_uid": "1:fork_replay",
       "message_id": null,
       "parent_id": "019da866-c280-7000-8000-0000000000a0",
-      "payload_json": "{\"closed_by\":\"turn_id\",\"closed_by_turn_id\":\"019da867-37b0-7000-8000-0000000000b1\",\"first_line\":1,\"inherited_total_tokens\":null,\"last_line\":8,\"parent_session_id\":\"019da866-c280-7000-8000-0000000000a0\",\"replayed_lines\":8}",
+      "payload_json": "{\"closed_by\":\"turn_id\",\"closed_by_turn_id\":\"019da867-37b0-7000-8000-0000000000b1\",\"first_line\":1,\"inherited_baseline\":null,\"inherited_total_tokens\":null,\"last_line\":8,\"parent_session_id\":\"019da866-c280-7000-8000-0000000000a0\",\"replayed_lines\":8}",
       "session_id": "019da867-37b0-7000-8000-0000000000b0",
       "source": "codex",
       "subkind": "session_meta",
