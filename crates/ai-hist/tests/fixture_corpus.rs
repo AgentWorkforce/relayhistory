@@ -1071,6 +1071,17 @@ fn assert_home_paths_fit_marker_bound(snapshot: &Value, homes: &[String]) {
             _ => {}
         }
     }
+    // A HOME at or over the bound would be cut inside itself, and the cut
+    // string would no longer contain it for `walk` to find. Every form is
+    // checked, because the canonical one (`/private/tmp/…` on macOS) is what
+    // ingest may have stored.
+    for home in homes {
+        assert!(
+            home.chars().count() < MARKER_PAYLOAD_FIELD_LIMIT,
+            "fixture HOME `{home}` is at least the {MARKER_PAYLOAD_FIELD_LIMIT}-char marker \
+             payload bound; stage the corpus under a shorter temp root",
+        );
+    }
     let home_len = homes.iter().map(String::len).min().unwrap_or(0);
     let markers = snapshot["session_markers"].as_array().into_iter().flatten();
     for payload in markers.filter_map(|marker| marker["payload_json"].as_str()) {
