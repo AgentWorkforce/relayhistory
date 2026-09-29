@@ -131,7 +131,11 @@ Notable changes to the native `ai-hist` CLI are documented here.
   skips instead of stalling behind the rewrite. It refuses with
   `a sync is running` while one holds the lock. It also refuses up front when
   the volume lacks room for twice the live pages plus the 512 MiB write
-  floor, because a rewrite that ran out of space midway would repeat #44. On
+  floor, because a rewrite that ran out of space midway would repeat #44;
+  that check runs before the database is opened writable (so before any schema
+  migration), and compact refuses when free space cannot be measured at all.
+  When a reader keeps the WAL from being truncated, compact says so
+  (`wal_truncated: false` under `--json`) instead of claiming it. On
   the 248 MB benchmark store it took 2.8 s and saved 9 MB (#53).
 - `ai-hist doctor` reports `reclaimable` (`reclaimable_bytes` under `--json`),
   the freelist bytes a `compact` would return. It points at `compact` when at

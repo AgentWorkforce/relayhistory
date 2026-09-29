@@ -2508,6 +2508,7 @@ fn compact_report_json(report: &CompactReport, db_path: &Path) -> Value {
         "reclaimable_bytes_before": report.reclaimable_before,
         "saved_bytes": report.saved_bytes(),
         "fts_optimized": report.fts_optimized,
+        "wal_truncated": report.wal_truncated,
     })
 }
 
@@ -2546,6 +2547,11 @@ fn compact(db_path: &Path, json: bool) -> Result<()> {
         println!("  saved:  {}", human_bytes(saved as u64));
     } else {
         println!("  grew:   {}", human_bytes(saved.unsigned_abs() as u64));
+    }
+    if !report.wal_truncated {
+        println!(
+            "  note:   a reader kept the WAL from being truncated; it shrinks at the next checkpoint once that reader closes"
+        );
     }
     Ok(())
 }
@@ -4620,6 +4626,7 @@ mod tests {
             assert!(report[field].is_u64(), "{field}: {report}");
         }
         assert_eq!(report["wal_bytes_after"], json!(0));
+        assert_eq!(report["wal_truncated"], json!(true));
         assert!(report["saved_bytes"].is_i64(), "{report}");
         assert_eq!(rows(&open_db(&db_path).unwrap()), before);
     }
