@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -16,8 +16,11 @@ async function fakeRosterServer(t: test.TestContext, path: string, requests: str
   const server = createServer((connection) => {
     let request = '';
     connection.setEncoding('utf8');
-    connection.on('data', (chunk) => { request += chunk; });
-    connection.on('end', () => {
+    let responded = false;
+    connection.on('data', (chunk) => {
+      request += chunk;
+      if (responded || !request.includes('\r\n\r\n')) return;
+      responded = true;
       requests.push(request);
       const body = JSON.stringify({
         ok: true,
@@ -43,6 +46,89 @@ async function fakeRosterServer(t: test.TestContext, path: string, requests: str
   });
   return server;
 }
+
+test('decodes chunked desktop responses', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'relay-agents-chunked-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const socket = join(root, 'relay.sock');
+  const server = createServer((connection) => {
+    connection.once('data', () => {
+      const body = JSON.stringify({
+        ok: true,
+        data: { agents: [], fetched_at_ms: 1_790_683_200_123 },
+      });
+      const midpoint = Math.floor(body.length / 2);
+      const chunks = [body.slice(0, midpoint), body.slice(midpoint)];
+      connection.write('HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n');
+      for (const chunk of chunks) connection.write(`${Buffer.byteLength(chunk).toString(16)}\r\n${chunk}\r\n`);
+      connection.end('0\r\n\r\n');
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(socket, resolve);
+  });
+  t.after(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(socket, { force: true });
+  });
+
+  const result = await listRelayAgents({}, {
+    env: { AGENT_RELAY_SOCKET: socket }, home: root, platform: 'linux', temporaryDirectory: root, uid: 501,
+  });
+  assert.deepEqual(result, { agents: [], fetched_at_ms: 1_790_683_200_123 });
+});
+
+test('enforces a total request deadline even while the peer sends data', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'relay-agents-deadline-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const socket = join(root, 'relay.sock');
+  const server = createServer((connection) => {
+    connection.once('data', () => {
+      connection.write('HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n');
+      const interval = setInterval(() => connection.write('1\r\n{\r\n'), 10);
+      connection.once('close', () => clearInterval(interval));
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(socket, resolve);
+  });
+  t.after(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(socket, { force: true });
+  });
+
+  const started = Date.now();
+  const result = await listRelayAgents({}, {
+    env: { AGENT_RELAY_SOCKET: socket }, home: root, platform: 'linux', temporaryDirectory: root, uid: 501,
+    timeoutMs: 60,
+  });
+  assert.deepEqual(result, { available: false, message: NOT_RUNNING });
+  assert.ok(Date.now() - started < 500);
+});
+
+test('reports inaccessible sockets instead of claiming the desktop is absent', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'relay-agents-denied-'));
+  const denied = join(root, 'denied');
+  await mkdir(denied);
+  await chmod(denied, 0o000);
+  t.after(async () => {
+    await chmod(denied, 0o700);
+    await rm(root, { recursive: true, force: true });
+  });
+
+  await assert.rejects(
+    listRelayAgents({}, {
+      env: { AGENT_RELAY_SOCKET: join(denied, 'relay.sock') },
+      home: root, platform: 'linux', temporaryDirectory: root, uid: 501,
+      timeoutMs: 50,
+    }),
+    (error: unknown) => error instanceof Error
+      && (error as { code?: string }).code === 'socket_access_denied'
+      && error.message.includes('Cannot access Agent Relay desktop socket'),
+  );
+});
 
 test('lists and filters live participants through AGENT_RELAY_SOCKET', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'relay-agents-'));

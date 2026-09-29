@@ -144,6 +144,7 @@ test('relay roster stays a local-socket read outside the history SDK layers', as
   const registration = mcp.slice(start, end === -1 ? undefined : end);
   assert.match(registration, /READ/);
   assert.doesNotMatch(registration, /SESSION_SCOPE|ACQUIRE/);
-  assert.match(relay, /from 'node:net'/);
+  assert.match(relay, /from 'node:http'/);
+  assert.match(relay, /socketPath:/);
   assert.doesNotMatch(relay, /cloud-client|cloud-auth|@agent-relay\/cloud|fetch\(|https?:|ai-hist-native/);
 });

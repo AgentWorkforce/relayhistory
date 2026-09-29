@@ -1,5 +1,5 @@
 import { readFile } from 'node:fs/promises';
-import { createConnection } from 'node:net';
+import { request } from 'node:http';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -52,6 +52,7 @@ export class RelayAgentsError extends Error {
 }
 
 class SocketUnavailable extends Error {}
+class SocketPermissionDenied extends Error {}
 
 /** List live Relay participants through the local desktop app, never the cloud. */
 export async function listRelayAgents(
@@ -64,17 +65,26 @@ export async function listRelayAgents(
   if (options.includeIdle === true) query.set('include_idle', '1');
   const target = `/agents${query.size > 0 ? `?${query.toString()}` : ''}`;
   const paths = await relaySocketCandidates(runtime);
+  let permissionError: SocketPermissionDenied | undefined;
   for (const path of paths) {
     try {
       return parseRoster(await requestRoster(path, target, runtime.timeoutMs ?? 1_500));
     } catch (error) {
       if (error instanceof SocketUnavailable) continue;
+      if (error instanceof SocketPermissionDenied) {
+        permissionError = error;
+        continue;
+      }
       throw error;
     }
+  }
+  if (permissionError) {
+    throw new RelayAgentsError('socket_access_denied', permissionError.message);
   }
   return { available: false, message: NOT_RUNNING };
 }
 
+/** Resolve desktop sockets in the public env, pointer-file, platform-default order. */
 export async function relaySocketCandidates(runtime: RelaySocketRuntime = {}): Promise<string[]> {
   const env = runtime.env ?? process.env;
   const home = runtime.home ?? homedir();
@@ -111,45 +121,71 @@ export async function relaySocketCandidates(runtime: RelaySocketRuntime = {}): P
   return result;
 }
 
-function requestRoster(path: string, target: string, timeoutMs: number): Promise<Buffer> {
+interface RosterResponse {
+  status: number;
+  body: Buffer;
+}
+
+/** Send one bounded HTTP request over a local Unix-domain socket. */
+function requestRoster(path: string, target: string, timeoutMs: number): Promise<RosterResponse> {
   return new Promise((resolve, reject) => {
-    const socket = createConnection(path);
-    const chunks: Buffer[] = [];
-    let size = 0;
     let settled = false;
+    let deadline: ReturnType<typeof setTimeout>;
     const finish = (action: () => void) => {
       if (settled) return;
       settled = true;
+      clearTimeout(deadline);
       action();
     };
-    socket.setTimeout(timeoutMs, () => {
-      socket.destroy();
+    const clientRequest = request({
+      socketPath: path,
+      path: target,
+      method: 'GET',
+      headers: { Connection: 'close' },
+    }, (response) => {
+      const chunks: Buffer[] = [];
+      let size = 0;
+      response.on('data', (chunk: Buffer) => {
+        size += chunk.length;
+        if (size > MAX_RESPONSE_BYTES) {
+          clientRequest.destroy();
+          finish(() => reject(new RelayAgentsError('response_too_large', 'Agent Relay desktop returned too much roster data.')));
+        } else {
+          chunks.push(chunk);
+        }
+      });
+      response.once('end', () => finish(() => resolve({
+        status: response.statusCode ?? 0,
+        body: Buffer.concat(chunks),
+      })));
+      response.once('error', (error) => finish(() => reject(
+        new RelayAgentsError('invalid_response', `Agent Relay desktop response failed: ${error.message}`),
+      )));
+    });
+    deadline = setTimeout(() => {
       finish(() => reject(new SocketUnavailable('socket timed out')));
-    });
-    socket.once('connect', () => {
-      socket.end(`GET ${target} HTTP/1.1\r\nHost: relay\r\nConnection: close\r\n\r\n`);
-    });
-    socket.on('data', (chunk: Buffer) => {
-      size += chunk.length;
-      if (size > MAX_RESPONSE_BYTES) {
-        socket.destroy();
-        finish(() => reject(new RelayAgentsError('response_too_large', 'Agent Relay desktop returned too much roster data.')));
+      clientRequest.destroy();
+    }, timeoutMs);
+    clientRequest.once('error', (error: NodeJS.ErrnoException) => {
+      const message = `Cannot access Agent Relay desktop socket at ${path}: ${error.message}`;
+      if (error.code === 'EACCES' || error.code === 'EPERM') {
+        finish(() => reject(new SocketPermissionDenied(message)));
+      } else if (error.code === 'ENOENT' || error.code === 'ENOTDIR'
+        || error.code === 'ECONNREFUSED' || error.code === 'EINVAL') {
+        finish(() => reject(new SocketUnavailable(error.message)));
       } else {
-        chunks.push(chunk);
+        finish(() => reject(new RelayAgentsError('socket_error', message)));
       }
     });
-    socket.once('end', () => finish(() => resolve(Buffer.concat(chunks))));
-    socket.once('error', (error) => finish(() => reject(new SocketUnavailable(error.message))));
+    clientRequest.end();
   });
 }
 
-function parseRoster(response: Buffer): RelayAgentRoster {
-  const separator = response.indexOf('\r\n\r\n');
-  if (separator < 0) throw new RelayAgentsError('invalid_response', 'Agent Relay desktop returned an unreadable HTTP response.');
-  const head = response.subarray(0, separator).toString('utf8');
-  const status = Number(/^HTTP\/1\.[01] (\d{3})\b/.exec(head)?.[1] ?? 0);
+/** Validate the desktop response envelope and reduce it to the documented roster. */
+function parseRoster(response: RosterResponse): RelayAgentRoster {
+  const status = response.status;
   let envelope: unknown;
-  try { envelope = JSON.parse(response.subarray(separator + 4).toString('utf8')); }
+  try { envelope = JSON.parse(response.body.toString('utf8')); }
   catch { throw new RelayAgentsError('invalid_response', 'Agent Relay desktop returned unreadable roster JSON.'); }
   const object = record(envelope);
   if (status < 200 || status >= 300 || object.ok !== true) {
@@ -169,6 +205,7 @@ function parseRoster(response: Buffer): RelayAgentRoster {
   };
 }
 
+/** Validate and normalize one public roster entry. */
 function parseAgent(value: unknown): RelayAgent {
   const agent = record(value);
   const kinds = ['agent', 'human', 'service'] as const;
@@ -196,6 +233,7 @@ function parseAgent(value: unknown): RelayAgent {
   };
 }
 
+/** Require a non-array JSON object. */
 function record(value: unknown): Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     throw new RelayAgentsError('invalid_response', 'Agent Relay desktop returned an invalid roster response.');
