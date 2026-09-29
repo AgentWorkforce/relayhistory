@@ -218,15 +218,18 @@ call by the number of records it was split across.
   `cache_read_input_tokens`, `cache_creation_input_tokens`, `cache_creation`)
   is the same on every copy; `output_tokens` grows, and `iterations`,
   `server_tool_use` and `output_tokens_details` appear only on later copies.
-  The parser settles those copies when it stores them: counters take the
-  largest value any copy reports, a field only some copies carry is kept, and
-  the settled blob is written onto **every** row of the request, including rows
-  an earlier pass stored, so the view still sees one blob. The rule is
-  order-independent, so a copy that arrives out of order never shrinks a stored
-  value. Copies that disagree on the input side, carry a counter that is not a
-  non-negative integer, or differ in any other field are not snapshots of one
-  response; they are stored verbatim and the request stays
-  `ambiguous-usage-copies`. Each copy keeps its own event rows: the copies
+  The parser settles those copies when it stores them, on the key the view
+  groups them by — `requestId`, or `message.id` alone for a transcript that
+  writes no `requestId`. Within the output side, counters take the largest
+  value any copy reports and `iterations` keeps the longest run of entries
+  (the shared entries reconciled, the extra ones kept); a field only some
+  copies carry is kept; and the settled blob is written onto **every** row of
+  the request, including rows an earlier pass stored, so the view still sees
+  one blob. The rule is order-independent, so a copy that arrives out of order
+  never shrinks a stored value. Copies that disagree on the input side, carry
+  an output counter that is not a non-negative integer, or differ in any other
+  field — a reported `cost_usd` included — are not snapshots of one response;
+  they are stored verbatim and the request stays `ambiguous-usage-copies`. Each copy keeps its own event rows: the copies
   carry different content blocks, not growing text, so nothing is dropped to
   make the numbers agree. A database indexed before this rule is settled once,
   from its stored rows, when it is next opened writable.
@@ -235,7 +238,9 @@ call by the number of records it was split across.
   is `<synthetic>`, with zeroed usage. They are stored as a `local_notice`
   marker, never as assistant events, so they are not requests, carry no
   usage, contribute no model and never become a session's last assistant
-  text.
+  text. A database indexed before this rule also has the placeholder removed
+  from each session's model list, and an excerpt quoting a notice replaced by
+  the last real assistant text, when it is next opened writable.
 
 Because it is a view rather than a materialized table, it cannot drift from the
 events it is derived from, and there is exactly one implementation of the
