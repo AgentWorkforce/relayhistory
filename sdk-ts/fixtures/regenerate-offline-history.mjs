@@ -7,13 +7,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { sync } from '../dist/index.js';
+import { scrubHistoryEnv } from '../dist/test-env.js';
 
 const root = await mkdtemp(join(tmpdir(), 'offline-history-fixture-'));
-const saved = { ...process.env };
 // This generator must never discover the operator's history or credentials.
-for (const key of Object.keys(process.env)) {
-  if (/^(HOME|USERPROFILE|XDG_|OPENCODE_|TRAJECTORY_|AI_HIST_|RELAYHISTORY_|RELAYCAST_)/.test(key)) delete process.env[key];
-}
+const restoreEnv = scrubHistoryEnv();
 process.env.HOME = root;
 process.env.USERPROFILE = root;
 process.env.RELAYHISTORY_HOME = join(root, 'commercial');
@@ -53,7 +51,6 @@ try {
   }
   await writeFile(new URL('./offline-history.db.gz', import.meta.url), gzipSync(await readFile(dbPath), { level: 9 }));
 } finally {
-  for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
-  Object.assign(process.env, saved);
+  restoreEnv();
   await rm(root, { recursive: true, force: true });
 }

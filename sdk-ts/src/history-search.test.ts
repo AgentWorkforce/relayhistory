@@ -12,6 +12,7 @@ import {
   InvalidArgumentError, hydrateSession, search, sync,
   type SearchMatch, type SearchOptions,
 } from './index.js';
+import { scrubHistoryEnv } from './test-env.js';
 
 // One search contract (`history_search::search_all`) serves the CLI, the SDK
 // and MCP. These fixtures pin what a caller sees through each surface.
@@ -22,10 +23,7 @@ const mcp = fileURLToPath(new URL('./mcp-server.js', import.meta.url));
 
 async function withIndexedSession(body: (dbPath: string) => Promise<void>): Promise<void> {
   const home = await mkdtemp(join(tmpdir(), 'relayhistory-search-'));
-  const saved = { ...process.env };
-  for (const key of Object.keys(process.env)) {
-    if (/^(HOME|USERPROFILE|XDG_|OPENCODE_|TRAJECTORY_|AI_HIST_|RELAYHISTORY_|RELAYCAST_)/.test(key)) delete process.env[key];
-  }
+  const restoreEnv = scrubHistoryEnv();
   process.env.HOME = home;
   process.env.USERPROFILE = home;
   process.env.RELAYHISTORY_HOME = join(home, 'commercial');
@@ -48,8 +46,7 @@ async function withIndexedSession(body: (dbPath: string) => Promise<void>): Prom
     await hydrateSession({ source: 'claude', sessionId, dbPath });
     await body(dbPath);
   } finally {
-    for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
-    Object.assign(process.env, saved);
+    restoreEnv();
     await rm(home, { recursive: true, force: true });
   }
 }
