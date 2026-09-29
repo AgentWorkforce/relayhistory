@@ -819,6 +819,16 @@ How each adapter works:
   anything opens it — here and in the full sync walk alike. It records
   workflow orchestration (`started` / `result` lines), not a conversation, and
   no session, event, marker, cursor or continuity row is derived from it.
+  `$CLAUDE_CONFIG_DIR/transcripts/` is deliberately **not** a Claude root —
+  not enumerated, synced, hydrated or watched. Claude Code does not write
+  there; oh-my-opencode's Claude-hook compatibility layer does, one
+  `<OpenCode ses_* id>.jsonl` per *OpenCode* session, as `user` / `tool_use` /
+  `tool_result` lines with top-level `content` and `tool_name` / `tool_input`
+  / `tool_output`, and no `sessionId`, `uuid`, `cwd`, model, usage or
+  assistant turn. That session is already indexed, with full evidence, by the
+  **opencode** adapter from OpenCode's own store; reading the copy as `claude`
+  would publish each one twice under two sources with no project identity
+  ([#208](https://github.com/AgentWorkforce/relayhistory/issues/208)).
 - **codex** — `rollout-*.jsonl` under `$CODEX_HOME/sessions` and
   `$CODEX_HOME/archived_sessions` (defaulting under `~/.codex`). The first line
   is a `session_meta` record, which
