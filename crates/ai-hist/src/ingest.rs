@@ -9029,11 +9029,15 @@ fn heal_claude_synthetic_session_summaries(conn: &Connection) -> Result<()> {
     quoting_a_notice.dedup();
     for session_id in quoting_a_notice {
         // What the fold would have kept had it skipped the notices: the text
-        // of the last main-thread assistant record that is model output.
+        // of the last main-thread assistant record that is model output, its
+        // blocks in block order (`{message_id}:{block_index}`), not storage
+        // order.
         let excerpt: Option<String> = conn
             .query_row(
-                "SELECT substr(group_concat(text, char(10)), 1, 4096) FROM ( \
-                     SELECT text FROM session_events \
+                "SELECT substr(group_concat(text, char(10) \
+                         ORDER BY CAST(substr(event_uid, length(message_id) + 2) AS INTEGER), id), \
+                       1, 4096) FROM ( \
+                     SELECT text, event_uid, message_id, id FROM session_events \
                      WHERE source = 'claude' AND session_id = ?1 AND role = 'assistant' \
                        AND kind = 'text' AND text IS NOT NULL \
                        AND message_id = ( \
@@ -9042,8 +9046,7 @@ fn heal_claude_synthetic_session_summaries(conn: &Connection) -> Result<()> {
                              AND role = 'assistant' AND kind = 'text' AND text IS NOT NULL \
                              AND COALESCE(is_sidechain, 0) = 0 \
                              AND (model IS NULL OR lower(trim(model)) <> '<synthetic>') \
-                           ORDER BY ts_ms DESC, id DESC LIMIT 1) \
-                     ORDER BY id)",
+                           ORDER BY ts_ms DESC, id DESC LIMIT 1))",
                 [&session_id],
                 |row| row.get(0),
             )
@@ -28321,6 +28324,33 @@ mod tests {
                 heal_older_claude_database(with_request_id, notice_already_moved);
             }
         }
+    }
+
+    /// The repaired excerpt joins the last reply's text blocks in block
+    /// order, whatever order their rows were stored in.
+    #[test]
+    fn the_summary_heal_joins_the_last_reply_in_block_order() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO session_markers (source, session_id, marker_uid, message_id, kind, subkind, text) \
+             VALUES ('claude', 's', 'n:marker', 'n', 'local_notice', 'synthetic', 'Login expired'); \
+             INSERT INTO sessions (session_id, source, last_assistant_text) \
+             VALUES ('s', 'claude', 'Login expired'); \
+             INSERT INTO session_events (source, session_id, message_id, ts_ms, role, kind, text, model, event_uid) \
+             VALUES ('claude', 's', 'm', 5, 'assistant', 'text', 'second', 'claude-opus-4-7', 'm:10'), \
+                    ('claude', 's', 'm', 5, 'assistant', 'text', 'first', 'claude-opus-4-7', 'm:2');",
+        )
+        .unwrap();
+        heal_claude_synthetic_session_summaries(&conn).unwrap();
+        let last: Option<String> = conn
+            .query_row(
+                "SELECT last_assistant_text FROM sessions WHERE session_id = 's'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(last.as_deref(), Some("first\nsecond"));
     }
 
     /// A real reply whose whole text is the start of a notice's text is the
