@@ -12,7 +12,7 @@ import {
 } from './index.js';
 
 test('exports immutable, aligned runtime source registries and matching type guards', () => {
-  assert.deepEqual(SOURCES, ['claude', 'codex', 'cursor', 'grok', 'relay', 'trajectory', 'opencode']);
+  assert.deepEqual(SOURCES, ['claude', 'codex', 'cursor', 'grok', 'relay', 'trajectory', 'opencode', 'muse']);
   assert.deepEqual(CATALOG_SOURCES, SOURCES.filter((source) => source !== 'trajectory'));
   assert.equal(Object.isFrozen(SOURCES), true);
   assert.equal(Object.isFrozen(CATALOG_SOURCES), true);
@@ -49,4 +49,5 @@ test('resumeCommand preserves source and project-aware commands', () => {
   assert.equal(resumeCommand({ source: 'cursor', sessionId: 's3', project: '/work/app', locations: ['local', 'remote'] }), 'cd /work/app && cursor-agent --resume=s3');
   assert.equal(resumeCommand({ source: 'grok', sessionId: 's4', project: null, locations: ['remote'] }), null);
   assert.equal(resumeCommand({ source: 'relay', sessionId: 's5', project: null, locations: ['local'] }), null);
+  assert.equal(resumeCommand({ source: 'muse', sessionId: 's6', project: '/work/app', locations: ['local'] }), 'cd /work/app && muse resume s6');
 });

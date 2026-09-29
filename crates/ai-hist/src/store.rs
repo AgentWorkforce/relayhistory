@@ -30,6 +30,7 @@ pub const SOURCE_CHOICES: &[&str] = &[
     "relay",
     "trajectory",
     "opencode",
+    "muse",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -327,6 +328,10 @@ CREATE TABLE IF NOT EXISTS session_events (
     -- Null for a genuine prompt and for every model-output row. See
     -- `ingest::control`.
     control_kind TEXT,
+    -- Which evidence backs this row: 'local' (a local parser read it from
+    -- the provider's own files), 'remote' (a remote observation supplied
+    -- it) or 'both'. See `EVIDENCE_LOCATION_TABLES`.
+    location TEXT NOT NULL DEFAULT 'local' CHECK(location IN ('local', 'remote', 'both')),
     UNIQUE(source, session_id, event_uid)
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS session_events_fts USING fts5(
@@ -348,6 +353,10 @@ CREATE TABLE IF NOT EXISTS session_markers (
     subkind TEXT,
     text TEXT,
     payload_json TEXT,
+    -- Which evidence backs this row: 'local' (a local parser read it from
+    -- the provider's own files), 'remote' (a remote observation supplied
+    -- it) or 'both'. See `EVIDENCE_LOCATION_TABLES`.
+    location TEXT NOT NULL DEFAULT 'local' CHECK(location IN ('local', 'remote', 'both')),
     UNIQUE(source, session_id, marker_uid)
 );
 CREATE TABLE IF NOT EXISTS tool_calls (
@@ -361,6 +370,10 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     args_json TEXT,
     is_error INTEGER,
     ts_ms INTEGER,
+    -- Which evidence backs this row: 'local' (a local parser read it from
+    -- the provider's own files), 'remote' (a remote observation supplied
+    -- it) or 'both'. See `EVIDENCE_LOCATION_TABLES`.
+    location TEXT NOT NULL DEFAULT 'local' CHECK(location IN ('local', 'remote', 'both')),
     UNIQUE(source, session_id, tool_use_id)
 );
 CREATE TABLE IF NOT EXISTS file_edits (
@@ -378,6 +391,10 @@ CREATE TABLE IF NOT EXISTS file_edits (
     ts_ms INTEGER,
     git_branch TEXT,
     cwd TEXT,
+    -- Which evidence backs this row: 'local' (a local parser read it from
+    -- the provider's own files), 'remote' (a remote observation supplied
+    -- it) or 'both'. See `EVIDENCE_LOCATION_TABLES`.
+    location TEXT NOT NULL DEFAULT 'local' CHECK(location IN ('local', 'remote', 'both')),
     UNIQUE(source, session_id, tool_use_id)
 );
 CREATE TABLE IF NOT EXISTS session_commit_links (
@@ -1000,6 +1017,7 @@ const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &[
     // so the marker is what makes the rebuild happen exactly once.
     "session_events_fts_update_of_v1",
     "history_fts_update_of_v1",
+    "evidence_location_v1",
     EXPORT_CAPTURE_RETIRED,
 ];
 
@@ -1149,6 +1167,14 @@ fn schema_has_required_indexes(conn: &Connection, required_indexes: &[&str]) -> 
         .all(|(needed, _)| event_columns.contains(*needed))
     {
         return Ok(false);
+    }
+    for table in EVIDENCE_LOCATION_TABLES {
+        let has_location: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info(?) WHERE name = 'location'")?
+            .exists([table])?;
+        if !has_location {
+            return Ok(false);
+        }
     }
     let relationship_columns: HashSet<String> = conn
         .prepare("SELECT name FROM pragma_table_info('session_relationships')")?
@@ -1476,6 +1502,7 @@ END;
     )?;
     migrate_session_relationships_v2(conn)?;
     migrate_tool_result_fidelity_v1(conn)?;
+    migrate_evidence_location_v1(conn)?;
     // Additive: a v2 table predating continuity gains the one column the
     // continuity kinds need, and a fresh database already has it from the DDL
     // above, so both paths converge on the same shape.
@@ -1883,6 +1910,119 @@ const TOOL_RESULT_FIDELITY_COLUMNS: &[(&str, &str, &str)] = &[
         "INTEGER",
     ),
 ];
+
+/// The evidence tables whose rows record which evidence backs them.
+///
+/// Local and remote evidence for one session share its `(source,
+/// session_id)` identity and each table's unique key, so one record is one
+/// row whichever side supplied it. Without a per-row location a local parser
+/// re-reading a session could not tell the rows it wrote from rows a remote
+/// observation supplied, and a whole-session replacement deleted both.
+///
+/// `location` is `'local'`, `'remote'` or `'both'`. A writer stamps its own
+/// side — local parsers by the column default, remote intake explicitly — and
+/// an upsert that meets the other side's row makes it `'both'`
+/// ([`location_on_conflict`]). A side retiring its evidence
+/// ([`retire_evidence_share`]) deletes the rows only it backs and hands the
+/// rows both back to the other side, so neither side's re-read can remove
+/// what the other still evidences.
+pub(crate) const EVIDENCE_LOCATION_TABLES: &[&str] = &[
+    "session_events",
+    "tool_calls",
+    "file_edits",
+    "session_markers",
+];
+
+/// The `location = …` assignment for an `ON CONFLICT … DO UPDATE` on one of
+/// [`EVIDENCE_LOCATION_TABLES`]: unchanged when the writer is the side that
+/// already backs the row, `'both'` once the other side does too.
+pub(crate) fn location_on_conflict(table: &str) -> String {
+    format!(
+        "location = CASE WHEN {table}.location = excluded.location \
+         THEN {table}.location ELSE 'both' END"
+    )
+}
+
+/// Retire one side's share of the rows `condition` selects in `table`, one of
+/// [`EVIDENCE_LOCATION_TABLES`]: rows only `side` backs are deleted, and rows
+/// both sides back are left to the other side alone. `condition` is a SQL
+/// boolean over the table's columns; `params` bind its placeholders.
+///
+/// Returns how many rows were deleted.
+pub(crate) fn retire_evidence_share(
+    conn: &Connection,
+    table: &str,
+    condition: &str,
+    params: &[&dyn rusqlite::ToSql],
+    side: SessionLocation,
+) -> Result<usize> {
+    let (own, other) = match side {
+        SessionLocation::Local => ("local", "remote"),
+        SessionLocation::Remote => ("remote", "local"),
+    };
+    // `table` and `condition` come from internal call sites, never from input.
+    let deleted = conn.execute(
+        &format!("DELETE FROM {table} WHERE ({condition}) AND location = '{own}'"),
+        params,
+    )?;
+    conn.execute(
+        &format!(
+            "UPDATE {table} SET location = '{other}' WHERE ({condition}) AND location = 'both'"
+        ),
+        params,
+    )?;
+    Ok(deleted)
+}
+
+/// Add `location` to every table in [`EVIDENCE_LOCATION_TABLES`], once.
+///
+/// Rows that predate the column default to `'local'`, which is what every
+/// local parser wrote. The one case that can be told apart is a session known
+/// *only* remotely: nothing local ever read it, so its rows came from remote
+/// intake, and they are backfilled as `'remote'`. A session known both ways is
+/// ambiguous row by row and stays `'local'`, which is what a local re-read
+/// already assumed about every row before the column existed.
+fn migrate_evidence_location_v1(conn: &Connection) -> Result<()> {
+    // The column is ensured on every open, like every other added column, so
+    // a table rebuilt by a later migration (or by hand) regains it; only the
+    // backfill is once.
+    for table in EVIDENCE_LOCATION_TABLES {
+        ensure_columns(
+            conn,
+            table,
+            &[(
+                "location",
+                "TEXT NOT NULL DEFAULT 'local' CHECK(location IN ('local', 'remote', 'both'))",
+            )],
+        )?;
+    }
+    if migration_applied(conn, "evidence_location_v1")? {
+        return Ok(());
+    }
+    for table in EVIDENCE_LOCATION_TABLES {
+        // `table` comes exclusively from the constant list above.
+        conn.execute(
+            &format!(
+                "UPDATE {table} SET location = 'remote' \
+                 WHERE EXISTS (SELECT 1 FROM session_presences p \
+                               WHERE p.source = {table}.source \
+                                 AND p.session_id = {table}.session_id \
+                                 AND p.location = 'remote') \
+                   AND NOT EXISTS (SELECT 1 FROM session_presences p \
+                                   WHERE p.source = {table}.source \
+                                     AND p.session_id = {table}.session_id \
+                                     AND p.location = 'local')"
+            ),
+            [],
+        )
+        .with_context(|| format!("backfilling {table}.location"))?;
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations (name) VALUES ('evidence_location_v1')",
+        [],
+    )?;
+    Ok(())
+}
 
 fn migrate_tool_result_fidelity_v1(conn: &Connection) -> Result<()> {
     let migrated: bool = conn.query_row(
@@ -3088,7 +3228,9 @@ pub fn insert_session_marker(
          ON CONFLICT(source, session_id, marker_uid) DO UPDATE SET \
          ts_ms=excluded.ts_ms, message_id=excluded.message_id, parent_id=excluded.parent_id, \
          turn_id=excluded.turn_id, kind=excluded.kind, subkind=excluded.subkind, \
-         text=excluded.text, payload_json=excluded.payload_json",
+         text=excluded.text, payload_json=excluded.payload_json, \
+         location=CASE WHEN session_markers.location = excluded.location \
+           THEN session_markers.location ELSE 'both' END",
         params![
             source,
             session_id,
@@ -4460,6 +4602,12 @@ pub fn resume_command(entry: &HistoryEntry) -> Option<String> {
         "grok" => Some(entry.project.as_ref().map_or_else(
             || format!("grok resume {}", shell_quote(sid)),
             |p| format!("cd {} && grok resume {}", shell_quote(p), shell_quote(sid)),
+        )),
+        // `muse resume <id>` finds the session by id; the `cd` puts the
+        // resumed agent back in the workspace it recorded.
+        "muse" => Some(entry.project.as_ref().map_or_else(
+            || format!("muse resume {}", shell_quote(sid)),
+            |p| format!("cd {} && muse resume {}", shell_quote(p), shell_quote(sid)),
         )),
         _ => None,
     }
@@ -6702,6 +6850,61 @@ mod tests {
         conn.execute("DELETE FROM sessions WHERE session_id = 'kept-1'", [])
             .unwrap();
         assert!(session_markers(&conn, "grok", "kept-1").unwrap().is_empty());
+    }
+
+    /// Rows that predate the `location` column were all written as local.
+    /// The one case that can be told apart is a session known only
+    /// remotely: its rows came from remote intake and are backfilled as such.
+    /// A session known both ways stays local, row by row, as before.
+    #[test]
+    fn the_location_backfill_marks_only_remote_only_sessions_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ai-history.db");
+        {
+            let conn = open_db(&db_path).unwrap();
+            for (session, locations) in [
+                ("remote-only", &["remote"][..]),
+                ("both-ways", &["local", "remote"][..]),
+                ("local-only", &["local"][..]),
+            ] {
+                for location in locations {
+                    let location = if *location == "remote" {
+                        SessionLocation::Remote
+                    } else {
+                        SessionLocation::Local
+                    };
+                    crate::mark_session_presence(&conn, "muse", session, location).unwrap();
+                }
+                conn.execute(
+                    "INSERT INTO session_events \
+                     (source, session_id, ts_ms, role, kind, text, event_uid) \
+                     VALUES ('muse', ?, 1, 'assistant', 'text', 'hi', 'e1')",
+                    [session],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "DELETE FROM schema_migrations WHERE name = 'evidence_location_v1'",
+                [],
+            )
+            .unwrap();
+        }
+        let conn = open_db(&db_path).unwrap();
+        let located: Vec<(String, String)> = conn
+            .prepare("SELECT session_id, location FROM session_events ORDER BY session_id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            located,
+            vec![
+                ("both-ways".to_string(), "local".to_string()),
+                ("local-only".to_string(), "local".to_string()),
+                ("remote-only".to_string(), "remote".to_string()),
+            ]
+        );
     }
 
     /// A database written by the v1 marker code must come forward with its

@@ -660,6 +660,7 @@ handle.
 | codex | ✓ | ✓ | ✓ | ✓ | ✓ | cumulative-delta |
 | cursor | ✓ | ✓ | ✓ | ✓ | — | none |
 | grok | ✓ | ✓ | ✓ | ✓ | ✓ | per-request |
+| muse | ✓ | ✓ | ✓ | ✓ | ✓ | per-request |
 | opencode | ✓ | ✓ | ✓ | ✓ | ✓ | none |
 | relay | — | — | — | — | — | none |
 | trajectory | — | — | — | — | — | none |

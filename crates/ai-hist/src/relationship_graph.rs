@@ -295,6 +295,11 @@ pub fn relationship_capabilities(source: &str) -> RelationshipCapabilities {
         // the normal sessions tree. The id is never taken from the file name,
         // so an entry without one stays unlinked evidence.
         "grok" => ("sometimes", true, true, true),
+        // A Muse subagent writes its own `subagent/<id>/session.jsonl`, whose
+        // metadata record names the child session, so a linked child's
+        // identity is always its own. The parent's `task_stream_linked`
+        // names its role, label and model.
+        "muse" => ("always", true, true, true),
         _ => ("never", false, false, false),
     };
     RelationshipCapabilities {

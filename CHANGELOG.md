@@ -132,6 +132,34 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Added
 
+- Evidence rows record which side backs them. `session_events`,
+  `tool_calls`, `file_edits` and `session_markers` gain `location`
+  (`local` / `remote` / `both`). Local parsers stamp `local`, remote intake
+  stamps the observation's location, and meeting the other side's row makes
+  it `both`. A local whole-session re-read (Muse, Grok, Cursor, OpenCode, and
+  the per-record Claude and Codex rewrites) now retires only local rows and
+  leaves remote-supplied evidence under the same session id, which it used to
+  delete; a remote observation retiring a record likewise leaves the local
+  share. The `evidence_location_v1` migration adds the column and marks rows
+  of sessions known only remotely as `remote`. The change feed's
+  `Change.columns` carries the new column.
+- Muse Code (Meta's `muse` CLI) is a first-class source, `muse`. Sessions are
+  read from `$XDG_DATA_HOME/muse/sessions/YYYY/MM/DD/<id>/session.jsonl`
+  (`~/.local/share/muse/sessions` by default) by discovery, `sync`,
+  targeted hydration and live capture: typed prompts become `history` rows at
+  the microsecond time Muse recorded them, and each session gets its prose,
+  readable thinking, tool calls and results (status from Muse's own
+  `tool_batch.effect.terminal` outcome, and a non-zero `bash` exit code),
+  `write_file` / `edit_file` edits, per-model-step token usage (normalized as
+  `per-request`), models, CLI version and lifecycle markers (`turn_end`,
+  `session_start`, `session_resumed`, `session_end`, `model_switch`,
+  `encrypted_reasoning`). Subagent and reminder logs
+  (`subagent/<id>/session.jsonl`, at any depth) are indexed under the child's
+  own session id and linked to their parent as `delegated` children, typed
+  from the parent's `task_stream_linked` record; they are not catalogued as
+  sessions and their objectives are not history rows. A Muse hydration
+  reports `full`. `ai-hist resume` prints `muse resume <id>`, and the sync
+  service forwards `XDG_DATA_HOME`.
 - Read every OpenCode channel database. OpenCode keeps one SQLite store per
   release channel — `opencode.db` for `latest`/`beta`, and
   `opencode-stable.db`, `opencode-nightly.db`, ... beside it — and only
@@ -489,6 +517,9 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Rust API
 
+- `Source::Muse` and `ProviderRoots::muse` (the Muse Code sessions directory;
+  `from_env` honours `XDG_DATA_HOME`). Both types are `#[non_exhaustive]`, so
+  this is additive.
 - `ProviderRoots` gains `opencode_db_pinned: bool`. `from_env` sets it when
   `OPENCODE_DB` is set; `from_home` leaves it `false`, so every OpenCode channel
   database beside `opencode_db` is read. Set it to read `opencode_db` alone.

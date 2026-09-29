@@ -1671,37 +1671,33 @@ fn retire_absent_rows(
     parent_id: Option<&str>,
 ) -> Result<usize> {
     let mut retired = 0;
-    for (sql, present) in [
-        (
-            "DELETE FROM session_events WHERE source = 'opencode' AND session_id = ?1 \
-             AND event_uid NOT IN (SELECT value FROM json_each(?2))",
-            &keys.events,
-        ),
-        (
-            "DELETE FROM tool_calls WHERE source = 'opencode' AND session_id = ?1 \
-             AND tool_use_id NOT IN (SELECT value FROM json_each(?2))",
-            &keys.tool_calls,
-        ),
-        (
-            "DELETE FROM file_edits WHERE source = 'opencode' AND session_id = ?1 \
-             AND tool_use_id NOT IN (SELECT value FROM json_each(?2))",
-            &keys.file_edits,
-        ),
-        (
-            "DELETE FROM session_markers WHERE source = 'opencode' AND session_id = ?1 \
-             AND marker_uid NOT IN (SELECT value FROM json_each(?2))",
-            &keys.markers,
-        ),
-        (
-            "DELETE FROM history WHERE source = 'opencode' AND session_id = ?1 \
-             AND (timestamp_ms || ':' || coalesce(prompt_hash, '')) \
-             NOT IN (SELECT value FROM json_each(?2))",
-            &keys.prompts,
-        ),
+    // The evidence tables record which side backs each row, so only this
+    // local read's share is retired; a row remote evidence also backs stays.
+    for (table, key, present) in [
+        ("session_events", "event_uid", &keys.events),
+        ("tool_calls", "tool_use_id", &keys.tool_calls),
+        ("file_edits", "tool_use_id", &keys.file_edits),
+        ("session_markers", "marker_uid", &keys.markers),
     ] {
         let present = serde_json::to_string(present).unwrap_or_else(|_| "[]".into());
-        retired += conn.execute(sql, params![session_id, present])?;
+        retired += crate::store::retire_evidence_share(
+            conn,
+            table,
+            &format!(
+                "source = 'opencode' AND session_id = ?1 \
+                 AND {key} NOT IN (SELECT value FROM json_each(?2))"
+            ),
+            params![session_id, present],
+            crate::SessionLocation::Local,
+        )?;
     }
+    let present = serde_json::to_string(&keys.prompts).unwrap_or_else(|_| "[]".into());
+    retired += conn.execute(
+        "DELETE FROM history WHERE source = 'opencode' AND session_id = ?1 \
+         AND (timestamp_ms || ':' || coalesce(prompt_hash, '')) \
+         NOT IN (SELECT value FROM json_each(?2))",
+        params![session_id, present],
+    )?;
     retired += match parent_id {
         // The link is still asserted, but possibly to a different parent than
         // the one recorded before.

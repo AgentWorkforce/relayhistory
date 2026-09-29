@@ -1,6 +1,7 @@
 //! Validated canonical evidence records accepted from installed source adapters.
 //! Foreign database row ids are retained in observations but never assigned locally.
 use crate::observations::ObservationKey;
+use crate::SessionLocation;
 use anyhow::{ensure, Context, Result};
 use rusqlite::{params_from_iter, Connection};
 use serde::{Deserialize, Serialize};
@@ -511,34 +512,55 @@ impl EvidenceRecord {
             |row| row.get(0),
         )?)
     }
-    pub(crate) fn remove(&self, conn: &Connection) -> Result<()> {
+    /// Retire this record for the observation at `location`. In a table
+    /// whose rows record which evidence backs them, only that side's share is
+    /// retired: a record the other side also backs stays, as the other side's.
+    pub(crate) fn remove(&self, conn: &Connection, location: SessionLocation) -> Result<()> {
+        let table = self.kind.spec().table;
         let (condition, values) = self.key_sql();
+        if crate::store::EVIDENCE_LOCATION_TABLES.contains(&table) {
+            let params = values
+                .iter()
+                .map(|value| value as &dyn rusqlite::ToSql)
+                .collect::<Vec<_>>();
+            crate::store::retire_evidence_share(conn, table, &condition, &params, location)?;
+            return Ok(());
+        }
         conn.execute(
-            &format!("DELETE FROM {} WHERE {condition}", self.kind.spec().table),
+            &format!("DELETE FROM {table} WHERE {condition}"),
             params_from_iter(values),
         )?;
         Ok(())
     }
-    pub(crate) fn write(&self, conn: &Connection) -> Result<()> {
+    /// Write this record for the observation at `location`. In a table whose
+    /// rows record which evidence backs them, the row is stamped with that
+    /// side, and becomes `'both'` where the other side already backs it.
+    pub(crate) fn write(&self, conn: &Connection, location: SessionLocation) -> Result<()> {
         let spec = self.kind.spec();
-        let columns = spec.columns.split(',').collect::<Vec<_>>();
-        let values = columns
+        let located = crate::store::EVIDENCE_LOCATION_TABLES.contains(&spec.table);
+        let mut columns = spec.columns.split(',').collect::<Vec<_>>();
+        let mut values = columns
             .iter()
             .map(|column| sql_value(self.payload.get(*column).unwrap_or(&Value::Null)))
             .collect::<Vec<_>>();
-        let updates = columns
+        let mut updates = columns
             .iter()
             .filter(|column| !spec.key.split(',').any(|key| key == **column))
             .map(|column| format!("{column}=excluded.{column}"))
-            .collect::<Vec<_>>()
-            .join(",");
+            .collect::<Vec<_>>();
+        if located {
+            columns.push("location");
+            values.push(rusqlite::types::Value::Text(location.as_str().to_string()));
+            updates.push(crate::store::location_on_conflict(spec.table));
+        }
         conn.execute(
             &format!(
-                "INSERT INTO {}({}) VALUES({}) ON CONFLICT({}) DO UPDATE SET {updates}",
+                "INSERT INTO {}({}) VALUES({}) ON CONFLICT({}) DO UPDATE SET {}",
                 spec.table,
-                spec.columns,
+                columns.join(","),
                 vec!["?"; columns.len()].join(","),
-                spec.key
+                spec.key,
+                updates.join(",")
             ),
             params_from_iter(values),
         )
@@ -612,6 +634,49 @@ mod tests {
             connector_id: "c".into(),
             connector_instance: "i".into(),
         }
+    }
+
+    /// Which evidence backs one row, through every write and retirement:
+    /// each side stamps itself, meeting the other makes the row `both`, and
+    /// retiring one side's share leaves what the other still backs.
+    #[test]
+    fn evidence_rows_record_which_side_backs_them() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::init_db(&conn).unwrap();
+        let record = EvidenceRecord {
+            kind: EvidenceKind::SessionEvent,
+            payload: json!({
+                "source": "muse", "session_id": "s1", "event_uid": "e1",
+                "ts_ms": 1, "role": "assistant", "kind": "text", "text": "hi",
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            record_id: None,
+            revision_id: None,
+        };
+        let location = |conn: &Connection| -> Option<String> {
+            conn.query_row(
+                "SELECT location FROM session_events WHERE source = 'muse' AND event_uid = 'e1'",
+                [],
+                |row| row.get(0),
+            )
+            .ok()
+        };
+        record.write(&conn, SessionLocation::Local).unwrap();
+        assert_eq!(location(&conn).as_deref(), Some("local"));
+        record.write(&conn, SessionLocation::Local).unwrap();
+        assert_eq!(location(&conn).as_deref(), Some("local"), "same side stays itself");
+        record.write(&conn, SessionLocation::Remote).unwrap();
+        assert_eq!(location(&conn).as_deref(), Some("both"));
+        record.remove(&conn, SessionLocation::Local).unwrap();
+        assert_eq!(location(&conn).as_deref(), Some("remote"), "the remote share stays");
+        record.write(&conn, SessionLocation::Local).unwrap();
+        assert_eq!(location(&conn).as_deref(), Some("both"));
+        record.remove(&conn, SessionLocation::Remote).unwrap();
+        assert_eq!(location(&conn).as_deref(), Some("local"), "the local share stays");
+        record.remove(&conn, SessionLocation::Local).unwrap();
+        assert_eq!(location(&conn), None, "nothing backs it any more");
     }
 
     /// A tool-result event with the fidelity fields a plugin may legitimately
@@ -845,6 +910,14 @@ mod tests {
             ("session_markers", "revision"),
             ("history", "revision"),
             ("session_commit_links", "revision"),
+            // Which evidence backs the row. It is this database's own
+            // bookkeeping of who supplied the row, stamped by the writer
+            // (`EvidenceRecord::write` from the observation's location), so an
+            // adapter can neither supply it nor be held to it.
+            ("session_events", "location"),
+            ("tool_calls", "location"),
+            ("file_edits", "location"),
+            ("session_markers", "location"),
         ];
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         crate::init_db(&conn).unwrap();

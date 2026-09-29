@@ -21,8 +21,8 @@ const READ = { readOnlyHint: true, idempotentHint: true, openWorldHint: false } 
 // (claude.ai/code web sessions, Codex cloud tasks), so it is open-world.
 const ACQUIRE = { readOnlyHint: false, idempotentHint: true, openWorldHint: true } as const;
 const LOCAL_ACQUIRE = { readOnlyHint: false, idempotentHint: true, openWorldHint: false } as const;
-const SOURCE = z.enum(['claude', 'codex', 'cursor', 'grok', 'relay', 'trajectory', 'opencode']);
-const CATALOG_SOURCE = z.enum(['claude', 'codex', 'cursor', 'grok', 'relay', 'opencode']);
+const SOURCE = z.enum(['claude', 'codex', 'cursor', 'grok', 'relay', 'trajectory', 'opencode', 'muse']);
+const CATALOG_SOURCE = z.enum(['claude', 'codex', 'cursor', 'grok', 'relay', 'opencode', 'muse']);
 const SESSION_SCOPE = z.enum(['local', 'remote', 'all']);
 const SINCE_MS = z.number().int().optional().describe('Inclusive lower bound on timestampMs.');
 const UNTIL_MS = z.number().int().optional().describe('Inclusive upper bound on timestampMs.');

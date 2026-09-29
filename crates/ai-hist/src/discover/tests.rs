@@ -3867,6 +3867,97 @@ fn cancellation_during_row_emission_preserves_the_committed_window() {
     }
 }
 
+/// A Muse subagent's log is never a session of its own, however it reaches
+/// the shallow reader — enumeration skips it, a by-path read must too.
+#[test]
+fn muse_shallow_read_refuses_a_subagent_log() {
+    let home = tempfile::tempdir().unwrap();
+    let conn = catalog();
+    let session = home
+        .path()
+        .join(".local/share/muse/sessions/2026/09/20/parent");
+    let header = |id: &str| {
+        format!(
+            "{{\"id\":\"r1\",\"stream\":{{\"kind\":\"session\",\"id\":\"{id}\"}},\
+             \"recorded_at\":1790337600000000,\"payload_type\":\"runtime.session.metadata\",\
+             \"payload\":{{\"kind\":\"metadata\",\"record\":{{\"workspace_root\":\"/w\"}}}}}}\n"
+        )
+    };
+    write(&session.join("session.jsonl"), &header("parent"));
+    let child = session.join("subagent/child/session.jsonl");
+    write(&child, &header("child"));
+
+    let env = env_at(&conn, home.path());
+    let candidates = MuseProvider.enumerate(&env, None).unwrap();
+    assert_eq!(candidates.len(), 1, "only the parent is enumerated");
+    let mut by_path = candidates[0].clone();
+    by_path.locator = child.to_string_lossy().into_owned();
+    assert!(MuseProvider
+        .read_shallow(&env.scan(), None, &by_path)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        MuseProvider
+            .read_shallow(&env.scan(), None, &candidates[0])
+            .unwrap()
+            .unwrap()
+            .session_id,
+        "parent"
+    );
+}
+
+/// One session's child log that cannot be statted leaves that session's
+/// transcript in the fingerprint and every other session's tree untouched,
+/// rather than failing the fold.
+#[cfg(unix)]
+#[test]
+fn a_muse_child_log_stat_error_does_not_fail_the_fingerprint() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let conn = catalog();
+    let sessions = home.path().join(".local/share/muse/sessions/2026/09/20");
+    let header = |id: &str| {
+        format!(
+            "{{\"id\":\"r1\",\"stream\":{{\"kind\":\"session\",\"id\":\"{id}\"}},\
+             \"recorded_at\":1790337600000000,\"payload_type\":\"runtime.session.metadata\",\
+             \"payload\":{{\"kind\":\"metadata\",\"record\":{{\"workspace_root\":\"/w\"}}}}}}\n"
+        )
+    };
+    write(&sessions.join("a/session.jsonl"), &header("a"));
+    write(&sessions.join("a/subagent/c/session.jsonl"), &header("c"));
+    write(&sessions.join("b/session.jsonl"), &header("b"));
+    write(&sessions.join("b/subagent/d/session.jsonl"), &header("d"));
+    let blocked = sessions.join("a/subagent/c");
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o644)).unwrap();
+    let stat_blocked = fs::metadata(blocked.join("session.jsonl")).is_err();
+
+    let env = env_at(&conn, home.path());
+    let inputs = MuseProvider.fingerprint_inputs(&env);
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755)).unwrap();
+    if !stat_blocked {
+        return;
+    }
+    let mut locators: Vec<String> = inputs
+        .unwrap()
+        .into_iter()
+        .map(|candidate| {
+            candidate
+                .locator
+                .trim_start_matches(&*sessions.to_string_lossy())
+                .to_string()
+        })
+        .collect();
+    locators.sort();
+    assert_eq!(
+        locators,
+        vec![
+            "/a/session.jsonl".to_string(),
+            "/b/session.jsonl".to_string(),
+            "/b/subagent/d/session.jsonl".to_string(),
+        ]
+    );
+}
+
 /// A subagent workflow journal shares the `.jsonl` extension and sits inside
 /// the project tree, but it is not a transcript, so discovery never lists it
 /// as a candidate session.

@@ -367,7 +367,7 @@ contract:
 
 | Field | Kind | Notes |
 |---|---|---|
-| `source` | observed | `claude`, `codex`, `cursor`, `grok`, `opencode`, `relay` |
+| `source` | observed | `claude`, `codex`, `cursor`, `grok`, `muse`, `opencode`, `relay` |
 | `session_id` | observed | provider-native; `(source, session_id)` is the primary key, so the same native id under two providers is two rows |
 | `cwd` | observed | working directory the provider recorded |
 | `git_branch` | observed | last branch the provider recorded |
@@ -463,6 +463,7 @@ which this table must stay consistent with.
 | **codex** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | **cursor** | ✓ (dir name) | ✓ (decoded path) | – (never) | ✓ (injected `<timestamp>`) | ✓ (injected `<timestamp>`, else mtime) | ✓ | ✓ (if a build writes `message.model`) | – | – | – | – | – |
 | **grok** | ✓ | ✓ | ✓ | ✓ (`updates.jsonl`, else `summary.json`) | ✓ (`updates.jsonl`, else `summary.json`) | ✓ | ✓ | – | – | – | – | – |
+| **muse** | ✓ (metadata `stream.id`) | ✓ (`workspace_root`) | – (never) | ✓ (metadata `recorded_at`) | ✓ (tail `recorded_at`) | ✓ (first `started` prompt) | ✓ (metadata, then `model_completed`) | – | ✓ (`build.semver`) | – | – | – |
 | **opencode** | ✓ | ✓ (directory / message `path.cwd`) | – | ✓ | ✓ | ✓ | ✓ (`providerID/modelID`) | – | – | – | – | – |
 | **relay** | ✓ | – (never) | – | ✓ (synced min ts) | ✓ (synced max ts) | ✓ (earliest synced prompt) | – | – | – | – | – | – |
 
@@ -491,26 +492,31 @@ keys would silently drop whatever it adds next, which is the failure this
 table exists to end. Either way the bound is the promise the column makes, and
 it holds for every kind.
 
-| `kind` | claude | codex | grok | `subkind` examples |
-|---|---|---|---|---|
-| `compaction_boundary` | ✓ `type:"system"`, `subtype:"compact_boundary"` | ✓ top-level `compacted`, `context_compacted` | ✓ | `compact_boundary`, `compacted` |
-| `summary` | ✓ `type:"summary"` | – | – | `summary` |
-| `subagent_notification` | ✓ system rows with `parent_tool_use_id`; tool results carrying `toolUseResult.agentId` | ✓ `subagent_*` | – | `subagent_completed`, `tool_use_result_agent_id`, `subagent_message_complete` |
-| `task_started` | – | ✓ | – | `task_started` |
-| `task_complete` | – | ✓ | – | `task_complete` |
-| `turn_diff` | – | ✓ | – | `turn_diff` |
-| `stream_error` | – | ✓ | – | `stream_error` |
-| `tool_begin` | – | ✓ any `*_begin` | – | `exec_command_begin`, `patch_apply_begin`, `mcp_tool_call_begin` |
-| `review_mode` | – | ✓ | – | `entered_review_mode`, `exited_review_mode` |
-| `unsupported_block` | ✓ any content block with no event `kind`, plus thinking signatures | – | – | `image`, `document`, `redacted_thinking`, `server_tool_use`, `thinking_signature` |
-| `encrypted_reasoning` | – | ✓ `response_item/reasoning` | ✓ an opaque reasoning trace with no summary | `reasoning` |
-| `tool_replacement` | ✓ `_meta.replaces` / `_meta.collapsedCalls` | – | – | `tool_result` |
-| `system` | – | – | ✓ a system preamble, in `text` | – |
-| `synthetic_turn` | – | – | ✓ a turn the harness wrote, in `text` | – |
-| `signals` | – | – | ✓ | – |
-| `prompt_context` | – | – | ✓ | – |
-| `local_notice` | ✓ an `assistant` record whose model is `<synthetic>`: a notice Claude Code wrote itself (API error, expired login), text in `text`, `error` and `is_api_error_message` in `payload_json` | – | – | `synthetic` |
-| `unknown` | ✓ any unclassified record type, plus a `user`/`assistant` record that produced no event at all | ✓ any unclassified payload type, including `agent_reasoning_raw_content` and `agent_reasoning_section_break` | – | the provider type, verbatim |
+| `kind` | claude | codex | grok | muse | `subkind` examples |
+|---|---|---|---|---|---|
+| `compaction_boundary` | ✓ `type:"system"`, `subtype:"compact_boundary"` | ✓ top-level `compacted`, `context_compacted` | ✓ | – | `compact_boundary`, `compacted` |
+| `summary` | ✓ `type:"summary"` | – | – | – | `summary` |
+| `subagent_notification` | ✓ system rows with `parent_tool_use_id`; tool results carrying `toolUseResult.agentId` | ✓ `subagent_*` | – | – | `subagent_completed`, `tool_use_result_agent_id`, `subagent_message_complete` |
+| `task_started` | – | ✓ | – | – | `task_started` |
+| `task_complete` | – | ✓ | – | – | `task_complete` |
+| `turn_diff` | – | ✓ | – | – | `turn_diff` |
+| `stream_error` | – | ✓ | – | – | `stream_error` |
+| `tool_begin` | – | ✓ any `*_begin` | – | – | `exec_command_begin`, `patch_apply_begin`, `mcp_tool_call_begin` |
+| `review_mode` | – | ✓ | – | – | `entered_review_mode`, `exited_review_mode` |
+| `unsupported_block` | ✓ any content block with no event `kind`, plus thinking signatures | – | – | – | `image`, `document`, `redacted_thinking`, `server_tool_use`, `thinking_signature` |
+| `encrypted_reasoning` | – | ✓ `response_item/reasoning` | ✓ an opaque reasoning trace with no summary | ✓ `reasoning_committed` with only `encrypted_content` | `reasoning` |
+| `tool_replacement` | ✓ `_meta.replaces` / `_meta.collapsedCalls` | – | – | – | `tool_result` |
+| `system` | – | – | ✓ a system preamble, in `text` | – | – |
+| `synthetic_turn` | – | – | ✓ a turn the harness wrote, in `text` | – | – |
+| `signals` | – | – | ✓ | – | – |
+| `prompt_context` | – | – | ✓ | – | – |
+| `local_notice` | ✓ an `assistant` record whose model is `<synthetic>`: a notice Claude Code wrote itself (API error, expired login), text in `text`, `error` and `is_api_error_message` in `payload_json` | – | – | – | `synthetic` |
+| `unknown` | ✓ any unclassified record type, plus a `user`/`assistant` record that produced no event at all | ✓ any unclassified payload type, including `agent_reasoning_raw_content` and `agent_reasoning_section_break` | – | – | the provider type, verbatim |
+| `turn_end` | – | – | – | ✓ run `terminal` (`completed`, `interrupted`, …) in `text` | `terminal` |
+| `session_start` | – | – | – | ✓ `session.opened.observed`, `resume` in the payload | `session.opened.observed` |
+| `session_resumed` | – | – | – | ✓ | `session.resumed` |
+| `session_end` | – | – | – | ✓ `exit_reason` in `text` | `session.end` |
+| `model_switch` | – | – | – | ✓ a later metadata record, the new model in `text` | `runtime.session.metadata` |
 
 `text` is the provider's own readable prose for a marker, and `payload_json`
 its structure; a marker may carry either, both or neither. Grok records a
@@ -596,6 +602,7 @@ status, because a fabricated measurement reads exactly like a real one:
 | **cursor** | ✓ (raw block `content`) | ✓ (harness markers) | ✓ | ✓ | `tool_result` | `tool_result.is_error` | – (no notification rail) |
 | **grok** | ✓ (raw line `content`) | ✓ (harness markers) | ✓ | ✓ (`unknown` with neither signal) | `function_call_output` | `tool_result.is_error`, `tool_status` | – (no notification rail) |
 | **opencode** | ✓ (raw part `output`) | ✓ (harness markers) | ✓ | ✓ | `function_call_output` | `exit_code`, `tool_status` | – (no notification rail) |
+| **muse** | ✓ (result `text`) | ✓ (harness markers) | ✓ | ✓ (`tool_batch.effect.terminal`, joined by call id) | `function_call_output` | `tool_batch.effect`, `exit_code` (`bash`) | – |
 | **relay** | – | – | – | – | – | – | – |
 
 `payload_bytes` is the raw UTF-8 length of what the provider handed back —
@@ -680,6 +687,7 @@ follows.
 | **codex** | ✓ | ✓ | ✓ | ✓ | ✓ when the bounded child search is complete | `full` or `partial` |
 | **cursor** | ✓ | ✓ | ✓ | ✓ | – (never: a `Task` block names no child transcript) | `partial` |
 | **grok** | ✓ | ✓ | ✓ | ✓ | ✓ | `full` |
+| **muse** | ✓ | ✓ | ✓ | ✓ | ✓ | `full` |
 | **opencode** | ✓ | ✓ | ✓ | ✓ | ✓ | `full` |
 | **relay** | – | – | – | – | – | targeted hydration unsupported |
 
@@ -696,6 +704,7 @@ in flight.
 | **claude** | ✓ (`requestId`) | ✓ (`message.stop_reason`) | ✓ (`version` / `sourceVersion`) | ✓ (`isSidechain`) | ✓ (`isMeta`) | – |
 | **codex** | – | – | – | – | – | ✓ (`turn_context.turn_id`, carried to the next `turn_context`) |
 | **opencode** | – | ✓ (`step-finish.reason`, pending event-level parity) | – | – | – | – |
+| **muse** | ✓ (`response_id`) | ✓ (the step's `finish_reason`) | ✓ (`build.semver`) | – | – | ✓ (the run's `run_id`) |
 | **cursor**, **grok**, **relay** | – | – | – | – | – | – |
 
 A null is "the provider did not record it", which is not the same as `false`
@@ -748,6 +757,7 @@ Delegation is a separate capability, reported on every relationship result as
 | **opencode** | always | – | ✓ | ✓ |
 | **claude** | sometimes | ✓ | ✓ | ✓ |
 | **grok** | sometimes | ✓ | ✓ | ✓ |
+| **muse** | always | ✓ | ✓ | ✓ |
 | **cursor**, **relay** | never | – | – | – |
 
 OpenCode is `always` because a subagent session is a session in its own right
@@ -766,6 +776,13 @@ entry that records a child session id links to a child session in the normal
 sessions tree, and one that does not is stored as unlinked evidence. The id is
 never taken from the entry's file name. A `Task` call inside the transcript
 names no child at all. See ["grok"](#grok).
+
+Muse is `always` because every subagent writes its own
+`subagent/<id>/session.jsonl` beside the parent, and that log's metadata
+record names the child session. The edge is recorded with `evidence_kind =
+"muse_subagent_log"`; the agent type, name and model come from the parent's
+`task_stream_linked` (or `memory_reminder_child_session_linked`) record for
+that log. See ["muse"](#muse).
 
 Cursor is `never` for a different reason from grok, opencode and relay: it does
 record the spawn — a `Task` / `functions.Subagent` tool call, preserved as a
@@ -1216,7 +1233,9 @@ How each adapter works:
   identity shifted when the file was rewritten, sitting in the database
   forever with nothing to distinguish them from live evidence. A relationship
   another session recorded about *this* one is not this session's to delete,
-  and is left alone.
+  and is left alone. "Clears" means the local share only: a row a remote
+  observation also supplied stays, as the remote side's (see
+  [evidence location](#evidence-location)).
 
   The change stamp covers **every file the read consumes**: the transcript, the
   summary and the update stream each keep a readable marker, and
@@ -1469,6 +1488,86 @@ How each adapter works:
     original format research: no per-turn `input_tokens`/`output_tokens`, a
     `totalTokens` context proxy that decreases on compaction, the models
     `grok-composer-2.5-fast` and `grok-build`, and the tool-name list.
+
+<a id="muse"></a>
+
+- **muse** — Muse Code (Meta's `muse` CLI) keeps one append-only log per
+  session at `$XDG_DATA_HOME/muse/sessions/YYYY/MM/DD/<session-id>/session.jsonl`
+  (`~/.local/share/muse/sessions/…` when `XDG_DATA_HOME` is unset, on every
+  platform). Record interpretation lives in `crates/ai-hist/src/ingest/muse.rs`
+  so discovery, sync and hydration read it the same way.
+
+  Every line is an envelope `{id, stream: {kind, id}, sequence, recorded_at,
+  payload_type, payload}`, and `recorded_at` is **microseconds** on every
+  record, so no time here is inferred. Identity is the `stream.id` of the
+  `runtime.session.metadata` record — searched for rather than assumed to be
+  line one, because a permission frame can precede it — never the directory
+  name. That record also gives `workspace_root` (the `cwd`), `model_id` and
+  `build.semver`.
+
+  The conversation is `payload_type: "runtime.session"` with
+  `payload.kind: "run"`, keyed by `payload.event.kind`: `started` (the typed
+  prompt, one `history` row), `reasoning_committed`,
+  `assistant_message_committed`, `assistant_tool_calls_committed` (`args` is a
+  JSON *string*), `tool_result_batch_committed`, `model_completed` (per model
+  step: `model`, `usage`, `finish_reason`) and `terminal`. `payload.kind:
+  "task"` is execution bookkeeping and is not read. A call's outcome is the
+  separate `tool_batch.effect.terminal` record, joined by call id; the result
+  text carries no error flag of its own. Only records on the session's own
+  stream are read: subagent and reminder task streams are mirrored into the
+  parent file under a different `stream.id`, and reading them would present
+  every child objective as a prompt somebody typed.
+
+  Usage is recorded as Muse wrote it: each `model_completed.usage` object
+  (`input_tokens` inclusive of the cached prefix, `cache_read_tokens` /
+  `cached_tokens`, `cache_write_tokens`, `output_tokens`, `reasoning_tokens`)
+  goes verbatim into `token_json` on the assistant row that step committed,
+  with its `model` and `finish_reason`, and normalizes as `per-request`. Muse
+  does not write the two in one order — a step that calls tools logs
+  `model_completed` *before* its calls, a step that answers in prose logs it
+  *after* the reply, and one step can commit readable reasoning and then its
+  tool calls. A step is what lies between the model being called and the
+  next `started`, `tool_result_batch_committed` or `terminal` in its run; its
+  first assistant record owns its usage, in whichever direction the step
+  wrote the two. A step that committed
+  nothing keeps its usage off every row and is reported as
+  `MUSE_USAGE_UNATTACHED`. Only newline-terminated records are read, so a
+  live session's half-written last line waits for the next read, and Muse is
+  one of the sources the sweep's destination marker guards: rows lost under
+  an unchanged stamp are restored by the next `sync`.
+  Reasoning Muse kept only encrypted is an `encrypted_reasoning` marker
+  (`MUSE_REASONING_ENCRYPTED`).
+
+  A sync or hydration reads the whole file and **replaces** the session's
+  local evidence, so a re-read after the log grew adds exactly the new turns
+  and duplicates nothing, while a row a remote observation also supplied is
+  left to the remote side (see [evidence location](#evidence-location)).
+
+  **Subagents.** Every child agent — a `subagent_spawn` worker, or a reminder
+  child when Muse is set to save those — writes
+  `subagent/<child-dir>/session.jsonl` beside its parent, and may nest its own
+  `subagent/` below that. These are never enumerated as sessions. Reading a
+  session reads its whole tree: each child is indexed under the session id
+  its **own** metadata record names (never the directory name) and linked to
+  its parent as `delegated`, with `spawn_depth`, the parent's
+  `task_stream_linked` `display.role` (`worker`, `reminder`, …) as
+  `child_agent_type`, its `display.label` as `child_agent_name`, a concrete
+  `display.model` (else the child's own `model_id`) as `child_model`, and the
+  task id as `evidence_ref`. As for a Codex subagent rollout, a child's
+  `history` rows and catalog row are removed — its objective is not a prompt
+  anybody typed — and its events stay addressable through the edge
+  (`sessions tree`, `related_session_ids`). The change stamp covers every
+  child log, so a background subagent that keeps writing after the parent's
+  last record is still re-read; a child whose log disappears loses its edge
+  and its evidence. A reminder linked by `memory_reminder_child_session_linked`
+  but saved only in memory (Muse's default for reminders) has no log and no
+  edge. `MUSE_SUBAGENT_LOG_MISSING` reports `subagent_spawn` calls with no log
+  to link, and `MUSE_SUBAGENT_LOG_UNIDENTIFIED` a log with no session
+  metadata. The shapes were characterized from a transcript
+  the real CLI wrote (`tests/fixtures/muse/cli-capture`, from
+  [xhluca/session-migrate](https://github.com/xhluca/session-migrate)) and
+  cross-checked against the published [Muse Code
+  SDK](https://github.com/meta-models/muse-code-sdk) and independent readers.
 
 - **opencode** — **two storage layouts**, because both are in the field.
   RelayHistory prefers `opencode.db` when the host has it and falls back to the
@@ -1989,6 +2088,24 @@ Databases created by an older release are migrated in place by a serialized
 missing-column check in `init_db`, and `schema_is_current` knows about the new
 columns, so a read-only handle over an old database is upgraded instead of
 failing with `no such column`.
+
+<a id="evidence-location"></a>
+
+**Evidence location.** Local and remote evidence for one session share its
+`(source, session_id)` identity and each table's unique key, so one record is
+one row whichever side supplied it. `session_events`, `tool_calls`,
+`file_edits` and `session_markers` therefore carry a per-row `location`:
+`local`, `remote`, or `both`. A local parser's rows default to `local`, remote
+intake (`EvidenceRecord::write`) stamps the observation's location, and an
+upsert that meets the other side's row makes it `both`. A side that retires
+its evidence — a local whole-session re-read, a remote observation dropping a
+record — deletes only the rows it alone backs and hands `both` rows to the
+other side, so neither side can remove what the other still evidences. The
+column is this database's own bookkeeping: it is not part of any adapter
+projection, and is ensured on every open. The `evidence_location_v1` migration
+backfills rows written before it existed: a session known *only* remotely was
+supplied by remote intake and its rows become `remote`; every other row stays
+`local`, which is what a local re-read already assumed of it.
 
 `session_presences` is the location child table. It is keyed by
 `(source, session_id, location)`, where `location` is `local` or `remote`, and
