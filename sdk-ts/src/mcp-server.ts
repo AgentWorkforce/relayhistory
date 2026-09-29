@@ -13,7 +13,7 @@ import {
   MAX_HANDOFF_INTENT_CHARS,
 } from './index.js';
 
-import type { HistoryPluginRegistry } from './index.js';
+import type { HistoryCursor, HistoryPluginRegistry } from './index.js';
 import { loadHistoryApplicationConfig } from './delivery-cli.js';
 
 const READ = { readOnlyHint: true, idempotentHint: true, openWorldHint: false } as const;
@@ -24,6 +24,16 @@ const LOCAL_ACQUIRE = { readOnlyHint: false, idempotentHint: true, openWorldHint
 const SOURCE = z.enum(['claude', 'codex', 'cursor', 'grok', 'relay', 'trajectory', 'opencode']);
 const CATALOG_SOURCE = z.enum(['claude', 'codex', 'cursor', 'grok', 'relay', 'opencode']);
 const SESSION_SCOPE = z.enum(['local', 'remote', 'all']);
+const SINCE_MS = z.number().int().optional().describe('Inclusive lower bound on timestampMs.');
+const UNTIL_MS = z.number().int().optional().describe('Inclusive upper bound on timestampMs.');
+const HISTORY_AFTER = z.object({
+  timestampMs: z.number().int(), id: z.number().int(), matchSource: z.string().optional()
+    .describe('history or session_event; any other value is rejected by the shared cursor validation.'),
+}).optional().describe('Continue strictly after this row: the last row\'s timestampMs, id and (for search) matchSource.')
+  // The schema leaves matchSource open so an unknown value reaches the native
+  // cursor validation and fails with its INVALID_ARGUMENT, as on every other
+  // surface, instead of a schema error.
+  .transform((after) => after as HistoryCursor | undefined);
 const SOURCE_CONNECTORS = z.array(z.string().min(1)).optional().describe('Explicit configured source-plugin IDs; [] disables remote acquisition.');
 const packageVersion = JSON.parse(
   readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
@@ -47,18 +57,36 @@ async function call(operation: () => Promise<unknown>) {
   }
 }
 
-server.tool('search_history', 'Search already-indexed RelayHistory prompts.', {
+server.tool('search_history',
+  'Full-text search of already-indexed user prompts and session events (assistant text, tool calls and results), '
+  + 'newest first; the same contract as `ai-hist search`. By default each word is matched as a literal token and all '
+  + 'must match; a leading - excludes a word. A query containing AND, OR, NOT, a trailing * or a "quoted phrase" is '
+  + 'passed to SQLite FTS5 as written, and raw_fts: true always does so. Each match carries matchSource '
+  + '(history or session_event), role and kind; id is unique only within matchSource. To page, pass the last '
+  + 'match\'s timestampMs, id and matchSource as after.', {
   query: z.string(), source: SOURCE.optional(), project: z.string().optional(), tag: z.string().optional(),
   scope: SESSION_SCOPE.optional().default('local'),
+  role: z.enum(['all', 'user', 'assistant', 'prompt']).optional().default('all')
+    .describe('all: prompts and every event; user: prompts and user events; assistant: assistant events; prompt: prompts only.'),
+  raw_fts: z.boolean().optional().default(false)
+    .describe('Pass the query to SQLite FTS5 verbatim; a malformed expression is an error.'),
+  before_ms: z.number().int().optional().describe('Deprecated: exclusive, so it skips rows tied on the timestamp. Use after.'),
+  since_ms: SINCE_MS, until_ms: UNTIL_MS, after: HISTORY_AFTER,
   limit: z.number().int().min(1).max(1000).optional().default(20),
-}, READ, ({ query, source, project, tag, scope, limit }) => call(() => search(query, { source, project, tag, scope, limit })));
+}, READ, ({ query, source, project, tag, scope, role, raw_fts, before_ms, since_ms, until_ms, after, limit }) => call(() => search(query, {
+  source, project, tag, scope, role, rawFts: raw_fts, beforeMs: before_ms, sinceMs: since_ms, untilMs: until_ms, after, limit,
+})));
 
-server.tool('recent_history', 'List recent already-indexed history.', {
+server.tool('recent_history', 'List recent already-indexed prompts, newest first by (timestampMs, id). '
+  + 'To page, pass the last row\'s timestampMs and id as after.', {
   source: SOURCE.optional(), project: z.string().optional(), tag: z.string().optional(),
   scope: SESSION_SCOPE.optional().default('local'),
   n: z.number().int().min(1).max(1000).optional().default(20),
-  before_ms: z.number().int().optional(),
-}, READ, ({ source, project, tag, scope, n, before_ms }) => call(() => recent({ source, project, tag, scope, limit: n, beforeMs: before_ms })));
+  before_ms: z.number().int().optional().describe('Deprecated: exclusive, so it skips rows tied on the timestamp. Use after.'),
+  since_ms: SINCE_MS, until_ms: UNTIL_MS, after: HISTORY_AFTER,
+}, READ, ({ source, project, tag, scope, n, before_ms, since_ms, until_ms, after }) => call(() => recent({
+  source, project, tag, scope, limit: n, beforeMs: before_ms, sinceMs: since_ms, untilMs: until_ms, after,
+})));
 
 server.tool('list_sessions', 'Cache-only indexed session catalog listing. This never discovers or syncs.', {
   sources: z.array(CATALOG_SOURCE).optional(), limit: z.number().int().min(1).max(1000).optional().default(20),

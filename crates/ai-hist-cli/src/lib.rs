@@ -100,12 +100,33 @@ enum Command {
         project: Option<String>,
         #[arg(long)]
         tag: Option<String>,
+        /// `all` (prompts and every session event), `user` (prompts and
+        /// user events), `assistant` (assistant events) or `prompt` (prompts
+        /// only). The same values the SDK and MCP `search` accept.
         #[arg(long, default_value = "all")]
         role: String,
         #[arg(long)]
         agent: bool,
         #[arg(long)]
         human: bool,
+        /// Only entries at or after this epoch-millisecond timestamp.
+        #[arg(long)]
+        since_ms: Option<i64>,
+        /// Only entries at or before this epoch-millisecond timestamp.
+        #[arg(long)]
+        until_ms: Option<i64>,
+        /// Continue after a previous page's last row: its `timestamp_ms`.
+        /// Requires --after-id.
+        #[arg(long, requires = "after_id")]
+        after_ms: Option<i64>,
+        /// Continue after a previous page's last row: its `id`. Requires
+        /// --after-ms.
+        #[arg(long, requires = "after_ms")]
+        after_id: Option<i64>,
+        /// The last row's `match_source` (`history` or `session_event`); omit
+        /// for `history`. Requires --after-id.
+        #[arg(long, requires = "after_id")]
+        after_match_source: Option<String>,
         #[arg(long, default_value_t = 20)]
         limit: i64,
         /// Pass the query through as a raw FTS5 MATCH expression. Operators such as
@@ -127,6 +148,20 @@ enum Command {
         project: Option<String>,
         #[arg(long)]
         tag: Option<String>,
+        /// Only entries at or after this epoch-millisecond timestamp.
+        #[arg(long)]
+        since_ms: Option<i64>,
+        /// Only entries at or before this epoch-millisecond timestamp.
+        #[arg(long)]
+        until_ms: Option<i64>,
+        /// Continue after a previous page's last row: its `timestamp_ms`.
+        /// Requires --after-id.
+        #[arg(long, requires = "after_id")]
+        after_ms: Option<i64>,
+        /// Continue after a previous page's last row: its `id`. Requires
+        /// --after-ms.
+        #[arg(long, requires = "after_ms")]
+        after_id: Option<i64>,
         #[arg(long)]
         json: bool,
     },
@@ -457,7 +492,7 @@ enum SessionsAction {
     /// bytes have not changed since the last run are served from the catalog.
     /// The summary `scope` echoes the request; `locations_run` reports the
     /// connector locations that executed. `--remote` requires at least one
-    /// configured remote connector (see docs/remote-connectors.md); `--all`
+    /// configured remote connector (see docs/source-plugins.md); `--all`
     /// runs local adapters plus every configured connector.
     Discover {
         #[command(flatten)]
@@ -719,6 +754,11 @@ pub fn run() -> Result<()> {
             role,
             agent,
             human,
+            since_ms,
+            until_ms,
+            after_ms,
+            after_id,
+            after_match_source,
             limit,
             fts,
             json,
@@ -734,6 +774,9 @@ pub fn run() -> Result<()> {
                     source,
                     project,
                     tag,
+                    since_ms,
+                    until_ms,
+                    after: history_cursor(after_ms, after_id, after_match_source),
                     limit,
                     ..Default::default()
                 },
@@ -755,6 +798,10 @@ pub fn run() -> Result<()> {
             source,
             project,
             tag,
+            since_ms,
+            until_ms,
+            after_ms,
+            after_id,
             json,
         } => {
             validate_source(source.as_deref())?;
@@ -765,6 +812,9 @@ pub fn run() -> Result<()> {
                     source,
                     project,
                     tag,
+                    since_ms,
+                    until_ms,
+                    after: history_cursor(after_ms, after_id, None),
                     limit: n,
                     ..Default::default()
                 },
@@ -1547,6 +1597,21 @@ fn print_entries(rows: Vec<HistoryEntry>, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// The keyset cursor `--after-ms`/`--after-id` name, if given. clap pairs the
+/// two flags; an unknown match source is left for `QueryFilter::validate` so
+/// the CLI reports the same `INVALID_ARGUMENT` message as the SDK and MCP.
+fn history_cursor(
+    after_ms: Option<i64>,
+    after_id: Option<i64>,
+    match_source: Option<String>,
+) -> Option<HistoryCursor> {
+    Some(HistoryCursor {
+        timestamp_ms: after_ms?,
+        id: after_id?,
+        match_source,
+    })
+}
+
 fn resolve_search_role(raw: &str, agent: bool, human: bool) -> Result<SearchRole> {
     anyhow::ensure!(
         !(agent && human),
@@ -1558,14 +1623,7 @@ fn resolve_search_role(raw: &str, agent: bool, human: bool) -> Result<SearchRole
     if human {
         return Ok(SearchRole::User);
     }
-    match raw {
-        "all" => Ok(SearchRole::All),
-        "user" => Ok(SearchRole::User),
-        "assistant" => Ok(SearchRole::Assistant),
-        other => anyhow::bail!(
-            "ai-hist search: --role must be one of user, assistant, all (got {other})"
-        ),
-    }
+    SearchRole::parse(raw).map_err(|error| anyhow::anyhow!("ai-hist search: --role: {error}"))
 }
 
 fn print_search_rows(rows: Vec<SearchRow>, as_json: bool) -> Result<()> {
@@ -1573,20 +1631,20 @@ fn print_search_rows(rows: Vec<SearchRow>, as_json: bool) -> Result<()> {
         let out = rows
             .iter()
             .map(|row| {
-                let mut value = json!({
+                // Provenance is always present: `id` is only unique within
+                // its `match_source` table, so a consumer comparing results
+                // across surfaces needs the pair.
+                json!({
                     "id": row.id,
                     "source": row.source,
                     "session_id": row.session_id,
                     "project": row.project,
                     "prompt": row.text,
                     "timestamp_ms": row.timestamp_ms,
-                });
-                if row.match_source != "history" {
-                    value["role"] = json!(row.role);
-                    value["kind"] = json!(row.kind);
-                    value["match_source"] = json!(row.match_source);
-                }
-                value
+                    "role": row.role,
+                    "kind": row.kind,
+                    "match_source": row.match_source,
+                })
             })
             .collect::<Vec<_>>();
         println!("{}", serde_json::to_string(&out)?);

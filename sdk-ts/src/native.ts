@@ -19,7 +19,7 @@ import {
   ConnectorFailureError,
 } from './sdk-common.js';
 
-export const NATIVE_CONTRACT_VERSION = 22;
+export const NATIVE_CONTRACT_VERSION = 25;
 type UnknownRecord = Record<string, unknown>;
 
 interface NativeBinding {
@@ -33,7 +33,9 @@ interface NativeBinding {
   nativeBuildProfile?(): string;
   sessionStoreCall(op: string, argsJson: string): Promise<string>;
   search(query: string, options?: object): Promise<UnknownRecord[]>;
+  searchPage(query: string, options?: object): Promise<UnknownRecord>;
   recent(options?: object): Promise<UnknownRecord[]>;
+  recentPage(options?: object): Promise<UnknownRecord>;
   getSession(sessionId: string, options?: object): Promise<UnknownRecord[]>;
   getSessionEventsPage(sessionId: string, options?: object): Promise<UnknownRecord>;
   getSessionToolCallsPage(source: string, sessionId: string, options?: object): Promise<UnknownRecord>;
@@ -140,6 +142,8 @@ export const SESSION_STORE_OPS = Object.freeze({
   usageSummary: 'usage_summary',
   userTurns: 'user_turns',
   capabilities: 'capabilities',
+  changes: 'changes',
+  commitChanges: 'commit_changes',
 } as const);
 export type SessionStoreOp = (typeof SESSION_STORE_OPS)[keyof typeof SESSION_STORE_OPS];
 
@@ -158,11 +162,35 @@ export interface SessionStoreCallArgs {
 }
 
 /**
+ * The change feed's argument documents. The feed is store-wide rather than
+ * one source's, so these carry no `source`: `changes` reads a page from
+ * `from` (`'start'`, `'consumer'` or a watermark), and `commit_changes` moves
+ * the named cursor to a page's `position`.
+ */
+export interface ChangeFeedCallArgs {
+  dbPath?: string;
+  from?: 'start' | 'consumer' | { epoch: string; revision: number };
+  consumer?: string;
+  kinds?: string[];
+  session?: { source: string; sessionId: string };
+  limit?: number;
+}
+export interface CommitChangesCallArgs {
+  dbPath?: string;
+  consumer: string;
+  kinds?: string[];
+  position: { epoch: string; revision: number };
+}
+
+/**
  * One JSON request against the native `SessionStore` facade. The answer has
  * the same camelCase shape the typed native functions return, so the callers
  * normalize it with the same functions.
  */
-export async function sessionStoreCall(op: SessionStoreOp, args: SessionStoreCallArgs): Promise<UnknownRecord> {
+export async function sessionStoreCall(
+  op: SessionStoreOp,
+  args: SessionStoreCallArgs | ChangeFeedCallArgs | CommitChangesCallArgs,
+): Promise<UnknownRecord> {
   return nativeCall(async (native) => {
     const answer = await native.sessionStoreCall(op, JSON.stringify(args));
     const parsed: unknown = JSON.parse(answer);

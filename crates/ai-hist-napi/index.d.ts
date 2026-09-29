@@ -9,7 +9,9 @@ export declare function historyExport(requestJson: string, dbPath?: string | und
  *
  * `op` names the read (`markers`, `requests`, `usage_summary`, `user_turns`,
  * `capabilities`) and `args_json` carries `{dbPath?, source, sessionId?,
- * limit?, after?}`. The answer is the same camelCase document the matching
+ * limit?, after?}`; the change feed's `changes` and `commit_changes` read
+ * `{dbPath?, from?, consumer?, kinds?, session?, limit?}` and
+ * `{dbPath?, consumer, kinds?, position}` (see `change_feed.rs`). The answer is the same camelCase document the matching
  * typed function returns. A missing database answers an empty page, never an
  * error, and never creates the file.
  */
@@ -24,13 +26,33 @@ export declare function nativeContractVersion(): number
  * Performance measurements are only meaningful against `release`.
  */
 export declare function nativeBuildProfile(): string
+/**
+ * Where a newest-first history read stopped: its last row's
+ * `(timestampMs, id)` and, for a search match, its `matchSource`.
+ */
+export interface NativeHistoryCursor {
+  timestampMs: number
+  id: number
+  /** `history` (the default when absent) or `session_event`. */
+  matchSource?: string
+}
 export interface HistoryQueryOptions {
   scope?: string
   dbPath?: string
   source?: string
   project?: string
   tag?: string
+  /**
+   * Deprecated: exclusive, so it skips rows tied on the boundary
+   * timestamp. Page with `after` instead.
+   */
   beforeMs?: number
+  /** Inclusive lower timestamp bound. */
+  sinceMs?: number
+  /** Inclusive upper timestamp bound. */
+  untilMs?: number
+  /** Continue after this row (the previous page's `nextCursor`). */
+  after?: NativeHistoryCursor
   limit?: number
 }
 export interface SearchOptions {
@@ -39,9 +61,31 @@ export interface SearchOptions {
   source?: string
   project?: string
   tag?: string
+  /**
+   * Deprecated: exclusive, so it skips rows tied on the boundary
+   * timestamp. Page with `after` instead.
+   */
   beforeMs?: number
+  /** Inclusive lower timestamp bound. */
+  sinceMs?: number
+  /** Inclusive upper timestamp bound. */
+  untilMs?: number
+  /** Continue after this match (the previous page's `nextCursor`). */
+  after?: NativeHistoryCursor
   limit?: number
   rawFts?: boolean
+  /** `all` (default), `user`, `assistant` or `prompt` — the CLI's `--role`. */
+  role?: string
+}
+export interface NativeSearchPage {
+  matches: Array<NativeSearchMatch>
+  /** Present only when a further match exists. */
+  nextCursor?: NativeHistoryCursor
+}
+export interface NativeHistoryPage {
+  entries: Array<NativeHistoryEntry>
+  /** Present only when a further entry exists. */
+  nextCursor?: NativeHistoryCursor
 }
 export interface SessionOptions {
   dbPath?: string
@@ -56,6 +100,29 @@ export interface NativeHistoryEntry {
   prompt: string
   timestampMs: number
   locations: Array<string>
+}
+/**
+ * One `search` match. `id` is unique only within `match_source`: a prompt
+ * is a `history` row, anything else a `session_event` row.
+ */
+export interface NativeSearchMatch {
+  id: number
+  source: string
+  sessionId?: string
+  project?: string
+  /**
+   * The matched text: the prompt for a `history` match, the event text
+   * otherwise. Named `prompt` so a match is still a history entry.
+   */
+  prompt: string
+  timestampMs: number
+  locations: Array<string>
+  /** `history` or `session_event`. */
+  matchSource: string
+  /** `user` for a `history` match; the event's role otherwise. */
+  role: string
+  /** `history` for a `history` match; the event's kind otherwise. */
+  kind: string
 }
 export interface NativeSessionEvent {
   id: number
@@ -364,10 +431,17 @@ export interface StatsOptions {
    */
   byCwd?: boolean
 }
-/** Full-text search of indexed history. Never discovers or syncs implicitly. */
-export declare function search(query: string, options?: SearchOptions | undefined | null): Promise<Array<NativeHistoryEntry>>
+/**
+ * Full-text search of indexed prompts and session events. Never discovers or
+ * syncs implicitly. Same contract as `ai-hist search`.
+ */
+export declare function search(query: string, options?: SearchOptions | undefined | null): Promise<Array<NativeSearchMatch>>
+/** One page of `search`, newest first, with the cursor to the next page. */
+export declare function searchPage(query: string, options?: SearchOptions | undefined | null): Promise<NativeSearchPage>
 /** Recent indexed history. Never discovers or syncs implicitly. */
 export declare function recent(options?: HistoryQueryOptions | undefined | null): Promise<Array<NativeHistoryEntry>>
+/** One page of `recent`, newest first, with the cursor to the next page. */
+export declare function recentPage(options?: HistoryQueryOptions | undefined | null): Promise<NativeHistoryPage>
 /** Indexed prompts for one session. Event payloads are separately paginated. */
 export declare function getSession(sessionId: string, options?: SessionOptions | undefined | null): Promise<Array<NativeHistoryEntry>>
 /** One bounded page of normalized events for a session. */

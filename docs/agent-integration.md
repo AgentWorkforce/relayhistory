@@ -17,7 +17,13 @@ Use these public operations:
 - `discoverSessions()` / MCP `discover_sessions` to refresh shallow provider
   metadata.
 - `search()`, `recent()`, `getSession()`, and `getSessionEventsPage()` for
-  indexed history reads.
+  indexed history reads. `search()`, MCP `search_history` and `ai-hist search`
+  share one contract: prompts and session events, filtered by `role`
+  (`all`, `user`, `assistant`, `prompt`), with each match's `matchSource`,
+  `role` and `kind`. Page them with `searchPage()` / `recentPage()` and the
+  returned `nextCursor` (MCP: pass the last row's `timestampMs`, `id` and
+  `matchSource` as `after`), and bound them with inclusive `sinceMs` /
+  `untilMs`. `beforeMs` is deprecated: it skips rows tied on its timestamp.
 - `getSessionRelationships()` / MCP `get_session_relationships` and
   `getSessionTree()` / MCP `get_session_tree` for delegation topology, plus
   the SDK-only `getSessionChildrenPage()`, `sessionDescendants()`, and
@@ -40,7 +46,7 @@ lookups are identity-based and scope-independent.
 
 Remote discovery and remote sync run through provider connectors
 (claude.ai/code web sessions and Codex cloud tasks — see
-[Remote connectors](remote-connectors.md)). A `remote`-only request on a
+[Remote connectors](source-plugins.md)). A `remote`-only request on a
 machine with no connector configured fails explicitly, and integrations must
 surface that error rather than retrying locally; an `all` request runs
 whatever is configured and skips remote quietly on absence — `locationsRun`

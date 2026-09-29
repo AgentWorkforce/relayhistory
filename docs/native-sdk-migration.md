@@ -40,7 +40,7 @@ exclusive `--local`, `--remote`, and `--all` flags. Local and remote rows live
 in one ledger and represent presences of the same session, so `all` is
 deduplicated. Direct session and event lookup does not take a scope. Remote
 discovery and sync require explicitly installed source plugins
-([Source plugins](remote-connectors.md)); provider or commercial login does not
+([Source plugins](source-plugins.md)); provider or commercial login does not
 select them. `all` acquisition runs local adapters and the selected plugins.
 
 The acquisition result's `scope` echoes what was requested; the separate

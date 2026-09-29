@@ -11,7 +11,7 @@ import {
   hydrateSession, listSessionCatalogPage, recent, resumeCommand, search, stats, sync,
   type CatalogCursor, type EvidenceCursor, type HistoryEntry, type LocalStoreReadiness,
   type SessionFileEditsPage, type SessionMarkersPage, type SessionRelationship, type SessionScope,
-  type SessionToolCallsPage, type SessionUsage,
+  type SessionToolCallsPage, type SessionUsage, type SearchRole, type HistoryCursor,
 } from './index.js';
 import { runHistoryExportCommand, loadHistoryApplicationConfig } from './delivery-cli.js';
 
@@ -50,7 +50,7 @@ type PackageMetadata = { version?: string };
 export const BOOLEAN_FLAGS = new Set(['all', 'by-cwd', 'fts', 'help', 'json', 'local', 'no-bootstrap', 'no-related', 'no-source-connectors', 'no-warning', 'once', 'pretty', 'remote', 'version']);
 export const VALUE_FLAGS = new Set([
   'config', 'selection', 'interval', 'out', 'after', 'after-ms', 'after-session-id', 'after-source', 'before-ms', 'db', 'limit',
-  'max-depth', 'max-nodes', 'config', 'source-connector', 'project', 'source', 'tag', 'tokens',
+  'max-depth', 'max-nodes', 'config', 'source-connector', 'project', 'role', 'since-ms', 'source', 'tag', 'tokens', 'until-ms',
   // Documented in the usage text and read by `sessions discover`, `sessions
   // hydrate` and `sync`, but absent here, so `parse` rejected it as unknown.
   'acquisition-timeout-ms',
@@ -207,6 +207,8 @@ function common(args: Parsed) {
     tag: textFlag(args, 'tag'),
     limit: numberFlag(args, 'limit'),
     beforeMs: numberFlag(args, 'before-ms'),
+    sinceMs: numberFlag(args, 'since-ms'),
+    untilMs: numberFlag(args, 'until-ms'),
   };
 }
 
@@ -229,7 +231,12 @@ export function humanLine(value: unknown): string {
   if (!value || typeof value !== 'object') return String(value);
   const row = value as Record<string, unknown>;
   const locations = Array.isArray(row.locations) ? `[${row.locations.join(',')}]` : '';
-  return [row.timestampMs ?? row.lastActivityMs ?? '', row.source ?? '', locations, row.sessionId ?? '', row.project ?? row.cwd ?? '', row.prompt ?? row.firstPrompt ?? '']
+  // A search match that is a session event, not a prompt, says which event it
+  // is, as the Rust CLI labels it: `source:role:kind`.
+  const source = row.matchSource != null && row.matchSource !== 'history'
+    ? `${row.source ?? ''}:${row.role ?? ''}:${row.kind ?? ''}`
+    : row.source ?? '';
+  return [row.timestampMs ?? row.lastActivityMs ?? '', source, locations, row.sessionId ?? '', row.project ?? row.cwd ?? '', row.prompt ?? row.firstPrompt ?? '']
     .filter((item) => item !== '' && item != null)
     .join('  ');
 }
@@ -264,8 +271,8 @@ const USAGE_TEXT = `Usage:
   ai-hist sessions edits SOURCE SESSION_ID [--limit N] [--after JSON] [--db PATH] [--json]
   ai-hist sessions markers SOURCE SESSION_ID [--limit N] [--after JSON] [--db PATH] [--json]
   ai-hist sessions usage SOURCE SESSION_ID [--db PATH] [--json]
-  ai-hist search QUERY... [--local | --remote | --all] [--source SOURCE] [--project PATH] [--limit N] [--json]
-  ai-hist recent [N] [--local | --remote | --all] [--source SOURCE] [--project PATH] [--json]
+  ai-hist search QUERY... [--local | --remote | --all] [--source SOURCE] [--project PATH] [--role all|user|assistant|prompt] [--fts] [--since-ms MS] [--until-ms MS] [--after JSON] [--limit N] [--json]
+  ai-hist recent [N] [--local | --remote | --all] [--source SOURCE] [--project PATH] [--since-ms MS] [--until-ms MS] [--after JSON] [--json]
   ai-hist session SESSION_ID [--source SOURCE] [--json]
   ai-hist events SESSION_ID [--source SOURCE] [--limit N] [--after JSON] [--json]
   ai-hist resume QUERY... [--local | --remote | --all] [--db PATH] [--fts] [--json]
@@ -289,6 +296,24 @@ function usage(message?: string): never {
 function cursorFlag<T>(args: Parsed): T | undefined {
   const raw = textFlag(args, 'after');
   return raw ? JSON.parse(raw) as T : undefined;
+}
+
+// `search`/`recent` --json rows are snake_case, so --after takes a row's
+// `timestamp_ms`/`id`/`match_source` or the SDK's camelCase cursor.
+function historyCursorFlag(args: Parsed): HistoryCursor | undefined {
+  const raw = cursorFlag<Record<string, unknown>>(args);
+  if (raw === undefined) return undefined;
+  const timestampMs = raw?.timestampMs ?? raw?.timestamp_ms;
+  const matchSource = raw?.matchSource ?? raw?.match_source;
+  if (!Number.isInteger(timestampMs) || !Number.isInteger(raw.id)) {
+    throw new Error('--after must be a JSON cursor with integer timestamp_ms (or timestampMs) and id');
+  }
+  // Any string is passed on: the native cursor validation rejects an unknown
+  // source with the same INVALID_ARGUMENT the SDK and MCP report.
+  if (matchSource != null && typeof matchSource !== 'string') {
+    throw new Error('--after match_source must be a string');
+  }
+  return { timestampMs: timestampMs as number, id: raw.id as number, ...(matchSource != null ? { matchSource } : {}) } as HistoryCursor;
 }
 
 function catalogCursorFlag(args: Parsed): CatalogCursor | undefined {
@@ -515,6 +540,7 @@ async function runResume(io: CliIo, args: Parsed, subcommand: string | undefined
   // one row is checked for a usable session id rather than scanning further.
   const rows = await search(query.join(' '), {
     dbPath: textFlag(args, 'db'), scope: scopeFlag(args), rawFts: args.flags.has('fts'), limit: 1,
+    role: 'prompt',
   });
   const entry = rows.find((row) => row.sessionId);
   if (!entry) throw new Error('No session found');
@@ -570,7 +596,7 @@ async function runPack(io: CliIo, args: Parsed, subcommand: string | undefined, 
   // The native Pack command defaults its own limit to 10, distinct from
   // search()'s general-purpose default of 20 — match Pack specifically.
   const rows = await search(queryStr, {
-    ...common(args), limit: numberFlag(args, 'limit') ?? 10, rawFts: args.flags.has('fts'),
+    ...common(args), limit: numberFlag(args, 'limit') ?? 10, rawFts: args.flags.has('fts'), role: 'prompt',
   });
   if (rows.length === 0) {
     if (json) {
@@ -716,7 +742,7 @@ export const FLAG_SPECS: Record<string, { flags: string; description: string }> 
   'after-session-id': { flags: '--after-session-id <id>', description: 'Cursor session id, with --after-source.' },
   'after-source': { flags: '--after-source <source>', description: 'Cursor source, with --after-session-id.' },
   all: { flags: '--all', description: 'Read local and remote history.' },
-  'before-ms': { flags: '--before-ms <ms>', description: 'Only entries older than this epoch-millisecond timestamp.' },
+  'before-ms': { flags: '--before-ms <ms>', description: 'Deprecated: only entries older than this timestamp; skips ties. Use --after.' },
   config: { flags: '--config <file>', description: 'History application config file.' },
   db: { flags: '--db <path>', description: 'History database to read or write.' },
   fts: { flags: '--fts', description: 'Treat the query as raw SQLite full-text syntax.' },
@@ -733,6 +759,9 @@ export const FLAG_SPECS: Record<string, { flags: string; description: string }> 
   'by-cwd': { flags: '--by-cwd', description: 'Group projects by working directory instead of canonical project key.' },
   project: { flags: '--project <value>', description: 'Restrict to one project: a canonical project key for `sessions list`, a project path elsewhere.' },
   remote: { flags: '--remote', description: 'Read only remote history.' },
+  role: { flags: '--role <role>', description: 'Match all (default), user, assistant or prompt rows.' },
+  'since-ms': { flags: '--since-ms <ms>', description: 'Only entries at or after this epoch-millisecond timestamp.' },
+  'until-ms': { flags: '--until-ms <ms>', description: 'Only entries at or before this epoch-millisecond timestamp.' },
   selection: { flags: '--selection <file>', description: 'Export selection file.' },
   source: { flags: '--source <source>', description: 'Restrict to one coding-agent source.' },
   'source-connector': { flags: '--source-connector <id>', description: 'Run this remote connector; repeatable.' },
@@ -791,10 +820,10 @@ export const COMMANDS = new Map<string, CommandSpec>([
   ['sessions usage', { name: 'sessions usage', description: 'Provider-reported token usage rollup for a session; cost is never computed.',
     surface: ['usage'], positionals: [2, 2], args: [{ name: 'source', description: 'Coding-agent source, e.g. claude or codex.', required: true }, { name: 'session-id', description: 'Session identifier.', required: true }], readsLocalStore: true,
     requires: 'sessions usage requires SOURCE and SESSION_ID', allowed: ['db', 'json'] }],
-  ['search', { name: 'search', description: 'Search indexed prompts.', surface: ['search'],
+  ['search', { name: 'search', description: 'Search indexed prompts and session events.', surface: ['search'],
     positionals: [1, null], args: [{ name: 'query', description: 'Search terms.', required: true, variadic: true }],
     requires: 'search requires a query', readsLocalStore: true,
-    allowed: ['all', 'before-ms', 'db', 'fts', 'json', 'limit', 'local', 'project', 'remote', 'source', 'tag'] }],
+    allowed: ['after', 'all', 'before-ms', 'db', 'fts', 'json', 'limit', 'local', 'project', 'remote', 'role', 'since-ms', 'source', 'tag', 'until-ms'] }],
   ['recent', { name: 'recent', description: 'Show the most recent prompts.', surface: ['recent'],
     positionals: [0, 1], args: [{ name: 'count', description: 'How many to show.', required: false }],
     readsLocalStore: true,
@@ -804,7 +833,7 @@ export const COMMANDS = new Map<string, CommandSpec>([
         usage(`recent count must be a number (got '${count}')`);
       }
     },
-    allowed: ['all', 'before-ms', 'db', 'json', 'limit', 'local', 'project', 'remote', 'source', 'tag'] }],
+    allowed: ['after', 'all', 'before-ms', 'db', 'json', 'limit', 'local', 'project', 'remote', 'since-ms', 'source', 'tag', 'until-ms'] }],
   // `agent-relay sessions session ID` reads badly, so the mounted spelling is
   // `show`; the original name stays as an alias for existing muscle memory.
   ['session', { name: 'session', description: 'Show one session.', surface: ['show'], surfaceAliases: ['session'],
@@ -1065,11 +1094,16 @@ async function dispatch(argv: readonly string[], io: CliIo, options: RunCliOptio
     return 0;
   }
   if (command === 'search') {
-    output(io, await search([subcommand, ...rest].join(' '), { ...common(args), rawFts: args.flags.has('fts') }), json);
+    output(io, await search([subcommand, ...rest].join(' '), {
+      ...common(args), rawFts: args.flags.has('fts'), role: textFlag(args, 'role') as SearchRole | undefined,
+      after: historyCursorFlag(args),
+    }), json);
     return 0;
   }
   if (command === 'recent') {
-    output(io, await recent({ ...common(args), limit: numberFlag(args, 'limit') ?? recentFallback }), json);
+    output(io, await recent({
+      ...common(args), limit: numberFlag(args, 'limit') ?? recentFallback, after: historyCursorFlag(args),
+    }), json);
     return 0;
   }
   if (command === 'session') {

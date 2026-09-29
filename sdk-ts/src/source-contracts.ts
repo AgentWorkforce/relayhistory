@@ -44,7 +44,20 @@ export interface SourceEvidenceSnapshot {
 export interface HistorySource {
   id: string;
   instanceId: string;
-  location: 'remote';
+  /**
+   * `remote` sources run only for `remote` and `all` scope requests. `local`
+   * sources read this machine's own files and run for `local` and `all`
+   * scope, beside the built-in parsers, with their sessions presented as
+   * local. Default and `local` scope never invoke a remote source.
+   */
+  location: SessionLocation;
+  /**
+   * Required for a `local` source, ignored for a `remote` one: the absolute
+   * directories this source reads. Every `raw_path` it reports must lie inside
+   * one of them, or its discovery is rejected, so a local plugin cannot point
+   * the catalog at files it did not declare.
+   */
+  roots?: readonly string[];
   supportedSources: readonly CatalogSource[];
   discover(options: {
     sources?: CatalogSource[];

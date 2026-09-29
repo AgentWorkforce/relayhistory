@@ -23,7 +23,8 @@ The config is resolved beside its installed node_modules. MCP loads it only when
 results in `HistoryPluginRegistry` and pass `plugins` on acquisition calls.
 `sourceConnectors` selects IDs, or `id:instance` for one instance; omitted means
 all explicitly registered sources. `[]` disables remotes. Default/local scope
-never invokes remote callbacks. Cached search, recent, catalog and stats preserve
+never invokes remote callbacks; it runs only the local source plugins described
+below. Cached search, recent, catalog and stats preserve
 local/remote/all independently of auth.
 
 The local native engine does not contain remote transports. A remote request
@@ -55,3 +56,49 @@ Partial evidence is reported as partial capability.
 A plugin may also register destinations (`HistoryDestination`), separately from
 sources: a custom service can receive history without providing remote
 discovery, or expose a source without accepting history.
+
+## Local source plugins
+
+A source plugin can also read this machine's own files. That is how a harness
+store the built-in parsers do not know about — a host application that keeps
+Claude Code transcripts in its own directory, say — reaches the catalog
+without a core release. Declare `location: 'local'` and the absolute
+directories the source reads:
+
+```js
+export function createHistoryPlugin({ root }) {
+  return { sources: [{
+    id: 'host-app', instanceId: 'default', location: 'local', roots: [root],
+    supportedSources: ['claude'],
+    async discover() { /* { observations: [{ source, session_id, raw_path, source_stamp }] } */ },
+    async hydrate(observation) { /* a SourceEvidenceSnapshot */ },
+  }] };
+}
+```
+
+- **Scope.** A local source runs for `local` scope — which is the default — and
+  for `all`, beside the built-in parsers. It never runs for `remote`, and a
+  remote source still never runs for `local` or default scope. A request that
+  registers no local source keeps the native-only path. `sourceConnectors: []`
+  opts out of local sources the same way it opts out of remotes.
+- **Roots.** Registration refuses a local source without a nonempty `roots`
+  list of absolute paths. Every `raw_path` its discovery reports, and every
+  `raw_locator` that is an absolute path, must resolve inside one of them; a
+  discovery that names any other path is rejected whole and reported as that
+  connector's diagnostic, so a plugin cannot point the catalog at files it did
+  not declare. The check is lexical: it is an integrity check on what the
+  plugin reports, not a sandbox around in-process plugin code.
+- **Source filters.** A local source that supports none of a request's
+  `sources` is not run for it, and the native pass answers alone.
+- **Identity.** Sessions are keyed by an existing source (`supportedSources`
+  is a `CatalogSource`) and are presented with `locations: ['local']`. The
+  evidence goes through the same intake as a remote snapshot — the same
+  validation, revision fence and per-connector provenance — so a session seen
+  by both a local plugin and the built-in parser is still one session.
+- **Hydration.** The built-in parser is asked first; the plugin then adds what
+  it holds for the same identity. A session only the plugin observed, or one
+  the built-in adapter cannot hydrate (`relay`), hydrates from the plugin
+  alone.
+
+`sdk-ts/fixtures/local-source-plugin` is a complete, dependency-free example,
+and `sdk-ts/src/local-source-plugins.test.ts` runs it end to end.

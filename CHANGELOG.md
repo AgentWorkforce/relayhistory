@@ -6,6 +6,57 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Breaking
 
+- One search contract for the CLI, the SDK and MCP (#66). The SDK's
+  `search()` and MCP `search_history` now run `history_search::search_all`,
+  the query the CLI's `search` already used. They match session events
+  (assistant text, tool calls and results) as well as prompts, apply the same
+  filters (including `beforeMs`) to both, and order ties by
+  `(timestamp, id, match source)`. Each result is a `SearchMatch`, which is a
+  `HistoryEntry` plus `matchSource` (`history` | `session_event`), `role` and
+  `kind`; `id` is unique only within `matchSource`.
+  - `search` accepts `role`: `all` (default), `user`, `assistant`, or the new
+    `prompt` (prompts only). `resume` and `pack` search with `prompt`, as the
+    native CLI's resume and pack do. `ai-hist search --role` on both CLIs
+    accepts the same four values.
+  - MCP `search_history` gains `role`, `raw_fts` and `before_ms`. Its
+    description now says exactly what a query means instead of "prompts".
+  - A prompt that a hydrated session also recorded as a user text event
+    matches once, as its `history` row. The event is a copy only when it is
+    the same turn -- same session, same timestamp, same text up to
+    surrounding whitespace -- so a later turn repeating the text still
+    matches, and it is dropped only when the prompt is itself a match of the
+    same search (same query, same filters).
+  - An ordinary (non-raw) query matches an event's `text` and `project`, as a
+    prompt's `prompt` and `project`; it no longer matches the indexed `role`,
+    so searching for `assistant` or `user` does not return every event of
+    that role.
+  - The native CLI's `search --json` always emits `role`, `kind` and
+    `match_source`, including on `history` matches.
+- Native contract 22 -> 23: `search` returns `NativeSearchMatch` rows and
+  takes `role`. An SDK paired with an addon of the other contract fails at
+  load with `NATIVE_CONTRACT_MISMATCH`.
+- Keyset pagination and inclusive time windows for history reads (#67).
+  Native contract 23 -> 24.
+  - `search` and `recent` take `sinceMs`/`untilMs` (inclusive) and an
+    `after` cursor `{ timestampMs, id, matchSource? }` on every surface: SDK
+    options, MCP `search_history`/`recent_history` (`since_ms`, `until_ms`,
+    `after`), `--since-ms`/`--until-ms`/`--after` on the TS CLI, and
+    `--since-ms`/`--until-ms`/`--after-ms`/`--after-id` (and
+    `--after-match-source` on `search`) on the native CLI.
+  - New SDK `searchPage()`/`recentPage()` (napi `searchPage`/`recentPage`)
+    return `{ matches | entries, nextCursor }`. `nextCursor` comes from
+    over-fetching one row, and is `null` when nothing further exists.
+  - Every newest-first read orders by `(timestamp, id)`, and the cursor
+    predicate uses the same tuple. Rows sharing a timestamp, such as every
+    prompt of a Cursor transcript, page without skips or repeats.
+    `getSession` orders ties by id.
+  - `sinceMs > untilMs` and a cursor with an unknown `matchSource` are
+    `INVALID_ARGUMENT`, with the same message on every surface.
+  - `beforeMs`/`before_ms`/`--before-ms` keep their exclusive semantics but
+    are deprecated: they skip rows tied on the boundary timestamp.
+- Native contract 24 -> 25. The `sessionStoreCall` dispatcher gains the
+  change feed ops `changes` and `commit_changes`. An SDK paired with an addon
+  of the other contract fails at load with `NATIVE_CONTRACT_MISMATCH`.
 - Native contract 21 -> 22. `historyExport` serves snapshots that each hold
   one read transaction, emits schema-version-2 records, and no longer accepts
   the upload-journal operations. An SDK paired with an addon of the other
@@ -151,6 +202,38 @@ Notable changes to the native `ai-hist` CLI are documented here.
 - `ai-hist doctor` reports `reclaimable` (`reclaimable_bytes` under `--json`),
   the freelist bytes a `compact` would return. It points at `compact` when at
   least 64 MiB and a quarter of the file are free pages.
+
+- The SDK reads the revision-stamped change feed (`SessionStore::changes_since`):
+  `getChangesPage` returns one bounded page (`changes`, `position`, `head`,
+  `done`) from `'start'`, a named `consumer` cursor or a kept `Watermark`, with
+  `kinds` and single-`session` filters; `changesSince` iterates it page by
+  page; `commitChanges(consumer, position)` acknowledges a page, forward-only
+  and bound to the cursor's kind set. Each `FeedChange` carries `kind`,
+  `source`/`sourceName`, `sessionId`, `recordKey`, `key`, `revision`, `op` and
+  the row as stored in `columns`; `source` is any known `Source`, trajectory
+  included, and null only for a source this SDK does not know. `done` means
+  nothing the page's filters select is left, so a filtered drain ends on its
+  last match rather than one empty page later. A database written before the
+  feed existed is migrated on its first page instead of refused. Exported with
+  `CHANGE_KINDS` and the `ChangeKind`, `Watermark`, `FeedChange`, `ChangesPage`
+  and `CommittedCursor` types.
+
+- Local source plugins (#177). A `HistorySource` may declare
+  `location: 'local'` with the absolute `roots` it reads; it runs for `local`
+  (the default) and `all` scope beside the built-in parsers, never for
+  `remote`, and its sessions are catalogued with `locations: ['local']`
+  through the same normalized evidence intake as a remote snapshot.
+  Registration refuses a local source without absolute roots, and a discovery
+  that reports a `raw_path` (or an absolute `raw_locator`) outside them is
+  rejected as that connector's diagnostic. A local source that supports none
+  of a request's `sources` is not run for it, and a `relay` session a local
+  source holds hydrates from it even when the built-in adapter has catalogued
+  it too. Remote sources are unchanged and still never run for local or
+  default scope; a request that registers no local source keeps the
+  native-only path. A plugin-backed `sync` at `all` scope now reports the
+  native local pass's diagnostics and completion with its own.
+  `docs/remote-connectors.md` is now `docs/source-plugins.md`.
+
 - Add workspace-scoped agent handoffs through `create_handoff(intent)` and
   `resume_handoff(source, session_id)`. The sender emits only a session pointer
   plus one self-describing intent and origin identity; the intent tells the

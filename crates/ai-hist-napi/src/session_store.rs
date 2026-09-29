@@ -47,6 +47,8 @@ pub const SESSION_STORE_OPS: &[&str] = &[
     OP_USAGE_SUMMARY,
     OP_USER_TURNS,
     OP_CAPABILITIES,
+    crate::change_feed::OP_CHANGES,
+    crate::change_feed::OP_COMMIT_CHANGES,
 ];
 const OP_MARKERS: &str = "markers";
 const OP_REQUESTS: &str = "requests";
@@ -266,6 +268,11 @@ fn evidence_cursor(cursor: Option<CursorArgs>) -> Option<SessionEvidenceCursor> 
 /// Answer one op. Synchronous so it can be unit-tested without a runtime; the
 /// `#[napi]` wrapper moves it onto a blocking worker.
 pub(crate) fn dispatch(op: &str, args_json: &str) -> napi::Result<String> {
+    // The change feed is store-wide, not one source's, so it reads its own
+    // argument shape rather than the per-session one below.
+    if op == crate::change_feed::OP_CHANGES || op == crate::change_feed::OP_COMMIT_CHANGES {
+        return crate::change_feed::dispatch(op, args_json);
+    }
     let mut args = parse_args(args_json)?;
     let source_name = validate_identity(std::mem::take(&mut args.source), "source")?;
     let source = parse_source(&source_name)?;
@@ -432,7 +439,9 @@ pub(crate) fn dispatch(op: &str, args_json: &str) -> napi::Result<String> {
 ///
 /// `op` names the read (`markers`, `requests`, `usage_summary`, `user_turns`,
 /// `capabilities`) and `args_json` carries `{dbPath?, source, sessionId?,
-/// limit?, after?}`. The answer is the same camelCase document the matching
+/// limit?, after?}`; the change feed's `changes` and `commit_changes` read
+/// `{dbPath?, from?, consumer?, kinds?, session?, limit?}` and
+/// `{dbPath?, consumer, kinds?, position}` (see `change_feed.rs`). The answer is the same camelCase document the matching
 /// typed function returns. A missing database answers an empty page, never an
 /// error, and never creates the file.
 #[napi]

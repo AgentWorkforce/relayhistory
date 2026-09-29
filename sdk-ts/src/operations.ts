@@ -6,7 +6,56 @@ import {
   camelSourceResult,
   sourceAcquisitionTimeout,
   throwIfSourceAborted,
+  sourceConnectorsInScope,
 } from './source-plugins.js';
+import type { HistoryPluginRegistry } from './delivery-plugins.js';
+import type { HistorySource } from './source-contracts.js';
+
+/** The most rows one catalog page returns; native rejects a larger limit. */
+const CATALOG_PAGE_MAX = 1000;
+
+/**
+ * The scope an acquisition runs installed source plugins at, or `null` when it
+ * runs none and the native engine answers alone.
+ *
+ * `remote` and `all` run the selected plugins, as they always have. `local`
+ * (and the default, which is local) runs only `local` connectors, and only
+ * when one is registered and not deselected: a request that never asked for a
+ * plugin keeps the pure native path, and a remote connector is never invoked
+ * for a local request. Deselection here never throws for an unknown id,
+ * because local scope ignored `sourceConnectors` before local plugins existed.
+ *
+ * A local connector that supports none of the requested `sources` is not
+ * selected either: it has nothing to add, and selecting it would turn a
+ * source filter it does not cover into a request that fails after the native
+ * pass already answered. Remote connectors keep their existing selection.
+ */
+function pluginScope(
+  plugins: HistoryPluginRegistry | undefined,
+  scope: SessionScope | undefined,
+  ids: readonly string[] | undefined,
+  sources?: readonly CatalogSource[],
+): { scope: SessionScope; selected: HistorySource[] } | null {
+  if (!plugins) return null;
+  const covers = (connector: HistorySource) =>
+    connector.location !== 'local' ||
+    sources === undefined ||
+    connector.supportedSources.some((source) => sources.includes(source));
+  if (scope === 'remote' || scope === 'all') {
+    return { scope, selected: sourceConnectorsInScope(plugins, ids, scope).filter(covers) };
+  }
+  const selected = plugins
+    .sourceConnectors()
+    .filter(
+      (connector) =>
+        connector.location === 'local' &&
+        covers(connector) &&
+        (ids === undefined ||
+          ids.includes(connector.id) ||
+          ids.includes(`${connector.id}:${connector.instanceId}`)),
+    );
+  return selected.length ? { scope: 'local', selected } : null;
+}
 /**
  * RelayHistory's public TypeScript API.
  *
@@ -50,6 +99,9 @@ export * from './git.js';
 export * from './contracts.js';
 import type {
   HistoryEntry,
+  HistoryPage,
+  SearchMatch,
+  SearchPage,
   ListOptions,
   SearchOptions,
   SessionOptions,
@@ -108,6 +160,11 @@ import type {
   SessionUserTurnsPage,
   SessionMarkersPage,
   SourceCapabilities,
+  ChangesPage,
+  ChangesPageOptions,
+  CommitChangesOptions,
+  CommittedCursor,
+  Watermark,
   Stats,
   StatsOptions,
   SyncOptions,
@@ -123,6 +180,9 @@ import {
   MAX_TREE_MAX_NODES,
   nullableString,
   historyEntry,
+  historyCursor,
+  nativeHistoryCursor,
+  searchMatch,
   catalogCursor,
   catalogSession,
   validateNativeLocation,
@@ -148,6 +208,8 @@ import {
   requestCursor,
   sessionMarker,
   sourceCapabilities,
+  changesPage,
+  committedCursor,
   catalogSource,
   relationshipType,
   identityStatus,
@@ -168,18 +230,53 @@ export async function nativeBuildProfile(): Promise<string> {
   return nativeCall(async (native) => native.nativeBuildProfile?.() ?? 'unknown');
 }
 
-export async function search(query: string, options: SearchOptions = {}): Promise<HistoryEntry[]> {
+/**
+ * Full-text search over indexed prompts and session events: the same
+ * contract, filters and `(timestampMs, id)` order as `ai-hist search`. Each
+ * match says where it was found (`matchSource`) and, for an event, its `role`
+ * and `kind`.
+ */
+export async function search(query: string, options: SearchOptions = {}): Promise<SearchMatch[]> {
   const scope = options.scope ?? 'local';
   return nativeCall(async (native) =>
-    (await native.search(query, { ...options, scope })).map(historyEntry),
+    (await native.search(query, { ...options, scope, after: nativeHistoryCursor(options.after) })).map(searchMatch),
   );
+}
+
+/**
+ * One page of `search`. Pass the returned `nextCursor` back as `after` to
+ * continue; it is `null` once no further match exists. Pages never skip or
+ * repeat a match among rows present for the whole walk; rows committed
+ * meanwhile appear wherever their `(timestampMs, id)` places them.
+ */
+export async function searchPage(query: string, options: SearchOptions = {}): Promise<SearchPage> {
+  const scope = options.scope ?? 'local';
+  return nativeCall(async (native) => {
+    const page = await native.searchPage(query, { ...options, scope, after: nativeHistoryCursor(options.after) });
+    return {
+      matches: Array.isArray(page.matches) ? page.matches.map(searchMatch) : [],
+      nextCursor: historyCursor(page.nextCursor),
+    };
+  });
 }
 
 export async function recent(options: ListOptions = {}): Promise<HistoryEntry[]> {
   const scope = options.scope ?? 'local';
   return nativeCall(async (native) =>
-    (await native.recent({ ...options, scope })).map(historyEntry),
+    (await native.recent({ ...options, scope, after: nativeHistoryCursor(options.after) })).map(historyEntry),
   );
+}
+
+/** One page of `recent`, with the same cursor contract as `searchPage`. */
+export async function recentPage(options: ListOptions = {}): Promise<HistoryPage> {
+  const scope = options.scope ?? 'local';
+  return nativeCall(async (native) => {
+    const page = await native.recentPage({ ...options, scope, after: nativeHistoryCursor(options.after) });
+    return {
+      entries: Array.isArray(page.entries) ? page.entries.map(historyEntry) : [],
+      nextCursor: historyCursor(page.nextCursor),
+    };
+  });
 }
 
 export async function getSession(
@@ -239,10 +336,16 @@ export async function discoverSessions(
 ): Promise<DiscoverResult> {
   validateAcquisition(options);
   const sourceConnectors = validateSourceConnectors(options.sourceConnectors);
-  if (options.plugins && options.scope !== undefined && options.scope !== 'local') {
-    const selected = options.plugins.sourceConnectors(options.sourceConnectors);
+  const plugins = pluginScope(
+    options.plugins,
+    options.scope,
+    options.sourceConnectors,
+    options.sources,
+  );
+  if (options.plugins && plugins) {
+    const { scope, selected } = plugins;
     const local =
-      options.scope === 'all'
+      scope !== 'remote'
         ? await discoverSessions({
             ...options,
             plugins: undefined,
@@ -250,11 +353,13 @@ export async function discoverSessions(
             sourceConnectors: [],
           })
         : null;
-    if (!selected.length && local) return { ...local, scope: 'all' };
+    if (!selected.length && local) return { ...local, scope };
     const failures: DiscoveryDiagnostic[] = [];
     let sourceFailure: RelayHistoryError | undefined;
     const runs = await discoverSourcePlugins(options.plugins, {
       ...options,
+      scope,
+      sourceConnectors: selected.map((connector) => `${connector.id}:${connector.instanceId}`),
       onUnavailable: (source, error) => {
         sourceFailure ??= error;
         failures.push({ source, locator: null, error: `${error.code}: ${error.message}` });
@@ -265,15 +370,37 @@ export async function discoverSessions(
         'No selected source plugin is available',
         'CONNECTOR_NOT_CONFIGURED',
       );
-    const page = await listSessionCatalogPage({ ...options, scope: options.scope });
+    // Native discovery returns every session it saw when no limit is given,
+    // and up to its 1-10000 acquisition limit when one is. The catalog read
+    // that stands in for it pages at most CATALOG_PAGE_MAX rows, so follow the
+    // cursor to the requested count (or the end) rather than passing an
+    // acquisition limit the catalog would reject.
+    const sessions: CatalogSession[] = [];
+    const pageLimit = () =>
+      options.limit === undefined
+        ? undefined
+        : Math.min(options.limit - sessions.length, CATALOG_PAGE_MAX);
+    let page = await listSessionCatalogPage({ ...options, scope, limit: pageLimit() });
+    sessions.push(...page.sessions);
+    while (page.nextCursor && (options.limit === undefined || sessions.length < options.limit)) {
+      page = await listSessionCatalogPage({
+        ...options,
+        scope,
+        limit: pageLimit(),
+        after: page.nextCursor,
+      });
+      sessions.push(...page.sessions);
+    }
     return {
       contractVersion: SESSION_CATALOG_CONTRACT_VERSION,
-      scope: options.scope,
+      scope,
       locationsRun: [
-        ...(local?.locationsRun ?? []),
-        ...new Set(runs.map((run) => run.connector.location)),
+        ...new Set([
+          ...(local?.locationsRun ?? []),
+          ...runs.map((run) => run.connector.location),
+        ]),
       ],
-      sessions: page.sessions,
+      sessions,
       discovered:
         (local?.discovered ?? 0) +
         runs.reduce(
@@ -358,14 +485,18 @@ export async function hydrateSession(
   }
   validateAcquisition(options);
   const sourceConnectors = validateSourceConnectors(options.sourceConnectors);
-  if (options.plugins && options.scope !== undefined && options.scope !== 'local') {
-    const selected = options.plugins
-      .sourceConnectors(sourceConnectors)
-      .filter((source) => source.supportedSources.includes(options.source));
+  const plugins = pluginScope(options.plugins, options.scope, sourceConnectors, [options.source]);
+  if (options.plugins && plugins) {
+    const selected = plugins.selected.filter((source) =>
+      source.supportedSources.includes(options.source),
+    );
     const failures: HydrationDiagnostic[] = [];
     let sourceFailure: RelayHistoryError | undefined;
     let result: HydrateSessionResult | undefined;
-    if (options.scope === 'all') {
+    // The built-in parser answers first whenever the local side is asked for;
+    // a local plugin then adds the evidence it holds for the same identity.
+    let localFailure: RelayHistoryError | undefined;
+    if (plugins.scope !== 'remote') {
       try {
         result = await hydrateSession({
           ...options,
@@ -374,10 +505,22 @@ export async function hydrateSession(
           sourceConnectors: [],
         });
       } catch (error) {
+        // A session only a local plugin observed is catalogued as local, so the
+        // built-in adapter reports that it has not observed it rather than that
+        // it does not exist. Either way the plugins below may still hold it.
         if (
-          !(error instanceof SessionNotFoundError || error instanceof SessionSourceUnavailableError)
+          !(
+            error instanceof SessionNotFoundError ||
+            error instanceof SessionSourceUnavailableError ||
+            ((error instanceof ConnectorNotConfiguredError ||
+              // The built-in adapter has no full-evidence parser for this
+              // source (relay); a plugin that supports it may still have one.
+              error instanceof HydrationUnsupportedError) &&
+              selected.length > 0)
+          )
         )
           throw error;
+        localFailure = error;
       }
     }
     if (!selected.length && result) return result;
@@ -432,7 +575,7 @@ export async function hydrateSession(
       }
     }
     if (!result)
-      throw sourceFailure ?? new SessionSourceUnavailableError(
+      throw sourceFailure ?? localFailure ?? new SessionSourceUnavailableError(
         'No selected plugin observed this session',
         'SESSION_SOURCE_UNAVAILABLE',
       );
@@ -661,6 +804,47 @@ export async function getSessionMarkersPage(
 }
 
 /**
+ * One bounded page of the revision-stamped change feed
+ * (`SessionStore::changes_since`): every row write and delete across the
+ * store, in `(revision, kind, recordKey)` order, each with the row as stored.
+ * Pass the page's `position` back as `from` for the next page. A named
+ * `consumer` resumes from its cursor inside the store, which moves only on
+ * `commitChanges`, so a page that was read but not applied is served again.
+ * A missing database is an empty, finished feed and is not created.
+ */
+export async function getChangesPage(options: ChangesPageOptions = {}): Promise<ChangesPage> {
+  return changesPage(await sessionStoreCall(SESSION_STORE_OPS.changes, {
+    dbPath: options.dbPath,
+    from: options.from === undefined || typeof options.from === 'string'
+      ? options.from
+      : { epoch: options.from.epoch, revision: options.from.revision },
+    consumer: options.consumer,
+    kinds: options.kinds ? [...options.kinds] : undefined,
+    session: options.session ? { source: options.session.source, sessionId: options.session.sessionId } : undefined,
+    limit: options.limit,
+  }));
+}
+
+/**
+ * Acknowledge everything up to `position` for a named cursor. Forward-only: a
+ * commit behind the stored cursor leaves it where it is, and the answer says
+ * where that is. The kind set must be the one the cursor was first committed
+ * for (`CONSUMER_KINDS_MISMATCH` otherwise). Needs a writable database.
+ */
+export async function commitChanges(
+  consumer: string,
+  position: Watermark,
+  options: CommitChangesOptions = {},
+): Promise<CommittedCursor> {
+  return committedCursor(await sessionStoreCall(SESSION_STORE_OPS.commitChanges, {
+    dbPath: options.dbPath,
+    consumer,
+    kinds: options.kinds ? [...options.kinds] : undefined,
+    position: { epoch: position.epoch, revision: position.revision },
+  }));
+}
+
+/**
  * What one provider's parser can record. Answered from RelayHistory's own
  * capability tables, never from a database, so it does not depend on what has
  * been synced: `evidenceKinds` is the `coverage` a hydration of this source
@@ -788,10 +972,11 @@ export async function stats(options: StatsOptions = {}): Promise<Stats> {
 export async function sync(options: SyncOptions = {}): Promise<SyncResult> {
   validateAcquisition(options);
   const sourceConnectors = validateSourceConnectors(options.sourceConnectors);
-  if (options.plugins && options.scope !== undefined && options.scope !== 'local') {
-    const selected = options.plugins.sourceConnectors(sourceConnectors);
+  const plugins = pluginScope(options.plugins, options.scope, sourceConnectors);
+  if (options.plugins && plugins) {
+    const { scope, selected } = plugins;
     const local =
-      options.scope === 'all'
+      scope !== 'remote'
         ? await sync({ ...options, plugins: undefined, scope: 'local', sourceConnectors: [] })
         : null;
     const diagnostics: DiscoveryDiagnostic[] = [];
@@ -799,6 +984,8 @@ export async function sync(options: SyncOptions = {}): Promise<SyncResult> {
     const runs = selected.length
       ? await discoverSourcePlugins(options.plugins, {
           ...options,
+          scope,
+          sourceConnectors: selected.map((connector) => `${connector.id}:${connector.instanceId}`),
           onUnavailable: (source, error) => {
             sourceFailure ??= error;
             diagnostics.push({ source, locator: null, error: `${error.code}: ${error.message}` });
@@ -830,9 +1017,11 @@ export async function sync(options: SyncOptions = {}): Promise<SyncResult> {
       }
     return {
       databasePath: local?.databasePath ?? options.dbPath ?? defaultDbPath(),
-      scope: options.scope,
-      completed: diagnostics.length === 0,
-      diagnostics,
+      scope,
+      // The native local pass is part of this sync: its diagnostics are this
+      // sync's diagnostics, and an incomplete local pass is an incomplete sync.
+      completed: (local?.completed ?? true) && diagnostics.length === 0,
+      diagnostics: [...(local?.diagnostics ?? []), ...diagnostics],
     };
   }
   return nativeCall(async (native) => {

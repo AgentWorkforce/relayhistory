@@ -10,7 +10,9 @@ import {
   ConnectorFailureError,
   ConnectorNotConfiguredError,
   type CatalogSource,
+  type SessionScope,
 } from './sdk-common.js';
+import { isAbsolute, relative, resolve, sep } from 'node:path';
 import type {
   HistorySource,
   SourceObservationKey,
@@ -20,6 +22,11 @@ import type {
 import type { HistoryPluginRegistry } from './delivery-plugins.js';
 export interface SourcePluginOptions {
   dbPath?: string;
+  /**
+   * Which connectors may run: `remote` ones for `remote`, `local` ones for
+   * `local`, both for `all`. Omitted means every selected connector.
+   */
+  scope?: SessionScope;
   sourceConnectors?: string[];
   sources?: CatalogSource[];
   sessionId?: string;
@@ -81,6 +88,55 @@ async function acquire<T>(
     signal?.removeEventListener('abort', cancel);
   }
 }
+/** Whether a connector at `location` may run for a request at `scope`. */
+export function connectorRunsInScope(connector: HistorySource, scope: SessionScope | undefined): boolean {
+  return scope === undefined || scope === 'all' || connector.location === scope;
+}
+/**
+ * The registered connectors a request at `scope` would run, after the
+ * caller's explicit `sourceConnectors` selection.
+ */
+export function sourceConnectorsInScope(
+  registry: HistoryPluginRegistry,
+  ids: readonly string[] | undefined,
+  scope: SessionScope | undefined,
+): HistorySource[] {
+  return registry.sourceConnectors(ids).filter((connector) => connectorRunsInScope(connector, scope));
+}
+/**
+ * A local connector may only name files under the roots it declared. The
+ * check is lexical, on the resolved path: it keeps a plugin from pointing the
+ * catalog at files it never said it reads, which is the same promise the
+ * built-in parsers keep by resolving every path under their provider root.
+ * It is an integrity check on what the plugin reports, not a sandbox: the
+ * plugin is in-process code that can read any file it likes.
+ *
+ * `raw_path` must be absolute and inside a root. `raw_locator` is an opaque
+ * handle the connector gets back at hydration, but the catalog presents it
+ * as the session's path, so an absolute one is held to the same rule; a
+ * relative one names no file and passes.
+ */
+function insideDeclaredRoots(connector: HistorySource, row: ShallowSourceSession): boolean {
+  if (connector.location !== 'local') return true;
+  const within = (path: string) => {
+    const target = resolve(path);
+    return (connector.roots ?? []).some((root) => {
+      const rel = relative(resolve(root), target);
+      // Only a `..` path component escapes: `..archive` is a child named so.
+      return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+    });
+  };
+  const path = row.raw_path;
+  if (path !== undefined && path !== null) {
+    if (typeof path !== 'string' || !isAbsolute(path) || !within(path)) return false;
+  }
+  const locator = row.raw_locator;
+  if (locator !== undefined && locator !== null) {
+    if (typeof locator !== 'string') return false;
+    if (isAbsolute(locator) && !within(locator)) return false;
+  }
+  return true;
+}
 export function getSourceObservation(
   key: SourceObservationKey,
   options: { dbPath?: string } = {},
@@ -98,8 +154,7 @@ export async function discoverSourcePlugins(
 ) {
   throwIfSourceAborted(options.signal);
   sourceAcquisitionTimeout(options.acquisitionTimeoutMs);
-  const selected = registry
-    .sourceConnectors(options.sourceConnectors)
+  const selected = sourceConnectorsInScope(registry, options.sourceConnectors, options.scope)
     .filter(
       (source) =>
         !options.sources ||
@@ -140,7 +195,8 @@ export async function discoverSourcePlugins(
           !row ||
           !connector.supportedSources.includes(row.source) ||
           typeof row.session_id !== 'string' ||
-          !row.session_id,
+          !row.session_id ||
+          !insideDeclaredRoots(connector, row),
       )
     ) {
       const failure = sourceAcquisitionError(null);
