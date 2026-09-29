@@ -1421,7 +1421,7 @@ fn corpus_readme_lists_every_fixture_and_quirk() {
 /// The harness registry and the corpus agree: every `LocalSource` descriptor
 /// either names a fixture directory that holds at least one staged fixture
 /// and a committed snapshot, or carries a documented fixture exemption; and
-/// every `SOURCE_CHOICES` value is a descriptor. Adding a provider without a
+/// the public `Source` enum names exactly the descriptors. Adding a provider without a
 /// fixture fails here.
 ///
 /// A source that is not a provider session at all (a trajectory, a relay row
@@ -1431,12 +1431,30 @@ fn corpus_readme_lists_every_fixture_and_quirk() {
 fn every_source_choice_has_a_fixture_or_an_exemption() {
     use ai_hist::sources::catalog::{local_source, local_sources, Fixtures};
 
-    for source in ai_hist::SOURCE_CHOICES {
-        assert!(
-            local_source(source).is_some(),
-            "SOURCE_CHOICES names {source}, which has no descriptor in sources/catalog.rs"
-        );
-    }
+    // The public `Source` enum is hand-written (it is default API), so it is
+    // the list that can drift from the registry: it must name exactly the
+    // descriptors, each once.
+    let public = ai_hist::Source::ALL
+        .iter()
+        .map(|source| source.as_str())
+        .collect::<Vec<_>>();
+    let mut public_sorted = public.clone();
+    public_sorted.sort_unstable();
+    public_sorted.dedup();
+    assert_eq!(
+        public_sorted.len(),
+        public.len(),
+        "Source::ALL repeats a source"
+    );
+    let mut descriptors = local_sources()
+        .iter()
+        .map(|descriptor| descriptor.id())
+        .collect::<Vec<_>>();
+    descriptors.sort_unstable();
+    assert_eq!(
+        public_sorted, descriptors,
+        "Source::ALL and the sources/catalog.rs descriptors name different sources"
+    );
     let staged = CORPUS
         .iter()
         .filter(|fixture| fixture.layout != Layout::Reference)
@@ -1460,6 +1478,12 @@ fn every_source_choice_has_a_fixture_or_an_exemption() {
                 "{source} is both exempt and covered; pick one"
             ),
             Fixtures::Dir(dir) => {
+                // The corpus keys fixtures and snapshots by source id, so the
+                // descriptor's directory must be that id.
+                assert_eq!(
+                    dir, source,
+                    "{source}'s fixture directory must be named after the source"
+                );
                 assert!(
                     !covering.is_empty(),
                     "{source} has no fixture under tests/fixtures/{dir} and no exemption; see \
@@ -1478,7 +1502,7 @@ fn every_source_choice_has_a_fixture_or_an_exemption() {
                         );
                     }
                     let snapshot = snapshots_root()
-                        .join(fixture.source)
+                        .join(dir)
                         .join(format!("{}.json", fixture.name));
                     assert!(
                         snapshot.is_file(),

@@ -1,28 +1,22 @@
-//! The harness registry: one [`LocalSource`] descriptor per built-in source.
+//! The harness registry: one `LocalSource` descriptor per built-in source.
 //!
-//! Everything that used to be a per-source list or `match` elsewhere in the
-//! crate is derived from [`LOCAL_SOURCES`]:
+//! These per-source tables are derived from `LOCAL_SOURCES` instead of being
+//! kept as separate lists:
 //!
 //! - `SOURCE_CHOICES` is the descriptor ids, in declaration order;
-//! - `shallow_providers()` and `DISCOVERY_EXEMPTIONS` come from
-//!   [`LocalSource::discovery`], and so does the declared evidence coverage
-//!   (`declared_evidence_kinds`), which the provider reports;
+//! - `shallow_providers()` and `DISCOVERY_EXEMPTIONS` come from each
+//!   descriptor's `discovery`;
 //! - hydration's source validation and `ingest_selected` dispatch come from
-//!   [`LocalSource::hydration`], and `validate_provider_path` from
-//!   [`LocalSource::transcript_roots`];
-//! - `relationship_capabilities` comes from [`LocalSource::relationships`];
-//! - `resume_command` comes from [`LocalSource::resume`];
-//! - the fixture-corpus and registry tests read [`LocalSource::fixtures`].
+//!   `hydration`, and `validate_provider_path` from `transcript_roots`;
+//! - `relationship_capabilities` comes from `relationships`;
+//! - `resume_command` comes from `resume`;
+//! - the fixture-corpus registry test reads `fixtures`.
 //!
-//! Adding a built-in harness means adding one entry here plus its fixture
-//! directory; see `docs/session-catalog.md`, "Adding a provider". Harnesses
-//! that live outside this crate register through
-//! [`super::SourceRegistry::register`] (Rust) or a local source plugin (JS)
-//! instead, and do not appear here.
-
-// The accessors are read by the workspace crates and tests, which enable
-// `unstable-internal`; without it some are unused by design.
-#![cfg_attr(not(feature = "unstable-internal"), allow(dead_code))]
+//! Some per-source code still lives outside the descriptor (the parsers and
+//! full-sync pass, sync watch roots, `Source`, usage accounting); see
+//! `docs/session-catalog.md`, "Adding a provider". Harnesses that live outside
+//! this crate register through `SourceRegistry::register` (Rust) or a local
+//! source plugin (JS) instead, and do not appear here.
 
 use crate::discover::{
     ClaudeProvider, CodexProvider, CursorProvider, GrokProvider, MuseProvider, OpencodeProvider,
@@ -47,8 +41,10 @@ pub struct LocalSource {
     /// What the provider's records establish about delegation.
     pub(crate) relationships: Relationships,
     /// How to reopen a session in the provider's own CLI, if it has one.
+    #[cfg_attr(not(feature = "unstable-internal"), allow(dead_code))]
     pub(crate) resume: Option<Resume>,
     /// Where the source's fixture-corpus entries live.
+    #[cfg_attr(not(feature = "unstable-internal"), allow(dead_code))]
     pub(crate) fixtures: Fixtures,
 }
 
@@ -98,6 +94,7 @@ impl Relationships {
 
 /// How to reopen a session in its provider's CLI.
 #[derive(Clone, Copy)]
+#[cfg_attr(not(feature = "unstable-internal"), allow(dead_code))]
 pub(crate) struct Resume {
     /// The command, given the already shell-quoted session id.
     pub(crate) command: fn(&str) -> String,
@@ -116,10 +113,12 @@ pub enum Fixtures {
 
 impl LocalSource {
     /// The source id.
+    #[cfg_attr(not(feature = "unstable-internal"), allow(dead_code))]
     pub fn id(&self) -> &'static str {
         self.id
     }
     /// Why this source has no discovery adapter, or `None` when it has one.
+    #[cfg_attr(not(feature = "unstable-internal"), allow(dead_code))]
     pub fn discovery_exemption(&self) -> Option<&'static str> {
         match self.discovery {
             Discovery::Provider(_) => None,
@@ -127,6 +126,7 @@ impl LocalSource {
         }
     }
     /// Where this source's fixture-corpus entries live.
+    #[cfg_attr(not(feature = "unstable-internal"), allow(dead_code))]
     pub fn fixtures(&self) -> Fixtures {
         self.fixtures
     }
@@ -288,6 +288,7 @@ pub(crate) const LOCAL_SOURCES: &[LocalSource] = &[
 ];
 
 /// Every built-in harness descriptor, in `SOURCE_CHOICES` order.
+#[cfg_attr(not(feature = "unstable-internal"), allow(dead_code))]
 pub fn local_sources() -> &'static [LocalSource] {
     LOCAL_SOURCES
 }
@@ -349,10 +350,9 @@ pub(crate) const DISCOVERY_EXEMPTIONS: &[SourceExemption] = &EXEMPTIONS;
 
 /// A fresh shallow adapter for every discoverable source, in source-id order.
 ///
-/// Discovery has always run its adapters alphabetically, which puts `relay`
-/// — whose rows are read back from the catalog the others just wrote — after
-/// the file-backed providers. Sorting here keeps that order independent of
-/// where a descriptor is declared.
+/// Discovery has always run its adapters in alphabetical order, which is the
+/// order connector summaries and diagnostics are reported in. Sorting here
+/// keeps that order stable, independent of where a descriptor is declared.
 pub(crate) fn shallow_providers() -> Vec<Box<dyn ShallowSessionProvider>> {
     let mut providers: Vec<&LocalSource> = LOCAL_SOURCES
         .iter()
@@ -397,6 +397,7 @@ pub(crate) fn relationships(source: &str) -> Relationships {
 
 /// The resume command for one session, `cd`-ing into `project` first when the
 /// provider resumes relative to it.
+#[cfg_attr(not(feature = "unstable-internal"), allow(dead_code))]
 pub(crate) fn resume_command(source: &str, session_id: &str, project: Option<&str>) -> Option<String> {
     let resume = local_source(source)?.resume?;
     let command = (resume.command)(&crate::shell_quote(session_id));
