@@ -22,8 +22,38 @@ export interface ListOptions {
   limit?: number;
 }
 
+/** Which rows a search matches. See `SearchOptions.role`. */
+export type SearchRole = 'all' | 'user' | 'assistant' | 'prompt';
+
 export interface SearchOptions extends ListOptions {
+  /**
+   * Pass the query to SQLite FTS5 verbatim (`AND`/`OR`/`NOT`, `prefix*`,
+   * `"quoted phrases"`, column filters). A malformed expression rejects with
+   * an actionable error. Without it, words are matched as quoted literal
+   * tokens and all must match; a leading `-` excludes a word.
+   */
   rawFts?: boolean;
+  /**
+   * `all` (default) matches prompts and every session event, `user` prompts
+   * and user-role events, `assistant` only assistant-role events, `prompt`
+   * only prompts. Same as `ai-hist search --role`.
+   */
+  role?: SearchRole;
+}
+
+/** Where a search match was found. */
+export type SearchMatchSource = 'history' | 'session_event';
+
+/**
+ * One `search` result. It is a `HistoryEntry` (the matched text is in
+ * `prompt`) plus its provenance. `id` is unique only within `matchSource`.
+ */
+export interface SearchMatch extends HistoryEntry {
+  matchSource: SearchMatchSource;
+  /** `user` for a prompt; the event's role otherwise. */
+  role: string;
+  /** `history` for a prompt; the event's kind (for example `text`, `tool_result`) otherwise. */
+  kind: string;
 }
 
 export interface SessionOptions {

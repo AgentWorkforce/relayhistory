@@ -50,6 +50,7 @@ export * from './git.js';
 export * from './contracts.js';
 import type {
   HistoryEntry,
+  SearchMatch,
   ListOptions,
   SearchOptions,
   SessionOptions,
@@ -123,6 +124,7 @@ import {
   MAX_TREE_MAX_NODES,
   nullableString,
   historyEntry,
+  searchMatch,
   catalogCursor,
   catalogSession,
   validateNativeLocation,
@@ -168,10 +170,16 @@ export async function nativeBuildProfile(): Promise<string> {
   return nativeCall(async (native) => native.nativeBuildProfile?.() ?? 'unknown');
 }
 
-export async function search(query: string, options: SearchOptions = {}): Promise<HistoryEntry[]> {
+/**
+ * Full-text search over indexed prompts and session events: the same
+ * contract, filters and `(timestampMs, id)` order as `ai-hist search`. Each
+ * match says where it was found (`matchSource`) and, for an event, its `role`
+ * and `kind`.
+ */
+export async function search(query: string, options: SearchOptions = {}): Promise<SearchMatch[]> {
   const scope = options.scope ?? 'local';
   return nativeCall(async (native) =>
-    (await native.search(query, { ...options, scope })).map(historyEntry),
+    (await native.search(query, { ...options, scope })).map(searchMatch),
   );
 }
 

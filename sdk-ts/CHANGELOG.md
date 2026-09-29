@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `search()` runs the same contract as `ai-hist search` and MCP
+  `search_history` (#66). It matches session events as well as prompts and
+  returns `SearchMatch[]`: each is a `HistoryEntry` plus `matchSource`, `role`
+  and `kind`. A new `role` option takes `all` (default), `user`, `assistant`
+  or `prompt`, where `prompt` restores the prompts-only result. `beforeMs` now
+  bounds event matches too, and ties order by `(timestampMs, id)`. Requires
+  native contract 23.
+
 ### Added
 
 - Add `createHandoff()` / `resumeHandoff()` and their default MCP tools. Handoff

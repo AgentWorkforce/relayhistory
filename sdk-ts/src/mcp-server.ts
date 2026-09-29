@@ -47,11 +47,20 @@ async function call(operation: () => Promise<unknown>) {
   }
 }
 
-server.tool('search_history', 'Search already-indexed RelayHistory prompts.', {
+server.tool('search_history',
+  'Full-text search of already-indexed user prompts and session events (assistant text, tool calls and results), '
+  + 'newest first; the same contract as `ai-hist search`. By default each word is matched as a literal token and all '
+  + 'must match; a leading - excludes a word. A query containing AND, OR, NOT, a trailing * or a "quoted phrase" is '
+  + 'passed to SQLite FTS5 as written, and raw_fts: true always does so. Each match carries matchSource '
+  + '(history or session_event), role and kind; id is unique only within matchSource.', {
   query: z.string(), source: SOURCE.optional(), project: z.string().optional(), tag: z.string().optional(),
   scope: SESSION_SCOPE.optional().default('local'),
+  role: z.enum(['all', 'user', 'assistant', 'prompt']).optional().default('all')
+    .describe('all: prompts and every event; user: prompts and user events; assistant: assistant events; prompt: prompts only.'),
+  raw_fts: z.boolean().optional().default(false)
+    .describe('Pass the query to SQLite FTS5 verbatim; a malformed expression is an error.'),
   limit: z.number().int().min(1).max(1000).optional().default(20),
-}, READ, ({ query, source, project, tag, scope, limit }) => call(() => search(query, { source, project, tag, scope, limit })));
+}, READ, ({ query, source, project, tag, scope, role, raw_fts, limit }) => call(() => search(query, { source, project, tag, scope, role, rawFts: raw_fts, limit })));
 
 server.tool('recent_history', 'List recent already-indexed history.', {
   source: SOURCE.optional(), project: z.string().optional(), tag: z.string().optional(),

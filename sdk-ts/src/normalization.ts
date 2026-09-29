@@ -24,6 +24,7 @@ import {
 
 import type {
   HistoryEntry,
+  SearchMatch,
   ListOptions,
   SearchOptions,
   SessionOptions,
@@ -118,6 +119,22 @@ export function historyEntry(value: UnknownRecord): HistoryEntry {
           (location): location is SessionLocation => location === 'local' || location === 'remote',
         )
       : [],
+  };
+}
+
+export function searchMatch(value: UnknownRecord): SearchMatch {
+  const matchSource = String(value.matchSource);
+  if (matchSource !== 'history' && matchSource !== 'session_event') {
+    throw new NativeContractMismatchError(
+      `ai-hist-native returned an unknown search matchSource '${matchSource}'. Reinstall matching ai-hist packages.`,
+      'NATIVE_CONTRACT_MISMATCH',
+    );
+  }
+  return {
+    ...historyEntry(value),
+    matchSource,
+    role: String(value.role),
+    kind: String(value.kind),
   };
 }
 

@@ -11,7 +11,7 @@ import {
   hydrateSession, listSessionCatalogPage, recent, resumeCommand, search, stats, sync,
   type CatalogCursor, type EvidenceCursor, type HistoryEntry, type LocalStoreReadiness,
   type SessionFileEditsPage, type SessionMarkersPage, type SessionRelationship, type SessionScope,
-  type SessionToolCallsPage, type SessionUsage,
+  type SessionToolCallsPage, type SessionUsage, type SearchRole,
 } from './index.js';
 import { runHistoryExportCommand, loadHistoryApplicationConfig } from './delivery-cli.js';
 
@@ -50,7 +50,7 @@ type PackageMetadata = { version?: string };
 export const BOOLEAN_FLAGS = new Set(['all', 'by-cwd', 'fts', 'help', 'json', 'local', 'no-bootstrap', 'no-related', 'no-source-connectors', 'no-warning', 'once', 'pretty', 'remote', 'version']);
 export const VALUE_FLAGS = new Set([
   'config', 'selection', 'interval', 'out', 'after', 'after-ms', 'after-session-id', 'after-source', 'before-ms', 'db', 'limit',
-  'max-depth', 'max-nodes', 'config', 'source-connector', 'project', 'source', 'tag', 'tokens',
+  'max-depth', 'max-nodes', 'config', 'source-connector', 'project', 'role', 'source', 'tag', 'tokens',
   // Documented in the usage text and read by `sessions discover`, `sessions
   // hydrate` and `sync`, but absent here, so `parse` rejected it as unknown.
   'acquisition-timeout-ms',
@@ -264,7 +264,7 @@ const USAGE_TEXT = `Usage:
   ai-hist sessions edits SOURCE SESSION_ID [--limit N] [--after JSON] [--db PATH] [--json]
   ai-hist sessions markers SOURCE SESSION_ID [--limit N] [--after JSON] [--db PATH] [--json]
   ai-hist sessions usage SOURCE SESSION_ID [--db PATH] [--json]
-  ai-hist search QUERY... [--local | --remote | --all] [--source SOURCE] [--project PATH] [--limit N] [--json]
+  ai-hist search QUERY... [--local | --remote | --all] [--source SOURCE] [--project PATH] [--role all|user|assistant|prompt] [--fts] [--limit N] [--json]
   ai-hist recent [N] [--local | --remote | --all] [--source SOURCE] [--project PATH] [--json]
   ai-hist session SESSION_ID [--source SOURCE] [--json]
   ai-hist events SESSION_ID [--source SOURCE] [--limit N] [--after JSON] [--json]
@@ -515,6 +515,7 @@ async function runResume(io: CliIo, args: Parsed, subcommand: string | undefined
   // one row is checked for a usable session id rather than scanning further.
   const rows = await search(query.join(' '), {
     dbPath: textFlag(args, 'db'), scope: scopeFlag(args), rawFts: args.flags.has('fts'), limit: 1,
+    role: 'prompt',
   });
   const entry = rows.find((row) => row.sessionId);
   if (!entry) throw new Error('No session found');
@@ -570,7 +571,7 @@ async function runPack(io: CliIo, args: Parsed, subcommand: string | undefined, 
   // The native Pack command defaults its own limit to 10, distinct from
   // search()'s general-purpose default of 20 — match Pack specifically.
   const rows = await search(queryStr, {
-    ...common(args), limit: numberFlag(args, 'limit') ?? 10, rawFts: args.flags.has('fts'),
+    ...common(args), limit: numberFlag(args, 'limit') ?? 10, rawFts: args.flags.has('fts'), role: 'prompt',
   });
   if (rows.length === 0) {
     if (json) {
@@ -733,6 +734,7 @@ export const FLAG_SPECS: Record<string, { flags: string; description: string }> 
   'by-cwd': { flags: '--by-cwd', description: 'Group projects by working directory instead of canonical project key.' },
   project: { flags: '--project <value>', description: 'Restrict to one project: a canonical project key for `sessions list`, a project path elsewhere.' },
   remote: { flags: '--remote', description: 'Read only remote history.' },
+  role: { flags: '--role <role>', description: 'Match all (default), user, assistant or prompt rows.' },
   selection: { flags: '--selection <file>', description: 'Export selection file.' },
   source: { flags: '--source <source>', description: 'Restrict to one coding-agent source.' },
   'source-connector': { flags: '--source-connector <id>', description: 'Run this remote connector; repeatable.' },
@@ -791,10 +793,10 @@ export const COMMANDS = new Map<string, CommandSpec>([
   ['sessions usage', { name: 'sessions usage', description: 'Provider-reported token usage rollup for a session; cost is never computed.',
     surface: ['usage'], positionals: [2, 2], args: [{ name: 'source', description: 'Coding-agent source, e.g. claude or codex.', required: true }, { name: 'session-id', description: 'Session identifier.', required: true }], readsLocalStore: true,
     requires: 'sessions usage requires SOURCE and SESSION_ID', allowed: ['db', 'json'] }],
-  ['search', { name: 'search', description: 'Search indexed prompts.', surface: ['search'],
+  ['search', { name: 'search', description: 'Search indexed prompts and session events.', surface: ['search'],
     positionals: [1, null], args: [{ name: 'query', description: 'Search terms.', required: true, variadic: true }],
     requires: 'search requires a query', readsLocalStore: true,
-    allowed: ['all', 'before-ms', 'db', 'fts', 'json', 'limit', 'local', 'project', 'remote', 'source', 'tag'] }],
+    allowed: ['all', 'before-ms', 'db', 'fts', 'json', 'limit', 'local', 'project', 'remote', 'role', 'source', 'tag'] }],
   ['recent', { name: 'recent', description: 'Show the most recent prompts.', surface: ['recent'],
     positionals: [0, 1], args: [{ name: 'count', description: 'How many to show.', required: false }],
     readsLocalStore: true,
@@ -1065,7 +1067,9 @@ async function dispatch(argv: readonly string[], io: CliIo, options: RunCliOptio
     return 0;
   }
   if (command === 'search') {
-    output(io, await search([subcommand, ...rest].join(' '), { ...common(args), rawFts: args.flags.has('fts') }), json);
+    output(io, await search([subcommand, ...rest].join(' '), {
+      ...common(args), rawFts: args.flags.has('fts'), role: textFlag(args, 'role') as SearchRole | undefined,
+    }), json);
     return 0;
   }
   if (command === 'recent') {

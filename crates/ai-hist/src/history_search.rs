@@ -1,13 +1,47 @@
 //! Typed history and event search, independent of command-line formatting.
+//!
+//! This is the one search contract every surface uses: the CLI's `search`,
+//! the napi `search` the TypeScript SDK wraps, and the MCP `search_history`
+//! tool. It matches user prompts (`history`) and normalized session events
+//! (`session_events`) through their FTS5 indexes, applies the same
+//! scope/source/project/tag/time filters to both, and orders the merged result
+//! by `(timestamp_ms DESC, id DESC, match_source)` so a tie never reorders
+//! between calls.
 use crate::{normalize_tag_name, raw_fts_query_error, QueryFilter, SessionScope};
 use anyhow::Result;
 use rusqlite::Connection;
+/// Which rows a search may match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchRole {
+    /// Prompts and every session event.
     All,
+    /// Prompts and user-role session events.
     User,
+    /// Assistant-role session events only.
     Assistant,
+    /// Prompts (`history` rows) only — what `resume` and `pack` search.
+    Prompt,
 }
+
+impl SearchRole {
+    /// Parse the wire spelling every surface accepts: `all`, `user`,
+    /// `assistant`, `prompt`.
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw {
+            "all" => Ok(Self::All),
+            "user" => Ok(Self::User),
+            "assistant" => Ok(Self::Assistant),
+            "prompt" => Ok(Self::Prompt),
+            other => anyhow::bail!(
+                "search role must be one of all, user, assistant, prompt (got {other})"
+            ),
+        }
+    }
+}
+
+/// Where a search match was found.
+pub const MATCH_SOURCE_HISTORY: &str = "history";
+pub const MATCH_SOURCE_SESSION_EVENT: &str = "session_event";
 
 #[derive(Debug, Clone)]
 pub struct SearchRow {
@@ -33,7 +67,9 @@ pub fn search_all(
     if !matches!(role, SearchRole::Assistant) {
         rows.extend(search_history_rows(conn, terms, raw_fts, filter)?);
     }
-    rows.extend(search_event_rows(conn, terms, raw_fts, filter, role)?);
+    if !matches!(role, SearchRole::Prompt) {
+        rows.extend(search_event_rows(conn, terms, raw_fts, filter, role)?);
+    }
     rows.sort_by(|a, b| {
         b.timestamp_ms
             .cmp(&a.timestamp_ms)
@@ -62,7 +98,7 @@ fn search_history_rows(
             .to_string()
     };
     append_history_search_filters(&mut sql, &mut params_vec, filter, "h");
-    sql.push_str(" ORDER BY h.timestamp_ms DESC LIMIT ?");
+    sql.push_str(" ORDER BY h.timestamp_ms DESC, h.id DESC LIMIT ?");
     params_vec.push(filter.limit.max(1).to_string());
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
@@ -76,7 +112,7 @@ fn search_history_rows(
                 timestamp_ms: row.get(5)?,
                 role: "user".to_string(),
                 kind: "history".to_string(),
-                match_source: "history".to_string(),
+                match_source: MATCH_SOURCE_HISTORY.to_string(),
             })
         })
         .map_err(|error| raw_fts_query_error(raw_fts, error))?
@@ -104,7 +140,7 @@ fn search_event_rows(
             .to_string()
     };
     append_event_search_filters(&mut sql, &mut params_vec, filter, "e", role);
-    sql.push_str(" ORDER BY e.ts_ms DESC LIMIT ?");
+    sql.push_str(" ORDER BY e.ts_ms DESC, e.id DESC LIMIT ?");
     params_vec.push(filter.limit.max(1).to_string());
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
@@ -118,7 +154,7 @@ fn search_event_rows(
                 timestamp_ms: row.get(5)?,
                 role: row.get(6)?,
                 kind: row.get(7)?,
-                match_source: "session_event".to_string(),
+                match_source: MATCH_SOURCE_SESSION_EVENT.to_string(),
             })
         })
         .map_err(|error| raw_fts_query_error(raw_fts, error))?
@@ -146,6 +182,10 @@ fn append_history_search_filters(
         sql.push_str(&format!(" AND {}", tag_filter_clause(alias)));
         params.push(normalize_tag_name(tag));
     }
+    if let Some(before_ms) = filter.before_ms {
+        sql.push_str(&format!(" AND {alias}.timestamp_ms < ?"));
+        params.push(before_ms.to_string());
+    }
 }
 
 fn append_event_search_filters(
@@ -156,6 +196,14 @@ fn append_event_search_filters(
     role: SearchRole,
 ) {
     append_session_scope_filter(sql, filter.scope, alias);
+    // A hydrated session records each prompt twice: as its `history` row and
+    // as a user text event. The prompt is the `history` match; the verbatim
+    // event copy would only repeat it under a second id.
+    sql.push_str(&format!(
+        " AND NOT ({alias}.role = 'user' AND {alias}.kind = 'text' \
+           AND EXISTS (SELECT 1 FROM history hp WHERE hp.source = {alias}.source \
+             AND hp.session_id = {alias}.session_id AND hp.prompt = {alias}.text))"
+    ));
     if let Some(source) = &filter.source {
         sql.push_str(&format!(" AND {alias}.source = ?"));
         params.push(source.clone());
@@ -168,8 +216,12 @@ fn append_event_search_filters(
         sql.push_str(&format!(" AND {}", tag_filter_clause(alias)));
         params.push(normalize_tag_name(tag));
     }
+    if let Some(before_ms) = filter.before_ms {
+        sql.push_str(&format!(" AND {alias}.ts_ms < ?"));
+        params.push(before_ms.to_string());
+    }
     match role {
-        SearchRole::All => {}
+        SearchRole::All | SearchRole::Prompt => {}
         SearchRole::User => sql.push_str(&format!(" AND {alias}.role = 'user'")),
         SearchRole::Assistant => sql.push_str(&format!(" AND {alias}.role = 'assistant'")),
     }
@@ -199,4 +251,182 @@ fn tag_filter_clause(alias: &str) -> String {
     format!(
         "EXISTS (SELECT 1 FROM session_tags st JOIN tags t ON t.id = st.tag_id WHERE st.source = {alias}.source AND st.session_id = {alias}.session_id AND t.name = ?)"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{init_db, insert_history, HistoryEntry};
+    use rusqlite::params;
+
+    fn fixture() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // Three prompts and three events share one timestamp, so only the id
+        // tie-break can order them; a fourth prompt is older.
+        for (index, ts) in [(1, 1_000), (2, 1_000), (3, 1_000), (4, 500)] {
+            insert_history(
+                &conn,
+                &HistoryEntry {
+                    id: 0,
+                    source: "claude".into(),
+                    session_id: Some("s1".into()),
+                    project: Some("/work/needle".into()),
+                    prompt: format!("needle prompt {index}"),
+                    prompt_hash: Some(format!("hash-{index}")),
+                    timestamp_ms: ts,
+                },
+            )
+            .unwrap();
+        }
+        for (uid, role, kind) in [
+            ("e1", "assistant", "text"),
+            ("e2", "tool_result", "tool_result"),
+            ("e3", "assistant", "text"),
+        ] {
+            conn.execute(
+                "INSERT INTO session_events \
+                 (source, session_id, project, message_id, ts_ms, role, kind, text, event_uid) \
+                 VALUES ('claude', 's1', '/work/needle', 'm1', 1000, ?, ?, ?, ?)",
+                params![role, kind, format!("needle event {uid}"), uid],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    fn filter(limit: i64) -> QueryFilter {
+        QueryFilter {
+            limit,
+            ..Default::default()
+        }
+    }
+
+    fn keys(rows: &[SearchRow]) -> Vec<(String, i64)> {
+        rows.iter()
+            .map(|row| (row.match_source.clone(), row.id))
+            .collect()
+    }
+
+    #[test]
+    fn ties_are_ordered_by_id_then_match_source_and_limit_takes_the_top() {
+        let conn = fixture();
+        let terms = ["needle".to_string()];
+        let all = search_all(&conn, &terms, false, &filter(100), SearchRole::All).unwrap();
+        assert_eq!(
+            keys(&all),
+            vec![
+                ("history".into(), 3),
+                ("session_event".into(), 3),
+                ("history".into(), 2),
+                ("session_event".into(), 2),
+                ("history".into(), 1),
+                ("session_event".into(), 1),
+                ("history".into(), 4),
+            ]
+        );
+        // Each branch pushes the limit into SQL; the merged top-N must still
+        // be the prefix of the full ordering.
+        for limit in 1..=all.len() as i64 {
+            let page = search_all(&conn, &terms, false, &filter(limit), SearchRole::All).unwrap();
+            assert_eq!(keys(&page), keys(&all)[..limit as usize].to_vec());
+        }
+    }
+
+    #[test]
+    fn roles_select_match_sources_and_carry_provenance() {
+        let conn = fixture();
+        let terms = ["needle".to_string()];
+        let assistant =
+            search_all(&conn, &terms, false, &filter(100), SearchRole::Assistant).unwrap();
+        assert_eq!(
+            keys(&assistant),
+            vec![("session_event".into(), 3), ("session_event".into(), 1)]
+        );
+        assert!(assistant
+            .iter()
+            .all(|row| row.role == "assistant" && row.kind == "text"));
+
+        let user = search_all(&conn, &terms, false, &filter(100), SearchRole::User).unwrap();
+        assert_eq!(user.len(), 4);
+        assert!(user.iter().all(|row| row.match_source == "history"
+            && row.role == "user"
+            && row.kind == "history"));
+
+        let prompts = search_all(&conn, &terms, false, &filter(100), SearchRole::Prompt).unwrap();
+        assert_eq!(
+            keys(&prompts),
+            vec![
+                ("history".into(), 3),
+                ("history".into(), 2),
+                ("history".into(), 1),
+                ("history".into(), 4),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_prompt_mirrored_as_a_user_event_matches_once_as_history() {
+        let conn = fixture();
+        for (uid, text) in [("u-copy", "needle prompt 1"), ("u-own", "needle follow-up")] {
+            conn.execute(
+                "INSERT INTO session_events \
+                 (source, session_id, message_id, ts_ms, role, kind, text, event_uid) \
+                 VALUES ('claude', 's1', 'm2', 2000, 'user', 'text', ?, ?)",
+                params![text, uid],
+            )
+            .unwrap();
+        }
+        let rows = search_all(
+            &conn,
+            &["needle".to_string()],
+            false,
+            &filter(100),
+            SearchRole::User,
+        )
+        .unwrap();
+        let events = rows
+            .iter()
+            .filter(|row| row.match_source == MATCH_SOURCE_SESSION_EVENT)
+            .map(|row| row.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(events, vec!["needle follow-up"]);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.text == "needle prompt 1")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn before_ms_bounds_both_prompts_and_events() {
+        let conn = fixture();
+        let rows = search_all(
+            &conn,
+            &["needle".to_string()],
+            false,
+            &QueryFilter {
+                before_ms: Some(1_000),
+                limit: 100,
+                ..Default::default()
+            },
+            SearchRole::All,
+        )
+        .unwrap();
+        assert_eq!(keys(&rows), vec![("history".into(), 4)]);
+    }
+
+    #[test]
+    fn role_parse_accepts_the_wire_spellings_only() {
+        assert_eq!(SearchRole::parse("all").unwrap(), SearchRole::All);
+        assert_eq!(SearchRole::parse("user").unwrap(), SearchRole::User);
+        assert_eq!(
+            SearchRole::parse("assistant").unwrap(),
+            SearchRole::Assistant
+        );
+        assert_eq!(SearchRole::parse("prompt").unwrap(), SearchRole::Prompt);
+        let error = SearchRole::parse("tool").unwrap_err().to_string();
+        assert!(error.contains("all, user, assistant, prompt"), "got: {error}");
+    }
 }
