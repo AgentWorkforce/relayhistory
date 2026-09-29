@@ -66,34 +66,90 @@ pub(crate) fn is_opencode_db_filename(name: &str) -> bool {
 /// regular files are returned (a symlink counts when it resolves to one), and
 /// the directory is listed at call time: a channel database OpenCode creates
 /// while a watch loop runs is picked up by the next scan.
+///
+/// A directory that exists but cannot be listed yields only the configured
+/// store; callers that must not mistake that for "there are no channel
+/// databases" ask [`list_opencode_db_files`] instead.
 pub(crate) fn opencode_db_files(configured: &Path, pinned: bool) -> Vec<PathBuf> {
-    let mut files = Vec::new();
+    list_opencode_db_files(configured, pinned).stores
+}
+
+/// [`opencode_db_files`], plus whether the channel directory could be listed.
+pub(crate) struct OpencodeDbListing {
+    /// The stores found, in [`opencode_db_files`] order.
+    pub stores: Vec<PathBuf>,
+    /// The directory whose listing failed, and why. `None` when it was listed,
+    /// when the store is pinned, or when the directory does not exist (then
+    /// there is nothing beside the configured store to miss).
+    pub unlisted: Option<(PathBuf, std::io::Error)>,
+}
+
+/// See [`opencode_db_files`]. An unlistable directory is reported rather than
+/// read as empty, so a sweep that could see only the configured store does not
+/// record the channel databases beside it as absent.
+pub(crate) fn list_opencode_db_files(configured: &Path, pinned: bool) -> OpencodeDbListing {
+    let mut stores = Vec::new();
     if configured.is_file() {
-        files.push(configured.to_path_buf());
+        stores.push(configured.to_path_buf());
     }
+    let unlisted = |stores, dir: &Path, error| OpencodeDbListing {
+        stores,
+        unlisted: Some((dir.to_path_buf(), error)),
+    };
     if pinned {
-        return files;
+        return OpencodeDbListing {
+            stores,
+            unlisted: None,
+        };
     }
-    let Some(dir) = configured.parent() else {
-        return files;
+    let dir = match configured.parent() {
+        Some(dir) if dir.as_os_str().is_empty() => Path::new("."),
+        Some(dir) => dir,
+        None => {
+            return OpencodeDbListing {
+                stores,
+                unlisted: None,
+            }
+        }
     };
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return files;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return OpencodeDbListing {
+                stores,
+                unlisted: None,
+            }
+        }
+        Err(error) => return unlisted(stores, dir, error),
     };
-    let mut channels: Vec<PathBuf> = entries
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .is_some_and(is_opencode_db_filename)
-        })
-        .map(|entry| entry.path())
-        .filter(|path| path.is_file() && path.as_path() != configured)
-        .collect();
+    let mut channels = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => return unlisted(stores, dir, error),
+        };
+        if !entry
+            .file_name()
+            .to_str()
+            .is_some_and(is_opencode_db_filename)
+        {
+            continue;
+        }
+        // Same directory, so the same name is the configured store itself.
+        if Some(entry.file_name().as_os_str()) == configured.file_name() {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_file() {
+            channels.push(path);
+        }
+    }
     channels.sort();
-    files.extend(channels);
-    files
+    stores.extend(channels);
+    OpencodeDbListing {
+        stores,
+        unlisted: None,
+    }
 }
 
 /// Where OpenCode's legacy JSON tree lives: `session/<scope>/<id>.json`,
@@ -284,6 +340,35 @@ mod tests {
             ]
         );
         assert!(opencode_db_files(&default, true).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unlistable_channel_directory_is_reported_not_read_as_empty() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let default = dir.path().join("opencode.db");
+        std::fs::write(&default, b"").unwrap();
+        std::fs::write(dir.path().join("opencode-nightly.db"), b"").unwrap();
+        // Searchable but not listable: the configured store still opens.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o300)).unwrap();
+        let listable = std::fs::read_dir(dir.path()).is_ok();
+        let listing = list_opencode_db_files(&default, false);
+        let pinned = list_opencode_db_files(&default, true);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        if listable {
+            // Running as root: permissions do not bind, nothing to observe.
+            return;
+        }
+        assert_eq!(listing.stores, vec![default.clone()]);
+        assert_eq!(
+            listing.unlisted.map(|(path, _)| path),
+            Some(dir.path().to_path_buf())
+        );
+        assert!(pinned.unlisted.is_none(), "a pinned store lists nothing");
+        // A directory that does not exist has nothing in it to miss.
+        let missing = dir.path().join("absent/opencode.db");
+        assert!(list_opencode_db_files(&missing, false).unlisted.is_none());
     }
 
     #[test]

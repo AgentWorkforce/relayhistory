@@ -88,8 +88,13 @@ Notable changes to the native `ai-hist` CLI are documented here.
   at all. Discovery, `sync`, `sync-opencode`, hydration and live-capture
   fingerprints now cover every channel store in the directory; a session found
   in more than one is owned by the first (`opencode.db`, then the channel
-  stores in name order). `OPENCODE_DB` still names exactly one store, as does
-  `sync-opencode --opencode-db`.
+  stores in name order), including under a discovery `--limit`; hydrating a
+  copy an earlier store has since gained is refused with
+  `SESSION_SOURCE_MISMATCH` until rediscovery. A channel store that cannot be
+  opened, or a channel directory that cannot be listed, is reported as a
+  diagnostic while the other stores are still read, and the sweep does not
+  record its fingerprint over it. `OPENCODE_DB` still names exactly one store,
+  as does `sync-opencode --opencode-db`.
 
 - Add workspace-scoped agent handoffs through `create_handoff(intent)` and
   `resume_handoff(source, session_id)`. The sender emits only a session pointer

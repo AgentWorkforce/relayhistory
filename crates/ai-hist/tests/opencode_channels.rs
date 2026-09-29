@@ -115,6 +115,10 @@ fn opencode_channel_databases_are_discovered_synced_and_hydrated() {
     a_plain_sync_indexes_every_channel_store();
     a_session_in_two_stores_is_owned_by_the_first();
     a_pinned_opencode_db_reads_only_that_file();
+    a_limited_page_is_not_shortened_by_duplicates();
+    a_limited_page_keeps_first_store_ownership();
+    one_broken_channel_store_does_not_hide_the_others();
+    hydration_refuses_a_copy_an_earlier_store_has_since_claimed();
 }
 
 /// `opencode.db` holds one session and `opencode-nightly.db` the other; a
@@ -247,5 +251,159 @@ fn a_pinned_opencode_db_reads_only_that_file() {
         "OPENCODE_DB names one store, and its channel siblings are not read"
     );
     assert_eq!(history_sessions(&db_path), vec![CHILD.to_string()]);
+    fs::remove_dir_all(&root).ok();
+}
+
+/// With a limit, a session a later store shares with an earlier one must not
+/// take one of the later store's slots: `opencode.db` holds an old copy of
+/// the root, `opencode-nightly.db` a fresh copy of it plus the child. The
+/// root belongs to `opencode.db` at its old time, so the newest session
+/// overall is the nightly child — which a per-store page cut before
+/// de-duplication never reached.
+fn a_limited_page_is_not_shortened_by_duplicates() {
+    let root = temp_root("limited");
+    let home = root.join("home");
+    let data = home.join(".local/share/opencode");
+    build_store(&data.join("opencode.db"), &[ROOT]);
+    Connection::open(data.join("opencode.db"))
+        .unwrap()
+        .execute(
+            "UPDATE session SET time_updated = 1776643000000 WHERE id = ?",
+            [ROOT],
+        )
+        .unwrap();
+    build_store(&data.join("opencode-nightly.db"), &[ROOT, CHILD]);
+    use_home(&home, None);
+    let db_path = root.join("history.db");
+    let (rows, _) = discover_sessions_scoped_at(
+        &db_path,
+        &DiscoverOptions {
+            limit: Some(1),
+            ..opencode_only()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| (
+                row.session_id.clone(),
+                row.raw_path.clone().unwrap_or_default()
+            ))
+            .collect::<Vec<_>>(),
+        vec![(
+            CHILD.to_string(),
+            data.join("opencode-nightly.db")
+                .to_string_lossy()
+                .into_owned()
+        )]
+    );
+    fs::remove_dir_all(&root).ok();
+}
+
+/// A channel database that cannot be opened is that store's failure: the
+/// healthy store is still catalogued, and the broken one is named in a
+/// diagnostic rather than failing the whole provider.
+fn one_broken_channel_store_does_not_hide_the_others() {
+    let root = temp_root("broken");
+    let home = root.join("home");
+    let data = home.join(".local/share/opencode");
+    build_store(&data.join("opencode-stable.db"), &[ROOT]);
+    fs::write(data.join("opencode-nightly.db"), b"not a database at all").unwrap();
+    use_home(&home, None);
+    let db_path = root.join("history.db");
+    let (_, summary) = discover_sessions_scoped_at(&db_path, &opencode_only()).unwrap();
+    assert_eq!(
+        catalog(&db_path),
+        vec![(
+            ROOT.to_string(),
+            data.join("opencode-stable.db")
+                .to_string_lossy()
+                .into_owned()
+        )]
+    );
+    let broken = data
+        .join("opencode-nightly.db")
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        summary
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.locator.as_deref() == Some(broken.as_str())),
+        "the unreadable store is reported against its path: {:?}",
+        summary.diagnostics
+    );
+    assert!(!summary.providers["opencode"].failed);
+    fs::remove_dir_all(&root).ok();
+}
+
+/// A row catalogued from `opencode-nightly.db` names a superseded copy once
+/// `opencode.db` gains the same session: sync now reads that one, so
+/// hydration refuses rather than import evidence sync disagrees with.
+fn hydration_refuses_a_copy_an_earlier_store_has_since_claimed() {
+    let (root, home, data) = channel_home("superseded");
+    use_home(&home, None);
+    let db_path = root.join("history.db");
+    discover_sessions_scoped_at(&db_path, &opencode_only()).unwrap();
+    fs::remove_file(data.join("opencode.db")).unwrap();
+    build_store(&data.join("opencode.db"), &[ROOT, CHILD]);
+    let error = hydrate_session_at(
+        &db_path,
+        &HydrateSessionOptions {
+            source: "opencode".into(),
+            session_id: CHILD.into(),
+            scope: SessionScope::Local,
+            include_related: false,
+        },
+    )
+    .expect_err("hydrating a superseded channel copy must be refused");
+    assert!(
+        format!("{error:#}").contains("SESSION_SOURCE_MISMATCH"),
+        "{error:#}"
+    );
+    fs::remove_dir_all(&root).ok();
+}
+
+/// With a limit, ownership is still decided over everything a store holds,
+/// not only over its limited page: `opencode.db` holds the child and an old
+/// copy of the root (outside its one-row page), `opencode-nightly.db` a fresh
+/// copy of the root. The root is `opencode.db`'s — sync reads it there — so a
+/// limited page must not catalogue it from the nightly store.
+fn a_limited_page_keeps_first_store_ownership() {
+    let root = temp_root("limited-owner");
+    let home = root.join("home");
+    let data = home.join(".local/share/opencode");
+    build_store(&data.join("opencode.db"), &[ROOT, CHILD]);
+    Connection::open(data.join("opencode.db"))
+        .unwrap()
+        .execute(
+            "UPDATE session SET time_updated = 1776643000000 WHERE id = ?",
+            [ROOT],
+        )
+        .unwrap();
+    build_store(&data.join("opencode-nightly.db"), &[ROOT]);
+    use_home(&home, None);
+    let db_path = root.join("history.db");
+    let (rows, _) = discover_sessions_scoped_at(
+        &db_path,
+        &DiscoverOptions {
+            limit: Some(1),
+            ..opencode_only()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| (
+                row.session_id.clone(),
+                row.raw_path.clone().unwrap_or_default()
+            ))
+            .collect::<Vec<_>>(),
+        vec![(
+            CHILD.to_string(),
+            data.join("opencode.db").to_string_lossy().into_owned()
+        )],
+        "the root belongs to opencode.db, whose copy is older than the child"
+    );
     fs::remove_dir_all(&root).ok();
 }
