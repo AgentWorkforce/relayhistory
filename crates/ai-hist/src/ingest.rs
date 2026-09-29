@@ -11322,8 +11322,9 @@ pub(crate) struct GrokIngestOutcome {
     pub updates_yielded_no_timing: bool,
     /// The newest `turn_completed` context snapshot, for the caller's report.
     pub context_total_tokens: Option<i64>,
-    /// Turns whose `turn_completed` carried a per-turn usage breakdown, and
-    /// how many turns `updates.jsonl` opened in all.
+    /// Turns whose `turn_completed` usage breakdown was stored on one of the
+    /// turn's assistant rows, and how many turns `updates.jsonl` opened in
+    /// all.
     pub usage_turns: usize,
     pub turns: usize,
 }
@@ -11388,6 +11389,9 @@ fn ingest_grok_session(
     // displace the message, and a turn with no message still has a tail.
     let mut turn_tail: HashMap<usize, String> = HashMap::new();
     let mut turn_tool_tail: HashMap<usize, String> = HashMap::new();
+    // The last resort: a turn whose only readable output was its thinking
+    // still shares one request span, and its usage belongs on that row.
+    let mut turn_thinking_tail: HashMap<usize, String> = HashMap::new();
 
     for (idx, line) in session.lines.iter().enumerate() {
         check_capture_cancelled()?;
@@ -11582,6 +11586,9 @@ fn ingest_grok_session(
                     },
                 )?;
                 outcome.events += 1;
+                if let Some(turn) = turn {
+                    turn_thinking_tail.insert(turn, uid);
+                }
             }
             grok::GrokRecord::Assistant { text, model, calls } => {
                 if let Some(text) = text {
@@ -11782,8 +11789,16 @@ fn ingest_grok_session(
     // is estimated here.
     for (turn, timing) in session.updates.turns.iter().enumerate() {
         check_capture_cancelled()?;
-        let tail = turn_tail.get(&turn).or_else(|| turn_tool_tail.get(&turn));
+        let tail = turn_tail
+            .get(&turn)
+            .or_else(|| turn_tool_tail.get(&turn))
+            .or_else(|| turn_thinking_tail.get(&turn));
         let Some(uid) = tail else {
+            // A breakdown with no assistant row to carry it is not stored,
+            // so it must not count toward the coverage the caller reports.
+            if timing.usage.is_some() {
+                outcome.usage_turns = outcome.usage_turns.saturating_sub(1);
+            }
             continue;
         };
         if timing.total_tokens.is_none() && timing.usage.is_none() {
@@ -14407,6 +14422,49 @@ mod tests {
             )
             .unwrap();
         assert_eq!((usage, span.as_deref()), (Some(1000), Some("0")));
+    }
+
+    /// A turn whose only readable output is its thinking still stores its
+    /// `turn_completed.usage`, on that thinking row, and counts as measured.
+    #[test]
+    fn a_thinking_only_grok_turn_keeps_its_usage() {
+        let home = tempfile::tempdir().unwrap();
+        let (chat, dir) = grok_stream_fixture(home.path(), "grok-think-0001");
+        fs::write(
+            &chat,
+            concat!(
+                r#"{"type":"user","content":"<user_query>hi</user_query>"}"#,
+                "\n",
+                r#"{"type":"reasoning","summary":"Working through it"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("updates.jsonl"),
+            concat!(
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"eventId":"u1","agentTimestampMs":1789560000000,"turnStartMs":1789560000000}}}"#,
+                "\n",
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_thought_chunk"},"_meta":{"eventId":"t1","agentTimestampMs":1789560001000,"turnStartMs":1789560000000}}}"#,
+                "\n",
+                r#"{"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"turn_completed","usage":{"inputTokens":10,"outputTokens":3}},"_meta":{"agentTimestampMs":1789560002000,"turnStartMs":1789560000000}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let session = super::scan_grok_session_file(&chat).unwrap().unwrap();
+        let outcome = super::ingest_grok_session(&conn, &session, &chat.to_string_lossy()).unwrap();
+        let (kind, input): (String, Option<i64>) = conn
+            .query_row(
+                "SELECT kind, json_extract(token_json, '$.usage.inputTokens') \
+                 FROM session_events WHERE source = 'grok' AND token_json IS NOT NULL",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((kind.as_str(), input), ("thinking", Some(10)));
+        assert_eq!((outcome.usage_turns, outcome.turns), (1, 1));
     }
 
     /// An `updates.jsonl` that exists and cannot be read is a failure, not an
