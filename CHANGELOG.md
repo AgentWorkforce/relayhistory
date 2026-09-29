@@ -186,9 +186,13 @@ Notable changes to the native `ai-hist` CLI are documented here.
   page; `commitChanges(consumer, position)` acknowledges a page, forward-only
   and bound to the cursor's kind set. Each `FeedChange` carries `kind`,
   `source`/`sourceName`, `sessionId`, `recordKey`, `key`, `revision`, `op` and
-  the row as stored in `columns`. Exported with `CHANGE_KINDS` and the
-  `ChangeKind`, `Watermark`, `FeedChange`, `ChangesPage` and `CommittedCursor`
-  types.
+  the row as stored in `columns`; `source` is any known `Source`, trajectory
+  included, and null only for a source this SDK does not know. `done` means
+  nothing the page's filters select is left, so a filtered drain ends on its
+  last match rather than one empty page later. A database written before the
+  feed existed is migrated on its first page instead of refused. Exported with
+  `CHANGE_KINDS` and the `ChangeKind`, `Watermark`, `FeedChange`, `ChangesPage`
+  and `CommittedCursor` types.
 - Add workspace-scoped agent handoffs through `create_handoff(intent)` and
   `resume_handoff(source, session_id)`. The sender emits only a session pointer
   plus one self-describing intent and origin identity; the intent tells the

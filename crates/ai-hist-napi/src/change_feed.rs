@@ -21,8 +21,8 @@
 use std::path::PathBuf;
 
 use ai_hist::{
-    Change, ChangeKind, ChangeOp, ChangeQuery, SessionStore, StoreOptions, Watermark,
-    DEFAULT_CHANGE_BATCH, MAX_CHANGE_BATCH,
+    open_db_readonly, schema_is_current, Change, ChangeKind, ChangeOp, ChangeQuery, SessionStore,
+    StoreOptions, Watermark, DEFAULT_CHANGE_BATCH, MAX_CHANGE_BATCH,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -168,7 +168,8 @@ pub struct ChangesPage {
     pub position: WireWatermark,
     /// The store head the page was bounded to.
     pub head: WireWatermark,
-    /// True when nothing at or below `head` is left after `position`.
+    /// True when no change the query selects is left after `position` at or
+    /// below `head`.
     pub done: bool,
     /// The named cursor the page was read for, if any.
     pub consumer: Option<String>,
@@ -255,21 +256,39 @@ fn facade_error(error: ai_hist::Error) -> napi::Error {
     }
 }
 
-/// Read one page. A read-only open first; only a stale schema reopens
-/// writable, exactly as the dispatcher's other reads do.
+/// Whether the change-feed schema is already in place. `SessionStore::open`
+/// read-only checks only the session-evidence indexes, so a database written
+/// before the feed existed passes it and is refused later by
+/// `changes_since`; checking here lets that database migrate instead.
+fn feed_schema_is_current(path: &std::path::Path) -> napi::Result<bool> {
+    open_db_readonly(path)
+        .and_then(|conn| schema_is_current(&conn))
+        .map_err(|error| database_error(path, format!("{error:#}")))
+}
+
+/// Read one page. A read-only open first; only a stale schema — the
+/// facade's session-evidence gate or the feed's own — reopens writable,
+/// exactly as the dispatcher's other reads do.
+///
+/// `done` is filtered exhaustion, not `position == head`: under a kind or
+/// session filter the last matching change can sit below a head that
+/// unrelated writes moved, so the page looks one change past its limit
+/// before saying another page exists.
 fn read_page(
     path: PathBuf,
     from: Watermark,
     query: ChangeQuery,
     limit: usize,
 ) -> napi::Result<String> {
-    let store = match open_store(&path, true) {
-        Ok(store) => store,
-        Err(error) if error.is_stale_schema() => {
-            open_store(&path, false).map_err(|error| database_error(&path, format!("{error:#}")))?
-        }
-        Err(error) => return Err(database_error(&path, format!("{error:#}"))),
-    };
+    let store =
+        match open_store(&path, true) {
+            Ok(store) if feed_schema_is_current(&path)? => store,
+            Ok(_) => open_store(&path, false)
+                .map_err(|error| database_error(&path, format!("{error:#}")))?,
+            Err(error) if error.is_stale_schema() => open_store(&path, false)
+                .map_err(|error| database_error(&path, format!("{error:#}")))?,
+            Err(error) => return Err(database_error(&path, format!("{error:#}"))),
+        };
     let mut drain = store.changes_since(from, query).map_err(facade_error)?;
     let mut changes = Vec::new();
     while changes.len() < limit {
@@ -278,10 +297,19 @@ fn read_page(
             None => break,
         }
     }
-    let position = drain.position();
     let head = drain.head();
+    let (position, done) = if changes.len() < limit {
+        (drain.position(), true)
+    } else {
+        let position = drain.position();
+        match drain.next() {
+            Some(Err(error)) => return Err(facade_error(error)),
+            Some(Ok(_)) => (position, false),
+            None => (drain.position(), true),
+        }
+    };
     let page = ChangesPage {
-        done: position.revision >= head.revision,
+        done,
         position: WireWatermark::from_watermark(position),
         head: WireWatermark::from_watermark(head),
         consumer: drain.consumer().map(str::to_string),
@@ -309,7 +337,9 @@ pub(crate) fn dispatch(op: &str, args_json: &str) -> napi::Result<String> {
         DEFAULT_CHANGE_BATCH as i64,
         MAX_CHANGE_BATCH as i64,
     )? as usize;
-    let mut query = ChangeQuery::default().batch(limit);
+    // One past the page, so the look-ahead that settles `done` is normally
+    // served by the same indexed read.
+    let mut query = ChangeQuery::default().batch(limit + 1);
     if let Some(kinds) = parse_kinds(args.kinds)? {
         query = query.kinds(kinds);
     }
@@ -508,6 +538,73 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("CONSUMER_KINDS_MISMATCH"), "{error}");
+    }
+
+    #[test]
+    fn a_filtered_page_ending_below_the_head_reports_done() {
+        let dir = seeded(1);
+        let db = dir.path().join("history.db");
+        // An unrelated later write moves the head past the only match.
+        let conn = open_db(&db).unwrap();
+        insert_session_marker(
+            &conn,
+            "claude",
+            "sess-2",
+            &NewSessionMarker {
+                marker_uid: "other",
+                ts_ms: Some(9),
+                kind: "summary",
+                text: Some("marker"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        drop(conn);
+        let args = json!({
+            "dbPath": db,
+            "kinds": ["session_marker"],
+            "session": { "source": "claude", "sessionId": "sess-1" },
+            "limit": 1,
+        });
+        let page = call("changes", args).unwrap();
+        assert_eq!(uids(&page), ["m0"]);
+        assert_eq!(page["done"], json!(true));
+        assert_eq!(page["position"], page["head"]);
+
+        // A full page with a match still to come is not done, and stops at
+        // the last change it returned.
+        let dir = seeded(2);
+        let db = dir.path().join("history.db");
+        let page = call(
+            "changes",
+            json!({ "dbPath": db, "kinds": ["session_marker"], "limit": 1 }),
+        )
+        .unwrap();
+        assert_eq!(uids(&page), ["m0"]);
+        assert_eq!(page["done"], json!(false));
+        assert_eq!(page["position"]["revision"], page["changes"][0]["revision"]);
+    }
+
+    #[test]
+    fn a_database_from_before_the_feed_is_migrated_on_first_read() {
+        let dir = seeded(2);
+        let db = dir.path().join("history.db");
+        // Strip a piece of the feed schema only: the session-evidence
+        // indexes the facade's read-only gate checks are all still there.
+        let conn = open_db(&db).unwrap();
+        conn.execute_batch("DROP TABLE consumer_cursors;").unwrap();
+        drop(conn);
+        let conn = ai_hist::open_db_readonly(&db).unwrap();
+        assert!(!ai_hist::schema_is_current(&conn).unwrap());
+        drop(conn);
+
+        let page = call(
+            "changes",
+            json!({ "dbPath": db, "kinds": ["session_marker"] }),
+        )
+        .unwrap();
+        assert_eq!(uids(&page), ["m0", "m1"]);
+        assert_eq!(page["done"], json!(true));
     }
 
     #[test]
