@@ -82,7 +82,7 @@ field or inline the transcript. Before sending, call `resume_handoff` once with
 the pointer to verify that Agent Relay desktop has uploaded the session to the
 current workspace.
 
-The MCP server reads local history only, plus any source plugins named by `AI_HIST_PLUGIN_CONFIG`. The relay roster, status, join, and leave tools are also local: they use `AGENT_RELAY_SOCKET`, then `~/.agentworkforce/desktop/relay-socket`, then the platform socket defaults. They never load cloud credentials. If the desktop app is absent, the tools return a non-fatal instruction to open it or use the Agent Relay MCP. A connected desktop gets a 15-second local response deadline; exceeding it reports `timeout` instead of claiming the app is absent. If the app setting disallows self-registration, `join_relay` returns the desktop's readable `not_allowed` guidance.
+The MCP server reads local history only, plus any source plugins named by `AI_HIST_PLUGIN_CONFIG`. The relay roster, status, join, and leave tools are also local: they use `AGENT_RELAY_SOCKET`, then `~/.agentworkforce/desktop/relay-socket`, then the platform socket defaults. They never load cloud credentials. If the desktop app is absent, the tools return a non-fatal instruction to open it or use the Agent Relay MCP. A connected desktop gets a 15-second local response deadline. Read-only roster and status calls that exceed it report `timeout` instead of claiming the app is absent. A sent `join_relay` or `leave_relay` mutation reports `indeterminate_result` because the desktop may have completed it, and directs the caller to `relay_status`. If the app setting disallows self-registration, `join_relay` returns the desktop's readable `not_allowed` guidance.
 
 ## Local and remote history
 
