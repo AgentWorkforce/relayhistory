@@ -11,6 +11,9 @@ import {
 import type { HistoryPluginRegistry } from './delivery-plugins.js';
 import type { HistorySource } from './source-contracts.js';
 
+/** The most rows one catalog page returns; native rejects a larger limit. */
+const CATALOG_PAGE_MAX = 1000;
+
 /**
  * The scope an acquisition runs installed source plugins at, or `null` when it
  * runs none and the native engine answers alone.
@@ -367,14 +370,25 @@ export async function discoverSessions(
         'No selected source plugin is available',
         'CONNECTOR_NOT_CONFIGURED',
       );
-    // Native discovery returns every session it saw when no limit is given;
-    // the catalog read that stands in for it here pages, so follow the cursor
-    // rather than returning only its first page.
+    // Native discovery returns every session it saw when no limit is given,
+    // and up to its 1-10000 acquisition limit when one is. The catalog read
+    // that stands in for it pages at most CATALOG_PAGE_MAX rows, so follow the
+    // cursor to the requested count (or the end) rather than passing an
+    // acquisition limit the catalog would reject.
     const sessions: CatalogSession[] = [];
-    let page = await listSessionCatalogPage({ ...options, scope });
+    const pageLimit = () =>
+      options.limit === undefined
+        ? undefined
+        : Math.min(options.limit - sessions.length, CATALOG_PAGE_MAX);
+    let page = await listSessionCatalogPage({ ...options, scope, limit: pageLimit() });
     sessions.push(...page.sessions);
-    while (options.limit === undefined && page.nextCursor) {
-      page = await listSessionCatalogPage({ ...options, scope, after: page.nextCursor });
+    while (page.nextCursor && (options.limit === undefined || sessions.length < options.limit)) {
+      page = await listSessionCatalogPage({
+        ...options,
+        scope,
+        limit: pageLimit(),
+        after: page.nextCursor,
+      });
       sessions.push(...page.sessions);
     }
     return {

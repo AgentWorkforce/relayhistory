@@ -325,4 +325,8 @@ test('plugin discovery without a limit returns every catalogued session, past th
   assert.deepEqual(discovery.sessions.map((session) => session.sessionId).sort(), ids);
   const limited = await discoverSessions({ plugins: registry, dbPath, limit: 10 });
   assert.equal(limited.sessions.length, 10);
+  // An acquisition limit above one catalog page (1-10000) is accepted, as it
+  // is on the native-only path, and pages rather than being passed through.
+  const wide = await discoverSessions({ plugins: registry, dbPath, limit: 2000 });
+  assert.equal(wide.sessions.length, 60);
 });
