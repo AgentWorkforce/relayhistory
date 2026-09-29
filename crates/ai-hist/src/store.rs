@@ -1617,11 +1617,14 @@ VALUES ('session_presences_local_backfill_v1');
         "INSERT OR IGNORE INTO schema_migrations (name) VALUES ('session_markers_v1');",
     )?;
     migrate_session_markers_v2(conn)?;
-    // Partial: only rows that name a provider request carry a key, which on
-    // the local parsers is Claude's assistant output alone.
+    // Partial: only rows that name a provider message carry a key. On
+    // `message.id` rather than `requestId` because settlement always names the
+    // message and only sometimes the request: a transcript that writes no
+    // `requestId` is grouped on `message.id` alone.
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_session_events_request \
-         ON session_events(source, session_id, request_id) WHERE request_id IS NOT NULL",
+         ON session_events(source, session_id, provider_message_id) \
+         WHERE provider_message_id IS NOT NULL",
         [],
     )?;
     // Rows stored before the parser settled streamed Claude requests and
@@ -7489,7 +7492,7 @@ mod tests {
     /// A pre-usage database also predates the derived request view. SQLite
     /// refuses to drop one of the view's source columns while the view still
     /// references it, so the legacy shape is modelled without it.
-    /// Also the index over `request_id`, which SQLite will not let a
+    /// Also the index over `provider_message_id`, which SQLite will not let a
     /// column drop leave dangling: a database from before the raw facts had
     /// neither.
     fn drop_session_requests_view(conn: &Connection) {
