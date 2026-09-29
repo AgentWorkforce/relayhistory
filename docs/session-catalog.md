@@ -774,7 +774,11 @@ How each adapter works:
   in the head read and skipped, so a session is emitted once per run and its
   row keeps pointing at its own transcript. A transcript whose complete records
   parse as nothing is reported as a diagnostic rather than published under its
-  file name; an empty one is simply not a session yet.
+  file name; an empty one is simply not a session yet. The subagent workflow
+  journal, `<session>/subagents/**/journal.jsonl`, is excluded by name before
+  anything opens it — here and in the full sync walk alike. It records
+  workflow orchestration (`started` / `result` lines), not a conversation, and
+  no session, event, marker, cursor or continuity row is derived from it.
 - **codex** — `rollout-*.jsonl` under `$CODEX_HOME/sessions` and
   `$CODEX_HOME/archived_sessions` (defaulting under `~/.codex`). The first line
   is a `session_meta` record, which

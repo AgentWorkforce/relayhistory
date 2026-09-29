@@ -3866,3 +3866,37 @@ fn cancellation_during_row_emission_preserves_the_committed_window() {
         assert_eq!(resumed.summary.discovered, 0);
     }
 }
+
+/// A subagent workflow journal shares the `.jsonl` extension and sits inside
+/// the project tree, but it is not a transcript, so discovery never lists it
+/// as a candidate session.
+#[test]
+fn claude_discovery_skips_subagent_workflow_journals() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let project = home.path().join(".claude/projects/app");
+    write(&project.join("s1.jsonl"), CLAUDE_BODY);
+    write(
+        &project.join("s1/subagents/journal.jsonl"),
+        "{\"type\":\"started\",\"agentId\":\"a\"}\n",
+    );
+    write(
+        &project.join("s1/subagents/agent-a.jsonl"),
+        "{\"type\":\"assistant\",\"isSidechain\":true}\n",
+    );
+
+    let env = env_at(&conn, home.path());
+    let locators: Vec<String> = ClaudeProvider
+        .enumerate(&env, None)
+        .unwrap()
+        .into_iter()
+        .map(|candidate| candidate.locator)
+        .collect();
+    assert_eq!(locators.len(), 2, "{locators:?}");
+    assert!(
+        locators
+            .iter()
+            .all(|locator| !locator.ends_with("journal.jsonl")),
+        "{locators:?}"
+    );
+}

@@ -1349,7 +1349,7 @@ impl ShallowSessionProvider for ClaudeProvider {
     ) -> Result<Vec<Candidate>> {
         file_candidates(
             "claude",
-            crate::collect_matching_files(&env.claude_config_dir.join("projects"), "", "jsonl")?,
+            crate::ingest::claude_transcript_files(&env.claude_config_dir.join("projects"))?,
             crate::file_stamp_and_modified,
         )
     }

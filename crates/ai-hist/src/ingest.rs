@@ -5398,7 +5398,7 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
     // transcript it discovered, and a caller told the sync completed would
     // treat an incomplete cache as current.
     let mut read_error: Option<anyhow::Error> = None;
-    let transcripts = collect_matching_files(root, "", "jsonl")?;
+    let transcripts = claude_transcript_files(root)?;
     // Same question the codex walk asks of its roots, and asked the same way:
     // per path, because a project tree can be readable while part of it is
     // not. Under cursors the set of files this install knows about is the
@@ -5419,7 +5419,12 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
         // and resuming from the stale cursor is exactly how its rows would
         // keep null facts after the archive returns.
         transcript_cursor::forget_locator(conn, "claude", &missing)?;
-        walked_every_known_root = false;
+        // A workflow journal an earlier build walked as a transcript is still
+        // on disk; it is excluded now, not missing, so forgetting its cursor
+        // is the whole repair and leaves this walk's coverage complete.
+        if !is_claude_workflow_journal(root, Path::new(&missing)) {
+            walked_every_known_root = false;
+        }
     }
     let mut scanned = 0;
     let mut upserted = 0;
@@ -9069,6 +9074,44 @@ fn upsert_session_inner(
         Some("full"),
     )?;
     Ok(())
+}
+
+/// Whether `path` is the subagent workflow journal Claude Code keeps beside
+/// its `agent-*.jsonl` transcripts, rather than a transcript.
+///
+/// `<session>/subagents/**/journal.jsonl` records the orchestration of a
+/// subagent workflow — `started` / `result` lines naming the spawned agents —
+/// not a conversation. It shares the `.jsonl` extension and sits inside the
+/// tree the Claude walk recurses, so without this it was stamped, re-read on
+/// every change, and one classifier change away from its `started` / `result`
+/// lines being stored as `unknown` markers on some session.
+///
+/// Only the part of the path below `root` is consulted, so a directory named
+/// `subagents` above the Claude root cannot turn an ordinary transcript named
+/// `journal.jsonl` into a journal.
+pub(crate) fn is_claude_workflow_journal(root: &Path, path: &Path) -> bool {
+    if path.file_name().and_then(|name| name.to_str()) != Some("journal.jsonl") {
+        return false;
+    }
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    relative
+        .parent()
+        .into_iter()
+        .flat_map(Path::ancestors)
+        .any(|ancestor| ancestor.file_name().and_then(|name| name.to_str()) == Some("subagents"))
+}
+
+/// Every Claude transcript under `root`: each `*.jsonl` in the tree except the
+/// subagent workflow journals, which are metadata and never a transcript.
+///
+/// Discovery and the sync walk both enumerate through this, so neither can
+/// list a journal the other has excluded.
+pub(crate) fn claude_transcript_files(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = collect_matching_files(root, "", "jsonl")?;
+    files.retain(|path| !is_claude_workflow_journal(root, path));
+    Ok(files)
 }
 
 pub(crate) fn collect_matching_files(root: &Path, prefix: &str, ext: &str) -> Result<Vec<PathBuf>> {
@@ -13930,6 +13973,113 @@ mod tests {
             .query_row("SELECT count(*) FROM session_markers", [], |row| row.get(0))
             .unwrap();
         assert_eq!(orphans, 0, "a marker with no session would be unreachable");
+    }
+
+    #[test]
+    fn claude_workflow_journal_is_recognized_only_below_a_subagents_directory() {
+        let root = Path::new("/home/u/.claude/projects");
+        for journal in [
+            "/home/u/.claude/projects/app/s1/subagents/journal.jsonl",
+            "/home/u/.claude/projects/app/s1/subagents/wf-1/journal.jsonl",
+        ] {
+            assert!(
+                is_claude_workflow_journal(root, Path::new(journal)),
+                "{journal}"
+            );
+        }
+        for transcript in [
+            "/home/u/.claude/projects/app/journal.jsonl",
+            "/home/u/.claude/projects/app/s1/subagents/agent-a.jsonl",
+            "/home/u/.claude/projects/app/s1/subagents/journal.jsonl.bak",
+        ] {
+            assert!(
+                !is_claude_workflow_journal(root, Path::new(transcript)),
+                "{transcript}"
+            );
+        }
+        // Only the path below the Claude root counts.
+        assert!(!is_claude_workflow_journal(
+            Path::new("/srv/subagents/.claude/projects"),
+            Path::new("/srv/subagents/.claude/projects/app/journal.jsonl"),
+        ));
+    }
+
+    /// Claude Code keeps a workflow journal beside a session's subagent
+    /// transcripts. It shares their extension and sits in the tree the sync
+    /// recurses, but it is orchestration metadata: the walk must not open it,
+    /// keep a cursor for it, or derive a single row from it — while the
+    /// session and the subagent beside it index exactly as before.
+    #[test]
+    fn claude_sync_never_reads_a_subagent_workflow_journal() {
+        let home = tempfile::tempdir().unwrap();
+        let project = home.path().join(".claude/projects/app");
+        let journal = project.join("s1/subagents/journal.jsonl");
+        fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        fs::write(
+            project.join("s1.jsonl"),
+            concat!(
+                r#"{"type":"user","uuid":"u1","sessionId":"s1","cwd":"/tmp/app","timestamp":"2026-09-20T00:00:00.000Z","message":{"role":"user","content":"spawn a helper"}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"s1","cwd":"/tmp/app","timestamp":"2026-09-20T00:00:01.000Z","requestId":"req_1","message":{"id":"msg_1","role":"assistant","model":"claude-opus-4-7","content":[{"type":"text","text":"On it."}]}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            project.join("s1/subagents/agent-a.jsonl"),
+            concat!(
+                r#"{"type":"assistant","uuid":"sa1","sessionId":"s1","agentId":"a","isSidechain":true,"cwd":"/tmp/app","timestamp":"2026-09-20T00:00:02.000Z","message":{"id":"msg_sub","role":"assistant","model":"claude-opus-4-7","content":[{"type":"text","text":"Helper report."}]}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        // The journal's own shape: lifecycle lines, not messages. A
+        // `sessionId` is included on purpose, so a walk that did read it
+        // would have a session to attribute rows to.
+        fs::write(
+            &journal,
+            concat!(
+                r#"{"type":"started","sessionId":"s1","agentId":"a","uuid":"j1","timestamp":"2026-09-20T00:00:02.000Z"}"#, "\n",
+                r#"{"type":"result","sessionId":"s1","agentId":"a","uuid":"j2","timestamp":"2026-09-20T00:00:03.000Z","verdict":"done"}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        let root = home.path().join(".claude/projects");
+        super::sync_claude_session_metadata(&conn, &mut state, &root).unwrap();
+
+        assert!(super::session_events_exist(&conn, "claude", "s1").unwrap());
+        let journal_locator = journal.to_string_lossy().to_string();
+        assert!(
+            !transcript_cursor::known_locators(&conn, "claude")
+                .unwrap()
+                .contains(&journal_locator),
+            "the journal must not be tracked as a transcript"
+        );
+        let derived: i64 = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM session_markers WHERE marker_uid LIKE 'j%') \
+                      + (SELECT COUNT(*) FROM session_events WHERE message_id IN ('j1', 'j2')) \
+                      + (SELECT COUNT(*) FROM sessions WHERE raw_path = ?1) \
+                      + (SELECT COUNT(*) FROM session_continuity_evidence WHERE locator = ?1)",
+                [&journal_locator],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(derived, 0, "nothing may be derived from the journal");
+
+        // A cursor an earlier build kept for the journal is dropped by the
+        // next walk rather than left naming a file nothing reads.
+        conn.execute(
+            "INSERT INTO transcript_cursors (source, locator, committed_offset, updated_ms) \
+             VALUES ('claude', ?, 0, 0)",
+            [&journal_locator],
+        )
+        .unwrap();
+        super::sync_claude_session_metadata(&conn, &mut state, &root).unwrap();
+        assert!(!transcript_cursor::known_locators(&conn, "claude")
+            .unwrap()
+            .contains(&journal_locator));
     }
 
     /// The Claude half of the marker-only fast path.
