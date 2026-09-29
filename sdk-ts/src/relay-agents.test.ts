@@ -88,6 +88,7 @@ test('enforces a total request deadline even while the peer sends data', async (
       connection.write('HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n');
       const interval = setInterval(() => connection.write('1\r\n{\r\n'), 10);
       connection.once('close', () => clearInterval(interval));
+      connection.on('error', () => clearInterval(interval));
     });
   });
   await new Promise<void>((resolve, reject) => {
