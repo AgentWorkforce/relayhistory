@@ -92,14 +92,20 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 3;
 /// row and the reminders folded into the prompt text, so every session
 /// re-parses once.
 ///
-/// Version 12 extends tool-result fidelity (#171) to Cursor, Grok and
+/// Version 12 is Grok's per-turn usage (#212): the `turn_completed.usage`
+/// breakdown stored beside the context proxy, and one request span per turn
+/// on the assistant rows. Both come only from `updates.jsonl`, so a Grok
+/// checkpoint at 11 re-parses once; `GROK_SYNC_STATE_KEY` moved to
+/// `grok_events_v2` in the same change so plain `sync` re-reads it too.
+///
+/// Version 13 extends tool-result fidelity (#171) to Cursor, Grok and
 /// OpenCode: their tool-result rows gain `payload_bytes`, `payload_hash`,
 /// `payload_truncated`, the ordering indexes, `result_status`, `event_source`
-/// and `error_signal`. A checkpoint at 11 has every one of them null on those
+/// and `error_signal`. A checkpoint at 12 has every one of them null on those
 /// rows, so each session re-parses once. Plain `sync` gets the same push by
-/// retiring `cursor_events_v2` and `grok_events_v1`; OpenCode re-normalizes
+/// retiring `cursor_events_v2` and `grok_events_v2`; OpenCode re-normalizes
 /// every session on every sync already.
-const HYDRATION_PARSER_VERSION: i64 = 12;
+const HYDRATION_PARSER_VERSION: i64 = 13;
 
 #[derive(Debug, Clone)]
 pub struct HydrateSessionOptions {
@@ -1465,10 +1471,13 @@ fn source_snapshot(
         // "The configured store" is any of them: the default `opencode.db`
         // and, unless it is pinned, every channel database beside it.
         let resolved = fs::canonicalize(&path).ok();
-        let is_configured_store = resolved.is_some()
-            && crate::paths::opencode_db_files(configured_path, roots.opencode_db_pinned)
+        let stores = crate::paths::opencode_db_files(configured_path, roots.opencode_db_pinned);
+        let store_index = resolved.as_ref().and_then(|resolved| {
+            stores
                 .iter()
-                .any(|store| fs::canonicalize(store).ok() == resolved);
+                .position(|store| fs::canonicalize(store).ok().as_ref() == Some(resolved))
+        });
+        let is_configured_store = store_index.is_some();
         let is_tree_session_file = !is_configured_store
             && opencode_locator_is_in_storage_tree(&path, &configured_storage.join("session"));
 
@@ -1498,6 +1507,19 @@ fn source_snapshot(
                 "SESSION_SOURCE_UNAVAILABLE",
                 format!("OpenCode source {} is unavailable", path.display()),
             ));
+        }
+        // A session held by more than one channel store belongs to the first
+        // (discovery and sync both claim it there). If an earlier store has
+        // gained this session since the row was cataloged, the row names a
+        // superseded copy: sync now reads the earlier one, so hydrating this
+        // one would import evidence sync disagrees with. An earlier store that
+        // cannot be read claims nothing, exactly as in sync.
+        for earlier in &stores[..store_index.unwrap_or(0)] {
+            if crate::ingest::opencode::sqlite_store_holds_session(earlier, &options.session_id)
+                .unwrap_or(false)
+            {
+                return Err(superseded(&path, earlier));
+            }
         }
         let src = Connection::open_with_flags(
             &path,
@@ -2076,10 +2098,13 @@ fn stored_source_diagnostics(
         }
     }
     if options.source == "grok" {
-        let (context_total_tokens, usage_turns, turns) =
-            stored_grok_usage(conn, &options.session_id)?;
+        let (context_total_tokens, usage_turns) = stored_grok_usage(conn, &options.session_id)?;
+        // The stored rows say which turns carried a breakdown, not how many
+        // turns `updates.jsonl` opened: a turn with no token fact leaves no
+        // row to count. So the denominator is unknown here, and the caveat
+        // says so rather than claiming full coverage.
         return Ok(
-            grok_usage_diagnostic(context_total_tokens, usage_turns, turns)
+            grok_usage_diagnostic(context_total_tokens, usage_turns, None)
                 .into_iter()
                 .collect(),
         );
@@ -2088,9 +2113,9 @@ fn stored_source_diagnostics(
 }
 
 /// What a Grok session's stored token facts say, for a read that did not
-/// parse: the newest context-window snapshot, how many turns carry a usage
-/// breakdown, and how many carry any token fact at all.
-fn stored_grok_usage(conn: &Connection, session_id: &str) -> Result<(Option<i64>, usize, usize)> {
+/// parse: the newest context-window snapshot any row stored, and how many
+/// turns carry a usage breakdown.
+fn stored_grok_usage(conn: &Connection, session_id: &str) -> Result<(Option<i64>, usize)> {
     let stored = conn
         .prepare(
             "SELECT token_json FROM session_events \
@@ -2103,14 +2128,17 @@ fn stored_grok_usage(conn: &Connection, session_id: &str) -> Result<(Option<i64>
         .iter()
         .filter_map(|stored| serde_json::from_str::<Value>(stored).ok())
         .collect();
+    // Newest first, and not only the newest row: a turn that wrote a
+    // breakdown but no snapshot must not hide the snapshot an earlier turn
+    // stored.
     let context_total_tokens = tokens
-        .first()
-        .and_then(|token| token.get("context_total_tokens").and_then(Value::as_i64));
+        .iter()
+        .find_map(|token| token.get("context_total_tokens").and_then(Value::as_i64));
     let usage_turns = tokens
         .iter()
         .filter(|token| token.get("usage").is_some())
         .count();
-    Ok((context_total_tokens, usage_turns, tokens.len()))
+    Ok((context_total_tokens, usage_turns))
 }
 
 /// Index the selected session and hand back whatever the provider's own
@@ -2666,8 +2694,11 @@ fn ingest_codex(
         // Codex records continuity only when a producer writes explicit
         // fields on `session_meta`; a plain `codex resume` leaves no signal.
         indexed.bytes_read += crate::continuity::capture_codex_rollout(conn, path)? as i64;
-        crate::continuity::reconcile(conn, "codex")?;
+        // Each child's own continuity is captured with it (a spawned
+        // subagent's `thread_spawn` parent is a fork edge that lives only in
+        // the child's `session_meta`), so reconcile once they are all banked.
         indexed.absorb_outcome(ingest_codex_children(conn, options, path)?);
+        crate::continuity::reconcile(conn, "codex")?;
     }
     Ok(indexed)
 }
@@ -2799,6 +2830,7 @@ fn ingest_codex_children(
         if let Some(parent_session_id) = meta.parent_session_id.as_deref() {
             record_codex_delegation(conn, parent_session_id, &meta, &candidate)?;
         }
+        indexed.bytes_read += crate::continuity::capture_codex_rollout(conn, &candidate)? as i64;
     }
     Ok(indexed)
 }
@@ -2986,11 +3018,13 @@ fn ingest_grok(
 /// reads `token_json` has to be told that before it adds the numbers up:
 /// `GROK_USAGE_CONTEXT_PROXY_ONLY`. A build that writes the `turn_completed.
 /// usage` breakdown on only some turns is `GROK_USAGE_PARTIAL`. A session
-/// whose every turn carried one needs no caveat, and gets none.
+/// whose every turn carried one needs no caveat, and gets none. `turns` is
+/// `None` when the caller cannot establish how many turns there were — a
+/// cached read of the stored rows — and then coverage is never claimed.
 fn grok_usage_diagnostic(
     context_total_tokens: Option<i64>,
     usage_turns: usize,
-    turns: usize,
+    turns: Option<usize>,
 ) -> Option<HydrationDiagnostic> {
     let diagnostic = |code: &str, message: String| HydrationDiagnostic {
         code: code.to_string(),
@@ -3014,15 +3048,24 @@ fn grok_usage_diagnostic(
             },
         ));
     }
-    (usage_turns < turns).then(|| {
-        diagnostic(
+    match turns {
+        Some(turns) if usage_turns >= turns => None,
+        Some(turns) => Some(diagnostic(
             "GROK_USAGE_PARTIAL",
             format!(
                 "{usage_turns} of {turns} grok turns carried a turn_completed usage breakdown; \
                  the rest have at most the context-window snapshot, which is not billing usage"
             ),
-        )
-    })
+        )),
+        None => Some(diagnostic(
+            "GROK_USAGE_PARTIAL",
+            format!(
+                "{usage_turns} grok turns carried a turn_completed usage breakdown; the stored \
+                 rows cannot establish how many turns the session had, so any others have at \
+                 most the context-window snapshot, which is not billing usage"
+            ),
+        )),
+    }
 }
 
 fn grok_diagnostics(outcome: &GrokIngestOutcome) -> Vec<HydrationDiagnostic> {
@@ -3036,7 +3079,7 @@ fn grok_diagnostics(outcome: &GrokIngestOutcome) -> Vec<HydrationDiagnostic> {
     let mut diagnostics: Vec<HydrationDiagnostic> = grok_usage_diagnostic(
         outcome.context_total_tokens,
         outcome.usage_turns,
-        outcome.turns,
+        Some(outcome.turns),
     )
     .into_iter()
     .collect();
@@ -4781,13 +4824,95 @@ mod tests {
         );
 
         // A cached read says the same thing from the stored rows.
-        let (context, usage_turns, turns) = stored_grok_usage(&conn, "grok-usage-0001").unwrap();
-        assert_eq!((context, usage_turns, turns), (Some(2100), 1, 2));
+        let (context, usage_turns) = stored_grok_usage(&conn, "grok-usage-0001").unwrap();
+        assert_eq!((context, usage_turns), (Some(2100), 1));
         assert_eq!(
-            grok_usage_diagnostic(context, usage_turns, turns).map(|diagnostic| diagnostic.code),
+            grok_usage_diagnostic(context, usage_turns, None).map(|diagnostic| diagnostic.code),
             Some("GROK_USAGE_PARTIAL".to_string())
         );
-        assert!(grok_usage_diagnostic(None, 2, 2).is_none());
+        assert!(grok_usage_diagnostic(None, 2, Some(2)).is_none());
+        // The stored rows cannot count a turn that left no token fact, so a
+        // cached read never claims full coverage.
+        assert_eq!(
+            grok_usage_diagnostic(None, 2, None).map(|diagnostic| diagnostic.code),
+            Some("GROK_USAGE_PARTIAL".to_string())
+        );
+    }
+
+    /// Grok's usage is one breakdown per turn, so every assistant row of a
+    /// turn — thinking, each tool call, the prose — is one request. A turn that
+    /// called tools must not read as several requests, all but one
+    /// unmeasured.
+    #[test]
+    fn a_grok_turn_is_one_request_whatever_rows_it_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let chat = grok_fixture_home(dir.path(), "events-session");
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "grok", "grok-evt-0001", Some(&chat));
+        drop(conn);
+        hydrate_session_at_with_home(&db, &options("grok", "grok-evt-0001"), dir.path()).unwrap();
+
+        let conn = open_db(&db).unwrap();
+        let unspanned: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events \
+                 WHERE source = 'grok' AND role = 'assistant' AND request_span IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unspanned, 0);
+        let requests: Vec<(String, i64)> = conn
+            .prepare(
+                "SELECT request_key, event_count FROM session_requests \
+                 WHERE source = 'grok' AND session_id = 'grok-evt-0001' ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["request-span:0", "request-span:1"],
+            "{requests:?}"
+        );
+        assert!(
+            requests.iter().all(|(_, events)| *events > 1),
+            "{requests:?}"
+        );
+    }
+
+    /// A cached read keeps the newest context snapshot any turn stored, even
+    /// when the newest token row is a breakdown with no snapshot beside it.
+    #[test]
+    fn a_cached_grok_read_finds_an_older_context_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        for (ts, uid, token) in [
+            (
+                1,
+                "a",
+                r#"{"context_total_tokens":900,"source":"updates.jsonl"}"#,
+            ),
+            (
+                2,
+                "b",
+                r#"{"source":"updates.jsonl","usage":{"inputTokens":5,"outputTokens":1}}"#,
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO session_events (source, session_id, message_id, ts_ms, role, kind, token_json, event_uid) \
+                 VALUES ('grok', 'g', ?1, ?2, 'assistant', 'text', ?3, ?1)",
+                params![uid, ts, token],
+            )
+            .unwrap();
+        }
+        assert_eq!(stored_grok_usage(&conn, "g").unwrap(), (Some(900), 1));
     }
 
     /// Write a minimal Grok session directory and answer with its transcript.
@@ -9846,7 +9971,8 @@ mod tests {
         let relationship: (String, String, String, Option<String>, Option<i64>) = conn
             .query_row(
                 "SELECT identity_status, evidence_kind, evidence_locator, child_agent_type, spawned_at_ms \
-                 FROM session_relationships WHERE source='codex' AND child_session_id='child'",
+                 FROM session_relationships WHERE source='codex' AND child_session_id='child' \
+                   AND relationship='delegated'",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
@@ -9859,12 +9985,43 @@ mod tests {
         let grandchild_parent: String = conn
             .query_row(
                 "SELECT parent_session_id FROM session_relationships \
-                 WHERE source='codex' AND child_session_id='grandchild'",
+                 WHERE source='codex' AND child_session_id='grandchild' \
+                   AND relationship='delegated'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
         assert_eq!(grandchild_parent, "child-thread-spawn");
+        // A spawned child's fork edge lives only in its own `session_meta`, so
+        // hydrating the parent captures it with the child rather than leaving
+        // it for a later sync.
+        let forks: Vec<(String, String, String)> = conn
+            .prepare(
+                "SELECT parent_session_id, child_session_id, evidence_ref \
+                 FROM session_relationships WHERE source='codex' AND relationship='fork' \
+                 ORDER BY child_session_id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let spawn_ref = "source.subagent.thread_spawn.parent_thread_id".to_string();
+        assert_eq!(
+            forks,
+            vec![
+                (
+                    "root".to_string(),
+                    "child-thread-spawn".to_string(),
+                    spawn_ref.clone()
+                ),
+                (
+                    "child-thread-spawn".to_string(),
+                    "grandchild".to_string(),
+                    spawn_ref
+                ),
+            ]
+        );
     }
 
     #[test]
