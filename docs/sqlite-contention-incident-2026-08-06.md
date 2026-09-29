@@ -85,6 +85,10 @@ a SQLite-induced stop.
 
 ## Deferred architecture: issue #47
 
+> **Resolved 2026-09-28:** see
+> [SQLite writers stay direct; no append-only spool layer](decisions/2026-09-28-sqlite-writers-stay-direct-no-append-only-spools.md).
+> Both producers described below were removed before that decision.
+
 The proposed spool migration should not be folded into the incident fix. The
 current producer model differs from issue #47's premise:
 

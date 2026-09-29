@@ -347,6 +347,11 @@ It does not make #47 unnecessary. The honest position is:
 This ADR neither depends on #47 landing first nor resolves it; the MCP server
 and `agent-relay` broker writers it names are out of scope here.
 
+**Update (2026-09-28):** #47 is answered by
+[SQLite writers stay direct; no append-only spool layer](2026-09-28-sqlite-writers-stay-direct-no-append-only-spools.md).
+The broker `syncAndPush` loop and the MCP sql.js writer it named no longer
+exist; the escalation triggers above are restated there.
+
 ## Consequences
 
 - Any new harness is added in this repository and nowhere else. See
