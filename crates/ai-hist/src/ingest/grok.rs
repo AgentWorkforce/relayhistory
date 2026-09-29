@@ -510,10 +510,11 @@ pub(crate) struct ChunkGroup {
     /// Grok reuses it across records, so it is never an identity on its own.
     pub event_id: Option<String>,
     /// The identity this message's event is stored under: the `eventId`
-    /// itself when no other message group in the stream carries it, and
-    /// `<eventId>#<n>` (its *n*-th occurrence, in stream order) when one does.
-    /// Keying two messages on one repeated id would upsert the second over
-    /// the first and silently drop a turn.
+    /// itself for its first occurrence in the stream, and `<eventId>#<n>` for
+    /// the *n*-th repeat after it (`#1`, `#2`, …). Keying two messages on one
+    /// repeated id would upsert the second over the first and silently drop a
+    /// turn; suffixing only the repeats means an append that reuses an id
+    /// never renames a message already stored.
     pub event_key: Option<String>,
     pub turn: usize,
     /// Position among every message group of the stream, for the
@@ -787,10 +788,11 @@ pub(crate) fn parse_updates(contents: &str, path: &Path) -> Result<GrokUpdates> 
 
 /// Give every message group the identity its event is stored under.
 ///
-/// Grok reuses `eventId` across records, so an id that more than one group
-/// carries is suffixed with its occurrence number in stream order. An id seen
-/// once keeps its plain form, which is what earlier builds stored, so a
-/// session with no repeats keeps every identity it already had.
+/// Grok reuses `eventId` across records. The first group in stream order to
+/// carry an id keeps it plain — what earlier builds stored — and each later
+/// group carrying it is suffixed with its repeat number (`#1`, `#2`, …).
+/// Only what came *before* a group decides its key, so appending to the
+/// stream never renames a message that is already stored.
 fn assign_event_keys(updates: &mut GrokUpdates) {
     let mut groups: Vec<&mut ChunkGroup> = updates
         .user_messages
@@ -799,24 +801,17 @@ fn assign_event_keys(updates: &mut GrokUpdates) {
         .chain(updates.agent_thoughts.iter_mut())
         .collect();
     groups.sort_by_key(|group| group.seq);
-    let mut totals: HashMap<String, usize> = HashMap::new();
-    for group in groups.iter() {
-        if let Some(id) = &group.event_id {
-            *totals.entry(id.clone()).or_default() += 1;
-        }
-    }
     let mut seen: HashMap<String, usize> = HashMap::new();
     for group in groups {
         let Some(id) = group.event_id.clone() else {
             continue;
         };
-        if totals.get(&id).copied().unwrap_or(0) > 1 {
-            let occurrence = seen.entry(id.clone()).or_default();
-            group.event_key = Some(format!("{id}#{occurrence}"));
-            *occurrence += 1;
-        } else {
-            group.event_key = Some(id);
-        }
+        let repeats = seen.entry(id.clone()).or_default();
+        group.event_key = Some(match *repeats {
+            0 => id,
+            n => format!("{id}#{n}"),
+        });
+        *repeats += 1;
     }
 }
 
@@ -1523,8 +1518,8 @@ mod tests {
 
     /// Grok reuses `eventId` across records (tokscale, `sessions/grok.rs`).
     /// Two messages carrying one id must not share an identity, or the second
-    /// upserts over the first and a turn disappears. An id seen once keeps
-    /// its plain form, which is what earlier builds stored.
+    /// upserts over the first and a turn disappears. The first occurrence
+    /// keeps its plain form, which is what earlier builds stored.
     #[test]
     fn a_repeated_event_id_is_disambiguated_and_a_unique_one_is_not() {
         let stream = [
@@ -1540,10 +1535,10 @@ mod tests {
         };
         assert_eq!(
             keys(&updates.user_messages),
-            vec![Some("dup#0".to_string()), Some("dup#1".to_string())]
+            vec![Some("dup".to_string()), Some("dup#1".to_string())]
         );
         // Numbered in stream order across every kind of message, so the
-        // thought after the second prompt is the third occurrence.
+        // thought after the second prompt is the second repeat.
         assert_eq!(
             keys(&updates.agent_thoughts),
             vec![Some("dup#2".to_string())]
@@ -1554,6 +1549,22 @@ mod tests {
         );
         // The raw id is still there, as a fact about the row.
         assert_eq!(updates.user_messages[1].event_id.as_deref(), Some("dup"));
+    }
+
+    /// Review regression: a message already stored keeps its identity when a
+    /// later append repeats its `eventId`. Renaming it to `#0` would retire
+    /// and re-insert it in the change feed and hand burn a new message id.
+    #[test]
+    fn review_event_key_renumbers_on_append() {
+        let first = r#"{"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"eventId":"X","agentTimestampMs":1000,"turnStartMs":1000}}}"#;
+        let second = r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"eventId":"X","agentTimestampMs":1500,"turnStartMs":1000}}}"#;
+        let before = parse_updates_ok(first);
+        let after = parse_updates_ok(&[first, second].join("\n"));
+        assert_eq!(
+            before.user_messages[0].event_key, after.user_messages[0].event_key,
+            "existing message identity changed on append"
+        );
+        assert_eq!(after.agent_messages[0].event_key.as_deref(), Some("X#1"));
     }
 
     #[test]

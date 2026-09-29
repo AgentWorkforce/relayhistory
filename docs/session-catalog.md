@@ -1207,7 +1207,7 @@ How each adapter works:
   | `tool_result.is_error` | **Inferred** — the failure signal is documented on the ACP `tool_call_update` `status` | Both are read; either marks `tool_calls.is_error` |
   | `reasoning.summary` / `reasoning.encrypted_content` | **Corroborated** ("reasoning is encrypted_content") | The summary is the thinking text; an encrypted-only record becomes an `encrypted_reasoning` marker and is never given invented text |
   | `updates.jsonl` envelope `{timestamp, method, params:{sessionId, update:{sessionUpdate,…}, _meta:{eventId, agentTimestampMs}}}` | **Corroborated** by three independent adapters | The timing source for the join; `eventId` also becomes the event's identity |
-  | `params._meta.eventId` is **not unique** | **Stated by tokscale** ("Grok reuses it across usage records", `sessions/grok.rs`) | An id carried by more than one message group is suffixed with its occurrence (`ev:<id>#<n>`), so two messages never share an identity; an id seen once keeps `ev:<id>` |
+  | `params._meta.eventId` is **not unique** | **Stated by tokscale** ("Grok reuses it across usage records", `sessions/grok.rs`) | The first message group carrying an id keeps `ev:<id>`; each later one is `ev:<id>#<n>` (`#1`, `#2`, …), so two messages never share an identity and an append never renames a stored one |
   | `params.update._meta.modelId` | **Read by tokscale** (`extract_model_id`); not seen in a public sample | The turn's model: written as `model` in the turn's `token_json` and added to `sessions.models_json` |
   | `turn_completed.usage.modelUsage` with one key | **Read by tokscale** | The turn's model when no row carried `_meta.modelId`; a map with several keys names no single model |
   | envelope `method` `session/update` **or** `_x.ai/session/update` | **Corroborated** | Both read; the method is not required to be either |
@@ -1269,10 +1269,17 @@ How each adapter works:
 
   - It is read **incrementally**, from a byte cursor in `transcript_cursors`
     (the machinery of #173), by every sweep after the session directories and
-    by every Grok hydration inside its own transaction. An unchanged log reads
-    zero bytes; a trailing line with no newline waits for one. The file is in
-    the sweep's stat-only fingerprint and is a watch root of its own, so an
-    append to it wakes live capture.
+    by every Grok hydration — `unchanged` ones included — in an `IMMEDIATE`
+    transaction of its own, before the hydration's stamp check (the session's
+    stamp never moves when the log grows). An unchanged log reads zero bytes;
+    a trailing line with no newline waits for one. The file is in the sweep's
+    stat-only fingerprint and is a watch root of its own, so an append to it
+    wakes live capture.
+  - The log is every session's, so a log that cannot be read — unreadable, or
+    replaced mid-read — never fails a session's hydration: it is reported as
+    `GROK_UNIFIED_LOG_UNREADABLE` for that run (not checkpointed), the cursor
+    stays put, and the next pass retries. A sweep notes it and keeps the
+    source out of its cached fingerprint.
   - Each usage row is copied into `grok_unified_usage`, the durable copy —
     the bytes are never read again — and then **materialized** onto the
     session it names as one `role = "assistant"`, `kind = "text"` event with
@@ -1281,28 +1288,45 @@ How each adapter works:
     "logs/unified.jsonl", "pid", "event_id"}`. One inference is one
     `per-request` record, normalized with the same counter lists as
     `turn_completed.usage`. `costUsdTicks` is kept verbatim and never read as
-    a cost.
+    a cost. Only rows with no event yet are inserted, so an append attaches
+    its own rows and leaves every stored event — and the change feed —
+    untouched. A row later than the session's `last_activity_ms` extends it.
   - Rows attach **by session id**, assumed to equal `summary.json`'s
     `info.id` (unverified). A row for a session that is not in the catalog yet
     is **retained** and attached when that session is indexed; one that names
     no session at all is counted and not attached, because guessing a session
     from the pid would be invention.
+  - **Retention.** `grok_unified_usage` keeps every row it is given, including
+    rows whose session is not in the catalog — or no longer is. The log is
+    never re-read, so a row deleted here is usage lost for good if the session
+    is indexed (again) later. Each sweep that reads new bytes reports how many
+    stored rows have no catalogued session ("retained for sessions not
+    indexed"), so the backlog is visible; the rows are small (one counter
+    object each).
   - A row is keyed on a digest of **the whole normalized row**, not on
     `eventId`: tokscale records that Grok reuses `eventId` across usage
     records, so an id key would collapse distinct inferences. The same row
     read twice (after a rotation) lands on the same key.
-  - **Precedence, never addition.** A session the log covers takes its usage
-    from it. Its `turn_completed.usage` breakdowns describe the same spend a
-    second time, so they are kept under `turn_usage`, which nothing
-    normalizes — whether the session was indexed before or after the log rows
-    arrived. A session the log does not cover keeps its turn breakdown under
-    `usage`, and the context snapshot is never usage in either case.
-  - A covered session needs no usage caveat: hydration reports none, parsed
-    or cached, and a cached hydration's stored diagnostics are cleared when
-    new rows attach, so an `unchanged` read does not replay a stale
-    `GROK_USAGE_CONTEXT_PROXY_ONLY`. An uncovered session keeps the caveat its
-    `updates.jsonl` earns. `capability` stays `full` either way — usage is not
-    an evidence kind (hydration contract 3).
+  - **Precedence per turn, never addition.** A turn's `turn_completed.usage`
+    is stored with the turn's window (`turn_start_ms`, `turn_end_ms`). When a
+    log row's time falls inside that window, the log has that turn's spend,
+    so the breakdown is moved to `turn_usage`, which nothing normalizes —
+    whether the session was indexed before or after the rows arrived. A turn
+    the log does not reach (a log that started mid-session, or was rotated
+    away) keeps its breakdown as `usage`, so it is neither counted twice nor
+    dropped. A log row with no time cannot be placed in a turn, so its
+    presence covers every turn: a demoted breakdown is still there as
+    `turn_usage`, while an inference counted twice could not be told apart.
+    The context snapshot is never usage in any case.
+  - Hydration's usage caveat for a session the log reaches is decided per
+    turn: none when the log covers every turn; `GROK_USAGE_MIXED_SOURCES`
+    when every turn has usage but some of it comes from `turn_completed.usage`
+    (each turn still counted once); `GROK_USAGE_PARTIAL` when some turn has
+    neither. A session the log does not reach keeps the caveat its
+    `updates.jsonl` earns. Cached diagnostics are cleared when new rows
+    attach, so an `unchanged` read rebuilds them from the stored rows.
+    `capability` stays `full` either way — usage is not an evidence kind
+    (hydration contract 3).
 
   The row shape is **inferred**. tokscale reads a session id, a pid, a model
   and per-inference input/output/cache counters, and keys rows on
@@ -1330,12 +1354,15 @@ How each adapter works:
   rebuild Grok performs on a format upgrade; an event that did not is keyed on
   its record index (`r<n>`), which does not. Tool calls and results are keyed
   on the provider's own call id (`tool:<id>`, `result:<id>`). Grok reuses an
-  `eventId` across records, so an id more than one message group carries is
-  suffixed with its occurrence in stream order (`ev:<id>#0`, `ev:<id>#1`, …):
-  keying both on `ev:<id>` upserted the second message over the first. A
-  session indexed before this is re-read once by `sync` (the `grok_events_v4`
-  state key). A `logs/unified.jsonl` usage event is keyed `unified:<digest>`
-  and is rebuilt, not cleared, by each replacing read.
+  `eventId` across records: the first message group in stream order to carry
+  an id keeps `ev:<id>`, and each later one is suffixed with its repeat number
+  (`ev:<id>#1`, `ev:<id>#2`, …). Keying both on `ev:<id>` upserted the second
+  message over the first; suffixing only the repeats means an append that
+  reuses an id never renames a message already stored. A session indexed
+  before this is re-read once, by `sync` (the `grok_events_v4` state key) and
+  by hydration (parser version 14). A `logs/unified.jsonl` usage event is
+  keyed `unified:<digest>` and is rebuilt, not cleared, by each replacing
+  read.
 
   **A Grok read is a replacement, not a merge.** Grok rewrites
   `chat_history.jsonl` in place on a format upgrade or a compaction, and prunes
