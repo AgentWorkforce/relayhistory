@@ -664,6 +664,14 @@ const CORPUS: &[Fixture] = &[
         files: &["grok/events-session"],
         quirk: "documented Grok Build layout: `chat_history.jsonl` with `tool_calls[]`, ACP `updates.jsonl` with real `agentTimestampMs` times, `compaction_checkpoints/`, `subagents/`, `signals.json` and `prompt_context.json`",
     },
+    Fixture {
+        source: "grok",
+        name: "unified-usage",
+        layout: Layout::HomeTree,
+        origin: Origin::RelayHistory,
+        files: &["grok/unified-usage"],
+        quirk: "two Grok Build sessions under one Grok home: one covered by the process-wide `logs/unified.jsonl` per-inference usage log (a repeated `eventId`, a pid-scoped model, top-level counters, an exact duplicate row, a row with no session and one for an unindexed session), one not covered and with no `summary.json`, so its model and start time come from `events.jsonl`",
+    },
     // -- muse --------------------------------------------------------------
     Fixture {
         source: "muse",

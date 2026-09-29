@@ -1418,6 +1418,26 @@ CREATE TABLE IF NOT EXISTS transcript_cursors (
     updated_ms INTEGER NOT NULL,
     PRIMARY KEY (source, locator)
 );
+-- Per-inference usage rows read from Grok's process-wide, append-only
+-- `logs/unified.jsonl`. The log is read once, from a byte cursor in
+-- `transcript_cursors`, so these rows are the durable copy: a Grok session
+-- read *replaces* its evidence, and each replacement re-materializes that
+-- session's rows from here as `session_events`. A row for a session not yet
+-- in the catalog waits here until the session is indexed. Keyed on a digest
+-- of the whole row, because Grok reuses `eventId` across usage records.
+CREATE TABLE IF NOT EXISTS grok_unified_usage (
+    row_key TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    ts_ms INTEGER,
+    pid INTEGER,
+    model TEXT,
+    event_id TEXT,
+    usage_json TEXT NOT NULL,
+    locator TEXT NOT NULL,
+    line_offset INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_grok_unified_usage_session
+    ON grok_unified_usage(session_id);
 CREATE TABLE IF NOT EXISTS session_identity_correlations (
     source TEXT NOT NULL,
     local_session_id TEXT NOT NULL,

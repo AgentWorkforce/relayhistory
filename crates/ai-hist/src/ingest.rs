@@ -1125,6 +1125,7 @@ fn sweep_only_fingerprint_inputs(roots: &crate::ProviderRoots) -> Vec<Candidate>
     let mut paths = vec![
         roots.claude.join("history.jsonl"),
         roots.codex.join("history.jsonl"),
+        grok_unified_log_path(&roots.grok),
     ];
     // Errors here mean an unreadable directory, not "no trajectories". The
     // fold simply omits what it could not enumerate, which can only cause an
@@ -1241,6 +1242,11 @@ pub(crate) fn source_watch_roots(
         "codex" => roots.push(discover::WatchRoot::file(
             provider_roots.codex.join("history.jsonl"),
         )),
+        // Grok's per-inference usage log sits outside the sessions tree, so
+        // an append to it is watched as the one file it is.
+        "grok" => roots.push(discover::WatchRoot::file(grok_unified_log_path(
+            &provider_roots.grok,
+        ))),
         "trajectory" => {
             for root in trajectory_roots(provider_roots).unwrap_or_default() {
                 roots.push(trajectory_watch_root(root));
@@ -1529,12 +1535,7 @@ fn sync_basic(
     check_capture_cancelled()?;
     if let Some(inserted) = report.capture(
         "grok",
-        sync_grok_with_coverage(
-            conn,
-            &mut state,
-            &roots.grok.join("sessions"),
-            &mut coverage,
-        ),
+        sync_grok_home(conn, &mut state, &roots.grok, &mut coverage),
     ) {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);
@@ -2376,6 +2377,7 @@ const RETIRED_SYNC_STATE_KEYS: &[(&str, &str)] = &[
     ("grok_sessions", GROK_SYNC_STATE_KEY),
     ("grok_events_v1", GROK_SYNC_STATE_KEY),
     ("grok_events_v2", GROK_SYNC_STATE_KEY),
+    ("grok_events_v3", GROK_SYNC_STATE_KEY),
 ];
 
 /// Where plain `sync` remembers how far it has read each Cursor transcript.
@@ -2461,7 +2463,14 @@ pub(crate) fn record_cursor_hydrate_checkpoint(
 /// token facts and one request per assistant row until it is read again.
 ///
 /// `v3` re-reads every session once more for tool-result fidelity (#171).
-const GROK_SYNC_STATE_KEY: &str = "grok_events_v3";
+///
+/// `v4` re-reads for #212: an `eventId` Grok reused across two messages keyed
+/// both to one event, so the second overwrote the first, and the turn models
+/// `updates.jsonl` names (`_meta.modelId`, a single-key `modelUsage`) were not
+/// read. Neither heals without reading the directory again. The
+/// `logs/unified.jsonl` usage needs no re-read: it attaches from its own
+/// cursor whatever the session's stamp says.
+const GROK_SYNC_STATE_KEY: &str = "grok_events_v4";
 
 fn merged_sync_state(path: &Path, ours: &Map<String, Value>) -> Result<Option<Map<String, Value>>> {
     let mut merged = load_sync_state(path)?;
@@ -12951,6 +12960,52 @@ pub(crate) fn ingest_muse_session(
     Ok(outcome)
 }
 
+/// Everything a sweep reads under one Grok home: the session directories,
+/// then the process-wide `logs/unified.jsonl`.
+///
+/// Sessions first, so a usage row whose session is indexed in this same sweep
+/// attaches to it now rather than on the next one. A log that cannot be read
+/// does not fail the sessions that could: it is noted, the source stays out
+/// of the cached fingerprint so the next sweep retries it, and the cursor has
+/// not moved.
+fn sync_grok_home(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    grok_home: &Path,
+    coverage: &mut SweepCoverage,
+) -> Result<usize> {
+    let inserted = sync_grok_with_coverage(conn, state, &grok_home.join("sessions"), coverage)?;
+    match sync_grok_unified_log(conn, grok_home) {
+        Ok(pass) => {
+            if pass.bytes_read > 0 {
+                let mut suffix = String::new();
+                if pass.unattributed > 0 {
+                    suffix.push_str(&format!(", {} with no session", pass.unattributed));
+                }
+                if pass.malformed > 0 {
+                    suffix.push_str(&format!(", {} unreadable rows", pass.malformed));
+                }
+                sync_note!(
+                    "  [grok] +{} usage rows from logs/unified.jsonl ({} sessions{suffix})",
+                    pass.new_rows,
+                    pass.sessions_materialized
+                );
+            }
+        }
+        Err(error) => {
+            if error.is::<CaptureCancelled>() {
+                return Err(error);
+            }
+            coverage.note_unread();
+            sync_note!(
+                "  [grok] unreadable {}: {error:#}",
+                grok_unified_log_path(grok_home).display()
+            );
+        }
+    }
+    Ok(inserted)
+}
+
 #[cfg(test)]
 fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> Result<usize> {
     sync_grok_with_coverage(conn, state, root, &mut SweepCoverage::default())
@@ -13129,6 +13184,324 @@ fn sync_grok_with_coverage(
     Ok(inserted)
 }
 
+/// Where Grok writes its process-wide per-inference log, under the Grok home
+/// (`GROK_HOME`, else `~/.grok`).
+pub(crate) fn grok_unified_log_path(grok_home: &Path) -> PathBuf {
+    grok_home.join("logs").join("unified.jsonl")
+}
+
+/// The key the unified log's per-process model memory is parked under in its
+/// `transcript_cursors` document.
+const GROK_UNIFIED_CURSOR_KEY: &str = "grok_unified";
+
+/// What one pass over `logs/unified.jsonl` did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct GrokUnifiedPass {
+    /// Bytes read past the committed cursor. Zero when nothing was appended.
+    pub bytes_read: u64,
+    /// Usage rows read this pass, and how many of them were new.
+    pub usage_rows: usize,
+    pub new_rows: usize,
+    /// Usage rows that named no session, so could not be attached.
+    pub unattributed: usize,
+    /// Terminated rows that were not JSON, or were too large to hold.
+    pub malformed: usize,
+    /// Catalogued sessions whose usage events were rebuilt.
+    pub sessions_materialized: usize,
+}
+
+/// Read what `logs/unified.jsonl` gained since the last pass, in one
+/// transaction: the new rows, the advanced cursor, and the rebuilt usage of
+/// every catalogued session they touch commit together or not at all.
+pub(crate) fn sync_grok_unified_log(
+    conn: &Connection,
+    grok_home: &Path,
+) -> Result<GrokUnifiedPass> {
+    let tx = conn.unchecked_transaction()?;
+    let pass = sync_grok_unified_log_in(&tx, grok_home)?;
+    tx.commit()?;
+    Ok(pass)
+}
+
+/// [`sync_grok_unified_log`] inside a transaction the caller already holds —
+/// targeted hydration's.
+///
+/// The log is append-only and covers every session on the machine, so it is
+/// read from a byte cursor, never re-read whole: a second pass over an
+/// unchanged log reads zero bytes. Each usage row is copied into
+/// `grok_unified_usage` — the durable copy, because the bytes are never read
+/// again — keyed on [`grok::unified_row_key`], so a region read twice after a
+/// rotation writes the same rows. A trailing line with no newline is withheld
+/// until it has one. A terminated row that is not JSON is counted and passed
+/// over: the log is Grok's process log, not a session's evidence, and holding
+/// the cursor on one bad line would stop every later inference being read.
+pub(crate) fn sync_grok_unified_log_in(
+    conn: &Connection,
+    grok_home: &Path,
+) -> Result<GrokUnifiedPass> {
+    let mut pass = GrokUnifiedPass::default();
+    let path = grok_unified_log_path(grok_home);
+    match path.metadata() {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return Ok(pass),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(pass),
+        Err(error) => {
+            return Err(error).with_context(|| format!("stat Grok unified log {}", path.display()))
+        }
+    }
+    let locator = path.to_string_lossy().to_string();
+    let key = transcript_cursor::CursorKey::Locator {
+        source: "grok",
+        locator: &locator,
+    };
+    let mut cursor = transcript_cursor::load_cursor(conn, &key)?;
+    let mut reader = transcript_cursor::TranscriptReader::open(&path, cursor.file.as_ref(), None)
+        .with_context(|| format!("read Grok unified log {}", path.display()))?;
+    let start = reader.start_offset();
+    // Which model each process last named. Only meaningful for the bytes
+    // after the cursor, so a log read from the start begins with none.
+    let mut pid_models: HashMap<i64, String> = if start == 0 {
+        HashMap::new()
+    } else {
+        cursor
+            .extra
+            .get(GROK_UNIFIED_CURSOR_KEY)
+            .and_then(|state| state.get("pid_models"))
+            .and_then(|models| serde_json::from_value(models.clone()).ok())
+            .unwrap_or_default()
+    };
+    let mut touched: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut line = String::new();
+    loop {
+        check_capture_cancelled()?;
+        let offset = reader.position();
+        match reader.next_line(&mut line)? {
+            None | Some(transcript_cursor::ReadRecord::Unterminated) => break,
+            Some(transcript_cursor::ReadRecord::Oversized { .. }) => {
+                pass.malformed += 1;
+                continue;
+            }
+            Some(transcript_cursor::ReadRecord::Terminated) => {}
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            pass.malformed += 1;
+            continue;
+        };
+        match grok::parse_unified_row(&value, &pid_models) {
+            grok::GrokUnifiedRow::Usage(usage) => {
+                pass.usage_rows += 1;
+                pass.new_rows += conn.execute(
+                    "INSERT OR IGNORE INTO grok_unified_usage \
+                     (row_key, session_id, ts_ms, pid, model, event_id, usage_json, locator, line_offset) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    params![
+                        grok::unified_row_key(&value),
+                        usage.session_id,
+                        usage.ts_ms,
+                        usage.pid,
+                        usage.model,
+                        usage.event_id,
+                        usage.usage.to_string(),
+                        locator,
+                        offset as i64,
+                    ],
+                )?;
+                touched.insert(usage.session_id);
+            }
+            grok::GrokUnifiedRow::ModelChange { pid, model } => {
+                pid_models.insert(pid, model);
+            }
+            grok::GrokUnifiedRow::Unattributed => pass.unattributed += 1,
+            grok::GrokUnifiedRow::Other => {}
+        }
+    }
+    pass.bytes_read = reader.position().saturating_sub(start);
+    match reader.commit(reader.position())? {
+        transcript_cursor::CommitOutcome::Published(file) => {
+            cursor.file = Some(file);
+            cursor.extra.insert(
+                GROK_UNIFIED_CURSOR_KEY.to_string(),
+                json!({ "pid_models": pid_models }),
+            );
+            transcript_cursor::store_cursor(conn, &key, &cursor)?;
+        }
+        // The log was replaced or truncated while it was being read. The rows
+        // already copied are keyed on their content, so keeping them is
+        // harmless; the cursor stays where it was and the next pass re-reads.
+        transcript_cursor::CommitOutcome::Superseded => {}
+    }
+    for session_id in touched {
+        if !grok_catalog_row_exists(conn, &session_id)? {
+            // Retained, not dropped: the rows wait in `grok_unified_usage`
+            // until the session is indexed, and that ingestion attaches them.
+            continue;
+        }
+        materialize_grok_unified_usage(conn, &session_id, None)?;
+        // A cached hydration replays the diagnostics it stored, and those
+        // were written before this usage existed. Clearing them makes the
+        // next unchanged read rebuild the usage caveat from the stored rows.
+        conn.execute(
+            "UPDATE session_hydration_checkpoints SET source_diagnostics_json = NULL \
+             WHERE source = 'grok' AND session_id = ?",
+            params![session_id],
+        )?;
+        pass.sessions_materialized += 1;
+    }
+    Ok(pass)
+}
+
+/// How many `logs/unified.jsonl` usage rows are stored for one session.
+fn grok_unified_rows_pending(conn: &Connection, session_id: &str) -> Result<usize> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM grok_unified_usage WHERE session_id = ?",
+        params![session_id],
+        |row| row.get(0),
+    )?;
+    Ok(count as usize)
+}
+
+/// One stored `grok_unified_usage` row, as materialization reads it.
+struct GrokUnifiedStored {
+    row_key: String,
+    ts_ms: Option<i64>,
+    pid: Option<i64>,
+    model: Option<String>,
+    event_id: Option<String>,
+    usage_json: String,
+}
+
+/// Rebuild one session's `logs/unified.jsonl` usage events from the stored
+/// rows, and return how many there are.
+///
+/// Each row becomes one assistant event keyed `unified:<row key>`, in its own
+/// request span, with `token_json = {"usage": <counters>, "source":
+/// "logs/unified.jsonl", …}` — one inference, one request, normalized as
+/// `per-request` usage. The event carries no text, so it is
+/// `kind = "text"` with `raw_kind = "unified_log_usage"` to say what it is.
+///
+/// When the session has any, they are its usage: a `turn_completed.usage`
+/// breakdown already stored for it is moved to `turn_usage`, which is not
+/// normalized, so the same spend is never counted from both files. Their
+/// models join the session's `models_json`.
+fn materialize_grok_unified_usage(
+    conn: &Connection,
+    session_id: &str,
+    fallback_ts: Option<i64>,
+) -> Result<usize> {
+    const SOURCE: &str = "grok";
+    type SessionFacts = (Option<String>, Option<String>, Option<i64>, Option<String>);
+    let session: Option<SessionFacts> = conn
+        .query_row(
+            "SELECT cwd, git_branch, first_activity_ms, models_json FROM sessions \
+             WHERE source = 'grok' AND session_id = ?",
+            params![session_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((cwd, branch, first_activity, models_json)) = session else {
+        return Ok(0);
+    };
+    crate::store::retire_evidence_share(
+        conn,
+        "session_events",
+        "source = 'grok' AND session_id = ? AND event_uid LIKE 'unified:%'",
+        params![session_id],
+        SessionLocation::Local,
+    )?;
+    let rows = conn
+        .prepare(
+            "SELECT row_key, ts_ms, pid, model, event_id, usage_json FROM grok_unified_usage \
+             WHERE session_id = ? ORDER BY ts_ms IS NULL, ts_ms, locator, line_offset, row_key",
+        )?
+        .query_map(params![session_id], |row| {
+            Ok(GrokUnifiedStored {
+                row_key: row.get(0)?,
+                ts_ms: row.get(1)?,
+                pid: row.get(2)?,
+                model: row.get(3)?,
+                event_id: row.get(4)?,
+                usage_json: row.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let fallback_ts = fallback_ts.or(first_activity).unwrap_or(0);
+    let mut models: Vec<String> = models_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_default();
+    let models_before = models.len();
+    for row in &rows {
+        check_capture_cancelled()?;
+        let uid = format!("unified:{}", row.row_key);
+        let mut token_json = serde_json::Map::new();
+        token_json.insert(
+            "usage".into(),
+            serde_json::from_str(&row.usage_json).unwrap_or(Value::Null),
+        );
+        token_json.insert("source".into(), json!("logs/unified.jsonl"));
+        if let Some(pid) = row.pid {
+            token_json.insert("pid".into(), json!(pid));
+        }
+        if let Some(event_id) = &row.event_id {
+            token_json.insert("event_id".into(), json!(event_id));
+        }
+        let token_json = Value::Object(token_json).to_string();
+        insert_session_event_with_provenance(
+            conn,
+            SOURCE,
+            session_id,
+            cwd.as_deref(),
+            cwd.as_deref(),
+            branch.as_deref(),
+            &uid,
+            None,
+            row.ts_ms.unwrap_or(fallback_ts),
+            "assistant",
+            "text",
+            None,
+            row.model.as_deref(),
+            Some(&token_json),
+            None,
+            None,
+            RequestIdentity::none(),
+            &uid,
+            None,
+            RawMessageFacts {
+                request_span: Some(&uid),
+                ..RawMessageFacts::default()
+            },
+            Some("unified_log_usage"),
+        )?;
+        if let Some(model) = &row.model {
+            if !models.iter().any(|seen| seen == model) {
+                models.push(model.clone());
+            }
+        }
+    }
+    conn.execute(
+        "UPDATE session_events SET token_json = json_set(json_remove(token_json, '$.usage'), \
+         '$.turn_usage', json(json_extract(token_json, '$.usage'))) \
+         WHERE source = 'grok' AND session_id = ? AND event_uid NOT LIKE 'unified:%' \
+         AND token_json IS NOT NULL AND json_valid(token_json) \
+         AND json_type(token_json, '$.usage') IS NOT NULL",
+        params![session_id],
+    )?;
+    if models.len() != models_before {
+        conn.execute(
+            "UPDATE sessions SET models_json = ? WHERE source = 'grok' AND session_id = ?",
+            params![serde_json::to_string(&models)?, session_id],
+        )?;
+    }
+    Ok(rows.len())
+}
+
 /// What indexing one Grok session directory produced, and what its own records
 /// could not establish.
 ///
@@ -13171,6 +13544,10 @@ pub(crate) struct GrokIngestOutcome {
     /// all.
     pub usage_turns: usize,
     pub turns: usize,
+    /// Per-inference usage rows from `logs/unified.jsonl` stored for this
+    /// session. When there are any, they are the session's usage and the
+    /// `turn_completed.usage` breakdowns are kept only as `turn_usage`.
+    pub unified_usage_rows: usize,
 }
 
 /// The request span of a Grok assistant row: the `updates.jsonl` turn it
@@ -13332,7 +13709,7 @@ fn ingest_grok_session(
                 if first_prompt.is_none() {
                     first_prompt = Some(crate::discover::excerpt(text));
                 }
-                let uid = grok_event_uid(group.and_then(|group| group.event_id.as_deref()), idx);
+                let uid = grok_event_uid(group.and_then(|group| group.event_key.as_deref()), idx);
                 insert_session_event(
                     conn,
                     SOURCE,
@@ -13408,7 +13785,7 @@ fn ingest_grok_session(
                     }
                     continue;
                 };
-                let uid = grok_event_uid(group.and_then(|group| group.event_id.as_deref()), idx);
+                let uid = grok_event_uid(group.and_then(|group| group.event_key.as_deref()), idx);
                 insert_session_event(
                     conn,
                     SOURCE,
@@ -13454,7 +13831,7 @@ fn ingest_grok_session(
                     );
                     inherited = Some(ts);
                     let uid =
-                        grok_event_uid(group.and_then(|group| group.event_id.as_deref()), idx);
+                        grok_event_uid(group.and_then(|group| group.event_key.as_deref()), idx);
                     insert_session_event(
                         conn,
                         SOURCE,
@@ -13651,6 +14028,12 @@ fn ingest_grok_session(
     // `usage` breakdown it rides beside the proxy, verbatim, under `usage` —
     // that is what `crate::usage` normalizes, and the proxy never is. Nothing
     // is estimated here.
+    //
+    // A session `logs/unified.jsonl` covers takes its usage from there, per
+    // inference. The turn breakdown describes the same spend a second time, so
+    // it is kept under `turn_usage`, which nothing normalizes: the two
+    // representations are never added together.
+    let unified_covered = grok_unified_rows_pending(conn, sid)? > 0;
     for (turn, timing) in session.updates.turns.iter().enumerate() {
         check_capture_cancelled()?;
         let tail = turn_tail
@@ -13674,7 +14057,15 @@ fn ingest_grok_session(
         }
         token_json.insert("source".into(), json!("updates.jsonl"));
         if let Some(usage) = &timing.usage {
-            token_json.insert("usage".into(), usage.clone());
+            let key = if unified_covered {
+                "turn_usage"
+            } else {
+                "usage"
+            };
+            token_json.insert(key.into(), usage.clone());
+        }
+        if let Some(model) = &timing.model {
+            token_json.insert("model".into(), json!(model));
         }
         let token_json = Value::Object(token_json).to_string();
         conn.execute(
@@ -13720,6 +14111,11 @@ fn ingest_grok_session(
             sid,
         ],
     )?;
+    // After the catalog row exists: the rows attach to a session, not to a
+    // directory, and a row that arrived before the session was indexed has
+    // been waiting for exactly this.
+    outcome.unified_usage_rows =
+        materialize_grok_unified_usage(conn, sid, Some(session.created_ms))?;
     Ok(outcome)
 }
 
@@ -13980,6 +14376,9 @@ fn grok_signals_summary(signals: &grok::GrokSignals) -> String {
     if let Some(tokens) = signals.context_tokens_used {
         parts.push(format!("context_tokens_used={tokens}"));
     }
+    if let Some(tokens) = signals.total_tokens_before_compaction {
+        parts.push(format!("total_tokens_before_compaction={tokens}"));
+    }
     parts.join(" ")
 }
 
@@ -14014,7 +14413,10 @@ fn resolve_grok_ts(
 /// `chat_history.jsonl` writes no record id at all, so without the join the
 /// only identity available is positional. Grok rebuilds that file on a format
 /// upgrade, which renumbers it; an `eventId` survives that, which is why it is
-/// preferred.
+/// preferred. Grok also *reuses* an `eventId` across records, so what arrives
+/// here is [`grok::ChunkGroup::event_key`] — the id, suffixed with its
+/// occurrence when more than one message carries it — and two messages can
+/// never be stored under one identity.
 fn grok_event_uid(event_id: Option<&str>, index: usize) -> String {
     match event_id {
         Some(id) => format!("ev:{id}"),
@@ -14041,7 +14443,12 @@ const GROK_STAMPED_SIBLINGS: &[&str] = &["summary.json", "updates.jsonl"];
 /// The remaining files `ingest_grok_session` reads. They are folded into one
 /// digest rather than appended, so a session with many checkpoints does not
 /// grow an unbounded stamp.
-const GROK_DIGESTED_SIBLINGS: &[&str] = &["signals.json", "prompt_context.json"];
+///
+/// `events.jsonl` is read only when `summary.json` is absent, but it is
+/// stamped always: whether the summary is there is itself something the stamp
+/// has to notice, and a stamp that covered the file only sometimes would call
+/// a session unchanged across the summary disappearing.
+const GROK_DIGESTED_SIBLINGS: &[&str] = &["signals.json", "prompt_context.json", "events.jsonl"];
 
 /// The directories `ingest_grok_session` reads, entry by entry.
 const GROK_DIGESTED_DIRECTORIES: &[&str] = &["compaction_checkpoints", "subagents"];
@@ -14277,10 +14684,19 @@ fn scan_grok_session_file(chat: &Path) -> Result<Option<GrokSession>> {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+    // `events.jsonl` stands in for the metadata `summary.json` would have
+    // given, and only when there is no summary: a summary that is present
+    // stays the one source of those facts, so the two can never disagree.
+    let events_head = if summary.is_none() {
+        read_grok_events_head(&chat.with_file_name("events.jsonl"))?
+    } else {
+        None
+    };
     let created_ms = summary
         .as_ref()
         .and_then(|s| s.get("created_at").and_then(Value::as_str))
         .and_then(parse_iso_ms)
+        .or_else(|| events_head.as_ref().and_then(|head| head.first_ts_ms))
         .or_else(|| file_modified_ms(chat))
         .unwrap_or(0);
     let updated_ms = summary
@@ -14339,14 +14755,21 @@ fn scan_grok_session_file(chat: &Path) -> Result<Option<GrokSession>> {
         }
         lines.push(parsed);
     }
+    // The models `updates.jsonl` names per turn (`_meta.modelId`, or a
+    // single-key `modelUsage`) are models the session ran on too, including
+    // any turn whose transcript record carried no `model_id`.
+    for model in updates.turns.iter().filter_map(|turn| turn.model.as_ref()) {
+        if !models.iter().any(|seen| seen == model) {
+            models.push(model.clone());
+        }
+    }
     if models.is_empty() {
         if let Some(model) = summary
             .as_ref()
-            .and_then(|s| s.pointer("/info/model").or_else(|| s.get("model")))
-            .and_then(Value::as_str)
-            .filter(|model| !model.is_empty())
+            .and_then(grok::summary_model)
+            .or_else(|| events_head.as_ref().and_then(|head| head.model.clone()))
         {
-            models.push(model.to_string());
+            models.push(model);
         }
     }
 
@@ -14407,6 +14830,28 @@ fn scan_grok_session_file(chat: &Path) -> Result<Option<GrokSession>> {
         compactions,
         subagents,
     }))
+}
+
+/// The head of a session's `events.jsonl`: `None` when it is not there, an
+/// error when it is there and cannot be read. Only the first
+/// [`grok::EVENTS_HEAD_LINES`] lines are read, however large the log is.
+fn read_grok_events_head(path: &Path) -> Result<Option<grok::GrokEventsHead>> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read Grok events {}", path.display()))
+        }
+    };
+    let mut head = String::new();
+    for line in BufReader::new(file).lines().take(grok::EVENTS_HEAD_LINES) {
+        // A line that is not UTF-8 is skipped like one that is not JSON: this
+        // is a metadata fallback, not evidence.
+        let Ok(line) = line else { continue };
+        head.push_str(&line);
+        head.push('\n');
+    }
+    Ok(Some(grok::parse_events_head(&head)))
 }
 
 /// What a read of one Grok sidecar found.

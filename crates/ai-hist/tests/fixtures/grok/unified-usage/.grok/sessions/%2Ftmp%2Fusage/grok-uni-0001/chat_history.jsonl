@@ -1,0 +1,4 @@
+{"type":"user","content":"<user_query>summarize the retry policy</user_query>"}
+{"type":"assistant","content":"The client retries three times with backoff."}
+{"type":"user","content":"<user_query>and the timeout?</user_query>"}
+{"type":"assistant","content":"Ten seconds per attempt."}

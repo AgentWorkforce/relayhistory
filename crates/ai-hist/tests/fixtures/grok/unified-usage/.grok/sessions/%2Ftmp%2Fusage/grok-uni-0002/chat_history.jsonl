@@ -1,0 +1,2 @@
+{"type":"user","content":"<user_query>list the open TODOs</user_query>"}
+{"type":"assistant","content":"There are two: the retry jitter and the timeout test."}

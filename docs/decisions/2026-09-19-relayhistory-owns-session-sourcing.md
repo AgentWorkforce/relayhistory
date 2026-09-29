@@ -136,7 +136,7 @@ of `sessions list`. It is listed for completeness; every session-evidence row is
 | `session_events` — `tool_use`                                      | ✓      | ✓     | ✓      | ✗    | ✓    | ✓        | ✗     | —          | [#166](https://github.com/AgentWorkforce/relayhistory/issues/166) / [#167](https://github.com/AgentWorkforce/relayhistory/issues/167) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                     |
 | `session_events` — `tool_result`                                   | ✓      | ✓     | —      | ✗    | ✓    | ✓        | ✗     | —          | [#166](https://github.com/AgentWorkforce/relayhistory/issues/166) / [#167](https://github.com/AgentWorkforce/relayhistory/issues/167) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                     |
 | Model, per event                                                   | ✓      | ✓     | —      | ◐    | ✓    | ✓        | ✗     | —          | [#166](https://github.com/AgentWorkforce/relayhistory/issues/166) / [#167](https://github.com/AgentWorkforce/relayhistory/issues/167) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                     |
-| Token usage                                                        | ✓      | ◐     | —      | ◐    | ✓    | ✓        | ✗     | —          | [#172](https://github.com/AgentWorkforce/relayhistory/issues/172) (supersedes #99) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168) / grok: [#212](https://github.com/AgentWorkforce/relayhistory/issues/212)                                               |
+| Token usage                                                        | ✓      | ◐     | —      | ✓    | ✓    | ✓        | ✗     | —          | [#172](https://github.com/AgentWorkforce/relayhistory/issues/172) (supersedes #99) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168) / grok: [#212](https://github.com/AgentWorkforce/relayhistory/issues/212)                                               |
 | `request_id`                                                       | ✗      | —     | —      | —    | ✓    | —        | —     | —          | [#164](https://github.com/AgentWorkforce/relayhistory/issues/164)                                                                                                                                                                                                             |
 | `stop_reason`                                                      | ✗      | —     | —      | —    | ✓    | ✓        | —     | —          | [#164](https://github.com/AgentWorkforce/relayhistory/issues/164) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                                                                                          |
 | Codex `turn_id`                                                    | —      | ✗     | —      | —    | —    | —        | —     | —          | [#164](https://github.com/AgentWorkforce/relayhistory/issues/164)                                                                                                                                                                                                             |
@@ -221,6 +221,16 @@ Grok is `◐`: a build that writes `turn_completed.usage` gets a per-turn
 the per-inference rows in `~/.grok/logs/unified.jsonl` are not read yet
 ([#212](https://github.com/AgentWorkforce/relayhistory/issues/212)), and older
 builds write only the snapshot, which is never usage.
+
+_Since [#212](https://github.com/AgentWorkforce/relayhistory/issues/212), Grok
+is `✓`: the per-inference rows of `<GROK_HOME>/logs/unified.jsonl` are read
+from a byte cursor and stored as one `per-request` record per inference on the
+session they name; a session the log does not cover keeps its
+`turn_completed.usage` breakdown; and a covered session's turn breakdown is
+kept as `turn_usage`, which is not normalized, so the two are never added.
+A build that writes neither has no usage to read — a limit of the source,
+reported as `GROK_USAGE_CONTEXT_PROXY_ONLY`, not a gap in capture. See
+`docs/session-catalog.md` ("grok")._
 
 _Since [#172](https://github.com/AgentWorkforce/relayhistory/issues/172) and
 [#211](https://github.com/AgentWorkforce/relayhistory/issues/211), Claude is
