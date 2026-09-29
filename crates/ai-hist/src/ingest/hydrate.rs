@@ -4161,6 +4161,31 @@ mod tests {
         .unwrap();
     }
 
+    /// `<claude root>/transcripts/` is not a Claude root (#208, see the claude
+    /// bullet in `docs/session-catalog.md`), so hydration refuses a path there
+    /// just as it refuses any other path outside `<claude root>/projects`.
+    #[test]
+    fn claude_hydration_rejects_the_opencode_wrapper_transcripts_root() {
+        let home = tempfile::tempdir().unwrap();
+        let wrapper = home
+            .path()
+            .join(".claude/transcripts/ses_0123456789abcdefghijklmno.jsonl");
+        fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
+        fs::write(
+            &wrapper,
+            r#"{"type":"user","timestamp":"2026-09-20T00:00:00.000Z","content":"wrapped"}"#,
+        )
+        .unwrap();
+        let roots = crate::ProviderRoots::from_home(
+            home.path().to_path_buf(),
+            home.path().join("opencode.db"),
+        );
+        assert!(
+            validate_provider_path("claude", &wrapper, &roots).is_err(),
+            "a transcripts/ path must not pass Claude root validation (#208)"
+        );
+    }
+
     #[test]
     fn a_captured_claude_snapshot_survives_source_removal_before_hydration() {
         let home = tempfile::tempdir().unwrap();
