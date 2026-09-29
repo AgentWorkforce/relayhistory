@@ -68,6 +68,7 @@ export async function listRelayAgents(
   const target = `/agents${query.size > 0 ? `?${query.toString()}` : ''}`;
   const paths = await relaySocketCandidates(runtime);
   let permissionError: SocketPermissionDenied | undefined;
+  let timeoutError: RelayAgentsError | undefined;
   for (const path of paths) {
     try {
       return parseRoster(await requestRoster(path, target, runtime.timeoutMs ?? DEFAULT_TIMEOUT_MS));
@@ -77,9 +78,14 @@ export async function listRelayAgents(
         permissionError = error;
         continue;
       }
+      if (error instanceof RelayAgentsError && error.code === 'timeout') {
+        timeoutError = error;
+        continue;
+      }
       throw error;
     }
   }
+  if (timeoutError) throw timeoutError;
   if (permissionError) {
     throw new RelayAgentsError('socket_access_denied', permissionError.message);
   }
@@ -118,7 +124,7 @@ export async function relaySocketCandidates(runtime: RelaySocketRuntime = {}): P
   } else if (platform === 'linux') {
     const runtimeDirectory = env.XDG_RUNTIME_DIR?.trim();
     if (runtimeDirectory) add(join(runtimeDirectory, 'agent-relay', 'relay.sock'));
-    else add(join(env.XDG_DATA_HOME?.trim() || join(home, '.local', 'share'), 'com.agentrelay.desktop', 'run', 'relay.sock'));
+    add(join(env.XDG_DATA_HOME?.trim() || join(home, '.local', 'share'), 'com.agentrelay.desktop', 'run', 'relay.sock'));
   }
   return result;
 }

@@ -113,6 +113,35 @@ test('reports a slow desktop as a timeout instead of claiming it is absent', asy
   assert.ok(Date.now() - started < 500);
 });
 
+test('tries a later candidate after an earlier socket stalls', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'relay-agents-stalled-candidate-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const stalledSocket = join(root, 'stalled.sock');
+  const workingSocket = join(root, 'working.sock');
+  const pointer = join(root, '.agentworkforce', 'desktop', 'relay-socket');
+  await mkdir(dirname(pointer), { recursive: true });
+  await writeFile(pointer, `${workingSocket}\n`, { mode: 0o600 });
+
+  const stalled = createServer((connection) => connection.once('data', () => undefined));
+  await new Promise<void>((resolve, reject) => {
+    stalled.once('error', reject);
+    stalled.listen(stalledSocket, resolve);
+  });
+  t.after(async () => {
+    await new Promise<void>((resolve) => stalled.close(() => resolve()));
+    await rm(stalledSocket, { force: true });
+  });
+  const requests: string[] = [];
+  await fakeRosterServer(t, workingSocket, requests);
+
+  const result = await listRelayAgents({}, {
+    env: { AGENT_RELAY_SOCKET: stalledSocket }, home: root, platform: 'linux', temporaryDirectory: root, uid: 501,
+    timeoutMs: 60,
+  });
+  assert.ok('agents' in result);
+  assert.equal(requests.length, 1);
+});
+
 test('allows a slow first roster response within the default local deadline', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'relay-agents-slow-'));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -220,6 +249,17 @@ test('socket candidates preserve the documented macOS discovery order', async ()
     '/private/tmp/agent-relay-dev-501/relay.sock',
     '/tmp/agent-relay-501/relay.sock',
     '/tmp/agent-relay-dev-501/relay.sock',
+  ]);
+});
+
+test('Linux discovery tries both runtime and data-directory defaults', async () => {
+  const paths = await relaySocketCandidates({
+    env: { XDG_RUNTIME_DIR: '/run/user/501', XDG_DATA_HOME: '/users/alice/data' },
+    home: '/users/alice', platform: 'linux', temporaryDirectory: '/tmp', uid: 501,
+  });
+  assert.deepEqual(paths, [
+    '/run/user/501/agent-relay/relay.sock',
+    '/users/alice/data/com.agentrelay.desktop/run/relay.sock',
   ]);
 });
 
