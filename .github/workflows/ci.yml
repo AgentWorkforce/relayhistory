@@ -156,56 +156,75 @@ jobs:
           cargo tree --prefix none --depth 1 -e normal | tee /dev/stderr \
             | grep -qE '^ai-hist v[0-9.]+ \(.*/crates/ai-hist\)$'
 
-  # burn (AgentWorkforce/burn) reads session evidence through this crate and
-  # derives its ledger identity from it: a change here to message ids,
-  # timestamps or usage dedup changes burn's turn fingerprints and duplicates
-  # or collapses its cost rows, and nothing in this workspace can see that.
-  # This job builds burn main against this checkout via `[patch.crates-io]`
-  # and runs burn's relayhistory parity suite over the shared fixture corpus
-  # (#183). Until burn main has that suite (burn #557: the
-  # `relayhistory-source` feature and the `relayhistory_parity` test target)
-  # the probe step reports a notice and the job passes without running it;
-  # it arms itself when the suite lands, with no change here. Making it a
-  # required check is a branch-protection setting.
+  # burn (AgentWorkforce/burn) is moving to reading session evidence through
+  # this crate (burn #557; the cutover is burn 5.0.0, burn #562) and derives
+  # its ledger identity from it: a change here to message ids, timestamps or
+  # usage dedup changes burn's turn fingerprints and duplicates or collapses
+  # its cost rows, and nothing in this workspace can see that. This job builds
+  # burn against this checkout and runs burn's relayhistory parity suite over
+  # the shared fixture corpus (#183). Steps, all in scripts/burn-guardrails.mjs:
+  #
+  # - relevant-change: only a change under crates/ai-hist/, the workspace
+  #   Cargo.toml, this job or the script runs the rest. Otherwise the job
+  #   passes in seconds, so it can still be a required check.
+  # - parity-probe: arms once burn's relayburn-sdk depends on ai-hist. The
+  #   suite is the `relayhistory_parity` test target if burn has one, else the
+  #   lib tests under a `relayhistory` module path. No dependency yet is a
+  #   notice; a dependency without a suite is a warning.
+  # - pin-ai-hist: rewrites burn's ai-hist requirement to a path dependency on
+  #   this checkout. `[patch.crates-io]` would silently stop applying the day
+  #   this workspace's version moves past burn's pin.
+  # - check-resolution: proves burn resolved this checkout's ai-hist.
+  # - run-parity: runs the suite and fails if it ran zero tests.
+  #
+  # burn is checked out at the repository variable BURN_REF when it is set,
+  # else main. If burn main breaks on its own, set BURN_REF to a known-good
+  # burn commit so relayhistory PRs are not blocked, and clear it once burn is
+  # green again. There is no base-vs-PR differential run: a red result means
+  # "burn at BURN_REF fails against this code", so re-run the base branch to
+  # tell a regression here from breakage in burn. Making the job a required
+  # check is a branch-protection setting.
   burn-contract-drift:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
         with:
-          repository: AgentWorkforce/burn
-          ref: main
-          path: burn
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+          # The merge commit and its first parent, for relevant-change.
+          fetch-depth: 2
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-      - name: Does burn main have the relayhistory parity suite?
+      - name: Does this change touch what burn consumes?
+        id: relevant
+        run: node scripts/burn-guardrails.mjs relevant-change
+      - uses: actions/checkout@v4
+        if: steps.relevant.outputs.run == 'true'
+        with:
+          repository: AgentWorkforce/burn
+          ref: ${{ vars.BURN_REF || 'main' }}
+          path: burn
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.relevant.outputs.run == 'true'
+      - name: Does burn have a relayhistory parity suite?
         id: probe
+        if: steps.relevant.outputs.run == 'true'
         run: node scripts/burn-guardrails.mjs parity-probe --burn-dir burn
       - uses: Swatinem/rust-cache@v2
         if: steps.probe.outputs.ready == 'true'
         with:
           workspaces: burn -> target
           key: ci-burn-contract-drift
-      # `--config` rather than editing burn's files, so a `.cargo/config.toml`
-      # burn may carry is left alone. A patch Cargo cannot apply is only a
-      # warning, and the suite would then test the published crate instead:
-      # the workspace crate's version must satisfy burn's `ai-hist` pin.
+      - name: Point burn's ai-hist requirement at this checkout
+        if: steps.probe.outputs.ready == 'true'
+        run: node scripts/burn-guardrails.mjs pin-ai-hist --burn-dir burn --ai-hist-path "$GITHUB_WORKSPACE/crates/ai-hist"
       - name: burn resolves ai-hist to this checkout
         if: steps.probe.outputs.ready == 'true'
-        working-directory: burn
-        run: |
-          cargo tree --config "patch.crates-io.ai-hist.path=\"$GITHUB_WORKSPACE/crates/ai-hist\"" \
-            -p relayburn-sdk --features relayhistory-source -e normal -i ai-hist --prefix none \
-            | tee /dev/stderr | grep -qE '^ai-hist v[0-9.]+ \(.*/crates/ai-hist\)$'
+        run: node scripts/burn-guardrails.mjs check-resolution --burn-dir burn --ai-hist-path "$GITHUB_WORKSPACE/crates/ai-hist"
       - name: burn parity suite against this checkout
         if: steps.probe.outputs.ready == 'true'
-        working-directory: burn
-        run: |
-          cargo test --config "patch.crates-io.ai-hist.path=\"$GITHUB_WORKSPACE/crates/ai-hist\"" \
-            -p relayburn-sdk --features relayhistory-source --test relayhistory_parity
+        run: node scripts/burn-guardrails.mjs run-parity --burn-dir burn
 
   msrv:
     runs-on: ubuntu-latest
