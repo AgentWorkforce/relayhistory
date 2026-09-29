@@ -1894,13 +1894,38 @@ fn sync_opencode_exclusive(
         sources: vec!["opencode".into()],
         ..Default::default()
     };
-    discover::discover_sessions_with_connectors(
+    let discovered = discover::discover_sessions_with_connectors(
         &env,
         &options,
         &remote::SourceConnectorSelection::new(Vec::new())?,
         |_| {},
     )?;
+    for diagnostic in &discovered.diagnostics {
+        sync_note!(
+            "  [discovery] {} not read: {}",
+            diagnostic.locator.as_deref().unwrap_or(&diagnostic.source),
+            diagnostic.error
+        );
+    }
     refresh_project_identity_after_sync(&conn);
+    // A channel directory that could not be listed may hold stores this run
+    // never saw. What could be read is indexed above; the run still fails, as
+    // it does when one channel store fails, so nobody takes a partial import
+    // for a complete one.
+    if matches!(
+        layout,
+        Some(crate::ingest::opencode::OpencodeLayout::Sqlite(_))
+    ) {
+        if let Some((dir, error)) =
+            crate::paths::list_opencode_db_files(opencode_path, pinned).unlisted
+        {
+            return Err(anyhow::Error::new(error).context(format!(
+                "could not list OpenCode channel databases in {} \
+                 (the stores that could be read were indexed)",
+                dir.display()
+            )));
+        }
+    }
     Ok(true)
 }
 

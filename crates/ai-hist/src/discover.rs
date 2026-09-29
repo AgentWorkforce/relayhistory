@@ -2569,12 +2569,17 @@ impl ShallowSessionProvider for OpencodeProvider {
 /// this run could not read. Like the JSON tree's unreadable directories, it
 /// carries a stamp unique to this run, so no cached row can match it, and
 /// `read_shallow` turns it back into the failure.
+///
+/// It sorts ahead of every session: the engine stops reading id-less
+/// candidates once a limited page is full, and a failure that sorted last
+/// would go unreported by exactly the bounded runs most likely to hit it. It
+/// never emits a row, so it costs a page no session.
 fn unreadable_opencode_candidate(locator: &str) -> Candidate {
     Candidate {
         source: "opencode",
         locator: locator.to_string(),
         session_id: None,
-        recency_hint_ms: None,
+        recency_hint_ms: Some(i64::MAX),
         stamp: format!(
             "unreadable:{}",
             std::time::SystemTime::now()

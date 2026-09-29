@@ -7,8 +7,9 @@
 //! environment variables and Rust runs the tests in a binary concurrently.
 
 use ai_hist::{
-    discover_sessions_scoped_at, hydrate_session_at, open_db, sync_local_at, DiscoverOptions,
-    HydrateSessionOptions, SessionScope,
+    discover_sessions_scoped_at, hydrate_session_at, open_db, sync_local_at,
+    sync_opencode_with_roots, DiscoverOptions, HydrateSessionOptions, ProviderRoots, SessionScope,
+    SyncOutput,
 };
 use rusqlite::Connection;
 use std::fs;
@@ -118,6 +119,9 @@ fn opencode_channel_databases_are_discovered_synced_and_hydrated() {
     a_limited_page_is_not_shortened_by_duplicates();
     a_limited_page_keeps_first_store_ownership();
     one_broken_channel_store_does_not_hide_the_others();
+    a_limited_page_still_reports_a_broken_channel_store();
+    #[cfg(unix)]
+    sync_opencode_fails_when_the_channel_directory_cannot_be_listed();
     hydration_refuses_a_copy_an_earlier_store_has_since_claimed();
 }
 
@@ -405,5 +409,65 @@ fn a_limited_page_keeps_first_store_ownership() {
         )],
         "the root belongs to opencode.db, whose copy is older than the child"
     );
+    fs::remove_dir_all(&root).ok();
+}
+
+/// A full page of healthy sessions must not crowd out the report of a
+/// channel store that could not be opened.
+fn a_limited_page_still_reports_a_broken_channel_store() {
+    let root = temp_root("broken-limited");
+    let home = root.join("home");
+    let data = home.join(".local/share/opencode");
+    build_store(&data.join("opencode.db"), &[ROOT, CHILD]);
+    fs::write(data.join("opencode-nightly.db"), b"not a database at all").unwrap();
+    use_home(&home, None);
+    let db_path = root.join("history.db");
+    let (rows, summary) = discover_sessions_scoped_at(
+        &db_path,
+        &DiscoverOptions {
+            limit: Some(1),
+            ..opencode_only()
+        },
+    )
+    .unwrap();
+    assert_eq!(rows.len(), 1, "the broken store costs the page no session");
+    let broken = data
+        .join("opencode-nightly.db")
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        summary
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.locator.as_deref() == Some(broken.as_str())),
+        "{:?}",
+        summary.diagnostics
+    );
+    fs::remove_dir_all(&root).ok();
+}
+
+/// `sync-opencode` over a directory it can search but not list indexes the
+/// configured store and then fails, rather than report a partial import of
+/// the channel stores as a complete one.
+#[cfg(unix)]
+fn sync_opencode_fails_when_the_channel_directory_cannot_be_listed() {
+    use std::os::unix::fs::PermissionsExt;
+    let (root, home, data) = channel_home("unlisted");
+    use_home(&home, None);
+    let db_path = root.join("history.db");
+    let roots = ProviderRoots::from_home(home.clone(), data.join("opencode.db"));
+    fs::set_permissions(&data, fs::Permissions::from_mode(0o300)).unwrap();
+    let listable = fs::read_dir(&data).is_ok();
+    let result = sync_opencode_with_roots(&db_path, &roots, SyncOutput::Silent);
+    fs::set_permissions(&data, fs::Permissions::from_mode(0o755)).unwrap();
+    // As root the permissions do not bind and there is nothing to observe.
+    if !listable {
+        let error = result.expect_err("an unlistable channel directory must fail the sync");
+        assert!(
+            format!("{error:#}").contains("could not list OpenCode channel databases"),
+            "{error:#}"
+        );
+        assert_eq!(history_sessions(&db_path), vec![ROOT.to_string()]);
+    }
     fs::remove_dir_all(&root).ok();
 }

@@ -92,8 +92,9 @@ Notable changes to the native `ai-hist` CLI are documented here.
   copy an earlier store has since gained is refused with
   `SESSION_SOURCE_MISMATCH` until rediscovery. A channel store that cannot be
   opened, or a channel directory that cannot be listed, is reported as a
-  diagnostic while the other stores are still read, and the sweep does not
-  record its fingerprint over it. `OPENCODE_DB` still names exactly one store,
+  diagnostic (even on a `--limit` page) while the other stores are still read;
+  the sweep does not record its fingerprint over it, and `sync-opencode`
+  indexes what it could read and then fails naming the unlistable directory. `OPENCODE_DB` still names exactly one store,
   as does `sync-opencode --opencode-db`.
 
 - Add workspace-scoped agent handoffs through `create_handoff(intent)` and
