@@ -70,10 +70,11 @@ server.tool('search_history',
     .describe('all: prompts and every event; user: prompts and user events; assistant: assistant events; prompt: prompts only.'),
   raw_fts: z.boolean().optional().default(false)
     .describe('Pass the query to SQLite FTS5 verbatim; a malformed expression is an error.'),
+  before_ms: z.number().int().optional().describe('Deprecated: exclusive, so it skips rows tied on the timestamp. Use after.'),
   since_ms: SINCE_MS, until_ms: UNTIL_MS, after: HISTORY_AFTER,
   limit: z.number().int().min(1).max(1000).optional().default(20),
-}, READ, ({ query, source, project, tag, scope, role, raw_fts, since_ms, until_ms, after, limit }) => call(() => search(query, {
-  source, project, tag, scope, role, rawFts: raw_fts, sinceMs: since_ms, untilMs: until_ms, after, limit,
+}, READ, ({ query, source, project, tag, scope, role, raw_fts, before_ms, since_ms, until_ms, after, limit }) => call(() => search(query, {
+  source, project, tag, scope, role, rawFts: raw_fts, beforeMs: before_ms, sinceMs: since_ms, untilMs: until_ms, after, limit,
 })));
 
 server.tool('recent_history', 'List recent already-indexed prompts, newest first by (timestampMs, id). '

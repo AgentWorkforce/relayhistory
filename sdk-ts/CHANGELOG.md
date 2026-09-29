@@ -16,18 +16,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so tied timestamps page without skips. `beforeMs` is deprecated. Requires
   native contract 24.
 
-### Changed
-
-- `search()` runs the same contract as `ai-hist search` and MCP
-  `search_history` (#66). It matches session events as well as prompts and
-  returns `SearchMatch[]`: each is a `HistoryEntry` plus `matchSource`, `role`
-  and `kind`. A new `role` option takes `all` (default), `user`, `assistant`
-  or `prompt`, where `prompt` restores the prompts-only result. `beforeMs` now
-  bounds event matches too, and ties order by `(timestampMs, id)`. Requires
-  native contract 23.
-
-### Added
-
 - Add `createHandoff()` / `resumeHandoff()` and their default MCP tools. Handoff
   pointers carry only session identity, one self-describing resume intent, and
   origin identity; no installed receiver skill is required. Resume performs
@@ -52,6 +40,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exit code and never calls `process.exit`, writes to `process.stdout`/
   `process.stderr`, or installs signal handlers; `main()` is now a thin wrapper
   that owns those. `ai-hist` itself behaves exactly as before.
+
+### Changed
+
+- `search()` runs the same contract as `ai-hist search` and MCP
+  `search_history` (#66). It matches session events as well as prompts and
+  returns `SearchMatch[]`: each is a `HistoryEntry` plus `matchSource`, `role`
+  and `kind`. A new `role` option takes `all` (default), `user`, `assistant`
+  or `prompt`, where `prompt` restores the prompts-only result. `beforeMs` now
+  bounds event matches too, and ties order by `(timestampMs, id)`. Requires
+  native contract 23. MCP `search_history` accepts `before_ms`.
 
 ### Fixed
 
