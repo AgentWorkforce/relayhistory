@@ -2,6 +2,9 @@
 //!
 //! Registration never probes credentials or calls a transport. The caller chooses
 //! connector instances first; only those adapters receive acquisition calls.
+//! The built-in harnesses themselves are declared once, in [`catalog`].
+pub mod catalog;
+
 use crate::discover::discover_sessions_with_provider_refs;
 use crate::observations::{self, ObservationKey, SessionObservation};
 use crate::*;
