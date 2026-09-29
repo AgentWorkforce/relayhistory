@@ -288,7 +288,7 @@ function requestSocket(
         finish(() => reject(new SocketPermissionDenied(message)));
       } else if (error.code === 'ENOENT' || error.code === 'ENOTDIR'
         || error.code === 'ECONNREFUSED' || error.code === 'EINVAL'
-        || error.code === 'EAGAIN' || error.code === 'ETIMEDOUT') {
+        || (!requestSent && (error.code === 'EAGAIN' || error.code === 'ETIMEDOUT'))) {
         finish(() => reject(new SocketUnavailable(error.message)));
       } else {
         finish(() => reject(new RelayAgentsError('socket_error', message)));
