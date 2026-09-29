@@ -2214,9 +2214,24 @@ fn export_history(
         ("sqlite", None) => Some(Path::new(DEFAULT_SQLITE_EXPORT)),
         (_, output) => output,
     };
-    if let Some(dest) = dest {
+    // An existing symlink destination is written through, to its target, as
+    // a direct write would; the rename below would otherwise replace the link.
+    let target = dest.map(follow_destination_symlink);
+    // `--db` is handed to SQLite as given, so a `file:` URI names a database
+    // whose filesystem path is not the argument's text. The connection knows
+    // the file it actually opened; both are guarded.
+    let opened = conn
+        .path()
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
+    let protected: Vec<&Path> = std::iter::once(active_db)
+        .chain(opened.as_deref())
+        .collect();
+    if let (Some(dest), Some(target)) = (dest, target.as_deref()) {
         anyhow::ensure!(
-            !names_active_database(dest, active_db),
+            !protected.iter().any(|active| {
+                names_active_database(dest, active) || names_active_database(target, active)
+            }),
             "Refusing to export over the active database {} (destination {}).",
             active_db.display(),
             dest.display()
@@ -2228,7 +2243,8 @@ fn export_history(
     }
     if format == "sqlite" {
         let dest = dest.expect("a sqlite export always has a destination");
-        let staged = staged_export_file(dest)?;
+        let target = target.as_deref().expect("resolved alongside dest");
+        let staged = staged_export_file(target)?;
         let inserted = {
             let dst = Connection::open(staged.path())?;
             ai_hist::init_db(&dst)?;
@@ -2242,12 +2258,7 @@ fn export_history(
             dst.close().map_err(|(_, error)| error)?;
             inserted
         };
-        // Stale sidecars of a database previously at `dest` must not be
-        // replayed onto the new file.
-        for suffix in ["-wal", "-shm", "-journal"] {
-            let _ = fs::remove_file(sqlite_sidecar(dest, suffix));
-        }
-        persist_export(staged, dest)?;
+        install_sqlite_export(staged, target, persist_export)?;
         println!("Exported {inserted} entries to {}", dest.display());
         return Ok(());
     }
@@ -2263,8 +2274,8 @@ fn export_history(
         });
         writeln!(&mut body, "{}", serde_json::to_string(&row)?)?;
     }
-    if let Some(path) = dest {
-        let mut staged = staged_export_file(path)?;
+    if let (Some(path), Some(target)) = (dest, target.as_deref()) {
+        let mut staged = staged_export_file(target)?;
         if path.extension().and_then(|s| s.to_str()) == Some("gz") {
             let mut enc = GzEncoder::new(staged.as_file_mut(), Compression::default());
             enc.write_all(&body)?;
@@ -2273,7 +2284,7 @@ fn export_history(
             staged.write_all(&body)?;
         }
         staged.as_file().sync_all()?;
-        persist_export(staged, path)?;
+        persist_export(staged, target)?;
         eprintln!("Exported {} entries to {}", rows.len(), path.display());
     } else {
         io::stdout().write_all(&body)?;
@@ -2304,6 +2315,89 @@ fn persist_export(staged: tempfile::NamedTempFile, dest: &Path) -> Result<()> {
         .map_err(|error| error.error)
         .with_context(|| format!("move the finished export into {}", dest.display()))?;
     Ok(())
+}
+
+/// `dest` itself, or the file an existing symlink at `dest` points to.
+fn follow_destination_symlink(dest: &Path) -> PathBuf {
+    match fs::symlink_metadata(dest) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            fs::canonicalize(dest).unwrap_or_else(|_| match fs::read_link(dest) {
+                // A dangling link: create its target, as a direct write would.
+                Ok(link) if link.is_absolute() => link,
+                Ok(link) => dest.parent().unwrap_or_else(|| Path::new("")).join(link),
+                Err(_) => dest.to_path_buf(),
+            })
+        }
+        _ => dest.to_path_buf(),
+    }
+}
+
+const SQLITE_SIDECARS: [&str; 3] = ["-wal", "-shm", "-journal"];
+
+/// Renames the staged SQLite export over `dest` without letting a previous
+/// database's sidecars pair with the new file, and without losing them if the
+/// replacement fails.
+///
+/// Existing sidecars are first parked under a private name (any failure other
+/// than "not found" aborts the export with everything restored), then
+/// `persist` installs the new file. On success the parked sidecars are
+/// discarded; on failure they are renamed back beside the untouched old file.
+fn install_sqlite_export(
+    staged: tempfile::NamedTempFile,
+    dest: &Path,
+    persist: impl FnOnce(tempfile::NamedTempFile, &Path) -> Result<()>,
+) -> Result<()> {
+    let mut parked: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for suffix in SQLITE_SIDECARS {
+        let sidecar = sqlite_sidecar(dest, suffix);
+        let aside = parked_sidecar(dest, suffix);
+        match fs::rename(&sidecar, &aside) {
+            Ok(()) => parked.push((sidecar, aside)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                restore_parked_sidecars(&parked);
+                return Err(error).with_context(|| {
+                    format!(
+                        "move the existing SQLite sidecar {} out of the way",
+                        sidecar.display()
+                    )
+                });
+            }
+        }
+    }
+    match persist(staged, dest) {
+        Ok(()) => {
+            // Renamed away from the database name, SQLite can no longer pair
+            // these with anything, so a failed removal is harmless.
+            for (_, aside) in &parked {
+                let _ = fs::remove_file(aside);
+            }
+            Ok(())
+        }
+        Err(error) => {
+            restore_parked_sidecars(&parked);
+            Err(error)
+        }
+    }
+}
+
+fn parked_sidecar(dest: &Path, suffix: &str) -> PathBuf {
+    sqlite_sidecar(
+        dest,
+        &format!("{suffix}.ai-hist-{}.replaced", std::process::id()),
+    )
+}
+
+fn restore_parked_sidecars(parked: &[(PathBuf, PathBuf)]) {
+    for (sidecar, aside) in parked {
+        if let Err(error) = fs::rename(aside, sidecar) {
+            eprintln!(
+                "warning: could not restore {} from {}: {error}",
+                sidecar.display(),
+                aside.display()
+            );
+        }
+    }
 }
 
 fn sqlite_sidecar(db: &Path, suffix: &str) -> PathBuf {
@@ -3826,6 +3920,76 @@ mod tests {
     use rusqlite::Connection;
     use serde_json::{json, Value};
     use std::fs;
+
+    fn staged_with(dir: &Path, body: &[u8]) -> tempfile::NamedTempFile {
+        let mut staged = tempfile::NamedTempFile::new_in(dir).unwrap();
+        std::io::Write::write_all(&mut staged, body).unwrap();
+        staged
+    }
+
+    /// A replacement that fails must leave the old database's committed WAL
+    /// beside it, not deleted ahead of the rename.
+    #[test]
+    fn a_failed_sqlite_export_keeps_the_old_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.db");
+        fs::write(&dest, b"old main").unwrap();
+        fs::write(sqlite_sidecar(&dest, "-wal"), b"old wal").unwrap();
+
+        let error = install_sqlite_export(staged_with(dir.path(), b"new"), &dest, |_, _| {
+            anyhow::bail!("simulated rename failure")
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("simulated rename failure"));
+        assert_eq!(fs::read(&dest).unwrap(), b"old main");
+        assert_eq!(fs::read(sqlite_sidecar(&dest, "-wal")).unwrap(), b"old wal");
+        assert!(!parked_sidecar(&dest, "-wal").exists());
+    }
+
+    /// A sidecar that cannot be moved aside fails the export instead of
+    /// leaving it to pair with the new file.
+    #[test]
+    fn an_immovable_sidecar_fails_the_sqlite_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.db");
+        fs::write(&dest, b"old main").unwrap();
+        fs::write(sqlite_sidecar(&dest, "-wal"), b"old wal").unwrap();
+        fs::write(sqlite_sidecar(&dest, "-shm"), b"old shm").unwrap();
+        // A non-empty directory where -shm would be parked: the rename fails.
+        let blocker = parked_sidecar(&dest, "-shm");
+        fs::create_dir(&blocker).unwrap();
+        fs::write(blocker.join("keep"), b"x").unwrap();
+
+        let mut persisted = false;
+        let result = install_sqlite_export(staged_with(dir.path(), b"new"), &dest, |_, _| {
+            persisted = true;
+            Ok(())
+        });
+
+        assert!(result.is_err(), "a stuck sidecar must fail the export");
+        assert!(
+            !persisted,
+            "the new file was installed beside a stale sidecar"
+        );
+        assert_eq!(fs::read(&dest).unwrap(), b"old main");
+        assert_eq!(fs::read(sqlite_sidecar(&dest, "-wal")).unwrap(), b"old wal");
+        assert_eq!(fs::read(sqlite_sidecar(&dest, "-shm")).unwrap(), b"old shm");
+    }
+
+    #[test]
+    fn a_successful_sqlite_export_drops_the_old_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.db");
+        fs::write(&dest, b"old main").unwrap();
+        fs::write(sqlite_sidecar(&dest, "-wal"), b"old wal").unwrap();
+
+        install_sqlite_export(staged_with(dir.path(), b"new"), &dest, persist_export).unwrap();
+
+        assert_eq!(fs::read(&dest).unwrap(), b"new");
+        assert!(!sqlite_sidecar(&dest, "-wal").exists());
+        assert!(!parked_sidecar(&dest, "-wal").exists());
+    }
 
     /// A remote-scoped watch must install no local roots. If it did, the
     /// filesystem-event driver would be selected by local writes the run is

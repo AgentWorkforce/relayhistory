@@ -643,7 +643,7 @@ None of this is optimized here. Recording it is the point: the parity issues in
 
 ### 2026-09-28 sweep profile and the tokscale techniques (#215)
 
-#215 asked whether relayhistory should adopt three techniques from
+Issue #215 asked whether relayhistory should adopt three techniques from
 [tokscale](https://github.com/junhoyeo/tokscale): a parallel `rayon` + `walkdir`
 scan, typed (and possibly SIMD) JSON deserialization, and sampled-content file
 fingerprints. The answer depends on where a sweep's time actually goes, so this
