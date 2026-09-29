@@ -182,3 +182,26 @@ fn export_refuses_a_symlink_to_the_active_database() {
         assert_refused_and_intact(&output, &db, &before);
     }
 }
+
+/// `--db` accepts a SQLite `file:` URI, whose text is not the path of the
+/// file SQLite opens; the guard must still recognize that file.
+#[test]
+fn export_refuses_the_database_opened_through_a_sqlite_uri() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = temp.path().join("mine.db");
+    seed(&temp, &db);
+    let uri = format!("file:{}?mode=rwc", db.display());
+
+    for (format, dest) in [
+        ("jsonl", "mine.db"),
+        ("sqlite", "mine.db"),
+        ("jsonl", "mine.db-wal"),
+    ] {
+        let before = std::fs::read(&db).unwrap();
+        let output = run(ai_hist(&temp)
+            .arg("--db")
+            .arg(&uri)
+            .args(["export", "--format", format, dest]));
+        assert_refused_and_intact(&output, &db, &before);
+    }
+}

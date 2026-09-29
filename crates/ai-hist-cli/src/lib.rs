@@ -2195,9 +2195,21 @@ fn export_history(
     // An existing symlink destination is written through, to its target, as
     // a direct write would; the rename below would otherwise replace the link.
     let target = dest.map(follow_destination_symlink);
+    // `--db` is handed to SQLite as given, so a `file:` URI names a database
+    // whose filesystem path is not the argument's text. The connection knows
+    // the file it actually opened; both are guarded.
+    let opened = conn
+        .path()
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
+    let protected: Vec<&Path> = std::iter::once(active_db)
+        .chain(opened.as_deref())
+        .collect();
     if let (Some(dest), Some(target)) = (dest, target.as_deref()) {
         anyhow::ensure!(
-            !names_active_database(dest, active_db) && !names_active_database(target, active_db),
+            !protected.iter().any(|active| {
+                names_active_database(dest, active) || names_active_database(target, active)
+            }),
             "Refusing to export over the active database {} (destination {}).",
             active_db.display(),
             dest.display()

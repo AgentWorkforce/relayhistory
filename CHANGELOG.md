@@ -254,7 +254,8 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 - `ai-hist export` no longer overwrites the database it is reading from
   (#73). The destination is checked against the database the command
-  actually opened (`--db` included, not only `AI_HIST_DB`/the default), for
+  actually opened (`--db` included, not only `AI_HIST_DB`/the default, and
+  for a SQLite `file:` URI the file SQLite resolved it to), for
   every format (`sqlite`, `jsonl`, `.gz`), after resolving relative
   spellings, `..`, symlinks and hard links, and its `-wal`/`-shm`/`-journal`
   sidecars are protected too. A refused export exits non-zero before reading
