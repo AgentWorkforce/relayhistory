@@ -536,16 +536,22 @@ pub fn normalize_usage(
             // `outputTokens` includes `reasoningTokens`; that stays as
             // written, with reasoning reported beside it, the same shape a
             // Codex record has.
-            let inclusive = input.unwrap_or(0);
+            // Only a reported input can be checked against the cache reads:
+            // an absent one is unknown, not zero, so a breakdown that names
+            // cache reads without it keeps them and reports no input.
             let cached = cache_read.unwrap_or(0);
-            usage.input_tokens =
-                inclusive
-                    .checked_sub(cached)
-                    .ok_or(UsageError::CounterRegressed {
-                        field: "usage.inputTokens",
-                        value: inclusive,
-                        subtracted: cached,
-                    })?;
+            usage.input_tokens = match input {
+                Some(inclusive) => {
+                    inclusive
+                        .checked_sub(cached)
+                        .ok_or(UsageError::CounterRegressed {
+                            field: "usage.inputTokens",
+                            value: inclusive,
+                            subtracted: cached,
+                        })?
+                }
+                None => 0,
+            };
             usage.output_tokens = output.unwrap_or(0);
             usage.reasoning_tokens = reasoning;
             usage.cache_read_tokens = cached;
@@ -1055,6 +1061,21 @@ mod tests {
                 .code(),
             "USAGE_COUNTER_REGRESSED"
         );
+        // No reported input is unknown input, not zero: the cache reads and
+        // output it did report are kept, and input coverage stays false.
+        let partial = grok(json!({"usage": {"cachedReadTokens": 400, "outputTokens": 10}}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                partial.input_tokens,
+                partial.cache_read_tokens,
+                partial.output_tokens
+            ),
+            (0, 400, 10)
+        );
+        assert!(!partial.coverage.has_input_tokens);
+        assert!(partial.coverage.has_cache_read_tokens);
         assert_eq!(
             grok(json!({"usage": {"outputTokens": -1}}))
                 .unwrap_err()

@@ -153,6 +153,10 @@ pub enum RequestKeySource {
     /// loop and holds as many API calls as it made round trips, each with its
     /// own snapshot; grouping by `turn_id` would merge them into one request
     /// with disagreeing usage blobs, which reports no usage at all.
+    ///
+    /// Grok is the exception that proves the rule: it reports usage once per
+    /// turn and names no calls inside it, so its span *is* the turn — the
+    /// finest unit its usage can be attributed to.
     RequestSpan,
     /// The stored `message_id`, because the provider recorded neither. For a
     /// source that writes one request as several records this is a *record*
