@@ -156,6 +156,16 @@ test('the TypeScript CLI and MCP page with the same cursor and window', async ()
       (error: unknown) => typeof error === 'object' && error !== null && 'stderr' in error
         && /must not be later than until_ms/.test(String(error.stderr)),
     );
+    // An unknown cursor source fails in the shared validation, as in the SDK
+    // and MCP, not with a CLI-only message.
+    await assert.rejects(
+      () => run(process.execPath, [
+        cli, 'search', 'pageneedle', '--db', dbPath, '--no-warning',
+        '--after', '{"timestampMs":1,"id":1,"matchSource":"tool"}',
+      ], { env: process.env }),
+      (error: unknown) => typeof error === 'object' && error !== null && 'stderr' in error
+        && /INVALID_ARGUMENT: cursor match_source must be history or session_event \(got tool\)/.test(String(error.stderr)),
+    );
 
     const env = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined));
     const client = new Client({ name: 'history-paging-fixture', version: '1' });
