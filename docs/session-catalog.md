@@ -131,7 +131,7 @@ ai-hist sessions discover
 ai-hist sessions discover --local
 
 # Run every configured discovery adapter: local adapters plus any
-# configured remote connectors (see remote-connectors.md).
+# configured remote connectors (see source-plugins.md).
 ai-hist sessions discover --all --limit 20
 
 # Read back what the catalog holds — no provider file is opened.
@@ -408,7 +408,7 @@ always wins — a shallow rescan refreshes a `full` row's metadata and stamp but
 never downgrades its state. Local connectors provide full sync today. Claude
 remote rows can become full through targeted teleport-evidence hydration;
 Codex remote rows remain shallow after their available diff is indexed because
-the CLI exposes no transcript export (see [Remote connectors](remote-connectors.md)).
+the CLI exposes no transcript export (see [Remote connectors](source-plugins.md)).
 
 ### Product boundary
 
@@ -427,7 +427,7 @@ Discovery and sync are acquisition operations. Local adapters are always
 available; remote acquisition runs through provider connectors —
 `claude-web` for claude.ai/code web sessions and `codex-cloud` for Codex
 cloud tasks — that are configured by the provider CLI's own stored sign-in
-(see [Remote connectors](remote-connectors.md)). Explicit remote acquisition
+(see [Remote connectors](source-plugins.md)). Explicit remote acquisition
 on a machine with no connector configured returns an error rather than
 silently doing local work. `--all` means every configured adapter: the local
 adapters plus whichever connectors are configured.
@@ -2058,6 +2058,12 @@ never be presented as a session.
 The exemption list also travels in the `summary` line as `exempt_sources`, so a
 consumer can tell "this source has no sessions" apart from "this source is not
 discoverable".
+
+A store that holds sessions of an existing source somewhere the built-in parser
+does not read needs no change here: a **local source plugin**
+(`location: 'local'` with declared `roots`) discovers and hydrates it through
+the normalized evidence intake, out of tree. See
+[local source plugins](source-plugins.md#local-source-plugins).
 
 ### Add a fixture and a snapshot
 

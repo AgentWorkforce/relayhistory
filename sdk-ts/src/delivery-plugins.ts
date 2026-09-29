@@ -1,6 +1,6 @@
 import type { HistorySource } from './source-contracts.js';
 import { pathToFileURL } from 'node:url';
-import { resolve } from 'node:path';
+import { isAbsolute, resolve } from 'node:path';
 import { createRequire } from 'node:module';
 import { InvalidArgumentError, RelayHistoryError } from './sdk-common.js';
 import type { HistoryDestination, HistoryPlugin } from './delivery-contracts.js';
@@ -9,6 +9,12 @@ function label(value: string): void {
   if (typeof value !== 'string' || !/^[A-Za-z0-9_.:/@-]{1,200}$/.test(value)) {
     throw new InvalidArgumentError('plugin identifiers must be nonempty non-secret labels', 'INVALID_ARGUMENT');
   }
+}
+
+/** A local source's declared roots: a nonempty list of absolute directories. */
+function validLocalRoots(roots: unknown): roots is readonly string[] {
+  return Array.isArray(roots) && roots.length > 0 && roots.length <= 64
+    && roots.every((root) => typeof root === 'string' && root.length > 0 && isAbsolute(root));
 }
 
 /** Per-client registry. Installing a module never registers or starts it. */
@@ -22,7 +28,8 @@ export class HistoryPluginRegistry {
     for(const source of plugin.sources ?? []) {
       label(source.id);label(source.instanceId);
       const key=JSON.stringify([source.id,source.instanceId]);
-      if(sources.has(key)||source.location!=='remote'||!Array.isArray(source.supportedSources)||typeof source.discover!=='function'||typeof source.hydrate!=='function') throw new InvalidArgumentError('invalid or duplicate source connector','INVALID_ARGUMENT');
+      if(sources.has(key)||(source.location!=='remote'&&source.location!=='local')||!Array.isArray(source.supportedSources)||typeof source.discover!=='function'||typeof source.hydrate!=='function') throw new InvalidArgumentError('invalid or duplicate source connector','INVALID_ARGUMENT');
+      if(source.location==='local'&&!validLocalRoots(source.roots)) throw new InvalidArgumentError('a local source connector must declare the absolute directories it reads as roots','INVALID_ARGUMENT');
       sources.set(key,source);
     }
     // Validate the whole registration before mutating this registry.

@@ -125,7 +125,7 @@ with `SOURCE_REVISION_CONFLICT`. Complete snapshots replace only covered kinds
 for that connector. JavaScript source and destination plugins use the public SDK/native contracts
 and do not open SQLite. Optional Rust compatibility implementations depend on
 public core storage operations; they do not move transport or credential
-dependencies back into the local engine. See [source plugins](remote-connectors.md).
+dependencies back into the local engine. See [source plugins](source-plugins.md).
 
 ## Evidence retention
 

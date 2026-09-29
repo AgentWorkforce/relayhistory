@@ -189,6 +189,20 @@ Notable changes to the native `ai-hist` CLI are documented here.
   the row as stored in `columns`. Exported with `CHANGE_KINDS` and the
   `ChangeKind`, `Watermark`, `FeedChange`, `ChangesPage` and `CommittedCursor`
   types.
+
+- Local source plugins (#177). A `HistorySource` may declare
+  `location: 'local'` with the absolute `roots` it reads; it runs for `local`
+  (the default) and `all` scope beside the built-in parsers, never for
+  `remote`, and its sessions are catalogued with `locations: ['local']`
+  through the same normalized evidence intake as a remote snapshot.
+  Registration refuses a local source without absolute roots, and a discovery
+  that reports a `raw_path` outside them is rejected as that connector's
+  diagnostic. Remote sources are unchanged and still never run for local or
+  default scope; a request that registers no local source keeps the
+  native-only path. A plugin-backed `sync` at `all` scope now reports the
+  native local pass's diagnostics and completion with its own.
+  `docs/remote-connectors.md` is now `docs/source-plugins.md`.
+
 - Add workspace-scoped agent handoffs through `create_handoff(intent)` and
   `resume_handoff(source, session_id)`. The sender emits only a session pointer
   plus one self-describing intent and origin identity; the intent tells the

@@ -6,7 +6,42 @@ import {
   camelSourceResult,
   sourceAcquisitionTimeout,
   throwIfSourceAborted,
+  sourceConnectorsInScope,
 } from './source-plugins.js';
+import type { HistoryPluginRegistry } from './delivery-plugins.js';
+import type { HistorySource } from './source-contracts.js';
+
+/**
+ * The scope an acquisition runs installed source plugins at, or `null` when it
+ * runs none and the native engine answers alone.
+ *
+ * `remote` and `all` run the selected plugins, as they always have. `local`
+ * (and the default, which is local) runs only `local` connectors, and only
+ * when one is registered and not deselected: a request that never asked for a
+ * plugin keeps the pure native path, and a remote connector is never invoked
+ * for a local request. Deselection here never throws for an unknown id,
+ * because local scope ignored `sourceConnectors` before local plugins existed.
+ */
+function pluginScope(
+  plugins: HistoryPluginRegistry | undefined,
+  scope: SessionScope | undefined,
+  ids: readonly string[] | undefined,
+): { scope: SessionScope; selected: HistorySource[] } | null {
+  if (!plugins) return null;
+  if (scope === 'remote' || scope === 'all') {
+    return { scope, selected: sourceConnectorsInScope(plugins, ids, scope) };
+  }
+  const selected = plugins
+    .sourceConnectors()
+    .filter(
+      (connector) =>
+        connector.location === 'local' &&
+        (ids === undefined ||
+          ids.includes(connector.id) ||
+          ids.includes(`${connector.id}:${connector.instanceId}`)),
+    );
+  return selected.length ? { scope: 'local', selected } : null;
+}
 /**
  * RelayHistory's public TypeScript API.
  *
@@ -287,10 +322,11 @@ export async function discoverSessions(
 ): Promise<DiscoverResult> {
   validateAcquisition(options);
   const sourceConnectors = validateSourceConnectors(options.sourceConnectors);
-  if (options.plugins && options.scope !== undefined && options.scope !== 'local') {
-    const selected = options.plugins.sourceConnectors(options.sourceConnectors);
+  const plugins = pluginScope(options.plugins, options.scope, options.sourceConnectors);
+  if (options.plugins && plugins) {
+    const { scope, selected } = plugins;
     const local =
-      options.scope === 'all'
+      scope !== 'remote'
         ? await discoverSessions({
             ...options,
             plugins: undefined,
@@ -298,11 +334,13 @@ export async function discoverSessions(
             sourceConnectors: [],
           })
         : null;
-    if (!selected.length && local) return { ...local, scope: 'all' };
+    if (!selected.length && local) return { ...local, scope };
     const failures: DiscoveryDiagnostic[] = [];
     let sourceFailure: RelayHistoryError | undefined;
     const runs = await discoverSourcePlugins(options.plugins, {
       ...options,
+      scope,
+      sourceConnectors: selected.map((connector) => `${connector.id}:${connector.instanceId}`),
       onUnavailable: (source, error) => {
         sourceFailure ??= error;
         failures.push({ source, locator: null, error: `${error.code}: ${error.message}` });
@@ -313,13 +351,15 @@ export async function discoverSessions(
         'No selected source plugin is available',
         'CONNECTOR_NOT_CONFIGURED',
       );
-    const page = await listSessionCatalogPage({ ...options, scope: options.scope });
+    const page = await listSessionCatalogPage({ ...options, scope });
     return {
       contractVersion: SESSION_CATALOG_CONTRACT_VERSION,
-      scope: options.scope,
+      scope,
       locationsRun: [
-        ...(local?.locationsRun ?? []),
-        ...new Set(runs.map((run) => run.connector.location)),
+        ...new Set([
+          ...(local?.locationsRun ?? []),
+          ...runs.map((run) => run.connector.location),
+        ]),
       ],
       sessions: page.sessions,
       discovered:
@@ -406,14 +446,18 @@ export async function hydrateSession(
   }
   validateAcquisition(options);
   const sourceConnectors = validateSourceConnectors(options.sourceConnectors);
-  if (options.plugins && options.scope !== undefined && options.scope !== 'local') {
-    const selected = options.plugins
-      .sourceConnectors(sourceConnectors)
-      .filter((source) => source.supportedSources.includes(options.source));
+  const plugins = pluginScope(options.plugins, options.scope, sourceConnectors);
+  if (options.plugins && plugins) {
+    const selected = plugins.selected.filter((source) =>
+      source.supportedSources.includes(options.source),
+    );
     const failures: HydrationDiagnostic[] = [];
     let sourceFailure: RelayHistoryError | undefined;
     let result: HydrateSessionResult | undefined;
-    if (options.scope === 'all') {
+    // The built-in parser answers first whenever the local side is asked for;
+    // a local plugin then adds the evidence it holds for the same identity.
+    let localFailure: RelayHistoryError | undefined;
+    if (plugins.scope !== 'remote') {
       try {
         result = await hydrateSession({
           ...options,
@@ -422,10 +466,18 @@ export async function hydrateSession(
           sourceConnectors: [],
         });
       } catch (error) {
+        // A session only a local plugin observed is catalogued as local, so the
+        // built-in adapter reports that it has not observed it rather than that
+        // it does not exist. Either way the plugins below may still hold it.
         if (
-          !(error instanceof SessionNotFoundError || error instanceof SessionSourceUnavailableError)
+          !(
+            error instanceof SessionNotFoundError ||
+            error instanceof SessionSourceUnavailableError ||
+            (error instanceof ConnectorNotConfiguredError && selected.length > 0)
+          )
         )
           throw error;
+        localFailure = error;
       }
     }
     if (!selected.length && result) return result;
@@ -480,7 +532,7 @@ export async function hydrateSession(
       }
     }
     if (!result)
-      throw sourceFailure ?? new SessionSourceUnavailableError(
+      throw sourceFailure ?? localFailure ?? new SessionSourceUnavailableError(
         'No selected plugin observed this session',
         'SESSION_SOURCE_UNAVAILABLE',
       );
@@ -877,10 +929,11 @@ export async function stats(options: StatsOptions = {}): Promise<Stats> {
 export async function sync(options: SyncOptions = {}): Promise<SyncResult> {
   validateAcquisition(options);
   const sourceConnectors = validateSourceConnectors(options.sourceConnectors);
-  if (options.plugins && options.scope !== undefined && options.scope !== 'local') {
-    const selected = options.plugins.sourceConnectors(sourceConnectors);
+  const plugins = pluginScope(options.plugins, options.scope, sourceConnectors);
+  if (options.plugins && plugins) {
+    const { scope, selected } = plugins;
     const local =
-      options.scope === 'all'
+      scope !== 'remote'
         ? await sync({ ...options, plugins: undefined, scope: 'local', sourceConnectors: [] })
         : null;
     const diagnostics: DiscoveryDiagnostic[] = [];
@@ -888,6 +941,8 @@ export async function sync(options: SyncOptions = {}): Promise<SyncResult> {
     const runs = selected.length
       ? await discoverSourcePlugins(options.plugins, {
           ...options,
+          scope,
+          sourceConnectors: selected.map((connector) => `${connector.id}:${connector.instanceId}`),
           onUnavailable: (source, error) => {
             sourceFailure ??= error;
             diagnostics.push({ source, locator: null, error: `${error.code}: ${error.message}` });
@@ -919,9 +974,11 @@ export async function sync(options: SyncOptions = {}): Promise<SyncResult> {
       }
     return {
       databasePath: local?.databasePath ?? options.dbPath ?? defaultDbPath(),
-      scope: options.scope,
-      completed: diagnostics.length === 0,
-      diagnostics,
+      scope,
+      // The native local pass is part of this sync: its diagnostics are this
+      // sync's diagnostics, and an incomplete local pass is an incomplete sync.
+      completed: (local?.completed ?? true) && diagnostics.length === 0,
+      diagnostics: [...(local?.diagnostics ?? []), ...diagnostics],
     };
   }
   return nativeCall(async (native) => {

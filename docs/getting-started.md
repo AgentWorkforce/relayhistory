@@ -56,7 +56,7 @@ accept a location flag.
 Remote acquisition requires an installed and explicitly configured source plugin.
 `@relayhistory/provider-sources` supplies `claude-web` and `codex-cloud`,
 using the provider CLI's existing sign-in only when selected. Signing in alone
-does not configure the local SDK. See [source plugins](remote-connectors.md) for
+does not configure the local SDK. See [source plugins](source-plugins.md) for
 an explicit `history.json` configuration and `--config` examples. With no source
 plugin configured, `sessions discover --remote` and `sync --remote` fail before
 opening the database. `--all` runs local acquisition plus selected plugins.

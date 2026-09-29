@@ -472,7 +472,7 @@ enum SessionsAction {
     /// bytes have not changed since the last run are served from the catalog.
     /// The summary `scope` echoes the request; `locations_run` reports the
     /// connector locations that executed. `--remote` requires at least one
-    /// configured remote connector (see docs/remote-connectors.md); `--all`
+    /// configured remote connector (see docs/source-plugins.md); `--all`
     /// runs local adapters plus every configured connector.
     Discover {
         #[command(flatten)]

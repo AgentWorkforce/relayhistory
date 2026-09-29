@@ -106,7 +106,7 @@ ai-hist events SESSION_ID [--source SOURCE]    # --source only narrows a reused 
 `sessions tree`, `sessions relationships`, `sessions tools`, `sessions edits`, `sessions markers` and `sessions usage` require both positionals and fail without `SOURCE`. `session` and `events` take `SESSION_ID` on its own and reject a `SOURCE` positional; pass `--source` only to disambiguate an id two harnesses happen to share. (`sessions hydrate` also takes `SOURCE SESSION_ID`, but it is an acquisition command and does accept a scope.)
 
 Install `@relayhistory/provider-sources` and configure it explicitly for
-remote provider acquisition. Its connectors reuse sign-ins you already have: `claude-web` lists your claude.ai/code sessions from the Claude Code CLI's stored OAuth token, and `codex-cloud` lists Codex cloud tasks through `codex cloud list --json`. With no connector configured, `--remote` fails loudly rather than silently falling back to local. See [remote connectors](docs/remote-connectors.md).
+remote provider acquisition. Its connectors reuse sign-ins you already have: `claude-web` lists your claude.ai/code sessions from the Claude Code CLI's stored OAuth token, and `codex-cloud` lists Codex cloud tasks through `codex cloud list --json`. With no connector configured, `--remote` fails loudly rather than silently falling back to local. See [remote connectors](docs/source-plugins.md).
 
 `ai-hist export --selection FILE` writes a selected slice of history as NDJSON for your own tooling. See [export](docs/export.md).
 
@@ -122,4 +122,4 @@ Team uploads come from the [Agent Relay desktop app](https://agentrelay.com), no
 
 ---
 
-Docs: [getting started](docs/getting-started.md) · [architecture](docs/architecture.md) · [remote connectors](docs/remote-connectors.md) · [export](docs/export.md) · [migration](docs/native-sdk-migration.md)
+Docs: [getting started](docs/getting-started.md) · [architecture](docs/architecture.md) · [source plugins](docs/source-plugins.md) · [export](docs/export.md) · [migration](docs/native-sdk-migration.md)

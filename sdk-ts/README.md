@@ -92,7 +92,7 @@ The CLI accepts `--config history.json` on acquisition commands. Config lists
 explicit plugin modules/options; `--source-connector` selects their IDs and is
 repeatable. `--no-source-connectors` disables remote acquisition. MCP uses
 `AI_HIST_PLUGIN_CONFIG` and `source_connectors`. Scope defaults to local even
-with plugins configured. See [source plugins](../docs/remote-connectors.md).
+with plugins configured. See [source plugins](../docs/source-plugins.md).
 Native contract 14 rejects old addons that lack the source/delivery boundary.
 
 Catalog pages, discovery results, statistics, and sync results echo the requested `scope`,
