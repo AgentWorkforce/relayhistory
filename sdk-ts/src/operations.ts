@@ -367,7 +367,16 @@ export async function discoverSessions(
         'No selected source plugin is available',
         'CONNECTOR_NOT_CONFIGURED',
       );
-    const page = await listSessionCatalogPage({ ...options, scope });
+    // Native discovery returns every session it saw when no limit is given;
+    // the catalog read that stands in for it here pages, so follow the cursor
+    // rather than returning only its first page.
+    const sessions: CatalogSession[] = [];
+    let page = await listSessionCatalogPage({ ...options, scope });
+    sessions.push(...page.sessions);
+    while (options.limit === undefined && page.nextCursor) {
+      page = await listSessionCatalogPage({ ...options, scope, after: page.nextCursor });
+      sessions.push(...page.sessions);
+    }
     return {
       contractVersion: SESSION_CATALOG_CONTRACT_VERSION,
       scope,
@@ -377,7 +386,7 @@ export async function discoverSessions(
           ...runs.map((run) => run.connector.location),
         ]),
       ],
-      sessions: page.sessions,
+      sessions,
       discovered:
         (local?.discovered ?? 0) +
         runs.reduce(

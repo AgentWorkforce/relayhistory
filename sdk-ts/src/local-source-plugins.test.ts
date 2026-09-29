@@ -300,3 +300,29 @@ test('the roots check rejects only real escapes, for raw_path and an absolute ra
   await accept({ raw_locator: join(dir, 'elsewhere', 'stolen.jsonl') }, 0);
   await accept({ raw_path: join(root, '..', 'sibling.jsonl') }, 0);
 });
+
+test('plugin discovery without a limit returns every catalogued session, past the first page', async (t) => {
+  const { dbPath, root } = await isolatedHome(t, 'rh-local-plugin-pages-');
+  const ids = Array.from({ length: 60 }, (_, index) => `paged-${String(index).padStart(2, '0')}`);
+  const registry = new HistoryPluginRegistry();
+  registry.register({
+    sources: [{
+      id: 'paged-local',
+      instanceId: 'one',
+      location: 'local',
+      roots: [root],
+      supportedSources: ['claude'],
+      discover: async () => ({
+        observations: ids.map((session_id, index) => ({
+          source: 'claude' as const, session_id, source_stamp: '1', last_activity_ms: 1_789_000_000_000 + index,
+        })),
+      }),
+      hydrate: async () => ({ source_stamp: 's', source_bytes: 0, covered_kinds: [], records: [] }),
+    }],
+  });
+  const discovery = await discoverSessions({ plugins: registry, dbPath });
+  assert.equal(discovery.discovered, 60);
+  assert.deepEqual(discovery.sessions.map((session) => session.sessionId).sort(), ids);
+  const limited = await discoverSessions({ plugins: registry, dbPath, limit: 10 });
+  assert.equal(limited.sessions.length, 10);
+});
