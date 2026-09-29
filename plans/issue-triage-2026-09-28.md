@@ -20,14 +20,53 @@ comment linking its replacement and is left open for a maintainer to close.
 
 ## Fixed by a PR
 
-_Filled in as the per-issue PRs open._
+| Issue | PR | Notes |
+| --- | --- | --- |
+| #181 | #274 | Part of: change feed through napi and the TS SDK; native contract 23 |
+| #73 | #272 | `export` refuses to overwrite the database it opened; atomic write |
+| #211 | #278 | Merge streamed Claude Code usage per request; `<synthetic>` becomes a marker |
+| #208 | #280 | Part of: skip subagent `journal.jsonl`; `~/.claude/transcripts/` still to characterize |
+| #66 | #277 | napi/SDK/MCP search share the CLI's Rust query; native contract 23 |
+| #67 | #282 | Keyset cursors and inclusive time windows; stacked on #277; native contract 24 |
+| #171 | #276 | Tool-result fidelity for Cursor, Grok and OpenCode; hydration parser version 12 |
+| #177 | #281 | Part of: local JS source plugins; registry consolidation and collector issues remain |
+| #210 | #273 | Part of: Codex fork edges from `session_meta`; replay gate remains |
+| #209 | #279 | OpenCode channel-suffixed databases; `ProviderRoots::opencode_db_pinned` |
+| #212 | #284 | Part of: Grok per-turn usage from `updates.jsonl`; `unified.jsonl` remains |
+| #42 | #271 | Part of: Codex metadata backfill scoped to re-read sessions (2.9s → 0.96s) |
+| #215 | #283 | Part of: pinned join order + locator index (incremental 6.97s → 2.12s); rayon/SIMD rejected with measurements |
+| #53 | #285 | Part of: `ai-hist compact` and reclaimable space in `doctor`; pruning policy remains |
+| #47 | #275 | ADR: writers stay direct, no append-only spools |
+
+## Still relevant, blocked
+
+| Issue | Blocked on |
+| --- | --- |
+| #183 | burn's `relayhistory-source` feature and parity suite (burn #555, #557, #558) |
+| #184 | #183's parity report, burn #562 cutover, #177 |
+
+## Merge order
+
+#274 and #277 both take native contract 23, and #282 is stacked on #277.
+Merge #277, then #282, then rebase #274 onto contract 25. #276 raises the
+hydration parser version to 12; any other parser bump rebases after it.
+Most PRs add `CHANGELOG.md` entries at the same spot and will need a trivial
+rebase as they land.
 
 ## Labelled `needs-investigation`
 
 Issues that no longer appear to apply to this repository as it stands. Each
 carries a comment with the evidence.
 
-_Filled in as triage completes._
+| Issue | Why |
+| --- | --- |
+| #119 | Fixed by #120: Linux GNU builds target glibc 2.28 and are smoke-tested on Bookworm |
+| #41 | `syncAndPush` was removed with cloud push; native `sync()` is already silent |
+| #64 | sql.js and the snapshot write path were removed in `4fe7aef`; reads open fresh rusqlite connections |
+| #99 | Shipped as `getSessionUsage` / `getSessionRequestsPage` / `ai-hist sessions usage` (`590fdae`, `b509a9c`) |
+| #163 | Delivered by #192 (its `Closes #163` was in backticks, so it never auto-closed) |
+| #214 | Reference record with no code to write; its use depends on #177's collector issues |
+| #40 | Hosted ingestion is cloud/relay-desktop scope; needs live Codex Cloud experiments |
 
 ## Not triaged
 
