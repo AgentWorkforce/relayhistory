@@ -8754,6 +8754,8 @@ pub(crate) fn heal_claude_request_evidence(conn: &Connection) -> Result<()> {
 /// events an earlier revision already moved is matched as well as one whose
 /// events are still in place.
 fn heal_claude_synthetic_session_summaries(conn: &Connection) -> Result<()> {
+    /// Where `ClaudeMetaFold` cuts `last_assistant_text`.
+    const CLAUDE_EXCERPT_MAX_CHARS: usize = 4096;
     let columns: HashSet<String> = conn
         .prepare("SELECT name FROM pragma_table_info('sessions')")?
         .query_map([], |row| row.get::<_, String>(0))?
@@ -8777,7 +8779,9 @@ fn heal_claude_synthetic_session_summaries(conn: &Connection) -> Result<()> {
     // The excerpt the metadata fold wrote from a notice is its text blocks
     // joined by newlines — blank ones included, which the event rows the
     // marker text was built from omit — and cut at 4096 characters. So the
-    // two are compared with whitespace removed, the excerpt as a prefix.
+    // two are compared with whitespace removed, and must be equal; only an
+    // excerpt the cut actually shortened may match as a prefix. A real reply
+    // that merely starts with a notice's words is not the notice.
     let candidates = conn
         .prepare(
             "SELECT s.session_id, s.last_assistant_text, m.text FROM sessions s \
@@ -8797,8 +8801,9 @@ fn heal_claude_synthetic_session_summaries(conn: &Connection) -> Result<()> {
     let mut quoting_a_notice: Vec<String> = candidates
         .into_iter()
         .filter(|(_, excerpt, notice)| {
-            let excerpt = squeeze(excerpt);
-            !excerpt.is_empty() && squeeze(notice).starts_with(&excerpt)
+            let cut = excerpt.chars().count() >= CLAUDE_EXCERPT_MAX_CHARS;
+            let (excerpt, notice) = (squeeze(excerpt), squeeze(notice));
+            !excerpt.is_empty() && (excerpt == notice || (cut && notice.starts_with(&excerpt)))
         })
         .map(|(session_id, _, _)| session_id)
         .collect();
@@ -27390,6 +27395,30 @@ mod tests {
                 heal_older_claude_database(with_request_id, notice_already_moved);
             }
         }
+    }
+
+    /// A real reply whose whole text is the start of a notice's text is the
+    /// model's last word, not the notice, and the repair leaves it alone.
+    #[test]
+    fn the_summary_heal_leaves_a_reply_that_is_only_a_notice_prefix() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO session_markers (source, session_id, marker_uid, message_id, kind, subkind, text) \
+             VALUES ('claude', 's', 'n:marker', 'n', 'local_notice', 'synthetic', 'Login expired'); \
+             INSERT INTO sessions (session_id, source, last_assistant_text) \
+             VALUES ('s', 'claude', 'Login');",
+        )
+        .unwrap();
+        heal_claude_synthetic_session_summaries(&conn).unwrap();
+        let last: Option<String> = conn
+            .query_row(
+                "SELECT last_assistant_text FROM sessions WHERE session_id = 's'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(last.as_deref(), Some("Login"));
     }
 
     fn heal_older_claude_database(with_request_id: bool, notice_already_moved: bool) {
