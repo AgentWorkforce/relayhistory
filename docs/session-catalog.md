@@ -1142,7 +1142,9 @@ How each adapter works:
   timestamps come from the first and last record of `updates.jsonl` when it is
   there, and from `summary.json`'s `created_at` / `updated_at` when it is not.
   Full hydration reads the whole directory — transcript, update stream,
-  signals, compaction checkpoints and subagent metadata. Details below.
+  signals, compaction checkpoints and subagent metadata — plus whatever the
+  Grok home's process-wide `logs/unified.jsonl` usage log gained since the last
+  pass. Details below.
 
   ### What Grok writes, and where relayhistory reads it
 
@@ -1150,7 +1152,12 @@ How each adapter works:
   `chat_history.jsonl`, `system_prompt.txt`, `prompt_context.json`,
   `tool_definitions.json`, `plan.json`, `rewind_points.jsonl`, `signals.json`
   and `feedback.jsonl`, plus the directories `compaction_checkpoints/` and
-  `subagents/`. RelayHistory reads six of those and ignores the rest.
+  `subagents/`; tokscale also reads an `events.jsonl` there. RelayHistory
+  reads six of those, reads `events.jsonl` only when `summary.json` is absent,
+  and ignores the rest. Outside the session directory, the Grok home
+  (`GROK_HOME`, else `~/.grok`) holds `logs/unified.jsonl`, one append-only log
+  every Grok process writes per-inference usage to; it is read as a second
+  Grok source (see "Usage" below).
 
   **`chat_history.jsonl` has the content; `updates.jsonl` has the time.** Grok's
   own guide calls `updates.jsonl` "the authoritative conversation log that
@@ -1200,6 +1207,9 @@ How each adapter works:
   | `tool_result.is_error` | **Inferred** — the failure signal is documented on the ACP `tool_call_update` `status` | Both are read; either marks `tool_calls.is_error` |
   | `reasoning.summary` / `reasoning.encrypted_content` | **Corroborated** ("reasoning is encrypted_content") | The summary is the thinking text; an encrypted-only record becomes an `encrypted_reasoning` marker and is never given invented text |
   | `updates.jsonl` envelope `{timestamp, method, params:{sessionId, update:{sessionUpdate,…}, _meta:{eventId, agentTimestampMs}}}` | **Corroborated** by three independent adapters | The timing source for the join; `eventId` also becomes the event's identity |
+  | `params._meta.eventId` is **not unique** | **Stated by tokscale** ("Grok reuses it across usage records", `sessions/grok.rs`) | An id carried by more than one message group is suffixed with its occurrence (`ev:<id>#<n>`), so two messages never share an identity; an id seen once keeps `ev:<id>` |
+  | `params.update._meta.modelId` | **Read by tokscale** (`extract_model_id`); not seen in a public sample | The turn's model: written as `model` in the turn's `token_json` and added to `sessions.models_json` |
+  | `turn_completed.usage.modelUsage` with one key | **Read by tokscale** | The turn's model when no row carried `_meta.modelId`; a map with several keys names no single model |
   | envelope `method` `session/update` **or** `_x.ai/session/update` | **Corroborated** | Both read; the method is not required to be either |
   | kinds `user_message_chunk`, `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `plan`, `turn_completed`, `hook_execution`, `retry_state` | **Corroborated** | The first five and `turn_completed` are read; the rest are counted and reported as `GROK_UPDATES_ROWS_UNREAD` |
   | `timestamp` in epoch **seconds**, `agentTimestampMs` in **milliseconds** | **Corroborated** | A field named `…Ms` is read as milliseconds; a bare `timestamp` is scaled if it is below 10¹² |
@@ -1207,8 +1217,12 @@ How each adapter works:
   | `turn_completed.totalTokens` | **Stated in #167**, and corroborated as a `turn_completed`-borne total | `token_json = {"context_total_tokens": n, "source": "updates.jsonl"}` on the turn's last assistant message |
   | `turn_completed.usage.{inputTokens, outputTokens, cachedReadTokens, reasoningTokens, costUsdTicks, modelUsage}` | **Reported by two community adapters for recent builds** and read in production by tokscale (`sessions/grok.rs`, commit `d8fd670`), which fixes its semantics: `inputTokens` includes `cachedReadTokens`, `outputTokens` includes `reasoningTokens`, `totalTokens` is input + output | Stored verbatim under `usage` in the turn's `token_json`, beside the context snapshot; normalized as `per-request` usage. See "Usage" below |
   | `summary.json` `info.id`, `info.cwd`, `info.model`, `git_root_dir`, `head_branch`, `created_at`, `updated_at` | **Corroborated** | Identity, project, branch, model and the fallback timestamps |
+  | `summary.json` `current_model_id`, `model_id` | **Read by tokscale** as its model fallback; whether they sit at the top level or under `info` is **unverified**, so both are tried | The session's model when no transcript record or turn named one, after `info.model` |
+  | `events.jsonl` `model_id`, `session_id`, `ts` (first 500 lines) | **Read by tokscale** as the fallback when `summary.json` is missing; that the file exists on current builds is **unverified** | Only when `summary.json` is absent: `model_id` is the model fallback and the earliest `ts` the `created_at` fallback. `session_id` is **not** taken as identity — the directory name already is the session id, and a file appearing later must not rename the session. Lines that do not parse are skipped: this is a metadata fallback, not evidence |
   | `summary.json` parent-session references for forked/restored sessions | **Corroborated** (named in the guide, field spelling unknown) | **Not read yet** — no field name to read |
   | `signals.json` `contextTokensUsed`, `turnCount`, `compactionCount` | **Stated in #167**; the guide says the file holds "token usage and tool/turn counters" | A `signals` marker whose `detail_json` is the file verbatim |
+  | `signals.json` `totalTokensBeforeCompaction` | **Read by tokscale** (`effective_total_from_signals`) | Named in the `signals` marker's text beside `contextTokensUsed`, and kept verbatim in its payload. Not reconciled against anything: reconciling totals across a compaction is accounting, which is burn's. tokscale also reads a model id from this file, under a key nothing public names, so it is not read |
+  | `<GROK_HOME>/logs/unified.jsonl` per-inference rows | **Read in production by tokscale** (`parse_grok_unified_log_file_with_prefix`); the row's field spellings are **inferred** — nothing public shows a row | See "Usage" below |
   | `prompt_context.json` | **Corroborated** ("inputs the system prompt was rendered from") | A `prompt_context` marker with the path, SHA-256 and size. The AGENTS.md body is never copied into the database |
   | `compaction_checkpoints/<entry>` | **Corroborated** as a directory; the entry's own fields are **unverified** | One `compaction_boundary` marker per entry, timed from `created_at`/`timestamp`/`turnStartMs` or the entry's numeric file name, with the parsed file in `detail_json` |
   | `subagents/<entry>` | **Corroborated** as "per-subagent metadata; child sessions live in the normal sessions tree"; the entry's own fields are **unverified** | One `session_relationships` row per entry, `evidence_kind = "grok_subagent_dir"` |
@@ -1244,10 +1258,70 @@ How each adapter works:
   `docs/usage-accounting.md`). A `usage` object holding only `totalTokens` is
   still the snapshot under another name. A session where only some turns carry
   a breakdown reports `GROK_USAGE_PARTIAL` instead; one where every turn does
-  reports no usage caveat. Still unread ([#212](https://github.com/AgentWorkforce/relayhistory/issues/212)):
-  `~/.grok/logs/unified.jsonl`'s per-inference rows, `events.jsonl`,
-  `signals.json`'s `totalTokensBeforeCompaction`, and `summary.json`'s
-  `current_model_id`.
+  reports no usage caveat.
+
+  **Per-inference usage from `logs/unified.jsonl`
+  ([#212](https://github.com/AgentWorkforce/relayhistory/issues/212)).**
+  Recent builds write every inference's token breakdown to one process-wide,
+  append-only log in the Grok home, `<GROK_HOME>/logs/unified.jsonl`
+  (`~/.grok/logs/unified.jsonl` when `GROK_HOME` is unset). It is a second
+  Grok source:
+
+  - It is read **incrementally**, from a byte cursor in `transcript_cursors`
+    (the machinery of #173), by every sweep after the session directories and
+    by every Grok hydration inside its own transaction. An unchanged log reads
+    zero bytes; a trailing line with no newline waits for one. The file is in
+    the sweep's stat-only fingerprint and is a watch root of its own, so an
+    append to it wakes live capture.
+  - Each usage row is copied into `grok_unified_usage`, the durable copy —
+    the bytes are never read again — and then **materialized** onto the
+    session it names as one `role = "assistant"`, `kind = "text"` event with
+    no text, `raw_kind = "unified_log_usage"`, its own `request_span`, the
+    row's model, and `token_json = {"usage": <counters>, "source":
+    "logs/unified.jsonl", "pid", "event_id"}`. One inference is one
+    `per-request` record, normalized with the same counter lists as
+    `turn_completed.usage`. `costUsdTicks` is kept verbatim and never read as
+    a cost.
+  - Rows attach **by session id**, assumed to equal `summary.json`'s
+    `info.id` (unverified). A row for a session that is not in the catalog yet
+    is **retained** and attached when that session is indexed; one that names
+    no session at all is counted and not attached, because guessing a session
+    from the pid would be invention.
+  - A row is keyed on a digest of **the whole normalized row**, not on
+    `eventId`: tokscale records that Grok reuses `eventId` across usage
+    records, so an id key would collapse distinct inferences. The same row
+    read twice (after a rotation) lands on the same key.
+  - **Precedence, never addition.** A session the log covers takes its usage
+    from it. Its `turn_completed.usage` breakdowns describe the same spend a
+    second time, so they are kept under `turn_usage`, which nothing
+    normalizes — whether the session was indexed before or after the log rows
+    arrived. A session the log does not cover keeps its turn breakdown under
+    `usage`, and the context snapshot is never usage in either case.
+  - A covered session needs no usage caveat: hydration reports none, parsed
+    or cached, and a cached hydration's stored diagnostics are cleared when
+    new rows attach, so an `unchanged` read does not replay a stale
+    `GROK_USAGE_CONTEXT_PROXY_ONLY`. An uncovered session keeps the caveat its
+    `updates.jsonl` earns. `capability` stays `full` either way — usage is not
+    an evidence kind (hydration contract 3).
+
+  The row shape is **inferred**. tokscale reads a session id, a pid, a model
+  and per-inference input/output/cache counters, and keys rows on
+  `event_id`/`eventId`/`id`/`uuid`/`ctx.event_id`, but nothing public shows
+  the spellings, so the parser looks for each field at the top level and then
+  under `ctx`: the session as `session_id`/`sessionId`, the process as `pid`,
+  the model as `model_id`/`modelId`/`model`, the time as `ts`/`timestamp`,
+  and the counters in a `usage` object — or, failing that, at the row's top
+  level, projected down to the counter keys so the rest of the log line is
+  never stored as usage — with the same key lists `turn_completed.usage` is
+  read with. A row that names a pid and a model and carries no counters (a
+  process start or a model change) sets that process's model for its later
+  rows that name none; the per-pid memory rides in the cursor. tokscale's
+  per-subagent scoping by `(pid, generation, session_id)`, with a conflict
+  state when evidence disagrees, is **not** implemented: its field names are
+  not public, and a row's own session id already scopes it. A terminated row
+  that is not JSON is counted and passed over rather than holding the cursor —
+  the log is Grok's process log, not a session's evidence, and one bad line
+  must not stop every later inference being read.
 
   ### Identity and re-reads
 
@@ -1255,7 +1329,13 @@ How each adapter works:
   is keyed on that update's ACP `eventId` (`ev:<id>`), which survives the
   rebuild Grok performs on a format upgrade; an event that did not is keyed on
   its record index (`r<n>`), which does not. Tool calls and results are keyed
-  on the provider's own call id (`tool:<id>`, `result:<id>`).
+  on the provider's own call id (`tool:<id>`, `result:<id>`). Grok reuses an
+  `eventId` across records, so an id more than one message group carries is
+  suffixed with its occurrence in stream order (`ev:<id>#0`, `ev:<id>#1`, …):
+  keying both on `ev:<id>` upserted the second message over the first. A
+  session indexed before this is re-read once by `sync` (the `grok_events_v4`
+  state key). A `logs/unified.jsonl` usage event is keyed `unified:<digest>`
+  and is rebuilt, not cleared, by each replacing read.
 
   **A Grok read is a replacement, not a merge.** Grok rewrites
   `chat_history.jsonl` in place on a format upgrade or a compaction, and prunes
@@ -1275,7 +1355,7 @@ How each adapter works:
 
   The change stamp covers **every file the read consumes**: the transcript, the
   summary and the update stream each keep a readable marker, and
-  `signals.json`, `prompt_context.json` and the sorted contents of
+  `signals.json`, `prompt_context.json`, `events.jsonl` and the sorted contents of
   `compaction_checkpoints/` and `subagents/` are folded into one digest (so a
   session with many checkpoints does not grow an unbounded stamp). Discovery,
   plain `sync` and targeted hydration all take the same stamp from the same
@@ -1479,6 +1559,18 @@ How each adapter works:
   jq -c . "$S/subagents/"* | head -2
   # 8. Does summary.json name a parent for a forked or restored session?
   jq -c 'with_entries(select(.key|test("parent|fork|restore";"i")))' "$S/summary.json"
+  # 9. Which model keys summary.json writes, and where (#212).
+  jq -c '{current_model_id, model_id, info_keys: (.info | keys)}' "$S/summary.json"
+  # 10. Does events.jsonl exist, and what does its head carry?
+  head -3 "$S/events.jsonl" | jq -c 'keys'
+  # 11. The unified log: its row keys, whether its session id equals
+  #     summary.json's info.id, and whether eventId repeats across usage rows.
+  U=${GROK_HOME:-~/.grok}/logs/unified.jsonl
+  jq -c 'keys' "$U" | sort | uniq -c | sort -rn | head
+  jq -r '.session_id // .sessionId // .ctx.session_id // empty' "$U" | sort -u | head
+  jq -r '.eventId // .event_id // empty' "$U" | sort | uniq -d | head
+  # 12. Does an update carry _meta.modelId inside params.update?
+  jq -c 'select(.params.update._meta.modelId) | .params.update._meta' "$S/updates.jsonl" | head -2
   ```
 
   Sources consulted (all public, September 2026):

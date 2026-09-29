@@ -132,6 +132,28 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Added
 
+- Grok per-inference usage from `<GROK_HOME>/logs/unified.jsonl` (#212). The
+  process-wide log recent Grok Build releases write is a second Grok source,
+  read from a byte cursor by every sweep and every Grok hydration (an
+  unchanged log reads zero bytes), watched as a file of its own and folded
+  into the sweep fingerprint. Each usage row is kept in a new
+  `grok_unified_usage` table and stored on the session it names as one
+  text-less assistant event (`raw_kind = "unified_log_usage"`, its own request
+  span) whose `token_json.usage` normalizes as `per-request` usage. Rows for a
+  session not indexed yet are retained and attached when it is. A covered
+  session's `turn_completed.usage` is kept as `turn_usage`, which is not
+  normalized, so the two are never added, and its hydration carries no usage
+  caveat; an uncovered one keeps `GROK_USAGE_CONTEXT_PROXY_ONLY` /
+  `GROK_USAGE_PARTIAL`. The row shape is inferred from tokscale and documented
+  as such in `docs/session-catalog.md`. Nothing here prices anything:
+  `costUsdTicks` is kept verbatim and never read as a cost.
+- Grok model and metadata fallbacks (#212): a turn's model from
+  `params.update._meta.modelId` or a single-key `turn_completed.usage.modelUsage`
+  (written as `model` in the turn's `token_json` and added to `models_json`);
+  `summary.json` `current_model_id` / `model_id` after `info.model`; and, for a
+  directory with no `summary.json`, the model and start time from the head of
+  `events.jsonl`. `signals.json`'s `totalTokensBeforeCompaction` is named in
+  the `signals` marker.
 - Evidence rows record which side backs them. `session_events`,
   `tool_calls`, `file_edits` and `session_markers` gain `location`
   (`local` / `remote` / `both`). Local parsers stamp `local`, remote intake
@@ -517,6 +539,12 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Fixed
 
+- Grok reuses an ACP `eventId` across records, and two messages carrying one
+  id were stored under one `ev:<id>` identity, so the second overwrote the
+  first (#212). An id more than one message carries is now suffixed with its
+  occurrence (`ev:<id>#<n>`); an id seen once keeps its old identity. The
+  `grok_events_v3` sync-state key is retired for `grok_events_v4`, so every
+  Grok session is re-read once by `sync`.
 - `ai-hist export` no longer overwrites the database it is reading from
   (#73). The destination is checked against the database the command
   actually opened (`--db` included, not only `AI_HIST_DB`/the default, and
