@@ -115,6 +115,18 @@ enum Command {
         /// Only entries at or before this epoch-millisecond timestamp.
         #[arg(long)]
         until_ms: Option<i64>,
+        /// Continue after a previous page's last row: its `timestamp_ms`.
+        /// Requires --after-id.
+        #[arg(long, requires = "after_id")]
+        after_ms: Option<i64>,
+        /// Continue after a previous page's last row: its `id`. Requires
+        /// --after-ms.
+        #[arg(long, requires = "after_ms")]
+        after_id: Option<i64>,
+        /// The last row's `match_source` (`history` or `session_event`); omit
+        /// for `history`. Requires --after-id.
+        #[arg(long, requires = "after_id")]
+        after_match_source: Option<String>,
         #[arg(long, default_value_t = 20)]
         limit: i64,
         /// Pass the query through as a raw FTS5 MATCH expression. Operators such as
@@ -142,6 +154,14 @@ enum Command {
         /// Only entries at or before this epoch-millisecond timestamp.
         #[arg(long)]
         until_ms: Option<i64>,
+        /// Continue after a previous page's last row: its `timestamp_ms`.
+        /// Requires --after-id.
+        #[arg(long, requires = "after_id")]
+        after_ms: Option<i64>,
+        /// Continue after a previous page's last row: its `id`. Requires
+        /// --after-ms.
+        #[arg(long, requires = "after_ms")]
+        after_id: Option<i64>,
         #[arg(long)]
         json: bool,
     },
@@ -736,6 +756,9 @@ pub fn run() -> Result<()> {
             human,
             since_ms,
             until_ms,
+            after_ms,
+            after_id,
+            after_match_source,
             limit,
             fts,
             json,
@@ -753,6 +776,7 @@ pub fn run() -> Result<()> {
                     tag,
                     since_ms,
                     until_ms,
+                    after: history_cursor(after_ms, after_id, after_match_source),
                     limit,
                     ..Default::default()
                 },
@@ -776,6 +800,8 @@ pub fn run() -> Result<()> {
             tag,
             since_ms,
             until_ms,
+            after_ms,
+            after_id,
             json,
         } => {
             validate_source(source.as_deref())?;
@@ -788,6 +814,7 @@ pub fn run() -> Result<()> {
                     tag,
                     since_ms,
                     until_ms,
+                    after: history_cursor(after_ms, after_id, None),
                     limit: n,
                     ..Default::default()
                 },
@@ -1568,6 +1595,21 @@ fn print_entries(rows: Vec<HistoryEntry>, json: bool) -> Result<()> {
         println!("{}", fmt_row(&row, false));
     }
     Ok(())
+}
+
+/// The keyset cursor `--after-ms`/`--after-id` name, if given. clap pairs the
+/// two flags; an unknown match source is left for `QueryFilter::validate` so
+/// the CLI reports the same `INVALID_ARGUMENT` message as the SDK and MCP.
+fn history_cursor(
+    after_ms: Option<i64>,
+    after_id: Option<i64>,
+    match_source: Option<String>,
+) -> Option<HistoryCursor> {
+    Some(HistoryCursor {
+        timestamp_ms: after_ms?,
+        id: after_id?,
+        match_source,
+    })
 }
 
 fn resolve_search_role(raw: &str, agent: bool, human: bool) -> Result<SearchRole> {
