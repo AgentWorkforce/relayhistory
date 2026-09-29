@@ -337,6 +337,16 @@ Notable changes to the native `ai-hist` CLI are documented here.
   appear as a session model, or become `last_assistant_text`. Existing rows
   move to markers on the next writable open.
   ([#211](https://github.com/AgentWorkforce/relayhistory/issues/211))
+- A sweep no longer re-runs the Codex project/branch backfill over every
+  Codex session ever indexed. It covers only the sessions whose rollout was
+  re-read or which gained a `history.jsonl` prompt in that sweep, after one
+  full pass per install (recorded as `codex_metadata_backfill` in
+  `.sync-state.json`) for rows an older build left unattributed. Before, any
+  change that moved the source fingerprint — one Claude transcript growing —
+  cost an `UPDATE`, a `MIN`/`MAX` scan and a `sessions` upsert per Codex
+  session, and gave every Codex row a new change-feed revision. On 3,000
+  Codex + 300 Claude sessions, the sweep after one Claude append drops from
+  2.9s to 1.0s and re-stamps 0 Codex rows instead of 3,000 (#42).
 
 ### Rust API
 

@@ -3047,8 +3047,15 @@ fn sync_codex_with_repairs_and_coverage(
     repairs: &SweepRepairs,
     coverage: &mut SweepCoverage,
 ) -> Result<usize> {
-    let (cwds, branches, mut inserted) =
-        sync_codex_rollouts_with_repairs_and_coverage(conn, state, root, repairs, coverage)?;
+    let mut touched = HashSet::new();
+    let (cwds, branches, mut inserted) = sync_codex_rollouts_with_repairs_and_coverage(
+        conn,
+        state,
+        root,
+        repairs,
+        coverage,
+        &mut touched,
+    )?;
     let path = root.join("history.jsonl");
     if !path.exists() {
         sync_note!("  [codex] not found: {} (skipped)", path.display());
@@ -3073,6 +3080,7 @@ fn sync_codex_with_repairs_and_coverage(
                         if entry.project.is_none() {
                             entry.project = cwds.get(session_id).cloned();
                         }
+                        touched.insert(session_id.to_string());
                     }
                     inserted += insert_history(conn, &entry)?;
                 }
@@ -3090,7 +3098,7 @@ fn sync_codex_with_repairs_and_coverage(
             source.committed_cursor(consumed, true)?.to_value(),
         );
     }
-    let backfilled = backfill_codex_metadata(conn, &cwds, &branches)?;
+    let backfilled = backfill_codex_metadata_scoped(conn, state, &cwds, &branches, &touched)?;
     if consumed == offset && backfilled == 0 {
         sync_note!("  [codex] up to date");
     } else {
@@ -3225,7 +3233,14 @@ fn sync_codex_rollouts_with_repairs(
     repairs: &SweepRepairs,
 ) -> Result<CodexRolloutWalk> {
     let mut coverage = SweepCoverage::default();
-    sync_codex_rollouts_with_repairs_and_coverage(conn, state, root, repairs, &mut coverage)
+    sync_codex_rollouts_with_repairs_and_coverage(
+        conn,
+        state,
+        root,
+        repairs,
+        &mut coverage,
+        &mut HashSet::new(),
+    )
 }
 
 fn sync_codex_rollouts_with_repairs_and_coverage(
@@ -3234,6 +3249,7 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
     root: &Path,
     repairs: &SweepRepairs,
     coverage: &mut SweepCoverage,
+    touched: &mut HashSet<String>,
 ) -> Result<CodexRolloutWalk> {
     let mut cwds = load_state_string_map(state, "codex_session_cwds");
     let mut branches = load_state_string_map(state, "codex_session_branches");
@@ -3399,6 +3415,7 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                 if let Some(branch) = &meta.git_branch {
                     branches.insert(meta.session_id.clone(), branch.clone());
                 }
+                touched.insert(meta.session_id.clone());
             }
             // Only rollouts whose `session_meta` actually names a prior thread
             // bank anything here; `codex resume` on its own does not.
@@ -5331,6 +5348,49 @@ fn count_unified_diff_lines(diff: &str) -> (i64, i64) {
         }
     }
     (added, removed)
+}
+
+/// Marks the one full [`backfill_codex_metadata`] pass an install owes.
+///
+/// Before it existed, every sweep that got past the source fingerprint ran the
+/// backfill over *every* session in `codex_session_cwds` — an `UPDATE`, a
+/// `MIN`/`MAX` scan and a `sessions` upsert apiece, each upsert taking a fresh
+/// change-feed revision — so one Claude transcript growing re-stamped thousands
+/// of Codex sessions nobody had touched (#42). The metadata a session's rows
+/// can be backfilled from only moves when its rollout is re-read or
+/// `history.jsonl` gains a line for it, so after one full pass (for rows an
+/// older build left without project/branch) the backfill is scoped to exactly
+/// those sessions. Bump to force a full pass again.
+const CODEX_METADATA_BACKFILL_GENERATION: i64 = 1;
+const CODEX_METADATA_BACKFILL_KEY: &str = "codex_metadata_backfill";
+
+/// Run [`backfill_codex_metadata`] over the sessions this sweep touched, or
+/// over every known session once, while the full pass is still owed.
+fn backfill_codex_metadata_scoped(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    cwds: &HashMap<String, String>,
+    branches: &HashMap<String, String>,
+    touched: &HashSet<String>,
+) -> Result<usize> {
+    let full_pass_owed = state
+        .get(CODEX_METADATA_BACKFILL_KEY)
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        < CODEX_METADATA_BACKFILL_GENERATION;
+    if full_pass_owed {
+        let updated = backfill_codex_metadata(conn, cwds, branches)?;
+        state.insert(
+            CODEX_METADATA_BACKFILL_KEY.to_string(),
+            json!(CODEX_METADATA_BACKFILL_GENERATION),
+        );
+        return Ok(updated);
+    }
+    let scoped: HashMap<String, String> = touched
+        .iter()
+        .filter_map(|id| cwds.get(id).map(|cwd| (id.clone(), cwd.clone())))
+        .collect();
+    backfill_codex_metadata(conn, &scoped, branches)
 }
 
 fn backfill_codex_metadata(
@@ -27621,6 +27681,142 @@ mod capture_progress_tests {
             .unwrap(),
             200
         );
+    }
+
+    /// Three Codex sessions with rollouts and `history.jsonl` prompts.
+    fn codex_backfill_fixture(root: &Path) {
+        let day = root.join("sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        let mut history = String::new();
+        for i in 0..3 {
+            let id = format!("sess-scope-{i}");
+            fs::write(
+                day.join(format!("rollout-2026-04-20T00-00-0{i}-{id}.jsonl")),
+                format!(
+                    "{{\"timestamp\":\"2026-04-20T00:00:0{i}.000Z\",\"type\":\"session_meta\",\
+                     \"payload\":{{\"id\":\"{id}\",\"cwd\":\"/work/p{i}\",\"git\":{{\"branch\":\"main\"}}}}}}\n\
+                     {{\"timestamp\":\"2026-04-20T00:00:0{i}.500Z\",\"type\":\"event_msg\",\
+                     \"payload\":{{\"type\":\"user_message\",\"message\":\"prompt {i}\"}}}}\n"
+                ),
+            )
+            .unwrap();
+            history.push_str(&format!(
+                "{{\"session_id\":\"{id}\",\"ts\":{},\"text\":\"prompt {i}\"}}\n",
+                1_776_643_200 + i
+            ));
+        }
+        fs::write(root.join("history.jsonl"), history).unwrap();
+    }
+
+    fn codex_session_revisions(conn: &Connection) -> Vec<(String, i64)> {
+        let mut statement = conn
+            .prepare(
+                "SELECT session_id, revision FROM sessions \
+                 WHERE source = 'codex' ORDER BY session_id",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn codex_metadata_backfill_leaves_untouched_sessions_alone() {
+        // #42: every sweep that got past the source fingerprint -- one Claude
+        // transcript growing is enough -- re-ran the metadata backfill over
+        // every Codex session ever indexed, and each `sessions` upsert took a
+        // fresh change-feed revision. A sweep that re-reads nothing of Codex
+        // must leave every Codex row exactly where it was.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".codex");
+        codex_backfill_fixture(&root);
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        sync_codex(&conn, &mut state, &root).unwrap();
+        assert_eq!(
+            state.get(CODEX_METADATA_BACKFILL_KEY),
+            Some(&json!(CODEX_METADATA_BACKFILL_GENERATION)),
+            "the first sweep pays the one full pass"
+        );
+        let settled = codex_session_revisions(&conn);
+        assert_eq!(settled.len(), 3);
+
+        sync_codex(&conn, &mut state, &root).unwrap();
+        assert_eq!(codex_session_revisions(&conn), settled);
+
+        // A new prompt for one session reaches that session, and only it.
+        use std::io::Write as _;
+        let mut history = fs::OpenOptions::new()
+            .append(true)
+            .open(root.join("history.jsonl"))
+            .unwrap();
+        writeln!(
+            history,
+            "{{\"session_id\":\"sess-scope-1\",\"ts\":1776650000,\"text\":\"later\"}}"
+        )
+        .unwrap();
+        drop(history);
+        sync_codex(&conn, &mut state, &root).unwrap();
+        let after = codex_session_revisions(&conn);
+        assert_eq!(after[0], settled[0]);
+        assert_eq!(after[2], settled[2]);
+        assert!(
+            after[1].1 > settled[1].1,
+            "the appended session is re-stamped"
+        );
+        let (project, branch, last): (String, String, i64) = conn
+            .query_row(
+                "SELECT h.project, h.git_branch, s.last_activity_ms \
+                 FROM history h JOIN sessions s \
+                   ON s.source = h.source AND s.session_id = h.session_id \
+                 WHERE h.source = 'codex' AND h.prompt = 'later'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(project, "/work/p1");
+        assert_eq!(branch, "main");
+        assert_eq!(last, 1_776_650_000_000);
+    }
+
+    #[test]
+    fn codex_metadata_backfill_runs_one_full_pass_for_an_upgraded_install() {
+        // Rows an older build left without project/branch are not tied to any
+        // file this sweep will re-read, so the scoped backfill alone would
+        // never reach them. An install whose state predates the scoping owes
+        // one full pass, and then never again.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".codex");
+        codex_backfill_fixture(&root);
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        sync_codex(&conn, &mut state, &root).unwrap();
+        conn.execute(
+            "UPDATE history SET project = NULL, git_branch = NULL WHERE source = 'codex'",
+            [],
+        )
+        .unwrap();
+        state.remove(CODEX_METADATA_BACKFILL_KEY);
+
+        sync_codex(&conn, &mut state, &root).unwrap();
+        let unattributed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM history \
+                 WHERE source = 'codex' AND (project IS NULL OR git_branch IS NULL)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unattributed, 0);
+        assert_eq!(
+            state.get(CODEX_METADATA_BACKFILL_KEY),
+            Some(&json!(CODEX_METADATA_BACKFILL_GENERATION))
+        );
+        let settled = codex_session_revisions(&conn);
+        sync_codex(&conn, &mut state, &root).unwrap();
+        assert_eq!(codex_session_revisions(&conn), settled);
     }
 
     #[test]
