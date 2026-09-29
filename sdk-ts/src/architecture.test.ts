@@ -150,10 +150,11 @@ test('relay roster stays a local-socket read outside the history SDK layers', as
 });
 
 test('relay registration and status remain local socket MCP operations', async () => {
-  const [mcp, relay, rootReadme] = await Promise.all([
+  const [mcp, relay, rootReadme, architecture] = await Promise.all([
     readFile(join(sourceDir, 'mcp-server.ts'), 'utf8'),
     readFile(join(sourceDir, 'relay-agents.ts'), 'utf8'),
     readFile(join(repositoryRoot, 'README.md'), 'utf8'),
+    readFile(join(repositoryRoot, 'docs', 'architecture.md'), 'utf8'),
   ]);
   for (const tool of ['join_relay', 'leave_relay']) {
     const start = mcp.indexOf(`server.tool('${tool}'`);
@@ -172,4 +173,7 @@ test('relay registration and status remain local socket MCP operations', async (
   assert.match(rootReadme, /Read-only roster and status calls[^.]+`timeout`/);
   assert.match(rootReadme, /sent `join_relay` or `leave_relay` mutation reports `indeterminate_result`/);
   assert.match(rootReadme, /directs the caller to `relay_status`/);
+  assert.match(architecture, /MCP-only relay presence tools/);
+  assert.match(architecture, /directly to the\s+Agent Relay desktop Unix-domain socket/);
+  assert.match(architecture, /does not load cloud clients, authentication, tokens, or\nworkspace keys/);
 });
