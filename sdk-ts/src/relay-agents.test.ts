@@ -7,12 +7,26 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { listRelayAgents, relaySocketCandidates } from './relay-agents.js';
+import {
+  joinRelay, leaveRelay, listRelayAgents, relaySocketCandidates, relayStatus,
+  RelayAgentsError,
+} from './relay-agents.js';
 
 const NOT_RUNNING = "Agent Relay desktop isn't running on this machine; open it, or use the Agent Relay MCP";
 
-async function fakeRosterServer(t: test.TestContext, path: string, requests: string[]): Promise<Server> {
+async function fakeRosterServer(
+  t: test.TestContext, path: string, requests: string[],
+  options: {
+    notAllowed?: boolean;
+    hangMutations?: boolean;
+    truncateMutations?: boolean;
+    closeDelimitedMutations?: boolean;
+    malformedMutations?: boolean;
+    oversizedMutations?: boolean;
+  } = {},
+): Promise<Server> {
   await mkdir(dirname(path), { recursive: true });
+  let registered = false;
   const server = createServer((connection) => {
     let request = '';
     connection.setEncoding('utf8');
@@ -22,18 +36,56 @@ async function fakeRosterServer(t: test.TestContext, path: string, requests: str
       if (responded || !request.includes('\r\n\r\n')) return;
       responded = true;
       requests.push(request);
-      const body = JSON.stringify({
-        ok: true,
-        data: {
+      if (options.hangMutations && /^(POST|DELETE) \/register /.test(request)) return;
+      if (options.truncateMutations && /^(POST|DELETE) \/register /.test(request)) {
+        const partial = '{"ok":true,"data":';
+        connection.end(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(partial) + 20}\r\nConnection: close\r\n\r\n${partial}`);
+        return;
+      }
+      if (options.malformedMutations && /^(POST|DELETE) \/register /.test(request)) {
+        const malformed = '{"ok":true,"data":';
+        connection.end(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(malformed)}\r\nConnection: close\r\n\r\n${malformed}`);
+        return;
+      }
+      if (options.oversizedMutations && /^(POST|DELETE) \/register /.test(request)) {
+        const oversized = 'x'.repeat((1024 * 1024) + 1);
+        connection.end(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(oversized)}\r\nConnection: close\r\n\r\n${oversized}`);
+        return;
+      }
+      let status = 200;
+      let data: unknown;
+      if (request.startsWith('GET /agents')) {
+        data = {
           agents: [{
             name: 'bob', address: 'bob@laptop', kind: 'agent', where: 'this_computer',
             status: 'active', last_seen_ms: 1_790_683_200_000,
             description: 'Fix the roster', is_self: true,
           }],
           fetched_at_ms: 1_790_683_200_123,
-        },
-      });
-      connection.end(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`);
+        };
+      } else if (request.startsWith('GET /whoami')) {
+        data = { name: registered ? 'review-bot' : null, session_id: 'session-1', registered };
+      } else if (request.startsWith('POST /register')) {
+        if (options.notAllowed) {
+          status = 403;
+          data = undefined;
+        } else {
+          const already = registered;
+          registered = true;
+          data = { name: 'review-bot', address: 'review-bot@direct', already_registered: already };
+        }
+      } else if (request.startsWith('DELETE /register')) {
+        const already = !registered;
+        registered = false;
+        data = { registered: false, already_unregistered: already };
+      }
+      const envelope = status === 200
+        ? { ok: true, data }
+        : { ok: false, error: { code: 'not_allowed', message: 'Turn on "Let sessions put themselves on the relay" in Agent Relay Settings first.' } };
+      const body = JSON.stringify(envelope);
+      const length = options.closeDelimitedMutations && /^(POST|DELETE) \/register /.test(request)
+        ? '' : `Content-Length: ${Buffer.byteLength(body)}\r\n`;
+      connection.end(`HTTP/1.1 ${status} ${status === 200 ? 'OK' : 'Forbidden'}\r\nContent-Type: application/json\r\n${length}Connection: close\r\n\r\n${body}`);
     });
   });
   await new Promise<void>((resolve, reject) => {
@@ -295,18 +347,207 @@ test('Linux discovery tries both runtime and data-directory defaults', async () 
 test('missing desktop is a clear non-fatal result', async () => {
   const root = await mkdtemp(join(tmpdir(), 'relay-agents-missing-'));
   try {
-    const result = await listRelayAgents({}, {
+    const runtime = {
       env: { AGENT_RELAY_SOCKET: join(root, 'missing.sock') },
-      home: root, platform: 'linux', temporaryDirectory: root, uid: 501,
+      home: root, platform: 'linux' as const, temporaryDirectory: root, uid: 501,
       timeoutMs: 50,
-    });
-    assert.deepEqual(result, { available: false, message: NOT_RUNNING });
+    };
+    const results = await Promise.all([
+      listRelayAgents({}, runtime), relayStatus(runtime), joinRelay({}, runtime), leaveRelay(runtime),
+    ]);
+    for (const result of results) assert.deepEqual(result, { available: false, message: NOT_RUNNING });
   } finally {
     await rm(root, { recursive: true, force: true });
   }
 });
 
-test('list_relay_agents is in the MCP inventory and calls the local socket', async (t) => {
+test('join_relay MCP returns readable not_allowed guidance', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'relay-not-allowed-mcp-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const socket = join(root, 'relay.sock');
+  await fakeRosterServer(t, socket, [], { notAllowed: true });
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [fileURLToPath(new URL('./mcp-server.js', import.meta.url))],
+    env: {
+      ...Object.fromEntries(Object.entries(process.env).filter(
+        (entry): entry is [string, string] => entry[1] !== undefined,
+      )),
+      AGENT_RELAY_SOCKET: socket,
+      HOME: root,
+      USERPROFILE: root,
+      AI_HIST_DB: join(root, 'history.db'),
+    },
+    stderr: 'pipe',
+  });
+  const client = new Client({ name: 'relay-not-allowed-test', version: '1' });
+  t.after(() => client.close());
+  await client.connect(transport);
+  const response = await client.callTool({ name: 'join_relay', arguments: {} });
+  assert.equal(response.isError, true);
+  const content = (response as { content: Array<{ type: string; text?: string }> }).content[0];
+  assert.match(content?.text ?? '', /^not_allowed: .*Let sessions put themselves on the relay/);
+});
+
+test('status, join, idempotent join and leave use only the local session socket', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'relay-registration-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const socket = join(root, 'relay.sock');
+  const requests: string[] = [];
+  await fakeRosterServer(t, socket, requests);
+  const runtime = { env: { AGENT_RELAY_SOCKET: socket }, home: root, platform: 'linux' as const, temporaryDirectory: root, uid: 501 };
+
+  assert.deepEqual(await relayStatus(runtime), { name: null, session_id: 'session-1', registered: false });
+  assert.deepEqual(await joinRelay({ name: 'review-bot', description: 'Reviews releases.' }, runtime), {
+    name: 'review-bot', address: 'review-bot@direct', already_registered: false,
+  });
+  assert.deepEqual(await joinRelay({}, runtime), {
+    name: 'review-bot', address: 'review-bot@direct', already_registered: true,
+  });
+  assert.deepEqual(await relayStatus(runtime), { name: 'review-bot', session_id: 'session-1', registered: true });
+  assert.deepEqual(await leaveRelay(runtime), { registered: false, already_unregistered: false });
+
+  assert.match(requests[1] ?? '', /^POST \/register HTTP\/1\.1\r\n/);
+  assert.match(requests[1] ?? '', /\r\nContent-Type: application\/json\r\n/i);
+  assert.match(requests[1] ?? '', /\r\n\r\n\{"name":"review-bot","description":"Reviews releases\."\}$/);
+  assert.doesNotMatch(requests.join('\n'), /token|api[_-]?key|workspace[_-]?key/i);
+  assert.match(requests[4] ?? '', /^DELETE \/register HTTP\/1\.1\r\n/);
+});
+
+test('registration refusal preserves the desktop not_allowed code and guidance', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'relay-not-allowed-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const socket = join(root, 'relay.sock');
+  await fakeRosterServer(t, socket, [], { notAllowed: true });
+  await assert.rejects(
+    joinRelay({}, { env: { AGENT_RELAY_SOCKET: socket }, home: root, platform: 'linux', temporaryDirectory: root, uid: 501 }),
+    (error: unknown) => error instanceof RelayAgentsError
+      && error.code === 'not_allowed'
+      && error.message.includes('Let sessions put themselves on the relay'),
+  );
+});
+
+test('a sent mutation is never retried against another desktop when its result is unknown', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'relay-indeterminate-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const first = join(root, 'first.sock');
+  const second = join(root, 'second.sock');
+  const firstRequests: string[] = [];
+  const secondRequests: string[] = [];
+  await fakeRosterServer(t, first, firstRequests, { hangMutations: true });
+  await fakeRosterServer(t, second, secondRequests);
+  const pointer = join(root, '.agentworkforce', 'desktop', 'relay-socket');
+  await mkdir(dirname(pointer), { recursive: true });
+  await writeFile(pointer, `${second}\n`);
+  const runtime = {
+    env: { AGENT_RELAY_SOCKET: first }, home: root, platform: 'linux' as const,
+    temporaryDirectory: root, uid: 501, timeoutMs: 50,
+  };
+
+  for (const operation of [() => joinRelay({}, runtime), () => leaveRelay(runtime)]) {
+    await assert.rejects(operation, (error: unknown) => error instanceof RelayAgentsError
+      && error.code === 'indeterminate_result'
+      && error.message.includes('use relay_status'));
+  }
+  assert.equal(firstRequests.length, 2);
+  assert.equal(secondRequests.length, 0);
+});
+
+test('a truncated mutation response is indeterminate and is not retried', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'relay-truncated-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const first = join(root, 'first.sock');
+  const second = join(root, 'second.sock');
+  const firstRequests: string[] = [];
+  const secondRequests: string[] = [];
+  await fakeRosterServer(t, first, firstRequests, { truncateMutations: true });
+  await fakeRosterServer(t, second, secondRequests);
+  const pointer = join(root, '.agentworkforce', 'desktop', 'relay-socket');
+  await mkdir(dirname(pointer), { recursive: true });
+  await writeFile(pointer, `${second}\n`);
+
+  await assert.rejects(
+    joinRelay({}, {
+      env: { AGENT_RELAY_SOCKET: first }, home: root, platform: 'linux',
+      temporaryDirectory: root, uid: 501, timeoutMs: 50,
+    }),
+    (error: unknown) => error instanceof RelayAgentsError && error.code === 'indeterminate_result',
+  );
+  assert.equal(firstRequests.length, 1);
+  assert.equal(secondRequests.length, 0);
+});
+
+test('a complete close-delimited mutation response is accepted', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'relay-close-delimited-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const socket = join(root, 'relay.sock');
+  const requests: string[] = [];
+  await fakeRosterServer(t, socket, requests, { closeDelimitedMutations: true });
+
+  const result = await joinRelay({}, {
+    env: { AGENT_RELAY_SOCKET: socket }, home: root, platform: 'linux',
+    temporaryDirectory: root, uid: 501,
+  });
+
+  assert.deepEqual(result, {
+    name: 'review-bot', address: 'review-bot@direct', already_registered: false,
+  });
+  assert.equal(requests.length, 1);
+});
+
+test('a malformed successful mutation response is indeterminate and is not retried', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'relay-malformed-mutation-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const first = join(root, 'first.sock');
+  const second = join(root, 'second.sock');
+  const firstRequests: string[] = [];
+  const secondRequests: string[] = [];
+  await fakeRosterServer(t, first, firstRequests, { malformedMutations: true });
+  await fakeRosterServer(t, second, secondRequests);
+  const pointer = join(root, '.agentworkforce', 'desktop', 'relay-socket');
+  await mkdir(dirname(pointer), { recursive: true });
+  await writeFile(pointer, `${second}\n`);
+
+  await assert.rejects(
+    joinRelay({}, {
+      env: { AGENT_RELAY_SOCKET: first }, home: root, platform: 'linux',
+      temporaryDirectory: root, uid: 501,
+    }),
+    (error: unknown) => error instanceof RelayAgentsError
+      && error.code === 'indeterminate_result'
+      && error.message.includes('use relay_status'),
+  );
+  assert.equal(firstRequests.length, 1);
+  assert.equal(secondRequests.length, 0);
+});
+
+test('an oversized mutation response is indeterminate and is not retried', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'relay-oversized-mutation-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const first = join(root, 'first.sock');
+  const second = join(root, 'second.sock');
+  const firstRequests: string[] = [];
+  const secondRequests: string[] = [];
+  await fakeRosterServer(t, first, firstRequests, { oversizedMutations: true });
+  await fakeRosterServer(t, second, secondRequests);
+  const pointer = join(root, '.agentworkforce', 'desktop', 'relay-socket');
+  await mkdir(dirname(pointer), { recursive: true });
+  await writeFile(pointer, `${second}\n`);
+
+  await assert.rejects(
+    joinRelay({}, {
+      env: { AGENT_RELAY_SOCKET: first }, home: root, platform: 'linux',
+      temporaryDirectory: root, uid: 501,
+    }),
+    (error: unknown) => error instanceof RelayAgentsError
+      && error.code === 'indeterminate_result'
+      && error.message.includes('use relay_status'),
+  );
+  assert.equal(firstRequests.length, 1);
+  assert.equal(secondRequests.length, 0);
+});
+
+test('relay roster, status, join and leave are in the MCP inventory and call the local socket', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'relay-agents-mcp-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const socket = join(root, 'relay.sock');
@@ -330,7 +571,9 @@ test('list_relay_agents is in the MCP inventory and calls the local socket', asy
   t.after(() => client.close());
   await client.connect(transport);
   const tools = await client.listTools();
-  assert.ok(tools.tools.some((tool) => tool.name === 'list_relay_agents'));
+  for (const name of ['list_relay_agents', 'relay_status', 'join_relay', 'leave_relay']) {
+    assert.ok(tools.tools.some((tool) => tool.name === name), `${name} is registered`);
+  }
 
   const response = await client.callTool({
     name: 'list_relay_agents',
@@ -341,4 +584,13 @@ test('list_relay_agents is in the MCP inventory and calls the local socket', asy
   const result = JSON.parse(content?.text ?? '{}') as { agents?: Array<{ name: string }> };
   assert.equal(result.agents?.[0]?.name, 'bob');
   assert.match(requests[0] ?? '', /^GET \/agents\?q=bob&include_idle=1 HTTP\/1\.1\r\n/);
+
+  for (const [name, arguments_] of [
+    ['relay_status', {}],
+    ['join_relay', { name: 'review-bot', description: 'Reviews releases.' }],
+    ['leave_relay', {}],
+  ] as const) {
+    const toolResponse = await client.callTool({ name, arguments: arguments_ });
+    assert.equal(toolResponse.isError, undefined, `${name} succeeds`);
+  }
 });
