@@ -24,8 +24,8 @@ Notable changes to the native `ai-hist` CLI are documented here.
     matches once, as its `history` row. The event is a copy only when it is
     the same turn -- same session, same timestamp, same text up to
     surrounding whitespace -- so a later turn repeating the text still
-    matches, and it is dropped only when the prompt passes the search's
-    project filter too.
+    matches, and it is dropped only when the prompt is itself a match of the
+    same search (same query, same filters).
   - An ordinary (non-raw) query matches an event's `text` and `project`, as a
     prompt's `prompt` and `project`; it no longer matches the indexed `role`,
     so searching for `assistant` or `user` does not return every event of
