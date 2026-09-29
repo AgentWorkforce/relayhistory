@@ -22,7 +22,7 @@ Rust owns provider discovery/parsing, schema creation and migration, direct
 SQLite connections, catalog queries, history/event queries, search,
 statistics, and sync. Blocking filesystem and SQLite work is dispatched away
 from Node's event loop. TypeScript validates inputs, validates native contract
-version 20, catalog contract version 4, hydration contract version 3,
+version 23, catalog contract version 4, hydration contract version 3,
 session-relationship contract version 2, and session evidence contract version
 3 and session usage contract version 3, normalizes nullable fields, maps native
 errors, and supplies pagination

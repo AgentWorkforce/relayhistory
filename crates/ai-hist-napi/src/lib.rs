@@ -10,11 +10,12 @@ pub mod sources;
 
 use std::path::{Path, PathBuf};
 
+use ai_hist::history_search::{search_all, SearchRole, SearchRow};
 use ai_hist::{
     default_db_path, open_db, open_db_readonly, recent as core_recent, relationship_capabilities,
     schema_is_catalog_read_current, schema_is_event_read_current, schema_is_evidence_read_current,
-    schema_is_read_current, schema_is_relationship_read_current, search as core_search,
-    session as core_session, session_children_page as core_session_children_page,
+    schema_is_read_current, schema_is_relationship_read_current, session as core_session,
+    session_children_page as core_session_children_page,
     session_events_page as core_session_events_page,
     session_file_edits_page as core_session_file_edits_page, session_locations,
     session_relationships as core_session_relationships,
@@ -67,7 +68,11 @@ use serde::Serialize;
 /// 22: `historyExport` serves snapshots that each hold one read transaction,
 /// emits schema-version-2 records, and no longer accepts the upload-journal
 /// operations (retention and compaction).
-pub const NATIVE_CONTRACT_VERSION: u32 = 22;
+/// 23: `search` runs the shared `history_search::search_all` contract the CLI
+/// uses — prompts and session events, a `role` option, a total
+/// `(timestamp, id)` order — and returns `NativeSearchMatch` rows carrying
+/// `matchSource`, `role` and `kind`.
+pub const NATIVE_CONTRACT_VERSION: u32 = 23;
 const DEFAULT_LIMIT: i64 = 50;
 const DEFAULT_EVENT_LIMIT: i64 = 200;
 
@@ -149,6 +154,11 @@ fn parse_scope(scope: Option<String>) -> napi::Result<SessionScope> {
             format!("scope must be local, remote, or all (got '{value}')"),
         )),
     }
+}
+
+fn parse_search_role(role: Option<&str>) -> napi::Result<SearchRole> {
+    SearchRole::parse(role.unwrap_or("all"))
+        .map_err(|error| native_error("INVALID_ARGUMENT", format!("{error:#}")))
 }
 
 fn scope_name(scope: SessionScope) -> String {
@@ -240,6 +250,8 @@ pub struct SearchOptions {
     pub before_ms: Option<i64>,
     pub limit: Option<i64>,
     pub raw_fts: Option<bool>,
+    /// `all` (default), `user`, `assistant` or `prompt` — the CLI's `--role`.
+    pub role: Option<String>,
 }
 
 #[napi(object)]
@@ -274,6 +286,48 @@ impl NativeHistoryEntry {
             prompt: entry.prompt,
             timestamp_ms: entry.timestamp_ms,
             locations,
+        })
+    }
+}
+
+/// One `search` match. `id` is unique only within `match_source`: a prompt
+/// is a `history` row, anything else a `session_event` row.
+#[napi(object)]
+pub struct NativeSearchMatch {
+    pub id: i64,
+    pub source: String,
+    pub session_id: Option<String>,
+    pub project: Option<String>,
+    /// The matched text: the prompt for a `history` match, the event text
+    /// otherwise. Named `prompt` so a match is still a history entry.
+    pub prompt: String,
+    pub timestamp_ms: i64,
+    pub locations: Vec<String>,
+    /// `history` or `session_event`.
+    pub match_source: String,
+    /// `user` for a `history` match; the event's role otherwise.
+    pub role: String,
+    /// `history` for a `history` match; the event's kind otherwise.
+    pub kind: String,
+}
+
+impl NativeSearchMatch {
+    fn from_row(conn: &rusqlite::Connection, row: SearchRow) -> anyhow::Result<Self> {
+        let locations = match row.session_id.as_deref() {
+            Some(session_id) => session_locations(conn, &row.source, session_id)?,
+            None => Vec::new(),
+        };
+        Ok(Self {
+            id: row.id,
+            source: row.source,
+            session_id: row.session_id,
+            project: row.project,
+            prompt: row.text,
+            timestamp_ms: row.timestamp_ms,
+            locations,
+            match_source: row.match_source,
+            role: row.role,
+            kind: row.kind,
         })
     }
 }
@@ -927,12 +981,13 @@ where
     .map_err(worker_error)?
 }
 
-/// Full-text search of indexed history. Never discovers or syncs implicitly.
+/// Full-text search of indexed prompts and session events. Never discovers or
+/// syncs implicitly. Same contract as `ai-hist search`.
 #[napi]
 pub async fn search(
     query: String,
     options: Option<SearchOptions>,
-) -> napi::Result<Vec<NativeHistoryEntry>> {
+) -> napi::Result<Vec<NativeSearchMatch>> {
     let options = options.unwrap_or(SearchOptions {
         scope: None,
         db_path: None,
@@ -942,8 +997,10 @@ pub async fn search(
         before_ms: None,
         limit: None,
         raw_fts: None,
+        role: None,
     });
     let limit = validate_limit(options.limit, 20, 1_000)?;
+    let role = parse_search_role(options.role.as_deref())?;
     let path = db_path(options.db_path.clone());
     let filter = QueryFilter {
         scope: parse_scope(options.scope)?,
@@ -959,9 +1016,9 @@ pub async fn search(
         .collect::<Vec<_>>();
     let raw_fts = options.raw_fts.unwrap_or(false);
     read_database(path, Vec::new(), move |conn| {
-        core_search(conn, &terms, raw_fts, &filter)?
+        search_all(conn, &terms, raw_fts, &filter, role)?
             .into_iter()
-            .map(|entry| NativeHistoryEntry::from_entry(conn, entry))
+            .map(|row| NativeSearchMatch::from_row(conn, row))
             .collect()
     })
     .await

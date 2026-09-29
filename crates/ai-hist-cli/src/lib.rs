@@ -100,6 +100,9 @@ enum Command {
         project: Option<String>,
         #[arg(long)]
         tag: Option<String>,
+        /// `all` (prompts and every session event), `user` (prompts and
+        /// user events), `assistant` (assistant events) or `prompt` (prompts
+        /// only). The same values the SDK and MCP `search` accept.
         #[arg(long, default_value = "all")]
         role: String,
         #[arg(long)]
@@ -1558,14 +1561,7 @@ fn resolve_search_role(raw: &str, agent: bool, human: bool) -> Result<SearchRole
     if human {
         return Ok(SearchRole::User);
     }
-    match raw {
-        "all" => Ok(SearchRole::All),
-        "user" => Ok(SearchRole::User),
-        "assistant" => Ok(SearchRole::Assistant),
-        other => anyhow::bail!(
-            "ai-hist search: --role must be one of user, assistant, all (got {other})"
-        ),
-    }
+    SearchRole::parse(raw).map_err(|error| anyhow::anyhow!("ai-hist search: --role: {error}"))
 }
 
 fn print_search_rows(rows: Vec<SearchRow>, as_json: bool) -> Result<()> {
@@ -1573,20 +1569,20 @@ fn print_search_rows(rows: Vec<SearchRow>, as_json: bool) -> Result<()> {
         let out = rows
             .iter()
             .map(|row| {
-                let mut value = json!({
+                // Provenance is always present: `id` is only unique within
+                // its `match_source` table, so a consumer comparing results
+                // across surfaces needs the pair.
+                json!({
                     "id": row.id,
                     "source": row.source,
                     "session_id": row.session_id,
                     "project": row.project,
                     "prompt": row.text,
                     "timestamp_ms": row.timestamp_ms,
-                });
-                if row.match_source != "history" {
-                    value["role"] = json!(row.role);
-                    value["kind"] = json!(row.kind);
-                    value["match_source"] = json!(row.match_source);
-                }
-                value
+                    "role": row.role,
+                    "kind": row.kind,
+                    "match_source": row.match_source,
+                })
             })
             .collect::<Vec<_>>();
         println!("{}", serde_json::to_string(&out)?);

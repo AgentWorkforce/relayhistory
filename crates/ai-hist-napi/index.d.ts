@@ -42,6 +42,8 @@ export interface SearchOptions {
   beforeMs?: number
   limit?: number
   rawFts?: boolean
+  /** `all` (default), `user`, `assistant` or `prompt` — the CLI's `--role`. */
+  role?: string
 }
 export interface SessionOptions {
   dbPath?: string
@@ -56,6 +58,29 @@ export interface NativeHistoryEntry {
   prompt: string
   timestampMs: number
   locations: Array<string>
+}
+/**
+ * One `search` match. `id` is unique only within `match_source`: a prompt
+ * is a `history` row, anything else a `session_event` row.
+ */
+export interface NativeSearchMatch {
+  id: number
+  source: string
+  sessionId?: string
+  project?: string
+  /**
+   * The matched text: the prompt for a `history` match, the event text
+   * otherwise. Named `prompt` so a match is still a history entry.
+   */
+  prompt: string
+  timestampMs: number
+  locations: Array<string>
+  /** `history` or `session_event`. */
+  matchSource: string
+  /** `user` for a `history` match; the event's role otherwise. */
+  role: string
+  /** `history` for a `history` match; the event's kind otherwise. */
+  kind: string
 }
 export interface NativeSessionEvent {
   id: number
@@ -364,8 +389,11 @@ export interface StatsOptions {
    */
   byCwd?: boolean
 }
-/** Full-text search of indexed history. Never discovers or syncs implicitly. */
-export declare function search(query: string, options?: SearchOptions | undefined | null): Promise<Array<NativeHistoryEntry>>
+/**
+ * Full-text search of indexed prompts and session events. Never discovers or
+ * syncs implicitly. Same contract as `ai-hist search`.
+ */
+export declare function search(query: string, options?: SearchOptions | undefined | null): Promise<Array<NativeSearchMatch>>
 /** Recent indexed history. Never discovers or syncs implicitly. */
 export declare function recent(options?: HistoryQueryOptions | undefined | null): Promise<Array<NativeHistoryEntry>>
 /** Indexed prompts for one session. Event payloads are separately paginated. */

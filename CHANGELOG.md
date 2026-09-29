@@ -6,6 +6,27 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Breaking
 
+- One search contract for the CLI, the SDK and MCP (#66). The SDK's
+  `search()` and MCP `search_history` now run `history_search::search_all`,
+  the query the CLI's `search` already used. They match session events
+  (assistant text, tool calls and results) as well as prompts, apply the same
+  filters (including `beforeMs`) to both, and order ties by
+  `(timestamp, id, match source)`. Each result is a `SearchMatch`, which is a
+  `HistoryEntry` plus `matchSource` (`history` | `session_event`), `role` and
+  `kind`; `id` is unique only within `matchSource`.
+  - `search` accepts `role`: `all` (default), `user`, `assistant`, or the new
+    `prompt` (prompts only). `resume` and `pack` search with `prompt`, as the
+    native CLI's resume and pack do. `ai-hist search --role` on both CLIs
+    accepts the same four values.
+  - MCP `search_history` gains `role` and `raw_fts`. Its description now says
+    exactly what a query means instead of "prompts".
+  - A prompt that a hydrated session also recorded as a user text event
+    matches once, as its `history` row.
+  - The native CLI's `search --json` always emits `role`, `kind` and
+    `match_source`, including on `history` matches.
+- Native contract 22 -> 23: `search` returns `NativeSearchMatch` rows and
+  takes `role`. An SDK paired with an addon of the other contract fails at
+  load with `NATIVE_CONTRACT_MISMATCH`.
 - Native contract 21 -> 22. `historyExport` serves snapshots that each hold
   one read transaction, emits schema-version-2 records, and no longer accepts
   the upload-journal operations. An SDK paired with an addon of the other

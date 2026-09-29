@@ -17,7 +17,10 @@ Use these public operations:
 - `discoverSessions()` / MCP `discover_sessions` to refresh shallow provider
   metadata.
 - `search()`, `recent()`, `getSession()`, and `getSessionEventsPage()` for
-  indexed history reads.
+  indexed history reads. `search()`, MCP `search_history` and `ai-hist search`
+  share one contract: prompts and session events, filtered by `role`
+  (`all`, `user`, `assistant`, `prompt`), with each match's `matchSource`,
+  `role` and `kind`.
 - `getSessionRelationships()` / MCP `get_session_relationships` and
   `getSessionTree()` / MCP `get_session_tree` for delegation topology, plus
   the SDK-only `getSessionChildrenPage()`, `sessionDescendants()`, and
