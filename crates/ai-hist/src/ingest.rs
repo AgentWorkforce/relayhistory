@@ -17643,6 +17643,65 @@ mod tests {
         assert_eq!(derived, 0, "nothing may be derived from the journal");
     }
 
+    /// `<claude root>/transcripts/` holds oh-my-opencode's copies of OpenCode
+    /// sessions, not Claude Code transcripts (#208, see the claude bullet in
+    /// `docs/session-catalog.md`). A full local sync must not read it: no
+    /// session, cursor or row may come from a file there, while the ordinary
+    /// `projects/` transcript beside it indexes as before.
+    #[test]
+    fn local_sync_never_reads_the_opencode_wrapper_transcripts_root() {
+        let home = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        fs::create_dir_all(claude.join("projects/app")).unwrap();
+        fs::write(
+            claude.join("projects/app/s1.jsonl"),
+            concat!(
+                r#"{"type":"user","uuid":"u1","sessionId":"s1","cwd":"/tmp/app","timestamp":"2026-09-20T00:00:00.000Z","message":{"role":"user","content":"hello"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let wrapper = claude.join("transcripts/ses_0123456789abcdefghijklmno.jsonl");
+        fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
+        // The wrapper's real shape carries no `sessionId`; one is added here
+        // so a walk that did open the file would have a session to publish.
+        fs::write(
+            &wrapper,
+            concat!(
+                r#"{"type":"user","sessionId":"ses_0123456789abcdefghijklmno","timestamp":"2026-09-20T00:00:00.000Z","content":"wrapped prompt"}"#, "\n",
+                r#"{"type":"tool_use","sessionId":"ses_0123456789abcdefghijklmno","timestamp":"2026-09-20T00:00:01.000Z","tool_name":"read","tool_input":{"filePath":"/src/main.rs"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let db_path = home.path().join("history.db");
+        sync_local_at_with_home(&db_path, home.path()).unwrap();
+
+        let conn = open_db(&db_path).unwrap();
+        assert!(super::session_events_exist(&conn, "claude", "s1").unwrap());
+        let wrapper_locator = wrapper.to_string_lossy().to_string();
+        assert!(
+            !transcript_cursor::known_locators(&conn, "claude")
+                .unwrap()
+                .contains(&wrapper_locator),
+            "a transcripts/ file must not be tracked as a Claude transcript (#208)"
+        );
+        let derived: i64 = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM sessions \
+                         WHERE raw_path = ?1 OR session_id = 'ses_0123456789abcdefghijklmno') \
+                      + (SELECT COUNT(*) FROM session_events \
+                         WHERE session_id = 'ses_0123456789abcdefghijklmno') \
+                      + (SELECT COUNT(*) FROM session_continuity_evidence WHERE locator = ?1)",
+                [&wrapper_locator],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            derived, 0,
+            "nothing may be derived from <claude root>/transcripts/ (#208)"
+        );
+    }
+
     /// An empty `sessionId` is no session: a journal whose first line
     /// carries one still attributes a sessionless line to the first real id,
     /// as the walk that wrote its marker did, and that marker is retracted.

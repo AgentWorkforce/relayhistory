@@ -4042,5 +4042,10 @@ fn claude_discovery_ignores_the_opencode_wrapper_transcripts_root() {
         .into_iter()
         .map(|root| root.path)
         .collect();
-    assert_eq!(watched, vec![home.path().join(".claude/projects")]);
+    assert_eq!(
+        watched,
+        vec![home.path().join(".claude/projects")],
+        "Claude watches only <claude root>/projects; transcripts/ is excluded on \
+         purpose (#208, see the claude bullet in docs/session-catalog.md)"
+    );
 }
