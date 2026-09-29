@@ -1934,10 +1934,6 @@ pub async fn hydrate_session(options: HydrateSessionOptions) -> napi::Result<Hyd
     })
 }
 
-const CATALOG_SOURCES: &[&str] = &[
-    "claude", "codex", "cursor", "grok", "relay", "opencode", "muse",
-];
-
 /// Reject an unusable identity before opening anything, so a typo is an
 /// argument error rather than an empty result that looks like real data.
 fn validate_relationship_identity(source: &str, session_id: &str) -> napi::Result<()> {
@@ -1947,7 +1943,11 @@ fn validate_relationship_identity(source: &str, session_id: &str) -> napi::Resul
             "sessionId must not be empty",
         ));
     }
-    if !CATALOG_SOURCES.contains(&source) {
+    // The catalog sources are the ones hydration accepts, as the harness
+    // registry declares them.
+    if !ai_hist::sources::catalog::local_source(source)
+        .is_some_and(|descriptor| descriptor.is_hydration_source())
+    {
         return Err(native_error(
             "INVALID_ARGUMENT",
             format!("unsupported catalog source '{source}'"),

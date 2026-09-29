@@ -2185,20 +2185,50 @@ matrix has record types as rows and sources as columns, so a new or extended
 provider must add or update its source column in the same change, and satisfy
 the record types in [`sourcing-contract.md`](sourcing-contract.md).
 
-Every entry in `SOURCE_CHOICES` must be covered by **exactly one** of:
+### One descriptor per harness
 
-- an adapter in `shallow_providers()` — implement `ShallowSessionProvider`
-  (`enumerate` may stat but not read; `read_shallow` stays inside the head/tail
-  budgets and returns `Ok(None)` for "this candidate is not a session"), or
-- an entry in `DISCOVERY_EXEMPTIONS`, which is machine-readable and carries a
-  reason.
+Every built-in harness is declared once, as a `LocalSource` descriptor in
+[`crates/ai-hist/src/sources/catalog.rs`](../crates/ai-hist/src/sources/catalog.rs).
+The per-source lists that used to be kept by hand are derived from it:
 
-A registry test enforces the pairing, so adding a source without deciding which
-list it belongs to fails the build. Today the only exemption is `trajectory`
-("derived trajectory records, not provider sessions"). It is enforced at both
-ends: `sessions discover --source trajectory` fails with that reason, and
-`sessions list` filters `trajectory` rows out defensively, so a trajectory can
-never be presented as a session.
+| Descriptor field   | Derived from it                                                                                   |
+| ------------------ | ------------------------------------------------------------------------------------------------- |
+| `id`               | `SOURCE_CHOICES` (declaration order)                                                              |
+| `discovery`        | `shallow_providers()` (ordered by id), `DISCOVERY_EXEMPTIONS`, and through the adapter's `evidence_kinds`, the declared coverage in `declared_evidence_kinds` / `missing_evidence_kinds` |
+| `hydration`        | hydration's source validation and the `ingest_selected` dispatch                                  |
+| `transcript_roots` | `validate_provider_path`, the root check for hydrated and hook-captured locators                  |
+| `relationships`    | `relationship_capabilities`                                                                       |
+| `resume`           | `resume_command`                                                                                  |
+| `fixtures`         | the registry test in `fixture_corpus.rs`                                                          |
+
+So a new harness is:
+
+1. **A descriptor** in `sources/catalog.rs`. Its `discovery` is either a
+   `ShallowSessionProvider` adapter (`enumerate` may stat but not read;
+   `read_shallow` stays inside the head/tail budgets and returns `Ok(None)` for
+   "this candidate is not a session") or `Discovery::Exempt(reason)`. Its
+   `hydration` names the parser for one selected session (a function taking
+   `SelectedIngest`), `NoConnector(message)` for a catalog source no local
+   parser backs, or `Unsupported`.
+2. **A fixture and a snapshot** (below), named by the descriptor's `fixtures`.
+
+Nothing else in the Rust crate needs a per-source edit for discovery,
+hydration dispatch, relationship capabilities, resume or coverage. Some things
+are still outside the descriptor and need their own edit:
+
+- the parser itself, and the full-sync pass in `ingest.rs` that runs it;
+- a `ProviderRoots` field and environment override, if the harness has its own
+  root;
+- the public `Source` enum in `session_store.rs`, since it is part of the
+  default API (a test checks it against `SOURCE_CHOICES`);
+- the TypeScript `SOURCES` list and MCP enums in `sdk-ts`.
+
+Exactly one of the adapter or an exemption is required, so a new source always
+carries a decision about whether it is discoverable. Today the only exemption
+is `trajectory` ("derived trajectory records, not provider sessions"). It is
+enforced at both ends: `sessions discover --source trajectory` fails with that
+reason, and `sessions list` filters `trajectory` rows out defensively, so a
+trajectory can never be presented as a session.
 
 The exemption list also travels in the `summary` line as `exempt_sources`, so a
 consumer can tell "this source has no sessions" apart from "this source is not
@@ -2213,22 +2243,24 @@ the normalized evidence intake, out of tree. See
 ### Add a fixture and a snapshot
 
 A provider is not added until its log shape is in the checked-in corpus. Add at
-least one fixture under `crates/ai-hist/tests/fixtures/<source>/`, register it
-in the `CORPUS` manifest in `crates/ai-hist/tests/fixture_corpus.rs` with the
-quirk it encodes, list it in `tests/fixtures/README.md`, and commit the
-generated snapshot under `crates/ai-hist/tests/snapshots/<source>/`:
+least one fixture under `crates/ai-hist/tests/fixtures/<source>/` (the
+directory the descriptor's `fixtures` names), register it in the `CORPUS`
+manifest in `crates/ai-hist/tests/fixture_corpus.rs` with the quirk it
+encodes, list it in `tests/fixtures/README.md`, and commit the generated
+snapshot under `crates/ai-hist/tests/snapshots/<source>/`:
 
 ```sh
 UPDATE_SNAPSHOTS=1 cargo test -p ai-hist --all-features --test fixture_corpus
 ```
 
-`every_source_choice_has_a_fixture_or_an_exemption` enforces the same pairing
-the discovery registry does: every `SOURCE_CHOICES` entry has a fixture, or a
-documented fixture exemption for a source that has no provider log on disk
-(`trajectory`, `relay`). `corpus_manifest_covers_every_fixture_file` and
-`corpus_readme_lists_every_fixture_and_quirk` stop a fixture from being added
-without being described, and `no_orphaned_snapshots` stops a snapshot from
-outliving its fixture.
+`every_source_choice_has_a_fixture_or_an_exemption` is the registry test: every
+`SOURCE_CHOICES` value is a descriptor, and every descriptor either names a
+fixture directory holding at least one staged fixture with a committed
+snapshot, or carries a fixture exemption for a source that has no provider log
+on disk (`trajectory`, `relay`). `corpus_manifest_covers_every_fixture_file`
+and `corpus_readme_lists_every_fixture_and_quirk` stop a fixture from being
+added without being described, and `no_orphaned_snapshots` stops a snapshot
+from outliving its fixture.
 
 The snapshots are the *current* extraction, gaps included — they are the
 review artifact for a parser change, not a statement of intent. Facts a

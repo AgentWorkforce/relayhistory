@@ -272,6 +272,20 @@ Notable changes to the native `ai-hist` CLI are documented here.
   native local pass's diagnostics and completion with its own.
   `docs/remote-connectors.md` is now `docs/source-plugins.md`.
 
+- One-entry harness registry (#177). Each built-in harness is declared once,
+  as a `LocalSource` descriptor in `crates/ai-hist/src/sources/catalog.rs`,
+  and `SOURCE_CHOICES`, `shallow_providers()`, `DISCOVERY_EXEMPTIONS`, the
+  declared evidence coverage, hydration's source validation and parser
+  dispatch, `validate_provider_path`'s roots, `relationship_capabilities`,
+  `resume_command` and the native relationship-identity check are derived from
+  it instead of kept as separate lists. The fixture-corpus registry test now
+  checks that every `SOURCE_CHOICES` value is a descriptor and every
+  descriptor has a fixture directory with committed snapshots or a fixture
+  exemption. Behaviour is unchanged, and so is the default Rust API; the
+  descriptors are readable under `unstable-internal` as
+  `ai_hist::sources::catalog`. `docs/session-catalog.md` "Adding a provider"
+  describes the descriptor path.
+
 - Add workspace-scoped agent handoffs through `create_handoff(intent)` and
   `resume_handoff(source, session_id)`. The sender emits only a session pointer
   plus one self-describing intent and origin identity; the intent tells the

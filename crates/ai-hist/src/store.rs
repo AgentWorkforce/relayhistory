@@ -22,16 +22,9 @@ pub use crate::relationship_graph::{
     SESSION_RELATIONSHIP_CONTRACT_VERSION,
 };
 
-pub const SOURCE_CHOICES: &[&str] = &[
-    "claude",
-    "codex",
-    "cursor",
-    "grok",
-    "relay",
-    "trajectory",
-    "opencode",
-    "muse",
-];
+/// Every built-in source id, in registry order. Derived from the harness
+/// registry (`sources::catalog`); add a source there, not here.
+pub const SOURCE_CHOICES: &[&str] = crate::sources::catalog::SOURCE_CHOICES;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HistoryEntry {
@@ -4576,41 +4569,11 @@ pub fn list_tags(conn: &Connection) -> Result<Vec<Tag>> {
 }
 
 pub fn resume_command(entry: &HistoryEntry) -> Option<String> {
-    let sid = entry.session_id.as_ref()?;
-    match entry.source.as_str() {
-        "claude" => Some(entry.project.as_ref().map_or_else(
-            || format!("claude --resume {}", shell_quote(sid)),
-            |p| {
-                format!(
-                    "cd {} && claude --resume {}",
-                    shell_quote(p),
-                    shell_quote(sid)
-                )
-            },
-        )),
-        "codex" => Some(format!("codex resume {}", shell_quote(sid))),
-        "cursor" => Some(entry.project.as_ref().map_or_else(
-            || format!("cursor-agent --resume={}", shell_quote(sid)),
-            |p| {
-                format!(
-                    "cd {} && cursor-agent --resume={}",
-                    shell_quote(p),
-                    shell_quote(sid)
-                )
-            },
-        )),
-        "grok" => Some(entry.project.as_ref().map_or_else(
-            || format!("grok resume {}", shell_quote(sid)),
-            |p| format!("cd {} && grok resume {}", shell_quote(p), shell_quote(sid)),
-        )),
-        // `muse resume <id>` finds the session by id; the `cd` puts the
-        // resumed agent back in the workspace it recorded.
-        "muse" => Some(entry.project.as_ref().map_or_else(
-            || format!("muse resume {}", shell_quote(sid)),
-            |p| format!("cd {} && muse resume {}", shell_quote(p), shell_quote(sid)),
-        )),
-        _ => None,
-    }
+    crate::sources::catalog::resume_command(
+        &entry.source,
+        entry.session_id.as_ref()?,
+        entry.project.as_deref(),
+    )
 }
 
 pub fn shell_quote(value: &str) -> String {
