@@ -1,0 +1,12 @@
+{"timestamp":"2026-04-20T01:00:00.000Z","type":"session_meta","payload":{"id":"019da866-c280-7000-8000-0000000000a0","cwd":"/tmp/project","timestamp":"2026-04-20T01:00:00.000Z","cli_version":"0.155.0","source":"vscode","thread_source":"user"}}
+{"timestamp":"2026-04-20T01:00:01.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"019da866-c668-7000-8000-0000000000a1","started_at":1776646801}}
+{"timestamp":"2026-04-20T01:00:01.001Z","type":"turn_context","payload":{"turn_id":"019da866-c668-7000-8000-0000000000a1","cwd":"/tmp/project","model":"gpt-5.4"}}
+{"timestamp":"2026-04-20T01:00:01.002Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"review the retry change with a subagent"}]}}
+{"timestamp":"2026-04-20T01:00:01.003Z","type":"event_msg","payload":{"type":"user_message","message":"review the retry change with a subagent"}}
+{"timestamp":"2026-04-20T01:00:03.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"command\": [\"git\", \"diff\"]}","call_id":"call_root_diff"}}
+{"timestamp":"2026-04-20T01:00:03.100Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_root_diff","output":"diff --git a/retry.rs b/retry.rs"}}
+{"timestamp":"2026-04-20T01:00:03.200Z","type":"response_item","payload":{"type":"function_call","name":"spawn_agent","arguments":"{\"task\": \"review retry.rs\"}","call_id":"call_spawn"}}
+{"timestamp":"2026-04-20T01:00:39.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_spawn","output":"subagent finished"}}
+{"timestamp":"2026-04-20T01:00:39.001Z","type":"event_msg","payload":{"type":"agent_message","message":"The reviewer approved the change."}}
+{"timestamp":"2026-04-20T01:00:39.002Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":5000,"cached_input_tokens":0,"output_tokens":400,"reasoning_output_tokens":0,"total_tokens":5400}}}}
+{"timestamp":"2026-04-20T01:00:39.003Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"019da866-c668-7000-8000-0000000000a1"}}

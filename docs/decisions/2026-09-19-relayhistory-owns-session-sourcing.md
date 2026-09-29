@@ -147,7 +147,7 @@ of `sessions list`. It is listed for completeness; every session-evidence row is
 | Compaction / summary markers                                       | ✗      | ✗     | ✗      | ✗    | ✗    | ✓        | ✗     | —          | [#165](https://github.com/AgentWorkforce/relayhistory/issues/165) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                                                                                          |
 | Control / lifecycle rows                                           | ✓      | ✓     | ✗      | ✗    | ✓    | ✗        | ✗     | —          | [#165](https://github.com/AgentWorkforce/relayhistory/issues/165), [#180](https://github.com/AgentWorkforce/relayhistory/issues/180)                                                                                                                                          |
 | Relationship — delegated                                           | ◐      | ✓     | —      | —    | ✓    | ✓        | —     | —          | [#170](https://github.com/AgentWorkforce/relayhistory/issues/170) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                                                                                          |
-| Relationship — fork / resume / continuation                        | ✗      | ◐     | ✗      | ✗    | ✗    | ✗        | ✗     | —          | [#170](https://github.com/AgentWorkforce/relayhistory/issues/170) / codex replay gate: [#210](https://github.com/AgentWorkforce/relayhistory/issues/210)                                                                                                                      |
+| Relationship — fork / resume / continuation                        | ✗      | ✓     | ✗      | ✗    | ✗    | ✗        | ✗     | —          | [#170](https://github.com/AgentWorkforce/relayhistory/issues/170)                                                                                                                                                                                                             |
 | Session metadata (cwd, branch, versions)                           | ◐      | ✓     | ◐      | ◐    | ◐    | ◐        | ✗     | —          | [#164](https://github.com/AgentWorkforce/relayhistory/issues/164), [#177](https://github.com/AgentWorkforce/relayhistory/issues/177)                                                                                                                                          |
 | Canonical `project_key`                                            | ✗      | ✗     | ✗      | ✗    | ✗    | ✗        | ✗     | —          | [#175](https://github.com/AgentWorkforce/relayhistory/issues/175)                                                                                                                                                                                                             |
 | Declared hydration `capability`                                    | ◐      | ◐     | ◐      | ◐    | ◐    | ◐        | ✗     | —          | [#169](https://github.com/AgentWorkforce/relayhistory/issues/169)                                                                                                                                                                                                             |
@@ -279,14 +279,18 @@ sidecar carries the _parent's_ `sessionId` on every record — the child is only
 independently addressable when the provider emits a per-child `agentId`;
 otherwise `relationship_capture` records it as `identity_status = 'unlinked'`
 with a null child id. `relationship_capabilities()` declares codex `always`,
-claude `sometimes`, and cursor/grok/opencode/relay `never`. Codex fork is `◐`:
+claude `sometimes`, and cursor/grok/opencode/relay `never`. Codex fork is `✓`:
 the `fork` edge is recorded from the fields Codex actually writes on
 `session_meta` — `forked_from_id` for a human fork, and
 `source.subagent.thread_spawn.parent_thread_id` for a subagent spawn — with the
-field name as `evidence_ref`, but a forked rollout's replay of its parent's
-history is not yet gated, so the child still re-indexes the parent's prompts
-and token baseline ([#210](https://github.com/AgentWorkforce/relayhistory/issues/210)).
-A plain `codex resume` writes no identity to record.
+field name as `evidence_ref`, and a forked rollout's replay of its parent's
+history is gated: the span from the parent's replayed `session_meta` to the
+child's first own turn (ordered by UUIDv7 turn id, else `started_at`) writes
+one `fork_replay_boundary` marker instead of re-indexing the parent's prompts,
+events and token baseline under the child
+([#210](https://github.com/AgentWorkforce/relayhistory/issues/210)). A plain
+`codex resume` writes no identity to record, so there is nothing further to
+capture.
 
 **Session metadata.** The `sessions` table has `originator`, `agent_version`,
 `repo_url`, `initial_commit`, `workspace_roots_json` and `models_json`.

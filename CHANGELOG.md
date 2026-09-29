@@ -422,8 +422,26 @@ Notable changes to the native `ai-hist` CLI are documented here.
   parent is hidden from the root catalog like any other subagent, and one an
   earlier build catalogued as a root is reclassified on that same pass.
   Hydrating a parent with `include_related` also records its spawned
-  children's fork edges. The replay of the parent's history inside a forked
-  rollout is not gated yet (#210).
+  children's fork edges.
+
+- Gate the parent history a forked Codex rollout replays (#210). Codex copies
+  the parent's `session_meta`, turns and cumulative `token_count` snapshots
+  into a fork's file before the fork's own first turn, and each copy used to
+  be indexed again under the child: the parent's prompts in the child's
+  `history` and `first_prompt`, its messages and tool calls in the child's
+  events, and its whole token total charged to the child's first request.
+  The span is now recognised from explicit evidence only -- it opens at the
+  parent's own `session_meta` reappearing in a rollout that named that parent
+  in `forked_from_id` or `thread_spawn.parent_thread_id`, and closes at the
+  first turn whose UUIDv7 `turn_id` (else `started_at`) is not earlier than
+  the fork, or that nothing can order -- and writes one
+  `fork_replay_boundary` marker instead. The last replayed `token_count` is
+  the child's inherited baseline, unless the child's own counter restarts
+  below it. Shallow discovery applies the same rule to `first_prompt`.
+  Rollouts indexed before this are repaired once: `SHALLOW_SCANNER_VERSION`
+  7 -> 8 moves the sweep generation, and the first `sync` re-reads every
+  unchanged fork rollout (`codex_fork_replay_gate` in the sync state),
+  retiring the rows it had indexed for the replayed lines.
 
 - Record fork, resume and continuation relationships, not delegation alone.
   `session_relationships.relationship` now takes `continuation | fork | resume`

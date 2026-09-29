@@ -470,6 +470,25 @@ pub(crate) fn codex_evidence_is_current(conn: &Connection, locator: &str) -> Res
         .unwrap_or(false))
 }
 
+/// Whether a Codex rollout's banked evidence names a parent in one of Codex's
+/// own fork fields (`forked_from_id`, `thread_spawn.parent_thread_id`).
+///
+/// These are the only rollouts the fork replay gate can apply to, so they are
+/// the only unchanged rollouts the one-time replay repair has to re-read.
+pub(crate) fn codex_evidence_names_fork(conn: &Connection, locator: &str) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM json_each(explicit_targets_json, '$.fork_refs')) \
+             FROM session_continuity_evidence \
+             WHERE source = 'codex' AND locator = ? AND json_valid(explicit_targets_json) \
+             LIMIT 1",
+            [locator],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()?
+        .unwrap_or(false))
+}
+
 /// Persist one transcript's evidence, replacing whatever the last read of the
 /// same file recorded.
 ///

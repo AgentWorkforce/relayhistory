@@ -386,8 +386,40 @@ top-level catalog session. Evidence banked before these fields were read is
 re-read once, from the `session_meta` line alone. What is still unobservable is
 a plain `codex resume`: it opens with a fresh `payload.id` and leaves behind
 only a carried-over token baseline, which is a number and not a session, so no
-`resume` row is recorded for it. A forked rollout also replays its parent's
-history before its own turns, and that replay is not yet gated (#210).
+`resume` row is recorded for it.
+
+A forked rollout also **replays its parent's history** before its own turns:
+Codex copies the parent's `session_meta`, its turns' `task_started` /
+`turn_context` / message records and their cumulative `token_count` snapshots
+into the child's file. The rollout walk gates that copy (`ForkReplaySpan` in
+`src/ingest.rs`), and only on explicit evidence:
+
+- The span **opens** at a `session_meta` after the file's first line whose
+  `payload.id` is the parent the opening `session_meta` named in
+  `forked_from_id` or `thread_spawn.parent_thread_id`. A rollout that names no
+  such parent, or a fork that opens on something else (a guardian's
+  `compaction` item), is never gated.
+- It **closes** at the first `task_started` or `turn_context` whose turn is the
+  child's: a UUIDv7 `turn_id` at or after the child thread's own UUIDv7
+  timestamp (else its `session_meta` timestamp), or, for a legacy turn id,
+  `started_at` at or after the fork's second. A turn nothing orders against the
+  fork also closes it — undecided is indexed rather than dropped. The presence
+  of `task_started` is not used: Codex 0.155 replays the parent's
+  `task_started` records too.
+
+Lines inside the span write nothing under the child. One
+`fork_replay_boundary` marker, keyed by the replayed `session_meta`'s line,
+accounts for them (`first_line`, `last_line`, `replayed_lines`, the closing
+turn and the rule that closed it). The last readable `token_count` inside the
+span becomes the child's inherited baseline, so the child's first request is
+charged only what it spent beyond the parent's total — unless the child's own
+first snapshot is below it, which means its counter restarted, and it is
+differenced from zero instead. The cursor never commits inside a span, so a
+live fork read before its first own turn re-reads the replay on the next pass.
+Rows an earlier parser indexed under the child for the replayed lines are
+retired when the span is read, and sync re-reads every unchanged fork rollout
+once (`codex_fork_replay_gate` in the sync state) so an existing install loses
+its duplicates too.
 
 Events use `(ts_ms, id)` keyset pagination. Tool calls and file edits use the
 same keyset shape over `(ts_ms IS NULL, ts_ms, id)`: both tables allow a null
