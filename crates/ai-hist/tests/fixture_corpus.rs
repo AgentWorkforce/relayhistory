@@ -1418,43 +1418,76 @@ fn corpus_readme_lists_every_fixture_and_quirk() {
     }
 }
 
-/// Every `SOURCE_CHOICES` entry has at least one fixture, or a documented
-/// exemption. Adding a provider without a fixture fails here.
+/// The harness registry and the corpus agree: every `LocalSource` descriptor
+/// either names a fixture directory that holds at least one staged fixture
+/// and a committed snapshot, or carries a documented fixture exemption; and
+/// every `SOURCE_CHOICES` value is a descriptor. Adding a provider without a
+/// fixture fails here.
 ///
-/// The exemption list mirrors `DISCOVERY_EXEMPTIONS`: a source that is not a
-/// provider session at all has nothing to put in a harness corpus.
+/// A source that is not a provider session at all (a trajectory, a relay row
+/// projected from other sources) has nothing to put in a harness corpus, and
+/// its descriptor says so.
 #[test]
 fn every_source_choice_has_a_fixture_or_an_exemption() {
-    const FIXTURE_EXEMPTIONS: &[(&str, &str)] = &[
-        (
-            "trajectory",
-            "derived trajectory records, not provider sessions",
-        ),
-        (
-            "relay",
-            "projected from already-synced local rows; no provider log on disk to capture",
-        ),
-    ];
-    let covered = CORPUS
+    use ai_hist::sources::catalog::{local_source, local_sources, Fixtures};
+
+    for source in ai_hist::SOURCE_CHOICES {
+        assert!(
+            local_source(source).is_some(),
+            "SOURCE_CHOICES names {source}, which has no descriptor in sources/catalog.rs"
+        );
+    }
+    let staged = CORPUS
         .iter()
         .filter(|fixture| fixture.layout != Layout::Reference)
-        .map(|fixture| fixture.source)
-        .collect::<BTreeSet<_>>();
-    for source in ai_hist::SOURCE_CHOICES {
-        let exempt = FIXTURE_EXEMPTIONS
+        .collect::<Vec<_>>();
+    for fixture in CORPUS {
+        assert!(
+            local_source(fixture.source).is_some(),
+            "{} names a source with no descriptor",
+            snapshot_key(fixture)
+        );
+    }
+    for descriptor in local_sources() {
+        let source = descriptor.id();
+        let covering = staged
             .iter()
-            .find(|(name, _)| name == source)
-            .map(|(_, reason)| *reason);
-        match exempt {
-            Some(reason) => assert!(
-                !reason.is_empty() && !covered.contains(source),
+            .filter(|fixture| fixture.source == source)
+            .collect::<Vec<_>>();
+        match descriptor.fixtures() {
+            Fixtures::Exempt(reason) => assert!(
+                !reason.is_empty() && covering.is_empty(),
                 "{source} is both exempt and covered; pick one"
             ),
-            None => assert!(
-                covered.contains(source),
-                "{source} has no fixture under tests/fixtures/ and no exemption; see \
-                 docs/session-catalog.md 'Adding a provider'"
-            ),
+            Fixtures::Dir(dir) => {
+                assert!(
+                    !covering.is_empty(),
+                    "{source} has no fixture under tests/fixtures/{dir} and no exemption; see \
+                     docs/session-catalog.md 'Adding a provider'"
+                );
+                assert!(
+                    fixtures_root().join(dir).is_dir(),
+                    "{source}'s descriptor names tests/fixtures/{dir}, which does not exist"
+                );
+                for fixture in &covering {
+                    for file in fixture.files {
+                        assert!(
+                            file.starts_with(&format!("{dir}/")),
+                            "{} stages {file}, outside its descriptor's fixture directory {dir}",
+                            snapshot_key(fixture)
+                        );
+                    }
+                    let snapshot = snapshots_root()
+                        .join(fixture.source)
+                        .join(format!("{}.json", fixture.name));
+                    assert!(
+                        snapshot.is_file(),
+                        "{} has no committed snapshot at {}",
+                        snapshot_key(fixture),
+                        snapshot.display()
+                    );
+                }
+            }
         }
     }
 }

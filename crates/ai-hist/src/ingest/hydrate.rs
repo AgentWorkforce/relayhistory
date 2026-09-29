@@ -171,7 +171,7 @@ pub struct HydrateSessionResult {
 }
 
 #[derive(Debug)]
-struct CatalogTarget {
+pub(crate) struct CatalogTarget {
     locator: Option<String>,
     discovery_state: Option<String>,
 }
@@ -225,7 +225,7 @@ struct SourceSnapshot {
 
 /// Which OpenCode store a validated locator names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OpencodeIngestLayout {
+pub(crate) enum OpencodeIngestLayout {
     /// The configured `OPENCODE_DB`, whatever it is called.
     Sqlite,
     /// A session file inside the configured `OPENCODE_STORAGE_DIR`.
@@ -1362,10 +1362,9 @@ fn validate_options(options: &HydrateSessionOptions) -> Result<()> {
             "sessionId must not be empty",
         ));
     }
-    if !matches!(
-        options.source.as_str(),
-        "claude" | "codex" | "cursor" | "grok" | "relay" | "opencode" | "muse"
-    ) {
+    if !crate::sources::catalog::local_source(&options.source)
+        .is_some_and(|source| source.is_hydration_source())
+    {
         return Err(hydration_error(
             "INVALID_ARGUMENT",
             format!("unsupported catalog source '{}'", options.source),
@@ -1410,11 +1409,8 @@ fn source_snapshot(
     roots: &crate::ProviderRoots,
     claude_snapshot: Option<ClaudeTranscriptSnapshot>,
 ) -> Result<SourceSnapshot> {
-    if options.source == "relay" {
-        return Err(hydration_error(
-            "HYDRATION_UNSUPPORTED",
-            "Relay catalog evidence has no configured full-evidence connector",
-        ));
+    if let Some(refusal) = crate::sources::catalog::hydration_refusal(&options.source) {
+        return Err(hydration_error("HYDRATION_UNSUPPORTED", refusal));
     }
     if options.source == "opencode" {
         let configured_path = &roots.opencode_db;
@@ -1945,17 +1941,7 @@ pub(crate) fn validate_provider_path(
     path: &Path,
     provider_roots: &crate::ProviderRoots,
 ) -> Result<()> {
-    let roots = match source {
-        "claude" => vec![provider_roots.claude.join("projects")],
-        "codex" => vec![
-            provider_roots.codex.join("sessions"),
-            provider_roots.codex.join("archived_sessions"),
-        ],
-        "cursor" => vec![provider_roots.home.join(".cursor/projects")],
-        "grok" => vec![provider_roots.grok.join("sessions")],
-        "muse" => vec![provider_roots.muse.clone()],
-        _ => Vec::new(),
-    };
+    let roots = crate::sources::catalog::transcript_roots(source, provider_roots);
     let canonical = fs::canonicalize(path)?;
     let valid = roots
         .iter()
@@ -2158,8 +2144,59 @@ fn stored_grok_usage(conn: &Connection, session_id: &str) -> Result<(Option<i64>
     Ok((context_total_tokens, usage_turns))
 }
 
+/// Everything a source's targeted-hydration parser may read, handed to the
+/// parser its catalog descriptor names (`sources::catalog::Hydration`).
+///
+/// One struct rather than one signature per provider, so the catalog can hold
+/// every parser behind the same function pointer. A parser takes the fields it
+/// needs and ignores the rest.
+pub(crate) struct SelectedIngest<'a> {
+    pub(crate) conn: &'a Connection,
+    pub(crate) options: &'a HydrateSessionOptions,
+    pub(crate) target: &'a CatalogTarget,
+    pub(crate) path: Option<&'a Path>,
+    pub(crate) claude_subagents: &'a [ClaudeSubagentEvidence],
+    pub(crate) claude_snapshot: Option<&'a ClaudeTranscriptSnapshot>,
+    pub(crate) cursor: &'a mut TranscriptCursorState,
+    pub(crate) records: i64,
+    pub(crate) opencode_layout: Option<OpencodeIngestLayout>,
+}
+
+/// What a selected-session parser indexed, the diagnostics the provider's own
+/// records could not settle, and how far into the transcript the pass consumed
+/// when the parser tracks that itself.
+pub(crate) type SelectedIngestResult = (IngestOutcome, Vec<HydrationDiagnostic>, Option<u64>);
+
+/// A source's targeted-hydration parser, as a catalog descriptor names it.
+pub(crate) type IngestSelectedFn = fn(SelectedIngest<'_>) -> Result<SelectedIngestResult>;
+
+impl<'a> SelectedIngest<'a> {
+    /// The locator every file-backed parser requires; `source_snapshot`
+    /// always resolves one before a parser runs.
+    fn file(&self) -> &'a Path {
+        self.path.unwrap()
+    }
+
+    /// A provider whose reader still re-reads the file on every change reports
+    /// the whole file as what it read, and the record count the snapshot walk
+    /// already paid for.
+    fn whole_file(&self) -> IngestOutcome {
+        IngestOutcome {
+            bytes_read: self
+                .path
+                .and_then(|p| p.metadata().ok())
+                .map_or(0, |m| m.len()) as i64,
+            records: self.records,
+            ..Default::default()
+        }
+    }
+}
+
 /// Index the selected session and hand back whatever the provider's own
 /// records could not establish, as diagnostics the caller reports verbatim.
+///
+/// Dispatches through the source's catalog descriptor; a source without a
+/// parser there has no targeted hydration.
 #[allow(clippy::too_many_arguments)]
 fn ingest_selected(
     conn: &Connection,
@@ -2171,90 +2208,106 @@ fn ingest_selected(
     cursor: &mut TranscriptCursorState,
     records: i64,
     opencode_layout: Option<OpencodeIngestLayout>,
-) -> Result<(IngestOutcome, Vec<HydrationDiagnostic>, Option<u64>)> {
-    // A provider whose reader still re-reads the file on every change reports
-    // the whole file as what it read, and the record count the snapshot walk
-    // already paid for.
-    let whole_file = || IngestOutcome {
-        bytes_read: path.and_then(|p| p.metadata().ok()).map_or(0, |m| m.len()) as i64,
-        records,
-        ..Default::default()
-    };
-    match options.source.as_str() {
-        "claude" => ingest_claude(
-            conn,
-            options,
-            path.unwrap(),
-            claude_subagents,
-            claude_snapshot,
-            cursor,
-        )
-        .map(|outcome| (outcome, Vec::new(), None)),
-        "codex" => ingest_codex(conn, options, path.unwrap(), cursor)
-            .map(|outcome| (outcome, Vec::new(), None)),
-        "cursor" => {
-            let (diagnostics, consumed) = ingest_cursor(conn, options, target, path.unwrap())?;
-            Ok((whole_file(), diagnostics, Some(consumed)))
-        }
-        "grok" => ingest_grok(conn, options, path.unwrap())
-            .map(|diagnostics| (whole_file(), diagnostics, None)),
-        "muse" => {
-            let path = path.unwrap();
-            let diagnostics = ingest_muse(conn, options, path)?;
-            let mut outcome = whole_file();
-            // With related evidence the read covers every subagent log too.
-            if options.include_related {
-                outcome.bytes_read = muse_session_files(path)?
-                    .iter()
-                    .filter_map(|file| file.metadata().ok())
-                    .map(|metadata| metadata.len() as i64)
-                    .sum();
-            }
-            Ok((outcome, diagnostics, None))
-        }
-        "opencode" => {
-            let path = path.unwrap();
-            // Whichever layout `source_snapshot` validated this locator
-            // against. Not the file extension: `OPENCODE_DB` is an arbitrary
-            // path, so a perfectly good SQLite store may be called
-            // `opencode.json`, and sniffing the suffix would hand it to the
-            // JSON-tree loader and index nothing. Both layouts end in the
-            // same normalizer, so the evidence is identical either way.
-            match opencode_layout {
-                Some(OpencodeIngestLayout::JsonTree) => {
-                    crate::store::sync_opencode_session_from_storage_dir(
-                        conn,
-                        path,
-                        &options.session_id,
-                    )?;
-                }
-                _ => {
-                    sync_opencode_session(conn, path, &options.session_id)?;
-                }
-            }
-            // The record count comes from the snapshot walk, as it does for
-            // every provider whose reader does not count for itself. Returning
-            // a default outcome dropped it: `records_parsed` is taken from the
-            // outcome now, so the zero reached `HYDRATION_METRICS` and the
-            // checkpoint, and every later `unchanged` pass read that zero back.
-            //
-            // Not `whole_file()`, which also reports the path's size as bytes
-            // read: OpenCode's locator can be a directory, whose length is not
-            // a count of anything.
-            Ok((
-                IngestOutcome {
-                    records,
-                    ..Default::default()
-                },
-                Vec::new(),
-                None,
-            ))
-        }
-        _ => Err(hydration_error(
+) -> Result<SelectedIngestResult> {
+    let Some(parser) = crate::sources::catalog::selected_ingest(&options.source) else {
+        return Err(hydration_error(
             "HYDRATION_UNSUPPORTED",
             format!("{} targeted hydration is unavailable", options.source),
-        )),
+        ));
+    };
+    parser(SelectedIngest {
+        conn,
+        options,
+        target,
+        path,
+        claude_subagents,
+        claude_snapshot,
+        cursor,
+        records,
+        opencode_layout,
+    })
+}
+
+pub(crate) fn ingest_selected_claude(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
+    let path = ctx.file();
+    ingest_claude(
+        ctx.conn,
+        ctx.options,
+        path,
+        ctx.claude_subagents,
+        ctx.claude_snapshot,
+        ctx.cursor,
+    )
+    .map(|outcome| (outcome, Vec::new(), None))
+}
+
+pub(crate) fn ingest_selected_codex(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
+    let path = ctx.file();
+    ingest_codex(ctx.conn, ctx.options, path, ctx.cursor).map(|outcome| (outcome, Vec::new(), None))
+}
+
+pub(crate) fn ingest_selected_cursor(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
+    let (diagnostics, consumed) = ingest_cursor(ctx.conn, ctx.options, ctx.target, ctx.file())?;
+    Ok((ctx.whole_file(), diagnostics, Some(consumed)))
+}
+
+pub(crate) fn ingest_selected_grok(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
+    ingest_grok(ctx.conn, ctx.options, ctx.file())
+        .map(|diagnostics| (ctx.whole_file(), diagnostics, None))
+}
+
+pub(crate) fn ingest_selected_muse(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
+    let path = ctx.file();
+    let diagnostics = ingest_muse(ctx.conn, ctx.options, path)?;
+    let mut outcome = ctx.whole_file();
+    // With related evidence the read covers every subagent log too.
+    if ctx.options.include_related {
+        outcome.bytes_read = muse_session_files(path)?
+            .iter()
+            .filter_map(|file| file.metadata().ok())
+            .map(|metadata| metadata.len() as i64)
+            .sum();
     }
+    Ok((outcome, diagnostics, None))
+}
+
+pub(crate) fn ingest_selected_opencode(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
+    let path = ctx.file();
+    // Whichever layout `source_snapshot` validated this locator
+    // against. Not the file extension: `OPENCODE_DB` is an arbitrary
+    // path, so a perfectly good SQLite store may be called
+    // `opencode.json`, and sniffing the suffix would hand it to the
+    // JSON-tree loader and index nothing. Both layouts end in the
+    // same normalizer, so the evidence is identical either way.
+    match ctx.opencode_layout {
+        Some(OpencodeIngestLayout::JsonTree) => {
+            crate::store::sync_opencode_session_from_storage_dir(
+                ctx.conn,
+                path,
+                &ctx.options.session_id,
+            )?;
+        }
+        _ => {
+            sync_opencode_session(ctx.conn, path, &ctx.options.session_id)?;
+        }
+    }
+    // The record count comes from the snapshot walk, as it does for
+    // every provider whose reader does not count for itself. Returning
+    // a default outcome dropped it: `records_parsed` is taken from the
+    // outcome now, so the zero reached `HYDRATION_METRICS` and the
+    // checkpoint, and every later `unchanged` pass read that zero back.
+    //
+    // Not `whole_file()`, which also reports the path's size as bytes
+    // read: OpenCode's locator can be a directory, whose length is not
+    // a count of anything.
+    Ok((
+        IngestOutcome {
+            records: ctx.records,
+            ..Default::default()
+        },
+        Vec::new(),
+        None,
+    ))
 }
 
 fn ingest_claude(

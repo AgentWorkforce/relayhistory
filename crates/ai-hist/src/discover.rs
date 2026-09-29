@@ -1003,26 +1003,17 @@ pub struct SourceExemption {
 
 /// Sources with no shallow adapter, and why.
 ///
-/// Paired with [`shallow_providers`] by a registry regression test that
-/// asserts every `SOURCE_CHOICES` entry is covered by exactly one of the two
-/// lists — so adding a provider to `SOURCE_CHOICES` fails the build until
-/// someone decides whether it is discoverable.
-pub const DISCOVERY_EXEMPTIONS: &[SourceExemption] = &[SourceExemption {
-    source: "trajectory",
-    reason: "derived trajectory records, not provider sessions",
-}];
+/// Derived from the harness registry (`sources::catalog`): a descriptor whose
+/// discovery is `Exempt` appears here, every other one has an adapter in
+/// [`shallow_providers`]. A registry test asserts every `SOURCE_CHOICES` entry
+/// is covered by exactly one of the two, so a descriptor always carries a
+/// decision about whether it is discoverable.
+pub const DISCOVERY_EXEMPTIONS: &[SourceExemption] = crate::sources::catalog::DISCOVERY_EXEMPTIONS;
 
-/// Every shallow adapter, one per discoverable source.
+/// Every shallow adapter, one per discoverable source, derived from the
+/// harness registry (`sources::catalog`) and ordered by source id.
 pub fn shallow_providers() -> Vec<Box<dyn ShallowSessionProvider>> {
-    vec![
-        Box::new(ClaudeProvider),
-        Box::new(CodexProvider),
-        Box::new(CursorProvider),
-        Box::new(GrokProvider),
-        Box::new(MuseProvider),
-        Box::new(OpencodeProvider::default()),
-        Box::new(RelayProvider),
-    ]
+    crate::sources::catalog::shallow_providers()
 }
 
 /// Declared local evidence coverage for one source, resolved from the shallow
@@ -1291,7 +1282,7 @@ fn text_of(content: Option<&Value>) -> Option<String> {
 // claude
 // ---------------------------------------------------------------------------
 
-struct ClaudeProvider;
+pub(crate) struct ClaudeProvider;
 
 /// The first substantive human turn's excerpt, or `None` for a record that
 /// is not one.
@@ -1542,7 +1533,7 @@ fn read_claude_shallow(
 // codex
 // ---------------------------------------------------------------------------
 
-struct CodexProvider;
+pub(crate) struct CodexProvider;
 
 impl ShallowSessionProvider for CodexProvider {
     fn acquire(
@@ -1705,7 +1696,7 @@ fn string_list(value: Option<&Value>) -> Vec<String> {
 // cursor
 // ---------------------------------------------------------------------------
 
-struct CursorProvider;
+pub(crate) struct CursorProvider;
 
 impl ShallowSessionProvider for CursorProvider {
     fn acquire(
@@ -1892,7 +1883,7 @@ fn cursor_assistant_text(line: &[u8]) -> Option<String> {
 // grok
 // ---------------------------------------------------------------------------
 
-struct GrokProvider;
+pub(crate) struct GrokProvider;
 
 impl ShallowSessionProvider for GrokProvider {
     fn acquire(
@@ -2082,7 +2073,7 @@ fn grok_update_bounds(
 /// `muse/sessions/YYYY/MM/DD/<session-id>/`. Subagent and reminder children
 /// write their own transcripts under `subagent/` beside the parent; those are
 /// not sessions of their own and are never enumerated.
-struct MuseProvider;
+pub(crate) struct MuseProvider;
 
 impl ShallowSessionProvider for MuseProvider {
     fn acquire(
@@ -2231,7 +2222,7 @@ impl ShallowSessionProvider for MuseProvider {
 /// message after a session seek). Metadata remains available on older schemas,
 /// but prompt/model extraction is omitted when it would require a table scan.
 #[derive(Default)]
-struct OpencodeProvider {
+pub(crate) struct OpencodeProvider {
     pass: Mutex<()>,
     live: Mutex<Option<OpencodeLive>>,
 }
@@ -3144,7 +3135,7 @@ fn opencode_store_generation(path: &Path) -> Result<String> {
 /// `ai-hist sync` already stored in `history` (indexed by
 /// `idx_history_session`). If nothing was ever synced it discovers nothing —
 /// that is the correct answer, not a failure.
-struct RelayProvider;
+pub(crate) struct RelayProvider;
 
 impl ShallowSessionProvider for RelayProvider {
     fn source(&self) -> &'static str {
