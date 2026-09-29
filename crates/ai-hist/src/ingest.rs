@@ -3089,6 +3089,11 @@ fn sync_codex_sources(
     let path = root.join("history.jsonl");
     if !path.exists() {
         sync_note!("  [codex] not found: {} (skipped)", path.display());
+        // The rows the backfill fills are already in the database; a missing
+        // log only means no new ones. Sessions a rollout re-read or an earlier
+        // sweep left owed still get their pass, or clearing them as pending
+        // would lose them.
+        backfill_codex_metadata_scoped(conn, state, &cwds, &branches, touched)?;
         return Ok(inserted);
     }
     let mut source = CompleteJsonlReader::open(&path, state.get("codex"))?;
@@ -27852,17 +27857,15 @@ mod capture_progress_tests {
         assert_eq!(codex_session_revisions(&conn), settled);
     }
 
-    #[test]
-    fn codex_metadata_backfill_interrupted_after_the_cursor_moved_is_retried() {
-        // The Codex cursor advances before the scoped backfill runs. If the
-        // backfill then fails, a later source can checkpoint that cursor, and
-        // the next sweep reads no new line for the session -- so the sessions
-        // it owed have to be carried forward, or their branch and activity
-        // window are never repaired.
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join(".codex");
+    /// Sync a fixture, append a prompt for `sess-scope-1`, and cancel the next
+    /// sweep inside its scoped backfill -- after the cursor moved past the
+    /// prompt.
+    fn interrupt_codex_backfill_after_a_new_prompt(
+        dir: &Path,
+    ) -> (Connection, Map<String, Value>, PathBuf) {
+        let root = dir.join(".codex");
         codex_backfill_fixture(&root);
-        let db = dir.path().join("history.db");
+        let db = dir.join("history.db");
         let conn = open_db(&db).unwrap();
         let mut state = Map::new();
         sync_codex(&conn, &mut state, &root).unwrap();
@@ -27901,19 +27904,36 @@ mod capture_progress_tests {
             state.get(CODEX_METADATA_PENDING_KEY),
             Some(&json!(["sess-scope-1"]))
         );
-        let branch = |conn: &Connection| -> Option<String> {
-            conn.query_row(
-                "SELECT git_branch FROM history WHERE source = 'codex' AND prompt = 'later'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap()
-        };
-        assert_eq!(branch(&conn), None, "the backfill was interrupted");
+        assert_eq!(
+            later_prompt_branch(&conn),
+            None,
+            "the backfill was interrupted"
+        );
+        (conn, state, root)
+    }
+
+    fn later_prompt_branch(conn: &Connection) -> Option<String> {
+        conn.query_row(
+            "SELECT git_branch FROM history WHERE source = 'codex' AND prompt = 'later'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn codex_metadata_backfill_interrupted_after_the_cursor_moved_is_retried() {
+        // The Codex cursor advances before the scoped backfill runs. If the
+        // backfill then fails, a later source can checkpoint that cursor, and
+        // the next sweep reads no new line for the session -- so the sessions
+        // it owed have to be carried forward, or their branch and activity
+        // window are never repaired.
+        let dir = tempfile::tempdir().unwrap();
+        let (conn, mut state, root) = interrupt_codex_backfill_after_a_new_prompt(dir.path());
 
         // The retry reads no new line, yet still reaches the owed session.
         sync_codex(&conn, &mut state, &root).unwrap();
-        assert_eq!(branch(&conn).as_deref(), Some("main"));
+        assert_eq!(later_prompt_branch(&conn).as_deref(), Some("main"));
         let last: i64 = conn
             .query_row(
                 "SELECT last_activity_ms FROM sessions \
@@ -27924,6 +27944,26 @@ mod capture_progress_tests {
             .unwrap();
         assert_eq!(last, 1_776_650_000_000);
         assert_eq!(state.get(CODEX_METADATA_PENDING_KEY), Some(&json!([])));
+    }
+
+    #[test]
+    fn codex_metadata_backfill_owed_is_paid_even_while_history_jsonl_is_missing() {
+        // A retry that finds no history.jsonl must not clear the owed sessions
+        // without backfilling them: when the log comes back unchanged its
+        // cursor is at EOF and nothing would touch them again.
+        let dir = tempfile::tempdir().unwrap();
+        let (conn, mut state, root) = interrupt_codex_backfill_after_a_new_prompt(dir.path());
+        let log = root.join("history.jsonl");
+        let parked = root.join("history.jsonl.parked");
+        fs::rename(&log, &parked).unwrap();
+
+        sync_codex(&conn, &mut state, &root).unwrap();
+        assert_eq!(later_prompt_branch(&conn).as_deref(), Some("main"));
+        assert_eq!(state.get(CODEX_METADATA_PENDING_KEY), Some(&json!([])));
+
+        fs::rename(&parked, &log).unwrap();
+        sync_codex(&conn, &mut state, &root).unwrap();
+        assert_eq!(later_prompt_branch(&conn).as_deref(), Some("main"));
     }
 
     #[test]
