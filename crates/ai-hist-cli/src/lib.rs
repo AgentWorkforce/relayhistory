@@ -109,6 +109,12 @@ enum Command {
         agent: bool,
         #[arg(long)]
         human: bool,
+        /// Only entries at or after this epoch-millisecond timestamp.
+        #[arg(long)]
+        since_ms: Option<i64>,
+        /// Only entries at or before this epoch-millisecond timestamp.
+        #[arg(long)]
+        until_ms: Option<i64>,
         #[arg(long, default_value_t = 20)]
         limit: i64,
         /// Pass the query through as a raw FTS5 MATCH expression. Operators such as
@@ -130,6 +136,12 @@ enum Command {
         project: Option<String>,
         #[arg(long)]
         tag: Option<String>,
+        /// Only entries at or after this epoch-millisecond timestamp.
+        #[arg(long)]
+        since_ms: Option<i64>,
+        /// Only entries at or before this epoch-millisecond timestamp.
+        #[arg(long)]
+        until_ms: Option<i64>,
         #[arg(long)]
         json: bool,
     },
@@ -722,6 +734,8 @@ pub fn run() -> Result<()> {
             role,
             agent,
             human,
+            since_ms,
+            until_ms,
             limit,
             fts,
             json,
@@ -737,6 +751,8 @@ pub fn run() -> Result<()> {
                     source,
                     project,
                     tag,
+                    since_ms,
+                    until_ms,
                     limit,
                     ..Default::default()
                 },
@@ -758,6 +774,8 @@ pub fn run() -> Result<()> {
             source,
             project,
             tag,
+            since_ms,
+            until_ms,
             json,
         } => {
             validate_source(source.as_deref())?;
@@ -768,6 +786,8 @@ pub fn run() -> Result<()> {
                     source,
                     project,
                     tag,
+                    since_ms,
+                    until_ms,
                     limit: n,
                     ..Default::default()
                 },

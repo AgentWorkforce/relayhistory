@@ -24,6 +24,7 @@ import {
 
 import type {
   HistoryEntry,
+  HistoryCursor,
   SearchMatch,
   ListOptions,
   SearchOptions,
@@ -119,6 +120,24 @@ export function historyEntry(value: UnknownRecord): HistoryEntry {
           (location): location is SessionLocation => location === 'local' || location === 'remote',
         )
       : [],
+  };
+}
+
+export function historyCursor(value: unknown): HistoryCursor | null {
+  if (!value || typeof value !== 'object') return null;
+  const row = value as UnknownRecord;
+  const cursor: HistoryCursor = { timestampMs: Number(row.timestampMs), id: Number(row.id) };
+  if (row.matchSource === 'history' || row.matchSource === 'session_event') cursor.matchSource = row.matchSource;
+  return cursor;
+}
+
+/** The native boundary takes an absent `matchSource`, not an explicit null. */
+export function nativeHistoryCursor(after: HistoryCursor | undefined): object | undefined {
+  if (!after) return undefined;
+  return {
+    timestampMs: after.timestampMs,
+    id: after.id,
+    ...(after.matchSource ? { matchSource: after.matchSource } : {}),
   };
 }
 

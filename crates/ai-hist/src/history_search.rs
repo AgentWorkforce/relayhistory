@@ -7,7 +7,10 @@
 //! scope/source/project/tag/time filters to both, and orders the merged result
 //! by `(timestamp_ms DESC, id DESC, match_source)` so a tie never reorders
 //! between calls.
-use crate::{normalize_tag_name, raw_fts_query_error, QueryFilter, SessionScope};
+use crate::{
+    append_window_filters, normalize_tag_name, raw_fts_query_error, HistoryCursor, HistoryPage,
+    QueryFilter, SessionScope,
+};
 use anyhow::Result;
 use rusqlite::Connection;
 /// Which rows a search may match.
@@ -63,6 +66,7 @@ pub fn search_all(
     filter: &QueryFilter,
     role: SearchRole,
 ) -> Result<Vec<SearchRow>> {
+    filter.validate()?;
     let mut rows = Vec::new();
     if !matches!(role, SearchRole::Assistant) {
         rows.extend(search_history_rows(conn, terms, raw_fts, filter)?);
@@ -78,6 +82,40 @@ pub fn search_all(
     });
     rows.truncate(filter.limit.max(1) as usize);
     Ok(rows)
+}
+
+/// One page of [`search_all`], with a cursor to the next page when a further
+/// match exists. The cursor carries the last row's match source, because a
+/// prompt and an event can share `(timestamp_ms, id)`.
+pub fn search_page(
+    conn: &Connection,
+    terms: &[String],
+    raw_fts: bool,
+    filter: &QueryFilter,
+    role: SearchRole,
+) -> Result<HistoryPage<SearchRow>> {
+    let limit = filter.limit.max(1);
+    let mut rows = search_all(
+        conn,
+        terms,
+        raw_fts,
+        &QueryFilter {
+            limit: limit + 1,
+            ..filter.clone()
+        },
+        role,
+    )?;
+    let next_cursor = if rows.len() as i64 > limit {
+        rows.truncate(limit as usize);
+        rows.last().map(|row| HistoryCursor {
+            timestamp_ms: row.timestamp_ms,
+            id: row.id,
+            match_source: Some(row.match_source.clone()),
+        })
+    } else {
+        None
+    };
+    Ok(HistoryPage { rows, next_cursor })
 }
 
 fn search_history_rows(
@@ -186,6 +224,14 @@ fn append_history_search_filters(
         sql.push_str(&format!(" AND {alias}.timestamp_ms < ?"));
         params.push(before_ms.to_string());
     }
+    append_window_filters(
+        sql,
+        params,
+        filter,
+        &format!("{alias}.timestamp_ms"),
+        &format!("{alias}.id"),
+        false,
+    );
 }
 
 fn append_event_search_filters(
@@ -220,6 +266,14 @@ fn append_event_search_filters(
         sql.push_str(&format!(" AND {alias}.ts_ms < ?"));
         params.push(before_ms.to_string());
     }
+    append_window_filters(
+        sql,
+        params,
+        filter,
+        &format!("{alias}.ts_ms"),
+        &format!("{alias}.id"),
+        true,
+    );
     match role {
         SearchRole::All | SearchRole::Prompt => {}
         SearchRole::User => sql.push_str(&format!(" AND {alias}.role = 'user'")),
@@ -415,6 +469,139 @@ mod tests {
         )
         .unwrap();
         assert_eq!(keys(&rows), vec![("history".into(), 4)]);
+    }
+
+    fn walk(conn: &Connection, page_size: i64, role: SearchRole) -> Vec<(String, i64)> {
+        let mut seen = Vec::new();
+        let mut after = None;
+        loop {
+            let page = search_page(
+                conn,
+                &["needle".to_string()],
+                false,
+                &QueryFilter {
+                    after: after.clone(),
+                    ..filter(page_size)
+                },
+                role,
+            )
+            .unwrap();
+            assert!(page.rows.len() as i64 <= page_size);
+            seen.extend(keys(&page.rows));
+            match page.next_cursor {
+                Some(cursor) => after = Some(cursor),
+                None => return seen,
+            }
+        }
+    }
+
+    #[test]
+    fn keyset_pages_traverse_tied_matches_exactly_once() {
+        let conn = fixture();
+        let full = keys(
+            &search_all(
+                &conn,
+                &["needle".to_string()],
+                false,
+                &filter(100),
+                SearchRole::All,
+            )
+            .unwrap(),
+        );
+        assert_eq!(full.len(), 7);
+        for page_size in [1, 2, 3, 7, 50] {
+            assert_eq!(walk(&conn, page_size, SearchRole::All), full, "page size {page_size}");
+        }
+        assert_eq!(walk(&conn, 1, SearchRole::Prompt).len(), 4);
+
+        // The legacy exclusive timestamp skips the rest of a tie.
+        let first = search_all(
+            &conn,
+            &["needle".to_string()],
+            false,
+            &filter(1),
+            SearchRole::All,
+        )
+        .unwrap();
+        let legacy = search_all(
+            &conn,
+            &["needle".to_string()],
+            false,
+            &QueryFilter {
+                before_ms: Some(first[0].timestamp_ms),
+                ..filter(100)
+            },
+            SearchRole::All,
+        )
+        .unwrap();
+        assert_eq!(legacy.len(), 1, "before_ms drops the five tied rows");
+    }
+
+    #[test]
+    fn since_and_until_are_inclusive_and_validated() {
+        let conn = fixture();
+        let window = |since: Option<i64>, until: Option<i64>| {
+            search_all(
+                &conn,
+                &["needle".to_string()],
+                false,
+                &QueryFilter {
+                    since_ms: since,
+                    until_ms: until,
+                    ..filter(100)
+                },
+                SearchRole::All,
+            )
+        };
+        assert_eq!(window(Some(1_000), None).unwrap().len(), 6);
+        assert_eq!(window(None, Some(500)).unwrap().len(), 1);
+        assert_eq!(window(Some(500), Some(500)).unwrap().len(), 1);
+        assert_eq!(window(Some(500), Some(1_000)).unwrap().len(), 7);
+        let error = window(Some(1_001), Some(1_000)).unwrap_err().to_string();
+        assert!(error.contains("must not be later than"), "got: {error}");
+
+        let bad_cursor = search_all(
+            &conn,
+            &["needle".to_string()],
+            false,
+            &QueryFilter {
+                after: Some(HistoryCursor {
+                    timestamp_ms: 1,
+                    id: 1,
+                    match_source: Some("tool".into()),
+                }),
+                ..filter(100)
+            },
+            SearchRole::All,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(bad_cursor.contains("match_source"), "got: {bad_cursor}");
+    }
+
+    #[test]
+    fn recent_pages_traverse_tied_prompts_exactly_once() {
+        let conn = fixture();
+        for page_size in [1, 2, 4, 10] {
+            let mut ids = Vec::new();
+            let mut after = None;
+            loop {
+                let page = crate::recent_page(
+                    &conn,
+                    &QueryFilter {
+                        after: after.clone(),
+                        ..filter(page_size)
+                    },
+                )
+                .unwrap();
+                ids.extend(page.rows.iter().map(|row| row.id));
+                match page.next_cursor {
+                    Some(cursor) => after = Some(cursor),
+                    None => break,
+                }
+            }
+            assert_eq!(ids, vec![3, 2, 1, 4], "page size {page_size}");
+        }
     }
 
     #[test]

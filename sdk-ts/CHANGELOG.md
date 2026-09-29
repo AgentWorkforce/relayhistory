@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `searchPage()` and `recentPage()` return one page plus a `nextCursor`
+  `{ timestampMs, id, matchSource? }`. `search()`, `recent()` and both page
+  functions accept `after` (that cursor, or the last row) and inclusive
+  `sinceMs`/`untilMs` (#67). Ordering is a total `(timestampMs, id)` keyset,
+  so tied timestamps page without skips. `beforeMs` is deprecated. Requires
+  native contract 24.
+
 ### Changed
 
 - `search()` runs the same contract as `ai-hist search` and MCP

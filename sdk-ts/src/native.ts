@@ -19,7 +19,7 @@ import {
   ConnectorFailureError,
 } from './sdk-common.js';
 
-export const NATIVE_CONTRACT_VERSION = 23;
+export const NATIVE_CONTRACT_VERSION = 24;
 type UnknownRecord = Record<string, unknown>;
 
 interface NativeBinding {
@@ -33,7 +33,9 @@ interface NativeBinding {
   nativeBuildProfile?(): string;
   sessionStoreCall(op: string, argsJson: string): Promise<string>;
   search(query: string, options?: object): Promise<UnknownRecord[]>;
+  searchPage(query: string, options?: object): Promise<UnknownRecord>;
   recent(options?: object): Promise<UnknownRecord[]>;
+  recentPage(options?: object): Promise<UnknownRecord>;
   getSession(sessionId: string, options?: object): Promise<UnknownRecord[]>;
   getSessionEventsPage(sessionId: string, options?: object): Promise<UnknownRecord>;
   getSessionToolCallsPage(source: string, sessionId: string, options?: object): Promise<UnknownRecord>;

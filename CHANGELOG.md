@@ -27,6 +27,24 @@ Notable changes to the native `ai-hist` CLI are documented here.
 - Native contract 22 -> 23: `search` returns `NativeSearchMatch` rows and
   takes `role`. An SDK paired with an addon of the other contract fails at
   load with `NATIVE_CONTRACT_MISMATCH`.
+- Keyset pagination and inclusive time windows for history reads (#67).
+  Native contract 23 -> 24.
+  - `search` and `recent` take `sinceMs`/`untilMs` (inclusive) and an
+    `after` cursor `{ timestampMs, id, matchSource? }` on every surface: SDK
+    options, MCP `search_history`/`recent_history` (`since_ms`, `until_ms`,
+    `after`), `--since-ms`/`--until-ms`/`--after` on the TS CLI, and
+    `--since-ms`/`--until-ms` on the native CLI.
+  - New SDK `searchPage()`/`recentPage()` (napi `searchPage`/`recentPage`)
+    return `{ matches | entries, nextCursor }`. `nextCursor` comes from
+    over-fetching one row, and is `null` when nothing further exists.
+  - Every newest-first read orders by `(timestamp, id)`, and the cursor
+    predicate uses the same tuple. Rows sharing a timestamp, such as every
+    prompt of a Cursor transcript, page without skips or repeats.
+    `getSession` orders ties by id.
+  - `sinceMs > untilMs` and a cursor with an unknown `matchSource` are
+    `INVALID_ARGUMENT`, with the same message on every surface.
+  - `beforeMs`/`before_ms`/`--before-ms` keep their exclusive semantics but
+    are deprecated: they skip rows tied on the boundary timestamp.
 - Native contract 21 -> 22. `historyExport` serves snapshots that each hold
   one read transaction, emits schema-version-2 records, and no longer accepts
   the upload-journal operations. An SDK paired with an addon of the other

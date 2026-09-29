@@ -71,9 +71,112 @@ pub struct QueryFilter {
     pub source: Option<String>,
     pub project: Option<String>,
     pub tag: Option<String>,
+    /// Deprecated exclusive timestamp bound. Rows sharing the boundary
+    /// timestamp are skipped, so it is not a pagination cursor; use `after`.
     pub before_ms: Option<i64>,
+    /// Inclusive lower bound on the row timestamp.
+    pub since_ms: Option<i64>,
+    /// Inclusive upper bound on the row timestamp.
+    pub until_ms: Option<i64>,
+    /// Keyset continuation: only rows strictly after this one in the read's
+    /// `(timestamp DESC, id DESC, match source)` order. Applied in addition
+    /// to the time window.
+    pub after: Option<HistoryCursor>,
     pub limit: i64,
     pub scope: SessionScope,
+}
+
+impl QueryFilter {
+    /// The checks every surface applies before a history read, so an invalid
+    /// window is the same error from the CLI, the SDK and MCP.
+    pub fn validate(&self) -> Result<()> {
+        if let (Some(since), Some(until)) = (self.since_ms, self.until_ms) {
+            anyhow::ensure!(
+                since <= until,
+                "since_ms ({since}) must not be later than until_ms ({until})"
+            );
+        }
+        if let Some(cursor) = &self.after {
+            cursor.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// Where a newest-first history read stopped: the last row it returned.
+///
+/// `recent` rows are always `history` matches, so their cursor may leave
+/// `match_source` unset. A `search` cursor carries the match source of its
+/// row, because a prompt and an event can share `(timestamp_ms, id)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryCursor {
+    pub timestamp_ms: i64,
+    pub id: i64,
+    #[serde(default)]
+    pub match_source: Option<String>,
+}
+
+impl HistoryCursor {
+    pub fn validate(&self) -> Result<()> {
+        match self.match_source.as_deref() {
+            None | Some("history") | Some("session_event") => Ok(()),
+            Some(other) => {
+                anyhow::bail!("cursor match_source must be history or session_event (got {other})")
+            }
+        }
+    }
+
+    /// True when the cursor row is a `history` match (the default).
+    pub fn is_history(&self) -> bool {
+        matches!(self.match_source.as_deref(), None | Some("history"))
+    }
+}
+
+/// One page of a newest-first read, and where the next page starts.
+#[derive(Debug, Clone)]
+pub struct HistoryPage<T> {
+    pub rows: Vec<T>,
+    /// Present only when a further row exists: the read over-fetches one row
+    /// rather than guessing from a full page.
+    pub next_cursor: Option<HistoryCursor>,
+}
+
+/// Append the time-window and keyset predicates shared by every
+/// newest-first history read. `row_is_after_history_tie` says whether a row
+/// in this table sorts after a `history` row with the same
+/// `(timestamp, id)` — true only for `session_events`, whose match source
+/// orders after `history`.
+pub(crate) fn append_window_filters(
+    sql: &mut String,
+    params: &mut Vec<String>,
+    filter: &QueryFilter,
+    ts_column: &str,
+    id_column: &str,
+    row_is_after_history_tie: bool,
+) {
+    if let Some(since_ms) = filter.since_ms {
+        sql.push_str(&format!(" AND {ts_column} >= ?"));
+        params.push(since_ms.to_string());
+    }
+    if let Some(until_ms) = filter.until_ms {
+        sql.push_str(&format!(" AND {ts_column} <= ?"));
+        params.push(until_ms.to_string());
+    }
+    if let Some(cursor) = &filter.after {
+        // Rows at the cursor's (timestamp, id) come after it only when this
+        // table's match source sorts after the cursor's.
+        let id_op = if row_is_after_history_tie && cursor.is_history() {
+            "<="
+        } else {
+            "<"
+        };
+        sql.push_str(&format!(
+            " AND ({ts_column} < ? OR ({ts_column} = ? AND {id_column} {id_op} ?))"
+        ));
+        params.push(cursor.timestamp_ms.to_string());
+        params.push(cursor.timestamp_ms.to_string());
+        params.push(cursor.id.to_string());
+    }
 }
 
 /// Which acquisition surface a query should include.
@@ -2106,6 +2209,14 @@ fn append_filters(sql: &mut String, params: &mut Vec<String>, filter: &QueryFilt
         sql.push_str(&format!(" AND {alias}.timestamp_ms < ?"));
         params.push(before_ms.to_string());
     }
+    append_window_filters(
+        sql,
+        params,
+        filter,
+        &format!("{alias}.timestamp_ms"),
+        &format!("{alias}.id"),
+        false,
+    );
 }
 
 fn append_scope_filter(sql: &mut String, scope: SessionScope, alias: &str) {
@@ -2308,12 +2419,13 @@ pub fn search(
     if terms.is_empty() {
         return recent(conn, filter);
     }
+    filter.validate()?;
     let query = build_fts_query(terms, raw_fts);
     let mut sql = "SELECT h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms FROM history_fts f JOIN history h ON f.rowid = h.id WHERE history_fts MATCH ?".to_string();
     let mut params_vec = vec![query];
     append_filters(&mut sql, &mut params_vec, filter, "h");
     append_scope_filter(&mut sql, filter.scope, "h");
-    sql.push_str(" ORDER BY h.timestamp_ms DESC LIMIT ?");
+    sql.push_str(" ORDER BY h.timestamp_ms DESC, h.id DESC LIMIT ?");
     params_vec.push(filter.limit.max(1).to_string());
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
@@ -2324,15 +2436,40 @@ pub fn search(
 }
 
 pub fn recent(conn: &Connection, filter: &QueryFilter) -> Result<Vec<HistoryEntry>> {
+    filter.validate()?;
     let mut sql = "SELECT h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms FROM history h WHERE 1=1".to_string();
     let mut params_vec = Vec::new();
     append_filters(&mut sql, &mut params_vec, filter, "h");
     append_scope_filter(&mut sql, filter.scope, "h");
-    sql.push_str(" ORDER BY h.timestamp_ms DESC LIMIT ?");
+    sql.push_str(" ORDER BY h.timestamp_ms DESC, h.id DESC LIMIT ?");
     params_vec.push(filter.limit.max(1).to_string());
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), row_to_entry)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// One page of [`recent`], newest first, with a cursor to the next page when
+/// one exists.
+pub fn recent_page(conn: &Connection, filter: &QueryFilter) -> Result<HistoryPage<HistoryEntry>> {
+    let limit = filter.limit.max(1);
+    let mut rows = recent(
+        conn,
+        &QueryFilter {
+            limit: limit + 1,
+            ..filter.clone()
+        },
+    )?;
+    let next_cursor = if rows.len() as i64 > limit {
+        rows.truncate(limit as usize);
+        rows.last().map(|row| HistoryCursor {
+            timestamp_ms: row.timestamp_ms,
+            id: row.id,
+            match_source: None,
+        })
+    } else {
+        None
+    };
+    Ok(HistoryPage { rows, next_cursor })
 }
 
 pub fn session(
@@ -2350,7 +2487,7 @@ pub fn session(
     let mut sql = "SELECT h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms FROM history h WHERE h.session_id = ?".to_string();
     let mut params_vec = vec![session_id.to_string()];
     append_filters(&mut sql, &mut params_vec, &filter, "h");
-    sql.push_str(" ORDER BY h.timestamp_ms ASC");
+    sql.push_str(" ORDER BY h.timestamp_ms ASC, h.id ASC");
     filter.limit = 0;
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), row_to_entry)?;

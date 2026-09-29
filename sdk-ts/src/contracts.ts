@@ -18,8 +18,51 @@ export interface ListOptions {
   source?: Source;
   project?: string;
   tag?: string;
+  /**
+   * Only rows strictly older than this timestamp.
+   *
+   * @deprecated Not a lossless page boundary: rows sharing the boundary
+   * timestamp are skipped. Page with `after` (or `recentPage` /
+   * `searchPage`), and bound a window with `sinceMs` / `untilMs`. Kept, with
+   * its exclusive semantics unchanged, until the next major version.
+   */
   beforeMs?: number;
+  /** Inclusive lower bound on `timestampMs`. */
+  sinceMs?: number;
+  /** Inclusive upper bound on `timestampMs`; must not be before `sinceMs`. */
+  untilMs?: number;
+  /**
+   * Continue strictly after this row in newest-first
+   * `(timestampMs, id, matchSource)` order: the previous page's
+   * `nextCursor`, or the last row's fields. Applied within the time window.
+   */
+  after?: HistoryCursor;
   limit?: number;
+}
+
+/**
+ * Where a newest-first history read stopped. `matchSource` is required to
+ * continue a search whose last row was a `session_event`; absent means
+ * `history`.
+ */
+export interface HistoryCursor {
+  timestampMs: number;
+  id: number;
+  matchSource?: SearchMatchSource;
+}
+
+/** One page of `recent`, newest first. */
+export interface HistoryPage {
+  entries: HistoryEntry[];
+  /** Present only when a further entry exists. */
+  nextCursor: HistoryCursor | null;
+}
+
+/** One page of `search`, newest first. */
+export interface SearchPage {
+  matches: SearchMatch[];
+  /** Present only when a further match exists. */
+  nextCursor: HistoryCursor | null;
 }
 
 /** Which rows a search matches. See `SearchOptions.role`. */

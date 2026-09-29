@@ -10,7 +10,7 @@ pub mod sources;
 
 use std::path::{Path, PathBuf};
 
-use ai_hist::history_search::{search_all, SearchRole, SearchRow};
+use ai_hist::history_search::{search_all, search_page as core_search_page, SearchRole, SearchRow};
 use ai_hist::{
     default_db_path, open_db, open_db_readonly, recent as core_recent, relationship_capabilities,
     schema_is_catalog_read_current, schema_is_event_read_current, schema_is_evidence_read_current,
@@ -36,6 +36,7 @@ use ai_hist::{
     MAX_CHILDREN_PAGE_LIMIT, MAX_TREE_MAX_DEPTH, MAX_TREE_MAX_NODES,
     SESSION_EVIDENCE_CONTRACT_VERSION, SESSION_RELATIONSHIP_CONTRACT_VERSION,
 };
+use ai_hist::{recent_page as core_recent_page, HistoryCursor};
 use ai_hist::{
     schema_is_usage_read_current, session_requests_page as core_session_requests_page,
     session_usage_summary as core_session_usage_summary, NormalizedUsage as CoreNormalizedUsage,
@@ -72,7 +73,10 @@ use serde::Serialize;
 /// uses — prompts and session events, a `role` option, a total
 /// `(timestamp, id)` order — and returns `NativeSearchMatch` rows carrying
 /// `matchSource`, `role` and `kind`.
-pub const NATIVE_CONTRACT_VERSION: u32 = 23;
+/// 24: `search` and `recent` take inclusive `sinceMs`/`untilMs` and a keyset
+/// `after` cursor, and `searchPage`/`recentPage` return a page with a
+/// `nextCursor` computed by over-fetching one row.
+pub const NATIVE_CONTRACT_VERSION: u32 = 24;
 const DEFAULT_LIMIT: i64 = 50;
 const DEFAULT_EVENT_LIMIT: i64 = 200;
 
@@ -216,42 +220,147 @@ pub fn native_build_profile() -> String {
     }
 }
 
+/// Where a newest-first history read stopped: its last row's
+/// `(timestampMs, id)` and, for a search match, its `matchSource`.
 #[napi(object)]
+#[derive(Clone)]
+pub struct NativeHistoryCursor {
+    pub timestamp_ms: i64,
+    pub id: i64,
+    /// `history` (the default when absent) or `session_event`.
+    pub match_source: Option<String>,
+}
+
+impl NativeHistoryCursor {
+    fn into_core(self) -> HistoryCursor {
+        HistoryCursor {
+            timestamp_ms: self.timestamp_ms,
+            id: self.id,
+            match_source: self.match_source,
+        }
+    }
+
+    fn from_core(cursor: HistoryCursor) -> Self {
+        Self {
+            timestamp_ms: cursor.timestamp_ms,
+            id: cursor.id,
+            match_source: cursor.match_source,
+        }
+    }
+}
+
+#[napi(object)]
+#[derive(Default)]
 pub struct HistoryQueryOptions {
     pub scope: Option<String>,
     pub db_path: Option<String>,
     pub source: Option<String>,
     pub project: Option<String>,
     pub tag: Option<String>,
+    /// Deprecated: exclusive, so it skips rows tied on the boundary
+    /// timestamp. Page with `after` instead.
     pub before_ms: Option<i64>,
+    /// Inclusive lower timestamp bound.
+    pub since_ms: Option<i64>,
+    /// Inclusive upper timestamp bound.
+    pub until_ms: Option<i64>,
+    /// Continue after this row (the previous page's `nextCursor`).
+    pub after: Option<NativeHistoryCursor>,
     pub limit: Option<i64>,
 }
 
 impl HistoryQueryOptions {
+    /// Build and validate the filter, so an invalid window or cursor is
+    /// `INVALID_ARGUMENT` with the message every surface uses.
     fn filter(&self, limit: i64) -> napi::Result<QueryFilter> {
-        Ok(QueryFilter {
+        let filter = QueryFilter {
             scope: parse_scope(self.scope.clone())?,
             source: self.source.clone(),
             project: self.project.clone(),
             tag: self.tag.clone(),
             before_ms: self.before_ms,
+            since_ms: self.since_ms,
+            until_ms: self.until_ms,
+            after: self.after.clone().map(NativeHistoryCursor::into_core),
             limit,
-        })
+        };
+        filter
+            .validate()
+            .map_err(|error| native_error("INVALID_ARGUMENT", format!("{error:#}")))?;
+        Ok(filter)
     }
 }
 
 #[napi(object)]
+#[derive(Default)]
 pub struct SearchOptions {
     pub scope: Option<String>,
     pub db_path: Option<String>,
     pub source: Option<String>,
     pub project: Option<String>,
     pub tag: Option<String>,
+    /// Deprecated: exclusive, so it skips rows tied on the boundary
+    /// timestamp. Page with `after` instead.
     pub before_ms: Option<i64>,
+    /// Inclusive lower timestamp bound.
+    pub since_ms: Option<i64>,
+    /// Inclusive upper timestamp bound.
+    pub until_ms: Option<i64>,
+    /// Continue after this match (the previous page's `nextCursor`).
+    pub after: Option<NativeHistoryCursor>,
     pub limit: Option<i64>,
     pub raw_fts: Option<bool>,
     /// `all` (default), `user`, `assistant` or `prompt` — the CLI's `--role`.
     pub role: Option<String>,
+}
+
+struct SearchRequest {
+    path: PathBuf,
+    terms: Vec<String>,
+    raw_fts: bool,
+    filter: QueryFilter,
+    role: SearchRole,
+}
+
+impl SearchRequest {
+    fn new(query: String, options: Option<SearchOptions>) -> napi::Result<Self> {
+        let options = options.unwrap_or_default();
+        let limit = validate_limit(options.limit, 20, 1_000)?;
+        let role = parse_search_role(options.role.as_deref())?;
+        Ok(Self {
+            path: db_path(options.db_path.clone()),
+            terms: query.split_whitespace().map(str::to_string).collect(),
+            raw_fts: options.raw_fts.unwrap_or(false),
+            filter: HistoryQueryOptions {
+                scope: options.scope,
+                db_path: None,
+                source: options.source,
+                project: options.project,
+                tag: options.tag,
+                before_ms: options.before_ms,
+                since_ms: options.since_ms,
+                until_ms: options.until_ms,
+                after: options.after,
+                limit: None,
+            }
+            .filter(limit)?,
+            role,
+        })
+    }
+}
+
+#[napi(object)]
+pub struct NativeSearchPage {
+    pub matches: Vec<NativeSearchMatch>,
+    /// Present only when a further match exists.
+    pub next_cursor: Option<NativeHistoryCursor>,
+}
+
+#[napi(object)]
+pub struct NativeHistoryPage {
+    pub entries: Vec<NativeHistoryEntry>,
+    /// Present only when a further entry exists.
+    pub next_cursor: Option<NativeHistoryCursor>,
 }
 
 #[napi(object)]
@@ -988,38 +1097,49 @@ pub async fn search(
     query: String,
     options: Option<SearchOptions>,
 ) -> napi::Result<Vec<NativeSearchMatch>> {
-    let options = options.unwrap_or(SearchOptions {
-        scope: None,
-        db_path: None,
-        source: None,
-        project: None,
-        tag: None,
-        before_ms: None,
-        limit: None,
-        raw_fts: None,
-        role: None,
-    });
-    let limit = validate_limit(options.limit, 20, 1_000)?;
-    let role = parse_search_role(options.role.as_deref())?;
-    let path = db_path(options.db_path.clone());
-    let filter = QueryFilter {
-        scope: parse_scope(options.scope)?,
-        source: options.source,
-        project: options.project,
-        tag: options.tag,
-        before_ms: options.before_ms,
-        limit,
+    let request = SearchRequest::new(query, options)?;
+    read_database(request.path, Vec::new(), move |conn| {
+        search_all(
+            conn,
+            &request.terms,
+            request.raw_fts,
+            &request.filter,
+            request.role,
+        )?
+        .into_iter()
+        .map(|row| NativeSearchMatch::from_row(conn, row))
+        .collect()
+    })
+    .await
+}
+
+/// One page of `search`, newest first, with the cursor to the next page.
+#[napi]
+pub async fn search_page(
+    query: String,
+    options: Option<SearchOptions>,
+) -> napi::Result<NativeSearchPage> {
+    let request = SearchRequest::new(query, options)?;
+    let empty = NativeSearchPage {
+        matches: Vec::new(),
+        next_cursor: None,
     };
-    let terms = query
-        .split_whitespace()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    let raw_fts = options.raw_fts.unwrap_or(false);
-    read_database(path, Vec::new(), move |conn| {
-        search_all(conn, &terms, raw_fts, &filter, role)?
-            .into_iter()
-            .map(|row| NativeSearchMatch::from_row(conn, row))
-            .collect()
+    read_database(request.path, empty, move |conn| {
+        let page = core_search_page(
+            conn,
+            &request.terms,
+            request.raw_fts,
+            &request.filter,
+            request.role,
+        )?;
+        Ok(NativeSearchPage {
+            matches: page
+                .rows
+                .into_iter()
+                .map(|row| NativeSearchMatch::from_row(conn, row))
+                .collect::<anyhow::Result<_>>()?,
+            next_cursor: page.next_cursor.map(NativeHistoryCursor::from_core),
+        })
     })
     .await
 }
@@ -1027,15 +1147,7 @@ pub async fn search(
 /// Recent indexed history. Never discovers or syncs implicitly.
 #[napi]
 pub async fn recent(options: Option<HistoryQueryOptions>) -> napi::Result<Vec<NativeHistoryEntry>> {
-    let options = options.unwrap_or(HistoryQueryOptions {
-        scope: None,
-        db_path: None,
-        source: None,
-        project: None,
-        tag: None,
-        before_ms: None,
-        limit: None,
-    });
+    let options = options.unwrap_or_default();
     let limit = validate_limit(options.limit, 20, 1_000)?;
     let path = db_path(options.db_path.clone());
     let filter = options.filter(limit)?;
@@ -1044,6 +1156,31 @@ pub async fn recent(options: Option<HistoryQueryOptions>) -> napi::Result<Vec<Na
             .into_iter()
             .map(|entry| NativeHistoryEntry::from_entry(conn, entry))
             .collect()
+    })
+    .await
+}
+
+/// One page of `recent`, newest first, with the cursor to the next page.
+#[napi]
+pub async fn recent_page(options: Option<HistoryQueryOptions>) -> napi::Result<NativeHistoryPage> {
+    let options = options.unwrap_or_default();
+    let limit = validate_limit(options.limit, 20, 1_000)?;
+    let path = db_path(options.db_path.clone());
+    let filter = options.filter(limit)?;
+    let empty = NativeHistoryPage {
+        entries: Vec::new(),
+        next_cursor: None,
+    };
+    read_database(path, empty, move |conn| {
+        let page = core_recent_page(conn, &filter)?;
+        Ok(NativeHistoryPage {
+            entries: page
+                .rows
+                .into_iter()
+                .map(|entry| NativeHistoryEntry::from_entry(conn, entry))
+                .collect::<anyhow::Result<_>>()?,
+            next_cursor: page.next_cursor.map(NativeHistoryCursor::from_core),
+        })
     })
     .await
 }

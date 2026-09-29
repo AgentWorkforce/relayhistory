@@ -50,7 +50,9 @@ export * from './git.js';
 export * from './contracts.js';
 import type {
   HistoryEntry,
+  HistoryPage,
   SearchMatch,
+  SearchPage,
   ListOptions,
   SearchOptions,
   SessionOptions,
@@ -124,6 +126,8 @@ import {
   MAX_TREE_MAX_NODES,
   nullableString,
   historyEntry,
+  historyCursor,
+  nativeHistoryCursor,
   searchMatch,
   catalogCursor,
   catalogSession,
@@ -179,15 +183,44 @@ export async function nativeBuildProfile(): Promise<string> {
 export async function search(query: string, options: SearchOptions = {}): Promise<SearchMatch[]> {
   const scope = options.scope ?? 'local';
   return nativeCall(async (native) =>
-    (await native.search(query, { ...options, scope })).map(searchMatch),
+    (await native.search(query, { ...options, scope, after: nativeHistoryCursor(options.after) })).map(searchMatch),
   );
+}
+
+/**
+ * One page of `search`. Pass the returned `nextCursor` back as `after` to
+ * continue; it is `null` once no further match exists. Pages never skip or
+ * repeat a match among rows present for the whole walk; rows committed
+ * meanwhile appear wherever their `(timestampMs, id)` places them.
+ */
+export async function searchPage(query: string, options: SearchOptions = {}): Promise<SearchPage> {
+  const scope = options.scope ?? 'local';
+  return nativeCall(async (native) => {
+    const page = await native.searchPage(query, { ...options, scope, after: nativeHistoryCursor(options.after) });
+    return {
+      matches: Array.isArray(page.matches) ? page.matches.map(searchMatch) : [],
+      nextCursor: historyCursor(page.nextCursor),
+    };
+  });
 }
 
 export async function recent(options: ListOptions = {}): Promise<HistoryEntry[]> {
   const scope = options.scope ?? 'local';
   return nativeCall(async (native) =>
-    (await native.recent({ ...options, scope })).map(historyEntry),
+    (await native.recent({ ...options, scope, after: nativeHistoryCursor(options.after) })).map(historyEntry),
   );
+}
+
+/** One page of `recent`, with the same cursor contract as `searchPage`. */
+export async function recentPage(options: ListOptions = {}): Promise<HistoryPage> {
+  const scope = options.scope ?? 'local';
+  return nativeCall(async (native) => {
+    const page = await native.recentPage({ ...options, scope, after: nativeHistoryCursor(options.after) });
+    return {
+      entries: Array.isArray(page.entries) ? page.entries.map(historyEntry) : [],
+      nextCursor: historyCursor(page.nextCursor),
+    };
+  });
 }
 
 export async function getSession(
