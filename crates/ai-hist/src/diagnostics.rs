@@ -386,6 +386,11 @@ pub struct CompactReport {
     pub reclaimable_before: u64,
     /// Full-text indexes whose segments were merged.
     pub fts_optimized: Vec<&'static str>,
+    /// Whether the final `wal_checkpoint(TRUNCATE)` completed. `false` when a
+    /// reader holding an older snapshot kept SQLite from resetting the WAL:
+    /// the rewrite still happened, but the WAL keeps its size until a later
+    /// checkpoint runs with no reader in the way.
+    pub wal_truncated: bool,
 }
 
 impl CompactReport {
@@ -412,6 +417,10 @@ pub enum CompactRefused {
     /// floor below which any write risks torn state. Running out of space
     /// midway is how #44 began, so this is checked up front.
     InsufficientSpace { needed: u64, free: u64 },
+    /// The volume's free space could not be measured (`df` missing or
+    /// unreadable). The space guard fails closed rather than starting a
+    /// rewrite it cannot vouch for.
+    SpaceUnknown { needed: u64 },
 }
 
 impl std::fmt::Display for CompactRefused {
@@ -426,6 +435,11 @@ impl std::fmt::Display for CompactRefused {
                 "compacting needs about {} free on the database's volume and only {} is free",
                 human_bytes(*needed),
                 human_bytes(*free)
+            ),
+            Self::SpaceUnknown { needed } => write!(
+                f,
+                "compacting needs about {} free on the database's volume and the free space could not be measured",
+                human_bytes(*needed)
             ),
         }
     }
@@ -445,24 +459,51 @@ impl std::error::Error for CompactRefused {}
 /// Holds the sync run lock for the duration, so a concurrent `sync` or `watch`
 /// tick skips rather than blocking on the rewrite, and refuses outright when
 /// the volume cannot hold the rewrite.
+///
+/// Other crate writers that do not take the sync lock (targeted hydration,
+/// discovery) wait behind the rewrite through their busy handler like behind
+/// any long write.
 pub fn compact_database(db_path: &Path) -> anyhow::Result<CompactReport> {
+    compact_database_measured(db_path, free_bytes)
+}
+
+/// Refuse unless the volume can hold a rewrite of `usage`'s live pages.
+fn ensure_room_to_compact(
+    db_path: &Path,
+    usage: PageUsage,
+    measure_free: &impl Fn(&Path) -> Option<u64>,
+) -> anyhow::Result<()> {
+    let needed = usage
+        .live_bytes()
+        .saturating_mul(2)
+        .saturating_add(FREE_SPACE_FLOOR_BYTES);
+    let Some(free) = measure_free(db_path) else {
+        return Err(CompactRefused::SpaceUnknown { needed }.into());
+    };
+    if free < needed {
+        return Err(CompactRefused::InsufficientSpace { needed, free }.into());
+    }
+    Ok(())
+}
+
+fn compact_database_measured(
+    db_path: &Path,
+    measure_free: impl Fn(&Path) -> Option<u64>,
+) -> anyhow::Result<CompactReport> {
     anyhow::ensure!(db_path.exists(), "no database at {}", db_path.display());
     let Some(_sync) = crate::ingest::try_acquire_sync_lock(db_path)? else {
         return Err(CompactRefused::SyncRunning.into());
     };
     let db_bytes_before = file_len(db_path);
     let wal_bytes_before = file_len(&wal_path(db_path));
+    // Measured through a read-only handle before anything opens the database
+    // writable: `open_db` can run schema migrations, and a refusal has to come
+    // before any write.
+    let before = page_usage(db_path)?;
+    ensure_room_to_compact(db_path, before, &measure_free)?;
     let conn = crate::open_db(db_path)?;
-    let before = read_page_usage(&conn)?;
-    let needed = before
-        .live_bytes()
-        .saturating_mul(2)
-        .saturating_add(FREE_SPACE_FLOOR_BYTES);
-    if let Some(free) = free_bytes(db_path) {
-        if free < needed {
-            return Err(CompactRefused::InsufficientSpace { needed, free }.into());
-        }
-    }
+    // Again after the open, in case a migration grew the live pages.
+    ensure_room_to_compact(db_path, read_page_usage(&conn)?, &measure_free)?;
     let mut fts_optimized = Vec::new();
     for table in COMPACTED_FTS_TABLES {
         let exists: bool = conn.query_row(
@@ -477,11 +518,14 @@ pub fn compact_database(db_path: &Path) -> anyhow::Result<CompactReport> {
             fts_optimized.push(*table);
         }
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
+    // Best effort: a busy result here only means VACUUM writes through a
+    // larger WAL, and the final checkpoint below is the one reported.
+    truncate_wal(&conn)?;
+    conn.execute_batch("VACUUM;")?;
     if fts_optimized.contains(&"trajectory_fts") {
         conn.execute_batch("INSERT INTO trajectory_fts(trajectory_fts) VALUES('rebuild');")?;
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    let wal_truncated = truncate_wal(&conn)?;
     drop(conn);
     Ok(CompactReport {
         db_bytes_before,
@@ -490,7 +534,18 @@ pub fn compact_database(db_path: &Path) -> anyhow::Result<CompactReport> {
         wal_bytes_after: file_len(&wal_path(db_path)),
         reclaimable_before: before.free_bytes(),
         fts_optimized,
+        wal_truncated,
     })
+}
+
+/// Run `wal_checkpoint(TRUNCATE)` and say whether it completed. SQLite reports
+/// a reader that blocked the reset as `busy = 1` in the result row, not as an
+/// error, so the row has to be read.
+fn truncate_wal(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+        row.get::<_, i64>(0)
+    })
+    .map(|busy| busy == 0)
 }
 
 #[cfg(test)]
@@ -545,6 +600,7 @@ mod compact_tests {
         );
         assert!(compacted.saved_bytes() > 0);
         assert_eq!(compacted.wal_bytes_after, 0);
+        assert!(compacted.wal_truncated);
         assert_eq!(
             compacted.fts_optimized,
             vec!["history_fts", "session_events_fts", "trajectory_fts"]
@@ -600,6 +656,74 @@ mod compact_tests {
             "{error:#}"
         );
         assert_eq!(file_len(&db_path), before, "a refusal writes nothing");
+    }
+
+    #[test]
+    fn compact_refuses_when_free_space_cannot_be_measured() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = seeded(dir.path());
+        let before = file_len(&db_path);
+        let error = compact_database_measured(&db_path, |_| None).unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<CompactRefused>(),
+                Some(CompactRefused::SpaceUnknown { .. })
+            ),
+            "{error:#}"
+        );
+        assert_eq!(file_len(&db_path), before, "a refusal writes nothing");
+        assert!(page_usage(&db_path).unwrap().freelist_count > 0);
+    }
+
+    #[test]
+    fn compact_refuses_for_space_before_migrating_an_older_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = seeded(dir.path());
+        // An index the current schema requires: opening writable would
+        // migrate it back into place.
+        Connection::open(&db_path)
+            .unwrap()
+            .execute_batch("DROP INDEX idx_sessions_recency;")
+            .unwrap();
+        let error = compact_database_measured(&db_path, |_| Some(0)).unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<CompactRefused>(),
+                Some(CompactRefused::InsufficientSpace { free: 0, .. })
+            ),
+            "{error:#}"
+        );
+        let migrated: bool = Connection::open(&db_path)
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'idx_sessions_recency')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!migrated, "the refusal must come before any migration");
+    }
+
+    #[test]
+    fn a_wal_checkpoint_blocked_by_a_reader_is_reported_not_claimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = seeded(dir.path());
+        let writer = Connection::open(&db_path).unwrap();
+        writer.busy_timeout(Duration::ZERO).unwrap();
+        writer
+            .execute("DELETE FROM history WHERE timestamp_ms < 100", [])
+            .unwrap();
+        let reader = Connection::open(&db_path).unwrap();
+        reader.execute_batch("BEGIN;").unwrap();
+        let _: i64 = reader
+            .query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))
+            .unwrap();
+        // No busy handler: the pinned snapshot shows up as busy at once.
+        assert!(!truncate_wal(&writer).unwrap());
+        assert!(file_len(&wal_path(&db_path)) > 0);
+        reader.execute_batch("COMMIT;").unwrap();
+        assert!(truncate_wal(&writer).unwrap());
+        assert_eq!(file_len(&wal_path(&db_path)), 0);
     }
 
     #[test]

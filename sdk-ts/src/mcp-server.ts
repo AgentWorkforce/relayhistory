@@ -13,7 +13,7 @@ import {
   MAX_HANDOFF_INTENT_CHARS,
 } from './index.js';
 
-import type { HistoryPluginRegistry } from './index.js';
+import type { HistoryCursor, HistoryPluginRegistry } from './index.js';
 import { loadHistoryApplicationConfig } from './delivery-cli.js';
 
 const READ = { readOnlyHint: true, idempotentHint: true, openWorldHint: false } as const;
@@ -27,8 +27,13 @@ const SESSION_SCOPE = z.enum(['local', 'remote', 'all']);
 const SINCE_MS = z.number().int().optional().describe('Inclusive lower bound on timestampMs.');
 const UNTIL_MS = z.number().int().optional().describe('Inclusive upper bound on timestampMs.');
 const HISTORY_AFTER = z.object({
-  timestampMs: z.number().int(), id: z.number().int(), matchSource: z.enum(['history', 'session_event']).optional(),
-}).optional().describe('Continue strictly after this row: the last row\'s timestampMs, id and (for search) matchSource.');
+  timestampMs: z.number().int(), id: z.number().int(), matchSource: z.string().optional()
+    .describe('history or session_event; any other value is rejected by the shared cursor validation.'),
+}).optional().describe('Continue strictly after this row: the last row\'s timestampMs, id and (for search) matchSource.')
+  // The schema leaves matchSource open so an unknown value reaches the native
+  // cursor validation and fails with its INVALID_ARGUMENT, as on every other
+  // surface, instead of a schema error.
+  .transform((after) => after as HistoryCursor | undefined);
 const SOURCE_CONNECTORS = z.array(z.string().min(1)).optional().describe('Explicit configured source-plugin IDs; [] disables remote acquisition.');
 const packageVersion = JSON.parse(
   readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
@@ -65,10 +70,11 @@ server.tool('search_history',
     .describe('all: prompts and every event; user: prompts and user events; assistant: assistant events; prompt: prompts only.'),
   raw_fts: z.boolean().optional().default(false)
     .describe('Pass the query to SQLite FTS5 verbatim; a malformed expression is an error.'),
+  before_ms: z.number().int().optional().describe('Deprecated: exclusive, so it skips rows tied on the timestamp. Use after.'),
   since_ms: SINCE_MS, until_ms: UNTIL_MS, after: HISTORY_AFTER,
   limit: z.number().int().min(1).max(1000).optional().default(20),
-}, READ, ({ query, source, project, tag, scope, role, raw_fts, since_ms, until_ms, after, limit }) => call(() => search(query, {
-  source, project, tag, scope, role, rawFts: raw_fts, sinceMs: since_ms, untilMs: until_ms, after, limit,
+}, READ, ({ query, source, project, tag, scope, role, raw_fts, before_ms, since_ms, until_ms, after, limit }) => call(() => search(query, {
+  source, project, tag, scope, role, rawFts: raw_fts, beforeMs: before_ms, sinceMs: since_ms, untilMs: until_ms, after, limit,
 })));
 
 server.tool('recent_history', 'List recent already-indexed prompts, newest first by (timestampMs, id). '

@@ -10,6 +10,7 @@ import {
   changesSince, commitChanges, getChangesPage, sync,
   type FeedChange,
 } from './index.js';
+import { feedChange } from './normalization.js';
 
 const SESSION = 'feed-1';
 
@@ -126,4 +127,18 @@ test('the feed refuses what it cannot serve and never creates a database', async
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test('a feed change keeps every source the native feed names, trajectory included', () => {
+  const row = {
+    kind: 'trajectory', source: 'trajectory', sourceName: 'trajectory', sessionId: 't-1',
+    recordKey: 't-1', key: ['trajectory', 't-1'], revision: 7, op: 'upsert', columns: { id: 't-1' },
+  };
+  assert.equal(feedChange(row).source, 'trajectory');
+  // A source a newer release wrote is carried, not failed on.
+  const future = feedChange({ ...row, source: null, sourceName: 'future-harness' });
+  assert.equal(future.source, null);
+  assert.equal(future.sourceName, 'future-harness');
+  // A revision a JavaScript number cannot hold exactly is a broken contract.
+  assert.throws(() => feedChange({ ...row, revision: 2 ** 53 + 2 }), RelayHistoryError);
 });

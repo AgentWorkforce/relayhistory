@@ -12,6 +12,7 @@ import {
   CatalogSource,
   CATALOG_SOURCES,
   isCatalogSource,
+  isSource,
   SessionScope,
   SessionLocation,
   NativeContractMismatchError,
@@ -137,13 +138,17 @@ export function historyCursor(value: unknown): HistoryCursor | null {
   return cursor;
 }
 
-/** The native boundary takes an absent `matchSource`, not an explicit null. */
+/**
+ * The native boundary takes an absent `matchSource`, not an explicit null. Any
+ * other value, an empty string included, goes through so native validation
+ * rejects it instead of it silently paging as `history`.
+ */
 export function nativeHistoryCursor(after: HistoryCursor | undefined): object | undefined {
   if (!after) return undefined;
   return {
     timestampMs: after.timestampMs,
     id: after.id,
-    ...(after.matchSource ? { matchSource: after.matchSource } : {}),
+    ...(after.matchSource != null ? { matchSource: after.matchSource } : {}),
   };
 }
 
@@ -992,17 +997,21 @@ export function changeKind(value: unknown): ChangeKind {
 export function feedChange(value: UnknownRecord): FeedChange {
   const op = value.op;
   if (op !== 'upsert' && op !== 'delete') throw feedMismatch('op', op);
+  // Held to the watermark's rule: a revision a JavaScript number cannot hold
+  // exactly would resume or commit at the wrong place.
+  if (!Number.isSafeInteger(value.revision)) throw feedMismatch('revision', value.revision);
   const columns = value.columns;
   return {
     kind: changeKind(value.kind),
-    // The feed carries a row a newer release wrote rather than failing on it;
+    // Every source the native feed names, trajectory included. A row a newer
+    // release wrote is carried rather than failed on: `source` is null and
     // `sourceName` names a source this SDK does not know.
-    source: isCatalogSource(value.source) ? value.source : null,
+    source: isSource(value.source) ? value.source : null,
     sourceName: String(value.sourceName),
     sessionId: String(value.sessionId),
     recordKey: String(value.recordKey),
     key: Array.isArray(value.key) ? value.key : [],
-    revision: Number(value.revision),
+    revision: value.revision as number,
     op,
     columns: columns && typeof columns === 'object' && !Array.isArray(columns)
       ? (columns as Record<string, unknown>)

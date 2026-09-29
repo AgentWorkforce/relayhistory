@@ -94,7 +94,9 @@ pub fn search_page(
     filter: &QueryFilter,
     role: SearchRole,
 ) -> Result<HistoryPage<SearchRow>> {
-    let limit = filter.limit.max(1);
+    // One row past the page shows whether another follows; a limit no table
+    // can reach is clamped so that over-fetch cannot overflow.
+    let limit = filter.limit.clamp(1, i64::MAX - 1);
     let mut rows = search_all(
         conn,
         terms,
@@ -172,12 +174,33 @@ fn search_event_rows(
          FROM session_events e WHERE 1=1"
             .to_string()
     } else {
-        params_vec.push(crate::build_fts_query(terms, raw_fts));
+        // `session_events_fts` also indexes `role`; an ordinary query must not
+        // match `assistant` or `user` against it, or searching for the word
+        // would return every event of that role. `text` and `project` are the
+        // columns `history_fts` matches a prompt on (`prompt`, `project`), so
+        // both branches read a term the same way. A raw query is the caller's
+        // FTS5 expression, column filters included, and is left as written.
+        let query = crate::build_fts_query(terms, raw_fts);
+        params_vec.push(if raw_fts {
+            query
+        } else {
+            format!("{{text project}} : ({query})")
+        });
         "SELECT e.id, e.source, e.session_id, e.project, COALESCE(e.text, ''), e.ts_ms, e.role, e.kind \
          FROM session_events_fts f JOIN session_events e ON f.rowid = e.id WHERE session_events_fts MATCH ?"
             .to_string()
     };
-    append_event_search_filters(&mut sql, &mut params_vec, filter, "e", role);
+    // The query the history branch runs, which a prompt must match for its
+    // event copy to be dropped as a duplicate of it.
+    let prompt_match = (!terms.is_empty()).then(|| crate::build_fts_query(terms, raw_fts));
+    append_event_search_filters(
+        &mut sql,
+        &mut params_vec,
+        filter,
+        "e",
+        role,
+        prompt_match.as_deref(),
+    );
     sql.push_str(" ORDER BY e.ts_ms DESC, e.id DESC LIMIT ?");
     params_vec.push(filter.limit.max(1).to_string());
     let mut stmt = conn.prepare(&sql)?;
@@ -234,22 +257,54 @@ fn append_history_search_filters(
     );
 }
 
+/// The characters Rust's `str::trim` strips (Unicode `White_Space`), as a
+/// SQLite `trim` set, so a prompt a parser trimmed in Rust pairs with its
+/// verbatim event text.
+const RUST_WHITESPACE: &str = "char(9, 10, 11, 12, 13, 32, 133, 160, 5760, 8192, 8193, 8194, 8195, \
+     8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288)";
+
 fn append_event_search_filters(
     sql: &mut String,
     params: &mut Vec<String>,
     filter: &QueryFilter,
     alias: &str,
     role: SearchRole,
+    prompt_match: Option<&str>,
 ) {
     append_session_scope_filter(sql, filter.scope, alias);
     // A hydrated session records each prompt twice: as its `history` row and
-    // as a user text event. The prompt is the `history` match; the verbatim
-    // event copy would only repeat it under a second id.
-    sql.push_str(&format!(
-        " AND NOT ({alias}.role = 'user' AND {alias}.kind = 'text' \
-           AND EXISTS (SELECT 1 FROM history hp WHERE hp.source = {alias}.source \
-             AND hp.session_id = {alias}.session_id AND hp.prompt = {alias}.text))"
-    ));
+    // as a user text event, written from the same provider record with the
+    // same timestamp. The prompt is the `history` match; the event copy would
+    // only repeat it under a second id. A copy is that turn's row -- same
+    // session, same timestamp, same text up to the surrounding whitespace a
+    // parser trims before writing `history` (OpenCode, with `str::trim`) --
+    // not merely equal text, so a later turn that repeats an earlier prompt
+    // still matches. It is dropped only when the prompt is itself one of this
+    // search's `history` matches: it matches the same query and passes the
+    // same filters. Scope, source and tag are per session and time is the
+    // shared timestamp, so the query and the per-row project are re-applied.
+    // An assistant search reads no prompts and no user events, so it has no
+    // copies to drop.
+    if role != SearchRole::Assistant {
+        let mut mirror = format!(
+            "SELECT 1 FROM history hp WHERE hp.source = {alias}.source \
+               AND hp.session_id = {alias}.session_id AND hp.timestamp_ms = {alias}.ts_ms \
+               AND hp.prompt = trim({alias}.text, {RUST_WHITESPACE})"
+        );
+        if let Some(query) = prompt_match {
+            mirror.push_str(
+                " AND hp.id IN (SELECT rowid FROM history_fts WHERE history_fts MATCH ?)",
+            );
+            params.push(query.to_string());
+        }
+        if let Some(project) = &filter.project {
+            mirror.push_str(" AND hp.project LIKE ?");
+            params.push(format!("%{project}%"));
+        }
+        sql.push_str(&format!(
+            " AND NOT ({alias}.role = 'user' AND {alias}.kind = 'text' AND EXISTS ({mirror}))"
+        ));
+    }
     if let Some(source) = &filter.source {
         sql.push_str(&format!(" AND {alias}.source = ?"));
         params.push(source.clone());
@@ -422,12 +477,18 @@ mod tests {
     #[test]
     fn a_prompt_mirrored_as_a_user_event_matches_once_as_history() {
         let conn = fixture();
-        for (uid, text) in [("u-copy", "needle prompt 1"), ("u-own", "needle follow-up")] {
+        // `u-copy` is prompt 1's own event; `u-padded` is prompt 2's, with
+        // the whitespace a parser trims before writing `history`.
+        for (uid, ts, text) in [
+            ("u-copy", 1_000, "needle prompt 1"),
+            ("u-padded", 1_000, "\u{a0} needle prompt 2\n\u{3000}"),
+            ("u-own", 2_000, "needle follow-up"),
+        ] {
             conn.execute(
                 "INSERT INTO session_events \
                  (source, session_id, message_id, ts_ms, role, kind, text, event_uid) \
-                 VALUES ('claude', 's1', 'm2', 2000, 'user', 'text', ?, ?)",
-                params![text, uid],
+                 VALUES ('claude', 's1', 'm2', ?, 'user', 'text', ?, ?)",
+                params![ts, text, uid],
             )
             .unwrap();
         }
@@ -451,6 +512,126 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    fn prompt_and_user_event(prompt_project: &str, event_ts: i64) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        insert_history(
+            &conn,
+            &HistoryEntry {
+                id: 0,
+                source: "claude".into(),
+                session_id: Some("s1".into()),
+                project: Some(prompt_project.into()),
+                prompt: "retry please".into(),
+                prompt_hash: Some("hash-retry".into()),
+                timestamp_ms: 1_000,
+            },
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, project, message_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('claude', 's1', '/work/needle', 'm1', ?, 'user', 'text', 'retry please', 'u1')",
+            [event_ts],
+        )
+        .unwrap();
+        conn
+    }
+
+    fn filtered(before_ms: Option<i64>, project: Option<&str>) -> QueryFilter {
+        QueryFilter {
+            before_ms,
+            project: project.map(str::to_string),
+            limit: 100,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_later_turn_repeating_a_prompt_is_not_taken_for_its_copy() {
+        let conn = prompt_and_user_event("/work/needle", 2_000);
+        let terms = ["retry".to_string()];
+        let all = search_all(&conn, &terms, false, &filtered(None, None), SearchRole::All).unwrap();
+        assert_eq!(
+            keys(&all),
+            vec![("session_event".into(), 1), ("history".into(), 1)]
+        );
+        let before = search_all(
+            &conn,
+            &terms,
+            false,
+            &filtered(Some(1_500), None),
+            SearchRole::All,
+        )
+        .unwrap();
+        assert_eq!(keys(&before), vec![("history".into(), 1)]);
+    }
+
+    #[test]
+    fn a_copy_survives_when_its_prompt_fails_the_project_filter() {
+        // The prompt and its event copy share the timestamp, but the prompt
+        // row carries a different project.
+        let conn = prompt_and_user_event("/work/other", 1_000);
+        let terms = ["retry".to_string()];
+        let all = search_all(&conn, &terms, false, &filtered(None, None), SearchRole::All).unwrap();
+        assert_eq!(keys(&all), vec![("history".into(), 1)]);
+        let project = search_all(
+            &conn,
+            &terms,
+            false,
+            &filtered(None, Some("needle")),
+            SearchRole::User,
+        )
+        .unwrap();
+        assert_eq!(keys(&project), vec![("session_event".into(), 1)]);
+    }
+
+    #[test]
+    fn a_copy_matched_only_by_its_own_project_is_kept() {
+        // Same turn, but only the event's project matches the query; the
+        // prompt is not a match, so the event must not be dropped for it.
+        let conn = prompt_and_user_event("/work/alpha", 1_000);
+        let by_text =
+            search_all(&conn, &["retry".to_string()], false, &filtered(None, None), SearchRole::All)
+                .unwrap();
+        assert_eq!(keys(&by_text), vec![("history".into(), 1)]);
+        let by_project = search_all(
+            &conn,
+            &["needle".to_string()],
+            false,
+            &filtered(None, None),
+            SearchRole::User,
+        )
+        .unwrap();
+        assert_eq!(keys(&by_project), vec![("session_event".into(), 1)]);
+    }
+
+    #[test]
+    fn an_ordinary_query_does_not_match_an_events_role() {
+        let conn = fixture();
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, project, message_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('claude', 's1', '/work/needle', 'm3', 3000, 'assistant', 'text', 'done', 'e-done')",
+            [],
+        )
+        .unwrap();
+        let role_word = ["assistant".to_string()];
+        assert!(search_all(&conn, &role_word, false, &filter(100), SearchRole::All)
+            .unwrap()
+            .is_empty());
+        // The project column is matched on both branches, as `history_fts`
+        // always has; a raw query may still name the role column itself.
+        let project_word = ["work".to_string()];
+        let by_project =
+            search_all(&conn, &project_word, false, &filter(100), SearchRole::Assistant).unwrap();
+        assert!(by_project.iter().any(|row| row.text == "done"));
+        let raw = ["role : assistant".to_string()];
+        let by_role =
+            search_all(&conn, &raw, true, &filter(100), SearchRole::Assistant).unwrap();
+        assert_eq!(by_role.len(), 3);
     }
 
     #[test]
@@ -602,6 +783,18 @@ mod tests {
             }
             assert_eq!(ids, vec![3, 2, 1, 4], "page size {page_size}");
         }
+    }
+
+    #[test]
+    fn the_largest_limit_returns_every_row_without_overflowing() {
+        let conn = fixture();
+        let terms = ["needle".to_string()];
+        let search = search_page(&conn, &terms, false, &filter(i64::MAX), SearchRole::All).unwrap();
+        assert_eq!(search.rows.len(), 7);
+        assert!(search.next_cursor.is_none());
+        let recent = crate::recent_page(&conn, &filter(i64::MAX)).unwrap();
+        assert_eq!(recent.rows.len(), 4);
+        assert!(recent.next_cursor.is_none());
     }
 
     #[test]

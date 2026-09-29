@@ -134,6 +134,19 @@ test('the TypeScript CLI and MCP return the SDK search result', async () => {
       const text = (result.content as Array<{ text: string }>)[0].text;
       assert.deepEqual(JSON.parse(text), JSON.parse(JSON.stringify(expected)));
 
+      assert.ok(tool.inputSchema.properties?.before_ms, 'search_history exposes before_ms');
+      const newest = expected[0];
+      const bounded = await client.callTool({
+        name: 'search_history', arguments: { query: 'searchneedle', before_ms: newest.timestampMs },
+      });
+      assert.equal(bounded.isError, undefined);
+      const boundedRows = JSON.parse((bounded.content as Array<{ text: string }>)[0].text) as SearchMatch[];
+      assert.deepEqual(
+        boundedRows.map(identity),
+        expected.filter((match) => match.timestampMs < newest.timestampMs).map(identity),
+      );
+      assert.ok(boundedRows.length > 0, 'an older match is still returned');
+
       const malformed = await client.callTool({
         name: 'search_history', arguments: { query: 'parity-check', raw_fts: true },
       });

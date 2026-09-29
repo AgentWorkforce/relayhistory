@@ -122,10 +122,14 @@ test('sinceMs and untilMs are inclusive and validated at the boundary', async ()
       await assert.rejects(read, (error: unknown) =>
         error instanceof InvalidArgumentError && /since_ms \(2\) must not be later than until_ms \(1\)/.test(error.message));
     }
-    await assert.rejects(
-      () => search('pageneedle', { dbPath, after: { timestampMs: 1, id: 1, matchSource: 'tool' as never } }),
-      InvalidArgumentError,
-    );
+    for (const matchSource of ['tool', '']) {
+      await assert.rejects(
+        () => search('pageneedle', { dbPath, after: { timestampMs: 1, id: 1, matchSource: matchSource as never } }),
+        (error: unknown) => error instanceof InvalidArgumentError
+          && /cursor match_source must be history or session_event/.test(error.message),
+        `matchSource ${JSON.stringify(matchSource)} is rejected, not read as history`,
+      );
+    }
   });
 });
 
@@ -174,6 +178,14 @@ test('the TypeScript CLI and MCP page with the same cursor and window', async ()
       const invalid = await client.callTool({ name: 'search_history', arguments: { query: 'pageneedle', since_ms: 2, until_ms: 1 } });
       assert.equal(invalid.isError, true);
       assert.match(JSON.stringify(invalid.content), /since_ms \(2\) must not be later than until_ms \(1\)/);
+
+      // An unknown cursor source reaches the shared validation, not a schema error.
+      const badCursor = await client.callTool({
+        name: 'search_history',
+        arguments: { query: 'pageneedle', after: { timestampMs: 1, id: 1, matchSource: 'tool' } },
+      });
+      assert.equal(badCursor.isError, true);
+      assert.match(JSON.stringify(badCursor.content), /INVALID_ARGUMENT: cursor match_source must be history or session_event \(got tool\)/);
     } finally {
       await client.close();
       await transport.close();

@@ -72,7 +72,9 @@ totalTokens, modelUsage}`. It is stored verbatim under `usage` in the turn's
 last assistant event's `token_json`, beside the `context_total_tokens`
 snapshot, and only `usage` is normalized. `inputTokens` includes the
 `cachedReadTokens` subset, so cache reads are subtracted out of input (a cache
-count above input is `USAGE_COUNTER_REGRESSED`, never a clamp);
+count above a reported input is `USAGE_COUNTER_REGRESSED`, never a clamp; a
+breakdown with no input keeps its cache reads and reports input as not
+covered);
 `outputTokens` includes `reasoningTokens` and stays as written, with reasoning
 reported beside it, as for Codex. `usage.totalTokens` is the provider's total
 (input + output). The context snapshot is a window occupancy, not spend: a
@@ -81,6 +83,13 @@ evidence, and the two numbers are never added. Spellings accepted for each
 counter follow tokscale's reader (`promptTokens`/`input_tokens`,
 `completionTokens`/`output_tokens`, `cacheReadTokens`/`cache_read_input_tokens`,
 ...). `costUsdTicks` is kept in the stored object but not read as a cost.
+
+Grok names none of its API calls, and the breakdown is one per turn, so the
+turn is the request: every assistant row of a turn — thinking, each tool call,
+the prose — carries the turn's index as its `request_span`, and
+`session_requests` groups them as one `request-span` request. A session
+indexed before this is re-read once, by `sync` (the `grok_events_v2` state
+key) and by hydration (parser version 12).
 
 ### Codex
 
@@ -235,15 +244,18 @@ call by the number of records it was split across.
   `cache_read_input_tokens`, `cache_creation_input_tokens`, `cache_creation`)
   is the same on every copy; `output_tokens` grows, and `iterations`,
   `server_tool_use` and `output_tokens_details` appear only on later copies.
-  The parser settles those copies when it stores them: counters take the
-  largest value any copy reports, a field only some copies carry is kept, and
-  the settled blob is written onto **every** row of the request, including rows
-  an earlier pass stored, so the view still sees one blob. The rule is
-  order-independent, so a copy that arrives out of order never shrinks a stored
-  value. Copies that disagree on the input side, carry a counter that is not a
-  non-negative integer, or differ in any other field are not snapshots of one
-  response; they are stored verbatim and the request stays
-  `ambiguous-usage-copies`. Each copy keeps its own event rows: the copies
+  The parser settles those copies when it stores them, on the key the view
+  groups them by — `requestId`, or `message.id` alone for a transcript that
+  writes no `requestId`. Within the output side, counters take the largest
+  value any copy reports and `iterations` keeps the longest run of entries
+  (the shared entries reconciled, the extra ones kept); a field only some
+  copies carry is kept; and the settled blob is written onto **every** row of
+  the request, including rows an earlier pass stored, so the view still sees
+  one blob. The rule is order-independent, so a copy that arrives out of order
+  never shrinks a stored value. Copies that disagree on the input side, carry
+  an output counter that is not a non-negative integer, or differ in any other
+  field — a reported `cost_usd` included — are not snapshots of one response;
+  they are stored verbatim and the request stays `ambiguous-usage-copies`. Each copy keeps its own event rows: the copies
   carry different content blocks, not growing text, so nothing is dropped to
   make the numbers agree. A database indexed before this rule is settled once,
   from its stored rows, when it is next opened writable.
@@ -252,7 +264,9 @@ call by the number of records it was split across.
   is `<synthetic>`, with zeroed usage. They are stored as a `local_notice`
   marker, never as assistant events, so they are not requests, carry no
   usage, contribute no model and never become a session's last assistant
-  text.
+  text. A database indexed before this rule also has the placeholder removed
+  from each session's model list, and an excerpt quoting a notice replaced by
+  the last real assistant text, when it is next opened writable.
 
 Because it is a view rather than a materialized table, it cannot drift from the
 events it is derived from, and there is exactly one implementation of the

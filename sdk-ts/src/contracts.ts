@@ -727,7 +727,7 @@ export interface Watermark {
 export interface FeedChange {
   kind: ChangeKind;
   /** Null for a source this build does not know; `sourceName` still names it. */
-  source: CatalogSource | null;
+  source: Source | null;
   sourceName: string;
   /** The parent for a relationship, the id for a trajectory, empty for a prompt with no session. */
   sessionId: string;
