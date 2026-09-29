@@ -1,0 +1,45 @@
+# "A second parser reappeared" tripwire (#184). relayhistory is the single
+# owner of acquiring and parsing harness session logs; burn reads evidence
+# through the ai-hist crate. burn's cutover release (burn #562, the 5.0.0
+# major) deletes its harness readers. After that release is tagged, this
+# fails if burn main again has `crates/relayburn-sdk/src/reader/claude.rs`,
+# `reader/codex.rs` or `reader/opencode.rs`.
+#
+# It keys off the tag `relayburn-sdk-v5.0.0` (burn tags each crate release;
+# the readers live in relayburn-sdk). Until that tag exists the run is a
+# notice and green. If burn names the cutover release differently, set the
+# repository variable BURN_CUTOVER_TAG, or pass `cutover_tag` to a manual run.
+#
+# Weekly and manual only -- not on pull requests: nothing in a relayhistory
+# PR can change the outcome.
+name: burn reader tripwire
+
+on:
+  workflow_dispatch:
+    inputs:
+      cutover_tag:
+        description: "burn tag after which its harness readers must be gone"
+        required: false
+        default: ""
+  schedule:
+    # Mondays, 07:41 UTC. Off the hour so it does not queue behind every
+    # other scheduled workflow on the runners.
+    - cron: "41 7 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  tripwire:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Shallow-clone burn main
+        run: git clone --depth 1 --no-tags https://github.com/AgentWorkforce/burn.git burn
+      - name: burn has no harness readers after its cutover release
+        env:
+          BURN_CUTOVER_TAG: ${{ inputs.cutover_tag || vars.BURN_CUTOVER_TAG || 'relayburn-sdk-v5.0.0' }}
+        run: node scripts/burn-guardrails.mjs tripwire --burn-dir burn --cutover-tag "$BURN_CUTOVER_TAG"

@@ -156,6 +156,57 @@ jobs:
           cargo tree --prefix none --depth 1 -e normal | tee /dev/stderr \
             | grep -qE '^ai-hist v[0-9.]+ \(.*/crates/ai-hist\)$'
 
+  # burn (AgentWorkforce/burn) reads session evidence through this crate and
+  # derives its ledger identity from it: a change here to message ids,
+  # timestamps or usage dedup changes burn's turn fingerprints and duplicates
+  # or collapses its cost rows, and nothing in this workspace can see that.
+  # This job builds burn main against this checkout via `[patch.crates-io]`
+  # and runs burn's relayhistory parity suite over the shared fixture corpus
+  # (#183). Until burn main has that suite (burn #557: the
+  # `relayhistory-source` feature and the `relayhistory_parity` test target)
+  # the probe step reports a notice and the job passes without running it;
+  # it arms itself when the suite lands, with no change here. Making it a
+  # required check is a branch-protection setting.
+  burn-contract-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: AgentWorkforce/burn
+          ref: main
+          path: burn
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Does burn main have the relayhistory parity suite?
+        id: probe
+        run: node scripts/burn-guardrails.mjs parity-probe --burn-dir burn
+      - uses: Swatinem/rust-cache@v2
+        if: steps.probe.outputs.ready == 'true'
+        with:
+          workspaces: burn -> target
+          key: ci-burn-contract-drift
+      # `--config` rather than editing burn's files, so a `.cargo/config.toml`
+      # burn may carry is left alone. A patch Cargo cannot apply is only a
+      # warning, and the suite would then test the published crate instead:
+      # the workspace crate's version must satisfy burn's `ai-hist` pin.
+      - name: burn resolves ai-hist to this checkout
+        if: steps.probe.outputs.ready == 'true'
+        working-directory: burn
+        run: |
+          cargo tree --config "patch.crates-io.ai-hist.path=\"$GITHUB_WORKSPACE/crates/ai-hist\"" \
+            -p relayburn-sdk --features relayhistory-source -e normal -i ai-hist --prefix none \
+            | tee /dev/stderr | grep -qE '^ai-hist v[0-9.]+ \(.*/crates/ai-hist\)$'
+      - name: burn parity suite against this checkout
+        if: steps.probe.outputs.ready == 'true'
+        working-directory: burn
+        run: |
+          cargo test --config "patch.crates-io.ai-hist.path=\"$GITHUB_WORKSPACE/crates/ai-hist\"" \
+            -p relayburn-sdk --features relayhistory-source --test relayhistory_parity
+
   msrv:
     runs-on: ubuntu-latest
     steps:
