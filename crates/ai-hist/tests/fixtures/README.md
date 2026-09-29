@@ -159,6 +159,9 @@ source without deciding which one fails the test.
 | `codex/recovered-span-covers-two-turns` | relayhistory | `codex/recovered-span-covers-two-turns.jsonl` | a readable snapshot recovers a span an unreadable one left open, so its delta measures both turns as one request |
 | `codex/context-wrapper` | relayhistory | `codex/context-wrapper.jsonl` | an `<environment_context>` wrapper the app injects as a user `response_item` ahead of the human's mirrored turn |
 | `codex/two-requests-one-turn` | relayhistory | `codex/two-requests-one-turn.jsonl` | a tool loop makes two API calls inside one turn_id, so the turn is not the request |
+| `codex/fork-human` | relayhistory | `codex/fork-human/parent.jsonl`, `codex/fork-human/child.jsonl` | a human fork (`forked_from_id`, `thread_source: user`) whose rollout replays the parent's `session_meta`, both turns and their cumulative `token_count` before its own turn |
+| `codex/fork-subagent` | relayhistory | `codex/fork-subagent/root.jsonl`, `codex/fork-subagent/subagent.jsonl` | a spawned subagent naming its parent in `source.subagent.thread_spawn.parent_thread_id`, replaying the parent's open turn (with a tool call) and starting its own turn in the thread id's own millisecond |
+| `codex/guardian-review` | relayhistory | `codex/guardian-review/parent.jsonl`, `codex/guardian-review/guardian.jsonl` | a Codex 0.150+ `thread_source: guardian_review` rollout with `parent_thread_id` that opens on a `compaction` item rather than a replay |
 
 ### `cursor`
 

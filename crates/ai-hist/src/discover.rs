@@ -84,7 +84,7 @@ pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 4;
 /// invalidates every stored stamp, so a scanner that learns to extract a new
 /// field re-reads sources whose bytes never changed. `parser_version` keeps its
 /// existing meaning (full-ingest parser generation) and is untouched.
-pub const SHALLOW_SCANNER_VERSION: u32 = 7;
+pub const SHALLOW_SCANNER_VERSION: u32 = 8;
 
 /// Version 2 shipped the classification that hid standalone guardians (see
 /// [`crate::codex_is_subagent`]). Their rollouts never change on disk, so the
@@ -126,6 +126,16 @@ const _: () = assert!(SHALLOW_SCANNER_VERSION > 5);
 /// `session_meta` line once (see `codex_evidence_is_current`), which is what
 /// banks Codex fork lineage and reclassifies those guardians.
 const _: () = assert!(SHALLOW_SCANNER_VERSION > 6);
+
+/// Version 8 applies the forked-rollout replay gate
+/// (`codex::ForkReplayGate`) to a Codex fork's `first_prompt`: a human fork
+/// used to be catalogued under the parent's first prompt, copied into its
+/// file by the replay. A finished fork never changes on disk, so only this
+/// bump sends its cached row through the gate. It also moves the sweep
+/// generation, so the first `sync` after the upgrade runs and its rollout walk
+/// spends the one-time `codex_fork_replay_gate` re-read that retires the
+/// replayed rows an earlier build indexed under each fork.
+const _: () = assert!(SHALLOW_SCANNER_VERSION > 7);
 
 /// Most bytes a shallow head read may consume from one transcript.
 pub const HEAD_SCAN_MAX_BYTES: u64 = 256 * 1024;
@@ -1619,13 +1629,23 @@ impl ShallowSessionProvider for CodexProvider {
         let mut first_prompt = None;
         let mut first_activity_ms = claude_timestamp(&meta);
         let mut last_activity_ms = first_activity_ms;
-        for line in bounded.head_records() {
+        // A fork's copy of its parent's history is the parent's, so its
+        // prompts are not this session's first prompt -- the same rule the
+        // rollout walk applies to `history`.
+        let mut replay_gate = crate::codex::ForkReplayGate::new(
+            crate::codex::fork_parent_id(payload, session_id),
+            crate::codex::fork_origin_ms(payload, session_id, claude_timestamp(&meta)),
+        );
+        for (index, line) in bounded.head_records().enumerate() {
             let Some(value) = parse_record(line) else {
                 continue;
             };
             if let Some(ts) = claude_timestamp(&value) {
                 first_activity_ms.get_or_insert(ts);
                 last_activity_ms = Some(ts);
+            }
+            if replay_gate.step(index == 0, &value) == crate::codex::ReplayStep::Replay {
+                continue;
             }
             if value.get("type").and_then(Value::as_str) == Some("turn_context") {
                 push_unique(

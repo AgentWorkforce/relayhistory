@@ -509,6 +509,7 @@ it holds for every kind.
 | `stream_error` | – | ✓ | – | – | `stream_error` |
 | `tool_begin` | – | ✓ any `*_begin` | – | – | `exec_command_begin`, `patch_apply_begin`, `mcp_tool_call_begin` |
 | `review_mode` | – | ✓ | – | – | `entered_review_mode`, `exited_review_mode` |
+| `fork_replay_boundary` | – | ✓ one per replayed span in a forked rollout: `parent_id` is the fork parent, `turn_id` the child turn that closed it, `payload_json` carries `first_line`, `last_line`, `replayed_lines`, `closed_by` (`turn_id`, `task_started.started_at`, `undecided`, or null while the span is still open) and `inherited_total_tokens` | – | – | `session_meta` |
 | `unsupported_block` | ✓ any content block with no event `kind`, plus thinking signatures | – | – | – | `image`, `document`, `redacted_thinking`, `server_tool_use`, `thinking_signature` |
 | `encrypted_reasoning` | – | ✓ `response_item/reasoning` | ✓ an opaque reasoning trace with no summary | ✓ `reasoning_committed` with only `encrypted_content` | `reasoning` |
 | `tool_replacement` | ✓ `_meta.replaces` / `_meta.collapsedCalls` | – | – | – | `tool_result` |
@@ -547,6 +548,18 @@ is one more rule to miss. A Claude record that wrote no row falls back to
 `unknown` carrying its provider type, and a Codex line measured against
 SQLite's own `total_changes` does the same: a blank `agent_message` or a
 `*_end` with no `call_id` is stored by nothing, whatever the handler list says.
+
+One Codex span is accounted for as a whole rather than line by line: the
+parent history a forked rollout replays before its own first turn. Those lines
+are the parent's evidence, already indexed under the parent, so they write
+nothing under the child, and the single `fork_replay_boundary` marker above
+stands for all of them. The span opens only at the parent's own `session_meta`
+reappearing in a rollout that named that parent in `forked_from_id` or
+`source.subagent.thread_spawn.parent_thread_id`, and closes at the first turn
+it can attribute to the child or cannot order at all; the rule is
+`codex::ForkReplayGate`, which shallow discovery applies too, so a fork's
+`first_prompt` is its own. See [architecture](architecture.md) for the full
+rule.
 
 Codex keeps one explicit exception list, for lines that are state updates
 rather than records and whose information is stored elsewhere: `session_meta`
@@ -1775,10 +1788,13 @@ copy. In the benchmark below, a rescan of 450 unchanged sessions performs
 The `v{N}` prefix is the *scanner* version (`SHALLOW_SCANNER_VERSION`), separate
 from `parser_version` (the full-ingest parser generation). Bumping it
 invalidates every stored stamp, so a scanner taught to extract a new field
-re-reads sources whose bytes never changed. It is at **5**: version 3 shipped
+re-reads sources whose bytes never changed. It is at **8**: version 3 shipped
 the prompt-only Cursor reader, 4 added that provider's injected turn times,
-models and last assistant reply, and 5 qualifies OpenCode model IDs with their
-provider. Without these bumps, unchanged sources would keep serving the older
+models and last assistant reply, 5 qualifies OpenCode model IDs with their
+provider, 6 derives Claude's `first_prompt` from `ingest::control`, 7
+classifies a Codex `guardian_review` thread with a parent as a subagent, and 8
+keeps a Codex fork's replayed parent prompt out of its `first_prompt`. Without
+these bumps, unchanged sources would keep serving the older
 cached shape forever. The cost is one re-read per source, once.
 
 ### Transcript byte cursors
