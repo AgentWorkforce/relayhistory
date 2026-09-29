@@ -268,8 +268,11 @@ Notable changes to the native `ai-hist` CLI are documented here.
 - Claude discovery and `sync` no longer treat the subagent workflow journal
   (`<session>/subagents/**/journal.jsonl`) as a transcript. It is metadata
   that shares the `.jsonl` extension; it is no longer listed as a discovery
-  candidate, opened, or tracked with a transcript cursor, and a cursor an
-  earlier build kept for it is dropped on the next sync.
+  candidate, opened, or tracked with a transcript cursor. On the first sync
+  after upgrading, what an earlier build derived from a journal is retracted:
+  its cursor and continuity evidence, the `unknown` markers its lines were
+  stored as (matched by each line's identity, so a transcript's own markers
+  are untouched), and a session `raw_path` left pointing at it.
   ([#208](https://github.com/AgentWorkforce/relayhistory/issues/208))
 
 ### Rust API
