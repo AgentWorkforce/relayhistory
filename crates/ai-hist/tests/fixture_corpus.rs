@@ -833,7 +833,7 @@ fn build_corpus() -> BTreeMap<String, Value> {
     // `getenv` inside the staging window is the library's own. It is dropped
     // when the build finishes: every snapshot is already in memory by then,
     // and nothing else in this binary reads `HOME`.
-    let root = tempfile::tempdir().expect("corpus temp root");
+    let root = corpus_temp_root();
     let mut snapshots = BTreeMap::new();
     for fixture in CORPUS {
         if fixture.layout == Layout::Reference {
@@ -847,6 +847,30 @@ fn build_corpus() -> BTreeMap<String, Value> {
     }
     snapshots
 }
+
+/// The temp root every fixture `HOME` is staged under, kept short.
+///
+/// Marker payload strings are bounded at [`MARKER_PAYLOAD_FIELD_LIMIT`]
+/// characters, and some of them are absolute paths under `HOME` (Grok's
+/// `prompt_context` marker records where `prompt_context.json` was). Where that
+/// bound cuts such a path depends on how long `HOME` is, so a long temp root
+/// makes the snapshot depend on the machine: `$TMPDIR` on macOS is
+/// `/var/folders/<2>/<28>/T/`, long enough to cut
+/// `…/grok-evt-0001/prompt_context.json` to `…/grok-evt-0001/prom`, while
+/// Linux CI's `/tmp` is not. Staging under `/tmp` on every Unix keeps each
+/// path whole, so the committed (Linux-generated) values hold everywhere, and
+/// [`assert_home_paths_fit_marker_bound`] fails loudly if a platform's root is
+/// still too long rather than letting it read as a parser change.
+fn corpus_temp_root() -> tempfile::TempDir {
+    let builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    return builder.tempdir_in("/tmp").expect("corpus temp root");
+    #[cfg(not(unix))]
+    return builder.tempdir().expect("corpus temp root");
+}
+
+/// Mirrors `ingest::MARKER_PAYLOAD_FIELD_LIMIT`, which is crate-private.
+const MARKER_PAYLOAD_FIELD_LIMIT: usize = 128;
 
 fn capture(fixture: &Fixture, home: &Path) -> Value {
     let opencode_db = home.join(".local/share/opencode/opencode.db");
@@ -1019,7 +1043,52 @@ fn redact(value: Value, home: &Path) -> Value {
     // form is `/private/var/...`, so replacing the short one first would leave
     // `/private<home>/…` behind and the long one would then never match.
     homes.sort_by_key(|home| std::cmp::Reverse(home.len()));
+    assert_home_paths_fit_marker_bound(&value, &homes);
     redact_value(value, &homes, false)
+}
+
+/// Fail if a marker payload string that carries the fixture's `HOME` reached
+/// the payload bound.
+///
+/// Such a string was (or may have been) cut at a point set by `HOME`'s length,
+/// which redaction cannot undo: `<home>` replaces the prefix, but the missing
+/// tail stays missing, and the snapshot would then differ between machines for
+/// a reason no parser change explains. See [`corpus_temp_root`].
+fn assert_home_paths_fit_marker_bound(snapshot: &Value, homes: &[String]) {
+    fn walk(value: &Value, homes: &[String], home_len: usize) {
+        match value {
+            Value::String(text) => {
+                let carries_home = homes.iter().any(|home| text.contains(home.as_str()));
+                assert!(
+                    !carries_home || text.chars().count() < MARKER_PAYLOAD_FIELD_LIMIT,
+                    "marker payload path `{text}` reached the {MARKER_PAYLOAD_FIELD_LIMIT}-char \
+                     payload bound, so where it was cut depends on the fixture HOME's length \
+                     ({home_len} chars); stage the corpus under a shorter temp root",
+                );
+            }
+            Value::Array(items) => items.iter().for_each(|item| walk(item, homes, home_len)),
+            Value::Object(map) => map.values().for_each(|item| walk(item, homes, home_len)),
+            _ => {}
+        }
+    }
+    // A HOME at or over the bound would be cut inside itself, and the cut
+    // string would no longer contain it for `walk` to find. Every form is
+    // checked, because the canonical one (`/private/tmp/…` on macOS) is what
+    // ingest may have stored.
+    for home in homes {
+        assert!(
+            home.chars().count() < MARKER_PAYLOAD_FIELD_LIMIT,
+            "fixture HOME `{home}` is at least the {MARKER_PAYLOAD_FIELD_LIMIT}-char marker \
+             payload bound; stage the corpus under a shorter temp root",
+        );
+    }
+    let home_len = homes.iter().map(String::len).min().unwrap_or(0);
+    let markers = snapshot["session_markers"].as_array().into_iter().flatten();
+    for payload in markers.filter_map(|marker| marker["payload_json"].as_str()) {
+        if let Ok(payload) = serde_json::from_str::<Value>(payload) {
+            walk(&payload, homes, home_len);
+        }
+    }
 }
 
 fn redact_value(value: Value, homes: &[String], stamp: bool) -> Value {
