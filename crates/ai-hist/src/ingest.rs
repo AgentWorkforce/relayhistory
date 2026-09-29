@@ -8830,9 +8830,9 @@ pub(crate) fn heal_claude_request_evidence(conn: &Connection) -> Result<()> {
             None,
         )?;
     }
-    // The notice's text is joined in block order, as a fresh parse writes it:
-    // a Claude text row's uid is `{message_id}:{block_index}`, and
-    // `group_concat` alone promises no order, so the rows' storage order
+    // The notice's text is its text rows joined in block order, as a fresh
+    // parse writes it: a Claude row's uid is `{message_id}:{block_index}`,
+    // and `group_concat` alone promises no order, so the rows' storage order
     // could otherwise reorder a multi-block notice.
     conn.execute_batch(
         "INSERT INTO session_markers \
@@ -8841,6 +8841,7 @@ pub(crate) fn heal_claude_request_evidence(conn: &Connection) -> Result<()> {
                 message_id, MIN(parent_id), 'local_notice', 'synthetic', \
                 group_concat(text, char(10) \
                   ORDER BY CAST(substr(event_uid, length(message_id) + 2) AS INTEGER), id) \
+                  FILTER (WHERE kind = 'text') \
          FROM session_events \
          WHERE source = 'claude' AND role = 'assistant' \
            AND lower(trim(model)) = '<synthetic>' \
@@ -9703,15 +9704,20 @@ fn retract_claude_workflow_journal(conn: &Connection, journal: &Path) -> Result<
                 _ => None,
             })
             .collect();
+        // An empty `sessionId` names no session, as in the walk that wrote
+        // these markers: it neither is the file's session nor keeps a line
+        // from falling back to it.
+        let non_empty_session_id = |obj: &Map<String, Value>| {
+            obj.get("sessionId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
+        };
         let file_session_id = records
             .iter()
-            .find_map(|(obj, _)| obj.get("sessionId").and_then(Value::as_str))
-            .map(str::to_owned);
+            .find_map(|(obj, _)| non_empty_session_id(obj));
         for (obj, line) in &records {
-            let Some(session_id) = obj
-                .get("sessionId")
-                .and_then(Value::as_str)
-                .or(file_session_id.as_deref())
+            let Some(session_id) = non_empty_session_id(obj).or_else(|| file_session_id.clone())
             else {
                 continue;
             };
@@ -11329,8 +11335,9 @@ pub(crate) struct GrokIngestOutcome {
     pub updates_yielded_no_timing: bool,
     /// The newest `turn_completed` context snapshot, for the caller's report.
     pub context_total_tokens: Option<i64>,
-    /// Turns whose `turn_completed` carried a per-turn usage breakdown, and
-    /// how many turns `updates.jsonl` opened in all.
+    /// Turns whose `turn_completed` usage breakdown was stored on one of the
+    /// turn's assistant rows, and how many turns `updates.jsonl` opened in
+    /// all.
     pub usage_turns: usize,
     pub turns: usize,
 }
@@ -11395,6 +11402,9 @@ fn ingest_grok_session(
     // displace the message, and a turn with no message still has a tail.
     let mut turn_tail: HashMap<usize, String> = HashMap::new();
     let mut turn_tool_tail: HashMap<usize, String> = HashMap::new();
+    // The last resort: a turn whose only readable output was its thinking
+    // still shares one request span, and its usage belongs on that row.
+    let mut turn_thinking_tail: HashMap<usize, String> = HashMap::new();
     // The whole session is re-read on every pass (its evidence is replaced
     // above), so the indexes are the same every time.
     let mut tool_results = tool_result_facts::ToolResultIndexer::default();
@@ -11592,6 +11602,9 @@ fn ingest_grok_session(
                     },
                 )?;
                 outcome.events += 1;
+                if let Some(turn) = turn {
+                    turn_thinking_tail.insert(turn, uid);
+                }
             }
             grok::GrokRecord::Assistant { text, model, calls } => {
                 if let Some(text) = text {
@@ -11805,8 +11818,16 @@ fn ingest_grok_session(
     // is estimated here.
     for (turn, timing) in session.updates.turns.iter().enumerate() {
         check_capture_cancelled()?;
-        let tail = turn_tail.get(&turn).or_else(|| turn_tool_tail.get(&turn));
+        let tail = turn_tail
+            .get(&turn)
+            .or_else(|| turn_tool_tail.get(&turn))
+            .or_else(|| turn_thinking_tail.get(&turn));
         let Some(uid) = tail else {
+            // A breakdown with no assistant row to carry it is not stored,
+            // so it must not count toward the coverage the caller reports.
+            if timing.usage.is_some() {
+                outcome.usage_turns = outcome.usage_turns.saturating_sub(1);
+            }
             continue;
         };
         if timing.total_tokens.is_none() && timing.usage.is_none() {
@@ -14432,6 +14453,49 @@ mod tests {
         assert_eq!((usage, span.as_deref()), (Some(1000), Some("0")));
     }
 
+    /// A turn whose only readable output is its thinking still stores its
+    /// `turn_completed.usage`, on that thinking row, and counts as measured.
+    #[test]
+    fn a_thinking_only_grok_turn_keeps_its_usage() {
+        let home = tempfile::tempdir().unwrap();
+        let (chat, dir) = grok_stream_fixture(home.path(), "grok-think-0001");
+        fs::write(
+            &chat,
+            concat!(
+                r#"{"type":"user","content":"<user_query>hi</user_query>"}"#,
+                "\n",
+                r#"{"type":"reasoning","summary":"Working through it"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("updates.jsonl"),
+            concat!(
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"eventId":"u1","agentTimestampMs":1789560000000,"turnStartMs":1789560000000}}}"#,
+                "\n",
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_thought_chunk"},"_meta":{"eventId":"t1","agentTimestampMs":1789560001000,"turnStartMs":1789560000000}}}"#,
+                "\n",
+                r#"{"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"turn_completed","usage":{"inputTokens":10,"outputTokens":3}},"_meta":{"agentTimestampMs":1789560002000,"turnStartMs":1789560000000}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let session = super::scan_grok_session_file(&chat).unwrap().unwrap();
+        let outcome = super::ingest_grok_session(&conn, &session, &chat.to_string_lossy()).unwrap();
+        let (kind, input): (String, Option<i64>) = conn
+            .query_row(
+                "SELECT kind, json_extract(token_json, '$.usage.inputTokens') \
+                 FROM session_events WHERE source = 'grok' AND token_json IS NOT NULL",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((kind.as_str(), input), ("thinking", Some(10)));
+        assert_eq!((outcome.usage_turns, outcome.turns), (1, 1));
+    }
+
     /// An `updates.jsonl` that exists and cannot be read is a failure, not an
     /// absent stream.
     ///
@@ -14887,6 +14951,44 @@ mod tests {
             )
             .unwrap();
         assert_eq!(derived, 0, "nothing may be derived from the journal");
+    }
+
+    /// An empty `sessionId` is no session: a journal whose first line
+    /// carries one still attributes a sessionless line to the first real id,
+    /// as the walk that wrote its marker did, and that marker is retracted.
+    #[test]
+    fn journal_retraction_skips_an_empty_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("journal.jsonl");
+        fs::write(
+            &journal,
+            concat!(
+                r#"{"type":"started","sessionId":"","uuid":"j0"}"#,
+                "\n",
+                r#"{"type":"started","sessionId":"s1","uuid":"j1"}"#,
+                "\n",
+                r#"{"type":"result","uuid":"j2"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO session_markers (source, session_id, marker_uid, kind, subkind) \
+             VALUES ('claude', 's1', 'j2:marker', 'unknown', 'result')",
+            [],
+        )
+        .unwrap();
+        super::retract_claude_workflow_journal(&conn, &journal).unwrap();
+        let left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_markers WHERE marker_uid = 'j2:marker'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0);
     }
 
     /// An install upgraded from a build that walked the journal as a
@@ -28105,9 +28207,10 @@ mod tests {
         assert_eq!(last.as_deref(), Some("Login"));
     }
 
-    /// A multi-block notice is migrated in block order, not in the order its
-    /// rows happen to be stored: here the later block was stored first, and
-    /// its index sorts first as text.
+    /// A multi-block notice is migrated as its text blocks in block order,
+    /// not in the order its rows happen to be stored: here the later block was
+    /// stored first, its index sorts first as text, and a non-text row of the
+    /// same message is not part of the notice.
     #[test]
     fn the_notice_migration_joins_blocks_in_block_order() {
         let conn = Connection::open_in_memory().unwrap();
@@ -28115,6 +28218,7 @@ mod tests {
         conn.execute_batch(
             "INSERT INTO session_events (source, session_id, message_id, ts_ms, role, kind, text, model, event_uid) \
              VALUES ('claude', 's', 'n', 5, 'assistant', 'text', 'Run /login', '<synthetic>', 'n:10'), \
+                    ('claude', 's', 'n', 5, 'assistant', 'thinking', 'not the notice', '<synthetic>', 'n:1'), \
                     ('claude', 's', 'n', 5, 'assistant', 'text', 'Login expired', '<synthetic>', 'n:2');",
         )
         .unwrap();
