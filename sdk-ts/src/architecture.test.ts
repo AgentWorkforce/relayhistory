@@ -148,3 +148,33 @@ test('relay roster stays a local-socket read outside the history SDK layers', as
   assert.match(relay, /socketPath:/);
   assert.doesNotMatch(relay, /cloud-client|cloud-auth|@agent-relay\/cloud|fetch\(|https?:|ai-hist-native/);
 });
+
+test('relay registration and status remain local socket MCP operations', async () => {
+  const [mcp, relay, rootReadme, architecture] = await Promise.all([
+    readFile(join(sourceDir, 'mcp-server.ts'), 'utf8'),
+    readFile(join(sourceDir, 'relay-agents.ts'), 'utf8'),
+    readFile(join(repositoryRoot, 'README.md'), 'utf8'),
+    readFile(join(repositoryRoot, 'docs', 'architecture.md'), 'utf8'),
+  ]);
+  for (const tool of ['join_relay', 'leave_relay']) {
+    const start = mcp.indexOf(`server.tool('${tool}'`);
+    assert.notEqual(start, -1, `${tool} is registered`);
+    const end = mcp.indexOf("server.tool('", start + 13);
+    const registration = mcp.slice(start, end === -1 ? undefined : end);
+    assert.match(registration, /RELAY_MUTATION/);
+    assert.doesNotMatch(registration, /SESSION_SCOPE/);
+  }
+  assert.match(mcp, /const RELAY_MUTATION = \{ readOnlyHint: false, idempotentHint: true, openWorldHint: true \}/);
+  const statusStart = mcp.indexOf("server.tool('relay_status'");
+  assert.notEqual(statusStart, -1, 'relay_status is registered');
+  const statusEnd = mcp.indexOf("server.tool('", statusStart + 13);
+  assert.match(mcp.slice(statusStart, statusEnd === -1 ? undefined : statusEnd), /READ/);
+  for (const operation of ['joinRelay', 'leaveRelay', 'relayStatus']) assert.match(relay, new RegExp(`export async function ${operation}`));
+  assert.doesNotMatch(relay, /cloud-client|cloud-auth|@agent-relay\/cloud|fetch\(|https?:|ai-hist-native/);
+  assert.match(rootReadme, /Read-only roster and status calls[^.]+`timeout`/);
+  assert.match(rootReadme, /sent `join_relay` or `leave_relay` mutation reports `indeterminate_result`/);
+  assert.match(rootReadme, /directs the caller to `relay_status`/);
+  assert.match(architecture, /MCP-only relay presence tools/);
+  assert.match(architecture, /directly to the\s+Agent Relay desktop Unix-domain socket/);
+  assert.match(architecture, /does not load cloud clients, authentication, tokens, or\nworkspace keys/);
+});

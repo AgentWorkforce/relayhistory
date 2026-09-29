@@ -40,6 +40,12 @@ Use these public operations:
 - MCP `list_relay_agents` to list live Agent Relay participants through the
   local desktop socket. This is presence, not history; it takes optional
   `query`, `where`, and `include_idle` filters and uses no cloud auth.
+- MCP `relay_status`, `join_relay`, and `leave_relay` to inspect whether the
+  local session hosting the MCP server is reachable, put only that session on the relay (optionally
+  with a public name and description), and remove it again. Joining makes the
+  session reachable by teammates and agents. These use the same local socket,
+  return a non-fatal instruction when desktop is absent, and preserve the
+  desktop's `not_allowed` setting guidance.
 
 Pass `scope` to collection operations when the default local view is not
 enough. The CLI spelling is the mutually exclusive `--local`, `--remote`, and

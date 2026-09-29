@@ -166,6 +166,10 @@ Notable changes to the native `ai-hist` CLI are documented here.
   desktop app as a non-fatal result instead of requiring Relaycast credentials.
   A connected desktop gets a 15-second response deadline, with an honest
   `timeout` error rather than the missing-app result if it does not answer.
+- Add MCP `relay_status`, `join_relay`, and `leave_relay` on that same local
+  socket. A calling session can make itself reachable, inspect its registered
+  state, and remove itself without any Relaycast token entering ai-hist.
+
 - Read every OpenCode channel database. OpenCode keeps one SQLite store per
   release channel — `opencode.db` for `latest`/`beta`, and
   `opencode-stable.db`, `opencode-nightly.db`, ... beside it — and only
