@@ -11766,7 +11766,11 @@ fn ingest_grok_session(
                     || timing
                         .and_then(|timing| timing.status.as_deref())
                         .is_some_and(|status| {
-                            matches!(status, "failed" | "error" | "cancelled" | "canceled")
+                            // Case-blind, as `grok_tool_result_facts` reads
+                            // it, so the call and its result agree.
+                            ["failed", "error", "cancelled", "canceled"]
+                                .iter()
+                                .any(|terminal| status.eq_ignore_ascii_case(terminal))
                         });
                 let uid = format!("result:{tool_use_id}");
                 // Only the provider's own call id is recorded on the facts;
@@ -14189,6 +14193,44 @@ mod tests {
             tool_times,
             vec![5000, 5000],
             "a call and its result join by id, so their turn is known exactly"
+        );
+    }
+
+    /// ACP's terminal status is read case-blind for the call as for its
+    /// result, so a `Cancelled` call is not stored as a success beside a
+    /// cancelled result.
+    #[test]
+    fn a_mixed_case_acp_failure_marks_the_grok_call_failed() {
+        let home = tempfile::tempdir().unwrap();
+        let conn = ingest_grok_lines(
+            home.path(),
+            &[
+                r#"{"type":"user","content":"first"}"#,
+                r#"{"type":"assistant","content":"","tool_calls":[{"id":"call_x","name":"Shell","arguments":{"command":"ls"}}]}"#,
+                r#"{"type":"tool_result","tool_call_id":"call_x","content":"stopped"}"#,
+                "",
+            ]
+            .join("\n"),
+            &[
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1000,"turnStartMs":1000}}}"#,
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"call_x"},"_meta":{"agentTimestampMs":1100,"turnStartMs":1000}}}"#,
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"call_x","status":"Cancelled"},"_meta":{"agentTimestampMs":1200,"turnStartMs":1000}}}"#,
+                "",
+            ]
+            .join("\n"),
+        );
+        let (is_error, result_status): (Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT (SELECT is_error FROM tool_calls WHERE source = 'grok' AND tool_use_id = 'call_x'), \
+                        (SELECT result_status FROM session_events \
+                          WHERE source = 'grok' AND event_uid = 'result:call_x')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (is_error, result_status.as_deref()),
+            (Some(1), Some("cancelled"))
         );
     }
 
