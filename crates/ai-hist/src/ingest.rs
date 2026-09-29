@@ -3349,10 +3349,16 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                 // trusted forever. Such a rollout falls through to the full
                 // path below, which removes its root registration, records its
                 // delegation and re-stamps it as a subagent.
+                //
+                // A reclassified rollout is *not* captured here: the full path
+                // captures it after removing the stale root registration,
+                // whose deletion trigger would otherwise drop the evidence just
+                // banked. Capturing last is also what keeps the gate open: if
+                // the full path fails part way, the evidence is still stale
+                // and the next pass reclassifies again.
                 let mut reclassified = false;
                 if recorded_session.is_some() && !codex_continuity_evidence_exists(conn, &rollout)?
                 {
-                    crate::continuity::capture_codex_rollout(conn, &rollout)?;
                     let recorded_subagent = record
                         .and_then(|r| r.get("subagent"))
                         .and_then(Value::as_bool)
@@ -3360,6 +3366,9 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                     if !recorded_subagent {
                         reclassified =
                             read_codex_session_meta(&rollout)?.is_some_and(|meta| meta.is_subagent);
+                    }
+                    if !reclassified {
+                        crate::continuity::capture_codex_rollout(conn, &rollout)?;
                     }
                 }
                 match recorded_session {
@@ -3412,9 +3421,6 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                     branches.insert(meta.session_id.clone(), branch.clone());
                 }
             }
-            // Only rollouts whose `session_meta` actually names a prior thread
-            // bank anything here; `codex resume` on its own does not.
-            crate::continuity::capture_codex_rollout(conn, &rollout)?;
             let outcome = if repair_user_messages {
                 repair_codex_rollout_user_messages(conn, &rollout, &meta)
             } else {
@@ -3438,6 +3444,14 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                     return Err(error);
                 }
             };
+            // Only rollouts whose `session_meta` actually names a prior thread
+            // bank anything here; `codex resume` on its own does not. After
+            // the subagent cleanup, not before: removing a stale root
+            // registration deletes the session's continuity evidence with it
+            // (the `sessions` delete trigger), and evidence banked first would
+            // go with it -- a reclassified guardian would lose its fork edge
+            // and, its evidence looking current, never be re-read for it.
+            crate::continuity::capture_codex_rollout(conn, &rollout)?;
             inserted += outcome.prompts;
             events += outcome.events;
             // Topology is recorded by the full sync too, so delegation is
@@ -25223,7 +25237,7 @@ mod tests {
         fs::write(
             &rollout,
             concat!(
-                r#"{"timestamp":"2026-08-01T10:01:00.000Z","type":"session_meta","payload":{"id":"sess-guardian-review","parent_thread_id":"parent","thread_source":"guardian_review","source":"vscode","cwd":"/tmp/proj"}}"#,
+                r#"{"timestamp":"2026-08-01T10:01:00.000Z","type":"session_meta","payload":{"id":"sess-guardian-review","parent_thread_id":"parent","thread_source":"guardian_review","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent"}}},"cwd":"/tmp/proj"}}"#,
                 "\n",
                 r#"{"timestamp":"2026-08-01T10:01:01.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Reviewing."}}"#,
                 "\n",
@@ -25308,6 +25322,19 @@ mod tests {
             json!(true),
             "the stamp map is corrected, so the next pass trusts the right flag"
         );
+        // Its fork edge survives the removal of the stale root registration,
+        // whose delete trigger drops continuity evidence banked before it.
+        let fork_parent: String = conn
+            .query_row(
+                "SELECT parent_session_id FROM session_relationships \
+                 WHERE source='codex' AND child_session_id='sess-guardian-review' \
+                   AND relationship='fork'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fork_parent, "parent");
+        assert!(crate::continuity::codex_evidence_is_current(&conn, &key).unwrap());
     }
 
     #[test]
