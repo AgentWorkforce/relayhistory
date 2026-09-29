@@ -16,5 +16,5 @@
 {"timestamp":"2026-04-20T00:01:05.001Z","type":"turn_context","payload":{"turn_id":"019da830-d1e8-7000-8000-0000000000c1","cwd":"/tmp/project","model":"gpt-5.4"}}
 {"timestamp":"2026-04-20T00:01:05.002Z","type":"event_msg","payload":{"type":"user_message","message":"child prompt after the fork"}}
 {"timestamp":"2026-04-20T00:01:08.000Z","type":"event_msg","payload":{"type":"agent_message","message":"child answer"}}
-{"timestamp":"2026-04-20T00:01:08.001Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2400,"cached_input_tokens":0,"output_tokens":700,"reasoning_output_tokens":0,"total_tokens":3100}}}}
+{"timestamp":"2026-04-20T00:01:08.001Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2400,"cached_input_tokens":0,"output_tokens":700,"reasoning_output_tokens":0,"total_tokens":3100},"last_token_usage":{"input_tokens":400,"cached_input_tokens":0,"output_tokens":200,"reasoning_output_tokens":0,"total_tokens":600}}}}
 {"timestamp":"2026-04-20T00:01:08.002Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"019da830-d1e8-7000-8000-0000000000c1","last_agent_message":"child answer"}}
