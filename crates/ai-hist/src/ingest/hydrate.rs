@@ -105,7 +105,15 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 3;
 /// rows, so each session re-parses once. Plain `sync` gets the same push by
 /// retiring `cursor_events_v2` and `grok_events_v2`; OpenCode re-normalizes
 /// every session on every sync already.
-const HYDRATION_PARSER_VERSION: i64 = 13;
+///
+/// Version 14 is Grok's #212 identities and models: an `eventId` Grok reused
+/// across two messages keyed both to one event, so the second overwrote the
+/// first, and the turn models `updates.jsonl` names were not read. A Grok
+/// checkpoint at 13 re-parses once, so an embedder that only hydrates gets the
+/// same repair `sync` gets from retiring `grok_events_v3`. The
+/// `logs/unified.jsonl` usage needs no re-parse: every Grok hydration reads
+/// the log before its stamp check.
+const HYDRATION_PARSER_VERSION: i64 = 14;
 
 #[derive(Debug, Clone)]
 pub struct HydrateSessionOptions {
@@ -398,6 +406,12 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
             "CONNECTOR_NOT_CONFIGURED: the builtin local adapter has not observed this session"
         );
     }
+    // Before the stamp short-circuit: see `read_grok_unified_log_for_hydration`.
+    let log_diagnostics = if options.source == "grok" {
+        read_grok_unified_log_for_hydration(&conn, &roots.grok)?
+    } else {
+        Vec::new()
+    };
     let snapshot = source_snapshot(&conn, options, &target, roots, claude_snapshot)?;
     let previous = observations::checkpoint(&conn, &local_key)?.map(|checkpoint| {
         (
@@ -460,6 +474,7 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
             ..IngestOutcome::default()
         };
         cached_diagnostics.extend(outcome_diagnostics(&outcome, snapshot.bytes));
+        cached_diagnostics.extend(log_diagnostics);
         // The record count comes from the checkpoint the last parse wrote:
         // this run parsed nothing, and counting the records again would mean
         // reading every file the short-circuit exists to skip. `bytes` is
@@ -622,6 +637,9 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
     // How the pass read, beside what the provider's records could not say.
     let mut source_diagnostics = source_diagnostics;
     source_diagnostics.extend(outcome_diagnostics(&indexed, snapshot.bytes));
+    // About this run, not the stored evidence, so it is reported and not
+    // checkpointed.
+    source_diagnostics.extend(log_diagnostics);
     build_result_with(
         &conn,
         options,
@@ -2101,12 +2119,17 @@ fn stored_source_diagnostics(
         }
     }
     if options.source == "grok" {
-        let (context_total_tokens, usage_turns, unified_rows) =
-            stored_grok_usage(conn, &options.session_id)?;
-        // Per-inference usage from `logs/unified.jsonl` is the session's
-        // usage in full; there is no caveat to give.
-        if unified_rows > 0 {
-            return Ok(Vec::new());
+        let stored = stored_grok_usage(conn, &options.session_id)?;
+        let (context_total_tokens, usage_turns) = (stored.0, stored.1);
+        // A session `logs/unified.jsonl` reaches is judged turn by turn: the
+        // covered turns, the ones that still count their own breakdown, and
+        // the stored turn rows that carry only the proxy.
+        if stored.2 > 0 {
+            return Ok(
+                grok_unified_usage_diagnostic(stored.3, usage_turns, stored.4)
+                    .into_iter()
+                    .collect(),
+            );
         }
         // The stored rows say which turns carried a breakdown, not how many
         // turns `updates.jsonl` opened: a turn with no token fact leaves no
@@ -2123,9 +2146,13 @@ fn stored_source_diagnostics(
 
 /// What a Grok session's stored token facts say, for a read that did not
 /// parse: the newest context-window snapshot any row stored, and how many
-/// turns carry a usage breakdown, and how many `logs/unified.jsonl` usage rows
-/// are stored.
-fn stored_grok_usage(conn: &Connection, session_id: &str) -> Result<(Option<i64>, usize, usize)> {
+/// turns carry a usage breakdown that still counts, how many
+/// `logs/unified.jsonl` usage rows are stored, how many turns the log covers
+/// (`turn_usage`), and how many stored turn rows carry only the proxy.
+fn stored_grok_usage(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<(Option<i64>, usize, usize, usize, usize)> {
     let stored = conn
         .prepare(
             "SELECT token_json FROM session_events \
@@ -2151,7 +2178,64 @@ fn stored_grok_usage(conn: &Connection, session_id: &str) -> Result<(Option<i64>
         .filter(|token| token.get("usage").is_some() && !is_unified(token))
         .count();
     let unified_rows = tokens.iter().filter(|token| is_unified(token)).count();
-    Ok((context_total_tokens, usage_turns, unified_rows))
+    let covered_turns = tokens
+        .iter()
+        .filter(|token| token.get("turn_usage").is_some())
+        .count();
+    let proxy_only_turns = tokens
+        .iter()
+        .filter(|token| {
+            !is_unified(token) && token.get("usage").is_none() && token.get("turn_usage").is_none()
+        })
+        .count();
+    Ok((
+        context_total_tokens,
+        usage_turns,
+        unified_rows,
+        covered_turns,
+        proxy_only_turns,
+    ))
+}
+
+/// The usage caveat for a session `logs/unified.jsonl` reaches, decided per
+/// turn. Every turn covered by the log needs none. A turn the log does not
+/// reach but whose own `turn_completed.usage` still counts is complete but
+/// from a second source — `GROK_USAGE_MIXED_SOURCES`, so a reader knows the
+/// session's spend comes from two representations, each turn counted once. A
+/// turn with neither has at most the context proxy — `GROK_USAGE_PARTIAL`.
+fn grok_unified_usage_diagnostic(
+    covered_turns: usize,
+    turn_usage_turns: usize,
+    proxy_only_turns: usize,
+) -> Option<HydrationDiagnostic> {
+    let diagnostic = |code: &str, message: String| HydrationDiagnostic {
+        code: code.to_string(),
+        message,
+        duration_ms: None,
+        source_bytes: None,
+        records_parsed: None,
+    };
+    if proxy_only_turns > 0 {
+        return Some(diagnostic(
+            "GROK_USAGE_PARTIAL",
+            format!(
+                "{covered_turns} grok turn(s) take their usage from logs/unified.jsonl and \
+                 {turn_usage_turns} from turn_completed.usage; {proxy_only_turns} have at most \
+                 the context-window snapshot, which is not billing usage"
+            ),
+        ));
+    }
+    (turn_usage_turns > 0).then(|| {
+        diagnostic(
+            "GROK_USAGE_MIXED_SOURCES",
+            format!(
+                "{covered_turns} grok turn(s) take their usage from logs/unified.jsonl (their \
+                 turn_completed.usage is kept as turn_usage and not counted) and \
+                 {turn_usage_turns} from turn_completed.usage, which the log does not reach; \
+                 each turn is counted once"
+            ),
+        )
+    })
 }
 
 /// Everything a source's targeted-hydration parser may read, handed to the
@@ -3100,24 +3184,43 @@ fn ingest_grok(
             "Grok source identity does not match the catalog row",
         ));
     }
-    // The session's per-inference usage lives outside its directory, in the
-    // Grok home's `logs/unified.jsonl`. Whatever that log gained since the
-    // last pass is read first, in this same transaction, so a hydration
-    // attaches it without waiting for a sweep.
-    if let Some(grok_home) = grok_home_of_chat(path) {
-        super::sync_grok_unified_log_in(conn, &grok_home)?;
-    }
     let outcome = ingest_grok_session(conn, &session, &path.to_string_lossy())?;
     Ok(grok_diagnostics(&outcome))
 }
 
-/// The Grok home a session's `chat_history.jsonl` lives under, when the path
-/// has the `<home>/sessions/<encoded-cwd>/<session-id>/chat_history.jsonl`
-/// shape; `None` for anything else, so no log is ever looked for beside a
-/// directory that is not a Grok home.
-fn grok_home_of_chat(chat: &Path) -> Option<PathBuf> {
-    let sessions = chat.parent()?.parent()?.parent()?;
-    (sessions.file_name()? == "sessions").then(|| sessions.parent().map(Path::to_path_buf))?
+/// Read what the Grok home's `logs/unified.jsonl` gained, before a Grok
+/// hydration decides whether its session changed.
+///
+/// The log lives outside the session directory, so the session's stamp never
+/// moves when it grows: reading it only on the parse path meant an
+/// `unchanged` hydration never attached an inference appended after the
+/// session's last write. It runs in its own transaction, before the
+/// hydration's, and whatever it attaches clears the touched sessions' cached
+/// diagnostics so an `unchanged` result is rebuilt from the stored rows.
+///
+/// The log is every session's, so failing to read it — unreadable, replaced
+/// mid-read — is not a reason to fail this session's hydration. It is
+/// reported as `GROK_UNIFIED_LOG_UNREADABLE` and the hydration goes on with
+/// whatever the log had already given; the cursor has not moved, so the next
+/// pass tries again.
+fn read_grok_unified_log_for_hydration(
+    conn: &Connection,
+    grok_home: &Path,
+) -> Result<Vec<HydrationDiagnostic>> {
+    match super::sync_grok_unified_log(conn, grok_home) {
+        Ok(_) => Ok(Vec::new()),
+        Err(error) if error.is::<super::CaptureCancelled>() => Err(error),
+        Err(error) => Ok(vec![HydrationDiagnostic {
+            code: "GROK_UNIFIED_LOG_UNREADABLE".to_string(),
+            message: format!(
+                "grok's logs/unified.jsonl could not be read, so any usage it gained since the \
+                 last pass is not attached yet: {error:#}"
+            ),
+            duration_ms: None,
+            source_bytes: None,
+            records_parsed: None,
+        }]),
+    }
 }
 
 fn ingest_muse(
@@ -3294,11 +3397,18 @@ fn grok_diagnostics(outcome: &GrokIngestOutcome) -> Vec<HydrationDiagnostic> {
         source_bytes: None,
         records_parsed: None,
     };
-    // A session `logs/unified.jsonl` covers has its usage per inference, and
-    // needs no usage caveat; one it does not cover is told what its
-    // `updates.jsonl` could and could not establish.
+    // A session `logs/unified.jsonl` reaches is judged turn by turn; one it
+    // does not reach is told what its `updates.jsonl` could and could not
+    // establish. Here the parse knows how many turns there were, so a turn
+    // that left no token row at all still counts as uncovered.
     let mut diagnostics: Vec<HydrationDiagnostic> = if outcome.unified_usage_rows > 0 {
-        Vec::new()
+        let coverage = outcome.unified_coverage;
+        let uncovered = outcome
+            .turns
+            .saturating_sub(coverage.covered_turns + coverage.turn_usage_turns);
+        grok_unified_usage_diagnostic(coverage.covered_turns, coverage.turn_usage_turns, uncovered)
+            .into_iter()
+            .collect()
     } else {
         grok_usage_diagnostic(
             outcome.context_total_tokens,
@@ -4586,6 +4696,203 @@ mod tests {
         assert_eq!((pass.bytes_read, pass.usage_rows), (0, 0));
     }
 
+    /// Every counted input token (cache reads included) of one Grok session.
+    fn review_input_sum(conn: &Connection, sid: &str) -> u64 {
+        grok_token_json(conn, sid)
+            .iter()
+            .filter_map(|t| crate::usage::normalize_usage("grok", t).unwrap())
+            .map(|u| u.input_tokens + u.cache_read_tokens)
+            .sum()
+    }
+
+    /// Review regression: a log that starts mid-session covers only turn 2.
+    /// Turn 1's `turn_completed.usage` must still count, and turn 2's must
+    /// not count twice.
+    #[test]
+    fn review_partial_coverage_loses_uncovered_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let (grok_home, covered, _) = grok_unified_fixture(dir.path());
+        let log = grok_unified_log_path(&grok_home);
+        fs::write(&log, "{\"ts\":\"2026-09-20T10:01:03.000Z\",\"pid\":4242,\"session_id\":\"grok-uni-0001\",\"usage\":{\"inputTokens\":900,\"outputTokens\":90,\"cachedReadTokens\":300}}\n").unwrap();
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        // Baseline: without the log, both turns count (1200 + 900 inclusive input).
+        let base_dir = tempfile::tempdir().unwrap();
+        let (base_home, _, _) = grok_unified_fixture(base_dir.path());
+        fs::remove_file(grok_unified_log_path(&base_home)).unwrap();
+        let base = open_db(&base_dir.path().join("history.db")).unwrap();
+        sync_grok_home(
+            &base,
+            &mut Map::new(),
+            &base_home,
+            &mut SweepCoverage::default(),
+        )
+        .unwrap();
+        let before = review_input_sum(&base, "grok-uni-0001");
+        assert_eq!(before, 2100);
+        sync_grok_home(
+            &conn,
+            &mut Map::new(),
+            &grok_home,
+            &mut SweepCoverage::default(),
+        )
+        .unwrap();
+        let after = review_input_sum(&conn, "grok-uni-0001");
+        assert_eq!(after, before, "turn 1's usage was dropped");
+        drop(conn);
+
+        // Hydration says the session's usage comes from two sources, each
+        // turn once — parsed, and again from the cache.
+        let db = dir.path().join("hydrated.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "grok", "grok-uni-0001", Some(&covered));
+        drop(conn);
+        for _ in 0..2 {
+            let result =
+                hydrate_session_at_with_home(&db, &options("grok", "grok-uni-0001"), dir.path())
+                    .unwrap();
+            let codes: Vec<&str> = result
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code.starts_with("GROK_USAGE"))
+                .map(|diagnostic| diagnostic.code.as_str())
+                .collect();
+            assert_eq!(
+                codes,
+                vec!["GROK_USAGE_MIXED_SOURCES"],
+                "{:?}",
+                result.diagnostics
+            );
+        }
+    }
+
+    /// Review regression: an unreadable unified log does not fail hydration
+    /// of a session it has nothing to do with; it is reported instead.
+    #[cfg(unix)]
+    #[test]
+    fn review_unreadable_log_fails_hydration() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (grok_home, _, uncovered) = grok_unified_fixture(dir.path());
+        let log = grok_unified_log_path(&grok_home);
+        fs::set_permissions(&log, fs::Permissions::from_mode(0o000)).unwrap();
+        // Running as root, the permission bits do not stop the read, and
+        // there is nothing to test.
+        if fs::read(&log).is_ok() {
+            fs::set_permissions(&log, fs::Permissions::from_mode(0o644)).unwrap();
+            return;
+        }
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "grok", "grok-uni-0002", Some(&uncovered));
+        drop(conn);
+        let result =
+            hydrate_session_at_with_home(&db, &options("grok", "grok-uni-0002"), dir.path());
+        fs::set_permissions(&log, fs::Permissions::from_mode(0o644)).unwrap();
+        let result = result.expect("hydration failed on an unreadable process log");
+        assert_eq!(result.status, "hydrated");
+        assert!(result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "GROK_UNIFIED_LOG_UNREADABLE"));
+        // The next hydration, with the log readable again, attaches nothing
+        // for this session (the log does not cover it) and reports nothing.
+        let again =
+            hydrate_session_at_with_home(&db, &options("grok", "grok-uni-0002"), dir.path())
+                .unwrap();
+        assert!(!again
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "GROK_UNIFIED_LOG_UNREADABLE"));
+    }
+
+    /// Review regression: an `unchanged` hydration still reads the log, so a
+    /// row appended after the session's last write attaches.
+    #[test]
+    fn review_unchanged_hydration_skips_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let (grok_home, _, uncovered) = grok_unified_fixture(dir.path());
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "grok", "grok-uni-0002", Some(&uncovered));
+        drop(conn);
+        hydrate_session_at_with_home(&db, &options("grok", "grok-uni-0002"), dir.path()).unwrap();
+        let log = grok_unified_log_path(&grok_home);
+        let mut f = OpenOptions::new().append(true).open(&log).unwrap();
+        f.write_all(b"{\"ts\":\"2026-09-20T11:00:20.000Z\",\"pid\":6000,\"session_id\":\"grok-uni-0002\",\"usage\":{\"inputTokens\":80,\"outputTokens\":8}}\n").unwrap();
+        drop(f);
+        let r = hydrate_session_at_with_home(&db, &options("grok", "grok-uni-0002"), dir.path())
+            .unwrap();
+        assert_eq!(r.status, "unchanged");
+        let conn = open_db(&db).unwrap();
+        let n = grok_token_json(&conn, "grok-uni-0002")
+            .iter()
+            .filter(|t| is_unified(t))
+            .count();
+        assert_eq!(n, 1, "appended log row not attached by hydration");
+        // …and the cached diagnostics were rebuilt from the stored rows: the
+        // one turn has no breakdown and the log does not reach it.
+        assert!(r
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "GROK_USAGE_PARTIAL"));
+        // A row later than the session's last activity extends it.
+        let last: i64 = conn
+            .query_row(
+                "SELECT last_activity_ms FROM sessions WHERE source = 'grok' \
+                 AND session_id = 'grok-uni-0002'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(last, 1_789_902_020_000);
+    }
+
+    /// Review regression: appending one row for a covered session attaches
+    /// that row and leaves every event already stored untouched.
+    #[test]
+    fn review_append_restamps_existing_unified_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let (grok_home, _, _) = grok_unified_fixture(dir.path());
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        sync_grok_home(
+            &conn,
+            &mut Map::new(),
+            &grok_home,
+            &mut SweepCoverage::default(),
+        )
+        .unwrap();
+        let revs = |conn: &Connection| -> Vec<(String, i64, i64)> {
+            conn.prepare("SELECT event_uid, id, revision FROM session_events WHERE session_id='grok-uni-0001' AND event_uid LIKE 'unified:%' ORDER BY event_uid").unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+        };
+        let tombstones = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM evidence_tombstones WHERE session_id='grok-uni-0001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let before = revs(&conn);
+        let tombstones_before = tombstones(&conn);
+        let log = grok_unified_log_path(&grok_home);
+        let mut f = OpenOptions::new().append(true).open(&log).unwrap();
+        f.write_all(b"{\"ts\":\"2026-09-20T10:05:00.000Z\",\"pid\":4242,\"session_id\":\"grok-uni-0001\",\"usage\":{\"inputTokens\":1,\"outputTokens\":1}}\n").unwrap();
+        drop(f);
+        let pass = sync_grok_unified_log(&conn, &grok_home).unwrap();
+        assert_eq!(pass.new_rows, 1);
+        let after = revs(&conn);
+        assert_eq!(after.len(), before.len() + 1);
+        for row in &before {
+            assert!(after.contains(row), "{row:?} was rewritten");
+        }
+        assert_eq!(
+            tombstones(&conn),
+            tombstones_before,
+            "an append retired evidence"
+        );
+    }
+
     /// Hydration reads the log too, and says so in its diagnostics: the
     /// covered session carries no usage caveat, the other is told its only
     /// token fact is a context proxy — parsed, and again from the cache.
@@ -5339,7 +5646,7 @@ mod tests {
         );
 
         // A cached read says the same thing from the stored rows.
-        let (context, usage_turns, _) = stored_grok_usage(&conn, "grok-usage-0001").unwrap();
+        let (context, usage_turns, ..) = stored_grok_usage(&conn, "grok-usage-0001").unwrap();
         assert_eq!((context, usage_turns), (Some(2100), 1));
         assert_eq!(
             grok_usage_diagnostic(context, usage_turns, None).map(|diagnostic| diagnostic.code),
@@ -5427,7 +5734,10 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(stored_grok_usage(&conn, "g").unwrap(), (Some(900), 1, 0));
+        assert_eq!(
+            stored_grok_usage(&conn, "g").unwrap(),
+            (Some(900), 1, 0, 0, 1)
+        );
     }
 
     /// Write a minimal Grok session directory and answer with its transcript.

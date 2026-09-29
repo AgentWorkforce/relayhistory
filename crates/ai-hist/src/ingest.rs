@@ -12974,6 +12974,12 @@ fn sync_grok_home(
                 if pass.malformed > 0 {
                     suffix.push_str(&format!(", {} unreadable rows", pass.malformed));
                 }
+                if pass.orphan_rows > 0 {
+                    suffix.push_str(&format!(
+                        ", {} retained for sessions not indexed",
+                        pass.orphan_rows
+                    ));
+                }
                 sync_note!(
                     "  [grok] +{} usage rows from logs/unified.jsonl ({} sessions{suffix})",
                     pass.new_rows,
@@ -13195,18 +13201,28 @@ pub(crate) struct GrokUnifiedPass {
     pub unattributed: usize,
     /// Terminated rows that were not JSON, or were too large to hold.
     pub malformed: usize,
-    /// Catalogued sessions whose usage events were rebuilt.
+    /// Catalogued sessions that gained usage events.
     pub sessions_materialized: usize,
+    /// Stored rows, from any pass, whose session is not in the catalog. They
+    /// are kept — the log is never re-read, so dropping them would lose the
+    /// usage for good if the session is indexed later — and counted so the
+    /// retained backlog is visible.
+    pub orphan_rows: usize,
 }
 
 /// Read what `logs/unified.jsonl` gained since the last pass, in one
-/// transaction: the new rows, the advanced cursor, and the rebuilt usage of
+/// transaction: the new rows, the advanced cursor, and the usage events of
 /// every catalogued session they touch commit together or not at all.
+///
+/// The transaction is taken `IMMEDIATE`, so the write lock is held from the
+/// first read of the cursor: a deferred one that read the cursor while a
+/// hydration was writing would fail to upgrade (`SQLITE_BUSY_SNAPSHOT`)
+/// instead of waiting behind it.
 pub(crate) fn sync_grok_unified_log(
     conn: &Connection,
     grok_home: &Path,
 ) -> Result<GrokUnifiedPass> {
-    let tx = conn.unchecked_transaction()?;
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let pass = sync_grok_unified_log_in(&tx, grok_home)?;
     tx.commit()?;
     Ok(pass)
@@ -13329,7 +13345,9 @@ pub(crate) fn sync_grok_unified_log_in(
             // until the session is indexed, and that ingestion attaches them.
             continue;
         }
-        materialize_grok_unified_usage(conn, &session_id, None)?;
+        if materialize_grok_unified_usage(conn, &session_id, None)?.inserted == 0 {
+            continue;
+        }
         // A cached hydration replays the diagnostics it stored, and those
         // were written before this usage existed. Clearing them makes the
         // next unchanged read rebuild the usage caveat from the stored rows.
@@ -13340,6 +13358,13 @@ pub(crate) fn sync_grok_unified_log_in(
         )?;
         pass.sessions_materialized += 1;
     }
+    let orphans: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM grok_unified_usage u WHERE NOT EXISTS \
+         (SELECT 1 FROM sessions s WHERE s.source = 'grok' AND s.session_id = u.session_id)",
+        [],
+        |row| row.get(0),
+    )?;
+    pass.orphan_rows = orphans as usize;
     Ok(pass)
 }
 
@@ -13353,6 +13378,21 @@ fn grok_unified_rows_pending(conn: &Connection, session_id: &str) -> Result<usiz
     Ok(count as usize)
 }
 
+/// What attaching one session's `logs/unified.jsonl` rows established.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GrokUnifiedCoverage {
+    /// Stored usage rows for the session, attached now or before.
+    pub rows: usize,
+    /// Rows attached by this call; zero when nothing was new.
+    pub inserted: usize,
+    /// Turns whose `turn_completed.usage` the log covers, kept as `turn_usage`.
+    pub covered_turns: usize,
+    /// Turns the log does not cover whose `turn_completed.usage` still counts.
+    pub turn_usage_turns: usize,
+    /// Stored turn rows with neither: only the context proxy.
+    pub proxy_only_turns: usize,
+}
+
 /// One stored `grok_unified_usage` row, as materialization reads it.
 struct GrokUnifiedStored {
     row_key: String,
@@ -13363,24 +13403,33 @@ struct GrokUnifiedStored {
     usage_json: String,
 }
 
-/// Rebuild one session's `logs/unified.jsonl` usage events from the stored
-/// rows, and return how many there are.
+/// Attach one session's stored `logs/unified.jsonl` rows as usage events, and
+/// settle which of its turns they cover.
 ///
 /// Each row becomes one assistant event keyed `unified:<row key>`, in its own
 /// request span, with `token_json = {"usage": <counters>, "source":
 /// "logs/unified.jsonl", …}` — one inference, one request, normalized as
 /// `per-request` usage. The event carries no text, so it is
 /// `kind = "text"` with `raw_kind = "unified_log_usage"` to say what it is.
+/// Only rows with no event yet are inserted: an append attaches its own rows
+/// and leaves every event already stored untouched, so the change feed sees
+/// the new rows and nothing else.
 ///
-/// When the session has any, they are its usage: a `turn_completed.usage`
-/// breakdown already stored for it is moved to `turn_usage`, which is not
-/// normalized, so the same spend is never counted from both files. Their
-/// models join the session's `models_json`.
+/// Coverage is decided **per turn**. A turn's `turn_completed.usage` is moved
+/// to `turn_usage` (not normalized) only when a log row falls inside that
+/// turn's `[turn_start_ms, turn_end_ms]`; a turn the log does not reach —
+/// the log started mid-session, or was rotated away — keeps its breakdown as
+/// `usage`. So the same spend is never counted twice and a turn the log never
+/// saw is not dropped. A log row with no time cannot be placed in a turn, so
+/// its presence covers every turn: dropping a turn's breakdown is recoverable
+/// from `turn_usage`, counting one inference twice is not. The rows' models
+/// join `models_json`, and a row later than the session's last activity
+/// extends it.
 fn materialize_grok_unified_usage(
     conn: &Connection,
     session_id: &str,
     fallback_ts: Option<i64>,
-) -> Result<usize> {
+) -> Result<GrokUnifiedCoverage> {
     const SOURCE: &str = "grok";
     type SessionFacts = (Option<String>, Option<String>, Option<i64>, Option<String>);
     let session: Option<SessionFacts> = conn
@@ -13392,19 +13441,21 @@ fn materialize_grok_unified_usage(
         )
         .optional()?;
     let Some((cwd, branch, first_activity, models_json)) = session else {
-        return Ok(0);
+        return Ok(GrokUnifiedCoverage::default());
     };
-    crate::store::retire_evidence_share(
-        conn,
-        "session_events",
-        "source = 'grok' AND session_id = ? AND event_uid LIKE 'unified:%'",
-        params![session_id],
-        SessionLocation::Local,
-    )?;
+    let total = grok_unified_rows_pending(conn, session_id)?;
+    if total == 0 {
+        return Ok(GrokUnifiedCoverage::default());
+    }
+    // Rows whose local event is not stored yet. A row already attached is
+    // left exactly as it is.
     let rows = conn
         .prepare(
-            "SELECT row_key, ts_ms, pid, model, event_id, usage_json FROM grok_unified_usage \
-             WHERE session_id = ? ORDER BY ts_ms IS NULL, ts_ms, locator, line_offset, row_key",
+            "SELECT row_key, ts_ms, pid, model, event_id, usage_json FROM grok_unified_usage u \
+             WHERE session_id = ?1 AND NOT EXISTS (SELECT 1 FROM session_events e \
+               WHERE e.source = 'grok' AND e.session_id = ?1 \
+               AND e.event_uid = 'unified:' || u.row_key AND e.location IN ('local', 'both')) \
+             ORDER BY ts_ms IS NULL, ts_ms, locator, line_offset, row_key",
         )?
         .query_map(params![session_id], |row| {
             Ok(GrokUnifiedStored {
@@ -13417,9 +13468,6 @@ fn materialize_grok_unified_usage(
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    if rows.is_empty() {
-        return Ok(0);
-    }
     let fallback_ts = fallback_ts.or(first_activity).unwrap_or(0);
     let mut models: Vec<String> = models_json
         .as_deref()
@@ -13474,12 +13522,21 @@ fn materialize_grok_unified_usage(
             }
         }
     }
+    // Per turn: demote a turn's breakdown only when the log reaches into it.
     conn.execute(
         "UPDATE session_events SET token_json = json_set(json_remove(token_json, '$.usage'), \
          '$.turn_usage', json(json_extract(token_json, '$.usage'))) \
-         WHERE source = 'grok' AND session_id = ? AND event_uid NOT LIKE 'unified:%' \
+         WHERE source = 'grok' AND session_id = ?1 AND event_uid NOT LIKE 'unified:%' \
          AND token_json IS NOT NULL AND json_valid(token_json) \
-         AND json_type(token_json, '$.usage') IS NOT NULL",
+         AND json_extract(token_json, '$.source') = 'updates.jsonl' \
+         AND json_type(token_json, '$.usage') IS NOT NULL \
+         AND (json_type(token_json, '$.turn_start_ms') IS NULL \
+           OR json_type(token_json, '$.turn_end_ms') IS NULL \
+           OR EXISTS (SELECT 1 FROM grok_unified_usage u WHERE u.session_id = ?1 \
+                AND u.ts_ms IS NULL) \
+           OR EXISTS (SELECT 1 FROM grok_unified_usage u WHERE u.session_id = ?1 \
+                AND u.ts_ms BETWEEN json_extract(token_json, '$.turn_start_ms') \
+                                AND json_extract(token_json, '$.turn_end_ms')))",
         params![session_id],
     )?;
     if models.len() != models_before {
@@ -13488,7 +13545,35 @@ fn materialize_grok_unified_usage(
             params![serde_json::to_string(&models)?, session_id],
         )?;
     }
-    Ok(rows.len())
+    // An inference logged after the session's last recorded activity is
+    // activity too.
+    conn.execute(
+        "UPDATE sessions SET last_activity_ms = \
+           (SELECT MAX(ts_ms) FROM grok_unified_usage WHERE session_id = ?1) \
+         WHERE source = 'grok' AND session_id = ?1 \
+         AND (SELECT MAX(ts_ms) FROM grok_unified_usage WHERE session_id = ?1) \
+             > COALESCE(last_activity_ms, 0)",
+        params![session_id],
+    )?;
+    let (covered, turn_usage, proxy): (i64, i64, i64) = conn.query_row(
+        "SELECT \
+           COALESCE(SUM(json_type(token_json, '$.turn_usage') IS NOT NULL), 0), \
+           COALESCE(SUM(json_type(token_json, '$.usage') IS NOT NULL), 0), \
+           COALESCE(SUM(json_type(token_json, '$.usage') IS NULL \
+                    AND json_type(token_json, '$.turn_usage') IS NULL), 0) \
+         FROM session_events WHERE source = 'grok' AND session_id = ? \
+         AND token_json IS NOT NULL AND json_valid(token_json) \
+         AND json_extract(token_json, '$.source') = 'updates.jsonl'",
+        params![session_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    Ok(GrokUnifiedCoverage {
+        rows: total,
+        inserted: rows.len(),
+        covered_turns: covered as usize,
+        turn_usage_turns: turn_usage as usize,
+        proxy_only_turns: proxy as usize,
+    })
 }
 
 /// What indexing one Grok session directory produced, and what its own records
@@ -13534,9 +13619,10 @@ pub(crate) struct GrokIngestOutcome {
     pub usage_turns: usize,
     pub turns: usize,
     /// Per-inference usage rows from `logs/unified.jsonl` stored for this
-    /// session. When there are any, they are the session's usage and the
-    /// `turn_completed.usage` breakdowns are kept only as `turn_usage`.
+    /// session.
     pub unified_usage_rows: usize,
+    /// Which turns those rows cover, and what the rest carry.
+    pub unified_coverage: GrokUnifiedCoverage,
 }
 
 /// The request span of a Grok assistant row: the `updates.jsonl` turn it
@@ -14018,11 +14104,12 @@ fn ingest_grok_session(
     // that is what `crate::usage` normalizes, and the proxy never is. Nothing
     // is estimated here.
     //
-    // A session `logs/unified.jsonl` covers takes its usage from there, per
-    // inference. The turn breakdown describes the same spend a second time, so
-    // it is kept under `turn_usage`, which nothing normalizes: the two
-    // representations are never added together.
-    let unified_covered = grok_unified_rows_pending(conn, sid)? > 0;
+    // A turn `logs/unified.jsonl` covers takes its usage from there, per
+    // inference. Its breakdown is written here as `usage` like any other, with
+    // the turn's window beside it, and `materialize_grok_unified_usage` below
+    // moves it to `turn_usage` only if a log row falls inside that window: the
+    // two representations are never added together, and a turn the log never
+    // saw keeps its own.
     for (turn, timing) in session.updates.turns.iter().enumerate() {
         check_capture_cancelled()?;
         let tail = turn_tail
@@ -14046,12 +14133,15 @@ fn ingest_grok_session(
         }
         token_json.insert("source".into(), json!("updates.jsonl"));
         if let Some(usage) = &timing.usage {
-            let key = if unified_covered {
-                "turn_usage"
-            } else {
-                "usage"
-            };
-            token_json.insert(key.into(), usage.clone());
+            token_json.insert("usage".into(), usage.clone());
+            // The window the per-turn coverage decision is made over. Only
+            // written beside a breakdown, the one fact it decides about.
+            if let Some(start) = timing.start_ms {
+                token_json.insert("turn_start_ms".into(), json!(start));
+            }
+            if let Some(end) = timing.end_ms {
+                token_json.insert("turn_end_ms".into(), json!(end));
+            }
         }
         if let Some(model) = &timing.model {
             token_json.insert("model".into(), json!(model));
@@ -14103,8 +14193,9 @@ fn ingest_grok_session(
     // After the catalog row exists: the rows attach to a session, not to a
     // directory, and a row that arrived before the session was indexed has
     // been waiting for exactly this.
-    outcome.unified_usage_rows =
-        materialize_grok_unified_usage(conn, sid, Some(session.created_ms))?;
+    let coverage = materialize_grok_unified_usage(conn, sid, Some(session.created_ms))?;
+    outcome.unified_usage_rows = coverage.rows;
+    outcome.unified_coverage = coverage;
     Ok(outcome)
 }
 
@@ -14403,9 +14494,9 @@ fn resolve_grok_ts(
 /// only identity available is positional. Grok rebuilds that file on a format
 /// upgrade, which renumbers it; an `eventId` survives that, which is why it is
 /// preferred. Grok also *reuses* an `eventId` across records, so what arrives
-/// here is [`grok::ChunkGroup::event_key`] — the id, suffixed with its
-/// occurrence when more than one message carries it — and two messages can
-/// never be stored under one identity.
+/// here is [`grok::ChunkGroup::event_key`] — the id for its first message and
+/// the id suffixed with a repeat number for each later one — and two messages
+/// can never be stored under one identity.
 fn grok_event_uid(event_id: Option<&str>, index: usize) -> String {
     match event_id {
         Some(id) => format!("ev:{id}"),
@@ -14566,17 +14657,47 @@ pub(crate) fn grok_source_inventory(chat: &Path) -> Result<GrokSourceInventory> 
 /// Grok layout writes subagent transcripts that way.
 pub(crate) fn grok_source_records(chat: &Path) -> Result<i64> {
     let mut records = hydrate::complete_jsonl_records(chat)?;
+    let summary_present = grok_entry_metadata(&chat.with_file_name("summary.json"))?
+        .is_some_and(|found| found.is_file());
     for name in GROK_STAMPED_SIBLINGS.iter().chain(GROK_DIGESTED_SIBLINGS) {
         let path = chat.with_file_name(name);
-        if grok_entry_metadata(&path)?.is_some_and(|found| found.is_file()) {
-            records += grok_record_count(&path)?;
+        if !grok_entry_metadata(&path)?.is_some_and(|found| found.is_file()) {
+            continue;
         }
+        if *name == "events.jsonl" {
+            // Read only when there is no summary, and then only its head —
+            // so that is all that is counted, and a long event log is never
+            // read to the end just to count it.
+            if !summary_present {
+                records += grok_events_head_records(&path)?;
+            }
+            continue;
+        }
+        records += grok_record_count(&path)?;
     }
     for directory in GROK_DIGESTED_DIRECTORIES {
         let mut entries = read_dir_files(&chat.with_file_name(directory))?;
         entries.sort();
         for entry in entries {
             records += grok_record_count(&entry)?;
+        }
+    }
+    Ok(records)
+}
+
+/// The non-blank lines among the first [`grok::EVENTS_HEAD_LINES`] of an
+/// `events.jsonl` — what the metadata fallback reads.
+fn grok_events_head_records(path: &Path) -> Result<i64> {
+    let file =
+        fs::File::open(path).with_context(|| format!("read Grok events {}", path.display()))?;
+    let mut records = 0;
+    for line in BufReader::new(file)
+        .split(b'\n')
+        .take(grok::EVENTS_HEAD_LINES)
+    {
+        let line = line.with_context(|| format!("read Grok events {}", path.display()))?;
+        if !line.iter().all(u8::is_ascii_whitespace) {
+            records += 1;
         }
     }
     Ok(records)

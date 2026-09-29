@@ -95,11 +95,13 @@ Recent builds also write a per-inference breakdown to the process-wide
 `<GROK_HOME>/logs/unified.jsonl` ([#212](https://github.com/AgentWorkforce/relayhistory/issues/212)).
 Each of its rows is stored as one assistant event with its own request span and
 `token_json = {"usage": <counters>, "source": "logs/unified.jsonl", "pid", "event_id"}`,
-normalized with the same counter lists as `turn_completed.usage`. A session the
-log covers takes its usage from there: the turn breakdown describes the same
-spend a second time, so it is kept under `turn_usage`, which is never
-normalized. A session the log does not cover keeps its turn breakdown as
-`usage`. The two representations are never added together.
+normalized with the same counter lists as `turn_completed.usage`. Coverage is
+decided per turn: a turn with a log row inside its `[turn_start_ms,
+turn_end_ms]` takes its usage from the log, and its breakdown describes the
+same spend a second time, so it is kept under `turn_usage`, which is never
+normalized. A turn the log does not reach keeps its breakdown as `usage`. The
+two representations are never added together, and a turn the log never saw is
+not dropped. A log row with no time cannot be placed, so it covers every turn.
 
 ### Codex
 
