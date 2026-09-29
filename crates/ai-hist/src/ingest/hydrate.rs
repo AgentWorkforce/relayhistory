@@ -91,7 +91,15 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 3;
 /// `slash_command` marker. A checkpoint at 10 has the column null on every
 /// row and the reminders folded into the prompt text, so every session
 /// re-parses once.
-const HYDRATION_PARSER_VERSION: i64 = 11;
+///
+/// Version 12 extends tool-result fidelity (#171) to Cursor, Grok and
+/// OpenCode: their tool-result rows gain `payload_bytes`, `payload_hash`,
+/// `payload_truncated`, the ordering indexes, `result_status`, `event_source`
+/// and `error_signal`. A checkpoint at 11 has every one of them null on those
+/// rows, so each session re-parses once. Plain `sync` gets the same push by
+/// retiring `cursor_events_v2` and `grok_events_v1`; OpenCode re-normalizes
+/// every session on every sync already.
+const HYDRATION_PARSER_VERSION: i64 = 12;
 
 #[derive(Debug, Clone)]
 pub struct HydrateSessionOptions {

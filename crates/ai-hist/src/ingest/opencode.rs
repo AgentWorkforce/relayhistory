@@ -1320,6 +1320,9 @@ fn normalize_session(
     };
 
     let mut last_assistant_text: Option<String> = None;
+    // A session is always normalized whole, in the provider's message order,
+    // so the tool-result indexes are the same on every pass.
+    let mut tool_results = super::tool_result_facts::ToolResultIndexer::default();
 
     for message in &loaded.messages {
         super::check_capture_cancelled()?;
@@ -1537,6 +1540,14 @@ fn normalize_session(
             // and its result is what the model saw next.
             if let Some(output) = tool.state.and_then(|state| state.get("output")) {
                 if let Some(text) = tool_output_text(output) {
+                    // Measured over the raw `output`, not the reshaped text.
+                    let (call_index, event_index) = tool_results.next(tool.call_id);
+                    let facts = super::tool_result_facts::opencode_tool_result_facts(
+                        output,
+                        tool.call_id,
+                        tool.state,
+                    )
+                    .with_ordering(call_index, event_index);
                     insert_session_event_with_provenance(
                         conn,
                         "opencode",
@@ -1556,7 +1567,7 @@ fn normalize_session(
                         stop_reason.as_deref(),
                         RequestIdentity::none(),
                         &format!("tool_result:{}", tool.call_id),
-                        None,
+                        Some(&facts),
                         RawMessageFacts::default(),
                         None,
                     )?;

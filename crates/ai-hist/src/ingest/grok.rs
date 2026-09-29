@@ -110,6 +110,9 @@ pub(crate) enum GrokRecord {
         call_id: Option<String>,
         text: Option<String>,
         is_error: Option<bool>,
+        /// The raw `content`, which the tool-result fidelity facts are
+        /// measured over; `text` is already reshaped for display.
+        content: Value,
     },
     /// A record type this parser does not interpret. Counted, never guessed at.
     Other,
@@ -179,6 +182,7 @@ pub(crate) fn parse_chat_record(value: &Value) -> GrokChatLine {
                 .get("is_error")
                 .or_else(|| value.get("isError"))
                 .and_then(Value::as_bool),
+            content: content.cloned().unwrap_or(Value::Null),
         },
         _ => GrokRecord::Other,
     };

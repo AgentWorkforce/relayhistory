@@ -2400,7 +2400,8 @@ pub struct SessionEvent {
     /// `tool_result` / `subagent_notification` / `function_call_output`.
     pub event_source: Option<String>,
     /// Which provider signal set the error: `tool_result.is_error`,
-    /// `exit_code`, `patch_apply`, `mcp_err`, or `subagent_status`.
+    /// `exit_code`, `patch_apply`, `mcp_err`, `subagent_status`, or
+    /// `tool_status`.
     pub error_signal: Option<String>,
     /// Delegated child session this result reports on.
     pub subagent_session_id: Option<String>,

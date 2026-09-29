@@ -104,6 +104,25 @@ Notable changes to the native `ai-hist` CLI are documented here.
   `usage` holding only `totalTokens` is still read as the context snapshot.
   `~/.grok/logs/unified.jsonl` is not read yet (#212).
 
+- Tool-result fidelity now covers Cursor, Grok and OpenCode (#171). Their
+  `tool_result` events carry `payload_bytes`, `payload_hash`,
+  `payload_truncated`, `call_index`, `event_index`, `result_status`,
+  `event_source` and `error_signal`, measured over the raw provider payload
+  through the same helper as Claude and Codex. A Cursor result is a block of
+  its message (`event_source = 'tool_result'`); a Grok `tool_result` line and
+  an OpenCode tool part's `output` are standalone
+  (`event_source = 'function_call_output'`) and so are not counted among a
+  user turn's blocks. `error_signal` gains `tool_status`, the provider's own
+  terminal status on the call (OpenCode `state.status: "error"`, a failed or
+  cancelled Grok ACP update); OpenCode's non-zero `metadata.exit` is reported
+  as `exit_code`. `ToolResultErrorSignal` in the TS SDK and the submitted-record
+  validation accept the new value. `HYDRATION_PARSER_VERSION` is 12 and the
+  `cursor_events_v2` / `grok_events_v1` sync-state keys are retired, so every
+  already indexed Cursor and Grok session re-parses once; OpenCode re-reads on
+  every sync already. The fixture corpus snapshots now include the fidelity
+  columns, and the three corpus tests held `#[ignore = "closed by #171"]`
+  assert them.
+
 - Add workspace-scoped agent handoffs through `create_handoff(intent)` and
   `resume_handoff(source, session_id)`. The sender emits only a session pointer
   plus one self-describing intent and origin identity; the intent tells the

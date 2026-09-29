@@ -593,7 +593,10 @@ status, because a fabricated measurement reads exactly like a real one:
 |---|---|---|---|---|---|---|---|
 | **claude** | ✓ (raw `content`) | ✓ (harness markers) | ✓ | ✓ | `tool_result`, `subagent_notification` | `tool_result.is_error`, `subagent_status` | ✓ (system subagent notifications) |
 | **codex** | ✓ (raw `output`) | ✓ (harness markers) | ✓ | ✓ (settled at `task_complete`) | `function_call_output` | `exit_code`, `patch_apply`, `mcp_err` | – (no notification rail) |
-| **cursor**, **grok**, **opencode**, **relay** | – | – | – | – | – | – | – |
+| **cursor** | ✓ (raw block `content`) | ✓ (harness markers) | ✓ | ✓ | `tool_result` | `tool_result.is_error` | – (no notification rail) |
+| **grok** | ✓ (raw line `content`) | ✓ (harness markers) | ✓ | ✓ (`unknown` with neither signal) | `function_call_output` | `tool_result.is_error`, `tool_status` | – (no notification rail) |
+| **opencode** | ✓ (raw part `output`) | ✓ (harness markers) | ✓ | ✓ | `function_call_output` | `exit_code`, `tool_status` | – (no notification rail) |
+| **relay** | – | – | – | – | – | – | – |
 
 `payload_bytes` is the raw UTF-8 length of what the provider handed back —
 a string payload as-is, any other JSON payload stable-stringified with sorted
@@ -611,10 +614,23 @@ Codex reports how a call ended out of band (`exec_command_end`,
 `task_complete`. End of file is **not** a turn boundary: a live rollout's last
 turn can still receive the `exec_command_end` that fails one of its calls after
 the bytes a sync read, so a partial read records the failures it saw and leaves
-anything else `unknown`. Only `task_complete` can call a result a success. The
-remaining providers land with their parity issues; they share the
-`ToolResultFacts::from_payload` helper, so the columns will mean the same thing
-for them.
+anything else `unknown`. Only `task_complete` can call a result a success.
+
+Cursor, Grok and OpenCode measure through the same
+`ToolResultFacts::from_payload` helper, so the columns mean the same thing for
+them. `event_source` says where the result was recorded, and that decides
+whether it is a block of a user turn: a Cursor result is a Claude-shaped
+`tool_result` block inside a message record, so it is `tool_result`; a Grok
+`tool_result` chat line and the `output` of an OpenCode tool part are records
+of their own (OpenCode's lives on the assistant message), so they are
+`function_call_output`, like Codex's, and are not counted among a user turn's
+blocks. `tool_status` is the provider's own terminal status on the call — an
+OpenCode part's `state.status: "error"`, or a failed or cancelled `status` on
+Grok's last ACP update for the call. OpenCode's non-zero `metadata.exit` is
+named `exit_code` in preference to it, and Grok's own `is_error` on the result
+line in preference to the ACP status. A Grok result with neither signal is
+`unknown`, not `completed`: `updates.jsonl` can be missing, and a result line
+alone does not say the call succeeded.
 
 A result with nothing displayable in it — a silent command's empty string, a
 structured payload carrying no text — is still recorded. `payload_bytes = 0` is

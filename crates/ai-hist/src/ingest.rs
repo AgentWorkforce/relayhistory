@@ -62,7 +62,7 @@ pub use hydrate::{
 pub use tool_result_facts::{
     content_hash, stable_stringify, ToolResultFacts, ToolResultIndexer, ERROR_SIGNAL_EXIT_CODE,
     ERROR_SIGNAL_MCP_ERR, ERROR_SIGNAL_PATCH_APPLY, ERROR_SIGNAL_SUBAGENT_STATUS,
-    ERROR_SIGNAL_TOOL_RESULT, EVENT_SOURCE_FUNCTION_CALL_OUTPUT,
+    ERROR_SIGNAL_TOOL_RESULT, ERROR_SIGNAL_TOOL_STATUS, EVENT_SOURCE_FUNCTION_CALL_OUTPUT,
     EVENT_SOURCE_SUBAGENT_NOTIFICATION, EVENT_SOURCE_TOOL_RESULT, STATUS_COMPLETED, STATUS_ERRORED,
     STATUS_UNKNOWN,
 };
@@ -2302,7 +2302,9 @@ const RETIRED_SYNC_STATE_KEYS: &[(&str, &str)] = &[
     ("claude_sessions_v3", "claude_sessions_v4"),
     ("cursor", CURSOR_SYNC_STATE_KEY),
     ("cursor_events_v1", CURSOR_SYNC_STATE_KEY),
+    ("cursor_events_v2", CURSOR_SYNC_STATE_KEY),
     ("grok_sessions", GROK_SYNC_STATE_KEY),
+    ("grok_events_v1", GROK_SYNC_STATE_KEY),
 ];
 
 /// Where plain `sync` remembers how far it has read each Cursor transcript.
@@ -2313,7 +2315,9 @@ const RETIRED_SYNC_STATE_KEYS: &[(&str, &str)] = &[
 /// `session_events`, `tool_calls` and `file_edits`. Bumping
 /// `HYDRATION_PARSER_VERSION` alone only repairs sessions somebody hydrates by
 /// name; plain `sync` would keep skipping the rest forever.
-const CURSOR_SYNC_STATE_KEY: &str = "cursor_events_v2";
+///
+/// `v3` re-reads every transcript once for tool-result fidelity (#171).
+const CURSOR_SYNC_STATE_KEY: &str = "cursor_events_v3";
 
 /// Byte cursor covering the complete records hydration actually indexed.
 ///
@@ -2379,7 +2383,9 @@ pub(crate) fn record_cursor_hydrate_checkpoint(
 /// `updates.jsonl` recorded, in place of the synthesized ones the previous
 /// parser wrote. Bumping `HYDRATION_PARSER_VERSION` alone only repairs
 /// sessions somebody hydrates by name.
-const GROK_SYNC_STATE_KEY: &str = "grok_events_v1";
+///
+/// `v2` re-reads every session once for tool-result fidelity (#171).
+const GROK_SYNC_STATE_KEY: &str = "grok_events_v2";
 
 fn merged_sync_state(path: &Path, ours: &Map<String, Value>) -> Result<Option<Map<String, Value>>> {
     let mut merged = load_sync_state(path)?;
@@ -10290,6 +10296,7 @@ pub(crate) fn ingest_cursor_transcript(
     // The last turn time seen while walking forward, inherited by the records
     // that answer that turn.
     let mut turn_ts: Option<i64> = None;
+    let mut tool_results = tool_result_facts::ToolResultIndexer::default();
     // Only complete records are indexed, matching `CompleteJsonlReader` and
     // `complete_jsonl_records`. A transcript Cursor is mid-write has a partial
     // final line; indexing it would publish a truncated prompt that the next
@@ -10629,6 +10636,12 @@ pub(crate) fn ingest_cursor_transcript(
                         .to_string();
                     let content = block.get("content").unwrap_or(&Value::Null);
                     emitted_evidence = true;
+                    // Measured over the raw block before the text column is
+                    // materialized, like Claude's; the walk always starts at
+                    // offset 0, so the indexes are the same on every pass.
+                    let (call_index, event_index) = tool_results.next(&tool_use_id);
+                    let facts = tool_result_facts::cursor_tool_result_facts(block)
+                        .with_ordering(call_index, event_index);
                     insert_session_event(
                         conn,
                         "cursor",
@@ -10647,7 +10660,7 @@ pub(crate) fn ingest_cursor_transcript(
                         // Cursor records no request identity on this path.
                         RequestIdentity::none(),
                         &event_uid,
-                        None,
+                        Some(&facts),
                         RawMessageFacts::default(),
                     )?;
                     if !tool_use_id.is_empty() {
@@ -11013,6 +11026,9 @@ fn ingest_grok_session(
     // displace the message, and a turn with no message still has a tail.
     let mut turn_tail: HashMap<usize, String> = HashMap::new();
     let mut turn_tool_tail: HashMap<usize, String> = HashMap::new();
+    // The whole session is re-read on every pass (its evidence is replaced
+    // above), so the indexes are the same every time.
+    let mut tool_results = tool_result_facts::ToolResultIndexer::default();
 
     for (idx, line) in session.lines.iter().enumerate() {
         check_capture_cancelled()?;
@@ -11336,6 +11352,7 @@ fn ingest_grok_session(
                 call_id,
                 text,
                 is_error,
+                content,
             } => {
                 let tool_use_id = call_id.clone().unwrap_or_else(|| format!("r{idx}:result"));
                 let timing = session.updates.tools.get(&tool_use_id);
@@ -11361,6 +11378,18 @@ fn ingest_grok_session(
                             matches!(status, "failed" | "error" | "cancelled" | "canceled")
                         });
                 let uid = format!("result:{tool_use_id}");
+                // Only the provider's own call id is recorded on the facts;
+                // the positional fallback above is a row identity, not a call
+                // anyone made, so it gets no per-call index either.
+                let (call_index, event_index) =
+                    tool_results.next(call_id.as_deref().unwrap_or_default());
+                let facts = tool_result_facts::grok_tool_result_facts(
+                    content,
+                    call_id.as_deref(),
+                    *is_error,
+                    timing.and_then(|timing| timing.status.as_deref()),
+                )
+                .with_ordering(call_index, event_index);
                 insert_session_event(
                     conn,
                     SOURCE,
@@ -11378,7 +11407,7 @@ fn ingest_grok_session(
                     None,
                     RequestIdentity::none(),
                     &uid,
-                    None,
+                    Some(&facts),
                     RawMessageFacts::default(),
                 )?;
                 outcome.events += 1;
