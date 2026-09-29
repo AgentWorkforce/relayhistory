@@ -700,7 +700,7 @@ const REQUIRED_INDEXES: &[&str] = &[
     // request once per assistant record; without it that is a scan of the
     // session per record. Also what routes a database stored before the
     // settlement through the writable open that heals it.
-    "idx_session_events_request",
+    "idx_session_events_provider_message",
     "idx_session_continuity_parent_uuid",
     "idx_session_continuity_pending",
     "idx_sessions_project_key",
@@ -1621,8 +1621,10 @@ VALUES ('session_presences_local_backfill_v1');
     // `message.id` rather than `requestId` because settlement always names the
     // message and only sometimes the request: a transcript that writes no
     // `requestId` is grouped on `message.id` alone.
+    // An earlier revision indexed `request_id` under this name.
+    conn.execute("DROP INDEX IF EXISTS idx_session_events_request", [])?;
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_session_events_request \
+        "CREATE INDEX IF NOT EXISTS idx_session_events_provider_message \
          ON session_events(source, session_id, provider_message_id) \
          WHERE provider_message_id IS NOT NULL",
         [],
@@ -1632,10 +1634,12 @@ VALUES ('session_presences_local_backfill_v1');
     // rows, so they run here once instead of waiting for every transcript to
     // be re-read. After the marker migration, whose columns the notices move
     // into.
-    if !migration_applied(conn, "claude_request_evidence_v1")? {
+    // v2 because the summary repair joined the pass after a revision had
+    // already recorded v1 without it; every step is idempotent.
+    if !migration_applied(conn, "claude_request_evidence_v2")? {
         crate::ingest::heal_claude_request_evidence(conn)?;
         conn.execute(
-            "INSERT OR IGNORE INTO schema_migrations (name) VALUES ('claude_request_evidence_v1')",
+            "INSERT OR IGNORE INTO schema_migrations (name) VALUES ('claude_request_evidence_v2')",
             [],
         )?;
     }
@@ -7498,7 +7502,7 @@ mod tests {
     fn drop_session_requests_view(conn: &Connection) {
         conn.execute_batch(
             "DROP VIEW IF EXISTS session_requests; \
-             DROP INDEX IF EXISTS idx_session_events_request;",
+             DROP INDEX IF EXISTS idx_session_events_provider_message;",
         )
         .unwrap();
     }

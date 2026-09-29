@@ -8716,7 +8716,6 @@ pub(crate) fn heal_claude_request_evidence(conn: &Connection) -> Result<()> {
             None,
         )?;
     }
-    heal_claude_synthetic_session_summaries(conn)?;
     conn.execute_batch(
         "INSERT INTO session_markers \
            (source, session_id, marker_uid, ts_ms, message_id, parent_id, kind, subkind, text) \
@@ -8728,8 +8727,11 @@ pub(crate) fn heal_claude_request_evidence(conn: &Connection) -> Result<()> {
            AND lower(trim(model)) = '<synthetic>' \
            AND message_id IS NOT NULL AND message_id <> '' \
          GROUP BY session_id, message_id \
-         ON CONFLICT(source, session_id, marker_uid) DO NOTHING; \
-         DELETE FROM session_events \
+         ON CONFLICT(source, session_id, marker_uid) DO NOTHING;",
+    )?;
+    heal_claude_synthetic_session_summaries(conn)?;
+    conn.execute_batch(
+        "DELETE FROM session_events \
          WHERE source = 'claude' AND role = 'assistant' \
            AND lower(trim(model)) = '<synthetic>' \
            AND message_id IS NOT NULL AND message_id <> '';",
@@ -8745,8 +8747,12 @@ pub(crate) fn heal_claude_request_evidence(conn: &Connection) -> Result<()> {
 /// without this a finished session would keep naming a model nobody ran and
 /// quoting a login notice as the model's last word forever. Repaired from the
 /// stored rows, not the transcript, so a session whose transcript is gone is
-/// repaired too. Runs before the notices' events are moved to markers, while
-/// they can still be matched against the excerpt.
+/// repaired too.
+///
+/// The excerpt is matched against the notices' `local_notice` markers, which
+/// both the migration and a fresh parse write, so a database whose notice
+/// events an earlier revision already moved is matched as well as one whose
+/// events are still in place.
 fn heal_claude_synthetic_session_summaries(conn: &Connection) -> Result<()> {
     let columns: HashSet<String> = conn
         .prepare("SELECT name FROM pragma_table_info('sessions')")?
@@ -8768,22 +8774,36 @@ fn heal_claude_synthetic_session_summaries(conn: &Connection) -> Result<()> {
     if !columns.contains("last_assistant_text") {
         return Ok(());
     }
-    // The excerpt the metadata fold wrote from a notice: its text blocks
-    // joined by newlines, cut at 4096 characters.
-    let quoting_a_notice = conn
+    // The excerpt the metadata fold wrote from a notice is its text blocks
+    // joined by newlines — blank ones included, which the event rows the
+    // marker text was built from omit — and cut at 4096 characters. So the
+    // two are compared with whitespace removed, the excerpt as a prefix.
+    let candidates = conn
         .prepare(
-            "SELECT DISTINCT s.session_id FROM sessions s \
-             JOIN (SELECT session_id, substr(group_concat(text, char(10)), 1, 4096) AS excerpt \
-                   FROM (SELECT session_id, message_id, text FROM session_events \
-                         WHERE source = 'claude' AND role = 'assistant' AND kind = 'text' \
-                           AND lower(trim(model)) = '<synthetic>' AND text IS NOT NULL \
-                         ORDER BY id) \
-                   GROUP BY session_id, message_id) n \
-               ON n.session_id = s.session_id AND n.excerpt = s.last_assistant_text \
-             WHERE s.source = 'claude'",
+            "SELECT s.session_id, s.last_assistant_text, m.text FROM sessions s \
+             JOIN session_markers m ON m.source = s.source AND m.session_id = s.session_id \
+             WHERE s.source = 'claude' AND s.last_assistant_text IS NOT NULL \
+               AND m.kind = 'local_notice' AND m.subkind = 'synthetic' AND m.text IS NOT NULL",
         )?
-        .query_map([], |row| row.get::<_, String>(0))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    let squeeze = |text: &str| -> String { text.chars().filter(|c| !c.is_whitespace()).collect() };
+    let mut quoting_a_notice: Vec<String> = candidates
+        .into_iter()
+        .filter(|(_, excerpt, notice)| {
+            let excerpt = squeeze(excerpt);
+            !excerpt.is_empty() && squeeze(notice).starts_with(&excerpt)
+        })
+        .map(|(session_id, _, _)| session_id)
+        .collect();
+    quoting_a_notice.sort();
+    quoting_a_notice.dedup();
     for session_id in quoting_a_notice {
         // What the fold would have kept had it skipped the notices: the text
         // of the last main-thread assistant record that is model output.
@@ -27361,15 +27381,18 @@ mod tests {
     /// verbatim, the notice as assistant output, and the session summaries
     /// the notice fed. Opening it repairs all of them from the stored rows
     /// alone, once, without the transcript — with or without a `requestId`
-    /// on the copies.
+    /// on the copies, and whether or not an earlier revision already moved
+    /// the notice to its marker without repairing the summaries.
     #[test]
     fn opening_an_older_database_heals_claude_request_evidence() {
         for with_request_id in [true, false] {
-            heal_older_claude_database(with_request_id);
+            for notice_already_moved in [false, true] {
+                heal_older_claude_database(with_request_id, notice_already_moved);
+            }
         }
     }
 
-    fn heal_older_claude_database(with_request_id: bool) {
+    fn heal_older_claude_database(with_request_id: bool, notice_already_moved: bool) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s-stream.jsonl");
         fs::write(&path, streamed_turn([5, 40, 120])).unwrap();
@@ -27382,16 +27405,29 @@ mod tests {
                WHERE event_uid = 'u-block-0:0'; \
              UPDATE session_events SET token_json = json_set(token_json, '$.output_tokens', 40) \
                WHERE event_uid = 'u-block-1:0'; \
-             DELETE FROM schema_migrations WHERE name = 'claude_request_evidence_v1'; \
-             DROP INDEX idx_session_events_request;",
+             DELETE FROM schema_migrations WHERE name = 'claude_request_evidence_v2'; \
+             DROP INDEX idx_session_events_provider_message;",
         )
         .unwrap();
-        conn.execute(
+        // A notice of two text blocks with a blank one between them: the
+        // event rows omit the blank block, the cached excerpt kept it.
+        conn.execute_batch(
             "INSERT INTO session_events (source, session_id, message_id, parent_id, ts_ms, role, kind, text, model, event_uid) \
-             VALUES ('claude', 's-stream', 'a-synth', 'u-block-2', 5, 'assistant', 'text', 'Login expired', '<synthetic>', 'a-synth:0')",
-            [],
+             VALUES ('claude', 's-stream', 'a-synth', 'u-block-2', 5, 'assistant', 'text', 'Login expired', '<synthetic>', 'a-synth:0'), \
+                    ('claude', 's-stream', 'a-synth', 'u-block-2', 5, 'assistant', 'text', 'Run /login', '<synthetic>', 'a-synth:2');",
         )
         .unwrap();
+        if notice_already_moved {
+            // What the first revision of this repair left: the marker written,
+            // the events gone, the summaries untouched, and v1 recorded.
+            conn.execute_batch(
+                "INSERT INTO session_markers (source, session_id, marker_uid, ts_ms, message_id, parent_id, kind, subkind, text) \
+                 VALUES ('claude', 's-stream', 'a-synth:marker', 5, 'a-synth', 'u-block-2', 'local_notice', 'synthetic', 'Login expired' || char(10) || 'Run /login'); \
+                 DELETE FROM session_events WHERE model = '<synthetic>'; \
+                 INSERT INTO schema_migrations (name) VALUES ('claude_request_evidence_v1');",
+            )
+            .unwrap();
+        }
         if !with_request_id {
             conn.execute("UPDATE session_events SET request_id = NULL", [])
                 .unwrap();
@@ -27399,7 +27435,8 @@ mod tests {
         let summaries = conn
             .execute(
                 "INSERT INTO sessions (session_id, source, models_json, last_assistant_text) \
-                 VALUES ('s-stream', 'claude', '[\"claude-opus-4-7\",\"<synthetic>\"]', 'Login expired')",
+                 VALUES ('s-stream', 'claude', '[\"claude-opus-4-7\",\"<synthetic>\"]', \
+                         'Login expired' || char(10) || ' ' || char(10) || 'Run /login')",
                 [],
             )
             .unwrap();
@@ -27427,7 +27464,7 @@ mod tests {
             marker,
             (
                 "local_notice".to_string(),
-                Some("Login expired".to_string()),
+                Some("Login expired\nRun /login".to_string()),
                 Some("u-block-2".to_string())
             )
         );
