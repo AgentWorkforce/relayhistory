@@ -98,6 +98,76 @@ Notable changes to the native `ai-hist` CLI are documented here.
   sessions and their objectives are not history rows. A Muse hydration
   reports `full`. `ai-hist resume` prints `muse resume <id>`, and the sync
   service forwards `XDG_DATA_HOME`.
+- Read every OpenCode channel database. OpenCode keeps one SQLite store per
+  release channel — `opencode.db` for `latest`/`beta`, and
+  `opencode-stable.db`, `opencode-nightly.db`, ... beside it — and only
+  `opencode.db` was read, so a user on another channel had no OpenCode history
+  at all. Discovery, `sync`, `sync-opencode`, hydration and live-capture
+  fingerprints now cover every channel store in the directory; a session found
+  in more than one is owned by the first (`opencode.db`, then the channel
+  stores in name order), including under a discovery `--limit`; hydrating a
+  copy an earlier store has since gained is refused with
+  `SESSION_SOURCE_MISMATCH` until rediscovery. A channel store that cannot be
+  opened, or a channel directory that cannot be listed, is reported as a
+  diagnostic (even on a `--limit` page) while the other stores are still read;
+  the sweep does not record its fingerprint over it, and `sync-opencode`
+  indexes what it could read and then fails naming the unlistable directory. `OPENCODE_DB` still names exactly one store,
+  as does `sync-opencode --opencode-db`.
+
+- Record Grok's per-turn usage. Recent Grok Build releases write a
+  `turn_completed.usage` breakdown (`inputTokens`, `outputTokens`,
+  `cachedReadTokens`, `reasoningTokens`, `totalTokens`); it is now stored
+  verbatim under `usage` in the turn's `token_json`, beside the
+  `context_total_tokens` snapshot, and normalized as `per-request` usage with
+  cache reads taken out of input. `source_accounting("grok")` is
+  `per-request` and `NORMALIZABLE_SOURCES` gains `grok`; a Grok record with
+  only the context snapshot normalizes to no usage rather than
+  `USAGE_UNKNOWN_SOURCE`. Hydration reports `GROK_USAGE_CONTEXT_PROXY_ONLY` only
+  when no turn carried a breakdown, `GROK_USAGE_PARTIAL` when some did. A
+  `usage` holding only `totalTokens` is still read as the context snapshot.
+  Every assistant row of a Grok turn now carries the turn index as its
+  `request_span`, so `session_requests` reports one request per turn instead
+  of one per row. Already indexed Grok sessions are re-read once, by `sync`
+  (state key `grok_events_v2`) and by hydration (parser version 12). A cached
+  hydration whose checkpoint predates stored diagnostics never claims full
+  usage coverage. `~/.grok/logs/unified.jsonl` is not read yet (#212).
+
+- Tool-result fidelity now covers Cursor, Grok and OpenCode (#171). Their
+  `tool_result` events carry `payload_bytes`, `payload_hash`,
+  `payload_truncated`, `call_index`, `event_index`, `result_status`,
+  `event_source` and `error_signal`, measured over the raw provider payload
+  through the same helper as Claude and Codex. A Cursor result is a block of
+  its message (`event_source = 'tool_result'`); a Grok `tool_result` line and
+  an OpenCode tool part's `output` are standalone
+  (`event_source = 'function_call_output'`) and so are not counted among a
+  user turn's blocks. `error_signal` gains `tool_status`, the provider's own
+  terminal status on the call (OpenCode `state.status: "error"`, a failed or
+  cancelled Grok ACP update); OpenCode's non-zero `metadata.exit` is reported
+  as `exit_code`. `ToolResultErrorSignal` in the TS SDK and the submitted-record
+  validation accept the new value. `HYDRATION_PARSER_VERSION` is 13 and the
+  `cursor_events_v2` / `grok_events_v2` sync-state keys are retired, so every
+  already indexed Cursor and Grok session re-parses once; OpenCode re-reads on
+  every sync already. The fixture corpus snapshots now include the fidelity
+  columns, and the three corpus tests held `#[ignore = "closed by #171"]`
+  assert them.
+
+- New `ai-hist compact [--json]` returns space the history database holds
+  but no longer uses, and deletes no rows. It merges the three full-text
+  indexes, runs `VACUUM` and truncates the WAL, and afterwards rebuilds
+  `trajectory_fts`, because `VACUUM` may renumber the rowids that index is
+  keyed on. It takes the sync run lock, so a concurrent `sync` or `watch` tick
+  skips instead of stalling behind the rewrite. It refuses with
+  `a sync is running` while one holds the lock. It also refuses up front when
+  the volume lacks room for twice the live pages plus the 512 MiB write
+  floor, because a rewrite that ran out of space midway would repeat #44;
+  that check runs before the database is opened writable (so before any schema
+  migration), and compact refuses when free space cannot be measured at all.
+  When a reader keeps the WAL from being truncated, compact says so
+  (`wal_truncated: false` under `--json`) instead of claiming it. On
+  the 248 MB benchmark store it took 2.8 s and saved 9 MB (#53).
+- `ai-hist doctor` reports `reclaimable` (`reclaimable_bytes` under `--json`),
+  the freelist bytes a `compact` would return. It points at `compact` when at
+  least 64 MiB and a quarter of the file are free pages.
 - Add workspace-scoped agent handoffs through `create_handoff(intent)` and
   `resume_handoff(source, session_id)`. The sender emits only a session pointer
   plus one self-describing intent and origin identity; the intent tells the
@@ -235,6 +305,22 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Session topology
 
+- Record Codex forks from the fields Codex actually writes. A rollout whose
+  `session_meta` carries `forked_from_id` (a human "fork conversation") or
+  `source.subagent.thread_spawn.parent_thread_id` (a spawned subagent) now
+  gets a `fork` edge to that thread, with the field name as `evidence_ref`; a
+  subagent keeps its `delegated` row beside it and a human fork stays a
+  top-level session. A rollout indexed before this re-reads its `session_meta`
+  line once on the next `sync`: `SHALLOW_SCANNER_VERSION` 6 -> 7 moves the
+  sweep generation, so that sync runs even when no source changed, and sends
+  cached discovery rows through the current classifier once. A
+  `thread_source: "guardian_review"` rollout (Codex 0.150+) that names a
+  parent is hidden from the root catalog like any other subagent, and one an
+  earlier build catalogued as a root is reclassified on that same pass.
+  Hydrating a parent with `include_related` also records its spawned
+  children's fork edges. The replay of the parent's history inside a forked
+  rollout is not gated yet (#210).
+
 - Record fork, resume and continuation relationships, not delegation alone.
   `session_relationships.relationship` now takes `continuation | fork | resume`
   beside `delegated | materialized_local`, and carries `origin_session_id` —
@@ -267,11 +353,83 @@ Notable changes to the native `ai-hist` CLI are documented here.
   table left the old trigger delivering rows that looked complete and were
   missing a field, for the life of the database.
 
+### Fixed
+
+- `ai-hist export` no longer overwrites the database it is reading from
+  (#73). The destination is checked against the database the command
+  actually opened (`--db` included, not only `AI_HIST_DB`/the default, and
+  for a SQLite `file:` URI the file SQLite resolved it to), for
+  every format (`sqlite`, `jsonl`, `.gz`), after resolving relative
+  spellings, `..`, symlinks and hard links, and its `-wal`/`-shm`/`-journal`
+  sidecars are protected too. A refused export exits non-zero before reading
+  or writing anything.
+- `ai-hist export` stages its output in a temporary file beside the
+  destination and renames it into place once complete, so a failed export
+  leaves an existing destination file untouched. A SQLite export is written
+  as a single self-contained file. Sidecars left at the destination by an
+  earlier database are moved aside before the rename and discarded only once
+  it succeeds, so they can neither be replayed onto the new file nor lost if
+  the replacement fails; a sidecar that cannot be moved aside fails the
+  export. A destination that is a symlink is written through to its target,
+  which is itself checked against the active database.
+- Claude discovery and `sync` no longer treat the subagent workflow journal
+  (`<session>/subagents/**/journal.jsonl`) as a transcript. It is metadata
+  that shares the `.jsonl` extension; it is no longer listed as a discovery
+  candidate, opened, or tracked with a transcript cursor. On the first sync
+  after upgrading, what an earlier build derived from a journal is retracted:
+  its continuity evidence, the `unknown` markers its lines were stored as
+  (matched by session, line identity and record type, so a transcript's own
+  markers are untouched; lines no longer in the journal cannot be matched and
+  are left), and a session `raw_path`, local presence or local observation
+  left pointing at it. The journal's cursor is dropped only after that
+  succeeds, so an interrupted retraction is retried by the next sync.
+  ([#208](https://github.com/AgentWorkforce/relayhistory/issues/208))
+- Claude requests written as streamed snapshots — one record per content block,
+  same `message.id` (and `requestId`, when the transcript writes one),
+  `output_tokens` growing — now report their final usage instead of being
+  refused as `ambiguous-usage-copies`. The parser merges the copies per field
+  (largest output counter wins, `iterations` may gain entries, everything else
+  including a reported cost must agree) and writes the result onto every row
+  of the request; contradictory copies are still refused. Existing databases are settled once on the next writable
+  open. ([#211](https://github.com/AgentWorkforce/relayhistory/issues/211))
+- Claude `<synthetic>` assistant records (local API-error and login notices)
+  are stored as `session_markers` rows of kind `local_notice`, subkind
+  `synthetic`, instead of assistant events: they no longer form a request,
+  appear as a session model, or become `last_assistant_text`. Existing rows
+  move to markers on the next writable open, and the session's `models_json`
+  and a `last_assistant_text` quoting the notice are repaired with them.
+  ([#211](https://github.com/AgentWorkforce/relayhistory/issues/211))
+- A sweep no longer re-runs the Codex project/branch backfill over every
+  Codex session ever indexed. It covers only the sessions whose rollout was
+  re-read or which gained a `history.jsonl` prompt in that sweep, after one
+  full pass per install (recorded as `codex_metadata_backfill` in
+  `.sync-state.json`) for rows an older build left unattributed. Sessions
+  whose backfill a failed or cancelled sweep left unfinished are carried in
+  `codex_metadata_pending` and retried on the next sweep. Before, any
+  change that moved the source fingerprint — one Claude transcript growing —
+  cost an `UPDATE`, a `MIN`/`MAX` scan and a `sessions` upsert per Codex
+  session, and gave every Codex row a new change-feed revision. On 3,000
+  Codex + 300 Claude sessions, the sweep after one Claude append drops from
+  2.9s to 1.0s and re-stamps 0 Codex rows instead of 3,000 (#42).
+- The Claude sync walk's per-transcript "has this path left evidence?" probe
+  is a keyed search again. SQLite, with no statistics to go on, drove it from
+  `session_events` rather than from the one `sessions` row the path names, so
+  every transcript with no row of its own — each subagent sidecar, each new
+  file — scanned every Claude event, once per file per sweep. The probes now
+  pin their join order, and a new `idx_session_relationships_locator` index
+  (created on the next writable open) serves the sidecar probe. On the 100 MB
+  synthetic store, a sync after a 1 KiB append drops from 7.0 s to 2.1 s, and
+  a cold sync from 60 s to 43 s, in the benchmark harness (#215).
+
 ### Rust API
 
 - `Source::Muse` and `ProviderRoots::muse` (the Muse Code sessions directory;
   `from_env` honours `XDG_DATA_HOME`). Both types are `#[non_exhaustive]`, so
   this is additive.
+- `ProviderRoots` gains `opencode_db_pinned: bool`. `from_env` sets it when
+  `OPENCODE_DB` is set; `from_home` leaves it `false`, so every OpenCode channel
+  database beside `opencode_db` is read. Set it to read `opencode_db` alone.
+
 - The `export` feature is local export alone: `ExportSnapshot` (`open`,
   `handle`, `page`, `owns_cursor`, `expired`, `snapshot_id`),
   `ExportSelection`, `ExportLimits`, `ExportHandle`, `HistoryExportPage`,

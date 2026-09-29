@@ -853,7 +853,7 @@ fn build_corpus() -> BTreeMap<String, Value> {
     // `getenv` inside the staging window is the library's own. It is dropped
     // when the build finishes: every snapshot is already in memory by then,
     // and nothing else in this binary reads `HOME`.
-    let root = tempfile::tempdir().expect("corpus temp root");
+    let root = corpus_temp_root();
     let mut snapshots = BTreeMap::new();
     for fixture in CORPUS {
         if fixture.layout == Layout::Reference {
@@ -867,6 +867,30 @@ fn build_corpus() -> BTreeMap<String, Value> {
     }
     snapshots
 }
+
+/// The temp root every fixture `HOME` is staged under, kept short.
+///
+/// Marker payload strings are bounded at [`MARKER_PAYLOAD_FIELD_LIMIT`]
+/// characters, and some of them are absolute paths under `HOME` (Grok's
+/// `prompt_context` marker records where `prompt_context.json` was). Where that
+/// bound cuts such a path depends on how long `HOME` is, so a long temp root
+/// makes the snapshot depend on the machine: `$TMPDIR` on macOS is
+/// `/var/folders/<2>/<28>/T/`, long enough to cut
+/// `…/grok-evt-0001/prompt_context.json` to `…/grok-evt-0001/prom`, while
+/// Linux CI's `/tmp` is not. Staging under `/tmp` on every Unix keeps each
+/// path whole, so the committed (Linux-generated) values hold everywhere, and
+/// [`assert_home_paths_fit_marker_bound`] fails loudly if a platform's root is
+/// still too long rather than letting it read as a parser change.
+fn corpus_temp_root() -> tempfile::TempDir {
+    let builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    return builder.tempdir_in("/tmp").expect("corpus temp root");
+    #[cfg(not(unix))]
+    return builder.tempdir().expect("corpus temp root");
+}
+
+/// Mirrors `ingest::MARKER_PAYLOAD_FIELD_LIMIT`, which is crate-private.
+const MARKER_PAYLOAD_FIELD_LIMIT: usize = 128;
 
 fn capture(fixture: &Fixture, home: &Path) -> Value {
     let opencode_db = home.join(".local/share/opencode/opencode.db");
@@ -976,9 +1000,14 @@ const SESSIONS_SQL: &str = "SELECT source, session_id, cwd, git_branch, first_ac
      last_activity_ms, last_assistant_text, raw_path, first_prompt, models_json, \
      originator, agent_version, repo_url, initial_commit, workspace_roots_json, source_stamp, \
      discovery_state FROM sessions ORDER BY source, session_id";
+/// The tool-result fidelity columns (#171) are selected too: they are
+/// measured from the raw provider payload, so a parser change that moves a
+/// byte count, a status or an error signal shows up in the snapshot diff.
 const SESSION_EVENTS_SQL: &str =
     "SELECT source, session_id, project, cwd, git_branch, message_id, \
-     parent_id, ts_ms, role, kind, text, model, token_json, event_uid, control_kind \
+     parent_id, ts_ms, role, kind, text, model, token_json, event_uid, control_kind, \
+     tool_use_id, payload_bytes, payload_truncated, payload_hash, call_index, event_index, \
+     result_status, event_source, error_signal, subagent_session_id, agent_id \
      FROM session_events ORDER BY source, session_id, ts_ms, event_uid";
 /// `marker_uid` is derived from the provider record, not from insertion
 /// order, so it is a stable key to select and sort by.
@@ -1042,7 +1071,52 @@ fn redact(value: Value, home: &Path) -> Value {
     // form is `/private/var/...`, so replacing the short one first would leave
     // `/private<home>/…` behind and the long one would then never match.
     homes.sort_by_key(|home| std::cmp::Reverse(home.len()));
+    assert_home_paths_fit_marker_bound(&value, &homes);
     redact_value(value, &homes, false)
+}
+
+/// Fail if a marker payload string that carries the fixture's `HOME` reached
+/// the payload bound.
+///
+/// Such a string was (or may have been) cut at a point set by `HOME`'s length,
+/// which redaction cannot undo: `<home>` replaces the prefix, but the missing
+/// tail stays missing, and the snapshot would then differ between machines for
+/// a reason no parser change explains. See [`corpus_temp_root`].
+fn assert_home_paths_fit_marker_bound(snapshot: &Value, homes: &[String]) {
+    fn walk(value: &Value, homes: &[String], home_len: usize) {
+        match value {
+            Value::String(text) => {
+                let carries_home = homes.iter().any(|home| text.contains(home.as_str()));
+                assert!(
+                    !carries_home || text.chars().count() < MARKER_PAYLOAD_FIELD_LIMIT,
+                    "marker payload path `{text}` reached the {MARKER_PAYLOAD_FIELD_LIMIT}-char \
+                     payload bound, so where it was cut depends on the fixture HOME's length \
+                     ({home_len} chars); stage the corpus under a shorter temp root",
+                );
+            }
+            Value::Array(items) => items.iter().for_each(|item| walk(item, homes, home_len)),
+            Value::Object(map) => map.values().for_each(|item| walk(item, homes, home_len)),
+            _ => {}
+        }
+    }
+    // A HOME at or over the bound would be cut inside itself, and the cut
+    // string would no longer contain it for `walk` to find. Every form is
+    // checked, because the canonical one (`/private/tmp/…` on macOS) is what
+    // ingest may have stored.
+    for home in homes {
+        assert!(
+            home.chars().count() < MARKER_PAYLOAD_FIELD_LIMIT,
+            "fixture HOME `{home}` is at least the {MARKER_PAYLOAD_FIELD_LIMIT}-char marker \
+             payload bound; stage the corpus under a shorter temp root",
+        );
+    }
+    let home_len = homes.iter().map(String::len).min().unwrap_or(0);
+    let markers = snapshot["session_markers"].as_array().into_iter().flatten();
+    for payload in markers.filter_map(|marker| marker["payload_json"].as_str()) {
+        if let Ok(payload) = serde_json::from_str::<Value>(payload) {
+            walk(&payload, homes, home_len);
+        }
+    }
 }
 
 fn redact_value(value: Value, homes: &[String], stamp: bool) -> Value {
@@ -2173,45 +2247,184 @@ fn codex_session_meta_relationship_ids_are_recorded() {
     assert!(parents.contains("sess_fork_base"), "{relationships:?}");
 }
 
+/// The `session_events` rows of a fixture that record a tool result.
+fn tool_results(key: &str) -> Vec<&Value> {
+    rows(key, "session_events")
+        .iter()
+        .filter(|event| text(event, "kind") == "tool_result")
+        .collect()
+}
+
+/// The one tool result a fixture recorded for `tool_use_id`.
+fn tool_result<'a>(key: &'a str, tool_use_id: &str) -> &'a Value {
+    let matching = rows(key, "session_events")
+        .iter()
+        .filter(|event| {
+            text(event, "kind") == "tool_result" && text(event, "tool_use_id") == tool_use_id
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "{key}: results for {tool_use_id}");
+    matching[0]
+}
+
 /// burn: `measure_tool_result_populates_byte_length_and_truncation_flag` — the
 /// size of a tool result is the fact that decides whether it was truncated.
+/// The fixture is 80 000 literal characters with no harness marker, so burn's
+/// own reader reports it untruncated too.
 #[test]
-#[ignore = "closed by #171"]
 fn claude_oversized_tool_result_records_its_byte_length() {
-    let results = rows("claude/oversized-bash-output", "tool_results");
+    let results = tool_results("claude/oversized-bash-output");
     assert_eq!(results.len(), 1, "{results:?}");
-    assert!(
-        field(&results[0], "bytes").as_i64().unwrap_or_default() > 70_000,
-        "{results:?}"
-    );
+    assert_eq!(field(results[0], "payload_bytes").as_i64(), Some(80_000));
+    assert_eq!(field(results[0], "payload_truncated").as_i64(), Some(0));
+    assert_eq!(text(results[0], "event_source"), "tool_result");
+    assert_eq!(text(results[0], "tool_use_id"), "tu_bash_big");
 }
 
 /// burn: the codex shell output fixture is the same fact on the other
 /// provider.
 #[test]
-#[ignore = "closed by #171"]
 fn codex_oversized_shell_output_records_its_byte_length() {
-    let results = rows("codex/oversized-shell-output", "tool_results");
+    let results = tool_results("codex/oversized-shell-output");
     assert_eq!(results.len(), 1, "{results:?}");
-    assert!(
-        field(&results[0], "bytes").as_i64().unwrap_or_default() > 70_000,
-        "{results:?}"
-    );
+    assert_eq!(field(results[0], "payload_bytes").as_i64(), Some(80_000));
+    assert_eq!(field(results[0], "payload_truncated").as_i64(), Some(0));
+    assert_eq!(text(results[0], "event_source"), "function_call_output");
+    assert_eq!(text(results[0], "result_status"), "completed");
 }
 
 /// burn: `user_turn_blocks_text_and_tool_results` — three user records, the
-/// middle two carrying tool_result blocks of very different sizes.
+/// middle two carrying tool_result blocks of very different sizes, one of
+/// them failed by Claude's own `is_error`.
 #[test]
-#[ignore = "closed by #171"]
 fn claude_user_turn_tool_result_blocks_are_indexed_individually() {
-    let results = rows("claude/user-turn-blocks", "tool_results");
+    let key = "claude/user-turn-blocks";
+    let results = tool_results(key);
     assert_eq!(results.len(), 3, "{results:?}");
-    assert!(
-        results
-            .iter()
-            .any(|result| field(result, "is_error").as_i64() == Some(1)),
-        "{results:?}"
+    let indexed = results
+        .iter()
+        .map(|result| {
+            (
+                text(result, "tool_use_id"),
+                field(result, "payload_bytes").as_i64(),
+                field(result, "event_index").as_i64(),
+                field(result, "call_index").as_i64(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        indexed,
+        [
+            ("tu_bash_1", Some(4), Some(0), Some(0)),
+            ("tu_read_1", Some(100), Some(1), Some(0)),
+            ("tu_bash_2", Some(15), Some(2), Some(0)),
+        ]
     );
+    let failed = tool_result(key, "tu_bash_2");
+    assert_eq!(text(failed, "result_status"), "errored");
+    assert_eq!(text(failed, "error_signal"), "tool_result.is_error");
+}
+
+/// burn: codex `user_turn_blocks` — the failing shell call is failed out of
+/// band by `exec_command_end.exit_code`, and the row says which signal did it.
+#[test]
+fn codex_failed_call_names_its_exit_code_signal() {
+    let failed = tool_result("codex/user-turn-blocks", "call_b2");
+    assert_eq!(text(failed, "result_status"), "errored");
+    assert_eq!(text(failed, "error_signal"), "exit_code");
+    assert_eq!(text(failed, "event_source"), "function_call_output");
+    let passed = tool_result("codex/user-turn-blocks", "call_b1");
+    assert_eq!(text(passed, "result_status"), "completed");
+    assert!(field(passed, "error_signal").is_null(), "{passed}");
+}
+
+/// burn: `system_subagent_notification` — the harness line reporting a
+/// delegated child is a result on its own rail, linked to the child.
+#[test]
+fn claude_subagent_notification_links_the_child() {
+    let results = tool_results("claude/system-subagent-notification");
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert_eq!(text(results[0], "event_source"), "subagent_notification");
+    assert_eq!(
+        text(results[0], "subagent_session_id"),
+        "session-system-child"
+    );
+    assert_eq!(text(results[0], "agent_id"), "agent-system-1");
+}
+
+/// `replacement-meta`: both results are content blocks, each linked to the
+/// call it answers.
+#[test]
+fn claude_replacement_meta_results_keep_their_call_linkage() {
+    for id in ["tu_search_1", "tu_read_1"] {
+        let result = tool_result("claude/replacement-meta", id);
+        assert_eq!(text(result, "event_source"), "tool_result");
+        assert_eq!(field(result, "call_index").as_i64(), Some(0));
+    }
+}
+
+/// Cursor writes Claude-shaped result blocks, measured the same way.
+#[test]
+fn cursor_tool_result_records_its_fidelity() {
+    let result = tool_result("cursor/prompt-transcript", "toolu_cursor_1");
+    assert_eq!(field(result, "payload_bytes").as_i64(), Some(2));
+    assert_eq!(text(result, "event_source"), "tool_result");
+    assert_eq!(text(result, "result_status"), "completed");
+    assert_eq!(field(result, "event_index").as_i64(), Some(0));
+}
+
+/// Grok's result line carries its own `is_error`; that is the signal named.
+#[test]
+fn grok_failed_result_names_its_own_error_flag() {
+    let key = "grok/events-session";
+    let failed = tool_result(key, "call_shell_2");
+    assert_eq!(text(failed, "result_status"), "errored");
+    assert_eq!(text(failed, "error_signal"), "tool_result.is_error");
+    assert_eq!(text(failed, "event_source"), "function_call_output");
+    let results = tool_results(key);
+    let indexes = results
+        .iter()
+        .filter_map(|result| field(result, "event_index").as_i64())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(indexes, (0..results.len() as i64).collect());
+}
+
+/// burn: opencode `user_turn_blocks` — a bash part that exited 1 is a failed
+/// call even though the part's own status says `completed`.
+#[test]
+fn opencode_failed_part_names_its_exit_code_signal() {
+    let failed = tool_result("opencode/legacy-json-user-turn-blocks", "call_fail");
+    assert_eq!(text(failed, "result_status"), "errored");
+    assert_eq!(text(failed, "error_signal"), "exit_code");
+    assert_eq!(text(failed, "event_source"), "function_call_output");
+    assert_eq!(
+        field(failed, "payload_bytes").as_i64(),
+        Some("ERROR: tests failed".len() as i64)
+    );
+}
+
+/// Every provider with a tool-result parser records the fidelity facts on
+/// every tool-result row it writes: a null there is a parser that forgot, not
+/// a provider that does not say.
+#[test]
+fn every_parsed_tool_result_carries_its_fidelity() {
+    for fixture in CORPUS.iter().filter(|fixture| {
+        matches!(
+            fixture.source,
+            "claude" | "codex" | "cursor" | "grok" | "opencode"
+        ) && fixture.layout != Layout::Reference
+    }) {
+        let key = snapshot_key(fixture);
+        for result in tool_results(&key) {
+            for column in ["event_source", "result_status", "event_index"] {
+                assert!(
+                    !field(result, column).is_null(),
+                    "{key}: {column} is null on {}",
+                    text(result, "event_uid")
+                );
+            }
+        }
+    }
 }
 
 /// burn: `multi_block_turn_emits_one_inference_with_merged_usage` — the four

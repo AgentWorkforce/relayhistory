@@ -510,6 +510,7 @@ it holds for every kind.
 | `synthetic_turn` | – | – | ✓ a turn the harness wrote, in `text` | – | – |
 | `signals` | – | – | ✓ | – | – |
 | `prompt_context` | – | – | ✓ | – | – |
+| `local_notice` | ✓ an `assistant` record whose model is `<synthetic>`: a notice Claude Code wrote itself (API error, expired login), text in `text`, `error` and `is_api_error_message` in `payload_json` | – | – | – | `synthetic` |
 | `unknown` | ✓ any unclassified record type, plus a `user`/`assistant` record that produced no event at all | ✓ any unclassified payload type, including `agent_reasoning_raw_content` and `agent_reasoning_section_break` | – | – | the provider type, verbatim |
 | `turn_end` | – | – | – | ✓ run `terminal` (`completed`, `interrupted`, …) in `text` | `terminal` |
 | `session_start` | – | – | – | ✓ `session.opened.observed`, `resume` in the payload | `session.opened.observed` |
@@ -598,8 +599,11 @@ status, because a fabricated measurement reads exactly like a real one:
 |---|---|---|---|---|---|---|---|
 | **claude** | ✓ (raw `content`) | ✓ (harness markers) | ✓ | ✓ | `tool_result`, `subagent_notification` | `tool_result.is_error`, `subagent_status` | ✓ (system subagent notifications) |
 | **codex** | ✓ (raw `output`) | ✓ (harness markers) | ✓ | ✓ (settled at `task_complete`) | `function_call_output` | `exit_code`, `patch_apply`, `mcp_err` | – (no notification rail) |
+| **cursor** | ✓ (raw block `content`) | ✓ (harness markers) | ✓ | ✓ | `tool_result` | `tool_result.is_error` | – (no notification rail) |
+| **grok** | ✓ (raw line `content`) | ✓ (harness markers) | ✓ | ✓ (`unknown` with neither signal) | `function_call_output` | `tool_result.is_error`, `tool_status` | – (no notification rail) |
+| **opencode** | ✓ (raw part `output`) | ✓ (harness markers) | ✓ | ✓ | `function_call_output` | `exit_code`, `tool_status` | – (no notification rail) |
 | **muse** | ✓ (result `text`) | ✓ (harness markers) | ✓ | ✓ (`tool_batch.effect.terminal`, joined by call id) | `tool_result` | `tool_batch.effect`, `exit_code` (`bash`) | – |
-| **cursor**, **grok**, **opencode**, **relay** | – | – | – | – | – | – | – |
+| **relay** | – | – | – | – | – | – | – |
 
 `payload_bytes` is the raw UTF-8 length of what the provider handed back —
 a string payload as-is, any other JSON payload stable-stringified with sorted
@@ -617,10 +621,23 @@ Codex reports how a call ended out of band (`exec_command_end`,
 `task_complete`. End of file is **not** a turn boundary: a live rollout's last
 turn can still receive the `exec_command_end` that fails one of its calls after
 the bytes a sync read, so a partial read records the failures it saw and leaves
-anything else `unknown`. Only `task_complete` can call a result a success. The
-remaining providers land with their parity issues; they share the
-`ToolResultFacts::from_payload` helper, so the columns will mean the same thing
-for them.
+anything else `unknown`. Only `task_complete` can call a result a success.
+
+Cursor, Grok and OpenCode measure through the same
+`ToolResultFacts::from_payload` helper, so the columns mean the same thing for
+them. `event_source` says where the result was recorded, and that decides
+whether it is a block of a user turn: a Cursor result is a Claude-shaped
+`tool_result` block inside a message record, so it is `tool_result`; a Grok
+`tool_result` chat line and the `output` of an OpenCode tool part are records
+of their own (OpenCode's lives on the assistant message), so they are
+`function_call_output`, like Codex's, and are not counted among a user turn's
+blocks. `tool_status` is the provider's own terminal status on the call — an
+OpenCode part's `state.status: "error"`, or a failed or cancelled `status` on
+Grok's last ACP update for the call. OpenCode's non-zero `metadata.exit` is
+named `exit_code` in preference to it, and Grok's own `is_error` on the result
+line in preference to the ACP status. A Grok result with neither signal is
+`unknown`, not `completed`: `updates.jsonl` can be missing, and a result line
+alone does not say the call succeeded.
 
 A result with nothing displayable in it — a silent command's empty string, a
 structured payload carrying no text — is still recorded. `payload_bytes = 0` is
@@ -791,7 +808,11 @@ How each adapter works:
   in the head read and skipped, so a session is emitted once per run and its
   row keeps pointing at its own transcript. A transcript whose complete records
   parse as nothing is reported as a diagnostic rather than published under its
-  file name; an empty one is simply not a session yet.
+  file name; an empty one is simply not a session yet. The subagent workflow
+  journal, `<session>/subagents/**/journal.jsonl`, is excluded by name before
+  anything opens it — here and in the full sync walk alike. It records
+  workflow orchestration (`started` / `result` lines), not a conversation, and
+  no session, event, marker, cursor or continuity row is derived from it.
 - **codex** — `rollout-*.jsonl` under `$CODEX_HOME/sessions` and
   `$CODEX_HOME/archived_sessions` (defaulting under `~/.codex`). The first line
   is a `session_meta` record, which
@@ -1148,7 +1169,7 @@ How each adapter works:
   | `timestamp` in epoch **seconds**, `agentTimestampMs` in **milliseconds** | **Corroborated** | A field named `…Ms` is read as milliseconds; a bare `timestamp` is scaled if it is below 10¹² |
   | `turnStartMs` | **Stated in [#167](https://github.com/AgentWorkforce/relayhistory/issues/167)** from burn #489; not seen in a public sample | Read from `params.update`, `params._meta` or the envelope; the turn's fallback time |
   | `turn_completed.totalTokens` | **Stated in #167**, and corroborated as a `turn_completed`-borne total | `token_json = {"context_total_tokens": n, "source": "updates.jsonl"}` on the turn's last assistant message |
-  | `turn_completed.usage.{inputTokens, outputTokens, cachedReadTokens, reasoningTokens, costUsdTicks, modelUsage}` | **Reported by two community adapters for recent builds**, and contradicted by #167's "Grok does not log per-turn input/output tokens" | **Not read.** See "Usage" below |
+  | `turn_completed.usage.{inputTokens, outputTokens, cachedReadTokens, reasoningTokens, costUsdTicks, modelUsage}` | **Reported by two community adapters for recent builds** and read in production by tokscale (`sessions/grok.rs`, commit `d8fd670`), which fixes its semantics: `inputTokens` includes `cachedReadTokens`, `outputTokens` includes `reasoningTokens`, `totalTokens` is input + output | Stored verbatim under `usage` in the turn's `token_json`, beside the context snapshot; normalized as `per-request` usage. See "Usage" below |
   | `summary.json` `info.id`, `info.cwd`, `info.model`, `git_root_dir`, `head_branch`, `created_at`, `updated_at` | **Corroborated** | Identity, project, branch, model and the fallback timestamps |
   | `summary.json` parent-session references for forked/restored sessions | **Corroborated** (named in the guide, field spelling unknown) | **Not read yet** — no field name to read |
   | `signals.json` `contextTokensUsed`, `turnCount`, `compactionCount` | **Stated in #167**; the guide says the file holds "token usage and tool/turn counters" | A `signals` marker whose `detail_json` is the file verbatim |
@@ -1165,26 +1186,32 @@ How each adapter works:
   failed is a `file_edits` row whose `tool_calls` row carries `is_error`.
   `Shell` records only its command, so no file is attributed to it.
 
-  ### Usage: a context proxy, never billing
+  ### Usage: a context proxy, plus per-turn usage when the build writes it
 
-  Grok logs **no per-turn input/output token counts** (burn #489). The one
-  token fact recorded here is `updates.jsonl`'s `totalTokens`, stored as
+  Older Grok builds log **no per-turn input/output token counts** (burn #489).
+  The token fact every build records is `updates.jsonl`'s `totalTokens`, stored as
   `{"context_total_tokens": n, "source": "updates.jsonl"}` on that turn's last
   assistant event — its last message, or, for a turn answered entirely with
   tool calls, its last tool use — so a consumer can see both the number and
   what it is. It is a context-window snapshot: it
   **decreases** after a compaction, and summing it across turns is meaningless.
-  Every Grok hydration therefore reports `GROK_USAGE_CONTEXT_PROXY_ONLY`,
-  present or not. Nothing here estimates tokens — that is burn's job, from its
-  own estimator and `xai` pricing.
+  A session with no turn carrying a breakdown therefore reports
+  `GROK_USAGE_CONTEXT_PROXY_ONLY`. Nothing here estimates tokens — that is
+  burn's job, from its own estimator and `xai` pricing.
 
-  Two community adapters report that recent Grok builds *do* write a
-  `turn_completed.usage` breakdown (`inputTokens`, `outputTokens`,
-  `cachedReadTokens`, `reasoningTokens`, `costUsdTicks`, `modelUsage`). That
-  contradicts #167, and neither claim was checked against a real session here,
-  so **nothing is read from it**: recording a number this repo cannot vouch for
-  is exactly the failure this parser exists to stop. Confirming it is the first
-  item on the checklist below.
+  Recent builds *do* write a `turn_completed.usage` breakdown (`inputTokens`,
+  `outputTokens`, `cachedReadTokens`, `reasoningTokens`, `totalTokens`,
+  `costUsdTicks`, `modelUsage`). Two community adapters reported it and
+  tokscale reads it in production, so it is recorded — verbatim, under `usage`
+  in the same `token_json`, beside the snapshot and never added to it — and
+  `crate::usage` normalizes it as `per-request` usage (see
+  `docs/usage-accounting.md`). A `usage` object holding only `totalTokens` is
+  still the snapshot under another name. A session where only some turns carry
+  a breakdown reports `GROK_USAGE_PARTIAL` instead; one where every turn does
+  reports no usage caveat. Still unread ([#212](https://github.com/AgentWorkforce/relayhistory/issues/212)):
+  `~/.grok/logs/unified.jsonl`'s per-inference rows, `events.jsonl`,
+  `signals.json`'s `totalTokensBeforeCompaction`, and `summary.json`'s
+  `current_model_id`.
 
   ### Identity and re-reads
 
@@ -1241,9 +1268,10 @@ How each adapter works:
 
   Grok hydration reports `capability: "full"` because its parser covers every
   evidence kind. The usage caveat travels with it as
-  `GROK_USAGE_CONTEXT_PROXY_ONLY` on parsed and cached reads alike: Grok writes
-  no per-turn billing tokens, and `updates.jsonl`'s running context total is
-  stored as a labelled proxy, never as usage. Capability is defined by
+  `GROK_USAGE_CONTEXT_PROXY_ONLY` (no turn carried a breakdown) or
+  `GROK_USAGE_PARTIAL` (some did) on parsed and cached reads alike:
+  `updates.jsonl`'s running context total is stored as a labelled proxy, never
+  as usage. Capability is defined by
   `coverage` (hydration contract 3); usage is not one of those kinds, so a
   `partial` result that covered every kind would be a contract mismatch the
   SDK rejects. The diagnostic is what tells a cost report not to add the
@@ -1404,8 +1432,9 @@ How each adapter works:
   jq -c 'select(.params._meta.turnStartMs or .params.update.turnStartMs) | {meta: .params._meta, update: .params.update}' "$S/updates.jsonl" | head -2
   # 6. THE IMPORTANT ONE: what a turn_completed actually carries.
   jq -c 'select(.params.update.sessionUpdate=="turn_completed") | .params.update' "$S/updates.jsonl" | head -3
-  #    If that prints inputTokens/outputTokens, this repo is under-recording
-  #    usage on purpose and issue #167 needs correcting — say so there.
+  #    If that prints inputTokens/outputTokens, the build writes the per-turn
+  #    breakdown this parser now records under `usage`. Check that inputTokens
+  #    includes cachedReadTokens and totalTokens is input + output (#212).
   # 7. What signals.json, a compaction checkpoint and a subagent entry hold.
   jq -c . "$S/signals.json"
   jq -c . "$S/compaction_checkpoints/"* | head -2
@@ -1441,8 +1470,12 @@ How each adapter works:
     events, and `costUsdTicks` at 10¹⁰ ticks per USD.
   - [telemetry-dev/stats #8](https://github.com/telemetry-dev/stats/pull/8) and
     [BrokkAi/mjolnir #989](https://github.com/BrokkAi/mjolnir/issues/989) — the
-    `turn_completed.usage` breakdown recent builds are reported to write. Read
-    here as a **contradiction to resolve**, not as a licence to record tokens.
+    `turn_completed.usage` breakdown recent builds are reported to write.
+  - [junhoyeo/tokscale](https://github.com/junhoyeo/tokscale) (commit
+    `d8fd670`, `crates/tokscale-core/src/sessions/grok.rs`) — reads that
+    breakdown in production and fixes its semantics (`inputTokens` includes
+    `cachedReadTokens`, `outputTokens` includes `reasoningTokens`), which is
+    what this parser's normalization follows.
   - [paperboytm/spool #512](https://github.com/paperboytm/spool/issues/512) and
     [Ishannaik/agent-sweep #219](https://github.com/Ishannaik/agent-sweep/pull/219)
     — independent confirmation of the directory layout and of
@@ -1540,8 +1573,22 @@ How each adapter works:
 
   | Layout | Location | Environment override |
   |---|---|---|
-  | SQLite (current releases) | `~/.local/share/opencode/opencode.db` | `OPENCODE_DB` |
+  | SQLite (current releases) | `~/.local/share/opencode/opencode.db` and every channel database beside it (`opencode-stable.db`, `opencode-nightly.db`, ...) | `OPENCODE_DB` pins one file |
   | Legacy JSON tree (older installs) | `~/.local/share/opencode/storage` | `OPENCODE_STORAGE_DIR` |
+
+  OpenCode writes one SQLite store per release channel: `latest` and `beta`
+  use `opencode.db`, every other channel `opencode-<channel>.db` in the same
+  directory, and all of them are read (`-wal`, `-shm` and `-journal` sidecars
+  are not stores). A session present in more than one store is catalogued,
+  synced and hydrated from the first that holds it — `opencode.db`, then the
+  channel stores in name order — so it is one session with one `raw_path`.
+  Ownership is decided over everything each store holds, including under a
+  discovery limit, and hydration refuses a catalogued copy once an earlier
+  store holds the session (`SESSION_SOURCE_MISMATCH`; rediscover). A store
+  that cannot be opened, or a directory that cannot be listed, is a
+  diagnostic against its path; the remaining stores are still read.
+  Setting `OPENCODE_DB` names exactly one store and its channel siblings are
+  not read; so does `ai-hist sync-opencode --opencode-db <path>`.
 
   The JSON tree is laid out as `session/<scope>/<sessionId>.json`,
   `message/<sessionId>/<messageId>.json` and `part/<messageId>/<partId>.json`.
@@ -2072,7 +2119,9 @@ row. Beside the identity columns (`child_session_id`, nullable, and
 `evidence_locator`, `evidence_ref`, `child_has_events`, `spawned_at_ms`,
 `created_ms`, and `updated_ms`; re-ingestion refreshes mutable fields and
 preserves first-observation time. It is read through
-`idx_session_relationships_parent` and `idx_session_relationships_child`.
+`idx_session_relationships_parent` and `idx_session_relationships_child`;
+the sync walk's per-transcript sidecar probe uses
+`idx_session_relationships_locator` (`source, evidence_locator`).
 Databases written before this shape are rebuilt in place by the
 `session_relationships_v2` marker migration, which copies every existing edge
 forward as an observed `legacy_hydration` row; the marker is required, so an

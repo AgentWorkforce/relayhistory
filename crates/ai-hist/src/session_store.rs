@@ -2408,11 +2408,13 @@ impl ToolCall {
 /// One `tool_result` event with its measured fidelity.
 ///
 /// Every fidelity field is `None` when the provider does not record it —
-/// never a stand-in value. Claude and codex record all of them; the
-/// vocabularies are `result_status` ∈ {running, completed, errored,
-/// cancelled, unknown}, `event_source` ∈ {tool_result,
+/// never a stand-in value. Claude, codex, cursor, grok and opencode record
+/// them (see the fidelity matrix in `docs/session-catalog.md` for which
+/// columns each fills); the vocabularies are `result_status` ∈ {running,
+/// completed, errored, cancelled, unknown}, `event_source` ∈ {tool_result,
 /// subagent_notification, function_call_output}, `error_signal` ∈
-/// {tool_result.is_error, exit_code, patch_apply, mcp_err, subagent_status}.
+/// {tool_result.is_error, exit_code, patch_apply, mcp_err, subagent_status,
+/// tool_status}.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ToolResult {
