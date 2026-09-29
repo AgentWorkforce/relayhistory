@@ -40,6 +40,18 @@
 //!   (`inputTokens`, `outputTokens`, `cachedReadTokens`, `reasoningTokens`,
 //!   `totalTokens`, `modelUsage`), which is kept verbatim beside the proxy and
 //!   normalized by `crate::usage`. The two are never added together.
+//! * `~/.grok/logs/unified.jsonl` (under `GROK_HOME` when it is set) is one
+//!   process-wide, append-only log that recent builds write a per-inference
+//!   token breakdown to. It is read incrementally from a byte cursor
+//!   ([`parse_unified_row`]); its rows attach to sessions by session id, and a
+//!   session it covers takes its usage from there rather than from
+//!   `turn_completed.usage` — two representations of the same spend are never
+//!   added together.
+//! * `params._meta.eventId` is **not unique**: Grok reuses it across records
+//!   (tokscale, `sessions/grok.rs`). An event identity built from it is
+//!   disambiguated when it repeats ([`ChunkGroup::event_key`]), and a
+//!   `unified.jsonl` row is keyed on its whole normalized content
+//!   ([`unified_row_key`]), never on the id alone.
 //!
 //! ## The join
 //!
@@ -67,6 +79,7 @@
 use super::jsonl;
 use anyhow::Result;
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -493,10 +506,19 @@ fn update_kind(raw: &str) -> UpdateKind {
 pub(crate) struct ChunkGroup {
     /// The first chunk's time — when the message started, not when it ended.
     pub ts_ms: Option<i64>,
-    /// The first chunk's ACP `eventId`, which is a provider-stable identity
-    /// for the message; `chat_history.jsonl` has none of its own.
+    /// The first chunk's ACP `eventId`. Provider-stable, but **not unique**:
+    /// Grok reuses it across records, so it is never an identity on its own.
     pub event_id: Option<String>,
+    /// The identity this message's event is stored under: the `eventId`
+    /// itself when no other message group in the stream carries it, and
+    /// `<eventId>#<n>` (its *n*-th occurrence, in stream order) when one does.
+    /// Keying two messages on one repeated id would upsert the second over
+    /// the first and silently drop a turn.
+    pub event_key: Option<String>,
     pub turn: usize,
+    /// Position among every message group of the stream, for the
+    /// disambiguation pass.
+    seq: usize,
 }
 
 /// When a tool call started and when its result came back.
@@ -520,6 +542,10 @@ pub(crate) struct TurnTiming {
     /// breakdown ([`usage_breakdown`]). Billing evidence for the turn, kept
     /// apart from `total_tokens`.
     pub usage: Option<Value>,
+    /// The model the turn ran on: `params.update._meta.modelId` on any of its
+    /// rows (the last one wins), else the single key of
+    /// `turn_completed.usage.modelUsage` when that map names exactly one.
+    pub model: Option<String>,
 }
 
 /// The counters a `turn_completed.usage` object carries when it is a per-turn
@@ -590,6 +616,7 @@ pub(crate) fn parse_updates(contents: &str, path: &Path) -> Result<GrokUpdates> 
     let mut updates = GrokUpdates::default();
     let mut previous_kind: Option<UpdateKind> = None;
     let mut turn;
+    let mut group_seq = 0usize;
     for (number, row) in jsonl::rows(contents).enumerate() {
         let Some(value) = jsonl::parse_row(row, path, number + 1)? else {
             continue;
@@ -659,6 +686,14 @@ pub(crate) fn parse_updates(contents: &str, path: &Path) -> Result<GrokUpdates> 
                 }
             }
         }
+        if let Some(model) = update
+            .get("_meta")
+            .and_then(|update_meta| string_field(update_meta, &["modelId"]))
+        {
+            if let Some(current) = updates.turns.get_mut(turn) {
+                current.model = Some(model);
+            }
+        }
         let event_id = string_field(meta, &["eventId", "event_id"]);
         // A turn boundary ends the message, even when the next row is the same
         // kind: two `agent_message_chunk`s either side of a new `turnStartMs`
@@ -686,8 +721,11 @@ pub(crate) fn parse_updates(contents: &str, path: &Path) -> Result<GrokUpdates> 
                     bucket.push(ChunkGroup {
                         ts_ms,
                         event_id,
+                        event_key: None,
                         turn,
+                        seq: group_seq,
                     });
+                    group_seq += 1;
                 }
             }
             UpdateKind::ToolCall | UpdateKind::ToolCallUpdate => {
@@ -733,6 +771,9 @@ pub(crate) fn parse_updates(contents: &str, path: &Path) -> Result<GrokUpdates> 
                     current.total_tokens = total;
                     current.usage = breakdown.cloned();
                     current.end_ms = ts_ms.or(current.end_ms);
+                    if current.model.is_none() {
+                        current.model = breakdown.and_then(single_model_usage_key);
+                    }
                 }
             }
             // Handled above, before any turn or coalescing state was touched.
@@ -740,7 +781,56 @@ pub(crate) fn parse_updates(contents: &str, path: &Path) -> Result<GrokUpdates> 
         }
         previous_kind = Some(kind);
     }
+    assign_event_keys(&mut updates);
     Ok(updates)
+}
+
+/// Give every message group the identity its event is stored under.
+///
+/// Grok reuses `eventId` across records, so an id that more than one group
+/// carries is suffixed with its occurrence number in stream order. An id seen
+/// once keeps its plain form, which is what earlier builds stored, so a
+/// session with no repeats keeps every identity it already had.
+fn assign_event_keys(updates: &mut GrokUpdates) {
+    let mut groups: Vec<&mut ChunkGroup> = updates
+        .user_messages
+        .iter_mut()
+        .chain(updates.agent_messages.iter_mut())
+        .chain(updates.agent_thoughts.iter_mut())
+        .collect();
+    groups.sort_by_key(|group| group.seq);
+    let mut totals: HashMap<String, usize> = HashMap::new();
+    for group in groups.iter() {
+        if let Some(id) = &group.event_id {
+            *totals.entry(id.clone()).or_default() += 1;
+        }
+    }
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for group in groups {
+        let Some(id) = group.event_id.clone() else {
+            continue;
+        };
+        if totals.get(&id).copied().unwrap_or(0) > 1 {
+            let occurrence = seen.entry(id.clone()).or_default();
+            group.event_key = Some(format!("{id}#{occurrence}"));
+            *occurrence += 1;
+        } else {
+            group.event_key = Some(id);
+        }
+    }
+}
+
+/// The model a `modelUsage` map names, when it names exactly one: a turn that
+/// ran on one model says so there even when no row carries `modelId`.
+fn single_model_usage_key(usage: &Value) -> Option<String> {
+    let map = usage.get("modelUsage")?.as_object()?;
+    if map.len() != 1 {
+        return None;
+    }
+    map.keys()
+        .next()
+        .map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty())
 }
 
 /// The time one whole `updates.jsonl` line recorded, for a caller that has the
@@ -799,6 +889,11 @@ pub(crate) struct GrokSignals {
     pub turn_count: Option<i64>,
     pub compaction_count: Option<i64>,
     pub context_tokens_used: Option<i64>,
+    /// `totalTokensBeforeCompaction`: the session's running total as it stood
+    /// before the last compaction reset the context snapshot. Recorded, never
+    /// reconciled against anything here — reconciling totals across a
+    /// compaction is accounting, which is burn's.
+    pub total_tokens_before_compaction: Option<i64>,
     pub raw: Map<String, Value>,
 }
 
@@ -810,8 +905,190 @@ pub(crate) fn parse_signals(value: &Value) -> GrokSignals {
         turn_count: number(&["turnCount", "turn_count", "turns"]),
         compaction_count: number(&["compactionCount", "compaction_count", "compactions"]),
         context_tokens_used: number(&["contextTokensUsed", "context_tokens_used", "contextTokens"]),
+        total_tokens_before_compaction: number(&["totalTokensBeforeCompaction"]),
         raw: object,
     }
+}
+
+// ---------------------------------------------------------------------------
+// summary.json and events.jsonl model fallbacks
+// ---------------------------------------------------------------------------
+
+/// The model `summary.json` names, in the order it is trusted: `info.model`
+/// (what earlier builds read), then `current_model_id` and `model_id`, each
+/// looked for at the top level and under `info` because no public sample
+/// fixes which. tokscale reads the latter two as its model fallback.
+pub(crate) fn summary_model(summary: &Value) -> Option<String> {
+    let info = summary.get("info").unwrap_or(&Value::Null);
+    string_field(info, &["model"])
+        .or_else(|| string_field(summary, &["model"]))
+        .or_else(|| string_field(summary, &["current_model_id"]))
+        .or_else(|| string_field(info, &["current_model_id"]))
+        .or_else(|| string_field(summary, &["model_id"]))
+        .or_else(|| string_field(info, &["model_id"]))
+}
+
+/// How many leading lines of `events.jsonl` the metadata fallback reads. The
+/// file is an event log that grows with the session; the fields it is read
+/// for are written at its head, and tokscale bounds its own read the same way.
+pub(crate) const EVENTS_HEAD_LINES: usize = 500;
+
+/// What the head of `events.jsonl` says about its session, for a directory
+/// with no `summary.json`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct GrokEventsHead {
+    /// The first `model_id` any row names.
+    pub model: Option<String>,
+    /// The first `session_id` any row names. Recorded for diagnostics only:
+    /// the session's identity stays the directory name, which is already the
+    /// session id, so a file appearing later never renames the session.
+    pub session_id: Option<String>,
+    /// The earliest `ts` in the head.
+    pub first_ts_ms: Option<i64>,
+}
+
+/// Read the head of `events.jsonl`. The shape is **unverified** — tokscale
+/// reads `model_id`, `session_id` and `ts` from it and nothing public shows a
+/// row — so a line that does not parse is skipped rather than failing the
+/// read: this is a fallback for metadata `summary.json` normally supplies,
+/// never evidence a replacing read could lose.
+pub(crate) fn parse_events_head(contents: &str) -> GrokEventsHead {
+    let mut head = GrokEventsHead::default();
+    for line in contents.lines().take(EVENTS_HEAD_LINES) {
+        let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if head.model.is_none() {
+            head.model = string_field(&value, &["model_id"]);
+        }
+        if head.session_id.is_none() {
+            head.session_id = string_field(&value, &["session_id"]);
+        }
+        if let Some(ts) = value.get("ts").and_then(timestamp_value_ms) {
+            head.first_ts_ms = Some(head.first_ts_ms.map_or(ts, |first| first.min(ts)));
+        }
+    }
+    head
+}
+
+// ---------------------------------------------------------------------------
+// logs/unified.jsonl
+// ---------------------------------------------------------------------------
+
+/// One per-inference usage record from `logs/unified.jsonl`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct GrokUnifiedUsage {
+    pub session_id: String,
+    pub pid: Option<i64>,
+    /// The row's own model, else the one its process last named.
+    pub model: Option<String>,
+    pub ts_ms: Option<i64>,
+    /// The counters: the row's `usage` object verbatim, or — for a row that
+    /// writes them at its top level — just the counter keys projected out of
+    /// it, so a whole log row is never stored as "usage".
+    pub usage: Value,
+    /// `event_id`/`eventId`, kept as a fact about the row. Not its identity:
+    /// Grok reuses it across usage records.
+    pub event_id: Option<String>,
+}
+
+/// What one `logs/unified.jsonl` row is.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum GrokUnifiedRow {
+    /// A per-inference token breakdown naming its session.
+    Usage(GrokUnifiedUsage),
+    /// A breakdown that names no session. Counted; there is nothing to attach
+    /// it to, and guessing one from the pid would be invention.
+    Unattributed,
+    /// A row naming a process's model without a breakdown — a process start
+    /// or a model change. Later usage rows from that pid with no model of
+    /// their own take it.
+    ModelChange { pid: i64, model: String },
+    /// Anything else the process logged.
+    Other,
+}
+
+/// The counter keys a unified row's top level is projected down to when it
+/// carries no `usage` object of its own.
+const UNIFIED_PROJECTED_KEYS: &[&str] =
+    &["totalTokens", "total_tokens", "costUsdTicks", "modelUsage"];
+
+/// Interpret one `logs/unified.jsonl` row.
+///
+/// The row shape is **inferred**, not observed: tokscale reads a session id, a
+/// pid, a model and per-inference input/output/cache counters from it, but no
+/// public sample shows the field spellings. So every field is looked for in
+/// the spellings Grok uses elsewhere, at the top level and then under `ctx`
+/// (where tokscale reads `ctx.event_id`), and the counters are the same key
+/// lists `turn_completed.usage` is read with.
+pub(crate) fn parse_unified_row(
+    value: &Value,
+    pid_models: &HashMap<i64, String>,
+) -> GrokUnifiedRow {
+    let ctx = value.get("ctx").unwrap_or(&Value::Null);
+    let field = |keys: &[&str]| string_field(value, keys).or_else(|| string_field(ctx, keys));
+    let pid = first_number(&[value.get("pid"), ctx.get("pid")]);
+    let model = field(&["model_id", "modelId", "model"]);
+    let usage = match usage_breakdown(value.get("usage")) {
+        Some(usage) => Some(usage.clone()),
+        None => usage_breakdown(Some(value)).map(|row| {
+            let object = row.as_object().cloned().unwrap_or_default();
+            let keep: Vec<&str> = [
+                GROK_USAGE_INPUT_KEYS,
+                GROK_USAGE_OUTPUT_KEYS,
+                GROK_USAGE_CACHE_READ_KEYS,
+                GROK_USAGE_CACHE_WRITE_KEYS,
+                GROK_USAGE_REASONING_KEYS,
+                UNIFIED_PROJECTED_KEYS,
+            ]
+            .concat();
+            Value::Object(
+                object
+                    .into_iter()
+                    .filter(|(key, _)| keep.contains(&key.as_str()))
+                    .collect(),
+            )
+        }),
+    };
+    let Some(usage) = usage else {
+        return match (pid, model) {
+            (Some(pid), Some(model)) => GrokUnifiedRow::ModelChange { pid, model },
+            _ => GrokUnifiedRow::Other,
+        };
+    };
+    let Some(session_id) = field(&["session_id", "sessionId"]) else {
+        return GrokUnifiedRow::Unattributed;
+    };
+    let model = model
+        .or_else(|| single_model_usage_key(&usage))
+        .or_else(|| pid.and_then(|pid| pid_models.get(&pid).cloned()));
+    let ts_ms = ["ts", "timestamp"]
+        .iter()
+        .find_map(|key| value.get(*key).or_else(|| ctx.get(*key)))
+        .and_then(timestamp_value_ms);
+    GrokUnifiedRow::Usage(GrokUnifiedUsage {
+        session_id,
+        pid,
+        model,
+        ts_ms,
+        usage,
+        event_id: field(&["event_id", "eventId"]),
+    })
+}
+
+/// The identity a `logs/unified.jsonl` row is stored under: a digest of the
+/// whole row, normalized through `serde_json` so whitespace does not matter.
+///
+/// tokscale keys these rows on `event_id`/`eventId`/`id` first — but it also
+/// records that Grok reuses `eventId` across usage records, and a key that is
+/// not unique collapses distinct inferences into one. The whole row is what
+/// is actually unique: a row read twice (a rotation, a second pass over the
+/// same bytes) is the same row and lands on the same key, and two inferences
+/// that share an id but not their counters or time do not.
+pub(crate) fn unified_row_key(value: &Value) -> String {
+    let normalized = serde_json::to_string(value).unwrap_or_default();
+    let digest = Sha256::digest(normalized.as_bytes());
+    format!("{:.32}", format!("{digest:x}"))
 }
 
 /// What one file in `subagents/` says about a delegated child.
@@ -1242,5 +1519,195 @@ mod tests {
         let updates = parse_updates_ok(stream);
         assert_eq!(updates.unread_rows, 1);
         assert!(updates.agent_messages.is_empty());
+    }
+
+    /// Grok reuses `eventId` across records (tokscale, `sessions/grok.rs`).
+    /// Two messages carrying one id must not share an identity, or the second
+    /// upserts over the first and a turn disappears. An id seen once keeps
+    /// its plain form, which is what earlier builds stored.
+    #[test]
+    fn a_repeated_event_id_is_disambiguated_and_a_unique_one_is_not() {
+        let stream = [
+            r#"{"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"eventId":"dup","agentTimestampMs":1000,"turnStartMs":1000}}}"#,
+            r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"eventId":"once","agentTimestampMs":1500,"turnStartMs":1000}}}"#,
+            r#"{"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"eventId":"dup","agentTimestampMs":5000,"turnStartMs":5000}}}"#,
+            r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_thought_chunk"},"_meta":{"eventId":"dup","agentTimestampMs":5100,"turnStartMs":5000}}}"#,
+        ]
+        .join("\n");
+        let updates = parse_updates_ok(&stream);
+        let keys = |groups: &[ChunkGroup]| -> Vec<Option<String>> {
+            groups.iter().map(|group| group.event_key.clone()).collect()
+        };
+        assert_eq!(
+            keys(&updates.user_messages),
+            vec![Some("dup#0".to_string()), Some("dup#1".to_string())]
+        );
+        // Numbered in stream order across every kind of message, so the
+        // thought after the second prompt is the third occurrence.
+        assert_eq!(
+            keys(&updates.agent_thoughts),
+            vec![Some("dup#2".to_string())]
+        );
+        assert_eq!(
+            keys(&updates.agent_messages),
+            vec![Some("once".to_string())]
+        );
+        // The raw id is still there, as a fact about the row.
+        assert_eq!(updates.user_messages[1].event_id.as_deref(), Some("dup"));
+    }
+
+    #[test]
+    fn a_turn_takes_its_model_from_meta_model_id_or_a_single_key_model_usage() {
+        let stream = [
+            r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","_meta":{"modelId":"grok-4.5-build"}},"_meta":{"agentTimestampMs":1000,"turnStartMs":1000}}}"#,
+            r#"{"method":"session/update","params":{"update":{"sessionUpdate":"turn_completed","usage":{"inputTokens":1,"modelUsage":{"other":{},"grok-x":{}}}},"_meta":{"agentTimestampMs":1100,"turnStartMs":1000}}}"#,
+            r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"agentTimestampMs":2000,"turnStartMs":2000}}}"#,
+            r#"{"method":"session/update","params":{"update":{"sessionUpdate":"turn_completed","usage":{"inputTokens":1,"modelUsage":{"grok-code-fast":{"inputTokens":1}}}},"_meta":{"agentTimestampMs":2100,"turnStartMs":2000}}}"#,
+            r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"agentTimestampMs":3000,"turnStartMs":3000}}}"#,
+            r#"{"method":"session/update","params":{"update":{"sessionUpdate":"turn_completed","usage":{"inputTokens":1,"modelUsage":{"a":{},"b":{}}}},"_meta":{"agentTimestampMs":3100,"turnStartMs":3000}}}"#,
+        ]
+        .join("\n");
+        let models: Vec<Option<String>> = parse_updates_ok(&stream)
+            .turns
+            .into_iter()
+            .map(|turn| turn.model)
+            .collect();
+        assert_eq!(
+            models,
+            vec![
+                // `_meta.modelId` wins over a `modelUsage` map.
+                Some("grok-4.5-build".to_string()),
+                Some("grok-code-fast".to_string()),
+                // Two models in the map name no single model for the turn.
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn signals_record_the_total_before_compaction() {
+        let signals = parse_signals(&json!({
+            "contextTokensUsed": 5200,
+            "totalTokensBeforeCompaction": 48000,
+        }));
+        assert_eq!(signals.context_tokens_used, Some(5200));
+        assert_eq!(signals.total_tokens_before_compaction, Some(48000));
+    }
+
+    #[test]
+    fn summary_model_falls_back_to_current_model_id_then_model_id() {
+        assert_eq!(
+            summary_model(&json!({"info": {"model": "a"}, "current_model_id": "b"})).as_deref(),
+            Some("a"),
+            "info.model is what earlier builds read, and it still wins"
+        );
+        assert_eq!(
+            summary_model(&json!({"current_model_id": "b", "model_id": "c"})).as_deref(),
+            Some("b")
+        );
+        assert_eq!(
+            summary_model(&json!({"info": {"model_id": "c"}})).as_deref(),
+            Some("c")
+        );
+        assert_eq!(summary_model(&json!({"info": {}})), None);
+    }
+
+    #[test]
+    fn the_events_head_supplies_model_id_and_start_time_and_skips_bad_lines() {
+        let contents = [
+            "not json",
+            r#"{"ts":"2026-09-20T11:00:05.000Z","session_id":"s1","type":"turn"}"#,
+            r#"{"ts":"2026-09-20T11:00:00.000Z","model_id":"grok-code-fast"}"#,
+        ]
+        .join("\n");
+        let head = parse_events_head(&contents);
+        assert_eq!(head.model.as_deref(), Some("grok-code-fast"));
+        assert_eq!(head.session_id.as_deref(), Some("s1"));
+        assert_eq!(
+            head.first_ts_ms,
+            timestamp_value_ms(&json!("2026-09-20T11:00:00.000Z"))
+        );
+        // Only the head is read, however long the log grows.
+        let long = std::iter::repeat_n(r#"{"type":"noise"}"#, EVENTS_HEAD_LINES)
+            .chain([r#"{"model_id":"too-late"}"#])
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(parse_events_head(&long).model, None);
+    }
+
+    #[test]
+    fn a_unified_row_is_usage_a_model_change_or_nothing() {
+        let mut pid_models = HashMap::new();
+        // A process naming its model, with no counters: a model change.
+        assert_eq!(
+            parse_unified_row(
+                &json!({"pid": 7, "model_id": "grok-4.5-build", "msg": "start"}),
+                &pid_models
+            ),
+            GrokUnifiedRow::ModelChange {
+                pid: 7,
+                model: "grok-4.5-build".to_string()
+            }
+        );
+        pid_models.insert(7, "grok-4.5-build".to_string());
+
+        // A `usage` object is kept verbatim; the model comes from the pid.
+        let row = json!({"ts": "2026-09-20T10:00:01.500Z", "pid": 7, "session_id": "s1",
+            "eventId": "e", "usage": {"inputTokens": 700, "outputTokens": 80, "costUsdTicks": 5}});
+        let GrokUnifiedRow::Usage(usage) = parse_unified_row(&row, &pid_models) else {
+            panic!("expected usage");
+        };
+        assert_eq!(usage.session_id, "s1");
+        assert_eq!(usage.model.as_deref(), Some("grok-4.5-build"));
+        assert_eq!(usage.event_id.as_deref(), Some("e"));
+        assert_eq!(usage.usage["costUsdTicks"], json!(5));
+        assert_eq!(
+            usage.ts_ms,
+            timestamp_value_ms(&json!("2026-09-20T10:00:01.500Z"))
+        );
+
+        // Counters written at the top level are projected out of the row, so
+        // the rest of the log line is never stored as usage.
+        let row = json!({"ctx": {"session_id": "s2"}, "inputTokens": 9, "outputTokens": 1,
+            "msg": "inference complete", "model": "m"});
+        let GrokUnifiedRow::Usage(usage) = parse_unified_row(&row, &pid_models) else {
+            panic!("expected usage");
+        };
+        assert_eq!(usage.session_id, "s2");
+        assert_eq!(usage.model.as_deref(), Some("m"));
+        assert_eq!(usage.usage, json!({"inputTokens": 9, "outputTokens": 1}));
+
+        // Counters with no session cannot be attached to anything.
+        assert_eq!(
+            parse_unified_row(&json!({"usage": {"inputTokens": 1}}), &pid_models),
+            GrokUnifiedRow::Unattributed
+        );
+        // A total alone is not a breakdown, and a heartbeat is not usage.
+        assert_eq!(
+            parse_unified_row(
+                &json!({"session_id": "s1", "usage": {"totalTokens": 4}}),
+                &pid_models
+            ),
+            GrokUnifiedRow::Other
+        );
+        assert_eq!(
+            parse_unified_row(&json!({"pid": 7, "msg": "heartbeat"}), &pid_models),
+            GrokUnifiedRow::Other
+        );
+    }
+
+    /// Grok reuses `eventId` across usage records, so a unified row is keyed
+    /// on its whole content. Two inferences that share an id are two rows; the
+    /// same row read twice is one.
+    #[test]
+    fn unified_rows_sharing_an_event_id_keep_distinct_keys() {
+        let first = json!({"session_id": "s", "eventId": "e", "usage": {"inputTokens": 700}});
+        let second = json!({"session_id": "s", "eventId": "e", "usage": {"inputTokens": 500}});
+        assert_ne!(unified_row_key(&first), unified_row_key(&second));
+        let reread: Value = serde_json::from_str(
+            r#"{ "session_id":"s",  "eventId":"e", "usage":{"inputTokens":700} }"#,
+        )
+        .unwrap();
+        assert_eq!(unified_row_key(&first), unified_row_key(&reread));
     }
 }

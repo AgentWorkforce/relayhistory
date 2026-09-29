@@ -1,0 +1,10 @@
+{
+  "info": {
+    "id": "grok-uni-0001",
+    "cwd": "/tmp/usage"
+  },
+  "current_model_id": "grok-4.5-build",
+  "head_branch": "main",
+  "created_at": "2026-09-20T10:00:00.000Z",
+  "updated_at": "2026-09-20T10:01:10.000Z"
+}

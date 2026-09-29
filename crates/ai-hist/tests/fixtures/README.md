@@ -178,6 +178,7 @@ source without deciding which one fails the test.
 | --- | --- | --- | --- |
 | `grok/full-session` | relayhistory | `grok/full-session` | older Claude-shaped grok directory: per-record timestamps, `tool_use` blocks in `content`, `updates.jsonl` as `file_changed` rows, plus `prompt_context.json`, `signals.json` and `subagents/` |
 | `grok/events-session` | relayhistory | `grok/events-session` | documented Grok Build layout: `chat_history.jsonl` with `tool_calls[]`, ACP `updates.jsonl` with real `agentTimestampMs` times, `compaction_checkpoints/`, `subagents/`, `signals.json` and `prompt_context.json` |
+| `grok/unified-usage` | relayhistory | `grok/unified-usage` | two Grok Build sessions under one Grok home: one covered by the process-wide `logs/unified.jsonl` per-inference usage log (a repeated `eventId`, a pid-scoped model, top-level counters, an exact duplicate row, a row with no session and one for an unindexed session), one not covered and with no `summary.json`, so its model and start time come from `events.jsonl` |
 
 ### `muse`
 
