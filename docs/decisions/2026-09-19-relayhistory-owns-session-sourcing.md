@@ -135,7 +135,7 @@ of `sessions list`. It is listed for completeness; every session-evidence row is
 | `session_events` — `tool_use`                                      | ✓      | ✓     | ✓      | ✗    | ✓        | ✗     | —          | [#166](https://github.com/AgentWorkforce/relayhistory/issues/166) / [#167](https://github.com/AgentWorkforce/relayhistory/issues/167) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                     |
 | `session_events` — `tool_result`                                   | ✓      | ✓     | —      | ✗    | ✓        | ✗     | —          | [#166](https://github.com/AgentWorkforce/relayhistory/issues/166) / [#167](https://github.com/AgentWorkforce/relayhistory/issues/167) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                     |
 | Model, per event                                                   | ✓      | ✓     | —      | ◐    | ✓        | ✗     | —          | [#166](https://github.com/AgentWorkforce/relayhistory/issues/166) / [#167](https://github.com/AgentWorkforce/relayhistory/issues/167) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                     |
-| Token usage                                                        | ◐      | ◐     | —      | ✗    | ✓        | ✗     | —          | [#172](https://github.com/AgentWorkforce/relayhistory/issues/172) (supersedes #99) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                                                                         |
+| Token usage                                                        | ✓      | ◐     | —      | ✗    | ✓        | ✗     | —          | [#172](https://github.com/AgentWorkforce/relayhistory/issues/172) (supersedes #99) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                                                                         |
 | `request_id`                                                       | ✗      | —     | —      | —    | —        | —     | —          | [#164](https://github.com/AgentWorkforce/relayhistory/issues/164)                                                                                                                                                                                                             |
 | `stop_reason`                                                      | ✗      | —     | —      | —    | ✓        | —     | —          | [#164](https://github.com/AgentWorkforce/relayhistory/issues/164) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                                                                                          |
 | Codex `turn_id`                                                    | —      | ✗     | —      | —    | —        | —     | —          | [#164](https://github.com/AgentWorkforce/relayhistory/issues/164)                                                                                                                                                                                                             |
@@ -195,6 +195,13 @@ reason: `token_count` events carry _cumulative_ totals, and the parser derives a
 delta against the previous snapshot and attaches it to one assistant event,
 holding a `pending_delta` when no event is available yet. Both are usable, both
 are source-specific, and neither is a normalized per-request usage record.
+
+_Since [#172](https://github.com/AgentWorkforce/relayhistory/issues/172) and
+[#211](https://github.com/AgentWorkforce/relayhistory/issues/211), Claude is
+`✓`: the `session_requests` view counts a request once however many blocks
+carry its usage, streamed copies whose output side grows are settled onto one
+blob at parse time, and `<synthetic>` notices are stored as `local_notice`
+markers rather than as requests. See `docs/usage-accounting.md`._
 
 **`request_id`, `stop_reason`, `turn_id`, sidechain and meta flags.** Grep the
 crate: `requestId`, `stop_reason`, `stopReason` and `turn_id` appear only in

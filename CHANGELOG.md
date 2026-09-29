@@ -271,6 +271,19 @@ Notable changes to the native `ai-hist` CLI are documented here.
   candidate, opened, or tracked with a transcript cursor, and a cursor an
   earlier build kept for it is dropped on the next sync.
   ([#208](https://github.com/AgentWorkforce/relayhistory/issues/208))
+- Claude requests written as streamed snapshots — one record per content block,
+  same `message.id` and `requestId`, `output_tokens` growing — now report their
+  final usage instead of being refused as `ambiguous-usage-copies`. The parser
+  merges the copies per field (largest counter wins, input side must agree)
+  and writes the result onto every row of the request; contradictory copies
+  are still refused. Existing databases are settled once on the next writable
+  open. ([#211](https://github.com/AgentWorkforce/relayhistory/issues/211))
+- Claude `<synthetic>` assistant records (local API-error and login notices)
+  are stored as `session_markers` rows of kind `local_notice`, subkind
+  `synthetic`, instead of assistant events: they no longer form a request,
+  appear as a session model, or become `last_assistant_text`. Existing rows
+  move to markers on the next writable open.
+  ([#211](https://github.com/AgentWorkforce/relayhistory/issues/211))
 
 ### Rust API
 

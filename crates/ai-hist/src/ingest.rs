@@ -6122,8 +6122,14 @@ impl ClaudeMetaFold {
             self.first_ts.get_or_insert(ts);
             self.last_ts = Some(ts);
         }
+        // A `<synthetic>` notice is the harness talking, not the model's last
+        // word, so it never becomes the session's assistant excerpt.
         if value.get("type").and_then(Value::as_str) == Some("assistant")
             && value.get("isSidechain").and_then(Value::as_bool) != Some(true)
+            && !value
+                .pointer("/message/model")
+                .and_then(Value::as_str)
+                .is_some_and(is_claude_synthetic_placeholder_model)
         {
             if let Some(content) = value.pointer("/message/content") {
                 if let Some(text) = content.as_str() {
@@ -7071,7 +7077,7 @@ fn ingest_claude_record(
         .or_else(|| obj.get("type").and_then(Value::as_str))
         .unwrap_or("");
     let model = message.and_then(|m| m.get("model")).and_then(Value::as_str);
-    let token_json = message
+    let mut token_json = message
         .and_then(|m| m.get("usage"))
         .and_then(|v| serde_json::to_string(v).ok());
     // Read once per record: every row this record produces belongs to the
@@ -7103,7 +7109,13 @@ fn ingest_claude_record(
         // Decided per text row below, once the record is classified.
         control_kind: None,
     };
-    if message_role == "assistant" && !sidechain {
+    // A notice Claude Code wrote itself, not model output; see
+    // `is_claude_synthetic_placeholder_model`.
+    let synthetic =
+        message_role == "assistant" && model.is_some_and(is_claude_synthetic_placeholder_model);
+    // A notice's zeroed usage is not the context the last real response
+    // reported, so it neither sets nor clears the compaction size.
+    if message_role == "assistant" && !sidechain && !synthetic {
         match message
             .and_then(|m| m.get("usage"))
             .and_then(|usage| usage.get("cache_read_input_tokens"))
@@ -7136,6 +7148,57 @@ fn ingest_claude_record(
                 message,
                 message_role,
                 model,
+                token_json.as_deref(),
+            )?;
+        }
+    }
+    if synthetic {
+        // An earlier parser stored the notice as assistant output under this
+        // same identity; those rows are this record's and nothing else's, so
+        // they are replaced by the marker rather than left beside it.
+        delete_claude_record_rows(conn, session_id, message_uuid)?;
+        let text = message
+            .and_then(|m| m.get("content"))
+            .map(claude_user_text)
+            .filter(|text| !text.is_empty());
+        let payload = marker_payload(vec![
+            ("error", marker_string(obj.get("error"))),
+            (
+                "is_api_error_message",
+                obj.get("isApiErrorMessage")
+                    .and_then(Value::as_bool)
+                    .map(Value::from)
+                    .unwrap_or(Value::Null),
+            ),
+        ]);
+        let marker_uid = format!("{message_uuid}:marker");
+        insert_session_marker(
+            conn,
+            "claude",
+            session_id,
+            &NewSessionMarker {
+                marker_uid: &marker_uid,
+                ts_ms: (ts_ms != 0).then_some(ts_ms),
+                message_id: Some(message_uuid),
+                parent_id,
+                turn_id: None,
+                kind: "local_notice",
+                subkind: Some("synthetic"),
+                text: text.as_deref(),
+                payload_json: payload.as_deref(),
+            },
+        )?;
+        return Ok(());
+    }
+    if message_role == "assistant" {
+        if let (Some(request_id), Some(provider_message_id)) =
+            (identity.request_id, identity.provider_message_id)
+        {
+            token_json = settle_claude_request_usage(
+                conn,
+                session_id,
+                request_id,
+                provider_message_id,
                 token_json.as_deref(),
             )?;
         }
@@ -8391,6 +8454,232 @@ fn opencode_step_finish_stop_reason(part: &Value) -> Option<&str> {
     (part.get("type").and_then(Value::as_str) == Some("step-finish"))
         .then(|| part.get("reason").and_then(Value::as_str))
         .flatten()
+}
+
+/// Whether a Claude `message.model` is the placeholder Claude Code writes on a
+/// notice it produced itself.
+///
+/// Local API-error and authentication notices ("Login expired · Please run
+/// /login") are written as `type: "assistant"` records whose model is
+/// `<synthetic>`. No model produced them: they carry zero usage, usually no
+/// `requestId`, and their text is the harness talking. Stored as assistant
+/// output they read as the model's last word in `sessions list`, become a
+/// request of their own and put a model nobody ran in the session's list.
+pub(crate) fn is_claude_synthetic_placeholder_model(model: &str) -> bool {
+    model.trim().eq_ignore_ascii_case("<synthetic>")
+}
+
+/// Usage fields Claude fixes when a response *starts* streaming.
+///
+/// Claude Code can write one API response as several records — one per
+/// content block — while it is still streaming, and each record carries the
+/// usage snapshot current when it was written: the output side (`output_tokens`,
+/// `output_tokens_details`, `server_tool_use`, `iterations`) grows or first
+/// appears on a later copy. The input side is settled by the time the first
+/// block exists, so copies that disagree on one of these are not snapshots of
+/// one measurement, and they are left to read as `ambiguous-usage-copies`.
+const CLAUDE_REQUEST_INPUT_USAGE_FIELDS: &[&str] = &[
+    "input_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "cache_creation",
+];
+
+/// One Claude request's usage settled from the snapshots its records carry,
+/// or `None` when the copies contradict each other.
+///
+/// Merged per field: a counter takes the largest value any copy reports, a
+/// field only some copies carry is kept, and anything else must agree. That is
+/// order-independent, so a copy that arrives out of order never shrinks what
+/// an earlier pass stored.
+pub(crate) fn merge_claude_usage_copies<'a>(
+    copies: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    let mut merged: Option<Value> = None;
+    for copy in copies {
+        let value: Value = serde_json::from_str(copy).ok()?;
+        if !value.is_object() {
+            return None;
+        }
+        merged = Some(match merged {
+            None => value,
+            Some(have) => {
+                if !CLAUDE_REQUEST_INPUT_USAGE_FIELDS
+                    .iter()
+                    .all(|field| usage_values_agree(have.get(*field), value.get(*field)))
+                {
+                    return None;
+                }
+                merge_usage_value(&have, &value)?
+            }
+        });
+    }
+    serde_json::to_string(&merged?).ok()
+}
+
+/// Whether two copies of a field report the same thing wherever both report
+/// it. An absent or null field states nothing and agrees with anything.
+fn usage_values_agree(a: Option<&Value>, b: Option<&Value>) -> bool {
+    match (a, b) {
+        (None | Some(Value::Null), _) | (_, None | Some(Value::Null)) => true,
+        (Some(Value::Object(a)), Some(Value::Object(b))) => a
+            .iter()
+            .all(|(key, value)| usage_values_agree(Some(value), b.get(key))),
+        (Some(a), Some(b)) => a == b,
+    }
+}
+
+fn merge_usage_value(a: &Value, b: &Value) -> Option<Value> {
+    match (a, b) {
+        (Value::Null, other) | (other, Value::Null) => Some(other.clone()),
+        (Value::Object(ours), Value::Object(theirs)) => {
+            let mut out = ours.clone();
+            for (key, value) in theirs {
+                let merged = match ours.get(key) {
+                    Some(have) => merge_usage_value(have, value)?,
+                    None => value.clone(),
+                };
+                out.insert(key.clone(), merged);
+            }
+            Some(Value::Object(out))
+        }
+        (Value::Array(ours), Value::Array(theirs)) if ours.len() == theirs.len() => ours
+            .iter()
+            .zip(theirs)
+            .map(|(a, b)| merge_usage_value(a, b))
+            .collect::<Option<Vec<_>>>()
+            .map(Value::Array),
+        // Only a count can grow. A negative or fractional value is not one,
+        // and a copy carrying it is unreadable rather than an earlier
+        // snapshot, so it has to agree exactly or the request stays disputed.
+        (Value::Number(x), Value::Number(y)) => match (x.as_u64(), y.as_u64()) {
+            (Some(x), Some(y)) => Some(if x < y { b.clone() } else { a.clone() }),
+            _ => (a == b).then(|| a.clone()),
+        },
+        (a, b) if a == b => Some(a.clone()),
+        _ => None,
+    }
+}
+
+/// Settle one streamed Claude request's usage across every row stored for it,
+/// and return the blob a new copy should be written with.
+///
+/// `session_requests` expects every row of a request to carry one usage blob
+/// and refuses the request as `ambiguous-usage-copies` when they differ. For a
+/// request written as growing snapshots that refusal is wrong — they are one
+/// measurement read at different moments — so the settled blob is written
+/// onto every row of the request, including rows an earlier pass stored.
+/// Copies that genuinely contradict are left verbatim, and the refusal stands.
+///
+/// Keyed on `requestId` *and* `message.id`, the pair Claude repeats on every
+/// copy, and scoped to one session because the rows are.
+fn settle_claude_request_usage(
+    conn: &Connection,
+    session_id: &str,
+    request_id: &str,
+    provider_message_id: &str,
+    token_json: Option<&str>,
+) -> Result<Option<String>> {
+    let stored = conn
+        .prepare_cached(
+            "SELECT DISTINCT token_json FROM session_events \
+             WHERE source = 'claude' AND session_id = ?1 AND request_id = ?2 \
+               AND provider_message_id = ?3 AND role = 'assistant' \
+               AND token_json IS NOT NULL",
+        )?
+        .query_map(
+            params![session_id, request_id, provider_message_id],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let unchanged = match token_json {
+        Some(new) => stored.iter().all(|have| have == new),
+        None => stored.len() < 2,
+    };
+    if unchanged {
+        return Ok(token_json.map(str::to_string));
+    }
+    let Some(merged) =
+        merge_claude_usage_copies(stored.iter().map(String::as_str).chain(token_json))
+    else {
+        return Ok(token_json.map(str::to_string));
+    };
+    conn.execute(
+        "UPDATE session_events SET token_json = ?4 \
+         WHERE source = 'claude' AND session_id = ?1 AND request_id = ?2 \
+           AND provider_message_id = ?3 AND role = 'assistant' \
+           AND token_json IS NOT NULL AND token_json <> ?4",
+        params![session_id, request_id, provider_message_id, merged],
+    )?;
+    Ok(Some(merged))
+}
+
+/// Bring Claude rows an earlier parser stored up to the current request model,
+/// without re-reading a transcript: both repairs are functions of the stored
+/// rows alone.
+///
+/// Streamed copies of one request get their usage settled exactly as a fresh
+/// parse would, and a `<synthetic>` notice stored as assistant output moves to
+/// the `local_notice` marker a fresh parse writes, under the same marker uid,
+/// so a later re-read updates it in place. The text moves with it: this is a
+/// reclassification of evidence, not a deletion.
+pub(crate) fn heal_claude_request_evidence(conn: &Connection) -> Result<()> {
+    // A table from before usage or models were stored holds nothing either
+    // repair could apply to.
+    let columns: HashSet<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('session_events')")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if ![
+        "token_json",
+        "model",
+        "parent_id",
+        "request_id",
+        "provider_message_id",
+    ]
+    .iter()
+    .all(|column| columns.contains(*column))
+    {
+        return Ok(());
+    }
+    let groups = conn
+        .prepare(
+            "SELECT session_id, request_id, provider_message_id FROM session_events \
+             WHERE source = 'claude' AND role = 'assistant' \
+               AND request_id IS NOT NULL AND provider_message_id IS NOT NULL \
+               AND token_json IS NOT NULL \
+             GROUP BY session_id, request_id, provider_message_id \
+             HAVING COUNT(DISTINCT token_json) > 1",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (session_id, request_id, provider_message_id) in groups {
+        settle_claude_request_usage(conn, &session_id, &request_id, &provider_message_id, None)?;
+    }
+    conn.execute_batch(
+        "INSERT INTO session_markers \
+           (source, session_id, marker_uid, ts_ms, message_id, parent_id, kind, subkind, text) \
+         SELECT 'claude', session_id, message_id || ':marker', MIN(NULLIF(ts_ms, 0)), \
+                message_id, MIN(parent_id), 'local_notice', 'synthetic', \
+                group_concat(text, char(10)) \
+         FROM session_events \
+         WHERE source = 'claude' AND role = 'assistant' \
+           AND lower(trim(model)) = '<synthetic>' \
+           AND message_id IS NOT NULL AND message_id <> '' \
+         GROUP BY session_id, message_id \
+         ON CONFLICT(source, session_id, marker_uid) DO NOTHING; \
+         DELETE FROM session_events \
+         WHERE source = 'claude' AND role = 'assistant' \
+           AND lower(trim(model)) = '<synthetic>' \
+           AND message_id IS NOT NULL AND message_id <> '';",
+    )?;
+    Ok(())
 }
 
 /// The per-message facts a provider records on the envelope rather than in the
@@ -26624,6 +26913,301 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ephemeral_1h, 4002);
+    }
+
+    /// One streamed Claude response as Claude Code 2.1.x writes it: one record
+    /// per content block, the same `message.id` and `requestId` on each, and
+    /// the usage snapshot current when the block was written. The input side
+    /// is fixed; `output_tokens` grows, and fields such as `iterations` appear
+    /// only on later copies. `outputs` gives each copy's `output_tokens` in
+    /// file order.
+    fn jsonl_line(value: Value) -> String {
+        format!("{}\n", serde_json::to_string(&value).unwrap())
+    }
+
+    fn streamed_turn(outputs: [u64; 3]) -> String {
+        let blocks = [
+            json!({"type": "thinking", "thinking": "Considering the repo."}),
+            json!({"type": "text", "text": "Let me look."}),
+            json!({"type": "tool_use", "id": "toolu_ls", "name": "Bash", "input": {"command": "ls"}}),
+        ];
+        let mut out = jsonl_line(json!({
+            "type": "user", "uuid": "u-prompt", "sessionId": "s-stream",
+            "timestamp": "2026-09-20T00:00:00.000Z",
+            "message": {"role": "user", "content": "list the files"},
+        }));
+        let mut parent = "u-prompt".to_string();
+        for (index, (block, output)) in blocks.into_iter().zip(outputs).enumerate() {
+            let mut usage = json!({
+                "input_tokens": 2,
+                "cache_creation_input_tokens": 2100,
+                "cache_read_input_tokens": 111256,
+                "cache_creation": {"ephemeral_5m_input_tokens": 2100, "ephemeral_1h_input_tokens": 0},
+                "output_tokens": output,
+                "service_tier": "standard",
+            });
+            if output == 120 {
+                usage["iterations"] = json!([{"output_tokens": 120}]);
+                usage["server_tool_use"] = json!({"web_search_requests": 0});
+            }
+            let uuid = format!("u-block-{index}");
+            out.push_str(&jsonl_line(json!({
+                "type": "assistant", "uuid": uuid, "parentUuid": parent,
+                "sessionId": "s-stream", "requestId": "req_stream",
+                "timestamp": format!("2026-09-20T00:00:0{}.000Z", index + 1),
+                "message": {
+                    "id": "msg_stream", "role": "assistant", "model": "claude-opus-4-7",
+                    "content": [block], "usage": usage,
+                },
+            })));
+            parent = uuid;
+        }
+        out
+    }
+
+    fn stream_token_outputs(conn: &Connection) -> Vec<(String, i64)> {
+        conn.prepare(
+            "SELECT event_uid, json_extract(token_json, '$.output_tokens') FROM session_events \
+             WHERE role = 'assistant' ORDER BY event_uid",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    /// The copies are one measurement read at different moments, so the
+    /// request reports its final value — not the sum of the copies, and not a
+    /// refusal because they differ — whatever order they arrive in. Every
+    /// block is still its own row: the copies carry different content, so
+    /// nothing is dropped to make the numbers agree.
+    #[test]
+    fn claude_streamed_request_usage_settles_on_the_final_snapshot() {
+        for outputs in [[5, 40, 120], [5, 120, 40], [120, 40, 5]] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("s-stream.jsonl");
+            fs::write(&path, streamed_turn(outputs)).unwrap();
+            let conn = Connection::open_in_memory().unwrap();
+            init_db(&conn).unwrap();
+            // Twice: a re-read of the same file must land on the same rows.
+            ingest_claude_transcript(&conn, &path).unwrap();
+            ingest_claude_transcript(&conn, &path).unwrap();
+
+            assert_eq!(
+                stream_token_outputs(&conn),
+                vec![
+                    ("u-block-0:0".to_string(), 120),
+                    ("u-block-1:0".to_string(), 120),
+                    ("u-block-2:0".to_string(), 120),
+                ],
+                "{outputs:?}"
+            );
+            let (variants, iterations): (i64, Option<String>) = conn
+                .query_row(
+                    "SELECT usage_variants, json_extract(token_json, '$.iterations') \
+                     FROM session_requests WHERE session_id = 's-stream'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(variants, 1, "{outputs:?}");
+            assert!(iterations.is_some(), "later-only fields are kept");
+            let summary = crate::session_usage::session_usage_summary(&conn, "claude", "s-stream")
+                .unwrap()
+                .unwrap();
+            let usage = summary.usage.expect("the request's usage is established");
+            assert_eq!(usage.output_tokens, 120, "{outputs:?}");
+            assert_eq!(usage.cache_read_tokens, 111256);
+            assert_eq!(summary.request_count, 1);
+            assert!(summary.diagnostics.is_empty(), "{:?}", summary.diagnostics);
+        }
+    }
+
+    /// Copies that disagree on the input side are not snapshots of one
+    /// response, and settling them would invent a measurement. They stay
+    /// verbatim and the request stays refused.
+    #[test]
+    fn claude_contradictory_request_usage_copies_stay_ambiguous() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s-stream.jsonl");
+        let text =
+            streamed_turn([5, 40, 120]).replacen("\"input_tokens\":2,", "\"input_tokens\":9,", 1);
+        assert!(text.contains("\"input_tokens\":9,"), "fixture edit applied");
+        fs::write(&path, text).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let summary = crate::session_usage::session_usage_summary(&conn, "claude", "s-stream")
+            .unwrap()
+            .unwrap();
+        assert!(summary.usage.is_none());
+        assert!(summary
+            .diagnostics
+            .contains(&crate::session_usage::UsageDiagnostic::AmbiguousUsageCopies));
+    }
+
+    #[test]
+    fn claude_usage_copies_merge_per_field_and_refuse_contradictions() {
+        let early = r#"{"input_tokens":2,"cache_read_input_tokens":7,"output_tokens":5}"#;
+        let late = r#"{"input_tokens":2,"cache_read_input_tokens":7,"output_tokens":120,"iterations":[{"output_tokens":120}]}"#;
+        let forward = merge_claude_usage_copies([early, late]).unwrap();
+        let backward = merge_claude_usage_copies([late, early]).unwrap();
+        let forward: Value = serde_json::from_str(&forward).unwrap();
+        assert_eq!(forward, serde_json::from_str::<Value>(&backward).unwrap());
+        assert_eq!(forward["output_tokens"], 120);
+        assert_eq!(forward["iterations"][0]["output_tokens"], 120);
+
+        let other_cache = r#"{"input_tokens":2,"cache_read_input_tokens":8,"output_tokens":5}"#;
+        assert!(merge_claude_usage_copies([early, other_cache]).is_none());
+        assert!(merge_claude_usage_copies([early, r#"{"service_tier":1}"#]).is_some());
+        assert!(merge_claude_usage_copies([early, "[]"]).is_none());
+        let negative = r#"{"input_tokens":2,"cache_read_input_tokens":7,"output_tokens":-40}"#;
+        assert!(merge_claude_usage_copies([early, negative]).is_none());
+    }
+
+    /// Claude Code writes a local API-error or auth notice as an assistant
+    /// record whose model is `<synthetic>`. It is the harness talking, so it
+    /// is a `local_notice` marker: no assistant event, no request, no model,
+    /// and not the session's last assistant text.
+    #[test]
+    fn claude_synthetic_notice_is_a_marker_not_model_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s-synth.jsonl");
+        let lines = [
+            json!({"type": "user", "uuid": "u1", "sessionId": "s-synth",
+                "timestamp": "2026-09-20T00:00:00.000Z",
+                "message": {"role": "user", "content": "run the tests"}}),
+            json!({"type": "assistant", "uuid": "a1", "parentUuid": "u1", "sessionId": "s-synth",
+                "requestId": "req_1", "timestamp": "2026-09-20T00:00:01.000Z",
+                "message": {"id": "msg_1", "role": "assistant", "model": "claude-opus-4-7",
+                    "content": [{"type": "text", "text": "Running them now."}],
+                    "usage": {"input_tokens": 3, "output_tokens": 9}}}),
+            json!({"type": "assistant", "uuid": "a2", "parentUuid": "a1", "sessionId": "s-synth",
+                "isApiErrorMessage": true, "error": "authentication_failed",
+                "timestamp": "2026-09-20T00:00:02.000Z",
+                "message": {"id": "5d300740-7f9b-4292-9910-8a01649169ad", "role": "assistant",
+                    "model": "<synthetic>",
+                    "content": [{"type": "text", "text": "Login expired · Please run /login"}],
+                    "usage": {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0}}}),
+            json!({"type": "user", "uuid": "u2", "parentUuid": "a2", "sessionId": "s-synth",
+                "timestamp": "2026-09-20T00:00:03.000Z",
+                "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_x", "content": "ok"}]}}),
+        ];
+        let text: String = lines.into_iter().map(jsonl_line).collect();
+        fs::write(&path, &text).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let synthetic_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE model = '<synthetic>' OR message_id = 'a2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(synthetic_events, 0);
+        let marker: (String, String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT kind, subkind, text, payload_json FROM session_markers WHERE message_id = 'a2'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(marker.0, "local_notice");
+        assert_eq!(marker.1, "synthetic");
+        assert_eq!(
+            marker.2.as_deref(),
+            Some("Login expired · Please run /login")
+        );
+        let payload: Value = serde_json::from_str(marker.3.as_deref().unwrap()).unwrap();
+        assert_eq!(payload["error"], "authentication_failed");
+        assert_eq!(payload["is_api_error_message"], true);
+        let tool_result_model: Option<String> = conn
+            .query_row(
+                "SELECT model FROM session_events WHERE kind = 'tool_result'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tool_result_model, None);
+        let requests: Vec<String> = conn
+            .prepare("SELECT request_key FROM session_requests WHERE session_id = 's-synth'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(requests, vec!["request-id:req_1".to_string()]);
+
+        let mut fold = ClaudeMetaFold::default();
+        for line in text.lines() {
+            fold.observe(&serde_json::from_str(line).unwrap());
+        }
+        assert_eq!(
+            fold.last_assistant_text.as_deref(),
+            Some("Running them now.")
+        );
+    }
+
+    /// A database indexed before the settlement holds the streamed copies
+    /// verbatim and the notice as assistant output. Opening it repairs both
+    /// from the stored rows alone, once, without the transcript.
+    #[test]
+    fn opening_an_older_database_heals_claude_request_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s-stream.jsonl");
+        fs::write(&path, streamed_turn([5, 40, 120])).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        // What the previous parser left behind.
+        conn.execute_batch(
+            "UPDATE session_events SET token_json = json_set(token_json, '$.output_tokens', 5) \
+               WHERE event_uid = 'u-block-0:0'; \
+             UPDATE session_events SET token_json = json_set(token_json, '$.output_tokens', 40) \
+               WHERE event_uid = 'u-block-1:0'; \
+             DELETE FROM schema_migrations WHERE name = 'claude_request_evidence_v1'; \
+             DROP INDEX idx_session_events_request;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_events (source, session_id, message_id, parent_id, ts_ms, role, kind, text, model, event_uid) \
+             VALUES ('claude', 's-stream', 'a-synth', 'u-block-2', 5, 'assistant', 'text', 'Login expired', '<synthetic>', 'a-synth:0')",
+            [],
+        )
+        .unwrap();
+        assert!(!crate::store::schema_is_current(&conn).unwrap());
+
+        init_db(&conn).unwrap();
+
+        assert_eq!(
+            stream_token_outputs(&conn),
+            vec![
+                ("u-block-0:0".to_string(), 120),
+                ("u-block-1:0".to_string(), 120),
+                ("u-block-2:0".to_string(), 120),
+            ]
+        );
+        let marker: (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT kind, text, parent_id FROM session_markers WHERE marker_uid = 'a-synth:marker'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            marker,
+            (
+                "local_notice".to_string(),
+                Some("Login expired".to_string()),
+                Some("u-block-2".to_string())
+            )
+        );
+        assert!(crate::store::schema_is_current(&conn).unwrap());
     }
 
     /// Codex names a turn once, in `turn_context`, and every later record

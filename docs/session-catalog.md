@@ -509,6 +509,7 @@ it holds for every kind.
 | `synthetic_turn` | – | – | ✓ a turn the harness wrote, in `text` | – |
 | `signals` | – | – | ✓ | – |
 | `prompt_context` | – | – | ✓ | – |
+| `local_notice` | ✓ an `assistant` record whose model is `<synthetic>`: a notice Claude Code wrote itself (API error, expired login), text in `text`, `error` and `is_api_error_message` in `payload_json` | – | – | `synthetic` |
 | `unknown` | ✓ any unclassified record type, plus a `user`/`assistant` record that produced no event at all | ✓ any unclassified payload type, including `agent_reasoning_raw_content` and `agent_reasoning_section_break` | – | the provider type, verbatim |
 
 `text` is the provider's own readable prose for a marker, and `payload_json`

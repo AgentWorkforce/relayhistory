@@ -211,6 +211,31 @@ call by the number of records it was split across.
   group. The expected value is 1. Anything higher means the copies disagree,
   which does not establish what the request cost, so the request reports no
   usage and carries the `ambiguous-usage-copies` diagnostic.
+- **Streamed Claude copies are one measurement.** Claude Code can write a
+  response while it is still streaming — one record per content block, each
+  with the same `message.id` and `requestId` and the usage snapshot current
+  when that block was written. The input side (`input_tokens`,
+  `cache_read_input_tokens`, `cache_creation_input_tokens`, `cache_creation`)
+  is the same on every copy; `output_tokens` grows, and `iterations`,
+  `server_tool_use` and `output_tokens_details` appear only on later copies.
+  The parser settles those copies when it stores them: counters take the
+  largest value any copy reports, a field only some copies carry is kept, and
+  the settled blob is written onto **every** row of the request, including rows
+  an earlier pass stored, so the view still sees one blob. The rule is
+  order-independent, so a copy that arrives out of order never shrinks a stored
+  value. Copies that disagree on the input side, carry a counter that is not a
+  non-negative integer, or differ in any other field are not snapshots of one
+  response; they are stored verbatim and the request stays
+  `ambiguous-usage-copies`. Each copy keeps its own event rows: the copies
+  carry different content blocks, not growing text, so nothing is dropped to
+  make the numbers agree. A database indexed before this rule is settled once,
+  from its stored rows, when it is next opened writable.
+- **`<synthetic>` is not a model.** Claude Code writes local API-error and
+  authentication notices as `type: "assistant"` records whose `message.model`
+  is `<synthetic>`, with zeroed usage. They are stored as a `local_notice`
+  marker, never as assistant events, so they are not requests, carry no
+  usage, contribute no model and never become a session's last assistant
+  text.
 
 Because it is a view rather than a materialized table, it cannot drift from the
 events it is derived from, and there is exactly one implementation of the

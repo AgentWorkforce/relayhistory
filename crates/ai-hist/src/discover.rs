@@ -1423,9 +1423,14 @@ fn read_claude_shallow(
             if let Some(version) = value.get("version").and_then(Value::as_str) {
                 session.agent_version = Some(version.to_string());
             }
+            // `<synthetic>` is the placeholder on a notice Claude Code wrote
+            // itself; no model by that name ran in the session.
             push_unique(
                 &mut models,
-                value.pointer("/message/model").and_then(Value::as_str),
+                value
+                    .pointer("/message/model")
+                    .and_then(Value::as_str)
+                    .filter(|model| !crate::ingest::is_claude_synthetic_placeholder_model(model)),
             );
             if let Some(ts) = claude_timestamp(&value) {
                 session.first_activity_ms.get_or_insert(ts);

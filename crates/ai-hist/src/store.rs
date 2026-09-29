@@ -696,6 +696,11 @@ const REQUIRED_INDEXES: &[&str] = &[
     // against the record that carries it, across every session. Without this
     // that is a scan of every event on every hydration.
     "idx_session_events_message",
+    // Settling a streamed Claude request's usage reads every row of that
+    // request once per assistant record; without it that is a scan of the
+    // session per record. Also what routes a database stored before the
+    // settlement through the writable open that heals it.
+    "idx_session_events_request",
     "idx_session_continuity_parent_uuid",
     "idx_session_continuity_pending",
     "idx_sessions_project_key",
@@ -1612,6 +1617,25 @@ VALUES ('session_presences_local_backfill_v1');
         "INSERT OR IGNORE INTO schema_migrations (name) VALUES ('session_markers_v1');",
     )?;
     migrate_session_markers_v2(conn)?;
+    // Partial: only rows that name a provider request carry a key, which on
+    // the local parsers is Claude's assistant output alone.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_events_request \
+         ON session_events(source, session_id, request_id) WHERE request_id IS NOT NULL",
+        [],
+    )?;
+    // Rows stored before the parser settled streamed Claude requests and
+    // reclassified `<synthetic>` notices. Both repairs read only the stored
+    // rows, so they run here once instead of waiting for every transcript to
+    // be re-read. After the marker migration, whose columns the notices move
+    // into.
+    if !migration_applied(conn, "claude_request_evidence_v1")? {
+        crate::ingest::heal_claude_request_evidence(conn)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (name) VALUES ('claude_request_evidence_v1')",
+            [],
+        )?;
+    }
     // Derived from `session_events`, so it must come after the DDL and the
     // column migrations above, and needs no backfill: the first query over an
     // upgraded database already sees every request its events describe.
@@ -7465,9 +7489,15 @@ mod tests {
     /// A pre-usage database also predates the derived request view. SQLite
     /// refuses to drop one of the view's source columns while the view still
     /// references it, so the legacy shape is modelled without it.
+    /// Also the index over `request_id`, which SQLite will not let a
+    /// column drop leave dangling: a database from before the raw facts had
+    /// neither.
     fn drop_session_requests_view(conn: &Connection) {
-        conn.execute_batch("DROP VIEW IF EXISTS session_requests;")
-            .unwrap();
+        conn.execute_batch(
+            "DROP VIEW IF EXISTS session_requests; \
+             DROP INDEX IF EXISTS idx_session_events_request;",
+        )
+        .unwrap();
     }
 
     /// A fresh database and a migrated one must end up with the same
