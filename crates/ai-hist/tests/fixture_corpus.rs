@@ -590,6 +590,30 @@ const CORPUS: &[Fixture] = &[
         files: &["codex/two-requests-one-turn.jsonl"],
         quirk: "a tool loop makes two API calls inside one turn_id, so the turn is not the request",
     },
+    Fixture {
+        source: "codex",
+        name: "fork-human",
+        layout: Layout::CodexRollout,
+        origin: Origin::RelayHistory,
+        files: &["codex/fork-human/parent.jsonl", "codex/fork-human/child.jsonl"],
+        quirk: "a human fork (`forked_from_id`, `thread_source: user`) whose rollout replays the parent's `session_meta`, both turns and their cumulative `token_count` before its own turn",
+    },
+    Fixture {
+        source: "codex",
+        name: "fork-subagent",
+        layout: Layout::CodexRollout,
+        origin: Origin::RelayHistory,
+        files: &["codex/fork-subagent/root.jsonl", "codex/fork-subagent/subagent.jsonl"],
+        quirk: "a spawned subagent naming its parent in `source.subagent.thread_spawn.parent_thread_id`, replaying the parent's open turn (with a tool call) and starting its own turn in the thread id's own millisecond",
+    },
+    Fixture {
+        source: "codex",
+        name: "guardian-review",
+        layout: Layout::CodexRollout,
+        origin: Origin::RelayHistory,
+        files: &["codex/guardian-review/parent.jsonl", "codex/guardian-review/guardian.jsonl"],
+        quirk: "a Codex 0.150+ `thread_source: guardian_review` rollout with `parent_thread_id` that opens on a `compaction` item rather than a replay",
+    },
     // -- cursor, authored here ---------------------------------------------
     Fixture {
         source: "cursor",
@@ -1812,6 +1836,220 @@ fn codex_parent_thread_id_becomes_a_delegation_edge() {
         .map(|session| text(session, "session_id").to_string())
         .collect::<Vec<_>>();
     assert_eq!(catalog, vec!["sess_parent_thread_root".to_string()]);
+}
+
+/// The events of one session, as `(role, text)` in stored order.
+fn session_texts(key: &str, session_id: &str) -> Vec<(String, String)> {
+    rows(key, "session_events")
+        .iter()
+        .filter(|event| text(event, "session_id") == session_id)
+        .map(|event| {
+            (
+                text(event, "role").to_string(),
+                text(event, "text").to_string(),
+            )
+        })
+        .collect()
+}
+
+/// The one `fork_replay_boundary` marker a session carries, as its payload.
+fn fork_replay_marker(key: &str, session_id: &str) -> Option<Value> {
+    let markers = rows(key, "session_markers")
+        .iter()
+        .filter(|marker| {
+            text(marker, "session_id") == session_id
+                && text(marker, "kind") == "fork_replay_boundary"
+        })
+        .collect::<Vec<_>>();
+    assert!(markers.len() <= 1, "{markers:?}");
+    markers
+        .first()
+        .map(|marker| serde_json::from_str(text(marker, "payload_json")).expect("marker payload"))
+}
+
+const FORK_HUMAN_PARENT: &str = "019da82f-d400-7000-8000-00000000000a";
+const FORK_HUMAN_CHILD: &str = "019da830-be60-7000-8000-00000000000c";
+
+/// #210: a human fork records a `fork` edge from `forked_from_id`, and the
+/// parent history its rollout replays is not indexed a second time under the
+/// child: two prompts for the parent, one for the child, and the child's
+/// first request charged only what it spent beyond the inherited total.
+#[test]
+fn codex_human_fork_records_lineage_and_gates_the_replay() {
+    let key = "codex/fork-human";
+    let edges = rows(key, "session_relationships");
+    assert_eq!(edges.len(), 1, "{edges:?}");
+    assert_eq!(text(&edges[0], "relationship"), "fork");
+    assert_eq!(text(&edges[0], "parent_session_id"), FORK_HUMAN_PARENT);
+    assert_eq!(text(&edges[0], "child_session_id"), FORK_HUMAN_CHILD);
+    assert_eq!(text(&edges[0], "evidence_ref"), "forked_from_id");
+
+    // A human fork stays a root.
+    let catalog = rows(key, "sessions")
+        .iter()
+        .map(|session| text(session, "session_id").to_string())
+        .collect::<BTreeSet<_>>();
+    assert!(catalog.contains(FORK_HUMAN_CHILD), "{catalog:?}");
+    // Shallow discovery applies the same gate: the child's first prompt is
+    // its own, not the parent's replayed one.
+    let child_row = rows(key, "sessions")
+        .iter()
+        .find(|session| text(session, "session_id") == FORK_HUMAN_CHILD)
+        .expect("child row");
+    assert_eq!(
+        text(child_row, "first_prompt"),
+        "child prompt after the fork"
+    );
+
+    let history = rows(key, "history")
+        .iter()
+        .map(|entry| {
+            (
+                text(entry, "session_id").to_string(),
+                text(entry, "prompt").to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        history,
+        vec![
+            (
+                FORK_HUMAN_PARENT.to_string(),
+                "parent prompt one".to_string()
+            ),
+            (
+                FORK_HUMAN_PARENT.to_string(),
+                "parent prompt two".to_string()
+            ),
+            (
+                FORK_HUMAN_CHILD.to_string(),
+                "child prompt after the fork".to_string()
+            ),
+        ]
+    );
+
+    assert_eq!(
+        session_texts(key, FORK_HUMAN_CHILD),
+        vec![
+            (
+                "user".to_string(),
+                "child prompt after the fork".to_string()
+            ),
+            ("assistant".to_string(), "child answer".to_string()),
+        ],
+        "the child's events hold only its own turn"
+    );
+    let child_usage = rows(key, "session_events")
+        .iter()
+        .filter(|event| text(event, "session_id") == FORK_HUMAN_CHILD)
+        .filter_map(|event| field(event, "token_json").as_str())
+        .map(|raw| serde_json::from_str::<Value>(raw).expect("token json"))
+        .map(|usage| usage["total_tokens"].as_i64().expect("total"))
+        .collect::<Vec<_>>();
+    // Final 3100 minus the inherited 2500.
+    assert_eq!(child_usage, vec![600]);
+
+    let marker = fork_replay_marker(key, FORK_HUMAN_CHILD).expect("replay marker");
+    assert_eq!(marker["parent_session_id"], FORK_HUMAN_PARENT);
+    assert_eq!(marker["first_line"], 1);
+    assert_eq!(marker["replayed_lines"], 13);
+    assert_eq!(marker["closed_by"], "turn_id");
+    assert_eq!(marker["inherited_total_tokens"], 2500);
+    assert!(fork_replay_marker(key, FORK_HUMAN_PARENT).is_none());
+}
+
+/// #210: a spawned subagent names its parent only in
+/// `source.subagent.thread_spawn.parent_thread_id`. It keeps its delegation
+/// edge and gains a `fork` edge, and the parent's open turn it replays -- a
+/// prompt and a tool call -- stays the parent's. Its own first turn begins in
+/// the thread id's own millisecond and is still the child's.
+#[test]
+fn codex_subagent_fork_records_lineage_and_gates_the_replay() {
+    let key = "codex/fork-subagent";
+    let root = "019da866-c280-7000-8000-0000000000a0";
+    let child = "019da867-37b0-7000-8000-0000000000b0";
+    let edges = rows(key, "session_relationships")
+        .iter()
+        .map(|edge| {
+            (
+                text(edge, "relationship").to_string(),
+                text(edge, "parent_session_id").to_string(),
+                text(edge, "child_session_id").to_string(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    assert!(edges.contains(&("delegated".to_string(), root.to_string(), child.to_string())));
+    assert!(edges.contains(&("fork".to_string(), root.to_string(), child.to_string())));
+    let fork = rows(key, "session_relationships")
+        .iter()
+        .find(|edge| text(edge, "relationship") == "fork")
+        .expect("fork edge");
+    assert_eq!(
+        text(fork, "evidence_ref"),
+        "source.subagent.thread_spawn.parent_thread_id"
+    );
+
+    let catalog = rows(key, "sessions")
+        .iter()
+        .map(|session| text(session, "session_id").to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(catalog, vec![root.to_string()], "a subagent stays hidden");
+
+    let child_texts = session_texts(key, child);
+    assert_eq!(
+        child_texts[0],
+        ("user".to_string(), "review retry.rs".to_string())
+    );
+    assert!(
+        child_texts
+            .iter()
+            .all(|(_, text)| !text.contains("review the retry change") && !text.contains("git")),
+        "no replayed parent record reached the child: {child_texts:?}"
+    );
+    let child_calls = rows(key, "tool_calls")
+        .iter()
+        .filter(|call| text(call, "session_id") == child)
+        .map(|call| text(call, "tool_use_id").to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(child_calls, vec!["call_sub_cat".to_string()]);
+
+    let marker = fork_replay_marker(key, child).expect("replay marker");
+    assert_eq!(marker["closed_by"], "turn_id");
+    assert_eq!(
+        marker["closed_by_turn_id"],
+        "019da867-37b0-7000-8000-0000000000b1"
+    );
+}
+
+/// #210: a Codex 0.150+ `guardian_review` thread that names its parent is a
+/// subagent -- hidden from the root catalog, delegated from its parent -- and
+/// it carries no Codex fork field, so it has no `fork` edge and nothing is
+/// gated: its `compaction` opening is not a replay.
+#[test]
+fn codex_guardian_review_is_a_hidden_subagent_without_a_replay() {
+    let key = "codex/guardian-review";
+    let parent = "019da89d-b100-7000-8000-0000000000d0";
+    let guardian = "019da89e-4d40-7000-8000-0000000000e0";
+    let catalog = rows(key, "sessions")
+        .iter()
+        .map(|session| text(session, "session_id").to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(catalog, vec![parent.to_string()]);
+    let edges = rows(key, "session_relationships");
+    assert_eq!(edges.len(), 1, "{edges:?}");
+    assert_eq!(text(&edges[0], "relationship"), "delegated");
+    assert_eq!(text(&edges[0], "child_session_id"), guardian);
+    assert!(fork_replay_marker(key, guardian).is_none());
+    assert_eq!(
+        session_texts(key, guardian),
+        vec![
+            ("user".to_string(), "assess: rm -rf target/".to_string()),
+            (
+                "assistant".to_string(),
+                "low risk: build output only".to_string()
+            ),
+        ]
+    );
 }
 
 /// This transcript carries no `<timestamp>` tag on any turn, so every prompt

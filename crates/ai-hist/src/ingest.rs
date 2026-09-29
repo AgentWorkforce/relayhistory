@@ -2196,6 +2196,15 @@ const RAW_MESSAGE_FACTS_GENERATION: i64 = 3;
 const CLAUDE_RAW_MESSAGE_FACTS_KEY: &str = "claude_raw_message_facts";
 const CODEX_RAW_MESSAGE_FACTS_KEY: &str = "codex_raw_message_facts";
 
+/// One-time re-read of every Codex fork rollout, so the fork replay gate
+/// (`ForkReplaySpan`) retires the replayed parent rows an earlier parser
+/// indexed under the child. A fork's stamp never changes once it is finished,
+/// so without this the duplicates would stay for the life of the install.
+/// Recorded only after a walk that reached every known root, like the other
+/// backfills.
+const CODEX_FORK_REPLAY_GENERATION: i64 = 1;
+const CODEX_FORK_REPLAY_KEY: &str = "codex_fork_replay_gate";
+
 /// Whether this provider still owes a one-time raw-facts backfill pass.
 fn raw_facts_backfill_pending(state: &Map<String, Value>, key: &str) -> bool {
     state.get(key).and_then(Value::as_i64).unwrap_or(0) < RAW_MESSAGE_FACTS_GENERATION
@@ -3387,6 +3396,11 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
     state.remove("codex_rollouts_v5");
     let backfill_fidelity = fidelity_backfill_pending(state, CODEX_FIDELITY_GENERATION_KEY);
     let backfill_raw_facts = raw_facts_backfill_pending(state, CODEX_RAW_MESSAGE_FACTS_KEY);
+    let backfill_fork_replay = state
+        .get(CODEX_FORK_REPLAY_KEY)
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        < CODEX_FORK_REPLAY_GENERATION;
     // A root the stamp map has entries for but whose rollouts this run cannot
     // see is an archive we could not read, not an archive that is gone.
     // Walking it vacuously and then recording the generation would retire the
@@ -3511,6 +3525,11 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                     // session lost rows since the last sweep. Existence is not
                     // enough to answer that — re-ingest, which is idempotent.
                     Some(id) if repairs.contains("codex", id) => {}
+                    // A fork indexed before the replay gate: re-read once so
+                    // the gate retires the parent history it duplicated.
+                    Some(_)
+                        if backfill_fork_replay
+                            && crate::continuity::codex_evidence_names_fork(conn, &key)? => {}
                     Some(id)
                         if codex_session_evidence_exists(conn, id)?
                             && !(backfill_fidelity
@@ -3654,6 +3673,12 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
     }
     crate::continuity::reconcile(conn, "codex")?;
     record_raw_facts_backfill(state, CODEX_RAW_MESSAGE_FACTS_KEY, walked_every_known_root);
+    if walked_every_known_root {
+        state.insert(
+            CODEX_FORK_REPLAY_KEY.to_string(),
+            json!(CODEX_FORK_REPLAY_GENERATION),
+        );
+    }
     if repairs.repairs_all() && !walked_every_known_root {
         coverage.note_unread();
     }
@@ -3846,6 +3871,16 @@ pub(crate) struct CodexSessionMeta {
     /// The `session_meta` line's own timestamp: when the provider recorded
     /// this thread starting.
     meta_ts_ms: Option<i64>,
+    /// The thread this one was forked from, when Codex names it outright:
+    /// `forked_from_id` for a human fork, else
+    /// `source.subagent.thread_spawn.parent_thread_id` for a spawned subagent.
+    /// These are the same two fields the continuity scanner records `fork`
+    /// edges from, and only they arm the replay gate.
+    fork_parent_id: Option<String>,
+    /// When this thread began, for ordering its turns against the fork: the
+    /// UUIDv7 thread id's timestamp, else `payload.timestamp`, else the
+    /// record's own timestamp.
+    fork_origin_ms: Option<i64>,
 }
 
 /// Resolve the parent identity from every Codex session-meta shape observed in
@@ -4093,6 +4128,8 @@ fn codex_session_meta_from_record(value: &Value) -> Option<CodexSessionMeta> {
         .get("timestamp")
         .and_then(Value::as_str)
         .and_then(parse_iso_ms);
+    let fork_parent_id = codex::fork_parent_id(payload_value, session_id);
+    let fork_origin_ms = codex::fork_origin_ms(payload_value, session_id, meta_ts_ms);
     Some(CodexSessionMeta {
         session_id: session_id.to_string(),
         cwd: cwd.to_string(),
@@ -4102,6 +4139,8 @@ fn codex_session_meta_from_record(value: &Value) -> Option<CodexSessionMeta> {
         parent_thread_id,
         subagent_label,
         meta_ts_ms,
+        fork_parent_id,
+        fork_origin_ms,
     })
 }
 
@@ -4528,6 +4567,19 @@ fn ingest_codex_rollout_incremental(
     // shape of the bug this exists to prevent.
     let mut unwritten_line: Option<UnwrittenCodexLine> = None;
     let mut changes_before_line = conn.total_changes();
+    // The parent history a fork copied into this file, while it is being read
+    // (see `ForkReplaySpan`). Never carried across passes: the replay holds no
+    // `task_complete` the cursor could commit at, because its lines are
+    // skipped before the arms that would.
+    let mut fork_replay: Option<ForkReplaySpan> = None;
+    let mut replay_gate =
+        codex::ForkReplayGate::new(meta.fork_parent_id.clone(), meta.fork_origin_ms);
+    // Set when the baseline was inherited from a replay and no child snapshot
+    // has confirmed it yet. If the child's first readable snapshot is *below*
+    // it, the child's counter started from zero rather than from the parent's
+    // total, and the inherited baseline is dropped instead of swallowing every
+    // delta until the child caught up with its parent.
+    let mut inherited_baseline_unconfirmed = false;
     loop {
         check_capture_cancelled()?;
         // A line without its newline is the half-written tail of a live
@@ -4579,6 +4631,34 @@ fn ingest_codex_rollout_incremental(
             conn.total_changes() == changes_before_line,
         )?;
         changes_before_line = conn.total_changes();
+        // A forked rollout's copy of its parent's history: see
+        // `ForkReplaySpan` and `codex::ForkReplayGate`, which states the rule.
+        match replay_gate.step(index == 0, &value) {
+            codex::ReplayStep::Outside => {}
+            codex::ReplayStep::Replay => {
+                fork_replay
+                    .get_or_insert_with(|| ForkReplaySpan::new(index, ts_ms))
+                    .absorb(index, &value, payload);
+                continue;
+            }
+            codex::ReplayStep::Closed { turn_id, basis } => {
+                if let Some(span) = fork_replay.take() {
+                    record_codex_fork_replay(conn, meta, &span, Some((turn_id.as_deref(), basis)))?;
+                    human_messages = codex::HumanMessageDeduper::default();
+                    if prev_totals.is_none() {
+                        if let Some(inherited) = span.inherited {
+                            prev_totals = Some(inherited);
+                            baseline_generation += 1;
+                            span_run_start = request_span;
+                            inherited_baseline_unconfirmed = true;
+                        }
+                    }
+                    // The marker and retirements above are the span's, not
+                    // this line's: measure this line from here.
+                    changes_before_line = conn.total_changes();
+                }
+            }
+        }
         // A state-only line is never registered: it writes no row by design,
         // and the allocation would land on the highest-volume lines in the file.
         unwritten_line = (!codex_line_is_state_only(line_type, payload_type, payload)).then(|| {
@@ -4821,6 +4901,15 @@ fn ingest_codex_rollout_incremental(
                         }
                         continue;
                     };
+                    // A child whose counter restarted below the baseline it
+                    // inherited from its fork's replay: that total was never
+                    // this thread's, so difference from zero as a fresh
+                    // thread would.
+                    if std::mem::take(&mut inherited_baseline_unconfirmed)
+                        && prev_totals.is_some_and(|prev| totals.regressed_from(&prev))
+                    {
+                        prev_totals = None;
+                    }
                     match prev_totals {
                         // The first snapshot before any model output is the
                         // carried-over baseline of a resumed session (a fresh
@@ -4922,6 +5011,7 @@ fn ingest_codex_rollout_incremental(
                     let usage_settled = pending_usage.is_none()
                         && span_run_start == request_span
                         && !baseline_unknown
+                        && !inherited_baseline_unconfirmed
                         && surviving_refusals(&unreadable_snapshots, &measured_generations)
                             .is_empty();
                     if usage_settled {
@@ -5197,6 +5287,12 @@ fn ingest_codex_rollout_incremental(
         &mut unwritten_line,
         conn.total_changes() == changes_before_line,
     )?;
+    // The readable file ended inside a replay: the fork's first own turn is
+    // not written yet. The span is still accounted for, and the next pass,
+    // which re-reads it, closes it.
+    if let Some(span) = fork_replay.take() {
+        record_codex_fork_replay(conn, meta, &span, None)?;
+    }
     // Collapse each measured run onto its first span, so the rows a single
     // delta accounted for read as the one request it measured rather than as
     // one measured request and a trail of unmeasured ones.
@@ -5262,6 +5358,182 @@ fn ingest_codex_rollout_incremental(
         .saturating_add(reader.tail_bytes())
         .saturating_add(pass.validation_bytes);
     Ok((outcome, pass))
+}
+
+/// The span of a forked rollout that is a copy of its parent's history.
+///
+/// When Codex forks a thread — a human "fork conversation" or a spawned
+/// subagent — it writes the child's own `session_meta` and then **replays the
+/// parent's history** into the child's file: the parent's `session_meta`, its
+/// turns' `task_started` / `turn_context` / message records, and whatever
+/// `token_count` snapshots they carried. Those records are the parent's
+/// evidence, already indexed under the parent's id; indexing them again under
+/// the child's id duplicates every replayed prompt in `history` and every
+/// replayed message in `session_events`.
+///
+/// Which records form the span is decided by [`codex::ForkReplayGate`], the
+/// one statement of the rule, shared with shallow discovery. It is armed only
+/// by explicit evidence: the parent's own `session_meta` reappearing in a
+/// rollout whose opening `session_meta` named that parent in
+/// `forked_from_id` or `thread_spawn.parent_thread_id`, and it closes at the
+/// first turn it can attribute to the child -- or cannot order at all,
+/// because undecided means indexed.
+///
+/// Every line inside the span writes nothing; one `fork_replay_boundary`
+/// marker, keyed by the replayed `session_meta`'s line, accounts for all of
+/// them. A readable `token_count` inside it is the parent's cumulative total,
+/// kept as the child's inherited baseline so its first request is not charged
+/// the parent's whole context.
+struct ForkReplaySpan {
+    /// Line index of the replayed parent `session_meta`.
+    first_line: usize,
+    /// Line index of the last replayed line read so far.
+    last_line: usize,
+    /// The envelope timestamp of the replayed `session_meta`: when the fork
+    /// wrote the copy.
+    ts_ms: i64,
+    /// Tool call ids the replay carried, so rows an earlier parser indexed
+    /// under the child for them can be retired.
+    call_ids: Vec<String>,
+    /// `(timestamp, prompt)` of each replayed human turn, for the same reason
+    /// on `history`.
+    prompts: Vec<(i64, String)>,
+    /// The last readable cumulative snapshot inside the replay.
+    inherited: Option<CodexTokenTotals>,
+}
+
+impl ForkReplaySpan {
+    fn new(first_line: usize, ts_ms: i64) -> Self {
+        Self {
+            first_line,
+            last_line: first_line,
+            ts_ms,
+            call_ids: Vec::new(),
+            prompts: Vec::new(),
+            inherited: None,
+        }
+    }
+
+    /// Remember what a replayed line would have written.
+    fn absorb(&mut self, index: usize, value: &Value, payload: &Map<String, Value>) {
+        self.last_line = index;
+        if let Some(call_id) = payload
+            .get("call_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
+            if !self.call_ids.iter().any(|seen| seen == call_id) {
+                self.call_ids.push(call_id.to_string());
+            }
+        }
+        if let Some(message) = codex::human_message(value) {
+            let ts_ms = value
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(parse_iso_ms)
+                .unwrap_or(0);
+            self.prompts.push((ts_ms, message.text));
+        }
+        if payload.get("type").and_then(Value::as_str) == Some("token_count") {
+            if let Some(totals) = payload
+                .get("info")
+                .and_then(|info| info.get("total_token_usage"))
+                .and_then(CodexTokenTotals::from_usage)
+            {
+                self.inherited = Some(totals);
+            }
+        }
+    }
+}
+
+/// Write the one marker that stands for a replayed span, and retire whatever
+/// an earlier parser indexed under the child for the lines inside it.
+///
+/// `closed_by` is the child turn that ended the span and the fact that
+/// attributed it, or `None` when the readable file ended inside the replay
+/// (a live fork whose first own turn is not written yet). The marker is keyed
+/// by the span's first line, so the pass that later sees the span close
+/// rewrites the same row.
+fn record_codex_fork_replay(
+    conn: &Connection,
+    meta: &CodexSessionMeta,
+    span: &ForkReplaySpan,
+    closed_by: Option<(Option<&str>, &str)>,
+) -> Result<()> {
+    let session_id = meta.session_id.as_str();
+    let marker_uid = format!("{}:fork_replay", span.first_line);
+    let payload_json = json!({
+        "parent_session_id": meta.fork_parent_id,
+        "first_line": span.first_line,
+        "last_line": span.last_line,
+        "replayed_lines": span.last_line + 1 - span.first_line,
+        "closed_by_turn_id": closed_by.and_then(|(turn, _)| turn),
+        "closed_by": closed_by.map(|(_, basis)| basis),
+        "inherited_total_tokens": span.inherited.map(|totals| totals.total),
+    })
+    .to_string();
+    insert_session_marker(
+        conn,
+        "codex",
+        session_id,
+        &NewSessionMarker {
+            marker_uid: &marker_uid,
+            ts_ms: (span.ts_ms != 0).then_some(span.ts_ms),
+            message_id: None,
+            parent_id: meta.fork_parent_id.as_deref(),
+            turn_id: closed_by.and_then(|(turn, _)| turn),
+            kind: "fork_replay_boundary",
+            subkind: Some("session_meta"),
+            text: None,
+            payload_json: Some(&payload_json),
+        },
+    )?;
+    // Rows keyed by line index: events and markers from the replayed lines.
+    let (first, last) = (span.first_line as i64, span.last_line as i64);
+    let in_span = "source = 'codex' AND session_id = ?1 \
+                   AND instr({col}, ':') > 1 \
+                   AND CAST(substr({col}, 1, instr({col}, ':') - 1) AS INTEGER) BETWEEN ?2 AND ?3";
+    crate::store::retire_evidence_share(
+        conn,
+        "session_events",
+        &in_span.replace("{col}", "event_uid"),
+        params![session_id, first, last],
+        SessionLocation::Local,
+    )?;
+    crate::store::retire_evidence_share(
+        conn,
+        "session_markers",
+        &format!(
+            "{} AND marker_uid != ?4",
+            in_span.replace("{col}", "marker_uid")
+        ),
+        params![session_id, first, last, marker_uid],
+        SessionLocation::Local,
+    )?;
+    for call_id in &span.call_ids {
+        crate::store::retire_evidence_share(
+            conn,
+            "tool_calls",
+            "source = 'codex' AND session_id = ? AND tool_use_id = ?",
+            params![session_id, call_id],
+            SessionLocation::Local,
+        )?;
+        crate::store::retire_evidence_share(
+            conn,
+            "file_edits",
+            "source = 'codex' AND session_id = ? AND substr(tool_use_id, 1, ?) = ?",
+            params![session_id, call_id.len() as i64 + 1, format!("{call_id}#")],
+            SessionLocation::Local,
+        )?;
+    }
+    for (ts_ms, prompt) in &span.prompts {
+        conn.execute(
+            "DELETE FROM history WHERE source = 'codex' AND session_id = ? \
+               AND timestamp_ms = ? AND prompt = ?",
+            params![session_id, ts_ms, prompt],
+        )?;
+    }
+    Ok(())
 }
 
 /// One Codex rollout line that has not yet been shown to write anything.
@@ -31810,5 +32082,360 @@ pub(crate) fn marker_payload_is_bounded(value: &Value) -> bool {
                 })
         }
         _ => true,
+    }
+}
+
+#[cfg(test)]
+mod codex_fork_replay_tests {
+    //! The forked-rollout replay gate (#210): see `ForkReplaySpan`.
+    use super::*;
+    use crate::{init_db, open_db};
+    use rusqlite::Connection;
+    use std::fs;
+
+    const PARENT: &str = "019da82f-d400-7000-8000-00000000000a";
+    const CHILD: &str = "019da830-be60-7000-8000-00000000000c";
+    /// A parent turn, well before the fork.
+    const PARENT_TURN: &str = "019da82f-d7e8-7000-8000-000000000001";
+    /// The child's own turn, after the fork.
+    const CHILD_TURN: &str = "019da830-d1e8-7000-8000-0000000000c1";
+
+    fn line(ts: &str, kind: &str, payload: Value) -> String {
+        format!(
+            "{}\n",
+            json!({"timestamp": ts, "type": kind, "payload": payload})
+        )
+    }
+
+    fn usage(total: u64) -> Value {
+        json!({"type": "token_count", "info": {"total_token_usage": {
+            "input_tokens": total, "cached_input_tokens": 0, "output_tokens": 0,
+            "reasoning_output_tokens": 0, "total_tokens": total}}})
+    }
+
+    /// The child's `session_meta` and the replay of one parent turn.
+    fn forked_prefix(child_meta: Value, parent_turn: &str) -> String {
+        let at = "2026-04-20T00:01:00.000Z";
+        [
+            line(at, "session_meta", child_meta),
+            line(
+                at,
+                "session_meta",
+                json!({"id": PARENT, "cwd": "/tmp/project", "thread_source": "user"}),
+            ),
+            line(
+                at,
+                "event_msg",
+                json!({"type": "task_started", "turn_id": parent_turn}),
+            ),
+            line(
+                at,
+                "turn_context",
+                json!({"turn_id": parent_turn, "cwd": "/tmp/project", "model": "gpt-5.4"}),
+            ),
+            line(
+                at,
+                "event_msg",
+                json!({"type": "user_message", "message": "parent prompt"}),
+            ),
+            line(
+                at,
+                "event_msg",
+                json!({"type": "agent_message", "message": "parent answer"}),
+            ),
+            line(at, "event_msg", usage(1000)),
+            line(
+                at,
+                "event_msg",
+                json!({"type": "task_complete", "turn_id": parent_turn}),
+            ),
+        ]
+        .concat()
+    }
+
+    fn child_turn(turn: &str, total: u64) -> String {
+        [
+            line(
+                "2026-04-20T00:01:05.000Z",
+                "event_msg",
+                json!({"type": "task_started", "turn_id": turn}),
+            ),
+            line(
+                "2026-04-20T00:01:05.001Z",
+                "turn_context",
+                json!({"turn_id": turn, "cwd": "/tmp/project", "model": "gpt-5.4"}),
+            ),
+            line(
+                "2026-04-20T00:01:05.002Z",
+                "event_msg",
+                json!({"type": "user_message", "message": "child prompt"}),
+            ),
+            line(
+                "2026-04-20T00:01:08.000Z",
+                "event_msg",
+                json!({"type": "agent_message", "message": "child answer"}),
+            ),
+            line("2026-04-20T00:01:08.001Z", "event_msg", usage(total)),
+            line(
+                "2026-04-20T00:01:08.002Z",
+                "event_msg",
+                json!({"type": "task_complete", "turn_id": turn}),
+            ),
+        ]
+        .concat()
+    }
+
+    fn human_fork_meta() -> Value {
+        json!({"id": CHILD, "forked_from_id": PARENT, "cwd": "/tmp/project",
+               "timestamp": "2026-04-20T00:01:00.000Z", "thread_source": "user"})
+    }
+
+    fn texts(conn: &Connection, session: &str) -> Vec<String> {
+        let mut statement = conn
+            .prepare(
+                "SELECT text FROM session_events WHERE source = 'codex' AND session_id = ? \
+                 ORDER BY id",
+            )
+            .unwrap();
+        statement
+            .query_map([session], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    fn prompts(conn: &Connection, session: &str) -> Vec<String> {
+        let mut statement = conn
+            .prepare(
+                "SELECT prompt FROM history WHERE source = 'codex' AND session_id = ? ORDER BY id",
+            )
+            .unwrap();
+        statement
+            .query_map([session], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    fn replay_marker(conn: &Connection, session: &str) -> Option<Value> {
+        conn.query_row(
+            "SELECT payload_json FROM session_markers \
+             WHERE source = 'codex' AND session_id = ? AND kind = 'fork_replay_boundary'",
+            [session],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .unwrap()
+        .map(|raw| serde_json::from_str(&raw).unwrap())
+    }
+
+    fn token_totals(conn: &Connection, session: &str) -> Vec<i64> {
+        let mut statement = conn
+            .prepare(
+                "SELECT json_extract(token_json, '$.total_tokens') FROM session_events \
+                 WHERE source = 'codex' AND session_id = ? AND token_json IS NOT NULL ORDER BY id",
+            )
+            .unwrap();
+        statement
+            .query_map([session], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// A live fork whose own first turn is not written yet: the replay is
+    /// held back whole, accounted for by one open marker, and the cursor does
+    /// not commit inside it. When the child's turn arrives the resumed pass
+    /// re-reads the replay, closes the span, and indexes only the child.
+    #[test]
+    fn a_live_fork_holds_its_replay_until_the_first_own_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-child.jsonl");
+        fs::write(&rollout, forked_prefix(human_fork_meta(), PARENT_TURN)).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let meta = read_codex_session_meta(&rollout).unwrap().unwrap();
+        assert_eq!(meta.fork_parent_id.as_deref(), Some(PARENT));
+        let mut cursor = transcript_cursor::TranscriptCursorState::default();
+
+        ingest_codex_rollout_incremental(&conn, &rollout, &meta, &mut cursor).unwrap();
+        assert!(texts(&conn, CHILD).is_empty());
+        assert!(prompts(&conn, CHILD).is_empty());
+        let open = replay_marker(&conn, CHILD).expect("open replay marker");
+        assert_eq!(open["closed_by"], Value::Null);
+        assert_eq!(open["replayed_lines"], 7);
+        assert_eq!(
+            cursor.file.as_ref().map(|file| file.offset).unwrap_or(0),
+            0,
+            "the replayed task_complete is not a commit point"
+        );
+
+        let mut file = fs::OpenOptions::new().append(true).open(&rollout).unwrap();
+        std::io::Write::write_all(&mut file, child_turn(CHILD_TURN, 1600).as_bytes()).unwrap();
+        drop(file);
+        ingest_codex_rollout_incremental(&conn, &rollout, &meta, &mut cursor).unwrap();
+
+        assert_eq!(texts(&conn, CHILD), vec!["child prompt", "child answer"]);
+        assert_eq!(prompts(&conn, CHILD), vec!["child prompt"]);
+        let closed = replay_marker(&conn, CHILD).expect("closed replay marker");
+        assert_eq!(closed["closed_by_turn_id"], CHILD_TURN);
+        assert_eq!(closed["inherited_total_tokens"], 1000);
+        // 1600 cumulative, 1000 of it inherited from the parent.
+        assert_eq!(token_totals(&conn, CHILD), vec![600]);
+    }
+
+    /// Rows an earlier parser indexed under the child for replayed lines are
+    /// retired when the gate re-reads them; the child's own rows are kept.
+    #[test]
+    fn the_gate_retires_replayed_rows_an_earlier_parser_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-child.jsonl");
+        fs::write(
+            &rollout,
+            forked_prefix(human_fork_meta(), PARENT_TURN) + &child_turn(CHILD_TURN, 1600),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // What the pre-gate parser left: the replayed prompt as an event, a
+        // marker and a history row, all under the child.
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, role, kind, text, event_uid, message_id, ts_ms) \
+             VALUES ('codex', ?, 'user', 'text', 'parent prompt', '4:user_message', '4:user_message', 1)",
+            [CHILD],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_markers (source, session_id, marker_uid, kind) \
+             VALUES ('codex', ?, '2:marker', 'task_started')",
+            [CHILD],
+        )
+        .unwrap();
+        let replay_ms = parse_iso_ms("2026-04-20T00:01:00.000Z").unwrap();
+        conn.execute(
+            "INSERT INTO history (source, session_id, prompt, timestamp_ms) \
+             VALUES ('codex', ?, 'parent prompt', ?)",
+            params![CHILD, replay_ms],
+        )
+        .unwrap();
+
+        let meta = read_codex_session_meta(&rollout).unwrap().unwrap();
+        ingest_codex_rollout(&conn, &rollout, &meta).unwrap();
+
+        assert_eq!(texts(&conn, CHILD), vec!["child prompt", "child answer"]);
+        assert_eq!(prompts(&conn, CHILD), vec!["child prompt"]);
+        let stale_markers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_markers \
+                 WHERE session_id = ? AND marker_uid = '2:marker'",
+                [CHILD],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_markers, 0);
+    }
+
+    /// A turn nothing explicit can order against the fork -- a legacy id and
+    /// no `started_at` -- ends the gate: undecided is indexed, not dropped.
+    #[test]
+    fn an_undecidable_turn_closes_the_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-child.jsonl");
+        fs::write(&rollout, forked_prefix(human_fork_meta(), "legacy-turn-id")).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let meta = read_codex_session_meta(&rollout).unwrap().unwrap();
+        ingest_codex_rollout(&conn, &rollout, &meta).unwrap();
+        assert_eq!(texts(&conn, CHILD), vec!["parent prompt", "parent answer"]);
+        let marker = replay_marker(&conn, CHILD).expect("marker");
+        assert_eq!(marker["closed_by"], "undecided");
+        assert_eq!(marker["replayed_lines"], 1);
+    }
+
+    /// A rollout that names no Codex fork field never arms the gate, even if
+    /// a later `session_meta` names some other thread.
+    #[test]
+    fn a_rollout_without_a_fork_field_is_never_gated() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-child.jsonl");
+        fs::write(
+            &rollout,
+            forked_prefix(
+                json!({"id": CHILD, "cwd": "/tmp/project", "thread_source": "user"}),
+                PARENT_TURN,
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let meta = read_codex_session_meta(&rollout).unwrap().unwrap();
+        assert_eq!(meta.fork_parent_id, None);
+        ingest_codex_rollout(&conn, &rollout, &meta).unwrap();
+        assert_eq!(texts(&conn, CHILD), vec!["parent prompt", "parent answer"]);
+        assert!(replay_marker(&conn, CHILD).is_none());
+    }
+
+    /// A child whose counter restarted from zero, below the total it
+    /// inherited from the replay, is differenced from zero rather than
+    /// having its spend swallowed by the parent's larger baseline.
+    #[test]
+    fn a_child_counter_below_the_inherited_total_drops_the_inherited_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-child.jsonl");
+        fs::write(
+            &rollout,
+            forked_prefix(human_fork_meta(), PARENT_TURN) + &child_turn(CHILD_TURN, 300),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let meta = read_codex_session_meta(&rollout).unwrap().unwrap();
+        ingest_codex_rollout(&conn, &rollout, &meta).unwrap();
+        assert_eq!(token_totals(&conn, CHILD), vec![300]);
+    }
+
+    /// A fork a pre-gate build indexed has an unchanged stamp, so only the
+    /// one-time backfill re-reads it. Once recorded, the backfill is spent.
+    #[test]
+    fn an_unchanged_fork_is_re_read_once_to_retire_its_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(
+            day.join("rollout-child.jsonl"),
+            forked_prefix(human_fork_meta(), PARENT_TURN) + &child_turn(CHILD_TURN, 1600),
+        )
+        .unwrap();
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+        assert_eq!(
+            state.get(CODEX_FORK_REPLAY_KEY),
+            Some(&json!(CODEX_FORK_REPLAY_GENERATION))
+        );
+        let replay_ms = parse_iso_ms("2026-04-20T00:01:00.000Z").unwrap();
+        let plant_stale = || {
+            conn.execute(
+                "INSERT OR IGNORE INTO history (source, session_id, prompt, timestamp_ms) \
+                 VALUES ('codex', ?, 'parent prompt', ?)",
+                params![CHILD, replay_ms],
+            )
+            .unwrap();
+        };
+
+        // With the backfill spent, an unchanged rollout is not re-read.
+        plant_stale();
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+        assert_eq!(prompts(&conn, CHILD), vec!["child prompt", "parent prompt"]);
+
+        // An install that predates the gate owes the backfill.
+        state.remove(CODEX_FORK_REPLAY_KEY);
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+        assert_eq!(prompts(&conn, CHILD), vec!["child prompt"]);
+        assert_eq!(
+            state.get(CODEX_FORK_REPLAY_KEY),
+            Some(&json!(CODEX_FORK_REPLAY_GENERATION))
+        );
     }
 }

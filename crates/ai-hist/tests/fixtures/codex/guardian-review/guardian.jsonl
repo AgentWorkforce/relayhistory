@@ -1,0 +1,8 @@
+{"timestamp":"2026-04-20T02:00:40.000Z","type":"session_meta","payload":{"id":"019da89e-4d40-7000-8000-0000000000e0","parent_thread_id":"019da89d-b100-7000-8000-0000000000d0","cwd":"/tmp/project","timestamp":"2026-04-20T02:00:40.000Z","cli_version":"0.155.0","originator":"Codex Desktop","source":{"subagent":{"other":"guardian"}},"thread_source":"guardian_review"}}
+{"timestamp":"2026-04-20T02:00:40.000Z","type":"response_item","payload":{"type":"compaction","encrypted_content":"opaque"}}
+{"timestamp":"2026-04-20T02:00:40.010Z","type":"event_msg","payload":{"type":"task_started","turn_id":"019da89e-4d72-7000-8000-0000000000e1","started_at":1776650440}}
+{"timestamp":"2026-04-20T02:00:40.011Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"assess: rm -rf target/"}]}}
+{"timestamp":"2026-04-20T02:00:40.012Z","type":"turn_context","payload":{"turn_id":"019da89e-4d72-7000-8000-0000000000e1","cwd":"/tmp/project","model":"gpt-5.4"}}
+{"timestamp":"2026-04-20T02:00:42.000Z","type":"event_msg","payload":{"type":"agent_message","message":"low risk: build output only"}}
+{"timestamp":"2026-04-20T02:00:42.001Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":900,"cached_input_tokens":0,"output_tokens":40,"reasoning_output_tokens":0,"total_tokens":940}}}}
+{"timestamp":"2026-04-20T02:00:42.002Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"019da89e-4d72-7000-8000-0000000000e1"}}

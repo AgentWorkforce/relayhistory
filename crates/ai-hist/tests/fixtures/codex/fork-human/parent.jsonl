@@ -1,0 +1,13 @@
+{"timestamp":"2026-04-20T00:00:00.000Z","type":"session_meta","payload":{"id":"019da82f-d400-7000-8000-00000000000a","cwd":"/tmp/project","timestamp":"2026-04-20T00:00:00.000Z","cli_version":"0.155.0","originator":"Codex Desktop","source":"vscode","thread_source":"user"}}
+{"timestamp":"2026-04-20T00:00:01.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"019da82f-d7e8-7000-8000-000000000001","started_at":1776643201}}
+{"timestamp":"2026-04-20T00:00:01.001Z","type":"turn_context","payload":{"turn_id":"019da82f-d7e8-7000-8000-000000000001","cwd":"/tmp/project","model":"gpt-5.4"}}
+{"timestamp":"2026-04-20T00:00:01.002Z","type":"event_msg","payload":{"type":"user_message","message":"parent prompt one"}}
+{"timestamp":"2026-04-20T00:00:04.000Z","type":"event_msg","payload":{"type":"agent_message","message":"parent answer one"}}
+{"timestamp":"2026-04-20T00:00:04.001Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":800,"cached_input_tokens":0,"output_tokens":200,"reasoning_output_tokens":0,"total_tokens":1000}}}}
+{"timestamp":"2026-04-20T00:00:04.002Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"019da82f-d7e8-7000-8000-000000000001","last_agent_message":"parent answer one"}}
+{"timestamp":"2026-04-20T00:00:20.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"019da830-2220-7000-8000-000000000002","started_at":1776643220}}
+{"timestamp":"2026-04-20T00:00:20.001Z","type":"turn_context","payload":{"turn_id":"019da830-2220-7000-8000-000000000002","cwd":"/tmp/project","model":"gpt-5.4"}}
+{"timestamp":"2026-04-20T00:00:20.002Z","type":"event_msg","payload":{"type":"user_message","message":"parent prompt two"}}
+{"timestamp":"2026-04-20T00:00:23.000Z","type":"event_msg","payload":{"type":"agent_message","message":"parent answer two"}}
+{"timestamp":"2026-04-20T00:00:23.001Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2000,"cached_input_tokens":0,"output_tokens":500,"reasoning_output_tokens":0,"total_tokens":2500}}}}
+{"timestamp":"2026-04-20T00:00:23.002Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"019da830-2220-7000-8000-000000000002","last_agent_message":"parent answer two"}}
