@@ -2018,7 +2018,9 @@ row. Beside the identity columns (`child_session_id`, nullable, and
 `evidence_locator`, `evidence_ref`, `child_has_events`, `spawned_at_ms`,
 `created_ms`, and `updated_ms`; re-ingestion refreshes mutable fields and
 preserves first-observation time. It is read through
-`idx_session_relationships_parent` and `idx_session_relationships_child`.
+`idx_session_relationships_parent` and `idx_session_relationships_child`;
+the sync walk's per-transcript sidecar probe uses
+`idx_session_relationships_locator` (`source, evidence_locator`).
 Databases written before this shape are rebuilt in place by the
 `session_relationships_v2` marker migration, which copies every existing edge
 forward as an observed `legacy_hydration` row; the marker is required, so an

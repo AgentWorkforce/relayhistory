@@ -5765,6 +5765,28 @@ fn claude_transcript_unchanged(conn: &Connection, path: &Path) -> Result<bool> {
 /// source: these files never become sessions, they only describe one.
 pub(crate) const CLAUDE_SUBAGENT_META_SOURCE: &str = "claude-subagent-meta";
 
+/// [`claude_sidecar_evidence_exists`]'s probe, asked of every Claude transcript
+/// the walk considers. `idx_session_relationships_locator` is what makes it a
+/// search rather than a scan of every Claude relationship.
+const CLAUDE_SIDECAR_EVIDENCE_SQL: &str = "SELECT EXISTS(
+            SELECT 1
+            FROM session_relationships r
+            WHERE r.source = 'claude' AND r.evidence_locator = ?
+              AND (
+                EXISTS(
+                  SELECT 1 FROM session_events e
+                  WHERE e.source = 'claude'
+                    AND e.session_id = COALESCE(r.child_session_id, r.parent_session_id)
+                )
+                OR EXISTS(
+                  SELECT 1 FROM session_markers m
+                  WHERE m.source = 'claude'
+                    AND m.session_id = COALESCE(r.child_session_id, r.parent_session_id)
+                )
+              )
+            LIMIT 1
+        )";
+
 /// Whether an unchanged subagent sidecar has already been ingested.
 ///
 /// A sidecar is deliberately never registered as a session, so the catalog
@@ -5782,28 +5804,9 @@ fn claude_sidecar_evidence_exists(conn: &Connection, path: &Path) -> Result<bool
     // and no events. Asking only about events reads that as "this file left
     // nothing behind", so an unchanged sidecar is re-parsed on every sync
     // forever while the sync reports itself perfectly normal.
-    let exists: i64 = conn.query_row(
-        "SELECT EXISTS(
-            SELECT 1
-            FROM session_relationships r
-            WHERE r.source = 'claude' AND r.evidence_locator = ?
-              AND (
-                EXISTS(
-                  SELECT 1 FROM session_events e
-                  WHERE e.source = 'claude'
-                    AND e.session_id = COALESCE(r.child_session_id, r.parent_session_id)
-                )
-                OR EXISTS(
-                  SELECT 1 FROM session_markers m
-                  WHERE m.source = 'claude'
-                    AND m.session_id = COALESCE(r.child_session_id, r.parent_session_id)
-                )
-              )
-            LIMIT 1
-        )",
-        [locator.as_ref()],
-        |row| row.get(0),
-    )?;
+    let exists: i64 = conn.query_row(CLAUDE_SIDECAR_EVIDENCE_SQL, [locator.as_ref()], |row| {
+        row.get(0)
+    })?;
     Ok(exists != 0)
 }
 
@@ -5969,15 +5972,13 @@ fn events_lack_raw_facts(conn: &Connection, source: &str, session_id: &str) -> R
     Ok(lacking != 0)
 }
 
-/// The fidelity question for a Claude transcript, which the walk knows by path.
-fn claude_transcript_lacks_tool_result_fidelity(conn: &Connection, path: &Path) -> Result<bool> {
-    let raw_path = path.to_string_lossy();
-    let lacking: i64 = conn.query_row(
-        "SELECT
+/// [`claude_transcript_lacks_tool_result_fidelity`]'s probe; `CROSS JOIN`
+/// pins the join order for the reason [`CLAUDE_TRANSCRIPT_EVENTS_SQL`] gives.
+const CLAUDE_LACKS_TOOL_RESULT_FIDELITY_SQL: &str = "SELECT
             EXISTS(
                 SELECT 1
                 FROM sessions s
-                JOIN session_events e ON e.source = s.source AND e.session_id = s.session_id
+                CROSS JOIN session_events e ON e.source = s.source AND e.session_id = s.session_id
                 WHERE s.source = 'claude' AND s.raw_path = ?1
                   AND e.kind = 'tool_result' AND e.event_index IS NULL
                 LIMIT 1
@@ -5985,18 +5986,46 @@ fn claude_transcript_lacks_tool_result_fidelity(conn: &Connection, path: &Path) 
             OR EXISTS(
                 SELECT 1
                 FROM session_relationships r
-                JOIN session_events e
+                CROSS JOIN session_events e
                   ON e.source = 'claude'
                  AND e.session_id = COALESCE(r.child_session_id, r.parent_session_id)
                 WHERE r.source = 'claude' AND r.evidence_locator = ?1
                   AND e.kind = 'tool_result' AND e.event_index IS NULL
                 LIMIT 1
-            )",
+            )";
+
+/// The fidelity question for a Claude transcript, which the walk knows by path.
+fn claude_transcript_lacks_tool_result_fidelity(conn: &Connection, path: &Path) -> Result<bool> {
+    let raw_path = path.to_string_lossy();
+    let lacking: i64 = conn.query_row(
+        CLAUDE_LACKS_TOOL_RESULT_FIDELITY_SQL,
         [raw_path.as_ref()],
         |row| row.get(0),
     )?;
     Ok(lacking != 0)
 }
+
+/// [`claude_transcript_lacks_raw_facts`]'s probe; `CROSS JOIN` pins the join
+/// order for the reason [`CLAUDE_TRANSCRIPT_EVENTS_SQL`] gives.
+const CLAUDE_LACKS_RAW_FACTS_SQL: &str = "SELECT
+            EXISTS(
+                SELECT 1
+                FROM sessions s
+                CROSS JOIN session_events e ON e.source = s.source AND e.session_id = s.session_id
+                WHERE s.source = 'claude' AND s.raw_path = ?1
+                  AND COALESCE(e.raw_facts_version, 0) < ?2
+                LIMIT 1
+            )
+            OR EXISTS(
+                SELECT 1
+                FROM session_relationships r
+                CROSS JOIN session_events e
+                  ON e.source = 'claude'
+                 AND e.session_id = COALESCE(r.child_session_id, r.parent_session_id)
+                WHERE r.source = 'claude' AND r.evidence_locator = ?1
+                  AND COALESCE(e.raw_facts_version, 0) < ?2
+                LIMIT 1
+        )";
 
 /// The raw-facts question for a Claude transcript.
 ///
@@ -6011,30 +6040,35 @@ fn claude_transcript_lacks_tool_result_fidelity(conn: &Connection, path: &Path) 
 fn claude_transcript_lacks_raw_facts(conn: &Connection, path: &Path) -> Result<bool> {
     let raw_path = path.to_string_lossy();
     let lacking: i64 = conn.query_row(
-        "SELECT
-            EXISTS(
-                SELECT 1
-                FROM sessions s
-                JOIN session_events e ON e.source = s.source AND e.session_id = s.session_id
-                WHERE s.source = 'claude' AND s.raw_path = ?1
-                  AND COALESCE(e.raw_facts_version, 0) < ?2
-                LIMIT 1
-            )
-            OR EXISTS(
-                SELECT 1
-                FROM session_relationships r
-                JOIN session_events e
-                  ON e.source = 'claude'
-                 AND e.session_id = COALESCE(r.child_session_id, r.parent_session_id)
-                WHERE r.source = 'claude' AND r.evidence_locator = ?1
-                  AND COALESCE(e.raw_facts_version, 0) < ?2
-                LIMIT 1
-        )",
+        CLAUDE_LACKS_RAW_FACTS_SQL,
         params![raw_path.as_ref(), RAW_MESSAGE_FACTS_VERSION],
         |row| row.get(0),
     )?;
     Ok(lacking != 0)
 }
+
+/// [`claude_transcript_events_exist`]'s probe.
+///
+/// The sync walk asks it of every Claude transcript on every sweep, so its
+/// plan is the walk's cost. `CROSS JOIN` makes SQLite drive the lookup from
+/// the one `sessions` row the path names. Left to choose, the planner (with no
+/// `sqlite_stat1`, which this crate never writes) drove it from
+/// `session_events` instead -- a scan of every Claude event until one belonged
+/// to that path's session, so a path with no row (every subagent sidecar, every
+/// new transcript) read the whole table, once per file (#215).
+const CLAUDE_TRANSCRIPT_EVENTS_SQL: &str = "SELECT EXISTS(
+            SELECT 1
+            FROM sessions s
+            CROSS JOIN session_events e ON e.source = s.source AND e.session_id = s.session_id
+            WHERE s.source = 'claude' AND s.raw_path = ?
+            LIMIT 1
+        ) OR EXISTS(
+            SELECT 1
+            FROM sessions s
+            CROSS JOIN session_markers m ON m.source = s.source AND m.session_id = s.session_id
+            WHERE s.source = 'claude' AND s.raw_path = ?
+            LIMIT 1
+        )";
 
 /// Whether this transcript has left any evidence behind, of any kind.
 ///
@@ -6047,19 +6081,7 @@ fn claude_transcript_lacks_raw_facts(conn: &Connection, path: &Path) -> Result<b
 fn claude_transcript_events_exist(conn: &Connection, path: &Path) -> Result<bool> {
     let raw_path = path.to_string_lossy();
     let exists: i64 = conn.query_row(
-        "SELECT EXISTS(
-            SELECT 1
-            FROM sessions s
-            JOIN session_events e ON e.source = s.source AND e.session_id = s.session_id
-            WHERE s.source = 'claude' AND s.raw_path = ?
-            LIMIT 1
-        ) OR EXISTS(
-            SELECT 1
-            FROM sessions s
-            JOIN session_markers m ON m.source = s.source AND m.session_id = s.session_id
-            WHERE s.source = 'claude' AND s.raw_path = ?
-            LIMIT 1
-        )",
+        CLAUDE_TRANSCRIPT_EVENTS_SQL,
         [raw_path.as_ref(), raw_path.as_ref()],
         |row| row.get(0),
     )?;
@@ -12931,6 +12953,119 @@ mod tests {
     use rusqlite::Connection;
     use serde_json::{json, Map, Value};
     use std::{fs, io::Write as _, time::Duration};
+
+    /// The walk's per-transcript probes are asked of every Claude file on
+    /// every sweep, so each must be a keyed search whatever the planner knows.
+    /// Unpinned, the "has this path left evidence?" probe was driven from
+    /// `session_events` -- a scan of every Claude event for a path with no
+    /// row, once per file (#215). Checked with and without `sqlite_stat1`,
+    /// because the planner chooses differently once it has statistics.
+    #[test]
+    fn claude_walk_probes_are_keyed_searches() {
+        for analyze in [false, true] {
+            let conn = Connection::open_in_memory().unwrap();
+            init_db(&conn).unwrap();
+            for i in 0..40 {
+                conn.execute(
+                    "INSERT INTO sessions (session_id, source, raw_path) VALUES (?1, 'claude', ?2)",
+                    params![format!("s{i}"), format!("/t/{i}.jsonl")],
+                )
+                .unwrap();
+                for n in 0..20 {
+                    conn.execute(
+                        "INSERT INTO session_events \
+                         (source, session_id, ts_ms, role, kind, text, event_uid) \
+                         VALUES ('claude', ?1, ?2, 'user', 'text', 'hi', ?3)",
+                        params![format!("s{i}"), n, format!("s{i}-e{n}")],
+                    )
+                    .unwrap();
+                }
+                conn.execute(
+                    "INSERT INTO session_relationships \
+                     (source, parent_session_id, relationship_uid, child_session_id, \
+                      relationship, identity_status, evidence_kind, evidence_locator, \
+                      created_ms, updated_ms) \
+                     VALUES ('claude', ?1, ?2, ?2, 'subagent', 'observed', 'sidecar', ?3, 0, 0)",
+                    params![
+                        format!("s{i}"),
+                        format!("c{i}"),
+                        format!("/t/{i}/subagents/agent-{i}.jsonl")
+                    ],
+                )
+                .unwrap();
+            }
+            if analyze {
+                conn.execute_batch("ANALYZE").unwrap();
+            }
+            let plan = |sql: &str, params: &[&dyn rusqlite::ToSql]| {
+                let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+                statement
+                    .query_map(params, |row| row.get::<_, String>(3))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+            };
+            let path = "/t/missing.jsonl";
+            for (name, sql, params, drivers) in [
+                (
+                    "events",
+                    CLAUDE_TRANSCRIPT_EVENTS_SQL,
+                    vec![&path as &dyn rusqlite::ToSql, &path],
+                    vec!["idx_sessions_raw_path"],
+                ),
+                (
+                    "sidecar",
+                    CLAUDE_SIDECAR_EVIDENCE_SQL,
+                    vec![&path as &dyn rusqlite::ToSql],
+                    vec!["idx_session_relationships_locator"],
+                ),
+                (
+                    "fidelity",
+                    CLAUDE_LACKS_TOOL_RESULT_FIDELITY_SQL,
+                    vec![&path as &dyn rusqlite::ToSql],
+                    vec!["idx_sessions_raw_path", "idx_session_relationships_locator"],
+                ),
+                (
+                    "raw facts",
+                    CLAUDE_LACKS_RAW_FACTS_SQL,
+                    vec![&path as &dyn rusqlite::ToSql, &RAW_MESSAGE_FACTS_VERSION],
+                    vec!["idx_sessions_raw_path", "idx_session_relationships_locator"],
+                ),
+            ] {
+                let steps = plan(sql, &params);
+                let joined = steps.join(" | ");
+                assert!(
+                    steps
+                        .iter()
+                        .all(|step| !step.starts_with("SCAN") || step == "SCAN CONSTANT ROW"),
+                    "the {name} probe scans a table (analyze={analyze}): {joined}"
+                );
+                for driver in drivers {
+                    assert!(
+                        joined.contains(driver),
+                        "the {name} probe is not driven by {driver} (analyze={analyze}): {joined}"
+                    );
+                }
+                // The outer table of every join is the one the path keys:
+                // the first search in each top-level subquery names `s` or
+                // `r`. A correlated subquery is already keyed by its outer row.
+                let firsts = steps
+                    .windows(2)
+                    .filter(|pair| {
+                        pair[0].starts_with("SCALAR SUBQUERY") && pair[1].starts_with("SEARCH")
+                    })
+                    .map(|pair| pair[1].clone())
+                    .collect::<Vec<_>>();
+                assert!(!firsts.is_empty(), "{name}: {joined}");
+                for first in firsts {
+                    assert!(
+                        first.starts_with("SEARCH s ") || first.starts_with("SEARCH r "),
+                        "the {name} probe is driven from the evidence table (analyze={analyze}): {joined}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn checkpoint_requires_both_destination_checks_to_be_known_and_clear() {

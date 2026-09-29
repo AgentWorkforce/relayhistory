@@ -692,6 +692,9 @@ const REQUIRED_INDEXES: &[&str] = &[
     "idx_session_presences_locator",
     "idx_session_relationships_parent",
     "idx_session_relationships_child",
+    // The sync walk's per-transcript "is this a sidecar we already indexed?"
+    // probe keys on the evidence locator.
+    "idx_session_relationships_locator",
     // Continuity reconciliation resolves a transcript's first parent uuid
     // against the record that carries it, across every session. Without this
     // that is a scan of every event on every hydration.
@@ -1530,6 +1533,13 @@ VALUES ('session_presences_local_backfill_v1');
     )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_session_relationships_child ON session_relationships(source, child_session_id)",
+        [],
+    )?;
+    // The sync walk asks, for every Claude transcript it considers, whether a
+    // delegation edge names that file as its evidence. Without this, each
+    // question is a scan of every Claude relationship.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_relationships_locator ON session_relationships(source, evidence_locator)",
         [],
     )?;
     conn.execute(

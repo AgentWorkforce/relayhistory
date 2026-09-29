@@ -347,6 +347,15 @@ Notable changes to the native `ai-hist` CLI are documented here.
   session, and gave every Codex row a new change-feed revision. On 3,000
   Codex + 300 Claude sessions, the sweep after one Claude append drops from
   2.9s to 1.0s and re-stamps 0 Codex rows instead of 3,000 (#42).
+- The Claude sync walk's per-transcript "has this path left evidence?" probe
+  is a keyed search again. SQLite, with no statistics to go on, drove it from
+  `session_events` rather than from the one `sessions` row the path names, so
+  every transcript with no row of its own — each subagent sidecar, each new
+  file — scanned every Claude event, once per file per sweep. The probes now
+  pin their join order, and a new `idx_session_relationships_locator` index
+  (created on the next writable open) serves the sidecar probe. On the 100 MB
+  synthetic store, a sync after a 1 KiB append drops from 7.0 s to 2.1 s, and
+  a cold sync from 60 s to 43 s, in the benchmark harness (#215).
 
 ### Rust API
 
