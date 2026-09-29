@@ -36,6 +36,14 @@ section](docs/decisions/2026-09-19-relayhistory-owns-session-sourcing.md#store-s
   in that matrix in the same PR.
 - [`docs/sourcing-contract.md`](docs/sourcing-contract.md) — the record types
   the Rust SDK must expose, mapped onto burn's reader types.
+- [`docs/session-catalog.md` → Adding a
+  provider](docs/session-catalog.md#adding-a-provider) — the only place a
+  harness is added; the ADR's per-source matrix is the contract of record.
+- burn is a consumer, not a second parser: it prices and analyzes the evidence
+  this crate captures. CI enforces that from both sides — the
+  `burn-contract-drift` job (burn main built against your change) and the
+  weekly `burn-reader-tripwire.yml` (burn's readers must stay deleted after
+  its cutover tag); see `scripts/burn-guardrails.mjs`.
 
 RelayHistory will never own pricing, cost, token estimation, activity
 classification, or similarity-based session linking.
@@ -82,3 +90,9 @@ updates `crates/ai-hist/public-api.txt` with `--update` and adds a `### Rust
 API` changelog entry in the same PR). The plugin crates are not workspace members, so
 `cargo test --workspace` does not reach them — run them directly when you touch
 `plugins/`.
+
+The `burn-contract-drift` job builds `AgentWorkforce/burn` main against this
+checkout and runs its relayhistory parity suite. A failure there means your
+change moves burn's ledger identity (message ids, timestamps, usage dedup):
+fix it here or document the difference as intended — do not work around it in
+burn. Until burn has that suite the job passes with a notice.

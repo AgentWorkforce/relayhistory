@@ -454,8 +454,13 @@ read.
 This table covers *shallow discovery only*. The full-evidence picture — which
 record types each source captures, stores and exposes after `ai-hist sync` —
 is the capture matrix in [ADR: relayhistory owns session
-sourcing](decisions/2026-09-19-relayhistory-owns-session-sourcing.md#capture-matrix),
-which this table must stay consistent with.
+sourcing](decisions/2026-09-19-relayhistory-owns-session-sourcing.md#capture-matrix)
+([#161](https://github.com/AgentWorkforce/relayhistory/issues/161)), which this
+table must stay consistent with. That per-source matrix is the contract of
+record for what a harness's sessions carry: downstream consumers such as burn
+read evidence only through this crate and parse no harness logs of their own,
+so a record type the matrix does not mark captured is missing for every
+consumer, not just for `ai-hist`.
 
 | Source | `session_id` | `cwd` | `git_branch` | `first_activity` | `last_activity` | `first_prompt` | `models` | `originator` | `agent_version` | `repo_url` | `initial_commit` | `workspace_roots` |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
@@ -1823,9 +1828,9 @@ held message is indexed as it stands, reported as
 making progress; the blocks that arrive later land as further rows under their
 own record identity rather than as corrections.
 
-Codex has no per-message completion marker, so its cursor follows the same rule
-burn's `CommittedSnapshot` does: the committed offset and parser state advance
-only at a `task_complete` record. A turn's token accounting is not final until
+Codex has no per-message completion marker, so its cursor commits only at turn
+boundaries: the committed offset and parser state advance only at a
+`task_complete` record. A turn's token accounting is not final until
 the turn is, and committing inside an open turn would freeze a cumulative
 baseline mid-turn. The open turn's events are still indexed as they are read —
 this is an evidence store, and a live session should be visible before its turn
