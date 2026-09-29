@@ -8814,9 +8814,9 @@ pub(crate) fn heal_claude_request_evidence(conn: &Connection) -> Result<()> {
             None,
         )?;
     }
-    // The notice's text is joined in block order, as a fresh parse writes it:
-    // a Claude text row's uid is `{message_id}:{block_index}`, and
-    // `group_concat` alone promises no order, so the rows' storage order
+    // The notice's text is its text rows joined in block order, as a fresh
+    // parse writes it: a Claude row's uid is `{message_id}:{block_index}`,
+    // and `group_concat` alone promises no order, so the rows' storage order
     // could otherwise reorder a multi-block notice.
     conn.execute_batch(
         "INSERT INTO session_markers \
@@ -8825,6 +8825,7 @@ pub(crate) fn heal_claude_request_evidence(conn: &Connection) -> Result<()> {
                 message_id, MIN(parent_id), 'local_notice', 'synthetic', \
                 group_concat(text, char(10) \
                   ORDER BY CAST(substr(event_uid, length(message_id) + 2) AS INTEGER), id) \
+                  FILTER (WHERE kind = 'text') \
          FROM session_events \
          WHERE source = 'claude' AND role = 'assistant' \
            AND lower(trim(model)) = '<synthetic>' \
@@ -9687,15 +9688,20 @@ fn retract_claude_workflow_journal(conn: &Connection, journal: &Path) -> Result<
                 _ => None,
             })
             .collect();
+        // An empty `sessionId` names no session, as in the walk that wrote
+        // these markers: it neither is the file's session nor keeps a line
+        // from falling back to it.
+        let non_empty_session_id = |obj: &Map<String, Value>| {
+            obj.get("sessionId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
+        };
         let file_session_id = records
             .iter()
-            .find_map(|(obj, _)| obj.get("sessionId").and_then(Value::as_str))
-            .map(str::to_owned);
+            .find_map(|(obj, _)| non_empty_session_id(obj));
         for (obj, line) in &records {
-            let Some(session_id) = obj
-                .get("sessionId")
-                .and_then(Value::as_str)
-                .or(file_session_id.as_deref())
+            let Some(session_id) = non_empty_session_id(obj).or_else(|| file_session_id.clone())
             else {
                 continue;
             };
@@ -14743,6 +14749,44 @@ mod tests {
             )
             .unwrap();
         assert_eq!(derived, 0, "nothing may be derived from the journal");
+    }
+
+    /// An empty `sessionId` is no session: a journal whose first line
+    /// carries one still attributes a sessionless line to the first real id,
+    /// as the walk that wrote its marker did, and that marker is retracted.
+    #[test]
+    fn journal_retraction_skips_an_empty_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("journal.jsonl");
+        fs::write(
+            &journal,
+            concat!(
+                r#"{"type":"started","sessionId":"","uuid":"j0"}"#,
+                "\n",
+                r#"{"type":"started","sessionId":"s1","uuid":"j1"}"#,
+                "\n",
+                r#"{"type":"result","uuid":"j2"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO session_markers (source, session_id, marker_uid, kind, subkind) \
+             VALUES ('claude', 's1', 'j2:marker', 'unknown', 'result')",
+            [],
+        )
+        .unwrap();
+        super::retract_claude_workflow_journal(&conn, &journal).unwrap();
+        let left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_markers WHERE marker_uid = 'j2:marker'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0);
     }
 
     /// An install upgraded from a build that walked the journal as a
@@ -27961,9 +28005,10 @@ mod tests {
         assert_eq!(last.as_deref(), Some("Login"));
     }
 
-    /// A multi-block notice is migrated in block order, not in the order its
-    /// rows happen to be stored: here the later block was stored first, and
-    /// its index sorts first as text.
+    /// A multi-block notice is migrated as its text blocks in block order,
+    /// not in the order its rows happen to be stored: here the later block was
+    /// stored first, its index sorts first as text, and a non-text row of the
+    /// same message is not part of the notice.
     #[test]
     fn the_notice_migration_joins_blocks_in_block_order() {
         let conn = Connection::open_in_memory().unwrap();
@@ -27971,6 +28016,7 @@ mod tests {
         conn.execute_batch(
             "INSERT INTO session_events (source, session_id, message_id, ts_ms, role, kind, text, model, event_uid) \
              VALUES ('claude', 's', 'n', 5, 'assistant', 'text', 'Run /login', '<synthetic>', 'n:10'), \
+                    ('claude', 's', 'n', 5, 'assistant', 'thinking', 'not the notice', '<synthetic>', 'n:1'), \
                     ('claude', 's', 'n', 5, 'assistant', 'text', 'Login expired', '<synthetic>', 'n:2');",
         )
         .unwrap();
