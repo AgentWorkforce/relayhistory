@@ -9919,10 +9919,13 @@ fn retract_claude_workflow_journal(conn: &Connection, journal: &Path) -> Result<
                 record_type
             };
             let identity = claude_record_identity(obj, line, stem);
-            conn.execute(
-                "DELETE FROM session_markers WHERE source = 'claude' AND session_id = ?1 \
+            crate::store::retire_evidence_share(
+                conn,
+                "session_markers",
+                "source = 'claude' AND session_id = ?1 \
                    AND marker_uid = ?2 AND kind = 'unknown' AND subkind = ?3",
                 params![session_id, format!("{identity}:marker"), subkind],
+                SessionLocation::Local,
             )?;
         }
     }
