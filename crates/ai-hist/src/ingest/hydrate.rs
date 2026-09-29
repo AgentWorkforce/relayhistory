@@ -2646,8 +2646,11 @@ fn ingest_codex(
         // Codex records continuity only when a producer writes explicit
         // fields on `session_meta`; a plain `codex resume` leaves no signal.
         indexed.bytes_read += crate::continuity::capture_codex_rollout(conn, path)? as i64;
-        crate::continuity::reconcile(conn, "codex")?;
+        // Each child's own continuity is captured with it (a spawned
+        // subagent's `thread_spawn` parent is a fork edge that lives only in
+        // the child's `session_meta`), so reconcile once they are all banked.
         indexed.absorb_outcome(ingest_codex_children(conn, options, path)?);
+        crate::continuity::reconcile(conn, "codex")?;
     }
     Ok(indexed)
 }
@@ -2779,6 +2782,7 @@ fn ingest_codex_children(
         if let Some(parent_session_id) = meta.parent_session_id.as_deref() {
             record_codex_delegation(conn, parent_session_id, &meta, &candidate)?;
         }
+        indexed.bytes_read += crate::continuity::capture_codex_rollout(conn, &candidate)? as i64;
     }
     Ok(indexed)
 }
@@ -9686,7 +9690,8 @@ mod tests {
         let relationship: (String, String, String, Option<String>, Option<i64>) = conn
             .query_row(
                 "SELECT identity_status, evidence_kind, evidence_locator, child_agent_type, spawned_at_ms \
-                 FROM session_relationships WHERE source='codex' AND child_session_id='child'",
+                 FROM session_relationships WHERE source='codex' AND child_session_id='child' \
+                   AND relationship='delegated'",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
@@ -9699,12 +9704,43 @@ mod tests {
         let grandchild_parent: String = conn
             .query_row(
                 "SELECT parent_session_id FROM session_relationships \
-                 WHERE source='codex' AND child_session_id='grandchild'",
+                 WHERE source='codex' AND child_session_id='grandchild' \
+                   AND relationship='delegated'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
         assert_eq!(grandchild_parent, "child-thread-spawn");
+        // A spawned child's fork edge lives only in its own `session_meta`, so
+        // hydrating the parent captures it with the child rather than leaving
+        // it for a later sync.
+        let forks: Vec<(String, String, String)> = conn
+            .prepare(
+                "SELECT parent_session_id, child_session_id, evidence_ref \
+                 FROM session_relationships WHERE source='codex' AND relationship='fork' \
+                 ORDER BY child_session_id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let spawn_ref = "source.subagent.thread_spawn.parent_thread_id".to_string();
+        assert_eq!(
+            forks,
+            vec![
+                (
+                    "root".to_string(),
+                    "child-thread-spawn".to_string(),
+                    spawn_ref.clone()
+                ),
+                (
+                    "child-thread-spawn".to_string(),
+                    "grandchild".to_string(),
+                    spawn_ref
+                ),
+            ]
+        );
     }
 
     #[test]

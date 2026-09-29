@@ -84,7 +84,7 @@ pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 4;
 /// invalidates every stored stamp, so a scanner that learns to extract a new
 /// field re-reads sources whose bytes never changed. `parser_version` keeps its
 /// existing meaning (full-ingest parser generation) and is untouched.
-pub const SHALLOW_SCANNER_VERSION: u32 = 6;
+pub const SHALLOW_SCANNER_VERSION: u32 = 7;
 
 /// Version 2 shipped the classification that hid standalone guardians (see
 /// [`crate::codex_is_subagent`]). Their rollouts never change on disk, so the
@@ -116,6 +116,16 @@ const _: () = assert!(SHALLOW_SCANNER_VERSION > 4);
 /// used to be never change -- so only this bump sends the cached row through
 /// the current classifier once.
 const _: () = assert!(SHALLOW_SCANNER_VERSION > 5);
+
+/// Version 7 classifies a Codex 0.150+ `thread_source: "guardian_review"`
+/// rollout that names its parent as a subagent. Such a rollout never changes
+/// on disk, so without this bump an install that catalogued it as a root would
+/// keep serving that cached row. The bump also moves the sweep generation, so
+/// the first `sync` after the upgrade runs instead of matching the stored
+/// source fingerprint, and its rollout walk re-reads each rollout's
+/// `session_meta` line once (see `codex_evidence_is_current`), which is what
+/// banks Codex fork lineage and reclassifies those guardians.
+const _: () = assert!(SHALLOW_SCANNER_VERSION > 6);
 
 /// Most bytes a shallow head read may consume from one transcript.
 pub const HEAD_SCAN_MAX_BYTES: u64 = 256 * 1024;

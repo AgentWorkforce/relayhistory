@@ -3341,11 +3341,29 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                 // reading that one line rather than re-ingesting the rollout.
                 // The capture always writes a row for a readable rollout, so
                 // this clears after one pass and never re-reads again.
+                //
+                // The same one-time re-read also catches a rollout the older
+                // build classified as a root that this build calls a subagent
+                // (a Codex 0.150 `guardian_review` thread with a parent): its
+                // stamp never changes, so the map's `subagent: false` would be
+                // trusted forever. Such a rollout falls through to the full
+                // path below, which removes its root registration, records its
+                // delegation and re-stamps it as a subagent.
+                let mut reclassified = false;
                 if recorded_session.is_some() && !codex_continuity_evidence_exists(conn, &rollout)?
                 {
                     crate::continuity::capture_codex_rollout(conn, &rollout)?;
+                    let recorded_subagent = record
+                        .and_then(|r| r.get("subagent"))
+                        .and_then(Value::as_bool)
+                        == Some(true);
+                    if !recorded_subagent {
+                        reclassified =
+                            read_codex_session_meta(&rollout)?.is_some_and(|meta| meta.is_subagent);
+                    }
                 }
                 match recorded_session {
+                    _ if reclassified => {}
                     // No session id was recorded because the file had no
                     // usable session_meta; there is nothing to re-ingest.
                     None => continue,
@@ -25188,6 +25206,108 @@ mod tests {
             }),
         );
         state
+    }
+
+    /// A Codex 0.150 `guardian_review` rollout an older build indexed as a
+    /// root: its stamp never changes, and the stamp map says `subagent: false`.
+    /// The one-time continuity re-read (its banked evidence predates
+    /// `fork_refs`) must also reclassify it, removing the root registration
+    /// and recording the delegation, rather than trusting the stale flag.
+    #[test]
+    fn unchanged_guardian_review_root_is_reclassified_on_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let day = home.join(".codex/sessions/2026/08/01");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-guardian-review.jsonl");
+        fs::write(
+            &rollout,
+            concat!(
+                r#"{"timestamp":"2026-08-01T10:01:00.000Z","type":"session_meta","payload":{"id":"sess-guardian-review","parent_thread_id":"parent","thread_source":"guardian_review","source":"vscode","cwd":"/tmp/proj"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-08-01T10:01:01.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Reviewing."}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // What the older build left: events, a root catalog row with a local
+        // presence, and continuity evidence banked without `fork_refs`.
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, ts_ms, role, kind, text, event_uid, raw_facts_version) \
+             VALUES ('codex', 'sess-guardian-review', 2, 'assistant', 'text', 'kept', 'event-1', ?)",
+            [super::RAW_MESSAGE_FACTS_VERSION],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (session_id, source, cwd) \
+             VALUES ('sess-guardian-review', 'codex', '/tmp/proj')",
+            [],
+        )
+        .unwrap();
+        crate::mark_session_presence(
+            &conn,
+            "codex",
+            "sess-guardian-review",
+            super::SessionLocation::Local,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_continuity_evidence \
+             (source, locator, session_id, file_session_id, in_log_session_ids_json, \
+              has_resume_marker, explicit_targets_json, pending_reason, updated_ms) \
+             VALUES ('codex', ?, 'sess-guardian-review', 'sess-guardian-review', \
+                     '[\"sess-guardian-review\"]', 0, \
+                     '{\"continuation\":[],\"fork\":[],\"source\":null}', NULL, 0)",
+            [rollout.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+        let key = rollout.to_string_lossy().to_string();
+        let mut state = Map::new();
+        state.insert(
+            "codex_rollouts_v6".into(),
+            json!({
+                (key.clone()): {
+                    "stamp": file_stamp(&rollout).unwrap(),
+                    "session": "sess-guardian-review",
+                    "subagent": false
+                }
+            }),
+        );
+
+        super::sync_codex_rollouts_with_repairs(
+            &conn,
+            &mut state,
+            &home.join(".codex"),
+            &Default::default(),
+        )
+        .unwrap();
+        let catalogued: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions \
+                 WHERE source='codex' AND session_id='sess-guardian-review'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(catalogued, 0, "the guardian must leave the root catalog");
+        let parent: String = conn
+            .query_row(
+                "SELECT parent_session_id FROM session_relationships \
+                 WHERE source='codex' AND child_session_id='sess-guardian-review' \
+                   AND relationship='delegated'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(parent, "parent");
+        assert_eq!(
+            state["codex_rollouts_v6"][&key]["subagent"],
+            json!(true),
+            "the stamp map is corrected, so the next pass trusts the right flag"
+        );
     }
 
     #[test]

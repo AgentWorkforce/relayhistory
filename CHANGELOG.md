@@ -234,10 +234,15 @@ Notable changes to the native `ai-hist` CLI are documented here.
   gets a `fork` edge to that thread, with the field name as `evidence_ref`; a
   subagent keeps its `delegated` row beside it and a human fork stays a
   top-level session. A rollout indexed before this re-reads its `session_meta`
-  line once on the next `sync`. A `thread_source: "guardian_review"` rollout
-  (Codex 0.150+) that names a parent is hidden from the root catalog like any
-  other subagent. The replay of the parent's history inside a forked rollout
-  is not gated yet (#210).
+  line once on the next `sync`: `SHALLOW_SCANNER_VERSION` 6 -> 7 moves the
+  sweep generation, so that sync runs even when no source changed, and sends
+  cached discovery rows through the current classifier once. A
+  `thread_source: "guardian_review"` rollout (Codex 0.150+) that names a
+  parent is hidden from the root catalog like any other subagent, and one an
+  earlier build catalogued as a root is reclassified on that same pass.
+  Hydrating a parent with `include_related` also records its spawned
+  children's fork edges. The replay of the parent's history inside a forked
+  rollout is not gated yet (#210).
 
 - Record fork, resume and continuation relationships, not delegation alone.
   `session_relationships.relationship` now takes `continuation | fork | resume`
