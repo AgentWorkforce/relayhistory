@@ -2,7 +2,10 @@
 
 The local history packages have this production call graph. burn, a separate
 repository, is shown beside them because it consumes the published crate rather
-than the Node packages:
+than the Node packages. That edge is the target of burn 5.0.0
+([burn #562](https://github.com/AgentWorkforce/burn/issues/562)); until then
+burn still reads harness logs with its own readers, as the ADR's context
+describes:
 
 ```text
 provider files / SQLite
@@ -10,7 +13,7 @@ provider files / SQLite
         ▼
 ai-hist (published Rust crate) ──── SessionStore facade ───▶ burn (cost)
         │ typed Rust functions         (in-process crates.io
-        │                               dependency, no parser)
+        │                               dependency, from burn 5.0.0)
         ▼
 ai-hist-native (Node-API, async worker tasks)
         │ typed native objects, plus one JSON dispatcher
@@ -85,14 +88,18 @@ decision, the rejected alternatives and the per-source capture matrix, and
 [`sourcing-contract.md`](sourcing-contract.md) for the record types the Rust SDK
 must expose.
 
-Two CI checks hold the boundary. The `burn-contract-drift` job in `ci.yml`
-builds burn main against the pull request's crate (`[patch.crates-io]`) and
+Two CI checks will hold the boundary; both are armed by burn's side of the
+migration, not by anything here. The `burn-contract-drift` job in `ci.yml`
+builds burn (main, or the `BURN_REF` repository variable) with its `ai-hist`
+requirement rewritten to a path dependency on the pull request's crate, and
 runs burn's relayhistory parity suite, because the effect of a change to
 message ids, timestamps or usage dedup lives in burn's ledger fingerprints,
-not in this workspace's tests; it is a notice until burn has that suite. The
-weekly `burn-reader-tripwire.yml` fails if burn's harness readers reappear
-after its cutover release tag. Both are driven by
-`scripts/burn-guardrails.mjs`.
+not in this workspace's tests. It runs only for changes under
+`crates/ai-hist/` (and the workspace manifest and the check itself), and is a
+notice until burn depends on `ai-hist` (burn #557). The weekly
+`burn-reader-tripwire.yml` fails if burn's harness-parser symbols reappear, or
+its parity suite is missing, after its cutover release tag
+(`relayburn-sdk-v5.0.0`). Both are driven by `scripts/burn-guardrails.mjs`.
 
 ## Optional services and package boundaries
 

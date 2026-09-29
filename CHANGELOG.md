@@ -459,26 +459,28 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Session sourcing for burn
 
-- RelayHistory is the sourcing layer for
-  [burn](https://github.com/AgentWorkforce/burn) (#160). It is the one place
-  that reads harness logs — usage, tool calls, file edits and session
-  topology for every supported harness — and burn prices and analyzes that
-  evidence, reading it from `ai-history.db` through the `ai-hist` crate's
-  `SessionStore` instead of parsing the logs a second time. What burn users
-  should expect once burn's cutover release (5.0.0, burn #562) ships: one
-  ingest instead of two, and the `ai-hist` database as the source of truth
-  for both tools, so a session `ai-hist` shows is the session burn costs.
-  Harnesses burn never read itself, such as Cursor and Grok (burn #560),
-  reach it through this crate. Pricing, cost, token estimation and activity
-  classification stay in burn. See
+- RelayHistory is becoming the sourcing layer for
+  [burn](https://github.com/AgentWorkforce/burn) (#160). Today burn still
+  reads Claude Code, Codex and OpenCode logs with its own readers. Its cutover
+  release (5.0.0, burn #562) removes them: burn will read usage, tool calls,
+  file edits and session topology from `ai-history.db` through the `ai-hist`
+  crate's `SessionStore`, and price and analyze that evidence. What burn users
+  should expect once 5.0.0 ships: one ingest instead of two, and the `ai-hist`
+  database as the source of truth for both tools, so a session `ai-hist` shows
+  is the session burn costs. Cursor and Grok support in burn is planned to
+  come through this crate (burn #560). Pricing, cost, token estimation and
+  activity classification stay in burn. See
   `docs/decisions/2026-09-19-relayhistory-owns-session-sourcing.md`.
-- CI guards the boundary from both sides (#183, #184). A `burn-contract-drift`
-  job builds burn main against the pull request's `ai-hist` and runs burn's
-  relayhistory parity suite, so a change to message ids, timestamps or usage
-  dedup that would move burn's ledger fails here; it reports a notice and
-  passes until that suite exists in burn (burn #557). A weekly
-  `burn reader tripwire` workflow fails if burn's Claude, Codex or OpenCode
-  readers reappear after its cutover tag, `relayburn-sdk-v5.0.0`.
+- CI checks for the boundary (#183, #184), armed by burn's side of the
+  migration. A `burn-contract-drift` job, for changes under `crates/ai-hist/`,
+  builds burn (main, or the `BURN_REF` repository variable) with its `ai-hist`
+  requirement pointed at the pull request's crate and runs burn's relayhistory
+  parity suite, so a change to message ids, timestamps or usage dedup that
+  would move burn's ledger fails here. It reports a notice and passes until
+  burn depends on `ai-hist` (burn #557). A weekly `burn reader tripwire`
+  workflow fails, and opens a tracking issue here, if burn's harness-parser
+  symbols reappear or its parity suite is missing after its cutover tag,
+  `relayburn-sdk-v5.0.0`.
 
 ### Fixed
 

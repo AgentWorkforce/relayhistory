@@ -457,10 +457,11 @@ is the capture matrix in [ADR: relayhistory owns session
 sourcing](decisions/2026-09-19-relayhistory-owns-session-sourcing.md#capture-matrix)
 ([#161](https://github.com/AgentWorkforce/relayhistory/issues/161)), which this
 table must stay consistent with. That per-source matrix is the contract of
-record for what a harness's sessions carry: downstream consumers such as burn
-read evidence only through this crate and parse no harness logs of their own,
-so a record type the matrix does not mark captured is missing for every
-consumer, not just for `ai-hist`.
+record for what a harness's sessions carry. burn is moving to reading evidence
+only through this crate: from burn 5.0.0
+([burn #562](https://github.com/AgentWorkforce/burn/issues/562)) it parses no
+harness logs of its own, and from then on a record type the matrix does not
+mark captured is missing for every consumer, not just for `ai-hist`.
 
 | Source | `session_id` | `cwd` | `git_branch` | `first_activity` | `last_activity` | `first_prompt` | `models` | `originator` | `agent_version` | `repo_url` | `initial_commit` | `workspace_roots` |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
