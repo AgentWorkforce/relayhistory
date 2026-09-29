@@ -9143,15 +9143,20 @@ fn retract_claude_workflow_journal(conn: &Connection, journal: &Path) -> Result<
                 _ => None,
             })
             .collect();
+        // An empty `sessionId` names no session, as in the walk that wrote
+        // these markers: it neither is the file's session nor keeps a line
+        // from falling back to it.
+        let non_empty_session_id = |obj: &Map<String, Value>| {
+            obj.get("sessionId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
+        };
         let file_session_id = records
             .iter()
-            .find_map(|(obj, _)| obj.get("sessionId").and_then(Value::as_str))
-            .map(str::to_owned);
+            .find_map(|(obj, _)| non_empty_session_id(obj));
         for (obj, line) in &records {
-            let Some(session_id) = obj
-                .get("sessionId")
-                .and_then(Value::as_str)
-                .or(file_session_id.as_deref())
+            let Some(session_id) = non_empty_session_id(obj).or_else(|| file_session_id.clone())
             else {
                 continue;
             };
@@ -14193,6 +14198,44 @@ mod tests {
             )
             .unwrap();
         assert_eq!(derived, 0, "nothing may be derived from the journal");
+    }
+
+    /// An empty `sessionId` is no session: a journal whose first line
+    /// carries one still attributes a sessionless line to the first real id,
+    /// as the walk that wrote its marker did, and that marker is retracted.
+    #[test]
+    fn journal_retraction_skips_an_empty_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("journal.jsonl");
+        fs::write(
+            &journal,
+            concat!(
+                r#"{"type":"started","sessionId":"","uuid":"j0"}"#,
+                "\n",
+                r#"{"type":"started","sessionId":"s1","uuid":"j1"}"#,
+                "\n",
+                r#"{"type":"result","uuid":"j2"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO session_markers (source, session_id, marker_uid, kind, subkind) \
+             VALUES ('claude', 's1', 'j2:marker', 'unknown', 'result')",
+            [],
+        )
+        .unwrap();
+        super::retract_claude_workflow_journal(&conn, &journal).unwrap();
+        let left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_markers WHERE marker_uid = 'j2:marker'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0);
     }
 
     /// An install upgraded from a build that walked the journal as a
