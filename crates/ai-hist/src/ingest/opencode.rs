@@ -584,6 +584,21 @@ pub(crate) fn list_sqlite_session_ids(src: &Connection) -> Result<Vec<String>> {
         .collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// Whether the OpenCode store at `store` holds `session_id` — the question
+/// that decides which channel store owns a session present in several.
+pub(crate) fn sqlite_store_holds_session(store: &Path, session_id: &str) -> Result<bool> {
+    let src = Connection::open_with_flags(
+        store,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| format!("opening {}", store.display()))?;
+    src.busy_timeout(std::time::Duration::from_secs(5))?;
+    let held = src
+        .prepare("SELECT 1 FROM session WHERE id = ?")?
+        .exists([session_id])?;
+    Ok(held)
+}
+
 fn table_columns(conn: &Connection, table: &str) -> Result<BTreeSet<String>> {
     Ok(conn
         .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))?
