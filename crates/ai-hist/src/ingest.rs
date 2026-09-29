@@ -1732,7 +1732,7 @@ fn checkpoint_is_safe(
 
 /// Cross-process sync guard for one canonical database identity. Reflex, launchd, cron, and
 /// manual invocations can otherwise all walk the same multi-gigabyte history at once.
-struct SyncRunLock {
+pub(crate) struct SyncRunLock {
     _file: fs::File,
 }
 
@@ -1770,7 +1770,7 @@ fn sync_lock_path(db_path: &Path) -> Result<PathBuf> {
     Ok(canonical.with_file_name(name))
 }
 
-fn try_acquire_sync_lock(db_path: &Path) -> Result<Option<SyncRunLock>> {
+pub(crate) fn try_acquire_sync_lock(db_path: &Path) -> Result<Option<SyncRunLock>> {
     let path = sync_lock_path(db_path)?;
     let file = fs::OpenOptions::new()
         .create(true)

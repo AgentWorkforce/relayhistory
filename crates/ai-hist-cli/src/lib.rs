@@ -20,7 +20,9 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ai_hist::diagnostics::{doctor_report, human_bytes, DoctorReport};
+use ai_hist::diagnostics::{
+    compact_database, doctor_report, human_bytes, CompactReport, DoctorReport,
+};
 use ai_hist::git_helpers::*;
 use ai_hist::history_search::{search_all, SearchRole, SearchRow};
 use ai_hist::paths::{default_opencode_db_path, home_dir};
@@ -279,6 +281,13 @@ enum Command {
     },
     /// Diagnose database health: size, WAL, free space, and who holds the write lock.
     Doctor {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reclaim space the database holds but no longer uses. Deletes no rows:
+    /// merges the full-text indexes, VACUUMs, and truncates the WAL. Refuses
+    /// while a sync is running or when the volume cannot hold the rewrite.
+    Compact {
         #[arg(long)]
         json: bool,
     },
@@ -663,6 +672,9 @@ pub fn run() -> Result<()> {
         Command::Ingest { hook, quiet, json } => {
             return run_hook_ingest(&db_path, hook, *quiet, *json);
         }
+        // Takes the sync lock and opens its own connection: a second handle
+        // held open here would pin the WAL the compaction is truncating.
+        Command::Compact { json } => return compact(&db_path, *json),
         Command::Sessions {
             action: SessionsAction::Discover { scope, source, .. },
         } if scope.resolve() == SessionScope::Remote => {
@@ -801,6 +813,7 @@ pub fn run() -> Result<()> {
         Command::Show { id, json } => show_entry(&conn, id, json),
         Command::Context { id, window } => show_context(&conn, id, window),
         Command::Doctor { json } => doctor(&db_path, json),
+        Command::Compact { .. } => unreachable!("compact is dispatched before a connection opens"),
         Command::Pack {
             scope,
             query,
@@ -2405,6 +2418,7 @@ fn doctor_report_json(report: &DoctorReport, db_path: &Path) -> Value {
         "db_path": db_path.display().to_string(),
         "db_bytes": report.db_bytes,
         "wal_bytes": report.wal_bytes,
+        "reclaimable_bytes": report.reclaimable,
         "free_bytes": report.free,
         "write_lock": match &report.lock {
             Ok(()) => json!("available"),
@@ -2433,6 +2447,7 @@ fn doctor(db_path: &Path, json: bool) -> Result<()> {
     let DoctorReport {
         db_bytes,
         wal_bytes,
+        reclaimable,
         free,
         lock,
         holders,
@@ -2442,6 +2457,12 @@ fn doctor(db_path: &Path, json: bool) -> Result<()> {
     println!("database: {}", db_path.display());
     println!("  size:  {}", human_bytes(db_bytes));
     println!("  WAL:   {}", human_bytes(wal_bytes));
+    println!(
+        "  reclaimable: {}",
+        reclaimable
+            .map(human_bytes)
+            .unwrap_or_else(|| "unknown".into())
+    );
     println!(
         "  free:  {}",
         free.map(human_bytes).unwrap_or_else(|| "unknown".into())
@@ -2473,6 +2494,58 @@ fn doctor(db_path: &Path, json: bool) -> Result<()> {
         for problem in &problems {
             println!("  - {problem}");
         }
+    }
+    Ok(())
+}
+
+fn compact_report_json(report: &CompactReport, db_path: &Path) -> Value {
+    json!({
+        "db_path": db_path.display().to_string(),
+        "db_bytes_before": report.db_bytes_before,
+        "wal_bytes_before": report.wal_bytes_before,
+        "db_bytes_after": report.db_bytes_after,
+        "wal_bytes_after": report.wal_bytes_after,
+        "reclaimable_bytes_before": report.reclaimable_before,
+        "saved_bytes": report.saved_bytes(),
+        "fts_optimized": report.fts_optimized,
+    })
+}
+
+fn compact(db_path: &Path, json: bool) -> Result<()> {
+    if !json {
+        eprintln!(
+            "compacting {} (this rewrites the whole file; writers wait until it finishes)...",
+            db_path.display()
+        );
+    }
+    let report = compact_database(db_path)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&compact_report_json(&report, db_path))?
+        );
+        return Ok(());
+    }
+    let before = report.db_bytes_before + report.wal_bytes_before;
+    let after = report.db_bytes_after + report.wal_bytes_after;
+    println!("database: {}", db_path.display());
+    println!(
+        "  before: {} ({} + {} WAL)",
+        human_bytes(before),
+        human_bytes(report.db_bytes_before),
+        human_bytes(report.wal_bytes_before)
+    );
+    println!(
+        "  after:  {} ({} + {} WAL)",
+        human_bytes(after),
+        human_bytes(report.db_bytes_after),
+        human_bytes(report.wal_bytes_after)
+    );
+    let saved = report.saved_bytes();
+    if saved >= 0 {
+        println!("  saved:  {}", human_bytes(saved as u64));
+    } else {
+        println!("  grew:   {}", human_bytes(saved.unsigned_abs() as u64));
     }
     Ok(())
 }
@@ -4524,6 +4597,34 @@ mod tests {
     }
 
     #[test]
+    fn compact_keeps_the_history_and_reports_what_it_did() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ai-history.db");
+        let conn = open_db(&db_path).unwrap();
+        seed_exportable_history(&conn);
+        let rows = |conn: &Connection| -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))
+                .unwrap()
+        };
+        let before = rows(&conn);
+        drop(conn);
+
+        let report = compact_report_json(&compact_database(&db_path).unwrap(), &db_path);
+        for field in [
+            "db_bytes_before",
+            "wal_bytes_before",
+            "db_bytes_after",
+            "wal_bytes_after",
+            "reclaimable_bytes_before",
+        ] {
+            assert!(report[field].is_u64(), "{field}: {report}");
+        }
+        assert_eq!(report["wal_bytes_after"], json!(0));
+        assert!(report["saved_bytes"].is_i64(), "{report}");
+        assert_eq!(rows(&open_db(&db_path).unwrap()), before);
+    }
+
+    #[test]
     fn doctor_reports_a_healthy_database_with_every_field_it_promises() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("ai-history.db");
@@ -4535,6 +4636,7 @@ mod tests {
         assert_eq!(report["db_path"], db_path.display().to_string());
         assert!(report["db_bytes"].as_u64().unwrap() > 0, "{report}");
         assert!(report["wal_bytes"].as_u64().is_some(), "{report}");
+        assert!(report["reclaimable_bytes"].is_u64(), "{report}");
         assert!(
             report["free_bytes"].is_u64() || report["free_bytes"].is_null(),
             "{report}"

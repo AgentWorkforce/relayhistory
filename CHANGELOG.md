@@ -123,6 +123,19 @@ Notable changes to the native `ai-hist` CLI are documented here.
   columns, and the three corpus tests held `#[ignore = "closed by #171"]`
   assert them.
 
+- New `ai-hist compact [--json]` returns space the history database holds
+  but no longer uses, and deletes no rows. It merges the three full-text
+  indexes, runs `VACUUM` and truncates the WAL, and afterwards rebuilds
+  `trajectory_fts`, because `VACUUM` may renumber the rowids that index is
+  keyed on. It takes the sync run lock, so a concurrent `sync` or `watch` tick
+  skips instead of stalling behind the rewrite. It refuses with
+  `a sync is running` while one holds the lock. It also refuses up front when
+  the volume lacks room for twice the live pages plus the 512 MiB write
+  floor, because a rewrite that ran out of space midway would repeat #44. On
+  the 248 MB benchmark store it took 2.8 s and saved 9 MB (#53).
+- `ai-hist doctor` reports `reclaimable` (`reclaimable_bytes` under `--json`),
+  the freelist bytes a `compact` would return. It points at `compact` when at
+  least 64 MiB and a quarter of the file are free pages.
 - Add workspace-scoped agent handoffs through `create_handoff(intent)` and
   `resume_handoff(source, session_id)`. The sender emits only a session pointer
   plus one self-describing intent and origin identity; the intent tells the
