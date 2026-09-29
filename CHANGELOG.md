@@ -501,12 +501,6 @@ Notable changes to the native `ai-hist` CLI are documented here.
   the replacement fails; a sidecar that cannot be moved aside fails the
   export. A destination that is a symlink is written through to its target,
   which is itself checked against the active database.
-- Documented and pinned by test that `$CLAUDE_CONFIG_DIR/transcripts/` is not
-  a Claude root (#208). Its files are oh-my-opencode's Claude-hook copies of
-  OpenCode sessions (OpenCode `ses_*` ids, no `sessionId`, `cwd`, model or
-  assistant turns), which the `opencode` adapter already indexes from
-  OpenCode's own store; reading them as `claude` would duplicate every such
-  session under a second source. No behavior change.
 - Claude discovery and `sync` no longer treat the subagent workflow journal
   (`<session>/subagents/**/journal.jsonl`) as a transcript. It is metadata
   that shares the `.jsonl` extension; it is no longer listed as a discovery
