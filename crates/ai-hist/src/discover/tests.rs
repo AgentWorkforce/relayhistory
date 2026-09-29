@@ -3991,3 +3991,56 @@ fn claude_discovery_skips_subagent_workflow_journals() {
         "{locators:?}"
     );
 }
+
+/// `<claude root>/transcripts/` is not a Claude Code transcript root. What
+/// lands there is oh-my-opencode's Claude-hook compatibility log of an
+/// *OpenCode* session: named by the OpenCode `ses_*` id, `user` / `tool_use` /
+/// `tool_result` lines with top-level `content` / `tool_*` fields, and no
+/// `sessionId`, `cwd`, model or assistant turn. The OpenCode adapter already
+/// indexes that session from OpenCode's own store, so Claude discovery neither
+/// lists nor watches the directory (#208).
+#[test]
+fn claude_discovery_ignores_the_opencode_wrapper_transcripts_root() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    write(
+        &home.path().join(".claude/projects/app/s1.jsonl"),
+        CLAUDE_BODY,
+    );
+    write(
+        &home
+            .path()
+            .join(".claude/transcripts/ses_0123456789abcdefghijklmno.jsonl"),
+        concat!(
+            r#"{"type":"user","timestamp":"2026-04-01T10:00:00.000Z","content":"Wrapped prompt"}"#,
+            "\n",
+            r#"{"type":"tool_use","timestamp":"2026-04-01T10:00:01.000Z","tool_name":"read","tool_input":{"filePath":"/src/main.rs"}}"#,
+            "\n",
+        ),
+    );
+
+    let env = env_at(&conn, home.path());
+    let locators: Vec<String> = ClaudeProvider
+        .enumerate(&env, None)
+        .unwrap()
+        .into_iter()
+        .chain(ClaudeProvider.fingerprint_inputs(&env).unwrap())
+        .map(|candidate| candidate.locator)
+        .collect();
+    assert!(
+        locators
+            .iter()
+            .all(|locator| !locator.contains("/.claude/transcripts/")),
+        "{locators:?}"
+    );
+
+    let roots = crate::ProviderRoots::from_home(
+        home.path().to_path_buf(),
+        home.path().join("opencode.db"),
+    );
+    let watched: Vec<PathBuf> = provider_watch_roots("claude", &roots)
+        .into_iter()
+        .map(|root| root.path)
+        .collect();
+    assert_eq!(watched, vec![home.path().join(".claude/projects")]);
+}
