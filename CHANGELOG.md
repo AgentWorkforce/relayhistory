@@ -341,7 +341,9 @@ Notable changes to the native `ai-hist` CLI are documented here.
   Codex session ever indexed. It covers only the sessions whose rollout was
   re-read or which gained a `history.jsonl` prompt in that sweep, after one
   full pass per install (recorded as `codex_metadata_backfill` in
-  `.sync-state.json`) for rows an older build left unattributed. Before, any
+  `.sync-state.json`) for rows an older build left unattributed. Sessions
+  whose backfill a failed or cancelled sweep left unfinished are carried in
+  `codex_metadata_pending` and retried on the next sweep. Before, any
   change that moved the source fingerprint — one Claude transcript growing —
   cost an `UPDATE`, a `MIN`/`MAX` scan and a `sessions` upsert per Codex
   session, and gave every Codex row a new change-feed revision. On 3,000

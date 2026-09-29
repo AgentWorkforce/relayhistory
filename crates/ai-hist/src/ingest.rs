@@ -3047,14 +3047,44 @@ fn sync_codex_with_repairs_and_coverage(
     repairs: &SweepRepairs,
     coverage: &mut SweepCoverage,
 ) -> Result<usize> {
-    let mut touched = HashSet::new();
+    // Sessions an earlier sweep touched but whose metadata backfill never
+    // completed. The scoped backfill only ever revisits what a sweep touches,
+    // and a failed Codex source can still have its advanced cursor and rollout
+    // stamps checkpointed by a later source — the next sweep would then see
+    // nothing new and never retry them.
+    let mut touched: HashSet<String> = state
+        .get(CODEX_METADATA_PENDING_KEY)
+        .and_then(Value::as_array)
+        .map(|ids| {
+            ids.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let result = sync_codex_sources(conn, state, root, repairs, coverage, &mut touched);
+    if result.is_err() {
+        let mut pending: Vec<&String> = touched.iter().collect();
+        pending.sort_unstable();
+        state.insert(CODEX_METADATA_PENDING_KEY.to_string(), json!(pending));
+    } else if state.contains_key(CODEX_METADATA_PENDING_KEY) {
+        // An empty value rather than a removal: the sync-state merge only
+        // folds keys forward, so a removal would leave the stale list on disk.
+        state.insert(CODEX_METADATA_PENDING_KEY.to_string(), json!([]));
+    }
+    result
+}
+
+fn sync_codex_sources(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    root: &Path,
+    repairs: &SweepRepairs,
+    coverage: &mut SweepCoverage,
+    touched: &mut HashSet<String>,
+) -> Result<usize> {
     let (cwds, branches, mut inserted) = sync_codex_rollouts_with_repairs_and_coverage(
-        conn,
-        state,
-        root,
-        repairs,
-        coverage,
-        &mut touched,
+        conn, state, root, repairs, coverage, touched,
     )?;
     let path = root.join("history.jsonl");
     if !path.exists() {
@@ -3098,7 +3128,7 @@ fn sync_codex_with_repairs_and_coverage(
             source.committed_cursor(consumed, true)?.to_value(),
         );
     }
-    let backfilled = backfill_codex_metadata_scoped(conn, state, &cwds, &branches, &touched)?;
+    let backfilled = backfill_codex_metadata_scoped(conn, state, &cwds, &branches, touched)?;
     if consumed == offset && backfilled == 0 {
         sync_note!("  [codex] up to date");
     } else {
@@ -5363,6 +5393,9 @@ fn count_unified_diff_lines(diff: &str) -> (i64, i64) {
 /// those sessions. Bump to force a full pass again.
 const CODEX_METADATA_BACKFILL_GENERATION: i64 = 1;
 const CODEX_METADATA_BACKFILL_KEY: &str = "codex_metadata_backfill";
+/// Sessions whose scoped backfill a failed sweep left owed, carried in
+/// `.sync-state.json` until a Codex pass completes.
+const CODEX_METADATA_PENDING_KEY: &str = "codex_metadata_pending";
 
 /// Run [`backfill_codex_metadata`] over the sessions this sweep touched, or
 /// over every known session once, while the full pass is still owed.
@@ -27817,6 +27850,80 @@ mod capture_progress_tests {
         let settled = codex_session_revisions(&conn);
         sync_codex(&conn, &mut state, &root).unwrap();
         assert_eq!(codex_session_revisions(&conn), settled);
+    }
+
+    #[test]
+    fn codex_metadata_backfill_interrupted_after_the_cursor_moved_is_retried() {
+        // The Codex cursor advances before the scoped backfill runs. If the
+        // backfill then fails, a later source can checkpoint that cursor, and
+        // the next sweep reads no new line for the session -- so the sessions
+        // it owed have to be carried forward, or their branch and activity
+        // window are never repaired.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".codex");
+        codex_backfill_fixture(&root);
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        let mut state = Map::new();
+        sync_codex(&conn, &mut state, &root).unwrap();
+
+        use std::io::Write as _;
+        let mut history = fs::OpenOptions::new()
+            .append(true)
+            .open(root.join("history.jsonl"))
+            .unwrap();
+        writeln!(
+            history,
+            "{{\"session_id\":\"sess-scope-1\",\"ts\":1776650000,\"text\":\"later\"}}"
+        )
+        .unwrap();
+        drop(history);
+
+        // Cancel at the first check after the new prompt landed: the first
+        // one inside the backfill.
+        let probe = Connection::open(&db).unwrap();
+        let error = with_capture_stop(
+            move || {
+                probe
+                    .query_row(
+                        "SELECT COUNT(*) FROM history WHERE prompt = 'later'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap()
+                    > 0
+            },
+            || sync_codex(&conn, &mut state, &root),
+        )
+        .unwrap_err();
+        assert!(error.is::<CaptureCancelled>());
+        assert_eq!(
+            state.get(CODEX_METADATA_PENDING_KEY),
+            Some(&json!(["sess-scope-1"]))
+        );
+        let branch = |conn: &Connection| -> Option<String> {
+            conn.query_row(
+                "SELECT git_branch FROM history WHERE source = 'codex' AND prompt = 'later'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(branch(&conn), None, "the backfill was interrupted");
+
+        // The retry reads no new line, yet still reaches the owed session.
+        sync_codex(&conn, &mut state, &root).unwrap();
+        assert_eq!(branch(&conn).as_deref(), Some("main"));
+        let last: i64 = conn
+            .query_row(
+                "SELECT last_activity_ms FROM sessions \
+                 WHERE source = 'codex' AND session_id = 'sess-scope-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(last, 1_776_650_000_000);
+        assert_eq!(state.get(CODEX_METADATA_PENDING_KEY), Some(&json!([])));
     }
 
     #[test]
