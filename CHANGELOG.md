@@ -250,6 +250,22 @@ Notable changes to the native `ai-hist` CLI are documented here.
   table left the old trigger delivering rows that looked complete and were
   missing a field, for the life of the database.
 
+### Fixed
+
+- `ai-hist export` no longer overwrites the database it is reading from
+  (#73). The destination is checked against the database the command
+  actually opened (`--db` included, not only `AI_HIST_DB`/the default), for
+  every format (`sqlite`, `jsonl`, `.gz`), after resolving relative
+  spellings, `..`, symlinks and hard links, and its `-wal`/`-shm`/`-journal`
+  sidecars are protected too. A refused export exits non-zero before reading
+  or writing anything.
+- `ai-hist export` stages its output in a temporary file beside the
+  destination and renames it into place once complete, so a failed export
+  leaves an existing destination file untouched. A SQLite export is written
+  as a single self-contained file, and stale sidecars left at the
+  destination by an earlier database are removed so they cannot be replayed
+  onto it.
+
 ### Rust API
 
 - The `export` feature is local export alone: `ExportSnapshot` (`open`,
