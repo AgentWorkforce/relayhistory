@@ -231,7 +231,12 @@ export function humanLine(value: unknown): string {
   if (!value || typeof value !== 'object') return String(value);
   const row = value as Record<string, unknown>;
   const locations = Array.isArray(row.locations) ? `[${row.locations.join(',')}]` : '';
-  return [row.timestampMs ?? row.lastActivityMs ?? '', row.source ?? '', locations, row.sessionId ?? '', row.project ?? row.cwd ?? '', row.prompt ?? row.firstPrompt ?? '']
+  // A search match that is a session event, not a prompt, says which event it
+  // is, as the Rust CLI labels it: `source:role:kind`.
+  const source = row.matchSource != null && row.matchSource !== 'history'
+    ? `${row.source ?? ''}:${row.role ?? ''}:${row.kind ?? ''}`
+    : row.source ?? '';
+  return [row.timestampMs ?? row.lastActivityMs ?? '', source, locations, row.sessionId ?? '', row.project ?? row.cwd ?? '', row.prompt ?? row.firstPrompt ?? '']
     .filter((item) => item !== '' && item != null)
     .join('  ');
 }
