@@ -262,9 +262,12 @@ Notable changes to the native `ai-hist` CLI are documented here.
 - `ai-hist export` stages its output in a temporary file beside the
   destination and renames it into place once complete, so a failed export
   leaves an existing destination file untouched. A SQLite export is written
-  as a single self-contained file, and stale sidecars left at the
-  destination by an earlier database are removed so they cannot be replayed
-  onto it.
+  as a single self-contained file. Sidecars left at the destination by an
+  earlier database are moved aside before the rename and discarded only once
+  it succeeds, so they can neither be replayed onto the new file nor lost if
+  the replacement fails; a sidecar that cannot be moved aside fails the
+  export. A destination that is a symlink is written through to its target,
+  which is itself checked against the active database.
 
 ### Rust API
 

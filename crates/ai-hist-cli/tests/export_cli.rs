@@ -128,3 +128,57 @@ fn export_to_another_file_still_works() {
     let body = std::fs::read_to_string(temp.path().join("out.jsonl")).unwrap();
     assert_eq!(body.lines().count(), 2);
 }
+
+/// An export to a symlink writes through to the link's target, as a direct
+/// write did before exports were staged; the link itself stays a link.
+#[cfg(unix)]
+#[test]
+fn export_to_a_symlink_updates_its_target() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = temp.path().join("mine.db");
+    seed(&temp, &db);
+    std::fs::create_dir(temp.path().join("archives")).unwrap();
+    let target = temp.path().join("archives").join("september.jsonl");
+    std::fs::write(&target, "stale\n").unwrap();
+    let link = temp.path().join("latest.jsonl");
+    std::os::unix::fs::symlink("archives/september.jsonl", &link).unwrap();
+
+    let output = run(ai_hist(&temp).arg("--db").arg(&db).args([
+        "export",
+        "--format",
+        "jsonl",
+        "latest.jsonl",
+    ]));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the export replaced the symlink"
+    );
+    assert_eq!(std::fs::read_to_string(&target).unwrap().lines().count(), 2);
+}
+
+/// A symlink whose target is the active database is still refused.
+#[cfg(unix)]
+#[test]
+fn export_refuses_a_symlink_to_the_active_database() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = temp.path().join("mine.db");
+    seed(&temp, &db);
+    let before = std::fs::read(&db).unwrap();
+    std::os::unix::fs::symlink("mine.db", temp.path().join("alias.db")).unwrap();
+
+    for format in ["sqlite", "jsonl"] {
+        let output = run(ai_hist(&temp)
+            .arg("--db")
+            .arg(&db)
+            .args(["export", "--format", format, "alias.db"]));
+        assert_refused_and_intact(&output, &db, &before);
+    }
+}
