@@ -193,14 +193,24 @@ function requestRoster(path: string, target: string, timeoutMs: number): Promise
 function parseRoster(response: RosterResponse): RelayAgentRoster {
   const status = response.status;
   let envelope: unknown;
-  try { envelope = JSON.parse(response.body.toString('utf8')); }
-  catch { throw new RelayAgentsError('invalid_response', 'Agent Relay desktop returned unreadable roster JSON.'); }
-  const object = record(envelope);
-  if (status < 200 || status >= 300 || object.ok !== true) {
-    const detail = record(object.error);
+  try { envelope = JSON.parse(response.body.toString('utf8')); } catch {
+    if (status < 200 || status >= 300) throw httpError(status);
+    throw new RelayAgentsError('invalid_response', 'Agent Relay desktop returned unreadable roster JSON.');
+  }
+  if (status < 200 || status >= 300) {
+    const object = optionalRecord(envelope);
+    const detail = optionalRecord(object?.error);
     throw new RelayAgentsError(
-      typeof detail.code === 'string' ? detail.code : `http_${status || 'error'}`,
-      typeof detail.message === 'string' ? detail.message : `Agent Relay desktop returned HTTP ${status || 'error'}.`,
+      typeof detail?.code === 'string' ? detail.code : `http_${status || 'error'}`,
+      typeof detail?.message === 'string' ? detail.message : `Agent Relay desktop returned HTTP ${status || 'error'}.`,
+    );
+  }
+  const object = record(envelope);
+  if (object.ok !== true) {
+    const detail = optionalRecord(object.error);
+    throw new RelayAgentsError(
+      typeof detail?.code === 'string' ? detail.code : 'invalid_response',
+      typeof detail?.message === 'string' ? detail.message : 'Agent Relay desktop returned an invalid roster response.',
     );
   }
   const data = record(object.data);
@@ -211,6 +221,18 @@ function parseRoster(response: RosterResponse): RelayAgentRoster {
     agents: data.agents.map(parseAgent),
     fetched_at_ms: data.fetched_at_ms as number,
   };
+}
+
+function httpError(status: number): RelayAgentsError {
+  return new RelayAgentsError(
+    `http_${status || 'error'}`, `Agent Relay desktop returned HTTP ${status || 'error'}.`,
+  );
+}
+
+function optionalRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
 }
 
 /** Validate and normalize one public roster entry. */

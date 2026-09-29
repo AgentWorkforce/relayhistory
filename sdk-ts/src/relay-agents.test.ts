@@ -79,6 +79,35 @@ test('decodes chunked desktop responses', async (t) => {
   assert.deepEqual(result, { agents: [], fetched_at_ms: 1_790_683_200_123 });
 });
 
+test('preserves HTTP status when a desktop error has no typed envelope', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'relay-agents-http-error-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const socket = join(root, 'relay.sock');
+  const server = createServer((connection) => {
+    connection.once('data', () => {
+      const body = JSON.stringify({ message: 'Not Found' });
+      connection.end(`HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`);
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(socket, resolve);
+  });
+  t.after(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(socket, { force: true });
+  });
+
+  await assert.rejects(
+    listRelayAgents({}, {
+      env: { AGENT_RELAY_SOCKET: socket }, home: root, platform: 'linux', temporaryDirectory: root, uid: 501,
+    }),
+    (error: unknown) => error instanceof Error
+      && (error as { code?: string }).code === 'http_404'
+      && error.message === 'Agent Relay desktop returned HTTP 404.',
+  );
+});
+
 test('reports a slow desktop as a timeout instead of claiming it is absent', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'relay-agents-deadline-'));
   t.after(() => rm(root, { recursive: true, force: true }));
