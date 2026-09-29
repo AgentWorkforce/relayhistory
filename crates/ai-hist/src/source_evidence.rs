@@ -191,6 +191,7 @@ const ERROR_SIGNALS: &[&str] = &[
     "patch_apply",
     "mcp_err",
     "subagent_status",
+    "tool_status",
 ];
 
 /// The fidelity counts that cannot be negative. A byte count of `-1` is not a

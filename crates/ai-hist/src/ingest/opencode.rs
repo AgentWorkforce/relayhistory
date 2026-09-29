@@ -2,7 +2,9 @@
 //!
 //! OpenCode ships two on-disk layouts and both are in the field:
 //!
-//! * **SQLite** — `$OPENCODE_DB`, default `~/.local/share/opencode/opencode.db`,
+//! * **SQLite** — `~/.local/share/opencode/opencode.db` and every
+//!   channel-suffixed store beside it (`opencode-stable.db`,
+//!   `opencode-nightly.db`, ...), or exactly `$OPENCODE_DB` when that is set;
 //!   tables `session`, `message`, `part`, each row carrying the provider's own
 //!   JSON payload in a `data` column.
 //! * **Legacy JSON tree** — `$OPENCODE_STORAGE_DIR`, default
@@ -121,16 +123,21 @@ impl OpencodeSession {
 /// Which OpenCode store a host actually has. `opencode.db` wins when both are
 /// present: newer releases write SQLite and leave the old tree behind, so
 /// preferring the tree would silently serve stale history.
+///
+/// The SQLite layout is every store [`crate::paths::opencode_db_files`]
+/// finds: the configured `opencode.db` and, unless it was pinned, each
+/// channel database beside it. Never empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum OpencodeLayout {
-    Sqlite(PathBuf),
+    Sqlite(Vec<PathBuf>),
     JsonTree(PathBuf),
 }
 
 impl OpencodeLayout {
-    pub fn detect(db_path: &Path, storage_dir: &Path) -> Option<Self> {
-        if db_path.is_file() {
-            return Some(Self::Sqlite(db_path.to_path_buf()));
+    pub fn detect(db_path: &Path, pinned: bool, storage_dir: &Path) -> Option<Self> {
+        let stores = crate::paths::opencode_db_files(db_path, pinned);
+        if !stores.is_empty() {
+            return Some(Self::Sqlite(stores));
         }
         if storage_dir.join("session").is_dir() {
             return Some(Self::JsonTree(storage_dir.to_path_buf()));
@@ -575,6 +582,21 @@ pub(crate) fn list_sqlite_session_ids(src: &Connection) -> Result<Vec<String>> {
         .prepare("SELECT id FROM session WHERE id IS NOT NULL AND id <> ''")?
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Whether the OpenCode store at `store` holds `session_id` — the question
+/// that decides which channel store owns a session present in several.
+pub(crate) fn sqlite_store_holds_session(store: &Path, session_id: &str) -> Result<bool> {
+    let src = Connection::open_with_flags(
+        store,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| format!("opening {}", store.display()))?;
+    src.busy_timeout(std::time::Duration::from_secs(5))?;
+    let held = src
+        .prepare("SELECT 1 FROM session WHERE id = ?")?
+        .exists([session_id])?;
+    Ok(held)
 }
 
 fn table_columns(conn: &Connection, table: &str) -> Result<BTreeSet<String>> {
@@ -1313,6 +1335,9 @@ fn normalize_session(
     };
 
     let mut last_assistant_text: Option<String> = None;
+    // A session is always normalized whole, in the provider's message order,
+    // so the tool-result indexes are the same on every pass.
+    let mut tool_results = super::tool_result_facts::ToolResultIndexer::default();
 
     for message in &loaded.messages {
         super::check_capture_cancelled()?;
@@ -1530,6 +1555,14 @@ fn normalize_session(
             // and its result is what the model saw next.
             if let Some(output) = tool.state.and_then(|state| state.get("output")) {
                 if let Some(text) = tool_output_text(output) {
+                    // Measured over the raw `output`, not the reshaped text.
+                    let (call_index, event_index) = tool_results.next(tool.call_id);
+                    let facts = super::tool_result_facts::opencode_tool_result_facts(
+                        output,
+                        tool.call_id,
+                        tool.state,
+                    )
+                    .with_ordering(call_index, event_index);
                     insert_session_event_with_provenance(
                         conn,
                         "opencode",
@@ -1549,7 +1582,7 @@ fn normalize_session(
                         stop_reason.as_deref(),
                         RequestIdentity::none(),
                         &format!("tool_result:{}", tool.call_id),
-                        None,
+                        Some(&facts),
                         RawMessageFacts::default(),
                         None,
                     )?;
