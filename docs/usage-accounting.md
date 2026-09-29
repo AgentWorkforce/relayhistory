@@ -47,7 +47,7 @@ consumer whether summing records is meaningful.
 
 | Mode | Sources | What one record is |
 | --- | --- | --- |
-| `per-request` | (none yet) | One API request, reported once |
+| `per-request` | `grok` | One request — for Grok, one turn's `turn_completed.usage` — reported once |
 | `per-message` | `claude` | One assistant message, **copied onto every content block of that message** |
 | `cumulative-delta` | `codex` | A cumulative counter differenced into a per-request delta at parse time |
 | `context-proxy` | (none yet) | Context-window occupancy, not a billed request — never sum |
@@ -55,15 +55,32 @@ consumer whether summing records is meaningful.
 A session summary may report several modes. When it does, its totals mix units
 and should be read per mode rather than as one number.
 
-`cursor`, `grok`, `relay`, `trajectory` and `opencode` record no usage this
-crate can normalize; asking for one is `USAGE_UNKNOWN_SOURCE` rather than a
-zero.
+`cursor`, `relay`, `trajectory` and `opencode` record no usage this crate can
+normalize; asking for one is `USAGE_UNKNOWN_SOURCE` rather than a zero.
 
 ### Claude
 
 `message.usage` is written verbatim into `token_json`. `input_tokens` already
 excludes cache reads and writes, so it is carried through unchanged —
 subtracting them again would under-report ordinary input.
+
+### Grok
+
+Recent Grok Build releases write a per-turn breakdown on `turn_completed`:
+`usage.{inputTokens, outputTokens, cachedReadTokens, reasoningTokens,
+totalTokens, modelUsage}`. It is stored verbatim under `usage` in the turn's
+last assistant event's `token_json`, beside the `context_total_tokens`
+snapshot, and only `usage` is normalized. `inputTokens` includes the
+`cachedReadTokens` subset, so cache reads are subtracted out of input (a cache
+count above input is `USAGE_COUNTER_REGRESSED`, never a clamp);
+`outputTokens` includes `reasoningTokens` and stays as written, with reasoning
+reported beside it, as for Codex. `usage.totalTokens` is the provider's total
+(input + output). The context snapshot is a window occupancy, not spend: a
+`token_json` carrying only `context_total_tokens` normalizes to no usage
+evidence, and the two numbers are never added. Spellings accepted for each
+counter follow tokscale's reader (`promptTokens`/`input_tokens`,
+`completionTokens`/`output_tokens`, `cacheReadTokens`/`cache_read_input_tokens`,
+...). `costUsdTicks` is kept in the stored object but not read as a cost.
 
 ### Codex
 

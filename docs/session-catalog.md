@@ -1136,7 +1136,7 @@ How each adapter works:
   | `timestamp` in epoch **seconds**, `agentTimestampMs` in **milliseconds** | **Corroborated** | A field named `…Ms` is read as milliseconds; a bare `timestamp` is scaled if it is below 10¹² |
   | `turnStartMs` | **Stated in [#167](https://github.com/AgentWorkforce/relayhistory/issues/167)** from burn #489; not seen in a public sample | Read from `params.update`, `params._meta` or the envelope; the turn's fallback time |
   | `turn_completed.totalTokens` | **Stated in #167**, and corroborated as a `turn_completed`-borne total | `token_json = {"context_total_tokens": n, "source": "updates.jsonl"}` on the turn's last assistant message |
-  | `turn_completed.usage.{inputTokens, outputTokens, cachedReadTokens, reasoningTokens, costUsdTicks, modelUsage}` | **Reported by two community adapters for recent builds**, and contradicted by #167's "Grok does not log per-turn input/output tokens" | **Not read.** See "Usage" below |
+  | `turn_completed.usage.{inputTokens, outputTokens, cachedReadTokens, reasoningTokens, costUsdTicks, modelUsage}` | **Reported by two community adapters for recent builds** and read in production by tokscale (`sessions/grok.rs`, commit `d8fd670`), which fixes its semantics: `inputTokens` includes `cachedReadTokens`, `outputTokens` includes `reasoningTokens`, `totalTokens` is input + output | Stored verbatim under `usage` in the turn's `token_json`, beside the context snapshot; normalized as `per-request` usage. See "Usage" below |
   | `summary.json` `info.id`, `info.cwd`, `info.model`, `git_root_dir`, `head_branch`, `created_at`, `updated_at` | **Corroborated** | Identity, project, branch, model and the fallback timestamps |
   | `summary.json` parent-session references for forked/restored sessions | **Corroborated** (named in the guide, field spelling unknown) | **Not read yet** — no field name to read |
   | `signals.json` `contextTokensUsed`, `turnCount`, `compactionCount` | **Stated in #167**; the guide says the file holds "token usage and tool/turn counters" | A `signals` marker whose `detail_json` is the file verbatim |
@@ -1153,26 +1153,32 @@ How each adapter works:
   failed is a `file_edits` row whose `tool_calls` row carries `is_error`.
   `Shell` records only its command, so no file is attributed to it.
 
-  ### Usage: a context proxy, never billing
+  ### Usage: a context proxy, plus per-turn usage when the build writes it
 
-  Grok logs **no per-turn input/output token counts** (burn #489). The one
-  token fact recorded here is `updates.jsonl`'s `totalTokens`, stored as
+  Older Grok builds log **no per-turn input/output token counts** (burn #489).
+  The token fact every build records is `updates.jsonl`'s `totalTokens`, stored as
   `{"context_total_tokens": n, "source": "updates.jsonl"}` on that turn's last
   assistant event — its last message, or, for a turn answered entirely with
   tool calls, its last tool use — so a consumer can see both the number and
   what it is. It is a context-window snapshot: it
   **decreases** after a compaction, and summing it across turns is meaningless.
-  Every Grok hydration therefore reports `GROK_USAGE_CONTEXT_PROXY_ONLY`,
-  present or not. Nothing here estimates tokens — that is burn's job, from its
-  own estimator and `xai` pricing.
+  A session with no turn carrying a breakdown therefore reports
+  `GROK_USAGE_CONTEXT_PROXY_ONLY`. Nothing here estimates tokens — that is
+  burn's job, from its own estimator and `xai` pricing.
 
-  Two community adapters report that recent Grok builds *do* write a
-  `turn_completed.usage` breakdown (`inputTokens`, `outputTokens`,
-  `cachedReadTokens`, `reasoningTokens`, `costUsdTicks`, `modelUsage`). That
-  contradicts #167, and neither claim was checked against a real session here,
-  so **nothing is read from it**: recording a number this repo cannot vouch for
-  is exactly the failure this parser exists to stop. Confirming it is the first
-  item on the checklist below.
+  Recent builds *do* write a `turn_completed.usage` breakdown (`inputTokens`,
+  `outputTokens`, `cachedReadTokens`, `reasoningTokens`, `totalTokens`,
+  `costUsdTicks`, `modelUsage`). Two community adapters reported it and
+  tokscale reads it in production, so it is recorded — verbatim, under `usage`
+  in the same `token_json`, beside the snapshot and never added to it — and
+  `crate::usage` normalizes it as `per-request` usage (see
+  `docs/usage-accounting.md`). A `usage` object holding only `totalTokens` is
+  still the snapshot under another name. A session where only some turns carry
+  a breakdown reports `GROK_USAGE_PARTIAL` instead; one where every turn does
+  reports no usage caveat. Still unread ([#212](https://github.com/AgentWorkforce/relayhistory/issues/212)):
+  `~/.grok/logs/unified.jsonl`'s per-inference rows, `events.jsonl`,
+  `signals.json`'s `totalTokensBeforeCompaction`, and `summary.json`'s
+  `current_model_id`.
 
   ### Identity and re-reads
 
@@ -1229,9 +1235,10 @@ How each adapter works:
 
   Grok hydration reports `capability: "full"` because its parser covers every
   evidence kind. The usage caveat travels with it as
-  `GROK_USAGE_CONTEXT_PROXY_ONLY` on parsed and cached reads alike: Grok writes
-  no per-turn billing tokens, and `updates.jsonl`'s running context total is
-  stored as a labelled proxy, never as usage. Capability is defined by
+  `GROK_USAGE_CONTEXT_PROXY_ONLY` (no turn carried a breakdown) or
+  `GROK_USAGE_PARTIAL` (some did) on parsed and cached reads alike:
+  `updates.jsonl`'s running context total is stored as a labelled proxy, never
+  as usage. Capability is defined by
   `coverage` (hydration contract 3); usage is not one of those kinds, so a
   `partial` result that covered every kind would be a contract mismatch the
   SDK rejects. The diagnostic is what tells a cost report not to add the
@@ -1392,8 +1399,9 @@ How each adapter works:
   jq -c 'select(.params._meta.turnStartMs or .params.update.turnStartMs) | {meta: .params._meta, update: .params.update}' "$S/updates.jsonl" | head -2
   # 6. THE IMPORTANT ONE: what a turn_completed actually carries.
   jq -c 'select(.params.update.sessionUpdate=="turn_completed") | .params.update' "$S/updates.jsonl" | head -3
-  #    If that prints inputTokens/outputTokens, this repo is under-recording
-  #    usage on purpose and issue #167 needs correcting — say so there.
+  #    If that prints inputTokens/outputTokens, the build writes the per-turn
+  #    breakdown this parser now records under `usage`. Check that inputTokens
+  #    includes cachedReadTokens and totalTokens is input + output (#212).
   # 7. What signals.json, a compaction checkpoint and a subagent entry hold.
   jq -c . "$S/signals.json"
   jq -c . "$S/compaction_checkpoints/"* | head -2
@@ -1429,8 +1437,12 @@ How each adapter works:
     events, and `costUsdTicks` at 10¹⁰ ticks per USD.
   - [telemetry-dev/stats #8](https://github.com/telemetry-dev/stats/pull/8) and
     [BrokkAi/mjolnir #989](https://github.com/BrokkAi/mjolnir/issues/989) — the
-    `turn_completed.usage` breakdown recent builds are reported to write. Read
-    here as a **contradiction to resolve**, not as a licence to record tokens.
+    `turn_completed.usage` breakdown recent builds are reported to write.
+  - [junhoyeo/tokscale](https://github.com/junhoyeo/tokscale) (commit
+    `d8fd670`, `crates/tokscale-core/src/sessions/grok.rs`) — reads that
+    breakdown in production and fixes its semantics (`inputTokens` includes
+    `cachedReadTokens`, `outputTokens` includes `reasoningTokens`), which is
+    what this parser's normalization follows.
   - [paperboytm/spool #512](https://github.com/paperboytm/spool/issues/512) and
     [Ishannaik/agent-sweep #219](https://github.com/Ishannaik/agent-sweep/pull/219)
     — independent confirmation of the directory layout and of

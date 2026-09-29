@@ -2068,29 +2068,41 @@ fn stored_source_diagnostics(
         }
     }
     if options.source == "grok" {
-        return Ok(vec![grok_usage_diagnostic(stored_grok_context_tokens(
-            conn,
-            &options.session_id,
-        )?)]);
+        let (context_total_tokens, usage_turns, turns) =
+            stored_grok_usage(conn, &options.session_id)?;
+        return Ok(
+            grok_usage_diagnostic(context_total_tokens, usage_turns, turns)
+                .into_iter()
+                .collect(),
+        );
     }
     Ok(Vec::new())
 }
 
-/// The newest context-window snapshot already stored for a Grok session.
-fn stored_grok_context_tokens(conn: &Connection, session_id: &str) -> Result<Option<i64>> {
-    let stored: Option<String> = conn
-        .query_row(
+/// What a Grok session's stored token facts say, for a read that did not
+/// parse: the newest context-window snapshot, how many turns carry a usage
+/// breakdown, and how many carry any token fact at all.
+fn stored_grok_usage(conn: &Connection, session_id: &str) -> Result<(Option<i64>, usize, usize)> {
+    let stored = conn
+        .prepare(
             "SELECT token_json FROM session_events \
              WHERE source = 'grok' AND session_id = ? AND token_json IS NOT NULL \
-             ORDER BY ts_ms DESC, id DESC LIMIT 1",
-            params![session_id],
-            |row| row.get(0),
-        )
-        .optional()?
-        .flatten();
-    Ok(stored
-        .and_then(|stored| serde_json::from_str::<Value>(&stored).ok())
-        .and_then(|token| token.get("context_total_tokens").and_then(Value::as_i64)))
+             ORDER BY ts_ms DESC, id DESC",
+        )?
+        .query_map(params![session_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let tokens: Vec<Value> = stored
+        .iter()
+        .filter_map(|stored| serde_json::from_str::<Value>(stored).ok())
+        .collect();
+    let context_total_tokens = tokens
+        .first()
+        .and_then(|token| token.get("context_total_tokens").and_then(Value::as_i64));
+    let usage_turns = tokens
+        .iter()
+        .filter(|token| token.get("usage").is_some())
+        .count();
+    Ok((context_total_tokens, usage_turns, tokens.len()))
 }
 
 /// Index the selected session and hand back whatever the provider's own
@@ -2958,33 +2970,51 @@ fn ingest_grok(
     Ok(grok_diagnostics(&outcome))
 }
 
-/// What a Grok session directory could not establish on its own.
+/// How much of a Grok session's usage is billing evidence, parsed or cached.
 ///
 /// Every code here describes an absence in Grok's records, not a failure of
-/// this run. `GROK_USAGE_CONTEXT_PROXY_ONLY` is unconditional because it is
-/// true of every Grok session: the harness logs no per-turn billing tokens at
-/// all, and a consumer that reads `token_json` has to be told that before it
-/// adds the numbers up.
-/// The one thing that is true of **every** Grok session, parsed or cached:
-/// the harness writes no per-turn billing tokens, so the only token fact
-/// stored is a context-window snapshot that can go down as well as up.
-fn grok_usage_diagnostic(context_total_tokens: Option<i64>) -> HydrationDiagnostic {
-    HydrationDiagnostic {
-        code: "GROK_USAGE_CONTEXT_PROXY_ONLY".to_string(),
-        message: match context_total_tokens {
-            Some(total) => format!(
-                "grok records no per-turn input/output tokens; the only token fact is the \
-                 updates.jsonl context-window snapshot (latest: {total}), which can decrease \
-                 on compaction and is not billing usage"
-            ),
-            None => "grok records no per-turn input/output tokens, and this session's \
-                     updates.jsonl carried no totalTokens snapshot either"
-                .to_string(),
-        },
+/// this run. Older builds write no per-turn billing tokens at all, only a
+/// context-window snapshot that can go down as well as up, and a consumer that
+/// reads `token_json` has to be told that before it adds the numbers up:
+/// `GROK_USAGE_CONTEXT_PROXY_ONLY`. A build that writes the `turn_completed.
+/// usage` breakdown on only some turns is `GROK_USAGE_PARTIAL`. A session
+/// whose every turn carried one needs no caveat, and gets none.
+fn grok_usage_diagnostic(
+    context_total_tokens: Option<i64>,
+    usage_turns: usize,
+    turns: usize,
+) -> Option<HydrationDiagnostic> {
+    let diagnostic = |code: &str, message: String| HydrationDiagnostic {
+        code: code.to_string(),
+        message,
         duration_ms: None,
         source_bytes: None,
         records_parsed: None,
+    };
+    if usage_turns == 0 {
+        return Some(diagnostic(
+            "GROK_USAGE_CONTEXT_PROXY_ONLY",
+            match context_total_tokens {
+                Some(total) => format!(
+                    "grok recorded no per-turn input/output tokens for this session; the only \
+                     token fact is the updates.jsonl context-window snapshot (latest: {total}), \
+                     which can decrease on compaction and is not billing usage"
+                ),
+                None => "grok recorded no per-turn input/output tokens for this session, and \
+                         its updates.jsonl carried no totalTokens snapshot either"
+                    .to_string(),
+            },
+        ));
     }
+    (usage_turns < turns).then(|| {
+        diagnostic(
+            "GROK_USAGE_PARTIAL",
+            format!(
+                "{usage_turns} of {turns} grok turns carried a turn_completed usage breakdown; \
+                 the rest have at most the context-window snapshot, which is not billing usage"
+            ),
+        )
+    })
 }
 
 fn grok_diagnostics(outcome: &GrokIngestOutcome) -> Vec<HydrationDiagnostic> {
@@ -2995,7 +3025,13 @@ fn grok_diagnostics(outcome: &GrokIngestOutcome) -> Vec<HydrationDiagnostic> {
         source_bytes: None,
         records_parsed: None,
     };
-    let mut diagnostics = vec![grok_usage_diagnostic(outcome.context_total_tokens)];
+    let mut diagnostics: Vec<HydrationDiagnostic> = grok_usage_diagnostic(
+        outcome.context_total_tokens,
+        outcome.usage_turns,
+        outcome.turns,
+    )
+    .into_iter()
+    .collect();
     if outcome.missing_updates {
         diagnostics.push(diagnostic(
             "GROK_UPDATES_STREAM_MISSING",
@@ -4628,6 +4664,122 @@ mod tests {
             "{:?}",
             result.diagnostics
         );
+    }
+
+    /// A build that writes the `turn_completed.usage` breakdown: the turn that
+    /// carries one stores it verbatim beside its context snapshot and
+    /// normalizes as per-request usage, the turn that does not keeps only the
+    /// snapshot, and the session is reported as partially covered rather than
+    /// proxy-only. The two numbers are never added.
+    #[test]
+    fn a_grok_turn_usage_breakdown_is_stored_beside_the_context_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir
+            .path()
+            .join(".grok/sessions/%2Ftmp%2Fusage/grok-usage-0001");
+        fs::create_dir_all(&session_dir).unwrap();
+        let chat = session_dir.join("chat_history.jsonl");
+        fs::write(
+            &chat,
+            concat!(
+                r#"{"type":"user","content":"<user_query>first</user_query>"}"#,
+                "\n",
+                r#"{"type":"assistant","content":"one","model_id":"grok-4.5-build"}"#,
+                "\n",
+                r#"{"type":"user","content":"<user_query>second</user_query>"}"#,
+                "\n",
+                r#"{"type":"assistant","content":"two","model_id":"grok-4.5-build"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            session_dir.join("summary.json"),
+            br#"{"info":{"id":"grok-usage-0001","cwd":"/tmp/usage"},"created_at":"2026-09-16T12:00:00.000Z"}"#,
+        )
+        .unwrap();
+        fs::write(
+            session_dir.join("updates.jsonl"),
+            concat!(
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"eventId":"u1","agentTimestampMs":1789560000000,"turnStartMs":1789560000000}}}"#,
+                "\n",
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"eventId":"a1","agentTimestampMs":1789560001000,"turnStartMs":1789560000000}}}"#,
+                "\n",
+                r#"{"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"turn_completed","totalTokens":1800,"usage":{"inputTokens":1000,"outputTokens":100,"reasoningTokens":20,"cachedReadTokens":400,"totalTokens":1100}},"_meta":{"agentTimestampMs":1789560002000,"turnStartMs":1789560000000}}}"#,
+                "\n",
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"eventId":"u2","agentTimestampMs":1789560010000,"turnStartMs":1789560010000}}}"#,
+                "\n",
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"eventId":"a2","agentTimestampMs":1789560011000,"turnStartMs":1789560010000}}}"#,
+                "\n",
+                r#"{"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"turn_completed","totalTokens":2100},"_meta":{"agentTimestampMs":1789560012000,"turnStartMs":1789560010000}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "grok", "grok-usage-0001", Some(&chat));
+        drop(conn);
+
+        let result =
+            hydrate_session_at_with_home(&db, &options("grok", "grok-usage-0001"), dir.path())
+                .unwrap();
+        let conn = open_db(&db).unwrap();
+        let recorded: Vec<String> = conn
+            .prepare(
+                "SELECT token_json FROM session_events \
+                 WHERE source = 'grok' AND token_json IS NOT NULL ORDER BY ts_ms",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(recorded.len(), 2, "{recorded:?}");
+        let first: Value = serde_json::from_str(&recorded[0]).unwrap();
+        assert_eq!(first["context_total_tokens"], 1800);
+        assert_eq!(first["usage"]["cachedReadTokens"], 400);
+        let usage = crate::usage::normalize_usage_str("grok", &recorded[0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(usage.accounting, crate::usage::UsageAccounting::PerRequest);
+        assert_eq!(
+            (
+                usage.input_tokens,
+                usage.cache_read_tokens,
+                usage.output_tokens
+            ),
+            (600, 400, 100)
+        );
+        assert_eq!(usage.provider_total_tokens, Some(1100));
+        assert_eq!(
+            recorded[1],
+            r#"{"context_total_tokens":2100,"source":"updates.jsonl"}"#
+        );
+        assert_eq!(
+            crate::usage::normalize_usage_str("grok", &recorded[1]),
+            Ok(None)
+        );
+
+        let codes: Vec<&str> = result
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code.as_str())
+            .collect();
+        assert!(codes.contains(&"GROK_USAGE_PARTIAL"), "{codes:?}");
+        assert!(
+            !codes.contains(&"GROK_USAGE_CONTEXT_PROXY_ONLY"),
+            "{codes:?}"
+        );
+
+        // A cached read says the same thing from the stored rows.
+        let (context, usage_turns, turns) = stored_grok_usage(&conn, "grok-usage-0001").unwrap();
+        assert_eq!((context, usage_turns, turns), (Some(2100), 1, 2));
+        assert_eq!(
+            grok_usage_diagnostic(context, usage_turns, turns).map(|diagnostic| diagnostic.code),
+            Some("GROK_USAGE_PARTIAL".to_string())
+        );
+        assert!(grok_usage_diagnostic(None, 2, 2).is_none());
     }
 
     /// Write a minimal Grok session directory and answer with its transcript.

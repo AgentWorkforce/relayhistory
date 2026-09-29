@@ -91,6 +91,19 @@ Notable changes to the native `ai-hist` CLI are documented here.
   stores in name order). `OPENCODE_DB` still names exactly one store, as does
   `sync-opencode --opencode-db`.
 
+- Record Grok's per-turn usage. Recent Grok Build releases write a
+  `turn_completed.usage` breakdown (`inputTokens`, `outputTokens`,
+  `cachedReadTokens`, `reasoningTokens`, `totalTokens`); it is now stored
+  verbatim under `usage` in the turn's `token_json`, beside the
+  `context_total_tokens` snapshot, and normalized as `per-request` usage with
+  cache reads taken out of input. `source_accounting("grok")` is
+  `per-request` and `NORMALIZABLE_SOURCES` gains `grok`; a Grok record with
+  only the context snapshot normalizes to no usage rather than
+  `USAGE_UNKNOWN_SOURCE`. Hydration reports `GROK_USAGE_CONTEXT_PROXY_ONLY` only
+  when no turn carried a breakdown, `GROK_USAGE_PARTIAL` when some did. A
+  `usage` holding only `totalTokens` is still read as the context snapshot.
+  `~/.grok/logs/unified.jsonl` is not read yet (#212).
+
 - Add workspace-scoped agent handoffs through `create_handoff(intent)` and
   `resume_handoff(source, session_id)`. The sender emits only a session pointer
   plus one self-describing intent and origin identity; the intent tells the

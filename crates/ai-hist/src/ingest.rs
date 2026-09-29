@@ -10960,6 +10960,10 @@ pub(crate) struct GrokIngestOutcome {
     pub updates_yielded_no_timing: bool,
     /// The newest `turn_completed` context snapshot, for the caller's report.
     pub context_total_tokens: Option<i64>,
+    /// Turns whose `turn_completed` carried a per-turn usage breakdown, and
+    /// how many turns `updates.jsonl` opened in all.
+    pub usage_turns: usize,
+    pub turns: usize,
 }
 
 /// Index one Grok session directory: prompts, events, tools, edits, markers
@@ -10984,6 +10988,13 @@ fn ingest_grok_session(
             .iter()
             .rev()
             .find_map(|turn| turn.total_tokens),
+        usage_turns: session
+            .updates
+            .turns
+            .iter()
+            .filter(|turn| turn.usage.is_some())
+            .count(),
+        turns: session.updates.turns.len(),
         ..Default::default()
     };
 
@@ -11379,21 +11390,30 @@ fn ingest_grok_session(
         }
     }
 
-    // The context-token proxy, on the turn's final assistant message. It is
-    // stored with its source named so a consumer can see that it is a context
-    // snapshot and not billed usage: Grok logs no per-turn input/output token
-    // counts, and none are estimated here.
+    // The turn's token facts, on its final assistant message. The context
+    // proxy is stored with its source named so a consumer can see that it is
+    // a context snapshot and not billed usage. When the build wrote a per-turn
+    // `usage` breakdown it rides beside the proxy, verbatim, under `usage` —
+    // that is what `crate::usage` normalizes, and the proxy never is. Nothing
+    // is estimated here.
     for (turn, timing) in session.updates.turns.iter().enumerate() {
         check_capture_cancelled()?;
         let tail = turn_tail.get(&turn).or_else(|| turn_tool_tail.get(&turn));
-        let (Some(total), Some(uid)) = (timing.total_tokens, tail) else {
+        let Some(uid) = tail else {
             continue;
         };
-        let token_json = json!({
-            "context_total_tokens": total,
-            "source": "updates.jsonl",
-        })
-        .to_string();
+        if timing.total_tokens.is_none() && timing.usage.is_none() {
+            continue;
+        }
+        let mut token_json = serde_json::Map::new();
+        if let Some(total) = timing.total_tokens {
+            token_json.insert("context_total_tokens".into(), json!(total));
+        }
+        token_json.insert("source".into(), json!("updates.jsonl"));
+        if let Some(usage) = &timing.usage {
+            token_json.insert("usage".into(), usage.clone());
+        }
+        let token_json = Value::Object(token_json).to_string();
         conn.execute(
             "UPDATE session_events SET token_json = ? \
              WHERE source = 'grok' AND session_id = ? AND event_uid = ?",

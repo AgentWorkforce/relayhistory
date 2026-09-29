@@ -35,8 +35,11 @@
 //!   `agent_thought_chunk`, `tool_call`, `tool_call_update` and `plan`, plus
 //!   the x.ai extensions `turn_completed`, `hook_execution` and `retry_state`.
 //! * `turn_completed` carries a `totalTokens` context snapshot, which **can
-//!   decrease** when the context is compacted. It is not billing usage, and
-//!   this parser records no per-turn input/output token counts.
+//!   decrease** when the context is compacted. It is not billing usage.
+//!   Recent builds also write a per-turn `usage` breakdown on the same row
+//!   (`inputTokens`, `outputTokens`, `cachedReadTokens`, `reasoningTokens`,
+//!   `totalTokens`, `modelUsage`), which is kept verbatim beside the proxy and
+//!   normalized by `crate::usage`. The two are never added together.
 //!
 //! ## The join
 //!
@@ -509,6 +512,48 @@ pub(crate) struct TurnTiming {
     /// The `turn_completed` context-window snapshot. A proxy, not billing
     /// usage, and it can decrease after a compaction.
     pub total_tokens: Option<i64>,
+    /// The `turn_completed.usage` object, verbatim, when it carries a per-turn
+    /// breakdown ([`usage_breakdown`]). Billing evidence for the turn, kept
+    /// apart from `total_tokens`.
+    pub usage: Option<Value>,
+}
+
+/// The counters a `turn_completed.usage` object carries when it is a per-turn
+/// breakdown rather than only a total, in every spelling seen in the field.
+/// The same lists `crate::usage` normalizes from.
+pub(crate) const GROK_USAGE_INPUT_KEYS: &[&str] = &["inputTokens", "input_tokens", "promptTokens"];
+pub(crate) const GROK_USAGE_OUTPUT_KEYS: &[&str] =
+    &["outputTokens", "output_tokens", "completionTokens"];
+pub(crate) const GROK_USAGE_CACHE_READ_KEYS: &[&str] = &[
+    "cachedReadTokens",
+    "cacheReadTokens",
+    "cache_read_input_tokens",
+];
+pub(crate) const GROK_USAGE_CACHE_WRITE_KEYS: &[&str] = &[
+    "cachedWriteTokens",
+    "cacheWriteTokens",
+    "cacheCreationTokens",
+    "cache_creation_input_tokens",
+];
+pub(crate) const GROK_USAGE_REASONING_KEYS: &[&str] =
+    &["reasoningTokens", "thoughtTokens", "thinkingTokens"];
+
+/// `usage` when it is a per-turn breakdown: an object naming at least one
+/// input, output, cache or reasoning counter. A `usage` holding only
+/// `totalTokens` is the context snapshot under another name and stays that.
+fn usage_breakdown(usage: Option<&Value>) -> Option<&Value> {
+    let object = usage?.as_object()?;
+    [
+        GROK_USAGE_INPUT_KEYS,
+        GROK_USAGE_OUTPUT_KEYS,
+        GROK_USAGE_CACHE_READ_KEYS,
+        GROK_USAGE_CACHE_WRITE_KEYS,
+        GROK_USAGE_REASONING_KEYS,
+    ]
+    .iter()
+    .flat_map(|keys| keys.iter())
+    .any(|key| object.get(*key).is_some_and(|value| !value.is_null()))
+    .then_some(usage?)
 }
 
 /// Everything `updates.jsonl` establishes about a session's timing.
@@ -661,15 +706,28 @@ pub(crate) fn parse_updates(contents: &str, path: &Path) -> Result<GrokUpdates> 
                 }
             }
             UpdateKind::TurnCompleted => {
+                let breakdown = usage_breakdown(update.get("usage"));
+                // Beside a breakdown, `usage.totalTokens` is that turn's
+                // input + output, not the context window, so it is only the
+                // proxy when the object carries nothing else.
+                let usage_total = if breakdown.is_some() {
+                    [None, None]
+                } else {
+                    [
+                        update.pointer("/usage/totalTokens"),
+                        update.pointer("/usage/total_tokens"),
+                    ]
+                };
                 let total = first_number(&[
                     update.get("totalTokens"),
                     update.get("total_tokens"),
-                    update.pointer("/usage/totalTokens"),
-                    update.pointer("/usage/total_tokens"),
+                    usage_total[0],
+                    usage_total[1],
                     meta.get("totalTokens"),
                 ]);
                 if let Some(current) = updates.turns.get_mut(turn) {
                     current.total_tokens = total;
+                    current.usage = breakdown.cloned();
                     current.end_ms = ts_ms.or(current.end_ms);
                 }
             }
@@ -1090,6 +1148,37 @@ mod tests {
         assert_eq!(updates.turns[1].total_tokens, Some(99));
         assert_eq!(updates.user_messages.len(), 2);
         assert_eq!(updates.user_messages[1].turn, 1);
+        // A `usage` holding only a total is the proxy, not a breakdown.
+        assert!(updates.turns.iter().all(|turn| turn.usage.is_none()));
+    }
+
+    /// The breakdown recent builds write, in the shape tokscale's fixtures
+    /// carry. It is kept verbatim for the normalizer, and its `totalTokens`
+    /// (input + output for the turn) is not mistaken for the context snapshot.
+    #[test]
+    fn turn_completed_keeps_a_usage_breakdown_apart_from_the_context_proxy() {
+        let stream = [
+            r#"{"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1000,"turnStartMs":1000}}}"#,
+            r#"{"method":"session/update","params":{"update":{"sessionUpdate":"turn_completed","usage":{"inputTokens":1000,"outputTokens":100,"reasoningTokens":20,"cachedReadTokens":400,"totalTokens":1100,"modelUsage":{"grok-4.5-build":{"inputTokens":1000,"outputTokens":100}}}},"_meta":{"eventId":"turn-1","agentTimestampMs":2000,"turnStartMs":1000}}}"#,
+            r#"{"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":3000,"turnStartMs":3000}}}"#,
+            r#"{"method":"session/update","params":{"update":{"sessionUpdate":"turn_completed","totalTokens":5000,"usage":{"inputTokens":70,"outputTokens":7}},"_meta":{"agentTimestampMs":4000,"turnStartMs":3000}}}"#,
+        ]
+        .join("\n");
+        let updates = parse_updates_ok(&stream);
+        assert_eq!(updates.turns.len(), 2);
+        assert_eq!(updates.turns[0].total_tokens, None);
+        assert_eq!(
+            updates.turns[0]
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.get("cachedReadTokens")),
+            Some(&serde_json::json!(400))
+        );
+        assert_eq!(updates.turns[1].total_tokens, Some(5000));
+        assert_eq!(
+            updates.turns[1].usage,
+            Some(serde_json::json!({"inputTokens": 70, "outputTokens": 7}))
+        );
     }
 
     /// Grok interleaves `plan`, `hook_execution` and `retry_state` rows into

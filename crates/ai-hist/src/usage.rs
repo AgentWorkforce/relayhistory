@@ -356,7 +356,7 @@ impl std::error::Error for UsageError {}
 
 /// Sources this build can normalize. Anything else is an explicit
 /// [`UsageError::UnknownSource`] rather than a silent zero.
-pub const NORMALIZABLE_SOURCES: &[&str] = &["claude", "codex"];
+pub const NORMALIZABLE_SOURCES: &[&str] = &["claude", "codex", "grok"];
 
 /// Whether one model request can be spread across several stored records for
 /// this source.
@@ -380,6 +380,10 @@ pub fn source_accounting(source: &str) -> Option<UsageAccounting> {
         // Codex reports cumulative `token_count` snapshots, which the parser
         // differences into per-request deltas before storing them.
         "codex" => Some(UsageAccounting::CumulativeDelta),
+        // Grok's `turn_completed.usage` is one turn's spend, written once on
+        // that turn's last assistant event. The context-window snapshot
+        // stored beside it is never normalized.
+        "grok" => Some(UsageAccounting::PerRequest),
         _ => None,
     }
 }
@@ -492,6 +496,66 @@ pub fn normalize_usage(
             };
             usage.coverage.has_cache_write_tokens =
                 cache_write_total.is_some() || ephemeral_5m.is_some() || ephemeral_1h.is_some();
+        }
+        "grok" => {
+            // Only the verbatim `turn_completed.usage` breakdown is usage. A
+            // record holding only `context_total_tokens` is a context-window
+            // snapshot, which is no usage evidence at all.
+            let Some(breakdown) = object.get("usage") else {
+                return Ok(None);
+            };
+            let Some(breakdown) = breakdown.as_object() else {
+                return Err(UsageError::NotAnObject);
+            };
+            let mut grok_counter =
+                |keys: &[&str], field: &'static str| -> Result<Option<u64>, UsageError> {
+                    let value = keys
+                        .iter()
+                        .find_map(|key| breakdown.get(*key).filter(|value| !value.is_null()));
+                    let value = read_counter(value, field)?;
+                    reported |= value.is_some();
+                    Ok(value)
+                };
+            use crate::ingest::grok::{
+                GROK_USAGE_CACHE_READ_KEYS, GROK_USAGE_CACHE_WRITE_KEYS, GROK_USAGE_INPUT_KEYS,
+                GROK_USAGE_OUTPUT_KEYS, GROK_USAGE_REASONING_KEYS,
+            };
+            let input = grok_counter(GROK_USAGE_INPUT_KEYS, "usage.inputTokens")?;
+            let output = grok_counter(GROK_USAGE_OUTPUT_KEYS, "usage.outputTokens")?;
+            let cache_read = grok_counter(GROK_USAGE_CACHE_READ_KEYS, "usage.cachedReadTokens")?;
+            let cache_write = grok_counter(GROK_USAGE_CACHE_WRITE_KEYS, "usage.cachedWriteTokens")?;
+            let reasoning = grok_counter(GROK_USAGE_REASONING_KEYS, "usage.reasoningTokens")?;
+            let total = read_counter(
+                ["totalTokens", "total_tokens"]
+                    .iter()
+                    .find_map(|key| breakdown.get(*key).filter(|value| !value.is_null())),
+                "usage.totalTokens",
+            )?;
+            // Grok's `inputTokens` includes its `cachedReadTokens`, as
+            // Codex's does, so the cache reads come out of input here. Its
+            // `outputTokens` includes `reasoningTokens`; that stays as
+            // written, with reasoning reported beside it, the same shape a
+            // Codex record has.
+            let inclusive = input.unwrap_or(0);
+            let cached = cache_read.unwrap_or(0);
+            usage.input_tokens =
+                inclusive
+                    .checked_sub(cached)
+                    .ok_or(UsageError::CounterRegressed {
+                        field: "usage.inputTokens",
+                        value: inclusive,
+                        subtracted: cached,
+                    })?;
+            usage.output_tokens = output.unwrap_or(0);
+            usage.reasoning_tokens = reasoning;
+            usage.cache_read_tokens = cached;
+            usage.cache_write_tokens = cache_write.unwrap_or(0);
+            usage.provider_total_tokens = total;
+            usage.coverage.has_input_tokens = input.is_some();
+            usage.coverage.has_output_tokens = output.is_some();
+            usage.coverage.has_reasoning_tokens = reasoning.is_some();
+            usage.coverage.has_cache_read_tokens = cache_read.is_some();
+            usage.coverage.has_cache_write_tokens = cache_write.is_some();
         }
         // `source_accounting` already rejected anything else.
         _ => unreachable!("source_accounting accepted an unhandled source"),
@@ -937,6 +1001,66 @@ mod tests {
 
     fn codex(value: Value) -> Result<Option<NormalizedUsage>, UsageError> {
         normalize_usage("codex", &value)
+    }
+
+    fn grok(value: Value) -> Result<Option<NormalizedUsage>, UsageError> {
+        normalize_usage("grok", &value)
+    }
+
+    #[test]
+    fn grok_turn_usage_is_per_request_with_cache_exclusive_input() {
+        let usage = grok(json!({
+            "context_total_tokens": 18432,
+            "source": "updates.jsonl",
+            "usage": {
+                "inputTokens": 1000,
+                "outputTokens": 100,
+                "reasoningTokens": 20,
+                "cachedReadTokens": 400,
+                "totalTokens": 1100,
+                "modelUsage": {"grok-4.5-build": {"inputTokens": 1000}}
+            }
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(usage.accounting, UsageAccounting::PerRequest);
+        assert_eq!(usage.input_tokens, 600);
+        assert_eq!(usage.cache_read_tokens, 400);
+        assert_eq!(usage.output_tokens, 100);
+        assert_eq!(usage.reasoning_tokens, Some(20));
+        // The provider's own total, never the context snapshot beside it.
+        assert_eq!(usage.provider_total_tokens, Some(1100));
+        assert!(usage.coverage.has_input_tokens && usage.coverage.has_cache_read_tokens);
+        assert!(!usage.coverage.has_cache_write_tokens);
+    }
+
+    #[test]
+    fn a_grok_context_snapshot_alone_is_no_usage_evidence() {
+        assert_eq!(
+            grok(json!({"context_total_tokens": 9210, "source": "updates.jsonl"})).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn grok_counters_are_read_in_every_spelling_and_never_clamped() {
+        let usage = grok(json!({"usage": {"promptTokens": 50, "completionTokens": 5}}))
+            .unwrap()
+            .unwrap();
+        assert_eq!((usage.input_tokens, usage.output_tokens), (50, 5));
+        assert_eq!(usage.reasoning_tokens, None);
+        assert_eq!(
+            grok(json!({"usage": {"inputTokens": 10, "cachedReadTokens": 11}}))
+                .unwrap_err()
+                .code(),
+            "USAGE_COUNTER_REGRESSED"
+        );
+        assert_eq!(
+            grok(json!({"usage": {"outputTokens": -1}}))
+                .unwrap_err()
+                .code(),
+            "USAGE_NON_INTEGER_COUNTER"
+        );
     }
 
     #[test]
