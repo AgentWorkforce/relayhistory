@@ -811,15 +811,22 @@ What changed, largest first:
    observation of the source for every candidate — O(files x sessions), the
    shape #42 reported on a 930 MB store. `ORDER BY +session_id` leaves it to
    `idx_observation_locator`.
-3. **Unchanged transcripts are proven by `ctime`.** Size, mtime and inode do
-   not prove bytes (a writer can restore an mtime; a coarse clock can give two
-   writes one tick), which is why every skip hashed a window. `ctime` cannot be
-   set from user space, so once a digest has proven a cursor and the file's
-   `ctime` is more than three seconds old — past any filesystem's timestamp
-   granularity, the "racy" case — the cursor records it, and an unchanged
-   `ctime` proves the file without a read. Bound to the prefix hashes it
-   proved, so a cursor that moved is not vouched for; any write, truncate,
-   chmod or rename falls back to the digest. The same `settled` stamp covers
+3. **Unchanged transcripts are proven by `ctime`, where it is real.** Size,
+   mtime and inode do not prove bytes (a writer can restore an mtime; a
+   coarse clock can give two writes one tick), which is why every skip hashed
+   a window. On APFS, HFS+, ext2/3/4, XFS, Btrfs, ZFS, tmpfs and F2FS —
+   an allowlist read from `statfs`, cached per device — `ctime` cannot be set
+   from user space, so once a digest has proven a cursor and the file's
+   `ctime` is more than three seconds old (past those filesystems' timestamp
+   granularity, the "racy" case) the cursor records it, and an unchanged
+   `ctime` proves the file without a read. FAT and exFAT report the mtime as
+   the change time, so a same-size rewrite with the mtime restored leaves it
+   equal too; there, on any filesystem not on the list and on Windows,
+   nothing settles and the digest stays. A settle expires after six hours and
+   the digest is taken again, so no miss is permanent. Bound to the prefix
+   hashes it proved, so a cursor that moved is not vouched for; any write,
+   truncate, chmod or rename falls back to the digest. The stamp is written
+   best-effort and compare-and-swap on the document it was proven from. The same `settled` stamp covers
    Cursor transcripts and the flat prompt logs, whose whole-prefix SHA-256 is
    now paid once per change rather than once per sweep — and a Cursor
    transcript that did not advance is no longer hashed a second time to build

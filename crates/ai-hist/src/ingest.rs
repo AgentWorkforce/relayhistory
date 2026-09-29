@@ -2814,13 +2814,17 @@ struct FileCursor {
 /// its end. While both still describe the file, nothing has written to it
 /// since, so the prefix need not be read again to say so.
 ///
-/// Recorded only at end of file, and only once the change time is outside
-/// the racy window. The cursor's own offset has to equal the recorded length,
-/// so a cursor that moved on without clearing it is not vouched for.
+/// Recorded only at end of file, only on a filesystem that keeps a real
+/// change time, and only once it is outside the racy window; trusted only
+/// until [`transcript_cursor::SETTLE_REVERIFY_MS`] has passed. The cursor's
+/// own offset has to equal the recorded length, so a cursor that moved on
+/// without clearing it is not vouched for.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct FileSettled {
     ctime_ns: i64,
     size: u64,
+    #[serde(default)]
+    settled_at_ms: i64,
 }
 
 enum DecodedFileCursor {
@@ -2864,6 +2868,8 @@ impl FileCursor {
             && settled.size == self.offset
             && metadata.len() == settled.size
             && metadata_mtime_ns(&metadata) == self.observed_mtime_ns
+            && transcript_cursor::settle_is_fresh(settled.settled_at_ms)
+            && transcript_cursor::filesystem_keeps_change_time(path, &metadata)
             && transcript_cursor::change_time_ns(&metadata) == Some(settled.ctime_ns)
     }
 
@@ -3009,7 +3015,7 @@ impl CompleteJsonlReader {
         let size = metadata.len();
         let mtime_ns = metadata_mtime_ns(&metadata);
         let (device, inode) = metadata_identity(&metadata);
-        let settle_ctime_ns = transcript_cursor::settled_change_time(&metadata);
+        let settle_ctime_ns = transcript_cursor::settled_change_time(path, &metadata);
         let decoded = saved.and_then(FileCursor::decode);
 
         let (offset, generation, prefix_hasher) = match decoded {
@@ -3118,6 +3124,10 @@ impl CompleteJsonlReader {
         cursor.settled = Some(FileSettled {
             ctime_ns,
             size: self.validated_size,
+            settled_at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+                .unwrap_or(0),
         });
         Some(cursor)
     }
@@ -32419,12 +32429,18 @@ mod tests {
         assert_eq!(stop_reason.as_deref(), Some("tool-calls"));
     }
 
-    /// Restores the production settle window however a test ends.
+    /// Settles immediately, on a filesystem treated as keeping a real change
+    /// time (or not), and restores both however a test ends.
     struct ImmediateSettle;
 
     impl ImmediateSettle {
         fn new() -> Self {
+            Self::on_filesystem_keeping_ctime(true)
+        }
+
+        fn on_filesystem_keeping_ctime(keeps: bool) -> Self {
             transcript_cursor::set_settle_window_for_test(Some(0));
+            transcript_cursor::set_filesystem_keeps_change_time_for_test(Some(keeps));
             Self
         }
     }
@@ -32432,6 +32448,7 @@ mod tests {
     impl Drop for ImmediateSettle {
         fn drop(&mut self) {
             transcript_cursor::set_settle_window_for_test(None);
+            transcript_cursor::set_filesystem_keeps_change_time_for_test(None);
         }
     }
 
@@ -32554,7 +32571,12 @@ mod tests {
         );
 
         // Appends still land, through the same fast path.
-        let_the_clock_tick();
+        let newest_ctime = [&claude, &cursor]
+            .iter()
+            .filter_map(|path| transcript_cursor::change_time_ns(&fs::metadata(path).unwrap()))
+            .max()
+            .unwrap_or(0);
+        transcript_cursor::wait_for_change_time_after(home.path(), newest_ctime);
         {
             let mut file = fs::OpenOptions::new().append(true).open(&claude).unwrap();
             file.write_all(claude_sweep_turn("sweep-a", 3).as_bytes())
@@ -32593,12 +32615,163 @@ mod tests {
         assert_eq!(prompts, vec!["first".to_string(), "second".to_string()]);
     }
 
-    /// Long enough for any filesystem clock the suite runs on to tick, so a
-    /// write after a settle lands on a later change time than the one it
-    /// recorded. The production settle window is what guarantees that
-    /// outside a test.
-    fn let_the_clock_tick() {
-        std::thread::sleep(Duration::from_millis(50));
+    fn settled_byte_cursor(value: &Value) -> Option<FileSettled> {
+        match FileCursor::decode(value)? {
+            DecodedFileCursor::Typed(cursor) => cursor.settled,
+            DecodedFileCursor::Legacy(_) => None,
+        }
+    }
+
+    /// Rewrite `path` to `body` (same length) and put its mtime back, once
+    /// the change time has moved past `settled_ctime` — the rewrite a stat
+    /// cannot see, on the filesystems that settle.
+    fn rewrite_restoring_mtime(path: &Path, body: &str, settled_ctime: i64) {
+        let before = fs::metadata(path).unwrap();
+        assert_eq!(before.len() as usize, body.len());
+        transcript_cursor::wait_for_change_time_after(path.parent().unwrap(), settled_ctime);
+        fs::write(path, body).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(before.modified().unwrap())
+            .unwrap();
+        let after = fs::metadata(path).unwrap();
+        assert_eq!(after.len(), before.len());
+        assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+    }
+
+    fn history_prompts(conn: &Connection) -> Vec<String> {
+        conn.prepare("SELECT prompt FROM history ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// A settled flat log rewritten in place with its length and mtime
+    /// restored is still read again: only the change time moved, and that is
+    /// exactly what the settled stamp compares.
+    #[test]
+    fn a_same_size_rewrite_of_a_settled_flat_log_is_reread() {
+        let _settle = ImmediateSettle::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.jsonl");
+        let line = |text: &str| {
+            format!(r#"{{"display":"{text}","timestamp":1,"project":"/p","sessionId":"s"}}"#) + "\n"
+        };
+        fs::write(&path, line("prompt aaaa")).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        let sync = |state: &mut Map<String, Value>| {
+            sync_jsonl_incremental(
+                &conn,
+                state,
+                "claude",
+                &path,
+                parse_claude_line,
+                &mut |_| {},
+            )
+            .unwrap()
+        };
+        assert_eq!(sync(&mut state), 1);
+        assert_eq!(sync(&mut state), 0);
+        let settled = settled_byte_cursor(&state["claude"]).expect("proven and settled");
+        reset_prefix_hash_meter();
+        assert_eq!(sync(&mut state), 0);
+        assert_eq!(prefix_hash_meter(), 0, "a settled log is skipped on a stat");
+
+        rewrite_restoring_mtime(&path, &line("prompt bbbb"), settled.ctime_ns);
+        assert_eq!(
+            sync(&mut state),
+            1,
+            "the rewrite was served from the cursor"
+        );
+        assert!(history_prompts(&conn).contains(&"prompt bbbb".to_string()));
+    }
+
+    /// The same rewrite of a settled Cursor transcript restarts it, so the
+    /// write phase rebuilds the session from the new generation.
+    #[test]
+    fn a_same_size_rewrite_of_a_settled_cursor_transcript_restarts_it() {
+        let _settle = ImmediateSettle::new();
+        let dir = tempfile::tempdir().unwrap();
+        let original = concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query>aaaa</user_query>"}]}}"#,
+            "\n"
+        );
+        let path = write_cursor_transcript(dir.path(), "s-settled", original);
+        let first = scan_cursor_transcript(&path, None).unwrap();
+        assert!(first.advanced);
+        let proven = scan_cursor_transcript(&path, first.checkpoint.as_ref()).unwrap();
+        assert!(!proven.advanced);
+        let settled_value = proven.checkpoint.expect("an unadvanced scan settles");
+        let settled = settled_byte_cursor(&settled_value).unwrap();
+
+        reset_prefix_hash_meter();
+        let skipped = scan_cursor_transcript(&path, Some(&settled_value)).unwrap();
+        assert!(!skipped.advanced && skipped.checkpoint.is_none());
+        assert_eq!(
+            prefix_hash_meter(),
+            0,
+            "a settled transcript is skipped on a stat"
+        );
+
+        rewrite_restoring_mtime(&path, &original.replace("aaaa", "bbbb"), settled.ctime_ns);
+        let rescanned = scan_cursor_transcript(&path, Some(&settled_value)).unwrap();
+        assert!(
+            rescanned.restarted && rescanned.advanced,
+            "a same-size, same-mtime rewrite must restart the transcript"
+        );
+    }
+
+    /// Where the filesystem does not keep a real change time, neither byte
+    /// cursor path ever settles, and every pass proves the prefix again.
+    #[test]
+    fn byte_cursors_never_settle_on_a_filesystem_without_a_real_change_time() {
+        let _settle = ImmediateSettle::on_filesystem_keeping_ctime(false);
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("history.jsonl");
+        fs::write(
+            &log,
+            r#"{"display":"p","timestamp":1,"project":"/p","sessionId":"s"}"#.to_string() + "\n",
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        for _ in 0..3 {
+            sync_jsonl_incremental(
+                &conn,
+                &mut state,
+                "claude",
+                &log,
+                parse_claude_line,
+                &mut |_| {},
+            )
+            .unwrap();
+        }
+        assert!(settled_byte_cursor(&state["claude"]).is_none());
+
+        let transcript = write_cursor_transcript(
+            dir.path(),
+            "s-fat",
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query>x</user_query>"}]}}"#,
+                "\n"
+            ),
+        );
+        let first = scan_cursor_transcript(&transcript, None).unwrap();
+        let second = scan_cursor_transcript(&transcript, first.checkpoint.as_ref()).unwrap();
+        assert!(
+            second.checkpoint.is_none(),
+            "nothing to settle, nothing written"
+        );
+        reset_prefix_hash_meter();
+        scan_cursor_transcript(&transcript, first.checkpoint.as_ref()).unwrap();
+        assert!(prefix_hash_meter() > 0, "every pass proves the prefix");
     }
 
     /// A settled Cursor cursor rides the sync state through a concurrent
@@ -32623,6 +32796,7 @@ mod tests {
         let proof = FileSettled {
             ctime_ns: 5,
             size: 42,
+            settled_at_ms: 1,
         };
         for (on_disk, ours) in [
             (cursor(None), cursor(Some(proof.clone()))),

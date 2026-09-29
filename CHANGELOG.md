@@ -622,21 +622,32 @@ Notable changes to the native `ai-hist` CLI are documented here.
   whenever anything moved) drops from 1.77 s and 838 MiB read to 0.39 s and
   114 MiB; a `watch` tick with nothing changed reads 22 MiB instead of 28 MiB.
   - Unchanged Claude transcripts and subagent metadata are skipped on a
-    `stat`. Once a window digest has proven a transcript's cursor and the
-    file's change time is more than three seconds old, the cursor records
-    that change time (`settled`); an unchanged `ctime` — which no writer can
-    restore, unlike an mtime — then proves the bytes without reading them.
-    Any write, truncate, chmod or rename falls back to the digest.
+    `stat`, on filesystems known to keep a real change time (APFS, HFS+,
+    ext2/3/4, XFS, Btrfs, ZFS, tmpfs, F2FS). Once a window digest has proven
+    a transcript's cursor and the file's change time is more than three
+    seconds old, the cursor records that change time (`settled`); an
+    unchanged `ctime` — which no writer can restore there, unlike an mtime —
+    then proves the bytes without reading them. Any write, truncate, chmod
+    or rename falls back to the digest. Elsewhere — FAT and exFAT, whose
+    "ctime" is the mtime, any filesystem not on the list, and Windows —
+    nothing settles and every skip keeps the digest. A settle is trusted for
+    six hours, then the file is proven by its digest again, so no miss is
+    permanent. Recording it is best-effort and only replaces the cursor
+    document it was proven from, so it cannot roll back a cursor hydration
+    advanced in between.
   - Unchanged Cursor transcripts and the flat prompt logs are skipped the
     same way (`settled` on their byte cursor in `.sync-state.json`), and a
     Cursor transcript that did not advance is no longer hashed a second time
     to identify a generation nothing used.
   - The project-identity refresh no longer reads every event row. The stale
     event probe is driven from the catalog through a new covering index,
-    `idx_session_events_project` (created on the next writable open), the
+    `idx_session_events_project`, the
     delegated-thread pass from the relationship ledger, and the path-key
     upgrade pass reads the catalog once instead of once per directory. A
-    sweep runs the refresh once instead of twice.
+    sweep runs the refresh once instead of twice. The first writable open
+    after upgrading builds the index: about 1.6 s and 78 bytes per event
+    for a million events. Until then the schema is not current, so a
+    read-only CLI or change-feed open falls back to a writable one once.
   - Discovery's locator lookup is a search on `idx_observation_locator`
     again; with no `sqlite_stat1`, SQLite served its `ORDER BY` from the
     primary key and walked every observation of the source per file.
