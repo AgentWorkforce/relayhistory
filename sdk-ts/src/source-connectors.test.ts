@@ -12,6 +12,7 @@ import {
   InvalidArgumentError, NativeContractMismatchError, RelayHistoryError,
   discoverSessions, hydrateSession, sync, validateNativeContract,
 } from './index.js';
+import { scrubHistoryEnv } from './test-env.js';
 
 const run = promisify(execFile);
 const cli = fileURLToPath(new URL('./cli.js', import.meta.url));
@@ -19,9 +20,7 @@ const mcp = fileURLToPath(new URL('./mcp-server.js', import.meta.url));
 
 async function isolated(body: (dbPath: string) => Promise<void>): Promise<void> {
   const home = await mkdtemp(join(tmpdir(), 'relayhistory-connectors-'));
-  const keys = Object.keys(process.env).filter((key) => /^(HOME|USERPROFILE|XDG_|OPENCODE_|TRAJECTORY_|AI_HIST_|RELAYHISTORY_|RELAYCAST_)/.test(key));
-  const saved = { ...process.env };
-  for (const key of keys) delete process.env[key];
+  const restoreEnv = scrubHistoryEnv();
   process.env.HOME = home;
   process.env.USERPROFILE = home;
   process.env.RELAYHISTORY_HOME = join(home, 'commercial');
@@ -33,8 +32,7 @@ async function isolated(body: (dbPath: string) => Promise<void>): Promise<void> 
     await writeFile(join(process.env.RELAYHISTORY_HOME, 'stages', 'broken.auth.json'), '{not-json', { mode: 0o600 });
     await body(process.env.AI_HIST_DB);
   } finally {
-    for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
-    Object.assign(process.env, saved);
+    restoreEnv();
     await rm(home, { recursive: true, force: true });
   }
 }
