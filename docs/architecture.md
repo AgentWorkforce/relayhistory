@@ -340,10 +340,18 @@ transcripts carrying the same in-log `sessionId` are branches with no identity
 of their own, so each is recorded as unlinked evidence keyed on its transcript;
 a branch's identity is never taken from its file name, here or anywhere else.
 
-Codex records continuity only when a producer writes those explicit fields on
-`session_meta`. A plain `codex resume` opens with a fresh `payload.id` and
-leaves behind only a carried-over token baseline, which is a number and not a
-session, so no `resume` row is recorded for it.
+Codex does record forks, under field names of its own on `session_meta`: a
+human "fork conversation" carries `forked_from_id` (with `thread_source:
+"user"`), and a spawned subagent names the thread it started from in
+`source.subagent.thread_spawn.parent_thread_id`. Each becomes a `fork` edge
+whose `evidence_ref` is the field that named it; a subagent keeps its
+`delegated` row and gains the `fork` edge beside it, and a human fork stays a
+top-level catalog session. Evidence banked before these fields were read is
+re-read once, from the `session_meta` line alone. What is still unobservable is
+a plain `codex resume`: it opens with a fresh `payload.id` and leaves behind
+only a carried-over token baseline, which is a number and not a session, so no
+`resume` row is recorded for it. A forked rollout also replays its parent's
+history before its own turns, and that replay is not yet gated (#210).
 
 Events use `(ts_ms, id)` keyset pagination. Tool calls and file edits use the
 same keyset shape over `(ts_ms IS NULL, ts_ms, id)`: both tables allow a null

@@ -20,7 +20,9 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ai_hist::diagnostics::{doctor_report, human_bytes, DoctorReport};
+use ai_hist::diagnostics::{
+    compact_database, doctor_report, human_bytes, CompactReport, DoctorReport,
+};
 use ai_hist::git_helpers::*;
 use ai_hist::history_search::{search_all, SearchRole, SearchRow};
 use ai_hist::paths::{default_opencode_db_path, home_dir};
@@ -279,6 +281,13 @@ enum Command {
     },
     /// Diagnose database health: size, WAL, free space, and who holds the write lock.
     Doctor {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reclaim space the database holds but no longer uses. Deletes no rows:
+    /// merges the full-text indexes, VACUUMs, and truncates the WAL. Refuses
+    /// while a sync is running or when the volume cannot hold the rewrite.
+    Compact {
         #[arg(long)]
         json: bool,
     },
@@ -663,6 +672,9 @@ pub fn run() -> Result<()> {
         Command::Ingest { hook, quiet, json } => {
             return run_hook_ingest(&db_path, hook, *quiet, *json);
         }
+        // Takes the sync lock and opens its own connection: a second handle
+        // held open here would pin the WAL the compaction is truncating.
+        Command::Compact { json } => return compact(&db_path, *json),
         Command::Sessions {
             action: SessionsAction::Discover { scope, source, .. },
         } if scope.resolve() == SessionScope::Remote => {
@@ -673,8 +685,17 @@ pub fn run() -> Result<()> {
             )?;
         }
         Command::SyncOpencode { opencode_db } => {
-            let source = opencode_db.clone().unwrap_or_else(default_opencode_db_path);
-            return sync_opencode_at(&db_path, &source, SyncOutput::Progress).map(|_| ());
+            // An explicit `--opencode-db` names one store; otherwise every
+            // channel database is read, as `sync` reads them.
+            return match opencode_db {
+                Some(source) => sync_opencode_at(&db_path, source, SyncOutput::Progress),
+                None => sync_opencode_with_roots(
+                    &db_path,
+                    &ProviderRoots::from_env(home_dir()),
+                    SyncOutput::Progress,
+                ),
+            }
+            .map(|_| ());
         }
         _ => {}
     }
@@ -792,6 +813,7 @@ pub fn run() -> Result<()> {
         Command::Show { id, json } => show_entry(&conn, id, json),
         Command::Context { id, window } => show_context(&conn, id, window),
         Command::Doctor { json } => doctor(&db_path, json),
+        Command::Compact { .. } => unreachable!("compact is dispatched before a connection opens"),
         Command::Pack {
             scope,
             query,
@@ -971,6 +993,7 @@ pub fn run() -> Result<()> {
             } else {
                 export_history(
                     &conn,
+                    &db_path,
                     output.as_deref(),
                     &format,
                     source.as_deref(),
@@ -2164,36 +2187,81 @@ fn print_tags(
     Ok(())
 }
 
+/// Where `export --format sqlite` writes when no destination is given.
+const DEFAULT_SQLITE_EXPORT: &str = "ai-hist-export.db";
+
+/// Exports history rows to `output` (stdout for JSONL when absent).
+///
+/// `active_db` is the database this invocation actually opened, `--db`
+/// included. A destination that names it, or one of its SQLite sidecars, is
+/// refused for every format before anything is read or written. The export is
+/// staged in a sibling temporary file and renamed over the destination only
+/// once it is complete, so a failed export leaves an existing file untouched.
 fn export_history(
     conn: &Connection,
+    active_db: &Path,
     output: Option<&Path>,
     format: &str,
     source: Option<&str>,
     project: Option<&str>,
     since: Option<&str>,
 ) -> Result<()> {
+    anyhow::ensure!(
+        matches!(format, "sqlite" | "jsonl"),
+        "unsupported export format '{format}'"
+    );
+    let dest = match (format, output) {
+        ("sqlite", None) => Some(Path::new(DEFAULT_SQLITE_EXPORT)),
+        (_, output) => output,
+    };
+    // An existing symlink destination is written through, to its target, as
+    // a direct write would; the rename below would otherwise replace the link.
+    let target = dest.map(follow_destination_symlink);
+    // `--db` is handed to SQLite as given, so a `file:` URI names a database
+    // whose filesystem path is not the argument's text. The connection knows
+    // the file it actually opened; both are guarded.
+    let opened = conn
+        .path()
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
+    let protected: Vec<&Path> = std::iter::once(active_db)
+        .chain(opened.as_deref())
+        .collect();
+    if let (Some(dest), Some(target)) = (dest, target.as_deref()) {
+        anyhow::ensure!(
+            !protected.iter().any(|active| {
+                names_active_database(dest, active) || names_active_database(target, active)
+            }),
+            "Refusing to export over the active database {} (destination {}).",
+            active_db.display(),
+            dest.display()
+        );
+    }
     let rows = export_rows(conn, source, project, since)?;
     if rows.is_empty() {
         anyhow::bail!("No entries matched the export filters.");
     }
     if format == "sqlite" {
-        let dest = output.unwrap_or_else(|| Path::new("ai-hist-export.db"));
-        let db_path = default_db_path();
-        anyhow::ensure!(
-            dest != db_path,
-            "Refusing to export SQLite over the active AI_HIST_DB."
-        );
-        let _ = fs::remove_file(dest);
-        let dst = Connection::open(dest)?;
-        ai_hist::init_db(&dst)?;
-        let mut inserted = 0;
-        for entry in &rows {
-            inserted += insert_history(&dst, entry)?;
-        }
+        let dest = dest.expect("a sqlite export always has a destination");
+        let target = target.as_deref().expect("resolved alongside dest");
+        let staged = staged_export_file(target)?;
+        let inserted = {
+            let dst = Connection::open(staged.path())?;
+            ai_hist::init_db(&dst)?;
+            let mut inserted = 0;
+            for entry in &rows {
+                inserted += insert_history(&dst, entry)?;
+            }
+            // A self-contained single file: nothing left in a -wal sidecar
+            // that the rename below would not carry along.
+            dst.query_row("PRAGMA journal_mode=DELETE", [], |_| Ok(()))?;
+            dst.close().map_err(|(_, error)| error)?;
+            inserted
+        };
+        install_sqlite_export(staged, target, persist_export)?;
         println!("Exported {inserted} entries to {}", dest.display());
         return Ok(());
     }
-    anyhow::ensure!(format == "jsonl", "unsupported export format '{format}'");
     let mut body = Vec::new();
     for entry in &rows {
         let row = json!({
@@ -2206,20 +2274,183 @@ fn export_history(
         });
         writeln!(&mut body, "{}", serde_json::to_string(&row)?)?;
     }
-    if let Some(path) = output {
+    if let (Some(path), Some(target)) = (dest, target.as_deref()) {
+        let mut staged = staged_export_file(target)?;
         if path.extension().and_then(|s| s.to_str()) == Some("gz") {
-            let file = fs::File::create(path)?;
-            let mut enc = GzEncoder::new(file, Compression::default());
+            let mut enc = GzEncoder::new(staged.as_file_mut(), Compression::default());
             enc.write_all(&body)?;
             enc.finish()?;
         } else {
-            fs::write(path, body)?;
+            staged.write_all(&body)?;
         }
+        staged.as_file().sync_all()?;
+        persist_export(staged, target)?;
         eprintln!("Exported {} entries to {}", rows.len(), path.display());
     } else {
         io::stdout().write_all(&body)?;
     }
     Ok(())
+}
+
+/// A temporary file beside `dest`, so the final rename stays on one filesystem.
+fn staged_export_file(dest: &Path) -> Result<tempfile::NamedTempFile> {
+    let dir = match dest.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let name = dest
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "ai-hist-export".into());
+    tempfile::Builder::new()
+        .prefix(&format!(".{name}."))
+        .suffix(".partial")
+        .tempfile_in(dir)
+        .with_context(|| format!("create a temporary export file in {}", dir.display()))
+}
+
+fn persist_export(staged: tempfile::NamedTempFile, dest: &Path) -> Result<()> {
+    staged
+        .persist(dest)
+        .map_err(|error| error.error)
+        .with_context(|| format!("move the finished export into {}", dest.display()))?;
+    Ok(())
+}
+
+/// `dest` itself, or the file an existing symlink at `dest` points to.
+fn follow_destination_symlink(dest: &Path) -> PathBuf {
+    match fs::symlink_metadata(dest) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            fs::canonicalize(dest).unwrap_or_else(|_| match fs::read_link(dest) {
+                // A dangling link: create its target, as a direct write would.
+                Ok(link) if link.is_absolute() => link,
+                Ok(link) => dest.parent().unwrap_or_else(|| Path::new("")).join(link),
+                Err(_) => dest.to_path_buf(),
+            })
+        }
+        _ => dest.to_path_buf(),
+    }
+}
+
+const SQLITE_SIDECARS: [&str; 3] = ["-wal", "-shm", "-journal"];
+
+/// Renames the staged SQLite export over `dest` without letting a previous
+/// database's sidecars pair with the new file, and without losing them if the
+/// replacement fails.
+///
+/// Existing sidecars are first parked under a private name (any failure other
+/// than "not found" aborts the export with everything restored), then
+/// `persist` installs the new file. On success the parked sidecars are
+/// discarded; on failure they are renamed back beside the untouched old file.
+fn install_sqlite_export(
+    staged: tempfile::NamedTempFile,
+    dest: &Path,
+    persist: impl FnOnce(tempfile::NamedTempFile, &Path) -> Result<()>,
+) -> Result<()> {
+    let mut parked: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for suffix in SQLITE_SIDECARS {
+        let sidecar = sqlite_sidecar(dest, suffix);
+        let aside = parked_sidecar(dest, suffix);
+        match fs::rename(&sidecar, &aside) {
+            Ok(()) => parked.push((sidecar, aside)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                restore_parked_sidecars(&parked);
+                return Err(error).with_context(|| {
+                    format!(
+                        "move the existing SQLite sidecar {} out of the way",
+                        sidecar.display()
+                    )
+                });
+            }
+        }
+    }
+    match persist(staged, dest) {
+        Ok(()) => {
+            // Renamed away from the database name, SQLite can no longer pair
+            // these with anything, so a failed removal is harmless.
+            for (_, aside) in &parked {
+                let _ = fs::remove_file(aside);
+            }
+            Ok(())
+        }
+        Err(error) => {
+            restore_parked_sidecars(&parked);
+            Err(error)
+        }
+    }
+}
+
+fn parked_sidecar(dest: &Path, suffix: &str) -> PathBuf {
+    sqlite_sidecar(
+        dest,
+        &format!("{suffix}.ai-hist-{}.replaced", std::process::id()),
+    )
+}
+
+fn restore_parked_sidecars(parked: &[(PathBuf, PathBuf)]) {
+    for (sidecar, aside) in parked {
+        if let Err(error) = fs::rename(aside, sidecar) {
+            eprintln!(
+                "warning: could not restore {} from {}: {error}",
+                sidecar.display(),
+                aside.display()
+            );
+        }
+    }
+}
+
+fn sqlite_sidecar(db: &Path, suffix: &str) -> PathBuf {
+    let mut name = db.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Whether writing `candidate` would overwrite the database at `active` or
+/// one of its SQLite sidecars. Paths are compared after resolving `.`/`..`,
+/// symlinks and relative spellings; on Unix, two existing paths that are hard
+/// links to one file also match.
+fn names_active_database(candidate: &Path, active: &Path) -> bool {
+    let candidate_resolved = resolve_export_path(candidate);
+    ["", "-wal", "-shm", "-journal"].iter().any(|suffix| {
+        let protected = sqlite_sidecar(active, suffix);
+        candidate_resolved == resolve_export_path(&protected) || same_file(candidate, &protected)
+    })
+}
+
+/// The canonical form of `path`, or, when it does not exist yet, its
+/// canonical parent joined with its file name.
+fn resolve_export_path(path: &Path) -> PathBuf {
+    if let Ok(resolved) = fs::canonicalize(path) {
+        return resolved;
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    match (absolute.parent(), absolute.file_name()) {
+        (Some(parent), Some(name)) => fs::canonicalize(parent)
+            .map(|parent| parent.join(name))
+            .unwrap_or(absolute),
+        _ => absolute,
+    }
+}
+
+#[cfg(unix)]
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (fs::metadata(a), fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn same_file(_a: &Path, _b: &Path) -> bool {
+    false
 }
 
 fn import_history(conn: &Connection, path: &Path, dry_run: bool) -> Result<()> {
@@ -2281,6 +2512,7 @@ fn doctor_report_json(report: &DoctorReport, db_path: &Path) -> Value {
         "db_path": db_path.display().to_string(),
         "db_bytes": report.db_bytes,
         "wal_bytes": report.wal_bytes,
+        "reclaimable_bytes": report.reclaimable,
         "free_bytes": report.free,
         "write_lock": match &report.lock {
             Ok(()) => json!("available"),
@@ -2309,6 +2541,7 @@ fn doctor(db_path: &Path, json: bool) -> Result<()> {
     let DoctorReport {
         db_bytes,
         wal_bytes,
+        reclaimable,
         free,
         lock,
         holders,
@@ -2318,6 +2551,12 @@ fn doctor(db_path: &Path, json: bool) -> Result<()> {
     println!("database: {}", db_path.display());
     println!("  size:  {}", human_bytes(db_bytes));
     println!("  WAL:   {}", human_bytes(wal_bytes));
+    println!(
+        "  reclaimable: {}",
+        reclaimable
+            .map(human_bytes)
+            .unwrap_or_else(|| "unknown".into())
+    );
     println!(
         "  free:  {}",
         free.map(human_bytes).unwrap_or_else(|| "unknown".into())
@@ -2349,6 +2588,64 @@ fn doctor(db_path: &Path, json: bool) -> Result<()> {
         for problem in &problems {
             println!("  - {problem}");
         }
+    }
+    Ok(())
+}
+
+fn compact_report_json(report: &CompactReport, db_path: &Path) -> Value {
+    json!({
+        "db_path": db_path.display().to_string(),
+        "db_bytes_before": report.db_bytes_before,
+        "wal_bytes_before": report.wal_bytes_before,
+        "db_bytes_after": report.db_bytes_after,
+        "wal_bytes_after": report.wal_bytes_after,
+        "reclaimable_bytes_before": report.reclaimable_before,
+        "saved_bytes": report.saved_bytes(),
+        "fts_optimized": report.fts_optimized,
+        "wal_truncated": report.wal_truncated,
+    })
+}
+
+fn compact(db_path: &Path, json: bool) -> Result<()> {
+    if !json {
+        eprintln!(
+            "compacting {} (this rewrites the whole file; writers wait until it finishes)...",
+            db_path.display()
+        );
+    }
+    let report = compact_database(db_path)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&compact_report_json(&report, db_path))?
+        );
+        return Ok(());
+    }
+    let before = report.db_bytes_before + report.wal_bytes_before;
+    let after = report.db_bytes_after + report.wal_bytes_after;
+    println!("database: {}", db_path.display());
+    println!(
+        "  before: {} ({} + {} WAL)",
+        human_bytes(before),
+        human_bytes(report.db_bytes_before),
+        human_bytes(report.wal_bytes_before)
+    );
+    println!(
+        "  after:  {} ({} + {} WAL)",
+        human_bytes(after),
+        human_bytes(report.db_bytes_after),
+        human_bytes(report.wal_bytes_after)
+    );
+    let saved = report.saved_bytes();
+    if saved >= 0 {
+        println!("  saved:  {}", human_bytes(saved as u64));
+    } else {
+        println!("  grew:   {}", human_bytes(saved.unsigned_abs() as u64));
+    }
+    if !report.wal_truncated {
+        println!(
+            "  note:   a reader kept the WAL from being truncated; it shrinks at the next checkpoint once that reader closes"
+        );
     }
     Ok(())
 }
@@ -3624,6 +3921,76 @@ mod tests {
     use serde_json::{json, Value};
     use std::fs;
 
+    fn staged_with(dir: &Path, body: &[u8]) -> tempfile::NamedTempFile {
+        let mut staged = tempfile::NamedTempFile::new_in(dir).unwrap();
+        std::io::Write::write_all(&mut staged, body).unwrap();
+        staged
+    }
+
+    /// A replacement that fails must leave the old database's committed WAL
+    /// beside it, not deleted ahead of the rename.
+    #[test]
+    fn a_failed_sqlite_export_keeps_the_old_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.db");
+        fs::write(&dest, b"old main").unwrap();
+        fs::write(sqlite_sidecar(&dest, "-wal"), b"old wal").unwrap();
+
+        let error = install_sqlite_export(staged_with(dir.path(), b"new"), &dest, |_, _| {
+            anyhow::bail!("simulated rename failure")
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("simulated rename failure"));
+        assert_eq!(fs::read(&dest).unwrap(), b"old main");
+        assert_eq!(fs::read(sqlite_sidecar(&dest, "-wal")).unwrap(), b"old wal");
+        assert!(!parked_sidecar(&dest, "-wal").exists());
+    }
+
+    /// A sidecar that cannot be moved aside fails the export instead of
+    /// leaving it to pair with the new file.
+    #[test]
+    fn an_immovable_sidecar_fails_the_sqlite_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.db");
+        fs::write(&dest, b"old main").unwrap();
+        fs::write(sqlite_sidecar(&dest, "-wal"), b"old wal").unwrap();
+        fs::write(sqlite_sidecar(&dest, "-shm"), b"old shm").unwrap();
+        // A non-empty directory where -shm would be parked: the rename fails.
+        let blocker = parked_sidecar(&dest, "-shm");
+        fs::create_dir(&blocker).unwrap();
+        fs::write(blocker.join("keep"), b"x").unwrap();
+
+        let mut persisted = false;
+        let result = install_sqlite_export(staged_with(dir.path(), b"new"), &dest, |_, _| {
+            persisted = true;
+            Ok(())
+        });
+
+        assert!(result.is_err(), "a stuck sidecar must fail the export");
+        assert!(
+            !persisted,
+            "the new file was installed beside a stale sidecar"
+        );
+        assert_eq!(fs::read(&dest).unwrap(), b"old main");
+        assert_eq!(fs::read(sqlite_sidecar(&dest, "-wal")).unwrap(), b"old wal");
+        assert_eq!(fs::read(sqlite_sidecar(&dest, "-shm")).unwrap(), b"old shm");
+    }
+
+    #[test]
+    fn a_successful_sqlite_export_drops_the_old_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.db");
+        fs::write(&dest, b"old main").unwrap();
+        fs::write(sqlite_sidecar(&dest, "-wal"), b"old wal").unwrap();
+
+        install_sqlite_export(staged_with(dir.path(), b"new"), &dest, persist_export).unwrap();
+
+        assert_eq!(fs::read(&dest).unwrap(), b"new");
+        assert!(!sqlite_sidecar(&dest, "-wal").exists());
+        assert!(!parked_sidecar(&dest, "-wal").exists());
+    }
+
     /// A remote-scoped watch must install no local roots. If it did, the
     /// filesystem-event driver would be selected by local writes the run is
     /// not even collecting, and every one of them would fire the remote
@@ -4082,7 +4449,16 @@ mod tests {
         seed_exportable_history(&exported_from);
         let path = dir.path().join("history.jsonl");
 
-        export_history(&exported_from, Some(&path), "jsonl", None, None, None).unwrap();
+        export_history(
+            &exported_from,
+            Path::new(":memory:"),
+            Some(&path),
+            "jsonl",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         // One self-describing JSON object per row, oldest first.
         let body = fs::read_to_string(&path).unwrap();
@@ -4108,7 +4484,16 @@ mod tests {
         seed_exportable_history(&exported_from);
         let path = dir.path().join("history.jsonl.gz");
 
-        export_history(&exported_from, Some(&path), "jsonl", None, None, None).unwrap();
+        export_history(
+            &exported_from,
+            Path::new(":memory:"),
+            Some(&path),
+            "jsonl",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         // Really gzip, not JSONL that happens to be named .gz.
         assert_eq!(&fs::read(&path).unwrap()[..2], &[0x1f, 0x8b]);
@@ -4125,7 +4510,16 @@ mod tests {
         seed_exportable_history(&exported_from);
         let dest = dir.path().join("history-export.db");
 
-        export_history(&exported_from, Some(&dest), "sqlite", None, None, None).unwrap();
+        export_history(
+            &exported_from,
+            Path::new(":memory:"),
+            Some(&dest),
+            "sqlite",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         let exported = Connection::open(&dest).unwrap();
         assert_eq!(history_rows(&exported), history_rows(&exported_from));
@@ -4145,27 +4539,136 @@ mod tests {
         assert_eq!(history_rows(&restored), history_rows(&exported_from));
     }
 
+    /// Every destination spelling that reaches the live database, or one of
+    /// its sidecars, is refused for every format, whether the database was
+    /// picked by `--db` or `AI_HIST_DB`, and the live file is left intact.
     #[test]
-    fn a_sqlite_export_refuses_to_overwrite_the_active_database() {
+    fn an_export_refuses_every_destination_that_names_the_active_database() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().unwrap();
-        let active = dir.path().join("ai-history.db");
-        let _db_env = EnvVarGuard::set("AI_HIST_DB", &active);
+        // `--db` selects a database the default path knows nothing about.
+        let _db_env = EnvVarGuard::set("AI_HIST_DB", dir.path().join("default.db"));
+        let active = dir.path().join("mine.db");
         let conn = open_db(&active).unwrap();
         seed_exportable_history(&conn);
+        let before = fs::read(&active).unwrap();
 
-        let error = export_history(&conn, Some(&active), "sqlite", None, None, None)
-            .expect_err("exporting over the live database must fail");
-        assert!(
-            error
-                .to_string()
-                .contains("Refusing to export SQLite over the active AI_HIST_DB"),
-            "unexpected error: {error}"
-        );
+        let nested = dir.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+        let mut destinations = vec![
+            active.clone(),
+            nested.join("..").join("mine.db"),
+            sqlite_sidecar(&active, "-wal"),
+            sqlite_sidecar(&active, "-shm"),
+        ];
+        #[cfg(unix)]
+        {
+            let symlink = dir.path().join("alias.db");
+            std::os::unix::fs::symlink(&active, &symlink).unwrap();
+            destinations.push(symlink);
+            let hard_link = dir.path().join("hard.db");
+            fs::hard_link(&active, &hard_link).unwrap();
+            destinations.push(hard_link);
+        }
 
-        // The refusal happens before the destination is truncated, so the live
-        // history is still there.
+        for format in ["sqlite", "jsonl"] {
+            for dest in &destinations {
+                let error = export_history(&conn, &active, Some(dest), format, None, None, None)
+                    .expect_err("exporting over the live database must fail");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("Refusing to export over the active database"),
+                    "{format} to {}: unexpected error: {error}",
+                    dest.display()
+                );
+            }
+            let journal = sqlite_sidecar(&active, "-journal");
+            assert!(
+                export_history(&conn, &active, Some(&journal), format, None, None, None).is_err(),
+                "{format} over the rollback journal must fail"
+            );
+        }
+
+        assert_eq!(fs::read(&active).unwrap(), before);
         assert_eq!(history_count(&conn), 3);
+        assert_eq!(history_count(&open_db(&active).unwrap()), 3);
+    }
+
+    #[test]
+    fn the_default_sqlite_export_destination_is_guarded_too() {
+        let conn = fresh_db();
+        seed_exportable_history(&conn);
+        let error = export_history(
+            &conn,
+            Path::new(DEFAULT_SQLITE_EXPORT),
+            None,
+            "sqlite",
+            None,
+            None,
+            None,
+        )
+        .expect_err("the default export file is the active database here");
+        assert!(error
+            .to_string()
+            .contains("Refusing to export over the active database"));
+    }
+
+    #[test]
+    fn an_export_replaces_an_existing_destination_without_leaving_staging_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let exported_from = fresh_db();
+        seed_exportable_history(&exported_from);
+        let active = dir.path().join("ai-history.db");
+
+        for (format, name) in [
+            ("sqlite", "out.db"),
+            ("jsonl", "out.jsonl"),
+            ("jsonl", "out.jsonl.gz"),
+        ] {
+            let dest = dir.path().join(name);
+            fs::write(&dest, b"previous contents").unwrap();
+            // A stale sidecar from whatever used to live at the destination.
+            fs::write(sqlite_sidecar(&dest, "-wal"), b"stale").unwrap();
+            export_history(
+                &exported_from,
+                &active,
+                Some(&dest),
+                format,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+            let restored = fresh_db();
+            import_history(&restored, &dest, false).unwrap();
+            assert_eq!(history_rows(&restored), history_rows(&exported_from));
+        }
+        assert!(!sqlite_sidecar(&dir.path().join("out.db"), "-wal").exists());
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".partial"))
+            .collect();
+        assert!(leftovers.is_empty(), "staging files left: {leftovers:?}");
+    }
+
+    #[test]
+    fn a_failed_export_leaves_the_existing_destination_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = fresh_db();
+        let dest = dir.path().join("keep.db");
+        fs::write(&dest, b"previous contents").unwrap();
+        let active = dir.path().join("ai-history.db");
+
+        for format in ["sqlite", "jsonl", "parquet"] {
+            assert!(
+                export_history(&empty, &active, Some(&dest), format, None, None, None).is_err()
+            );
+            assert_eq!(fs::read(&dest).unwrap(), b"previous contents");
+        }
     }
 
     #[test]
@@ -4174,7 +4677,16 @@ mod tests {
         let exported_from = fresh_db();
         seed_exportable_history(&exported_from);
         let path = dir.path().join("history.jsonl");
-        export_history(&exported_from, Some(&path), "jsonl", None, None, None).unwrap();
+        export_history(
+            &exported_from,
+            Path::new(":memory:"),
+            Some(&path),
+            "jsonl",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         let restored = fresh_db();
         import_history(&restored, &path, false).unwrap();
@@ -4190,7 +4702,16 @@ mod tests {
         let exported_from = fresh_db();
         seed_exportable_history(&exported_from);
         let path = dir.path().join("history.jsonl");
-        export_history(&exported_from, Some(&path), "jsonl", None, None, None).unwrap();
+        export_history(
+            &exported_from,
+            Path::new(":memory:"),
+            Some(&path),
+            "jsonl",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         let restored = fresh_db();
         import_history(&restored, &path, true).unwrap();
@@ -4246,6 +4767,35 @@ mod tests {
     }
 
     #[test]
+    fn compact_keeps_the_history_and_reports_what_it_did() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ai-history.db");
+        let conn = open_db(&db_path).unwrap();
+        seed_exportable_history(&conn);
+        let rows = |conn: &Connection| -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))
+                .unwrap()
+        };
+        let before = rows(&conn);
+        drop(conn);
+
+        let report = compact_report_json(&compact_database(&db_path).unwrap(), &db_path);
+        for field in [
+            "db_bytes_before",
+            "wal_bytes_before",
+            "db_bytes_after",
+            "wal_bytes_after",
+            "reclaimable_bytes_before",
+        ] {
+            assert!(report[field].is_u64(), "{field}: {report}");
+        }
+        assert_eq!(report["wal_bytes_after"], json!(0));
+        assert_eq!(report["wal_truncated"], json!(true));
+        assert!(report["saved_bytes"].is_i64(), "{report}");
+        assert_eq!(rows(&open_db(&db_path).unwrap()), before);
+    }
+
+    #[test]
     fn doctor_reports_a_healthy_database_with_every_field_it_promises() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("ai-history.db");
@@ -4257,6 +4807,7 @@ mod tests {
         assert_eq!(report["db_path"], db_path.display().to_string());
         assert!(report["db_bytes"].as_u64().unwrap() > 0, "{report}");
         assert!(report["wal_bytes"].as_u64().is_some(), "{report}");
+        assert!(report["reclaimable_bytes"].is_u64(), "{report}");
         assert!(
             report["free_bytes"].is_u64() || report["free_bytes"].is_null(),
             "{report}"

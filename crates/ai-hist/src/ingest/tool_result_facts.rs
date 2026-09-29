@@ -30,7 +30,14 @@ use sha2::{Digest, Sha256};
 pub const EVENT_SOURCE_TOOL_RESULT: &str = "tool_result";
 /// A harness notification that a delegated subagent finished.
 pub const EVENT_SOURCE_SUBAGENT_NOTIFICATION: &str = "subagent_notification";
-/// A Codex `function_call_output` / `custom_tool_call_output` response item.
+/// A result recorded on a record of its own (or on the call's own record)
+/// rather than as a block of a user message: a Codex `function_call_output` /
+/// `custom_tool_call_output` response item, a Grok `tool_result` chat line, or
+/// the `output` of an OpenCode tool part.
+///
+/// The distinction from [`EVENT_SOURCE_TOOL_RESULT`] is load-bearing:
+/// `session_user_turns_page` counts only `tool_result` rows as blocks of a user
+/// turn, and a standalone output is not part of anything the user sent.
 pub const EVENT_SOURCE_FUNCTION_CALL_OUTPUT: &str = "function_call_output";
 
 /// The result is known to have finished without an error.
@@ -54,6 +61,10 @@ pub const ERROR_SIGNAL_PATCH_APPLY: &str = "patch_apply";
 pub const ERROR_SIGNAL_MCP_ERR: &str = "mcp_err";
 /// A harness subagent notification reporting a failed or cancelled child.
 pub const ERROR_SIGNAL_SUBAGENT_STATUS: &str = "subagent_status";
+/// The provider's own terminal status on the tool call: an OpenCode tool
+/// part's `state.status`, or the `status` of Grok's last ACP update for the
+/// call.
+pub const ERROR_SIGNAL_TOOL_STATUS: &str = "tool_status";
 
 /// Harness truncation markers, matched case-insensitively.
 ///
@@ -343,6 +354,80 @@ pub fn codex_output_facts(output: &Value, call_id: &str) -> ToolResultFacts {
     facts
 }
 
+/// Facts for one Cursor `tool_result` content block.
+///
+/// Cursor writes Claude-shaped blocks (`tool_use_id`, `content`, `is_error`)
+/// inside a message record, so they are measured and classified exactly as
+/// Claude's are, and they are a block of that message
+/// ([`EVENT_SOURCE_TOOL_RESULT`]).
+pub fn cursor_tool_result_facts(block: &Value) -> ToolResultFacts {
+    claude_tool_result_facts(block)
+}
+
+/// Facts for one Grok `tool_result` chat line.
+///
+/// Grok records a call's failure in two places and neither is always present:
+/// the line's own `is_error`, and the terminal `status` of the call's last ACP
+/// update in `updates.jsonl`. The line's flag wins when it says the call
+/// failed, because it is the more specific claim. With neither signal the
+/// status is `unknown`: `updates.jsonl` can be missing, and a result line is
+/// not by itself a statement that the call succeeded.
+pub fn grok_tool_result_facts(
+    content: &Value,
+    call_id: Option<&str>,
+    is_error: Option<bool>,
+    acp_status: Option<&str>,
+) -> ToolResultFacts {
+    let mut facts = ToolResultFacts::from_payload(content);
+    facts.event_source = Some(EVENT_SOURCE_FUNCTION_CALL_OUTPUT.to_string());
+    facts.tool_use_id = call_id.filter(|id| !id.is_empty()).map(str::to_string);
+    let acp = acp_status.map(str::to_ascii_lowercase);
+    let (status, signal) = match (is_error, acp.as_deref()) {
+        (Some(true), _) => (STATUS_ERRORED, Some(ERROR_SIGNAL_TOOL_RESULT)),
+        (_, Some("failed" | "error")) => (STATUS_ERRORED, Some(ERROR_SIGNAL_TOOL_STATUS)),
+        (_, Some("cancelled" | "canceled")) => (STATUS_CANCELLED, Some(ERROR_SIGNAL_TOOL_STATUS)),
+        (Some(false), _) | (_, Some("completed")) => (STATUS_COMPLETED, None),
+        _ => (STATUS_UNKNOWN, None),
+    };
+    facts.result_status = Some(status.to_string());
+    facts.error_signal = signal.map(str::to_string);
+    facts
+}
+
+/// Facts for the `output` of one finished OpenCode tool part.
+///
+/// The output lives on the assistant message's tool part, not on anything the
+/// user sent, so it is a standalone output
+/// ([`EVENT_SOURCE_FUNCTION_CALL_OUTPUT`]). A non-zero `metadata.exit` is the
+/// more specific failure and is named first; otherwise `state.status` says how
+/// the call ended.
+pub fn opencode_tool_result_facts(
+    output: &Value,
+    call_id: &str,
+    state: Option<&Map<String, Value>>,
+) -> ToolResultFacts {
+    let mut facts = ToolResultFacts::from_payload(output);
+    facts.event_source = Some(EVENT_SOURCE_FUNCTION_CALL_OUTPUT.to_string());
+    facts.tool_use_id = (!call_id.is_empty()).then(|| call_id.to_string());
+    let exit = state
+        .and_then(|state| state.get("metadata"))
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get("exit"))
+        .and_then(Value::as_i64);
+    let status = state
+        .and_then(|state| state.get("status"))
+        .and_then(Value::as_str);
+    let (result_status, signal) = match (exit, status) {
+        (Some(code), _) if code != 0 => (STATUS_ERRORED, Some(ERROR_SIGNAL_EXIT_CODE)),
+        (_, Some("error")) => (STATUS_ERRORED, Some(ERROR_SIGNAL_TOOL_STATUS)),
+        (_, Some("completed")) => (STATUS_COMPLETED, None),
+        _ => (STATUS_UNKNOWN, None),
+    };
+    facts.result_status = Some(result_status.to_string());
+    facts.error_signal = signal.map(str::to_string);
+    facts
+}
+
 fn first_str(line: &Map<String, Value>, keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| {
         line.get(*key)
@@ -493,5 +578,83 @@ mod tests {
         );
         assert_eq!(facts.tool_use_id.as_deref(), Some("call_1"));
         assert_eq!(facts.payload_bytes, Some(2));
+    }
+
+    #[test]
+    fn cursor_block_is_measured_like_a_claude_block() {
+        let block = json!({
+            "type": "tool_result",
+            "tool_use_id": "toolu_cursor_1",
+            "content": "ok",
+            "is_error": false,
+        });
+        assert_eq!(
+            cursor_tool_result_facts(&block),
+            claude_tool_result_facts(&block)
+        );
+    }
+
+    #[test]
+    fn grok_result_names_which_of_its_two_signals_failed_it() {
+        let own = grok_tool_result_facts(&json!("boom"), Some("call_1"), Some(true), None);
+        assert_eq!(own.result_status.as_deref(), Some(STATUS_ERRORED));
+        assert_eq!(own.error_signal.as_deref(), Some(ERROR_SIGNAL_TOOL_RESULT));
+        assert_eq!(
+            own.event_source.as_deref(),
+            Some(EVENT_SOURCE_FUNCTION_CALL_OUTPUT)
+        );
+        assert_eq!(own.tool_use_id.as_deref(), Some("call_1"));
+        assert_eq!(own.payload_bytes, Some(4));
+
+        let acp = grok_tool_result_facts(&json!("x"), Some("call_1"), None, Some("failed"));
+        assert_eq!(acp.result_status.as_deref(), Some(STATUS_ERRORED));
+        assert_eq!(acp.error_signal.as_deref(), Some(ERROR_SIGNAL_TOOL_STATUS));
+
+        let cancelled = grok_tool_result_facts(&json!("x"), None, None, Some("Cancelled"));
+        assert_eq!(cancelled.result_status.as_deref(), Some(STATUS_CANCELLED));
+        assert_eq!(cancelled.tool_use_id, None);
+
+        let done = grok_tool_result_facts(&json!("x"), None, None, Some("completed"));
+        assert_eq!(done.result_status.as_deref(), Some(STATUS_COMPLETED));
+        assert_eq!(done.error_signal, None);
+    }
+
+    #[test]
+    fn grok_result_with_no_signal_is_unknown_not_completed() {
+        let facts = grok_tool_result_facts(&json!("x"), Some("call_1"), None, None);
+        assert_eq!(facts.result_status.as_deref(), Some(STATUS_UNKNOWN));
+        assert_eq!(facts.error_signal, None);
+    }
+
+    #[test]
+    fn opencode_output_prefers_the_exit_code_over_the_part_status() {
+        let failed_exit = json!({ "status": "completed", "metadata": { "exit": 1 } });
+        let facts = opencode_tool_result_facts(
+            &json!("ERROR: tests failed"),
+            "call_fail",
+            failed_exit.as_object(),
+        );
+        assert_eq!(facts.result_status.as_deref(), Some(STATUS_ERRORED));
+        assert_eq!(facts.error_signal.as_deref(), Some(ERROR_SIGNAL_EXIT_CODE));
+        assert_eq!(facts.tool_use_id.as_deref(), Some("call_fail"));
+        assert_eq!(facts.payload_bytes, Some(19));
+
+        let errored = json!({ "status": "error" });
+        let facts = opencode_tool_result_facts(&json!("x"), "c", errored.as_object());
+        assert_eq!(facts.result_status.as_deref(), Some(STATUS_ERRORED));
+        assert_eq!(
+            facts.error_signal.as_deref(),
+            Some(ERROR_SIGNAL_TOOL_STATUS)
+        );
+
+        let ok = json!({ "status": "completed", "metadata": { "exit": 0 } });
+        let facts = opencode_tool_result_facts(&json!({ "b": 1, "a": 2 }), "c", ok.as_object());
+        assert_eq!(facts.result_status.as_deref(), Some(STATUS_COMPLETED));
+        assert_eq!(facts.error_signal, None);
+        assert_eq!(facts.payload_hash, Some(content_hash(br#"{"a":2,"b":1}"#)));
+
+        let facts = opencode_tool_result_facts(&json!("x"), "", None);
+        assert_eq!(facts.result_status.as_deref(), Some(STATUS_UNKNOWN));
+        assert_eq!(facts.tool_use_id, None);
     }
 }

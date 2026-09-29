@@ -79,6 +79,10 @@ name = "hydration_preflight"
 required-features = ["unstable-internal"]
 
 [[test]]
+name = "opencode_channels"
+required-features = ["unstable-internal"]
+
+[[test]]
 name = "opencode_parity"
 required-features = ["unstable-internal"]
 

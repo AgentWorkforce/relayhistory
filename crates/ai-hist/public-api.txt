@@ -460,6 +460,7 @@ pub ai_hist::ProviderRoots::codex: std::path::PathBuf
 pub ai_hist::ProviderRoots::grok: std::path::PathBuf
 pub ai_hist::ProviderRoots::home: std::path::PathBuf
 pub ai_hist::ProviderRoots::opencode_db: std::path::PathBuf
+pub ai_hist::ProviderRoots::opencode_db_pinned: bool
 pub ai_hist::ProviderRoots::opencode_storage_dir: std::path::PathBuf
 pub ai_hist::ProviderRoots::trajectory_roots: core::option::Option<alloc::vec::Vec<std::path::PathBuf>>
 pub ai_hist::ProviderRoots::use_env_roots: bool

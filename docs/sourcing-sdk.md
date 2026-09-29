@@ -659,7 +659,7 @@ handle.
 | claude | ✓ | ✓ | ✓ | ✓ | ✓ | per-message |
 | codex | ✓ | ✓ | ✓ | ✓ | ✓ | cumulative-delta |
 | cursor | ✓ | ✓ | ✓ | ✓ | — | none |
-| grok | ✓ | ✓ | ✓ | ✓ | ✓ | none |
+| grok | ✓ | ✓ | ✓ | ✓ | ✓ | per-request |
 | opencode | ✓ | ✓ | ✓ | ✓ | ✓ | none |
 | relay | — | — | — | — | — | none |
 | trajectory | — | — | — | — | — | none |

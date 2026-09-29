@@ -6,7 +6,7 @@ use rusqlite::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -692,10 +692,18 @@ const REQUIRED_INDEXES: &[&str] = &[
     "idx_session_presences_locator",
     "idx_session_relationships_parent",
     "idx_session_relationships_child",
+    // The sync walk's per-transcript "is this a sidecar we already indexed?"
+    // probe keys on the evidence locator.
+    "idx_session_relationships_locator",
     // Continuity reconciliation resolves a transcript's first parent uuid
     // against the record that carries it, across every session. Without this
     // that is a scan of every event on every hydration.
     "idx_session_events_message",
+    // Settling a streamed Claude request's usage reads every row of that
+    // request once per assistant record; without it that is a scan of the
+    // session per record. Also what routes a database stored before the
+    // settlement through the writable open that heals it.
+    "idx_session_events_provider_message",
     "idx_session_continuity_parent_uuid",
     "idx_session_continuity_pending",
     "idx_sessions_project_key",
@@ -1527,6 +1535,13 @@ VALUES ('session_presences_local_backfill_v1');
         "CREATE INDEX IF NOT EXISTS idx_session_relationships_child ON session_relationships(source, child_session_id)",
         [],
     )?;
+    // The sync walk asks, for every Claude transcript it considers, whether a
+    // delegation edge names that file as its evidence. Without this, each
+    // question is a scan of every Claude relationship.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_relationships_locator ON session_relationships(source, evidence_locator)",
+        [],
+    )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_session_continuity_parent_uuid ON session_continuity_evidence(source, first_parent_uuid)",
         [],
@@ -1612,6 +1627,32 @@ VALUES ('session_presences_local_backfill_v1');
         "INSERT OR IGNORE INTO schema_migrations (name) VALUES ('session_markers_v1');",
     )?;
     migrate_session_markers_v2(conn)?;
+    // Partial: only rows that name a provider message carry a key. On
+    // `message.id` rather than `requestId` because settlement always names the
+    // message and only sometimes the request: a transcript that writes no
+    // `requestId` is grouped on `message.id` alone.
+    // An earlier revision indexed `request_id` under this name.
+    conn.execute("DROP INDEX IF EXISTS idx_session_events_request", [])?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_events_provider_message \
+         ON session_events(source, session_id, provider_message_id) \
+         WHERE provider_message_id IS NOT NULL",
+        [],
+    )?;
+    // Rows stored before the parser settled streamed Claude requests and
+    // reclassified `<synthetic>` notices. Both repairs read only the stored
+    // rows, so they run here once instead of waiting for every transcript to
+    // be re-read. After the marker migration, whose columns the notices move
+    // into.
+    // v2 because the summary repair joined the pass after a revision had
+    // already recorded v1 without it; every step is idempotent.
+    if !migration_applied(conn, "claude_request_evidence_v2")? {
+        crate::ingest::heal_claude_request_evidence(conn)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (name) VALUES ('claude_request_evidence_v2')",
+            [],
+        )?;
+    }
     // Derived from `session_events`, so it must come after the DDL and the
     // column migrations above, and needs no backfill: the first query over an
     // upgraded database already sees every request its events describe.
@@ -2376,7 +2417,8 @@ pub struct SessionEvent {
     /// `tool_result` / `subagent_notification` / `function_call_output`.
     pub event_source: Option<String>,
     /// Which provider signal set the error: `tool_result.is_error`,
-    /// `exit_code`, `patch_apply`, `mcp_err`, or `subagent_status`.
+    /// `exit_code`, `patch_apply`, `mcp_err`, `subagent_status`, or
+    /// `tool_status`.
     pub error_signal: Option<String>,
     /// Delegated child session this result reports on.
     pub subagent_session_id: Option<String>,
@@ -4317,20 +4359,58 @@ fn opencode_backup_requested() -> bool {
 /// cost is proportional to the history actually read rather than to the size
 /// of the provider's database.
 pub fn sync_opencode_db(conn: &Connection, opencode_db: &Path) -> Result<usize> {
-    let files = if opencode_db.is_file() {
-        vec![opencode_db]
-    } else {
-        vec![]
-    };
-    let mut inserted = 0;
-    for path in crate::ingest::capture_files("opencode", files) {
-        inserted += sync_opencode_db_file(conn, path)?;
-    }
-    crate::ingest::check_capture_cancelled()?;
-    Ok(inserted)
+    sync_opencode_dbs(conn, &[opencode_db.to_path_buf()])
 }
 
-fn sync_opencode_db_file(conn: &Connection, opencode_db: &Path) -> Result<usize> {
+/// Index every session in each OpenCode store, in order.
+///
+/// OpenCode keeps one database per release channel, and the caller passes
+/// them in [`crate::paths::opencode_db_files`] order. A session present in
+/// more than one is claimed by the first store that holds it — the same rule
+/// discovery applies — so it is indexed once, from the store its catalog row
+/// names, rather than rewritten by each store in turn. One store's failure is
+/// that store's: the rest are still indexed, and the error names every store
+/// that failed.
+pub fn sync_opencode_dbs(conn: &Connection, opencode_dbs: &[PathBuf]) -> Result<usize> {
+    let files: Vec<&Path> = opencode_dbs
+        .iter()
+        .map(PathBuf::as_path)
+        .filter(|path| path.is_file())
+        .collect();
+    let mut inserted = 0;
+    let mut claimed = BTreeSet::new();
+    let mut failures: Vec<anyhow::Error> = Vec::new();
+    for path in crate::ingest::capture_files("opencode", files) {
+        match sync_opencode_db_file(conn, path, &mut claimed) {
+            Ok(count) => inserted += count,
+            Err(error) => {
+                // Cancellation ends the whole sweep, not one store.
+                crate::ingest::check_capture_cancelled()?;
+                failures.push(error);
+            }
+        }
+    }
+    crate::ingest::check_capture_cancelled()?;
+    match failures.len() {
+        0 => Ok(inserted),
+        1 => Err(failures.remove(0)),
+        _ => anyhow::bail!(
+            "{} OpenCode stores could not be fully indexed (the rest were): {}",
+            failures.len(),
+            failures
+                .iter()
+                .map(|error| format!("{error:#}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ),
+    }
+}
+
+fn sync_opencode_db_file(
+    conn: &Connection,
+    opencode_db: &Path,
+    claimed: &mut BTreeSet<String>,
+) -> Result<usize> {
     crate::ingest::check_capture_cancelled()?;
     // `is_file`, the same question `OpencodeLayout::detect` asks. `exists` is
     // true for a directory, and `OPENCODE_DB` is an arbitrary path, so the
@@ -4357,7 +4437,7 @@ fn sync_opencode_db_file(conn: &Connection, opencode_db: &Path) -> Result<usize>
         src.execute_batch(
             "CREATE INDEX IF NOT EXISTS ai_hist_sync_part_session ON part(session_id);",
         )?;
-        return sync_opencode_sessions_from_source(conn, &src, opencode_db);
+        return sync_opencode_sessions_from_source(conn, &src, opencode_db, claimed);
     }
     let src = Connection::open_with_flags(
         opencode_db,
@@ -4366,7 +4446,7 @@ fn sync_opencode_db_file(conn: &Connection, opencode_db: &Path) -> Result<usize>
     .with_context(|| format!("opening {}", opencode_db.display()))?;
     src.busy_timeout(std::time::Duration::from_secs(5))?;
     src.execute_batch("BEGIN")?;
-    let result = sync_opencode_sessions_from_source(conn, &src, opencode_db);
+    let result = sync_opencode_sessions_from_source(conn, &src, opencode_db, claimed);
     let _ = src.execute_batch("ROLLBACK");
     result
 }
@@ -4423,10 +4503,13 @@ pub fn sync_opencode_storage_dir(conn: &Connection, storage_dir: &Path) -> Resul
     Ok(inserted)
 }
 
+/// `claimed` holds the sessions an earlier store already owns; they are
+/// skipped here, and this store's own sessions are added to it.
 fn sync_opencode_sessions_from_source(
     conn: &Connection,
     src: &Connection,
     raw_path: &Path,
+    claimed: &mut BTreeSet<String>,
 ) -> Result<usize> {
     crate::ingest::check_capture_cancelled()?;
     let raw_path = raw_path.to_string_lossy().into_owned();
@@ -4445,6 +4528,9 @@ fn sync_opencode_sessions_from_source(
         crate::ingest::opencode::OpencodeSyncPlan::PerSession => {
             for session_id in crate::ingest::opencode::list_sqlite_session_ids(src)? {
                 crate::ingest::check_capture_cancelled()?;
+                if !claimed.insert(session_id.clone()) {
+                    continue;
+                }
                 let indexed = crate::ingest::opencode::load_from_sqlite(src, &session_id).and_then(
                     |loaded| match loaded {
                         Some(loaded) => {
@@ -4463,13 +4549,27 @@ fn sync_opencode_sessions_from_source(
         crate::ingest::opencode::OpencodeSyncPlan::SinglePass => {
             crate::ingest::check_capture_cancelled()?;
             let load = crate::ingest::opencode::load_all_from_sqlite(src)?;
+            // Decided before anything is written, over every session this
+            // store holds — readable or not — so a session that failed here
+            // is not then indexed from a later store behind this one's back.
+            let already_claimed: BTreeSet<String> = load
+                .failures
+                .iter()
+                .map(|failure| failure.session_id.clone())
+                .chain(load.sessions.iter().map(|loaded| loaded.session.id.clone()))
+                .filter(|session_id| !claimed.insert(session_id.clone()))
+                .collect();
             failures.extend(
                 load.failures
                     .iter()
+                    .filter(|failure| !already_claimed.contains(&failure.session_id))
                     .map(|failure| format!("{}: {}", failure.session_id, failure.error)),
             );
             for loaded in load.sessions {
                 crate::ingest::check_capture_cancelled()?;
+                if already_claimed.contains(&loaded.session.id) {
+                    continue;
+                }
                 match crate::ingest::opencode::normalize(conn, &loaded, &raw_path) {
                     Ok(counts) => inserted += counts.prompts,
                     Err(error) => failures.push(format!("{}: {error:#}", loaded.session.id)),
@@ -7465,9 +7565,15 @@ mod tests {
     /// A pre-usage database also predates the derived request view. SQLite
     /// refuses to drop one of the view's source columns while the view still
     /// references it, so the legacy shape is modelled without it.
+    /// Also the index over `provider_message_id`, which SQLite will not let a
+    /// column drop leave dangling: a database from before the raw facts had
+    /// neither.
     fn drop_session_requests_view(conn: &Connection) {
-        conn.execute_batch("DROP VIEW IF EXISTS session_requests;")
-            .unwrap();
+        conn.execute_batch(
+            "DROP VIEW IF EXISTS session_requests; \
+             DROP INDEX IF EXISTS idx_session_events_provider_message;",
+        )
+        .unwrap();
     }
 
     /// A fresh database and a migrated one must end up with the same

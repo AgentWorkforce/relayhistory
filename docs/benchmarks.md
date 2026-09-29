@@ -640,3 +640,108 @@ records. The unchanged hydration path does what it claims: 7.8 ms, 135 ms and
 
 None of this is optimized here. Recording it is the point: the parity issues in
 #160 can now show a before and an after.
+
+### 2026-09-28 sweep profile and the tokscale techniques (#215)
+
+Issue #215 asked whether relayhistory should adopt three techniques from
+[tokscale](https://github.com/junhoyeo/tokscale): a parallel `rayon` + `walkdir`
+scan, typed (and possibly SIMD) JSON deserialization, and sampled-content file
+fingerprints. The answer depends on where a sweep's time actually goes, so this
+section measures that first.
+
+**How it was measured.** Apple M4 Pro (12 cores, 24 GiB), macOS, release build,
+the `full` profile's 100 MB store (seed 176, 4,399 files, 3,518 sessions).
+`Bytes read` comes from `/proc/self/io` and so is Linux-only; on this machine
+the attribution is by CPU sampling instead — macOS `sample` against the release
+`ai-hist sync` process on the same store, frames aggregated inclusively. These
+numbers are not comparable with the Linux baseline above; the before/after
+pairs below are each from one machine.
+
+```bash
+node scripts/benchmark-sync.mjs --profile full --large-session-bytes 1048576
+```
+
+| Phase (harness) | `main` @ `66ed973` | with the probe fix |
+|---|---:|---:|
+| `cold_sync` | 59.98 s | 42.59 s |
+| `incremental_sync` (1 KiB appended) | 6.97 s | 2.12 s |
+| `unchanged_sync` | 65.2 ms | 76.4 ms |
+| `hydrate_cold` (1 MB) | 147.8 ms | 178.0 ms |
+| `hydrate_unchanged` (1 MB) | 3.0 ms | 3.4 ms |
+
+The unchanged and hydration rows are within run-to-run noise; neither touches
+the changed code.
+
+#### Where an incremental sweep went
+
+The source fingerprint already makes an unchanged tick stat-only (65 ms), so
+the interesting tick is one where something *did* change and the whole sweep
+runs. Share of samples in the release CLI's sync after one Claude append:
+
+| Frame (inclusive) | `main` | after the fix |
+|---|---:|---:|
+| Claude walk, of which the "has this path left evidence?" probe | 75%, **72%** | 12%, <1% |
+| `refresh_project_identity` (after sync + inside discovery) | 11% | 43% |
+| Discovery (`discover_sessions_with_providers`) | 12% | 39% |
+| Transcript cursor window digests (`prefix_window_digest_counted`) | 2.2% | 9% |
+| Directory walk (`collect_matching_files`) | 1.7% | 2% |
+| Flat-log whole-prefix SHA-256 (`hash_file_prefix`) | 0.3% | 0.8% |
+| JSON parsing (`serde_json`) | <0.5% | <0.5% |
+
+The 72% was one query. `claude_transcript_events_exist` joins `sessions` to
+`session_events` on a path; with no `sqlite_stat1` (the crate never runs
+`ANALYZE`) SQLite chose `session_events` as the outer table, so answering it
+for a path with no catalog row — every subagent sidecar, every new transcript —
+walked every Claude event: 12 ms per file at 138 K events, against 0.03 ms keyed
+on `idx_sessions_raw_path`. That is O(files × events), so it grows with the
+database, which is the shape #42 reported on a 930 MB store. The fix pins the
+join order (`CROSS JOIN`) on that probe and the two backfill probes built the
+same way, and adds `idx_session_relationships_locator` for the sidecar probe,
+which otherwise scanned every Claude relationship per file. A plan test
+(`claude_walk_probes_are_keyed_searches`) checks all four with and without
+statistics.
+
+#### Where a cold sweep goes
+
+Share of samples in the release CLI's cold sync, after the fix:
+
+| Frame (inclusive) | Share |
+|---|---:|
+| `sqlite3_step` | 89% |
+| `pwrite` (WAL frames) | 38% |
+| `fsync` | 35% |
+| WAL checkpoint | 12% |
+| File `read` | 6% |
+| Claude record scan (`scan_claude_session_file_resumed`) | 3.5% |
+| JSON parsing (`serde_json`) | <1% |
+
+A cold sweep is write-bound: every evidence row is its own autocommit at the
+default `synchronous = FULL`. Two measured prototypes, neither shipped:
+
+| Prototype (cold sync, CLI, same store) | Time |
+|---|---:|
+| as shipped here | 76.1 s |
+| `PRAGMA synchronous = NORMAL` for the sweep | 60.1 s (−21%) |
+| one transaction per Claude transcript ingest | 71.7 s (−6%) |
+
+(The CLI is slower than the harness above because it also runs catalog
+discovery and project-identity maintenance.) `synchronous = NORMAL` is what
+discovery already uses for its own reconstructible writes; extending it to the
+sweep is a durability decision — on power loss the last commits can vanish
+while `.sync-state.json` stamps survive — that the destination marker is meant
+to detect, and it wants its own review rather than riding along here.
+
+#### Decisions
+
+| Technique | Decision | Why |
+|---|---|---|
+| `rayon` parallel parse | **Reject for now** | Parsing is under 1% of a cold sweep and under 0.5% of an incremental one; writes are serialized behind one connection and are ~90% of the cold cost. Parallelism has nothing to speed up. |
+| `walkdir` with trusted `file_type()` | **Already adopted** | `collect_matching_files_inner` trusts `DirEntry::file_type()` and stats only symlinks. The walk is ~2% of a sweep. |
+| Typed / SIMD JSON envelopes | **Reject for now** | `serde_json::Value` construction is under 1% of any phase measured. Revisit only if a profile shows it. |
+| Sampled-content fingerprints | **Adopted for transcripts; defer for flat logs** | Transcript cursors already hash a head-and-tail window (`prefix_window_digest_counted`), not the whole prefix. The whole-prefix SHA-256 remains on the three flat logs (`CompleteJsonlReader`), at under 1% of a sweep on this store; it is the byte-exact resume guard, so it stays until a profile says otherwise. |
+
+The next costs, in order, are the global `refresh_project_identity` passes
+(each a scan of `session_events`, run twice per sweep: 43% of the remaining
+incremental tick) and the cold sweep's per-row commits. The CI gate thresholds
+are unchanged: they are baselined per runner class, and these numbers are from
+a developer machine.

@@ -977,9 +977,14 @@ const SESSIONS_SQL: &str = "SELECT source, session_id, cwd, git_branch, first_ac
      last_activity_ms, last_assistant_text, raw_path, first_prompt, models_json, \
      originator, agent_version, repo_url, initial_commit, workspace_roots_json, source_stamp, \
      discovery_state FROM sessions ORDER BY source, session_id";
+/// The tool-result fidelity columns (#171) are selected too: they are
+/// measured from the raw provider payload, so a parser change that moves a
+/// byte count, a status or an error signal shows up in the snapshot diff.
 const SESSION_EVENTS_SQL: &str =
     "SELECT source, session_id, project, cwd, git_branch, message_id, \
-     parent_id, ts_ms, role, kind, text, model, token_json, event_uid, control_kind \
+     parent_id, ts_ms, role, kind, text, model, token_json, event_uid, control_kind, \
+     tool_use_id, payload_bytes, payload_truncated, payload_hash, call_index, event_index, \
+     result_status, event_source, error_signal, subagent_session_id, agent_id \
      FROM session_events ORDER BY source, session_id, ts_ms, event_uid";
 /// `marker_uid` is derived from the provider record, not from insertion
 /// order, so it is a stable key to select and sort by.
@@ -2219,45 +2224,184 @@ fn codex_session_meta_relationship_ids_are_recorded() {
     assert!(parents.contains("sess_fork_base"), "{relationships:?}");
 }
 
+/// The `session_events` rows of a fixture that record a tool result.
+fn tool_results(key: &str) -> Vec<&Value> {
+    rows(key, "session_events")
+        .iter()
+        .filter(|event| text(event, "kind") == "tool_result")
+        .collect()
+}
+
+/// The one tool result a fixture recorded for `tool_use_id`.
+fn tool_result<'a>(key: &'a str, tool_use_id: &str) -> &'a Value {
+    let matching = rows(key, "session_events")
+        .iter()
+        .filter(|event| {
+            text(event, "kind") == "tool_result" && text(event, "tool_use_id") == tool_use_id
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "{key}: results for {tool_use_id}");
+    matching[0]
+}
+
 /// burn: `measure_tool_result_populates_byte_length_and_truncation_flag` — the
 /// size of a tool result is the fact that decides whether it was truncated.
+/// The fixture is 80 000 literal characters with no harness marker, so burn's
+/// own reader reports it untruncated too.
 #[test]
-#[ignore = "closed by #171"]
 fn claude_oversized_tool_result_records_its_byte_length() {
-    let results = rows("claude/oversized-bash-output", "tool_results");
+    let results = tool_results("claude/oversized-bash-output");
     assert_eq!(results.len(), 1, "{results:?}");
-    assert!(
-        field(&results[0], "bytes").as_i64().unwrap_or_default() > 70_000,
-        "{results:?}"
-    );
+    assert_eq!(field(results[0], "payload_bytes").as_i64(), Some(80_000));
+    assert_eq!(field(results[0], "payload_truncated").as_i64(), Some(0));
+    assert_eq!(text(results[0], "event_source"), "tool_result");
+    assert_eq!(text(results[0], "tool_use_id"), "tu_bash_big");
 }
 
 /// burn: the codex shell output fixture is the same fact on the other
 /// provider.
 #[test]
-#[ignore = "closed by #171"]
 fn codex_oversized_shell_output_records_its_byte_length() {
-    let results = rows("codex/oversized-shell-output", "tool_results");
+    let results = tool_results("codex/oversized-shell-output");
     assert_eq!(results.len(), 1, "{results:?}");
-    assert!(
-        field(&results[0], "bytes").as_i64().unwrap_or_default() > 70_000,
-        "{results:?}"
-    );
+    assert_eq!(field(results[0], "payload_bytes").as_i64(), Some(80_000));
+    assert_eq!(field(results[0], "payload_truncated").as_i64(), Some(0));
+    assert_eq!(text(results[0], "event_source"), "function_call_output");
+    assert_eq!(text(results[0], "result_status"), "completed");
 }
 
 /// burn: `user_turn_blocks_text_and_tool_results` — three user records, the
-/// middle two carrying tool_result blocks of very different sizes.
+/// middle two carrying tool_result blocks of very different sizes, one of
+/// them failed by Claude's own `is_error`.
 #[test]
-#[ignore = "closed by #171"]
 fn claude_user_turn_tool_result_blocks_are_indexed_individually() {
-    let results = rows("claude/user-turn-blocks", "tool_results");
+    let key = "claude/user-turn-blocks";
+    let results = tool_results(key);
     assert_eq!(results.len(), 3, "{results:?}");
-    assert!(
-        results
-            .iter()
-            .any(|result| field(result, "is_error").as_i64() == Some(1)),
-        "{results:?}"
+    let indexed = results
+        .iter()
+        .map(|result| {
+            (
+                text(result, "tool_use_id"),
+                field(result, "payload_bytes").as_i64(),
+                field(result, "event_index").as_i64(),
+                field(result, "call_index").as_i64(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        indexed,
+        [
+            ("tu_bash_1", Some(4), Some(0), Some(0)),
+            ("tu_read_1", Some(100), Some(1), Some(0)),
+            ("tu_bash_2", Some(15), Some(2), Some(0)),
+        ]
     );
+    let failed = tool_result(key, "tu_bash_2");
+    assert_eq!(text(failed, "result_status"), "errored");
+    assert_eq!(text(failed, "error_signal"), "tool_result.is_error");
+}
+
+/// burn: codex `user_turn_blocks` — the failing shell call is failed out of
+/// band by `exec_command_end.exit_code`, and the row says which signal did it.
+#[test]
+fn codex_failed_call_names_its_exit_code_signal() {
+    let failed = tool_result("codex/user-turn-blocks", "call_b2");
+    assert_eq!(text(failed, "result_status"), "errored");
+    assert_eq!(text(failed, "error_signal"), "exit_code");
+    assert_eq!(text(failed, "event_source"), "function_call_output");
+    let passed = tool_result("codex/user-turn-blocks", "call_b1");
+    assert_eq!(text(passed, "result_status"), "completed");
+    assert!(field(passed, "error_signal").is_null(), "{passed}");
+}
+
+/// burn: `system_subagent_notification` — the harness line reporting a
+/// delegated child is a result on its own rail, linked to the child.
+#[test]
+fn claude_subagent_notification_links_the_child() {
+    let results = tool_results("claude/system-subagent-notification");
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert_eq!(text(results[0], "event_source"), "subagent_notification");
+    assert_eq!(
+        text(results[0], "subagent_session_id"),
+        "session-system-child"
+    );
+    assert_eq!(text(results[0], "agent_id"), "agent-system-1");
+}
+
+/// `replacement-meta`: both results are content blocks, each linked to the
+/// call it answers.
+#[test]
+fn claude_replacement_meta_results_keep_their_call_linkage() {
+    for id in ["tu_search_1", "tu_read_1"] {
+        let result = tool_result("claude/replacement-meta", id);
+        assert_eq!(text(result, "event_source"), "tool_result");
+        assert_eq!(field(result, "call_index").as_i64(), Some(0));
+    }
+}
+
+/// Cursor writes Claude-shaped result blocks, measured the same way.
+#[test]
+fn cursor_tool_result_records_its_fidelity() {
+    let result = tool_result("cursor/prompt-transcript", "toolu_cursor_1");
+    assert_eq!(field(result, "payload_bytes").as_i64(), Some(2));
+    assert_eq!(text(result, "event_source"), "tool_result");
+    assert_eq!(text(result, "result_status"), "completed");
+    assert_eq!(field(result, "event_index").as_i64(), Some(0));
+}
+
+/// Grok's result line carries its own `is_error`; that is the signal named.
+#[test]
+fn grok_failed_result_names_its_own_error_flag() {
+    let key = "grok/events-session";
+    let failed = tool_result(key, "call_shell_2");
+    assert_eq!(text(failed, "result_status"), "errored");
+    assert_eq!(text(failed, "error_signal"), "tool_result.is_error");
+    assert_eq!(text(failed, "event_source"), "function_call_output");
+    let results = tool_results(key);
+    let indexes = results
+        .iter()
+        .filter_map(|result| field(result, "event_index").as_i64())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(indexes, (0..results.len() as i64).collect());
+}
+
+/// burn: opencode `user_turn_blocks` — a bash part that exited 1 is a failed
+/// call even though the part's own status says `completed`.
+#[test]
+fn opencode_failed_part_names_its_exit_code_signal() {
+    let failed = tool_result("opencode/legacy-json-user-turn-blocks", "call_fail");
+    assert_eq!(text(failed, "result_status"), "errored");
+    assert_eq!(text(failed, "error_signal"), "exit_code");
+    assert_eq!(text(failed, "event_source"), "function_call_output");
+    assert_eq!(
+        field(failed, "payload_bytes").as_i64(),
+        Some("ERROR: tests failed".len() as i64)
+    );
+}
+
+/// Every provider with a tool-result parser records the fidelity facts on
+/// every tool-result row it writes: a null there is a parser that forgot, not
+/// a provider that does not say.
+#[test]
+fn every_parsed_tool_result_carries_its_fidelity() {
+    for fixture in CORPUS.iter().filter(|fixture| {
+        matches!(
+            fixture.source,
+            "claude" | "codex" | "cursor" | "grok" | "opencode"
+        ) && fixture.layout != Layout::Reference
+    }) {
+        let key = snapshot_key(fixture);
+        for result in tool_results(&key) {
+            for column in ["event_source", "result_status", "event_index"] {
+                assert!(
+                    !field(result, column).is_null(),
+                    "{key}: {column} is null on {}",
+                    text(result, "event_uid")
+                );
+            }
+        }
+    }
 }
 
 /// burn: `multi_block_turn_emits_one_inference_with_merged_usage` — the four
