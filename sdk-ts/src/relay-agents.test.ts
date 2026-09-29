@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { createServer, type Server } from 'node:net';
+import { createConnection, createServer, type Server, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
@@ -251,6 +252,66 @@ test('allows a slow first roster response within the default local deadline', as
     env: { AGENT_RELAY_SOCKET: socket }, home: root, platform: 'linux', temporaryDirectory: root, uid: 501,
   });
   assert.deepEqual(result, { agents: [], fetched_at_ms: 1_790_683_200_123 });
+});
+
+test('falls back when a socket cannot connect before the deadline', {
+  skip: process.platform === 'win32',
+}, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'relay-agents-connect-timeout-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const stalled = join(root, 'stalled.sock');
+  const healthy = join(root, 'healthy.sock');
+  const healthyRequests: string[] = [];
+  await fakeRosterServer(t, healthy, healthyRequests);
+  const pointer = join(root, '.agentworkforce', 'desktop', 'relay-socket');
+  await mkdir(dirname(pointer), { recursive: true });
+  await writeFile(pointer, `${healthy}\n`);
+
+  // Keep a real socket listening while preventing its process from accepting.
+  // Filling the kernel backlog makes the next connection either wait or report
+  // EAGAIN, depending on the Unix kernel; both are pre-request unavailability.
+  const childScript = [
+    'const { createServer } = require("node:net");',
+    'const server = createServer();',
+    'server.listen({ path: process.argv[1], backlog: 1 }, () => {',
+    '  process.stdout.write("ready\\n");',
+    '  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);',
+    '});',
+  ].join('\n');
+  const stalledServer = spawn(process.execPath, ['-e', childScript, stalled], {
+    stdio: ['ignore', 'pipe', 'inherit'],
+  });
+  await new Promise<void>((resolve, reject) => {
+    stalledServer.once('error', reject);
+    stalledServer.stdout.once('data', () => resolve());
+  });
+  const fillers: Socket[] = [];
+  t.after(async () => {
+    for (const socket of fillers) socket.destroy();
+    if (stalledServer.exitCode === null) {
+      stalledServer.kill();
+      await new Promise<void>((resolve) => stalledServer.once('exit', () => resolve()));
+    }
+  });
+  for (let index = 0; index < 2; index += 1) {
+    const filler = createConnection(stalled);
+    fillers.push(filler);
+    await new Promise<void>((resolve, reject) => {
+      filler.once('connect', resolve);
+      filler.once('error', reject);
+    });
+  }
+
+  const result = await listRelayAgents({}, {
+    env: { AGENT_RELAY_SOCKET: stalled }, home: root, platform: 'linux',
+    temporaryDirectory: root, uid: 501, timeoutMs: 50,
+  });
+  assert.deepEqual(result, { agents: [{
+    name: 'bob', address: 'bob@laptop', kind: 'agent', where: 'this_computer',
+    status: 'active', last_seen_ms: 1_790_683_200_000,
+    description: 'Fix the roster', is_self: true,
+  }], fetched_at_ms: 1_790_683_200_123 });
+  assert.equal(healthyRequests.length, 1);
 });
 
 test('reports inaccessible sockets instead of claiming the desktop is absent', async (t) => {

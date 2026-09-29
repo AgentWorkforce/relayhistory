@@ -271,9 +271,11 @@ function requestSocket(
       else markSent();
     });
     deadline = setTimeout(() => {
-      finish(() => reject(method !== 'GET' && requestSent
-        ? indeterminate(method, target)
-        : new RelayAgentsError('timeout', DESKTOP_TIMEOUT)));
+      finish(() => reject(!requestSent
+        ? new SocketUnavailable(DESKTOP_TIMEOUT)
+        : method !== 'GET'
+          ? indeterminate(method, target)
+          : new RelayAgentsError('timeout', DESKTOP_TIMEOUT)));
       clientRequest.destroy();
     }, timeoutMs);
     clientRequest.once('error', (error: NodeJS.ErrnoException) => {
@@ -285,7 +287,8 @@ function requestSocket(
       if (error.code === 'EACCES' || error.code === 'EPERM') {
         finish(() => reject(new SocketPermissionDenied(message)));
       } else if (error.code === 'ENOENT' || error.code === 'ENOTDIR'
-        || error.code === 'ECONNREFUSED' || error.code === 'EINVAL') {
+        || error.code === 'ECONNREFUSED' || error.code === 'EINVAL'
+        || error.code === 'EAGAIN' || error.code === 'ETIMEDOUT') {
         finish(() => reject(new SocketUnavailable(error.message)));
       } else {
         finish(() => reject(new RelayAgentsError('socket_error', message)));
