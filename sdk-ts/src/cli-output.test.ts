@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import { SESSION_EVIDENCE_CONTRACT_VERSION, SESSION_USAGE_CONTRACT_VERSION } from './index.js';
+import { humanLine } from './cli.js';
 
 const run = promisify(execFile);
 const cli = join(dirname(fileURLToPath(import.meta.url)), 'cli.js');
@@ -942,4 +943,13 @@ test('sessions relationships names the other end of a continuity edge', async ()
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test('human search output labels a session-event match by role and kind', () => {
+  const base = { id: 1, timestampMs: 5, source: 'claude', sessionId: 's', prompt: 'hello' };
+  assert.equal(humanLine({ ...base, matchSource: 'history', role: 'user', kind: 'text' }), '5  claude  s  hello');
+  assert.equal(
+    humanLine({ ...base, matchSource: 'session_event', role: 'assistant', kind: 'tool_use' }),
+    '5  claude:assistant:tool_use  s  hello',
+  );
 });
