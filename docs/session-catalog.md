@@ -1458,6 +1458,11 @@ How each adapter works:
   are not stores). A session present in more than one store is catalogued,
   synced and hydrated from the first that holds it — `opencode.db`, then the
   channel stores in name order — so it is one session with one `raw_path`.
+  Ownership is decided over everything each store holds, including under a
+  discovery limit, and hydration refuses a catalogued copy once an earlier
+  store holds the session (`SESSION_SOURCE_MISMATCH`; rediscover). A store
+  that cannot be opened, or a directory that cannot be listed, is a
+  diagnostic against its path; the remaining stores are still read.
   Setting `OPENCODE_DB` names exactly one store and its channel siblings are
   not read; so does `ai-hist sync-opencode --opencode-db <path>`.
 

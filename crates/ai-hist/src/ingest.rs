@@ -1894,13 +1894,38 @@ fn sync_opencode_exclusive(
         sources: vec!["opencode".into()],
         ..Default::default()
     };
-    discover::discover_sessions_with_connectors(
+    let discovered = discover::discover_sessions_with_connectors(
         &env,
         &options,
         &remote::SourceConnectorSelection::new(Vec::new())?,
         |_| {},
     )?;
+    for diagnostic in &discovered.diagnostics {
+        sync_note!(
+            "  [discovery] {} not read: {}",
+            diagnostic.locator.as_deref().unwrap_or(&diagnostic.source),
+            diagnostic.error
+        );
+    }
     refresh_project_identity_after_sync(&conn);
+    // A channel directory that could not be listed may hold stores this run
+    // never saw. What could be read is indexed above; the run still fails, as
+    // it does when one channel store fails, so nobody takes a partial import
+    // for a complete one.
+    if matches!(
+        layout,
+        Some(crate::ingest::opencode::OpencodeLayout::Sqlite(_))
+    ) {
+        if let Some((dir, error)) =
+            crate::paths::list_opencode_db_files(opencode_path, pinned).unlisted
+        {
+            return Err(anyhow::Error::new(error).context(format!(
+                "could not list OpenCode channel databases in {} \
+                 (the stores that could be read were indexed)",
+                dir.display()
+            )));
+        }
+    }
     Ok(true)
 }
 
@@ -5488,13 +5513,19 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
         // that vanished and came back is not something this process watched,
         // and resuming from the stale cursor is exactly how its rows would
         // keep null facts after the archive returns.
-        transcript_cursor::forget_locator(conn, "claude", &missing)?;
-        // A workflow journal an earlier build walked as a transcript is still
-        // on disk; it is excluded now, not missing, so forgetting its cursor
-        // is the whole repair and leaves this walk's coverage complete.
-        if !is_claude_workflow_journal(root, Path::new(&missing)) {
+        //
+        // A workflow journal an earlier build walked as a transcript is
+        // excluded now, not missing: its coverage is complete, but the rows
+        // that build derived from it are still standing. They are retracted
+        // before the cursor is forgotten, because that cursor is the only
+        // thing that brings the journal here: a retraction that fails leaves
+        // it in place, and the next sync tries again.
+        if is_claude_workflow_journal(root, Path::new(&missing)) {
+            retract_claude_workflow_journal(conn, Path::new(&missing))?;
+        } else {
             walked_every_known_root = false;
         }
+        transcript_cursor::forget_locator(conn, "claude", &missing)?;
     }
     let mut scanned = 0;
     let mut upserted = 0;
@@ -7258,9 +7289,14 @@ fn ingest_claude_record(
         return Ok(());
     }
     if message_role == "assistant" {
-        if let (Some(request_id), Some(provider_message_id)) =
-            (identity.request_id, identity.provider_message_id)
-        {
+        if let Some(provider_message_id) = identity.provider_message_id {
+            // The request id exactly as the row stores it, so the rows settled
+            // together are the rows the request view groups together: by
+            // `requestId` when there is one, else by `message.id` alone.
+            let request_id = identity
+                .request_id
+                .or(raw_facts.request_id)
+                .filter(|id| !id.is_empty());
             token_json = settle_claude_request_usage(
                 conn,
                 session_id,
@@ -8552,22 +8588,36 @@ const CLAUDE_REQUEST_INPUT_USAGE_FIELDS: &[&str] = &[
     "cache_creation",
 ];
 
+/// Usage fields that grow while a Claude response streams, and so the only
+/// ones whose copies may differ and still be one measurement.
+///
+/// Everything beneath one of these is output-side progress: counters take the
+/// largest value any copy reports, and `iterations` may gain entries. Any
+/// other number — a reported `cost_usd`, say — is not a snapshot of anything
+/// growing, so two copies that differ on it contradict each other.
+const CLAUDE_REQUEST_GROWING_USAGE_FIELDS: &[&str] = &[
+    "output_tokens",
+    "output_tokens_details",
+    "server_tool_use",
+    "iterations",
+];
+
 /// One Claude request's usage settled from the snapshots its records carry,
 /// or `None` when the copies contradict each other.
 ///
-/// Merged per field: a counter takes the largest value any copy reports, a
-/// field only some copies carry is kept, and anything else must agree. That is
+/// Merged per field: a growing counter takes the largest value any copy
+/// reports, a growing list keeps its longest run of entries, a field only some
+/// copies carry is kept, and anything else must agree. That is
 /// order-independent, so a copy that arrives out of order never shrinks what
 /// an earlier pass stored.
 pub(crate) fn merge_claude_usage_copies<'a>(
     copies: impl IntoIterator<Item = &'a str>,
 ) -> Option<String> {
-    let mut merged: Option<Value> = None;
+    let mut merged: Option<Map<String, Value>> = None;
     for copy in copies {
-        let value: Value = serde_json::from_str(copy).ok()?;
-        if !value.is_object() {
+        let Value::Object(value) = serde_json::from_str(copy).ok()? else {
             return None;
-        }
+        };
         merged = Some(match merged {
             None => value,
             Some(have) => {
@@ -8577,7 +8627,16 @@ pub(crate) fn merge_claude_usage_copies<'a>(
                 {
                     return None;
                 }
-                merge_usage_value(&have, &value)?
+                let mut out = have.clone();
+                for (key, theirs) in &value {
+                    let growing = CLAUDE_REQUEST_GROWING_USAGE_FIELDS.contains(&key.as_str());
+                    let field = match have.get(key) {
+                        Some(ours) => merge_usage_value(ours, theirs, growing)?,
+                        None => theirs.clone(),
+                    };
+                    out.insert(key.clone(), field);
+                }
+                out
             }
         });
     }
@@ -8596,30 +8655,45 @@ fn usage_values_agree(a: Option<&Value>, b: Option<&Value>) -> bool {
     }
 }
 
-fn merge_usage_value(a: &Value, b: &Value) -> Option<Value> {
+/// Merge two copies of one usage field. `growing` says the field sits under a
+/// [`CLAUDE_REQUEST_GROWING_USAGE_FIELDS`] entry, where a later copy may carry
+/// a larger count or more list entries; everywhere else the copies must agree.
+fn merge_usage_value(a: &Value, b: &Value, growing: bool) -> Option<Value> {
     match (a, b) {
         (Value::Null, other) | (other, Value::Null) => Some(other.clone()),
         (Value::Object(ours), Value::Object(theirs)) => {
             let mut out = ours.clone();
             for (key, value) in theirs {
                 let merged = match ours.get(key) {
-                    Some(have) => merge_usage_value(have, value)?,
+                    Some(have) => merge_usage_value(have, value, growing)?,
                     None => value.clone(),
                 };
                 out.insert(key.clone(), merged);
             }
             Some(Value::Object(out))
         }
-        (Value::Array(ours), Value::Array(theirs)) if ours.len() == theirs.len() => ours
-            .iter()
-            .zip(theirs)
-            .map(|(a, b)| merge_usage_value(a, b))
-            .collect::<Option<Vec<_>>>()
-            .map(Value::Array),
+        // A growing list is append-only: the entries both copies carry are
+        // the same entries read at different moments, and the longer copy's
+        // extra entries are ones the shorter had not reached yet. Anywhere
+        // else a list must be the same length to be the same list.
+        (Value::Array(ours), Value::Array(theirs)) if growing || ours.len() == theirs.len() => {
+            let (longer, shorter) = if ours.len() >= theirs.len() {
+                (ours, theirs)
+            } else {
+                (theirs, ours)
+            };
+            let mut out = longer
+                .iter()
+                .zip(shorter)
+                .map(|(a, b)| merge_usage_value(a, b, growing))
+                .collect::<Option<Vec<_>>>()?;
+            out.extend(longer[shorter.len()..].iter().cloned());
+            Some(Value::Array(out))
+        }
         // Only a count can grow. A negative or fractional value is not one,
         // and a copy carrying it is unreadable rather than an earlier
         // snapshot, so it has to agree exactly or the request stays disputed.
-        (Value::Number(x), Value::Number(y)) => match (x.as_u64(), y.as_u64()) {
+        (Value::Number(x), Value::Number(y)) if growing => match (x.as_u64(), y.as_u64()) {
             (Some(x), Some(y)) => Some(if x < y { b.clone() } else { a.clone() }),
             _ => (a == b).then(|| a.clone()),
         },
@@ -8638,21 +8712,24 @@ fn merge_usage_value(a: &Value, b: &Value) -> Option<Value> {
 /// onto every row of the request, including rows an earlier pass stored.
 /// Copies that genuinely contradict are left verbatim, and the refusal stands.
 ///
-/// Keyed on `requestId` *and* `message.id`, the pair Claude repeats on every
-/// copy, and scoped to one session because the rows are.
+/// Keyed on `message.id`, which Claude repeats on every copy, within the
+/// request-view namespace the rows fall in: the rows naming this `requestId`
+/// when the record carries one, else only the rows that carry none — the same
+/// rows `session_requests` groups under `provider-message-id:`. Scoped to one
+/// session because the rows are.
 fn settle_claude_request_usage(
     conn: &Connection,
     session_id: &str,
-    request_id: &str,
+    request_id: Option<&str>,
     provider_message_id: &str,
     token_json: Option<&str>,
 ) -> Result<Option<String>> {
     let stored = conn
         .prepare_cached(
             "SELECT DISTINCT token_json FROM session_events \
-             WHERE source = 'claude' AND session_id = ?1 AND request_id = ?2 \
-               AND provider_message_id = ?3 AND role = 'assistant' \
-               AND token_json IS NOT NULL",
+             WHERE source = 'claude' AND session_id = ?1 AND provider_message_id = ?3 \
+               AND (request_id = ?2 OR (?2 IS NULL AND NULLIF(request_id, '') IS NULL)) \
+               AND role = 'assistant' AND token_json IS NOT NULL",
         )?
         .query_map(
             params![session_id, request_id, provider_message_id],
@@ -8673,9 +8750,9 @@ fn settle_claude_request_usage(
     };
     conn.execute(
         "UPDATE session_events SET token_json = ?4 \
-         WHERE source = 'claude' AND session_id = ?1 AND request_id = ?2 \
-           AND provider_message_id = ?3 AND role = 'assistant' \
-           AND token_json IS NOT NULL AND token_json <> ?4",
+         WHERE source = 'claude' AND session_id = ?1 AND provider_message_id = ?3 \
+           AND (request_id = ?2 OR (?2 IS NULL AND NULLIF(request_id, '') IS NULL)) \
+           AND role = 'assistant' AND token_json IS NOT NULL AND token_json <> ?4",
         params![session_id, request_id, provider_message_id, merged],
     )?;
     Ok(Some(merged))
@@ -8703,31 +8780,39 @@ pub(crate) fn heal_claude_request_evidence(conn: &Connection) -> Result<()> {
         "parent_id",
         "request_id",
         "provider_message_id",
+        "is_sidechain",
     ]
     .iter()
     .all(|column| columns.contains(*column))
     {
         return Ok(());
     }
+    // Grouped the way the request view groups: by `requestId` where the row
+    // has one, else by `message.id` among the rows that have none.
     let groups = conn
         .prepare(
-            "SELECT session_id, request_id, provider_message_id FROM session_events \
+            "SELECT session_id, NULLIF(request_id, ''), provider_message_id FROM session_events \
              WHERE source = 'claude' AND role = 'assistant' \
-               AND request_id IS NOT NULL AND provider_message_id IS NOT NULL \
-               AND token_json IS NOT NULL \
-             GROUP BY session_id, request_id, provider_message_id \
+               AND provider_message_id IS NOT NULL AND token_json IS NOT NULL \
+             GROUP BY session_id, NULLIF(request_id, ''), provider_message_id \
              HAVING COUNT(DISTINCT token_json) > 1",
         )?
         .query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(1)?,
                 row.get::<_, String>(2)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for (session_id, request_id, provider_message_id) in groups {
-        settle_claude_request_usage(conn, &session_id, &request_id, &provider_message_id, None)?;
+        settle_claude_request_usage(
+            conn,
+            &session_id,
+            request_id.as_deref(),
+            &provider_message_id,
+            None,
+        )?;
     }
     conn.execute_batch(
         "INSERT INTO session_markers \
@@ -8740,12 +8825,116 @@ pub(crate) fn heal_claude_request_evidence(conn: &Connection) -> Result<()> {
            AND lower(trim(model)) = '<synthetic>' \
            AND message_id IS NOT NULL AND message_id <> '' \
          GROUP BY session_id, message_id \
-         ON CONFLICT(source, session_id, marker_uid) DO NOTHING; \
-         DELETE FROM session_events \
+         ON CONFLICT(source, session_id, marker_uid) DO NOTHING;",
+    )?;
+    heal_claude_synthetic_session_summaries(conn)?;
+    conn.execute_batch(
+        "DELETE FROM session_events \
          WHERE source = 'claude' AND role = 'assistant' \
            AND lower(trim(model)) = '<synthetic>' \
            AND message_id IS NOT NULL AND message_id <> '';",
     )?;
+    Ok(())
+}
+
+/// Take `<synthetic>` back out of the `sessions` summaries an earlier parser
+/// derived from it: the model list and the last assistant excerpt.
+///
+/// Both are cached on the session row and only rewritten when the transcript
+/// is read again, and an unchanged transcript is skipped on a stat — so
+/// without this a finished session would keep naming a model nobody ran and
+/// quoting a login notice as the model's last word forever. Repaired from the
+/// stored rows, not the transcript, so a session whose transcript is gone is
+/// repaired too.
+///
+/// The excerpt is matched against the notices' `local_notice` markers, which
+/// both the migration and a fresh parse write, so a database whose notice
+/// events an earlier revision already moved is matched as well as one whose
+/// events are still in place.
+fn heal_claude_synthetic_session_summaries(conn: &Connection) -> Result<()> {
+    /// Where `ClaudeMetaFold` cuts `last_assistant_text`.
+    const CLAUDE_EXCERPT_MAX_CHARS: usize = 4096;
+    let columns: HashSet<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('sessions')")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if columns.contains("models_json") {
+        conn.execute(
+            "UPDATE sessions SET models_json = ( \
+                 SELECT CASE WHEN COUNT(*) = 0 THEN NULL ELSE json_group_array(m.value) END \
+                 FROM json_each(sessions.models_json) m \
+                 WHERE m.type <> 'text' OR lower(trim(m.value)) <> '<synthetic>') \
+             WHERE source = 'claude' AND json_valid(models_json) \
+               AND json_type(models_json) = 'array' \
+               AND EXISTS (SELECT 1 FROM json_each(sessions.models_json) m \
+                           WHERE m.type = 'text' AND lower(trim(m.value)) = '<synthetic>')",
+            [],
+        )?;
+    }
+    if !columns.contains("last_assistant_text") {
+        return Ok(());
+    }
+    // The excerpt the metadata fold wrote from a notice is its text blocks
+    // joined by newlines — blank ones included, which the event rows the
+    // marker text was built from omit — and cut at 4096 characters. So the
+    // two are compared with whitespace removed, and must be equal; only an
+    // excerpt the cut actually shortened may match as a prefix. A real reply
+    // that merely starts with a notice's words is not the notice.
+    let candidates = conn
+        .prepare(
+            "SELECT s.session_id, s.last_assistant_text, m.text FROM sessions s \
+             JOIN session_markers m ON m.source = s.source AND m.session_id = s.session_id \
+             WHERE s.source = 'claude' AND s.last_assistant_text IS NOT NULL \
+               AND m.kind = 'local_notice' AND m.subkind = 'synthetic' AND m.text IS NOT NULL",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let squeeze = |text: &str| -> String { text.chars().filter(|c| !c.is_whitespace()).collect() };
+    let mut quoting_a_notice: Vec<String> = candidates
+        .into_iter()
+        .filter(|(_, excerpt, notice)| {
+            let cut = excerpt.chars().count() >= CLAUDE_EXCERPT_MAX_CHARS;
+            let (excerpt, notice) = (squeeze(excerpt), squeeze(notice));
+            !excerpt.is_empty() && (excerpt == notice || (cut && notice.starts_with(&excerpt)))
+        })
+        .map(|(session_id, _, _)| session_id)
+        .collect();
+    quoting_a_notice.sort();
+    quoting_a_notice.dedup();
+    for session_id in quoting_a_notice {
+        // What the fold would have kept had it skipped the notices: the text
+        // of the last main-thread assistant record that is model output.
+        let excerpt: Option<String> = conn
+            .query_row(
+                "SELECT substr(group_concat(text, char(10)), 1, 4096) FROM ( \
+                     SELECT text FROM session_events \
+                     WHERE source = 'claude' AND session_id = ?1 AND role = 'assistant' \
+                       AND kind = 'text' AND text IS NOT NULL \
+                       AND message_id = ( \
+                           SELECT message_id FROM session_events \
+                           WHERE source = 'claude' AND session_id = ?1 \
+                             AND role = 'assistant' AND kind = 'text' AND text IS NOT NULL \
+                             AND COALESCE(is_sidechain, 0) = 0 \
+                             AND (model IS NULL OR lower(trim(model)) <> '<synthetic>') \
+                           ORDER BY ts_ms DESC, id DESC LIMIT 1) \
+                     ORDER BY id)",
+                [&session_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        conn.execute(
+            "UPDATE sessions SET last_assistant_text = ?2 \
+             WHERE source = 'claude' AND session_id = ?1",
+            params![session_id, excerpt],
+        )?;
+    }
     Ok(())
 }
 
@@ -9459,6 +9648,122 @@ pub(crate) fn is_claude_workflow_journal(root: &Path, path: &Path) -> bool {
         .any(|ancestor| ancestor.file_name().and_then(|name| name.to_str()) == Some("subagents"))
 }
 
+/// Retract what an earlier build derived from a workflow journal it walked as
+/// a transcript.
+///
+/// Only rows whose ownership by the journal can be established are touched:
+///
+/// - continuity evidence is keyed on the journal's own locator;
+/// - a marker is deleted only when it has exactly the shape the old walk gave
+///   that journal line: the session the line was attributed to (its own
+///   `sessionId`, else the file's), the identity the line derives, and an
+///   `unknown` kind whose subkind is the line's record type. A marker any
+///   transcript wrote differs in at least one of those. The journal has to
+///   still be readable for this; lines that are gone or were rewritten leave
+///   nothing to prove ownership with, and their markers are left alone;
+/// - a session locator the journal overwrote — the catalog `raw_path`, the
+///   local presence, and every local observation — is pointed back at the
+///   session's own transcript beside the `subagents` directory, or cleared
+///   when that transcript does not exist, so hydration cannot reopen the
+///   journal through any of them.
+fn retract_claude_workflow_journal(conn: &Connection, journal: &Path) -> Result<()> {
+    let locator = journal.to_string_lossy().to_string();
+    crate::continuity::clear_evidence(conn, "claude", &locator)?;
+    if let Ok(file) = fs::File::open(journal) {
+        let stem = journal
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("journal");
+        let records: Vec<(Map<String, Value>, String)> = BufReader::new(file)
+            .lines()
+            .map_while(Result::ok)
+            .filter_map(|line| match serde_json::from_str::<Value>(&line) {
+                Ok(Value::Object(obj)) => Some((obj, line)),
+                _ => None,
+            })
+            .collect();
+        let file_session_id = records
+            .iter()
+            .find_map(|(obj, _)| obj.get("sessionId").and_then(Value::as_str))
+            .map(str::to_owned);
+        for (obj, line) in &records {
+            let Some(session_id) = obj
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .or(file_session_id.as_deref())
+            else {
+                continue;
+            };
+            let record_type = obj.get("type").and_then(Value::as_str).unwrap_or("");
+            let subkind = if record_type.is_empty() {
+                "record"
+            } else {
+                record_type
+            };
+            let identity = claude_record_identity(obj, line, stem);
+            conn.execute(
+                "DELETE FROM session_markers WHERE source = 'claude' AND session_id = ?1 \
+                   AND marker_uid = ?2 AND kind = 'unknown' AND subkind = ?3",
+                params![session_id, format!("{identity}:marker"), subkind],
+            )?;
+        }
+    }
+    let own_transcript = journal
+        .ancestors()
+        .find(|dir| dir.file_name().and_then(|name| name.to_str()) == Some("subagents"))
+        .and_then(Path::parent)
+        .map(|session_dir| session_dir.with_extension("jsonl"))
+        .filter(|transcript| transcript.is_file())
+        .map(|transcript| transcript.to_string_lossy().to_string());
+    conn.execute(
+        "UPDATE sessions SET raw_path = ?1 WHERE source = 'claude' AND raw_path = ?2",
+        params![own_transcript, locator],
+    )?;
+    // Observations first: an upsert refreshes the presence projection from
+    // them. The direct presence update then covers a presence no observation
+    // backs.
+    let observed: Vec<crate::observations::SessionObservation> = {
+        let mut statement = conn.prepare(
+            "SELECT DISTINCT session_id FROM session_observations \
+             WHERE source = 'claude' AND location = 'local' AND raw_locator = ?1",
+        )?;
+        let sessions: Vec<String> = statement
+            .query_map([&locator], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut observed = Vec::new();
+        for session_id in sessions {
+            observed.extend(
+                crate::observations::list(conn, "claude", &session_id)?
+                    .into_iter()
+                    .filter(|observation| {
+                        observation.key.location == SessionLocation::Local
+                            && observation.raw_locator.as_deref() == Some(locator.as_str())
+                    }),
+            );
+        }
+        observed
+    };
+    for mut observation in observed {
+        observation.raw_locator = own_transcript.clone();
+        observation.updated_ms = now_ms();
+        crate::observations::upsert(conn, &observation)?;
+    }
+    conn.execute(
+        "UPDATE session_presences SET raw_locator = ?1 \
+         WHERE source = 'claude' AND location = 'local' AND raw_locator = ?2",
+        params![own_transcript, locator],
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Walk workflow journals as transcripts again, as builds before #208 did,
+    /// so an upgrade test can index one the old way first.
+    static LEGACY_WALKS_WORKFLOW_JOURNALS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 /// Every Claude transcript under `root`: each `*.jsonl` in the tree except the
 /// subagent workflow journals, which are metadata and never a transcript.
 ///
@@ -9466,6 +9771,10 @@ pub(crate) fn is_claude_workflow_journal(root: &Path, path: &Path) -> bool {
 /// list a journal the other has excluded.
 pub(crate) fn claude_transcript_files(root: &Path) -> Result<Vec<PathBuf>> {
     let mut files = collect_matching_files(root, "", "jsonl")?;
+    #[cfg(test)]
+    if LEGACY_WALKS_WORKFLOW_JOURNALS.with(std::cell::Cell::get) {
+        return Ok(files);
+    }
     files.retain(|path| !is_claude_workflow_journal(root, path));
     Ok(files)
 }
@@ -14429,19 +14738,165 @@ mod tests {
             )
             .unwrap();
         assert_eq!(derived, 0, "nothing may be derived from the journal");
+    }
 
-        // A cursor an earlier build kept for the journal is dropped by the
-        // next walk rather than left naming a file nothing reads.
+    /// An install upgraded from a build that walked the journal as a
+    /// transcript still holds what that build derived from it. The first walk
+    /// after the upgrade must retract it — the markers, the continuity row and
+    /// a `raw_path` pointing at the journal — while the session's real
+    /// evidence stays.
+    #[test]
+    fn claude_sync_retracts_what_an_earlier_build_derived_from_a_workflow_journal() {
+        let home = tempfile::tempdir().unwrap();
+        let project = home.path().join(".claude/projects/app");
+        let transcript = project.join("s1.jsonl");
+        let journal = project.join("s1/subagents/journal.jsonl");
+        fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"user","uuid":"u1","sessionId":"s1","cwd":"/tmp/app","timestamp":"2026-09-20T00:00:00.000Z","message":{"role":"user","content":"spawn a helper"}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"s1","cwd":"/tmp/app","timestamp":"2026-09-20T00:00:01.000Z","requestId":"req_1","message":{"id":"msg_1","role":"assistant","model":"claude-opus-4-7","content":[{"type":"text","text":"On it."}]}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &journal,
+            concat!(
+                r#"{"type":"started","sessionId":"s1","agentId":"a","uuid":"j1","timestamp":"2026-09-20T00:00:02.000Z"}"#, "\n",
+                r#"{"type":"result","sessionId":"s1","agentId":"a","uuid":"j2","timestamp":"2026-09-20T00:00:03.000Z","verdict":"done"}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        let root = home.path().join(".claude/projects");
+        let journal_locator = journal.to_string_lossy().to_string();
+        let journal_rows = |conn: &Connection| -> (i64, i64, i64) {
+            conn.query_row(
+                "SELECT (SELECT COUNT(*) FROM session_markers WHERE marker_uid IN ('j1:marker', 'j2:marker')), \
+                        (SELECT COUNT(*) FROM session_continuity_evidence WHERE locator = ?1), \
+                        (SELECT COUNT(*) FROM sessions WHERE raw_path = ?1)",
+                [&journal_locator],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+        };
+
+        // The old walk: the journal is indexed like a transcript.
+        LEGACY_WALKS_WORKFLOW_JOURNALS.with(|legacy| legacy.set(true));
+        let legacy = super::sync_claude_session_metadata(&conn, &mut state, &root);
+        LEGACY_WALKS_WORKFLOW_JOURNALS.with(|legacy| legacy.set(false));
+        legacy.unwrap();
+        // Whichever file the old walk upserted last owned `raw_path`.
         conn.execute(
-            "INSERT INTO transcript_cursors (source, locator, committed_offset, updated_ms) \
-             VALUES ('claude', ?, 0, 0)",
+            "UPDATE sessions SET raw_path = ?1 WHERE source = 'claude' AND session_id = 's1'",
             [&journal_locator],
         )
         .unwrap();
+        // ...and hydration's locators: the local presence and observation.
+        crate::observations::upsert(
+            &conn,
+            &crate::observations::SessionObservation {
+                key: crate::observations::ObservationKey {
+                    source: "claude".into(),
+                    session_id: "s1".into(),
+                    location: SessionLocation::Local,
+                    connector_id: "claude".into(),
+                    connector_instance: "default".into(),
+                },
+                raw_locator: Some(journal_locator.clone()),
+                source_stamp: None,
+                discovery_state: "full".into(),
+                access_state: "available".into(),
+                updated_ms: 1,
+            },
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE session_presences SET raw_locator = ?1 \
+             WHERE source = 'claude' AND session_id = 's1' AND location = 'local'",
+            [&journal_locator],
+        )
+        .unwrap();
+        // A real transcript's marker in another session that happens to share
+        // a journal line's identity is not the journal's to retract.
+        conn.execute(
+            "INSERT INTO session_markers (source, session_id, marker_uid, kind, subkind) \
+             VALUES ('claude', 's2', 'j1:marker', 'unknown', 'started')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            journal_rows(&conn),
+            (3, 1, 1),
+            "the old walk must have derived rows from the journal, or nothing is tested"
+        );
+
+        // A retraction that fails keeps the cursor that brings the journal
+        // back, so the next sync retries instead of forgetting the work.
+        conn.execute_batch(
+            "CREATE TRIGGER fail_retraction BEFORE DELETE ON session_continuity_evidence \
+             BEGIN SELECT RAISE(ABORT, 'retraction interrupted'); END;",
+        )
+        .unwrap();
+        assert!(super::sync_claude_session_metadata(&conn, &mut state, &root).is_err());
+        assert!(transcript_cursor::known_locators(&conn, "claude")
+            .unwrap()
+            .contains(&journal_locator));
+        conn.execute_batch("DROP TRIGGER fail_retraction;").unwrap();
+
         super::sync_claude_session_metadata(&conn, &mut state, &root).unwrap();
+
+        assert_eq!(journal_rows(&conn), (1, 0, 0));
+        let survivor: String = conn
+            .query_row(
+                "SELECT session_id FROM session_markers WHERE marker_uid = 'j1:marker'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(survivor, "s2", "only the journal's own marker is retracted");
+        let locators: (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT (SELECT raw_locator FROM session_presences \
+                          WHERE source = 'claude' AND session_id = 's1' AND location = 'local'), \
+                        (SELECT raw_locator FROM session_observations \
+                          WHERE source = 'claude' AND session_id = 's1' AND location = 'local')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let own = Some(transcript.to_string_lossy().to_string());
+        assert_eq!(
+            locators,
+            (own.clone(), own),
+            "hydration must not reopen the journal"
+        );
         assert!(!transcript_cursor::known_locators(&conn, "claude")
             .unwrap()
             .contains(&journal_locator));
+        let raw_path: Option<String> = conn
+            .query_row(
+                "SELECT raw_path FROM sessions WHERE source = 'claude' AND session_id = 's1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw_path.as_deref(), Some(&*transcript.to_string_lossy()));
+        assert!(super::session_events_exist(&conn, "claude", "s1").unwrap());
+        let transcript_continuity: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_continuity_evidence WHERE locator = ?1",
+                [&*transcript.to_string_lossy()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            transcript_continuity, 1,
+            "the real transcript's evidence stays"
+        );
     }
 
     /// The Claude half of the marker-only fast path.
@@ -27303,6 +27758,77 @@ mod tests {
         assert!(merge_claude_usage_copies([early, "[]"]).is_none());
         let negative = r#"{"input_tokens":2,"cache_read_input_tokens":7,"output_tokens":-40}"#;
         assert!(merge_claude_usage_copies([early, negative]).is_none());
+
+        // A reported cost is not a growing counter: copies that disagree on
+        // it contradict each other, whichever is larger.
+        let cost_1 = r#"{"input_tokens":2,"output_tokens":5,"cost_usd":1}"#;
+        let cost_2 = r#"{"input_tokens":2,"output_tokens":20,"cost_usd":2}"#;
+        assert!(merge_claude_usage_copies([cost_1, cost_2]).is_none());
+        assert!(merge_claude_usage_copies([cost_2, cost_1]).is_none());
+        let same_cost = r#"{"input_tokens":2,"output_tokens":20,"cost_usd":1}"#;
+        assert!(merge_claude_usage_copies([cost_1, same_cost]).is_some());
+        // Nor may a counter outside the output side grow.
+        let tier_a = r#"{"input_tokens":2,"output_tokens":5,"server_tool_use":{"web_search_requests":1},"extra":{"n":1}}"#;
+        let tier_b = r#"{"input_tokens":2,"output_tokens":9,"server_tool_use":{"web_search_requests":3},"extra":{"n":2}}"#;
+        assert!(merge_claude_usage_copies([tier_a, tier_b]).is_none());
+
+        // `iterations` is append-only: a later copy's extra entry is kept, the
+        // shared prefix is reconciled, and the order of arrival is irrelevant.
+        let one = r#"{"input_tokens":2,"output_tokens":5,"iterations":[{"output_tokens":5}]}"#;
+        let two = r#"{"input_tokens":2,"output_tokens":20,"iterations":[{"output_tokens":8},{"output_tokens":20}]}"#;
+        let forward: Value =
+            serde_json::from_str(&merge_claude_usage_copies([one, two]).unwrap()).unwrap();
+        let backward: Value =
+            serde_json::from_str(&merge_claude_usage_copies([two, one]).unwrap()).unwrap();
+        assert_eq!(forward, backward);
+        assert_eq!(
+            forward["iterations"],
+            json!([{"output_tokens": 8}, {"output_tokens": 20}])
+        );
+        // Overlapping entries that are not the same entry still contradict.
+        let clash =
+            r#"{"input_tokens":2,"output_tokens":20,"iterations":[{"type":"a"},{"type":"b"}]}"#;
+        let other = r#"{"input_tokens":2,"output_tokens":5,"iterations":[{"type":"c"}]}"#;
+        assert!(merge_claude_usage_copies([clash, other]).is_none());
+        // A list outside the output side must be the same length.
+        let short = r#"{"input_tokens":2,"output_tokens":5,"notes":[1]}"#;
+        let long = r#"{"input_tokens":2,"output_tokens":5,"notes":[1,2]}"#;
+        assert!(merge_claude_usage_copies([short, long]).is_none());
+    }
+
+    /// A transcript that writes no `requestId` is grouped by the request view
+    /// on `message.id` alone, so its streamed copies are settled on the same
+    /// key rather than left as disagreeing blobs of one request.
+    #[test]
+    fn claude_streamed_request_without_request_id_settles_on_message_id() {
+        let text: String = streamed_turn([5, 40, 120])
+            .lines()
+            .map(|line| {
+                let mut value: Value = serde_json::from_str(line).unwrap();
+                value.as_object_mut().unwrap().remove("requestId");
+                jsonl_line(value)
+            })
+            .collect();
+        assert!(!text.contains("requestId"));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s-stream.jsonl");
+        fs::write(&path, text).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        assert!(stream_token_outputs(&conn)
+            .iter()
+            .all(|(_, output)| *output == 120));
+        let summary = crate::session_usage::session_usage_summary(&conn, "claude", "s-stream")
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.request_count, 1);
+        assert_eq!(
+            summary.usage.expect("usage is established").output_tokens,
+            120
+        );
+        assert!(summary.diagnostics.is_empty(), "{:?}", summary.diagnostics);
     }
 
     /// Claude Code writes a local API-error or auth notice as an assistant
@@ -27392,10 +27918,45 @@ mod tests {
     }
 
     /// A database indexed before the settlement holds the streamed copies
-    /// verbatim and the notice as assistant output. Opening it repairs both
-    /// from the stored rows alone, once, without the transcript.
+    /// verbatim, the notice as assistant output, and the session summaries
+    /// the notice fed. Opening it repairs all of them from the stored rows
+    /// alone, once, without the transcript — with or without a `requestId`
+    /// on the copies, and whether or not an earlier revision already moved
+    /// the notice to its marker without repairing the summaries.
     #[test]
     fn opening_an_older_database_heals_claude_request_evidence() {
+        for with_request_id in [true, false] {
+            for notice_already_moved in [false, true] {
+                heal_older_claude_database(with_request_id, notice_already_moved);
+            }
+        }
+    }
+
+    /// A real reply whose whole text is the start of a notice's text is the
+    /// model's last word, not the notice, and the repair leaves it alone.
+    #[test]
+    fn the_summary_heal_leaves_a_reply_that_is_only_a_notice_prefix() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO session_markers (source, session_id, marker_uid, message_id, kind, subkind, text) \
+             VALUES ('claude', 's', 'n:marker', 'n', 'local_notice', 'synthetic', 'Login expired'); \
+             INSERT INTO sessions (session_id, source, last_assistant_text) \
+             VALUES ('s', 'claude', 'Login');",
+        )
+        .unwrap();
+        heal_claude_synthetic_session_summaries(&conn).unwrap();
+        let last: Option<String> = conn
+            .query_row(
+                "SELECT last_assistant_text FROM sessions WHERE session_id = 's'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(last.as_deref(), Some("Login"));
+    }
+
+    fn heal_older_claude_database(with_request_id: bool, notice_already_moved: bool) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s-stream.jsonl");
         fs::write(&path, streamed_turn([5, 40, 120])).unwrap();
@@ -27408,16 +27969,42 @@ mod tests {
                WHERE event_uid = 'u-block-0:0'; \
              UPDATE session_events SET token_json = json_set(token_json, '$.output_tokens', 40) \
                WHERE event_uid = 'u-block-1:0'; \
-             DELETE FROM schema_migrations WHERE name = 'claude_request_evidence_v1'; \
-             DROP INDEX idx_session_events_request;",
+             DELETE FROM schema_migrations WHERE name = 'claude_request_evidence_v2'; \
+             DROP INDEX idx_session_events_provider_message;",
         )
         .unwrap();
-        conn.execute(
+        // A notice of two text blocks with a blank one between them: the
+        // event rows omit the blank block, the cached excerpt kept it.
+        conn.execute_batch(
             "INSERT INTO session_events (source, session_id, message_id, parent_id, ts_ms, role, kind, text, model, event_uid) \
-             VALUES ('claude', 's-stream', 'a-synth', 'u-block-2', 5, 'assistant', 'text', 'Login expired', '<synthetic>', 'a-synth:0')",
-            [],
+             VALUES ('claude', 's-stream', 'a-synth', 'u-block-2', 5, 'assistant', 'text', 'Login expired', '<synthetic>', 'a-synth:0'), \
+                    ('claude', 's-stream', 'a-synth', 'u-block-2', 5, 'assistant', 'text', 'Run /login', '<synthetic>', 'a-synth:2');",
         )
         .unwrap();
+        if notice_already_moved {
+            // What the first revision of this repair left: the marker written,
+            // the events gone, the summaries untouched, and v1 recorded.
+            conn.execute_batch(
+                "INSERT INTO session_markers (source, session_id, marker_uid, ts_ms, message_id, parent_id, kind, subkind, text) \
+                 VALUES ('claude', 's-stream', 'a-synth:marker', 5, 'a-synth', 'u-block-2', 'local_notice', 'synthetic', 'Login expired' || char(10) || 'Run /login'); \
+                 DELETE FROM session_events WHERE model = '<synthetic>'; \
+                 INSERT INTO schema_migrations (name) VALUES ('claude_request_evidence_v1');",
+            )
+            .unwrap();
+        }
+        if !with_request_id {
+            conn.execute("UPDATE session_events SET request_id = NULL", [])
+                .unwrap();
+        }
+        let summaries = conn
+            .execute(
+                "INSERT INTO sessions (session_id, source, models_json, last_assistant_text) \
+                 VALUES ('s-stream', 'claude', '[\"claude-opus-4-7\",\"<synthetic>\"]', \
+                         'Login expired' || char(10) || ' ' || char(10) || 'Run /login')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(summaries, 1);
         assert!(!crate::store::schema_is_current(&conn).unwrap());
 
         init_db(&conn).unwrap();
@@ -27441,10 +28028,19 @@ mod tests {
             marker,
             (
                 "local_notice".to_string(),
-                Some("Login expired".to_string()),
+                Some("Login expired\nRun /login".to_string()),
                 Some("u-block-2".to_string())
             )
         );
+        let (models, last): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT models_json, last_assistant_text FROM sessions WHERE session_id = 's-stream'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(models.as_deref(), Some(r#"["claude-opus-4-7"]"#));
+        assert_eq!(last.as_deref(), Some("Let me look."));
         assert!(crate::store::schema_is_current(&conn).unwrap());
     }
 

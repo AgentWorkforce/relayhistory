@@ -1457,10 +1457,13 @@ fn source_snapshot(
         // "The configured store" is any of them: the default `opencode.db`
         // and, unless it is pinned, every channel database beside it.
         let resolved = fs::canonicalize(&path).ok();
-        let is_configured_store = resolved.is_some()
-            && crate::paths::opencode_db_files(configured_path, roots.opencode_db_pinned)
+        let stores = crate::paths::opencode_db_files(configured_path, roots.opencode_db_pinned);
+        let store_index = resolved.as_ref().and_then(|resolved| {
+            stores
                 .iter()
-                .any(|store| fs::canonicalize(store).ok() == resolved);
+                .position(|store| fs::canonicalize(store).ok().as_ref() == Some(resolved))
+        });
+        let is_configured_store = store_index.is_some();
         let is_tree_session_file = !is_configured_store
             && opencode_locator_is_in_storage_tree(&path, &configured_storage.join("session"));
 
@@ -1490,6 +1493,19 @@ fn source_snapshot(
                 "SESSION_SOURCE_UNAVAILABLE",
                 format!("OpenCode source {} is unavailable", path.display()),
             ));
+        }
+        // A session held by more than one channel store belongs to the first
+        // (discovery and sync both claim it there). If an earlier store has
+        // gained this session since the row was cataloged, the row names a
+        // superseded copy: sync now reads the earlier one, so hydrating this
+        // one would import evidence sync disagrees with. An earlier store that
+        // cannot be read claims nothing, exactly as in sync.
+        for earlier in &stores[..store_index.unwrap_or(0)] {
+            if crate::ingest::opencode::sqlite_store_holds_session(earlier, &options.session_id)
+                .unwrap_or(false)
+            {
+                return Err(superseded(&path, earlier));
+            }
         }
         let src = Connection::open_with_flags(
             &path,
