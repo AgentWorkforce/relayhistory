@@ -1955,6 +1955,10 @@ fn codex_human_fork_records_lineage_and_gates_the_replay() {
     assert_eq!(marker["replayed_lines"], 13);
     assert_eq!(marker["closed_by"], "turn_id");
     assert_eq!(marker["inherited_total_tokens"], 2500);
+    // 3100 == 2500 + last_token_usage 600: the child continued its
+    // parent's counter, as codex-rs seeds it.
+    assert_eq!(marker["inherited_baseline"], "applied");
+    assert_eq!(marker["inherited_baseline_basis"], "last_token_usage");
     assert!(fork_replay_marker(key, FORK_HUMAN_PARENT).is_none());
 }
 

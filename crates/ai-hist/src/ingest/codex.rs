@@ -245,10 +245,11 @@ pub(crate) fn forked_turn_owner(
 }
 
 /// The thread a rollout was forked from, when Codex names it outright:
-/// `forked_from_id` for a human fork, else
+/// `forked_from_id` (or `forkedFromId`) for a human fork, else
 /// `source.subagent.thread_spawn.parent_thread_id` for a spawned subagent.
-/// These are the same two fields the continuity scanner records `fork` edges
-/// from, and the only ones that arm the replay gate.
+/// These are the same fields, in the same precedence, that the continuity
+/// scanner records `fork` edges from, and the only ones that arm the replay
+/// gate.
 pub(crate) fn fork_parent_id(payload: Option<&Value>, session_id: &str) -> Option<String> {
     let named = |value: Option<&Value>| {
         value
@@ -257,15 +258,19 @@ pub(crate) fn fork_parent_id(payload: Option<&Value>, session_id: &str) -> Optio
             .map(str::to_string)
     };
     let payload = payload?;
-    named(payload.get("forked_from_id")).or_else(|| {
-        named(
-            payload
-                .get("source")
-                .and_then(|source| source.get("subagent"))
-                .and_then(|subagent| subagent.get("thread_spawn"))
-                .and_then(|spawn| spawn.get("parent_thread_id")),
-        )
-    })
+    // Both spellings, as the continuity scanner reads them, so the gate and
+    // the `fork` edge are armed by exactly the same field.
+    named(payload.get("forked_from_id"))
+        .or_else(|| named(payload.get("forkedFromId")))
+        .or_else(|| {
+            named(
+                payload
+                    .get("source")
+                    .and_then(|source| source.get("subagent"))
+                    .and_then(|subagent| subagent.get("thread_spawn"))
+                    .and_then(|spawn| spawn.get("parent_thread_id")),
+            )
+        })
 }
 
 /// When a thread began, for ordering its turns against its fork: the UUIDv7
@@ -315,11 +320,31 @@ pub(crate) enum ReplayStep {
 /// else opens or closes it: a rollout without an explicit fork field, or a
 /// fork that opens on something other than its parent's `session_meta`, is
 /// never gated.
+///
+/// Known limits, each resolved toward indexing rather than dropping:
+///
+/// - A replayed turn nothing can order -- a legacy (non-v7) `turn_id` with no
+///   `started_at` -- closes the span, so the rest of that replay is indexed
+///   under the child as before.
+/// - A record the child writes *before* its first `task_started` or
+///   `turn_context` is inside the span and is not indexed. Nothing in such a
+///   record distinguishes it from the parent's copied history (the envelope
+///   timestamps of a copy are the fork's, and the `thread_settings_applied`
+///   codex-rs appends after the copy has the same shape as the parent's own).
+///   Every observed build opens a turn with `task_started` before any prompt
+///   or model output, so what this drops is settings state that the child's
+///   own `turn_context` restates.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ForkReplayGate {
     parent: Option<String>,
     origin_ms: Option<i64>,
     replaying: bool,
+    /// Whether the last `task_started` inside the span was judged a replay.
+    /// A `turn_context` that carries no `turn_id` describes the turn its
+    /// `task_started` opened, so it takes that verdict instead of being
+    /// undecided -- which would close the span in the middle of the parent's
+    /// history.
+    in_replayed_turn: bool,
 }
 
 impl ForkReplayGate {
@@ -330,6 +355,7 @@ impl ForkReplayGate {
             parent: parent.filter(|_| origin_ms.is_some()),
             origin_ms,
             replaying: false,
+            in_replayed_turn: false,
         }
     }
 
@@ -349,6 +375,7 @@ impl ForkReplayGate {
                 return ReplayStep::Outside;
             }
             self.replaying = true;
+            self.in_replayed_turn = false;
             return ReplayStep::Replay;
         }
         let payload_type = payload.and_then(|p| p.get("type")).and_then(Value::as_str);
@@ -363,13 +390,23 @@ impl ForkReplayGate {
         let started_at = payload
             .and_then(|p| p.get("started_at"))
             .and_then(Value::as_i64);
+        let is_task_started = line_type == Some("event_msg");
+        if !is_task_started && turn_id.is_none() && self.in_replayed_turn {
+            return ReplayStep::Replay;
+        }
         let basis = match forked_turn_owner(turn_id, started_at, self.origin_ms.unwrap_or_default())
         {
-            ForkedTurnOwner::Replay => return ReplayStep::Replay,
+            ForkedTurnOwner::Replay => {
+                if is_task_started {
+                    self.in_replayed_turn = true;
+                }
+                return ReplayStep::Replay;
+            }
             ForkedTurnOwner::Child(basis) => basis,
             ForkedTurnOwner::Undecided => "undecided",
         };
         self.replaying = false;
+        self.in_replayed_turn = false;
         ReplayStep::Closed {
             turn_id: turn_id.map(str::to_string),
             basis,
@@ -392,6 +429,48 @@ mod tests {
         assert_eq!(uuid_v7_ms("01a0c210-ec76-41c2-8585-47285eab37cc"), None);
         assert_eq!(uuid_v7_ms("sess_child"), None);
         assert_eq!(uuid_v7_ms(""), None);
+    }
+
+    #[test]
+    fn an_id_less_turn_context_takes_its_task_started_verdict() {
+        let child = "01a0c210-ec76-71c2-8585-47285eab37cc";
+        let mut gate = ForkReplayGate::new(
+            fork_parent_id(Some(&json!({"forkedFromId": "parent"})), child),
+            uuid_v7_ms(child),
+        );
+        let rec = |kind: &str, payload: Value| json!({"type": kind, "payload": payload});
+        assert_eq!(
+            gate.step(false, &rec("session_meta", json!({"id": "parent"}))),
+            ReplayStep::Replay
+        );
+        assert_eq!(
+            gate.step(
+                false,
+                &rec(
+                    "event_msg",
+                    json!({"type": "task_started", "turn_id": "01a0c20f-64c5-7e82-bd2b-e08bab70470c"})
+                )
+            ),
+            ReplayStep::Replay
+        );
+        // Without the inherited verdict this was undecided and closed the span.
+        assert_eq!(
+            gate.step(false, &rec("turn_context", json!({"model": "gpt-5.4"}))),
+            ReplayStep::Replay
+        );
+        assert_eq!(
+            gate.step(
+                false,
+                &rec(
+                    "event_msg",
+                    json!({"type": "task_started", "turn_id": "01a0c210-ecae-71e2-9c2e-a0801741c6a4"})
+                )
+            ),
+            ReplayStep::Closed {
+                turn_id: Some("01a0c210-ecae-71e2-9c2e-a0801741c6a4".to_string()),
+                basis: "turn_id"
+            }
+        );
     }
 
     #[test]
