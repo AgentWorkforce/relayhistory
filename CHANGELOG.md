@@ -18,10 +18,18 @@ Notable changes to the native `ai-hist` CLI are documented here.
     `prompt` (prompts only). `resume` and `pack` search with `prompt`, as the
     native CLI's resume and pack do. `ai-hist search --role` on both CLIs
     accepts the same four values.
-  - MCP `search_history` gains `role` and `raw_fts`. Its description now says
-    exactly what a query means instead of "prompts".
+  - MCP `search_history` gains `role`, `raw_fts` and `before_ms`. Its
+    description now says exactly what a query means instead of "prompts".
   - A prompt that a hydrated session also recorded as a user text event
-    matches once, as its `history` row.
+    matches once, as its `history` row. The event is a copy only when it is
+    the same turn -- same session, same timestamp, same text up to
+    surrounding whitespace -- so a later turn repeating the text still
+    matches, and it is dropped only when the prompt passes the search's
+    project filter too.
+  - An ordinary (non-raw) query matches an event's `text` and `project`, as a
+    prompt's `prompt` and `project`; it no longer matches the indexed `role`,
+    so searching for `assistant` or `user` does not return every event of
+    that role.
   - The native CLI's `search --json` always emits `role`, `kind` and
     `match_source`, including on `history` matches.
 - Native contract 22 -> 23: `search` returns `NativeSearchMatch` rows and

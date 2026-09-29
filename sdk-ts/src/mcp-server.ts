@@ -59,8 +59,10 @@ server.tool('search_history',
     .describe('all: prompts and every event; user: prompts and user events; assistant: assistant events; prompt: prompts only.'),
   raw_fts: z.boolean().optional().default(false)
     .describe('Pass the query to SQLite FTS5 verbatim; a malformed expression is an error.'),
+  before_ms: z.number().int().optional()
+    .describe('Only matches (prompts and events) strictly older than this Unix-ms timestamp.'),
   limit: z.number().int().min(1).max(1000).optional().default(20),
-}, READ, ({ query, source, project, tag, scope, role, raw_fts, limit }) => call(() => search(query, { source, project, tag, scope, role, rawFts: raw_fts, limit })));
+}, READ, ({ query, source, project, tag, scope, role, raw_fts, before_ms, limit }) => call(() => search(query, { source, project, tag, scope, role, rawFts: raw_fts, beforeMs: before_ms, limit })));
 
 server.tool('recent_history', 'List recent already-indexed history.', {
   source: SOURCE.optional(), project: z.string().optional(), tag: z.string().optional(),
