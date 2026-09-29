@@ -8830,12 +8830,17 @@ pub(crate) fn heal_claude_request_evidence(conn: &Connection) -> Result<()> {
             None,
         )?;
     }
+    // The notice's text is joined in block order, as a fresh parse writes it:
+    // a Claude text row's uid is `{message_id}:{block_index}`, and
+    // `group_concat` alone promises no order, so the rows' storage order
+    // could otherwise reorder a multi-block notice.
     conn.execute_batch(
         "INSERT INTO session_markers \
            (source, session_id, marker_uid, ts_ms, message_id, parent_id, kind, subkind, text) \
          SELECT 'claude', session_id, message_id || ':marker', MIN(NULLIF(ts_ms, 0)), \
                 message_id, MIN(parent_id), 'local_notice', 'synthetic', \
-                group_concat(text, char(10)) \
+                group_concat(text, char(10) \
+                  ORDER BY CAST(substr(event_uid, length(message_id) + 2) AS INTEGER), id) \
          FROM session_events \
          WHERE source = 'claude' AND role = 'assistant' \
            AND lower(trim(model)) = '<synthetic>' \
@@ -28098,6 +28103,30 @@ mod tests {
             )
             .unwrap();
         assert_eq!(last.as_deref(), Some("Login"));
+    }
+
+    /// A multi-block notice is migrated in block order, not in the order its
+    /// rows happen to be stored: here the later block was stored first, and
+    /// its index sorts first as text.
+    #[test]
+    fn the_notice_migration_joins_blocks_in_block_order() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO session_events (source, session_id, message_id, ts_ms, role, kind, text, model, event_uid) \
+             VALUES ('claude', 's', 'n', 5, 'assistant', 'text', 'Run /login', '<synthetic>', 'n:10'), \
+                    ('claude', 's', 'n', 5, 'assistant', 'text', 'Login expired', '<synthetic>', 'n:2');",
+        )
+        .unwrap();
+        heal_claude_request_evidence(&conn).unwrap();
+        let text: Option<String> = conn
+            .query_row(
+                "SELECT text FROM session_markers WHERE marker_uid = 'n:marker'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(text.as_deref(), Some("Login expired\nRun /login"));
     }
 
     fn heal_older_claude_database(with_request_id: bool, notice_already_moved: bool) {
