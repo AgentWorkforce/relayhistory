@@ -72,7 +72,9 @@ totalTokens, modelUsage}`. It is stored verbatim under `usage` in the turn's
 last assistant event's `token_json`, beside the `context_total_tokens`
 snapshot, and only `usage` is normalized. `inputTokens` includes the
 `cachedReadTokens` subset, so cache reads are subtracted out of input (a cache
-count above input is `USAGE_COUNTER_REGRESSED`, never a clamp);
+count above a reported input is `USAGE_COUNTER_REGRESSED`, never a clamp; a
+breakdown with no input keeps its cache reads and reports input as not
+covered);
 `outputTokens` includes `reasoningTokens` and stays as written, with reasoning
 reported beside it, as for Codex. `usage.totalTokens` is the provider's total
 (input + output). The context snapshot is a window occupancy, not spend: a
