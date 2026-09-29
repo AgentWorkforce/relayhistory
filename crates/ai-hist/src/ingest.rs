@@ -1,6 +1,6 @@
 use crate::{
     default_db_path, insert_history, insert_session_marker, now_ms, open_db, open_db_readonly,
-    parse_cursor_text, prompt_hash, schema_is_catalog_read_current, sync_opencode_db,
+    parse_cursor_text, prompt_hash, schema_is_catalog_read_current, sync_opencode_dbs,
     sync_opencode_session, sync_opencode_storage_dir, HistoryEntry, NewSessionMarker,
     SessionLocation, SessionScope,
 };
@@ -423,12 +423,35 @@ pub fn sync_scoped_at_with_output(
 }
 
 /// Import the selected OpenCode store with the same exclusive ingestion lock.
+///
+/// `source_path` is named outright, so it is the only database read — its
+/// channel siblings are not. [`sync_opencode_with_roots`] reads them.
 pub fn sync_opencode_at(db_path: &Path, source_path: &Path, output: SyncOutput) -> Result<bool> {
     SYNC_QUIET.store(
         matches!(output, SyncOutput::Silent),
         AtomicOrdering::Relaxed,
     );
-    sync_opencode_exclusive(db_path, source_path)
+    sync_opencode_exclusive(db_path, source_path, true, &default_opencode_storage_dir())
+}
+
+/// Import every OpenCode store `roots` names — the configured database and,
+/// unless it is pinned, each channel database beside it — with the same
+/// exclusive ingestion lock.
+pub fn sync_opencode_with_roots(
+    db_path: &Path,
+    roots: &crate::ProviderRoots,
+    output: SyncOutput,
+) -> Result<bool> {
+    SYNC_QUIET.store(
+        matches!(output, SyncOutput::Silent),
+        AtomicOrdering::Relaxed,
+    );
+    sync_opencode_exclusive(
+        db_path,
+        &roots.opencode_db,
+        roots.opencode_db_pinned,
+        &roots.opencode_storage_dir,
+    )
 }
 
 fn sync_scope_with_connectors(
@@ -1090,6 +1113,7 @@ fn sweep_only_fingerprint_inputs(roots: &crate::ProviderRoots) -> Vec<Candidate>
     if let Some(crate::ingest::opencode::OpencodeLayout::JsonTree(tree)) =
         crate::ingest::opencode::OpencodeLayout::detect(
             &roots.opencode_db,
+            roots.opencode_db_pinned,
             &roots.opencode_storage_dir,
         )
     {
@@ -1510,9 +1534,13 @@ fn sync_basic(
     // true for a *directory* named by `OPENCODE_DB`, so sync opened it as
     // SQLite and failed while detect read the legacy tree — catalog rows with
     // no evidence behind them, and nothing saying why.
-    let layout = crate::ingest::opencode::OpencodeLayout::detect(&opencode, &opencode_storage);
+    let layout = crate::ingest::opencode::OpencodeLayout::detect(
+        &opencode,
+        roots.opencode_db_pinned,
+        &opencode_storage,
+    );
     let opencode_result = match &layout {
-        Some(crate::ingest::opencode::OpencodeLayout::Sqlite(db)) => sync_opencode_db(conn, db),
+        Some(crate::ingest::opencode::OpencodeLayout::Sqlite(dbs)) => sync_opencode_dbs(conn, dbs),
         Some(crate::ingest::opencode::OpencodeLayout::JsonTree(tree)) => {
             sync_opencode_storage_dir(conn, tree)
         }
@@ -1823,7 +1851,12 @@ fn sync_exclusive_with_roots(
     })
 }
 
-fn sync_opencode_exclusive(db_path: &Path, opencode_path: &Path) -> Result<bool> {
+fn sync_opencode_exclusive(
+    db_path: &Path,
+    opencode_path: &Path,
+    pinned: bool,
+    storage_dir: &Path,
+) -> Result<bool> {
     let Some(_sync_lock) = try_acquire_sync_lock(db_path)? else {
         sync_note!("  [sync-opencode] another sync is already running; skipped");
         return Ok(false);
@@ -1836,10 +1869,10 @@ fn sync_opencode_exclusive(db_path: &Path, opencode_path: &Path) -> Result<bool>
     // was opened as SQLite and failed, rather than falling through to the tree
     // beside it. `sync --local` has classified this way since the layout gate
     // landed; this path was simply never brought along.
-    let storage_dir = default_opencode_storage_dir();
-    let layout = crate::ingest::opencode::OpencodeLayout::detect(opencode_path, &storage_dir);
+    let layout =
+        crate::ingest::opencode::OpencodeLayout::detect(opencode_path, pinned, storage_dir);
     let inserted = match &layout {
-        Some(crate::ingest::opencode::OpencodeLayout::Sqlite(db)) => sync_opencode_db(&conn, db),
+        Some(crate::ingest::opencode::OpencodeLayout::Sqlite(dbs)) => sync_opencode_dbs(&conn, dbs),
         Some(crate::ingest::opencode::OpencodeLayout::JsonTree(tree)) => {
             sync_opencode_storage_dir(&conn, tree)
         }
@@ -1852,12 +1885,11 @@ fn sync_opencode_exclusive(db_path: &Path, opencode_path: &Path) -> Result<bool>
         }
         _ => sync_note!("  [opencode] +{inserted} rows"),
     }
-    let home = home_dir();
-    let env = DiscoveryEnv::with_provider_roots(
-        &conn,
-        crate::ProviderRoots::from_home(home, opencode_path.to_path_buf()),
-    )
-    .with_opencode_storage_dir(storage_dir);
+    // Discovery reads exactly the stores the sync just read.
+    let mut roots = crate::ProviderRoots::from_home(home_dir(), opencode_path.to_path_buf());
+    roots.opencode_db_pinned = pinned;
+    roots.opencode_storage_dir = storage_dir.to_path_buf();
+    let env = DiscoveryEnv::with_provider_roots(&conn, roots);
     let options = DiscoverOptions {
         sources: vec!["opencode".into()],
         ..Default::default()
@@ -13209,7 +13241,13 @@ mod tests {
         );
         assert!(!sync_exclusive(&alias).unwrap());
         assert!(!sync_local_at(&alias).unwrap());
-        assert!(!sync_opencode_exclusive(&alias, &missing_opencode).unwrap());
+        assert!(!sync_opencode_exclusive(
+            &alias,
+            &missing_opencode,
+            true,
+            &dir.path().join("storage")
+        )
+        .unwrap());
         assert!(
             !db_path.exists(),
             "contended sync paths must not create the DB"

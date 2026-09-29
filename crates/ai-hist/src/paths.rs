@@ -29,6 +29,73 @@ pub fn opencode_db_path(home: &Path) -> PathBuf {
         .unwrap_or_else(|| home.join(".local/share/opencode/opencode.db"))
 }
 
+/// Whether `name` is an OpenCode SQLite store: `opencode.db`, or a
+/// channel-suffixed `opencode-<channel>.db` such as `opencode-stable.db` or
+/// `opencode-nightly.db`.
+///
+/// OpenCode writes one database per release channel (`getChannelPath` in its
+/// `storage/db.ts`): `latest` and `beta`, and anyone with
+/// `OPENCODE_DISABLE_CHANNEL_DB=1`, use `opencode.db`; every other channel gets
+/// its own file beside it. `<channel>` is drawn from the `[a-zA-Z0-9._-]`
+/// class OpenCode normalizes channel names to. The `-wal`, `-shm` and
+/// `-journal` sidecars do not end in `.db`, so they are never mistaken for a
+/// store.
+pub(crate) fn is_opencode_db_filename(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".db") else {
+        return false;
+    };
+    if stem == "opencode" {
+        return true;
+    }
+    let Some(channel) = stem.strip_prefix("opencode-") else {
+        return false;
+    };
+    !channel.is_empty()
+        && channel
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Every OpenCode SQLite store to read, given the configured one.
+///
+/// `pinned` means the store was named outright (`OPENCODE_DB`, or an explicit
+/// path): exactly that file is read. Otherwise every channel database in its
+/// directory is read too. The configured file comes first when it exists, then
+/// the channel files in name order, so a session present in more than one
+/// store resolves to the same file on every path that asks. Only existing
+/// regular files are returned (a symlink counts when it resolves to one), and
+/// the directory is listed at call time: a channel database OpenCode creates
+/// while a watch loop runs is picked up by the next scan.
+pub(crate) fn opencode_db_files(configured: &Path, pinned: bool) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if configured.is_file() {
+        files.push(configured.to_path_buf());
+    }
+    if pinned {
+        return files;
+    }
+    let Some(dir) = configured.parent() else {
+        return files;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return files;
+    };
+    let mut channels: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(is_opencode_db_filename)
+        })
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file() && path.as_path() != configured)
+        .collect();
+    channels.sort();
+    files.extend(channels);
+    files
+}
+
 /// Where OpenCode's legacy JSON tree lives: `session/<scope>/<id>.json`,
 /// `message/<sessionId>/*.json`, `part/<messageId>/*.json`.
 pub fn opencode_storage_dir(home: &Path) -> PathBuf {
@@ -59,8 +126,16 @@ pub struct ProviderRoots {
     pub codex: PathBuf,
     /// Grok state root (`~/.grok`).
     pub grok: PathBuf,
-    /// The OpenCode SQLite store.
+    /// The OpenCode SQLite store. Unless [`Self::opencode_db_pinned`], every
+    /// channel database beside it (`opencode-stable.db`,
+    /// `opencode-nightly.db`, ...) is read as well.
     pub opencode_db: PathBuf,
+    /// Whether `opencode_db` was named outright, so it is the only OpenCode
+    /// database read. [`ProviderRoots::from_env`] sets this when
+    /// `OPENCODE_DB` is set; the default reads every channel database in the
+    /// store's directory.
+    #[serde(default)]
+    pub opencode_db_pinned: bool,
     /// OpenCode's legacy `storage/` JSON tree, read only when there is no
     /// `opencode.db`.
     pub opencode_storage_dir: PathBuf,
@@ -86,6 +161,7 @@ impl ProviderRoots {
             codex: codex_home(&home),
             grok: grok_home(&home),
             opencode_db: opencode_db_path(&home),
+            opencode_db_pinned: env_dir("OPENCODE_DB").is_some(),
             opencode_storage_dir: opencode_storage_dir(&home),
             trajectory_roots: trajectory_roots_from_env(),
             use_env_roots: true,
@@ -106,6 +182,7 @@ impl ProviderRoots {
             grok: home.join(".grok"),
             home,
             opencode_db,
+            opencode_db_pinned: false,
             opencode_storage_dir,
             trajectory_roots: None,
             use_env_roots: false,
@@ -144,6 +221,71 @@ pub fn home_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn opencode_db_filenames_match_the_channel_rule() {
+        for name in [
+            "opencode.db",
+            "opencode-stable.db",
+            "opencode-nightly.db",
+            "opencode-v1.2_rc-3.db",
+        ] {
+            assert!(is_opencode_db_filename(name), "{name}");
+        }
+        for name in [
+            "opencode.db-wal",
+            "opencode.db-shm",
+            "opencode-nightly.db-wal",
+            "opencode-nightly.db-journal",
+            "opencode-.db",
+            "opencode-a b.db",
+            "opencodex.db",
+            "other.db",
+            "opencode",
+        ] {
+            assert!(!is_opencode_db_filename(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn channel_databases_are_found_beside_the_configured_store_unless_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let default = dir.path().join("opencode.db");
+        for name in [
+            "opencode.db",
+            "opencode-nightly.db",
+            "opencode-nightly.db-wal",
+            "opencode-stable.db",
+            "notes.db",
+        ] {
+            std::fs::write(dir.path().join(name), b"").unwrap();
+        }
+        std::fs::create_dir(dir.path().join("opencode-dir.db")).unwrap();
+        assert_eq!(
+            opencode_db_files(&default, false),
+            vec![
+                default.clone(),
+                dir.path().join("opencode-nightly.db"),
+                dir.path().join("opencode-stable.db"),
+            ]
+        );
+        assert_eq!(opencode_db_files(&default, true), vec![default.clone()]);
+        let stable = dir.path().join("opencode-stable.db");
+        assert_eq!(opencode_db_files(&stable, true), vec![stable.clone()]);
+
+        // No default store at all: the channel files are still the stores.
+        std::fs::remove_file(&default).unwrap();
+        assert_eq!(
+            opencode_db_files(&default, false),
+            vec![
+                dir.path().join("opencode-nightly.db"),
+                dir.path().join("opencode-stable.db"),
+            ]
+        );
+        assert!(opencode_db_files(&default, true).is_empty());
+    }
+
     #[test]
     fn provider_roots_have_one_owner() {
         for (name, source) in [

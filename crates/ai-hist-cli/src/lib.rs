@@ -673,8 +673,17 @@ pub fn run() -> Result<()> {
             )?;
         }
         Command::SyncOpencode { opencode_db } => {
-            let source = opencode_db.clone().unwrap_or_else(default_opencode_db_path);
-            return sync_opencode_at(&db_path, &source, SyncOutput::Progress).map(|_| ());
+            // An explicit `--opencode-db` names one store; otherwise every
+            // channel database is read, as `sync` reads them.
+            return match opencode_db {
+                Some(source) => sync_opencode_at(&db_path, source, SyncOutput::Progress),
+                None => sync_opencode_with_roots(
+                    &db_path,
+                    &ProviderRoots::from_env(home_dir()),
+                    SyncOutput::Progress,
+                ),
+            }
+            .map(|_| ());
         }
         _ => {}
     }

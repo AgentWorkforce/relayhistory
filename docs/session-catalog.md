@@ -1449,8 +1449,17 @@ How each adapter works:
 
   | Layout | Location | Environment override |
   |---|---|---|
-  | SQLite (current releases) | `~/.local/share/opencode/opencode.db` | `OPENCODE_DB` |
+  | SQLite (current releases) | `~/.local/share/opencode/opencode.db` and every channel database beside it (`opencode-stable.db`, `opencode-nightly.db`, ...) | `OPENCODE_DB` pins one file |
   | Legacy JSON tree (older installs) | `~/.local/share/opencode/storage` | `OPENCODE_STORAGE_DIR` |
+
+  OpenCode writes one SQLite store per release channel: `latest` and `beta`
+  use `opencode.db`, every other channel `opencode-<channel>.db` in the same
+  directory, and all of them are read (`-wal`, `-shm` and `-journal` sidecars
+  are not stores). A session present in more than one store is catalogued,
+  synced and hydrated from the first that holds it — `opencode.db`, then the
+  channel stores in name order — so it is one session with one `raw_path`.
+  Setting `OPENCODE_DB` names exactly one store and its channel siblings are
+  not read; so does `ai-hist sync-opencode --opencode-db <path>`.
 
   The JSON tree is laid out as `session/<scope>/<sessionId>.json`,
   `message/<sessionId>/<messageId>.json` and `part/<messageId>/<partId>.json`.

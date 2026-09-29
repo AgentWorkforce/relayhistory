@@ -304,6 +304,10 @@ pub struct DiscoveryEnv<'a> {
     pub grok_home: PathBuf,
     /// Path to the opencode database.
     pub opencode_db: PathBuf,
+    /// Whether `opencode_db` is the only OpenCode database to read, rather
+    /// than the first of its channel databases. See
+    /// [`crate::ProviderRoots::opencode_db_pinned`].
+    pub opencode_db_pinned: bool,
     /// Root of OpenCode's legacy `storage/` JSON tree, read only when there
     /// is no `opencode.db`.
     pub opencode_storage_dir: PathBuf,
@@ -328,6 +332,7 @@ impl<'a> DiscoveryEnv<'a> {
             codex_home: roots.codex,
             grok_home: roots.grok,
             opencode_db: roots.opencode_db,
+            opencode_db_pinned: roots.opencode_db_pinned,
             opencode_storage_dir: roots.opencode_storage_dir,
             conn,
             counters: CounterCell::default(),
@@ -362,6 +367,7 @@ impl<'a> DiscoveryEnv<'a> {
                 codex: codex_home,
                 grok: grok_home,
                 opencode_db,
+                opencode_db_pinned: false,
                 opencode_storage_dir,
                 trajectory_roots: None,
                 use_env_roots: false,
@@ -394,6 +400,7 @@ impl<'a> DiscoveryEnv<'a> {
             codex_home: &self.codex_home,
             grok_home: &self.grok_home,
             opencode_db: &self.opencode_db,
+            opencode_db_pinned: self.opencode_db_pinned,
             opencode_storage_dir: &self.opencode_storage_dir,
             counters: &self.counters,
         }
@@ -436,6 +443,8 @@ pub struct ScanEnv<'a> {
     pub grok_home: &'a Path,
     /// Path to the opencode database.
     pub opencode_db: &'a Path,
+    /// Whether `opencode_db` is the only OpenCode database to read.
+    pub opencode_db_pinned: bool,
     /// Root of OpenCode's legacy `storage/` JSON tree.
     pub opencode_storage_dir: &'a Path,
     counters: &'a CounterCell,
@@ -2048,10 +2057,16 @@ fn grok_update_bounds(
 // opencode
 // ---------------------------------------------------------------------------
 
-/// Shallow adapter over the live OpenCode SQLite store.
+/// Shallow adapter over the live OpenCode SQLite stores.
 ///
-/// One read-only connection and one deferred transaction live for the whole
-/// discovery run. The first schema read establishes a coherent SQLite
+/// OpenCode keeps one database per release channel (`opencode.db`,
+/// `opencode-stable.db`, `opencode-nightly.db`, ...), and each is read. A
+/// session present in more than one is claimed by the first store in
+/// [`crate::paths::opencode_db_files`] order, so the catalog lists it once and
+/// its `raw_path` names the store hydration and sync read it from.
+///
+/// Per store, one read-only connection and one deferred transaction live for
+/// the whole discovery run. The first schema read establishes a coherent SQLite
 /// snapshot; candidate enumeration and every selected-session query therefore
 /// see the same committed state even while OpenCode appends in WAL mode.
 ///
@@ -2062,7 +2077,7 @@ fn grok_update_bounds(
 #[derive(Default)]
 struct OpencodeProvider {
     pass: Mutex<()>,
-    live: Mutex<Option<OpencodeReadSnapshot>>,
+    live: Mutex<Option<Vec<OpencodeReadSnapshot>>>,
 }
 
 #[derive(Clone)]
@@ -2075,6 +2090,8 @@ struct OpencodeSessionSeed {
 /// One run's coherent live snapshot and the schema/index facts that are
 /// invariant across its selected candidates.
 struct OpencodeReadSnapshot {
+    /// The store this snapshot reads, recorded as each session's `raw_path`.
+    path: PathBuf,
     conn: Connection,
     store_identity: String,
     session_columns: BTreeSet<String>,
@@ -2091,10 +2108,20 @@ impl OpencodeProvider {
     /// the run's SQLite snapshot. `None` means this host is not on the SQLite
     /// layout — either it has the legacy JSON tree, or it has no OpenCode
     /// store at all.
-    fn snapshot(&self, scan: &ScanEnv<'_>) -> Result<MutexGuard<'_, Option<OpencodeReadSnapshot>>> {
+    fn snapshot(
+        &self,
+        scan: &ScanEnv<'_>,
+    ) -> Result<MutexGuard<'_, Option<Vec<OpencodeReadSnapshot>>>> {
         let mut guard = self.live.lock().expect("opencode live snapshot lock");
-        if guard.is_none() && matches!(scan.opencode_layout(), Some(OpencodeLayout::Sqlite(_))) {
-            *guard = Some(open_opencode_snapshot(scan)?);
+        if guard.is_none() {
+            if let Some(OpencodeLayout::Sqlite(stores)) = scan.opencode_layout() {
+                *guard = Some(
+                    stores
+                        .iter()
+                        .map(|store| open_opencode_snapshot(scan, store))
+                        .collect::<Result<Vec<_>>>()?,
+                );
+            }
         }
         Ok(guard)
     }
@@ -2105,17 +2132,21 @@ impl ScanEnv<'_> {
     /// both are present: newer releases write SQLite and leave the old tree
     /// behind, so preferring the tree would serve stale history.
     pub(crate) fn opencode_layout(&self) -> Option<OpencodeLayout> {
-        OpencodeLayout::detect(self.opencode_db, self.opencode_storage_dir)
+        OpencodeLayout::detect(
+            self.opencode_db,
+            self.opencode_db_pinned,
+            self.opencode_storage_dir,
+        )
     }
 }
 
 /// Open a connection whose filesystem generation is known to match the path
 /// we inspected. The before/after check closes the replacement race between
 /// SQLite opening the file and RelayHistory computing the source stamp.
-fn open_opencode_snapshot(scan: &ScanEnv<'_>) -> Result<OpencodeReadSnapshot> {
+fn open_opencode_snapshot(scan: &ScanEnv<'_>, store: &Path) -> Result<OpencodeReadSnapshot> {
     for _ in 0..3 {
-        let generation_before = opencode_store_generation(scan.opencode_db)?;
-        let conn = open_db_readonly(scan.opencode_db)?;
+        let generation_before = opencode_store_generation(store)?;
+        let conn = open_db_readonly(store)?;
         scan.note_open();
         conn.execute_batch("PRAGMA query_only = ON; BEGIN DEFERRED")?;
         let session_columns = table_columns(&conn, "session")?;
@@ -2125,11 +2156,12 @@ fn open_opencode_snapshot(scan: &ScanEnv<'_>) -> Result<OpencodeReadSnapshot> {
         let part_by_session = has_leading_index(&conn, "part", "session_id")?;
         let part_by_message = has_leading_index(&conn, "part", "message_id")?;
         let schema_version: i64 = conn.query_row("PRAGMA schema_version", [], |row| row.get(0))?;
-        let generation_after = opencode_store_generation(scan.opencode_db)?;
+        let generation_after = opencode_store_generation(store)?;
         if generation_before != generation_after {
             continue;
         }
         return Ok(OpencodeReadSnapshot {
+            path: store.to_path_buf(),
             conn,
             store_identity: format!("{generation_before}:{schema_version}"),
             session_columns,
@@ -2143,7 +2175,7 @@ fn open_opencode_snapshot(scan: &ScanEnv<'_>) -> Result<OpencodeReadSnapshot> {
     }
     anyhow::bail!(
         "OpenCode database {} was repeatedly replaced while discovery opened it",
-        scan.opencode_db.display()
+        store.display()
     )
 }
 
@@ -2249,22 +2281,26 @@ impl ShallowSessionProvider for OpencodeProvider {
     /// write-ahead log, where a commit lands first) move whenever a session or
     /// message does, and cost three stats.
     fn fingerprint_inputs(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
-        let db = &env.opencode_db;
+        // Every channel store, so a write to `opencode-nightly.db` moves the
+        // fingerprint as surely as one to `opencode.db` — and a channel store
+        // that appears adds a candidate, which moves it too.
         let mut out = Vec::new();
-        for suffix in ["", "-wal", "-shm"] {
-            let mut path = db.clone().into_os_string();
-            path.push(suffix);
-            let path = PathBuf::from(path);
-            let Ok((stamp, recency_hint_ms)) = crate::file_stamp_and_modified(&path) else {
-                continue;
-            };
-            out.push(Candidate {
-                source: "opencode",
-                locator: path.to_string_lossy().into_owned(),
-                session_id: None,
-                recency_hint_ms,
-                stamp,
-            });
+        for db in crate::paths::opencode_db_files(&env.opencode_db, env.opencode_db_pinned) {
+            for suffix in ["", "-wal", "-shm"] {
+                let mut path = db.clone().into_os_string();
+                path.push(suffix);
+                let path = PathBuf::from(path);
+                let Ok((stamp, recency_hint_ms)) = crate::file_stamp_and_modified(&path) else {
+                    continue;
+                };
+                out.push(Candidate {
+                    source: "opencode",
+                    locator: path.to_string_lossy().into_owned(),
+                    session_id: None,
+                    recency_hint_ms,
+                    stamp,
+                });
+            }
         }
         Ok(out)
     }
@@ -2279,100 +2315,31 @@ impl ShallowSessionProvider for OpencodeProvider {
             return enumerate_opencode_json_tree(&scan, &root);
         }
         let mut guard = self.snapshot(&scan)?;
-        let Some(snapshot) = guard.as_mut() else {
+        let Some(snapshots) = guard.as_mut() else {
             return Ok(Vec::new());
         };
-        let columns = &snapshot.session_columns;
-        if !columns.contains("id") {
-            return Ok(Vec::new());
+        let mut out = Vec::new();
+        let mut claimed = BTreeSet::new();
+        for snapshot in snapshots.iter_mut() {
+            for candidate in enumerate_opencode_snapshot(&scan, snapshot, requested_limit)? {
+                if claimed.insert(candidate.locator.clone()) {
+                    out.push(candidate);
+                } else {
+                    // An earlier store already holds this session. Forget the
+                    // seed here too, so the shallow read finds one owner.
+                    snapshot.sessions.remove(&candidate.locator);
+                }
+            }
         }
-        let updated = if columns.contains("time_updated") {
-            "time_updated"
-        } else {
-            "NULL"
-        };
-        let created = if columns.contains("time_created") {
-            "time_created"
-        } else {
-            "NULL"
-        };
-        let directory = if columns.contains("directory") {
-            "directory"
-        } else {
-            "NULL"
-        };
-        // Current OpenCode releases index the session primary key but do not
-        // all provide the compound ordering needed to apply both update
-        // recency and the global id tie-break before LIMIT. Otherwise the
-        // provider's descending, time-encoded `ses_` ids make PRIMARY KEY ASC
-        // a bounded newest-created fallback; resumed old sessions can be
-        // delayed on that schema (documented).
-        let recency_order = if columns.contains("time_updated")
-            && has_ordered_index_prefix(
-                &snapshot.conn,
-                "session",
-                &[("time_updated", true), ("id", false)],
-            )? {
-            "time_updated DESC, id ASC"
-        } else {
-            "id ASC"
-        };
-        let sqlite_limit = requested_limit
-            .map(i64::try_from)
-            .transpose()
-            .context("OpenCode discovery limit exceeds SQLite's signed 64-bit range")?;
-        let limit_sql = sqlite_limit.map(|_| " LIMIT ?").unwrap_or_default();
-        let sql = format!(
-            "SELECT id, {directory}, {created}, {updated} FROM session \
-             WHERE id IS NOT NULL AND id <> '' ORDER BY {recency_order}{limit_sql}"
-        );
-        let mut stmt = snapshot.conn.prepare(&sql)?;
-        scan.note_query();
-        let collect = |row: &rusqlite::Row<'_>| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, Option<i64>>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-            ))
-        };
-        let rows = match sqlite_limit {
-            Some(limit) => stmt
-                .query_map([limit], collect)?
-                .collect::<rusqlite::Result<Vec<_>>>()?,
-            None => stmt
-                .query_map([], collect)?
-                .collect::<rusqlite::Result<Vec<_>>>()?,
-        };
-        scan.note_records(rows.len() as u64);
-        snapshot.sessions = rows
-            .iter()
-            .map(|(id, directory, created, updated)| {
-                (
-                    id.clone(),
-                    OpencodeSessionSeed {
-                        directory: directory.clone(),
-                        created: *created,
-                        updated: *updated,
-                    },
-                )
-            })
-            .collect();
-        Ok(rows
-            .into_iter()
-            .map(|(id, _directory, created, updated)| Candidate {
-                source: "opencode",
-                locator: id.clone(),
-                session_id: Some(id),
-                recency_hint_ms: updated.or(created),
-                stamp: format!(
-                    "{}:{}:{}",
-                    snapshot.store_identity,
-                    created.unwrap_or(0),
-                    updated.unwrap_or(0)
-                ),
-            })
-            .collect())
+        if snapshots.len() > 1 {
+            // Each store answered with its own newest; the run's newest are
+            // the merge of those lists, cut back to the limit asked for.
+            out.sort_by_key(|candidate| std::cmp::Reverse(candidate.recency_hint_ms));
+            if let Some(limit) = requested_limit {
+                out.truncate(limit);
+            }
+        }
+        Ok(out)
     }
 
     fn read_shallow(
@@ -2391,7 +2358,11 @@ impl ShallowSessionProvider for OpencodeProvider {
             return read_shallow_opencode_json_tree(scan, candidate);
         }
         let guard = self.live.lock().expect("opencode live snapshot lock");
-        let Some(snapshot) = guard.as_ref() else {
+        let Some(snapshot) = guard.as_ref().and_then(|snapshots| {
+            snapshots
+                .iter()
+                .find(|snapshot| snapshot.sessions.contains_key(&candidate.locator))
+        }) else {
             return Ok(None);
         };
         let conn = &snapshot.conn;
@@ -2518,10 +2489,110 @@ impl ShallowSessionProvider for OpencodeProvider {
             models,
             // Preserve which concrete OpenCode store produced this catalog
             // identity. Hydration verifies that provenance before reading.
-            raw_path: Some(scan.opencode_db.to_string_lossy().into_owned()),
+            raw_path: Some(snapshot.path.to_string_lossy().into_owned()),
             ..Default::default()
         }))
     }
+}
+
+/// One OpenCode store's session candidates, newest first, and the seeds the
+/// shallow read needs for them.
+fn enumerate_opencode_snapshot(
+    scan: &ScanEnv<'_>,
+    snapshot: &mut OpencodeReadSnapshot,
+    requested_limit: Option<usize>,
+) -> Result<Vec<Candidate>> {
+    let columns = &snapshot.session_columns;
+    if !columns.contains("id") {
+        return Ok(Vec::new());
+    }
+    let updated = if columns.contains("time_updated") {
+        "time_updated"
+    } else {
+        "NULL"
+    };
+    let created = if columns.contains("time_created") {
+        "time_created"
+    } else {
+        "NULL"
+    };
+    let directory = if columns.contains("directory") {
+        "directory"
+    } else {
+        "NULL"
+    };
+    // Current OpenCode releases index the session primary key but do not
+    // all provide the compound ordering needed to apply both update
+    // recency and the global id tie-break before LIMIT. Otherwise the
+    // provider's descending, time-encoded `ses_` ids make PRIMARY KEY ASC
+    // a bounded newest-created fallback; resumed old sessions can be
+    // delayed on that schema (documented).
+    let recency_order = if columns.contains("time_updated")
+        && has_ordered_index_prefix(
+            &snapshot.conn,
+            "session",
+            &[("time_updated", true), ("id", false)],
+        )? {
+        "time_updated DESC, id ASC"
+    } else {
+        "id ASC"
+    };
+    let sqlite_limit = requested_limit
+        .map(i64::try_from)
+        .transpose()
+        .context("OpenCode discovery limit exceeds SQLite's signed 64-bit range")?;
+    let limit_sql = sqlite_limit.map(|_| " LIMIT ?").unwrap_or_default();
+    let sql = format!(
+        "SELECT id, {directory}, {created}, {updated} FROM session \
+         WHERE id IS NOT NULL AND id <> '' ORDER BY {recency_order}{limit_sql}"
+    );
+    let mut stmt = snapshot.conn.prepare(&sql)?;
+    scan.note_query();
+    let collect = |row: &rusqlite::Row<'_>| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<i64>>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+        ))
+    };
+    let rows = match sqlite_limit {
+        Some(limit) => stmt
+            .query_map([limit], collect)?
+            .collect::<rusqlite::Result<Vec<_>>>()?,
+        None => stmt
+            .query_map([], collect)?
+            .collect::<rusqlite::Result<Vec<_>>>()?,
+    };
+    scan.note_records(rows.len() as u64);
+    snapshot.sessions = rows
+        .iter()
+        .map(|(id, directory, created, updated)| {
+            (
+                id.clone(),
+                OpencodeSessionSeed {
+                    directory: directory.clone(),
+                    created: *created,
+                    updated: *updated,
+                },
+            )
+        })
+        .collect();
+    Ok(rows
+        .into_iter()
+        .map(|(id, _directory, created, updated)| Candidate {
+            source: "opencode",
+            locator: id.clone(),
+            session_id: Some(id),
+            recency_hint_ms: updated.or(created),
+            stamp: format!(
+                "{}:{}:{}",
+                snapshot.store_identity,
+                created.unwrap_or(0),
+                updated.unwrap_or(0)
+            ),
+        })
+        .collect())
 }
 
 /// Enumerate the legacy tree's `session/<scope>/ses_*.json` files.

@@ -2,7 +2,9 @@
 //!
 //! OpenCode ships two on-disk layouts and both are in the field:
 //!
-//! * **SQLite** — `$OPENCODE_DB`, default `~/.local/share/opencode/opencode.db`,
+//! * **SQLite** — `~/.local/share/opencode/opencode.db` and every
+//!   channel-suffixed store beside it (`opencode-stable.db`,
+//!   `opencode-nightly.db`, ...), or exactly `$OPENCODE_DB` when that is set;
 //!   tables `session`, `message`, `part`, each row carrying the provider's own
 //!   JSON payload in a `data` column.
 //! * **Legacy JSON tree** — `$OPENCODE_STORAGE_DIR`, default
@@ -121,16 +123,21 @@ impl OpencodeSession {
 /// Which OpenCode store a host actually has. `opencode.db` wins when both are
 /// present: newer releases write SQLite and leave the old tree behind, so
 /// preferring the tree would silently serve stale history.
+///
+/// The SQLite layout is every store [`crate::paths::opencode_db_files`]
+/// finds: the configured `opencode.db` and, unless it was pinned, each
+/// channel database beside it. Never empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum OpencodeLayout {
-    Sqlite(PathBuf),
+    Sqlite(Vec<PathBuf>),
     JsonTree(PathBuf),
 }
 
 impl OpencodeLayout {
-    pub fn detect(db_path: &Path, storage_dir: &Path) -> Option<Self> {
-        if db_path.is_file() {
-            return Some(Self::Sqlite(db_path.to_path_buf()));
+    pub fn detect(db_path: &Path, pinned: bool, storage_dir: &Path) -> Option<Self> {
+        let stores = crate::paths::opencode_db_files(db_path, pinned);
+        if !stores.is_empty() {
+            return Some(Self::Sqlite(stores));
         }
         if storage_dir.join("session").is_dir() {
             return Some(Self::JsonTree(storage_dir.to_path_buf()));

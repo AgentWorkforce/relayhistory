@@ -81,6 +81,16 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Added
 
+- Read every OpenCode channel database. OpenCode keeps one SQLite store per
+  release channel — `opencode.db` for `latest`/`beta`, and
+  `opencode-stable.db`, `opencode-nightly.db`, ... beside it — and only
+  `opencode.db` was read, so a user on another channel had no OpenCode history
+  at all. Discovery, `sync`, `sync-opencode`, hydration and live-capture
+  fingerprints now cover every channel store in the directory; a session found
+  in more than one is owned by the first (`opencode.db`, then the channel
+  stores in name order). `OPENCODE_DB` still names exactly one store, as does
+  `sync-opencode --opencode-db`.
+
 - Add workspace-scoped agent handoffs through `create_handoff(intent)` and
   `resume_handoff(source, session_id)`. The sender emits only a session pointer
   plus one self-describing intent and origin identity; the intent tells the
@@ -286,6 +296,10 @@ Notable changes to the native `ai-hist` CLI are documented here.
   ([#211](https://github.com/AgentWorkforce/relayhistory/issues/211))
 
 ### Rust API
+
+- `ProviderRoots` gains `opencode_db_pinned: bool`. `from_env` sets it when
+  `OPENCODE_DB` is set; `from_home` leaves it `false`, so every OpenCode channel
+  database beside `opencode_db` is read. Set it to read `opencode_db` alone.
 
 - The `export` feature is local export alone: `ExportSnapshot` (`open`,
   `handle`, `page`, `owns_cursor`, `expired`, `snapshot_id`),

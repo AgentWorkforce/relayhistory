@@ -1425,8 +1425,11 @@ fn source_snapshot(
         // from the other store -- so hydrating from the current one behind
         // its back would stamp the checkpoint against a store the row does
         // not describe. Refuse, and name the way out.
-        let current_layout =
-            crate::ingest::opencode::OpencodeLayout::detect(configured_path, configured_storage);
+        let current_layout = crate::ingest::opencode::OpencodeLayout::detect(
+            configured_path,
+            roots.opencode_db_pinned,
+            configured_storage,
+        );
         let superseded = |stale: &Path, current: &Path| {
             hydration_error(
                 "SESSION_SOURCE_MISMATCH",
@@ -1450,15 +1453,20 @@ fn source_snapshot(
         // only then is the locator considered as a session file, which means
         // sitting under the tree's own `session/` subtree rather than merely
         // somewhere beneath the storage root.
+        //
+        // "The configured store" is any of them: the default `opencode.db`
+        // and, unless it is pinned, every channel database beside it.
         let resolved = fs::canonicalize(&path).ok();
-        let is_configured_store =
-            resolved.is_some() && resolved == fs::canonicalize(configured_path).ok();
+        let is_configured_store = resolved.is_some()
+            && crate::paths::opencode_db_files(configured_path, roots.opencode_db_pinned)
+                .iter()
+                .any(|store| fs::canonicalize(store).ok() == resolved);
         let is_tree_session_file = !is_configured_store
             && opencode_locator_is_in_storage_tree(&path, &configured_storage.join("session"));
 
         if is_tree_session_file {
-            if let Some(crate::ingest::opencode::OpencodeLayout::Sqlite(store)) = &current_layout {
-                return Err(superseded(&path, store));
+            if let Some(crate::ingest::opencode::OpencodeLayout::Sqlite(stores)) = &current_layout {
+                return Err(superseded(&path, &stores[0]));
             }
             return opencode_json_tree_snapshot(options, &path);
         }
