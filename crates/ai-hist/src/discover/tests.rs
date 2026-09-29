@@ -3801,6 +3801,7 @@ fn stopped_serial_and_parallel_discovery_do_not_claim_the_rest_of_the_window() {
                 &[&provider],
                 |_| panic!("cancelled window emitted a row"),
                 worker_limit,
+                true,
             )
         })
         .unwrap_err();
@@ -4048,4 +4049,52 @@ fn claude_discovery_ignores_the_opencode_wrapper_transcripts_root() {
         "Claude watches only <claude root>/projects; transcripts/ is excluded on \
          purpose (#208, see the claude bullet in docs/session-catalog.md)"
     );
+}
+
+/// Discovery asks this once per candidate whose session id the path does not
+/// name. Served from the primary key to satisfy its ORDER BY, it walked every
+/// observation of the source per candidate: O(files x sessions) on every pass
+/// (#42, #215). It has to be a search on the locator index.
+#[test]
+fn observed_session_by_locator_is_a_keyed_search() {
+    for analyze in [false, true] {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for i in 0..60 {
+            conn.execute(
+                "INSERT INTO session_observations \
+                 (source, session_id, location, connector_id, connector_instance, \
+                  raw_locator, source_stamp, updated_ms) \
+                 VALUES ('claude', ?1, 'local', 'claude', 'default', ?2, 'stamp', 0)",
+                rusqlite::params![format!("s{i}"), format!("/t/{i}.jsonl")],
+            )
+            .unwrap();
+        }
+        if analyze {
+            conn.execute_batch("ANALYZE").unwrap();
+        }
+        let steps: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {OBSERVED_SESSION_BY_LOCATOR_SQL}"))
+            .unwrap()
+            .query_map(
+                rusqlite::params!["claude", "local", "claude", "default", "/t/7.jsonl"],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let joined = steps.join(" | ");
+        assert!(
+            joined.contains("idx_observation_locator") && joined.contains("raw_locator=?"),
+            "the locator lookup is not a search on its index (analyze={analyze}): {joined}"
+        );
+        let found: String = conn
+            .query_row(
+                OBSERVED_SESSION_BY_LOCATOR_SQL,
+                rusqlite::params!["claude", "local", "claude", "default", "/t/7.jsonl"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(found, "s7");
+    }
 }

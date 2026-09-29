@@ -713,6 +713,29 @@ const SOURCE_FINGERPRINT_KEY: &str = "source_fingerprint";
 /// fingerprint it qualifies.
 const DESTINATION_GENERATION_KEY: &str = "destination_generation";
 
+/// Where the change-feed head the destination marker was taken at is
+/// remembered, so a tick can tell "nothing was written since" without
+/// recounting every session. See [`destination_head`].
+const DESTINATION_HEAD_KEY: &str = "destination_head";
+
+/// The destination's change-feed head, as `epoch:revision`.
+///
+/// Every insert, update and delete on the tables the marker counts —
+/// `sessions`, `session_events`, `tool_calls`, `file_edits` — advances the
+/// database-wide revision through the change-feed triggers, and the epoch is
+/// drawn once per database. So a head equal to the one read *before* the
+/// marker was taken proves no row the marker counted has been written or
+/// deleted since, and the marker is still exact. A head that moved says
+/// nothing either way — the hook fast path and hydration add rows between
+/// sweeps — and the tick falls back to comparing the counts.
+///
+/// Before this, every unchanged tick recounted every session's evidence to
+/// confirm what the head already said (#42).
+fn destination_head(conn: &Connection) -> Result<String> {
+    let head = crate::change_feed::read_head(conn)?;
+    Ok(format!("{}:{}", head.epoch, head.revision))
+}
+
 /// The parser and state generations a stored fingerprint is valid for.
 ///
 /// These are the sync-state keys whose *names* carry a generation: bumping one
@@ -1345,6 +1368,18 @@ fn sources_unchanged(conn: &Connection, state: &Map<String, Value>, current: &st
         // anything about one. The sweep below writes it.
         return false;
     };
+    // Nothing written since the marker was taken: it is still the current
+    // marker, so it covers itself. Only a marker this build can read may be
+    // vouched for this way — an empty or foreign one still has to sweep.
+    let stored_head = state
+        .get(DESTINATION_HEAD_KEY)
+        .and_then(Value::as_str)
+        .filter(|head| !head.is_empty());
+    if let (Some(stored_head), Ok(current_head)) = (stored_head, destination_head(conn)) {
+        if stored_head == current_head && parse_destination_marker(stored_destination).is_some() {
+            return true;
+        }
+    }
     match destination_generation(conn) {
         Ok(current_destination) => destination_covers(stored_destination, &current_destination),
         // Prefer a loud extra sweep to a confident skip.
@@ -1409,6 +1444,7 @@ fn sync_basic(
         }
     }
     let mut state = load_sync_state(&state_path)?;
+    let mut checkpoints = SweepCheckpoints::new(&state_path, &state);
     let mut coverage = SweepCoverage::default();
     let providers = shallow_providers();
     // Captured before the sweep, not after. Anything that changes while the
@@ -1479,11 +1515,13 @@ fn sync_basic(
             "claude",
             &roots.claude.join("history.jsonl"),
             parse_claude_line,
-            &mut |in_progress| checkpoint_sync_state(&state_path, in_progress),
+            &mut |in_progress| {
+                checkpoint_sync_state(&state_path, in_progress);
+            },
         ),
     ) {
         total_inserted += inserted;
-        checkpoint_sync_state(&state_path, &state);
+        checkpoints.save(&state);
     }
     capture_progress("claude", 0, None);
     check_capture_cancelled()?;
@@ -1500,7 +1538,7 @@ fn sync_basic(
         )
         .is_some()
     {
-        checkpoint_sync_state(&state_path, &state);
+        checkpoints.save(&state);
     }
     capture_progress("codex", 0, None);
     check_capture_cancelled()?;
@@ -1515,7 +1553,7 @@ fn sync_basic(
         ),
     ) {
         total_inserted += inserted;
-        checkpoint_sync_state(&state_path, &state);
+        checkpoints.save(&state);
     }
     capture_progress("cursor", 0, None);
     check_capture_cancelled()?;
@@ -1529,7 +1567,7 @@ fn sync_basic(
         ),
     ) {
         total_inserted += inserted;
-        checkpoint_sync_state(&state_path, &state);
+        checkpoints.save(&state);
     }
     capture_progress("grok", 0, None);
     check_capture_cancelled()?;
@@ -1538,7 +1576,7 @@ fn sync_basic(
         sync_grok_home(conn, &mut state, &roots.grok, &mut coverage),
     ) {
         total_inserted += inserted;
-        checkpoint_sync_state(&state_path, &state);
+        checkpoints.save(&state);
     }
     capture_progress("muse", 0, None);
     check_capture_cancelled()?;
@@ -1547,7 +1585,7 @@ fn sync_basic(
         sync_muse_with_coverage(conn, &mut state, &roots.muse, &repairs, &mut coverage),
     ) {
         total_inserted += inserted;
-        checkpoint_sync_state(&state_path, &state);
+        checkpoints.save(&state);
     }
     capture_progress("trajectory", 0, None);
     check_capture_cancelled()?;
@@ -1556,7 +1594,7 @@ fn sync_basic(
         sync_trajectories(conn, &mut state, roots, &mut coverage),
     ) {
         total_inserted += inserted;
-        checkpoint_sync_state(&state_path, &state);
+        checkpoints.save(&state);
     }
     capture_progress("opencode", 0, None);
     check_capture_cancelled()?;
@@ -1622,11 +1660,12 @@ fn sync_basic(
     // whose evidence landed but whose catalog pass did not from one that
     // failed outright; the CLI prints the same chain it always did, behind
     // the code.
-    let discovered = discover::discover_sessions_with_providers(
+    // Without discovery's own identity refresh: the sweep runs it itself just
+    // below, and running both was the same whole-catalog pass twice.
+    let discovered = discover::discover_sessions_for_sweep(
         &discovery_env,
         &DiscoverOptions::default(),
         &providers,
-        |_| {},
     )?;
     // After discovery, not before: shallow discovery is what fills in `cwd`
     // and `repo_url` for sessions a provider's history file mentions without
@@ -1704,6 +1743,15 @@ fn sync_basic(
             // merge only ever folds keys forward, so an in-memory `remove` is
             // invisible on disk and would leave a stale marker vouching for a
             // destination nobody measured.
+            //
+            // The head is read *before* the counts. A write that lands between
+            // the two then shows as a head that moved, which only costs the
+            // next tick a recount; read after, a delete in that gap would be
+            // under a head that vouches for counts taken before it.
+            let head = destination_head(conn).unwrap_or_else(|error| {
+                sync_note!("  [sync] destination head unavailable: {error:#}");
+                String::new()
+            });
             let destination = destination_generation(conn).unwrap_or_else(|error| {
                 sync_note!("  [sync] destination generation unavailable: {error:#}");
                 String::new()
@@ -1713,7 +1761,8 @@ fn sync_basic(
                 DESTINATION_GENERATION_KEY.to_string(),
                 Value::from(destination),
             );
-            checkpoint_sync_state(&state_path, &state);
+            state.insert(DESTINATION_HEAD_KEY.to_string(), Value::from(head));
+            checkpoints.save(&state);
         }
     }
     let total: i64 = conn.query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))?;
@@ -2046,7 +2095,9 @@ fn load_sync_state(path: &Path) -> Result<Map<String, Value>> {
 /// write did not land. The next checkpoint retries, and [`save_sync_state`]
 /// leaves the previous state intact when a write fails, so the worst case is a
 /// re-scan rather than corruption.
-fn checkpoint_sync_state(path: &Path, state: &Map<String, Value>) {
+///
+/// Returns whether the checkpoint landed (or had nothing to write).
+fn checkpoint_sync_state(path: &Path, state: &Map<String, Value>) -> bool {
     let checkpoint = || -> Result<()> {
         let _lock = SyncStateLock::acquire(path)?;
         match merged_sync_state(path, state)? {
@@ -2055,8 +2106,45 @@ fn checkpoint_sync_state(path: &Path, state: &Map<String, Value>) {
             Some(merged) => save_sync_state(path, &merged),
         }
     };
-    if let Err(err) = checkpoint() {
-        eprintln!("ai-hist: could not checkpoint sync state: {err:#}");
+    match checkpoint() {
+        Ok(()) => true,
+        Err(err) => {
+            eprintln!("ai-hist: could not checkpoint sync state: {err:#}");
+            false
+        }
+    }
+}
+
+/// One sweep's checkpoints, minus the ones that could write nothing.
+///
+/// A sweep checkpoints after every source, and each checkpoint takes the
+/// state lock, reads and parses the whole state file, merges and compares it.
+/// On an archive whose state has grown past a megabyte that was a
+/// megabyte-scale read and parse per source per sweep — most of them for a
+/// source that advanced nothing. What this sweep already put on disk (or
+/// loaded from it) cannot be news to the file, so an unchanged in-memory
+/// state skips the round trip. A checkpoint that failed is not remembered,
+/// so the next one retries it.
+struct SweepCheckpoints<'a> {
+    path: &'a Path,
+    last: Map<String, Value>,
+}
+
+impl<'a> SweepCheckpoints<'a> {
+    fn new(path: &'a Path, loaded: &Map<String, Value>) -> Self {
+        Self {
+            path,
+            last: loaded.clone(),
+        }
+    }
+
+    fn save(&mut self, state: &Map<String, Value>) {
+        if *state == self.last {
+            return;
+        }
+        if checkpoint_sync_state(self.path, state) {
+            self.last = state.clone();
+        }
     }
 }
 
@@ -2715,6 +2803,24 @@ struct FileCursor {
     /// it detects in-place rewrites that regrow past the cursor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prefix_hash: Option<String>,
+    /// The stat under which `prefix_hash` was last proven against the whole
+    /// file at its end. See [`FileSettled`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    settled: Option<FileSettled>,
+}
+
+/// A byte cursor's [`transcript_cursor::SettledStat`]: the change time and
+/// length of the file when a whole-prefix hash last proved the cursor sat at
+/// its end. While both still describe the file, nothing has written to it
+/// since, so the prefix need not be read again to say so.
+///
+/// Recorded only at end of file, and only once the change time is outside
+/// the racy window. The cursor's own offset has to equal the recorded length,
+/// so a cursor that moved on without clearing it is not vouched for.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct FileSettled {
+    ctime_ns: i64,
+    size: u64,
 }
 
 enum DecodedFileCursor {
@@ -2734,6 +2840,31 @@ impl FileCursor {
 
     fn to_value(&self) -> Value {
         serde_json::to_value(self).expect("file cursor serialization cannot fail")
+    }
+
+    /// Whether this cursor's [`FileSettled`] still describes `path`: the file
+    /// is exactly as long as the cursor, has the cursor's identity and mtime,
+    /// and has not changed since the prefix was proven. One `stat`, no read.
+    fn settled_at(&self, path: &Path) -> bool {
+        let Some(settled) = self.settled.as_ref() else {
+            return false;
+        };
+        let Ok(metadata) = fs::metadata(path) else {
+            return false;
+        };
+        let (device, inode) = metadata_identity(&metadata);
+        let identity_matches = match (self.generation.device, device) {
+            (Some(_), Some(_)) => {
+                (self.generation.device, self.generation.inode) == (device, inode)
+            }
+            _ => true,
+        };
+        metadata.is_file()
+            && identity_matches
+            && settled.size == self.offset
+            && metadata.len() == settled.size
+            && metadata_mtime_ns(&metadata) == self.observed_mtime_ns
+            && transcript_cursor::change_time_ns(&metadata) == Some(settled.ctime_ns)
     }
 
     fn same_generation(&self, other: &Self) -> bool {
@@ -2776,6 +2907,15 @@ impl FileCursor {
                 (ours, on_disk)
             };
             winner.observed_mtime_ns = winner.observed_mtime_ns.max(other.observed_mtime_ns);
+            // Two writers at the same position over the same prefix: a settled
+            // stat either of them proved describes both. It is checked against
+            // the live file before it is ever trusted, so carrying it is safe.
+            if winner.settled.is_none()
+                && winner.offset == other.offset
+                && winner.prefix_hash == other.prefix_hash
+            {
+                winner.settled = other.settled;
+            }
             winner
         } else if on_disk.same_known_identity(&ours) == Some(true)
             && on_disk.generation.rewrite_epoch != ours.generation.rewrite_epoch
@@ -2790,6 +2930,32 @@ impl FileCursor {
         } else {
             on_disk
         }
+    }
+}
+
+/// The saved cursor for `path`, if it is settled at the file's end: the whole
+/// "has anything arrived?" question answered by one `stat`.
+fn saved_cursor_settled(saved: Option<&Value>, path: &Path) -> bool {
+    matches!(
+        saved.and_then(FileCursor::decode),
+        Some(DecodedFileCursor::Typed(cursor)) if cursor.settled_at(path)
+    )
+}
+
+/// Whether `saved` is the cursor a reader just opened at, ignoring whether it
+/// was settled. The reader never carries a settled stat forward, so without
+/// this a settled cursor would never compare equal to the one it reopened.
+fn same_opened_cursor(saved: Option<&Value>, opened: &Value) -> bool {
+    let Some(saved) = saved else {
+        return false;
+    };
+    match saved.as_object() {
+        Some(fields) if fields.contains_key("settled") => {
+            let mut plain = fields.clone();
+            plain.remove("settled");
+            opened.as_object() == Some(&plain)
+        }
+        _ => saved == opened,
     }
 }
 
@@ -2831,6 +2997,9 @@ struct CompleteJsonlReader {
     validated_size: u64,
     validated_mtime_ns: u64,
     reset_cursor: Option<FileCursor>,
+    /// The change time of the stat `open` validated against, when it is old
+    /// enough to settle a cursor on. Taken before the prefix was hashed.
+    settle_ctime_ns: Option<i64>,
 }
 
 impl CompleteJsonlReader {
@@ -2840,6 +3009,7 @@ impl CompleteJsonlReader {
         let size = metadata.len();
         let mtime_ns = metadata_mtime_ns(&metadata);
         let (device, inode) = metadata_identity(&metadata);
+        let settle_ctime_ns = transcript_cursor::settled_change_time(&metadata);
         let decoded = saved.and_then(FileCursor::decode);
 
         let (offset, generation, prefix_hasher) = match decoded {
@@ -2922,6 +3092,7 @@ impl CompleteJsonlReader {
                 generation,
                 observed_mtime_ns: mtime_ns,
                 prefix_hash: Some(prefix_hash.clone()),
+                settled: None,
             },
             position: offset,
             prefix_hasher,
@@ -2930,7 +3101,25 @@ impl CompleteJsonlReader {
             validated_size: size,
             validated_mtime_ns: mtime_ns,
             reset_cursor: None,
+            settle_ctime_ns,
         })
+    }
+
+    /// The opened cursor, settled, when `open` proved the whole prefix and it
+    /// reaches the end of the file: the next pass can then skip the file on a
+    /// `stat`. `None` when the stat was too recent to settle on, or when there
+    /// are unread bytes past the cursor.
+    fn settled_cursor(&self) -> Option<FileCursor> {
+        let ctime_ns = self.settle_ctime_ns?;
+        if self.reset_cursor.is_some() || self.cursor.offset != self.validated_size {
+            return None;
+        }
+        let mut cursor = self.cursor.clone();
+        cursor.settled = Some(FileSettled {
+            ctime_ns,
+            size: self.validated_size,
+        });
+        Some(cursor)
     }
 
     /// Returns only newline-terminated records. A partial final buffer remains
@@ -2981,6 +3170,7 @@ impl CompleteJsonlReader {
                 },
                 observed_mtime_ns: mtime_ns,
                 prefix_hash: Some(empty_prefix_hash()),
+                settled: None,
             };
             self.reset_cursor = Some(reset.clone());
             return Ok(reset);
@@ -3003,7 +3193,35 @@ fn finish_prefix_hash(hasher: &Sha256) -> String {
     format!("{:x}", hasher.clone().finalize())
 }
 
+// Whole-prefix bytes hashed on this thread, so a test can assert that a pass
+// over byte-cursor files it had already proven read none of them again.
+#[cfg(test)]
+thread_local! {
+    static PREFIX_HASH_METER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn meter_prefix_hash(bytes: u64) {
+    PREFIX_HASH_METER.with(|meter| meter.set(meter.get() + bytes));
+}
+
+#[cfg(not(test))]
+fn meter_prefix_hash(_bytes: u64) {}
+
+/// Start counting whole-prefix hash bytes from zero on this thread.
+#[cfg(test)]
+pub(crate) fn reset_prefix_hash_meter() {
+    PREFIX_HASH_METER.with(|meter| meter.set(0));
+}
+
+/// Whole-prefix hash bytes read on this thread since the last reset.
+#[cfg(test)]
+pub(crate) fn prefix_hash_meter() -> u64 {
+    PREFIX_HASH_METER.with(|meter| meter.get())
+}
+
 fn hash_file_prefix(path: &Path, offset: u64) -> Result<(String, Sha256)> {
+    meter_prefix_hash(offset);
     let mut file = fs::File::open(path)?;
     let mut remaining = offset;
     let mut hasher = Sha256::new();
@@ -3037,11 +3255,20 @@ fn sync_jsonl_incremental(
         sync_note!("  [{name}] not found: {} (skipped)", path.display());
         return Ok(0);
     }
+    // A cursor settled at the end of an untouched file is up to date on a
+    // `stat`; everything else reopens it and proves the prefix again.
+    if saved_cursor_settled(state.get(name), path) {
+        sync_note!("  [{name}] up to date");
+        return Ok(0);
+    }
     let mut source = CompleteJsonlReader::open(path, state.get(name))?;
     let offset = source.position;
     let size = source.reader.get_ref().metadata()?.len();
     let opened_cursor = source.cursor.to_value();
-    if offset >= size && state.get(name) == Some(&opened_cursor) {
+    if offset >= size && same_opened_cursor(state.get(name), &opened_cursor) {
+        if let Some(settled) = source.settled_cursor() {
+            state.insert(name.to_string(), settled.to_value());
+        }
         sync_note!("  [{name}] up to date");
         return Ok(0);
     }
@@ -10745,6 +10972,26 @@ fn scan_cursor_transcript_with(
     saved: Option<&Value>,
     after_read: &mut dyn FnMut(&Path),
 ) -> Result<ScannedCursorTranscript> {
+    // A cursor settled at the end of an untouched file needs nothing read:
+    // there are no new bytes, the prefix is the one it proved, and an
+    // unadvanced scan is never indexed, so it needs no generation either.
+    // Before this, every Cursor transcript was hashed whole twice per sweep —
+    // once to validate the cursor, once more to identify a generation nothing
+    // would use (#215).
+    if let Some(DecodedFileCursor::Typed(cursor)) = saved.and_then(FileCursor::decode) {
+        if cursor.settled_at(jsonl) {
+            return Ok(ScannedCursorTranscript {
+                timestamp_ms: i64::try_from(cursor.observed_mtime_ns / 1_000_000).unwrap_or(0),
+                parse_errors: 0,
+                checkpoint: None,
+                restarted: cursor.offset == 0,
+                advanced: false,
+                resumed_from: cursor.offset,
+                consumed_through: cursor.offset,
+                generation: None,
+            });
+        }
+    }
     let mut source = CompleteJsonlReader::open(jsonl, saved)
         .with_context(|| format!("open Cursor transcript {}", jsonl.display()))?;
     let offset = source.position;
@@ -10794,7 +11041,7 @@ fn scan_cursor_transcript_with(
     // recorded as the generation the scan saw and then compare equal at the
     // index check, laundering the new file in under the old scan's offsets.
     // Hashing what was read closes that window by construction.
-    let committed = if consumed != offset || saved != Some(&opened_cursor) {
+    let committed = if consumed != offset || !same_opened_cursor(saved, &opened_cursor) {
         Some(
             source
                 .committed_cursor(consumed, true)
@@ -10816,6 +11063,9 @@ fn scan_cursor_transcript_with(
     // `scanned_through` then all come from the one read that saw the
     // replacement whole.
     let replaced_mid_scan = source.reset_cursor.is_some();
+    let advanced = consumed != offset
+        || replaced_mid_scan
+        || (offset == 0 && saved_offset.is_some_and(|previous| previous > 0));
     let generation = if replaced_mid_scan {
         None
     } else {
@@ -10830,14 +11080,24 @@ fn scan_cursor_transcript_with(
                     prefix_len: cursor.offset,
                 }),
             // Nothing advanced and the saved cursor still describes the file,
-            // so there is nothing to index and no offsets to protect.
+            // so there is nothing to index and no offsets to protect. Only an
+            // advanced scan is queued, and only a queued one reads its
+            // generation, so hashing the prefix again here bought nothing.
+            None if !advanced => None,
             None => cursor_generation(jsonl, consumed)?,
         }
+    };
+    // Unchanged, proven by the whole-prefix hash `open` just took, and old
+    // enough to settle on: record that, so the next sweep can stop at a stat.
+    let checkpoint = match committed {
+        Some(cursor) => Some(cursor.to_value()),
+        None if !advanced => source.settled_cursor().map(|cursor| cursor.to_value()),
+        None => None,
     };
     Ok(ScannedCursorTranscript {
         timestamp_ms,
         parse_errors,
-        checkpoint: committed.map(|cursor| cursor.to_value()),
+        checkpoint,
         restarted: offset == 0,
         // A replacement is work even when the read that found it consumed
         // nothing: the session's stored evidence belongs to a file that no
@@ -10852,9 +11112,7 @@ fn scan_cursor_transcript_with(
         // `consumed != offset` nor `reset_cursor` fires. The checkpoint
         // still advances (the opened cursor is a new generation), and
         // without this the obsolete rows stay.
-        advanced: consumed != offset
-            || replaced_mid_scan
-            || (offset == 0 && saved_offset.is_some_and(|previous| previous > 0)),
+        advanced,
         resumed_from: offset,
         consumed_through: consumed,
         // Re-checked by the index phase, because a replacement can still land
@@ -10934,6 +11192,7 @@ pub(crate) fn cursor_generation(path: &Path, through: u64) -> Result<Option<Curs
 /// would turn an ordinary rewrite into a failed sync. Only a real I/O failure
 /// is an error here.
 fn hash_prefix_bytes(path: &Path, through: u64) -> Result<Option<String>> {
+    meter_prefix_hash(through);
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
@@ -16173,6 +16432,7 @@ mod tests {
             },
             observed_mtime_ns: generation,
             prefix_hash: Some("test-prefix".to_string()),
+            settled: None,
         }
         .to_value()
     }
@@ -32157,6 +32417,227 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stop_reason.as_deref(), Some("tool-calls"));
+    }
+
+    /// Restores the production settle window however a test ends.
+    struct ImmediateSettle;
+
+    impl ImmediateSettle {
+        fn new() -> Self {
+            transcript_cursor::set_settle_window_for_test(Some(0));
+            Self
+        }
+    }
+
+    impl Drop for ImmediateSettle {
+        fn drop(&mut self) {
+            transcript_cursor::set_settle_window_for_test(None);
+        }
+    }
+
+    fn sweep_claude_transcript(home: &Path, session_id: &str, turns: usize) -> PathBuf {
+        let dir = home.join(".claude/projects/-work-sweep");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{session_id}.jsonl"));
+        let mut body = String::new();
+        for turn in 0..turns {
+            body.push_str(&claude_sweep_turn(session_id, turn));
+        }
+        fs::write(&path, body).unwrap();
+        path
+    }
+
+    fn claude_sweep_turn(session_id: &str, turn: usize) -> String {
+        let user = claude_line(json!({
+            "type": "user", "uuid": format!("{session_id}-u{turn}"), "sessionId": session_id,
+            "cwd": "/work/sweep", "timestamp": format!("2026-04-20T00:{turn:02}:00.000Z"),
+            "message": { "role": "user", "content": format!("prompt {turn}") },
+        }));
+        let assistant = claude_line(json!({
+            "type": "assistant", "uuid": format!("{session_id}-a{turn}"),
+            "parentUuid": format!("{session_id}-u{turn}"), "sessionId": session_id,
+            "cwd": "/work/sweep", "timestamp": format!("2026-04-20T00:{turn:02}:01.000Z"),
+            "message": { "role": "assistant", "id": format!("msg-{session_id}-{turn}"),
+                         "model": "claude-opus-4", "stop_reason": "end_turn",
+                         "content": [{ "type": "text", "text": format!("answer {turn}") }] },
+        }));
+        format!("{user}\n{assistant}\n")
+    }
+
+    /// Everything a sweep could have written, as one comparable value: the
+    /// change-feed head (every catalog and evidence write moves it) and every
+    /// transcript cursor as stored.
+    fn sweep_footprint(db_path: &Path) -> (String, Vec<(String, String, String)>) {
+        let conn = open_db(db_path).unwrap();
+        let head = super::destination_head(&conn).unwrap();
+        let cursors = conn
+            .prepare(
+                "SELECT source, locator, parser_state_json FROM transcript_cursors \
+                 ORDER BY source, locator",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        (head, cursors)
+    }
+
+    /// #42 and #215: a sweep over a corpus that has not changed — the one a
+    /// `watch` event tick or a periodic Reflex sync runs whenever anything
+    /// else moved — must neither write per-session rows nor re-read the
+    /// transcripts it already proved. Forced, so the source fingerprint
+    /// cannot short-circuit it: the per-file paths are what is under test.
+    ///
+    /// And the fast path must not cost correctness: bytes appended to a
+    /// transcript afterwards are still found and ingested.
+    #[test]
+    fn a_forced_sweep_over_an_unchanged_corpus_reads_and_writes_nothing() {
+        let _settle = ImmediateSettle::new();
+        let home = tempfile::tempdir().unwrap();
+        let db_path = home.path().join("history.db");
+        let claude = sweep_claude_transcript(home.path(), "sweep-a", 3);
+        sweep_claude_transcript(home.path(), "sweep-b", 2);
+        let cursor = write_cursor_transcript(
+            home.path(),
+            "sweep-cursor",
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query>first</user_query>"}]}}"#,
+                "\n",
+                r#"{"role":"assistant","message":{"content":[{"type":"text","text":"done"}]}}"#,
+                "\n"
+            ),
+        );
+        let codex = home.path().join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&codex).unwrap();
+        fs::write(
+            codex.join("rollout-2026-04-20T00-00-00-sweep-codex.jsonl"),
+            "{\"timestamp\":\"2026-04-20T00:00:00.000Z\",\"type\":\"session_meta\",\
+             \"payload\":{\"id\":\"sweep-codex\",\"cwd\":\"/work/sweep\",\"git\":{\"branch\":\"main\"}}}\n\
+             {\"timestamp\":\"2026-04-20T00:00:00.500Z\",\"type\":\"event_msg\",\
+             \"payload\":{\"type\":\"user_message\",\"message\":\"codex prompt\"}}\n",
+        )
+        .unwrap();
+
+        let sweep = || {
+            SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
+            let tick = sync_exclusive_with_home(&db_path, home.path(), true).unwrap();
+            assert!(tick.attempted && tick.swept);
+        };
+        // The first sweep ingests; the second proves every file once more
+        // with its digest and records the stat it proved it under.
+        sweep();
+        sweep();
+        let settled = sweep_footprint(&db_path);
+        assert!(
+            settled.1.iter().any(|(source, _, _)| source == "claude"),
+            "the fixture's transcripts carry cursors"
+        );
+
+        transcript_cursor::reset_validation_meter();
+        reset_prefix_hash_meter();
+        sweep();
+        assert_eq!(
+            transcript_cursor::validation_meter(),
+            0,
+            "an unchanged Claude transcript was re-read to prove it had not changed"
+        );
+        assert_eq!(
+            prefix_hash_meter(),
+            0,
+            "an unchanged byte-cursor file was re-hashed to prove it had not changed"
+        );
+        assert_eq!(
+            sweep_footprint(&db_path),
+            settled,
+            "a sweep over an unchanged corpus wrote catalog, evidence or cursor rows"
+        );
+
+        // Appends still land, through the same fast path.
+        let_the_clock_tick();
+        {
+            let mut file = fs::OpenOptions::new().append(true).open(&claude).unwrap();
+            file.write_all(claude_sweep_turn("sweep-a", 3).as_bytes())
+                .unwrap();
+            let mut file = fs::OpenOptions::new().append(true).open(&cursor).unwrap();
+            file.write_all(
+                concat!(
+                    r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query>second</user_query>"}]}}"#,
+                    "\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        }
+        sweep();
+        let conn = open_db(&db_path).unwrap();
+        let answered: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE source = 'claude' \
+                 AND session_id = 'sweep-a' AND text = 'answer 3'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(answered, 1, "the appended Claude turn was not ingested");
+        let prompts: Vec<String> = conn
+            .prepare(
+                "SELECT prompt FROM history WHERE source = 'cursor' \
+                 AND session_id = 'sweep-cursor' ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(prompts, vec!["first".to_string(), "second".to_string()]);
+    }
+
+    /// Long enough for any filesystem clock the suite runs on to tick, so a
+    /// write after a settle lands on a later change time than the one it
+    /// recorded. The production settle window is what guarantees that
+    /// outside a test.
+    fn let_the_clock_tick() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    /// A settled Cursor cursor rides the sync state through a concurrent
+    /// writer's checkpoint that holds the same position unsettled, instead of
+    /// being dropped by the merge and re-proven on every sweep.
+    #[test]
+    fn a_settled_byte_cursor_survives_the_checkpoint_merge() {
+        let cursor = |settled: Option<FileSettled>| FileCursor {
+            offset: 42,
+            generation: FileGeneration {
+                device: Some(1),
+                inode: Some(7),
+                started_mtime_ns: 10,
+                started_size: 42,
+                observed_at_ns: 10,
+                rewrite_epoch: 0,
+            },
+            observed_mtime_ns: 10,
+            prefix_hash: Some("prefix".into()),
+            settled,
+        };
+        let proof = FileSettled {
+            ctime_ns: 5,
+            size: 42,
+        };
+        for (on_disk, ours) in [
+            (cursor(None), cursor(Some(proof.clone()))),
+            (cursor(Some(proof.clone())), cursor(None)),
+        ] {
+            let merged = FileCursor::merge(on_disk, ours);
+            assert_eq!(merged.settled, Some(proof.clone()));
+        }
+        // A different position is a different claim; its proof is not carried.
+        let mut moved = cursor(None);
+        moved.offset = 84;
+        moved.prefix_hash = Some("longer".into());
+        let merged = FileCursor::merge(moved, cursor(Some(proof)));
+        assert_eq!(merged.offset, 84);
+        assert_eq!(merged.settled, None);
     }
 }
 

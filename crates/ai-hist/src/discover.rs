@@ -3669,6 +3669,21 @@ fn observation_key(
     }
 }
 
+/// The session a candidate's locator was last observed as.
+///
+/// `ORDER BY +session_id`, not `ORDER BY session_id`: with no `sqlite_stat1`
+/// (the crate never runs `ANALYZE`) SQLite otherwise serves the ORDER BY from
+/// the primary key, which pins only `source` for this lookup, and walks every
+/// observation of the source for every candidate — O(files x sessions) on
+/// each discovery pass, and the largest remaining cost of a sweep over an
+/// unchanged store once the identity refresh stopped scanning (#42, #215).
+/// The unary `+` leaves the sort to the at-most-a-few rows
+/// `idx_observation_locator` returns.
+pub(crate) const OBSERVED_SESSION_BY_LOCATOR_SQL: &str = "SELECT session_id FROM session_observations \
+     WHERE source=? AND location=? AND connector_id=? AND connector_instance=? \
+       AND raw_locator=? AND access_state='available' \
+     ORDER BY +session_id LIMIT 1";
+
 fn fetch_observed_candidate(
     conn: &Connection,
     provider: &dyn ShallowSessionProvider,
@@ -3676,7 +3691,7 @@ fn fetch_observed_candidate(
 ) -> Result<Option<ShallowSession>> {
     let id = match candidate.session_id.as_ref() {
         Some(id) => Some(id.clone()),
-        None => conn.query_row("SELECT session_id FROM session_observations WHERE source=? AND location=? AND connector_id=? AND connector_instance=? AND raw_locator=? AND access_state='available' ORDER BY session_id LIMIT 1",params![candidate.source,provider.location().as_str(),provider.connector_id(),provider.connector_instance(),candidate.locator],|r|r.get(0)).optional()?,
+        None => conn.query_row(OBSERVED_SESSION_BY_LOCATOR_SQL,params![candidate.source,provider.location().as_str(),provider.connector_id(),provider.connector_instance(),candidate.locator],|r|r.get(0)).optional()?,
     };
     let Some(id) = id else { return Ok(None) };
     let Some(observation) =
@@ -4301,7 +4316,26 @@ pub fn discover_sessions_with_provider_refs(
     on_row: impl FnMut(&ShallowSession),
 ) -> Result<DiscoverySummary> {
     let worker_limit = std::thread::available_parallelism().map_or(1, |n| n.get());
-    discover_sessions_with_worker_limit(env, options, providers, on_row, worker_limit)
+    discover_sessions_with_worker_limit(env, options, providers, on_row, worker_limit, true)
+}
+
+/// [`discover_sessions_with_providers`] for the end of a sync sweep, which
+/// refreshes project identity itself immediately afterwards.
+///
+/// The refresh is a pass over every session and event. Discovery's own copy
+/// and the sweep's ran back to back with nothing written in between, so the
+/// second always found nothing to do and cost a sweep as much as the first.
+pub(crate) fn discover_sessions_for_sweep(
+    env: &DiscoveryEnv<'_>,
+    options: &DiscoverOptions,
+    providers: &[Box<dyn ShallowSessionProvider>],
+) -> Result<DiscoverySummary> {
+    let providers = providers
+        .iter()
+        .map(|provider| provider.as_ref())
+        .collect::<Vec<_>>();
+    let worker_limit = std::thread::available_parallelism().map_or(1, |n| n.get());
+    discover_sessions_with_worker_limit(env, options, &providers, |_| {}, worker_limit, false)
 }
 
 // An explicit limit lets regression tests exercise both read paths regardless
@@ -4312,6 +4346,7 @@ fn discover_sessions_with_worker_limit(
     providers: &[&dyn ShallowSessionProvider],
     mut on_row: impl FnMut(&ShallowSession),
     worker_limit: usize,
+    refresh_identity: bool,
 ) -> Result<DiscoverySummary> {
     // A pass is the unit over which the filesystem is treated as fixed, so it
     // is also the unit the project-identity cache may span. A host that stays
@@ -4791,11 +4826,13 @@ fn discover_sessions_with_worker_limit(
     // nothing to upgrade stays read-only. Reporting rather than failing, for
     // the same reason the sync path does: the rows this discovery wrote are
     // already committed, and every key here is derived from them.
-    if let Err(error) = crate::store::refresh_project_identity(env.conn) {
-        eprintln!(
-            "ai-hist: could not refresh canonical project identity after discovery: {error:#} \
-             (project keys stay as they were; the next pass retries)"
-        );
+    if refresh_identity {
+        if let Err(error) = crate::store::refresh_project_identity(env.conn) {
+            eprintln!(
+                "ai-hist: could not refresh canonical project identity after discovery: {error:#} \
+                 (project keys stay as they were; the next pass retries)"
+            );
+        }
     }
     summary.counters = env.counters();
     Ok(summary)

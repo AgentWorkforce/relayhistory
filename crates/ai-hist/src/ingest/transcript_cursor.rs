@@ -313,6 +313,91 @@ pub(crate) struct CodexCursorState {
     pub inherited_baseline_marker: Option<String>,
 }
 
+/// A stat under which a cursor's positions were proven by their digests.
+///
+/// The skip path's window digest exists because size, mtime and inode do not
+/// prove a file's bytes: a writer can put a timestamp back, and a coarse clock
+/// can give two writes the same one. It pays for that with a read of every
+/// file it skips -- on a large archive, a sweep that finds one transcript
+/// changed re-read up to 256 KiB of every other one to confirm it had not
+/// (#215).
+///
+/// The change time closes both holes without the read. `ctime` cannot be set
+/// from user space -- restoring an mtime, and every write, truncate, chmod or
+/// rename onto the path, moves it to *now* -- so once a digest has proven the
+/// positions, an unchanged `ctime` proves nothing has touched the file since.
+/// The coarse-clock case is the one version-control tools call "racy": a write
+/// in the same tick as the stat would leave `ctime` equal. So a file is
+/// settled only once its `ctime` is at least [`SETTLE_WINDOW_NS`] in the past
+/// when the digest runs; any later change then lands on a strictly later tick.
+///
+/// Bound to the prefix hashes it was proven for, so a cursor rewritten to a
+/// new position -- by this build, or by an older one that carries the key
+/// through unread -- is not vouched for by a stat taken over the old one.
+/// Platforms with no `ctime` never settle, and keep the digest.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct SettledStat {
+    pub ctime_ns: i64,
+    pub prefix_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_prefix_hash: Option<String>,
+}
+
+/// How long a file must have been left alone before its change time alone is
+/// trusted. Wider than any timestamp granularity the supported filesystems
+/// use (FAT's is two seconds), so a write after the proving stat always lands
+/// on a later tick.
+pub(crate) const SETTLE_WINDOW_NS: i64 = 3_000_000_000;
+
+#[cfg(test)]
+thread_local! {
+    static SETTLE_WINDOW_OVERRIDE: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Let a test settle files it has only just written.
+#[cfg(test)]
+pub(crate) fn set_settle_window_for_test(window_ns: Option<i64>) {
+    SETTLE_WINDOW_OVERRIDE.with(|slot| slot.set(window_ns));
+}
+
+fn settle_window_ns() -> i64 {
+    #[cfg(test)]
+    if let Some(window) = SETTLE_WINDOW_OVERRIDE.with(|slot| slot.get()) {
+        return window;
+    }
+    SETTLE_WINDOW_NS
+}
+
+/// The file's change time in nanoseconds, where the platform reports one.
+#[cfg(unix)]
+pub(crate) fn change_time_ns(metadata: &fs::Metadata) -> Option<i64> {
+    use std::os::unix::fs::MetadataExt;
+    metadata
+        .ctime()
+        .checked_mul(1_000_000_000)?
+        .checked_add(metadata.ctime_nsec())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn change_time_ns(_metadata: &fs::Metadata) -> Option<i64> {
+    None
+}
+
+/// `metadata`'s change time, if it is old enough to settle on. `metadata` must
+/// have been taken *before* the digest that is about to prove the file, so a
+/// write racing the digest leaves a different `ctime` behind.
+pub(crate) fn settled_change_time(metadata: &fs::Metadata) -> Option<i64> {
+    let ctime = change_time_ns(metadata)?;
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos(),
+    )
+    .ok()?;
+    (now.checked_sub(ctime)? >= settle_window_ns()).then_some(ctime)
+}
+
 /// One transcript's complete resume state.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct TranscriptCursorState {
@@ -324,6 +409,10 @@ pub(crate) struct TranscriptCursorState {
     pub claude: Option<ClaudeCursorState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex: Option<CodexCursorState>,
+    /// The file's change time when every position above was last proven
+    /// against the bytes on disk; see [`SettledStat`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled: Option<SettledStat>,
     /// Keys this version does not know about, preserved across a round trip so
     /// sibling per-source states can share the document.
     #[serde(flatten)]
@@ -340,6 +429,7 @@ impl Default for TranscriptCursorState {
             file: None,
             claude: None,
             codex: None,
+            settled: None,
             extra: Map::new(),
         }
     }
@@ -618,7 +708,67 @@ pub(crate) fn transcript_unchanged(conn: &Connection, source: &str, path: &Path)
     // walk's: a superseded metadata scan leaves a fold that has to be made
     // again, and skipping on the record cursor alone would leave it stale for
     // as long as nothing else about the file changed.
-    Ok(committed_prefix_matches(file, path).valid && scan_position_current(&cursor, path).valid)
+    if settled_proves_unchanged(&cursor, file, &metadata) {
+        return Ok(true);
+    }
+    let valid =
+        committed_prefix_matches(file, path).valid && scan_position_current(&cursor, path).valid;
+    if valid {
+        if let Some(ctime_ns) = settled_change_time(&metadata) {
+            // Proven by the digests just taken, over a stat taken before them
+            // and old enough to be past the racy window: from here on this
+            // file is skipped on its stat alone until something touches it.
+            let mut settled = cursor.clone();
+            settled.settled = Some(SettledStat {
+                ctime_ns,
+                prefix_hash: file.prefix_hash.clone(),
+                scan_prefix_hash: scan_prefix_hash(&cursor),
+            });
+            store_cursor(
+                conn,
+                &CursorKey::Locator {
+                    source,
+                    locator: &locator,
+                },
+                &settled,
+            )?;
+        }
+    }
+    Ok(valid)
+}
+
+/// The metadata fold's prefix hash, for a Claude cursor that has one.
+fn scan_prefix_hash(cursor: &TranscriptCursorState) -> Option<String> {
+    cursor
+        .claude
+        .as_ref()?
+        .scan
+        .as_ref()?
+        .file
+        .as_ref()
+        .map(|file| file.prefix_hash.clone())
+}
+
+/// Whether the [`SettledStat`] recorded for this cursor still describes the
+/// file, which proves every position in it without reading a byte. The caller
+/// has already matched the record cursor's offset, mtime and identity.
+fn settled_proves_unchanged(
+    cursor: &TranscriptCursorState,
+    file: &TranscriptFileCursor,
+    metadata: &fs::Metadata,
+) -> bool {
+    let Some(settled) = cursor.settled.as_ref() else {
+        return false;
+    };
+    let scan = scan_prefix_hash(cursor);
+    // A Claude cursor with no metadata position is a fold that has to be made
+    // again, whatever the stat says.
+    if cursor.claude.is_some() && scan.is_none() {
+        return false;
+    }
+    settled.prefix_hash == file.prefix_hash
+        && settled.scan_prefix_hash == scan
+        && change_time_ns(metadata) == Some(settled.ctime_ns)
 }
 
 /// Whether the metadata walk's own position is recorded and still describes
@@ -1570,5 +1720,160 @@ mod tests {
             "the gap between the windows is a known blind spot; if this now \
              fails the window rule changed and the docs above must follow"
         );
+    }
+
+    /// Restores the production settle window when a test ends, pass or fail,
+    /// so a thread the harness reuses does not inherit a zero window.
+    struct SettleWindow;
+
+    impl SettleWindow {
+        fn immediate() -> Self {
+            set_settle_window_for_test(Some(0));
+            Self
+        }
+    }
+
+    impl Drop for SettleWindow {
+        fn drop(&mut self) {
+            set_settle_window_for_test(None);
+        }
+    }
+
+    fn stamped_transcript(dir: &Path, body: &str) -> (Connection, PathBuf) {
+        let path = dir.join("settled.jsonl");
+        fs::write(&path, body).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        crate::init_db(&conn).unwrap();
+        stamp_whole_file(&conn, "claude", &path).unwrap();
+        (conn, path)
+    }
+
+    /// Long enough for any filesystem clock this runs on to tick, so a write
+    /// after the settle is on a later `ctime` than the one it recorded. The
+    /// production window is what guarantees that outside a test.
+    fn let_the_clock_tick() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    /// Once a digest has proven a file and its change time is settled, the
+    /// skip path stops reading it: the stat alone answers until something
+    /// touches the file (#215).
+    #[test]
+    fn a_settled_transcript_is_skipped_on_its_stat_alone() {
+        let _window = SettleWindow::immediate();
+        let dir = tempfile::tempdir().unwrap();
+        let body = "{\"type\":\"user\",\"uuid\":\"u1\"}\n".repeat(64);
+        let (conn, path) = stamped_transcript(dir.path(), &body);
+
+        reset_validation_meter();
+        assert!(transcript_unchanged(&conn, "claude", &path).unwrap());
+        assert_eq!(
+            validation_meter(),
+            body.len() as u64,
+            "the first skip proves the file with its window digest"
+        );
+        let settled = load_cursor(
+            &conn,
+            &CursorKey::Locator {
+                source: "claude",
+                locator: &path.to_string_lossy(),
+            },
+        )
+        .unwrap()
+        .settled;
+        assert!(settled.is_some(), "and records the stat it proved it under");
+
+        reset_validation_meter();
+        for _ in 0..3 {
+            assert!(transcript_unchanged(&conn, "claude", &path).unwrap());
+        }
+        assert_eq!(
+            validation_meter(),
+            0,
+            "a settled, untouched file is skipped without reading a byte"
+        );
+    }
+
+    /// Settling must not reopen the hole the digest closed: a rewrite that
+    /// keeps the length and puts the mtime back still moves the change time,
+    /// which no writer can restore.
+    #[test]
+    fn a_same_stat_rewrite_of_a_settled_transcript_is_still_caught() {
+        let _window = SettleWindow::immediate();
+        let dir = tempfile::tempdir().unwrap();
+        let original = "{\"type\":\"user\",\"text\":\"aaaaa\"}\n";
+        let (conn, path) = stamped_transcript(dir.path(), original);
+        let stamped = fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(transcript_unchanged(&conn, "claude", &path).unwrap());
+        assert!(transcript_unchanged(&conn, "claude", &path).unwrap());
+
+        let_the_clock_tick();
+        let rewritten = original.replace("aaaaa", "bbbbb");
+        fs::write(&path, &rewritten).unwrap();
+        fs::File::open(&path)
+            .unwrap()
+            .set_modified(stamped)
+            .unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        assert_eq!(metadata.len() as usize, original.len());
+        assert_eq!(metadata.modified().unwrap(), stamped);
+
+        assert!(
+            !transcript_unchanged(&conn, "claude", &path).unwrap(),
+            "a same-size, same-mtime rewrite must not be served from a settled cursor"
+        );
+    }
+
+    /// The settled stat is bound to the positions it proved. A cursor moved
+    /// to a new position under it — here, a record walk published at a
+    /// different offset — is not vouched for by the old stat.
+    #[test]
+    fn a_settled_stat_does_not_vouch_for_a_cursor_that_moved() {
+        let _window = SettleWindow::immediate();
+        let dir = tempfile::tempdir().unwrap();
+        let (conn, path) = stamped_transcript(dir.path(), "{\"a\":1}\n{\"b\":2}\n");
+        assert!(transcript_unchanged(&conn, "claude", &path).unwrap());
+        let key_locator = path.to_string_lossy().to_string();
+        let key = CursorKey::Locator {
+            source: "claude",
+            locator: &key_locator,
+        };
+        let mut cursor = load_cursor(&conn, &key).unwrap();
+        assert!(cursor.settled.is_some());
+        cursor.file.as_mut().unwrap().prefix_hash = "not-the-proven-prefix".into();
+        store_cursor(&conn, &key, &cursor).unwrap();
+
+        reset_validation_meter();
+        assert!(
+            !transcript_unchanged(&conn, "claude", &path).unwrap(),
+            "a position the settled stat never proved is checked against the bytes"
+        );
+        assert!(validation_meter() > 0);
+    }
+
+    /// A file whose change time is inside the racy window is proven by its
+    /// digest every time and never settled: a write in the same clock tick
+    /// as the proving stat would otherwise go unseen.
+    #[test]
+    fn a_recently_changed_transcript_is_not_settled() {
+        set_settle_window_for_test(None);
+        let dir = tempfile::tempdir().unwrap();
+        let (conn, path) = stamped_transcript(dir.path(), "{\"a\":1}\n");
+        reset_validation_meter();
+        assert!(transcript_unchanged(&conn, "claude", &path).unwrap());
+        assert!(transcript_unchanged(&conn, "claude", &path).unwrap());
+        assert!(
+            validation_meter() > 0,
+            "a file written moments ago is read to be proven, every time"
+        );
+        let cursor = load_cursor(
+            &conn,
+            &CursorKey::Locator {
+                source: "claude",
+                locator: &path.to_string_lossy(),
+            },
+        )
+        .unwrap();
+        assert!(cursor.settled.is_none());
     }
 }

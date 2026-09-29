@@ -616,6 +616,34 @@ Notable changes to the native `ai-hist` CLI are documented here.
   (created on the next writable open) serves the sidecar probe. On the 100 MB
   synthetic store, a sync after a 1 KiB append drops from 7.0 s to 2.1 s, and
   a cold sync from 60 s to 43 s, in the benchmark harness (#215).
+- A sweep over files that have not changed no longer re-reads or re-queries
+  them (#42, #215). Measured on the 100 MB synthetic store, a sync after a
+  1 KiB append (what a `watch` event tick or a periodic Reflex sync runs
+  whenever anything moved) drops from 1.77 s and 838 MiB read to 0.39 s and
+  114 MiB; a `watch` tick with nothing changed reads 22 MiB instead of 28 MiB.
+  - Unchanged Claude transcripts and subagent metadata are skipped on a
+    `stat`. Once a window digest has proven a transcript's cursor and the
+    file's change time is more than three seconds old, the cursor records
+    that change time (`settled`); an unchanged `ctime` — which no writer can
+    restore, unlike an mtime — then proves the bytes without reading them.
+    Any write, truncate, chmod or rename falls back to the digest.
+  - Unchanged Cursor transcripts and the flat prompt logs are skipped the
+    same way (`settled` on their byte cursor in `.sync-state.json`), and a
+    Cursor transcript that did not advance is no longer hashed a second time
+    to identify a generation nothing used.
+  - The project-identity refresh no longer reads every event row. The stale
+    event probe is driven from the catalog through a new covering index,
+    `idx_session_events_project` (created on the next writable open), the
+    delegated-thread pass from the relationship ledger, and the path-key
+    upgrade pass reads the catalog once instead of once per directory. A
+    sweep runs the refresh once instead of twice.
+  - Discovery's locator lookup is a search on `idx_observation_locator`
+    again; with no `sqlite_stat1`, SQLite served its `ORDER BY` from the
+    primary key and walked every observation of the source per file.
+  - A sweep skips per-source sync-state checkpoints whose state did not
+    change, and an unchanged tick whose change-feed head matches the one
+    recorded with the destination marker (`destination_head`) skips
+    recounting every session's evidence.
 
 ### Rust API
 
