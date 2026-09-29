@@ -70,7 +70,7 @@ it.
 npx -y ai-hist-mcp
 ```
 
-Exposes `search_history`, `list_sessions`, `get_session_events`, `get_session_tool_calls`, `get_session_file_edits`, `get_session_tree`, `history_stats`, and more as MCP tools. `list_relay_agents` lists live Agent Relay participants (not history) through the local desktop app's Unix socket. Wire it into any MCP-capable agent so it can query its own history mid-session.
+Exposes `search_history`, `list_sessions`, `get_session_events`, `get_session_tool_calls`, `get_session_file_edits`, `get_session_tree`, `history_stats`, and more as MCP tools. `list_relay_agents` lists live Agent Relay participants (not history) through the local desktop app's Unix socket. `relay_status` reports whether the local session hosting the MCP server is reachable; `join_relay` makes that session reachable by teammates and agents, with optional public `name` and `description`; `leave_relay` removes it again. Wire it into any MCP-capable agent so it can query its own history and participate on the relay mid-session.
 
 Workspace handoffs need no installed receiver skill. `create_handoff(intent)`
 returns one pointer whose existing `intent` field is itself the continuation
@@ -82,7 +82,7 @@ field or inline the transcript. Before sending, call `resume_handoff` once with
 the pointer to verify that Agent Relay desktop has uploaded the session to the
 current workspace.
 
-The MCP server reads local history only, plus any source plugins named by `AI_HIST_PLUGIN_CONFIG`. `list_relay_agents` is also local: it uses `AGENT_RELAY_SOCKET`, then `~/.agentworkforce/desktop/relay-socket`, then the platform socket defaults. It never loads cloud credentials. If the desktop app is absent, the tool returns a non-fatal instruction to open it or use the Agent Relay MCP. A connected desktop gets a 15-second local response deadline; exceeding it reports `timeout` instead of claiming the app is absent.
+The MCP server reads local history only, plus any source plugins named by `AI_HIST_PLUGIN_CONFIG`. The relay roster, status, join, and leave tools are also local: they use `AGENT_RELAY_SOCKET`, then `~/.agentworkforce/desktop/relay-socket`, then the platform socket defaults. They never load cloud credentials. If the desktop app is absent, the tools return a non-fatal instruction to open it or use the Agent Relay MCP. A connected desktop gets a 15-second local response deadline; exceeding it reports `timeout` instead of claiming the app is absent. If the app setting disallows self-registration, `join_relay` returns the desktop's readable `not_allowed` guidance.
 
 ## Local and remote history
 
