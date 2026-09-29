@@ -272,20 +272,6 @@ Notable changes to the native `ai-hist` CLI are documented here.
   native local pass's diagnostics and completion with its own.
   `docs/remote-connectors.md` is now `docs/source-plugins.md`.
 
-- One-entry harness registry (#177). Each built-in harness is declared once,
-  as a `LocalSource` descriptor in `crates/ai-hist/src/sources/catalog.rs`,
-  and `SOURCE_CHOICES`, `shallow_providers()`, `DISCOVERY_EXEMPTIONS`, the
-  declared evidence coverage, hydration's source validation and parser
-  dispatch, `validate_provider_path`'s roots, `relationship_capabilities`,
-  `resume_command` and the native relationship-identity check are derived from
-  it instead of kept as separate lists. The fixture-corpus registry test now
-  checks that every `SOURCE_CHOICES` value is a descriptor and every
-  descriptor has a fixture directory with committed snapshots or a fixture
-  exemption. Behaviour is unchanged, and so is the default Rust API; the
-  descriptors are readable under `unstable-internal` as
-  `ai_hist::sources::catalog`. `docs/session-catalog.md` "Adding a provider"
-  describes the descriptor path.
-
 - Add workspace-scoped agent handoffs through `create_handoff(intent)` and
   `resume_handoff(source, session_id)`. The sender emits only a session pointer
   plus one self-describing intent and origin identity; the intent tells the
@@ -495,6 +481,24 @@ Notable changes to the native `ai-hist` CLI are documented here.
   workflow fails, and opens a tracking issue here, if burn's harness-parser
   symbols reappear or its parity suite is missing after its cutover tag,
   `relayburn-sdk-v5.0.0`.
+
+### Changed
+
+- Internal refactor: one-entry harness registry (#177). Each built-in harness
+  is declared once, as a `LocalSource` descriptor in
+  `crates/ai-hist/src/sources/catalog.rs`, and `SOURCE_CHOICES`,
+  `shallow_providers()`, `DISCOVERY_EXEMPTIONS`, hydration's source validation
+  and parser dispatch, `validate_provider_path`'s roots,
+  `relationship_capabilities`, `resume_command` and the native
+  relationship-identity check are derived from it instead of kept as separate
+  lists. Other per-source code (parsers and full sync, sync watch roots,
+  `Source`, usage accounting, the TypeScript source lists) is not yet on the
+  descriptor; `docs/session-catalog.md` "Adding a provider" lists it. The
+  fixture-corpus registry test now checks that `Source::ALL` names exactly the
+  descriptors and that every descriptor has a fixture directory with committed
+  snapshots or a fixture exemption. Behaviour is unchanged, and so is the
+  default Rust API; the descriptors are readable under `unstable-internal` as
+  `ai_hist::sources::catalog`.
 
 ### Fixed
 

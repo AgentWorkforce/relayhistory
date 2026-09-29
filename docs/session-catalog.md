@@ -2189,39 +2189,52 @@ the record types in [`sourcing-contract.md`](sourcing-contract.md).
 
 Every built-in harness is declared once, as a `LocalSource` descriptor in
 [`crates/ai-hist/src/sources/catalog.rs`](../crates/ai-hist/src/sources/catalog.rs).
-The per-source lists that used to be kept by hand are derived from it:
+These per-source tables are derived from it:
 
-| Descriptor field   | Derived from it                                                                                   |
-| ------------------ | ------------------------------------------------------------------------------------------------- |
-| `id`               | `SOURCE_CHOICES` (declaration order)                                                              |
-| `discovery`        | `shallow_providers()` (ordered by id), `DISCOVERY_EXEMPTIONS`, and through the adapter's `evidence_kinds`, the declared coverage in `declared_evidence_kinds` / `missing_evidence_kinds` |
-| `hydration`        | hydration's source validation and the `ingest_selected` dispatch                                  |
-| `transcript_roots` | `validate_provider_path`, the root check for hydrated and hook-captured locators                  |
-| `relationships`    | `relationship_capabilities`                                                                       |
-| `resume`           | `resume_command`                                                                                  |
-| `fixtures`         | the registry test in `fixture_corpus.rs`                                                          |
+| Descriptor field   | Derived from it                                                                    |
+| ------------------ | ---------------------------------------------------------------------------------- |
+| `id`               | `SOURCE_CHOICES` (declaration order)                                               |
+| `discovery`        | `shallow_providers()` (alphabetical by id) and `DISCOVERY_EXEMPTIONS`              |
+| `hydration`        | hydration's source validation and the `ingest_selected` dispatch                   |
+| `transcript_roots` | `validate_provider_path`, the root check for hydrated and hook-captured locators   |
+| `relationships`    | `relationship_capabilities`                                                        |
+| `resume`           | `resume_command`                                                                   |
+| `fixtures`         | the registry test in `fixture_corpus.rs`                                           |
 
-So a new harness is:
+A new harness starts with:
 
 1. **A descriptor** in `sources/catalog.rs`. Its `discovery` is either a
    `ShallowSessionProvider` adapter (`enumerate` may stat but not read;
    `read_shallow` stays inside the head/tail budgets and returns `Ok(None)` for
-   "this candidate is not a session") or `Discovery::Exempt(reason)`. Its
+   "this candidate is not a session") or `Discovery::Exempt(reason)`. The
+   adapter's `evidence_kinds` is the source's declared parser coverage. Its
    `hydration` names the parser for one selected session (a function taking
    `SelectedIngest`), `NoConnector(message)` for a catalog source no local
    parser backs, or `Unsupported`.
-2. **A fixture and a snapshot** (below), named by the descriptor's `fixtures`.
+2. **A fixture and a snapshot** (below), in the directory the descriptor's
+   `fixtures` names, which is the source id.
 
-Nothing else in the Rust crate needs a per-source edit for discovery,
-hydration dispatch, relationship capabilities, resume or coverage. Some things
-are still outside the descriptor and need their own edit:
+The descriptor does not yet cover everything. These still need their own
+per-source edit:
 
-- the parser itself, and the full-sync pass in `ingest.rs` that runs it;
+- the parser itself, the targeted-hydration snapshot branches in
+  `source_snapshot` (`hydrate.rs`), and the full-sync pass in `ingest.rs` that
+  runs the parser;
+- `source_watch_roots` in `ingest.rs`, for anything sync reads beyond the
+  adapter's own `watch_roots` (Claude's and Codex's `history.jsonl`,
+  trajectory roots);
+- the public `Source` enum in `session_store.rs` (`Source::ALL`, `as_str`),
+  which is default API; the registry test checks it names exactly the
+  descriptors. `Source::capabilities` also adds evidence kinds (session
+  markers, prompt history) beyond the adapter's `evidence_kinds`, and states
+  each source's message-id origin, by hand;
+- `HOOK_HARNESSES`, for a harness whose lifecycle hook hands over a
+  transcript path;
+- usage normalization (`NORMALIZABLE_SOURCES` and `source_accounting` in
+  `usage.rs`), for a harness that reports token usage;
 - a `ProviderRoots` field and environment override, if the harness has its own
   root;
-- the public `Source` enum in `session_store.rs`, since it is part of the
-  default API (a test checks it against `SOURCE_CHOICES`);
-- the TypeScript `SOURCES` list and MCP enums in `sdk-ts`.
+- the TypeScript `SOURCES` list, MCP enums and resume command in `sdk-ts`.
 
 Exactly one of the adapter or an exemption is required, so a new source always
 carries a decision about whether it is discoverable. Today the only exemption
