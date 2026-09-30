@@ -2916,11 +2916,16 @@ impl FileCursor {
             // Two writers at the same position over the same prefix: a settled
             // stat either of them proved describes both. It is checked against
             // the live file before it is ever trusted, so carrying it is safe.
-            if winner.settled.is_none()
-                && winner.offset == other.offset
-                && winner.prefix_hash == other.prefix_hash
-            {
-                winner.settled = other.settled;
+            // The more recent proof wins, so a renewal (after the reverify
+            // interval, or after a ctime-only change such as a chmod) replaces
+            // the stale stamp instead of being discarded by the fold.
+            if winner.offset == other.offset && winner.prefix_hash == other.prefix_hash {
+                winner.settled = match (winner.settled.take(), other.settled) {
+                    (Some(left), Some(right)) if right.settled_at_ms > left.settled_at_ms => {
+                        Some(right)
+                    }
+                    (left, right) => left.or(right),
+                };
             }
             winner
         } else if on_disk.same_known_identity(&ours) == Some(true)
@@ -33067,6 +33072,31 @@ mod tests {
             let merged = FileCursor::merge(on_disk, ours);
             assert_eq!(merged.settled, Some(proof.clone()));
         }
+        // A renewed proof replaces an expired one whichever side carries it,
+        // so the checkpoint sees a change and writes it.
+        let renewed = FileSettled {
+            ctime_ns: 9,
+            size: 42,
+            settled_at_ms: 2,
+        };
+        for (on_disk, ours) in [
+            (cursor(Some(proof.clone())), cursor(Some(renewed.clone()))),
+            (cursor(Some(renewed.clone())), cursor(Some(proof.clone()))),
+        ] {
+            let merged = FileCursor::merge(on_disk, ours);
+            assert_eq!(merged.settled, Some(renewed.clone()));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join(".sync-state.json");
+        let mut on_disk = Map::new();
+        on_disk.insert("claude".into(), cursor(Some(proof.clone())).to_value());
+        fs::write(&state_path, serde_json::to_vec(&on_disk).unwrap()).unwrap();
+        let mut ours = Map::new();
+        ours.insert("claude".into(), cursor(Some(renewed.clone())).to_value());
+        let written = merged_sync_state(&state_path, &ours)
+            .unwrap()
+            .expect("a renewed settle is a change to checkpoint");
+        assert_eq!(settled_byte_cursor(&written["claude"]), Some(renewed));
         // A different position is a different claim; its proof is not carried.
         let mut moved = cursor(None);
         moved.offset = 84;
