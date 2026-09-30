@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 const ci = await readFile(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
@@ -81,4 +85,38 @@ test("full core smoke checks gate release finalization and downstream publicatio
   );
   assert.match(plugins, /needs\.verify-core\.result == 'success'/);
   assert.match(plugins, /needs\.finalize-core\.result == 'success'/);
+});
+
+test("a tagged custom version can still run the build-only release path", () => {
+  const version = jobBlock(publish, "version", "build");
+  const marker = "        run: |\n";
+  const script = version.slice(version.indexOf(marker) + marker.length)
+    .split("\n")
+    .map((line) => line.startsWith("          ") ? line.slice(10) : line)
+    .join("\n")
+    .replaceAll("${{ github.repository }}", "AgentWorkforce/relayhistory");
+  const directory = mkdtempSync(join(tmpdir(), "ai-hist-release-version-test-"));
+  try {
+    writeFileSync(join(directory, "gh"), "#!/bin/sh\nprintf '%s\\n' refs/tags/sdk-ts-v0.32.2\n", { mode: 0o755 });
+    const run = (dryRun) => spawnSync("bash", ["-c", script], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${directory}:${process.env.PATH}`,
+        VERSION_TYPE: "patch",
+        CUSTOM_VERSION: "0.32.2",
+        SKIP_CORE: "false",
+        DRY_RUN: dryRun ? "true" : "false",
+        GITHUB_OUTPUT: join(directory, "output"),
+      },
+    });
+    const dryRun = run(true);
+    assert.equal(dryRun.status, 0, dryRun.stderr);
+    assert.match(dryRun.stdout, /Release version 0\.32\.2/);
+    const publishRun = run(false);
+    assert.equal(publishRun.status, 1);
+    assert.match(publishRun.stderr, /Release tag sdk-ts-v0\.32\.2 already exists/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
