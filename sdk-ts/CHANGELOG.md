@@ -13,7 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Upgrading the ai-hist database to <version>...`, then
   `Database upgraded in <elapsed>.` -- and only when an open actually
   migrates an existing database. `onStoreMigration()` delivers the same
-  `started`/`finished` events to SDK callers, and `migrateStore()` runs the
+  `started`/`finished`/`failed` events, with the database path, to SDK
+  callers, and `migrateStore()` runs the
   migration explicitly. Requires native contract 26.
 
 - `searchPage()` and `recentPage()` return one page plus a `nextCursor`

@@ -1287,6 +1287,8 @@ pub enum MigrationEvent {
     Started,
     /// The migration committed.
     Finished,
+    /// The migration failed and rolled back; the open reports the error.
+    Failed,
 }
 
 type MigrationObserver = Box<dyn Fn(MigrationEvent, Option<&str>) + Send + Sync>;
@@ -1341,12 +1343,18 @@ fn init_db_once(conn: &Connection) -> Result<()> {
     if upgrading {
         notify_migration(conn, MigrationEvent::Started);
     }
-    init_db_locked(&transaction)?;
-    transaction.commit()?;
+    // Every `Started` ends in exactly one `Finished` or `Failed`, so an
+    // observer waiting on it is never left hanging.
+    let migrated = init_db_locked(&transaction).and_then(|()| Ok(transaction.commit()?));
     if upgrading {
-        notify_migration(conn, MigrationEvent::Finished);
+        let event = if migrated.is_ok() {
+            MigrationEvent::Finished
+        } else {
+            MigrationEvent::Failed
+        };
+        notify_migration(conn, event);
     }
-    Ok(())
+    migrated
 }
 
 /// One observed delegation edge, or one piece of related evidence whose child
@@ -5179,7 +5187,7 @@ mod tests {
     }
 
     #[test]
-    fn the_migration_observer_hears_an_upgrade_but_not_a_creation() {
+    fn the_migration_observer_hears_every_upgrade_end_but_not_a_creation() {
         use std::sync::Mutex;
         static EVENTS: Mutex<Vec<(MigrationEvent, String)>> = Mutex::new(Vec::new());
         observe_migrations(|event, path| {
@@ -5215,6 +5223,26 @@ mod tests {
         assert_eq!(
             ours(&EVENTS.lock().unwrap()),
             [MigrationEvent::Started, MigrationEvent::Finished]
+        );
+
+        // A table squatting on an index's name makes the migration fail after
+        // it started; the observer still hears how it ended.
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "DROP INDEX idx_session_presences_location;
+                 CREATE TABLE idx_session_presences_location (x);",
+            )
+            .unwrap();
+        assert!(open_db(&path).is_err());
+        assert_eq!(
+            ours(&EVENTS.lock().unwrap()),
+            [
+                MigrationEvent::Started,
+                MigrationEvent::Finished,
+                MigrationEvent::Started,
+                MigrationEvent::Failed
+            ]
         );
     }
 

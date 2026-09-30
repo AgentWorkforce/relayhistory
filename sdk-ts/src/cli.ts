@@ -93,11 +93,15 @@ async function packageVersion(): Promise<string> {
   return (JSON.parse(contents) as PackageMetadata).version ?? 'unknown';
 }
 
-/** Where the command lines running in this process send their stderr. */
-const migrationSinks = new Set<CliIo>();
-/** Start time of each migration announced but not yet finished, by database. */
+/**
+ * Where the command lines running in this process send their stderr, with how
+ * many running calls share each sink.
+ */
+const migrationSinks = new Map<CliIo, number>();
+/** Start time of each migration announced but not yet ended, by database. */
 const migrationsRunning = new Map<string, number>();
-let migrationsSettled: (() => void) | null = null;
+/** Calls waiting for every running migration to end. */
+const migrationWaiters = new Set<() => void>();
 let migrationListener: Promise<unknown> | null = null;
 
 /**
@@ -114,35 +118,45 @@ function listenForMigrations(): Promise<unknown> {
       const key = dbPath ?? '';
       if (event === 'started') {
         migrationsRunning.set(key, Date.now());
-        for (const io of migrationSinks) {
+        for (const io of migrationSinks.keys()) {
           io.stderr(`Upgrading the ai-hist database to ${version}. This runs once and can take a few minutes on a large history...\n`);
         }
         return;
       }
       const started = migrationsRunning.get(key) ?? Date.now();
       migrationsRunning.delete(key);
-      for (const io of migrationSinks) io.stderr(`Database upgraded in ${formatElapsed(Date.now() - started)}.\n`);
-      if (migrationsRunning.size === 0) migrationsSettled?.();
+      // A failed migration is reported by the command whose open it was.
+      if (event === 'finished') {
+        for (const io of migrationSinks.keys()) io.stderr(`Database upgraded in ${formatElapsed(Date.now() - started)}.\n`);
+      }
+      if (migrationsRunning.size === 0) for (const settle of [...migrationWaiters]) settle();
     });
   })().catch(() => false);
   return migrationListener;
 }
 
 /**
- * Wait for the `finished` of any migration that started, so the notice is not
- * lost to an exit. It was queued before the migrating call returned, so this
- * takes milliseconds; the bound only covers a migration that failed.
+ * Wait for the end of every migration that started, so its last line is not
+ * lost to an exit. Each `started` is followed by a `finished` or `failed`
+ * queued before the migrating call returned, so this takes milliseconds. The
+ * listener never keeps the process alive, so a timer does while waiting; if it
+ * fires, the migrations it waited on are forgotten rather than delaying every
+ * later call.
  */
-async function migrationsFinished(): Promise<void> {
+async function migrationsEnded(): Promise<void> {
   if (migrationsRunning.size === 0) return;
+  const awaited = [...migrationsRunning.keys()];
   await new Promise<void>((resolve) => {
-    const timer = setTimeout(settle, 2_000);
+    const timer = setTimeout(() => {
+      for (const key of awaited) migrationsRunning.delete(key);
+      settle();
+    }, 2_000);
     function settle(): void {
       clearTimeout(timer);
-      migrationsSettled = null;
+      migrationWaiters.delete(settle);
       resolve();
     }
-    migrationsSettled = settle;
+    migrationWaiters.add(settle);
   });
 }
 
@@ -1226,7 +1240,7 @@ export interface RunCliOptions {
  */
 export async function runCli(argv: readonly string[], io: CliIo, options: RunCliOptions = {}): Promise<number> {
   await listenForMigrations();
-  migrationSinks.add(io);
+  migrationSinks.set(io, (migrationSinks.get(io) ?? 0) + 1);
   try {
     return await dispatch(argv, io, options);
   } catch (error: unknown) {
@@ -1239,8 +1253,10 @@ export async function runCli(argv: readonly string[], io: CliIo, options: RunCli
     io.stderr(`ai-hist: ${value.code ? `${value.code}: ` : ''}${value.message ?? String(error)}\n`);
     return 1;
   } finally {
-    await migrationsFinished();
-    migrationSinks.delete(io);
+    await migrationsEnded();
+    const calls = (migrationSinks.get(io) ?? 1) - 1;
+    if (calls > 0) migrationSinks.set(io, calls);
+    else migrationSinks.delete(io);
   }
 }
 

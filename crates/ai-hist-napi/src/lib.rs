@@ -216,13 +216,16 @@ pub fn native_contract_version() -> u32 {
     NATIVE_CONTRACT_VERSION
 }
 
-/// Call `callback` with `"started"` or `"finished"` and the database's path
-/// whenever an open in this process migrates an existing database. Returns
+/// Call `callback` with `"started"`, then `"finished"` or `"failed"`, and the
+/// database's path whenever an open in this process migrates an existing
+/// database. Returns
 /// false when a callback is already registered: the first registration wins.
 ///
 /// The callback never keeps the process alive. It runs asynchronously on the
 /// JS thread, so a caller that needs `finished` before exiting waits for it.
-#[napi(ts_args_type = "callback: (event: 'started' | 'finished', dbPath: string | null) => void")]
+#[napi(
+    ts_args_type = "callback: (event: 'started' | 'finished' | 'failed', dbPath: string | null) => void"
+)]
 pub fn on_store_migration(env: Env, callback: JsFunction) -> napi::Result<bool> {
     use napi::threadsafe_function::{
         ErrorStrategy, ThreadSafeCallContext, ThreadsafeFunction, ThreadsafeFunctionCallMode,
@@ -244,6 +247,7 @@ pub fn on_store_migration(env: Env, callback: JsFunction) -> napi::Result<bool> 
         let event = match event {
             ai_hist::MigrationEvent::Started => "started",
             ai_hist::MigrationEvent::Finished => "finished",
+            ai_hist::MigrationEvent::Failed => "failed",
         };
         notify.call(
             (event, path.map(str::to_string)),
