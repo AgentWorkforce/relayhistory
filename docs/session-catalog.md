@@ -1319,7 +1319,9 @@ How each adapter works:
     whether the session was indexed before or after the rows arrived. A turn
     the log does not reach (a log that started mid-session, or was rotated
     away) keeps its breakdown as `usage`, so it is neither counted twice nor
-    dropped. A log row with no time cannot be placed in a turn, so its
+    dropped. A turn whose stream recorded no window cannot be placed either,
+    so a timed log row never covers it and it keeps its own `usage`. A log
+    row with no time cannot be placed in a turn, so its
     presence covers every turn: a demoted breakdown is still there as
     `turn_usage`, while an inference counted twice could not be told apart.
     The context snapshot is never usage in any case. Its turn window is stored

@@ -190,8 +190,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # The merge commit and its first parent, for relevant-change.
+          # The merge commit and its first parent, for relevant-change. On
+          # push, relevant-change fetches the event's `before` itself.
           fetch-depth: 2
+          # This job builds and tests burn's code; keep GITHUB_TOKEN out of
+          # .git/config. relevant-change's fetch from this public repo needs none.
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
