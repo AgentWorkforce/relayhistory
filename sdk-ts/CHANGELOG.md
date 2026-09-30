@@ -9,11 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- The CLI announces a pending schema migration before it runs:
-  `Upgrading the ai-hist database to <version>...`, then
-  `Database upgraded in <elapsed>.` on stderr. `storeNeedsMigration()` and
-  `migrateStore()` expose the same check and migration to SDK callers.
-  Requires native contract 26.
+- The CLI announces a pending schema migration on stderr --
+  `Upgrading the ai-hist database to <version>...` -- before the command's
+  first open runs it, for every scope. `storeNeedsMigration()` exposes the
+  check and `migrateStore()` runs the migration explicitly. Requires native
+  contract 26.
 
 - `searchPage()` and `recentPage()` return one page plus a `nextCursor`
   `{ timestampMs, id, matchSource? }`. `search()`, `recent()` and both page

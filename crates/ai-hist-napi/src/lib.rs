@@ -215,22 +215,24 @@ pub fn native_contract_version() -> u32 {
     NATIVE_CONTRACT_VERSION
 }
 
-/// Whether opening the database would first run a schema migration. False
-/// when the database does not exist yet: creating one is not an upgrade.
-/// Read-only; never migrates.
+/// Whether opening the database would first run a schema migration. Read-only;
+/// never migrates.
+///
+/// Advisory, so it never fails: an absent or empty file is a database about to
+/// be created, which is not an upgrade, and a file the check cannot read is
+/// left for the operation's own open to report.
 #[napi]
 pub async fn store_needs_migration(db_path: Option<String>) -> napi::Result<bool> {
     let path = crate::db_path(db_path);
     napi::tokio::task::spawn_blocking(move || {
-        if !path.exists() {
-            return Ok(false);
-        }
-        open_db_readonly(&path)
-            .and_then(|conn| needs_migration(&conn))
-            .map_err(|error| database_error(&path, format!("{error:#}")))
+        let populated = std::fs::metadata(&path).is_ok_and(|meta| meta.len() > 0);
+        populated
+            && open_db_readonly(&path)
+                .and_then(|conn| needs_migration(&conn))
+                .unwrap_or(false)
     })
     .await
-    .map_err(worker_error)?
+    .map_err(worker_error)
 }
 
 /// Run any outstanding schema migration now, creating the database if it

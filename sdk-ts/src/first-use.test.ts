@@ -148,6 +148,8 @@ test('every documented local-history command accepts --no-bootstrap', async () =
 
 // A migration after an upgrade can run for minutes on a large history; silent,
 // it reads as a hang. Creating a database is not an upgrade and says nothing.
+// The notice never forces the migration: a line rejected before its first open
+// leaves the database as it was.
 test('a pending schema migration is announced once, and a new database is not', { skip: needsNodeSqlite }, async () => {
   const { home, env } = await emptyHome();
   try {
@@ -161,10 +163,19 @@ test('a pending schema migration is announced once, and a new database is not', 
     database.exec("DELETE FROM schema_migrations WHERE name = 'history_fts_update_of_v1'");
     database.close();
 
+    const badConfig = join(home, 'bad-config.json');
+    await writeFile(badConfig, '{ not json');
+    const rejected = await run(['sync', '--config', badConfig], env);
+    assert.notEqual(rejected.code, 0);
+    assert.doesNotMatch(rejected.stderr, /Upgrading/);
+    const untouched = new sqlite!.DatabaseSync(dbPath, { readOnly: true });
+    const pending = untouched.prepare("SELECT COUNT(*) AS n FROM schema_migrations WHERE name = 'history_fts_update_of_v1'").get() as { n: number };
+    untouched.close();
+    assert.equal(pending.n, 0, 'a rejected command must not run the migration');
+
     const upgraded = await run(['stats'], env);
     assert.equal(upgraded.code, 0, upgraded.stderr);
     assert.match(upgraded.stderr, /Upgrading the ai-hist database to \d+\.\d+\.\d+/);
-    assert.match(upgraded.stderr, /Database upgraded in \d+s\./);
     assert.match(upgraded.stdout, /total: 1/);
 
     const again = await run(['stats'], env);

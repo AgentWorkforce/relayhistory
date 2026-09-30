@@ -22,9 +22,12 @@ export declare function applySourceEvidence(requestJson: string): Promise<string
 /** Contract version implemented by this native addon. */
 export declare function nativeContractVersion(): number
 /**
- * Whether opening the database would first run a schema migration. False
- * when the database does not exist yet: creating one is not an upgrade.
- * Read-only; never migrates.
+ * Whether opening the database would first run a schema migration. Read-only;
+ * never migrates.
+ *
+ * Advisory, so it never fails: an absent or empty file is a database about to
+ * be created, which is not an upgrade, and a file the check cannot read is
+ * left for the operation's own open to report.
  */
 export declare function storeNeedsMigration(dbPath?: string | undefined | null): Promise<boolean>
 /**

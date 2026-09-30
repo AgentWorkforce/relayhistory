@@ -26,7 +26,7 @@ async function write(stream: Writable, chunk: string): Promise<void> {
 export async function runHistoryExportCommand(
   options: {
     dbPath?: string; selectionPath: string; outputPath?: string;
-    /** Runs once the command line is known to be valid, before the database is opened. */
+    /** Runs once the output path is known to be safe, before the database is opened. */
     beforeOpen?: () => Promise<void>;
   },
   /** Destination when no `--out` is given. Required unless `outputPath` is set. */
