@@ -4049,3 +4049,58 @@ fn claude_discovery_ignores_the_opencode_wrapper_transcripts_root() {
          purpose (#208, see the claude bullet in docs/session-catalog.md)"
     );
 }
+
+/// A shallow rescan replaces the directory's activity end and model list.
+/// `logs/unified.jsonl` is not that directory: a later log row raises the end
+/// again, a model only the log named is appended, and a model the new
+/// directory snapshot does not name stays gone. A directory end later than
+/// the log still wins.
+#[test]
+fn a_grok_shallow_rescan_keeps_a_later_log_time_and_log_only_models() {
+    let conn = catalog();
+    conn.execute_batch(
+        "INSERT INTO grok_unified_usage \
+         (row_key, session_id, ts_ms, model, usage_json, locator, line_offset) VALUES \
+         ('early', 'grok-cat', 1000, 'log-early', '{}', 'loc', 0), \
+         ('dup', 'grok-cat', 2000, 'from-summary', '{}', 'loc', 5), \
+         ('late', 'grok-cat', 5000, 'log-late', '{}', 'loc', 10), \
+         ('timeless', 'grok-cat', NULL, 'log-timeless', '{}', 'loc', 20);",
+    )
+    .unwrap();
+    let shallow = |last: Option<i64>, models: &[&str]| ShallowSession {
+        source: "grok".into(),
+        session_id: "grok-cat".into(),
+        last_activity_ms: last,
+        models: models.iter().map(|model| (*model).to_string()).collect(),
+        discovery_state: "shallow".into(),
+        ..Default::default()
+    };
+    let earlier = upsert_shallow_session(&conn, &shallow(Some(100), &["from-summary"])).unwrap();
+    assert_eq!(earlier.last_activity_ms, Some(5000));
+    assert_eq!(
+        earlier.models,
+        vec![
+            "from-summary".to_string(),
+            "log-early".to_string(),
+            "log-late".to_string(),
+            "log-timeless".to_string()
+        ]
+    );
+
+    conn.execute(
+        "UPDATE sessions SET models_json = ? WHERE source = 'grok' AND session_id = 'grok-cat'",
+        params![r#"["from-summary","log-early","dir-only"]"#],
+    )
+    .unwrap();
+    let later = upsert_shallow_session(&conn, &shallow(Some(9000), &["from-summary"])).unwrap();
+    assert_eq!(later.last_activity_ms, Some(9000));
+    assert_eq!(
+        later.models,
+        vec![
+            "from-summary".to_string(),
+            "log-early".to_string(),
+            "log-late".to_string(),
+            "log-timeless".to_string()
+        ]
+    );
+}
