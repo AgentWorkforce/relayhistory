@@ -16,6 +16,7 @@ import {
   parityProbe,
   parseArgs,
   parseTreeRoot,
+  pushBefore,
   pinAiHist,
   relevantChange,
   resolutionVerdict,
@@ -128,7 +129,7 @@ test("only changes burn could observe are relevant", () => {
   assert.equal(isRelevantChange(["plugins/Cargo.toml"]), false);
 });
 
-test("relevant-change diffs HEAD^1..HEAD on pull_request and push", (t) => {
+test("relevant-change diffs HEAD^1..HEAD on pull_request", (t) => {
   const { io, calls, outputs } = fakeIo(
     t,
     { "git diff": () => ({ status: 0, stdout: "docs/a.md\n" }) },
@@ -145,9 +146,61 @@ test("relevant-change runs on manual events and when the diff fails", (t) => {
   assert.equal(manual.outputs(), "run=true\n");
   assert.equal(manual.calls.length, 0);
 
-  const shallow = fakeIo(t, { "git diff": () => ({ status: 128 }) }, { GITHUB_EVENT_NAME: "push" });
+  const shallow = fakeIo(t, { "git diff": () => ({ status: 128 }) }, { GITHUB_EVENT_NAME: "pull_request" });
   relevantChange({}, shallow.io);
   assert.equal(shallow.outputs(), "run=true\n");
+});
+
+function pushEvent(t, before) {
+  const file = path.join(tempDir(t), "event.json");
+  writeFileSync(file, JSON.stringify({ before }));
+  return { GITHUB_EVENT_NAME: "push", GITHUB_EVENT_PATH: file };
+}
+
+const BEFORE = "a".repeat(40);
+
+test("relevant-change on push diffs the whole pushed range, not just the last commit", (t) => {
+  const { io, calls, outputs } = fakeIo(
+    t,
+    {
+      "git cat-file": () => ({ status: 0 }),
+      "git diff": () => ({ status: 0, stdout: "crates/ai-hist/src/lib.rs\ndocs/a.md\n" }),
+    },
+    pushEvent(t, BEFORE),
+  );
+  assert.equal(relevantChange({}, io), 0);
+  assert.deepEqual(calls.at(-1).args, ["diff", "--name-only", BEFORE, "HEAD"]);
+  assert.equal(outputs(), "run=true\n");
+});
+
+test("relevant-change on push fetches a before commit the shallow clone lacks", (t) => {
+  const { io, calls } = fakeIo(
+    t,
+    { "git cat-file": () => ({ status: 1 }), "git fetch": () => ({ status: 0 }) },
+    pushEvent(t, BEFORE),
+  );
+  assert.equal(pushBefore(io), BEFORE);
+  assert.deepEqual(calls[1].args, ["fetch", "--no-tags", "--depth=1", "origin", BEFORE]);
+});
+
+test("relevant-change on push runs when the range cannot be determined", (t) => {
+  const newBranch = fakeIo(t, {}, pushEvent(t, "0".repeat(40)));
+  relevantChange({}, newBranch.io);
+  assert.equal(newBranch.outputs(), "run=true\n");
+  assert.equal(newBranch.calls.length, 0);
+
+  const noPayload = fakeIo(t, {}, { GITHUB_EVENT_NAME: "push" });
+  relevantChange({}, noPayload.io);
+  assert.equal(noPayload.outputs(), "run=true\n");
+
+  const unfetchable = fakeIo(
+    t,
+    { "git cat-file": () => ({ status: 1 }), "git fetch": () => ({ status: 128 }) },
+    pushEvent(t, BEFORE),
+  );
+  relevantChange({}, unfetchable.io);
+  assert.equal(unfetchable.outputs(), "run=true\n");
+  assert.ok(!unfetchable.calls.some((c) => c.args[0] === "diff"));
 });
 
 // -------------------------------------------------------------- parity plan

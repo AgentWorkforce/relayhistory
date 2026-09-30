@@ -6,7 +6,9 @@
 //   relevant-change
 //     Is this push/PR a change burn could observe (crates/ai-hist/**, the
 //     workspace manifest, or this guardrail itself)? Writes `run=true|false`.
-//     Anything that cannot be decided (no parent commit, a manual run) runs.
+//     A PR diffs its merge commit against the base; a push diffs the whole
+//     pushed range (event `before`..HEAD). Anything that cannot be decided
+//     (no parent commit, a new branch, a manual run) runs.
 //
 //   parity-probe --burn-dir <dir>
 //     Does burn have a relayhistory parity suite to run? Writes
@@ -156,6 +158,23 @@ export function isRelevantChange(files) {
   );
 }
 
+/**
+ * The push event's `before` commit, present locally, or null when there is
+ * none to diff against (a new branch, an unreadable payload, a failed fetch).
+ */
+export function pushBefore(io) {
+  let before;
+  try {
+    before = JSON.parse(readFileSync(io.env.GITHUB_EVENT_PATH, "utf8")).before;
+  } catch {
+    return null;
+  }
+  if (typeof before !== "string" || !/^[0-9a-f]{40,64}$/.test(before) || /^0+$/.test(before)) return null;
+  if (io.run("git", ["cat-file", "-e", `${before}^{commit}`]).status === 0) return before;
+  const fetched = io.run("git", ["fetch", "--no-tags", "--depth=1", "origin", before]);
+  return fetched.status === 0 ? before : null;
+}
+
 export function relevantChange(options, io) {
   const event = io.env.GITHUB_EVENT_NAME;
   if (event !== "pull_request" && event !== "push") {
@@ -164,12 +183,22 @@ export function relevantChange(options, io) {
     return 0;
   }
   // A pull_request checkout is the merge commit; its first parent is the
-  // base branch tip, so HEAD^1..HEAD is exactly the PR's change. On push it is
-  // the previous tip of the branch.
-  const diff = io.run("git", ["diff", "--name-only", "HEAD^1", "HEAD"]);
+  // base branch tip, so HEAD^1..HEAD is exactly the PR's change. A push can
+  // carry several commits, so it diffs from the event's `before` (the previous
+  // tip of the branch), fetching it when the shallow checkout lacks it.
+  let base = "HEAD^1";
+  if (event === "push") {
+    base = pushBefore(io);
+    if (!base) {
+      setOutput(io, "run", "true");
+      annotate(io, "notice", "Could not determine the pushed range; running the burn contract-drift check.");
+      return 0;
+    }
+  }
+  const diff = io.run("git", ["diff", "--name-only", base, "HEAD"]);
   if (diff.status !== 0) {
     setOutput(io, "run", "true");
-    annotate(io, "notice", "Could not diff against the parent commit; running the burn contract-drift check.");
+    annotate(io, "notice", `Could not diff against ${base}; running the burn contract-drift check.`);
     return 0;
   }
   const files = diff.stdout.split("\n").filter(Boolean);
