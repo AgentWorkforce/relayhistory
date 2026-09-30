@@ -373,7 +373,7 @@ pub(crate) fn page_usage(db_path: &Path) -> rusqlite::Result<PageUsage> {
 
 /// The full-text indexes `compact` merges. Each is an external-content FTS5
 /// table, so `optimize` rewrites only its own segments into one b-tree.
-const COMPACTED_FTS_TABLES: &[&str] = &["history_fts", "session_events_fts", "trajectory_fts"];
+const COMPACTED_FTS_TABLES: &[&str] = &["history_fts", "session_events_fts"];
 
 /// What one [`compact_database`] run found and did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -451,10 +451,8 @@ impl std::error::Error for CompactRefused {}
 ///
 /// Deletes nothing: every row survives. It merges each full-text index's
 /// segments, rewrites the file with `VACUUM` so freelist pages go back to the
-/// volume, and truncates the WAL. `VACUUM` may renumber the implicit rowids of
-/// a table without an `INTEGER PRIMARY KEY`; `trajectories` is one, and
-/// `trajectory_fts` is keyed on its rowid, so that index is rebuilt from its
-/// content table afterwards rather than trusted to still line up.
+/// volume, and truncates the WAL. Both indexes are keyed on an explicit
+/// `INTEGER PRIMARY KEY`, so the rowids `VACUUM` preserves still line up.
 ///
 /// Holds the sync run lock for the duration, so a concurrent `sync` or `watch`
 /// tick skips rather than blocking on the rewrite, and refuses outright when
@@ -522,9 +520,6 @@ fn compact_database_measured(
     // larger WAL, and the final checkpoint below is the one reported.
     truncate_wal(&conn)?;
     conn.execute_batch("VACUUM;")?;
-    if fts_optimized.contains(&"trajectory_fts") {
-        conn.execute_batch("INSERT INTO trajectory_fts(trajectory_fts) VALUES('rebuild');")?;
-    }
     let wal_truncated = truncate_wal(&conn)?;
     drop(conn);
     Ok(CompactReport {
@@ -603,7 +598,7 @@ mod compact_tests {
         assert!(compacted.wal_truncated);
         assert_eq!(
             compacted.fts_optimized,
-            vec!["history_fts", "session_events_fts", "trajectory_fts"]
+            vec!["history_fts", "session_events_fts"]
         );
         assert_eq!(page_usage(&db_path).unwrap().freelist_count, 0);
 
@@ -622,15 +617,6 @@ mod compact_tests {
             )
             .unwrap();
         assert_eq!(hits, 1);
-        let trajectory: String = conn
-            .query_row(
-                "SELECT t.id FROM trajectory_fts f JOIN trajectories t ON f.rowid = t.rowid \
-                 WHERE trajectory_fts MATCH 'needle'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(trajectory, "t-kept");
         for table in COMPACTED_FTS_TABLES {
             conn.execute_batch(&format!(
                 "INSERT INTO {table}({table}, rank) VALUES('integrity-check', 1);"
