@@ -93,8 +93,7 @@ Flows' `f.memory.recall / why / learn` (`flows/docs/SURFACE.md`) compile to the 
 
 ## 4. Enterprise / E2E tier
 
-The vendor-readable cloud miner cannot serve orgs on the opaque tier (`docs/cloud-sync.md`,
-`relayhistory-cloud/docs/encryption.md`). For those orgs extraction runs inside the tenant boundary — in
+The vendor-readable cloud miner cannot serve orgs on the opaque tier (`relayhistory-cloud/docs/encryption.md`). For those orgs extraction runs inside the tenant boundary — in
 this client or a tenant-hosted worker — and pushes opaque derived artifacts. Whether an opaque derived
 memory can preserve verifiable citations without exposing content to the vendor is an open question
 (cloud spec §8); confirm the relayfile proof does not target an E2E org before building anything here.

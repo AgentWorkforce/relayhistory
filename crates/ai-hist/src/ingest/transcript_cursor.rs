@@ -194,6 +194,16 @@ pub(crate) struct ClaudeCursorState {
     /// reads it can resume after the message that stated one.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub cache_reads: std::collections::HashMap<String, i64>,
+    /// The slash-command triad still being chained, per session.
+    ///
+    /// A command's caveat, invocation and output are three records, and a
+    /// pass can end between any two of them; the next pass has to know which
+    /// invocation the output row it reads belongs to.
+    #[serde(
+        default,
+        skip_serializing_if = "super::control::SlashCommandTriads::is_empty"
+    )]
+    pub slash_commands: super::control::SlashCommandTriads,
     /// Tool-result ordering as of the committed offset.
     ///
     /// `call_index` and `event_index` are assigned over the whole transcript,
@@ -295,6 +305,257 @@ pub(crate) struct CodexCursorState {
     /// `(is_response_item, text)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_human_message: Option<(bool, String)>,
+    /// The `fork_replay_boundary` marker whose inherited token baseline the
+    /// child's first readable snapshot has not yet confirmed or dropped.
+    /// Carried so a pass can commit before that snapshot arrives instead of
+    /// re-reading the whole replay until it does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherited_baseline_marker: Option<String>,
+}
+
+/// A stat under which a cursor's positions were proven by their digests.
+///
+/// The skip path's window digest exists because size, mtime and inode do not
+/// prove a file's bytes: a writer can put a timestamp back, and a coarse clock
+/// can give two writes the same one. It pays for that with a read of every
+/// file it skips -- on a large archive, a sweep that finds one transcript
+/// changed re-read up to 256 KiB of every other one to confirm it had not
+/// (#215).
+///
+/// On a filesystem that keeps a real change time, it closes both holes
+/// without the read. There, `ctime` cannot be set from user space --
+/// restoring an mtime, and every write, truncate, chmod or rename onto the
+/// path, moves it to *now* -- so once a digest has proven the positions, an
+/// unchanged `ctime` proves nothing has touched the file since. The
+/// coarse-clock case is the one version-control tools call "racy": a write in
+/// the same tick as the stat would leave `ctime` equal. So a file is settled
+/// only once its `ctime` is at least [`SETTLE_WINDOW_NS`] in the past when the
+/// digest runs; any later change then lands on a strictly later tick.
+///
+/// Not every filesystem keeps one. FAT and exFAT report the mtime as the
+/// change time, so a writer that restores the mtime restores it too, and a
+/// chmod moves neither. A file settles only on a filesystem this crate knows
+/// keeps a real `ctime` (see [`filesystem_keeps_change_time`]); everywhere
+/// else, including every platform without a `ctime`, it keeps the digest.
+///
+/// And no settle is permanent: after [`SETTLE_REVERIFY_MS`] the file is
+/// proven by its digest again, so a miss nothing could have foreseen — a
+/// clock set backwards, a filesystem that lies — costs a bounded delay rather
+/// than serving stale rows for good.
+///
+/// Bound to the prefix hashes it was proven for, so a cursor rewritten to a
+/// new position -- by this build, or by an older one that carries the key
+/// through unread -- is not vouched for by a stat taken over the old one.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct SettledStat {
+    pub ctime_ns: i64,
+    /// When the digest proved it, in wall-clock milliseconds.
+    #[serde(default)]
+    pub settled_at_ms: i64,
+    pub prefix_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_prefix_hash: Option<String>,
+}
+
+/// How long a file must have been left alone before its change time alone is
+/// trusted. Wider than the timestamp granularity of every filesystem that is
+/// allowed to settle at all, so a write after the proving stat always lands on
+/// a later tick.
+pub(crate) const SETTLE_WINDOW_NS: i64 = 3_000_000_000;
+
+/// How long a settled stat vouches for a file before its digest is taken
+/// again.
+pub(crate) const SETTLE_REVERIFY_MS: i64 = 6 * 60 * 60 * 1000;
+
+#[cfg(test)]
+thread_local! {
+    static FILESYSTEM_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Answer [`filesystem_keeps_change_time`] for every file on this thread, so
+/// a test can model a filesystem it is not running on.
+#[cfg(test)]
+pub(crate) fn set_filesystem_keeps_change_time_for_test(keeps: Option<bool>) {
+    FILESYSTEM_OVERRIDE.with(|slot| slot.set(keeps));
+}
+
+/// Whether the filesystem holding a file keeps a change time user space
+/// cannot set. An allowlist: a filesystem not named here, or one whose type
+/// cannot be read, keeps the digest.
+pub(crate) fn filesystem_keeps_change_time(path: &Path, metadata: &fs::Metadata) -> bool {
+    #[cfg(test)]
+    if let Some(keeps) = FILESYSTEM_OVERRIDE.with(|slot| slot.get()) {
+        return keeps;
+    }
+    filesystem_keeps_change_time_cached(path, metadata)
+}
+
+#[cfg(unix)]
+fn filesystem_keeps_change_time_cached(path: &Path, metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    static BY_DEVICE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, bool>>> =
+        std::sync::OnceLock::new();
+    let device = metadata.dev();
+    let cache = BY_DEVICE.get_or_init(Default::default);
+    if let Some(known) = cache.lock().ok().and_then(|map| map.get(&device).copied()) {
+        return known;
+    }
+    let keeps = statfs_keeps_change_time(path);
+    if let Ok(mut map) = cache.lock() {
+        map.insert(device, keeps);
+    }
+    keeps
+}
+
+#[cfg(not(unix))]
+fn filesystem_keeps_change_time_cached(_path: &Path, _metadata: &fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn statfs_keeps_change_time(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    // SAFETY: `statfs` writes a complete `statfs` on success and reads only
+    // the NUL-terminated path; both pointers are to live locals.
+    if unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: `statfs` returned 0, so the struct is initialized.
+    let stat = unsafe { stat.assume_init() };
+    // SAFETY: the kernel NUL-terminates `f_fstypename` within its bounds.
+    let name = unsafe { std::ffi::CStr::from_ptr(stat.f_fstypename.as_ptr()) };
+    matches!(name.to_bytes(), b"apfs" | b"hfs")
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn statfs_keeps_change_time(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    const EXT2_3_4: u64 = 0xEF53;
+    const XFS: u64 = 0x5846_5342;
+    const BTRFS: u64 = 0x9123_683E;
+    const ZFS: u64 = 0x2FC1_2FC1;
+    const TMPFS: u64 = 0x0102_1994;
+    const F2FS: u64 = 0xF2F5_2010;
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    // SAFETY: as above.
+    if unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: `statfs` returned 0, so the struct is initialized.
+    let stat = unsafe { stat.assume_init() };
+    #[allow(clippy::unnecessary_cast)]
+    let kind = (stat.f_type as u64) & 0xFFFF_FFFF;
+    matches!(kind, EXT2_3_4 | XFS | BTRFS | ZFS | TMPFS | F2FS)
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "android"
+    ))
+))]
+fn statfs_keeps_change_time(_path: &Path) -> bool {
+    false
+}
+
+fn now_wall_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// Whether a settle recorded at `settled_at_ms` still vouches for its file.
+/// A clock that went backwards past it is treated as expired.
+pub(crate) fn settle_is_fresh(settled_at_ms: i64) -> bool {
+    let age = now_wall_ms().saturating_sub(settled_at_ms);
+    (0..SETTLE_REVERIFY_MS).contains(&age)
+}
+
+#[cfg(test)]
+thread_local! {
+    static SETTLE_WINDOW_OVERRIDE: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Let a test settle files it has only just written.
+#[cfg(test)]
+pub(crate) fn set_settle_window_for_test(window_ns: Option<i64>) {
+    SETTLE_WINDOW_OVERRIDE.with(|slot| slot.set(window_ns));
+}
+
+/// Block until a file written in `dir` gets a change time later than
+/// `ctime_ns`, so a test's next write cannot share a tick with a stat it has
+/// already recorded, whatever the filesystem's timestamp resolution. Probes
+/// rather than sleeping a guessed interval.
+#[cfg(test)]
+pub(crate) fn wait_for_change_time_after(dir: &Path, ctime_ns: i64) {
+    let probe = dir.join(".ctime-probe");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        fs::write(&probe, b"x").unwrap();
+        let now = change_time_ns(&fs::metadata(&probe).unwrap()).unwrap_or(i64::MAX);
+        let _ = fs::remove_file(&probe);
+        if now > ctime_ns {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the filesystem's change time did not advance within 10 s"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+fn settle_window_ns() -> i64 {
+    #[cfg(test)]
+    if let Some(window) = SETTLE_WINDOW_OVERRIDE.with(|slot| slot.get()) {
+        return window;
+    }
+    SETTLE_WINDOW_NS
+}
+
+/// The file's change time in nanoseconds, where the platform reports one.
+#[cfg(unix)]
+pub(crate) fn change_time_ns(metadata: &fs::Metadata) -> Option<i64> {
+    use std::os::unix::fs::MetadataExt;
+    metadata
+        .ctime()
+        .checked_mul(1_000_000_000)?
+        .checked_add(metadata.ctime_nsec())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn change_time_ns(_metadata: &fs::Metadata) -> Option<i64> {
+    None
+}
+
+/// `metadata`'s change time, if the file may settle on it: its filesystem
+/// keeps a real one, and it is old enough to be past the racy window.
+/// `metadata` must have been taken *before* the digest that is about to prove
+/// the file, so a write racing the digest leaves a different `ctime` behind.
+pub(crate) fn settled_change_time(path: &Path, metadata: &fs::Metadata) -> Option<i64> {
+    if !filesystem_keeps_change_time(path, metadata) {
+        return None;
+    }
+    let ctime = change_time_ns(metadata)?;
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos(),
+    )
+    .ok()?;
+    (now.checked_sub(ctime)? >= settle_window_ns()).then_some(ctime)
 }
 
 /// One transcript's complete resume state.
@@ -308,6 +569,10 @@ pub(crate) struct TranscriptCursorState {
     pub claude: Option<ClaudeCursorState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex: Option<CodexCursorState>,
+    /// The file's change time when every position above was last proven
+    /// against the bytes on disk; see [`SettledStat`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled: Option<SettledStat>,
     /// Keys this version does not know about, preserved across a round trip so
     /// sibling per-source states can share the document.
     #[serde(flatten)]
@@ -324,6 +589,7 @@ impl Default for TranscriptCursorState {
             file: None,
             claude: None,
             codex: None,
+            settled: None,
             extra: Map::new(),
         }
     }
@@ -562,7 +828,7 @@ pub(crate) fn committed_prefix_matches(cursor: &TranscriptFileCursor, path: &Pat
 /// or because a message was still being written, and both mean "read me".
 pub(crate) fn transcript_unchanged(conn: &Connection, source: &str, path: &Path) -> Result<bool> {
     let locator = path.to_string_lossy().to_string();
-    let cursor = load_cursor(
+    let (cursor, raw) = load_cursor_with_document(
         conn,
         &CursorKey::Locator {
             source,
@@ -602,7 +868,97 @@ pub(crate) fn transcript_unchanged(conn: &Connection, source: &str, path: &Path)
     // walk's: a superseded metadata scan leaves a fold that has to be made
     // again, and skipping on the record cursor alone would leave it stale for
     // as long as nothing else about the file changed.
-    Ok(committed_prefix_matches(file, path).valid && scan_position_current(&cursor, path).valid)
+    if settled_proves_unchanged(&cursor, file, path, &metadata) {
+        return Ok(true);
+    }
+    let valid =
+        committed_prefix_matches(file, path).valid && scan_position_current(&cursor, path).valid;
+    if valid {
+        if let Some(ctime_ns) = settled_change_time(path, &metadata) {
+            // Proven by the digests just taken, over a stat taken before them
+            // and old enough to be past the racy window: from here on this
+            // file is skipped on its stat alone until something touches it.
+            let mut settled = cursor.clone();
+            settled.settled = Some(SettledStat {
+                ctime_ns,
+                settled_at_ms: now_wall_ms(),
+                prefix_hash: file.prefix_hash.clone(),
+                scan_prefix_hash: scan_prefix_hash(&cursor),
+            });
+            // An optimisation, so it may not cost the source: a stamp that
+            // cannot be written leaves the file on the digest path. And a
+            // compare-and-swap on the document read above, so a cursor
+            // another writer (hydration, a concurrent pass) advanced since
+            // is left alone rather than rolled back to what this pass saw.
+            if let Err(error) =
+                store_settled_cursor(conn, source, &locator, raw.as_deref(), &settled)
+            {
+                if !super::SYNC_QUIET.load(std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!("  [sync] could not record {locator} as settled: {error:#}");
+                }
+            }
+        }
+    }
+    Ok(valid)
+}
+
+/// Write a settled cursor over exactly the document `loaded` was, and nothing
+/// else. The positions and their projections are unchanged by a settle, so
+/// only the document moves.
+fn store_settled_cursor(
+    conn: &Connection,
+    source: &str,
+    locator: &str,
+    loaded: Option<&str>,
+    settled: &TranscriptCursorState,
+) -> Result<()> {
+    let Some(loaded) = loaded else {
+        return Ok(());
+    };
+    conn.execute(
+        "UPDATE transcript_cursors SET parser_state_json = ?1 \
+         WHERE source = ?2 AND locator = ?3 AND parser_state_json = ?4",
+        params![settled.encode(), source, locator, loaded],
+    )?;
+    Ok(())
+}
+
+/// The metadata fold's prefix hash, for a Claude cursor that has one.
+fn scan_prefix_hash(cursor: &TranscriptCursorState) -> Option<String> {
+    cursor
+        .claude
+        .as_ref()?
+        .scan
+        .as_ref()?
+        .file
+        .as_ref()
+        .map(|file| file.prefix_hash.clone())
+}
+
+/// Whether the [`SettledStat`] recorded for this cursor still describes the
+/// file, which proves every position in it without reading a byte. The caller
+/// has already matched the record cursor's offset, mtime and identity.
+fn settled_proves_unchanged(
+    cursor: &TranscriptCursorState,
+    file: &TranscriptFileCursor,
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> bool {
+    let Some(settled) = cursor.settled.as_ref() else {
+        return false;
+    };
+    if !settle_is_fresh(settled.settled_at_ms) || !filesystem_keeps_change_time(path, metadata) {
+        return false;
+    }
+    let scan = scan_prefix_hash(cursor);
+    // A Claude cursor with no metadata position is a fold that has to be made
+    // again, whatever the stat says.
+    if cursor.claude.is_some() && scan.is_none() {
+        return false;
+    }
+    settled.prefix_hash == file.prefix_hash
+        && settled.scan_prefix_hash == scan
+        && change_time_ns(metadata) == Some(settled.ctime_ns)
 }
 
 /// Whether the metadata walk's own position is recorded and still describes
@@ -1013,6 +1369,7 @@ impl TranscriptReader {
     /// indexed. The position does not advance over it, so the caller decides
     /// what to commit.
     pub(crate) fn next_line(&mut self, line: &mut String) -> Result<Option<ReadRecord>> {
+        super::check_capture_cancelled()?;
         line.clear();
         let mut raw = Vec::new();
         // The cap is on the reader, not on a check around it: `read_until`
@@ -1088,6 +1445,7 @@ impl TranscriptReader {
         let mut chunk = vec![0u8; 64 * 1024];
         let mut drained = MAX_RECORD_BYTES;
         loop {
+            super::check_capture_cancelled()?;
             let read = self.reader.read(&mut chunk)?;
             if read == 0 {
                 // The file ends inside the record. Nothing is committed — a
@@ -1257,6 +1615,15 @@ pub(crate) enum CursorKey<'a> {
 /// written by a different document version reads as "start from zero", which
 /// is always safe: every insert on the ingest path is an idempotent upsert.
 pub(crate) fn load_cursor(conn: &Connection, key: &CursorKey<'_>) -> Result<TranscriptCursorState> {
+    Ok(load_cursor_with_document(conn, key)?.0)
+}
+
+/// [`load_cursor`], and the stored document it decoded, for a writer that
+/// must only replace exactly what it read.
+fn load_cursor_with_document(
+    conn: &Connection,
+    key: &CursorKey<'_>,
+) -> Result<(TranscriptCursorState, Option<String>)> {
     let raw: Option<Option<String>> = match key {
         CursorKey::Session {
             source,
@@ -1279,7 +1646,8 @@ pub(crate) fn load_cursor(conn: &Connection, key: &CursorKey<'_>) -> Result<Tran
             )
             .optional()?,
     };
-    Ok(TranscriptCursorState::decode(raw.flatten().as_deref()))
+    let raw = raw.flatten();
+    Ok((TranscriptCursorState::decode(raw.as_deref()), raw))
 }
 
 /// Write one transcript's resume state, with the three projections.
@@ -1381,6 +1749,42 @@ pub(crate) struct IncrementalPass {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancellation_interrupts_an_oversized_record_between_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized.jsonl");
+        let mut bytes = vec![b'x'; MAX_RECORD_BYTES as usize + 256 * 1024];
+        bytes.extend_from_slice(b"\n{}\n");
+        fs::write(&path, &bytes).unwrap();
+        let mut reader = TranscriptReader::open(&path, None, None).unwrap();
+        // A cloned file shares its seek position, so the stop follows actual
+        // I/O rather than timing or an implementation-specific check count.
+        let probe = std::cell::RefCell::new(reader.reader.get_ref().try_clone().unwrap());
+        let error = crate::ingest::with_capture_stop(
+            move || probe.borrow_mut().stream_position().unwrap() >= MAX_RECORD_BYTES + 64 * 1024,
+            || reader.next_line(&mut String::new()),
+        )
+        .unwrap_err();
+        assert!(error.is::<crate::ingest::CaptureCancelled>());
+        assert_eq!(reader.position(), 0, "an unfinished record was consumed");
+        assert!(
+            reader.reader.get_mut().stream_position().unwrap() < bytes.len() as u64,
+            "the cancelled drain still read the rest of the file"
+        );
+
+        let mut retry = TranscriptReader::open(&path, None, None).unwrap();
+        let mut line = String::new();
+        assert_eq!(
+            retry.next_line(&mut line).unwrap(),
+            Some(ReadRecord::Oversized { terminated: true })
+        );
+        assert_eq!(
+            retry.next_line(&mut line).unwrap(),
+            Some(ReadRecord::Terminated)
+        );
+        assert_eq!(line, "{}\n");
+    }
 
     fn digest_of(bytes: &[u8], offset: u64) -> (String, u64) {
         let dir = tempfile::tempdir().unwrap();
@@ -1516,5 +1920,246 @@ mod tests {
             "the gap between the windows is a known blind spot; if this now \
              fails the window rule changed and the docs above must follow"
         );
+    }
+
+    /// Sets the settle window and the filesystem answer for one test, and
+    /// restores both when it ends, pass or fail, so a thread the harness
+    /// reuses does not inherit them.
+    struct SettleWindow;
+
+    impl SettleWindow {
+        fn with(window_ns: i64, filesystem_keeps_ctime: bool) -> Self {
+            set_settle_window_for_test(Some(window_ns));
+            set_filesystem_keeps_change_time_for_test(Some(filesystem_keeps_ctime));
+            Self
+        }
+
+        fn immediate() -> Self {
+            Self::with(0, true)
+        }
+    }
+
+    impl Drop for SettleWindow {
+        fn drop(&mut self) {
+            set_settle_window_for_test(None);
+            set_filesystem_keeps_change_time_for_test(None);
+        }
+    }
+
+    fn settled_of(conn: &Connection, path: &Path) -> Option<SettledStat> {
+        load_cursor(
+            conn,
+            &CursorKey::Locator {
+                source: "claude",
+                locator: &path.to_string_lossy(),
+            },
+        )
+        .unwrap()
+        .settled
+    }
+
+    fn stamped_transcript(dir: &Path, body: &str) -> (Connection, PathBuf) {
+        let path = dir.join("settled.jsonl");
+        fs::write(&path, body).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        crate::init_db(&conn).unwrap();
+        stamp_whole_file(&conn, "claude", &path).unwrap();
+        (conn, path)
+    }
+
+    /// Once a digest has proven a file and its change time is settled, the
+    /// skip path stops reading it: the stat alone answers until something
+    /// touches the file (#215).
+    #[test]
+    fn a_settled_transcript_is_skipped_on_its_stat_alone() {
+        let _window = SettleWindow::immediate();
+        let dir = tempfile::tempdir().unwrap();
+        let body = "{\"type\":\"user\",\"uuid\":\"u1\"}\n".repeat(64);
+        let (conn, path) = stamped_transcript(dir.path(), &body);
+
+        reset_validation_meter();
+        assert!(transcript_unchanged(&conn, "claude", &path).unwrap());
+        assert_eq!(
+            validation_meter(),
+            body.len() as u64,
+            "the first skip proves the file with its window digest"
+        );
+        let settled = load_cursor(
+            &conn,
+            &CursorKey::Locator {
+                source: "claude",
+                locator: &path.to_string_lossy(),
+            },
+        )
+        .unwrap()
+        .settled;
+        assert!(settled.is_some(), "and records the stat it proved it under");
+
+        reset_validation_meter();
+        for _ in 0..3 {
+            assert!(transcript_unchanged(&conn, "claude", &path).unwrap());
+        }
+        assert_eq!(
+            validation_meter(),
+            0,
+            "a settled, untouched file is skipped without reading a byte"
+        );
+    }
+
+    /// Settling must not reopen the hole the digest closed: a rewrite that
+    /// keeps the length and puts the mtime back still moves the change time,
+    /// which no writer can restore.
+    #[test]
+    fn a_same_stat_rewrite_of_a_settled_transcript_is_still_caught() {
+        let _window = SettleWindow::immediate();
+        let dir = tempfile::tempdir().unwrap();
+        let original = "{\"type\":\"user\",\"text\":\"aaaaa\"}\n";
+        let (conn, path) = stamped_transcript(dir.path(), original);
+        let stamped = fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(transcript_unchanged(&conn, "claude", &path).unwrap());
+        let settled = settled_of(&conn, &path).expect("proven and settled");
+        assert!(transcript_unchanged(&conn, "claude", &path).unwrap());
+
+        wait_for_change_time_after(dir.path(), settled.ctime_ns);
+        let rewritten = original.replace("aaaaa", "bbbbb");
+        fs::write(&path, &rewritten).unwrap();
+        fs::File::open(&path)
+            .unwrap()
+            .set_modified(stamped)
+            .unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        assert_eq!(metadata.len() as usize, original.len());
+        assert_eq!(metadata.modified().unwrap(), stamped);
+
+        assert!(
+            !transcript_unchanged(&conn, "claude", &path).unwrap(),
+            "a same-size, same-mtime rewrite must not be served from a settled cursor"
+        );
+    }
+
+    /// The settled stat is bound to the positions it proved. A cursor moved
+    /// to a new position under it — here, a record walk published at a
+    /// different offset — is not vouched for by the old stat.
+    #[test]
+    fn a_settled_stat_does_not_vouch_for_a_cursor_that_moved() {
+        let _window = SettleWindow::immediate();
+        let dir = tempfile::tempdir().unwrap();
+        let (conn, path) = stamped_transcript(dir.path(), "{\"a\":1}\n{\"b\":2}\n");
+        assert!(transcript_unchanged(&conn, "claude", &path).unwrap());
+        let key_locator = path.to_string_lossy().to_string();
+        let key = CursorKey::Locator {
+            source: "claude",
+            locator: &key_locator,
+        };
+        let mut cursor = load_cursor(&conn, &key).unwrap();
+        assert!(cursor.settled.is_some());
+        cursor.file.as_mut().unwrap().prefix_hash = "not-the-proven-prefix".into();
+        store_cursor(&conn, &key, &cursor).unwrap();
+
+        reset_validation_meter();
+        assert!(
+            !transcript_unchanged(&conn, "claude", &path).unwrap(),
+            "a position the settled stat never proved is checked against the bytes"
+        );
+        assert!(validation_meter() > 0);
+    }
+
+    /// A file whose change time is inside the racy window is proven by its
+    /// digest every time and never settled: a write in the same clock tick
+    /// as the proving stat would otherwise go unseen. The window is injected
+    /// as unbounded, so this holds however long the test takes.
+    #[test]
+    fn a_recently_changed_transcript_is_not_settled() {
+        let _window = SettleWindow::with(i64::MAX, true);
+        let dir = tempfile::tempdir().unwrap();
+        let (conn, path) = stamped_transcript(dir.path(), "{\"a\":1}\n");
+        reset_validation_meter();
+        assert!(transcript_unchanged(&conn, "claude", &path).unwrap());
+        assert!(transcript_unchanged(&conn, "claude", &path).unwrap());
+        assert!(
+            validation_meter() > 0,
+            "a file written moments ago is read to be proven, every time"
+        );
+        let cursor = load_cursor(
+            &conn,
+            &CursorKey::Locator {
+                source: "claude",
+                locator: &path.to_string_lossy(),
+            },
+        )
+        .unwrap();
+        assert!(cursor.settled.is_none());
+    }
+
+    /// FAT and exFAT report the mtime as the change time, so a writer that
+    /// restores the mtime restores the "ctime" with it. On a filesystem not
+    /// known to keep a real one, a file is never settled and every skip is
+    /// proven by its digest.
+    #[test]
+    fn a_filesystem_without_a_real_change_time_never_settles() {
+        let _window = SettleWindow::with(0, false);
+        let dir = tempfile::tempdir().unwrap();
+        let (conn, path) = stamped_transcript(dir.path(), "{\"a\":1}\n");
+        for _ in 0..3 {
+            reset_validation_meter();
+            assert!(transcript_unchanged(&conn, "claude", &path).unwrap());
+            assert!(validation_meter() > 0, "every skip reads the digest");
+        }
+        assert!(settled_of(&conn, &path).is_none());
+    }
+
+    /// No settle is permanent. Past the re-verify interval the digest is taken
+    /// again, and a file that still matches is settled afresh.
+    #[test]
+    fn a_settled_transcript_is_reproven_after_the_reverify_interval() {
+        let _window = SettleWindow::immediate();
+        let dir = tempfile::tempdir().unwrap();
+        let (conn, path) = stamped_transcript(dir.path(), "{\"a\":1}\n");
+        assert!(transcript_unchanged(&conn, "claude", &path).unwrap());
+        let locator = path.to_string_lossy().to_string();
+        let key = CursorKey::Locator {
+            source: "claude",
+            locator: &locator,
+        };
+        let mut cursor = load_cursor(&conn, &key).unwrap();
+        cursor.settled.as_mut().unwrap().settled_at_ms -= SETTLE_REVERIFY_MS + 1;
+        store_cursor(&conn, &key, &cursor).unwrap();
+
+        reset_validation_meter();
+        assert!(transcript_unchanged(&conn, "claude", &path).unwrap());
+        assert!(validation_meter() > 0, "an expired settle is proven again");
+        let renewed = settled_of(&conn, &path).unwrap();
+        assert!(settle_is_fresh(renewed.settled_at_ms));
+    }
+
+    /// The settle is written only over the document it was proven from. A
+    /// cursor another writer advanced in between is left as that writer left
+    /// it, not rolled back to the position this pass read.
+    #[test]
+    fn a_settle_does_not_clobber_a_cursor_advanced_underneath_it() {
+        let _window = SettleWindow::immediate();
+        let dir = tempfile::tempdir().unwrap();
+        let (conn, path) = stamped_transcript(dir.path(), "{\"a\":1}\n");
+        let locator = path.to_string_lossy().to_string();
+        let key = CursorKey::Locator {
+            source: "claude",
+            locator: &locator,
+        };
+        let (loaded, raw) = load_cursor_with_document(&conn, &key).unwrap();
+        let mut advanced = loaded.clone();
+        advanced.file.as_mut().unwrap().unchanged_since_ms = 12_345;
+        store_cursor(&conn, &key, &advanced).unwrap();
+
+        let mut stale = loaded;
+        stale.settled = Some(SettledStat {
+            ctime_ns: 1,
+            settled_at_ms: 1,
+            prefix_hash: "stale".into(),
+            scan_prefix_hash: None,
+        });
+        store_settled_cursor(&conn, "claude", &locator, raw.as_deref(), &stale).unwrap();
+        let stored = load_cursor(&conn, &key).unwrap();
+        assert!(stored.settled.is_none());
+        assert_eq!(stored.file.unwrap().unchanged_since_ms, 12_345);
     }
 }

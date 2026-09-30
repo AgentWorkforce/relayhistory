@@ -12,6 +12,7 @@ import {
   CatalogSource,
   CATALOG_SOURCES,
   isCatalogSource,
+  isSource,
   SessionScope,
   SessionLocation,
   NativeContractMismatchError,
@@ -22,8 +23,16 @@ import {
   HydrationFailedError,
 } from './sdk-common.js';
 
+import { CHANGE_KINDS } from './contracts.js';
 import type {
+  ChangeKind,
+  ChangesPage,
+  CommittedCursor,
+  FeedChange,
+  Watermark,
   HistoryEntry,
+  HistoryCursor,
+  SearchMatch,
   ListOptions,
   SearchOptions,
   SessionOptions,
@@ -79,6 +88,8 @@ import type {
   SessionRequest,
   RequestCursor,
   SessionFileEditsPage,
+  SessionMarker,
+  SourceCapabilities,
   Stats,
   StatsOptions,
   SyncOptions,
@@ -116,6 +127,44 @@ export function historyEntry(value: UnknownRecord): HistoryEntry {
           (location): location is SessionLocation => location === 'local' || location === 'remote',
         )
       : [],
+  };
+}
+
+export function historyCursor(value: unknown): HistoryCursor | null {
+  if (!value || typeof value !== 'object') return null;
+  const row = value as UnknownRecord;
+  const cursor: HistoryCursor = { timestampMs: Number(row.timestampMs), id: Number(row.id) };
+  if (row.matchSource === 'history' || row.matchSource === 'session_event') cursor.matchSource = row.matchSource;
+  return cursor;
+}
+
+/**
+ * The native boundary takes an absent `matchSource`, not an explicit null. Any
+ * other value, an empty string included, goes through so native validation
+ * rejects it instead of it silently paging as `history`.
+ */
+export function nativeHistoryCursor(after: HistoryCursor | undefined): object | undefined {
+  if (!after) return undefined;
+  return {
+    timestampMs: after.timestampMs,
+    id: after.id,
+    ...(after.matchSource != null ? { matchSource: after.matchSource } : {}),
+  };
+}
+
+export function searchMatch(value: UnknownRecord): SearchMatch {
+  const matchSource = String(value.matchSource);
+  if (matchSource !== 'history' && matchSource !== 'session_event') {
+    throw new NativeContractMismatchError(
+      `ai-hist-native returned an unknown search matchSource '${matchSource}'. Reinstall matching ai-hist packages.`,
+      'NATIVE_CONTRACT_MISMATCH',
+    );
+  }
+  return {
+    ...historyEntry(value),
+    matchSource,
+    role: String(value.role),
+    kind: String(value.kind),
   };
 }
 
@@ -244,6 +293,7 @@ export function sessionEvent(value: UnknownRecord): SessionEvent {
     isSidechain: nullableBoolean(value.isSidechain),
     isMeta: nullableBoolean(value.isMeta),
     turnId: nullableString(value.turnId),
+    controlKind: nullableString(value.controlKind) as SessionEvent['controlKind'],
   };
 }
 
@@ -335,6 +385,62 @@ export function sessionFileEdit(value: UnknownRecord): SessionFileEdit {
     tsMs: nullableNumber(value.tsMs),
     gitBranch: nullableString(value.gitBranch),
     cwd: nullableString(value.cwd),
+  };
+}
+
+export function sessionMarker(value: UnknownRecord): SessionMarker {
+  const payloadJson = nullableString(value.payloadJson);
+  return {
+    id: Number(value.id),
+    source: String(value.source) as Source,
+    sessionId: String(value.sessionId),
+    markerUid: String(value.markerUid),
+    tsMs: nullableNumber(value.tsMs),
+    messageId: nullableString(value.messageId),
+    parentId: nullableString(value.parentId),
+    turnId: nullableString(value.turnId),
+    kind: String(value.kind),
+    subkind: nullableString(value.subkind),
+    text: nullableString(value.text),
+    payload: parseStoredJson(payloadJson),
+    payloadJson,
+  };
+}
+
+/**
+ * Validate a list of evidence kinds rather than cast it: an unknown kind is a
+ * native contract mismatch, not a value to hand a caller that will branch on
+ * it. `what` names the field in the error.
+ */
+export function evidenceKindList(value: unknown, what: string): EvidenceKind[] {
+  if (!Array.isArray(value)) {
+    throw new NativeContractMismatchError(
+      `ai-hist-native returned ${what} without a kind list.`,
+      'NATIVE_CONTRACT_MISMATCH',
+    );
+  }
+  return value.map((kind) => {
+    if (!(EVIDENCE_KINDS as readonly string[]).includes(String(kind))) {
+      throw new NativeContractMismatchError(
+        `ai-hist-native returned an unknown evidence kind in ${what}: ${JSON.stringify(kind)}. Reinstall matching ai-hist packages.`,
+        'NATIVE_CONTRACT_MISMATCH',
+      );
+    }
+    return kind as EvidenceKind;
+  });
+}
+
+export function sourceCapabilities(value: UnknownRecord): SourceCapabilities {
+  assertHydrationContract(Number(value.hydrationContractVersion));
+  assertRelationshipContract(Number(value.relationshipContractVersion));
+  return {
+    hydrationContractVersion: Number(value.hydrationContractVersion),
+    relationshipContractVersion: Number(value.relationshipContractVersion),
+    source: catalogSource(value.source),
+    evidenceKinds: evidenceKindList(value.evidenceKinds, 'source capabilities'),
+    missingEvidenceKinds: evidenceKindList(value.missingEvidenceKinds, 'source capabilities'),
+    fullCoverage: value.fullCoverage === true,
+    relationships: relationshipCapabilities(value.relationships),
   };
 }
 
@@ -784,14 +890,18 @@ export function combineHydration(
   };
 }
 
-export function normalizeHydration(value: UnknownRecord): HydrateSessionResult {
-  const contractVersion = Number(value.contractVersion);
+export function assertHydrationContract(contractVersion: number): void {
   if (contractVersion !== SESSION_HYDRATION_CONTRACT_VERSION) {
     throw new NativeContractMismatchError(
       `ai-hist expects hydration contract ${SESSION_HYDRATION_CONTRACT_VERSION}, but native returned ${contractVersion}.`,
       'NATIVE_CONTRACT_MISMATCH',
     );
   }
+}
+
+export function normalizeHydration(value: UnknownRecord): HydrateSessionResult {
+  const contractVersion = Number(value.contractVersion);
+  assertHydrationContract(contractVersion);
   if (
     !['hydrated', 'updated', 'unchanged', 'capability_limited'].includes(String(value.status)) ||
     !['full', 'partial', 'shallow_only'].includes(String(value.capability)) ||
@@ -861,4 +971,64 @@ export function normalizeHydration(value: UnknownRecord): HydrateSessionResult {
         }))
       : [],
   };
+}
+
+function feedMismatch(what: string, value: unknown): NativeContractMismatchError {
+  return new NativeContractMismatchError(
+    `ai-hist-native returned an invalid change-feed ${what}: ${JSON.stringify(value)}. Reinstall matching ai-hist packages.`,
+    'NATIVE_CONTRACT_MISMATCH',
+  );
+}
+
+/** A feed position, validated: the epoch stays a hex string, never a number. */
+export function watermark(value: unknown): Watermark {
+  const row = (value ?? {}) as UnknownRecord;
+  if (typeof row.epoch !== 'string' || !/^[0-9a-f]{16}$/.test(row.epoch) || !Number.isSafeInteger(row.revision)) {
+    throw feedMismatch('watermark', value);
+  }
+  return { epoch: row.epoch, revision: row.revision as number };
+}
+
+export function changeKind(value: unknown): ChangeKind {
+  if (typeof value === 'string' && (CHANGE_KINDS as readonly string[]).includes(value)) return value as ChangeKind;
+  throw feedMismatch('kind', value);
+}
+
+export function feedChange(value: UnknownRecord): FeedChange {
+  const op = value.op;
+  if (op !== 'upsert' && op !== 'delete') throw feedMismatch('op', op);
+  // Held to the watermark's rule: a revision a JavaScript number cannot hold
+  // exactly would resume or commit at the wrong place.
+  if (!Number.isSafeInteger(value.revision)) throw feedMismatch('revision', value.revision);
+  const columns = value.columns;
+  return {
+    kind: changeKind(value.kind),
+    // Every source the native feed names, trajectory included. A row a newer
+    // release wrote is carried rather than failed on: `source` is null and
+    // `sourceName` names a source this SDK does not know.
+    source: isSource(value.source) ? value.source : null,
+    sourceName: String(value.sourceName),
+    sessionId: String(value.sessionId),
+    recordKey: String(value.recordKey),
+    key: Array.isArray(value.key) ? value.key : [],
+    revision: value.revision as number,
+    op,
+    columns: columns && typeof columns === 'object' && !Array.isArray(columns)
+      ? (columns as Record<string, unknown>)
+      : null,
+  };
+}
+
+export function changesPage(value: UnknownRecord): ChangesPage {
+  return {
+    changes: Array.isArray(value.changes) ? (value.changes as UnknownRecord[]).map(feedChange) : [],
+    position: watermark(value.position),
+    head: watermark(value.head),
+    done: value.done === true,
+    consumer: nullableString(value.consumer),
+  };
+}
+
+export function committedCursor(value: UnknownRecord): CommittedCursor {
+  return { consumer: String(value.consumer), cursor: watermark(value.cursor) };
 }

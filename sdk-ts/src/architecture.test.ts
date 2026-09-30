@@ -53,7 +53,7 @@ test('MCP session operations expose scope and acquisition is declared open-world
 
 test('identity-addressed MCP tools are read-only and take no scope', async () => {
   const mcp = await readFile(join(sourceDir, 'mcp-server.ts'), 'utf8');
-  for (const tool of ['get_session', 'get_session_events', 'get_session_relationships', 'get_session_tree']) {
+  for (const tool of ['get_session', 'get_session_events', 'get_session_relationships', 'get_session_tree', 'get_session_usage', 'get_session_markers', 'get_source_capabilities']) {
     const start = mcp.indexOf(`server.tool('${tool}'`);
     assert.notEqual(start, -1, `${tool} is registered`);
     const end = mcp.indexOf("server.tool('", start + 13);
@@ -78,7 +78,7 @@ test('native topology enums are validated rather than cast', async () => {
 
 test('MCP evidence tools require both halves of a session identity', async () => {
   const mcp = await readFile(join(sourceDir, 'mcp-server.ts'), 'utf8');
-  for (const tool of ['get_session_tool_calls', 'get_session_file_edits']) {
+  for (const tool of ['get_session_tool_calls', 'get_session_file_edits', 'get_session_markers']) {
     const start = mcp.indexOf(`server.tool('${tool}'`);
     assert.notEqual(start, -1, `${tool} is registered`);
     const end = mcp.indexOf("server.tool('", start + 13);
@@ -91,12 +91,90 @@ test('MCP evidence tools require both halves of a session identity', async () =>
 });
 
 
+test('the native session-store dispatcher is named in one place', async () => {
+  // `native.ts` owns the op vocabulary; every other production module reaches
+  // the dispatcher through its typed helper, so a new facade read is one entry
+  // there and one arm in Rust, never a string literal scattered across callers.
+  const native = await readFile(join(sourceDir, 'native.ts'), 'utf8');
+  assert.match(native, /export const SESSION_STORE_OPS = Object\.freeze\(\{/);
+  for (const op of ['markers', 'requests', 'usage_summary', 'user_turns', 'capabilities', 'changes', 'commit_changes']) {
+    assert.match(native, new RegExp(`'${op}'`), `native.ts names the ${op} op`);
+  }
+  const files = ['index.ts', 'cli.ts', 'mcp-server.ts', 'operations.ts', 'normalization.ts', 'pagination.ts', 'sdk-common.ts'];
+  const source = (await Promise.all(files.map((file) => readFile(join(sourceDir, file), 'utf8')))).join('\n');
+  assert.doesNotMatch(source, /\.sessionStoreCall\(/, 'only native.ts calls the binding directly');
+  assert.doesNotMatch(source, /sessionStoreCall\(\s*'/, 'op names are not spelled outside native.ts');
+  // The usage reads the SDK exposes go through the dispatcher, not the older
+  // typed functions, so the JSON boundary is what the usage tests exercise.
+  const operations = await readFile(join(sourceDir, 'operations.ts'), 'utf8');
+  for (const legacy of ['native.getSessionRequestsPage(', 'native.getSessionUsage(', 'native.getSessionUserTurnsPage(']) {
+    assert.equal(operations.includes(legacy), false, `${legacy} is no longer called by the SDK`);
+  }
+});
+
+test('MCP usage tools state that usage is provider-reported and cost is never computed', async () => {
+  const mcp = await readFile(join(sourceDir, 'mcp-server.ts'), 'utf8');
+  const start = mcp.indexOf("server.tool('get_session_usage'");
+  assert.notEqual(start, -1);
+  const end = mcp.indexOf("server.tool('", start + 13);
+  const registration = mcp.slice(start, end === -1 ? undefined : end);
+  assert.match(registration, /never an assumed zero/);
+  assert.match(registration, /cost appears only when the source data carried one/);
+});
+
 test('local artifacts exclude cloud APIs and dependencies', async () => {
-  const files=['index.ts','operations.ts','native.ts','sdk-common.ts','cli.ts','mcp-server.ts'];
+  const files=['index.ts','operations.ts','native.ts','sdk-common.ts','cli.ts','mcp-server.ts','relay-agents.ts'];
   const source=(await Promise.all(files.map(file=>readFile(join(sourceDir,file),'utf8')))).join('\n');
   assert.doesNotMatch(source,/cloud-client|cloud-auth|@agent-relay\/cloud|cloudLoadAuth|pushCloud/);
   const pkg=JSON.parse(await readFile(join(sourceDir,'../package.json'),'utf8'));
   assert.equal(pkg.exports['./cloud'],undefined);
   assert.equal(pkg.devDependencies['@agent-relay/cloud'],undefined);
   assert.doesNotMatch(pkg.scripts.build,/cloud/);
+});
+
+test('relay roster stays a local-socket read outside the history SDK layers', async () => {
+  const [mcp, relay] = await Promise.all([
+    readFile(join(sourceDir, 'mcp-server.ts'), 'utf8'),
+    readFile(join(sourceDir, 'relay-agents.ts'), 'utf8'),
+  ]);
+  assert.match(mcp, /from '\.\/relay-agents\.js'/);
+  const start = mcp.indexOf("server.tool('list_relay_agents'");
+  assert.notEqual(start, -1, 'list_relay_agents is registered');
+  const end = mcp.indexOf("server.tool('", start + 13);
+  const registration = mcp.slice(start, end === -1 ? undefined : end);
+  assert.match(registration, /READ/);
+  assert.doesNotMatch(registration, /SESSION_SCOPE|ACQUIRE/);
+  assert.match(relay, /from 'node:http'/);
+  assert.match(relay, /socketPath:/);
+  assert.doesNotMatch(relay, /cloud-client|cloud-auth|@agent-relay\/cloud|fetch\(|https?:|ai-hist-native/);
+});
+
+test('relay registration and status remain local socket MCP operations', async () => {
+  const [mcp, relay, rootReadme, architecture] = await Promise.all([
+    readFile(join(sourceDir, 'mcp-server.ts'), 'utf8'),
+    readFile(join(sourceDir, 'relay-agents.ts'), 'utf8'),
+    readFile(join(repositoryRoot, 'README.md'), 'utf8'),
+    readFile(join(repositoryRoot, 'docs', 'architecture.md'), 'utf8'),
+  ]);
+  for (const tool of ['join_relay', 'leave_relay']) {
+    const start = mcp.indexOf(`server.tool('${tool}'`);
+    assert.notEqual(start, -1, `${tool} is registered`);
+    const end = mcp.indexOf("server.tool('", start + 13);
+    const registration = mcp.slice(start, end === -1 ? undefined : end);
+    assert.match(registration, /RELAY_MUTATION/);
+    assert.doesNotMatch(registration, /SESSION_SCOPE/);
+  }
+  assert.match(mcp, /const RELAY_MUTATION = \{ readOnlyHint: false, idempotentHint: true, openWorldHint: true \}/);
+  const statusStart = mcp.indexOf("server.tool('relay_status'");
+  assert.notEqual(statusStart, -1, 'relay_status is registered');
+  const statusEnd = mcp.indexOf("server.tool('", statusStart + 13);
+  assert.match(mcp.slice(statusStart, statusEnd === -1 ? undefined : statusEnd), /READ/);
+  for (const operation of ['joinRelay', 'leaveRelay', 'relayStatus']) assert.match(relay, new RegExp(`export async function ${operation}`));
+  assert.doesNotMatch(relay, /cloud-client|cloud-auth|@agent-relay\/cloud|fetch\(|https?:|ai-hist-native/);
+  assert.match(rootReadme, /Read-only roster and status calls[^.]+`timeout`/);
+  assert.match(rootReadme, /sent `join_relay` or `leave_relay` mutation reports `indeterminate_result`/);
+  assert.match(rootReadme, /directs the caller to `relay_status`/);
+  assert.match(architecture, /MCP-only relay presence tools/);
+  assert.match(architecture, /directly to the\s+Agent Relay desktop Unix-domain socket/);
+  assert.match(architecture, /does not load cloud clients, authentication, tokens, or\nworkspace keys/);
 });

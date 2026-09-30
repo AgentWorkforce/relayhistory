@@ -4,8 +4,8 @@ name: Publish RelayHistory release
 # artifacts, publishes platform packages first, then the native root, SDK/CLI,
 # and MCP packages. The public SDK is deliberately last so npm can never select
 # a release whose mandatory native engine is not available yet. The optional
-# history plugins and the agent-relay-probe binaries follow at the very same
-# version, once the core release exists and its registry gates have passed.
+# provider-sources plugin follows at the very same version, once the core
+# release exists and its registry gates have passed.
 #
 # The file name is load-bearing: npm OIDC trusted publishing binds each package
 # to this repository plus this workflow file name, so renaming this file breaks
@@ -43,13 +43,8 @@ on:
         required: false
         default: true
         type: boolean
-      probe:
-        description: 'Also attach agent-relay-probe binaries to the GitHub Release'
-        required: false
-        default: true
-        type: boolean
       skip_core:
-        description: 'Re-run plugins/probe/crates.io for an already published core version; requires custom_version'
+        description: 'Verify and finish plugins/crates.io for an already published core version; requires custom_version'
         required: false
         default: false
         type: boolean
@@ -92,14 +87,15 @@ jobs:
           VERSION_TYPE: ${{ inputs.version }}
           CUSTOM_VERSION: ${{ inputs.custom_version }}
           SKIP_CORE: ${{ inputs.skip_core }}
+          DRY_RUN: ${{ inputs.dry_run }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if [ "$SKIP_CORE" = "true" ]; then
-            # A plugin/probe-only re-run has no publish job to name the version,
+            # A plugin-only re-run has no publish job to name the version,
             # and it must rebuild the code that release actually shipped.
             if [ -z "$CUSTOM_VERSION" ]; then
-              echo "skip_core needs custom_version: the already published core version the plugins and probe belong to" >&2
+              echo "skip_core needs custom_version: the already published core version the plugins belong to" >&2
               exit 1
             fi
             VERSION="$CUSTOM_VERSION"
@@ -150,7 +146,16 @@ jobs:
               echo "No release tag sdk-ts-v$VERSION; skip_core only re-runs a release this workflow already cut" >&2
               exit 1
             fi
-            echo "Re-running plugins/probe from the tag sdk-ts-v$VERSION"
+            echo "Re-running plugins from the tag sdk-ts-v$VERSION"
+          elif [ "$DRY_RUN" != "true" ]; then
+            # npm may still report E404 for a publish it already accepted.
+            # Only real publishes need this guard; a dry run can validate an
+            # already tagged version without changing the registry.
+            matching_tags=$(gh api "repos/${{ github.repository }}/git/matching-refs/tags/sdk-ts-v$VERSION" --jq '.[].ref')
+            if printf '%s\n' "$matching_tags" | grep -Fxq "refs/tags/sdk-ts-v$VERSION"; then
+              echo "Release tag sdk-ts-v$VERSION already exists; resume with skip_core=true and custom_version=$VERSION instead of republishing" >&2
+              exit 1
+            fi
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Release version $VERSION"
@@ -308,7 +313,7 @@ jobs:
   helpers:
     name: Helper ${{ matrix.plugin }} ${{ matrix.platform }}
     needs: version
-    if: ${{ inputs.plugins || inputs.probe }}
+    if: ${{ inputs.plugins }}
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -322,7 +327,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        plugin: [relayhistory, provider-sources]
+        plugin: [provider-sources]
         platform:
           [
             darwin-arm64,
@@ -334,22 +339,15 @@ jobs:
             win32-x64-msvc,
           ]
         include:
-          # `probe` marks the platforms agent-relay-probe ships for; `probe_run`
-          # marks those the runner can execute (all four are runner-native
-          # today, gnu cross builds included).
           - {
               platform: darwin-arm64,
               os: macos-15,
               target: aarch64-apple-darwin,
-              probe: true,
-              probe_run: true,
             }
           - {
               platform: darwin-x64,
               os: macos-15-intel,
               target: x86_64-apple-darwin,
-              probe: true,
-              probe_run: true,
             }
           - {
               platform: linux-x64-gnu,
@@ -357,8 +355,6 @@ jobs:
               target: x86_64-unknown-linux-gnu,
               abi: '.2.28',
               cross: true,
-              probe: true,
-              probe_run: true,
             }
           - {
               platform: linux-arm64-gnu,
@@ -367,8 +363,6 @@ jobs:
               abi: '.2.28',
               cross: true,
               rust: '1.97.0',
-              probe: true,
-              probe_run: true,
             }
           - {
               platform: linux-x64-musl,
@@ -436,61 +430,31 @@ jobs:
           ABI: ${{ matrix.abi }}
           CROSS: ${{ matrix.cross }}
           SUFFIX: ${{ matrix.suffix }}
-          PROBE: ${{ matrix.probe }}
-          PROBE_RUN: ${{ matrix.probe_run }}
         run: |
           set -euo pipefail
           manifest="plugins/$PLUGIN/rust/Cargo.toml"
           command=build
           if [ "$CROSS" = true ]; then command=zigbuild; fi
           binary=history-provider-sources
-          if [ "$PLUGIN" = relayhistory ]; then binary=relayhistory-plugin; fi
           release="plugins/$PLUGIN/rust/target/$TARGET/release"
-          bins=(--bin "$binary")
-          probe=
-          if [ "$PLUGIN" = relayhistory ] && [ "$PROBE" = true ]; then
-            # The probe lives in the same crate; one invocation shares the build.
-            bins+=(--bin agent-relay-probe)
-            probe="$release/agent-relay-probe$SUFFIX"
-          fi
           cargo "$command" --manifest-path "$manifest" --locked --release \
-            --target "$TARGET$ABI" "${bins[@]}"
+            --target "$TARGET$ABI" --bin "$binary"
           artifact="$release/$binary$SUFFIX"
           if [[ "$PLATFORM" == *musl ]]; then
             docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work node:22-alpine node scripts/verify-history-helper.mjs "/work/$artifact"
           else
             node scripts/verify-history-helper.mjs "$artifact"
           fi
-          if [ -n "$probe" ]; then
-            test -s "$probe"
-            if [ "$PROBE_RUN" = true ]; then
-              # The shipped binary must name the release it is attached to.
-              # Neither helper has a --version flag (one is a stdin JSON bridge,
-              # the other's compatibility CLI declares no version), so only the
-              # probe is asserted here.
-              printed=$("$probe" --version)
-              test "$printed" = "agent-relay-probe $VERSION"
-            fi
-          fi
           if [ -n "$ABI" ]; then
-            for elf in "$artifact" ${probe:+"$probe"}; do
-              readelf --version-info "$elf" > "$RUNNER_TEMP/versions.txt"
-              ELF="$elf" python3 -c 'import os,re; versions=[tuple(map(int,v.split("."))) for v in re.findall(r"GLIBC_(\d+\.\d+(?:\.\d+)?)",open(os.environ["RUNNER_TEMP"]+"/versions.txt").read())]; assert versions and max(versions)<=(2,28), (os.environ["ELF"], versions)'
-            done
+            readelf --version-info "$artifact" > "$RUNNER_TEMP/versions.txt"
+            ELF="$artifact" python3 -c 'import os,re; versions=[tuple(map(int,v.split("."))) for v in re.findall(r"GLIBC_(\d+\.\d+(?:\.\d+)?)",open(os.environ["RUNNER_TEMP"]+"/versions.txt").read())]; assert versions and max(versions)<=(2,28), (os.environ["ELF"], versions)'
           fi
           # The raw binary travels; the plugin job packages it at this version.
           echo "binary=$artifact" >> "$GITHUB_OUTPUT"
-          echo "probe=$probe" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
           name: helper-${{ matrix.plugin }}-${{ matrix.platform }}
           path: ${{ steps.helper.outputs.binary }}
-          if-no-files-found: error
-      - uses: actions/upload-artifact@v4
-        if: steps.helper.outputs.probe != ''
-        with:
-          name: probe-${{ matrix.platform }}
-          path: ${{ steps.helper.outputs.probe }}
           if-no-files-found: error
 
   publish:
@@ -505,7 +469,7 @@ jobs:
     env:
       VERSION: ${{ needs.version.outputs.version }}
     outputs:
-      # Passed through so the plugin and probe jobs need only one dependency
+      # Passed through so the plugin jobs need only one dependency
       # for the version, whether or not the core was published in this run.
       version: ${{ needs.version.outputs.version }}
       # The tagged published tree, not the post-rebase branch tip. Plugins
@@ -515,9 +479,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # A real release tags the published tree once publishing and the
-          # registry smoke tests succeed; persist-version then rebases that
-          # commit onto the branch.
+          # A real release tags the published tree once npm accepts every
+          # package; persist-version rebases that commit after verification.
           persist-credentials: true
       - uses: actions/setup-node@v6
         with:
@@ -637,22 +600,20 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # Always, whatever the plugins/probe inputs: the release tag must carry
+          # Always, whatever the plugins input: the release tag must carry
           # the same plugin manifests and crate versions the helper matrix built
           # from, so a later skip_core re-run against this tag publishes exactly
           # that, and the plugin job's re-application of this script is a no-op.
           node scripts/set-release-version.mjs "$VERSION"
           git add \
-            plugins/relayhistory/sdk/package.json \
-            plugins/relayhistory/sdk/package-lock.json \
-            plugins/relayhistory/rust/Cargo.toml \
-            plugins/relayhistory/rust/Cargo.lock \
             plugins/provider-sources/sdk/package.json \
             plugins/provider-sources/sdk/package-lock.json \
             plugins/provider-sources/rust/Cargo.toml \
             plugins/provider-sources/rust/Cargo.lock \
             Cargo.lock \
             crates/ai-hist/Cargo.toml \
+            examples/rust-consumer/Cargo.toml \
+            examples/rust-consumer/Cargo.lock \
             crates/ai-hist-napi/Cargo.toml \
             crates/ai-hist-napi/package.json \
             crates/ai-hist-napi/package-lock.json \
@@ -666,8 +627,8 @@ jobs:
           fi
       - uses: actions/download-artifact@v4
         with:
-          # Only the addon matrix; this run also carries helper and probe
-          # binaries that napi must never see.
+          # Only the addon matrix; this run also carries helper binaries that
+          # napi must never see.
           pattern: napi-*
           path: crates/ai-hist-napi/artifacts
       - name: Assemble per-platform packages
@@ -682,6 +643,23 @@ jobs:
       - name: Upgrade npm for OIDC
         if: ${{ !inputs.dry_run }}
         run: npm install -g npm@11.19.1
+      # The version was resolved before the build matrix. Another publisher
+      # may have claimed it while the binaries were compiling; catch that
+      # before this run publishes any of its ten npm packages.
+      - name: Recheck release version availability
+        if: ${{ !inputs.dry_run }}
+        working-directory: .
+        run: |
+          set -euo pipefail
+          # The tag may have appeared while the build matrix was running.
+          # git ls-remote fails closed on transport errors, unlike a lookup
+          # that treats every failed command as an absent tag.
+          tag=$(git ls-remote --tags origin "refs/tags/sdk-ts-v$VERSION")
+          if [ -n "$tag" ]; then
+            echo "Release tag sdk-ts-v$VERSION already exists; resume with skip_core=true and custom_version=$VERSION instead of republishing" >&2
+            exit 1
+          fi
+          node scripts/check-release-version-available.mjs
       - name: Publish
         env:
           DRY_RUN: ${{ inputs.dry_run }}
@@ -757,30 +735,10 @@ jobs:
           set -euo pipefail
           if [ "$DRY_RUN" != "true" ]; then npm publish --access public; fi
 
-      - name: Registry clean-install smoke test
-        if: ${{ !inputs.dry_run }}
-        env:
-          REGISTRY_VISIBILITY_ATTEMPTS: 36
-          REGISTRY_VISIBILITY_DELAY_MS: 10000
-          NPM_REGISTRY_RETRY_ATTEMPTS: 36
-          NPM_REGISTRY_RETRY_DELAY_MS: 10000
-        run: node "$GITHUB_WORKSPACE/scripts/registry-clean-install-smoke.mjs"
-
-      - name: Registry CLI smoke test on older glibc
-        if: ${{ !inputs.dry_run }}
-        working-directory: .
-        run: |
-          set -euo pipefail
-          for image in node:22-bookworm-slim ubuntu:22.04; do
-            bash scripts/smoke-linux-native.sh "$image" registry "$VERSION"
-          done
-
-      # Tag the tree that was published, then create the GitHub Release,
-      # before pushing the version commit. skip_core rebuilds from this tag,
-      # so a later persist failure (or a merge that lands during smoke)
-      # cannot leave npm at a version that has no tag.
-      # The commit itself was prepared before the publish-only
-      # sdk-ts/package.json rewrite, so the tag stays version-only.
+      # npm can accept a publish and keep it in processing for longer than a
+      # registry gate. Save the immutable recovery point after every publish
+      # command succeeds, before waiting for public visibility in verify-core.
+      # A later skip_core run can then resume without republishing the version.
       - name: Tag the published tree
         id: tag-published-tree
         if: ${{ !inputs.dry_run }}
@@ -796,23 +754,85 @@ jobs:
           git tag -a "sdk-ts-v$VERSION" HEAD -m "ai-hist@$VERSION"
           git push origin "refs/tags/sdk-ts-v$VERSION"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      - name: Create GitHub Release
-        if: ${{ !inputs.dry_run }}
+
+  verify-core:
+    name: Verify published core
+    needs: [version, publish]
+    # A normal run verifies after npm publication. A skip_core retry verifies
+    # the existing tagged release before resuming any downstream mutation.
+    if: ${{ !cancelled() && !inputs.dry_run && needs.version.result == 'success' && (inputs.skip_core || needs.publish.result == 'success') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: .
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ format('refs/tags/sdk-ts-v{0}', needs.version.outputs.version) }}
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22.14.0'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Match release npm version
+        run: npm install -g npm@11.19.1
+      - name: Registry clean-install smoke test
         env:
-          GH_TOKEN: ${{ github.token }}
+          # npm's post-publish processing can exceed the old six-minute gate.
+          # Keep a bounded wait, then allow skip_core to resume from the tag.
+          REGISTRY_VISIBILITY_ATTEMPTS: 150
+          REGISTRY_VISIBILITY_DELAY_MS: 20000
+          REGISTRY_VISIBILITY_MAX_WAIT_MS: 4200000
+          NPM_REGISTRY_RETRY_ATTEMPTS: 36
+          NPM_REGISTRY_RETRY_DELAY_MS: 10000
+        run: node scripts/registry-clean-install-smoke.mjs
+      - name: Registry CLI smoke test on older glibc
         run: |
           set -euo pipefail
-          gh release create "sdk-ts-v$VERSION" \
-            --target "${{ steps.tag-published-tree.outputs.sha }}" \
-            --title "ai-hist@$VERSION" \
-            --generate-notes
+          for image in node:22-bookworm-slim ubuntu:22.04; do
+            bash scripts/smoke-linux-native.sh "$image" registry "$VERSION"
+          done
+
+  finalize-core:
+    name: Finalize verified core release
+    needs: [version, publish, verify-core]
+    if: ${{ !cancelled() && !inputs.dry_run && needs.verify-core.result == 'success' && (inputs.skip_core || needs.publish.result == 'success') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: .
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Create GitHub Release after runtime verification
+        run: |
+          set -euo pipefail
+          tag="sdk-ts-v$VERSION"
+          gh api "repos/${GH_REPO}/git/ref/tags/$tag" >/dev/null
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "GitHub Release $tag already exists; leave it unchanged"
+          else
+            gh release create "$tag" \
+              --title "ai-hist@$VERSION" \
+              --generate-notes
+          fi
+
   persist-version:
     name: Persist release version
-    needs: [version, publish]
+    needs: [version, publish, finalize-core]
     # Bookkeeping only: npm, the tag and the GitHub Release already exist.
-    # Crate, plugins and probe depend on `publish`, not this job, so a rebase
+    # Crate and plugins depend on `finalize-core`, not this job, so a rebase
     # conflict cannot drop a version that is already on the registry.
-    if: ${{ !cancelled() && !inputs.dry_run && !inputs.skip_core && needs.publish.result == 'success' }}
+    if: ${{ !cancelled() && !inputs.dry_run && !inputs.skip_core && needs.finalize-core.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -838,10 +858,10 @@ jobs:
 
   publish-crate:
     name: Publish crate to crates.io
-    needs: [version, publish]
+    needs: [version, publish, verify-core, finalize-core]
     # skip_core is the crates.io-only retry: npm already published this version
     # and tagged it, so this job checks out that tag instead of the dispatch SHA.
-    if: ${{ !cancelled() && needs.version.result == 'success' && (inputs.skip_core || needs.publish.result == 'success') }}
+    if: ${{ !cancelled() && needs.version.result == 'success' && ((inputs.dry_run && (inputs.skip_core || needs.publish.result == 'success')) || (!inputs.dry_run && needs.verify-core.result == 'success' && needs.finalize-core.result == 'success')) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -917,16 +937,13 @@ jobs:
           # crates.io credential minted from GitHub OIDC above, not a repo secret.
           cargo publish -p ai-hist --allow-dirty --locked --no-verify
 
-  plugins:
-    name: Publish optional history plugins
-    needs: [version, publish, helpers]
-    # `publish` is deliberately skipped by a skip_core re-run, so it is only
-    # required when this run is actually releasing the core.
-    if: ${{ !cancelled() && inputs.plugins && needs.version.result == 'success' && needs.helpers.result == 'success' && (inputs.skip_core || needs.publish.result == 'success') }}
+  package-plugins:
+    name: Package optional history plugins
+    needs: [version, helpers]
+    if: ${{ !cancelled() && inputs.plugins && needs.version.result == 'success' && needs.helpers.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write
     defaults:
       run:
         working-directory: .
@@ -935,44 +952,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # The tagged published tree (or that same SHA via release_sha on a
-          # normal run). A dry run applies the version below instead. A
-          # skip_core re-run packages the code the named release shipped, from
-          # its tag, never the newer dispatch commit (`format` is never empty,
-          # so the release sha and the dispatch fallback only apply when
-          # skip_core is off).
-          ref: ${{ inputs.skip_core && format('refs/tags/sdk-ts-v{0}', needs.version.outputs.version) || needs.publish.outputs.release_sha || github.sha }}
+          # Normal releases package the immutable dispatch SHA while core npm
+          # publication runs. A retry must use the already-published tag.
+          ref: ${{ inputs.skip_core && format('refs/tags/sdk-ts-v{0}', needs.version.outputs.version) || github.sha }}
           persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-          registry-url: https://registry.npmjs.org
+          cache: npm
+          cache-dependency-path: |
+            crates/ai-hist-napi/package-lock.json
+            sdk-ts/package-lock.json
+            plugins/provider-sources/sdk/package-lock.json
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/download-artifact@v4
         with:
           pattern: helper-*
           path: helpers
-      # A skip_core retry takes its whole tree from the release tag, including
-      # the plugin manifests and the package contract that every later step
-      # derives coordinates from. Tags cut before the @relayhistory rename
-      # still name their plugins @agent-relay/*, and those names still produce
-      # valid tarballs — so such a retry would publish the obsolete packages
-      # and report success, leaving @relayhistory/* absent.
-      #
-      # This step is the one place the scope must NOT come from the checkout:
-      # a workflow_dispatch run reads this file from the dispatch ref, not
-      # from `ref:` above, so this literal is the only thing in the job that a
-      # stale tag cannot rewrite.
-      #
-      # There is no correct way to publish @relayhistory/* from a tag that does
-      # not contain those names — doing so would mix post-rename code into an
-      # older release, which is exactly what skip_core exists to avoid. So this
-      # refuses rather than repairs: cut a normal release instead.
       - name: Refuse a plugin-only retry from a pre-rename release
         if: ${{ inputs.skip_core }}
         run: |
           set -euo pipefail
-          for plugin in relayhistory provider-sources; do
+          for plugin in provider-sources; do
             name=$(node -p "require('./plugins/$plugin/sdk/package.json').name")
             case "$name" in
               @relayhistory/*) ;;
@@ -987,10 +988,7 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$VERSION"
-          # Idempotent, and identical to what the version commit already holds.
           node scripts/set-release-version.mjs "$VERSION"
-          # The staged smoke test installs this checkout's core next to the
-          # plugins under --strict-peer-deps, so it must satisfy ^VERSION.
           (cd crates/ai-hist-napi && npm version "$VERSION" --no-git-tag-version --allow-same-version)
           (cd sdk-ts && npm version "$VERSION" --no-git-tag-version --allow-same-version)
           node -e '
@@ -998,21 +996,18 @@ jobs:
             const path = "sdk-ts/package-lock.json";
             const lock = JSON.parse(fs.readFileSync(path, "utf8"));
             const native = lock.packages["../crates/ai-hist-napi"];
-            if (!native) {
-              throw new Error("SDK lockfile is missing its local ai-hist-native package");
-            }
+            if (!native) throw new Error("SDK lockfile is missing its local ai-hist-native package");
             native.version = process.env.VERSION;
             fs.writeFileSync(path, JSON.stringify(lock, null, 2) + "\n");
           '
-          git --no-pager diff --stat
-      - name: Build the local core and both plugin SDKs
+      - name: Build the local core and the plugin SDK
         run: |
           set -euo pipefail
           mkdir -p artifacts
           npm --prefix crates/ai-hist-napi ci
           npm --prefix crates/ai-hist-napi run build:debug
           npm --prefix sdk-ts ci
-          for plugin in relayhistory provider-sources; do
+          for plugin in provider-sources; do
             npm --prefix "plugins/$plugin/sdk" ci --ignore-scripts
             npm --prefix "plugins/$plugin/sdk" run build
             (cd "plugins/$plugin/sdk" && npm pack --ignore-scripts --pack-destination ../../../artifacts)
@@ -1021,7 +1016,6 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts staged
-          # The package contract owns the plugin, platform and binary names.
           node -e '
             import("./scripts/history-package-contract.mjs").then(({ plugins, platforms }) => {
               for (const [plugin, info] of Object.entries(plugins)) {
@@ -1040,12 +1034,81 @@ jobs:
           done < "$RUNNER_TEMP/helpers.txt"
       - name: Verify installed core and optional artifacts
         run: node scripts/smoke-history-packages.mjs --helpers artifacts
-      # Publication checks the oldest core admitted by each peer range, so an
-      # already-published older core cannot be hidden by our staged source SDK.
-      # The core's own registry smoke tests ran first, in the publish job.
-      - name: Verify actual published core compatibility before any publication
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plugin-packages
+          path: artifacts/*.tgz
+          if-no-files-found: error
+          retention-days: 1
+
+  plugins:
+    name: Publish optional plugin ${{ matrix.plugin }}
+    needs: [version, publish, verify-core, finalize-core, package-plugins]
+    # `publish` is deliberately skipped by a skip_core re-run, so it is only
+    # required when this run is actually releasing the core.
+    if: ${{ !cancelled() && inputs.plugins && needs.version.result == 'success' && needs.package-plugins.result == 'success' && ((inputs.dry_run && (inputs.skip_core || needs.publish.result == 'success')) || (!inputs.dry_run && needs.verify-core.result == 'success' && needs.finalize-core.result == 'success')) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: .
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      PLUGIN: ${{ matrix.plugin }}
+    strategy:
+      fail-fast: false
+      matrix:
+        plugin: [provider-sources]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.skip_core && format('refs/tags/sdk-ts-v{0}', needs.version.outputs.version) || needs.publish.outputs.release_sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        with:
+          name: plugin-packages
+          path: artifacts
+      # A skip_core retry takes its whole tree from the release tag, including
+      # the plugin manifests and the package contract that every later step
+      # derives coordinates from. Tags cut before the @relayhistory rename
+      # still name their plugins @agent-relay/*, and those names still produce
+      # valid tarballs — so such a retry would publish the obsolete packages
+      # and report success, leaving @relayhistory/* absent.
+      #
+      # Repeat the packaging-stage guard at the mutation boundary. A
+      # workflow_dispatch run reads this file from the dispatch ref, not from
+      # `ref:` above, so this literal cannot be rewritten by a stale tag.
+      #
+      # There is no correct way to publish @relayhistory/* from a tag that does
+      # not contain those names — doing so would mix post-rename code into an
+      # older release, which is exactly what skip_core exists to avoid. So this
+      # refuses rather than repairs: cut a normal release instead.
+      - name: Refuse a plugin-only retry from a pre-rename release
+        if: ${{ inputs.skip_core }}
+        run: |
+          set -euo pipefail
+          for plugin in provider-sources; do
+            name=$(node -p "require('./plugins/$plugin/sdk/package.json').name")
+            case "$name" in
+              @relayhistory/*) ;;
+              *)
+                echo "release tag sdk-ts-v${VERSION} predates the @relayhistory rename ($plugin is still $name)." >&2
+                echo "A plugin-only retry cannot publish @relayhistory/* from it; cut a normal release instead." >&2
+                exit 1
+                ;;
+            esac
+          done
+      # Each row checks the oldest core admitted by the plugin it is about to
+      # publish. The new core has already passed its full runtime gate.
+      - name: Verify actual published core compatibility before publication
         if: ${{ !inputs.dry_run }}
-        run: node scripts/verify-published-history-core.mjs all
+        run: node scripts/verify-published-history-core.mjs "$PLUGIN"
       # Same requirement, same pin as the core publish job: npm >= 11.5 mints
       # the OIDC token, and the runner's bundled npm 10.x cannot, so without
       # this the tokenless publish below fails ENEEDAUTH exactly as it did with
@@ -1083,96 +1146,48 @@ jobs:
           # rather than the literal pattern, and the counter below fails the
           # release instead of silently publishing a partial platform set.
           shopt -s nullglob
-          for plugin in relayhistory provider-sources; do
-            # Derive the tarball basename from the package name rather than
-            # repeating the scope: npm packs `@scope/name` as `scope-name-...`.
-            # The previous form stripped a hardcoded `@agent-relay/`, which
-            # silently stopped matching the moment the scope changed.
-            prefix=$(node -p "require('./plugins/$plugin/sdk/package.json').name.replace('@', '').replace('/', '-')")
-            helpers=(
-              ./artifacts/"$prefix"-darwin-*-"$VERSION".tgz
-              ./artifacts/"$prefix"-linux-*-"$VERSION".tgz
-              ./artifacts/"$prefix"-win32-*-"$VERSION".tgz
-            )
-            if [ "${#helpers[@]}" -eq 0 ]; then
-              echo "no platform helpers staged for $plugin at $VERSION" >&2
-              exit 1
-            fi
-            for package in "${helpers[@]}"; do
-              npm publish "$package" --access public --provenance
-            done
-            npm publish "./artifacts/$prefix-$VERSION.tgz" --access public --provenance
+          prefix=$(node -p "require('./plugins/$PLUGIN/sdk/package.json').name.replace('@', '').replace('/', '-')")
+          helpers=(
+            ./artifacts/"$prefix"-darwin-*-"$VERSION".tgz
+            ./artifacts/"$prefix"-linux-*-"$VERSION".tgz
+            ./artifacts/"$prefix"-win32-*-"$VERSION".tgz
+          )
+          if [ "${#helpers[@]}" -eq 0 ]; then
+            echo "no platform helpers staged for $PLUGIN at $VERSION" >&2
+            exit 1
+          fi
+          for package in "${helpers[@]}"; do
+            npm publish "$package" --access public --provenance
           done
-      # Nothing used to run after the publish above, so a publish that failed —
-      # or succeeded into names nobody checked — ended this job quietly. Six
-      # separate faults shipped that way, each only discoverable by cutting
-      # another release. This installs what was just published, from the
-      # registry, and imports it, so a broken publish fails the release that
-      # caused it.
-      - name: Verify the published plugins install from the registry
-        if: ${{ !inputs.dry_run }}
-        run: node scripts/verify-published-plugins.mjs "$VERSION"
-
-      - name: List the staged tarballs
+          npm publish "./artifacts/$prefix-$VERSION.tgz" --access public --provenance
+      - name: List this plugin's staged tarballs
         if: ${{ inputs.dry_run }}
-        run: ls -1 artifacts
+        run: |
+          prefix=$(node -p "require('./plugins/$PLUGIN/sdk/package.json').name.replace('@', '').replace('/', '-')")
+          ls -1 artifacts/"$prefix"-*.tgz
 
-  probe:
-    name: Attach agent-relay-probe binaries
-    needs: [version, publish, helpers]
-    if: ${{ !cancelled() && inputs.probe && needs.version.result == 'success' && needs.helpers.result == 'success' && (inputs.skip_core || needs.publish.result == 'success') }}
+  # The registry proof is a separate required release job, so it runs once
+  # every plugin in the matrix above has published.
+  verify-plugins:
+    name: Verify published plugins
+    needs: [version, publish, plugins]
+    if: ${{ !cancelled() && !inputs.dry_run && inputs.plugins && needs.plugins.result == 'success' && (inputs.skip_core || needs.publish.result == 'success') }}
     runs-on: ubuntu-latest
-    # Release assets only; no checkout and no registry credentials.
     permissions:
-      contents: write
+      contents: read
     defaults:
       run:
         working-directory: .
     env:
       VERSION: ${{ needs.version.outputs.version }}
-      PROBE_PLATFORMS: darwin-arm64 darwin-x64 linux-x64-gnu linux-arm64-gnu
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
         with:
-          pattern: probe-*
-          path: downloads
-      - name: Stage the probe binaries and checksums
-        run: |
-          set -euo pipefail
-          test -n "$VERSION"
-          for platform in $PROBE_PLATFORMS; do
-            built="downloads/probe-$platform/agent-relay-probe"
-            test -f "$built"
-            mkdir -p "probe/$platform"
-            # Artifact upload does not carry the executable bit.
-            install -m 0755 "$built" "probe/$platform/agent-relay-probe"
-            (cd "probe/$platform" && sha256sum agent-relay-probe > agent-relay-probe.sha256)
-          done
-          printf '%-18s %10s  %s\n' platform bytes sha256
-          for platform in $PROBE_PLATFORMS; do
-            printf '%-18s %10s  %s\n' \
-              "$platform" \
-              "$(stat -c %s "probe/$platform/agent-relay-probe")" \
-              "$(cut -d ' ' -f 1 "probe/$platform/agent-relay-probe.sha256")"
-          done
-      - name: Attach the probe binaries to the release
-        if: ${{ !inputs.dry_run }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          for platform in $PROBE_PLATFORMS; do
-            cp "probe/$platform/agent-relay-probe" "probe/agent-relay-probe-$platform"
-            cp "probe/$platform/agent-relay-probe.sha256" "probe/agent-relay-probe-$platform.sha256"
-          done
-          # skip_core requires the tag. A publish that pushed the tag and then
-          # failed at `gh release create` leaves that tag with no Release;
-          # upload would fail. Create the Release from the existing tag.
-          if ! gh release view "sdk-ts-v$VERSION" >/dev/null 2>&1; then
-            gh api "repos/${GH_REPO}/git/ref/tags/sdk-ts-v$VERSION" >/dev/null
-            gh release create "sdk-ts-v$VERSION" \
-              --title "ai-hist@$VERSION" \
-              --generate-notes
-          fi
-          gh release upload "sdk-ts-v$VERSION" --clobber probe/agent-relay-probe-*
+          ref: ${{ inputs.skip_core && format('refs/tags/sdk-ts-v{0}', needs.version.outputs.version) || needs.publish.outputs.release_sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: https://registry.npmjs.org
+      - name: Verify the published plugins install from the registry
+        run: node scripts/verify-published-plugins.mjs "$VERSION"

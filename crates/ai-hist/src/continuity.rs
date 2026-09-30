@@ -22,7 +22,7 @@
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crate::relationship_capture::{record_relationship, ObservedRelationship};
@@ -40,6 +40,10 @@ const REF_FORK_SESSION: &str = "forkSessionId";
 const REF_RESUME_MARKER: &str = "resume-marker";
 const REF_SHARED_SESSION_ID: &str = "sharedSessionId";
 const REF_SOURCE_SESSION: &str = "sourceSessionId";
+/// Codex's own fork field: a human "fork conversation" names its parent here.
+const REF_FORKED_FROM_ID: &str = "forked_from_id";
+/// A Codex subagent spawn, which starts from the parent thread's context.
+const REF_THREAD_SPAWN_PARENT: &str = "source.subagent.thread_spawn.parent_thread_id";
 
 /// What one transcript says about where its conversation came from.
 ///
@@ -68,6 +72,11 @@ pub struct ContinuityEvidence {
     pub resume_target: Option<String>,
     pub explicit_continuation_targets: Vec<String>,
     pub explicit_fork_targets: Vec<String>,
+    /// The field that named each fork target, when it was not
+    /// `forkSessionId`. Codex writes its fork parent under names of its own,
+    /// and the edge records whichever one the rollout actually carried.
+    #[serde(default)]
+    pub explicit_fork_refs: BTreeMap<String, String>,
     /// An explicit `sourceSessionId`, which names the origin directly.
     pub explicit_source_session_id: Option<String>,
     pub source_version: Option<String>,
@@ -101,6 +110,10 @@ impl ContinuityEvidence {
         json!({
             "continuation": self.explicit_continuation_targets,
             "fork": self.explicit_fork_targets,
+            // Always written, even empty: a Codex row without this key was
+            // banked by a scanner that did not read Codex's own fork fields,
+            // and `codex_evidence_is_current` re-reads it once.
+            "fork_refs": self.explicit_fork_refs,
             "source": self.explicit_source_session_id,
         })
         .to_string()
@@ -322,6 +335,11 @@ pub(crate) fn fold_claude_record(
 /// session. So this reads the explicit fields when a producer writes them and
 /// records nothing when it does not — see
 /// `codex_resume_without_explicit_fields_records_no_continuity`.
+///
+/// A fork is different: Codex names the parent outright, in `forked_from_id`
+/// for a human fork and in `source.subagent.thread_spawn.parent_thread_id`
+/// for a spawned subagent, and each is recorded as a `fork` target under the
+/// field that named it.
 pub fn scan_codex_rollout(path: &Path) -> Result<Option<ContinuityEvidence>> {
     Ok(scan_codex_rollout_counted(path)?.0)
 }
@@ -386,6 +404,31 @@ pub fn scan_codex_rollout_counted(path: &Path) -> Result<(Option<ContinuityEvide
     {
         push_unique(&mut evidence.explicit_continuation_targets, target);
     }
+    // Codex's own fork fields, which are what it actually writes: a human fork
+    // carries `forked_from_id` (with `thread_source: "user"`), and a subagent
+    // spawn names the thread it started from in
+    // `source.subagent.thread_spawn.parent_thread_id` — the same field the
+    // delegation edge is read from, so a spawned subagent keeps its
+    // `delegated` row and gains the `fork` edge beside it.
+    let codex_fork_parents = [
+        (
+            string_field(payload, &["forked_from_id", "forkedFromId"]),
+            REF_FORKED_FROM_ID,
+        ),
+        (codex_thread_spawn_parent(payload), REF_THREAD_SPAWN_PARENT),
+    ];
+    for (target, field) in codex_fork_parents {
+        let Some(target) = target else {
+            continue;
+        };
+        if target == evidence.session_id || evidence.explicit_fork_targets.contains(&target) {
+            continue;
+        }
+        evidence
+            .explicit_fork_refs
+            .insert(target.clone(), field.to_string());
+        evidence.explicit_fork_targets.push(target);
+    }
     if let Some(target) = string_field(payload, &["forkSessionId", "fork_session_id"]) {
         push_unique(&mut evidence.explicit_fork_targets, target);
     }
@@ -394,6 +437,56 @@ pub fn scan_codex_rollout_counted(path: &Path) -> Result<(Option<ContinuityEvide
     // it every rollout that carries no continuity — which is nearly all of
     // them — would be re-read on every sync forever.
     Ok((Some(evidence), bytes_read))
+}
+
+/// `source.subagent.thread_spawn.parent_thread_id`, when it names a thread.
+fn codex_thread_spawn_parent(payload: &serde_json::Map<String, Value>) -> Option<String> {
+    payload
+        .get("source")?
+        .get("subagent")?
+        .get("thread_spawn")?
+        .get("parent_thread_id")?
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+/// Whether a Codex rollout's banked evidence was read by this scanner.
+///
+/// A row banked before Codex's own fork fields were read has no `fork_refs`
+/// key, and its rollout's stamp never changes again, so without this check a
+/// fork synced before the upgrade would never gain its edge. Re-reading the
+/// one `session_meta` line clears it: the new row always carries the key.
+pub(crate) fn codex_evidence_is_current(conn: &Connection, locator: &str) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT instr(explicit_targets_json, '\"fork_refs\"') > 0 \
+             FROM session_continuity_evidence \
+             WHERE source = 'codex' AND locator = ? LIMIT 1",
+            [locator],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()?
+        .unwrap_or(false))
+}
+
+/// Whether a Codex rollout's banked evidence names a parent in one of Codex's
+/// own fork fields (`forked_from_id`, `thread_spawn.parent_thread_id`).
+///
+/// These are the only rollouts the fork replay gate can apply to, so they are
+/// the only unchanged rollouts the one-time replay repair has to re-read.
+pub(crate) fn codex_evidence_names_fork(conn: &Connection, locator: &str) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM json_each(explicit_targets_json, '$.fork_refs')) \
+             FROM session_continuity_evidence \
+             WHERE source = 'codex' AND locator = ? AND json_valid(explicit_targets_json) \
+             LIMIT 1",
+            [locator],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()?
+        .unwrap_or(false))
 }
 
 /// Persist one transcript's evidence, replacing whatever the last read of the
@@ -794,13 +887,17 @@ fn resolve_explicit(
             .explicit_source_session_id
             .as_deref()
             .unwrap_or(target.as_str());
+        let evidence_ref = evidence
+            .explicit_fork_refs
+            .get(target)
+            .map_or(REF_FORK_SESSION, String::as_str);
         written.push(write_edge(
             conn,
             evidence,
             RELATIONSHIP_FORK,
             target,
             Some(evidence.session_id.as_str()),
-            REF_FORK_SESSION,
+            evidence_ref,
             Some(origin),
         )?);
     }
@@ -1139,6 +1236,17 @@ fn map_evidence(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContinuityEvidence>
         resume_target: row.get(8)?,
         explicit_continuation_targets: string_array(&targets, "continuation"),
         explicit_fork_targets: string_array(&targets, "fork"),
+        explicit_fork_refs: targets
+            .get("fork_refs")
+            .and_then(Value::as_object)
+            .map(|refs| {
+                refs.iter()
+                    .filter_map(|(target, field)| {
+                        Some((target.clone(), field.as_str()?.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
         explicit_source_session_id: targets
             .get("source")
             .and_then(Value::as_str)
@@ -1220,17 +1328,18 @@ fn record_resume_marker(
     let Some(text) = plain_user_text(object) else {
         return;
     };
-    let trimmed = text.trim();
-    let (command, rest) = if crate::discover::is_claude_control_prompt(trimmed) {
-        match wrapped_command(trimmed) {
-            Some(parsed) => parsed,
-            None => return,
-        }
-    } else {
-        match bare_command(trimmed) {
-            Some(parsed) => parsed,
-            None => return,
-        }
+    // The same text ingestion classifies: a `<system-reminder>` Claude Code
+    // puts ahead of the wrapper is not the record's own text, and left in
+    // place it would hide the command from both parsers below.
+    let split = crate::ingest::control::split_system_reminders(&text);
+    let trimmed = split.prompt.as_str();
+    // The wrapped form first: a record that opens with a control tag is never
+    // a bare command, and `bare_command` refuses anything not starting with
+    // `/`, so an unparseable wrapper falls through to nothing rather than to
+    // a false match.
+    let Some((command, rest)) = wrapped_command(trimmed).or_else(|| bare_command(trimmed))
+    else {
+        return;
     };
     if command != "resume" && command != "continue" {
         return;
@@ -1262,20 +1371,20 @@ fn bare_command(text: &str) -> Option<(String, &str)> {
 ///
 /// `<command-args>` is absent when the command took none, and the elements can
 /// arrive in either order, so each is read independently rather than by
-/// position.
+/// position -- the same read `ingest::control` makes for the `slash_command`
+/// marker.
 fn wrapped_command(text: &str) -> Option<(String, &str)> {
-    let name = tag_body(text, "command-name")?;
+    if crate::ingest::control::claude_text_control_kind(text)
+        != Some(crate::ingest::control::ControlKind::SlashCommandInvocation)
+    {
+        return None;
+    }
+    let name = crate::ingest::control::tag_body(text, "command-name")?;
     let command = name.trim().trim_start_matches('/').to_lowercase();
-    let args = tag_body(text, "command-args").unwrap_or("").trim_start();
+    let args = crate::ingest::control::tag_body(text, "command-args")
+        .unwrap_or("")
+        .trim_start();
     Some((command, args))
-}
-
-fn tag_body<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let start = text.find(&open)? + open.len();
-    let end = text[start..].find(&close)? + start;
-    Some(&text[start..end])
 }
 
 /// The user's own typed text, from either content shape. Tool results and
@@ -1679,6 +1788,187 @@ mod tests {
         );
     }
 
+    fn codex_fork_rows(conn: &Connection) -> Vec<(String, String, Option<String>, String)> {
+        conn.prepare(
+            "SELECT relationship, parent_session_id, child_session_id, evidence_ref \
+             FROM session_relationships WHERE source = 'codex' \
+             ORDER BY relationship ASC, child_session_id ASC",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+    }
+
+    #[test]
+    fn a_codex_human_fork_records_a_fork_edge_from_forked_from_id() {
+        // The shape Codex Desktop writes for "fork conversation": its own
+        // thread id, the parent in `forked_from_id`, and `thread_source: user`.
+        let dir = tempfile::tempdir().unwrap();
+        let child = dir.path().join("rollout-child.jsonl");
+        std::fs::write(
+            &child,
+            concat!(
+                "{\"timestamp\":\"2026-09-20T10:00:00.000Z\",\"type\":\"session_meta\",",
+                "\"payload\":{\"id\":\"child\",\"forked_from_id\":\"parent\",",
+                "\"originator\":\"Codex Desktop\",\"source\":\"vscode\",",
+                "\"thread_source\":\"user\",\"model_provider\":\"openai\",",
+                "\"cwd\":\"/tmp/proj\",\"cli_version\":\"0.150.0\"}}\n",
+            ),
+        )
+        .unwrap();
+        let evidence = scan_codex_rollout(&child).unwrap().unwrap();
+        assert_eq!(evidence.explicit_fork_targets, vec!["parent".to_string()]);
+        assert_eq!(
+            evidence
+                .explicit_fork_refs
+                .get("parent")
+                .map(String::as_str),
+            Some(REF_FORKED_FROM_ID)
+        );
+        // A human fork is a conversation of its own, not a subagent: it stays
+        // a top-level catalog session.
+        let record: Value =
+            serde_json::from_str(std::fs::read_to_string(&child).unwrap().trim()).unwrap();
+        assert!(!crate::ingest::codex_is_subagent(
+            record.get("payload"),
+            "child"
+        ));
+
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        capture_codex_rollout(&conn, &child).unwrap();
+        reconcile(&conn, "codex").unwrap();
+        assert_eq!(
+            codex_fork_rows(&conn),
+            vec![(
+                RELATIONSHIP_FORK.to_string(),
+                "parent".to_string(),
+                Some("child".to_string()),
+                REF_FORKED_FROM_ID.to_string(),
+            )]
+        );
+        // The provider named the parent outright, so nothing waits on it —
+        // and the field name survives a reload of the stored evidence.
+        assert!(pending_reasons(&conn, "codex", "child").unwrap().is_empty());
+        let reloaded = load_pending_or_all(&conn);
+        assert_eq!(
+            reloaded[0].explicit_fork_refs.get("parent").map(String::as_str),
+            Some(REF_FORKED_FROM_ID)
+        );
+    }
+
+    #[test]
+    fn a_codex_subagent_spawn_is_also_a_fork_of_its_parent_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let spawned = dir.path().join("rollout-spawned.jsonl");
+        std::fs::write(
+            &spawned,
+            concat!(
+                "{\"timestamp\":\"2026-09-20T10:00:00.000Z\",\"type\":\"session_meta\",",
+                "\"payload\":{\"id\":\"worker\",\"cwd\":\"/tmp/proj\",",
+                "\"thread_source\":\"subagent\",",
+                "\"source\":{\"subagent\":{\"thread_spawn\":",
+                "{\"parent_thread_id\":\"lead\",\"depth\":1}}}}}\n",
+            ),
+        )
+        .unwrap();
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        capture_codex_rollout(&conn, &spawned).unwrap();
+        reconcile(&conn, "codex").unwrap();
+        assert_eq!(
+            codex_fork_rows(&conn),
+            vec![(
+                RELATIONSHIP_FORK.to_string(),
+                "lead".to_string(),
+                Some("worker".to_string()),
+                REF_THREAD_SPAWN_PARENT.to_string(),
+            )]
+        );
+    }
+
+    #[test]
+    fn a_codex_fork_named_twice_gets_one_edge_under_the_first_field() {
+        // `forked_from_id` and the thread-spawn parent naming the same thread
+        // are one fork, recorded once under the explicit fork field.
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-both.jsonl");
+        std::fs::write(
+            &rollout,
+            concat!(
+                "{\"timestamp\":\"2026-09-20T10:00:00.000Z\",\"type\":\"session_meta\",",
+                "\"payload\":{\"id\":\"worker\",\"forked_from_id\":\"lead\",",
+                "\"source\":{\"subagent\":{\"thread_spawn\":{\"parent_thread_id\":\"lead\"}}}}}\n",
+            ),
+        )
+        .unwrap();
+        let evidence = scan_codex_rollout(&rollout).unwrap().unwrap();
+        assert_eq!(evidence.explicit_fork_targets, vec!["lead".to_string()]);
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        capture_codex_rollout(&conn, &rollout).unwrap();
+        reconcile(&conn, "codex").unwrap();
+        assert_eq!(
+            codex_fork_rows(&conn),
+            vec![(
+                RELATIONSHIP_FORK.to_string(),
+                "lead".to_string(),
+                Some("worker".to_string()),
+                REF_FORKED_FROM_ID.to_string(),
+            )]
+        );
+    }
+
+    #[test]
+    fn codex_evidence_banked_before_fork_fields_were_read_is_not_current() {
+        // A rollout synced by an older build has an evidence row but no
+        // `fork_refs`, and its stamp never changes again; the sync's skip path
+        // asks this to decide whether to re-read its `session_meta` line.
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-old.jsonl");
+        std::fs::write(
+            &rollout,
+            concat!(
+                "{\"timestamp\":\"2026-09-20T10:00:00.000Z\",\"type\":\"session_meta\",",
+                "\"payload\":{\"id\":\"child\",\"forked_from_id\":\"parent\"}}\n",
+            ),
+        )
+        .unwrap();
+        let locator = rollout.to_string_lossy().to_string();
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        assert!(!codex_evidence_is_current(&conn, &locator).unwrap());
+        conn.execute(
+            "INSERT INTO session_continuity_evidence \
+             (source, locator, session_id, file_session_id, in_log_session_ids_json, \
+              has_resume_marker, explicit_targets_json, pending_reason, updated_ms) \
+             VALUES ('codex', ?, 'child', 'child', '[\"child\"]', 0, \
+                     '{\"continuation\":[],\"fork\":[],\"source\":null}', NULL, 0)",
+            [&locator],
+        )
+        .unwrap();
+        assert!(!codex_evidence_is_current(&conn, &locator).unwrap());
+
+        capture_codex_rollout(&conn, &rollout).unwrap();
+        reconcile(&conn, "codex").unwrap();
+        assert!(codex_evidence_is_current(&conn, &locator).unwrap());
+        assert_eq!(codex_fork_rows(&conn).len(), 1);
+    }
+
+    fn load_pending_or_all(conn: &Connection) -> Vec<ContinuityEvidence> {
+        conn.prepare(
+            "SELECT source, locator, session_id, file_session_id, first_parent_uuid, \
+                    first_ts_ms, in_log_session_ids_json, has_resume_marker, resume_target, \
+                    explicit_targets_json, source_version \
+             FROM session_continuity_evidence ORDER BY locator ASC",
+        )
+        .unwrap()
+        .query_map([], map_evidence)
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+    }
+
     #[test]
     fn codex_resume_without_explicit_fields_records_no_continuity() {
         // Characterization, with the positive control above: a rollout that a
@@ -1865,6 +2155,48 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![RELATIONSHIP_RESUME.to_string()]
         );
+    }
+
+    /// Claude Code can put a `<system-reminder>` block ahead of the wrapper
+    /// on the same record. Ingestion classifies the record with the reminder
+    /// removed, and continuity has to read the same text, or the resume the
+    /// ledger types as a slash command is a resume the graph never sees.
+    #[test]
+    fn a_reminder_ahead_of_a_wrapped_resume_does_not_hide_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reminded.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"sessionId\":\"reminded\",\"uuid\":\"u1\",\"parentUuid\":null,",
+                "\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[",
+                "{\"type\":\"text\",\"text\":\"<system-reminder>\\nbrief mode\\n</system-reminder>\"},",
+                "{\"type\":\"text\",\"text\":\"<command-message>resume is running…</command-message>\\n",
+                "<command-name>/resume</command-name>\\n",
+                "<command-args>prior-session</command-args>\"}]},",
+                "\"timestamp\":\"2026-08-31T10:00:00Z\"}\n",
+            ),
+        )
+        .unwrap();
+        let evidence = scan_claude_transcript(&path).unwrap().unwrap();
+        assert!(evidence.has_resume_marker);
+        assert_eq!(evidence.resume_target.as_deref(), Some("prior-session"));
+
+        // And the bare form under the same reminder.
+        let path = dir.path().join("reminded-bare.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"sessionId\":\"reminded-bare\",\"uuid\":\"u1\",\"parentUuid\":null,",
+                "\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":",
+                "\"<system-reminder>brief</system-reminder>\\n/continue prior-session\"},",
+                "\"timestamp\":\"2026-08-31T10:00:00Z\"}\n",
+            ),
+        )
+        .unwrap();
+        let evidence = scan_claude_transcript(&path).unwrap().unwrap();
+        assert!(evidence.has_resume_marker);
+        assert_eq!(evidence.resume_target.as_deref(), Some("prior-session"));
     }
 
     #[test]

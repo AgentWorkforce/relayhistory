@@ -4,7 +4,7 @@ One workflow releases everything: `Publish RelayHistory release`
 (`.github/workflows/publish.yml`; the file name is bound to npm OIDC
 trusted publishing and must not change -- see "Renaming this workflow" below). All public packages share one version:
 the `ai-hist` npm package, `ai-hist-native`, each native platform package, `ai-hist-mcp`,
-`@relayhistory/capture`, `@relayhistory/provider-sources` and their
+`@relayhistory/provider-sources` and its
 seven platform helper packages, and the `ai-hist` crates.io crate. The SDK checks the current native contract
 version at initialization; both halves declare it in source (`sdk-ts/src/native.ts`
 and `crates/ai-hist-napi/src/lib.rs`).
@@ -17,8 +17,7 @@ and `crates/ai-hist-napi/src/lib.rs`).
 | `custom_version` | empty   | Exact version; overrides the bump type.                             |
 | `dry_run`        | `false` | Build and validate everything, publish nothing, push nothing.       |
 | `plugins`        | `true`  | Also publish the optional history plugins at the same version.      |
-| `probe`          | `true`  | Also attach `agent-relay-probe` binaries to the GitHub Release.     |
-| `skip_core`      | `false` | Re-run only plugins/probe for an already published `custom_version`. |
+| `skip_core`      | `false` | Re-run only plugins for an already published `custom_version`.      |
 
 ## What happens, in order
 
@@ -27,16 +26,13 @@ and `crates/ai-hist-napi/src/lib.rs`).
    `custom_version`. Every other job takes the version from here, because the
    helper matrix has to stamp it into the Rust crates it compiles.
 2. `build` builds and tests the native addon on all seven targets, and
-   `helpers` builds the two Rust helpers for seven platforms — plus
-   `agent-relay-probe` on the four platforms it ships for — verifying each
-   executable and its glibc floor. `helpers` applies
+   `helpers` builds the provider-sources helper for seven platforms, verifying
+   each executable and its glibc floor. `helpers` applies
    `scripts/set-release-version.mjs` first, so the executables report the
-   release version (`agent-relay-probe --version` is asserted to print exactly
-   `agent-relay-probe <version>` wherever the runner can execute it). Both jobs
-   run in parallel and upload binaries as artifacts.
+   release version. Both jobs run in parallel and upload binaries as artifacts.
 3. `publish` applies that version to every manifest and lockfile — the core
-   packages and, whatever the `plugins`/`probe` inputs, the plugin manifests
-   and both plugin crates via `scripts/set-release-version.mjs`, so the tag
+   packages and, whatever the `plugins` input, the plugin manifest
+   and plugin crate via `scripts/set-release-version.mjs`, so the tag
    always carries what the helper matrix built from — prepares the
    version-only commit, then
    publishes the platform packages,
@@ -52,38 +48,41 @@ and `crates/ai-hist-napi/src/lib.rs`).
    publishes nothing. A crates.io-only retry uses `skip_core` with the
    already-published `custom_version`; the job checks out `sdk-ts-v<version>`
    and publishes the crate from that tag.
-5. After the clean registry install and the older-glibc CLI smoke tests pass,
-   `publish` tags the published tree as `sdk-ts-v<version>` and creates the
-   GitHub Release. A separate `persist-version` job rebases the version-only
-   commit onto the current branch tip and pushes, so a merge that landed
-   during publish does not drop the tag. Crate, plugins and probe depend on
-   `publish` (the tag), not on that persist. A rebase conflict still leaves
-   the tag and Release in place; `skip_core` with this `custom_version`
-   finishes anything that did not. The registry smoke installs `ai-hist` as
-   an ordinary dependency with npm's `--libc` set to this runner's family so
-   `ai-hist-native-linux-x64-gnu` (or musl) is selected.
+5. On a real publish, before building and again immediately before publishing,
+   the workflow checks for an existing recovery tag. A tagged version must be
+   resumed with `skip_core` and its `custom_version`, even if npm still
+   returns 404 while processing it. `publish` also checks whether the release
+   version became visible on npm while the build matrix ran. Once all npm publish commands
+   succeed, it tags the published tree as `sdk-ts-v<version>`. `verify-core`
+   waits up to 70 minutes for npm's processing queue, then runs the clean registry
+   install and older-glibc CLI smoke tests. `finalize-core` creates the GitHub
+   Release only after those tests pass. A separate `persist-version` job rebases
+   the version-only commit onto the current branch tip and pushes, so a merge
+   that landed during publish does not drop the tag. Crate and plugins depend
+   on the verified core, not on that persist. If npm accepts a publish but keeps
+   its version in processing beyond the wait, or a later gate fails, rerun with
+   `skip_core` and this `custom_version` once npm exposes the packages. The
+   tag preserves the exact tree without republishing immutable versions. The
+   registry smoke installs `ai-hist` as an ordinary dependency with npm's
+   `--libc` set to this runner's family so `ai-hist-native-linux-x64-gnu`
+   (or musl) is selected.
 6. `plugins` checks out the tagged published tree, packages each helper binary at
    the release version, verifies staged tarballs, verifies the *published* core
    at each plugin's peer minimum, then publishes the seven helpers of each
    plugin before its JavaScript package. Post-publish verification waits for
-   all 16 exact-version manifests to become visible on npm, then installs the
+   all 8 exact-version manifests to become visible on npm, then installs the
    JavaScript packages as ordinary dependencies with npm's `--libc` set to this
    runner's family (`glibc` or `musl`) so the matching platform helper is
    selected, and loads the plugins. Missing versions (`E404`/`ETARGET`) are
    retried up to 60 times, five seconds apart; other lookup errors or invalid
    metadata fail immediately. Exhausted retries include npm's original error
    output.
-7. `probe` attaches `agent-relay-probe-<platform>` and a matching `.sha256` to
-   the same Release. If the tag exists and the Release does not — a
-   `skip_core` retry after `gh release create` failed — probe creates the
-   Release from that tag first. See [agent-relay-probe.md](agent-relay-probe.md)
-   for the asset names the website mirrors.
 
 `scripts/set-release-version.mjs <version>` is the only place that knows what a
 plugin release version touches (version, the seven helper pins, the `ai-hist`
 peer range `^<version>`, the lockfile coordinates, and the `[package]` version
 of each plugin's Rust crate plus that crate's own `Cargo.lock` entry — the
-helper and probe executables report `CARGO_PKG_VERSION`). It is idempotent, and
+helper executable reports `CARGO_PKG_VERSION`). It is idempotent, and
 the helper matrix, the version commit and the plugin job all run it, so what was
 compiled, what was committed and what is published cannot diverge.
 
@@ -105,30 +104,64 @@ cargo add ai-hist
 ```
 
 ```rust
-use ai_hist::SessionStore;
+use ai_hist::{SessionQuery, SessionStore};
 let store = SessionStore::open(Default::default())?;
-store.sync(Default::default())?;
+let report = store.sync(Default::default())?;
+for changed in &report.changed {
+    let _evidence = store.session(changed, SessionQuery::default())?;
+}
 ```
+
+The full surface is documented in the embedder guide, [`sourcing-sdk.md`](sourcing-sdk.md).
+
+### Public API snapshot
+
+`crates/ai-hist/public-api.txt` is the crate's default-feature public API as
+`cargo public-api` lists it, with blanket, auto-trait and derived impls
+omitted. The `public-api` CI job regenerates the listing on a nightly toolchain
+and fails on any difference, and fails separately if any line names a
+`rusqlite` type. A change to the surface therefore ships with
+
+```bash
+cargo install cargo-public-api --locked   # once; needs a nightly toolchain for rustdoc JSON
+node scripts/check-public-api.mjs --update
+```
+
+and a `### Rust API` changelog entry in the same pull request. The snapshot is
+what a reviewer reads to see the contract move; the changelog entry is what an
+embedder reads before bumping.
+
+### The out-of-tree consumer
+
+`examples/rust-consumer` is a standalone Cargo project (its own lockfile,
+excluded from the workspace) that depends on `ai-hist` from crates.io. The
+`rust-consumer` CI job builds it on every pull request with `[patch.crates-io]`
+redirected at `crates/ai-hist` and asserts the patch was actually applied; the
+`Published crate consumer` workflow (`published-crate-consumer.yml`, nightly
+and on dispatch) builds it against the crate crates.io serves, which is the
+only check that sees a broken publish.
+
+`scripts/set-release-version.mjs` stamps the example's `ai-hist = "<version>"`
+requirement and its lock entry along with everything else, dropping the
+previous tarball's checksum for Cargo to refill. Without that, the first
+release after a minor bump would leave the pull-request patch silently unused
+and the nightly job on the previous release.
 
 ## Dry runs
 
 Leave `dry_run` enabled to build, verify and stage everything without
 publishing, pushing a commit, creating a Release or attaching assets. The
 plugin job applies the release version to its own checkout and prints the
-staged tarballs; the probe job prints the binary manifest with sizes and
-digests. Dry runs never change the checked-in version baseline.
+staged tarballs. Dry runs never change the checked-in version baseline.
 
-## Re-running plugins or probe alone
+## Re-running plugins alone
 
 Set `skip_core` with an explicit `custom_version` equal to an already published
 core version. `build` and `publish` are skipped. `version` verifies that the
 `sdk-ts-v<version>` tag exists before anything builds, and every job that builds
 or packages (`helpers`, `plugins`) checks out **that tag**, not the commit the
 run was dispatched from — otherwise a re-run would publish newer code under an
-older version and clobber the Release's probe binaries with it. Plugin manifests
-are re-derived from the tag and the assets are attached to the existing
-`sdk-ts-v<version>` Release. Turn off `plugins` or `probe` to narrow the re-run
-further.
+older version. Plugin manifests are re-derived from the tag.
 
 Because the re-run builds from the tag, it only works for releases cut by this
 workflow: a tag whose tree predates these scripts fails loudly at checkout or
@@ -142,8 +175,8 @@ name's very first publish fails:
 
 ```
 npm error code E404
-npm error 404 Not Found - PUT https://registry.npmjs.org/@relayhistory%2fcapture-darwin-arm64
-npm error 404 The requested resource '@relayhistory/capture-darwin-arm64@0.18.3'
+npm error 404 Not Found - PUT https://registry.npmjs.org/@relayhistory%2fprovider-sources-darwin-arm64
+npm error 404 The requested resource '@relayhistory/provider-sources-darwin-arm64@0.18.3'
               could not be found or you do not have permission to access it.
 ```
 

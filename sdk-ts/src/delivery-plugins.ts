@@ -1,34 +1,35 @@
 import type { HistorySource } from './source-contracts.js';
 import { pathToFileURL } from 'node:url';
-import { resolve } from 'node:path';
+import { isAbsolute, resolve } from 'node:path';
 import { createRequire } from 'node:module';
 import { InvalidArgumentError, RelayHistoryError } from './sdk-common.js';
 import type { HistoryDestination, HistoryPlugin } from './delivery-contracts.js';
 
-const CORE_COMMANDS = ['sessions', 'search', 'recent', 'session', 'events', 'resume', 'pack', 'stats', 'sync', 'export', 'delivery', 'plugin'];
-const CORE_TOOLS = ['search_history', 'recent_history', 'list_sessions', 'discover_sessions', 'hydrate_session', 'get_session', 'get_session_events', 'get_session_relationships', 'get_session_tree', 'get_session_tool_calls', 'get_session_file_edits', 'history_stats', 'sync', 'delivery_status', 'delivery_pause', 'delivery_resume', 'delivery_retry'];
 function label(value: string): void {
   if (typeof value !== 'string' || !/^[A-Za-z0-9_.:/@-]{1,200}$/.test(value)) {
     throw new InvalidArgumentError('plugin identifiers must be nonempty non-secret labels', 'INVALID_ARGUMENT');
   }
 }
 
+/** A local source's declared roots: a nonempty list of absolute directories. */
+function validLocalRoots(roots: unknown): roots is readonly string[] {
+  return Array.isArray(roots) && roots.length > 0 && roots.length <= 64
+    && roots.every((root) => typeof root === 'string' && root.length > 0 && isAbsolute(root));
+}
+
 /** Per-client registry. Installing a module never registers or starts it. */
 export class HistoryPluginRegistry {
   private readonly sources = new Map<string, HistorySource>();
   private readonly destinations = new Map<string, HistoryDestination>();
-  private readonly commands = new Map<string, NonNullable<HistoryPlugin['commands']>[number]>();
-  private readonly tools = new Map<string, NonNullable<HistoryPlugin['tools']>[number]>();
 
   register(plugin: HistoryPlugin): void {
     const sources = new Map(this.sources);
     const destinations = new Map(this.destinations);
-    const commands = new Map(this.commands);
-    const tools = new Map(this.tools);
     for(const source of plugin.sources ?? []) {
       label(source.id);label(source.instanceId);
       const key=JSON.stringify([source.id,source.instanceId]);
-      if(sources.has(key)||source.location!=='remote'||!Array.isArray(source.supportedSources)||typeof source.discover!=='function'||typeof source.hydrate!=='function') throw new InvalidArgumentError('invalid or duplicate source connector','INVALID_ARGUMENT');
+      if(sources.has(key)||(source.location!=='remote'&&source.location!=='local')||!Array.isArray(source.supportedSources)||typeof source.discover!=='function'||typeof source.hydrate!=='function') throw new InvalidArgumentError('invalid or duplicate source connector','INVALID_ARGUMENT');
+      if(source.location==='local'&&!validLocalRoots(source.roots)) throw new InvalidArgumentError('a local source connector must declare the absolute directories it reads as roots','INVALID_ARGUMENT');
       sources.set(key,source);
     }
     // Validate the whole registration before mutating this registry.
@@ -43,26 +44,8 @@ export class HistoryPluginRegistry {
       }
       destinations.set(key, destination);
     }
-    for (const command of plugin.commands ?? []) {
-      label(command.name);
-      if (CORE_COMMANDS.includes(command.name) || commands.has(command.name)) throw new InvalidArgumentError(`duplicate command: ${command.name}`, 'INVALID_ARGUMENT');
-      commands.set(command.name, { ...command, run: async (args) => {
-        try { return await command.run(args); }
-        catch { throw new RelayHistoryError(`plugin command ${command.name} failed`, 'HISTORY_PLUGIN_COMMAND_FAILED'); }
-      } });
-    }
-    for (const tool of plugin.tools ?? []) {
-      label(tool.name);
-      if (CORE_TOOLS.includes(tool.name) || tools.has(tool.name)) throw new InvalidArgumentError(`duplicate tool: ${tool.name}`, 'INVALID_ARGUMENT');
-      tools.set(tool.name, { ...tool, run: async (input) => {
-        try { return await tool.run(input); }
-        catch { throw new RelayHistoryError(`plugin tool ${tool.name} failed`, 'HISTORY_PLUGIN_TOOL_FAILED'); }
-      } });
-    }
     for (const [key,value] of sources) this.sources.set(key,value);
     for (const [key, value] of destinations) this.destinations.set(key, value);
-    for (const [key, value] of commands) this.commands.set(key, value);
-    for (const [key, value] of tools) this.tools.set(key, value);
   }
 
   sourceConnectors(ids?: readonly string[]): HistorySource[] {
@@ -75,15 +58,13 @@ export class HistoryPluginRegistry {
   destination(id: string, instanceId: string): HistoryDestination | undefined {
     return this.destinations.get(JSON.stringify([id, instanceId]));
   }
-  /** Every registered destination instance, for a drain to describe to core. */
+  /** Every registered destination instance. */
   registeredDestinations(): Array<{ destinationId: string; instanceId: string; destination: HistoryDestination }> {
     return [...this.destinations].map(([key, destination]) => {
       const [destinationId, instanceId] = JSON.parse(key) as [string, string];
       return { destinationId, instanceId, destination };
     });
   }
-  command(name: string) { return this.commands.get(name); }
-  registeredTools() { return [...this.tools.values()]; }
 }
 
 export interface HistoryPluginModule { module: string; options?: Record<string, unknown> }

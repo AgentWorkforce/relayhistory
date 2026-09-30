@@ -1,6 +1,6 @@
 use crate::{
     default_db_path, insert_history, insert_session_marker, now_ms, open_db, open_db_readonly,
-    parse_cursor_text, prompt_hash, schema_is_catalog_read_current, sync_opencode_db,
+    parse_cursor_text, prompt_hash, schema_is_catalog_read_current, sync_opencode_dbs,
     sync_opencode_session, sync_opencode_storage_dir, HistoryEntry, NewSessionMarker,
     SessionLocation, SessionScope,
 };
@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub(crate) mod codex;
+pub(crate) mod control;
 pub(crate) mod cursor;
 pub(crate) mod devin;
 pub(crate) mod grok;
@@ -23,6 +24,7 @@ pub(crate) mod hook;
 pub(crate) mod hydrate;
 pub(crate) mod incremental;
 pub(crate) mod jsonl;
+pub(crate) mod muse;
 pub(crate) mod opencode;
 pub(crate) mod tool_result_facts;
 pub(crate) mod transcript_cursor;
@@ -61,23 +63,11 @@ pub use hydrate::{
 };
 pub use tool_result_facts::{
     content_hash, stable_stringify, ToolResultFacts, ToolResultIndexer, ERROR_SIGNAL_EXIT_CODE,
-    ERROR_SIGNAL_MCP_ERR, ERROR_SIGNAL_PATCH_APPLY, ERROR_SIGNAL_SUBAGENT_STATUS,
-    ERROR_SIGNAL_TOOL_RESULT, EVENT_SOURCE_FUNCTION_CALL_OUTPUT,
-    EVENT_SOURCE_SUBAGENT_NOTIFICATION, EVENT_SOURCE_TOOL_RESULT, STATUS_COMPLETED, STATUS_ERRORED,
-    STATUS_UNKNOWN,
+    ERROR_SIGNAL_MCP_ERR, ERROR_SIGNAL_MUSE_TOOL_OUTCOME, ERROR_SIGNAL_PATCH_APPLY,
+    ERROR_SIGNAL_SUBAGENT_STATUS, ERROR_SIGNAL_TOOL_RESULT, ERROR_SIGNAL_TOOL_STATUS,
+    EVENT_SOURCE_FUNCTION_CALL_OUTPUT, EVENT_SOURCE_SUBAGENT_NOTIFICATION,
+    EVENT_SOURCE_TOOL_RESULT, STATUS_COMPLETED, STATUS_ERRORED, STATUS_UNKNOWN,
 };
-
-fn is_delivery_retention_limit(error: &anyhow::Error) -> bool {
-    #[cfg(feature = "export")]
-    {
-        crate::export::is_retention_limit(error)
-    }
-    #[cfg(not(feature = "export"))]
-    {
-        let _ = error;
-        false
-    }
-}
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 
@@ -113,7 +103,7 @@ pub fn sync_local_at(db_path: &Path) -> Result<bool> {
 }
 
 /// Content-free progress for hosts displaying a local capture operation.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CaptureProgress {
     pub source: String,
@@ -140,7 +130,31 @@ thread_local! {
     static CAPTURE_STOP: std::cell::RefCell<Option<CaptureStop>> = std::cell::RefCell::new(None);
 }
 
-fn with_capture_stop<T>(
+// The public facade supplies a thread-safe token. Keep the legacy thread-local
+// callback API usable with non-Send closures while sharing this token with readers.
+thread_local! {
+    static SHARED_CAPTURE_STOP: std::cell::RefCell<Option<crate::StopToken>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn shared_capture_stop() -> Option<crate::StopToken> {
+    SHARED_CAPTURE_STOP.with(|slot| slot.borrow().clone())
+}
+
+pub(crate) fn with_capture_token<T>(
+    token: crate::StopToken,
+    run: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    struct Restore(Option<crate::StopToken>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SHARED_CAPTURE_STOP.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(SHARED_CAPTURE_STOP.with(|slot| slot.replace(Some(token.clone()))));
+    with_capture_stop(move || token.is_stopped(), run)
+}
+
+pub(crate) fn with_capture_stop<T>(
     cancelled: impl Fn() -> bool + 'static,
     run: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
@@ -205,6 +219,23 @@ pub fn sync_local_at_with_progress(
     db_path: &Path,
     observer: impl Fn(CaptureProgress) + 'static,
 ) -> Result<bool> {
+    with_capture_observer(observer, || {
+        capture_progress("initializing", 0, None);
+        let result = sync_local_at(db_path);
+        check_capture_cancelled()?;
+        if result.is_ok() {
+            capture_progress("complete", 0, None);
+        }
+        result
+    })
+}
+
+/// Route this thread's capture progress to `observer` for the duration of
+/// `run`, restoring the previous observer on return, error, or panic.
+pub(crate) fn with_capture_observer<T>(
+    observer: impl Fn(CaptureProgress) + 'static,
+    run: impl FnOnce() -> Result<T>,
+) -> Result<T> {
     struct Restore(Option<CaptureObserver>);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -213,13 +244,7 @@ pub fn sync_local_at_with_progress(
     }
     let _restore =
         Restore(CAPTURE_OBSERVER.with(|slot| slot.replace(Some(std::rc::Rc::new(observer)))));
-    capture_progress("initializing", 0, None);
-    let result = sync_local_at(db_path);
-    check_capture_cancelled()?;
-    if result.is_ok() {
-        capture_progress("complete", 0, None);
-    }
-    result
+    run()
 }
 
 fn capture_progress(source: &str, processed_files: usize, total_files: Option<usize>) {
@@ -237,7 +262,7 @@ fn capture_progress(source: &str, processed_files: usize, total_files: Option<us
 
 // Report before taking each file, including the final None. This counts completed
 // files even when the ingest loop continues early for an unchanged checkpoint.
-fn capture_files(source: &'static str, files: Vec<PathBuf>) -> impl Iterator<Item = PathBuf> {
+pub(crate) fn capture_files<T>(source: &'static str, files: Vec<T>) -> impl Iterator<Item = T> {
     let total = files.len();
     let mut files = files.into_iter();
     let mut processed = 0;
@@ -252,10 +277,48 @@ fn capture_files(source: &'static str, files: Vec<PathBuf>) -> impl Iterator<Ite
 }
 
 /// Full local ingest using an explicit provider home instead of the process
-/// `HOME`. Used by [`crate::SessionStore`] when the embedder overrides home.
+/// `HOME`. The facade reads the richer [`sync_facade_tick`]; the boolean form
+/// remains for the in-module tests that predate it.
+#[cfg(test)]
 pub(crate) fn sync_local_at_with_home(db_path: &Path, home: &Path) -> Result<bool> {
+    let roots = crate::ProviderRoots::from_env(home.to_path_buf());
     SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
-    sync_exclusive_with_home(db_path, home, false).map(|tick| tick.attempted)
+    sync_exclusive_with_roots(db_path, &roots, false).map(|tick| tick.attempted)
+}
+
+/// One local sweep for [`crate::SessionStore`]: silent, against the store's
+/// resolved provider roots, forcing past the source fingerprint when asked,
+/// with two reads bracketing the sweep **inside the locked section**.
+///
+/// `before` runs once the `SyncRunLock` is held and before anything is
+/// written; `after` runs when the sweep has finished, on the same connection,
+/// still under the lock. That is what lets the facade say what *this* sweep
+/// changed: a baseline taken before the lock would also count whatever
+/// another sync wrote while this call waited for it. `None` means the lock
+/// was held elsewhere and nothing ran — the facade turns that into an error
+/// rather than a silent no-op.
+pub(crate) fn sync_facade_tick<B, R>(
+    db_path: &Path,
+    roots: &crate::ProviderRoots,
+    force: bool,
+    before: impl FnOnce(&Connection) -> Result<B>,
+    after: impl FnOnce(&Connection, B, SyncTick) -> Result<R>,
+) -> Result<Option<(SyncTick, R)>> {
+    SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
+    check_capture_cancelled()?;
+    let Some(_sync_lock) = try_acquire_sync_lock(db_path)? else {
+        return Ok(None);
+    };
+    let conn = open_db(db_path).map_err(|error| enrich_sync_error(db_path, error))?;
+    let baseline = before(&conn)?;
+    let swept = sync_basic(&conn, db_path, roots, force)
+        .map_err(|error| enrich_sync_error(db_path, error))?;
+    let tick = SyncTick {
+        attempted: true,
+        swept,
+    };
+    let outcome = after(&conn, baseline, tick)?;
+    Ok(Some((tick, outcome)))
 }
 
 /// One live-capture tick against an explicit provider home.
@@ -362,12 +425,35 @@ pub fn sync_scoped_at_with_output(
 }
 
 /// Import the selected OpenCode store with the same exclusive ingestion lock.
+///
+/// `source_path` is named outright, so it is the only database read — its
+/// channel siblings are not. [`sync_opencode_with_roots`] reads them.
 pub fn sync_opencode_at(db_path: &Path, source_path: &Path, output: SyncOutput) -> Result<bool> {
     SYNC_QUIET.store(
         matches!(output, SyncOutput::Silent),
         AtomicOrdering::Relaxed,
     );
-    sync_opencode_exclusive(db_path, source_path)
+    sync_opencode_exclusive(db_path, source_path, true, &default_opencode_storage_dir())
+}
+
+/// Import every OpenCode store `roots` names — the configured database and,
+/// unless it is pinned, each channel database beside it — with the same
+/// exclusive ingestion lock.
+pub fn sync_opencode_with_roots(
+    db_path: &Path,
+    roots: &crate::ProviderRoots,
+    output: SyncOutput,
+) -> Result<bool> {
+    SYNC_QUIET.store(
+        matches!(output, SyncOutput::Silent),
+        AtomicOrdering::Relaxed,
+    );
+    sync_opencode_exclusive(
+        db_path,
+        &roots.opencode_db,
+        roots.opencode_db_pinned,
+        &roots.opencode_storage_dir,
+    )
 }
 
 fn sync_scope_with_connectors(
@@ -525,10 +611,13 @@ pub fn discover_sessions_scoped_at_with_connectors(
     Ok((rows, summary))
 }
 
-#[derive(Default)]
-struct SyncSourceReport {
+/// Per-source outcomes of one sync pass. Failures are written to `out`,
+/// stderr outside tests.
+struct SyncSourceReport<W: io::Write = io::Stderr> {
+    db_path: PathBuf,
     succeeded: usize,
     failures: Vec<SyncSourceFailure>,
+    out: W,
 }
 
 struct SyncSourceFailure {
@@ -539,6 +628,25 @@ struct SyncSourceFailure {
 }
 
 impl SyncSourceReport {
+    /// `db_path` is where a contention diagnostic lands when a failure does
+    /// not name its own database.
+    fn new(db_path: &Path) -> Self {
+        SyncSourceReport::with_output(db_path, io::stderr())
+    }
+}
+
+impl<W: io::Write> SyncSourceReport<W> {
+    fn with_output(db_path: &Path, out: W) -> Self {
+        Self {
+            db_path: db_path.to_path_buf(),
+            succeeded: 0,
+            failures: Vec::new(),
+            out,
+        }
+    }
+
+    /// Record one source's outcome: a failure is folded into the
+    /// partial-source policy and reported when the pass finishes.
     fn capture<T>(&mut self, source: &str, result: Result<T>) -> Option<T> {
         match result {
             Ok(value) => {
@@ -557,39 +665,37 @@ impl SyncSourceReport {
         }
     }
 
-    fn finish(mut self, db_path: &Path) -> Result<()> {
+    /// Print every recorded failure, with one contention diagnostic per
+    /// database it names.
+    /// A failure report that cannot be written must not replace the pass's
+    /// own outcome, so write errors are dropped.
+    fn report_failures(&mut self) {
         if self.failures.is_empty() {
-            return Ok(());
+            return;
         }
-
-        eprintln!(
+        let _ = writeln!(
+            self.out,
             "ai-hist: {} history source(s) failed; {} source(s) completed:",
             self.failures.len(),
             self.succeeded
         );
         for failure in &self.failures {
-            eprintln!("  [{}] {:#}", failure.source, failure.error);
+            let _ = writeln!(self.out, "  [{}] {:#}", failure.source, failure.error);
         }
         let mut diagnosed = HashSet::new();
         for failure in self.failures.iter().filter(|failure| failure.is_contention) {
-            let path = failure.contention_path.as_deref().unwrap_or(db_path);
+            let path = failure.contention_path.as_deref().unwrap_or(&self.db_path);
             if diagnosed.insert(path.to_path_buf()) {
-                eprintln!("{}", write_contention_diagnostic(path));
+                let _ = writeln!(self.out, "{}", write_contention_diagnostic(path));
             }
         }
-        // An enabled durable capture job cannot silently lose history. Missing
-        // providers count as successful no-ops, so the ordinary partial-source
-        // policy would otherwise turn a full capture store into sync success.
-        // Preserve the cause so native/SDK callers can report its safe code.
-        if let Some(index) = self
-            .failures
-            .iter()
-            .position(|failure| is_delivery_retention_limit(&failure.error))
-        {
-            let failure = self.failures.remove(index);
-            return Err(failure.error)
-                .with_context(|| format!("{} history delivery capture failed", failure.source));
+    }
+
+    fn finish(mut self) -> Result<()> {
+        if self.failures.is_empty() {
+            return Ok(());
         }
+        self.report_failures();
         if self.succeeded == 0 {
             anyhow::bail!(
                 "all {} history sources failed; no source made progress",
@@ -608,6 +714,29 @@ const SOURCE_FINGERPRINT_KEY: &str = "source_fingerprint";
 /// fingerprint it qualifies.
 const DESTINATION_GENERATION_KEY: &str = "destination_generation";
 
+/// Where the change-feed head the destination marker was taken at is
+/// remembered, so a tick can tell "nothing was written since" without
+/// recounting every session. See [`destination_head`].
+const DESTINATION_HEAD_KEY: &str = "destination_head";
+
+/// The destination's change-feed head, as `epoch:revision`.
+///
+/// Every insert, update and delete on the tables the marker counts —
+/// `sessions`, `session_events`, `tool_calls`, `file_edits` — advances the
+/// database-wide revision through the change-feed triggers, and the epoch is
+/// drawn once per database. So a head equal to the one read *before* the
+/// marker was taken proves no row the marker counted has been written or
+/// deleted since, and the marker is still exact. A head that moved says
+/// nothing either way — the hook fast path and hydration add rows between
+/// sweeps — and the tick falls back to comparing the counts.
+///
+/// Before this, every unchanged tick recounted every session's evidence to
+/// confirm what the head already said (#42).
+fn destination_head(conn: &Connection) -> Result<String> {
+    let head = crate::change_feed::read_head(conn)?;
+    Ok(format!("{}:{}", head.epoch, head.revision))
+}
+
 /// The parser and state generations a stored fingerprint is valid for.
 ///
 /// These are the sync-state keys whose *names* carry a generation: bumping one
@@ -622,7 +751,11 @@ const DESTINATION_GENERATION_KEY: &str = "destination_generation";
 /// Add the new key here in the same change that introduces it; the old one
 /// stays in [`RETIRED_SYNC_STATE_KEYS`] for the migration, but only live
 /// generations belong in the stamp.
-const SWEEP_PARSER_GENERATIONS: &[&str] = &["claude_sessions_v3", "codex_rollouts_v5"];
+const SWEEP_PARSER_GENERATIONS: &[&str] = &[
+    "claude_sessions_v3",
+    "codex_rollouts_v5",
+    GROK_SYNC_STATE_KEY,
+];
 
 /// The generation half of a stored fingerprint: what this build of the sweep
 /// would produce from a given tree, independent of the tree itself.
@@ -649,7 +782,11 @@ const DESTINATION_MARKER_VERSION: &str = "v5";
 /// honour. Codex rollouts and Claude transcripts are re-read and re-ingested
 /// by this sweep, so a loss in one is repairable and belongs in the marker.
 /// Adding a source here means adding its repair path in the same change.
-const REPAIRABLE_EVENT_SOURCES: &[&str] = &["claude", "codex", "opencode", "devin"];
+///
+/// Muse Code joined with its parser: every session is a whole-transcript
+/// read, and a sweep re-reads a session this marker names short, or the
+/// parent whose tree holds a short subagent.
+const REPAIRABLE_EVENT_SOURCES: &[&str] = &["claude", "codex", "opencode", "muse", "devin"];
 
 /// The sources whose `history` and `session_markers` rows a sweep can replay.
 ///
@@ -981,6 +1118,10 @@ fn destination_shortfall(conn: &Connection, stored: &str) -> Result<SweepRepairs
     // keeps it nameable. `history` and `session_markers` are included for the
     // replayable store-backed sources, so a session holding only those rows
     // (e.g. an OpenCode prompt-only session) is still named as a repair target.
+    // A Muse subagent has no catalog row of its own, so once every event of
+    // it is gone neither table above can name it; the edge its parent's log
+    // recorded still does, and naming it is what sends the parent back to
+    // re-read the tree.
     let mut statement = conn.prepare(
         "SELECT source, session_id FROM sessions \
          WHERE source IN (SELECT value FROM json_each(?1)) \
@@ -992,7 +1133,11 @@ fn destination_shortfall(conn: &Connection, stored: &str) -> Result<SweepRepairs
          WHERE session_id IS NOT NULL AND source IN (SELECT value FROM json_each(?2)) \
          UNION \
          SELECT source, session_id FROM session_markers \
-         WHERE source IN (SELECT value FROM json_each(?2))",
+         WHERE source IN (SELECT value FROM json_each(?2)) \
+         UNION \
+         SELECT source, child_session_id FROM session_relationships \
+         WHERE source = 'muse' AND evidence_kind = 'muse_subagent_log' \
+           AND child_session_id IS NOT NULL",
     )?;
     let mut rows = statement.query([repairable_event_sources(), replayable_history_sources()])?;
     while let Some(row) = rows.next()? {
@@ -1009,11 +1154,21 @@ fn destination_shortfall(conn: &Connection, stored: &str) -> Result<SweepRepairs
         // expected evidence reclassification rather than destination loss.
         // A remote presence keeps the canonical catalog row and must retain
         // the ordinary catalog guard.
-        let expected_subagent_deregistration = source == "codex"
-            && before.catalog > 0
+        let expected_subagent_deregistration = before.catalog > 0
             && current.catalog == 0
-            && codex_delegation_recorded(conn, &session_id)?
-            && !codex_session_has_remote_presence(conn, &session_id)?;
+            && match source.as_str() {
+                "codex" => {
+                    codex_delegation_recorded(conn, &session_id)?
+                        && !codex_session_has_remote_presence(conn, &session_id)?
+                }
+                // A Muse subagent is deregistered the same way once its log
+                // is linked to its parent.
+                "muse" => {
+                    muse_delegation_recorded(conn, &session_id)?
+                        && !session_has_remote_presence(conn, "muse", &session_id)?
+                }
+                _ => false,
+            };
         let covered = current.events >= before.events
             && current.tool_calls >= before.tool_calls
             && current.file_edits >= before.file_edits
@@ -1046,11 +1201,12 @@ fn sweep_only_fingerprint_inputs(roots: &crate::ProviderRoots) -> Vec<Candidate>
     let mut paths = vec![
         roots.claude.join("history.jsonl"),
         roots.codex.join("history.jsonl"),
+        grok_unified_log_path(&roots.grok),
     ];
     // Errors here mean an unreadable directory, not "no trajectories". The
     // fold simply omits what it could not enumerate, which can only cause an
     // extra sweep, never a skipped one.
-    paths.extend(trajectory_files(&roots.home).unwrap_or_default());
+    paths.extend(trajectory_files(roots).unwrap_or_default());
     let mut candidates: Vec<Candidate> = Vec::new();
     // OpenCode's legacy layout is a *tree*, and the evidence a sweep reads
     // lives in the message and part files under it rather than in the session
@@ -1061,6 +1217,7 @@ fn sweep_only_fingerprint_inputs(roots: &crate::ProviderRoots) -> Vec<Candidate>
     if let Some(crate::ingest::opencode::OpencodeLayout::JsonTree(tree)) =
         crate::ingest::opencode::OpencodeLayout::detect(
             &roots.opencode_db,
+            roots.opencode_db_pinned,
             &roots.opencode_storage_dir,
         )
     {
@@ -1125,37 +1282,59 @@ pub fn sync_watch_roots(home: &Path, opencode_db: &Path) -> Vec<discover::WatchR
     sync_watch_roots_with_provider_roots(&provider_roots)
 }
 
-fn sync_watch_roots_with_provider_roots(
+pub(crate) fn sync_watch_roots_with_provider_roots(
     provider_roots: &crate::ProviderRoots,
 ) -> Vec<discover::WatchRoot> {
-    let home = &provider_roots.home;
-    let mut roots = discover::watch_roots(
-        &shallow_providers(),
-        &discover::ProviderRoots {
-            home,
-            claude: &provider_roots.claude,
-            codex: &provider_roots.codex,
-            grok: &provider_roots.grok,
-            devin: &provider_roots.devin,
-            opencode_db: &provider_roots.opencode_db,
-        },
-    );
-    // The flat logs, each as the one file it is. A `directory` root here would
-    // cover every entry beside them — `~/.claude/settings.json`, the
-    // credentials file, whatever a harness release adds next — and each of
-    // those writes would drive a *forced* sweep, the kind that bypasses the
-    // fingerprint. A file root registers the same parent (a watch on the file
-    // itself dies with the next atomic rewrite) and then filters back down to
-    // the one name, which is exactly the distinction it exists for.
-    roots.push(discover::WatchRoot::file(
-        provider_roots.claude.join("history.jsonl"),
-    ));
-    roots.push(discover::WatchRoot::file(
-        provider_roots.codex.join("history.jsonl"),
-    ));
-    for root in trajectory_roots(home).unwrap_or_default() {
-        roots.push(trajectory_watch_root(root));
+    // Per source, through the one builder `Source::capabilities()` also
+    // reads, so the roots the loop registers and the roots the facade
+    // advertises cannot drift apart.
+    let mut roots = Vec::new();
+    for source in crate::store::SOURCE_CHOICES {
+        roots.extend(source_watch_roots(source, provider_roots));
     }
+    merge_watch_roots(roots)
+}
+
+/// Everything the sweep reads for one source, as the watcher registers it:
+/// the adapter's transcript roots, plus the flat prompt log Claude and Codex
+/// keep beside them, plus the trajectory directories for that source.
+///
+/// The flat logs are watched each as the one file it is. A `directory` root
+/// would cover every entry beside them — `~/.claude/settings.json`, the
+/// credentials file, whatever a harness release adds next — and each of
+/// those writes would drive a *forced* sweep, the kind that bypasses the
+/// fingerprint. A file root registers the same parent (a watch on the file
+/// itself dies with the next atomic rewrite) and then filters back down to
+/// the one name, which is exactly the distinction it exists for.
+pub(crate) fn source_watch_roots(
+    source: &str,
+    provider_roots: &crate::ProviderRoots,
+) -> Vec<discover::WatchRoot> {
+    let mut roots = discover::provider_watch_roots(source, provider_roots);
+    match source {
+        "claude" => roots.push(discover::WatchRoot::file(
+            provider_roots.claude.join("history.jsonl"),
+        )),
+        "codex" => roots.push(discover::WatchRoot::file(
+            provider_roots.codex.join("history.jsonl"),
+        )),
+        // Grok's per-inference usage log sits outside the sessions tree, so
+        // an append to it is watched as the one file it is.
+        "grok" => roots.push(discover::WatchRoot::file(grok_unified_log_path(
+            &provider_roots.grok,
+        ))),
+        "trajectory" => {
+            for root in trajectory_roots(provider_roots).unwrap_or_default() {
+                roots.push(trajectory_watch_root(root));
+            }
+        }
+        _ => {}
+    }
+    merge_watch_roots(roots)
+}
+
+/// One entry per path, at the widest depth any claim asked for.
+fn merge_watch_roots(mut roots: Vec<discover::WatchRoot>) -> Vec<discover::WatchRoot> {
     roots.sort();
     roots.dedup_by(|later, first| {
         if later.path != first.path {
@@ -1242,6 +1421,18 @@ fn sources_unchanged(conn: &Connection, state: &Map<String, Value>, current: &st
         // anything about one. The sweep below writes it.
         return false;
     };
+    // Nothing written since the marker was taken: it is still the current
+    // marker, so it covers itself. Only a marker this build can read may be
+    // vouched for this way — an empty or foreign one still has to sweep.
+    let stored_head = state
+        .get(DESTINATION_HEAD_KEY)
+        .and_then(Value::as_str)
+        .filter(|head| !head.is_empty());
+    if let (Some(stored_head), Ok(current_head)) = (stored_head, destination_head(conn)) {
+        if stored_head == current_head && parse_destination_marker(stored_destination).is_some() {
+            return true;
+        }
+    }
     match destination_generation(conn) {
         Ok(current_destination) => destination_covers(stored_destination, &current_destination),
         // Prefer a loud extra sweep to a confident skip.
@@ -1279,7 +1470,7 @@ fn sync_basic(
         }
     }
     let mut total_inserted = 0;
-    let mut report = SyncSourceReport::default();
+    let mut report = SyncSourceReport::new(db_path);
     let state_path = db_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -1306,6 +1497,7 @@ fn sync_basic(
         }
     }
     let mut state = load_sync_state(&state_path)?;
+    let mut checkpoints = SweepCheckpoints::new(&state_path, &state);
     let mut coverage = SweepCoverage::default();
     let providers = shallow_providers();
     // Captured before the sweep, not after. Anything that changes while the
@@ -1376,11 +1568,13 @@ fn sync_basic(
             "claude",
             &roots.claude.join("history.jsonl"),
             parse_claude_line,
-            &mut |in_progress| checkpoint_sync_state(&state_path, in_progress),
+            &mut |in_progress| {
+                checkpoint_sync_state(&state_path, in_progress);
+            },
         ),
     ) {
         total_inserted += inserted;
-        checkpoint_sync_state(&state_path, &state);
+        checkpoints.save(&state);
     }
     capture_progress("claude", 0, None);
     check_capture_cancelled()?;
@@ -1397,7 +1591,7 @@ fn sync_basic(
         )
         .is_some()
     {
-        checkpoint_sync_state(&state_path, &state);
+        checkpoints.save(&state);
     }
     capture_progress("codex", 0, None);
     check_capture_cancelled()?;
@@ -1412,7 +1606,7 @@ fn sync_basic(
         ),
     ) {
         total_inserted += inserted;
-        checkpoint_sync_state(&state_path, &state);
+        checkpoints.save(&state);
     }
     capture_progress("cursor", 0, None);
     check_capture_cancelled()?;
@@ -1426,30 +1620,34 @@ fn sync_basic(
         ),
     ) {
         total_inserted += inserted;
-        checkpoint_sync_state(&state_path, &state);
+        checkpoints.save(&state);
     }
     capture_progress("grok", 0, None);
     check_capture_cancelled()?;
     if let Some(inserted) = report.capture(
         "grok",
-        sync_grok_with_coverage(
-            conn,
-            &mut state,
-            &roots.grok.join("sessions"),
-            &mut coverage,
-        ),
+        sync_grok_home(conn, &mut state, &roots.grok, &mut coverage),
     ) {
         total_inserted += inserted;
-        checkpoint_sync_state(&state_path, &state);
+        checkpoints.save(&state);
+    }
+    capture_progress("muse", 0, None);
+    check_capture_cancelled()?;
+    if let Some(inserted) = report.capture(
+        "muse",
+        sync_muse_with_coverage(conn, &mut state, &roots.muse, &repairs, &mut coverage),
+    ) {
+        total_inserted += inserted;
+        checkpoints.save(&state);
     }
     capture_progress("trajectory", 0, None);
     check_capture_cancelled()?;
     if let Some(inserted) = report.capture(
         "trajectory",
-        sync_trajectories(conn, &mut state, home, &mut coverage),
+        sync_trajectories(conn, &mut state, roots, &mut coverage),
     ) {
         total_inserted += inserted;
-        checkpoint_sync_state(&state_path, &state);
+        checkpoints.save(&state);
     }
     capture_progress("opencode", 0, None);
     check_capture_cancelled()?;
@@ -1464,9 +1662,13 @@ fn sync_basic(
     // true for a *directory* named by `OPENCODE_DB`, so sync opened it as
     // SQLite and failed while detect read the legacy tree — catalog rows with
     // no evidence behind them, and nothing saying why.
-    let layout = crate::ingest::opencode::OpencodeLayout::detect(&opencode, &opencode_storage);
+    let layout = crate::ingest::opencode::OpencodeLayout::detect(
+        &opencode,
+        roots.opencode_db_pinned,
+        &opencode_storage,
+    );
     let opencode_result = match &layout {
-        Some(crate::ingest::opencode::OpencodeLayout::Sqlite(db)) => sync_opencode_db(conn, db),
+        Some(crate::ingest::opencode::OpencodeLayout::Sqlite(dbs)) => sync_opencode_dbs(conn, dbs),
         Some(crate::ingest::opencode::OpencodeLayout::JsonTree(tree)) => {
             sync_opencode_storage_dir(conn, tree)
         }
@@ -1512,18 +1714,23 @@ fn sync_basic(
     // its way to a successful partial run, which never reach `failures` at
     // all.
     let sweep_read_everything = report.failures.is_empty() && coverage.complete();
-    report.finish(db_path)?;
+    report.finish()?;
     // Establish connector-owned locators from actual provider enumeration after
     // ingestion, including on a checkpoint-only retry. Never infer an adapter
     // from an old aggregate presence row.
     capture_progress("catalog", 0, None);
     check_capture_cancelled()?;
     let discovery_env = DiscoveryEnv::with_provider_roots(conn, roots.clone());
-    let discovered = discover::discover_sessions_with_providers(
+    // Coded like the hydration failures, so `SessionStore` can tell a sweep
+    // whose evidence landed but whose catalog pass did not from one that
+    // failed outright; the CLI prints the same chain it always did, behind
+    // the code.
+    // Without discovery's own identity refresh: the sweep runs it itself just
+    // below, and running both was the same whole-catalog pass twice.
+    let discovered = discover::discover_sessions_for_sweep(
         &discovery_env,
         &DiscoverOptions::default(),
         &providers,
-        |_| {},
     )?;
     // After discovery, not before: shallow discovery is what fills in `cwd`
     // and `repo_url` for sessions a provider's history file mentions without
@@ -1601,6 +1808,15 @@ fn sync_basic(
             // merge only ever folds keys forward, so an in-memory `remove` is
             // invisible on disk and would leave a stale marker vouching for a
             // destination nobody measured.
+            //
+            // The head is read *before* the counts. A write that lands between
+            // the two then shows as a head that moved, which only costs the
+            // next tick a recount; read after, a delete in that gap would be
+            // under a head that vouches for counts taken before it.
+            let head = destination_head(conn).unwrap_or_else(|error| {
+                sync_note!("  [sync] destination head unavailable: {error:#}");
+                String::new()
+            });
             let destination = destination_generation(conn).unwrap_or_else(|error| {
                 sync_note!("  [sync] destination generation unavailable: {error:#}");
                 String::new()
@@ -1610,7 +1826,8 @@ fn sync_basic(
                 DESTINATION_GENERATION_KEY.to_string(),
                 Value::from(destination),
             );
-            checkpoint_sync_state(&state_path, &state);
+            state.insert(DESTINATION_HEAD_KEY.to_string(), Value::from(head));
+            checkpoints.save(&state);
         }
     }
     let total: i64 = conn.query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))?;
@@ -1666,7 +1883,7 @@ fn checkpoint_is_safe(
 
 /// Cross-process sync guard for one canonical database identity. Reflex, launchd, cron, and
 /// manual invocations can otherwise all walk the same multi-gigabyte history at once.
-struct SyncRunLock {
+pub(crate) struct SyncRunLock {
     _file: fs::File,
 }
 
@@ -1704,7 +1921,7 @@ fn sync_lock_path(db_path: &Path) -> Result<PathBuf> {
     Ok(canonical.with_file_name(name))
 }
 
-fn try_acquire_sync_lock(db_path: &Path) -> Result<Option<SyncRunLock>> {
+pub(crate) fn try_acquire_sync_lock(db_path: &Path) -> Result<Option<SyncRunLock>> {
     let path = sync_lock_path(db_path)?;
     let file = fs::OpenOptions::new()
         .create(true)
@@ -1785,7 +2002,12 @@ fn sync_exclusive_with_roots(
     })
 }
 
-fn sync_opencode_exclusive(db_path: &Path, opencode_path: &Path) -> Result<bool> {
+fn sync_opencode_exclusive(
+    db_path: &Path,
+    opencode_path: &Path,
+    pinned: bool,
+    storage_dir: &Path,
+) -> Result<bool> {
     let Some(_sync_lock) = try_acquire_sync_lock(db_path)? else {
         sync_note!("  [sync-opencode] another sync is already running; skipped");
         return Ok(false);
@@ -1798,10 +2020,10 @@ fn sync_opencode_exclusive(db_path: &Path, opencode_path: &Path) -> Result<bool>
     // was opened as SQLite and failed, rather than falling through to the tree
     // beside it. `sync --local` has classified this way since the layout gate
     // landed; this path was simply never brought along.
-    let storage_dir = default_opencode_storage_dir();
-    let layout = crate::ingest::opencode::OpencodeLayout::detect(opencode_path, &storage_dir);
+    let layout =
+        crate::ingest::opencode::OpencodeLayout::detect(opencode_path, pinned, storage_dir);
     let inserted = match &layout {
-        Some(crate::ingest::opencode::OpencodeLayout::Sqlite(db)) => sync_opencode_db(&conn, db),
+        Some(crate::ingest::opencode::OpencodeLayout::Sqlite(dbs)) => sync_opencode_dbs(&conn, dbs),
         Some(crate::ingest::opencode::OpencodeLayout::JsonTree(tree)) => {
             sync_opencode_storage_dir(&conn, tree)
         }
@@ -1814,23 +2036,47 @@ fn sync_opencode_exclusive(db_path: &Path, opencode_path: &Path) -> Result<bool>
         }
         _ => sync_note!("  [opencode] +{inserted} rows"),
     }
-    let home = home_dir();
-    let env = DiscoveryEnv::with_provider_roots(
-        &conn,
-        crate::ProviderRoots::from_home(home, opencode_path.to_path_buf()),
-    )
-    .with_opencode_storage_dir(storage_dir);
+    // Discovery reads exactly the stores the sync just read.
+    let mut roots = crate::ProviderRoots::from_home(home_dir(), opencode_path.to_path_buf());
+    roots.opencode_db_pinned = pinned;
+    roots.opencode_storage_dir = storage_dir.to_path_buf();
+    let env = DiscoveryEnv::with_provider_roots(&conn, roots);
     let options = DiscoverOptions {
         sources: vec!["opencode".into()],
         ..Default::default()
     };
-    discover::discover_sessions_with_connectors(
+    let discovered = discover::discover_sessions_with_connectors(
         &env,
         &options,
         &remote::SourceConnectorSelection::new(Vec::new())?,
         |_| {},
     )?;
+    for diagnostic in &discovered.diagnostics {
+        sync_note!(
+            "  [discovery] {} not read: {}",
+            diagnostic.locator.as_deref().unwrap_or(&diagnostic.source),
+            diagnostic.error
+        );
+    }
     refresh_project_identity_after_sync(&conn);
+    // A channel directory that could not be listed may hold stores this run
+    // never saw. What could be read is indexed above; the run still fails, as
+    // it does when one channel store fails, so nobody takes a partial import
+    // for a complete one.
+    if matches!(
+        layout,
+        Some(crate::ingest::opencode::OpencodeLayout::Sqlite(_))
+    ) {
+        if let Some((dir, error)) =
+            crate::paths::list_opencode_db_files(opencode_path, pinned).unlisted
+        {
+            return Err(anyhow::Error::new(error).context(format!(
+                "could not list OpenCode channel databases in {} \
+                 (the stores that could be read were indexed)",
+                dir.display()
+            )));
+        }
+    }
     Ok(true)
 }
 
@@ -1914,7 +2160,9 @@ fn load_sync_state(path: &Path) -> Result<Map<String, Value>> {
 /// write did not land. The next checkpoint retries, and [`save_sync_state`]
 /// leaves the previous state intact when a write fails, so the worst case is a
 /// re-scan rather than corruption.
-fn checkpoint_sync_state(path: &Path, state: &Map<String, Value>) {
+///
+/// Returns whether the checkpoint landed (or had nothing to write).
+fn checkpoint_sync_state(path: &Path, state: &Map<String, Value>) -> bool {
     let checkpoint = || -> Result<()> {
         let _lock = SyncStateLock::acquire(path)?;
         match merged_sync_state(path, state)? {
@@ -1923,8 +2171,45 @@ fn checkpoint_sync_state(path: &Path, state: &Map<String, Value>) {
             Some(merged) => save_sync_state(path, &merged),
         }
     };
-    if let Err(err) = checkpoint() {
-        eprintln!("ai-hist: could not checkpoint sync state: {err:#}");
+    match checkpoint() {
+        Ok(()) => true,
+        Err(err) => {
+            eprintln!("ai-hist: could not checkpoint sync state: {err:#}");
+            false
+        }
+    }
+}
+
+/// One sweep's checkpoints, minus the ones that could write nothing.
+///
+/// A sweep checkpoints after every source, and each checkpoint takes the
+/// state lock, reads and parses the whole state file, merges and compares it.
+/// On an archive whose state has grown past a megabyte that was a
+/// megabyte-scale read and parse per source per sweep — most of them for a
+/// source that advanced nothing. What this sweep already put on disk (or
+/// loaded from it) cannot be news to the file, so an unchanged in-memory
+/// state skips the round trip. A checkpoint that failed is not remembered,
+/// so the next one retries it.
+struct SweepCheckpoints<'a> {
+    path: &'a Path,
+    last: Map<String, Value>,
+}
+
+impl<'a> SweepCheckpoints<'a> {
+    fn new(path: &'a Path, loaded: &Map<String, Value>) -> Self {
+        Self {
+            path,
+            last: loaded.clone(),
+        }
+    }
+
+    fn save(&mut self, state: &Map<String, Value>) {
+        if *state == self.last {
+            return;
+        }
+        if checkpoint_sync_state(self.path, state) {
+            self.last = state.clone();
+        }
     }
 }
 
@@ -2061,9 +2346,18 @@ fn record_fidelity_backfill(state: &mut Map<String, Value>, key: &str) {
 /// repairing the rows the bump was for — a change that reads as done and does
 /// nothing, for exactly the installs that needed it.
 /// `the_raw_facts_version_and_generation_are_bumped_together` is the guard.
-const RAW_MESSAGE_FACTS_GENERATION: i64 = 2;
+const RAW_MESSAGE_FACTS_GENERATION: i64 = 3;
 const CLAUDE_RAW_MESSAGE_FACTS_KEY: &str = "claude_raw_message_facts";
 const CODEX_RAW_MESSAGE_FACTS_KEY: &str = "codex_raw_message_facts";
+
+/// One-time re-read of every Codex fork rollout, so the fork replay gate
+/// (`ForkReplaySpan`) retires the replayed parent rows an earlier parser
+/// indexed under the child. A fork's stamp never changes once it is finished,
+/// so without this the duplicates would stay for the life of the install.
+/// Recorded only after a walk that reached every known root, like the other
+/// backfills.
+const CODEX_FORK_REPLAY_GENERATION: i64 = 1;
+const CODEX_FORK_REPLAY_KEY: &str = "codex_fork_replay_gate";
 
 /// Whether this provider still owes a one-time raw-facts backfill pass.
 fn raw_facts_backfill_pending(state: &Map<String, Value>, key: &str) -> bool {
@@ -2232,7 +2526,11 @@ const RETIRED_SYNC_STATE_KEYS: &[(&str, &str)] = &[
     ("claude_sessions_v3", "claude_sessions_v4"),
     ("cursor", CURSOR_SYNC_STATE_KEY),
     ("cursor_events_v1", CURSOR_SYNC_STATE_KEY),
+    ("cursor_events_v2", CURSOR_SYNC_STATE_KEY),
     ("grok_sessions", GROK_SYNC_STATE_KEY),
+    ("grok_events_v1", GROK_SYNC_STATE_KEY),
+    ("grok_events_v2", GROK_SYNC_STATE_KEY),
+    ("grok_events_v3", GROK_SYNC_STATE_KEY),
 ];
 
 /// Where plain `sync` remembers how far it has read each Cursor transcript.
@@ -2243,7 +2541,9 @@ const RETIRED_SYNC_STATE_KEYS: &[(&str, &str)] = &[
 /// `session_events`, `tool_calls` and `file_edits`. Bumping
 /// `HYDRATION_PARSER_VERSION` alone only repairs sessions somebody hydrates by
 /// name; plain `sync` would keep skipping the rest forever.
-const CURSOR_SYNC_STATE_KEY: &str = "cursor_events_v2";
+///
+/// `v3` re-reads every transcript once for tool-result fidelity (#171).
+const CURSOR_SYNC_STATE_KEY: &str = "cursor_events_v3";
 
 /// Byte cursor covering the complete records hydration actually indexed.
 ///
@@ -2309,7 +2609,21 @@ pub(crate) fn record_cursor_hydrate_checkpoint(
 /// `updates.jsonl` recorded, in place of the synthesized ones the previous
 /// parser wrote. Bumping `HYDRATION_PARSER_VERSION` alone only repairs
 /// sessions somebody hydrates by name.
-const GROK_SYNC_STATE_KEY: &str = "grok_events_v1";
+///
+/// `grok_events_v2` does it again for the per-turn `turn_completed.usage`
+/// breakdown and the per-turn request span on assistant rows: both live only
+/// in `updates.jsonl`, so a session indexed before them keeps proxy-only
+/// token facts and one request per assistant row until it is read again.
+///
+/// `v3` re-reads every session once more for tool-result fidelity (#171).
+///
+/// `v4` re-reads for #212: an `eventId` Grok reused across two messages keyed
+/// both to one event, so the second overwrote the first, and the turn models
+/// `updates.jsonl` names (`_meta.modelId`, a single-key `modelUsage`) were not
+/// read. Neither heals without reading the directory again. The
+/// `logs/unified.jsonl` usage needs no re-read: it attaches from its own
+/// cursor whatever the session's stamp says.
+const GROK_SYNC_STATE_KEY: &str = "grok_events_v4";
 
 fn merged_sync_state(path: &Path, ours: &Map<String, Value>) -> Result<Option<Map<String, Value>>> {
     let mut merged = load_sync_state(path)?;
@@ -2554,6 +2868,28 @@ struct FileCursor {
     /// it detects in-place rewrites that regrow past the cursor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prefix_hash: Option<String>,
+    /// The stat under which `prefix_hash` was last proven against the whole
+    /// file at its end. See [`FileSettled`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    settled: Option<FileSettled>,
+}
+
+/// A byte cursor's [`transcript_cursor::SettledStat`]: the change time and
+/// length of the file when a whole-prefix hash last proved the cursor sat at
+/// its end. While both still describe the file, nothing has written to it
+/// since, so the prefix need not be read again to say so.
+///
+/// Recorded only at end of file, only on a filesystem that keeps a real
+/// change time, and only once it is outside the racy window; trusted only
+/// until [`transcript_cursor::SETTLE_REVERIFY_MS`] has passed. The cursor's
+/// own offset has to equal the recorded length, so a cursor that moved on
+/// without clearing it is not vouched for.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct FileSettled {
+    ctime_ns: i64,
+    size: u64,
+    #[serde(default)]
+    settled_at_ms: i64,
 }
 
 enum DecodedFileCursor {
@@ -2573,6 +2909,33 @@ impl FileCursor {
 
     fn to_value(&self) -> Value {
         serde_json::to_value(self).expect("file cursor serialization cannot fail")
+    }
+
+    /// Whether this cursor's [`FileSettled`] still describes `path`: the file
+    /// is exactly as long as the cursor, has the cursor's identity and mtime,
+    /// and has not changed since the prefix was proven. One `stat`, no read.
+    fn settled_at(&self, path: &Path) -> bool {
+        let Some(settled) = self.settled.as_ref() else {
+            return false;
+        };
+        let Ok(metadata) = fs::metadata(path) else {
+            return false;
+        };
+        let (device, inode) = metadata_identity(&metadata);
+        let identity_matches = match (self.generation.device, device) {
+            (Some(_), Some(_)) => {
+                (self.generation.device, self.generation.inode) == (device, inode)
+            }
+            _ => true,
+        };
+        metadata.is_file()
+            && identity_matches
+            && settled.size == self.offset
+            && metadata.len() == settled.size
+            && metadata_mtime_ns(&metadata) == self.observed_mtime_ns
+            && transcript_cursor::settle_is_fresh(settled.settled_at_ms)
+            && transcript_cursor::filesystem_keeps_change_time(path, &metadata)
+            && transcript_cursor::change_time_ns(&metadata) == Some(settled.ctime_ns)
     }
 
     fn same_generation(&self, other: &Self) -> bool {
@@ -2615,6 +2978,20 @@ impl FileCursor {
                 (ours, on_disk)
             };
             winner.observed_mtime_ns = winner.observed_mtime_ns.max(other.observed_mtime_ns);
+            // Two writers at the same position over the same prefix: a settled
+            // stat either of them proved describes both. It is checked against
+            // the live file before it is ever trusted, so carrying it is safe.
+            // The more recent proof wins, so a renewal (after the reverify
+            // interval, or after a ctime-only change such as a chmod) replaces
+            // the stale stamp instead of being discarded by the fold.
+            if winner.offset == other.offset && winner.prefix_hash == other.prefix_hash {
+                winner.settled = match (winner.settled.take(), other.settled) {
+                    (Some(left), Some(right)) if right.settled_at_ms > left.settled_at_ms => {
+                        Some(right)
+                    }
+                    (left, right) => left.or(right),
+                };
+            }
             winner
         } else if on_disk.same_known_identity(&ours) == Some(true)
             && on_disk.generation.rewrite_epoch != ours.generation.rewrite_epoch
@@ -2629,6 +3006,32 @@ impl FileCursor {
         } else {
             on_disk
         }
+    }
+}
+
+/// The saved cursor for `path`, if it is settled at the file's end: the whole
+/// "has anything arrived?" question answered by one `stat`.
+fn saved_cursor_settled(saved: Option<&Value>, path: &Path) -> bool {
+    matches!(
+        saved.and_then(FileCursor::decode),
+        Some(DecodedFileCursor::Typed(cursor)) if cursor.settled_at(path)
+    )
+}
+
+/// Whether `saved` is the cursor a reader just opened at, ignoring whether it
+/// was settled. The reader never carries a settled stat forward, so without
+/// this a settled cursor would never compare equal to the one it reopened.
+fn same_opened_cursor(saved: Option<&Value>, opened: &Value) -> bool {
+    let Some(saved) = saved else {
+        return false;
+    };
+    match saved.as_object() {
+        Some(fields) if fields.contains_key("settled") => {
+            let mut plain = fields.clone();
+            plain.remove("settled");
+            opened.as_object() == Some(&plain)
+        }
+        _ => saved == opened,
     }
 }
 
@@ -2670,6 +3073,9 @@ struct CompleteJsonlReader {
     validated_size: u64,
     validated_mtime_ns: u64,
     reset_cursor: Option<FileCursor>,
+    /// The change time of the stat `open` validated against, when it is old
+    /// enough to settle a cursor on. Taken before the prefix was hashed.
+    settle_ctime_ns: Option<i64>,
 }
 
 impl CompleteJsonlReader {
@@ -2679,6 +3085,7 @@ impl CompleteJsonlReader {
         let size = metadata.len();
         let mtime_ns = metadata_mtime_ns(&metadata);
         let (device, inode) = metadata_identity(&metadata);
+        let settle_ctime_ns = transcript_cursor::settled_change_time(path, &metadata);
         let decoded = saved.and_then(FileCursor::decode);
 
         let (offset, generation, prefix_hasher) = match decoded {
@@ -2761,6 +3168,7 @@ impl CompleteJsonlReader {
                 generation,
                 observed_mtime_ns: mtime_ns,
                 prefix_hash: Some(prefix_hash.clone()),
+                settled: None,
             },
             position: offset,
             prefix_hasher,
@@ -2769,7 +3177,29 @@ impl CompleteJsonlReader {
             validated_size: size,
             validated_mtime_ns: mtime_ns,
             reset_cursor: None,
+            settle_ctime_ns,
         })
+    }
+
+    /// The opened cursor, settled, when `open` proved the whole prefix and it
+    /// reaches the end of the file: the next pass can then skip the file on a
+    /// `stat`. `None` when the stat was too recent to settle on, or when there
+    /// are unread bytes past the cursor.
+    fn settled_cursor(&self) -> Option<FileCursor> {
+        let ctime_ns = self.settle_ctime_ns?;
+        if self.reset_cursor.is_some() || self.cursor.offset != self.validated_size {
+            return None;
+        }
+        let mut cursor = self.cursor.clone();
+        cursor.settled = Some(FileSettled {
+            ctime_ns,
+            size: self.validated_size,
+            settled_at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+                .unwrap_or(0),
+        });
+        Some(cursor)
     }
 
     /// Returns only newline-terminated records. A partial final buffer remains
@@ -2820,6 +3250,7 @@ impl CompleteJsonlReader {
                 },
                 observed_mtime_ns: mtime_ns,
                 prefix_hash: Some(empty_prefix_hash()),
+                settled: None,
             };
             self.reset_cursor = Some(reset.clone());
             return Ok(reset);
@@ -2842,7 +3273,35 @@ fn finish_prefix_hash(hasher: &Sha256) -> String {
     format!("{:x}", hasher.clone().finalize())
 }
 
+// Whole-prefix bytes hashed on this thread, so a test can assert that a pass
+// over byte-cursor files it had already proven read none of them again.
+#[cfg(test)]
+thread_local! {
+    static PREFIX_HASH_METER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn meter_prefix_hash(bytes: u64) {
+    PREFIX_HASH_METER.with(|meter| meter.set(meter.get() + bytes));
+}
+
+#[cfg(not(test))]
+fn meter_prefix_hash(_bytes: u64) {}
+
+/// Start counting whole-prefix hash bytes from zero on this thread.
+#[cfg(test)]
+pub(crate) fn reset_prefix_hash_meter() {
+    PREFIX_HASH_METER.with(|meter| meter.set(0));
+}
+
+/// Whole-prefix hash bytes read on this thread since the last reset.
+#[cfg(test)]
+pub(crate) fn prefix_hash_meter() -> u64 {
+    PREFIX_HASH_METER.with(|meter| meter.get())
+}
+
 fn hash_file_prefix(path: &Path, offset: u64) -> Result<(String, Sha256)> {
+    meter_prefix_hash(offset);
     let mut file = fs::File::open(path)?;
     let mut remaining = offset;
     let mut hasher = Sha256::new();
@@ -2876,11 +3335,20 @@ fn sync_jsonl_incremental(
         sync_note!("  [{name}] not found: {} (skipped)", path.display());
         return Ok(0);
     }
+    // A cursor settled at the end of an untouched file is up to date on a
+    // `stat`; everything else reopens it and proves the prefix again.
+    if saved_cursor_settled(state.get(name), path) {
+        sync_note!("  [{name}] up to date");
+        return Ok(0);
+    }
     let mut source = CompleteJsonlReader::open(path, state.get(name))?;
     let offset = source.position;
     let size = source.reader.get_ref().metadata()?.len();
     let opened_cursor = source.cursor.to_value();
-    if offset >= size && state.get(name) == Some(&opened_cursor) {
+    if offset >= size && same_opened_cursor(state.get(name), &opened_cursor) {
+        if let Some(settled) = source.settled_cursor() {
+            state.insert(name.to_string(), settled.to_value());
+        }
         sync_note!("  [{name}] up to date");
         return Ok(0);
     }
@@ -2971,11 +3439,53 @@ fn sync_codex_with_repairs_and_coverage(
     repairs: &SweepRepairs,
     coverage: &mut SweepCoverage,
 ) -> Result<usize> {
-    let (cwds, branches, mut inserted) =
-        sync_codex_rollouts_with_repairs_and_coverage(conn, state, root, repairs, coverage)?;
+    // Sessions an earlier sweep touched but whose metadata backfill never
+    // completed. The scoped backfill only ever revisits what a sweep touches,
+    // and a failed Codex source can still have its advanced cursor and rollout
+    // stamps checkpointed by a later source — the next sweep would then see
+    // nothing new and never retry them.
+    let mut touched: HashSet<String> = state
+        .get(CODEX_METADATA_PENDING_KEY)
+        .and_then(Value::as_array)
+        .map(|ids| {
+            ids.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let result = sync_codex_sources(conn, state, root, repairs, coverage, &mut touched);
+    if result.is_err() {
+        let mut pending: Vec<&String> = touched.iter().collect();
+        pending.sort_unstable();
+        state.insert(CODEX_METADATA_PENDING_KEY.to_string(), json!(pending));
+    } else if state.contains_key(CODEX_METADATA_PENDING_KEY) {
+        // An empty value rather than a removal: the sync-state merge only
+        // folds keys forward, so a removal would leave the stale list on disk.
+        state.insert(CODEX_METADATA_PENDING_KEY.to_string(), json!([]));
+    }
+    result
+}
+
+fn sync_codex_sources(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    root: &Path,
+    repairs: &SweepRepairs,
+    coverage: &mut SweepCoverage,
+    touched: &mut HashSet<String>,
+) -> Result<usize> {
+    let (cwds, branches, mut inserted) = sync_codex_rollouts_with_repairs_and_coverage(
+        conn, state, root, repairs, coverage, touched,
+    )?;
     let path = root.join("history.jsonl");
     if !path.exists() {
         sync_note!("  [codex] not found: {} (skipped)", path.display());
+        // The rows the backfill fills are already in the database; a missing
+        // log only means no new ones. Sessions a rollout re-read or an earlier
+        // sweep left owed still get their pass, or clearing them as pending
+        // would lose them.
+        backfill_codex_metadata_scoped(conn, state, &cwds, &branches, touched)?;
         return Ok(inserted);
     }
     let mut source = CompleteJsonlReader::open(&path, state.get("codex"))?;
@@ -2997,6 +3507,7 @@ fn sync_codex_with_repairs_and_coverage(
                         if entry.project.is_none() {
                             entry.project = cwds.get(session_id).cloned();
                         }
+                        touched.insert(session_id.to_string());
                     }
                     inserted += insert_history(conn, &entry)?;
                 }
@@ -3014,7 +3525,7 @@ fn sync_codex_with_repairs_and_coverage(
             source.committed_cursor(consumed, true)?.to_value(),
         );
     }
-    let backfilled = backfill_codex_metadata(conn, &cwds, &branches)?;
+    let backfilled = backfill_codex_metadata_scoped(conn, state, &cwds, &branches, touched)?;
     if consumed == offset && backfilled == 0 {
         sync_note!("  [codex] up to date");
     } else {
@@ -3108,12 +3619,19 @@ fn cleanup_codex_subagent_registration(conn: &Connection, session_id: &str) -> R
 }
 
 fn codex_session_has_remote_presence(conn: &Connection, session_id: &str) -> Result<bool> {
+    session_has_remote_presence(conn, "codex", session_id)
+}
+
+/// Whether a session is also known remotely. Local and remote evidence share
+/// one `(source, session_id)` identity, so a local re-read must not delete
+/// rows a remote observation put there.
+fn session_has_remote_presence(conn: &Connection, source: &str, session_id: &str) -> Result<bool> {
     conn.query_row(
         "SELECT EXISTS(\
            SELECT 1 FROM session_presences \
-           WHERE source = 'codex' AND session_id = ? AND location = 'remote'\
+           WHERE source = ? AND session_id = ? AND location = 'remote'\
          )",
-        [session_id],
+        params![source, session_id],
         |row| row.get(0),
     )
     .map_err(Into::into)
@@ -3149,7 +3667,14 @@ fn sync_codex_rollouts_with_repairs(
     repairs: &SweepRepairs,
 ) -> Result<CodexRolloutWalk> {
     let mut coverage = SweepCoverage::default();
-    sync_codex_rollouts_with_repairs_and_coverage(conn, state, root, repairs, &mut coverage)
+    sync_codex_rollouts_with_repairs_and_coverage(
+        conn,
+        state,
+        root,
+        repairs,
+        &mut coverage,
+        &mut HashSet::new(),
+    )
 }
 
 fn sync_codex_rollouts_with_repairs_and_coverage(
@@ -3158,6 +3683,7 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
     root: &Path,
     repairs: &SweepRepairs,
     coverage: &mut SweepCoverage,
+    touched: &mut HashSet<String>,
 ) -> Result<CodexRolloutWalk> {
     let mut cwds = load_state_string_map(state, "codex_session_cwds");
     let mut branches = load_state_string_map(state, "codex_session_branches");
@@ -3186,6 +3712,11 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
     state.remove("codex_rollouts_v5");
     let backfill_fidelity = fidelity_backfill_pending(state, CODEX_FIDELITY_GENERATION_KEY);
     let backfill_raw_facts = raw_facts_backfill_pending(state, CODEX_RAW_MESSAGE_FACTS_KEY);
+    let backfill_fork_replay = state
+        .get(CODEX_FORK_REPLAY_KEY)
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        < CODEX_FORK_REPLAY_GENERATION;
     // A root the stamp map has entries for but whose rollouts this run cannot
     // see is an archive we could not read, not an archive that is gone.
     // Walking it vacuously and then recording the generation would retire the
@@ -3271,11 +3802,38 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                 // reading that one line rather than re-ingesting the rollout.
                 // The capture always writes a row for a readable rollout, so
                 // this clears after one pass and never re-reads again.
+                //
+                // The same one-time re-read also catches a rollout the older
+                // build classified as a root that this build calls a subagent
+                // (a Codex 0.150 `guardian_review` thread with a parent): its
+                // stamp never changes, so the map's `subagent: false` would be
+                // trusted forever. Such a rollout falls through to the full
+                // path below, which removes its root registration, records its
+                // delegation and re-stamps it as a subagent.
+                //
+                // A reclassified rollout is *not* captured here: the full path
+                // captures it after removing the stale root registration,
+                // whose deletion trigger would otherwise drop the evidence just
+                // banked. Capturing last is also what keeps the gate open: if
+                // the full path fails part way, the evidence is still stale
+                // and the next pass reclassifies again.
+                let mut reclassified = false;
                 if recorded_session.is_some() && !codex_continuity_evidence_exists(conn, &rollout)?
                 {
-                    crate::continuity::capture_codex_rollout(conn, &rollout)?;
+                    let recorded_subagent = record
+                        .and_then(|r| r.get("subagent"))
+                        .and_then(Value::as_bool)
+                        == Some(true);
+                    if !recorded_subagent {
+                        reclassified =
+                            read_codex_session_meta(&rollout)?.is_some_and(|meta| meta.is_subagent);
+                    }
+                    if !reclassified {
+                        crate::continuity::capture_codex_rollout(conn, &rollout)?;
+                    }
                 }
                 match recorded_session {
+                    _ if reclassified => {}
                     // No session id was recorded because the file had no
                     // usable session_meta; there is nothing to re-ingest.
                     None => continue,
@@ -3283,6 +3841,11 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                     // session lost rows since the last sweep. Existence is not
                     // enough to answer that — re-ingest, which is idempotent.
                     Some(id) if repairs.contains("codex", id) => {}
+                    // A fork indexed before the replay gate: re-read once so
+                    // the gate retires the parent history it duplicated.
+                    Some(_)
+                        if backfill_fork_replay
+                            && crate::continuity::codex_evidence_names_fork(conn, &key)? => {}
                     Some(id)
                         if codex_session_evidence_exists(conn, id)?
                             && !(backfill_fidelity
@@ -3323,10 +3886,8 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                 if let Some(branch) = &meta.git_branch {
                     branches.insert(meta.session_id.clone(), branch.clone());
                 }
+                touched.insert(meta.session_id.clone());
             }
-            // Only rollouts whose `session_meta` actually names a prior thread
-            // bank anything here; `codex resume` on its own does not.
-            crate::continuity::capture_codex_rollout(conn, &rollout)?;
             let outcome = if repair_user_messages {
                 repair_codex_rollout_user_messages(conn, &rollout, &meta)
             } else {
@@ -3350,6 +3911,14 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                     return Err(error);
                 }
             };
+            // Only rollouts whose `session_meta` actually names a prior thread
+            // bank anything here; `codex resume` on its own does not. After
+            // the subagent cleanup, not before: removing a stale root
+            // registration deletes the session's continuity evidence with it
+            // (the `sessions` delete trigger), and evidence banked first would
+            // go with it -- a reclassified guardian would lose its fork edge
+            // and, its evidence looking current, never be re-read for it.
+            crate::continuity::capture_codex_rollout(conn, &rollout)?;
             inserted += outcome.prompts;
             events += outcome.events;
             // Topology is recorded by the full sync too, so delegation is
@@ -3375,11 +3944,26 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                         outcome.last_assistant_text.as_deref(),
                         Some(&rollout.to_string_lossy()),
                     )?;
-                    if let Some(first_prompt) = outcome.first_prompt.as_deref() {
+                    // A fork's walk is authoritative even with no prompt of
+                    // its own: an earlier build may have stored the parent's
+                    // replayed prompt, and the shallow writer only ever
+                    // fills a missing value, so this is where it is cleared.
+                    if outcome.first_prompt.is_some() || outcome.saw_fork_replay {
                         conn.execute(
                             "UPDATE sessions SET first_prompt = ? \
                              WHERE source = 'codex' AND session_id = ?",
-                            params![first_prompt, meta.session_id],
+                            params![outcome.first_prompt, meta.session_id],
+                        )?;
+                    }
+                    // The same holds for the last assistant answer: the
+                    // upsert above only overwrites it with a value, so a fork
+                    // with no answer of its own would keep the parent's
+                    // replayed answer an earlier build stored.
+                    if outcome.saw_fork_replay && outcome.last_assistant_text.is_none() {
+                        conn.execute(
+                            "UPDATE sessions SET last_assistant_text = NULL \
+                             WHERE source = 'codex' AND session_id = ?",
+                            params![meta.session_id],
                         )?;
                     }
                 }
@@ -3420,6 +4004,12 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
     }
     crate::continuity::reconcile(conn, "codex")?;
     record_raw_facts_backfill(state, CODEX_RAW_MESSAGE_FACTS_KEY, walked_every_known_root);
+    if walked_every_known_root {
+        state.insert(
+            CODEX_FORK_REPLAY_KEY.to_string(),
+            json!(CODEX_FORK_REPLAY_GENERATION),
+        );
+    }
     if repairs.repairs_all() && !walked_every_known_root {
         coverage.note_unread();
     }
@@ -3517,6 +4107,50 @@ fn grok_state_had_evidence(entry: &Value) -> Option<bool> {
     entry.get("evidence").and_then(Value::as_bool)
 }
 
+/// Whether the indexing run wrote transcript events, as its stamp entry recorded.
+///
+/// Absent on a stamp written before that was recorded. Unified-log usage is
+/// not a transcript: it arrives from `logs/unified.jsonl` and can be the only
+/// event left after the transcript rows are gone.
+fn grok_state_transcript_events(entry: &Value) -> Option<bool> {
+    entry.get("transcript_events").and_then(Value::as_bool)
+}
+
+/// Whether any transcript event is stored for a Grok session.
+///
+/// `raw_kind = 'unified_log_usage'` is a row copied from `logs/unified.jsonl`,
+/// not from the session directory. Counting it would let a missing transcript
+/// look indexed for as long as one inference remained.
+fn grok_transcript_events_exist(conn: &Connection, session_id: &str) -> Result<bool> {
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM session_events \
+         WHERE source = 'grok' AND session_id = ? \
+           AND (raw_kind IS NULL OR raw_kind != 'unified_log_usage') LIMIT 1)",
+        params![session_id],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
+}
+
+/// What the unchanged-stamp skip asks, given what the indexing run recorded.
+///
+/// A run that wrote transcript events is still indexed only while one of
+/// those events remains. Unified-log usage and a sidecar marker are not a
+/// substitute: both survive a transcript that was deleted out from under an
+/// unchanged directory. A run that wrote no transcript events — markers or a
+/// relationship only — is still indexed while that evidence remains.
+fn grok_indexed_evidence_remains(
+    conn: &Connection,
+    session_id: &str,
+    transcript_events: Option<bool>,
+) -> Result<bool> {
+    if transcript_events == Some(true) {
+        grok_transcript_events_exist(conn, session_id)
+    } else {
+        grok_evidence_exists(conn, session_id)
+    }
+}
+
 /// Whether any Grok-owned evidence is stored for a session.
 ///
 /// Every table this ingestion writes, because a Grok session need not produce
@@ -3524,8 +4158,10 @@ fn grok_state_had_evidence(entry: &Value) -> Option<bool> {
 /// reasoning is stored entirely as markers, and one whose transcript is empty
 /// but whose `subagents/` directory names a child has only a relationship.
 /// Asking about a subset would call such a session unindexed on every run.
+/// Unified-log usage is not one of those tables' evidence — see
+/// [`grok_transcript_events_exist`].
 fn grok_evidence_exists(conn: &Connection, session_id: &str) -> Result<bool> {
-    if session_events_exist(conn, "grok", session_id)? {
+    if grok_transcript_events_exist(conn, session_id)? {
         return Ok(true);
     }
     for statement in [
@@ -3612,6 +4248,16 @@ pub(crate) struct CodexSessionMeta {
     /// The `session_meta` line's own timestamp: when the provider recorded
     /// this thread starting.
     meta_ts_ms: Option<i64>,
+    /// The thread this one was forked from, when Codex names it outright:
+    /// `forked_from_id` for a human fork, else
+    /// `source.subagent.thread_spawn.parent_thread_id` for a spawned subagent.
+    /// These are the same two fields the continuity scanner records `fork`
+    /// edges from, and only they arm the replay gate.
+    fork_parent_id: Option<String>,
+    /// When this thread began, for ordering its turns against the fork: the
+    /// UUIDv7 thread id's timestamp, else `payload.timestamp`, else the
+    /// record's own timestamp.
+    fork_origin_ms: Option<i64>,
 }
 
 /// Resolve the parent identity from every Codex session-meta shape observed in
@@ -3662,10 +4308,15 @@ fn codex_parent_session_id(
 /// `source.subagent` is treated as a child only when an explicit parent is
 /// present, so a standalone guardian remains discoverable under `payload.id`.
 pub(crate) fn codex_is_subagent(payload: Option<&Value>, session_id: &str) -> bool {
-    let thread_source_is_subagent = payload
+    let thread_source = payload
         .and_then(|p| p.get("thread_source"))
-        .and_then(Value::as_str)
-        == Some("subagent");
+        .and_then(Value::as_str);
+    let thread_source_is_subagent = thread_source == Some("subagent");
+    // Codex 0.150 renamed the guardian's `thread_source` from `subagent` to
+    // `guardian_review`. It is a child only when it names its parent, like the
+    // `source.subagent` marker below: a standalone guardian stays a root.
+    let guardian_review_with_parent = thread_source == Some("guardian_review")
+        && codex_parent_session_id(payload.and_then(Value::as_object), session_id).is_some();
     let source_marks_subagent = payload
         .and_then(|p| p.get("source"))
         .and_then(Value::as_object)
@@ -3676,6 +4327,7 @@ pub(crate) fn codex_is_subagent(payload: Option<&Value>, session_id: &str) -> bo
     // carry that marker while keeping their own identity, so they stay
     // discoverable under `payload.id`.
     thread_source_is_subagent
+        || guardian_review_with_parent
         || (source_marks_subagent
             && codex_parent_session_id(payload.and_then(Value::as_object), session_id).is_some())
 }
@@ -3853,6 +4505,8 @@ fn codex_session_meta_from_record(value: &Value) -> Option<CodexSessionMeta> {
         .get("timestamp")
         .and_then(Value::as_str)
         .and_then(parse_iso_ms);
+    let fork_parent_id = codex::fork_parent_id(payload_value, session_id);
+    let fork_origin_ms = codex::fork_origin_ms(payload_value, session_id, meta_ts_ms);
     Some(CodexSessionMeta {
         session_id: session_id.to_string(),
         cwd: cwd.to_string(),
@@ -3862,6 +4516,8 @@ fn codex_session_meta_from_record(value: &Value) -> Option<CodexSessionMeta> {
         parent_thread_id,
         subagent_label,
         meta_ts_ms,
+        fork_parent_id,
+        fork_origin_ms,
     })
 }
 
@@ -3873,6 +4529,11 @@ pub(crate) struct CodexIngestOutcome {
     last_ts: Option<i64>,
     first_prompt: Option<String>,
     last_assistant_text: Option<String>,
+    /// Whether this pass read a forked rollout's replayed parent history.
+    /// `first_prompt` is then authoritative even when it is `None`: whatever
+    /// the catalog holds may be the parent's prompt an earlier build took
+    /// from the replay.
+    saw_fork_replay: bool,
 }
 
 /// Cumulative token totals from a Codex `token_count` event
@@ -4129,10 +4790,12 @@ fn repair_codex_rollout_user_messages(
     // leave either the old user rows or the fully rebuilt ones. Assistant,
     // tool, and file-edit evidence is retained and idempotently upserted.
     let tx = conn.unchecked_transaction()?;
-    tx.execute(
-        "DELETE FROM session_events \
-         WHERE source = 'codex' AND session_id = ? AND role = 'user'",
-        [meta.session_id.as_str()],
+    crate::store::retire_evidence_share(
+        &tx,
+        "session_events",
+        "source = 'codex' AND session_id = ? AND role = 'user'",
+        params![meta.session_id.as_str()],
+        SessionLocation::Local,
     )?;
     if meta.is_subagent {
         cleanup_codex_subagent_history(&tx, &meta.session_id)?;
@@ -4286,6 +4949,18 @@ fn ingest_codex_rollout_incremental(
     // shape of the bug this exists to prevent.
     let mut unwritten_line: Option<UnwrittenCodexLine> = None;
     let mut changes_before_line = conn.total_changes();
+    // The parent history a fork copied into this file, while it is being read
+    // (see `ForkReplaySpan`). Never carried across passes: the replay holds no
+    // `task_complete` the cursor could commit at, because its lines are
+    // skipped before the arms that would.
+    let mut fork_replay: Option<ForkReplaySpan> = None;
+    let mut replay_gate =
+        codex::ForkReplayGate::new(meta.fork_parent_id.clone(), meta.fork_origin_ms);
+    // The replay marker whose inherited baseline no child snapshot has
+    // confirmed yet (see `inherited_baseline_verdict`). Carried across passes
+    // on the cursor, so a pass may commit before the child's first snapshot
+    // without re-reading the replay on every later pass.
+    let mut inherited_baseline_marker: Option<String> = resume.inherited_baseline_marker.clone();
     loop {
         check_capture_cancelled()?;
         // A line without its newline is the half-written tail of a live
@@ -4337,6 +5012,40 @@ fn ingest_codex_rollout_incremental(
             conn.total_changes() == changes_before_line,
         )?;
         changes_before_line = conn.total_changes();
+        // A forked rollout's copy of its parent's history: see
+        // `ForkReplaySpan` and `codex::ForkReplayGate`, which states the rule.
+        match replay_gate.step(index == 0, &value) {
+            codex::ReplayStep::Outside => {}
+            codex::ReplayStep::Replay => {
+                fork_replay
+                    .get_or_insert_with(|| ForkReplaySpan::new(index, ts_ms))
+                    .absorb(index, &value, payload);
+                continue;
+            }
+            codex::ReplayStep::Closed { turn_id, basis } => {
+                if let Some(span) = fork_replay.take() {
+                    outcome.saw_fork_replay = true;
+                    let seeded = prev_totals.is_none() && span.inherited.is_some();
+                    record_codex_fork_replay(
+                        conn,
+                        meta,
+                        &span,
+                        Some((turn_id.as_deref(), basis)),
+                        seeded.then_some("pending"),
+                    )?;
+                    human_messages = codex::HumanMessageDeduper::default();
+                    if let (true, Some(inherited)) = (seeded, span.inherited) {
+                        prev_totals = Some(inherited);
+                        baseline_generation += 1;
+                        span_run_start = request_span;
+                        inherited_baseline_marker = Some(span.marker_uid());
+                    }
+                    // The marker and retirements above are the span's, not
+                    // this line's: measure this line from here.
+                    changes_before_line = conn.total_changes();
+                }
+            }
+        }
         // A state-only line is never registered: it writes no row by design,
         // and the allocation would land on the highest-volume lines in the file.
         unwritten_line = (!codex_line_is_state_only(line_type, payload_type, payload)).then(|| {
@@ -4390,28 +5099,54 @@ fn ingest_codex_rollout_incremental(
             };
             let uid = format!("{index}:{suffix}");
             let message_id = message.message_id.as_deref().unwrap_or(uid.as_str());
-            insert_codex_event(
+            insert_session_event(
                 conn,
+                "codex",
                 session_id,
                 cwd,
+                cwd,
                 branch,
+                message_id,
+                None,
                 ts_ms,
                 "user",
                 "text",
-                &message.text,
+                Some(&message.text),
+                None,
+                None,
+                RequestIdentity::none(),
                 &uid,
-                message_id,
                 None,
-                None,
-                None,
-                turn_id.as_deref(),
-                // A user turn is not a request, and the view does not read it.
-                None,
+                RawMessageFacts {
+                    turn_id: turn_id.as_deref(),
+                    // A user turn is not a request, and the view does not
+                    // read it.
+                    request_span: None,
+                    // App-injected context is stored, typed, and is a
+                    // prompt nowhere: not in `history`, not as
+                    // `first_prompt`, not as a prompt root.
+                    control_kind: message.control.map(control::ControlKind::as_str),
+                    ..RawMessageFacts::default()
+                },
             )?;
             outcome.events += 1;
+            if message.control.is_some() {
+                // Before wrappers were typed this line stored nothing and was
+                // recorded as an `unknown` marker. It writes a row now, so
+                // the marker an earlier parser left for it is retired rather
+                // than kept beside the row as a second account of one line.
+                crate::store::retire_evidence_share(
+                    conn,
+                    "session_markers",
+                    "source = 'codex' AND session_id = ? AND marker_uid = ? \
+                       AND kind = 'unknown'",
+                    params![session_id, format!("{index}:marker")],
+                    SessionLocation::Local,
+                )?;
+            }
             // A subagent's "user" turns are the parent agent's task prompts;
             // only human threads feed prompt history and session discovery.
-            if !meta.is_subagent {
+            if !meta.is_subagent && message.control.is_none() {
                 outcome
                     .first_prompt
                     .get_or_insert_with(|| message.text.chars().take(4096).collect());
@@ -4553,6 +5288,32 @@ fn ingest_codex_rollout_incremental(
                         }
                         continue;
                     };
+                    // The child's first snapshot after a replay says whether
+                    // the total it inherited is really its baseline.
+                    if let (Some(marker_uid), Some(inherited)) =
+                        (inherited_baseline_marker.take(), prev_totals)
+                    {
+                        let last = payload
+                            .get("info")
+                            .and_then(|info| info.get("last_token_usage"))
+                            .and_then(CodexTokenTotals::from_usage);
+                        let (kept, basis) = inherited_baseline_verdict(inherited, totals, last);
+                        if !kept {
+                            prev_totals = None;
+                        }
+                        conn.execute(
+                            "UPDATE session_markers SET payload_json = json_set(payload_json, \
+                               '$.inherited_baseline', ?1, '$.inherited_baseline_basis', ?2) \
+                             WHERE source = 'codex' AND session_id = ?3 AND marker_uid = ?4 \
+                               AND json_valid(payload_json)",
+                            params![
+                                if kept { "applied" } else { "dropped" },
+                                basis,
+                                session_id,
+                                marker_uid
+                            ],
+                        )?;
+                    }
                     match prev_totals {
                         // The first snapshot before any model output is the
                         // carried-over baseline of a resumed session (a fresh
@@ -4670,6 +5431,7 @@ fn ingest_codex_rollout_incremental(
                                 turn_id: turn_id.clone(),
                                 saw_model_output,
                                 previous_human_message: human_messages.remembered(),
+                                inherited_baseline_marker: inherited_baseline_marker.clone(),
                             },
                         );
                     }
@@ -4929,6 +5691,13 @@ fn ingest_codex_rollout_incremental(
         &mut unwritten_line,
         conn.total_changes() == changes_before_line,
     )?;
+    // The readable file ended inside a replay: the fork's first own turn is
+    // not written yet. The span is still accounted for, and the next pass,
+    // which re-reads it, closes it.
+    if let Some(span) = fork_replay.take() {
+        outcome.saw_fork_replay = true;
+        record_codex_fork_replay(conn, meta, &span, None, None)?;
+    }
     // Collapse each measured run onto its first span, so the rows a single
     // delta accounted for read as the one request it measured rather than as
     // one measured request and a trail of unmeasured ones.
@@ -4994,6 +5763,231 @@ fn ingest_codex_rollout_incremental(
         .saturating_add(reader.tail_bytes())
         .saturating_add(pass.validation_bytes);
     Ok((outcome, pass))
+}
+
+/// The span of a forked rollout that is a copy of its parent's history.
+///
+/// When Codex forks a thread — a human "fork conversation" or a spawned
+/// subagent — it writes the child's own `session_meta` and then **replays the
+/// parent's history** into the child's file: the parent's `session_meta`, its
+/// turns' `task_started` / `turn_context` / message records, and whatever
+/// `token_count` snapshots they carried. Those records are the parent's
+/// evidence, already indexed under the parent's id; indexing them again under
+/// the child's id duplicates every replayed prompt in `history` and every
+/// replayed message in `session_events`.
+///
+/// Which records form the span is decided by [`codex::ForkReplayGate`], the
+/// one statement of the rule, shared with shallow discovery. It is armed only
+/// by explicit evidence: the parent's own `session_meta` reappearing in a
+/// rollout whose opening `session_meta` named that parent in
+/// `forked_from_id` or `thread_spawn.parent_thread_id`, and it closes at the
+/// first turn it can attribute to the child -- or cannot order at all,
+/// because undecided means indexed.
+///
+/// Every line inside the span writes nothing; one `fork_replay_boundary`
+/// marker, keyed by the replayed `session_meta`'s line, accounts for all of
+/// them. A readable `token_count` inside it is the parent's cumulative total,
+/// kept as the child's inherited baseline so its first request is not charged
+/// the parent's whole context.
+struct ForkReplaySpan {
+    /// Line index of the replayed parent `session_meta`.
+    first_line: usize,
+    /// Line index of the last replayed line read so far.
+    last_line: usize,
+    /// The envelope timestamp of the replayed `session_meta`: when the fork
+    /// wrote the copy.
+    ts_ms: i64,
+    /// Tool call ids the replay carried, so rows an earlier parser indexed
+    /// under the child for them can be retired.
+    call_ids: Vec<String>,
+    /// `(timestamp, prompt)` of each replayed human turn, for the same reason
+    /// on `history`.
+    prompts: Vec<(i64, String)>,
+    /// The last readable cumulative snapshot inside the replay.
+    inherited: Option<CodexTokenTotals>,
+}
+
+impl ForkReplaySpan {
+    fn new(first_line: usize, ts_ms: i64) -> Self {
+        Self {
+            first_line,
+            last_line: first_line,
+            ts_ms,
+            call_ids: Vec::new(),
+            prompts: Vec::new(),
+            inherited: None,
+        }
+    }
+
+    /// The marker that stands for this span, keyed by its first line.
+    fn marker_uid(&self) -> String {
+        format!("{}:fork_replay", self.first_line)
+    }
+
+    /// Remember what a replayed line would have written.
+    fn absorb(&mut self, index: usize, value: &Value, payload: &Map<String, Value>) {
+        self.last_line = index;
+        if let Some(call_id) = payload
+            .get("call_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
+            if !self.call_ids.iter().any(|seen| seen == call_id) {
+                self.call_ids.push(call_id.to_string());
+            }
+        }
+        if let Some(message) = codex::human_message(value) {
+            let ts_ms = value
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(parse_iso_ms)
+                .unwrap_or(0);
+            self.prompts.push((ts_ms, message.text));
+        }
+        if payload.get("type").and_then(Value::as_str) == Some("token_count") {
+            if let Some(totals) = payload
+                .get("info")
+                .and_then(|info| info.get("total_token_usage"))
+                .and_then(CodexTokenTotals::from_usage)
+            {
+                self.inherited = Some(totals);
+            }
+        }
+    }
+}
+
+/// Whether the cumulative total a fork inherited from its replay is the
+/// baseline of the child's own counter, decided at the child's first readable
+/// snapshot. Returns `(kept, basis)`.
+///
+/// codex-rs seeds a fork's usage from the replay: `record_initial_history`
+/// handles `InitialHistory::Forked` by passing the copied items to
+/// `last_token_info_from_rollout` and the result to `set_token_info`
+/// (`codex-rs/core/src/session/mod.rs`, openai/codex@d5e6526), and each later
+/// request adds its usage to that total, so `total_token_usage` grows by
+/// exactly `last_token_usage`. A child written that way continues from its
+/// parent's total. A build that did not seed it starts from zero, and then
+/// its first snapshot's total *is* its last request.
+///
+/// So `last_token_usage` decides when the snapshot carries it: `total ==
+/// last` is a restart and the inherited baseline is dropped; `total ==
+/// inherited + last` is a continuation and it is kept. Without that evidence
+/// a total below the inherited one can only be a restart, and anything else
+/// keeps the baseline. Comparing magnitudes alone misfires when a restarted
+/// child's first request exceeds a small parent total.
+fn inherited_baseline_verdict(
+    inherited: CodexTokenTotals,
+    total: CodexTokenTotals,
+    last: Option<CodexTokenTotals>,
+) -> (bool, &'static str) {
+    if let Some(last) = last {
+        if total == last {
+            return (false, "last_token_usage");
+        }
+        if inherited.plus(&last) == Some(total) {
+            return (true, "last_token_usage");
+        }
+    }
+    if total.regressed_from(&inherited) {
+        return (false, "regression");
+    }
+    (true, "no_evidence")
+}
+
+/// Write the one marker that stands for a replayed span, and retire whatever
+/// an earlier parser indexed under the child for the lines inside it.
+///
+/// `closed_by` is the child turn that ended the span and the fact that
+/// attributed it, or `None` when the readable file ended inside the replay
+/// (a live fork whose first own turn is not written yet). The marker is keyed
+/// by the span's first line, so the pass that later sees the span close
+/// rewrites the same row.
+fn record_codex_fork_replay(
+    conn: &Connection,
+    meta: &CodexSessionMeta,
+    span: &ForkReplaySpan,
+    closed_by: Option<(Option<&str>, &str)>,
+    inherited_baseline: Option<&str>,
+) -> Result<()> {
+    let session_id = meta.session_id.as_str();
+    let marker_uid = span.marker_uid();
+    let payload_json = json!({
+        "parent_session_id": meta.fork_parent_id,
+        "first_line": span.first_line,
+        "last_line": span.last_line,
+        "replayed_lines": span.last_line + 1 - span.first_line,
+        "closed_by_turn_id": closed_by.and_then(|(turn, _)| turn),
+        "closed_by": closed_by.map(|(_, basis)| basis),
+        "inherited_total_tokens": span.inherited.map(|totals| totals.total),
+        // `pending` until the child's first readable snapshot, then
+        // `applied` or `dropped` with `inherited_baseline_basis` (see
+        // `inherited_baseline_verdict`); null when nothing was inherited or
+        // the span is still open.
+        "inherited_baseline": inherited_baseline,
+    })
+    .to_string();
+    insert_session_marker(
+        conn,
+        "codex",
+        session_id,
+        &NewSessionMarker {
+            marker_uid: &marker_uid,
+            ts_ms: (span.ts_ms != 0).then_some(span.ts_ms),
+            message_id: None,
+            parent_id: meta.fork_parent_id.as_deref(),
+            turn_id: closed_by.and_then(|(turn, _)| turn),
+            kind: "fork_replay_boundary",
+            subkind: Some("session_meta"),
+            text: None,
+            payload_json: Some(&payload_json),
+        },
+    )?;
+    // Rows keyed by line index: events and markers from the replayed lines.
+    let (first, last) = (span.first_line as i64, span.last_line as i64);
+    let in_span = "source = 'codex' AND session_id = ?1 \
+                   AND instr({col}, ':') > 1 \
+                   AND CAST(substr({col}, 1, instr({col}, ':') - 1) AS INTEGER) BETWEEN ?2 AND ?3";
+    crate::store::retire_evidence_share(
+        conn,
+        "session_events",
+        &in_span.replace("{col}", "event_uid"),
+        params![session_id, first, last],
+        SessionLocation::Local,
+    )?;
+    crate::store::retire_evidence_share(
+        conn,
+        "session_markers",
+        &format!(
+            "{} AND marker_uid != ?4",
+            in_span.replace("{col}", "marker_uid")
+        ),
+        params![session_id, first, last, marker_uid],
+        SessionLocation::Local,
+    )?;
+    for call_id in &span.call_ids {
+        crate::store::retire_evidence_share(
+            conn,
+            "tool_calls",
+            "source = 'codex' AND session_id = ? AND tool_use_id = ?",
+            params![session_id, call_id],
+            SessionLocation::Local,
+        )?;
+        crate::store::retire_evidence_share(
+            conn,
+            "file_edits",
+            "source = 'codex' AND session_id = ? AND substr(tool_use_id, 1, ?) = ?",
+            params![session_id, call_id.len() as i64 + 1, format!("{call_id}#")],
+            SessionLocation::Local,
+        )?;
+    }
+    for (ts_ms, prompt) in &span.prompts {
+        conn.execute(
+            "DELETE FROM history WHERE source = 'codex' AND session_id = ? \
+               AND timestamp_ms = ? AND prompt = ?",
+            params![session_id, ts_ms, prompt],
+        )?;
+    }
+    Ok(())
 }
 
 /// One Codex rollout line that has not yet been shown to write anything.
@@ -5227,6 +6221,52 @@ fn count_unified_diff_lines(diff: &str) -> (i64, i64) {
     (added, removed)
 }
 
+/// Marks the one full [`backfill_codex_metadata`] pass an install owes.
+///
+/// Before it existed, every sweep that got past the source fingerprint ran the
+/// backfill over *every* session in `codex_session_cwds` — an `UPDATE`, a
+/// `MIN`/`MAX` scan and a `sessions` upsert apiece, each upsert taking a fresh
+/// change-feed revision — so one Claude transcript growing re-stamped thousands
+/// of Codex sessions nobody had touched (#42). The metadata a session's rows
+/// can be backfilled from only moves when its rollout is re-read or
+/// `history.jsonl` gains a line for it, so after one full pass (for rows an
+/// older build left without project/branch) the backfill is scoped to exactly
+/// those sessions. Bump to force a full pass again.
+const CODEX_METADATA_BACKFILL_GENERATION: i64 = 1;
+const CODEX_METADATA_BACKFILL_KEY: &str = "codex_metadata_backfill";
+/// Sessions whose scoped backfill a failed sweep left owed, carried in
+/// `.sync-state.json` until a Codex pass completes.
+const CODEX_METADATA_PENDING_KEY: &str = "codex_metadata_pending";
+
+/// Run [`backfill_codex_metadata`] over the sessions this sweep touched, or
+/// over every known session once, while the full pass is still owed.
+fn backfill_codex_metadata_scoped(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    cwds: &HashMap<String, String>,
+    branches: &HashMap<String, String>,
+    touched: &HashSet<String>,
+) -> Result<usize> {
+    let full_pass_owed = state
+        .get(CODEX_METADATA_BACKFILL_KEY)
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        < CODEX_METADATA_BACKFILL_GENERATION;
+    if full_pass_owed {
+        let updated = backfill_codex_metadata(conn, cwds, branches)?;
+        state.insert(
+            CODEX_METADATA_BACKFILL_KEY.to_string(),
+            json!(CODEX_METADATA_BACKFILL_GENERATION),
+        );
+        return Ok(updated);
+    }
+    let scoped: HashMap<String, String> = touched
+        .iter()
+        .filter_map(|id| cwds.get(id).map(|cwd| (id.clone(), cwd.clone())))
+        .collect();
+    backfill_codex_metadata(conn, &scoped, branches)
+}
+
 fn backfill_codex_metadata(
     conn: &Connection,
     cwds: &HashMap<String, String>,
@@ -5336,7 +6376,7 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
     // transcript it discovered, and a caller told the sync completed would
     // treat an incomplete cache as current.
     let mut read_error: Option<anyhow::Error> = None;
-    let transcripts = collect_matching_files(root, "", "jsonl")?;
+    let transcripts = claude_transcript_files(root)?;
     // Same question the codex walk asks of its roots, and asked the same way:
     // per path, because a project tree can be readable while part of it is
     // not. Under cursors the set of files this install knows about is the
@@ -5356,8 +6396,19 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
         // that vanished and came back is not something this process watched,
         // and resuming from the stale cursor is exactly how its rows would
         // keep null facts after the archive returns.
+        //
+        // A workflow journal an earlier build walked as a transcript is
+        // excluded now, not missing: its coverage is complete, but the rows
+        // that build derived from it are still standing. They are retracted
+        // before the cursor is forgotten, because that cursor is the only
+        // thing that brings the journal here: a retraction that fails leaves
+        // it in place, and the next sync tries again.
+        if is_claude_workflow_journal(root, Path::new(&missing)) {
+            retract_claude_workflow_journal(conn, Path::new(&missing))?;
+        } else {
+            walked_every_known_root = false;
+        }
         transcript_cursor::forget_locator(conn, "claude", &missing)?;
-        walked_every_known_root = false;
     }
     let mut scanned = 0;
     let mut upserted = 0;
@@ -5508,7 +6559,21 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
                 meta.last_assistant_text.as_deref(),
                 Some(&path.to_string_lossy()),
             )?;
+            // A superseded fold read bytes that were rewritten under it, so
+            // its first prompt describes no generation of the file that
+            // exists; writing it would put a title on the row that nothing
+            // rereads. Skipped here, and the cursor the record walk publishes
+            // below is forgotten afterwards, because the fast path consults
+            // that cursor alone: left standing over the new bytes it would
+            // skip this file on every later sync and the stale fold would
+            // never be replaced.
+            if !scan_superseded {
+                set_claude_first_prompt(conn, &meta)?;
+            }
             incremental::ingest_claude_transcript_at_locator(conn, &path, None)?;
+            if scan_superseded {
+                transcript_cursor::forget_locator_cursor(conn, "claude", &path)?;
+            }
             // Global sync is not scoped to one thread, so it indexes the
             // materialization edge like every other kind.
             record_claude_remote_relationship(conn, &meta, true)?;
@@ -5580,6 +6645,28 @@ fn claude_transcript_unchanged(conn: &Connection, path: &Path) -> Result<bool> {
 /// source: these files never become sessions, they only describe one.
 pub(crate) const CLAUDE_SUBAGENT_META_SOURCE: &str = "claude-subagent-meta";
 
+/// [`claude_sidecar_evidence_exists`]'s probe, asked of every Claude transcript
+/// the walk considers. `idx_session_relationships_locator` is what makes it a
+/// search rather than a scan of every Claude relationship.
+const CLAUDE_SIDECAR_EVIDENCE_SQL: &str = "SELECT EXISTS(
+            SELECT 1
+            FROM session_relationships r
+            WHERE r.source = 'claude' AND r.evidence_locator = ?
+              AND (
+                EXISTS(
+                  SELECT 1 FROM session_events e
+                  WHERE e.source = 'claude'
+                    AND e.session_id = COALESCE(r.child_session_id, r.parent_session_id)
+                )
+                OR EXISTS(
+                  SELECT 1 FROM session_markers m
+                  WHERE m.source = 'claude'
+                    AND m.session_id = COALESCE(r.child_session_id, r.parent_session_id)
+                )
+              )
+            LIMIT 1
+        )";
+
 /// Whether an unchanged subagent sidecar has already been ingested.
 ///
 /// A sidecar is deliberately never registered as a session, so the catalog
@@ -5597,28 +6684,9 @@ fn claude_sidecar_evidence_exists(conn: &Connection, path: &Path) -> Result<bool
     // and no events. Asking only about events reads that as "this file left
     // nothing behind", so an unchanged sidecar is re-parsed on every sync
     // forever while the sync reports itself perfectly normal.
-    let exists: i64 = conn.query_row(
-        "SELECT EXISTS(
-            SELECT 1
-            FROM session_relationships r
-            WHERE r.source = 'claude' AND r.evidence_locator = ?
-              AND (
-                EXISTS(
-                  SELECT 1 FROM session_events e
-                  WHERE e.source = 'claude'
-                    AND e.session_id = COALESCE(r.child_session_id, r.parent_session_id)
-                )
-                OR EXISTS(
-                  SELECT 1 FROM session_markers m
-                  WHERE m.source = 'claude'
-                    AND m.session_id = COALESCE(r.child_session_id, r.parent_session_id)
-                )
-              )
-            LIMIT 1
-        )",
-        [locator.as_ref()],
-        |row| row.get(0),
-    )?;
+    let exists: i64 = conn.query_row(CLAUDE_SIDECAR_EVIDENCE_SQL, [locator.as_ref()], |row| {
+        row.get(0)
+    })?;
     Ok(exists != 0)
 }
 
@@ -5702,20 +6770,17 @@ fn tool_results_lack_fidelity(conn: &Connection, source: &str, session_id: &str)
     Ok(lacking != 0)
 }
 
-/// Whether this rollout's continuity evidence has ever been banked.
+/// Whether this rollout's continuity evidence has been banked by the current
+/// scanner.
 ///
 /// Keyed on the locator, like the Claude probe below and for the same reason:
 /// the stamp map would otherwise skip exactly the rollouts that an upgrade
-/// into continuity needs to read.
+/// into continuity needs to read. A row banked before Codex's own fork fields
+/// (`forked_from_id`, `thread_spawn.parent_thread_id`) were read counts as
+/// missing, so a fork synced before that upgrade gains its edge on one
+/// `session_meta` re-read.
 fn codex_continuity_evidence_exists(conn: &Connection, path: &Path) -> Result<bool> {
-    let locator = path.to_string_lossy();
-    let exists: i64 = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM session_continuity_evidence \
-         WHERE source = 'codex' AND locator = ? LIMIT 1)",
-        [locator.as_ref()],
-        |row| row.get(0),
-    )?;
-    Ok(exists != 0)
+    crate::continuity::codex_evidence_is_current(conn, &path.to_string_lossy())
 }
 
 /// Whether an unchanged transcript still owes the continuity index one read.
@@ -5787,15 +6852,13 @@ fn events_lack_raw_facts(conn: &Connection, source: &str, session_id: &str) -> R
     Ok(lacking != 0)
 }
 
-/// The fidelity question for a Claude transcript, which the walk knows by path.
-fn claude_transcript_lacks_tool_result_fidelity(conn: &Connection, path: &Path) -> Result<bool> {
-    let raw_path = path.to_string_lossy();
-    let lacking: i64 = conn.query_row(
-        "SELECT
+/// [`claude_transcript_lacks_tool_result_fidelity`]'s probe; `CROSS JOIN`
+/// pins the join order for the reason [`CLAUDE_TRANSCRIPT_EVENTS_SQL`] gives.
+const CLAUDE_LACKS_TOOL_RESULT_FIDELITY_SQL: &str = "SELECT
             EXISTS(
                 SELECT 1
                 FROM sessions s
-                JOIN session_events e ON e.source = s.source AND e.session_id = s.session_id
+                CROSS JOIN session_events e ON e.source = s.source AND e.session_id = s.session_id
                 WHERE s.source = 'claude' AND s.raw_path = ?1
                   AND e.kind = 'tool_result' AND e.event_index IS NULL
                 LIMIT 1
@@ -5803,18 +6866,46 @@ fn claude_transcript_lacks_tool_result_fidelity(conn: &Connection, path: &Path) 
             OR EXISTS(
                 SELECT 1
                 FROM session_relationships r
-                JOIN session_events e
+                CROSS JOIN session_events e
                   ON e.source = 'claude'
                  AND e.session_id = COALESCE(r.child_session_id, r.parent_session_id)
                 WHERE r.source = 'claude' AND r.evidence_locator = ?1
                   AND e.kind = 'tool_result' AND e.event_index IS NULL
                 LIMIT 1
-            )",
+            )";
+
+/// The fidelity question for a Claude transcript, which the walk knows by path.
+fn claude_transcript_lacks_tool_result_fidelity(conn: &Connection, path: &Path) -> Result<bool> {
+    let raw_path = path.to_string_lossy();
+    let lacking: i64 = conn.query_row(
+        CLAUDE_LACKS_TOOL_RESULT_FIDELITY_SQL,
         [raw_path.as_ref()],
         |row| row.get(0),
     )?;
     Ok(lacking != 0)
 }
+
+/// [`claude_transcript_lacks_raw_facts`]'s probe; `CROSS JOIN` pins the join
+/// order for the reason [`CLAUDE_TRANSCRIPT_EVENTS_SQL`] gives.
+const CLAUDE_LACKS_RAW_FACTS_SQL: &str = "SELECT
+            EXISTS(
+                SELECT 1
+                FROM sessions s
+                CROSS JOIN session_events e ON e.source = s.source AND e.session_id = s.session_id
+                WHERE s.source = 'claude' AND s.raw_path = ?1
+                  AND COALESCE(e.raw_facts_version, 0) < ?2
+                LIMIT 1
+            )
+            OR EXISTS(
+                SELECT 1
+                FROM session_relationships r
+                CROSS JOIN session_events e
+                  ON e.source = 'claude'
+                 AND e.session_id = COALESCE(r.child_session_id, r.parent_session_id)
+                WHERE r.source = 'claude' AND r.evidence_locator = ?1
+                  AND COALESCE(e.raw_facts_version, 0) < ?2
+                LIMIT 1
+        )";
 
 /// The raw-facts question for a Claude transcript.
 ///
@@ -5829,30 +6920,35 @@ fn claude_transcript_lacks_tool_result_fidelity(conn: &Connection, path: &Path) 
 fn claude_transcript_lacks_raw_facts(conn: &Connection, path: &Path) -> Result<bool> {
     let raw_path = path.to_string_lossy();
     let lacking: i64 = conn.query_row(
-        "SELECT
-            EXISTS(
-                SELECT 1
-                FROM sessions s
-                JOIN session_events e ON e.source = s.source AND e.session_id = s.session_id
-                WHERE s.source = 'claude' AND s.raw_path = ?1
-                  AND COALESCE(e.raw_facts_version, 0) < ?2
-                LIMIT 1
-            )
-            OR EXISTS(
-                SELECT 1
-                FROM session_relationships r
-                JOIN session_events e
-                  ON e.source = 'claude'
-                 AND e.session_id = COALESCE(r.child_session_id, r.parent_session_id)
-                WHERE r.source = 'claude' AND r.evidence_locator = ?1
-                  AND COALESCE(e.raw_facts_version, 0) < ?2
-                LIMIT 1
-        )",
+        CLAUDE_LACKS_RAW_FACTS_SQL,
         params![raw_path.as_ref(), RAW_MESSAGE_FACTS_VERSION],
         |row| row.get(0),
     )?;
     Ok(lacking != 0)
 }
+
+/// [`claude_transcript_events_exist`]'s probe.
+///
+/// The sync walk asks it of every Claude transcript on every sweep, so its
+/// plan is the walk's cost. `CROSS JOIN` makes SQLite drive the lookup from
+/// the one `sessions` row the path names. Left to choose, the planner (with no
+/// `sqlite_stat1`, which this crate never writes) drove it from
+/// `session_events` instead -- a scan of every Claude event until one belonged
+/// to that path's session, so a path with no row (every subagent sidecar, every
+/// new transcript) read the whole table, once per file (#215).
+const CLAUDE_TRANSCRIPT_EVENTS_SQL: &str = "SELECT EXISTS(
+            SELECT 1
+            FROM sessions s
+            CROSS JOIN session_events e ON e.source = s.source AND e.session_id = s.session_id
+            WHERE s.source = 'claude' AND s.raw_path = ?
+            LIMIT 1
+        ) OR EXISTS(
+            SELECT 1
+            FROM sessions s
+            CROSS JOIN session_markers m ON m.source = s.source AND m.session_id = s.session_id
+            WHERE s.source = 'claude' AND s.raw_path = ?
+            LIMIT 1
+        )";
 
 /// Whether this transcript has left any evidence behind, of any kind.
 ///
@@ -5865,19 +6961,7 @@ fn claude_transcript_lacks_raw_facts(conn: &Connection, path: &Path) -> Result<b
 fn claude_transcript_events_exist(conn: &Connection, path: &Path) -> Result<bool> {
     let raw_path = path.to_string_lossy();
     let exists: i64 = conn.query_row(
-        "SELECT EXISTS(
-            SELECT 1
-            FROM sessions s
-            JOIN session_events e ON e.source = s.source AND e.session_id = s.session_id
-            WHERE s.source = 'claude' AND s.raw_path = ?
-            LIMIT 1
-        ) OR EXISTS(
-            SELECT 1
-            FROM sessions s
-            JOIN session_markers m ON m.source = s.source AND m.session_id = s.session_id
-            WHERE s.source = 'claude' AND s.raw_path = ?
-            LIMIT 1
-        )",
+        CLAUDE_TRANSCRIPT_EVENTS_SQL,
         [raw_path.as_ref(), raw_path.as_ref()],
         |row| row.get(0),
     )?;
@@ -5893,6 +6977,11 @@ pub(crate) struct ClaudeSessionMeta {
     first_ts: i64,
     last_ts: i64,
     last_assistant_text: Option<String>,
+    /// The first substantive human turn, by the same classification the
+    /// shallow scan uses -- over the whole transcript rather than its head.
+    /// `None` is the whole file's answer, not a gap: a transcript of nothing
+    /// but control rows has no first prompt, and the catalog says so.
+    first_prompt: Option<String>,
     /// Every identified record is a sidechain row, so this file is a delegated
     /// sidecar rather than a session of its own — the same rule discovery uses
     /// to keep sidecars out of the catalog.
@@ -5930,6 +7019,9 @@ pub(crate) struct ClaudeMetaFold {
     pub last_ts: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_assistant_text: Option<String>,
+    /// First-wins, from the same classifier as discovery's `first_prompt`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_prompt: Option<String>,
     #[serde(default)]
     pub identified_records: usize,
     #[serde(default)]
@@ -6020,6 +7112,9 @@ impl ClaudeMetaFold {
         if self.cwd.is_none() {
             self.cwd = value.get("cwd").and_then(Value::as_str).map(str::to_string);
         }
+        if self.first_prompt.is_none() {
+            self.first_prompt = crate::discover::claude_substantive_prompt(value);
+        }
         if let Some(branch) = value.get("gitBranch").and_then(Value::as_str) {
             self.git_branch = Some(branch.to_string());
         }
@@ -6030,8 +7125,14 @@ impl ClaudeMetaFold {
             self.first_ts.get_or_insert(ts);
             self.last_ts = Some(ts);
         }
+        // A `<synthetic>` notice is the harness talking, not the model's last
+        // word, so it never becomes the session's assistant excerpt.
         if value.get("type").and_then(Value::as_str) == Some("assistant")
             && value.get("isSidechain").and_then(Value::as_bool) != Some(true)
+            && !value
+                .pointer("/message/model")
+                .and_then(Value::as_str)
+                .is_some_and(is_claude_synthetic_placeholder_model)
         {
             if let Some(content) = value.pointer("/message/content") {
                 if let Some(text) = content.as_str() {
@@ -6064,6 +7165,7 @@ impl ClaudeMetaFold {
             first_ts: first,
             last_ts: self.last_ts.unwrap_or(first),
             last_assistant_text: self.last_assistant_text.clone(),
+            first_prompt: self.first_prompt.clone(),
             subagent: self.identified_records > 0
                 && self.sidechain_records == self.identified_records,
             agent_id: self.agent_id.clone(),
@@ -6109,6 +7211,82 @@ impl ClaudeScanPass {
     }
 }
 
+/// Retire the history row the previous parser wrote for a record this
+/// session now stores differently, without erasing another session's prompt.
+///
+/// `history` is unique on `(source, timestamp_ms, prompt)` with no session in
+/// the key, so a task notification in one session and a human prompt with the
+/// same text at the same millisecond in another are one row, owned by
+/// whichever transcript was read first. Deleting that row outright when the
+/// owner turns out to be control would erase the other session's prompt --
+/// its own re-read had already been ignored by the unique key -- so before
+/// the delete, the row is handed to a session that has a substantive user
+/// text event at that instant with that text. Only when no such session
+/// exists is it deleted. The lookup runs only when this session actually owns
+/// such a row, which outside the one-time re-read is never.
+fn retire_claude_history_row(
+    conn: &Connection,
+    session_id: &str,
+    ts_ms: i64,
+    raw: &str,
+) -> Result<()> {
+    let owned: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM history \
+         WHERE source = 'claude' AND session_id = ?1 AND timestamp_ms = ?2 AND prompt = ?3)",
+        params![session_id, ts_ms, raw],
+        |row| row.get(0),
+    )?;
+    if !owned {
+        return Ok(());
+    }
+    let handed_over = conn.execute(
+        "UPDATE history SET session_id = ( \
+             SELECT e.session_id FROM session_events e \
+             WHERE e.source = 'claude' AND e.session_id <> ?1 AND e.ts_ms = ?2 \
+               AND e.role = 'user' AND e.kind = 'text' AND e.control_kind IS NULL \
+               AND TRIM(e.text) = ?3 \
+             ORDER BY e.session_id LIMIT 1), \
+           project = COALESCE(( \
+             SELECT e.project FROM session_events e \
+             WHERE e.source = 'claude' AND e.session_id <> ?1 AND e.ts_ms = ?2 \
+               AND e.role = 'user' AND e.kind = 'text' AND e.control_kind IS NULL \
+               AND TRIM(e.text) = ?3 \
+             ORDER BY e.session_id LIMIT 1), project) \
+         WHERE source = 'claude' AND session_id = ?1 AND timestamp_ms = ?2 AND prompt = ?3 \
+           AND EXISTS( \
+             SELECT 1 FROM session_events e \
+             WHERE e.source = 'claude' AND e.session_id <> ?1 AND e.ts_ms = ?2 \
+               AND e.role = 'user' AND e.kind = 'text' AND e.control_kind IS NULL \
+               AND TRIM(e.text) = ?3)",
+        params![session_id, ts_ms, raw],
+    )?;
+    if handed_over == 0 {
+        conn.execute(
+            "DELETE FROM history \
+             WHERE source = 'claude' AND session_id = ?1 AND timestamp_ms = ?2 AND prompt = ?3",
+            params![session_id, ts_ms, raw],
+        )?;
+    }
+    Ok(())
+}
+
+/// Record what the whole-transcript fold found as the session's first prompt.
+///
+/// The shallow catalog upsert coalesces a null `first_prompt` into whatever
+/// the row already holds, because a shallow or remote read may simply not
+/// have seen the prompt. The metadata fold has seen every record, so its
+/// answer replaces the row's -- including with null. Without that, a session
+/// whose stored title was a row the classifier now types as control (a bare
+/// `/resume <id>`, a task notification) would keep it for good on an upgraded
+/// install, while a fresh database stores nothing.
+pub(crate) fn set_claude_first_prompt(conn: &Connection, meta: &ClaudeSessionMeta) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions SET first_prompt = ?1 WHERE source = 'claude' AND session_id = ?2",
+        params![meta.first_prompt, meta.session_id],
+    )?;
+    Ok(())
+}
+
 /// The same metadata fold, over bytes the lifecycle hook already captured.
 ///
 /// The hook hands over what it read, so there is no file to walk and no
@@ -6148,6 +7326,7 @@ fn ingest_claude_transcript_text_as(
     });
     let mut indexer = tool_result_facts::ToolResultIndexer::default();
     let mut cache_reads: HashMap<String, i64> = HashMap::new();
+    let mut triads = control::SlashCommandTriads::default();
     for line in text.lines() {
         check_capture_cancelled()?;
         let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -6165,6 +7344,7 @@ fn ingest_claude_transcript_text_as(
             obj,
             &mut indexer,
             &mut cache_reads,
+            &mut triads,
         )?;
     }
     Ok(())
@@ -6366,25 +7546,37 @@ fn delete_claude_record_rows(
     session_id: &str,
     message_uuid: &str,
 ) -> Result<()> {
-    conn.execute(
-        "DELETE FROM session_events WHERE source = 'claude' AND session_id = ? \
+    crate::store::retire_evidence_share(
+        conn,
+        "session_events",
+        "source = 'claude' AND session_id = ? \
          AND substr(event_uid, 1, length(?) + 1) = ? || ':'",
         params![session_id, message_uuid, message_uuid],
+        SessionLocation::Local,
     )?;
-    conn.execute(
-        "DELETE FROM tool_calls WHERE source = 'claude' AND session_id = ? AND message_id = ?",
+    crate::store::retire_evidence_share(
+        conn,
+        "tool_calls",
+        "source = 'claude' AND session_id = ? AND message_id = ?",
         params![session_id, message_uuid],
+        SessionLocation::Local,
     )?;
-    conn.execute(
-        "DELETE FROM file_edits WHERE source = 'claude' AND session_id = ? AND message_id = ?",
+    crate::store::retire_evidence_share(
+        conn,
+        "file_edits",
+        "source = 'claude' AND session_id = ? AND message_id = ?",
         params![session_id, message_uuid],
+        SessionLocation::Local,
     )?;
     // Markers are derived from the same record and keyed on the same prefix,
     // so they move with it rather than outliving it under the old identity.
-    conn.execute(
-        "DELETE FROM session_markers WHERE source = 'claude' AND session_id = ? \
+    crate::store::retire_evidence_share(
+        conn,
+        "session_markers",
+        "source = 'claude' AND session_id = ? \
          AND substr(marker_uid, 1, length(?) + 1) = ? || ':'",
         params![session_id, message_uuid, message_uuid],
+        SessionLocation::Local,
     )?;
     Ok(())
 }
@@ -6643,9 +7835,12 @@ fn heal_legacy_positional_rows(
         }
     }
     for message_id in &heal_messages {
-        conn.execute(
-            "DELETE FROM session_events WHERE source = 'claude' AND session_id = ? AND message_id = ?",
+        crate::store::retire_evidence_share(
+            conn,
+            "session_events",
+            "source = 'claude' AND session_id = ? AND message_id = ?",
             params![session_id, message_id],
+            SessionLocation::Local,
         )?;
     }
     // A tool use id names its own call and edit rows even when the record's
@@ -6708,6 +7903,7 @@ fn ingest_claude_transcript_as(
     // instead of advancing them.
     let mut indexer = tool_result_facts::ToolResultIndexer::default();
     let mut cache_reads: HashMap<String, i64> = HashMap::new();
+    let mut triads = control::SlashCommandTriads::default();
     loop {
         check_capture_cancelled()?;
         raw.clear();
@@ -6741,6 +7937,7 @@ fn ingest_claude_transcript_as(
             obj,
             &mut indexer,
             &mut cache_reads,
+            &mut triads,
         )?;
     }
     Ok(())
@@ -6799,6 +7996,7 @@ fn ingest_claude_record(
     obj: &Map<String, Value>,
     indexer: &mut tool_result_facts::ToolResultIndexer,
     last_assistant_cache_read: &mut HashMap<String, i64>,
+    triads: &mut control::SlashCommandTriads,
 ) -> Result<()> {
     let stem = path
         .file_stem()
@@ -6897,7 +8095,7 @@ fn ingest_claude_record(
         .or_else(|| obj.get("type").and_then(Value::as_str))
         .unwrap_or("");
     let model = message.and_then(|m| m.get("model")).and_then(Value::as_str);
-    let token_json = message
+    let mut token_json = message
         .and_then(|m| m.get("usage"))
         .and_then(|v| serde_json::to_string(v).ok());
     // Read once per record: every row this record produces belongs to the
@@ -6926,8 +8124,16 @@ fn ingest_claude_record(
         // Claude names its requests, so it groups on `request_id` and
         // needs no span.
         request_span: None,
+        // Decided per text row below, once the record is classified.
+        control_kind: None,
     };
-    if message_role == "assistant" && !sidechain {
+    // A notice Claude Code wrote itself, not model output; see
+    // `is_claude_synthetic_placeholder_model`.
+    let synthetic =
+        message_role == "assistant" && model.is_some_and(is_claude_synthetic_placeholder_model);
+    // A notice's zeroed usage is not the context the last real response
+    // reported, so it neither sets nor clears the compaction size.
+    if message_role == "assistant" && !sidechain && !synthetic {
         match message
             .and_then(|m| m.get("usage"))
             .and_then(|usage| usage.get("cache_read_input_tokens"))
@@ -6960,6 +8166,62 @@ fn ingest_claude_record(
                 message,
                 message_role,
                 model,
+                token_json.as_deref(),
+            )?;
+        }
+    }
+    if synthetic {
+        // An earlier parser stored the notice as assistant output under this
+        // same identity; those rows are this record's and nothing else's, so
+        // they are replaced by the marker rather than left beside it.
+        delete_claude_record_rows(conn, session_id, message_uuid)?;
+        let text = message
+            .and_then(|m| m.get("content"))
+            .map(claude_user_text)
+            .filter(|text| !text.is_empty());
+        let payload = marker_payload(vec![
+            ("error", marker_string(obj.get("error"))),
+            (
+                "is_api_error_message",
+                obj.get("isApiErrorMessage")
+                    .and_then(Value::as_bool)
+                    .map(Value::from)
+                    .unwrap_or(Value::Null),
+            ),
+        ]);
+        let marker_uid = format!("{message_uuid}:marker");
+        insert_session_marker(
+            conn,
+            "claude",
+            session_id,
+            &NewSessionMarker {
+                marker_uid: &marker_uid,
+                ts_ms: (ts_ms != 0).then_some(ts_ms),
+                message_id: Some(message_uuid),
+                parent_id,
+                turn_id: None,
+                kind: "local_notice",
+                subkind: Some("synthetic"),
+                text: text.as_deref(),
+                payload_json: payload.as_deref(),
+            },
+        )?;
+        return Ok(());
+    }
+    if message_role == "assistant" {
+        if let Some(provider_message_id) = identity.provider_message_id {
+            // The request id exactly as the row stores it, so the rows settled
+            // together are the rows the request view groups together: by
+            // `requestId` when there is one, else by `message.id` alone.
+            let request_id = identity
+                .request_id
+                .or(raw_facts.request_id)
+                .filter(|id| !id.is_empty());
+            token_json = settle_claude_request_usage(
+                conn,
+                session_id,
+                request_id,
+                provider_message_id,
                 token_json.as_deref(),
             )?;
         }
@@ -7085,6 +8347,25 @@ fn ingest_claude_record(
     if system_record {
         return Ok(());
     }
+    // Reminder rows carry derived identities, `{uid}:{block}:reminder:{n}`,
+    // that the upsert can only add to or overwrite, and a record Claude
+    // rewrites under the same uuid can lose the blocks that produced them --
+    // fewer reminders in a block, a block removed, its type changed, the
+    // content emptied. Every reminder row this record ever produced is
+    // therefore retired here, once per user record and before its current
+    // content is walked, so what the walk writes back is exactly the
+    // reminders the text has today. Keyed on the record's message id and the
+    // one kind the split writes, which is one probe on the message index.
+    if message_role == "user" && !sidechain {
+        crate::store::retire_evidence_share(
+            conn,
+            "session_events",
+            "source = 'claude' AND session_id = ?1 AND message_id = ?2 \
+               AND control_kind = 'system_reminder'",
+            params![session_id, message_uuid],
+            SessionLocation::Local,
+        )?;
+    }
     let Some(content) = message.and_then(|m| m.get("content")) else {
         // Nothing below can run for this record, so whether it left a row
         // behind is already settled: it is the marker above, or nothing.
@@ -7100,22 +8381,42 @@ fn ingest_claude_record(
         }
         return Ok(());
     };
-    if !sidechain && message_role == "user" && is_meta != Some(true) {
-        let prompt = if let Some(text) = content.as_str() {
-            text.trim().to_string()
-        } else {
-            content
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
-                .filter_map(|block| block.get("text").and_then(Value::as_str))
-                .map(str::trim)
-                .filter(|text| !text.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        if !prompt.is_empty() && !discover::is_claude_control_prompt(&prompt) {
+    // Control classification. A user record's own text, with the
+    // `<system-reminder>` blocks Claude Code injects removed, decides whether
+    // the record is a prompt or one of the harness's own rows; the envelope
+    // (`origin.kind`, `attachment.commandMode`, `isMeta`) is read in the same
+    // call. Model output is never control, and a sidechain user row is the
+    // parent agent's, which the guard above already settled. The one answer
+    // is what `history`, the event rows and the triad walk all act on, so a
+    // row cannot be kept out of `history` and still read back as a prompt.
+    let user_record = message_role == "user" && !sidechain;
+    let raw_user_text = user_record.then(|| claude_user_text(content));
+    let user_split = raw_user_text
+        .as_deref()
+        .map(control::split_system_reminders);
+    let record_control = user_split
+        .as_ref()
+        .and_then(|split| control::claude_record_control_kind(obj, &split.prompt));
+    if let (Some(raw), Some(split)) = (raw_user_text.as_deref(), &user_split) {
+        // What this record contributes to `history` now: the human's text, or
+        // nothing for a control row.
+        let current =
+            (record_control.is_none() && !split.prompt.is_empty()).then_some(split.prompt.as_str());
+        // A parser before control rows were typed wrote this record's whole
+        // text -- reminders included, task notifications included -- as a
+        // history row, and nothing on the Claude path removes a history row on
+        // re-read: a re-read that stores a different prompt, or none, would
+        // leave the old one beside it as a second searchable prompt for the
+        // life of the database. So the row that parser would have written
+        // for this record is retired first, keyed exactly: this session, this
+        // record's timestamp, that text. A row another session shares the
+        // timestamp and text with is that session's and is left alone; a row
+        // this parser writes back unchanged is deleted and reinserted only
+        // when the text really did change.
+        if !raw.is_empty() && current != Some(raw) {
+            retire_claude_history_row(conn, session_id, ts_ms, raw)?;
+        }
+        if let Some(prompt) = current {
             insert_history(
                 conn,
                 &HistoryEntry {
@@ -7123,42 +8424,48 @@ fn ingest_claude_record(
                     source: "claude".into(),
                     session_id: Some(session_id.to_string()),
                     project: project.map(str::to_string),
-                    prompt_hash: Some(prompt_hash(&prompt)),
-                    prompt,
+                    prompt_hash: Some(prompt_hash(prompt)),
+                    prompt: prompt.to_string(),
                     timestamp_ms: ts_ms,
                 },
             )?;
         }
     }
+    let text_rows = ClaudeTextRows {
+        session_id,
+        project,
+        cwd,
+        git_branch,
+        message_uuid,
+        parent_id,
+        ts_ms,
+        role: if message_role == "assistant" {
+            "assistant"
+        } else {
+            "user"
+        },
+        model,
+        token_json: token_json.as_deref(),
+        identity,
+        raw_facts,
+        // Every text row a control record writes carries the record's kind,
+        // verbatim; only a prompt is split further, its reminders becoming
+        // `system_reminder` rows of their own so the prompt text is the
+        // human's and the overhead is still on the ledger.
+        control: record_control,
+        split_reminders: user_record && record_control.is_none(),
+    };
+    // The event uid of the record's first text row, which is what a
+    // slash-command marker names.
+    let mut first_text_event_uid: Option<String> = None;
     if let Some(s) = content.as_str() {
-        if !s.trim().is_empty() {
-            let role = if message_role == "assistant" {
-                "assistant"
-            } else {
-                "user"
-            };
-            insert_session_event(
-                conn,
-                "claude",
-                session_id,
-                project,
-                cwd,
-                git_branch,
-                message_uuid,
-                parent_id,
-                ts_ms,
-                role,
-                "text",
-                Some(s),
-                model,
-                token_json.as_deref(),
-                identity,
-                &format!("{message_uuid}:0"),
-                None,
-                raw_facts,
-            )?;
-            record_rows += 1;
-        }
+        text_rows.insert(
+            conn,
+            s,
+            &format!("{message_uuid}:0"),
+            &mut record_rows,
+            &mut first_text_event_uid,
+        )?;
     }
     for (block_index, block) in content.as_array().into_iter().flatten().enumerate() {
         let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
@@ -7190,34 +8497,13 @@ fn ingest_claude_record(
         match block_type {
             "text" => {
                 if let Some(text) = block.get("text").and_then(Value::as_str) {
-                    if !text.trim().is_empty() {
-                        let role = if message_role == "assistant" {
-                            "assistant"
-                        } else {
-                            "user"
-                        };
-                        insert_session_event(
-                            conn,
-                            "claude",
-                            session_id,
-                            project,
-                            cwd,
-                            git_branch,
-                            message_uuid,
-                            parent_id,
-                            ts_ms,
-                            role,
-                            "text",
-                            Some(text),
-                            model,
-                            token_json.as_deref(),
-                            identity,
-                            &event_uid,
-                            None,
-                            raw_facts,
-                        )?;
-                        record_rows += 1;
-                    }
+                    text_rows.insert(
+                        conn,
+                        text,
+                        &event_uid,
+                        &mut record_rows,
+                        &mut first_text_event_uid,
+                    )?;
                 }
             }
             "thinking" => {
@@ -7372,6 +8658,52 @@ fn ingest_claude_record(
             _ => {}
         }
     }
+    // A slash command's three records are grouped into one `slash_command`
+    // marker keyed on the invocation, written when the invocation is read
+    // and rewritten as each chained output row arrives. The rows themselves
+    // are already stored above with their own `control_kind`; the marker is
+    // the parsed command and the linkage, so a consumer reads neither from
+    // the transcript.
+    if let (Some(kind), Some(event_uid)) = (record_control, first_text_event_uid.as_deref()) {
+        if matches!(
+            kind,
+            control::ControlKind::SlashCommandCaveat
+                | control::ControlKind::SlashCommandInvocation
+                | control::ControlKind::SlashCommandOutput
+        ) {
+            let row = control::ControlRow {
+                session_id,
+                uuid: message_uuid,
+                parent_uuid: parent_id,
+                event_uid,
+                ts_ms,
+                kind,
+                text: raw_user_text.as_deref().unwrap_or(""),
+                origin_kind: control::origin_kind(obj),
+                command_mode: control::command_mode(obj),
+                attachment_type: control::attachment_type(obj),
+            };
+            if let Some(marker) = triads.observe(&row) {
+                let payload_json = marker_payload(marker.payload);
+                insert_session_marker(
+                    conn,
+                    "claude",
+                    session_id,
+                    &NewSessionMarker {
+                        marker_uid: &marker.marker_uid,
+                        ts_ms: (marker.ts_ms != 0).then_some(marker.ts_ms),
+                        message_id: Some(&marker.message_id),
+                        parent_id: marker.parent_id.as_deref(),
+                        turn_id: None,
+                        kind: control::SLASH_COMMAND_MARKER_KIND,
+                        subkind: None,
+                        text: None,
+                        payload_json: payload_json.as_deref(),
+                    },
+                )?;
+            }
+        }
+    }
     // The invariant: every record leaves a row. A record whose content was
     // present but empty -- `""`, `[]`, or blocks that are all blank --
     // reaches none of the inserts above, and without this it would be
@@ -7387,6 +8719,134 @@ fn ingest_claude_record(
         )?;
     }
     Ok(())
+}
+
+/// The per-record facts every text row of one Claude record shares, and the
+/// control decision that applies to all of them.
+struct ClaudeTextRows<'a> {
+    session_id: &'a str,
+    project: Option<&'a str>,
+    cwd: Option<&'a str>,
+    git_branch: Option<&'a str>,
+    message_uuid: &'a str,
+    parent_id: Option<&'a str>,
+    ts_ms: i64,
+    role: &'static str,
+    model: Option<&'a str>,
+    token_json: Option<&'a str>,
+    identity: RequestIdentity<'a>,
+    raw_facts: RawMessageFacts<'a>,
+    /// The record's own control kind, stamped on every text row it writes.
+    control: Option<control::ControlKind>,
+    /// Whether `<system-reminder>` blocks are separated into rows of their
+    /// own: true for a prompt, false for model output and for a control
+    /// record, whose text is kept exactly as the harness wrote it.
+    split_reminders: bool,
+}
+
+impl ClaudeTextRows<'_> {
+    /// Write the text rows for one string of user or assistant text.
+    ///
+    /// `event_uid` is the row's identity when the text is stored whole. A
+    /// prompt with reminders inside it stores the human's text under that
+    /// uid and each reminder under `{event_uid}:reminder:{n}`, in text
+    /// order, so the reminder rows share the prompt's `message_id` and sort
+    /// beside it. A prompt with no reminder in it is stored verbatim, as it
+    /// always was. `first_uid` receives the uid of the first row written.
+    fn insert(
+        &self,
+        conn: &Connection,
+        text: &str,
+        event_uid: &str,
+        record_rows: &mut usize,
+        first_uid: &mut Option<String>,
+    ) -> Result<()> {
+        let mut write = |text: &str, uid: &str, kind: Option<control::ControlKind>| -> Result<()> {
+            if text.trim().is_empty() {
+                return Ok(());
+            }
+            insert_session_event(
+                conn,
+                "claude",
+                self.session_id,
+                self.project,
+                self.cwd,
+                self.git_branch,
+                self.message_uuid,
+                self.parent_id,
+                self.ts_ms,
+                self.role,
+                "text",
+                Some(text),
+                self.model,
+                self.token_json,
+                self.identity,
+                uid,
+                None,
+                RawMessageFacts {
+                    control_kind: kind.map(control::ControlKind::as_str),
+                    ..self.raw_facts
+                },
+            )?;
+            *record_rows += 1;
+            first_uid.get_or_insert_with(|| uid.to_string());
+            Ok(())
+        };
+        if !self.split_reminders {
+            return write(text, event_uid, self.control);
+        }
+        // The reminder rows this record produced last time were retired by
+        // the record walk before any block was written, so the rows below
+        // are exactly the current text's.
+        let split = control::split_system_reminders(text);
+        if split.reminders.is_empty() {
+            return write(text, event_uid, None);
+        }
+        if split.prompt.trim().is_empty() {
+            // Nothing keeps `event_uid`. A parser before the split stored the
+            // whole reminder under it, untyped, and the upsert below writes
+            // only the suffixed rows -- so on an upgraded database that old
+            // row would stay beside them and read as a prompt for as long as
+            // the transcript stood still. Scoped to this one uid: every other
+            // row of the record keeps its identity and is upserted in place.
+            crate::store::retire_evidence_share(
+                conn,
+                "session_events",
+                "source = 'claude' AND session_id = ? AND event_uid = ?",
+                params![self.session_id, event_uid],
+                SessionLocation::Local,
+            )?;
+        }
+        write(&split.prompt, event_uid, None)?;
+        for (index, reminder) in split.reminders.iter().enumerate() {
+            write(
+                reminder,
+                &format!("{event_uid}:reminder:{index}"),
+                Some(control::ControlKind::SystemReminder),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// A Claude user record's own text: the string, or its text blocks joined.
+///
+/// The same join `history` has always used, and the one the shallow scan
+/// uses for `first_prompt`, so the two classify the same string.
+fn claude_user_text(content: &Value) -> String {
+    if let Some(text) = content.as_str() {
+        return text.trim().to_string();
+    }
+    content
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The identity the Claude record loop keys a record by.
@@ -8023,6 +9483,394 @@ fn opencode_step_finish_stop_reason(part: &Value) -> Option<&str> {
         .flatten()
 }
 
+/// Whether a Claude `message.model` is the placeholder Claude Code writes on a
+/// notice it produced itself.
+///
+/// Local API-error and authentication notices ("Login expired · Please run
+/// /login") are written as `type: "assistant"` records whose model is
+/// `<synthetic>`. No model produced them: they carry zero usage, usually no
+/// `requestId`, and their text is the harness talking. Stored as assistant
+/// output they read as the model's last word in `sessions list`, become a
+/// request of their own and put a model nobody ran in the session's list.
+pub(crate) fn is_claude_synthetic_placeholder_model(model: &str) -> bool {
+    model.trim().eq_ignore_ascii_case("<synthetic>")
+}
+
+/// Usage fields Claude fixes when a response *starts* streaming.
+///
+/// Claude Code can write one API response as several records — one per
+/// content block — while it is still streaming, and each record carries the
+/// usage snapshot current when it was written: the output side (`output_tokens`,
+/// `output_tokens_details`, `server_tool_use`, `iterations`) grows or first
+/// appears on a later copy. The input side is settled by the time the first
+/// block exists, so copies that disagree on one of these are not snapshots of
+/// one measurement, and they are left to read as `ambiguous-usage-copies`.
+const CLAUDE_REQUEST_INPUT_USAGE_FIELDS: &[&str] = &[
+    "input_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "cache_creation",
+];
+
+/// Usage fields that grow while a Claude response streams, and so the only
+/// ones whose copies may differ and still be one measurement.
+///
+/// Everything beneath one of these is output-side progress: counters take the
+/// largest value any copy reports, and `iterations` may gain entries. Any
+/// other number — a reported `cost_usd`, say — is not a snapshot of anything
+/// growing, so two copies that differ on it contradict each other.
+const CLAUDE_REQUEST_GROWING_USAGE_FIELDS: &[&str] = &[
+    "output_tokens",
+    "output_tokens_details",
+    "server_tool_use",
+    "iterations",
+];
+
+/// One Claude request's usage settled from the snapshots its records carry,
+/// or `None` when the copies contradict each other.
+///
+/// Merged per field: a growing counter takes the largest value any copy
+/// reports, a growing list keeps its longest run of entries, a field only some
+/// copies carry is kept, and anything else must agree. That is
+/// order-independent, so a copy that arrives out of order never shrinks what
+/// an earlier pass stored.
+pub(crate) fn merge_claude_usage_copies<'a>(
+    copies: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    let mut merged: Option<Map<String, Value>> = None;
+    for copy in copies {
+        let Value::Object(value) = serde_json::from_str(copy).ok()? else {
+            return None;
+        };
+        merged = Some(match merged {
+            None => value,
+            Some(have) => {
+                if !CLAUDE_REQUEST_INPUT_USAGE_FIELDS
+                    .iter()
+                    .all(|field| usage_values_agree(have.get(*field), value.get(*field)))
+                {
+                    return None;
+                }
+                let mut out = have.clone();
+                for (key, theirs) in &value {
+                    let growing = CLAUDE_REQUEST_GROWING_USAGE_FIELDS.contains(&key.as_str());
+                    let field = match have.get(key) {
+                        Some(ours) => merge_usage_value(ours, theirs, growing)?,
+                        None => theirs.clone(),
+                    };
+                    out.insert(key.clone(), field);
+                }
+                out
+            }
+        });
+    }
+    serde_json::to_string(&merged?).ok()
+}
+
+/// Whether two copies of a field report the same thing wherever both report
+/// it. An absent or null field states nothing and agrees with anything.
+fn usage_values_agree(a: Option<&Value>, b: Option<&Value>) -> bool {
+    match (a, b) {
+        (None | Some(Value::Null), _) | (_, None | Some(Value::Null)) => true,
+        (Some(Value::Object(a)), Some(Value::Object(b))) => a
+            .iter()
+            .all(|(key, value)| usage_values_agree(Some(value), b.get(key))),
+        (Some(a), Some(b)) => a == b,
+    }
+}
+
+/// Merge two copies of one usage field. `growing` says the field sits under a
+/// [`CLAUDE_REQUEST_GROWING_USAGE_FIELDS`] entry, where a later copy may carry
+/// a larger count or more list entries; everywhere else the copies must agree.
+fn merge_usage_value(a: &Value, b: &Value, growing: bool) -> Option<Value> {
+    match (a, b) {
+        (Value::Null, other) | (other, Value::Null) => Some(other.clone()),
+        (Value::Object(ours), Value::Object(theirs)) => {
+            let mut out = ours.clone();
+            for (key, value) in theirs {
+                let merged = match ours.get(key) {
+                    Some(have) => merge_usage_value(have, value, growing)?,
+                    None => value.clone(),
+                };
+                out.insert(key.clone(), merged);
+            }
+            Some(Value::Object(out))
+        }
+        // A growing list is append-only: the entries both copies carry are
+        // the same entries read at different moments, and the longer copy's
+        // extra entries are ones the shorter had not reached yet. Anywhere
+        // else a list must be the same length to be the same list.
+        (Value::Array(ours), Value::Array(theirs)) if growing || ours.len() == theirs.len() => {
+            let (longer, shorter) = if ours.len() >= theirs.len() {
+                (ours, theirs)
+            } else {
+                (theirs, ours)
+            };
+            let mut out = longer
+                .iter()
+                .zip(shorter)
+                .map(|(a, b)| merge_usage_value(a, b, growing))
+                .collect::<Option<Vec<_>>>()?;
+            out.extend(longer[shorter.len()..].iter().cloned());
+            Some(Value::Array(out))
+        }
+        // Only a count can grow. A negative or fractional value is not one,
+        // and a copy carrying it is unreadable rather than an earlier
+        // snapshot, so it has to agree exactly or the request stays disputed.
+        (Value::Number(x), Value::Number(y)) if growing => match (x.as_u64(), y.as_u64()) {
+            (Some(x), Some(y)) => Some(if x < y { b.clone() } else { a.clone() }),
+            _ => (a == b).then(|| a.clone()),
+        },
+        (a, b) if a == b => Some(a.clone()),
+        _ => None,
+    }
+}
+
+/// Settle one streamed Claude request's usage across every row stored for it,
+/// and return the blob a new copy should be written with.
+///
+/// `session_requests` expects every row of a request to carry one usage blob
+/// and refuses the request as `ambiguous-usage-copies` when they differ. For a
+/// request written as growing snapshots that refusal is wrong — they are one
+/// measurement read at different moments — so the settled blob is written
+/// onto every row of the request, including rows an earlier pass stored.
+/// Copies that genuinely contradict are left verbatim, and the refusal stands.
+///
+/// Keyed on `message.id`, which Claude repeats on every copy, within the
+/// request-view namespace the rows fall in: the rows naming this `requestId`
+/// when the record carries one, else only the rows that carry none — the same
+/// rows `session_requests` groups under `provider-message-id:`. Scoped to one
+/// session because the rows are.
+fn settle_claude_request_usage(
+    conn: &Connection,
+    session_id: &str,
+    request_id: Option<&str>,
+    provider_message_id: &str,
+    token_json: Option<&str>,
+) -> Result<Option<String>> {
+    let stored = conn
+        .prepare_cached(
+            "SELECT DISTINCT token_json FROM session_events \
+             WHERE source = 'claude' AND session_id = ?1 AND provider_message_id = ?3 \
+               AND (request_id = ?2 OR (?2 IS NULL AND NULLIF(request_id, '') IS NULL)) \
+               AND role = 'assistant' AND token_json IS NOT NULL",
+        )?
+        .query_map(
+            params![session_id, request_id, provider_message_id],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let unchanged = match token_json {
+        Some(new) => stored.iter().all(|have| have == new),
+        None => stored.len() < 2,
+    };
+    if unchanged {
+        return Ok(token_json.map(str::to_string));
+    }
+    let Some(merged) =
+        merge_claude_usage_copies(stored.iter().map(String::as_str).chain(token_json))
+    else {
+        return Ok(token_json.map(str::to_string));
+    };
+    conn.execute(
+        "UPDATE session_events SET token_json = ?4 \
+         WHERE source = 'claude' AND session_id = ?1 AND provider_message_id = ?3 \
+           AND (request_id = ?2 OR (?2 IS NULL AND NULLIF(request_id, '') IS NULL)) \
+           AND role = 'assistant' AND token_json IS NOT NULL AND token_json <> ?4",
+        params![session_id, request_id, provider_message_id, merged],
+    )?;
+    Ok(Some(merged))
+}
+
+/// Bring Claude rows an earlier parser stored up to the current request model,
+/// without re-reading a transcript: both repairs are functions of the stored
+/// rows alone.
+///
+/// Streamed copies of one request get their usage settled exactly as a fresh
+/// parse would, and a `<synthetic>` notice stored as assistant output moves to
+/// the `local_notice` marker a fresh parse writes, under the same marker uid,
+/// so a later re-read updates it in place. The text moves with it: this is a
+/// reclassification of evidence, not a deletion.
+pub(crate) fn heal_claude_request_evidence(conn: &Connection) -> Result<()> {
+    // A table from before usage or models were stored holds nothing either
+    // repair could apply to.
+    let columns: HashSet<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('session_events')")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if ![
+        "token_json",
+        "model",
+        "parent_id",
+        "request_id",
+        "provider_message_id",
+        "is_sidechain",
+    ]
+    .iter()
+    .all(|column| columns.contains(*column))
+    {
+        return Ok(());
+    }
+    // Grouped the way the request view groups: by `requestId` where the row
+    // has one, else by `message.id` among the rows that have none.
+    let groups = conn
+        .prepare(
+            "SELECT session_id, NULLIF(request_id, ''), provider_message_id FROM session_events \
+             WHERE source = 'claude' AND role = 'assistant' \
+               AND provider_message_id IS NOT NULL AND token_json IS NOT NULL \
+             GROUP BY session_id, NULLIF(request_id, ''), provider_message_id \
+             HAVING COUNT(DISTINCT token_json) > 1",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (session_id, request_id, provider_message_id) in groups {
+        settle_claude_request_usage(
+            conn,
+            &session_id,
+            request_id.as_deref(),
+            &provider_message_id,
+            None,
+        )?;
+    }
+    // The notice's text is its text rows joined in block order, as a fresh
+    // parse writes it: a Claude row's uid is `{message_id}:{block_index}`,
+    // and `group_concat` alone promises no order, so the rows' storage order
+    // could otherwise reorder a multi-block notice.
+    conn.execute_batch(
+        "INSERT INTO session_markers \
+           (source, session_id, marker_uid, ts_ms, message_id, parent_id, kind, subkind, text) \
+         SELECT 'claude', session_id, message_id || ':marker', MIN(NULLIF(ts_ms, 0)), \
+                message_id, MIN(parent_id), 'local_notice', 'synthetic', \
+                group_concat(text, char(10) \
+                  ORDER BY CAST(substr(event_uid, length(message_id) + 2) AS INTEGER), id) \
+                  FILTER (WHERE kind = 'text') \
+         FROM session_events \
+         WHERE source = 'claude' AND role = 'assistant' \
+           AND lower(trim(model)) = '<synthetic>' \
+           AND message_id IS NOT NULL AND message_id <> '' \
+         GROUP BY session_id, message_id \
+         ON CONFLICT(source, session_id, marker_uid) DO NOTHING;",
+    )?;
+    heal_claude_synthetic_session_summaries(conn)?;
+    conn.execute_batch(
+        "DELETE FROM session_events \
+         WHERE source = 'claude' AND role = 'assistant' \
+           AND lower(trim(model)) = '<synthetic>' \
+           AND message_id IS NOT NULL AND message_id <> '';",
+    )?;
+    Ok(())
+}
+
+/// Take `<synthetic>` back out of the `sessions` summaries an earlier parser
+/// derived from it: the model list and the last assistant excerpt.
+///
+/// Both are cached on the session row and only rewritten when the transcript
+/// is read again, and an unchanged transcript is skipped on a stat — so
+/// without this a finished session would keep naming a model nobody ran and
+/// quoting a login notice as the model's last word forever. Repaired from the
+/// stored rows, not the transcript, so a session whose transcript is gone is
+/// repaired too.
+///
+/// The excerpt is matched against the notices' `local_notice` markers, which
+/// both the migration and a fresh parse write, so a database whose notice
+/// events an earlier revision already moved is matched as well as one whose
+/// events are still in place.
+fn heal_claude_synthetic_session_summaries(conn: &Connection) -> Result<()> {
+    /// Where `ClaudeMetaFold` cuts `last_assistant_text`.
+    const CLAUDE_EXCERPT_MAX_CHARS: usize = 4096;
+    let columns: HashSet<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('sessions')")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if columns.contains("models_json") {
+        conn.execute(
+            "UPDATE sessions SET models_json = ( \
+                 SELECT CASE WHEN COUNT(*) = 0 THEN NULL ELSE json_group_array(m.value) END \
+                 FROM json_each(sessions.models_json) m \
+                 WHERE m.type <> 'text' OR lower(trim(m.value)) <> '<synthetic>') \
+             WHERE source = 'claude' AND json_valid(models_json) \
+               AND json_type(models_json) = 'array' \
+               AND EXISTS (SELECT 1 FROM json_each(sessions.models_json) m \
+                           WHERE m.type = 'text' AND lower(trim(m.value)) = '<synthetic>')",
+            [],
+        )?;
+    }
+    if !columns.contains("last_assistant_text") {
+        return Ok(());
+    }
+    // The excerpt the metadata fold wrote from a notice is its text blocks
+    // joined by newlines — blank ones included, which the event rows the
+    // marker text was built from omit — and cut at 4096 characters. So the
+    // two are compared with whitespace removed, and must be equal; only an
+    // excerpt the cut actually shortened may match as a prefix. A real reply
+    // that merely starts with a notice's words is not the notice.
+    let candidates = conn
+        .prepare(
+            "SELECT s.session_id, s.last_assistant_text, m.text FROM sessions s \
+             JOIN session_markers m ON m.source = s.source AND m.session_id = s.session_id \
+             WHERE s.source = 'claude' AND s.last_assistant_text IS NOT NULL \
+               AND m.kind = 'local_notice' AND m.subkind = 'synthetic' AND m.text IS NOT NULL",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let squeeze = |text: &str| -> String { text.chars().filter(|c| !c.is_whitespace()).collect() };
+    let mut quoting_a_notice: Vec<String> = candidates
+        .into_iter()
+        .filter(|(_, excerpt, notice)| {
+            let cut = excerpt.chars().count() >= CLAUDE_EXCERPT_MAX_CHARS;
+            let (excerpt, notice) = (squeeze(excerpt), squeeze(notice));
+            !excerpt.is_empty() && (excerpt == notice || (cut && notice.starts_with(&excerpt)))
+        })
+        .map(|(session_id, _, _)| session_id)
+        .collect();
+    quoting_a_notice.sort();
+    quoting_a_notice.dedup();
+    for session_id in quoting_a_notice {
+        // What the fold would have kept had it skipped the notices: the text
+        // of the last main-thread assistant record that is model output, its
+        // blocks in block order (`{message_id}:{block_index}`), not storage
+        // order.
+        let excerpt: Option<String> = conn
+            .query_row(
+                "SELECT substr(group_concat(text, char(10) \
+                         ORDER BY CAST(substr(event_uid, length(message_id) + 2) AS INTEGER), id), \
+                       1, 4096) FROM ( \
+                     SELECT text, event_uid, message_id, id FROM session_events \
+                     WHERE source = 'claude' AND session_id = ?1 AND role = 'assistant' \
+                       AND kind = 'text' AND text IS NOT NULL \
+                       AND message_id = ( \
+                           SELECT message_id FROM session_events \
+                           WHERE source = 'claude' AND session_id = ?1 \
+                             AND role = 'assistant' AND kind = 'text' AND text IS NOT NULL \
+                             AND COALESCE(is_sidechain, 0) = 0 \
+                             AND (model IS NULL OR lower(trim(model)) <> '<synthetic>') \
+                           ORDER BY ts_ms DESC, id DESC LIMIT 1))",
+                [&session_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        conn.execute(
+            "UPDATE sessions SET last_assistant_text = ?2 \
+             WHERE source = 'claude' AND session_id = ?1",
+            params![session_id, excerpt],
+        )?;
+    }
+    Ok(())
+}
+
 /// The per-message facts a provider records on the envelope rather than in the
 /// message body, carried verbatim from the parser to the row.
 ///
@@ -8045,7 +9893,12 @@ fn opencode_step_finish_stop_reason(part: &Value) -> Option<&str> {
 /// later change adds facts that existing rows should be re-read for.
 /// 2 adds `request_span`: Codex rows indexed before it have none, so they
 /// would keep grouping one API call into a request per row until re-read.
-const RAW_MESSAGE_FACTS_VERSION: i64 = 2;
+/// Generation 3 adds `control_kind`. It is derived rather than copied off the
+/// envelope, but it is stamped by the same parser on the same rows, and a row
+/// indexed before it existed is indistinguishable from a prompt -- which is
+/// exactly the reading the column exists to prevent -- so the backfill this
+/// version drives is the one that repairs it.
+const RAW_MESSAGE_FACTS_VERSION: i64 = 3;
 
 #[derive(Debug, Default, Clone, Copy)]
 struct RawMessageFacts<'a> {
@@ -8059,6 +9912,11 @@ struct RawMessageFacts<'a> {
     /// its requests with usage snapshots instead of naming them. Numbered per
     /// session by the parser; see `codex_request_span` at its call site.
     request_span: Option<&'a str>,
+    /// Why this user-role row is not a human prompt, from
+    /// [`control::ControlKind`]; `None` for a prompt and for model output.
+    /// The one derived fact carried here, because every insert already
+    /// threads this struct and the column is stamped per row like the rest.
+    control_kind: Option<&'a str>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8204,9 +10062,9 @@ fn insert_session_event_with_provenance(
     let blank = ToolResultFacts::default();
     let tool_result_facts = tool_result_facts.unwrap_or(&blank);
     // Stamp `project_key` as the row is inserted rather than sweeping for it
-    // afterwards. An UPDATE over `session_events` is a change every
-    // durable-delivery subscriber has to be told about, so a sweep would
-    // journal a second upsert for every event of every session on every sync.
+    // afterwards. An UPDATE over `session_events` re-stamps the row's
+    // change-feed revision, so a sweep would report a second upsert for every
+    // event of every session on every sync.
     //
     // The owning session's key is preferred when the row already exists,
     // because it may be stronger than anything derivable here (a Codex
@@ -8226,7 +10084,7 @@ fn insert_session_event_with_provenance(
     // is what a plain `COALESCE(excluded.project_key, ...)` does now that the
     // fallback makes it non-null -- would overwrite a canonical repository key
     // with a machine-local path on every re-ingest, and hand every one of
-    // those events back to the sweep to fix, journalling a second delivery
+    // those events back to the sweep to fix, reporting a second change-feed
     // upsert each time.
     //
     // The *method* is stamped beside the key, always from the same arm that
@@ -8235,8 +10093,7 @@ fn insert_session_event_with_provenance(
     // key with no method is indistinguishable from one that was never
     // resolved: the denormalizing pass would then replace a delegated
     // thread's own repository with its delegator's, on every sync, forever.
-    // Reuse the compiled statement and capture triggers across records. Trigger
-    // predicates still read current subscription state on every execution.
+    // Reuse the compiled statement across records.
     let resolved = cwd.and_then(|cwd| crate::project_identity::identity_for(Some(cwd), None));
     let resolved_key = resolved.as_ref().map(|(key, _)| key.as_str());
     let resolved_method = resolved.as_ref().map(|(_, method)| method.as_str());
@@ -8245,7 +10102,8 @@ fn insert_session_event_with_provenance(
          (source, session_id, project, project_key, project_key_method, cwd, git_branch, message_id, parent_id, ts_ms, role, kind, text, model, token_json, provider, event_uid, \
           tool_use_id, payload_bytes, payload_truncated, payload_hash, call_index, event_index, result_status, event_source, \
           error_signal, subagent_session_id, agent_id, \
-          request_id, provider_message_id, stop_reason, agent_version, is_sidechain, is_meta, turn_id, request_span, raw_facts_version, raw_kind) \
+          request_id, provider_message_id, stop_reason, agent_version, is_sidechain, is_meta, turn_id, request_span, raw_facts_version, raw_kind, \
+          control_kind) \
          VALUES (?1, ?2, ?3, \
            COALESCE((SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2), ?16), \
            CASE WHEN (SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2) IS NOT NULL \
@@ -8253,7 +10111,7 @@ fn insert_session_event_with_provenance(
                 ELSE ?17 END, \
            ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
            ?14, ?15, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, \
-           ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38) \
+           ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39) \
          ON CONFLICT(source, session_id, event_uid) DO UPDATE SET \
          project=excluded.project, \
          project_key=COALESCE((SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2), session_events.project_key, ?16), \
@@ -8275,7 +10133,10 @@ fn insert_session_event_with_provenance(
          stop_reason=excluded.stop_reason, agent_version=excluded.agent_version, \
          is_sidechain=excluded.is_sidechain, is_meta=excluded.is_meta, turn_id=excluded.turn_id, \
          request_span=excluded.request_span, \
-         raw_facts_version=excluded.raw_facts_version, raw_kind=excluded.raw_kind",
+         raw_facts_version=excluded.raw_facts_version, raw_kind=excluded.raw_kind, \
+         control_kind=excluded.control_kind, \
+         location=CASE WHEN session_events.location = excluded.location \
+           THEN session_events.location ELSE 'both' END",
     )?.execute(
         params![
             source,
@@ -8316,6 +10177,7 @@ fn insert_session_event_with_provenance(
             raw_facts.request_span,
             RAW_MESSAGE_FACTS_VERSION,
             raw_kind,
+            raw_facts.control_kind,
         ],
     )?;
     Ok(())
@@ -8341,7 +10203,9 @@ fn insert_tool_call(
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(source, session_id, tool_use_id) DO UPDATE SET \
          message_id=excluded.message_id, name=excluded.name, target=excluded.target, args_json=excluded.args_json, \
-         is_error=COALESCE(excluded.is_error, tool_calls.is_error), ts_ms=excluded.ts_ms",
+         is_error=COALESCE(excluded.is_error, tool_calls.is_error), ts_ms=excluded.ts_ms, \
+         location=CASE WHEN tool_calls.location = excluded.location \
+           THEN tool_calls.location ELSE 'both' END",
     )?.execute(
         params![
             source,
@@ -8393,7 +10257,9 @@ fn upsert_file_edit_from_call(
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(source, session_id, tool_use_id) DO UPDATE SET \
          message_id=excluded.message_id, file_path=excluded.file_path, tool_name=excluded.tool_name, \
-         ts_ms=excluded.ts_ms, git_branch=COALESCE(excluded.git_branch, file_edits.git_branch), cwd=COALESCE(excluded.cwd, file_edits.cwd)",
+         ts_ms=excluded.ts_ms, git_branch=COALESCE(excluded.git_branch, file_edits.git_branch), cwd=COALESCE(excluded.cwd, file_edits.cwd), \
+         location=CASE WHEN file_edits.location = excluded.location \
+           THEN file_edits.location ELSE 'both' END",
     )?.execute(
         params![
             source,
@@ -8692,6 +10558,172 @@ fn upsert_session_inner(
         Some("full"),
     )?;
     Ok(())
+}
+
+/// Whether `path` is the subagent workflow journal Claude Code keeps beside
+/// its `agent-*.jsonl` transcripts, rather than a transcript.
+///
+/// `<session>/subagents/**/journal.jsonl` records the orchestration of a
+/// subagent workflow — `started` / `result` lines naming the spawned agents —
+/// not a conversation. It shares the `.jsonl` extension and sits inside the
+/// tree the Claude walk recurses, so without this it was stamped, re-read on
+/// every change, and one classifier change away from its `started` / `result`
+/// lines being stored as `unknown` markers on some session.
+///
+/// Only the part of the path below `root` is consulted, so a directory named
+/// `subagents` above the Claude root cannot turn an ordinary transcript named
+/// `journal.jsonl` into a journal.
+pub(crate) fn is_claude_workflow_journal(root: &Path, path: &Path) -> bool {
+    if path.file_name().and_then(|name| name.to_str()) != Some("journal.jsonl") {
+        return false;
+    }
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    relative
+        .parent()
+        .into_iter()
+        .flat_map(Path::ancestors)
+        .any(|ancestor| ancestor.file_name().and_then(|name| name.to_str()) == Some("subagents"))
+}
+
+/// Retract what an earlier build derived from a workflow journal it walked as
+/// a transcript.
+///
+/// Only rows whose ownership by the journal can be established are touched:
+///
+/// - continuity evidence is keyed on the journal's own locator;
+/// - a marker is deleted only when it has exactly the shape the old walk gave
+///   that journal line: the session the line was attributed to (its own
+///   `sessionId`, else the file's), the identity the line derives, and an
+///   `unknown` kind whose subkind is the line's record type. A marker any
+///   transcript wrote differs in at least one of those. The journal has to
+///   still be readable for this; lines that are gone or were rewritten leave
+///   nothing to prove ownership with, and their markers are left alone;
+/// - a session locator the journal overwrote — the catalog `raw_path`, the
+///   local presence, and every local observation — is pointed back at the
+///   session's own transcript beside the `subagents` directory, or cleared
+///   when that transcript does not exist, so hydration cannot reopen the
+///   journal through any of them.
+fn retract_claude_workflow_journal(conn: &Connection, journal: &Path) -> Result<()> {
+    let locator = journal.to_string_lossy().to_string();
+    crate::continuity::clear_evidence(conn, "claude", &locator)?;
+    if let Ok(file) = fs::File::open(journal) {
+        let stem = journal
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("journal");
+        let records: Vec<(Map<String, Value>, String)> = BufReader::new(file)
+            .lines()
+            .map_while(Result::ok)
+            .filter_map(|line| match serde_json::from_str::<Value>(&line) {
+                Ok(Value::Object(obj)) => Some((obj, line)),
+                _ => None,
+            })
+            .collect();
+        // An empty `sessionId` names no session, as in the walk that wrote
+        // these markers: it neither is the file's session nor keeps a line
+        // from falling back to it.
+        let non_empty_session_id = |obj: &Map<String, Value>| {
+            obj.get("sessionId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
+        };
+        let file_session_id = records
+            .iter()
+            .find_map(|(obj, _)| non_empty_session_id(obj));
+        for (obj, line) in &records {
+            let Some(session_id) = non_empty_session_id(obj).or_else(|| file_session_id.clone())
+            else {
+                continue;
+            };
+            let record_type = obj.get("type").and_then(Value::as_str).unwrap_or("");
+            let subkind = if record_type.is_empty() {
+                "record"
+            } else {
+                record_type
+            };
+            let identity = claude_record_identity(obj, line, stem);
+            crate::store::retire_evidence_share(
+                conn,
+                "session_markers",
+                "source = 'claude' AND session_id = ?1 \
+                   AND marker_uid = ?2 AND kind = 'unknown' AND subkind = ?3",
+                params![session_id, format!("{identity}:marker"), subkind],
+                SessionLocation::Local,
+            )?;
+        }
+    }
+    let own_transcript = journal
+        .ancestors()
+        .find(|dir| dir.file_name().and_then(|name| name.to_str()) == Some("subagents"))
+        .and_then(Path::parent)
+        .map(|session_dir| session_dir.with_extension("jsonl"))
+        .filter(|transcript| transcript.is_file())
+        .map(|transcript| transcript.to_string_lossy().to_string());
+    conn.execute(
+        "UPDATE sessions SET raw_path = ?1 WHERE source = 'claude' AND raw_path = ?2",
+        params![own_transcript, locator],
+    )?;
+    // Observations first: an upsert refreshes the presence projection from
+    // them. The direct presence update then covers a presence no observation
+    // backs.
+    let observed: Vec<crate::observations::SessionObservation> = {
+        let mut statement = conn.prepare(
+            "SELECT DISTINCT session_id FROM session_observations \
+             WHERE source = 'claude' AND location = 'local' AND raw_locator = ?1",
+        )?;
+        let sessions: Vec<String> = statement
+            .query_map([&locator], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut observed = Vec::new();
+        for session_id in sessions {
+            observed.extend(
+                crate::observations::list(conn, "claude", &session_id)?
+                    .into_iter()
+                    .filter(|observation| {
+                        observation.key.location == SessionLocation::Local
+                            && observation.raw_locator.as_deref() == Some(locator.as_str())
+                    }),
+            );
+        }
+        observed
+    };
+    for mut observation in observed {
+        observation.raw_locator = own_transcript.clone();
+        observation.updated_ms = now_ms();
+        crate::observations::upsert(conn, &observation)?;
+    }
+    conn.execute(
+        "UPDATE session_presences SET raw_locator = ?1 \
+         WHERE source = 'claude' AND location = 'local' AND raw_locator = ?2",
+        params![own_transcript, locator],
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Walk workflow journals as transcripts again, as builds before #208 did,
+    /// so an upgrade test can index one the old way first.
+    static LEGACY_WALKS_WORKFLOW_JOURNALS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Every Claude transcript under `root`: each `*.jsonl` in the tree except the
+/// subagent workflow journals, which are metadata and never a transcript.
+///
+/// Discovery and the sync walk both enumerate through this, so neither can
+/// list a journal the other has excluded.
+pub(crate) fn claude_transcript_files(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = collect_matching_files(root, "", "jsonl")?;
+    #[cfg(test)]
+    if LEGACY_WALKS_WORKFLOW_JOURNALS.with(std::cell::Cell::get) {
+        return Ok(files);
+    }
+    files.retain(|path| !is_claude_workflow_journal(root, path));
+    Ok(files)
 }
 
 pub(crate) fn collect_matching_files(root: &Path, prefix: &str, ext: &str) -> Result<Vec<PathBuf>> {
@@ -9077,6 +11109,26 @@ fn scan_cursor_transcript_with(
     saved: Option<&Value>,
     after_read: &mut dyn FnMut(&Path),
 ) -> Result<ScannedCursorTranscript> {
+    // A cursor settled at the end of an untouched file needs nothing read:
+    // there are no new bytes, the prefix is the one it proved, and an
+    // unadvanced scan is never indexed, so it needs no generation either.
+    // Before this, every Cursor transcript was hashed whole twice per sweep —
+    // once to validate the cursor, once more to identify a generation nothing
+    // would use (#215).
+    if let Some(DecodedFileCursor::Typed(cursor)) = saved.and_then(FileCursor::decode) {
+        if cursor.settled_at(jsonl) {
+            return Ok(ScannedCursorTranscript {
+                timestamp_ms: i64::try_from(cursor.observed_mtime_ns / 1_000_000).unwrap_or(0),
+                parse_errors: 0,
+                checkpoint: None,
+                restarted: cursor.offset == 0,
+                advanced: false,
+                resumed_from: cursor.offset,
+                consumed_through: cursor.offset,
+                generation: None,
+            });
+        }
+    }
     let mut source = CompleteJsonlReader::open(jsonl, saved)
         .with_context(|| format!("open Cursor transcript {}", jsonl.display()))?;
     let offset = source.position;
@@ -9126,7 +11178,7 @@ fn scan_cursor_transcript_with(
     // recorded as the generation the scan saw and then compare equal at the
     // index check, laundering the new file in under the old scan's offsets.
     // Hashing what was read closes that window by construction.
-    let committed = if consumed != offset || saved != Some(&opened_cursor) {
+    let committed = if consumed != offset || !same_opened_cursor(saved, &opened_cursor) {
         Some(
             source
                 .committed_cursor(consumed, true)
@@ -9148,6 +11200,9 @@ fn scan_cursor_transcript_with(
     // `scanned_through` then all come from the one read that saw the
     // replacement whole.
     let replaced_mid_scan = source.reset_cursor.is_some();
+    let advanced = consumed != offset
+        || replaced_mid_scan
+        || (offset == 0 && saved_offset.is_some_and(|previous| previous > 0));
     let generation = if replaced_mid_scan {
         None
     } else {
@@ -9162,14 +11217,24 @@ fn scan_cursor_transcript_with(
                     prefix_len: cursor.offset,
                 }),
             // Nothing advanced and the saved cursor still describes the file,
-            // so there is nothing to index and no offsets to protect.
+            // so there is nothing to index and no offsets to protect. Only an
+            // advanced scan is queued, and only a queued one reads its
+            // generation, so hashing the prefix again here bought nothing.
+            None if !advanced => None,
             None => cursor_generation(jsonl, consumed)?,
         }
+    };
+    // Unchanged, proven by the whole-prefix hash `open` just took, and old
+    // enough to settle on: record that, so the next sweep can stop at a stat.
+    let checkpoint = match committed {
+        Some(cursor) => Some(cursor.to_value()),
+        None if !advanced => source.settled_cursor().map(|cursor| cursor.to_value()),
+        None => None,
     };
     Ok(ScannedCursorTranscript {
         timestamp_ms,
         parse_errors,
-        checkpoint: committed.map(|cursor| cursor.to_value()),
+        checkpoint,
         restarted: offset == 0,
         // A replacement is work even when the read that found it consumed
         // nothing: the session's stored evidence belongs to a file that no
@@ -9184,9 +11249,7 @@ fn scan_cursor_transcript_with(
         // `consumed != offset` nor `reset_cursor` fires. The checkpoint
         // still advances (the opened cursor is a new generation), and
         // without this the obsolete rows stay.
-        advanced: consumed != offset
-            || replaced_mid_scan
-            || (offset == 0 && saved_offset.is_some_and(|previous| previous > 0)),
+        advanced,
         resumed_from: offset,
         consumed_through: consumed,
         // Re-checked by the index phase, because a replacement can still land
@@ -9266,6 +11329,7 @@ pub(crate) fn cursor_generation(path: &Path, through: u64) -> Result<Option<Curs
 /// would turn an ordinary rewrite into a failed sync. Only a real I/O failure
 /// is an error here.
 fn hash_prefix_bytes(path: &Path, through: u64) -> Result<Option<String>> {
+    meter_prefix_hash(through);
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
@@ -9335,6 +11399,7 @@ fn prepare_cursor_sync(
     let mut transcripts = Vec::new();
     let mut errors = 0;
     let mut files_seen = 0;
+    let mut files = Vec::new();
     for project_dir in sorted_dirs(root)? {
         check_capture_cancelled()?;
         let ts_root = project_dir.join("agent-transcripts");
@@ -9358,49 +11423,52 @@ fn prepare_cursor_sync(
             if !jsonl.exists() {
                 continue;
             }
-            before_transcript(&jsonl);
-            files_seen += 1;
-            let key = jsonl.to_string_lossy().to_string();
-            // Cursor rewrites and rotates transcripts underneath us, so a file can
-            // vanish or be replaced between enumeration and open. That race is
-            // per-file, not per-source: record it, leave this file's checkpoint
-            // untouched so the next sync retries it from the same offset, and keep
-            // preparing the remaining transcripts.
-            let scan = match scan_cursor_transcript_with(&jsonl, cursor_state.get(&key), after_read)
-            {
-                Ok(scan) => scan,
-                Err(error) => {
-                    if error.is::<CaptureCancelled>() {
-                        return Err(error);
-                    }
-                    sync_note!("  [cursor] skipping {}: {error:#}", jsonl.display());
-                    errors += 1;
-                    coverage.note_unread();
-                    continue;
+            files.push((jsonl, session_id, project_path.clone()));
+        }
+    }
+    for (jsonl, session_id, project_path) in capture_files("cursor", files) {
+        check_capture_cancelled()?;
+        before_transcript(&jsonl);
+        files_seen += 1;
+        let key = jsonl.to_string_lossy().to_string();
+        // Cursor rewrites and rotates transcripts underneath us, so a file can
+        // vanish or be replaced between enumeration and open. That race is
+        // per-file, not per-source: record it, leave this file's checkpoint
+        // untouched so the next sync retries it from the same offset, and keep
+        // preparing the remaining transcripts.
+        let scan = match scan_cursor_transcript_with(&jsonl, cursor_state.get(&key), after_read) {
+            Ok(scan) => scan,
+            Err(error) => {
+                if error.is::<CaptureCancelled>() {
+                    return Err(error);
                 }
-            };
-            errors += scan.parse_errors;
-            if let Some(checkpoint) = scan.checkpoint {
-                cursor_state.insert(key, checkpoint);
+                sync_note!("  [cursor] skipping {}: {error:#}", jsonl.display());
+                errors += 1;
+                coverage.note_unread();
+                continue;
             }
-            // The byte cursor is the change detector; the parser then reads the
-            // whole file. Cursor's records are id-less, so every event, tool
-            // call and file edit is keyed on the record's byte offset — which a
-            // full re-parse reproduces exactly, and a resumed partial read
-            // could not, because a window's records have no absolute position
-            // of their own.
-            if scan.advanced {
-                transcripts.push(PreparedCursorTranscript {
-                    path: jsonl,
-                    session_id,
-                    project: project_path.clone(),
-                    timestamp_ms: scan.timestamp_ms,
-                    restarted: scan.restarted,
-                    history_from_offset: scan.resumed_from,
-                    scanned_through: scan.consumed_through,
-                    generation: scan.generation,
-                });
-            }
+        };
+        errors += scan.parse_errors;
+        if let Some(checkpoint) = scan.checkpoint {
+            cursor_state.insert(key, checkpoint);
+        }
+        // The byte cursor is the change detector; the parser then reads the
+        // whole file. Cursor's records are id-less, so every event, tool
+        // call and file edit is keyed on the record's byte offset — which a
+        // full re-parse reproduces exactly, and a resumed partial read
+        // could not, because a window's records have no absolute position
+        // of their own.
+        if scan.advanced {
+            transcripts.push(PreparedCursorTranscript {
+                path: jsonl,
+                session_id,
+                project: project_path.clone(),
+                timestamp_ms: scan.timestamp_ms,
+                restarted: scan.restarted,
+                history_from_offset: scan.resumed_from,
+                scanned_through: scan.consumed_through,
+                generation: scan.generation,
+            });
         }
     }
     Ok(PreparedCursorSync {
@@ -9450,10 +11518,17 @@ fn stored_cursor_record_timestamps(
 /// edits it never made. Clearing all four tables together, inside the caller's
 /// transaction, is what makes a rebuild a rebuild.
 pub(crate) fn clear_cursor_session_evidence(conn: &Connection, session_id: &str) -> Result<()> {
-    for table in ["history", "session_events", "tool_calls", "file_edits"] {
-        conn.execute(
-            &format!("DELETE FROM {table} WHERE source = 'cursor' AND session_id = ?"),
-            [session_id],
+    conn.execute(
+        "DELETE FROM history WHERE source = 'cursor' AND session_id = ?",
+        [session_id],
+    )?;
+    for table in ["session_events", "tool_calls", "file_edits"] {
+        crate::store::retire_evidence_share(
+            conn,
+            table,
+            "source = 'cursor' AND session_id = ?",
+            params![session_id],
+            SessionLocation::Local,
         )?;
     }
     Ok(())
@@ -9542,6 +11617,7 @@ pub(crate) fn ingest_cursor_transcript(
     // The last turn time seen while walking forward, inherited by the records
     // that answer that turn.
     let mut turn_ts: Option<i64> = None;
+    let mut tool_results = tool_result_facts::ToolResultIndexer::default();
     // Only complete records are indexed, matching `CompleteJsonlReader` and
     // `complete_jsonl_records`. A transcript Cursor is mid-write has a partial
     // final line; indexing it would publish a truncated prompt that the next
@@ -9881,6 +11957,12 @@ pub(crate) fn ingest_cursor_transcript(
                         .to_string();
                     let content = block.get("content").unwrap_or(&Value::Null);
                     emitted_evidence = true;
+                    // Measured over the raw block before the text column is
+                    // materialized, like Claude's; the walk always starts at
+                    // offset 0, so the indexes are the same on every pass.
+                    let (call_index, event_index) = tool_results.next(&tool_use_id);
+                    let facts = tool_result_facts::cursor_tool_result_facts(block)
+                        .with_ordering(call_index, event_index);
                     insert_session_event(
                         conn,
                         "cursor",
@@ -9899,7 +11981,7 @@ pub(crate) fn ingest_cursor_transcript(
                         // Cursor records no request identity on this path.
                         RequestIdentity::none(),
                         &event_uid,
-                        None,
+                        Some(&facts),
                         RawMessageFacts::default(),
                     )?;
                     if !tool_use_id.is_empty() {
@@ -9997,6 +12079,1324 @@ pub(crate) fn decode_cursor_project(name: &str) -> String {
     format!("/{}", name.replace('-', "/"))
 }
 
+/// Where plain `sync` remembers the change stamp of each Muse Code transcript
+/// it has already read. Renamed on a parser upgrade so unchanged transcripts
+/// are read again; see [`GROK_SYNC_STATE_KEY`].
+const MUSE_SYNC_STATE_KEY: &str = "muse_sessions_v1";
+
+/// Every top-level Muse Code transcript under `root`, sorted.
+///
+/// A transcript under a `subagent/` directory belongs to a subagent or
+/// reminder child of the session beside it, not to a session of its own, so
+/// it is never returned.
+pub(crate) fn collect_muse_transcripts(root: &Path) -> Result<Vec<PathBuf>> {
+    Ok(
+        collect_matching_files(root, muse::SESSION_FILE.trim_end_matches(".jsonl"), "jsonl")?
+            .into_iter()
+            .filter(|path| {
+                path.file_name().and_then(|name| name.to_str()) == Some(muse::SESSION_FILE)
+                    && !muse::is_child_transcript(path, root)
+            })
+            .collect(),
+    )
+}
+
+#[cfg(test)]
+fn sync_muse(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> Result<usize> {
+    sync_muse_with_coverage(
+        conn,
+        state,
+        root,
+        &SweepRepairs::default(),
+        &mut SweepCoverage::default(),
+    )
+}
+
+/// Index every Muse Code transcript whose stamp changed since the last run.
+///
+/// A transcript is append-only, but it is read whole: a session is one file,
+/// its records carry their own ids and times, and a whole read is what lets a
+/// re-read replace rather than merge. Same state-map discipline as Grok: a
+/// stamp is trusted only while the evidence it recorded is still stored, and
+/// an unreadable transcript keeps no stamp, so the next run retries it.
+fn sync_muse_with_coverage(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    root: &Path,
+    repairs: &SweepRepairs,
+    coverage: &mut SweepCoverage,
+) -> Result<usize> {
+    if !root.exists() {
+        sync_note!("  [muse] not found: {} (skipped)", root.display());
+        return Ok(0);
+    }
+    let mut muse_state = state
+        .get(MUSE_SYNC_STATE_KEY)
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut inserted = 0;
+    let mut scanned = 0;
+    let mut sessions = 0;
+    let mut errors = 0;
+    let mut accounted = 0;
+    for transcript in capture_files("muse", collect_muse_transcripts(root)?) {
+        check_capture_cancelled()?;
+        let key = transcript.to_string_lossy().to_string();
+        let stamp = match muse_session_stamp(&transcript) {
+            Ok(stamp) => stamp,
+            Err(error) => {
+                if error.is::<CaptureCancelled>() {
+                    return Err(error);
+                }
+                scanned += 1;
+                errors += 1;
+                coverage.note_unread();
+                sync_note!(
+                    "  [muse] unreadable session {}: {error:#}",
+                    transcript.display()
+                );
+                continue;
+            }
+        };
+        let recorded = muse_state.get(&key);
+        if recorded.and_then(grok_state_stamp) == Some(stamp.as_str()) {
+            // The stamp says unchanged; the database has to agree before
+            // that is taken as "already indexed". Every Muse ingestion writes
+            // at least its catalog row, and one that wrote events is checked
+            // against those.
+            let still_there = match (
+                recorded.and_then(grok_state_session),
+                recorded.and_then(grok_state_had_evidence),
+            ) {
+                (None, _) => true,
+                // The destination marker says rows were lost under this
+                // unchanged stamp — in the session or in a subagent it links.
+                // Existence cannot see a partial loss; re-reading repairs it.
+                (Some(id), _) if muse_tree_needs_repair(conn, repairs, id)? => false,
+                (Some(id), Some(false)) => muse_catalog_row_exists(conn, id)?,
+                (Some(id), _) => muse_evidence_exists(conn, id)?,
+            };
+            if still_there {
+                accounted += 1;
+                continue;
+            }
+        }
+        scanned += 1;
+        // Everything is read before anything is written. A transcript or a
+        // subagent log that cannot be read is this session's failure alone:
+        // it keeps no stamp, so the next run retries it, and the pass goes on.
+        // A write that fails once the transaction is open is a database
+        // failure, not this session's, so it ends the pass, as it does for
+        // Grok.
+        match read_muse_tree(&transcript) {
+            Ok(Some((parsed, children))) => {
+                let session_id = parsed.metadata.session_id.clone();
+                let tx = conn.unchecked_transaction()?;
+                let written = muse_history_rows(&tx, &session_id).and_then(|before| {
+                    let outcome =
+                        ingest_muse_session_tree(&tx, &parsed, &transcript, Some(&children))?;
+                    let after = muse_history_rows(&tx, &session_id)?;
+                    Ok((outcome, after.saturating_sub(before)))
+                });
+                let (outcome, added) = match written {
+                    Ok(written) => written,
+                    Err(error) => {
+                        drop(tx);
+                        return Err(error);
+                    }
+                };
+                // A re-read replaces the session's prompts wholesale, so what
+                // it added is the difference, not what it wrote.
+                inserted += added;
+                tx.commit()?;
+                sessions += 1;
+                accounted += 1;
+                muse_state.insert(
+                    key,
+                    json!({
+                        "stamp": stamp,
+                        "session": session_id,
+                        "evidence": outcome.events > 0
+                            || outcome.markers > 0
+                            || outcome.relationships > 0,
+                    }),
+                );
+            }
+            Ok(None) => {
+                accounted += 1;
+                muse_state.insert(key, json!({ "stamp": stamp }));
+            }
+            Err(error) => {
+                if error.is::<CaptureCancelled>() {
+                    return Err(error);
+                }
+                errors += 1;
+                coverage.note_unread();
+                sync_note!(
+                    "  [muse] unreadable session {}: {error:#}",
+                    transcript.display()
+                );
+            }
+        }
+    }
+    state.insert(MUSE_SYNC_STATE_KEY.to_string(), Value::Object(muse_state));
+    if scanned > 0 {
+        let suffix = if errors > 0 {
+            format!(" ({errors} errors)")
+        } else {
+            String::new()
+        };
+        sync_note!("  [muse] +{inserted} rows from {sessions} sessions{suffix}");
+    }
+    if errors > 0 && accounted == 0 {
+        anyhow::bail!(
+            "{errors} Muse Code session(s) could not be read and none were indexed; \
+             the unreadable transcripts are named above"
+        );
+    }
+    Ok(inserted)
+}
+
+/// Whether the destination marker names this session, or any subagent its
+/// logs link, as having lost rows.
+fn muse_tree_needs_repair(
+    conn: &Connection,
+    repairs: &SweepRepairs,
+    session_id: &str,
+) -> Result<bool> {
+    if repairs.is_empty() {
+        return Ok(false);
+    }
+    if repairs.contains("muse", session_id) {
+        return Ok(true);
+    }
+    let descendants: Vec<String> = conn
+        .prepare(
+            "WITH RECURSIVE tree(id) AS ( \
+               SELECT child_session_id FROM session_relationships \
+               WHERE source = 'muse' AND parent_session_id = ?1 \
+                 AND evidence_kind = 'muse_subagent_log' AND child_session_id IS NOT NULL \
+               UNION \
+               SELECT r.child_session_id FROM session_relationships r JOIN tree \
+                 ON r.parent_session_id = tree.id \
+               WHERE r.source = 'muse' AND r.evidence_kind = 'muse_subagent_log' \
+                 AND r.child_session_id IS NOT NULL \
+             ) SELECT id FROM tree",
+        )?
+        .query_map(params![session_id], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(descendants
+        .iter()
+        .any(|child| repairs.contains("muse", child)))
+}
+
+/// Whether a Muse session is a subagent some parent's log links.
+fn muse_delegation_recorded(conn: &Connection, child_session_id: &str) -> Result<bool> {
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM session_relationships \
+         WHERE source = 'muse' AND child_session_id = ? \
+           AND evidence_kind = 'muse_subagent_log' LIMIT 1)",
+        params![child_session_id],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
+}
+
+fn muse_history_rows(conn: &Connection, session_id: &str) -> Result<usize> {
+    let rows: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM history WHERE source = 'muse' AND session_id = ?",
+        params![session_id],
+        |row| row.get(0),
+    )?;
+    Ok(rows as usize)
+}
+
+fn muse_evidence_exists(conn: &Connection, session_id: &str) -> Result<bool> {
+    if session_events_exist(conn, "muse", session_id)? {
+        return Ok(true);
+    }
+    for statement in [
+        "SELECT EXISTS(SELECT 1 FROM session_markers \
+         WHERE source = 'muse' AND session_id = ? LIMIT 1)",
+        "SELECT EXISTS(SELECT 1 FROM session_relationships \
+         WHERE source = 'muse' AND parent_session_id = ? \
+           AND evidence_kind = 'muse_subagent_log' LIMIT 1)",
+    ] {
+        let exists: i64 = conn.query_row(statement, params![session_id], |row| row.get(0))?;
+        if exists != 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn muse_catalog_row_exists(conn: &Connection, session_id: &str) -> Result<bool> {
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sessions \
+         WHERE source = 'muse' AND session_id = ? LIMIT 1)",
+        params![session_id],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
+}
+
+/// The transcript and every subagent log beneath its session directory,
+/// parent first, then children depth-first in sorted order.
+pub(crate) fn muse_session_files(transcript: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = vec![transcript.to_path_buf()];
+    if let Some(dir) = transcript.parent() {
+        collect_muse_child_logs(dir, &mut files)?;
+    }
+    Ok(files)
+}
+
+/// The `subagent/<id>/session.jsonl` logs under one session directory, and
+/// theirs in turn.
+///
+/// No depth limit is needed, and none is imposed — a limit would silently drop
+/// the logs beneath it. [`direct_muse_child_logs`] accepts a child only where
+/// it resolves beneath the session's *real* directory plus a literal
+/// `subagent/` component, so each level is strictly deeper in the real
+/// filesystem than the one before and adds at least `/subagent/<id>` to its
+/// path; the operating system's own path-length limit therefore bounds every
+/// walk, symlinks and all.
+fn collect_muse_child_logs(session_dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    for log in direct_muse_child_logs(session_dir)? {
+        check_capture_cancelled()?;
+        out.push(log.clone());
+        if let Some(child_dir) = log.parent() {
+            collect_muse_child_logs(child_dir, out)?;
+        }
+    }
+    Ok(())
+}
+
+/// The immediate `subagent/<id>/session.jsonl` logs of one session
+/// directory, sorted.
+fn direct_muse_child_logs(session_dir: &Path) -> Result<Vec<PathBuf>> {
+    let children = session_dir.join(muse::SUBAGENT_DIR);
+    let entries = match fs::read_dir(&children) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("list Muse subagents {}", children.display()))
+        }
+    };
+    // A child log is read only where it resolves beneath the session's real
+    // directory plus a literal `subagent/` component. The session directory
+    // is resolved first and `subagent` joined after, so a `subagent/` that is
+    // itself a symlink is measured against where it *should* be, not where
+    // it points. Anything else is not this session's evidence: outside the
+    // Muse root it would index a stranger's file, and back up into the
+    // session (`subagent -> .`, `subagent/loop -> ..`) it would read the
+    // parent's own transcript as its child and recurse. Requiring each level
+    // to resolve strictly beneath the previous one's real `subagent/` is what
+    // makes every walk of the tree finite.
+    let within = fs::canonicalize(session_dir)
+        .with_context(|| format!("resolve Muse session {}", session_dir.display()))?
+        .join(muse::SUBAGENT_DIR);
+    let mut logs = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("list Muse subagents {}", children.display()))?;
+        let log = entry.path().join(muse::SESSION_FILE);
+        // Only "not there" means absent. A log that cannot be statted is
+        // still there, and treating it as gone would forget its evidence;
+        // the error fails this session's read instead, so it is retried.
+        match fs::metadata(&log) {
+            Ok(metadata) if metadata.is_file() => {
+                let resolved = fs::canonicalize(&log)
+                    .with_context(|| format!("resolve Muse subagent log {}", log.display()))?;
+                if resolved.starts_with(&within) {
+                    logs.push(log);
+                }
+            }
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("stat Muse subagent log {}", log.display()))
+            }
+        }
+    }
+    logs.sort();
+    Ok(logs)
+}
+
+/// The change stamp of a Muse session: its transcript plus every child log
+/// beneath it, because a background subagent keeps writing its own log after
+/// the parent's last record, and a stamp over the parent alone would never
+/// see that.
+pub(crate) fn muse_session_stamp(transcript: &Path) -> Result<String> {
+    let files = muse_session_files(transcript)?;
+    let base = transcript.parent().unwrap_or(transcript);
+    let mut parts = Vec::with_capacity(files.len());
+    for (index, file) in files.iter().enumerate() {
+        let stamp = file_stamp(file)?;
+        if index == 0 {
+            parts.push(stamp);
+        } else {
+            let relative = file.strip_prefix(base).unwrap_or(file);
+            parts.push(format!("{}={stamp}", relative.to_string_lossy()));
+        }
+    }
+    Ok(parts.join("|"))
+}
+
+/// Index a Muse session and every subagent it left a log for.
+///
+/// Each child is indexed under the session id its **own** metadata record
+/// names — never the directory name — and linked to its parent as
+/// `delegated`, with the role, label, model and task the parent recorded for
+/// it. A child is not a session anybody started: its objective is not a
+/// prompt, and it is not a catalog row of its own. So, as for a Codex
+/// subagent rollout, its `history` rows and catalog registration are removed
+/// and its events stay addressable through the relationship.
+///
+/// `children` is the tree [`read_muse_children`] read, or `None` to leave the
+/// session's children and edges exactly as they are — a hydration that did
+/// not ask for related evidence must not rewrite it.
+pub(crate) fn ingest_muse_session_tree(
+    conn: &Connection,
+    transcript: &muse::MuseTranscript,
+    path: &Path,
+    children: Option<&[MuseChildLog]>,
+) -> Result<MuseIngestOutcome> {
+    // A subagent's log is read as one wherever the read starts — a child
+    // also known remotely keeps a catalog row, and hydrating it directly must
+    // not turn its objective into a typed prompt that the parent's next sweep
+    // would take back out.
+    let role = if muse::is_subagent_log(path) {
+        MuseRole::Subagent
+    } else {
+        MuseRole::Session
+    };
+    let mut outcome = ingest_muse_session(conn, transcript, &path.to_string_lossy(), role)?;
+    if role == MuseRole::Subagent {
+        // Not a catalog row of its own either, unless a remote presence
+        // stands behind it.
+        cleanup_subagent_registration(conn, "muse", &transcript.metadata.session_id)?;
+    }
+    if let (Some(dir), Some(children)) = (path.parent(), children) {
+        let mut visited = HashSet::from([transcript.metadata.session_id.clone()]);
+        link_muse_subagents(
+            conn,
+            transcript,
+            dir,
+            children,
+            1,
+            &mut visited,
+            &mut outcome,
+        )?;
+    }
+    Ok(outcome)
+}
+
+/// Whose transcript an ingestion is reading.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MuseRole {
+    /// A session someone started: its prompts were typed.
+    Session,
+    /// A subagent's log: its prompt is the objective its parent assigned.
+    Subagent,
+}
+
+/// One subagent log beneath a session, read, with its own children.
+pub(crate) struct MuseChildLog {
+    path: PathBuf,
+    /// `None` when the log names no session.
+    transcript: Option<muse::MuseTranscript>,
+    children: Vec<MuseChildLog>,
+}
+
+/// Read a transcript and every subagent log beneath it. `Ok(None)` when the
+/// transcript names no session.
+pub(crate) fn read_muse_tree(
+    transcript: &Path,
+) -> Result<Option<(muse::MuseTranscript, Vec<MuseChildLog>)>> {
+    let Some(parsed) = read_muse_transcript(transcript)? else {
+        return Ok(None);
+    };
+    let children = match transcript.parent() {
+        Some(dir) => read_muse_children(dir)?,
+        None => Vec::new(),
+    };
+    Ok(Some((parsed, children)))
+}
+
+/// The subagent logs directly beneath one session directory, each read along
+/// with its own children.
+/// Finite for the reason [`collect_muse_child_logs`] is.
+pub(crate) fn read_muse_children(session_dir: &Path) -> Result<Vec<MuseChildLog>> {
+    let mut out = Vec::new();
+    for path in direct_muse_child_logs(session_dir)? {
+        check_capture_cancelled()?;
+        let transcript = read_muse_transcript(&path)?;
+        let children = match path.parent() {
+            Some(dir) => read_muse_children(dir)?,
+            None => Vec::new(),
+        };
+        out.push(MuseChildLog {
+            path,
+            transcript,
+            children,
+        });
+    }
+    Ok(out)
+}
+
+fn link_muse_subagents(
+    conn: &Connection,
+    parent: &muse::MuseTranscript,
+    parent_dir: &Path,
+    children: &[MuseChildLog],
+    depth: i64,
+    visited: &mut HashSet<String>,
+    outcome: &mut MuseIngestOutcome,
+) -> Result<()> {
+    let parent_id = parent.metadata.session_id.as_str();
+    // Replaced, not merged: a child whose log is gone is no longer evidenced.
+    // The edges are upserted as the children are linked and only the ones
+    // left over are retired afterwards, so a child whose log is still there
+    // is never dropped in between.
+    let previous = muse_child_locators(conn, parent_id)?;
+    let mut linked = HashSet::new();
+    let mut unidentified_logs = HashSet::new();
+    let links = muse::subagent_links(parent);
+    for entry in children {
+        check_capture_cancelled()?;
+        let log = &entry.path;
+        let Some(child) = entry.transcript.as_ref() else {
+            // A log that names no session yet — Muse is still writing its
+            // header — is not a log that is gone.
+            outcome.unidentified_children += 1;
+            unidentified_logs.insert(log.to_string_lossy().to_string());
+            continue;
+        };
+        let child_id = child.metadata.session_id.clone();
+        // A log that names its own parent, or an ancestor, would loop.
+        if !visited.insert(child_id.clone()) {
+            continue;
+        }
+        linked.insert(child_id.clone());
+        let locator = log.to_string_lossy().to_string();
+        // Read as a subagent: its objective is an event, never `history`, and
+        // any history it held before is cleared the same way a session's is
+        // — all of it, or only this log's own rows where the child is also
+        // known remotely.
+        ingest_muse_session(conn, child, &locator, MuseRole::Subagent)?;
+        cleanup_subagent_registration(conn, "muse", &child_id)?;
+        if let Some(child_dir) = log.parent() {
+            link_muse_subagents(
+                conn,
+                child,
+                child_dir,
+                &entry.children,
+                depth + 1,
+                visited,
+                outcome,
+            )?;
+        }
+        let relative = log
+            .strip_prefix(parent_dir)
+            .map(|relative| muse::normalize_link_path(&relative.to_string_lossy()))
+            .unwrap_or_default();
+        let (linked_at, link) = links.get(&relative).cloned().unwrap_or_default();
+        // Only this session's own spawns are compared with its direct
+        // children, and only a child it typed as a worker answers one: a
+        // grandchild answers its own parent's spawn, and a log the parent
+        // never described is not evidence that a spawn succeeded.
+        if depth == 1 && link.role.as_deref().is_some_and(|role| role != "reminder") {
+            outcome.worker_children += 1;
+        }
+        let child_model = link
+            .model
+            .clone()
+            .or_else(|| child.metadata.model_id.clone());
+        let spawned_at_ms = (linked_at > 0)
+            .then_some(linked_at)
+            .or_else(|| child.first_ts());
+        record_relationship(
+            conn,
+            &ObservedRelationship {
+                source: "muse",
+                parent_session_id: parent_id,
+                child_session_id: Some(&child_id),
+                child_agent_type: link.role.as_deref(),
+                child_agent_name: link.label.as_deref(),
+                child_model: child_model.as_deref(),
+                spawn_depth: Some(depth),
+                evidence_kind: "muse_subagent_log",
+                evidence_locator: Some(&locator),
+                evidence_ref: link.task_id.as_deref(),
+                child_has_events: session_events_exist(conn, "muse", &child_id)?,
+                spawned_at_ms,
+                ..ObservedRelationship::default()
+            },
+        )?;
+        // The upsert keeps an optional field the new observation leaves empty,
+        // so a label, model or task the parent no longer records would stay
+        // on the edge. What the parent's record owns is assigned from it,
+        // empty values included; the edge itself — and its first-seen
+        // `created_ms` — stays in place.
+        conn.execute(
+            "UPDATE session_relationships SET child_agent_type = ?, child_agent_name = ?, \
+               child_model = ?, evidence_ref = ?, evidence_locator = ?, spawn_depth = ?, \
+               spawned_at_ms = ? \
+             WHERE source = 'muse' AND parent_session_id = ? AND child_session_id = ? \
+               AND evidence_kind = 'muse_subagent_log'",
+            params![
+                link.role.as_deref(),
+                link.label.as_deref(),
+                child_model.as_deref(),
+                link.task_id.as_deref(),
+                locator,
+                depth,
+                spawned_at_ms,
+                parent_id,
+                child_id,
+            ],
+        )?;
+        outcome.relationships += 1;
+    }
+    for (child, locator) in &previous {
+        if linked.contains(child) {
+            continue;
+        }
+        // Still on disk, just not identifiable yet: keep what it had.
+        if locator
+            .as_deref()
+            .is_some_and(|locator| unidentified_logs.contains(locator))
+        {
+            continue;
+        }
+        conn.execute(
+            "DELETE FROM session_relationships WHERE source = 'muse' \
+             AND parent_session_id = ? AND child_session_id = ? \
+             AND evidence_kind = 'muse_subagent_log'",
+            params![parent_id, child],
+        )?;
+        forget_muse_subagent(conn, child)?;
+    }
+    Ok(())
+}
+
+/// The children a parent's subagent logs linked on the last read, with the
+/// log each was read from.
+fn muse_child_locators(
+    conn: &Connection,
+    parent_id: &str,
+) -> Result<HashMap<String, Option<String>>> {
+    Ok(conn
+        .prepare(
+            "SELECT child_session_id, evidence_locator FROM session_relationships \
+             WHERE source = 'muse' AND parent_session_id = ? \
+               AND evidence_kind = 'muse_subagent_log' AND child_session_id IS NOT NULL",
+        )?
+        .query_map(params![parent_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+/// The children a parent's subagent logs linked on the last read.
+fn muse_linked_children(conn: &Connection, parent_id: &str) -> Result<HashSet<String>> {
+    Ok(conn
+        .prepare(
+            "SELECT child_session_id FROM session_relationships \
+             WHERE source = 'muse' AND parent_session_id = ? \
+               AND evidence_kind = 'muse_subagent_log' AND child_session_id IS NOT NULL",
+        )?
+        .query_map(params![parent_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+/// Drop the evidence of a child whose log is gone, and of its own children.
+/// It was only ever addressable through the edge that no longer exists.
+///
+/// Only the local share goes: a row remote evidence also backs stays, as the
+/// remote side's, and so do a remote presence, the catalog row standing on it,
+/// and the history it shares.
+fn forget_muse_subagent(conn: &Connection, child_id: &str) -> Result<()> {
+    // Its own children were linked from the same, now missing, directory,
+    // whatever the child itself is.
+    for grandchild in muse_linked_children(conn, child_id)? {
+        forget_muse_subagent(conn, &grandchild)?;
+    }
+    conn.execute(
+        "DELETE FROM session_relationships WHERE source = 'muse' \
+         AND parent_session_id = ? AND evidence_kind = 'muse_subagent_log'",
+        params![child_id],
+    )?;
+    retire_local_session_evidence(conn, "muse", child_id)?;
+    // Its log is gone, so it is no longer present locally.
+    conn.execute(
+        "DELETE FROM session_presences \
+         WHERE source = 'muse' AND session_id = ? AND location = 'local'",
+        params![child_id],
+    )?;
+    if !session_has_remote_presence(conn, "muse", child_id)? {
+        // Any history still filed under it — from before it was linked as a
+        // subagent — goes too, or moves to a session that still evidences it.
+        replace_session_history(conn, "muse", child_id)?;
+    }
+    Ok(())
+}
+
+/// Retire a local parser's share of one session's evidence ahead of a
+/// whole-session re-read: every row only local evidence backs is deleted, and
+/// every row remote evidence also backs is left as the remote side's. See
+/// [`crate::store::EVIDENCE_LOCATION_TABLES`].
+pub(crate) fn retire_local_session_evidence(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+) -> Result<()> {
+    for table in crate::store::EVIDENCE_LOCATION_TABLES {
+        crate::store::retire_evidence_share(
+            conn,
+            table,
+            "source = ? AND session_id = ?",
+            params![source, session_id],
+            SessionLocation::Local,
+        )?;
+    }
+    Ok(())
+}
+
+/// Read and interpret one transcript. `Ok(None)` when it names no session.
+pub(crate) fn read_muse_transcript(path: &Path) -> Result<Option<muse::MuseTranscript>> {
+    let bytes =
+        fs::read(path).with_context(|| format!("read Muse transcript {}", path.display()))?;
+    Ok(muse::parse_transcript(&String::from_utf8_lossy(&bytes)))
+}
+
+/// What indexing one Muse Code transcript produced, and what its records
+/// could not establish.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct MuseIngestOutcome {
+    pub prompts: usize,
+    pub events: usize,
+    pub tool_calls: usize,
+    pub file_edits: usize,
+    pub markers: usize,
+    /// Reasoning Muse kept only as an encrypted trace.
+    pub encrypted_reasoning: usize,
+    /// `model_completed` steps whose usage had no assistant record after them
+    /// in the same run to carry it.
+    pub unattached_usage: usize,
+    /// `subagent_spawn` calls in this session's own transcript.
+    pub subagent_calls: usize,
+    /// Child transcripts linked as `delegated` children, at any depth.
+    pub relationships: usize,
+    /// The session's direct children that it typed as something other than
+    /// a reminder: the ones its own `subagent_spawn` calls account for.
+    pub worker_children: usize,
+    /// `subagent/` logs that named no session, so there was no child to link.
+    pub unidentified_children: usize,
+    /// Tool results with no recorded outcome for their call.
+    pub results_without_outcome: usize,
+    /// Lines that did not parse, usually a live session's partial tail.
+    pub unparsed_lines: usize,
+}
+
+/// What one model step reported, for the assistant record that step owns:
+/// its usage verbatim, its model and its `finish_reason`.
+struct MuseStep<'a> {
+    token_json: Option<String>,
+    model: Option<&'a str>,
+    finish_reason: Option<&'a str>,
+}
+
+impl<'a> MuseStep<'a> {
+    fn of(transcript: &'a muse::MuseTranscript, index: usize) -> Self {
+        match &transcript.records[index].event {
+            muse::MuseEvent::ModelCompleted {
+                model,
+                usage,
+                finish_reason,
+                ..
+            } => Self {
+                token_json: usage.as_ref().map(Value::to_string),
+                model: model.as_deref(),
+                finish_reason: finish_reason.as_deref(),
+            },
+            _ => Self {
+                token_json: None,
+                model: None,
+                finish_reason: None,
+            },
+        }
+    }
+}
+
+/// Index one Muse Code transcript: prompts, prose, thinking, tool calls and
+/// results, file edits, per-step token usage and lifecycle markers.
+///
+/// A whole-transcript read replaces the session's evidence rather than
+/// merging into it, so a re-read after the file grew never duplicates a row
+/// and one that dropped a record (a rewritten or truncated file) leaves no
+/// stale one behind.
+///
+/// `role` says whose transcript this is. A [`MuseRole::Session`]'s prompts
+/// were typed and become `history`; a [`MuseRole::Subagent`]'s run-start
+/// prompt is the objective its parent assigned, which is an event but never
+/// a prompt anybody typed.
+pub(crate) fn ingest_muse_session(
+    conn: &Connection,
+    transcript: &muse::MuseTranscript,
+    raw_path: &str,
+    role: MuseRole,
+) -> Result<MuseIngestOutcome> {
+    const SOURCE: &str = "muse";
+    let sid = transcript.metadata.session_id.as_str();
+    let project = transcript.metadata.workspace_root.as_deref();
+    let version = transcript.metadata.cli_version.as_deref();
+    // History is replaced, not merged, so a prompt the transcript no longer
+    // has stops being searchable. A session also known remotely shares its
+    // `history` identity with that evidence, so there only the rows this
+    // transcript wrote last time — the ones its stored prompt events name —
+    // are removed; replacing the whole identity would delete prompts it never
+    // wrote. Either way this runs before the events it reads are replaced.
+    let scope = if session_has_remote_presence(conn, SOURCE, sid)? {
+        HistoryScope::OwnPromptEvents
+    } else {
+        HistoryScope::Session
+    };
+    replace_session_history_scoped(conn, SOURCE, sid, scope)?;
+    retire_local_session_evidence(conn, SOURCE, sid)?;
+
+    let mut outcome = MuseIngestOutcome {
+        unparsed_lines: transcript.unparsed_lines,
+        ..Default::default()
+    };
+    let outcomes = muse::tool_outcomes(transcript);
+    let tool_names = muse::tool_names(transcript);
+    // Calls whose result this transcript recorded.
+    let mut answered: HashSet<String> = HashSet::new();
+    let steps = muse::pair_model_steps(transcript);
+    outcome.unattached_usage = steps.orphans;
+    // The step a record belongs to: its model and finish reason are every one
+    // of its records', and its usage is its first record's alone, never a
+    // neighbour's.
+    let step_of = |index: usize| {
+        steps.members.get(&index).map(|step| {
+            let mut step_facts = MuseStep::of(transcript, *step);
+            if !steps.owners.contains_key(&index) {
+                step_facts.token_json = None;
+            }
+            step_facts
+        })
+    };
+    // The model a record ran under when its own step does not name one.
+    let mut model = transcript.metadata.model_id.clone();
+    let mut first_prompt: Option<String> = None;
+    let mut last_assistant_text: Option<String> = None;
+    let mut results = ToolResultIndexer::default();
+
+    for (idx, record) in transcript.records.iter().enumerate() {
+        check_capture_cancelled()?;
+        let ts = record.ts_ms;
+        let run_id = record.run_id.as_deref();
+        let record_uid = record
+            .record_id
+            .clone()
+            .unwrap_or_else(|| format!("r{}", record.sequence.unwrap_or(idx as i64)));
+        let facts = RawMessageFacts {
+            agent_version: version,
+            turn_id: run_id,
+            ..Default::default()
+        };
+        match &record.event {
+            muse::MuseEvent::Prompt { text } => {
+                // A subagent's run-start prompt is its assigned objective,
+                // not a title anybody typed.
+                if role == MuseRole::Session && first_prompt.is_none() {
+                    first_prompt = Some(crate::discover::excerpt(text));
+                }
+                insert_session_event(
+                    conn,
+                    SOURCE,
+                    sid,
+                    project,
+                    project,
+                    None,
+                    &record_uid,
+                    None,
+                    ts,
+                    "user",
+                    "text",
+                    Some(text),
+                    None,
+                    None,
+                    RequestIdentity::none(),
+                    &record_uid,
+                    None,
+                    facts,
+                )?;
+                outcome.events += 1;
+                if role == MuseRole::Session {
+                    outcome.prompts += insert_history(
+                        conn,
+                        &HistoryEntry {
+                            id: 0,
+                            source: SOURCE.into(),
+                            session_id: Some(sid.to_string()),
+                            project: project.map(str::to_string),
+                            prompt_hash: Some(prompt_hash(text)),
+                            prompt: text.clone(),
+                            timestamp_ms: ts,
+                        },
+                    )?;
+                }
+            }
+            // Paired with its assistant record up front; only the running
+            // model is tracked here.
+            muse::MuseEvent::ModelCompleted {
+                model: step_model, ..
+            } => {
+                if step_model.is_some() {
+                    model = step_model.clone();
+                }
+            }
+            muse::MuseEvent::Reasoning {
+                message_id,
+                text,
+                encrypted,
+            } => match text {
+                Some(text) => {
+                    let step = step_of(idx);
+                    let token_json = step.as_ref().and_then(|step| step.token_json.clone());
+                    let row_model = step
+                        .as_ref()
+                        .and_then(|step| step.model)
+                        .or(model.as_deref());
+                    let message_id = message_id.as_deref().unwrap_or(&record_uid);
+                    insert_session_event(
+                        conn,
+                        SOURCE,
+                        sid,
+                        project,
+                        project,
+                        None,
+                        message_id,
+                        None,
+                        ts,
+                        "assistant",
+                        "thinking",
+                        Some(text),
+                        row_model,
+                        token_json.as_deref(),
+                        RequestIdentity::none(),
+                        &record_uid,
+                        None,
+                        RawMessageFacts {
+                            stop_reason: step.as_ref().and_then(|step| step.finish_reason),
+                            ..facts
+                        },
+                    )?;
+                    outcome.events += 1;
+                }
+                None if *encrypted => {
+                    // The trace exists but is opaque: record that Muse thought
+                    // here, never readable thinking for it.
+                    outcome.encrypted_reasoning += 1;
+                    outcome.markers += insert_session_marker(
+                        conn,
+                        SOURCE,
+                        sid,
+                        &NewSessionMarker {
+                            marker_uid: &record_uid,
+                            kind: "encrypted_reasoning",
+                            subkind: Some("reasoning_committed"),
+                            ts_ms: Some(ts),
+                            message_id: message_id.as_deref(),
+                            turn_id: run_id,
+                            ..Default::default()
+                        },
+                    )?;
+                }
+                None => {}
+            },
+            muse::MuseEvent::AssistantText {
+                message_id,
+                response_id,
+                text,
+            } => {
+                let step = step_of(idx);
+                let token_json = step.as_ref().and_then(|step| step.token_json.clone());
+                let row_model = step
+                    .as_ref()
+                    .and_then(|step| step.model)
+                    .or(model.as_deref());
+                let finish_reason = step.as_ref().and_then(|step| step.finish_reason);
+                let message_id = message_id.as_deref().unwrap_or(&record_uid);
+                insert_session_event(
+                    conn,
+                    SOURCE,
+                    sid,
+                    project,
+                    project,
+                    None,
+                    message_id,
+                    None,
+                    ts,
+                    "assistant",
+                    "text",
+                    Some(text),
+                    row_model,
+                    token_json.as_deref(),
+                    RequestIdentity {
+                        request_id: response_id.as_deref(),
+                        provider_message_id: Some(message_id),
+                    },
+                    &record_uid,
+                    None,
+                    RawMessageFacts {
+                        request_id: response_id.as_deref(),
+                        stop_reason: finish_reason,
+                        ..facts
+                    },
+                )?;
+                outcome.events += 1;
+                last_assistant_text = Some(text.clone());
+            }
+            muse::MuseEvent::ToolCalls {
+                message_id,
+                response_id,
+                calls,
+            } => {
+                let message_id = message_id.as_deref().unwrap_or(&record_uid);
+                let step = step_of(idx);
+                let row_model = step
+                    .as_ref()
+                    .and_then(|step| step.model)
+                    .or(model.as_deref());
+                let finish_reason = step.as_ref().and_then(|step| step.finish_reason);
+                // One request, several calls: its usage is stored once, on
+                // the first call's row.
+                let mut step_usage = step.as_ref().and_then(|step| step.token_json.clone());
+                for call in calls {
+                    let token_json = step_usage.take();
+                    let target = muse::pick_tool_target(&call.name, &call.arguments);
+                    let uid = format!("tool:{}", call.call_id);
+                    insert_session_event(
+                        conn,
+                        SOURCE,
+                        sid,
+                        project,
+                        project,
+                        None,
+                        message_id,
+                        None,
+                        ts,
+                        "assistant",
+                        "tool_use",
+                        Some(&format_tool_event_text(
+                            &call.name,
+                            target.as_deref(),
+                            &call.arguments,
+                        )),
+                        row_model,
+                        token_json.as_deref(),
+                        RequestIdentity {
+                            request_id: response_id.as_deref(),
+                            provider_message_id: Some(message_id),
+                        },
+                        &uid,
+                        None,
+                        RawMessageFacts {
+                            request_id: response_id.as_deref(),
+                            stop_reason: finish_reason,
+                            ..facts
+                        },
+                    )?;
+                    outcome.events += 1;
+                    insert_tool_call(
+                        conn,
+                        SOURCE,
+                        sid,
+                        message_id,
+                        &call.call_id,
+                        &call.name,
+                        target.as_deref(),
+                        &serde_json::to_string(&call.arguments).unwrap_or_default(),
+                        None,
+                        ts,
+                    )?;
+                    outcome.tool_calls += 1;
+                    if muse::is_subagent_tool(&call.name) {
+                        outcome.subagent_calls += 1;
+                    }
+                    if muse::is_file_edit_tool(&call.name) {
+                        if let Some(path) = target.as_deref() {
+                            upsert_file_edit_from_call(
+                                conn,
+                                SOURCE,
+                                sid,
+                                message_id,
+                                &call.call_id,
+                                path,
+                                &call.name,
+                                ts,
+                                None,
+                                project,
+                            )?;
+                            outcome.file_edits += 1;
+                        }
+                    }
+                }
+            }
+            muse::MuseEvent::ToolResults { results: batch } => {
+                for result in batch {
+                    answered.insert(result.call_id.clone());
+                    let text = result.text.as_deref();
+                    let mut result_facts = tool_result_facts::muse_tool_result_facts(
+                        text,
+                        &result.call_id,
+                        tool_names.get(result.call_id.as_str()).copied(),
+                        outcomes.get(result.call_id.as_str()).copied(),
+                    );
+                    if result_facts.result_status.as_deref()
+                        == Some(tool_result_facts::STATUS_UNKNOWN)
+                    {
+                        outcome.results_without_outcome += 1;
+                    }
+                    let (call_index, event_index) = results.next(&result.call_id);
+                    result_facts = result_facts.with_ordering(call_index, event_index);
+                    let uid = format!("result:{}", result.call_id);
+                    insert_session_event(
+                        conn,
+                        SOURCE,
+                        sid,
+                        project,
+                        project,
+                        None,
+                        &uid,
+                        None,
+                        ts,
+                        "tool_result",
+                        "tool_result",
+                        text,
+                        None,
+                        None,
+                        RequestIdentity::none(),
+                        &uid,
+                        Some(&result_facts),
+                        facts,
+                    )?;
+                    outcome.events += 1;
+                    match result_facts.result_status.as_deref() {
+                        Some(tool_result_facts::STATUS_ERRORED)
+                        | Some(tool_result_facts::STATUS_CANCELLED) => {
+                            set_tool_call_error(conn, SOURCE, sid, &result.call_id, true)?
+                        }
+                        Some(tool_result_facts::STATUS_COMPLETED) => {
+                            set_tool_call_error(conn, SOURCE, sid, &result.call_id, false)?
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            muse::MuseEvent::RunTerminal { status, reason } => {
+                let payload_json =
+                    marker_payload(vec![("terminal", json!(status)), ("reason", json!(reason))]);
+                outcome.markers += insert_session_marker(
+                    conn,
+                    SOURCE,
+                    sid,
+                    &NewSessionMarker {
+                        marker_uid: &record_uid,
+                        kind: "turn_end",
+                        subkind: Some("terminal"),
+                        ts_ms: Some(ts),
+                        turn_id: run_id,
+                        text: status.as_deref(),
+                        payload_json: payload_json.as_deref(),
+                        ..Default::default()
+                    },
+                )?;
+            }
+            muse::MuseEvent::SessionOpened { resume } => {
+                let payload_json = marker_payload(vec![("resume", json!(resume))]);
+                outcome.markers += insert_session_marker(
+                    conn,
+                    SOURCE,
+                    sid,
+                    &NewSessionMarker {
+                        marker_uid: &record_uid,
+                        kind: "session_start",
+                        subkind: Some("session.opened.observed"),
+                        ts_ms: Some(ts),
+                        payload_json: payload_json.as_deref(),
+                        ..Default::default()
+                    },
+                )?;
+            }
+            muse::MuseEvent::SessionResumed => {
+                outcome.markers += insert_session_marker(
+                    conn,
+                    SOURCE,
+                    sid,
+                    &NewSessionMarker {
+                        marker_uid: &record_uid,
+                        kind: "session_resumed",
+                        subkind: Some("session.resumed"),
+                        ts_ms: Some(ts),
+                        ..Default::default()
+                    },
+                )?;
+            }
+            muse::MuseEvent::SessionEnd { exit_reason } => {
+                outcome.markers += insert_session_marker(
+                    conn,
+                    SOURCE,
+                    sid,
+                    &NewSessionMarker {
+                        marker_uid: &record_uid,
+                        kind: "session_end",
+                        subkind: Some("session.end"),
+                        ts_ms: Some(ts),
+                        text: exit_reason.as_deref(),
+                        ..Default::default()
+                    },
+                )?;
+            }
+            muse::MuseEvent::Metadata(metadata) => {
+                if metadata.model_id.is_some() {
+                    model = metadata.model_id.clone();
+                }
+                outcome.markers += insert_session_marker(
+                    conn,
+                    SOURCE,
+                    sid,
+                    &NewSessionMarker {
+                        marker_uid: &record_uid,
+                        kind: "model_switch",
+                        subkind: Some(muse::METADATA_PAYLOAD_TYPE),
+                        ts_ms: Some(ts),
+                        text: metadata.model_id.as_deref(),
+                        ..Default::default()
+                    },
+                )?;
+            }
+            // Folded into the result rows above, by call id.
+            muse::MuseEvent::ToolOutcome { .. } => {}
+            // Read by `link_muse_subagents`, which owns the edges.
+            muse::MuseEvent::SubagentLinked(_) => {}
+        }
+    }
+    // A call can end without a result record — cancelled, or failed before
+    // producing output. Its outcome is still Muse's word on how it ended, so
+    // it sets the call's status; a call that has a result was settled above,
+    // where the result's own evidence (a `bash` exit code) is weighed too.
+    for (call_id, (status, _)) in &outcomes {
+        if answered.contains(*call_id) {
+            continue;
+        }
+        let failed = match *status {
+            "completed" => false,
+            "failed" | "cancelled" | "canceled" | "skipped" => true,
+            _ => continue,
+        };
+        set_tool_call_error(conn, SOURCE, sid, call_id, failed)?;
+    }
+
+    let first_ts = transcript.first_ts().unwrap_or_default();
+    let last_ts = transcript.last_ts().unwrap_or(first_ts);
+    upsert_session(
+        conn,
+        sid,
+        SOURCE,
+        project,
+        None,
+        first_ts,
+        last_ts,
+        last_assistant_text.as_deref(),
+        Some(raw_path),
+    )?;
+    // `upsert_session` merges, which suits an append-only log read in pieces.
+    // This read is the whole transcript, so the fields it owns are assigned
+    // from it, empty values included: a rewritten file that no longer has a
+    // reply or a prompt must not keep quoting the old one. A subagent has no
+    // typed prompt to own, so its read leaves `first_prompt` as it is — a
+    // remotely known child keeps the title the remote side gave it.
+    let models = transcript.models();
+    conn.execute(
+        "UPDATE sessions SET first_activity_ms = ?, last_activity_ms = ?, \
+         last_assistant_text = ?, models_json = ?, \
+         first_prompt = CASE WHEN ? THEN ? ELSE first_prompt END, \
+         agent_version = COALESCE(?, agent_version) \
+         WHERE source = 'muse' AND session_id = ?",
+        params![
+            first_ts,
+            last_ts,
+            last_assistant_text.as_deref(),
+            (!models.is_empty()).then(|| serde_json::to_string(&models).unwrap_or_default()),
+            role == MuseRole::Session,
+            first_prompt.as_deref(),
+            version,
+            sid,
+        ],
+    )?;
+    Ok(outcome)
+}
+
+/// Everything a sweep reads under one Grok home: the session directories,
+/// then the process-wide `logs/unified.jsonl`.
+///
+/// Sessions first, so a usage row whose session is indexed in this same sweep
+/// attaches to it now rather than on the next one. A log that cannot be read
+/// does not fail the sessions that could: it is noted, the source stays out
+/// of the cached fingerprint so the next sweep retries it, and the cursor has
+/// not moved.
+fn sync_grok_home(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    grok_home: &Path,
+    coverage: &mut SweepCoverage,
+) -> Result<usize> {
+    let inserted = sync_grok_with_coverage(conn, state, &grok_home.join("sessions"), coverage)?;
+    match sync_grok_unified_log(conn, grok_home) {
+        Ok(pass) => {
+            if pass.bytes_read > 0 {
+                let mut suffix = String::new();
+                if pass.unattributed > 0 {
+                    suffix.push_str(&format!(", {} with no session", pass.unattributed));
+                }
+                if pass.malformed > 0 {
+                    suffix.push_str(&format!(", {} unreadable rows", pass.malformed));
+                }
+                if pass.orphan_rows > 0 {
+                    suffix.push_str(&format!(
+                        ", {} retained for sessions not indexed",
+                        pass.orphan_rows
+                    ));
+                }
+                sync_note!(
+                    "  [grok] +{} usage rows from logs/unified.jsonl ({} sessions{suffix})",
+                    pass.new_rows,
+                    pass.sessions_materialized
+                );
+            }
+        }
+        Err(error) => {
+            if error.is::<CaptureCancelled>() {
+                return Err(error);
+            }
+            coverage.note_unread();
+            sync_note!(
+                "  [grok] unreadable {}: {error:#}",
+                grok_unified_log_path(grok_home).display()
+            );
+        }
+    }
+    Ok(inserted)
+}
+
 #[cfg(test)]
 fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> Result<usize> {
     sync_grok_with_coverage(conn, state, root, &mut SweepCoverage::default())
@@ -10092,7 +13492,13 @@ fn sync_grok_with_coverage(
                     accounted += 1;
                     continue;
                 }
-                (Some(id), Some(true) | None) if grok_evidence_exists(conn, id)? => {
+                (Some(id), Some(true) | None)
+                    if grok_indexed_evidence_remains(
+                        conn,
+                        id,
+                        recorded.and_then(grok_state_transcript_events),
+                    )? =>
+                {
                     accounted += 1;
                     continue;
                 }
@@ -10128,7 +13534,15 @@ fn sync_grok_with_coverage(
                 // `evidence` says whether there was any to ask about.
                 grok_state.insert(
                     key,
-                    json!({ "stamp": stamp, "session": session_id, "evidence": had_evidence }),
+                    json!({
+                        "stamp": stamp,
+                        "session": session_id,
+                        "evidence": had_evidence,
+                        // Unified-log rows are not this flag. A later run that
+                        // still has one of them and has lost the transcript
+                        // must re-read; markers alone must not hide that.
+                        "transcript_events": outcome.events > 0,
+                    }),
                 );
             }
             Ok(None) => {
@@ -10175,6 +13589,502 @@ fn sync_grok_with_coverage(
     Ok(inserted)
 }
 
+/// Where Grok writes its process-wide per-inference log, under the Grok home
+/// (`GROK_HOME`, else `~/.grok`).
+pub(crate) fn grok_unified_log_path(grok_home: &Path) -> PathBuf {
+    grok_home.join("logs").join("unified.jsonl")
+}
+
+/// The key the unified log's per-process model memory is parked under in its
+/// `transcript_cursors` document.
+const GROK_UNIFIED_CURSOR_KEY: &str = "grok_unified";
+
+/// What one pass over `logs/unified.jsonl` did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct GrokUnifiedPass {
+    /// Bytes read past the committed cursor. Zero when nothing was appended.
+    pub bytes_read: u64,
+    /// Usage rows read this pass, and how many of them were new.
+    pub usage_rows: usize,
+    pub new_rows: usize,
+    /// Usage rows that named no session, so could not be attached.
+    pub unattributed: usize,
+    /// Terminated rows that were not JSON, or were too large to hold.
+    pub malformed: usize,
+    /// Catalogued sessions that gained usage events.
+    pub sessions_materialized: usize,
+    /// Stored rows, from any pass, whose session is not in the catalog. They
+    /// are kept — the log is never re-read, so dropping them would lose the
+    /// usage for good if the session is indexed later — and counted so the
+    /// retained backlog is visible.
+    pub orphan_rows: usize,
+}
+
+/// Read what `logs/unified.jsonl` gained since the last pass, in one
+/// transaction: the new rows, the advanced cursor, and the usage events of
+/// every catalogued session they touch commit together or not at all.
+///
+/// The transaction is taken `IMMEDIATE`, so the write lock is held from the
+/// first read of the cursor: a deferred one that read the cursor while a
+/// hydration was writing would fail to upgrade (`SQLITE_BUSY_SNAPSHOT`)
+/// instead of waiting behind it.
+pub(crate) fn sync_grok_unified_log(
+    conn: &Connection,
+    grok_home: &Path,
+) -> Result<GrokUnifiedPass> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let pass = sync_grok_unified_log_in(&tx, grok_home)?;
+    tx.commit()?;
+    Ok(pass)
+}
+
+/// [`sync_grok_unified_log`] inside a transaction the caller already holds —
+/// targeted hydration's.
+///
+/// The log is append-only and covers every session on the machine, so it is
+/// read from a byte cursor, never re-read whole: a second pass over an
+/// unchanged log reads zero bytes. Each usage row is copied into
+/// `grok_unified_usage` — the durable copy, because the bytes are never read
+/// again — keyed on [`grok::unified_row_key`], so a region read twice after a
+/// rotation writes the same rows. A trailing line with no newline is withheld
+/// until it has one. A terminated row that is not JSON is counted and passed
+/// over: the log is Grok's process log, not a session's evidence, and holding
+/// the cursor on one bad line would stop every later inference being read.
+pub(crate) fn sync_grok_unified_log_in(
+    conn: &Connection,
+    grok_home: &Path,
+) -> Result<GrokUnifiedPass> {
+    let mut pass = GrokUnifiedPass::default();
+    let path = grok_unified_log_path(grok_home);
+    match path.metadata() {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return Ok(pass),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(pass),
+        Err(error) => {
+            return Err(error).with_context(|| format!("stat Grok unified log {}", path.display()))
+        }
+    }
+    let locator = path.to_string_lossy().to_string();
+    let key = transcript_cursor::CursorKey::Locator {
+        source: "grok",
+        locator: &locator,
+    };
+    let mut cursor = transcript_cursor::load_cursor(conn, &key)?;
+    let mut reader = transcript_cursor::TranscriptReader::open(&path, cursor.file.as_ref(), None)
+        .with_context(|| format!("read Grok unified log {}", path.display()))?;
+    let start = reader.start_offset();
+    // Which model each process last named. Only meaningful for the bytes
+    // after the cursor, so a log read from the start begins with none.
+    let mut pid_models: HashMap<i64, String> = if start == 0 {
+        HashMap::new()
+    } else {
+        cursor
+            .extra
+            .get(GROK_UNIFIED_CURSOR_KEY)
+            .and_then(|state| state.get("pid_models"))
+            .and_then(|models| serde_json::from_value(models.clone()).ok())
+            .unwrap_or_default()
+    };
+    let mut touched: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut line = String::new();
+    loop {
+        check_capture_cancelled()?;
+        let offset = reader.position();
+        match reader.next_line(&mut line)? {
+            None | Some(transcript_cursor::ReadRecord::Unterminated) => break,
+            Some(transcript_cursor::ReadRecord::Oversized { .. }) => {
+                pass.malformed += 1;
+                continue;
+            }
+            Some(transcript_cursor::ReadRecord::Terminated) => {}
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            pass.malformed += 1;
+            continue;
+        };
+        match grok::parse_unified_row(&value, &pid_models) {
+            grok::GrokUnifiedRow::Usage(usage) => {
+                pass.usage_rows += 1;
+                pass.new_rows += conn.execute(
+                    "INSERT OR IGNORE INTO grok_unified_usage \
+                     (row_key, session_id, ts_ms, pid, model, event_id, usage_json, locator, line_offset) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    params![
+                        grok::unified_row_key(&value),
+                        usage.session_id,
+                        usage.ts_ms,
+                        usage.pid,
+                        usage.model,
+                        usage.event_id,
+                        usage.usage.to_string(),
+                        locator,
+                        offset as i64,
+                    ],
+                )?;
+                touched.insert(usage.session_id);
+            }
+            grok::GrokUnifiedRow::ModelChange { pid, model } => {
+                pid_models.insert(pid, model);
+            }
+            grok::GrokUnifiedRow::Unattributed => pass.unattributed += 1,
+            grok::GrokUnifiedRow::Other => {}
+        }
+    }
+    pass.bytes_read = reader.position().saturating_sub(start);
+    match reader.commit(reader.position())? {
+        transcript_cursor::CommitOutcome::Published(file) => {
+            cursor.file = Some(file);
+            cursor.extra.insert(
+                GROK_UNIFIED_CURSOR_KEY.to_string(),
+                json!({ "pid_models": pid_models }),
+            );
+            transcript_cursor::store_cursor(conn, &key, &cursor)?;
+        }
+        // The log was replaced or truncated while it was being read. The rows
+        // already copied are keyed on their content, so keeping them is
+        // harmless; the cursor stays where it was and the next pass re-reads.
+        transcript_cursor::CommitOutcome::Superseded => {}
+    }
+    for session_id in touched {
+        if !grok_catalog_row_exists(conn, &session_id)? {
+            // Retained, not dropped: the rows wait in `grok_unified_usage`
+            // until the session is indexed, and that ingestion attaches them.
+            continue;
+        }
+        if materialize_grok_unified_usage(conn, &session_id, None)?.inserted == 0 {
+            continue;
+        }
+        // A cached hydration replays the diagnostics it stored, and those
+        // were written before this usage existed. Clearing them makes the
+        // next unchanged read rebuild the usage caveat from the stored rows.
+        conn.execute(
+            "UPDATE session_hydration_checkpoints SET source_diagnostics_json = NULL \
+             WHERE source = 'grok' AND session_id = ?",
+            params![session_id],
+        )?;
+        pass.sessions_materialized += 1;
+    }
+    let orphans: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM grok_unified_usage u WHERE NOT EXISTS \
+         (SELECT 1 FROM sessions s WHERE s.source = 'grok' AND s.session_id = u.session_id)",
+        [],
+        |row| row.get(0),
+    )?;
+    pass.orphan_rows = orphans as usize;
+    Ok(pass)
+}
+
+/// How many `logs/unified.jsonl` usage rows are stored for one session.
+fn grok_unified_rows_pending(conn: &Connection, session_id: &str) -> Result<usize> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM grok_unified_usage WHERE session_id = ?",
+        params![session_id],
+        |row| row.get(0),
+    )?;
+    Ok(count as usize)
+}
+
+/// What attaching one session's `logs/unified.jsonl` rows established.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GrokUnifiedCoverage {
+    /// Stored usage rows for the session, attached now or before.
+    pub rows: usize,
+    /// Rows attached by this call; zero when nothing was new.
+    pub inserted: usize,
+    /// Turns the log covers: a demoted breakdown, or any other turn whose
+    /// window holds a log row (including a context snapshot with no breakdown).
+    pub covered_turns: usize,
+    /// Turns the log does not cover whose `turn_completed.usage` still counts.
+    pub turn_usage_turns: usize,
+    /// Turns the log does not cover and that carry no breakdown: a context
+    /// snapshot, or a turn the census recorded that left no row.
+    pub proxy_only_turns: usize,
+}
+
+/// How many turns the last replacing read of one Grok session saw.
+fn store_grok_turn_census(conn: &Connection, session_id: &str, turns: usize) -> Result<()> {
+    conn.execute(
+        "INSERT INTO grok_session_turns (session_id, turns) VALUES (?, ?) \
+         ON CONFLICT(session_id) DO UPDATE SET turns = excluded.turns",
+        params![session_id, turns as i64],
+    )?;
+    Ok(())
+}
+
+fn grok_turn_census(conn: &Connection, session_id: &str) -> Result<Option<usize>> {
+    let turns: Option<i64> = conn
+        .query_row(
+            "SELECT turns FROM grok_session_turns WHERE session_id = ?",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(turns.map(|turns| turns.max(0) as usize))
+}
+
+/// Whether one stored turn row's window contains a unified-log timestamp.
+fn unified_timestamp_covers(token: &Value, timestamps: &[Option<i64>]) -> bool {
+    let Some(start) = token.get("turn_start_ms").and_then(Value::as_i64) else {
+        return false;
+    };
+    let Some(end) = token.get("turn_end_ms").and_then(Value::as_i64) else {
+        return false;
+    };
+    timestamps
+        .iter()
+        .flatten()
+        .any(|ts| *ts >= start && *ts <= end)
+}
+
+/// Which of a session's turns `logs/unified.jsonl` covers.
+///
+/// `turn_tokens` are the `updates.jsonl` token objects, one per turn that
+/// left a row. `unified_timestamps` are every stored log row's time (`None`
+/// when the row named none — that row covers every turn). `census_turns` is
+/// how many turns the stream opened, when the replacing read recorded it;
+/// turns it counts that left no row are uncovered unless a timeless log row
+/// covers the session.
+pub(crate) fn classify_grok_turn_coverage(
+    turn_tokens: &[Value],
+    unified_timestamps: &[Option<i64>],
+    census_turns: Option<usize>,
+) -> GrokUnifiedCoverage {
+    let timeless = unified_timestamps.iter().any(Option::is_none);
+    let mut covered = 0usize;
+    let mut own = 0usize;
+    let mut proxy = 0usize;
+    for token in turn_tokens {
+        if timeless
+            || token.get("turn_usage").is_some()
+            || unified_timestamp_covers(token, unified_timestamps)
+        {
+            covered += 1;
+        } else if token.get("usage").is_some() {
+            own += 1;
+        } else {
+            proxy += 1;
+        }
+    }
+    if let Some(turns) = census_turns {
+        let hidden = turns.saturating_sub(covered + own + proxy);
+        if timeless {
+            covered += hidden;
+        } else {
+            proxy += hidden;
+        }
+    }
+    GrokUnifiedCoverage {
+        covered_turns: covered,
+        turn_usage_turns: own,
+        proxy_only_turns: proxy,
+        ..GrokUnifiedCoverage::default()
+    }
+}
+
+/// One stored `grok_unified_usage` row, as materialization reads it.
+struct GrokUnifiedStored {
+    row_key: String,
+    ts_ms: Option<i64>,
+    pid: Option<i64>,
+    model: Option<String>,
+    event_id: Option<String>,
+    usage_json: String,
+}
+
+/// Attach one session's stored `logs/unified.jsonl` rows as usage events, and
+/// settle which of its turns they cover.
+///
+/// Each row becomes one assistant event keyed `unified:<row key>`, in its own
+/// request span, with `token_json = {"usage": <counters>, "source":
+/// "logs/unified.jsonl", …}` — one inference, one request, normalized as
+/// `per-request` usage. The event carries no text, so it is
+/// `kind = "text"` with `raw_kind = "unified_log_usage"` to say what it is.
+/// Only rows with no event yet are inserted: an append attaches its own rows
+/// and leaves every event already stored untouched, so the change feed sees
+/// the new rows and nothing else.
+///
+/// Coverage is decided **per turn**. A turn's `turn_completed.usage` is moved
+/// to `turn_usage` (not normalized) only when a log row falls inside that
+/// turn's `[turn_start_ms, turn_end_ms]`; a turn the log does not reach —
+/// the log started mid-session, or was rotated away — keeps its breakdown as
+/// `usage`. So the same spend is never counted twice and a turn the log never
+/// saw is not dropped. A log row with no time cannot be placed in a turn, so
+/// its presence covers every turn: dropping a turn's breakdown is recoverable
+/// from `turn_usage`, counting one inference twice is not. The rows' models
+/// join `models_json`, and a row later than the session's last activity
+/// extends it.
+fn materialize_grok_unified_usage(
+    conn: &Connection,
+    session_id: &str,
+    fallback_ts: Option<i64>,
+) -> Result<GrokUnifiedCoverage> {
+    const SOURCE: &str = "grok";
+    type SessionFacts = (Option<String>, Option<String>, Option<i64>, Option<String>);
+    let session: Option<SessionFacts> = conn
+        .query_row(
+            "SELECT cwd, git_branch, first_activity_ms, models_json FROM sessions \
+             WHERE source = 'grok' AND session_id = ?",
+            params![session_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((cwd, branch, first_activity, models_json)) = session else {
+        return Ok(GrokUnifiedCoverage::default());
+    };
+    let total = grok_unified_rows_pending(conn, session_id)?;
+    if total == 0 {
+        return Ok(GrokUnifiedCoverage::default());
+    }
+    // Rows whose local event is not stored yet. A row already attached is
+    // left exactly as it is.
+    let rows = conn
+        .prepare(
+            "SELECT row_key, ts_ms, pid, model, event_id, usage_json FROM grok_unified_usage u \
+             WHERE session_id = ?1 AND NOT EXISTS (SELECT 1 FROM session_events e \
+               WHERE e.source = 'grok' AND e.session_id = ?1 \
+               AND e.event_uid = 'unified:' || u.row_key AND e.location IN ('local', 'both')) \
+             ORDER BY ts_ms IS NULL, ts_ms, locator, line_offset, row_key",
+        )?
+        .query_map(params![session_id], |row| {
+            Ok(GrokUnifiedStored {
+                row_key: row.get(0)?,
+                ts_ms: row.get(1)?,
+                pid: row.get(2)?,
+                model: row.get(3)?,
+                event_id: row.get(4)?,
+                usage_json: row.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let fallback_ts = fallback_ts.or(first_activity).unwrap_or(0);
+    let mut models: Vec<String> = models_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_default();
+    let models_before = models.len();
+    for row in &rows {
+        check_capture_cancelled()?;
+        let uid = format!("unified:{}", row.row_key);
+        let mut token_json = serde_json::Map::new();
+        token_json.insert(
+            "usage".into(),
+            serde_json::from_str(&row.usage_json).unwrap_or(Value::Null),
+        );
+        token_json.insert("source".into(), json!("logs/unified.jsonl"));
+        if let Some(pid) = row.pid {
+            token_json.insert("pid".into(), json!(pid));
+        }
+        if let Some(event_id) = &row.event_id {
+            token_json.insert("event_id".into(), json!(event_id));
+        }
+        let token_json = Value::Object(token_json).to_string();
+        insert_session_event_with_provenance(
+            conn,
+            SOURCE,
+            session_id,
+            cwd.as_deref(),
+            cwd.as_deref(),
+            branch.as_deref(),
+            &uid,
+            None,
+            row.ts_ms.unwrap_or(fallback_ts),
+            "assistant",
+            "text",
+            None,
+            row.model.as_deref(),
+            Some(&token_json),
+            None,
+            None,
+            RequestIdentity::none(),
+            &uid,
+            None,
+            RawMessageFacts {
+                request_span: Some(&uid),
+                ..RawMessageFacts::default()
+            },
+            Some("unified_log_usage"),
+        )?;
+        if let Some(model) = &row.model {
+            if !models.iter().any(|seen| seen == model) {
+                models.push(model.clone());
+            }
+        }
+    }
+    // Per turn: demote a turn's breakdown only when the log reaches into it.
+    // A turn with no recorded window cannot be placed, so a timed row never
+    // covers it; only a timeless row (which covers every turn) does. Otherwise
+    // it keeps its own `usage`, and `classify_grok_turn_coverage` counts it so.
+    conn.execute(
+        "UPDATE session_events SET token_json = json_set(json_remove(token_json, '$.usage'), \
+         '$.turn_usage', json(json_extract(token_json, '$.usage'))) \
+         WHERE source = 'grok' AND session_id = ?1 AND event_uid NOT LIKE 'unified:%' \
+         AND token_json IS NOT NULL AND json_valid(token_json) \
+         AND json_extract(token_json, '$.source') = 'updates.jsonl' \
+         AND json_type(token_json, '$.usage') IS NOT NULL \
+         AND (EXISTS (SELECT 1 FROM grok_unified_usage u WHERE u.session_id = ?1 \
+                AND u.ts_ms IS NULL) \
+           OR EXISTS (SELECT 1 FROM grok_unified_usage u WHERE u.session_id = ?1 \
+                AND u.ts_ms BETWEEN json_extract(token_json, '$.turn_start_ms') \
+                                AND json_extract(token_json, '$.turn_end_ms')))",
+        params![session_id],
+    )?;
+    if models.len() != models_before {
+        conn.execute(
+            "UPDATE sessions SET models_json = ? WHERE source = 'grok' AND session_id = ?",
+            params![serde_json::to_string(&models)?, session_id],
+        )?;
+    }
+    // An inference logged after the session's last recorded activity is
+    // activity too.
+    conn.execute(
+        "UPDATE sessions SET last_activity_ms = \
+           (SELECT MAX(ts_ms) FROM grok_unified_usage WHERE session_id = ?1) \
+         WHERE source = 'grok' AND session_id = ?1 \
+         AND (SELECT MAX(ts_ms) FROM grok_unified_usage WHERE session_id = ?1) \
+             > COALESCE(last_activity_ms, 0)",
+        params![session_id],
+    )?;
+    let class = grok_turn_coverage(conn, session_id)?;
+    Ok(GrokUnifiedCoverage {
+        rows: total,
+        inserted: rows.len(),
+        covered_turns: class.covered_turns,
+        turn_usage_turns: class.turn_usage_turns,
+        proxy_only_turns: class.proxy_only_turns,
+    })
+}
+
+/// Coverage of one session from the rows already stored: the turn token
+/// objects, the log timestamps, and the turn census when a replacing read
+/// wrote one.
+fn grok_turn_coverage(conn: &Connection, session_id: &str) -> Result<GrokUnifiedCoverage> {
+    let turn_tokens = conn
+        .prepare(
+            "SELECT token_json FROM session_events \
+             WHERE source = 'grok' AND session_id = ? \
+               AND token_json IS NOT NULL AND json_valid(token_json) \
+               AND json_extract(token_json, '$.source') = 'updates.jsonl'",
+        )?
+        .query_map(params![session_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .filter_map(|raw| serde_json::from_str::<Value>(raw).ok())
+        .collect::<Vec<_>>();
+    let unified_timestamps = conn
+        .prepare("SELECT ts_ms FROM grok_unified_usage WHERE session_id = ?")?
+        .query_map(params![session_id], |row| row.get::<_, Option<i64>>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(classify_grok_turn_coverage(
+        &turn_tokens,
+        &unified_timestamps,
+        grok_turn_census(conn, session_id)?,
+    ))
+}
+
 /// What indexing one Grok session directory produced, and what its own records
 /// could not establish.
 ///
@@ -10212,6 +14122,29 @@ pub(crate) struct GrokIngestOutcome {
     pub updates_yielded_no_timing: bool,
     /// The newest `turn_completed` context snapshot, for the caller's report.
     pub context_total_tokens: Option<i64>,
+    /// Turns whose `turn_completed` usage breakdown was stored on one of the
+    /// turn's assistant rows, and how many turns `updates.jsonl` opened in
+    /// all.
+    pub usage_turns: usize,
+    pub turns: usize,
+    /// Per-inference usage rows from `logs/unified.jsonl` stored for this
+    /// session.
+    pub unified_usage_rows: usize,
+    /// Which turns those rows cover, and what the rest carry.
+    pub unified_coverage: GrokUnifiedCoverage,
+}
+
+/// The request span of a Grok assistant row: the `updates.jsonl` turn it
+/// belongs to.
+///
+/// Grok names none of its API calls, and the only usage it reports is one
+/// `turn_completed.usage` per turn, so the turn is the finest unit a request
+/// can be measured at. Without a shared span each assistant row of a turn —
+/// its thinking, every tool call, its prose — grouped as a request of its
+/// own, and a turn that called a tool read as several requests, all but one
+/// unmeasured.
+fn grok_turn_span(turn: Option<usize>) -> Option<String> {
+    turn.map(|turn| turn.to_string())
 }
 
 /// Index one Grok session directory: prompts, events, tools, edits, markers
@@ -10236,6 +14169,13 @@ fn ingest_grok_session(
             .iter()
             .rev()
             .find_map(|turn| turn.total_tokens),
+        usage_turns: session
+            .updates
+            .turns
+            .iter()
+            .filter(|turn| turn.usage.is_some())
+            .count(),
+        turns: session.updates.turns.len(),
         ..Default::default()
     };
 
@@ -10254,6 +14194,12 @@ fn ingest_grok_session(
     // displace the message, and a turn with no message still has a tail.
     let mut turn_tail: HashMap<usize, String> = HashMap::new();
     let mut turn_tool_tail: HashMap<usize, String> = HashMap::new();
+    // The last resort: a turn whose only readable output was its thinking
+    // still shares one request span, and its usage belongs on that row.
+    let mut turn_thinking_tail: HashMap<usize, String> = HashMap::new();
+    // The whole session is re-read on every pass (its evidence is replaced
+    // above), so the indexes are the same every time.
+    let mut tool_results = tool_result_facts::ToolResultIndexer::default();
 
     for (idx, line) in session.lines.iter().enumerate() {
         check_capture_cancelled()?;
@@ -10347,7 +14293,7 @@ fn ingest_grok_session(
                 if first_prompt.is_none() {
                     first_prompt = Some(crate::discover::excerpt(text));
                 }
-                let uid = grok_event_uid(group.and_then(|group| group.event_id.as_deref()), idx);
+                let uid = grok_event_uid(group.and_then(|group| group.event_key.as_deref()), idx);
                 insert_session_event(
                     conn,
                     SOURCE,
@@ -10423,7 +14369,7 @@ fn ingest_grok_session(
                     }
                     continue;
                 };
-                let uid = grok_event_uid(group.and_then(|group| group.event_id.as_deref()), idx);
+                let uid = grok_event_uid(group.and_then(|group| group.event_key.as_deref()), idx);
                 insert_session_event(
                     conn,
                     SOURCE,
@@ -10442,9 +14388,15 @@ fn ingest_grok_session(
                     RequestIdentity::none(),
                     &uid,
                     None,
-                    RawMessageFacts::default(),
+                    RawMessageFacts {
+                        request_span: grok_turn_span(turn).as_deref(),
+                        ..RawMessageFacts::default()
+                    },
                 )?;
                 outcome.events += 1;
+                if let Some(turn) = turn {
+                    turn_thinking_tail.insert(turn, uid);
+                }
             }
             grok::GrokRecord::Assistant { text, model, calls } => {
                 if let Some(text) = text {
@@ -10463,7 +14415,7 @@ fn ingest_grok_session(
                     );
                     inherited = Some(ts);
                     let uid =
-                        grok_event_uid(group.and_then(|group| group.event_id.as_deref()), idx);
+                        grok_event_uid(group.and_then(|group| group.event_key.as_deref()), idx);
                     insert_session_event(
                         conn,
                         SOURCE,
@@ -10482,7 +14434,10 @@ fn ingest_grok_session(
                         RequestIdentity::none(),
                         &uid,
                         None,
-                        RawMessageFacts::default(),
+                        RawMessageFacts {
+                            request_span: grok_turn_span(turn).as_deref(),
+                            ..RawMessageFacts::default()
+                        },
                     )?;
                     outcome.events += 1;
                     if let Some(turn) = turn {
@@ -10529,7 +14484,10 @@ fn ingest_grok_session(
                         RequestIdentity::none(),
                         &uid,
                         None,
-                        RawMessageFacts::default(),
+                        RawMessageFacts {
+                            request_span: grok_turn_span(call_turn).as_deref(),
+                            ..RawMessageFacts::default()
+                        },
                     )?;
                     outcome.events += 1;
                     // `updates.jsonl` knows which turn the call belongs to even
@@ -10577,6 +14535,7 @@ fn ingest_grok_session(
                 call_id,
                 text,
                 is_error,
+                content,
             } => {
                 let tool_use_id = call_id.clone().unwrap_or_else(|| format!("r{idx}:result"));
                 let timing = session.updates.tools.get(&tool_use_id);
@@ -10599,9 +14558,25 @@ fn ingest_grok_session(
                     || timing
                         .and_then(|timing| timing.status.as_deref())
                         .is_some_and(|status| {
-                            matches!(status, "failed" | "error" | "cancelled" | "canceled")
+                            // Case-blind, as `grok_tool_result_facts` reads
+                            // it, so the call and its result agree.
+                            ["failed", "error", "cancelled", "canceled"]
+                                .iter()
+                                .any(|terminal| status.eq_ignore_ascii_case(terminal))
                         });
                 let uid = format!("result:{tool_use_id}");
+                // Only the provider's own call id is recorded on the facts;
+                // the positional fallback above is a row identity, not a call
+                // anyone made, so it gets no per-call index either.
+                let (call_index, event_index) =
+                    tool_results.next(call_id.as_deref().unwrap_or_default());
+                let facts = tool_result_facts::grok_tool_result_facts(
+                    content,
+                    call_id.as_deref(),
+                    *is_error,
+                    timing.and_then(|timing| timing.status.as_deref()),
+                )
+                .with_ordering(call_index, event_index);
                 insert_session_event(
                     conn,
                     SOURCE,
@@ -10619,7 +14594,7 @@ fn ingest_grok_session(
                     None,
                     RequestIdentity::none(),
                     &uid,
-                    None,
+                    Some(&facts),
                     RawMessageFacts::default(),
                 )?;
                 outcome.events += 1;
@@ -10631,21 +14606,60 @@ fn ingest_grok_session(
         }
     }
 
-    // The context-token proxy, on the turn's final assistant message. It is
-    // stored with its source named so a consumer can see that it is a context
-    // snapshot and not billed usage: Grok logs no per-turn input/output token
-    // counts, and none are estimated here.
+    // The turn's token facts, on its final assistant message. The context
+    // proxy is stored with its source named so a consumer can see that it is
+    // a context snapshot and not billed usage. When the build wrote a per-turn
+    // `usage` breakdown it rides beside the proxy, verbatim, under `usage` —
+    // that is what `crate::usage` normalizes, and the proxy never is. Nothing
+    // is estimated here.
+    //
+    // A turn `logs/unified.jsonl` covers takes its usage from there, per
+    // inference. Its breakdown is written here as `usage` like any other, with
+    // the turn's window beside it, and `materialize_grok_unified_usage` below
+    // moves it to `turn_usage` only if a log row falls inside that window: the
+    // two representations are never added together, and a turn the log never
+    // saw keeps its own.
     for (turn, timing) in session.updates.turns.iter().enumerate() {
         check_capture_cancelled()?;
-        let tail = turn_tail.get(&turn).or_else(|| turn_tool_tail.get(&turn));
-        let (Some(total), Some(uid)) = (timing.total_tokens, tail) else {
+        let tail = turn_tail
+            .get(&turn)
+            .or_else(|| turn_tool_tail.get(&turn))
+            .or_else(|| turn_thinking_tail.get(&turn));
+        let Some(uid) = tail else {
+            // A breakdown with no assistant row to carry it is not stored,
+            // so it must not count toward the coverage the caller reports.
+            if timing.usage.is_some() {
+                outcome.usage_turns = outcome.usage_turns.saturating_sub(1);
+            }
             continue;
         };
-        let token_json = json!({
-            "context_total_tokens": total,
-            "source": "updates.jsonl",
-        })
-        .to_string();
+        let mut token_json = serde_json::Map::new();
+        if let Some(total) = timing.total_tokens {
+            token_json.insert("context_total_tokens".into(), json!(total));
+        }
+        token_json.insert("source".into(), json!("updates.jsonl"));
+        if let Some(usage) = &timing.usage {
+            token_json.insert("usage".into(), usage.clone());
+        }
+        // The window the per-turn coverage decision is made over. A turn that
+        // recorded no breakdown still has one, and a log row inside it is
+        // that turn's usage — stored here so a cached read can see the same
+        // window the parse did.
+        if let Some(start) = timing.start_ms {
+            token_json.insert("turn_start_ms".into(), json!(start));
+        }
+        if let Some(end) = timing.end_ms {
+            token_json.insert("turn_end_ms".into(), json!(end));
+        }
+        if let Some(model) = &timing.model {
+            token_json.insert("model".into(), json!(model));
+        }
+        if token_json.len() == 1 && timing.start_ms.is_none() && timing.end_ms.is_none() {
+            // `source` alone: the turn named no time and no token fact. The
+            // census still counts it; an empty object would not.
+            continue;
+        }
+        let token_json = Value::Object(token_json).to_string();
         conn.execute(
             "UPDATE session_events SET token_json = ? \
              WHERE source = 'grok' AND session_id = ? AND event_uid = ?",
@@ -10689,6 +14703,15 @@ fn ingest_grok_session(
             sid,
         ],
     )?;
+    // After the catalog row exists: the rows attach to a session, not to a
+    // directory, and a row that arrived before the session was indexed has
+    // been waiting for exactly this. The census lands first so this
+    // materialization, and a later one that only reads the log, can see turns
+    // that left no token row.
+    store_grok_turn_census(conn, sid, outcome.turns)?;
+    let coverage = materialize_grok_unified_usage(conn, sid, Some(session.created_ms))?;
+    outcome.unified_usage_rows = coverage.rows;
+    outcome.unified_coverage = coverage;
     Ok(outcome)
 }
 
@@ -10710,46 +14733,92 @@ fn ingest_grok_session(
 /// child is untouched. The caller runs inside a transaction, so the window
 /// where the evidence is missing is never observable.
 fn replace_grok_session_evidence(conn: &Connection, session_id: &str) -> Result<()> {
-    for statement in [
-        "DELETE FROM session_events WHERE source = 'grok' AND session_id = ?",
-        "DELETE FROM tool_calls WHERE source = 'grok' AND session_id = ?",
-        "DELETE FROM file_edits WHERE source = 'grok' AND session_id = ?",
-        "DELETE FROM session_markers WHERE source = 'grok' AND session_id = ?",
-    ] {
-        conn.execute(statement, params![session_id])?;
-    }
-    // `history` is keyed `(source, timestamp_ms, prompt)` and inserted with
-    // `INSERT OR IGNORE`, so a prompt two sessions both contain is **one row**,
-    // attributed to whichever session was indexed first. Deleting this
-    // session's rows outright would therefore delete a prompt that another,
-    // unchanged session still has -- it would vanish from search with nothing
-    // to say it had ever been there, and nothing would ever put it back,
-    // because that session's own files never change again.
-    //
-    // So a row this session no longer owns is **re-attributed** rather than
-    // skipped. Skipping was the other option and is worse: it would leave the
-    // row filed under a session that no longer contains the prompt, which is
-    // a false statement about provenance, and would leave it undeletable --
-    // the only session that could ever clean it up is the one that no longer
-    // evidences it. Re-attribution moves the row to a session whose stored
-    // events actually carry that prompt at that moment, so the row stays true
-    // and stays owned.
+    retire_local_session_evidence(conn, "grok", session_id)?;
+    // Every Grok prompt written before this parser carried a timestamp
+    // synthesized as `created_at + index`; merging would keep the fabricated
+    // ones forever, so history is replaced, not merged.
+    replace_session_history(conn, "grok", session_id)?;
     conn.execute(
-        "UPDATE history AS h SET            session_id = (SELECT e.session_id FROM session_events e                          WHERE e.source = 'grok' AND e.role = 'user' AND e.kind = 'text'                            AND e.session_id <> h.session_id                            AND e.ts_ms = h.timestamp_ms AND e.text = h.prompt                          ORDER BY e.session_id LIMIT 1),            project = (SELECT e.project FROM session_events e                       WHERE e.source = 'grok' AND e.role = 'user' AND e.kind = 'text'                         AND e.session_id <> h.session_id                         AND e.ts_ms = h.timestamp_ms AND e.text = h.prompt                       ORDER BY e.session_id LIMIT 1)          WHERE h.source = 'grok' AND h.session_id = ?            AND EXISTS(SELECT 1 FROM session_events e                       WHERE e.source = 'grok' AND e.role = 'user' AND e.kind = 'text'                         AND e.session_id <> h.session_id                         AND e.ts_ms = h.timestamp_ms AND e.text = h.prompt)",
-        params![session_id],
-    )?;
-    for statement in [
-        // What is left is this session's alone. A prompt's identity is
-        // `(source, timestamp_ms, prompt)`, and every Grok prompt written
-        // before this parser carried a timestamp synthesized as
-        // `created_at + index`; merging would keep the fabricated ones
-        // forever.
-        "DELETE FROM history WHERE source = 'grok' AND session_id = ?",
         "DELETE FROM session_relationships WHERE source = 'grok' \
          AND parent_session_id = ? AND evidence_kind = 'grok_subagent_dir'",
-    ] {
-        conn.execute(statement, params![session_id])?;
-    }
+        params![session_id],
+    )?;
+    Ok(())
+}
+
+/// Drop the `history` rows one session owns, ahead of a whole-session
+/// re-read that writes them again.
+///
+/// `history` is keyed `(source, timestamp_ms, prompt)` and inserted with
+/// `INSERT OR IGNORE`, so a prompt two sessions both contain is **one row**,
+/// attributed to whichever session was indexed first. Deleting this
+/// session's rows outright would therefore delete a prompt that another,
+/// unchanged session still has -- it would vanish from search with nothing
+/// to say it had ever been there, and nothing would ever put it back,
+/// because that session's own files never change again.
+///
+/// So a row this session no longer owns is **re-attributed** rather than
+/// skipped. Skipping was the other option and is worse: it would leave the
+/// row filed under a session that no longer contains the prompt, which is
+/// a false statement about provenance, and would leave it undeletable --
+/// the only session that could ever clean it up is the one that no longer
+/// evidences it. Re-attribution moves the row to a session whose stored
+/// events actually carry that prompt at that moment, so the row stays true
+/// and stays owned. What is left is this session's alone, and is deleted.
+fn replace_session_history(conn: &Connection, source: &str, session_id: &str) -> Result<()> {
+    replace_session_history_scoped(conn, source, session_id, HistoryScope::Session)
+}
+
+/// Which of a session's `history` rows a re-read owns.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HistoryScope {
+    /// Every row filed under the session.
+    Session,
+    /// Only the rows its own stored prompt events name — what the previous
+    /// read of the same transcript wrote. For a session whose identity it
+    /// shares with remote evidence, whose rows it did not write. Must run
+    /// before those events are replaced.
+    OwnPromptEvents,
+}
+
+/// [`replace_session_history`] over the rows `scope` names: each is
+/// re-attributed to another session that still evidences it, or deleted.
+fn replace_session_history_scoped(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+    scope: HistoryScope,
+) -> Result<()> {
+    let owned = match scope {
+        HistoryScope::Session => "",
+        HistoryScope::OwnPromptEvents => {
+            " AND EXISTS(SELECT 1 FROM session_events own \
+                         WHERE own.source = h.source AND own.session_id = h.session_id \
+                           AND own.role = 'user' AND own.kind = 'text' \
+                           AND own.ts_ms = h.timestamp_ms AND own.text = h.prompt)"
+        }
+    };
+    let update = format!(
+        "UPDATE history AS h SET \
+           session_id = (SELECT e.session_id FROM session_events e \
+                         WHERE e.source = h.source AND e.role = 'user' AND e.kind = 'text' \
+                           AND e.session_id <> h.session_id \
+                           AND e.ts_ms = h.timestamp_ms AND e.text = h.prompt \
+                         ORDER BY e.session_id LIMIT 1), \
+           project = (SELECT e.project FROM session_events e \
+                      WHERE e.source = h.source AND e.role = 'user' AND e.kind = 'text' \
+                        AND e.session_id <> h.session_id \
+                        AND e.ts_ms = h.timestamp_ms AND e.text = h.prompt \
+                      ORDER BY e.session_id LIMIT 1) \
+         WHERE h.source = ? AND h.session_id = ? \
+           AND EXISTS(SELECT 1 FROM session_events e \
+                      WHERE e.source = h.source AND e.role = 'user' AND e.kind = 'text' \
+                        AND e.session_id <> h.session_id \
+                        AND e.ts_ms = h.timestamp_ms AND e.text = h.prompt){owned}",
+    );
+    conn.execute(&update, params![source, session_id])?;
+    let delete = format!("DELETE FROM history AS h WHERE h.source = ? AND h.session_id = ?{owned}");
+    conn.execute(&delete, params![source, session_id])?;
     Ok(())
 }
 
@@ -10903,6 +14972,9 @@ fn grok_signals_summary(signals: &grok::GrokSignals) -> String {
     if let Some(tokens) = signals.context_tokens_used {
         parts.push(format!("context_tokens_used={tokens}"));
     }
+    if let Some(tokens) = signals.total_tokens_before_compaction {
+        parts.push(format!("total_tokens_before_compaction={tokens}"));
+    }
     parts.join(" ")
 }
 
@@ -10937,7 +15009,10 @@ fn resolve_grok_ts(
 /// `chat_history.jsonl` writes no record id at all, so without the join the
 /// only identity available is positional. Grok rebuilds that file on a format
 /// upgrade, which renumbers it; an `eventId` survives that, which is why it is
-/// preferred.
+/// preferred. Grok also *reuses* an `eventId` across records, so what arrives
+/// here is [`grok::ChunkGroup::event_key`] — the id for its first message and
+/// the id suffixed with a repeat number for each later one — and two messages
+/// can never be stored under one identity.
 fn grok_event_uid(event_id: Option<&str>, index: usize) -> String {
     match event_id {
         Some(id) => format!("ev:{id}"),
@@ -10964,7 +15039,13 @@ const GROK_STAMPED_SIBLINGS: &[&str] = &["summary.json", "updates.jsonl"];
 /// The remaining files `ingest_grok_session` reads. They are folded into one
 /// digest rather than appended, so a session with many checkpoints does not
 /// grow an unbounded stamp.
-const GROK_DIGESTED_SIBLINGS: &[&str] = &["signals.json", "prompt_context.json"];
+///
+/// `events.jsonl` is read only when `summary.json` is absent, and it is
+/// digested only then. The file grows with the session; folding it in while
+/// the summary is present re-reads the directory on every append without the
+/// parser consuming the new bytes. `summary.json` has its own marker, so the
+/// summary appearing or disappearing changes the stamp on its own.
+const GROK_DIGESTED_SIBLINGS: &[&str] = &["signals.json", "prompt_context.json", "events.jsonl"];
 
 /// The directories `ingest_grok_session` reads, entry by entry.
 const GROK_DIGESTED_DIRECTORIES: &[&str] = &["compaction_checkpoints", "subagents"];
@@ -11037,7 +15118,11 @@ pub(crate) fn grok_source_inventory(chat: &Path) -> Result<GrokSourceInventory> 
         bytes += sibling.len() as i64;
     }
     let mut digest = Sha256::new();
+    let summary_present = grok_summary_present(chat)?;
     for sibling in GROK_DIGESTED_SIBLINGS {
+        if *sibling == "events.jsonl" && summary_present {
+            continue;
+        }
         let path = chat.with_file_name(sibling);
         let Some(found) = grok_entry_metadata(&path)? else {
             continue;
@@ -11093,17 +15178,51 @@ pub(crate) fn grok_source_inventory(chat: &Path) -> Result<GrokSourceInventory> 
 /// Grok layout writes subagent transcripts that way.
 pub(crate) fn grok_source_records(chat: &Path) -> Result<i64> {
     let mut records = hydrate::complete_jsonl_records(chat)?;
+    let summary_present = grok_summary_present(chat)?;
     for name in GROK_STAMPED_SIBLINGS.iter().chain(GROK_DIGESTED_SIBLINGS) {
         let path = chat.with_file_name(name);
-        if grok_entry_metadata(&path)?.is_some_and(|found| found.is_file()) {
-            records += grok_record_count(&path)?;
+        if !grok_entry_metadata(&path)?.is_some_and(|found| found.is_file()) {
+            continue;
         }
+        if *name == "events.jsonl" {
+            // Read only when there is no summary, and then only its head —
+            // so that is all that is counted, and a long event log is never
+            // read to the end just to count it.
+            if !summary_present {
+                records += grok_events_head_records(&path)?;
+            }
+            continue;
+        }
+        records += grok_record_count(&path)?;
     }
     for directory in GROK_DIGESTED_DIRECTORIES {
         let mut entries = read_dir_files(&chat.with_file_name(directory))?;
         entries.sort();
         for entry in entries {
             records += grok_record_count(&entry)?;
+        }
+    }
+    Ok(records)
+}
+
+fn grok_summary_present(chat: &Path) -> Result<bool> {
+    Ok(grok_entry_metadata(&chat.with_file_name("summary.json"))?
+        .is_some_and(|found| found.is_file()))
+}
+
+/// The non-blank lines among the first [`grok::EVENTS_HEAD_LINES`] of an
+/// `events.jsonl` — what the metadata fallback reads.
+fn grok_events_head_records(path: &Path) -> Result<i64> {
+    let file =
+        fs::File::open(path).with_context(|| format!("read Grok events {}", path.display()))?;
+    let mut records = 0;
+    for line in BufReader::new(file)
+        .split(b'\n')
+        .take(grok::EVENTS_HEAD_LINES)
+    {
+        let line = line.with_context(|| format!("read Grok events {}", path.display()))?;
+        if !line.iter().all(u8::is_ascii_whitespace) {
+            records += 1;
         }
     }
     Ok(records)
@@ -11200,10 +15319,19 @@ fn scan_grok_session_file(chat: &Path) -> Result<Option<GrokSession>> {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+    // `events.jsonl` stands in for the metadata `summary.json` would have
+    // given, and only when there is no summary: a summary that is present
+    // stays the one source of those facts, so the two can never disagree.
+    let events_head = if summary.is_none() {
+        read_grok_events_head(&chat.with_file_name("events.jsonl"))?
+    } else {
+        None
+    };
     let created_ms = summary
         .as_ref()
         .and_then(|s| s.get("created_at").and_then(Value::as_str))
         .and_then(parse_iso_ms)
+        .or_else(|| events_head.as_ref().and_then(|head| head.first_ts_ms))
         .or_else(|| file_modified_ms(chat))
         .unwrap_or(0);
     let updated_ms = summary
@@ -11262,14 +15390,21 @@ fn scan_grok_session_file(chat: &Path) -> Result<Option<GrokSession>> {
         }
         lines.push(parsed);
     }
+    // The models `updates.jsonl` names per turn (`_meta.modelId`, or a
+    // single-key `modelUsage`) are models the session ran on too, including
+    // any turn whose transcript record carried no `model_id`.
+    for model in updates.turns.iter().filter_map(|turn| turn.model.as_ref()) {
+        if !models.iter().any(|seen| seen == model) {
+            models.push(model.clone());
+        }
+    }
     if models.is_empty() {
         if let Some(model) = summary
             .as_ref()
-            .and_then(|s| s.pointer("/info/model").or_else(|| s.get("model")))
-            .and_then(Value::as_str)
-            .filter(|model| !model.is_empty())
+            .and_then(grok::summary_model)
+            .or_else(|| events_head.as_ref().and_then(|head| head.model.clone()))
         {
-            models.push(model.to_string());
+            models.push(model);
         }
     }
 
@@ -11330,6 +15465,28 @@ fn scan_grok_session_file(chat: &Path) -> Result<Option<GrokSession>> {
         compactions,
         subagents,
     }))
+}
+
+/// The head of a session's `events.jsonl`: `None` when it is not there, an
+/// error when it is there and cannot be read. Only the first
+/// [`grok::EVENTS_HEAD_LINES`] lines are read, however large the log is.
+fn read_grok_events_head(path: &Path) -> Result<Option<grok::GrokEventsHead>> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read Grok events {}", path.display()))
+        }
+    };
+    let mut head = String::new();
+    for line in BufReader::new(file).lines().take(grok::EVENTS_HEAD_LINES) {
+        // A line that is not UTF-8 is skipped like one that is not JSON: this
+        // is a metadata fallback, not evidence.
+        let Ok(line) = line else { continue };
+        head.push_str(&line);
+        head.push('\n');
+    }
+    Ok(Some(grok::parse_events_head(&head)))
 }
 
 /// What a read of one Grok sidecar found.
@@ -11621,10 +15778,10 @@ pub(crate) fn grok_chat_text(value: &Value, role: &str) -> Option<String> {
 fn sync_trajectories(
     conn: &Connection,
     state: &mut Map<String, Value>,
-    home: &Path,
+    roots: &crate::ProviderRoots,
     coverage: &mut SweepCoverage,
 ) -> Result<usize> {
-    let files = trajectory_files(home)?;
+    let files = trajectory_files(roots)?;
     if files.is_empty() {
         return Ok(0);
     }
@@ -11671,10 +15828,7 @@ fn sync_trajectories(
                 r.get(0)
             })
             .ok();
-        if let Err(error) = upsert_trajectory(conn, &row) {
-            if is_delivery_retention_limit(&error) {
-                return Err(error);
-            }
+        if upsert_trajectory(conn, &row).is_err() {
             errors += 1;
             coverage.note_unread();
             continue;
@@ -11728,28 +15882,32 @@ struct TrajectoryRow {
 /// all, contributes no files — but it is exactly what has to be watched, so
 /// the first trajectory written into it wakes live capture instead of waiting
 /// for the backstop.
-pub(crate) fn trajectory_roots(home: &Path) -> Result<Vec<PathBuf>> {
-    let mut roots = Vec::new();
-    if let Some(raw) = std::env::var_os("TRAJECTORY_ROOT") {
-        for part in std::env::split_paths(&raw) {
-            if !part.as_os_str().is_empty() {
-                roots.push(part);
+/// The trajectory roots these provider roots name: the explicit list when
+/// one was given (`TRAJECTORY_ROOT`, read once when the roots were built),
+/// otherwise every `.trajectories` directory under `<home>/Projects` as of
+/// now. The environment is not consulted here: an embedder that built its
+/// roots without it must not have a host's `TRAJECTORY_ROOT` redirect its
+/// sweep and its watcher outside the home it named.
+pub(crate) fn trajectory_roots(provider_roots: &crate::ProviderRoots) -> Result<Vec<PathBuf>> {
+    let mut roots = match &provider_roots.trajectory_roots {
+        Some(explicit) => explicit.clone(),
+        None => {
+            let mut derived = Vec::new();
+            let projects = provider_roots.home.join("Projects");
+            if projects.exists() {
+                collect_named_dirs(&projects, ".trajectories", &mut derived)?;
             }
+            derived
         }
-    } else {
-        let projects = home.join("Projects");
-        if projects.exists() {
-            collect_named_dirs(&projects, ".trajectories", &mut roots)?;
-        }
-    }
+    };
     roots.sort();
     roots.dedup();
     Ok(roots)
 }
 
-fn trajectory_files(home: &Path) -> Result<Vec<PathBuf>> {
+fn trajectory_files(provider_roots: &crate::ProviderRoots) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
-    for root in trajectory_roots(home)? {
+    for root in trajectory_roots(provider_roots)? {
         check_capture_cancelled()?;
         if root.is_file() && root.extension().and_then(|s| s.to_str()) == Some("json") {
             files.push(root);
@@ -12073,6 +16231,119 @@ mod tests {
     use rusqlite::Connection;
     use serde_json::{json, Map, Value};
     use std::{fs, io::Write as _, time::Duration};
+
+    /// The walk's per-transcript probes are asked of every Claude file on
+    /// every sweep, so each must be a keyed search whatever the planner knows.
+    /// Unpinned, the "has this path left evidence?" probe was driven from
+    /// `session_events` -- a scan of every Claude event for a path with no
+    /// row, once per file (#215). Checked with and without `sqlite_stat1`,
+    /// because the planner chooses differently once it has statistics.
+    #[test]
+    fn claude_walk_probes_are_keyed_searches() {
+        for analyze in [false, true] {
+            let conn = Connection::open_in_memory().unwrap();
+            init_db(&conn).unwrap();
+            for i in 0..40 {
+                conn.execute(
+                    "INSERT INTO sessions (session_id, source, raw_path) VALUES (?1, 'claude', ?2)",
+                    params![format!("s{i}"), format!("/t/{i}.jsonl")],
+                )
+                .unwrap();
+                for n in 0..20 {
+                    conn.execute(
+                        "INSERT INTO session_events \
+                         (source, session_id, ts_ms, role, kind, text, event_uid) \
+                         VALUES ('claude', ?1, ?2, 'user', 'text', 'hi', ?3)",
+                        params![format!("s{i}"), n, format!("s{i}-e{n}")],
+                    )
+                    .unwrap();
+                }
+                conn.execute(
+                    "INSERT INTO session_relationships \
+                     (source, parent_session_id, relationship_uid, child_session_id, \
+                      relationship, identity_status, evidence_kind, evidence_locator, \
+                      created_ms, updated_ms) \
+                     VALUES ('claude', ?1, ?2, ?2, 'subagent', 'observed', 'sidecar', ?3, 0, 0)",
+                    params![
+                        format!("s{i}"),
+                        format!("c{i}"),
+                        format!("/t/{i}/subagents/agent-{i}.jsonl")
+                    ],
+                )
+                .unwrap();
+            }
+            if analyze {
+                conn.execute_batch("ANALYZE").unwrap();
+            }
+            let plan = |sql: &str, params: &[&dyn rusqlite::ToSql]| {
+                let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+                statement
+                    .query_map(params, |row| row.get::<_, String>(3))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+            };
+            let path = "/t/missing.jsonl";
+            for (name, sql, params, drivers) in [
+                (
+                    "events",
+                    CLAUDE_TRANSCRIPT_EVENTS_SQL,
+                    vec![&path as &dyn rusqlite::ToSql, &path],
+                    vec!["idx_sessions_raw_path"],
+                ),
+                (
+                    "sidecar",
+                    CLAUDE_SIDECAR_EVIDENCE_SQL,
+                    vec![&path as &dyn rusqlite::ToSql],
+                    vec!["idx_session_relationships_locator"],
+                ),
+                (
+                    "fidelity",
+                    CLAUDE_LACKS_TOOL_RESULT_FIDELITY_SQL,
+                    vec![&path as &dyn rusqlite::ToSql],
+                    vec!["idx_sessions_raw_path", "idx_session_relationships_locator"],
+                ),
+                (
+                    "raw facts",
+                    CLAUDE_LACKS_RAW_FACTS_SQL,
+                    vec![&path as &dyn rusqlite::ToSql, &RAW_MESSAGE_FACTS_VERSION],
+                    vec!["idx_sessions_raw_path", "idx_session_relationships_locator"],
+                ),
+            ] {
+                let steps = plan(sql, &params);
+                let joined = steps.join(" | ");
+                assert!(
+                    steps
+                        .iter()
+                        .all(|step| !step.starts_with("SCAN") || step == "SCAN CONSTANT ROW"),
+                    "the {name} probe scans a table (analyze={analyze}): {joined}"
+                );
+                for driver in drivers {
+                    assert!(
+                        joined.contains(driver),
+                        "the {name} probe is not driven by {driver} (analyze={analyze}): {joined}"
+                    );
+                }
+                // The outer table of every join is the one the path keys:
+                // the first search in each top-level subquery names `s` or
+                // `r`. A correlated subquery is already keyed by its outer row.
+                let firsts = steps
+                    .windows(2)
+                    .filter(|pair| {
+                        pair[0].starts_with("SCALAR SUBQUERY") && pair[1].starts_with("SEARCH")
+                    })
+                    .map(|pair| pair[1].clone())
+                    .collect::<Vec<_>>();
+                assert!(!firsts.is_empty(), "{name}: {joined}");
+                for first in firsts {
+                    assert!(
+                        first.starts_with("SEARCH s ") || first.starts_with("SEARCH r "),
+                        "the {name} probe is driven from the evidence table (analyze={analyze}): {joined}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn checkpoint_requires_both_destination_checks_to_be_known_and_clear() {
@@ -12427,6 +16698,7 @@ mod tests {
             },
             observed_mtime_ns: generation,
             prefix_hash: Some("test-prefix".to_string()),
+            settled: None,
         }
         .to_value()
     }
@@ -12495,7 +16767,13 @@ mod tests {
         );
         assert!(!sync_exclusive(&alias).unwrap());
         assert!(!sync_local_at(&alias).unwrap());
-        assert!(!sync_opencode_exclusive(&alias, &missing_opencode).unwrap());
+        assert!(!sync_opencode_exclusive(
+            &alias,
+            &missing_opencode,
+            true,
+            &dir.path().join("storage")
+        )
+        .unwrap());
         assert!(
             !db_path.exists(),
             "contended sync paths must not create the DB"
@@ -12591,20 +16869,19 @@ mod tests {
 
     #[test]
     fn a_failed_source_does_not_prevent_later_sources_from_completing() {
-        let mut report = SyncSourceReport::default();
+        let db_path = std::path::Path::new("unused.db");
+        let mut report = SyncSourceReport::new(db_path);
         assert!(report
             .capture::<usize>("broken", Err(anyhow::anyhow!("bad source")))
             .is_none());
         assert_eq!(report.capture("healthy", Ok(7)), Some(7));
         assert_eq!(report.succeeded, 1);
         assert_eq!(report.failures.len(), 1);
-        assert!(report.finish(std::path::Path::new("unused.db")).is_ok());
+        assert!(report.finish().is_ok());
 
-        let mut all_failed = SyncSourceReport::default();
+        let mut all_failed = SyncSourceReport::new(db_path);
         all_failed.capture::<usize>("only", Err(anyhow::anyhow!("still bad")));
-        assert!(all_failed
-            .finish(std::path::Path::new("unused.db"))
-            .is_err());
+        assert!(all_failed.finish().is_err());
     }
 
     #[test]
@@ -12990,6 +17267,44 @@ mod tests {
         );
     }
 
+    /// ACP's terminal status is read case-blind for the call as for its
+    /// result, so a `Cancelled` call is not stored as a success beside a
+    /// cancelled result.
+    #[test]
+    fn a_mixed_case_acp_failure_marks_the_grok_call_failed() {
+        let home = tempfile::tempdir().unwrap();
+        let conn = ingest_grok_lines(
+            home.path(),
+            &[
+                r#"{"type":"user","content":"first"}"#,
+                r#"{"type":"assistant","content":"","tool_calls":[{"id":"call_x","name":"Shell","arguments":{"command":"ls"}}]}"#,
+                r#"{"type":"tool_result","tool_call_id":"call_x","content":"stopped"}"#,
+                "",
+            ]
+            .join("\n"),
+            &[
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1000,"turnStartMs":1000}}}"#,
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"call_x"},"_meta":{"agentTimestampMs":1100,"turnStartMs":1000}}}"#,
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"call_x","status":"Cancelled"},"_meta":{"agentTimestampMs":1200,"turnStartMs":1000}}}"#,
+                "",
+            ]
+            .join("\n"),
+        );
+        let (is_error, result_status): (Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT (SELECT is_error FROM tool_calls WHERE source = 'grok' AND tool_use_id = 'call_x'), \
+                        (SELECT result_status FROM session_events \
+                          WHERE source = 'grok' AND event_uid = 'result:call_x')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (is_error, result_status.as_deref()),
+            (Some(1), Some("cancelled"))
+        );
+    }
+
     /// Encrypted-only reasoning still occupies an `agent_thoughts` ordinal.
     /// Leaving that cursor unmoved handed the next readable thought the
     /// encrypted record's timestamp and event id.
@@ -13188,6 +17503,285 @@ mod tests {
         (dir.join("chat_history.jsonl"), dir)
     }
 
+    /// A Grok session indexed by a build that stored no `turn_completed.usage`
+    /// has not changed on disk, so only the retired `grok_events_v1` key can
+    /// send plain `sync` back over it. With that key the unchanged directory
+    /// is re-read and gains the breakdown and its turn's request span.
+    #[test]
+    fn an_upgraded_sync_rereads_unchanged_grok_sessions_for_turn_usage() {
+        let home = tempfile::tempdir().unwrap();
+        let (chat, dir) = grok_stream_fixture(home.path(), "grok-upg-0001");
+        fs::write(
+            &chat,
+            concat!(
+                r#"{"type":"user","content":"<user_query>hi</user_query>"}"#,
+                "\n",
+                r#"{"type":"assistant","content":"hello","model_id":"grok-4-build"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("updates.jsonl"),
+            concat!(
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"eventId":"u1","agentTimestampMs":1789560000000,"turnStartMs":1789560000000}}}"#,
+                "\n",
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"eventId":"a1","agentTimestampMs":1789560001000,"turnStartMs":1789560000000}}}"#,
+                "\n",
+                r#"{"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"turn_completed","totalTokens":1800,"usage":{"inputTokens":1000,"outputTokens":100}},"_meta":{"agentTimestampMs":1789560002000,"turnStartMs":1789560000000}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let root = home.path().join(".grok/sessions");
+        let mut state = Map::new();
+        assert_eq!(super::sync_grok(&conn, &mut state, &root).unwrap(), 1);
+        let stamps = state[super::GROK_SYNC_STATE_KEY].clone();
+
+        // What the previous build left: proxy-only token facts, no span, and
+        // its stamps under the key it used.
+        conn.execute_batch(
+            "UPDATE session_events SET request_span = NULL, \
+               token_json = json_remove(token_json, '$.usage') WHERE source = 'grok';",
+        )
+        .unwrap();
+        let mut old = Map::new();
+        old.insert("grok_events_v1".into(), stamps.clone());
+        let mut current = Map::new();
+        current.insert(super::GROK_SYNC_STATE_KEY.into(), stamps);
+        // The positive control: under the current key an unchanged session is
+        // skipped, which is exactly why the key had to move.
+        assert_eq!(super::sync_grok(&conn, &mut current, &root).unwrap(), 0);
+
+        assert_eq!(super::sync_grok(&conn, &mut old, &root).unwrap(), 1);
+        let (usage, span): (Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT json_extract(token_json, '$.usage.inputTokens'), request_span \
+                 FROM session_events WHERE source = 'grok' AND token_json IS NOT NULL",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((usage, span.as_deref()), (Some(1000), Some("0")));
+    }
+
+    /// A turn whose only readable output is its thinking still stores its
+    /// `turn_completed.usage`, on that thinking row, and counts as measured.
+    #[test]
+    fn a_thinking_only_grok_turn_keeps_its_usage() {
+        let home = tempfile::tempdir().unwrap();
+        let (chat, dir) = grok_stream_fixture(home.path(), "grok-think-0001");
+        fs::write(
+            &chat,
+            concat!(
+                r#"{"type":"user","content":"<user_query>hi</user_query>"}"#,
+                "\n",
+                r#"{"type":"reasoning","summary":"Working through it"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("updates.jsonl"),
+            concat!(
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"eventId":"u1","agentTimestampMs":1789560000000,"turnStartMs":1789560000000}}}"#,
+                "\n",
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_thought_chunk"},"_meta":{"eventId":"t1","agentTimestampMs":1789560001000,"turnStartMs":1789560000000}}}"#,
+                "\n",
+                r#"{"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"turn_completed","usage":{"inputTokens":10,"outputTokens":3}},"_meta":{"agentTimestampMs":1789560002000,"turnStartMs":1789560000000}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let session = super::scan_grok_session_file(&chat).unwrap().unwrap();
+        let outcome = super::ingest_grok_session(&conn, &session, &chat.to_string_lossy()).unwrap();
+        let (kind, input): (String, Option<i64>) = conn
+            .query_row(
+                "SELECT kind, json_extract(token_json, '$.usage.inputTokens') \
+                 FROM session_events WHERE source = 'grok' AND token_json IS NOT NULL",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((kind.as_str(), input), ("thinking", Some(10)));
+        assert_eq!((outcome.usage_turns, outcome.turns), (1, 1));
+    }
+
+    /// `events.jsonl` grows with the session and is not read while
+    /// `summary.json` is present, so it stays out of the stamp until the
+    /// summary is gone.
+    #[test]
+    fn events_jsonl_does_not_move_the_stamp_while_summary_json_is_present() {
+        let home = tempfile::tempdir().unwrap();
+        let (chat, dir) = grok_stream_fixture(home.path(), "grok-stamp-0001");
+        let with_summary = super::grok_session_stamp(&chat).unwrap();
+        fs::write(
+            dir.join("events.jsonl"),
+            "{\"model_id\":\"grok-x\",\"ts\":\"2026-01-01T00:00:00Z\"}\n",
+        )
+        .unwrap();
+        assert_eq!(super::grok_session_stamp(&chat).unwrap(), with_summary);
+        fs::write(
+            dir.join("events.jsonl"),
+            "{\"model_id\":\"grok-x\"}\n{\"model_id\":\"grok-y\"}\n",
+        )
+        .unwrap();
+        assert_eq!(super::grok_session_stamp(&chat).unwrap(), with_summary);
+
+        fs::remove_file(dir.join("summary.json")).unwrap();
+        let without_summary = super::grok_session_stamp(&chat).unwrap();
+        assert_ne!(without_summary, with_summary);
+        fs::write(dir.join("events.jsonl"), "{\"model_id\":\"grok-z\"}\n").unwrap();
+        assert_ne!(super::grok_session_stamp(&chat).unwrap(), without_summary);
+    }
+
+    /// A timed log row covers only the turn whose window holds it. A turn
+    /// with no recorded window keeps its own `usage` rather than losing it
+    /// to a row that belongs to another turn; a timeless row still covers it.
+    #[test]
+    fn a_windowless_grok_turn_keeps_its_usage_unless_a_timeless_row_covers_it() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (session_id, source, cwd) VALUES ('g', 'grok', '/tmp/g')",
+            [],
+        )
+        .unwrap();
+        let windowed = json!({
+            "source": "updates.jsonl",
+            "turn_start_ms": 10,
+            "turn_end_ms": 20,
+            "usage": {"inputTokens": 5}
+        });
+        let windowless = json!({
+            "source": "updates.jsonl",
+            "usage": {"inputTokens": 7}
+        });
+        for (uid, token) in [("t1", &windowed), ("t2", &windowless)] {
+            conn.execute(
+                "INSERT INTO session_events \
+                 (source, session_id, ts_ms, role, kind, event_uid, token_json) \
+                 VALUES ('grok', 'g', 15, 'assistant', 'text', ?, ?)",
+                params![uid, token.to_string()],
+            )
+            .unwrap();
+        }
+        let insert_row = |key: &str, ts: Option<i64>| {
+            conn.execute(
+                "INSERT INTO grok_unified_usage \
+                 (row_key, session_id, ts_ms, usage_json, locator, line_offset) \
+                 VALUES (?, 'g', ?, '{\"inputTokens\":3}', 'unified.jsonl', 0)",
+                params![key, ts],
+            )
+            .unwrap();
+        };
+        let token = |uid: &str| -> Value {
+            let raw: String = conn
+                .query_row(
+                    "SELECT token_json FROM session_events \
+                     WHERE session_id = 'g' AND event_uid = ?",
+                    params![uid],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            serde_json::from_str(&raw).unwrap()
+        };
+
+        insert_row("timed", Some(15));
+        let coverage = super::materialize_grok_unified_usage(&conn, "g", None).unwrap();
+        assert!(token("t1").get("usage").is_none());
+        assert!(token("t1").get("turn_usage").is_some());
+        assert_eq!(
+            token("t2")["usage"]["inputTokens"],
+            7,
+            "a windowless turn keeps its usage"
+        );
+        assert!(token("t2").get("turn_usage").is_none());
+        assert_eq!(
+            (
+                coverage.covered_turns,
+                coverage.turn_usage_turns,
+                coverage.proxy_only_turns
+            ),
+            (1, 1, 0)
+        );
+
+        insert_row("timeless", None);
+        let coverage = super::materialize_grok_unified_usage(&conn, "g", None).unwrap();
+        assert!(token("t2").get("usage").is_none());
+        assert_eq!(token("t2")["turn_usage"]["inputTokens"], 7);
+        assert_eq!(
+            (
+                coverage.covered_turns,
+                coverage.turn_usage_turns,
+                coverage.proxy_only_turns
+            ),
+            (2, 0, 0)
+        );
+    }
+
+    #[test]
+    fn classify_grok_turn_coverage_counts_windows_census_and_timeless_rows() {
+        let covered = json!({
+            "source": "updates.jsonl",
+            "turn_start_ms": 10,
+            "turn_end_ms": 20,
+            "context_total_tokens": 1
+        });
+        let own = json!({
+            "source": "updates.jsonl",
+            "turn_start_ms": 30,
+            "turn_end_ms": 40,
+            "usage": {"inputTokens": 1}
+        });
+        let proxy = json!({
+            "source": "updates.jsonl",
+            "context_total_tokens": 2,
+            "turn_start_ms": 50,
+            "turn_end_ms": 60
+        });
+        let class = super::classify_grok_turn_coverage(
+            &[covered.clone(), own.clone(), proxy],
+            &[Some(15)],
+            Some(4),
+        );
+        assert_eq!(
+            (
+                class.covered_turns,
+                class.turn_usage_turns,
+                class.proxy_only_turns
+            ),
+            (1, 1, 2)
+        );
+
+        let demoted = json!({
+            "source": "updates.jsonl",
+            "turn_usage": {"inputTokens": 1},
+            "turn_start_ms": 30
+        });
+        let timeless = super::classify_grok_turn_coverage(&[own, demoted], &[None], Some(3));
+        assert_eq!(
+            (
+                timeless.covered_turns,
+                timeless.turn_usage_turns,
+                timeless.proxy_only_turns
+            ),
+            (3, 0, 0)
+        );
+
+        let no_census = super::classify_grok_turn_coverage(&[covered], &[Some(15)], None);
+        assert_eq!(
+            (
+                no_census.covered_turns,
+                no_census.turn_usage_turns,
+                no_census.proxy_only_turns
+            ),
+            (1, 0, 0)
+        );
+    }
+
     /// An `updates.jsonl` that exists and cannot be read is a failure, not an
     /// absent stream.
     ///
@@ -13260,6 +17854,1028 @@ mod tests {
         assert!(outcome.missing_updates);
         assert!(!outcome.updates_yielded_no_timing);
         assert_eq!(outcome.unread_update_rows, 0);
+    }
+
+    /// Copy the checked-in Muse fixture into `home` and answer with the
+    /// sessions root and the transcript.
+    fn muse_fixture(home: &Path) -> (PathBuf, PathBuf) {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/muse/tools-session/.local/share/muse/sessions");
+        let root = home.join(".local/share/muse/sessions");
+        let day = "2026/09/20/muse-a001";
+        for file in super::muse_session_files(&fixture.join(day).join("session.jsonl")).unwrap() {
+            let target = root.join(file.strip_prefix(&fixture).unwrap());
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            fs::copy(&file, &target).unwrap();
+        }
+        let transcript = root.join(day).join("session.jsonl");
+        (root, transcript)
+    }
+
+    /// Rows one session owns in `table`.
+    fn muse_session_count(conn: &Connection, table: &str, session_id: &str) -> i64 {
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE source = 'muse' AND session_id = ?"),
+            [session_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    const MUSE_PARENT: &str = "muse-a001";
+    const MUSE_WORKER: &str = "muse-c001";
+
+    fn muse_count(conn: &Connection, table: &str) -> i64 {
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE source = 'muse'"),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Plain `sync` indexes the transcript once, re-reads it only when it
+    /// changes, replaces rather than duplicates on that re-read, and never
+    /// turns the `subagent/` child into a session.
+    #[test]
+    fn muse_sync_is_idempotent_and_rereads_a_grown_transcript() {
+        let home = tempfile::tempdir().unwrap();
+        let (root, transcript) = muse_fixture(home.path());
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+
+        assert_eq!(super::sync_muse(&conn, &mut state, &root).unwrap(), 2);
+        assert_eq!(muse_count(&conn, "sessions"), 1, "a child is not a session");
+        assert_eq!(muse_count(&conn, "session_relationships"), 3);
+        let events = muse_count(&conn, "session_events");
+        assert_eq!(muse_session_count(&conn, "session_events", MUSE_PARENT), 15);
+
+        // Unchanged: nothing is read again and nothing is duplicated.
+        assert_eq!(super::sync_muse(&conn, &mut state, &root).unwrap(), 0);
+        assert_eq!(muse_count(&conn, "session_events"), events);
+
+        // The session grows by one turn: the re-read adds exactly that turn.
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        for (sequence, event) in [
+            (40, json!({"kind": "started", "prompt": "Fix the test."})),
+            (
+                41,
+                json!({"kind": "assistant_message_committed", "message_id": "msg-5", "text": "Done."}),
+            ),
+        ] {
+            let record = json!({
+                "id": format!("grown-{sequence}"),
+                "stream": {"kind": "session", "id": "muse-a001"},
+                "sequence": sequence,
+                "recorded_at": 1_790_337_700_000_000i64 + sequence,
+                "payload_type": "runtime.session",
+                "payload": {"kind": "run", "run_id": "run-c", "event": event},
+            });
+            writeln!(file, "{record}").unwrap();
+        }
+        drop(file);
+        assert_eq!(super::sync_muse(&conn, &mut state, &root).unwrap(), 1);
+        assert_eq!(muse_count(&conn, "session_events"), events + 2);
+        assert_eq!(muse_count(&conn, "history"), 3);
+    }
+
+    /// `.sync-state.json` outlives a rebuilt database. An unchanged stamp is
+    /// trusted only while the evidence it recorded is still there.
+    #[test]
+    fn muse_sync_reindexes_an_unchanged_transcript_whose_rows_are_gone() {
+        let home = tempfile::tempdir().unwrap();
+        let (root, _) = muse_fixture(home.path());
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+
+        let rebuilt = open_db(&home.path().join("rebuilt.db")).unwrap();
+        assert_eq!(super::sync_muse(&rebuilt, &mut state, &root).unwrap(), 2);
+        assert_eq!(
+            muse_session_count(&rebuilt, "session_events", MUSE_PARENT),
+            15
+        );
+        assert_eq!(muse_count(&rebuilt, "session_relationships"), 3);
+    }
+
+    /// A background subagent keeps writing its own log after the parent's
+    /// last record. The parent's stamp covers the child logs, so that growth
+    /// is read even though the parent file never changes again.
+    #[test]
+    fn muse_sync_rereads_a_subagent_log_that_grew_on_its_own() {
+        let home = tempfile::tempdir().unwrap();
+        let (root, transcript) = muse_fixture(home.path());
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        let before = muse_session_count(&conn, "session_events", MUSE_WORKER);
+
+        let child_log = transcript
+            .parent()
+            .unwrap()
+            .join(format!("subagent/{MUSE_WORKER}/session.jsonl"));
+        let record = json!({
+            "id": "worker-late",
+            "stream": {"kind": "session", "id": MUSE_WORKER},
+            "sequence": 99,
+            "recorded_at": 1_790_337_700_000_000i64,
+            "payload_type": "runtime.session",
+            "payload": {"kind": "run", "run_id": "child-run", "event": {
+                "kind": "assistant_message_committed", "message_id": "late", "text": "Also: no docs."
+            }},
+        });
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&child_log)
+            .unwrap();
+        writeln!(file, "{record}").unwrap();
+        drop(file);
+
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        assert_eq!(
+            muse_session_count(&conn, "session_events", MUSE_WORKER),
+            before + 1
+        );
+        assert_eq!(muse_count(&conn, "session_relationships"), 3);
+        assert_eq!(
+            muse_session_count(&conn, "history", MUSE_WORKER),
+            0,
+            "a child's objective never becomes a typed prompt"
+        );
+    }
+
+    /// Roots under `home` with nothing read from the environment, for the
+    /// fingerprint-gated sync path.
+    fn muse_roots(home: &Path) -> crate::ProviderRoots {
+        crate::ProviderRoots::from_home(home.to_path_buf(), home.join("opencode.db"))
+    }
+
+    fn append_muse_record(log: &Path, session_id: &str, uid: &str, text: &str) {
+        let record = json!({
+            "id": uid,
+            "stream": {"kind": "session", "id": session_id},
+            "sequence": 99,
+            "recorded_at": 1_790_337_700_000_000i64,
+            "payload_type": "runtime.session",
+            "payload": {"kind": "run", "run_id": "late", "event": {
+                "kind": "assistant_message_committed", "message_id": uid, "text": text
+            }},
+        });
+        let mut file = fs::OpenOptions::new().append(true).open(log).unwrap();
+        writeln!(file, "{record}").unwrap();
+    }
+
+    /// A subagent that keeps writing after its parent has stopped changes
+    /// only its own log. That has to move the source fingerprint, or a
+    /// plain `sync` takes the fast path and never reads it.
+    #[test]
+    fn a_growing_muse_subagent_log_moves_the_sync_fast_path() {
+        let home = tempfile::tempdir().unwrap();
+        let (_, transcript) = muse_fixture(home.path());
+        let db = home.path().join("history.db");
+        let roots = muse_roots(home.path());
+        assert!(
+            super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept
+        );
+        assert!(
+            !super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept,
+            "an unchanged store takes the fast path"
+        );
+        let conn = open_db(&db).unwrap();
+        let before = muse_session_count(&conn, "session_events", MUSE_WORKER);
+
+        let child_log = transcript
+            .parent()
+            .unwrap()
+            .join(format!("subagent/{MUSE_WORKER}/session.jsonl"));
+        append_muse_record(&child_log, MUSE_WORKER, "worker-late", "Also: no docs.");
+        assert!(
+            super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept
+        );
+        assert_eq!(
+            muse_session_count(&conn, "session_events", MUSE_WORKER),
+            before + 1
+        );
+    }
+
+    /// Rows lost under an unchanged stamp — in a session, or in a subagent
+    /// it links — are put back by the next plain `sync`, not only by a forced
+    /// one: Muse is a source the destination marker guards.
+    #[test]
+    fn lost_muse_evidence_is_repaired_by_the_next_sync() {
+        let home = tempfile::tempdir().unwrap();
+        let _ = muse_fixture(home.path());
+        let db = home.path().join("history.db");
+        let roots = muse_roots(home.path());
+        super::sync_exclusive_with_roots(&db, &roots, false).unwrap();
+        let conn = open_db(&db).unwrap();
+        let parent_events = muse_session_count(&conn, "session_events", MUSE_PARENT);
+        let worker_events = muse_session_count(&conn, "session_events", MUSE_WORKER);
+
+        conn.execute(
+            "DELETE FROM session_events WHERE source = 'muse' AND session_id = ? \
+               AND event_uid = 'tool:call_read'",
+            [MUSE_PARENT],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM session_events WHERE source = 'muse' AND session_id = ? \
+               AND role = 'assistant'",
+            [MUSE_WORKER],
+        )
+        .unwrap();
+        super::sync_exclusive_with_roots(&db, &roots, false).unwrap();
+        assert_eq!(
+            muse_session_count(&conn, "session_events", MUSE_PARENT),
+            parent_events
+        );
+        assert_eq!(
+            muse_session_count(&conn, "session_events", MUSE_WORKER),
+            worker_events
+        );
+    }
+
+    /// Only the parent's own direct children that it typed as workers answer
+    /// its `subagent_spawn` calls; the worker's nested child does not.
+    #[test]
+    fn muse_worker_children_count_only_direct_typed_workers() {
+        let home = tempfile::tempdir().unwrap();
+        let (_, transcript) = muse_fixture(home.path());
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let (parsed, children) = super::read_muse_tree(&transcript).unwrap().unwrap();
+        let outcome =
+            super::ingest_muse_session_tree(&conn, &parsed, &transcript, Some(&children)).unwrap();
+        assert_eq!(outcome.subagent_calls, 1);
+        assert_eq!(outcome.worker_children, 1, "{outcome:?}");
+        assert_eq!(outcome.relationships, 3);
+    }
+
+    /// A subagent also known remotely shares its `history` identity with that
+    /// evidence. A local re-read removes the child's local objective only
+    /// when nothing remote stands behind the id.
+    #[test]
+    fn a_remote_muse_childs_history_survives_a_local_reread() {
+        let home = tempfile::tempdir().unwrap();
+        let (root, transcript) = muse_fixture(home.path());
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        crate::mark_session_presence(&conn, "muse", MUSE_WORKER, super::SessionLocation::Remote)
+            .unwrap();
+        insert_history(
+            &conn,
+            &HistoryEntry {
+                id: 0,
+                source: "muse".into(),
+                session_id: Some(MUSE_WORKER.to_string()),
+                project: None,
+                prompt: "remote prompt".into(),
+                prompt_hash: Some(prompt_hash("remote prompt")),
+                timestamp_ms: 42,
+            },
+        )
+        .unwrap();
+
+        let child_log = transcript
+            .parent()
+            .unwrap()
+            .join(format!("subagent/{MUSE_WORKER}/session.jsonl"));
+        append_muse_record(&child_log, MUSE_WORKER, "worker-late", "Also: no docs.");
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        let remote: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM history WHERE source = 'muse' AND session_id = ? \
+                   AND prompt = 'remote prompt'",
+                [MUSE_WORKER],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remote, 1, "a local re-read does not erase remote history");
+        let objectives: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM history WHERE source = 'muse' AND session_id = ? \
+                   AND prompt LIKE 'Role:%'",
+                [MUSE_WORKER],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            objectives, 0,
+            "a subagent's objective is never a typed prompt"
+        );
+    }
+
+    /// A remotely known session whose transcript drops a prompt stops
+    /// offering it, while the prompts only the remote side holds stay.
+    #[test]
+    fn a_remote_muse_session_drops_prompts_its_transcript_no_longer_has() {
+        let home = tempfile::tempdir().unwrap();
+        let (root, transcript) = muse_fixture(home.path());
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        crate::mark_session_presence(&conn, "muse", MUSE_PARENT, super::SessionLocation::Remote)
+            .unwrap();
+        insert_history(
+            &conn,
+            &HistoryEntry {
+                id: 0,
+                source: "muse".into(),
+                session_id: Some(MUSE_PARENT.to_string()),
+                project: None,
+                prompt: "remote prompt".into(),
+                prompt_hash: Some(prompt_hash("remote prompt")),
+                timestamp_ms: 42,
+            },
+        )
+        .unwrap();
+
+        // Drop the second typed prompt from the transcript.
+        let kept: String = fs::read_to_string(&transcript)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.contains("Why did it fail?"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        fs::write(&transcript, kept).unwrap();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        let prompts: Vec<String> = conn
+            .prepare(
+                "SELECT prompt FROM history WHERE source = 'muse' AND session_id = ? \
+                 ORDER BY timestamp_ms",
+            )
+            .unwrap()
+            .query_map([MUSE_PARENT], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            prompts,
+            vec![
+                "remote prompt".to_string(),
+                "Add a retry helper to src/http.rs and run the tests.".to_string()
+            ]
+        );
+    }
+
+    /// A local re-read of a session replaces only the evidence its transcript
+    /// backs: an event a remote observation supplied under the same session
+    /// survives it, and one both sides supplied stays with the remote side
+    /// when the transcript no longer has it.
+    #[test]
+    fn a_muse_reread_keeps_evidence_a_remote_observation_supplied() {
+        let home = tempfile::tempdir().unwrap();
+        let (root, transcript) = muse_fixture(home.path());
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, ts_ms, role, kind, text, event_uid, location) \
+             VALUES ('muse', ?, 1, 'assistant', 'text', 'from the remote side', 'remote:1', 'remote')",
+            [MUSE_PARENT],
+        )
+        .unwrap();
+        let local_before = muse_session_count(&conn, "session_events", MUSE_PARENT);
+
+        append_muse_record(&transcript, MUSE_PARENT, "parent-late", "More.");
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        let remote: Vec<String> = conn
+            .prepare(
+                "SELECT location FROM session_events \
+                 WHERE source = 'muse' AND session_id = ? AND event_uid = 'remote:1'",
+            )
+            .unwrap()
+            .query_map([MUSE_PARENT], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(remote, vec!["remote".to_string()]);
+        assert_eq!(
+            muse_session_count(&conn, "session_events", MUSE_PARENT),
+            local_before + 1,
+            "the re-read added its one new record and removed nothing remote"
+        );
+    }
+
+    /// A removed child's log takes the evidence only it backed with it: a row
+    /// remote evidence also backs stays, as the remote side's, and the
+    /// local-only children it linked, its edges to them and its local
+    /// presence go.
+    #[test]
+    fn a_removed_remote_muse_child_keeps_only_what_remote_evidence_backs() {
+        let home = tempfile::tempdir().unwrap();
+        let (root, transcript) = muse_fixture(home.path());
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        crate::mark_session_presence(&conn, "muse", MUSE_WORKER, super::SessionLocation::Remote)
+            .unwrap();
+        // A remote observation supplied the worker's reply as well.
+        conn.execute(
+            "UPDATE session_events SET location = 'both' \
+             WHERE source = 'muse' AND session_id = ? AND role = 'assistant'",
+            [MUSE_WORKER],
+        )
+        .unwrap();
+        fs::remove_dir_all(
+            transcript
+                .parent()
+                .unwrap()
+                .join(format!("subagent/{MUSE_WORKER}")),
+        )
+        .unwrap();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        let left: Vec<(String, String)> = conn
+            .prepare(
+                "SELECT role, location FROM session_events \
+                 WHERE source = 'muse' AND session_id = ? ORDER BY id",
+            )
+            .unwrap()
+            .query_map([MUSE_WORKER], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            left,
+            vec![("assistant".to_string(), "remote".to_string())],
+            "only the remote-backed row stays, now the remote side's alone"
+        );
+        assert_eq!(muse_session_count(&conn, "session_events", "muse-c002"), 0);
+        let edges_from_worker: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_relationships \
+                 WHERE source = 'muse' AND parent_session_id = ?",
+                [MUSE_WORKER],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(edges_from_worker, 0);
+        let local: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_presences \
+                 WHERE source = 'muse' AND session_id = ? AND location = 'local'",
+                [MUSE_WORKER],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(local, 0, "a child whose log is gone is not present locally");
+    }
+
+    /// A subagent with no catalog row and no events left can still be named
+    /// for repair — by its parent's edge — so the next plain `sync` re-reads
+    /// the parent's tree and restores it.
+    #[test]
+    fn a_muse_subagent_that_lost_every_event_is_repaired() {
+        let home = tempfile::tempdir().unwrap();
+        let _ = muse_fixture(home.path());
+        let db = home.path().join("history.db");
+        let roots = muse_roots(home.path());
+        super::sync_exclusive_with_roots(&db, &roots, false).unwrap();
+        let conn = open_db(&db).unwrap();
+        let worker_events = muse_session_count(&conn, "session_events", MUSE_WORKER);
+        conn.execute(
+            "DELETE FROM session_events WHERE source = 'muse' AND session_id = ?",
+            [MUSE_WORKER],
+        )
+        .unwrap();
+        super::sync_exclusive_with_roots(&db, &roots, false).unwrap();
+        assert_eq!(
+            muse_session_count(&conn, "session_events", MUSE_WORKER),
+            worker_events
+        );
+    }
+
+    /// A `subagent/` entry that is a symlink out of the session directory is
+    /// not the session's evidence: it is never read, stamped or linked.
+    #[cfg(unix)]
+    #[test]
+    fn a_muse_child_log_symlinked_outside_its_session_is_not_read() {
+        let home = tempfile::tempdir().unwrap();
+        let (root, transcript) = muse_fixture(home.path());
+        let outside = home.path().join("elsewhere/secret");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(
+            outside.join("session.jsonl"),
+            "{\"id\":\"x\",\"stream\":{\"kind\":\"session\",\"id\":\"escaped\"},\
+             \"recorded_at\":1790337600000000,\"payload_type\":\"runtime.session.metadata\",\
+             \"payload\":{\"kind\":\"metadata\",\"record\":{\"workspace_root\":\"/w\"}}}\n",
+        )
+        .unwrap();
+        let session_dir = transcript.parent().unwrap();
+        std::os::unix::fs::symlink(&outside, session_dir.join("subagent/escaped")).unwrap();
+
+        let files = super::muse_session_files(&transcript).unwrap();
+        assert!(
+            files
+                .iter()
+                .all(|file| !file.to_string_lossy().contains("escaped")),
+            "{files:?}"
+        );
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        assert_eq!(muse_session_count(&conn, "session_events", "escaped"), 0);
+        assert_eq!(muse_count(&conn, "session_relationships"), 3);
+    }
+
+    /// Muse commits tool results in their own records, not inside a user
+    /// message, so a user turn is the typed prompt alone: no tool output is
+    /// counted among its blocks.
+    #[test]
+    fn muse_user_turns_are_the_prompts_alone() {
+        let home = tempfile::tempdir().unwrap();
+        let (root, _) = muse_fixture(home.path());
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        let page = crate::session_user_turns_page(&conn, "muse", MUSE_PARENT, 100, None).unwrap();
+        assert_eq!(page.user_turns.len(), 2, "{:?}", page.user_turns);
+        for turn in &page.user_turns {
+            assert!(
+                turn.blocks.iter().all(|block| block.kind != "tool_result"),
+                "{turn:?}"
+            );
+        }
+        let sources: Vec<String> = conn
+            .prepare(
+                "SELECT DISTINCT event_source FROM session_events \
+                 WHERE source = 'muse' AND role = 'tool_result'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(sources, vec!["function_call_output".to_string()]);
+    }
+
+    /// A call that failed or was cancelled before any result was recorded
+    /// still takes its status from Muse's recorded outcome.
+    #[test]
+    fn a_muse_call_that_ended_without_a_result_keeps_its_outcome() {
+        let home = tempfile::tempdir().unwrap();
+        let (root, transcript) = muse_fixture(home.path());
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        // Drop the result record that answered the four calls of step 2,
+        // keeping their `tool_batch.effect.terminal` outcomes; make the
+        // write call's outcome a cancellation.
+        let rewritten: String = fs::read_to_string(&transcript)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.contains("\"batch_id\": \"msg-2\""))
+            .map(|line| {
+                if line.contains("\"call_id\": \"call_write\"") && line.contains("tool_batch") {
+                    line.replace("\"kind\": \"completed\"", "\"kind\": \"cancelled\"")
+                } else {
+                    line.to_string()
+                }
+            })
+            .map(|line| format!("{line}\n"))
+            .collect();
+        fs::write(&transcript, rewritten).unwrap();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        let status = |call: &str| -> Option<i64> {
+            conn.query_row(
+                "SELECT is_error FROM tool_calls WHERE source = 'muse' AND tool_use_id = ?",
+                [call],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(status("call_write"), Some(1), "cancelled without a result");
+        assert_eq!(status("call_edit"), Some(0), "completed without a result");
+    }
+
+    /// An edge reflects what the parent records now — a label the parent no
+    /// longer gives its child does not linger — while keeping the time it
+    /// was first observed.
+    #[test]
+    fn a_muse_delegation_drops_details_the_parent_no_longer_records() {
+        let home = tempfile::tempdir().unwrap();
+        let (root, transcript) = muse_fixture(home.path());
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        let label = |conn: &Connection| -> Option<String> {
+            conn.query_row(
+                "SELECT child_agent_name FROM session_relationships \
+                 WHERE source = 'muse' AND child_session_id = ?",
+                [MUSE_WORKER],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(label(&conn).as_deref(), Some("reviewer"));
+
+        let rewritten = fs::read_to_string(&transcript)
+            .unwrap()
+            .replace("\"label\": \"reviewer\", ", "");
+        let created = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT created_ms FROM session_relationships \
+                 WHERE source = 'muse' AND child_session_id = ?",
+                [MUSE_WORKER],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let first_seen = created(&conn);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        fs::write(&transcript, rewritten).unwrap();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        assert_eq!(label(&conn), None);
+        assert_eq!(
+            created(&conn),
+            first_seen,
+            "the edge keeps the time it was first observed"
+        );
+    }
+
+    /// A `subagent/` entry that points back up into its own session is not a
+    /// child: it is never read as one, and the walk ends rather than
+    /// recursing through it forever.
+    #[cfg(unix)]
+    #[test]
+    fn a_muse_subagent_symlink_back_into_its_session_is_not_followed() {
+        let home = tempfile::tempdir().unwrap();
+        let (root, transcript) = muse_fixture(home.path());
+        let session_dir = transcript.parent().unwrap();
+        std::os::unix::fs::symlink("..", session_dir.join("subagent/loop")).unwrap();
+
+        let files = super::muse_session_files(&transcript).unwrap();
+        assert_eq!(
+            files.len(),
+            4,
+            "the parent and its three real child logs: {files:?}"
+        );
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        assert_eq!(muse_count(&conn, "session_relationships"), 3);
+        let self_edges: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_relationships \
+                 WHERE source = 'muse' AND child_session_id = ?",
+                [MUSE_PARENT],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(self_edges, 0, "the parent is never its own child");
+    }
+
+    /// A `subagent/` directory that is itself a symlink — back into its own
+    /// session, or out of it — is not the session's subagents: nothing under
+    /// it is read, and the walk ends.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_muse_subagent_directory_is_not_followed() {
+        let home = tempfile::tempdir().unwrap();
+        let (_, transcript) = muse_fixture(home.path());
+        let session_dir = transcript.parent().unwrap();
+
+        // Back into the session.
+        let real = session_dir.join("subagent");
+        let moved = session_dir.join("subagent-real");
+        fs::rename(&real, &moved).unwrap();
+        std::os::unix::fs::symlink(".", &real).unwrap();
+        assert_eq!(
+            super::muse_session_files(&transcript).unwrap(),
+            vec![transcript.clone()]
+        );
+
+        // Out of the session, to a real subagent tree somewhere else.
+        fs::remove_file(&real).unwrap();
+        let elsewhere = home.path().join("elsewhere");
+        fs::rename(&moved, &elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &real).unwrap();
+        assert_eq!(
+            super::muse_session_files(&transcript).unwrap(),
+            vec![transcript.clone()]
+        );
+    }
+
+    /// A child log that names no session yet — Muse is still writing its
+    /// header — is not a child that is gone: its evidence and edge stay, and
+    /// it is linked again once it can be read.
+    #[test]
+    fn an_unidentified_muse_child_log_keeps_its_evidence() {
+        const REMINDER: &str = "muse-e001";
+        let home = tempfile::tempdir().unwrap();
+        let (root, transcript) = muse_fixture(home.path());
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        let reminder_events = muse_session_count(&conn, "session_events", REMINDER);
+        assert!(reminder_events > 0);
+
+        let log = transcript
+            .parent()
+            .unwrap()
+            .join(format!("subagent/{REMINDER}/session.jsonl"));
+        let complete = fs::read_to_string(&log).unwrap();
+        // Mid-write: the header record is not finished.
+        fs::write(&log, &complete[..complete.find('\n').unwrap() / 2]).unwrap();
+        append_muse_record(&transcript, MUSE_PARENT, "parent-late", "More.");
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        assert_eq!(
+            muse_session_count(&conn, "session_events", REMINDER),
+            reminder_events
+        );
+        assert_eq!(muse_count(&conn, "session_relationships"), 3);
+
+        fs::write(&log, &complete).unwrap();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        assert_eq!(
+            muse_session_count(&conn, "session_events", REMINDER),
+            reminder_events
+        );
+        assert_eq!(muse_count(&conn, "session_relationships"), 3);
+    }
+
+    /// A remotely known subagent keeps its catalog row; a local read of its
+    /// log must not turn its assigned objective into that row's typed title,
+    /// nor clear the title the remote side gave it.
+    #[test]
+    fn a_muse_subagent_read_leaves_its_catalog_title_alone() {
+        let home = tempfile::tempdir().unwrap();
+        let (_, transcript) = muse_fixture(home.path());
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        crate::mark_session_presence(&conn, "muse", MUSE_WORKER, super::SessionLocation::Remote)
+            .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO sessions (source, session_id, first_prompt) \
+             VALUES ('muse', ?, 'remote title')",
+            [MUSE_WORKER],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sessions SET first_prompt = 'remote title' \
+             WHERE source = 'muse' AND session_id = ?",
+            [MUSE_WORKER],
+        )
+        .unwrap();
+        let log = transcript
+            .parent()
+            .unwrap()
+            .join(format!("subagent/{MUSE_WORKER}/session.jsonl"));
+        let child = super::read_muse_transcript(&log).unwrap().unwrap();
+        super::ingest_muse_session_tree(&conn, &child, &log, None).unwrap();
+        let title: Option<String> = conn
+            .query_row(
+                "SELECT first_prompt FROM sessions WHERE source = 'muse' AND session_id = ?",
+                [MUSE_WORKER],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(title.as_deref(), Some("remote title"));
+    }
+
+    /// Every record of a model step shares its model and finish reason; only
+    /// its usage is the first record's alone. A step that thinks before it
+    /// calls tools keeps `finish_reason` on the thinking row and on the calls.
+    #[test]
+    fn every_record_of_a_muse_step_carries_its_finish_reason() {
+        let home = tempfile::tempdir().unwrap();
+        let (root, _) = muse_fixture(home.path());
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        let row = |uid: &str| -> (Option<String>, Option<String>) {
+            conn.query_row(
+                "SELECT stop_reason, token_json FROM session_events \
+                 WHERE source = 'muse' AND session_id = ? AND event_uid = ?",
+                params![MUSE_PARENT, uid],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        let (thinking_stop, thinking_usage) = row("a001-rec-006");
+        assert_eq!(thinking_stop.as_deref(), Some("tool_calls"));
+        assert!(
+            thinking_usage.is_some(),
+            "the step's first record owns its usage"
+        );
+        let (call_stop, call_usage) = row("tool:call_read");
+        assert_eq!(call_stop.as_deref(), Some("tool_calls"));
+        assert!(call_usage.is_none(), "…and only the first");
+    }
+
+    /// A subagent log that is there but cannot be read is not a log that is
+    /// gone: the session's read fails and is retried, and the child keeps
+    /// its evidence and its edge.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_muse_subagent_log_is_not_forgotten() {
+        use std::os::unix::fs::PermissionsExt;
+        const REMINDER: &str = "muse-e001";
+        let home = tempfile::tempdir().unwrap();
+        let (root, transcript) = muse_fixture(home.path());
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        let reminder_events = muse_session_count(&conn, "session_events", REMINDER);
+        assert!(reminder_events > 0);
+
+        // The parent changes, so its tree is read again; the reminder's
+        // directory stays listable but its log can no longer be statted.
+        append_muse_record(&transcript, MUSE_PARENT, "parent-late", "More.");
+        let reminder_dir = transcript
+            .parent()
+            .unwrap()
+            .join(format!("subagent/{REMINDER}"));
+        fs::set_permissions(&reminder_dir, fs::Permissions::from_mode(0o644)).unwrap();
+        let stat_blocked = fs::metadata(reminder_dir.join("session.jsonl")).is_err();
+        let result = super::sync_muse(&conn, &mut state, &root);
+        fs::set_permissions(&reminder_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        if !stat_blocked {
+            // Running as a user permissions do not bind (root in a
+            // container): there is nothing unreadable to test.
+            return;
+        }
+        assert!(result.is_err(), "the only session could not be read");
+        assert_eq!(
+            muse_session_count(&conn, "session_events", REMINDER),
+            reminder_events,
+            "an unreadable log is not a deleted one"
+        );
+        assert_eq!(muse_count(&conn, "session_relationships"), 3);
+    }
+
+    /// A removed child's leftover history — filed under it before it was
+    /// linked as a subagent — goes with the rest of its evidence.
+    #[test]
+    fn a_removed_muse_child_takes_its_leftover_history_with_it() {
+        let home = tempfile::tempdir().unwrap();
+        let (root, transcript) = muse_fixture(home.path());
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        insert_history(
+            &conn,
+            &HistoryEntry {
+                id: 0,
+                source: "muse".into(),
+                session_id: Some(MUSE_WORKER.to_string()),
+                project: None,
+                prompt: "indexed as a session once".into(),
+                prompt_hash: Some(prompt_hash("indexed as a session once")),
+                timestamp_ms: 42,
+            },
+        )
+        .unwrap();
+        fs::remove_dir_all(
+            transcript
+                .parent()
+                .unwrap()
+                .join(format!("subagent/{MUSE_WORKER}")),
+        )
+        .unwrap();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        assert_eq!(muse_session_count(&conn, "history", MUSE_WORKER), 0);
+    }
+
+    /// Hydrating a subagent's log directly reads it as a subagent: its
+    /// objective is an event, never history.
+    #[test]
+    fn a_muse_subagent_log_read_directly_writes_no_history() {
+        let home = tempfile::tempdir().unwrap();
+        let (_, transcript) = muse_fixture(home.path());
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let log = transcript
+            .parent()
+            .unwrap()
+            .join(format!("subagent/{MUSE_WORKER}/session.jsonl"));
+        let child = super::read_muse_transcript(&log).unwrap().unwrap();
+        super::ingest_muse_session_tree(&conn, &child, &log, None).unwrap();
+        assert!(muse_session_count(&conn, "session_events", MUSE_WORKER) > 0);
+        assert_eq!(muse_session_count(&conn, "history", MUSE_WORKER), 0);
+        assert_eq!(
+            muse_session_count(&conn, "sessions", MUSE_WORKER),
+            0,
+            "nor a catalog row of its own"
+        );
+    }
+
+    /// Scoped to its own prompt events, a remote session's history cleanup
+    /// still re-attributes a row another session evidences rather than
+    /// deleting it, and leaves rows it never wrote alone.
+    #[test]
+    fn scoped_history_cleanup_reattributes_shared_prompts() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for (session, text) in [("a", "shared"), ("b", "shared"), ("a", "only a")] {
+            conn.execute(
+                "INSERT INTO session_events (source, session_id, ts_ms, role, kind, text, event_uid) \
+                 VALUES ('muse', ?, 7, 'user', 'text', ?, ?)",
+                params![session, text, format!("{session}:{text}")],
+            )
+            .unwrap();
+        }
+        for (session, text) in [("a", "shared"), ("a", "only a"), ("a", "remote")] {
+            conn.execute(
+                "INSERT INTO history (source, session_id, prompt, timestamp_ms) \
+                 VALUES ('muse', ?, ?, 7)",
+                params![session, text],
+            )
+            .unwrap();
+        }
+        super::replace_session_history_scoped(
+            &conn,
+            "muse",
+            "a",
+            super::HistoryScope::OwnPromptEvents,
+        )
+        .unwrap();
+        let rows: Vec<(String, String)> = conn
+            .prepare("SELECT session_id, prompt FROM history ORDER BY prompt")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("a".to_string(), "remote".to_string()),
+                ("b".to_string(), "shared".to_string()),
+            ]
+        );
+    }
+
+    /// A rewritten transcript that no longer has a reply or a prompt does not
+    /// keep quoting the old ones in the catalog.
+    #[test]
+    fn a_rewritten_muse_transcript_replaces_its_catalog_text() {
+        let home = tempfile::tempdir().unwrap();
+        let (root, transcript) = muse_fixture(home.path());
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        let catalog = |conn: &Connection| -> (Option<String>, Option<String>) {
+            conn.query_row(
+                "SELECT first_prompt, last_assistant_text FROM sessions \
+                 WHERE source = 'muse' AND session_id = ?",
+                [MUSE_PARENT],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        let (prompt, reply) = catalog(&conn);
+        assert!(prompt.is_some() && reply.is_some());
+
+        // Keep only the permission frame, metadata and the open record.
+        let head: String = fs::read_to_string(&transcript)
+            .unwrap()
+            .lines()
+            .take(3)
+            .map(|line| format!("{line}\n"))
+            .collect();
+        fs::write(&transcript, head).unwrap();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        assert_eq!(catalog(&conn), (None, None));
+    }
+
+    /// A child whose log is gone is no longer evidenced: the edge and the
+    /// child's events go with it.
+    #[test]
+    fn muse_resync_drops_the_edge_to_a_removed_subagent_log() {
+        let home = tempfile::tempdir().unwrap();
+        let (root, transcript) = muse_fixture(home.path());
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        fs::remove_dir_all(transcript.parent().unwrap().join("subagent/muse-e001")).unwrap();
+        super::sync_muse(&conn, &mut state, &root).unwrap();
+        let children: Vec<String> = conn
+            .prepare(
+                "SELECT child_session_id FROM session_relationships \
+                 WHERE source = 'muse' ORDER BY child_session_id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            children,
+            vec![MUSE_WORKER.to_string(), "muse-c002".to_string()]
+        );
+        assert_eq!(
+            muse_session_count(&conn, "session_events", "muse-e001"),
+            0,
+            "the removed child's events go with its edge"
+        );
     }
 
     /// A stamp that fails closed has to be *reported*. Round four stopped one
@@ -13549,6 +19165,358 @@ mod tests {
             .query_row("SELECT count(*) FROM session_markers", [], |row| row.get(0))
             .unwrap();
         assert_eq!(orphans, 0, "a marker with no session would be unreachable");
+    }
+
+    #[test]
+    fn claude_workflow_journal_is_recognized_only_below_a_subagents_directory() {
+        let root = Path::new("/home/u/.claude/projects");
+        for journal in [
+            "/home/u/.claude/projects/app/s1/subagents/journal.jsonl",
+            "/home/u/.claude/projects/app/s1/subagents/wf-1/journal.jsonl",
+        ] {
+            assert!(
+                is_claude_workflow_journal(root, Path::new(journal)),
+                "{journal}"
+            );
+        }
+        for transcript in [
+            "/home/u/.claude/projects/app/journal.jsonl",
+            "/home/u/.claude/projects/app/s1/subagents/agent-a.jsonl",
+            "/home/u/.claude/projects/app/s1/subagents/journal.jsonl.bak",
+        ] {
+            assert!(
+                !is_claude_workflow_journal(root, Path::new(transcript)),
+                "{transcript}"
+            );
+        }
+        // Only the path below the Claude root counts.
+        assert!(!is_claude_workflow_journal(
+            Path::new("/srv/subagents/.claude/projects"),
+            Path::new("/srv/subagents/.claude/projects/app/journal.jsonl"),
+        ));
+    }
+
+    /// Claude Code keeps a workflow journal beside a session's subagent
+    /// transcripts. It shares their extension and sits in the tree the sync
+    /// recurses, but it is orchestration metadata: the walk must not open it,
+    /// keep a cursor for it, or derive a single row from it — while the
+    /// session and the subagent beside it index exactly as before.
+    #[test]
+    fn claude_sync_never_reads_a_subagent_workflow_journal() {
+        let home = tempfile::tempdir().unwrap();
+        let project = home.path().join(".claude/projects/app");
+        let journal = project.join("s1/subagents/journal.jsonl");
+        fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        fs::write(
+            project.join("s1.jsonl"),
+            concat!(
+                r#"{"type":"user","uuid":"u1","sessionId":"s1","cwd":"/tmp/app","timestamp":"2026-09-20T00:00:00.000Z","message":{"role":"user","content":"spawn a helper"}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"s1","cwd":"/tmp/app","timestamp":"2026-09-20T00:00:01.000Z","requestId":"req_1","message":{"id":"msg_1","role":"assistant","model":"claude-opus-4-7","content":[{"type":"text","text":"On it."}]}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            project.join("s1/subagents/agent-a.jsonl"),
+            concat!(
+                r#"{"type":"assistant","uuid":"sa1","sessionId":"s1","agentId":"a","isSidechain":true,"cwd":"/tmp/app","timestamp":"2026-09-20T00:00:02.000Z","message":{"id":"msg_sub","role":"assistant","model":"claude-opus-4-7","content":[{"type":"text","text":"Helper report."}]}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        // The journal's own shape: lifecycle lines, not messages. A
+        // `sessionId` is included on purpose, so a walk that did read it
+        // would have a session to attribute rows to.
+        fs::write(
+            &journal,
+            concat!(
+                r#"{"type":"started","sessionId":"s1","agentId":"a","uuid":"j1","timestamp":"2026-09-20T00:00:02.000Z"}"#, "\n",
+                r#"{"type":"result","sessionId":"s1","agentId":"a","uuid":"j2","timestamp":"2026-09-20T00:00:03.000Z","verdict":"done"}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        let root = home.path().join(".claude/projects");
+        super::sync_claude_session_metadata(&conn, &mut state, &root).unwrap();
+
+        assert!(super::session_events_exist(&conn, "claude", "s1").unwrap());
+        let journal_locator = journal.to_string_lossy().to_string();
+        assert!(
+            !transcript_cursor::known_locators(&conn, "claude")
+                .unwrap()
+                .contains(&journal_locator),
+            "the journal must not be tracked as a transcript"
+        );
+        let derived: i64 = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM session_markers WHERE marker_uid LIKE 'j%') \
+                      + (SELECT COUNT(*) FROM session_events WHERE message_id IN ('j1', 'j2')) \
+                      + (SELECT COUNT(*) FROM sessions WHERE raw_path = ?1) \
+                      + (SELECT COUNT(*) FROM session_continuity_evidence WHERE locator = ?1)",
+                [&journal_locator],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(derived, 0, "nothing may be derived from the journal");
+    }
+
+    /// `<claude root>/transcripts/` holds oh-my-opencode's copies of OpenCode
+    /// sessions, not Claude Code transcripts (#208, see the claude bullet in
+    /// `docs/session-catalog.md`). A full local sync must not read it: no
+    /// session, cursor or row may come from a file there, while the ordinary
+    /// `projects/` transcript beside it indexes as before.
+    #[test]
+    fn local_sync_never_reads_the_opencode_wrapper_transcripts_root() {
+        let home = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        fs::create_dir_all(claude.join("projects/app")).unwrap();
+        fs::write(
+            claude.join("projects/app/s1.jsonl"),
+            concat!(
+                r#"{"type":"user","uuid":"u1","sessionId":"s1","cwd":"/tmp/app","timestamp":"2026-09-20T00:00:00.000Z","message":{"role":"user","content":"hello"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let wrapper = claude.join("transcripts/ses_0123456789abcdefghijklmno.jsonl");
+        fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
+        // The wrapper's real shape carries no `sessionId`; one is added here
+        // so a walk that did open the file would have a session to publish.
+        fs::write(
+            &wrapper,
+            concat!(
+                r#"{"type":"user","sessionId":"ses_0123456789abcdefghijklmno","timestamp":"2026-09-20T00:00:00.000Z","content":"wrapped prompt"}"#, "\n",
+                r#"{"type":"tool_use","sessionId":"ses_0123456789abcdefghijklmno","timestamp":"2026-09-20T00:00:01.000Z","tool_name":"read","tool_input":{"filePath":"/src/main.rs"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let db_path = home.path().join("history.db");
+        sync_local_at_with_home(&db_path, home.path()).unwrap();
+
+        let conn = open_db(&db_path).unwrap();
+        assert!(super::session_events_exist(&conn, "claude", "s1").unwrap());
+        let wrapper_locator = wrapper.to_string_lossy().to_string();
+        assert!(
+            !transcript_cursor::known_locators(&conn, "claude")
+                .unwrap()
+                .contains(&wrapper_locator),
+            "a transcripts/ file must not be tracked as a Claude transcript (#208)"
+        );
+        let derived: i64 = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM sessions \
+                         WHERE raw_path = ?1 OR session_id = 'ses_0123456789abcdefghijklmno') \
+                      + (SELECT COUNT(*) FROM session_events \
+                         WHERE session_id = 'ses_0123456789abcdefghijklmno') \
+                      + (SELECT COUNT(*) FROM session_continuity_evidence WHERE locator = ?1)",
+                [&wrapper_locator],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            derived, 0,
+            "nothing may be derived from <claude root>/transcripts/ (#208)"
+        );
+    }
+
+    /// An empty `sessionId` is no session: a journal whose first line
+    /// carries one still attributes a sessionless line to the first real id,
+    /// as the walk that wrote its marker did, and that marker is retracted.
+    #[test]
+    fn journal_retraction_skips_an_empty_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("journal.jsonl");
+        fs::write(
+            &journal,
+            concat!(
+                r#"{"type":"started","sessionId":"","uuid":"j0"}"#,
+                "\n",
+                r#"{"type":"started","sessionId":"s1","uuid":"j1"}"#,
+                "\n",
+                r#"{"type":"result","uuid":"j2"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO session_markers (source, session_id, marker_uid, kind, subkind) \
+             VALUES ('claude', 's1', 'j2:marker', 'unknown', 'result')",
+            [],
+        )
+        .unwrap();
+        super::retract_claude_workflow_journal(&conn, &journal).unwrap();
+        let left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_markers WHERE marker_uid = 'j2:marker'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0);
+    }
+
+    /// An install upgraded from a build that walked the journal as a
+    /// transcript still holds what that build derived from it. The first walk
+    /// after the upgrade must retract it — the markers, the continuity row and
+    /// a `raw_path` pointing at the journal — while the session's real
+    /// evidence stays.
+    #[test]
+    fn claude_sync_retracts_what_an_earlier_build_derived_from_a_workflow_journal() {
+        let home = tempfile::tempdir().unwrap();
+        let project = home.path().join(".claude/projects/app");
+        let transcript = project.join("s1.jsonl");
+        let journal = project.join("s1/subagents/journal.jsonl");
+        fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"user","uuid":"u1","sessionId":"s1","cwd":"/tmp/app","timestamp":"2026-09-20T00:00:00.000Z","message":{"role":"user","content":"spawn a helper"}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"s1","cwd":"/tmp/app","timestamp":"2026-09-20T00:00:01.000Z","requestId":"req_1","message":{"id":"msg_1","role":"assistant","model":"claude-opus-4-7","content":[{"type":"text","text":"On it."}]}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &journal,
+            concat!(
+                r#"{"type":"started","sessionId":"s1","agentId":"a","uuid":"j1","timestamp":"2026-09-20T00:00:02.000Z"}"#, "\n",
+                r#"{"type":"result","sessionId":"s1","agentId":"a","uuid":"j2","timestamp":"2026-09-20T00:00:03.000Z","verdict":"done"}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        let root = home.path().join(".claude/projects");
+        let journal_locator = journal.to_string_lossy().to_string();
+        let journal_rows = |conn: &Connection| -> (i64, i64, i64) {
+            conn.query_row(
+                "SELECT (SELECT COUNT(*) FROM session_markers WHERE marker_uid IN ('j1:marker', 'j2:marker')), \
+                        (SELECT COUNT(*) FROM session_continuity_evidence WHERE locator = ?1), \
+                        (SELECT COUNT(*) FROM sessions WHERE raw_path = ?1)",
+                [&journal_locator],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+        };
+
+        // The old walk: the journal is indexed like a transcript.
+        LEGACY_WALKS_WORKFLOW_JOURNALS.with(|legacy| legacy.set(true));
+        let legacy = super::sync_claude_session_metadata(&conn, &mut state, &root);
+        LEGACY_WALKS_WORKFLOW_JOURNALS.with(|legacy| legacy.set(false));
+        legacy.unwrap();
+        // Whichever file the old walk upserted last owned `raw_path`.
+        conn.execute(
+            "UPDATE sessions SET raw_path = ?1 WHERE source = 'claude' AND session_id = 's1'",
+            [&journal_locator],
+        )
+        .unwrap();
+        // ...and hydration's locators: the local presence and observation.
+        crate::observations::upsert(
+            &conn,
+            &crate::observations::SessionObservation {
+                key: crate::observations::ObservationKey {
+                    source: "claude".into(),
+                    session_id: "s1".into(),
+                    location: SessionLocation::Local,
+                    connector_id: "claude".into(),
+                    connector_instance: "default".into(),
+                },
+                raw_locator: Some(journal_locator.clone()),
+                source_stamp: None,
+                discovery_state: "full".into(),
+                access_state: "available".into(),
+                updated_ms: 1,
+                first_prompt: None,
+                last_assistant_text: None,
+            },
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE session_presences SET raw_locator = ?1 \
+             WHERE source = 'claude' AND session_id = 's1' AND location = 'local'",
+            [&journal_locator],
+        )
+        .unwrap();
+        // A real transcript's marker in another session that happens to share
+        // a journal line's identity is not the journal's to retract.
+        conn.execute(
+            "INSERT INTO session_markers (source, session_id, marker_uid, kind, subkind) \
+             VALUES ('claude', 's2', 'j1:marker', 'unknown', 'started')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            journal_rows(&conn),
+            (3, 1, 1),
+            "the old walk must have derived rows from the journal, or nothing is tested"
+        );
+
+        // A retraction that fails keeps the cursor that brings the journal
+        // back, so the next sync retries instead of forgetting the work.
+        conn.execute_batch(
+            "CREATE TRIGGER fail_retraction BEFORE DELETE ON session_continuity_evidence \
+             BEGIN SELECT RAISE(ABORT, 'retraction interrupted'); END;",
+        )
+        .unwrap();
+        assert!(super::sync_claude_session_metadata(&conn, &mut state, &root).is_err());
+        assert!(transcript_cursor::known_locators(&conn, "claude")
+            .unwrap()
+            .contains(&journal_locator));
+        conn.execute_batch("DROP TRIGGER fail_retraction;").unwrap();
+
+        super::sync_claude_session_metadata(&conn, &mut state, &root).unwrap();
+
+        assert_eq!(journal_rows(&conn), (1, 0, 0));
+        let survivor: String = conn
+            .query_row(
+                "SELECT session_id FROM session_markers WHERE marker_uid = 'j1:marker'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(survivor, "s2", "only the journal's own marker is retracted");
+        let locators: (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT (SELECT raw_locator FROM session_presences \
+                          WHERE source = 'claude' AND session_id = 's1' AND location = 'local'), \
+                        (SELECT raw_locator FROM session_observations \
+                          WHERE source = 'claude' AND session_id = 's1' AND location = 'local')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let own = Some(transcript.to_string_lossy().to_string());
+        assert_eq!(
+            locators,
+            (own.clone(), own),
+            "hydration must not reopen the journal"
+        );
+        assert!(!transcript_cursor::known_locators(&conn, "claude")
+            .unwrap()
+            .contains(&journal_locator));
+        let raw_path: Option<String> = conn
+            .query_row(
+                "SELECT raw_path FROM sessions WHERE source = 'claude' AND session_id = 's1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw_path.as_deref(), Some(&*transcript.to_string_lossy()));
+        assert!(super::session_events_exist(&conn, "claude", "s1").unwrap());
+        let transcript_continuity: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_continuity_evidence WHERE locator = ?1",
+                [&*transcript.to_string_lossy()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            transcript_continuity, 1,
+            "the real transcript's evidence stays"
+        );
     }
 
     /// The Claude half of the marker-only fast path.
@@ -21251,6 +27219,505 @@ mod tests {
         assert_eq!(prompts, vec!["real prompt"]);
     }
 
+    fn corpus_fixture(relative: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(relative)
+    }
+
+    fn typed_event_uids(
+        conn: &Connection,
+        session_id: &str,
+        message_id: &str,
+    ) -> Vec<(String, Option<String>)> {
+        conn.prepare(
+            "SELECT event_uid, control_kind FROM session_events \
+             WHERE source = 'claude' AND session_id = ? AND message_id = ? ORDER BY event_uid",
+        )
+        .unwrap()
+        .query_map([session_id, message_id], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    /// Before reminders were split out, a standalone `<system-reminder>` text
+    /// block was stored under the block's own uid, untyped. The split stores
+    /// it under a suffixed uid, so an upgraded database would otherwise keep
+    /// the old row beside the new one -- and usage attribution would go on
+    /// reading it as a prompt.
+    #[test]
+    fn a_reminder_row_the_previous_parser_stored_untyped_is_retired_on_reparse() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // The row shape the previous parser wrote for `u-rem-1`'s first block.
+        conn.execute(
+            "INSERT INTO session_events (source, session_id, message_id, ts_ms, role, kind, text, event_uid, raw_facts_version) \
+             VALUES ('claude', 'reminder-session', 'u-rem-1', 1779753600000, 'user', 'text', \
+                     '<system-reminder>\nThe user has enabled brief mode. Keep answers short.\n</system-reminder>', \
+                     'u-rem-1:0', 2)",
+            [],
+        )
+        .unwrap();
+
+        ingest_claude_transcript(&conn, &corpus_fixture("claude/system-reminder.jsonl")).unwrap();
+
+        assert_eq!(
+            typed_event_uids(&conn, "reminder-session", "u-rem-1"),
+            vec![
+                (
+                    "u-rem-1:0:reminder:0".to_string(),
+                    Some("system_reminder".to_string())
+                ),
+                ("u-rem-1:1".to_string(), None),
+            ],
+            "the untyped row under the old uid is gone, the typed one stands"
+        );
+        let events = crate::session_events(&conn, "reminder-session", Some("claude")).unwrap();
+        let attributed = crate::usage::attribute_usage_to_prompts(&events, "claude");
+        let prompts: Vec<&str> = attributed
+            .keys()
+            .map(|(_, prompt)| prompt.as_str())
+            .collect();
+        assert!(
+            prompts
+                .iter()
+                .all(|prompt| !prompt.contains("<system-reminder>")),
+            "no reminder text is a prompt: {prompts:?}"
+        );
+    }
+
+    /// Reminder rows have derived identities the upsert can only add to, so
+    /// a record Claude rewrites under the same uuid with fewer reminders has
+    /// to lose the rows the earlier text produced.
+    #[test]
+    fn a_rewritten_record_keeps_only_the_reminders_its_current_text_has() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rewritten.jsonl");
+        let record = |content: &str| {
+            format!(
+                "{{\"type\":\"user\",\"uuid\":\"u1\",\"sessionId\":\"rewrite-session\",\"cwd\":\"/tmp/project\",\"timestamp\":\"2026-04-21T00:00:00.000Z\",\"message\":{{\"role\":\"user\",\"content\":\"{content}\"}}}}\n"
+            )
+        };
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let rows = |conn: &Connection| typed_event_uids(conn, "rewrite-session", "u1");
+        let reminder = |n: usize| {
+            (
+                format!("u1:0:reminder:{n}"),
+                Some("system_reminder".to_string()),
+            )
+        };
+
+        fs::write(
+            &path,
+            record(
+                "<system-reminder>a</system-reminder>fix it<system-reminder>b</system-reminder>",
+            ),
+        )
+        .unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        assert_eq!(
+            rows(&conn),
+            vec![("u1:0".to_string(), None), reminder(0), reminder(1)]
+        );
+
+        fs::write(&path, record("<system-reminder>a</system-reminder>fix it")).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        assert_eq!(
+            rows(&conn),
+            vec![("u1:0".to_string(), None), reminder(0)],
+            "the second reminder is gone with the text that produced it"
+        );
+
+        fs::write(&path, record("fix it")).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        assert_eq!(
+            rows(&conn),
+            vec![("u1:0".to_string(), None)],
+            "no reminder in the text, no reminder row"
+        );
+
+        // And back up again: the derived rows are recreated from the text.
+        fs::write(
+            &path,
+            record(
+                "<system-reminder>a</system-reminder>fix it<system-reminder>b</system-reminder>",
+            ),
+        )
+        .unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        assert_eq!(rows(&conn).len(), 3);
+    }
+
+    /// The block that carried a reminder can itself disappear from a
+    /// rewritten record -- dropped, emptied out, or turned into another block
+    /// type -- and then no text block reaches the split at all. The record
+    /// walk retires the record's reminder rows before it looks at any block.
+    #[test]
+    fn a_rewritten_record_drops_the_reminder_rows_of_blocks_it_no_longer_has() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rewritten-blocks.jsonl");
+        let record = |content: &str| {
+            format!(
+                "{{\"type\":\"user\",\"uuid\":\"u1\",\"sessionId\":\"rewrite-blocks\",\"cwd\":\"/tmp/project\",\"timestamp\":\"2026-04-21T00:00:00.000Z\",\"message\":{{\"role\":\"user\",\"content\":{content}}}}}\n"
+            )
+        };
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let rows = |conn: &Connection| typed_event_uids(conn, "rewrite-blocks", "u1");
+        let reminders = |conn: &Connection| -> Vec<String> {
+            rows(conn)
+                .into_iter()
+                .filter(|(_, kind)| kind.as_deref() == Some("system_reminder"))
+                .map(|(uid, _)| uid)
+                .collect()
+        };
+        let two_blocks = r#"[{"type":"text","text":"fix it"},{"type":"text","text":"<system-reminder>b</system-reminder>"}]"#;
+
+        fs::write(&path, record(two_blocks)).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        assert_eq!(
+            rows(&conn),
+            vec![
+                ("u1:0".to_string(), None),
+                (
+                    "u1:1:reminder:0".to_string(),
+                    Some("system_reminder".to_string())
+                ),
+            ]
+        );
+
+        // The reminder's block is gone.
+        fs::write(&path, record(r#"[{"type":"text","text":"fix it"}]"#)).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        assert_eq!(rows(&conn), vec![("u1:0".to_string(), None)]);
+
+        // Back, then the whole content emptied.
+        fs::write(&path, record(two_blocks)).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        assert_eq!(reminders(&conn), vec!["u1:1:reminder:0".to_string()]);
+        fs::write(&path, record("[]")).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        assert!(reminders(&conn).is_empty(), "{:?}", rows(&conn));
+
+        // Back, then the block turned into something that is not text.
+        fs::write(&path, record(two_blocks)).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        assert_eq!(reminders(&conn), vec!["u1:1:reminder:0".to_string()]);
+        fs::write(
+            &path,
+            record(r#"[{"type":"text","text":"fix it"},{"type":"image","source":{"type":"base64","data":"AAAA"}}]"#),
+        )
+        .unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        assert!(reminders(&conn).is_empty(), "{:?}", rows(&conn));
+        assert_eq!(rows(&conn)[0], ("u1:0".to_string(), None));
+    }
+
+    /// The same shape for Codex: a context wrapper used to store nothing and
+    /// was recorded as an `unknown` marker. It stores a typed row now, so the
+    /// marker an earlier parser left for that line is retired.
+    #[test]
+    fn a_codex_wrapper_marker_the_previous_parser_left_is_retired() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-current.jsonl");
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n{}\n",
+                r#"{"timestamp":"2026-08-31T10:00:00.000Z","type":"session_meta","payload":{"id":"sess-wrapper","cwd":"/tmp/proj"}}"#,
+                response_user(
+                    "2026-08-31T10:00:01.000Z",
+                    "<environment_context>injected</environment_context>"
+                ),
+                response_user("2026-08-31T10:00:02.000Z", "fix the scanner"),
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // What the previous parser left for line 1.
+        crate::insert_session_marker(
+            &conn,
+            "codex",
+            "sess-wrapper",
+            &crate::NewSessionMarker {
+                marker_uid: "1:marker",
+                ts_ms: Some(1),
+                kind: "unknown",
+                subkind: Some("message"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        super::ingest_codex_rollout(&conn, &path, &codex_meta(&path)).unwrap();
+
+        assert!(
+            markers_of(&conn, "codex", "sess-wrapper").is_empty(),
+            "the wrapper is a row now, not a marker: {:?}",
+            markers_of(&conn, "codex", "sess-wrapper")
+        );
+        let control: Vec<Option<String>> = conn
+            .prepare("SELECT control_kind FROM session_events WHERE role = 'user' ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(control, vec![Some("codex_context_wrapper".into()), None]);
+    }
+
+    fn claude_history(conn: &Connection, session_id: &str) -> Vec<(i64, String)> {
+        conn.prepare(
+            "SELECT timestamp_ms, prompt FROM history \
+             WHERE source = 'claude' AND session_id = ? ORDER BY timestamp_ms, prompt",
+        )
+        .unwrap()
+        .query_map([session_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    /// The parser before control rows stored a record's whole text as its
+    /// history row: reminders folded into the prompt, task notifications as
+    /// prompts. Nothing on the Claude path removes a history row on re-read,
+    /// so the one-time re-read retires exactly the row that parser wrote for
+    /// each record it now stores differently -- and leaves a row another
+    /// session happens to share alone.
+    #[test]
+    fn a_reparse_retires_the_history_rows_the_previous_parser_wrote() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for (session_id, ts_ms, prompt) in [
+            // `u-rem-1`, with the reminder block folded into the prompt.
+            (
+                "reminder-session",
+                1_779_753_600_000_i64,
+                "<system-reminder>\nThe user has enabled brief mode. Keep answers short.\n</system-reminder>\ntighten the retry loop",
+            ),
+            // `u-rem-2`, the inline form.
+            (
+                "reminder-session",
+                1_779_753_602_000,
+                "now add a test for it\n<system-reminder>Remember to read AGENTS.md before editing.</system-reminder>",
+            ),
+            // `u-tn-1`, a task notification stored as a prompt.
+            (
+                "tn-session",
+                1_779_667_202_000,
+                "<task-notification>background task bash_1 completed</task-notification>",
+            ),
+            // Another session's row at the same instant and text as `u-tn-1`
+            // is not this transcript's to retire.
+            (
+                "elsewhere",
+                1_779_667_202_001,
+                "<task-notification>background task bash_1 completed</task-notification>",
+            ),
+        ] {
+            insert_history(
+                &conn,
+                &HistoryEntry {
+                    id: 0,
+                    source: "claude".into(),
+                    session_id: Some(session_id.into()),
+                    project: Some("/tmp/project".into()),
+                    prompt_hash: Some(prompt_hash(prompt)),
+                    prompt: prompt.into(),
+                    timestamp_ms: ts_ms,
+                },
+            )
+            .unwrap();
+        }
+
+        ingest_claude_transcript(&conn, &corpus_fixture("claude/system-reminder.jsonl")).unwrap();
+        ingest_claude_transcript(&conn, &corpus_fixture("claude/task-notification.jsonl")).unwrap();
+
+        assert_eq!(
+            claude_history(&conn, "reminder-session"),
+            vec![
+                (1_779_753_600_000, "tighten the retry loop".to_string()),
+                (1_779_753_602_000, "now add a test for it".to_string()),
+            ]
+        );
+        assert_eq!(
+            claude_history(&conn, "tn-session"),
+            vec![
+                (1_779_667_200_000, "please fix the build".to_string()),
+                (
+                    1_779_667_204_000,
+                    "thanks, also add a changelog entry".to_string()
+                ),
+            ]
+        );
+        assert_eq!(claude_history(&conn, "elsewhere").len(), 1);
+
+        // Idempotent: a second read changes nothing.
+        ingest_claude_transcript(&conn, &corpus_fixture("claude/system-reminder.jsonl")).unwrap();
+        assert_eq!(claude_history(&conn, "reminder-session").len(), 2);
+    }
+
+    /// `history` is unique on `(source, timestamp_ms, prompt)`, so a task
+    /// notification in one session and a human prompt with the same text at
+    /// the same millisecond in another are one row. Whichever order the
+    /// upgrade re-reads the two transcripts in, the human prompt has to be
+    /// the one left standing.
+    #[test]
+    fn retiring_a_control_row_hands_a_shared_history_row_to_the_human_session() {
+        let control = concat!(
+            r#"{"type":"user","uuid":"a1","sessionId":"sess-control","cwd":"/tmp/a","origin":{"kind":"task-notification"},"timestamp":"2026-04-21T00:00:01.000Z","message":{"role":"user","content":"fix it"}}"#,
+            "\n",
+        );
+        let human = concat!(
+            r#"{"type":"user","uuid":"b1","sessionId":"sess-human","cwd":"/tmp/b","timestamp":"2026-04-21T00:00:01.000Z","message":{"role":"user","content":"fix it"}}"#,
+            "\n",
+        );
+        let owners = |conn: &Connection| -> Vec<(String, String)> {
+            conn.prepare(
+                "SELECT session_id, prompt FROM history WHERE source = 'claude' ORDER BY session_id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        };
+        for human_first in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let control_path = dir.path().join("control.jsonl");
+            let human_path = dir.path().join("human.jsonl");
+            fs::write(&control_path, control).unwrap();
+            fs::write(&human_path, human).unwrap();
+            let conn = Connection::open_in_memory().unwrap();
+            init_db(&conn).unwrap();
+            // What the previous parser left: the control session owns the
+            // one row, and both sessions' events are stored untyped.
+            insert_history(
+                &conn,
+                &HistoryEntry {
+                    id: 0,
+                    source: "claude".into(),
+                    session_id: Some("sess-control".into()),
+                    project: Some("/tmp/a".into()),
+                    prompt_hash: Some(prompt_hash("fix it")),
+                    prompt: "fix it".into(),
+                    timestamp_ms: 1_776_729_601_000,
+                },
+            )
+            .unwrap();
+            for (session, project, uid) in [
+                ("sess-control", "/tmp/a", "a1:0"),
+                ("sess-human", "/tmp/b", "b1:0"),
+            ] {
+                conn.execute(
+                    "INSERT INTO session_events (source, session_id, project, message_id, ts_ms, role, kind, text, event_uid) \
+                     VALUES ('claude', ?1, ?2, ?3, 1776729601000, 'user', 'text', 'fix it', ?4)",
+                    params![session, project, &uid[..2], uid],
+                )
+                .unwrap();
+            }
+
+            let order: Vec<&Path> = if human_first {
+                vec![&human_path, &control_path]
+            } else {
+                vec![&control_path, &human_path]
+            };
+            for path in order {
+                ingest_claude_transcript(&conn, path).unwrap();
+            }
+            assert_eq!(
+                owners(&conn),
+                vec![("sess-human".to_string(), "fix it".to_string())],
+                "human first: {human_first}"
+            );
+            let project: Option<String> = conn
+                .query_row(
+                    "SELECT project FROM history WHERE source = 'claude' AND prompt = 'fix it'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                project.as_deref(),
+                Some("/tmp/b"),
+                "the row is the human session's now, project included: {human_first}"
+            );
+            // Idempotent: reading both again moves nothing.
+            ingest_claude_transcript(&conn, &control_path).unwrap();
+            ingest_claude_transcript(&conn, &human_path).unwrap();
+            assert_eq!(owners(&conn).len(), 1, "human first: {human_first}");
+        }
+    }
+
+    fn stored_first_prompt(conn: &Connection, session_id: &str) -> Option<String> {
+        conn.query_row(
+            "SELECT first_prompt FROM sessions WHERE source = 'claude' AND session_id = ?",
+            [session_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// The shallow catalog upsert coalesces a null `first_prompt` into the
+    /// stored one, so a title an earlier scanner derived from a row that is
+    /// control now -- a bare `/resume <id>` -- would survive every rescan of
+    /// an unchanged transcript. The full sync walks every record, so its
+    /// answer, null included, is the one the catalog keeps.
+    #[test]
+    fn a_full_claude_sync_replaces_a_control_only_first_prompt_with_null() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resume-only.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","uuid":"u1","sessionId":"resume-only","cwd":"/tmp/project","timestamp":"2026-04-21T00:00:00.000Z","message":{"role":"user","content":"/resume 11111111-1111-1111-1111-111111111111"}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"resume-only","cwd":"/tmp/project","timestamp":"2026-04-21T00:00:01.000Z","message":{"role":"assistant","model":"claude-test","content":[{"type":"text","text":"continuing"}]}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // The row an earlier scanner left: the marker text as the title.
+        conn.execute(
+            "INSERT INTO sessions (source, session_id, first_prompt, discovery_state) \
+             VALUES ('claude', 'resume-only', '/resume 11111111-1111-1111-1111-111111111111', 'shallow')",
+            [],
+        )
+        .unwrap();
+
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(stored_first_prompt(&conn, "resume-only"), None);
+
+        // And where a substantive prompt does follow a control row, the sync
+        // names it rather than the control row.
+        let path = dir.path().join("notified-first.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","uuid":"u1","sessionId":"notified-first","cwd":"/tmp/project","timestamp":"2026-04-21T00:00:00.000Z","message":{"role":"user","content":"<task-notification>bash_1 done</task-notification>"}}"#, "\n",
+                r#"{"type":"user","uuid":"u2","parentUuid":"u1","sessionId":"notified-first","cwd":"/tmp/project","timestamp":"2026-04-21T00:00:01.000Z","message":{"role":"user","content":"now ship it"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (source, session_id, first_prompt, discovery_state) \
+             VALUES ('claude', 'notified-first', '<task-notification>bash_1 done</task-notification>', 'shallow')",
+            [],
+        )
+        .unwrap();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(
+            stored_first_prompt(&conn, "notified-first").as_deref(),
+            Some("now ship it")
+        );
+    }
+
     fn write_rich_claude_transcript(path: &std::path::Path) {
         fs::write(
             path,
@@ -21455,8 +27922,10 @@ mod tests {
     /// `input_text` part (an image-only turn) is rejected, nothing is written,
     /// and the blanket exemption then swallowed the line.
     ///
-    /// The same holds for a blank `user_message` and for an
-    /// application-injected control wrapper: the deduplicator refuses both.
+    /// The same holds for a blank `user_message`: the deduplicator refuses
+    /// it. An application-injected control wrapper is different since #180:
+    /// it is stored as a `codex_context_wrapper` event, so it earns no
+    /// marker.
     ///
     /// The exemption now has to be earned: it holds for a mirrored duplicate,
     /// whose twin really did write, and not for a message the deduplicator
@@ -21476,9 +27945,8 @@ mod tests {
                 // Image-only user turn: no `input_text` part, so the
                 // deduplicator rejects it and nothing stores it.
                 r#"{"timestamp":"2026-09-13T00:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]}}"#, "\n",
-                // Blank text, and an application-injected control wrapper:
-                // the deduplicator refuses both, so nothing stores them
-                // either.
+                // Blank text: refused, so nothing stores it either. The
+                // control wrapper after it is stored, typed.
                 r#"{"timestamp":"2026-09-13T00:00:02.000Z","type":"event_msg","payload":{"type":"user_message","message":"   "}}"#, "\n",
                 r#"{"timestamp":"2026-09-13T00:00:03.000Z","type":"event_msg","payload":{"type":"user_message","message":"<environment_context>cwd=/tmp/proj</environment_context>"}}"#, "\n",
             ),
@@ -21489,14 +27957,24 @@ mod tests {
         init_db(&conn).unwrap();
         super::ingest_codex_rollout(&conn, &rollout, &codex_meta(&rollout)).unwrap();
 
-        let events: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM session_events WHERE source='codex' AND session_id='sess-image'",
-                [],
-                |row| row.get(0),
+        let events: Vec<(String, Option<String>)> = conn
+            .prepare(
+                "SELECT text, control_kind FROM session_events \
+                 WHERE source='codex' AND session_id='sess-image' ORDER BY id",
             )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(events, 0, "the image-only turn reaches no event");
+        assert_eq!(
+            events,
+            vec![(
+                "<environment_context>cwd=/tmp/proj</environment_context>".to_string(),
+                Some("codex_context_wrapper".to_string())
+            )],
+            "the image-only turn reaches no event; the wrapper is a typed row"
+        );
 
         let markers = markers_of(&conn, "codex", "sess-image");
         assert_eq!(
@@ -21504,11 +27982,7 @@ mod tests {
                 .iter()
                 .map(|(kind, subkind, _)| (kind.as_str(), subkind.as_str()))
                 .collect::<Vec<_>>(),
-            vec![
-                ("unknown", "message"),
-                ("unknown", "user_message"),
-                ("unknown", "user_message"),
-            ],
+            vec![("unknown", "message"), ("unknown", "user_message")],
             "every user line nothing stored must leave a row: {markers:?}"
         );
         // No marker payload carries the image or the wrapper text, only the
@@ -23143,6 +29617,56 @@ mod tests {
         }
     }
 
+    /// Codex 0.150 writes a guardian's `thread_source` as `guardian_review`
+    /// where earlier builds wrote `subagent`. With a parent it is a child under
+    /// either spelling — including when `source` is the plain string form and
+    /// carries no `subagent` marker — and without one it stays a root, like
+    /// the marker-only guardian above.
+    #[test]
+    fn codex_guardian_review_thread_source_is_classified_like_subagent() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, payload, is_subagent) in [
+            (
+                "guardian-review-marker",
+                r#"{"id":"guardian-thread","cwd":"/tmp/proj","parent_thread_id":"parent-thread","source":{"subagent":{"other":"guardian"}},"thread_source":"guardian_review"}"#,
+                true,
+            ),
+            (
+                "pre-0150-subagent",
+                r#"{"id":"guardian-thread","cwd":"/tmp/proj","parent_thread_id":"parent-thread","source":{"subagent":{"other":"guardian"}},"thread_source":"subagent"}"#,
+                true,
+            ),
+            (
+                "guardian-review-string-source",
+                r#"{"id":"guardian-thread","cwd":"/tmp/proj","parent_thread_id":"parent-thread","source":"vscode","thread_source":"guardian_review"}"#,
+                true,
+            ),
+            (
+                "guardian-review-no-parent",
+                r#"{"id":"guardian-thread","cwd":"/tmp/proj","source":"vscode","thread_source":"guardian_review"}"#,
+                false,
+            ),
+        ] {
+            let path = dir.path().join(format!("rollout-{name}.jsonl"));
+            fs::write(
+                &path,
+                format!(
+                    "{{\"timestamp\":\"2026-08-31T10:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{payload}}}\n"
+                ),
+            )
+            .unwrap();
+            let meta = codex_meta(&path);
+            assert_eq!(meta.is_subagent, is_subagent, "{name}");
+            if is_subagent {
+                assert_eq!(
+                    meta.parent_session_id.as_deref(),
+                    Some("parent-thread"),
+                    "{name}"
+                );
+            }
+        }
+    }
+
     fn response_user(ts: &str, text: &str) -> String {
         serde_json::json!({
             "timestamp": ts,
@@ -23191,24 +29715,42 @@ mod tests {
 
         let outcome = super::ingest_codex_rollout(&conn, &path, &codex_meta(&path)).unwrap();
         assert_eq!(outcome.prompts, 1);
-        assert_eq!(outcome.events, 2);
+        assert_eq!(outcome.events, 3);
         assert_eq!(outcome.first_prompt.as_deref(), Some("fix\nthe scanner"));
-        let rows: Vec<(String, String, String)> = conn
-            .prepare("SELECT role, text, message_id FROM session_events ORDER BY ts_ms")
+        let rows: Vec<(String, String, String, Option<String>)> = conn
+            .prepare(
+                "SELECT role, text, message_id, control_kind FROM session_events ORDER BY ts_ms",
+            )
             .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(
             rows,
             vec![
+                // The injected context is a typed row, and the first prompt
+                // is still the human's.
+                (
+                    "user".into(),
+                    "<environment_context>injected</environment_context>".into(),
+                    "1:response_item_user_message".into(),
+                    Some("codex_context_wrapper".into()),
+                ),
                 (
                     "user".into(),
                     "fix\nthe scanner".into(),
-                    "msg_user_1".into()
+                    "msg_user_1".into(),
+                    None,
                 ),
-                ("assistant".into(), "Done.".into(), "5:agent_message".into()),
+                (
+                    "assistant".into(),
+                    "Done.".into(),
+                    "5:agent_message".into(),
+                    None,
+                ),
             ]
         );
     }
@@ -23262,7 +29804,7 @@ mod tests {
 
         let outcome = super::ingest_codex_rollout(&conn, &path, &meta).unwrap();
         assert_eq!(outcome.prompts, 1);
-        assert_eq!(outcome.events, 6);
+        assert_eq!(outcome.events, 7);
         assert_eq!(
             outcome.last_assistant_text.as_deref(),
             Some("Done. The importer is fixed.")
@@ -23279,6 +29821,9 @@ mod tests {
         assert_eq!(
             kinds,
             vec![
+                ("user".into(), "text".into(), None),
+                // The `<environment_context>` wrapper: a typed row, not a
+                // prompt.
                 ("user".into(), "text".into(), None),
                 (
                     "assistant".into(),
@@ -23300,7 +29845,8 @@ mod tests {
             ]
         );
 
-        // The boilerplate user message is filtered from both stores.
+        // The boilerplate user message is kept out of `history`, and typed
+        // on the event it does leave.
         let prompt_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM history WHERE source='codex'",
@@ -23309,6 +29855,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(prompt_count, 1);
+        let control: Vec<Option<String>> = conn
+            .prepare("SELECT control_kind FROM session_events WHERE role='user' ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(control, vec![None, Some("codex_context_wrapper".into())]);
 
         // Request 1's cumulative snapshot lands on the tool_use event that
         // closed it; the duplicate snapshot adds nothing; request 2's delta
@@ -23412,7 +29966,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
-        assert_eq!(counts, (6, 2, 1, 1));
+        assert_eq!(counts, (7, 2, 1, 1));
     }
 
     #[test]
@@ -23741,6 +30295,121 @@ mod tests {
             }),
         );
         state
+    }
+
+    /// A Codex 0.150 `guardian_review` rollout an older build indexed as a
+    /// root: its stamp never changes, and the stamp map says `subagent: false`.
+    /// The one-time continuity re-read (its banked evidence predates
+    /// `fork_refs`) must also reclassify it, removing the root registration
+    /// and recording the delegation, rather than trusting the stale flag.
+    #[test]
+    fn unchanged_guardian_review_root_is_reclassified_on_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let day = home.join(".codex/sessions/2026/08/01");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-guardian-review.jsonl");
+        fs::write(
+            &rollout,
+            concat!(
+                r#"{"timestamp":"2026-08-01T10:01:00.000Z","type":"session_meta","payload":{"id":"sess-guardian-review","parent_thread_id":"parent","thread_source":"guardian_review","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent"}}},"cwd":"/tmp/proj"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-08-01T10:01:01.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Reviewing."}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // What the older build left: events, a root catalog row with a local
+        // presence, and continuity evidence banked without `fork_refs`.
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, ts_ms, role, kind, text, event_uid, raw_facts_version) \
+             VALUES ('codex', 'sess-guardian-review', 2, 'assistant', 'text', 'kept', 'event-1', ?)",
+            [super::RAW_MESSAGE_FACTS_VERSION],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (session_id, source, cwd) \
+             VALUES ('sess-guardian-review', 'codex', '/tmp/proj')",
+            [],
+        )
+        .unwrap();
+        crate::mark_session_presence(
+            &conn,
+            "codex",
+            "sess-guardian-review",
+            super::SessionLocation::Local,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_continuity_evidence \
+             (source, locator, session_id, file_session_id, in_log_session_ids_json, \
+              has_resume_marker, explicit_targets_json, pending_reason, updated_ms) \
+             VALUES ('codex', ?, 'sess-guardian-review', 'sess-guardian-review', \
+                     '[\"sess-guardian-review\"]', 0, \
+                     '{\"continuation\":[],\"fork\":[],\"source\":null}', NULL, 0)",
+            [rollout.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+        let key = rollout.to_string_lossy().to_string();
+        let mut state = Map::new();
+        state.insert(
+            "codex_rollouts_v6".into(),
+            json!({
+                (key.clone()): {
+                    "stamp": file_stamp(&rollout).unwrap(),
+                    "session": "sess-guardian-review",
+                    "subagent": false
+                }
+            }),
+        );
+
+        super::sync_codex_rollouts_with_repairs(
+            &conn,
+            &mut state,
+            &home.join(".codex"),
+            &Default::default(),
+        )
+        .unwrap();
+        let catalogued: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions \
+                 WHERE source='codex' AND session_id='sess-guardian-review'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(catalogued, 0, "the guardian must leave the root catalog");
+        let parent: String = conn
+            .query_row(
+                "SELECT parent_session_id FROM session_relationships \
+                 WHERE source='codex' AND child_session_id='sess-guardian-review' \
+                   AND relationship='delegated'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(parent, "parent");
+        assert_eq!(
+            state["codex_rollouts_v6"][&key]["subagent"],
+            json!(true),
+            "the stamp map is corrected, so the next pass trusts the right flag"
+        );
+        // Its fork edge survives the removal of the stale root registration,
+        // whose delete trigger drops continuity evidence banked before it.
+        let fork_parent: String = conn
+            .query_row(
+                "SELECT parent_session_id FROM session_relationships \
+                 WHERE source='codex' AND child_session_id='sess-guardian-review' \
+                   AND relationship='fork'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fork_parent, "parent");
+        assert!(crate::continuity::codex_evidence_is_current(&conn, &key).unwrap());
     }
 
     #[test]
@@ -25559,6 +32228,495 @@ mod tests {
         assert_eq!(ephemeral_1h, 4002);
     }
 
+    /// One streamed Claude response as Claude Code 2.1.x writes it: one record
+    /// per content block, the same `message.id` and `requestId` on each, and
+    /// the usage snapshot current when the block was written. The input side
+    /// is fixed; `output_tokens` grows, and fields such as `iterations` appear
+    /// only on later copies. `outputs` gives each copy's `output_tokens` in
+    /// file order.
+    fn jsonl_line(value: Value) -> String {
+        format!("{}\n", serde_json::to_string(&value).unwrap())
+    }
+
+    fn streamed_turn(outputs: [u64; 3]) -> String {
+        let blocks = [
+            json!({"type": "thinking", "thinking": "Considering the repo."}),
+            json!({"type": "text", "text": "Let me look."}),
+            json!({"type": "tool_use", "id": "toolu_ls", "name": "Bash", "input": {"command": "ls"}}),
+        ];
+        let mut out = jsonl_line(json!({
+            "type": "user", "uuid": "u-prompt", "sessionId": "s-stream",
+            "timestamp": "2026-09-20T00:00:00.000Z",
+            "message": {"role": "user", "content": "list the files"},
+        }));
+        let mut parent = "u-prompt".to_string();
+        for (index, (block, output)) in blocks.into_iter().zip(outputs).enumerate() {
+            let mut usage = json!({
+                "input_tokens": 2,
+                "cache_creation_input_tokens": 2100,
+                "cache_read_input_tokens": 111256,
+                "cache_creation": {"ephemeral_5m_input_tokens": 2100, "ephemeral_1h_input_tokens": 0},
+                "output_tokens": output,
+                "service_tier": "standard",
+            });
+            if output == 120 {
+                usage["iterations"] = json!([{"output_tokens": 120}]);
+                usage["server_tool_use"] = json!({"web_search_requests": 0});
+            }
+            let uuid = format!("u-block-{index}");
+            out.push_str(&jsonl_line(json!({
+                "type": "assistant", "uuid": uuid, "parentUuid": parent,
+                "sessionId": "s-stream", "requestId": "req_stream",
+                "timestamp": format!("2026-09-20T00:00:0{}.000Z", index + 1),
+                "message": {
+                    "id": "msg_stream", "role": "assistant", "model": "claude-opus-4-7",
+                    "content": [block], "usage": usage,
+                },
+            })));
+            parent = uuid;
+        }
+        out
+    }
+
+    fn stream_token_outputs(conn: &Connection) -> Vec<(String, i64)> {
+        conn.prepare(
+            "SELECT event_uid, json_extract(token_json, '$.output_tokens') FROM session_events \
+             WHERE role = 'assistant' ORDER BY event_uid",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    /// The copies are one measurement read at different moments, so the
+    /// request reports its final value — not the sum of the copies, and not a
+    /// refusal because they differ — whatever order they arrive in. Every
+    /// block is still its own row: the copies carry different content, so
+    /// nothing is dropped to make the numbers agree.
+    #[test]
+    fn claude_streamed_request_usage_settles_on_the_final_snapshot() {
+        for outputs in [[5, 40, 120], [5, 120, 40], [120, 40, 5]] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("s-stream.jsonl");
+            fs::write(&path, streamed_turn(outputs)).unwrap();
+            let conn = Connection::open_in_memory().unwrap();
+            init_db(&conn).unwrap();
+            // Twice: a re-read of the same file must land on the same rows.
+            ingest_claude_transcript(&conn, &path).unwrap();
+            ingest_claude_transcript(&conn, &path).unwrap();
+
+            assert_eq!(
+                stream_token_outputs(&conn),
+                vec![
+                    ("u-block-0:0".to_string(), 120),
+                    ("u-block-1:0".to_string(), 120),
+                    ("u-block-2:0".to_string(), 120),
+                ],
+                "{outputs:?}"
+            );
+            let (variants, iterations): (i64, Option<String>) = conn
+                .query_row(
+                    "SELECT usage_variants, json_extract(token_json, '$.iterations') \
+                     FROM session_requests WHERE session_id = 's-stream'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(variants, 1, "{outputs:?}");
+            assert!(iterations.is_some(), "later-only fields are kept");
+            let summary = crate::session_usage::session_usage_summary(&conn, "claude", "s-stream")
+                .unwrap()
+                .unwrap();
+            let usage = summary.usage.expect("the request's usage is established");
+            assert_eq!(usage.output_tokens, 120, "{outputs:?}");
+            assert_eq!(usage.cache_read_tokens, 111256);
+            assert_eq!(summary.request_count, 1);
+            assert!(summary.diagnostics.is_empty(), "{:?}", summary.diagnostics);
+        }
+    }
+
+    /// Copies that disagree on the input side are not snapshots of one
+    /// response, and settling them would invent a measurement. They stay
+    /// verbatim and the request stays refused.
+    #[test]
+    fn claude_contradictory_request_usage_copies_stay_ambiguous() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s-stream.jsonl");
+        let text =
+            streamed_turn([5, 40, 120]).replacen("\"input_tokens\":2,", "\"input_tokens\":9,", 1);
+        assert!(text.contains("\"input_tokens\":9,"), "fixture edit applied");
+        fs::write(&path, text).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let summary = crate::session_usage::session_usage_summary(&conn, "claude", "s-stream")
+            .unwrap()
+            .unwrap();
+        assert!(summary.usage.is_none());
+        assert!(summary
+            .diagnostics
+            .contains(&crate::session_usage::UsageDiagnostic::AmbiguousUsageCopies));
+    }
+
+    #[test]
+    fn claude_usage_copies_merge_per_field_and_refuse_contradictions() {
+        let early = r#"{"input_tokens":2,"cache_read_input_tokens":7,"output_tokens":5}"#;
+        let late = r#"{"input_tokens":2,"cache_read_input_tokens":7,"output_tokens":120,"iterations":[{"output_tokens":120}]}"#;
+        let forward = merge_claude_usage_copies([early, late]).unwrap();
+        let backward = merge_claude_usage_copies([late, early]).unwrap();
+        let forward: Value = serde_json::from_str(&forward).unwrap();
+        assert_eq!(forward, serde_json::from_str::<Value>(&backward).unwrap());
+        assert_eq!(forward["output_tokens"], 120);
+        assert_eq!(forward["iterations"][0]["output_tokens"], 120);
+
+        let other_cache = r#"{"input_tokens":2,"cache_read_input_tokens":8,"output_tokens":5}"#;
+        assert!(merge_claude_usage_copies([early, other_cache]).is_none());
+        assert!(merge_claude_usage_copies([early, r#"{"service_tier":1}"#]).is_some());
+        assert!(merge_claude_usage_copies([early, "[]"]).is_none());
+        let negative = r#"{"input_tokens":2,"cache_read_input_tokens":7,"output_tokens":-40}"#;
+        assert!(merge_claude_usage_copies([early, negative]).is_none());
+
+        // A reported cost is not a growing counter: copies that disagree on
+        // it contradict each other, whichever is larger.
+        let cost_1 = r#"{"input_tokens":2,"output_tokens":5,"cost_usd":1}"#;
+        let cost_2 = r#"{"input_tokens":2,"output_tokens":20,"cost_usd":2}"#;
+        assert!(merge_claude_usage_copies([cost_1, cost_2]).is_none());
+        assert!(merge_claude_usage_copies([cost_2, cost_1]).is_none());
+        let same_cost = r#"{"input_tokens":2,"output_tokens":20,"cost_usd":1}"#;
+        assert!(merge_claude_usage_copies([cost_1, same_cost]).is_some());
+        // Nor may a counter outside the output side grow.
+        let tier_a = r#"{"input_tokens":2,"output_tokens":5,"server_tool_use":{"web_search_requests":1},"extra":{"n":1}}"#;
+        let tier_b = r#"{"input_tokens":2,"output_tokens":9,"server_tool_use":{"web_search_requests":3},"extra":{"n":2}}"#;
+        assert!(merge_claude_usage_copies([tier_a, tier_b]).is_none());
+
+        // `iterations` is append-only: a later copy's extra entry is kept, the
+        // shared prefix is reconciled, and the order of arrival is irrelevant.
+        let one = r#"{"input_tokens":2,"output_tokens":5,"iterations":[{"output_tokens":5}]}"#;
+        let two = r#"{"input_tokens":2,"output_tokens":20,"iterations":[{"output_tokens":8},{"output_tokens":20}]}"#;
+        let forward: Value =
+            serde_json::from_str(&merge_claude_usage_copies([one, two]).unwrap()).unwrap();
+        let backward: Value =
+            serde_json::from_str(&merge_claude_usage_copies([two, one]).unwrap()).unwrap();
+        assert_eq!(forward, backward);
+        assert_eq!(
+            forward["iterations"],
+            json!([{"output_tokens": 8}, {"output_tokens": 20}])
+        );
+        // Overlapping entries that are not the same entry still contradict.
+        let clash =
+            r#"{"input_tokens":2,"output_tokens":20,"iterations":[{"type":"a"},{"type":"b"}]}"#;
+        let other = r#"{"input_tokens":2,"output_tokens":5,"iterations":[{"type":"c"}]}"#;
+        assert!(merge_claude_usage_copies([clash, other]).is_none());
+        // A list outside the output side must be the same length.
+        let short = r#"{"input_tokens":2,"output_tokens":5,"notes":[1]}"#;
+        let long = r#"{"input_tokens":2,"output_tokens":5,"notes":[1,2]}"#;
+        assert!(merge_claude_usage_copies([short, long]).is_none());
+    }
+
+    /// A transcript that writes no `requestId` is grouped by the request view
+    /// on `message.id` alone, so its streamed copies are settled on the same
+    /// key rather than left as disagreeing blobs of one request.
+    #[test]
+    fn claude_streamed_request_without_request_id_settles_on_message_id() {
+        let text: String = streamed_turn([5, 40, 120])
+            .lines()
+            .map(|line| {
+                let mut value: Value = serde_json::from_str(line).unwrap();
+                value.as_object_mut().unwrap().remove("requestId");
+                jsonl_line(value)
+            })
+            .collect();
+        assert!(!text.contains("requestId"));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s-stream.jsonl");
+        fs::write(&path, text).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        assert!(stream_token_outputs(&conn)
+            .iter()
+            .all(|(_, output)| *output == 120));
+        let summary = crate::session_usage::session_usage_summary(&conn, "claude", "s-stream")
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.request_count, 1);
+        assert_eq!(
+            summary.usage.expect("usage is established").output_tokens,
+            120
+        );
+        assert!(summary.diagnostics.is_empty(), "{:?}", summary.diagnostics);
+    }
+
+    /// Claude Code writes a local API-error or auth notice as an assistant
+    /// record whose model is `<synthetic>`. It is the harness talking, so it
+    /// is a `local_notice` marker: no assistant event, no request, no model,
+    /// and not the session's last assistant text.
+    #[test]
+    fn claude_synthetic_notice_is_a_marker_not_model_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s-synth.jsonl");
+        let lines = [
+            json!({"type": "user", "uuid": "u1", "sessionId": "s-synth",
+                "timestamp": "2026-09-20T00:00:00.000Z",
+                "message": {"role": "user", "content": "run the tests"}}),
+            json!({"type": "assistant", "uuid": "a1", "parentUuid": "u1", "sessionId": "s-synth",
+                "requestId": "req_1", "timestamp": "2026-09-20T00:00:01.000Z",
+                "message": {"id": "msg_1", "role": "assistant", "model": "claude-opus-4-7",
+                    "content": [{"type": "text", "text": "Running them now."}],
+                    "usage": {"input_tokens": 3, "output_tokens": 9}}}),
+            json!({"type": "assistant", "uuid": "a2", "parentUuid": "a1", "sessionId": "s-synth",
+                "isApiErrorMessage": true, "error": "authentication_failed",
+                "timestamp": "2026-09-20T00:00:02.000Z",
+                "message": {"id": "5d300740-7f9b-4292-9910-8a01649169ad", "role": "assistant",
+                    "model": "<synthetic>",
+                    "content": [{"type": "text", "text": "Login expired · Please run /login"}],
+                    "usage": {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0}}}),
+            json!({"type": "user", "uuid": "u2", "parentUuid": "a2", "sessionId": "s-synth",
+                "timestamp": "2026-09-20T00:00:03.000Z",
+                "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_x", "content": "ok"}]}}),
+        ];
+        let text: String = lines.into_iter().map(jsonl_line).collect();
+        fs::write(&path, &text).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let synthetic_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE model = '<synthetic>' OR message_id = 'a2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(synthetic_events, 0);
+        let marker: (String, String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT kind, subkind, text, payload_json FROM session_markers WHERE message_id = 'a2'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(marker.0, "local_notice");
+        assert_eq!(marker.1, "synthetic");
+        assert_eq!(
+            marker.2.as_deref(),
+            Some("Login expired · Please run /login")
+        );
+        let payload: Value = serde_json::from_str(marker.3.as_deref().unwrap()).unwrap();
+        assert_eq!(payload["error"], "authentication_failed");
+        assert_eq!(payload["is_api_error_message"], true);
+        let tool_result_model: Option<String> = conn
+            .query_row(
+                "SELECT model FROM session_events WHERE kind = 'tool_result'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tool_result_model, None);
+        let requests: Vec<String> = conn
+            .prepare("SELECT request_key FROM session_requests WHERE session_id = 's-synth'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(requests, vec!["request-id:req_1".to_string()]);
+
+        let mut fold = ClaudeMetaFold::default();
+        for line in text.lines() {
+            fold.observe(&serde_json::from_str(line).unwrap());
+        }
+        assert_eq!(
+            fold.last_assistant_text.as_deref(),
+            Some("Running them now.")
+        );
+    }
+
+    /// A database indexed before the settlement holds the streamed copies
+    /// verbatim, the notice as assistant output, and the session summaries
+    /// the notice fed. Opening it repairs all of them from the stored rows
+    /// alone, once, without the transcript — with or without a `requestId`
+    /// on the copies, and whether or not an earlier revision already moved
+    /// the notice to its marker without repairing the summaries.
+    #[test]
+    fn opening_an_older_database_heals_claude_request_evidence() {
+        for with_request_id in [true, false] {
+            for notice_already_moved in [false, true] {
+                heal_older_claude_database(with_request_id, notice_already_moved);
+            }
+        }
+    }
+
+    /// The repaired excerpt joins the last reply's text blocks in block
+    /// order, whatever order their rows were stored in.
+    #[test]
+    fn the_summary_heal_joins_the_last_reply_in_block_order() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO session_markers (source, session_id, marker_uid, message_id, kind, subkind, text) \
+             VALUES ('claude', 's', 'n:marker', 'n', 'local_notice', 'synthetic', 'Login expired'); \
+             INSERT INTO sessions (session_id, source, last_assistant_text) \
+             VALUES ('s', 'claude', 'Login expired'); \
+             INSERT INTO session_events (source, session_id, message_id, ts_ms, role, kind, text, model, event_uid) \
+             VALUES ('claude', 's', 'm', 5, 'assistant', 'text', 'second', 'claude-opus-4-7', 'm:10'), \
+                    ('claude', 's', 'm', 5, 'assistant', 'text', 'first', 'claude-opus-4-7', 'm:2');",
+        )
+        .unwrap();
+        heal_claude_synthetic_session_summaries(&conn).unwrap();
+        let last: Option<String> = conn
+            .query_row(
+                "SELECT last_assistant_text FROM sessions WHERE session_id = 's'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(last.as_deref(), Some("first\nsecond"));
+    }
+
+    /// A real reply whose whole text is the start of a notice's text is the
+    /// model's last word, not the notice, and the repair leaves it alone.
+    #[test]
+    fn the_summary_heal_leaves_a_reply_that_is_only_a_notice_prefix() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO session_markers (source, session_id, marker_uid, message_id, kind, subkind, text) \
+             VALUES ('claude', 's', 'n:marker', 'n', 'local_notice', 'synthetic', 'Login expired'); \
+             INSERT INTO sessions (session_id, source, last_assistant_text) \
+             VALUES ('s', 'claude', 'Login');",
+        )
+        .unwrap();
+        heal_claude_synthetic_session_summaries(&conn).unwrap();
+        let last: Option<String> = conn
+            .query_row(
+                "SELECT last_assistant_text FROM sessions WHERE session_id = 's'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(last.as_deref(), Some("Login"));
+    }
+
+    /// A multi-block notice is migrated as its text blocks in block order,
+    /// not in the order its rows happen to be stored: here the later block was
+    /// stored first, its index sorts first as text, and a non-text row of the
+    /// same message is not part of the notice.
+    #[test]
+    fn the_notice_migration_joins_blocks_in_block_order() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO session_events (source, session_id, message_id, ts_ms, role, kind, text, model, event_uid) \
+             VALUES ('claude', 's', 'n', 5, 'assistant', 'text', 'Run /login', '<synthetic>', 'n:10'), \
+                    ('claude', 's', 'n', 5, 'assistant', 'thinking', 'not the notice', '<synthetic>', 'n:1'), \
+                    ('claude', 's', 'n', 5, 'assistant', 'text', 'Login expired', '<synthetic>', 'n:2');",
+        )
+        .unwrap();
+        heal_claude_request_evidence(&conn).unwrap();
+        let text: Option<String> = conn
+            .query_row(
+                "SELECT text FROM session_markers WHERE marker_uid = 'n:marker'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(text.as_deref(), Some("Login expired\nRun /login"));
+    }
+
+    fn heal_older_claude_database(with_request_id: bool, notice_already_moved: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s-stream.jsonl");
+        fs::write(&path, streamed_turn([5, 40, 120])).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        // What the previous parser left behind.
+        conn.execute_batch(
+            "UPDATE session_events SET token_json = json_set(token_json, '$.output_tokens', 5) \
+               WHERE event_uid = 'u-block-0:0'; \
+             UPDATE session_events SET token_json = json_set(token_json, '$.output_tokens', 40) \
+               WHERE event_uid = 'u-block-1:0'; \
+             DELETE FROM schema_migrations WHERE name = 'claude_request_evidence_v2'; \
+             DROP INDEX idx_session_events_provider_message;",
+        )
+        .unwrap();
+        // A notice of two text blocks with a blank one between them: the
+        // event rows omit the blank block, the cached excerpt kept it.
+        conn.execute_batch(
+            "INSERT INTO session_events (source, session_id, message_id, parent_id, ts_ms, role, kind, text, model, event_uid) \
+             VALUES ('claude', 's-stream', 'a-synth', 'u-block-2', 5, 'assistant', 'text', 'Login expired', '<synthetic>', 'a-synth:0'), \
+                    ('claude', 's-stream', 'a-synth', 'u-block-2', 5, 'assistant', 'text', 'Run /login', '<synthetic>', 'a-synth:2');",
+        )
+        .unwrap();
+        if notice_already_moved {
+            // What the first revision of this repair left: the marker written,
+            // the events gone, the summaries untouched, and v1 recorded.
+            conn.execute_batch(
+                "INSERT INTO session_markers (source, session_id, marker_uid, ts_ms, message_id, parent_id, kind, subkind, text) \
+                 VALUES ('claude', 's-stream', 'a-synth:marker', 5, 'a-synth', 'u-block-2', 'local_notice', 'synthetic', 'Login expired' || char(10) || 'Run /login'); \
+                 DELETE FROM session_events WHERE model = '<synthetic>'; \
+                 INSERT INTO schema_migrations (name) VALUES ('claude_request_evidence_v1');",
+            )
+            .unwrap();
+        }
+        if !with_request_id {
+            conn.execute("UPDATE session_events SET request_id = NULL", [])
+                .unwrap();
+        }
+        let summaries = conn
+            .execute(
+                "INSERT INTO sessions (session_id, source, models_json, last_assistant_text) \
+                 VALUES ('s-stream', 'claude', '[\"claude-opus-4-7\",\"<synthetic>\"]', \
+                         'Login expired' || char(10) || ' ' || char(10) || 'Run /login')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(summaries, 1);
+        assert!(!crate::store::schema_is_current(&conn).unwrap());
+
+        init_db(&conn).unwrap();
+
+        assert_eq!(
+            stream_token_outputs(&conn),
+            vec![
+                ("u-block-0:0".to_string(), 120),
+                ("u-block-1:0".to_string(), 120),
+                ("u-block-2:0".to_string(), 120),
+            ]
+        );
+        let marker: (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT kind, text, parent_id FROM session_markers WHERE marker_uid = 'a-synth:marker'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            marker,
+            (
+                "local_notice".to_string(),
+                Some("Login expired\nRun /login".to_string()),
+                Some("u-block-2".to_string())
+            )
+        );
+        let (models, last): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT models_json, last_assistant_text FROM sessions WHERE session_id = 's-stream'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(models.as_deref(), Some(r#"["claude-opus-4-7"]"#));
+        assert_eq!(last.as_deref(), Some("Let me look."));
+        assert!(crate::store::schema_is_current(&conn).unwrap());
+    }
+
     /// Codex names a turn once, in `turn_context`, and every later record
     /// belongs to it until the next one. Carrying it forward is what makes the
     /// turn boundary recoverable from the stored events.
@@ -25701,6 +32859,416 @@ mod tests {
             .unwrap();
         assert_eq!(stop_reason.as_deref(), Some("tool-calls"));
     }
+
+    /// Settles immediately, on a filesystem treated as keeping a real change
+    /// time (or not), and restores both however a test ends.
+    struct ImmediateSettle;
+
+    impl ImmediateSettle {
+        fn new() -> Self {
+            Self::on_filesystem_keeping_ctime(true)
+        }
+
+        fn on_filesystem_keeping_ctime(keeps: bool) -> Self {
+            transcript_cursor::set_settle_window_for_test(Some(0));
+            transcript_cursor::set_filesystem_keeps_change_time_for_test(Some(keeps));
+            Self
+        }
+    }
+
+    impl Drop for ImmediateSettle {
+        fn drop(&mut self) {
+            transcript_cursor::set_settle_window_for_test(None);
+            transcript_cursor::set_filesystem_keeps_change_time_for_test(None);
+        }
+    }
+
+    fn sweep_claude_transcript(home: &Path, session_id: &str, turns: usize) -> PathBuf {
+        let dir = home.join(".claude/projects/-work-sweep");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{session_id}.jsonl"));
+        let mut body = String::new();
+        for turn in 0..turns {
+            body.push_str(&claude_sweep_turn(session_id, turn));
+        }
+        fs::write(&path, body).unwrap();
+        path
+    }
+
+    fn claude_sweep_turn(session_id: &str, turn: usize) -> String {
+        let user = claude_line(json!({
+            "type": "user", "uuid": format!("{session_id}-u{turn}"), "sessionId": session_id,
+            "cwd": "/work/sweep", "timestamp": format!("2026-04-20T00:{turn:02}:00.000Z"),
+            "message": { "role": "user", "content": format!("prompt {turn}") },
+        }));
+        let assistant = claude_line(json!({
+            "type": "assistant", "uuid": format!("{session_id}-a{turn}"),
+            "parentUuid": format!("{session_id}-u{turn}"), "sessionId": session_id,
+            "cwd": "/work/sweep", "timestamp": format!("2026-04-20T00:{turn:02}:01.000Z"),
+            "message": { "role": "assistant", "id": format!("msg-{session_id}-{turn}"),
+                         "model": "claude-opus-4", "stop_reason": "end_turn",
+                         "content": [{ "type": "text", "text": format!("answer {turn}") }] },
+        }));
+        format!("{user}\n{assistant}\n")
+    }
+
+    /// Everything a sweep could have written, as one comparable value: the
+    /// change-feed head (every catalog and evidence write moves it) and every
+    /// transcript cursor as stored.
+    fn sweep_footprint(db_path: &Path) -> (String, Vec<(String, String, String)>) {
+        let conn = open_db(db_path).unwrap();
+        let head = super::destination_head(&conn).unwrap();
+        let cursors = conn
+            .prepare(
+                "SELECT source, locator, parser_state_json FROM transcript_cursors \
+                 ORDER BY source, locator",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        (head, cursors)
+    }
+
+    /// #42 and #215: a sweep over a corpus that has not changed — the one a
+    /// `watch` event tick or a periodic Reflex sync runs whenever anything
+    /// else moved — must neither write per-session rows nor re-read the
+    /// transcripts it already proved. Forced, so the source fingerprint
+    /// cannot short-circuit it: the per-file paths are what is under test.
+    ///
+    /// And the fast path must not cost correctness: bytes appended to a
+    /// transcript afterwards are still found and ingested.
+    #[test]
+    fn a_forced_sweep_over_an_unchanged_corpus_reads_and_writes_nothing() {
+        let _settle = ImmediateSettle::new();
+        let home = tempfile::tempdir().unwrap();
+        let db_path = home.path().join("history.db");
+        let claude = sweep_claude_transcript(home.path(), "sweep-a", 3);
+        sweep_claude_transcript(home.path(), "sweep-b", 2);
+        let cursor = write_cursor_transcript(
+            home.path(),
+            "sweep-cursor",
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query>first</user_query>"}]}}"#,
+                "\n",
+                r#"{"role":"assistant","message":{"content":[{"type":"text","text":"done"}]}}"#,
+                "\n"
+            ),
+        );
+        let codex = home.path().join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&codex).unwrap();
+        fs::write(
+            codex.join("rollout-2026-04-20T00-00-00-sweep-codex.jsonl"),
+            "{\"timestamp\":\"2026-04-20T00:00:00.000Z\",\"type\":\"session_meta\",\
+             \"payload\":{\"id\":\"sweep-codex\",\"cwd\":\"/work/sweep\",\"git\":{\"branch\":\"main\"}}}\n\
+             {\"timestamp\":\"2026-04-20T00:00:00.500Z\",\"type\":\"event_msg\",\
+             \"payload\":{\"type\":\"user_message\",\"message\":\"codex prompt\"}}\n",
+        )
+        .unwrap();
+
+        let sweep = || {
+            SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
+            let tick = sync_exclusive_with_home(&db_path, home.path(), true).unwrap();
+            assert!(tick.attempted && tick.swept);
+        };
+        // The first sweep ingests; the second proves every file once more
+        // with its digest and records the stat it proved it under.
+        sweep();
+        sweep();
+        let settled = sweep_footprint(&db_path);
+        assert!(
+            settled.1.iter().any(|(source, _, _)| source == "claude"),
+            "the fixture's transcripts carry cursors"
+        );
+
+        transcript_cursor::reset_validation_meter();
+        reset_prefix_hash_meter();
+        sweep();
+        assert_eq!(
+            transcript_cursor::validation_meter(),
+            0,
+            "an unchanged Claude transcript was re-read to prove it had not changed"
+        );
+        assert_eq!(
+            prefix_hash_meter(),
+            0,
+            "an unchanged byte-cursor file was re-hashed to prove it had not changed"
+        );
+        assert_eq!(
+            sweep_footprint(&db_path),
+            settled,
+            "a sweep over an unchanged corpus wrote catalog, evidence or cursor rows"
+        );
+
+        // Appends still land, through the same fast path.
+        let newest_ctime = [&claude, &cursor]
+            .iter()
+            .filter_map(|path| transcript_cursor::change_time_ns(&fs::metadata(path).unwrap()))
+            .max()
+            .unwrap_or(0);
+        transcript_cursor::wait_for_change_time_after(home.path(), newest_ctime);
+        {
+            let mut file = fs::OpenOptions::new().append(true).open(&claude).unwrap();
+            file.write_all(claude_sweep_turn("sweep-a", 3).as_bytes())
+                .unwrap();
+            let mut file = fs::OpenOptions::new().append(true).open(&cursor).unwrap();
+            file.write_all(
+                concat!(
+                    r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query>second</user_query>"}]}}"#,
+                    "\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        }
+        sweep();
+        let conn = open_db(&db_path).unwrap();
+        let answered: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE source = 'claude' \
+                 AND session_id = 'sweep-a' AND text = 'answer 3'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(answered, 1, "the appended Claude turn was not ingested");
+        let prompts: Vec<String> = conn
+            .prepare(
+                "SELECT prompt FROM history WHERE source = 'cursor' \
+                 AND session_id = 'sweep-cursor' ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(prompts, vec!["first".to_string(), "second".to_string()]);
+    }
+
+    fn settled_byte_cursor(value: &Value) -> Option<FileSettled> {
+        match FileCursor::decode(value)? {
+            DecodedFileCursor::Typed(cursor) => cursor.settled,
+            DecodedFileCursor::Legacy(_) => None,
+        }
+    }
+
+    /// Rewrite `path` to `body` (same length) and put its mtime back, once
+    /// the change time has moved past `settled_ctime` — the rewrite a stat
+    /// cannot see, on the filesystems that settle.
+    fn rewrite_restoring_mtime(path: &Path, body: &str, settled_ctime: i64) {
+        let before = fs::metadata(path).unwrap();
+        assert_eq!(before.len() as usize, body.len());
+        transcript_cursor::wait_for_change_time_after(path.parent().unwrap(), settled_ctime);
+        fs::write(path, body).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(before.modified().unwrap())
+            .unwrap();
+        let after = fs::metadata(path).unwrap();
+        assert_eq!(after.len(), before.len());
+        assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+    }
+
+    fn history_prompts(conn: &Connection) -> Vec<String> {
+        conn.prepare("SELECT prompt FROM history ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// A settled flat log rewritten in place with its length and mtime
+    /// restored is still read again: only the change time moved, and that is
+    /// exactly what the settled stamp compares.
+    #[test]
+    fn a_same_size_rewrite_of_a_settled_flat_log_is_reread() {
+        let _settle = ImmediateSettle::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.jsonl");
+        let line = |text: &str| {
+            format!(r#"{{"display":"{text}","timestamp":1,"project":"/p","sessionId":"s"}}"#) + "\n"
+        };
+        fs::write(&path, line("prompt aaaa")).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        let sync = |state: &mut Map<String, Value>| {
+            sync_jsonl_incremental(
+                &conn,
+                state,
+                "claude",
+                &path,
+                parse_claude_line,
+                &mut |_| {},
+            )
+            .unwrap()
+        };
+        assert_eq!(sync(&mut state), 1);
+        assert_eq!(sync(&mut state), 0);
+        let settled = settled_byte_cursor(&state["claude"]).expect("proven and settled");
+        reset_prefix_hash_meter();
+        assert_eq!(sync(&mut state), 0);
+        assert_eq!(prefix_hash_meter(), 0, "a settled log is skipped on a stat");
+
+        rewrite_restoring_mtime(&path, &line("prompt bbbb"), settled.ctime_ns);
+        assert_eq!(
+            sync(&mut state),
+            1,
+            "the rewrite was served from the cursor"
+        );
+        assert!(history_prompts(&conn).contains(&"prompt bbbb".to_string()));
+    }
+
+    /// The same rewrite of a settled Cursor transcript restarts it, so the
+    /// write phase rebuilds the session from the new generation.
+    #[test]
+    fn a_same_size_rewrite_of_a_settled_cursor_transcript_restarts_it() {
+        let _settle = ImmediateSettle::new();
+        let dir = tempfile::tempdir().unwrap();
+        let original = concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query>aaaa</user_query>"}]}}"#,
+            "\n"
+        );
+        let path = write_cursor_transcript(dir.path(), "s-settled", original);
+        let first = scan_cursor_transcript(&path, None).unwrap();
+        assert!(first.advanced);
+        let proven = scan_cursor_transcript(&path, first.checkpoint.as_ref()).unwrap();
+        assert!(!proven.advanced);
+        let settled_value = proven.checkpoint.expect("an unadvanced scan settles");
+        let settled = settled_byte_cursor(&settled_value).unwrap();
+
+        reset_prefix_hash_meter();
+        let skipped = scan_cursor_transcript(&path, Some(&settled_value)).unwrap();
+        assert!(!skipped.advanced && skipped.checkpoint.is_none());
+        assert_eq!(
+            prefix_hash_meter(),
+            0,
+            "a settled transcript is skipped on a stat"
+        );
+
+        rewrite_restoring_mtime(&path, &original.replace("aaaa", "bbbb"), settled.ctime_ns);
+        let rescanned = scan_cursor_transcript(&path, Some(&settled_value)).unwrap();
+        assert!(
+            rescanned.restarted && rescanned.advanced,
+            "a same-size, same-mtime rewrite must restart the transcript"
+        );
+    }
+
+    /// Where the filesystem does not keep a real change time, neither byte
+    /// cursor path ever settles, and every pass proves the prefix again.
+    #[test]
+    fn byte_cursors_never_settle_on_a_filesystem_without_a_real_change_time() {
+        let _settle = ImmediateSettle::on_filesystem_keeping_ctime(false);
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("history.jsonl");
+        fs::write(
+            &log,
+            r#"{"display":"p","timestamp":1,"project":"/p","sessionId":"s"}"#.to_string() + "\n",
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        for _ in 0..3 {
+            sync_jsonl_incremental(
+                &conn,
+                &mut state,
+                "claude",
+                &log,
+                parse_claude_line,
+                &mut |_| {},
+            )
+            .unwrap();
+        }
+        assert!(settled_byte_cursor(&state["claude"]).is_none());
+
+        let transcript = write_cursor_transcript(
+            dir.path(),
+            "s-fat",
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query>x</user_query>"}]}}"#,
+                "\n"
+            ),
+        );
+        let first = scan_cursor_transcript(&transcript, None).unwrap();
+        let second = scan_cursor_transcript(&transcript, first.checkpoint.as_ref()).unwrap();
+        assert!(
+            second.checkpoint.is_none(),
+            "nothing to settle, nothing written"
+        );
+        reset_prefix_hash_meter();
+        scan_cursor_transcript(&transcript, first.checkpoint.as_ref()).unwrap();
+        assert!(prefix_hash_meter() > 0, "every pass proves the prefix");
+    }
+
+    /// A settled Cursor cursor rides the sync state through a concurrent
+    /// writer's checkpoint that holds the same position unsettled, instead of
+    /// being dropped by the merge and re-proven on every sweep.
+    #[test]
+    fn a_settled_byte_cursor_survives_the_checkpoint_merge() {
+        let cursor = |settled: Option<FileSettled>| FileCursor {
+            offset: 42,
+            generation: FileGeneration {
+                device: Some(1),
+                inode: Some(7),
+                started_mtime_ns: 10,
+                started_size: 42,
+                observed_at_ns: 10,
+                rewrite_epoch: 0,
+            },
+            observed_mtime_ns: 10,
+            prefix_hash: Some("prefix".into()),
+            settled,
+        };
+        let proof = FileSettled {
+            ctime_ns: 5,
+            size: 42,
+            settled_at_ms: 1,
+        };
+        for (on_disk, ours) in [
+            (cursor(None), cursor(Some(proof.clone()))),
+            (cursor(Some(proof.clone())), cursor(None)),
+        ] {
+            let merged = FileCursor::merge(on_disk, ours);
+            assert_eq!(merged.settled, Some(proof.clone()));
+        }
+        // A renewed proof replaces an expired one whichever side carries it,
+        // so the checkpoint sees a change and writes it.
+        let renewed = FileSettled {
+            ctime_ns: 9,
+            size: 42,
+            settled_at_ms: 2,
+        };
+        for (on_disk, ours) in [
+            (cursor(Some(proof.clone())), cursor(Some(renewed.clone()))),
+            (cursor(Some(renewed.clone())), cursor(Some(proof.clone()))),
+        ] {
+            let merged = FileCursor::merge(on_disk, ours);
+            assert_eq!(merged.settled, Some(renewed.clone()));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join(".sync-state.json");
+        let mut on_disk = Map::new();
+        on_disk.insert("claude".into(), cursor(Some(proof.clone())).to_value());
+        fs::write(&state_path, serde_json::to_vec(&on_disk).unwrap()).unwrap();
+        let mut ours = Map::new();
+        ours.insert("claude".into(), cursor(Some(renewed.clone())).to_value());
+        let written = merged_sync_state(&state_path, &ours)
+            .unwrap()
+            .expect("a renewed settle is a change to checkpoint");
+        assert_eq!(settled_byte_cursor(&written["claude"]), Some(renewed));
+        // A different position is a different claim; its proof is not carried.
+        let mut moved = cursor(None);
+        moved.offset = 84;
+        moved.prefix_hash = Some("longer".into());
+        let merged = FileCursor::merge(moved, cursor(Some(proof)));
+        assert_eq!(merged.offset, 84);
+        assert_eq!(merged.settled, None);
+    }
 }
 
 #[cfg(test)]
@@ -25832,6 +33400,251 @@ mod capture_progress_tests {
         );
     }
 
+    /// Three Codex sessions with rollouts and `history.jsonl` prompts.
+    fn codex_backfill_fixture(root: &Path) {
+        let day = root.join("sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        let mut history = String::new();
+        for i in 0..3 {
+            let id = format!("sess-scope-{i}");
+            fs::write(
+                day.join(format!("rollout-2026-04-20T00-00-0{i}-{id}.jsonl")),
+                format!(
+                    "{{\"timestamp\":\"2026-04-20T00:00:0{i}.000Z\",\"type\":\"session_meta\",\
+                     \"payload\":{{\"id\":\"{id}\",\"cwd\":\"/work/p{i}\",\"git\":{{\"branch\":\"main\"}}}}}}\n\
+                     {{\"timestamp\":\"2026-04-20T00:00:0{i}.500Z\",\"type\":\"event_msg\",\
+                     \"payload\":{{\"type\":\"user_message\",\"message\":\"prompt {i}\"}}}}\n"
+                ),
+            )
+            .unwrap();
+            history.push_str(&format!(
+                "{{\"session_id\":\"{id}\",\"ts\":{},\"text\":\"prompt {i}\"}}\n",
+                1_776_643_200 + i
+            ));
+        }
+        fs::write(root.join("history.jsonl"), history).unwrap();
+    }
+
+    fn codex_session_revisions(conn: &Connection) -> Vec<(String, i64)> {
+        let mut statement = conn
+            .prepare(
+                "SELECT session_id, revision FROM sessions \
+                 WHERE source = 'codex' ORDER BY session_id",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn codex_metadata_backfill_leaves_untouched_sessions_alone() {
+        // #42: every sweep that got past the source fingerprint -- one Claude
+        // transcript growing is enough -- re-ran the metadata backfill over
+        // every Codex session ever indexed, and each `sessions` upsert took a
+        // fresh change-feed revision. A sweep that re-reads nothing of Codex
+        // must leave every Codex row exactly where it was.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".codex");
+        codex_backfill_fixture(&root);
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        sync_codex(&conn, &mut state, &root).unwrap();
+        assert_eq!(
+            state.get(CODEX_METADATA_BACKFILL_KEY),
+            Some(&json!(CODEX_METADATA_BACKFILL_GENERATION)),
+            "the first sweep pays the one full pass"
+        );
+        let settled = codex_session_revisions(&conn);
+        assert_eq!(settled.len(), 3);
+
+        sync_codex(&conn, &mut state, &root).unwrap();
+        assert_eq!(codex_session_revisions(&conn), settled);
+
+        // A new prompt for one session reaches that session, and only it.
+        use std::io::Write as _;
+        let mut history = fs::OpenOptions::new()
+            .append(true)
+            .open(root.join("history.jsonl"))
+            .unwrap();
+        writeln!(
+            history,
+            "{{\"session_id\":\"sess-scope-1\",\"ts\":1776650000,\"text\":\"later\"}}"
+        )
+        .unwrap();
+        drop(history);
+        sync_codex(&conn, &mut state, &root).unwrap();
+        let after = codex_session_revisions(&conn);
+        assert_eq!(after[0], settled[0]);
+        assert_eq!(after[2], settled[2]);
+        assert!(
+            after[1].1 > settled[1].1,
+            "the appended session is re-stamped"
+        );
+        let (project, branch, last): (String, String, i64) = conn
+            .query_row(
+                "SELECT h.project, h.git_branch, s.last_activity_ms \
+                 FROM history h JOIN sessions s \
+                   ON s.source = h.source AND s.session_id = h.session_id \
+                 WHERE h.source = 'codex' AND h.prompt = 'later'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(project, "/work/p1");
+        assert_eq!(branch, "main");
+        assert_eq!(last, 1_776_650_000_000);
+    }
+
+    #[test]
+    fn codex_metadata_backfill_runs_one_full_pass_for_an_upgraded_install() {
+        // Rows an older build left without project/branch are not tied to any
+        // file this sweep will re-read, so the scoped backfill alone would
+        // never reach them. An install whose state predates the scoping owes
+        // one full pass, and then never again.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".codex");
+        codex_backfill_fixture(&root);
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        sync_codex(&conn, &mut state, &root).unwrap();
+        conn.execute(
+            "UPDATE history SET project = NULL, git_branch = NULL WHERE source = 'codex'",
+            [],
+        )
+        .unwrap();
+        state.remove(CODEX_METADATA_BACKFILL_KEY);
+
+        sync_codex(&conn, &mut state, &root).unwrap();
+        let unattributed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM history \
+                 WHERE source = 'codex' AND (project IS NULL OR git_branch IS NULL)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unattributed, 0);
+        assert_eq!(
+            state.get(CODEX_METADATA_BACKFILL_KEY),
+            Some(&json!(CODEX_METADATA_BACKFILL_GENERATION))
+        );
+        let settled = codex_session_revisions(&conn);
+        sync_codex(&conn, &mut state, &root).unwrap();
+        assert_eq!(codex_session_revisions(&conn), settled);
+    }
+
+    /// Sync a fixture, append a prompt for `sess-scope-1`, and cancel the next
+    /// sweep inside its scoped backfill -- after the cursor moved past the
+    /// prompt.
+    fn interrupt_codex_backfill_after_a_new_prompt(
+        dir: &Path,
+    ) -> (Connection, Map<String, Value>, PathBuf) {
+        let root = dir.join(".codex");
+        codex_backfill_fixture(&root);
+        let db = dir.join("history.db");
+        let conn = open_db(&db).unwrap();
+        let mut state = Map::new();
+        sync_codex(&conn, &mut state, &root).unwrap();
+
+        use std::io::Write as _;
+        let mut history = fs::OpenOptions::new()
+            .append(true)
+            .open(root.join("history.jsonl"))
+            .unwrap();
+        writeln!(
+            history,
+            "{{\"session_id\":\"sess-scope-1\",\"ts\":1776650000,\"text\":\"later\"}}"
+        )
+        .unwrap();
+        drop(history);
+
+        // Cancel at the first check after the new prompt landed: the first
+        // one inside the backfill.
+        let probe = Connection::open(&db).unwrap();
+        let error = with_capture_stop(
+            move || {
+                probe
+                    .query_row(
+                        "SELECT COUNT(*) FROM history WHERE prompt = 'later'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap()
+                    > 0
+            },
+            || sync_codex(&conn, &mut state, &root),
+        )
+        .unwrap_err();
+        assert!(error.is::<CaptureCancelled>());
+        assert_eq!(
+            state.get(CODEX_METADATA_PENDING_KEY),
+            Some(&json!(["sess-scope-1"]))
+        );
+        assert_eq!(
+            later_prompt_branch(&conn),
+            None,
+            "the backfill was interrupted"
+        );
+        (conn, state, root)
+    }
+
+    fn later_prompt_branch(conn: &Connection) -> Option<String> {
+        conn.query_row(
+            "SELECT git_branch FROM history WHERE source = 'codex' AND prompt = 'later'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn codex_metadata_backfill_interrupted_after_the_cursor_moved_is_retried() {
+        // The Codex cursor advances before the scoped backfill runs. If the
+        // backfill then fails, a later source can checkpoint that cursor, and
+        // the next sweep reads no new line for the session -- so the sessions
+        // it owed have to be carried forward, or their branch and activity
+        // window are never repaired.
+        let dir = tempfile::tempdir().unwrap();
+        let (conn, mut state, root) = interrupt_codex_backfill_after_a_new_prompt(dir.path());
+
+        // The retry reads no new line, yet still reaches the owed session.
+        sync_codex(&conn, &mut state, &root).unwrap();
+        assert_eq!(later_prompt_branch(&conn).as_deref(), Some("main"));
+        let last: i64 = conn
+            .query_row(
+                "SELECT last_activity_ms FROM sessions \
+                 WHERE source = 'codex' AND session_id = 'sess-scope-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(last, 1_776_650_000_000);
+        assert_eq!(state.get(CODEX_METADATA_PENDING_KEY), Some(&json!([])));
+    }
+
+    #[test]
+    fn codex_metadata_backfill_owed_is_paid_even_while_history_jsonl_is_missing() {
+        // A retry that finds no history.jsonl must not clear the owed sessions
+        // without backfilling them: when the log comes back unchanged its
+        // cursor is at EOF and nothing would touch them again.
+        let dir = tempfile::tempdir().unwrap();
+        let (conn, mut state, root) = interrupt_codex_backfill_after_a_new_prompt(dir.path());
+        let log = root.join("history.jsonl");
+        let parked = root.join("history.jsonl.parked");
+        fs::rename(&log, &parked).unwrap();
+
+        sync_codex(&conn, &mut state, &root).unwrap();
+        assert_eq!(later_prompt_branch(&conn).as_deref(), Some("main"));
+        assert_eq!(state.get(CODEX_METADATA_PENDING_KEY), Some(&json!([])));
+
+        fs::rename(&parked, &log).unwrap();
+        sync_codex(&conn, &mut state, &root).unwrap();
+        assert_eq!(later_prompt_branch(&conn).as_deref(), Some("main"));
+    }
+
     #[test]
     fn cancellation_interrupts_codex_metadata_backfill_and_retry_completes_it() {
         let conn = Connection::open_in_memory().unwrap();
@@ -25912,7 +33725,7 @@ mod capture_progress_tests {
         CAPTURE_OBSERVER.with(|slot| {
             *slot.borrow_mut() = Some(std::rc::Rc::new(move |p| observed.lock().unwrap().push(p)))
         });
-        let files: Vec<_> = capture_files("claude", vec!["a".into(), "b".into()]).collect();
+        let files: Vec<PathBuf> = capture_files("claude", vec!["a".into(), "b".into()]).collect();
         assert_eq!(files.len(), 2);
         let values = updates.lock().unwrap();
         assert_eq!(
@@ -26027,5 +33840,501 @@ pub(crate) fn marker_payload_is_bounded(value: &Value) -> bool {
                 })
         }
         _ => true,
+    }
+}
+
+#[cfg(test)]
+mod codex_fork_replay_tests {
+    //! The forked-rollout replay gate (#210): see `ForkReplaySpan`.
+    use super::*;
+    use crate::{init_db, open_db};
+    use rusqlite::Connection;
+    use std::fs;
+
+    const PARENT: &str = "019da82f-d400-7000-8000-00000000000a";
+    const CHILD: &str = "019da830-be60-7000-8000-00000000000c";
+    /// A parent turn, well before the fork.
+    const PARENT_TURN: &str = "019da82f-d7e8-7000-8000-000000000001";
+    /// The child's own turn, after the fork.
+    const CHILD_TURN: &str = "019da830-d1e8-7000-8000-0000000000c1";
+
+    fn line(ts: &str, kind: &str, payload: Value) -> String {
+        format!(
+            "{}\n",
+            json!({"timestamp": ts, "type": kind, "payload": payload})
+        )
+    }
+
+    fn usage(total: u64) -> Value {
+        json!({"type": "token_count", "info": {"total_token_usage": {
+            "input_tokens": total, "cached_input_tokens": 0, "output_tokens": 0,
+            "reasoning_output_tokens": 0, "total_tokens": total}}})
+    }
+
+    /// The child's `session_meta` and the replay of one parent turn.
+    fn forked_prefix(child_meta: Value, parent_turn: &str) -> String {
+        let at = "2026-04-20T00:01:00.000Z";
+        [
+            line(at, "session_meta", child_meta),
+            line(
+                at,
+                "session_meta",
+                json!({"id": PARENT, "cwd": "/tmp/project", "thread_source": "user"}),
+            ),
+            line(
+                at,
+                "event_msg",
+                json!({"type": "task_started", "turn_id": parent_turn}),
+            ),
+            line(
+                at,
+                "turn_context",
+                json!({"turn_id": parent_turn, "cwd": "/tmp/project", "model": "gpt-5.4"}),
+            ),
+            line(
+                at,
+                "event_msg",
+                json!({"type": "user_message", "message": "parent prompt"}),
+            ),
+            line(
+                at,
+                "event_msg",
+                json!({"type": "agent_message", "message": "parent answer"}),
+            ),
+            line(at, "event_msg", usage(1000)),
+            line(
+                at,
+                "event_msg",
+                json!({"type": "task_complete", "turn_id": parent_turn}),
+            ),
+        ]
+        .concat()
+    }
+
+    fn child_turn(turn: &str, total: u64) -> String {
+        [
+            line(
+                "2026-04-20T00:01:05.000Z",
+                "event_msg",
+                json!({"type": "task_started", "turn_id": turn}),
+            ),
+            line(
+                "2026-04-20T00:01:05.001Z",
+                "turn_context",
+                json!({"turn_id": turn, "cwd": "/tmp/project", "model": "gpt-5.4"}),
+            ),
+            line(
+                "2026-04-20T00:01:05.002Z",
+                "event_msg",
+                json!({"type": "user_message", "message": "child prompt"}),
+            ),
+            line(
+                "2026-04-20T00:01:08.000Z",
+                "event_msg",
+                json!({"type": "agent_message", "message": "child answer"}),
+            ),
+            line("2026-04-20T00:01:08.001Z", "event_msg", usage(total)),
+            line(
+                "2026-04-20T00:01:08.002Z",
+                "event_msg",
+                json!({"type": "task_complete", "turn_id": turn}),
+            ),
+        ]
+        .concat()
+    }
+
+    fn human_fork_meta() -> Value {
+        json!({"id": CHILD, "forked_from_id": PARENT, "cwd": "/tmp/project",
+               "timestamp": "2026-04-20T00:01:00.000Z", "thread_source": "user"})
+    }
+
+    fn texts(conn: &Connection, session: &str) -> Vec<String> {
+        let mut statement = conn
+            .prepare(
+                "SELECT text FROM session_events WHERE source = 'codex' AND session_id = ? \
+                 ORDER BY id",
+            )
+            .unwrap();
+        statement
+            .query_map([session], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    fn prompts(conn: &Connection, session: &str) -> Vec<String> {
+        let mut statement = conn
+            .prepare(
+                "SELECT prompt FROM history WHERE source = 'codex' AND session_id = ? ORDER BY id",
+            )
+            .unwrap();
+        statement
+            .query_map([session], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    fn replay_marker(conn: &Connection, session: &str) -> Option<Value> {
+        conn.query_row(
+            "SELECT payload_json FROM session_markers \
+             WHERE source = 'codex' AND session_id = ? AND kind = 'fork_replay_boundary'",
+            [session],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .unwrap()
+        .map(|raw| serde_json::from_str(&raw).unwrap())
+    }
+
+    fn token_totals(conn: &Connection, session: &str) -> Vec<i64> {
+        let mut statement = conn
+            .prepare(
+                "SELECT json_extract(token_json, '$.total_tokens') FROM session_events \
+                 WHERE source = 'codex' AND session_id = ? AND token_json IS NOT NULL ORDER BY id",
+            )
+            .unwrap();
+        statement
+            .query_map([session], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// A live fork whose own first turn is not written yet: the replay is
+    /// held back whole, accounted for by one open marker, and the cursor does
+    /// not commit inside it. When the child's turn arrives the resumed pass
+    /// re-reads the replay, closes the span, and indexes only the child.
+    #[test]
+    fn a_live_fork_holds_its_replay_until_the_first_own_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-child.jsonl");
+        fs::write(&rollout, forked_prefix(human_fork_meta(), PARENT_TURN)).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let meta = read_codex_session_meta(&rollout).unwrap().unwrap();
+        assert_eq!(meta.fork_parent_id.as_deref(), Some(PARENT));
+        let mut cursor = transcript_cursor::TranscriptCursorState::default();
+
+        ingest_codex_rollout_incremental(&conn, &rollout, &meta, &mut cursor).unwrap();
+        assert!(texts(&conn, CHILD).is_empty());
+        assert!(prompts(&conn, CHILD).is_empty());
+        let open = replay_marker(&conn, CHILD).expect("open replay marker");
+        assert_eq!(open["closed_by"], Value::Null);
+        assert_eq!(open["replayed_lines"], 7);
+        assert_eq!(
+            cursor.file.as_ref().map(|file| file.offset).unwrap_or(0),
+            0,
+            "the replayed task_complete is not a commit point"
+        );
+
+        let mut file = fs::OpenOptions::new().append(true).open(&rollout).unwrap();
+        std::io::Write::write_all(&mut file, child_turn(CHILD_TURN, 1600).as_bytes()).unwrap();
+        drop(file);
+        ingest_codex_rollout_incremental(&conn, &rollout, &meta, &mut cursor).unwrap();
+
+        assert_eq!(texts(&conn, CHILD), vec!["child prompt", "child answer"]);
+        assert_eq!(prompts(&conn, CHILD), vec!["child prompt"]);
+        let closed = replay_marker(&conn, CHILD).expect("closed replay marker");
+        assert_eq!(closed["closed_by_turn_id"], CHILD_TURN);
+        assert_eq!(closed["inherited_total_tokens"], 1000);
+        // 1600 cumulative, 1000 of it inherited from the parent.
+        assert_eq!(token_totals(&conn, CHILD), vec![600]);
+    }
+
+    /// Rows an earlier parser indexed under the child for replayed lines are
+    /// retired when the gate re-reads them; the child's own rows are kept.
+    #[test]
+    fn the_gate_retires_replayed_rows_an_earlier_parser_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-child.jsonl");
+        fs::write(
+            &rollout,
+            forked_prefix(human_fork_meta(), PARENT_TURN) + &child_turn(CHILD_TURN, 1600),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // What the pre-gate parser left: the replayed prompt as an event, a
+        // marker and a history row, all under the child.
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, role, kind, text, event_uid, message_id, ts_ms) \
+             VALUES ('codex', ?, 'user', 'text', 'parent prompt', '4:user_message', '4:user_message', 1)",
+            [CHILD],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_markers (source, session_id, marker_uid, kind) \
+             VALUES ('codex', ?, '2:marker', 'task_started')",
+            [CHILD],
+        )
+        .unwrap();
+        let replay_ms = parse_iso_ms("2026-04-20T00:01:00.000Z").unwrap();
+        conn.execute(
+            "INSERT INTO history (source, session_id, prompt, timestamp_ms) \
+             VALUES ('codex', ?, 'parent prompt', ?)",
+            params![CHILD, replay_ms],
+        )
+        .unwrap();
+
+        let meta = read_codex_session_meta(&rollout).unwrap().unwrap();
+        ingest_codex_rollout(&conn, &rollout, &meta).unwrap();
+
+        assert_eq!(texts(&conn, CHILD), vec!["child prompt", "child answer"]);
+        assert_eq!(prompts(&conn, CHILD), vec!["child prompt"]);
+        let stale_markers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_markers \
+                 WHERE session_id = ? AND marker_uid = '2:marker'",
+                [CHILD],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_markers, 0);
+    }
+
+    /// A turn nothing explicit can order against the fork -- a legacy id and
+    /// no `started_at` -- ends the gate: undecided is indexed, not dropped.
+    #[test]
+    fn an_undecidable_turn_closes_the_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-child.jsonl");
+        fs::write(&rollout, forked_prefix(human_fork_meta(), "legacy-turn-id")).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let meta = read_codex_session_meta(&rollout).unwrap().unwrap();
+        ingest_codex_rollout(&conn, &rollout, &meta).unwrap();
+        assert_eq!(texts(&conn, CHILD), vec!["parent prompt", "parent answer"]);
+        let marker = replay_marker(&conn, CHILD).expect("marker");
+        assert_eq!(marker["closed_by"], "undecided");
+        assert_eq!(marker["replayed_lines"], 1);
+    }
+
+    /// A rollout that names no Codex fork field never arms the gate, even if
+    /// a later `session_meta` names some other thread.
+    #[test]
+    fn a_rollout_without_a_fork_field_is_never_gated() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-child.jsonl");
+        fs::write(
+            &rollout,
+            forked_prefix(
+                json!({"id": CHILD, "cwd": "/tmp/project", "thread_source": "user"}),
+                PARENT_TURN,
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let meta = read_codex_session_meta(&rollout).unwrap().unwrap();
+        assert_eq!(meta.fork_parent_id, None);
+        ingest_codex_rollout(&conn, &rollout, &meta).unwrap();
+        assert_eq!(texts(&conn, CHILD), vec!["parent prompt", "parent answer"]);
+        assert!(replay_marker(&conn, CHILD).is_none());
+    }
+
+    /// A child whose counter restarted from zero, below the total it
+    /// inherited from the replay, is differenced from zero rather than
+    /// having its spend swallowed by the parent's larger baseline.
+    #[test]
+    fn a_child_counter_below_the_inherited_total_drops_the_inherited_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-child.jsonl");
+        fs::write(
+            &rollout,
+            forked_prefix(human_fork_meta(), PARENT_TURN) + &child_turn(CHILD_TURN, 300),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let meta = read_codex_session_meta(&rollout).unwrap().unwrap();
+        ingest_codex_rollout(&conn, &rollout, &meta).unwrap();
+        assert_eq!(token_totals(&conn, CHILD), vec![300]);
+    }
+
+    /// A fork a pre-gate build indexed has an unchanged stamp, so only the
+    /// one-time backfill re-reads it. Once recorded, the backfill is spent.
+    #[test]
+    fn an_unchanged_fork_is_re_read_once_to_retire_its_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(
+            day.join("rollout-child.jsonl"),
+            forked_prefix(human_fork_meta(), PARENT_TURN) + &child_turn(CHILD_TURN, 1600),
+        )
+        .unwrap();
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+        assert_eq!(
+            state.get(CODEX_FORK_REPLAY_KEY),
+            Some(&json!(CODEX_FORK_REPLAY_GENERATION))
+        );
+        let replay_ms = parse_iso_ms("2026-04-20T00:01:00.000Z").unwrap();
+        let plant_stale = || {
+            conn.execute(
+                "INSERT OR IGNORE INTO history (source, session_id, prompt, timestamp_ms) \
+                 VALUES ('codex', ?, 'parent prompt', ?)",
+                params![CHILD, replay_ms],
+            )
+            .unwrap();
+        };
+
+        // With the backfill spent, an unchanged rollout is not re-read.
+        plant_stale();
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+        assert_eq!(prompts(&conn, CHILD), vec!["child prompt", "parent prompt"]);
+
+        // An install that predates the gate owes the backfill.
+        state.remove(CODEX_FORK_REPLAY_KEY);
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+        assert_eq!(prompts(&conn, CHILD), vec!["child prompt"]);
+        assert_eq!(
+            state.get(CODEX_FORK_REPLAY_KEY),
+            Some(&json!(CODEX_FORK_REPLAY_GENERATION))
+        );
+    }
+
+    /// A child turn whose snapshot carries `last_token_usage`, as codex-rs
+    /// writes it.
+    fn child_turn_with_last(turn: &str, total: u64, last: u64) -> String {
+        let usage = json!({"type": "token_count", "info": {
+            "total_token_usage": {"input_tokens": total, "total_tokens": total},
+            "last_token_usage": {"input_tokens": last, "total_tokens": last}}});
+        child_turn(turn, 0).replace(
+            &line("2026-04-20T00:01:08.001Z", "event_msg", self::usage(0)),
+            &line("2026-04-20T00:01:08.001Z", "event_msg", usage),
+        )
+    }
+
+    /// A restarted child whose first request (1100) is larger than its small
+    /// inherited total (1000): magnitude alone would call that a continuation
+    /// and charge 100. `total == last_token_usage` says it restarted.
+    #[test]
+    fn last_token_usage_decides_a_restart_above_the_inherited_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-child.jsonl");
+        fs::write(
+            &rollout,
+            forked_prefix(human_fork_meta(), PARENT_TURN)
+                + &child_turn_with_last(CHILD_TURN, 1100, 1100),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let meta = read_codex_session_meta(&rollout).unwrap().unwrap();
+        ingest_codex_rollout(&conn, &rollout, &meta).unwrap();
+        assert_eq!(token_totals(&conn, CHILD), vec![1100]);
+        let marker = replay_marker(&conn, CHILD).unwrap();
+        assert_eq!(marker["inherited_baseline"], "dropped");
+        assert_eq!(marker["inherited_baseline_basis"], "last_token_usage");
+    }
+
+    /// `total == inherited + last` is the continuation codex-rs writes.
+    #[test]
+    fn last_token_usage_confirms_a_continued_counter() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-child.jsonl");
+        fs::write(
+            &rollout,
+            forked_prefix(human_fork_meta(), PARENT_TURN)
+                + &child_turn_with_last(CHILD_TURN, 1100, 100),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let meta = read_codex_session_meta(&rollout).unwrap().unwrap();
+        ingest_codex_rollout(&conn, &rollout, &meta).unwrap();
+        assert_eq!(token_totals(&conn, CHILD), vec![100]);
+        let marker = replay_marker(&conn, CHILD).unwrap();
+        assert_eq!(marker["inherited_baseline"], "applied");
+        assert_eq!(marker["inherited_baseline_basis"], "last_token_usage");
+    }
+
+    /// A child turn that closes without a snapshot still commits the cursor
+    /// past the replay; the pending baseline rides on the cursor, and the
+    /// next pass settles it without re-reading the replay.
+    #[test]
+    fn a_pending_inherited_baseline_does_not_pin_the_cursor_before_the_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-child.jsonl");
+        let unmeasured_turn = child_turn(CHILD_TURN, 0)
+            .replace(&line("2026-04-20T00:01:08.001Z", "event_msg", usage(0)), "");
+        fs::write(
+            &rollout,
+            forked_prefix(human_fork_meta(), PARENT_TURN) + &unmeasured_turn,
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let meta = read_codex_session_meta(&rollout).unwrap().unwrap();
+        let mut cursor = transcript_cursor::TranscriptCursorState::default();
+        ingest_codex_rollout_incremental(&conn, &rollout, &meta, &mut cursor).unwrap();
+        let committed = cursor.file.as_ref().map(|file| file.offset).unwrap_or(0);
+        assert_eq!(committed, fs::metadata(&rollout).unwrap().len());
+        assert_eq!(
+            cursor
+                .codex
+                .as_ref()
+                .and_then(|codex| codex.inherited_baseline_marker.as_deref()),
+            Some("1:fork_replay")
+        );
+        assert_eq!(
+            replay_marker(&conn, CHILD).unwrap()["inherited_baseline"],
+            "pending"
+        );
+
+        let second_turn = "019da830-f000-7000-8000-0000000000c2";
+        let mut file = fs::OpenOptions::new().append(true).open(&rollout).unwrap();
+        std::io::Write::write_all(
+            &mut file,
+            child_turn_with_last(second_turn, 1250, 250).as_bytes(),
+        )
+        .unwrap();
+        drop(file);
+        ingest_codex_rollout_incremental(&conn, &rollout, &meta, &mut cursor).unwrap();
+        let marker = replay_marker(&conn, CHILD).unwrap();
+        assert_eq!(marker["inherited_baseline"], "applied");
+        assert_eq!(token_totals(&conn, CHILD), vec![250]);
+    }
+
+    /// A fork that never ran a turn of its own has no first prompt and no
+    /// answer. The walk clears the parent's prompt and answer an earlier build
+    /// stored from the replay;
+    /// the shallow writer never nulls a value, so it cannot.
+    #[test]
+    fn the_walk_clears_a_replayed_prompt_and_answer_on_a_fork_with_none_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(
+            day.join("rollout-child.jsonl"),
+            forked_prefix(human_fork_meta(), PARENT_TURN),
+        )
+        .unwrap();
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+        conn.execute(
+            "UPDATE sessions SET first_prompt = 'parent prompt', \
+             last_assistant_text = 'parent answer' \
+             WHERE source = 'codex' AND session_id = ?",
+            [CHILD],
+        )
+        .unwrap();
+        state.remove(CODEX_FORK_REPLAY_KEY);
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+        let (first_prompt, last_assistant_text): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT first_prompt, last_assistant_text FROM sessions \
+                 WHERE source = 'codex' AND session_id = ?",
+                [CHILD],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(first_prompt, None);
+        assert_eq!(last_assistant_text, None);
     }
 }

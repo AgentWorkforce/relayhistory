@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,8 +9,13 @@ import { gunzipSync } from 'node:zlib';
 
 import { assertSurfaceConforms, walkCommands, type RelayCliIo } from '@agent-relay/cli-surface';
 
-import { BOOLEAN_FLAGS, COMMANDS, FLAG_SPECS, HOST_OWNED_FLAGS, VALUE_FLAGS } from './cli.js';
+import { BOOLEAN_FLAGS, COMMANDS, FLAG_SPECS, HOST_OWNED_FLAGS, VALUE_FLAGS, runCli } from './cli.js';
 import { createRelayCliSurface, __testing } from './relay-cli.js';
+import { migrateStore } from './index.js';
+
+// Test-only: `node:sqlite` arrived in Node 22 while the SDK still supports Node 20.
+const sqlite = await import('node:sqlite').catch(() => null);
+const needsNodeSqlite = sqlite ? false : 'node:sqlite requires Node >= 22';
 import type { RelayhistoryCloudClient } from './cloud-contract.js';
 
 /**
@@ -44,6 +49,9 @@ async function historyFixture(): Promise<{ root: string; db: string }> {
   const root = await mkdtemp(join(tmpdir(), 'relayhistory-surface-delivery-'));
   const db = join(root, 'history.db');
   await writeFile(db, gunzipSync(await readFile(new URL('../fixtures/offline-history.db.gz', import.meta.url))));
+  // The fixture is a snapshot of an older schema; bring it current so a test
+  // sees its command's output rather than the one-time upgrade notice.
+  await migrateStore({ dbPath: db });
   return { root, db };
 }
 
@@ -457,6 +465,113 @@ test('importing the surface does not run the bin', async () => {
 // The mount must carry everything `runCli` needs, not just argv
 // ---------------------------------------------------------------------------
 
+/** The offline fixture as shipped: an older schema its first open migrates. */
+async function unmigratedFixture(root: string, name: string): Promise<string> {
+  const db = join(root, name);
+  await writeFile(db, gunzipSync(await readFile(new URL('../fixtures/offline-history.db.gz', import.meta.url))));
+  return db;
+}
+
+async function historySelection(root: string): Promise<string> {
+  const selectionPath = join(root, 'selection.json');
+  await writeFile(selectionPath, JSON.stringify({
+    all_sources: false, sources: ['claude'], sessions: [], kinds: ['history'], excluded_sessions: [],
+  }));
+  return selectionPath;
+}
+
+// A migration that fails still ends: the host sees it start, the command
+// reports the error, and nothing is left waiting on a finish that never comes.
+test('a failed mounted migration does not delay the next command', { skip: needsNodeSqlite }, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'relayhistory-surface-failed-upgrade-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const selectionPath = await historySelection(root);
+  const broken = await unmigratedFixture(root, 'broken.db');
+  // A table squatting on an index's name makes the migration fail once it runs.
+  const database = new sqlite!.DatabaseSync(broken);
+  database.exec('DROP INDEX IF EXISTS idx_session_presences_location; CREATE TABLE idx_session_presences_location (x)');
+  database.close();
+
+  const failed = capture();
+  assert.notEqual(await createRelayCliSurface().run(['export', '--selection', selectionPath, '--db', broken], failed), 0);
+  assert.match(failed.err, /Upgrading the ai-hist database/);
+  assert.doesNotMatch(failed.err, /Database upgraded/);
+
+  const { db } = await historyFixture();
+  const next = capture();
+  const started = Date.now();
+  assert.equal(await createRelayCliSurface().run(['export', '--selection', selectionPath, '--db', db], next), 0, next.err);
+  assert.ok(Date.now() - started < 1_500, `the next command waited ${Date.now() - started}ms`);
+  assert.equal(next.err, '');
+});
+
+/** Hold `db`'s write lock from another process until the returned release. */
+async function holdWriteLock(db: string): Promise<() => Promise<void>> {
+  // Another process: POSIX locks do not block across two SQLite copies inside
+  // one process.
+  const child = spawn(process.execPath, ['--input-type=module', '-e', `
+    import { DatabaseSync } from 'node:sqlite';
+    const db = new DatabaseSync(${JSON.stringify(db)});
+    db.exec('PRAGMA journal_mode = WAL');
+    db.exec('BEGIN IMMEDIATE');
+    process.stdout.write('locked\\n');
+    process.stdin.on('end', () => { db.exec('COMMIT'); db.close(); });
+    process.stdin.resume();
+  `], { stdio: ['pipe', 'pipe', 'inherit'] });
+  await new Promise<void>((resolve, reject) => {
+    child.stdout.once('data', () => resolve());
+    child.once('exit', (code) => reject(new Error(`lock holder exited with ${code}`)));
+  });
+  return () => new Promise<void>((resolve) => {
+    child.once('exit', () => resolve());
+    child.stdin.end();
+  });
+}
+
+// Concurrent command lines can share one sink; the one that finishes first
+// must not take it away from one still waiting to migrate. The outdated
+// database's write lock is held until the other command is done, so its
+// migration starts only after that.
+test('concurrent command lines sharing a sink both keep the notice', { skip: needsNodeSqlite }, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'relayhistory-shared-sink-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const selectionPath = await historySelection(root);
+  const { db: current } = await historyFixture();
+  const outdated = await unmigratedFixture(root, 'outdated.db');
+  const release = await holdWriteLock(outdated);
+
+  const io = capture();
+  const exportTo = (db: string, out: string) => runCli(['export', '--selection', selectionPath, '--db', db, '--out', join(root, out)], io);
+  const waiting = exportTo(outdated, 'outdated.ndjson');
+  assert.equal(await exportTo(current, 'current.ndjson'), 0, io.err);
+  assert.doesNotMatch(io.err, /Upgrading/);
+  await release();
+
+  assert.equal(await waiting, 0, io.err);
+  assert.match(io.err, /^Upgrading the ai-hist database to \S+\. This runs once[^\n]*\nDatabase upgraded in \d+s\.\n$/);
+});
+
+// A mounted command reaches `runCli` without the bin's `main`, and the host's
+// stderr sink is the only place its user can see a long migration named.
+test('a mounted command announces the migration it runs on the host stderr', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'relayhistory-surface-upgrade-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const db = join(root, 'history.db');
+  await writeFile(db, gunzipSync(await readFile(new URL('../fixtures/offline-history.db.gz', import.meta.url))));
+  const selectionPath = join(root, 'selection.json');
+  await writeFile(selectionPath, JSON.stringify({
+    all_sources: false, sources: ['claude'], sessions: [], kinds: ['history'], excluded_sessions: [],
+  }));
+
+  const io = capture();
+  const code = await createRelayCliSurface().run(['export', '--selection', selectionPath, '--db', db], io);
+
+  assert.equal(code, 0, io.err);
+  assert.match(io.err, /Upgrading the ai-hist database to \d+\.\d+\.\d+/);
+  assert.match(io.err, /Database upgraded in \d+s\./);
+  assert.equal(io.out.trim().split('\n').length, 3);
+});
+
 test('mounted export with no --out streams NDJSON to the host, as bytes', async (t) => {
   const { root, db } = await historyFixture();
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -480,11 +595,4 @@ test('mounted export with no --out streams NDJSON to the host, as bytes', async 
   // inside the surface would corrupt any chunk boundary falling mid-character,
   // which is the whole reason `RelayCliIo` carries `string | Uint8Array`.
   assert.ok(io.bytes > 0, 'streamed output must reach the host as Uint8Array chunks, not a decoded string');
-});
-
-test('mounted legacy delivery command reports the probe migration', async () => {
-  const io = capture();
-  const code = await createRelayCliSurface().run(['delivery', 'run'], io);
-  assert.equal(code, 1);
-  assert.match(io.err, /HISTORY_DELIVERY_MOVED/);
 });

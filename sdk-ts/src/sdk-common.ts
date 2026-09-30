@@ -5,7 +5,7 @@ import { join } from 'node:path';
 export const SESSION_CATALOG_CONTRACT_VERSION = 4;
 export const SESSION_HYDRATION_CONTRACT_VERSION = 3;
 export const SESSION_RELATIONSHIP_CONTRACT_VERSION = 2;
-export const SESSION_EVIDENCE_CONTRACT_VERSION = 2;
+export const SESSION_EVIDENCE_CONTRACT_VERSION = 3;
 export const SESSION_USAGE_CONTRACT_VERSION = 3;
 
 /**
@@ -21,6 +21,7 @@ export const SOURCES = Object.freeze([
   'relay',
   'trajectory',
   'opencode',
+  'muse',
   'devin',
 ] as const);
 

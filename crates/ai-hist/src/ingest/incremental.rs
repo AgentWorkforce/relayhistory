@@ -246,6 +246,7 @@ pub(crate) fn ingest_claude_transcript_incremental(
                             &mut claude.tool_results,
                             file_session_id.as_deref(),
                             &mut claude.cache_reads,
+                            &mut claude.slash_commands,
                         )?;
                     }
                 } else if complete || !defer_unfinished {
@@ -258,6 +259,7 @@ pub(crate) fn ingest_claude_transcript_incremental(
                         obj,
                         &mut claude.tool_results,
                         &mut claude.cache_reads,
+                        &mut claude.slash_commands,
                     )?;
                 } else {
                     deferred_bytes += line.len();
@@ -285,6 +287,7 @@ pub(crate) fn ingest_claude_transcript_incremental(
                 obj,
                 &mut claude.tool_results,
                 &mut claude.cache_reads,
+                &mut claude.slash_commands,
             )?,
         }
         if kind == ReadRecord::Unterminated {
@@ -308,6 +311,7 @@ pub(crate) fn ingest_claude_transcript_incremental(
                 &mut claude.tool_results,
                 file_session_id.as_deref(),
                 &mut claude.cache_reads,
+                &mut claude.slash_commands,
             )?;
         }
     }
@@ -382,6 +386,7 @@ fn flush_deferred(
     indexer: &mut crate::ingest::tool_result_facts::ToolResultIndexer,
     file_session_id: Option<&str>,
     cache_reads: &mut std::collections::HashMap<String, i64>,
+    triads: &mut super::control::SlashCommandTriads,
 ) -> Result<()> {
     let Some(entry) = deferred.remove(message_id) else {
         return Ok(());
@@ -405,6 +410,7 @@ fn flush_deferred(
             obj,
             indexer,
             cache_reads,
+            triads,
         )?;
     }
     Ok(())

@@ -19,6 +19,34 @@
   "origin": "burn",
   "quirk": "`sourceSessionId` / `forkSessionId` / `continuedFromSessionId` on a repeated `session_meta`",
   "session_events": [],
+  "session_markers": [
+    {
+      "kind": "task_started",
+      "marker_uid": "3:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_meta_child",
+      "source": "codex",
+      "subkind": "task_started",
+      "text": null,
+      "ts_ms": 1776988800100,
+      "turn_id": "turn_meta_1"
+    },
+    {
+      "kind": "task_complete",
+      "marker_uid": "5:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_meta_child",
+      "source": "codex",
+      "subkind": "task_complete",
+      "text": null,
+      "ts_ms": 1776988800300,
+      "turn_id": "turn_meta_1"
+    }
+  ],
   "session_relationships": [
     {
       "child_agent_name": null,

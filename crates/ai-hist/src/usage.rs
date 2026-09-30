@@ -356,7 +356,7 @@ impl std::error::Error for UsageError {}
 
 /// Sources this build can normalize. Anything else is an explicit
 /// [`UsageError::UnknownSource`] rather than a silent zero.
-pub const NORMALIZABLE_SOURCES: &[&str] = &["claude", "codex"];
+pub const NORMALIZABLE_SOURCES: &[&str] = &["claude", "codex", "grok", "muse"];
 
 /// Whether one model request can be spread across several stored records for
 /// this source.
@@ -380,6 +380,14 @@ pub fn source_accounting(source: &str) -> Option<UsageAccounting> {
         // Codex reports cumulative `token_count` snapshots, which the parser
         // differences into per-request deltas before storing them.
         "codex" => Some(UsageAccounting::CumulativeDelta),
+        // Grok's `turn_completed.usage` is one turn's spend, written once on
+        // that turn's last assistant event. The context-window snapshot
+        // stored beside it is never normalized.
+        "grok" => Some(UsageAccounting::PerRequest),
+        // Muse writes one `model_completed` usage object per model step, and
+        // the parser stores it once, on the first assistant row that step
+        // committed.
+        "muse" => Some(UsageAccounting::PerRequest),
         _ => None,
     }
 }
@@ -420,7 +428,13 @@ pub fn normalize_usage(
 
     let mut usage = NormalizedUsage::empty(accounting);
     let output = counter("output_tokens")?;
-    let reasoning = counter("reasoning_output_tokens")?;
+    // Muse names the reasoning counter `reasoning_tokens`; Codex spells it
+    // `reasoning_output_tokens`. Either way it is a subset of output.
+    let reasoning = counter(if source == "muse" {
+        "reasoning_tokens"
+    } else {
+        "reasoning_output_tokens"
+    })?;
     usage.output_tokens = output.unwrap_or(0);
     usage.reasoning_tokens = reasoning;
     usage.coverage.has_output_tokens = output.is_some();
@@ -451,6 +465,34 @@ pub fn normalize_usage(
             usage.cache_write_tokens = cache_write.unwrap_or(0);
             usage.coverage.has_input_tokens = input.is_some();
             usage.coverage.has_cache_read_tokens = cached.is_some();
+            usage.coverage.has_cache_write_tokens = cache_write.is_some();
+        }
+        "muse" => {
+            // Responses-shaped: `input_tokens` includes the cached prefix,
+            // which Muse reports as `cache_read_tokens` (and again as
+            // `cached_tokens`, the same count). Input is emitted exclusive of
+            // it, as for Codex, so summing the categories counts each token
+            // once.
+            let input = counter("input_tokens")?;
+            let cache_read = match counter("cache_read_tokens")? {
+                Some(value) => Some(value),
+                None => counter("cached_tokens")?,
+            };
+            let cache_write = counter("cache_write_tokens")?;
+            let inclusive = input.unwrap_or(0);
+            let cached_value = cache_read.unwrap_or(0);
+            usage.input_tokens =
+                inclusive
+                    .checked_sub(cached_value)
+                    .ok_or(UsageError::CounterRegressed {
+                        field: "input_tokens",
+                        value: inclusive,
+                        subtracted: cached_value,
+                    })?;
+            usage.cache_read_tokens = cached_value;
+            usage.cache_write_tokens = cache_write.unwrap_or(0);
+            usage.coverage.has_input_tokens = input.is_some();
+            usage.coverage.has_cache_read_tokens = cache_read.is_some();
             usage.coverage.has_cache_write_tokens = cache_write.is_some();
         }
         "claude" => {
@@ -492,6 +534,72 @@ pub fn normalize_usage(
             };
             usage.coverage.has_cache_write_tokens =
                 cache_write_total.is_some() || ephemeral_5m.is_some() || ephemeral_1h.is_some();
+        }
+        "grok" => {
+            // Only the verbatim `turn_completed.usage` breakdown is usage. A
+            // record holding only `context_total_tokens` is a context-window
+            // snapshot, which is no usage evidence at all.
+            let Some(breakdown) = object.get("usage") else {
+                return Ok(None);
+            };
+            let Some(breakdown) = breakdown.as_object() else {
+                return Err(UsageError::NotAnObject);
+            };
+            let mut grok_counter =
+                |keys: &[&str], field: &'static str| -> Result<Option<u64>, UsageError> {
+                    let value = keys
+                        .iter()
+                        .find_map(|key| breakdown.get(*key).filter(|value| !value.is_null()));
+                    let value = read_counter(value, field)?;
+                    reported |= value.is_some();
+                    Ok(value)
+                };
+            use crate::ingest::grok::{
+                GROK_USAGE_CACHE_READ_KEYS, GROK_USAGE_CACHE_WRITE_KEYS, GROK_USAGE_INPUT_KEYS,
+                GROK_USAGE_OUTPUT_KEYS, GROK_USAGE_REASONING_KEYS,
+            };
+            let input = grok_counter(GROK_USAGE_INPUT_KEYS, "usage.inputTokens")?;
+            let output = grok_counter(GROK_USAGE_OUTPUT_KEYS, "usage.outputTokens")?;
+            let cache_read = grok_counter(GROK_USAGE_CACHE_READ_KEYS, "usage.cachedReadTokens")?;
+            let cache_write = grok_counter(GROK_USAGE_CACHE_WRITE_KEYS, "usage.cachedWriteTokens")?;
+            let reasoning = grok_counter(GROK_USAGE_REASONING_KEYS, "usage.reasoningTokens")?;
+            let total = read_counter(
+                ["totalTokens", "total_tokens"]
+                    .iter()
+                    .find_map(|key| breakdown.get(*key).filter(|value| !value.is_null())),
+                "usage.totalTokens",
+            )?;
+            // Grok's `inputTokens` includes its `cachedReadTokens`, as
+            // Codex's does, so the cache reads come out of input here. Its
+            // `outputTokens` includes `reasoningTokens`; that stays as
+            // written, with reasoning reported beside it, the same shape a
+            // Codex record has.
+            // Only a reported input can be checked against the cache reads:
+            // an absent one is unknown, not zero, so a breakdown that names
+            // cache reads without it keeps them and reports no input.
+            let cached = cache_read.unwrap_or(0);
+            usage.input_tokens = match input {
+                Some(inclusive) => {
+                    inclusive
+                        .checked_sub(cached)
+                        .ok_or(UsageError::CounterRegressed {
+                            field: "usage.inputTokens",
+                            value: inclusive,
+                            subtracted: cached,
+                        })?
+                }
+                None => 0,
+            };
+            usage.output_tokens = output.unwrap_or(0);
+            usage.reasoning_tokens = reasoning;
+            usage.cache_read_tokens = cached;
+            usage.cache_write_tokens = cache_write.unwrap_or(0);
+            usage.provider_total_tokens = total;
+            usage.coverage.has_input_tokens = input.is_some();
+            usage.coverage.has_output_tokens = output.is_some();
+            usage.coverage.has_reasoning_tokens = reasoning.is_some();
+            usage.coverage.has_cache_read_tokens = cache_read.is_some();
+            usage.coverage.has_cache_write_tokens = cache_write.is_some();
         }
         // `source_accounting` already rejected anything else.
         _ => unreachable!("source_accounting accepted an unhandled source"),
@@ -605,6 +713,11 @@ struct UsageMessage {
     /// The API request this record belongs to. Several records can share one
     /// — see [`request_key`].
     request: String,
+    /// A user-role record every row of which carries a `control_kind`: a
+    /// slash-command wrapper, a task notification, Codex context. Not a
+    /// prompt, so never an owner; the walk to the owning prompt steps over
+    /// it.
+    control: bool,
 }
 
 /// What one record contributes to its request.
@@ -692,14 +805,18 @@ pub fn attribute_usage_to_prompts(
                 }
                 Some(_) => RecordUsage::Unreadable,
             };
+            // A `<system-reminder>` row shares its prompt's record id and is
+            // not the human's text; leaving it out is what keeps this key
+            // equal to the `history` prompt the row was stored beside.
             let text = rows
                 .iter()
-                .filter(|r| r.kind == "text")
+                .filter(|r| r.kind == "text" && r.control_kind.is_none())
                 .filter_map(|r| r.text.as_deref())
                 .map(str::trim)
                 .filter(|text| !text.is_empty())
                 .collect::<Vec<_>>()
                 .join("\n");
+            let control = first.role == "user" && rows.iter().all(|r| r.control_kind.is_some());
             Some((
                 id.to_string(),
                 UsageMessage {
@@ -710,19 +827,26 @@ pub fn attribute_usage_to_prompts(
                     text,
                     usage,
                     request,
+                    control,
                 },
             ))
         })
         .collect();
     // Keep even unidentifiable user events as boundaries; dropping one would
-    // incorrectly charge its answer to the preceding identifiable prompt.
-    let mut boundaries: Vec<_> = events.iter().filter(|e| e.role == "user").collect();
+    // incorrectly charge its answer to the preceding identifiable prompt. A
+    // control row is the one user row that is *not* a boundary: Codex
+    // prepends its context wrapper to the human's turn, and treating it as a
+    // turn of its own would hand the answer to the wrapper.
+    let mut boundaries: Vec<_> = events
+        .iter()
+        .filter(|e| e.role == "user" && e.control_kind.is_none())
+        .collect();
     boundaries.sort_by_key(|e| e.ts_ms);
     // Parsers use zero when time is missing. Such a turn could fall anywhere,
     // so timestamp-only ownership is unsafe for the session.
     let timestamps_known = boundaries.iter().all(|e| e.ts_ms > 0);
     let mut prompt_counts = HashMap::new();
-    for user in messages.values().filter(|m| m.role == "user") {
+    for user in messages.values().filter(|m| m.role == "user" && !m.control) {
         *prompt_counts
             .entry((user.ts, user.text.clone()))
             .or_insert(0) += 1;
@@ -897,7 +1021,10 @@ fn parent_prompt<'a>(
     let mut current = message;
     let mut visited = HashSet::new();
     while visited.insert(current.id.as_str()) {
-        if current.role == "user" {
+        // A slash command's rows sit between the answer and the prompt that
+        // caused it. They are chained like any record, and they are not the
+        // owner, so the walk continues through them to the prompt.
+        if current.role == "user" && !current.control {
             return Some(current);
         }
         current = messages.get(current.parent.as_deref()?)?;
@@ -918,6 +1045,81 @@ mod tests {
 
     fn codex(value: Value) -> Result<Option<NormalizedUsage>, UsageError> {
         normalize_usage("codex", &value)
+    }
+
+    fn grok(value: Value) -> Result<Option<NormalizedUsage>, UsageError> {
+        normalize_usage("grok", &value)
+    }
+
+    #[test]
+    fn grok_turn_usage_is_per_request_with_cache_exclusive_input() {
+        let usage = grok(json!({
+            "context_total_tokens": 18432,
+            "source": "updates.jsonl",
+            "usage": {
+                "inputTokens": 1000,
+                "outputTokens": 100,
+                "reasoningTokens": 20,
+                "cachedReadTokens": 400,
+                "totalTokens": 1100,
+                "modelUsage": {"grok-4.5-build": {"inputTokens": 1000}}
+            }
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(usage.accounting, UsageAccounting::PerRequest);
+        assert_eq!(usage.input_tokens, 600);
+        assert_eq!(usage.cache_read_tokens, 400);
+        assert_eq!(usage.output_tokens, 100);
+        assert_eq!(usage.reasoning_tokens, Some(20));
+        // The provider's own total, never the context snapshot beside it.
+        assert_eq!(usage.provider_total_tokens, Some(1100));
+        assert!(usage.coverage.has_input_tokens && usage.coverage.has_cache_read_tokens);
+        assert!(!usage.coverage.has_cache_write_tokens);
+    }
+
+    #[test]
+    fn a_grok_context_snapshot_alone_is_no_usage_evidence() {
+        assert_eq!(
+            grok(json!({"context_total_tokens": 9210, "source": "updates.jsonl"})).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn grok_counters_are_read_in_every_spelling_and_never_clamped() {
+        let usage = grok(json!({"usage": {"promptTokens": 50, "completionTokens": 5}}))
+            .unwrap()
+            .unwrap();
+        assert_eq!((usage.input_tokens, usage.output_tokens), (50, 5));
+        assert_eq!(usage.reasoning_tokens, None);
+        assert_eq!(
+            grok(json!({"usage": {"inputTokens": 10, "cachedReadTokens": 11}}))
+                .unwrap_err()
+                .code(),
+            "USAGE_COUNTER_REGRESSED"
+        );
+        // No reported input is unknown input, not zero: the cache reads and
+        // output it did report are kept, and input coverage stays false.
+        let partial = grok(json!({"usage": {"cachedReadTokens": 400, "outputTokens": 10}}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                partial.input_tokens,
+                partial.cache_read_tokens,
+                partial.output_tokens
+            ),
+            (0, 400, 10)
+        );
+        assert!(!partial.coverage.has_input_tokens);
+        assert!(partial.coverage.has_cache_read_tokens);
+        assert_eq!(
+            grok(json!({"usage": {"outputTokens": -1}}))
+                .unwrap_err()
+                .code(),
+            "USAGE_NON_INTEGER_COUNTER"
+        );
     }
 
     #[test]
@@ -1004,6 +1206,41 @@ mod tests {
         assert_eq!(usage.reasoning_tokens, None);
         assert_eq!(usage.provider_total_tokens, None);
         assert_eq!(usage.reported_cost_usd, None);
+    }
+
+    /// Muse's `model_completed` usage, as the real CLI writes it: input
+    /// inclusive of the cached prefix, reported under two keys.
+    #[test]
+    fn muse_input_is_made_cache_exclusive_and_counted_once() {
+        let usage = normalize_usage(
+            "muse",
+            &json!({
+                "input_tokens": 26964,
+                "output_tokens": 379,
+                "cached_tokens": 5105,
+                "cache_read_tokens": 5105,
+                "cache_write_tokens": 0,
+                "reasoning_tokens": 278,
+            }),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(usage.input_tokens, 21859);
+        assert_eq!(usage.cache_read_tokens, 5105);
+        assert_eq!(usage.cache_write_tokens, 0);
+        assert_eq!(usage.output_tokens, 379);
+        assert_eq!(usage.reasoning_tokens, Some(278));
+        assert_eq!(usage.accounting, UsageAccounting::PerRequest);
+
+        // An older record that spells the cache read only as `cached_tokens`.
+        let legacy = normalize_usage(
+            "muse",
+            &json!({"input_tokens": 10, "output_tokens": 1, "cached_tokens": 4}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(legacy.input_tokens, 6);
+        assert_eq!(legacy.cache_read_tokens, 4);
     }
 
     #[test]
@@ -1364,6 +1601,7 @@ mod tests {
             is_meta: None,
             turn_id: None,
             request_span: None,
+            control_kind: None,
             raw_kind: None,
         }
     }

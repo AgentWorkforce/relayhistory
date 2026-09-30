@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import { packageName, platforms, plugins } from "./history-package-contract.mjs";
 import {
+  hostHelperInstallRejection,
   hostLibc,
   pluginInstallArgs,
   publicRegistryEnv,
@@ -54,6 +58,23 @@ test("checks every published name at the exact release version", async () => {
   assert.deepEqual(calls, expected.map((name) => [name, version]));
 });
 
+test("bounds concurrent registry lookups", async () => {
+  let inFlight = 0;
+  let maximum = 0;
+  await waitForPublishedPackages(version, {
+    ...quiet,
+    concurrency: 3,
+    runView: async () => {
+      inFlight += 1;
+      maximum = Math.max(maximum, inFlight);
+      await new Promise((resolve) => setImmediate(resolve));
+      inFlight -= 1;
+      return available;
+    },
+  });
+  assert.equal(maximum, 3);
+});
+
 test("accepts npm's singleton-array metadata format", async () => {
   await waitForPublishedPackages(version, {
     ...quiet,
@@ -61,12 +82,12 @@ test("accepts npm's singleton-array metadata format", async () => {
   });
 });
 
-test("waits for independently delayed helpers even when both JS packages are visible", async () => {
-  // Reproduce the four missing helpers from the 0.19.0 release. The two JS
-  // packages and all other platforms are already visible on the first pass.
+test("waits for independently delayed helpers even when the JS package is visible", async () => {
+  // Reproduce four helpers that trail the release. The JS package and all
+  // other platforms are already visible on the first pass.
   const delayed = new Map([
-    ["@relayhistory/capture-darwin-arm64", 1],
-    ["@relayhistory/capture-darwin-x64", 2],
+    ["@relayhistory/provider-sources-darwin-arm64", 1],
+    ["@relayhistory/provider-sources-darwin-x64", 2],
     ["@relayhistory/provider-sources-linux-arm64-musl", 3],
     ["@relayhistory/provider-sources-win32-x64-msvc", 4],
   ]);
@@ -107,7 +128,7 @@ test("fails after bounded retries with the missing package and original npm erro
     assert.match(error.message, /after 3 attempts/);
     assert.ok(error.message.includes(`${missing}@${version}`));
     assert.match(error.message, /npm error code ETARGET\nNo matching version found/);
-    assert.ok(!error.message.includes("capture-darwin"));
+    assert.ok(!error.message.includes("provider-sources-darwin"));
     return true;
   });
   assert.equal(lookups, 3);
@@ -123,8 +144,10 @@ test("authentication and network errors fail immediately with npm diagnostics", 
         calls += 1;
         return { status: 1, stdout: "", stderr: `npm error code ${code}` };
       },
-    }), new RegExp(`npm view @relayhistory/capture@0\\.19\\.0 failed.*\\n.*${code}`));
-    assert.equal(calls, 1);
+    }), new RegExp(`npm view @relayhistory/provider-sources@0\\.19\\.0 failed.*\\n.*${code}`));
+    // The first bounded batch is already in flight when its first fatal
+    // result is inspected; no later batch is started.
+    assert.equal(calls, 4);
   }
 });
 
@@ -135,15 +158,45 @@ test("process launch failures preserve the package context and original error", 
     runView: () => ({ status: null, error: cause }),
   }), (error) => {
     assert.equal(error.cause, cause);
-    assert.match(error.message, /@relayhistory\/capture@0\.19\.0.*ENOENT/);
+    assert.match(error.message, /@relayhistory\/provider-sources@0\.19\.0.*ENOENT/);
     return true;
   });
 });
 
-test("verify project depends on both JS packages at the release version", () => {
+test("a zero-exit install without the host helpers is a retryable miss", () => {
+  const project = mkdtempSync(join(tmpdir(), "relayhistory-verify-helpers-"));
+  try {
+    const platform = "linux-x64-gnu";
+    const absent = hostHelperInstallRejection(project, platform, "glibc");
+    assert.match(absent, /@relayhistory\/provider-sources-linux-x64-gnu did not install/);
+    assert.match(absent, /npm libc=glibc/);
+    assert.match(absent, /installed @relayhistory\/\*: none/);
+
+    const scope = join(project, "node_modules", "@relayhistory");
+    mkdirSync(join(scope, "provider-sources"), { recursive: true });
+    writeFileSync(join(scope, "provider-sources", "package.json"), "{}\n");
+    const partial = hostHelperInstallRejection(project, platform, "glibc");
+    assert.match(partial, /provider-sources-linux-x64-gnu/);
+    assert.match(partial, /installed @relayhistory\/\*: provider-sources/);
+
+    for (const info of Object.values(plugins)) {
+      const helper = packageName(info, platform);
+      const dir = join(project, "node_modules", ...helper.split("/"));
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "package.json"), "{}\n");
+    }
+    assert.equal(hostHelperInstallRejection(project, platform, "glibc"), "");
+    rmSync(join(project, "node_modules"), { recursive: true, force: true });
+    const afterReset = hostHelperInstallRejection(project, platform, "glibc");
+    assert.match(afterReset, /@relayhistory\/provider-sources-linux-x64-gnu did not install/);
+  } finally {
+    rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("verify project depends on the JS package at the release version", () => {
   const manifest = verifyPluginManifest(version);
   assert.deepEqual(manifest.dependencies, {
-    "@relayhistory/capture": version,
     "@relayhistory/provider-sources": version,
   });
   assert.equal("optionalDependencies" in manifest, false);
@@ -189,7 +242,7 @@ test("invalid published manifests fail immediately instead of being treated as p
   for (const [stdout, message] of [
     [JSON.stringify({ version: "0.18.9", repository: { url: "repo" } }), /wrong version/],
     [JSON.stringify({ version }), /published without repository.url/],
-    ["not JSON", /@relayhistory\/capture@0\.19\.0: invalid JSON/],
+    ["not JSON", /@relayhistory\/provider-sources@0\.19\.0: invalid JSON/],
     ["[]", /expected exactly one manifest/],
     [`[${available.stdout},${available.stdout}]`, /expected exactly one manifest/],
     ["null", /invalid manifest/],

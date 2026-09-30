@@ -3738,3 +3738,418 @@ fn a_cached_grandchild_is_streamed_the_key_the_refresh_lends_across_a_gap() {
         "the grandparent was not promoted, so nothing above was actually tested"
     );
 }
+
+#[test]
+fn stopped_serial_and_parallel_discovery_do_not_claim_the_rest_of_the_window() {
+    struct StoppingProvider {
+        stop: crate::StopToken,
+        reads: AtomicUsize,
+        caller: std::thread::ThreadId,
+        worker_limit: usize,
+    }
+    impl ShallowSessionProvider for StoppingProvider {
+        fn source(&self) -> &'static str {
+            "codex"
+        }
+        fn enumerate(
+            &self,
+            env: &DiscoveryEnv<'_>,
+            limit: Option<usize>,
+        ) -> Result<Vec<Candidate>> {
+            CodexProvider.enumerate(env, limit)
+        }
+        fn read_shallow(
+            &self,
+            _: &ScanEnv<'_>,
+            _: Option<&Connection>,
+            _: &Candidate,
+        ) -> Result<Option<ShallowSession>> {
+            assert_eq!(
+                std::thread::current().id() != self.caller,
+                self.worker_limit > 1,
+                "the requested read path was not exercised"
+            );
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.stop.stop();
+            Ok(None)
+        }
+    }
+    for worker_limit in [1, 2] {
+        let conn = catalog();
+        let home = tempfile::tempdir().unwrap();
+        for i in 0..MAX_READ_WINDOW {
+            let id = format!("session-{i}");
+            codex_rollout(
+                home.path(),
+                &id,
+                &CODEX_BODY.replace("codex-1", &id),
+                1_750_000_000_000,
+            );
+        }
+        let stop = crate::StopToken::new();
+        let provider = StoppingProvider {
+            stop: stop.clone(),
+            reads: AtomicUsize::new(0),
+            caller: std::thread::current().id(),
+            worker_limit,
+        };
+        let env = env_at(&conn, home.path());
+        let error = crate::ingest::with_capture_token(stop, || {
+            discover_sessions_with_worker_limit(
+                &env,
+                &only(&["codex"]),
+                &[&provider],
+                |_| panic!("cancelled window emitted a row"),
+                worker_limit,
+                true,
+            )
+        })
+        .unwrap_err();
+        assert!(error.is::<crate::ingest::CaptureCancelled>());
+        let reads = provider.reads.load(Ordering::SeqCst);
+        assert!(
+            (1..=worker_limit).contains(&reads),
+            "read {reads} files after stop"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM discovery_skips", [], |row| row
+                .get::<_, usize>(0))
+                .unwrap(),
+            0
+        );
+    }
+}
+
+#[test]
+fn cancellation_during_row_emission_preserves_the_committed_window() {
+    for (cached, stop_after) in [(false, 1), (false, 3), (true, 1), (true, 3)] {
+        let conn = catalog();
+        let home = tempfile::tempdir().unwrap();
+        for id in ["first", "second", "third"] {
+            codex_rollout(
+                home.path(),
+                id,
+                &CODEX_BODY.replace("codex-1", id),
+                1_750_000_000_000,
+            );
+        }
+        if cached {
+            discover(&conn, home.path(), &only(&["codex"]));
+        }
+        let env = env_at(&conn, home.path());
+        let stop = crate::StopToken::new();
+        let stopper = stop.clone();
+        let mut emitted = 0;
+        let error = crate::ingest::with_capture_token(stop, || {
+            let result = discover_sessions_with_env(&env, &only(&["codex"]), |_| {
+                emitted += 1;
+                if emitted == stop_after {
+                    stopper.stop();
+                }
+            });
+            // The scope's final cancellation check must not hide an Ok from
+            // the engine when the final callback stops the last window.
+            assert!(result.unwrap_err().is::<crate::ingest::CaptureCancelled>());
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.is::<crate::ingest::CaptureCancelled>());
+        assert_eq!(emitted, stop_after, "rows were emitted after cancellation");
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| row
+                .get::<_, usize>(0))
+                .unwrap(),
+            3
+        );
+        let resumed = discover(&conn, home.path(), &only(&["codex"]));
+        assert_eq!(resumed.rows.len(), 3);
+        assert_eq!(resumed.summary.skipped_unchanged, 3);
+        assert_eq!(resumed.summary.discovered, 0);
+    }
+}
+
+/// A Muse subagent's log is never a session of its own, however it reaches
+/// the shallow reader — enumeration skips it, a by-path read must too.
+#[test]
+fn muse_shallow_read_refuses_a_subagent_log() {
+    let home = tempfile::tempdir().unwrap();
+    let conn = catalog();
+    let session = home
+        .path()
+        .join(".local/share/muse/sessions/2026/09/20/parent");
+    let header = |id: &str| {
+        format!(
+            "{{\"id\":\"r1\",\"stream\":{{\"kind\":\"session\",\"id\":\"{id}\"}},\
+             \"recorded_at\":1790337600000000,\"payload_type\":\"runtime.session.metadata\",\
+             \"payload\":{{\"kind\":\"metadata\",\"record\":{{\"workspace_root\":\"/w\"}}}}}}\n"
+        )
+    };
+    write(&session.join("session.jsonl"), &header("parent"));
+    let child = session.join("subagent/child/session.jsonl");
+    write(&child, &header("child"));
+
+    let env = env_at(&conn, home.path());
+    let candidates = MuseProvider.enumerate(&env, None).unwrap();
+    assert_eq!(candidates.len(), 1, "only the parent is enumerated");
+    let mut by_path = candidates[0].clone();
+    by_path.locator = child.to_string_lossy().into_owned();
+    assert!(MuseProvider
+        .read_shallow(&env.scan(), None, &by_path)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        MuseProvider
+            .read_shallow(&env.scan(), None, &candidates[0])
+            .unwrap()
+            .unwrap()
+            .session_id,
+        "parent"
+    );
+}
+
+/// One session's child log that cannot be statted leaves that session's
+/// transcript in the fingerprint and every other session's tree untouched,
+/// rather than failing the fold.
+#[cfg(unix)]
+#[test]
+fn a_muse_child_log_stat_error_does_not_fail_the_fingerprint() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let conn = catalog();
+    let sessions = home.path().join(".local/share/muse/sessions/2026/09/20");
+    let header = |id: &str| {
+        format!(
+            "{{\"id\":\"r1\",\"stream\":{{\"kind\":\"session\",\"id\":\"{id}\"}},\
+             \"recorded_at\":1790337600000000,\"payload_type\":\"runtime.session.metadata\",\
+             \"payload\":{{\"kind\":\"metadata\",\"record\":{{\"workspace_root\":\"/w\"}}}}}}\n"
+        )
+    };
+    write(&sessions.join("a/session.jsonl"), &header("a"));
+    write(&sessions.join("a/subagent/c/session.jsonl"), &header("c"));
+    write(&sessions.join("b/session.jsonl"), &header("b"));
+    write(&sessions.join("b/subagent/d/session.jsonl"), &header("d"));
+    let blocked = sessions.join("a/subagent/c");
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o644)).unwrap();
+    let stat_blocked = fs::metadata(blocked.join("session.jsonl")).is_err();
+
+    let env = env_at(&conn, home.path());
+    let inputs = MuseProvider.fingerprint_inputs(&env);
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755)).unwrap();
+    if !stat_blocked {
+        return;
+    }
+    let mut locators: Vec<String> = inputs
+        .unwrap()
+        .into_iter()
+        .map(|candidate| {
+            candidate
+                .locator
+                .trim_start_matches(&*sessions.to_string_lossy())
+                .to_string()
+        })
+        .collect();
+    locators.sort();
+    assert_eq!(
+        locators,
+        vec![
+            "/a/session.jsonl".to_string(),
+            "/b/session.jsonl".to_string(),
+            "/b/subagent/d/session.jsonl".to_string(),
+        ]
+    );
+}
+
+/// A subagent workflow journal shares the `.jsonl` extension and sits inside
+/// the project tree, but it is not a transcript, so discovery never lists it
+/// as a candidate session.
+#[test]
+fn claude_discovery_skips_subagent_workflow_journals() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let project = home.path().join(".claude/projects/app");
+    write(&project.join("s1.jsonl"), CLAUDE_BODY);
+    write(
+        &project.join("s1/subagents/journal.jsonl"),
+        "{\"type\":\"started\",\"agentId\":\"a\"}\n",
+    );
+    write(
+        &project.join("s1/subagents/agent-a.jsonl"),
+        "{\"type\":\"assistant\",\"isSidechain\":true}\n",
+    );
+
+    let env = env_at(&conn, home.path());
+    let locators: Vec<String> = ClaudeProvider
+        .enumerate(&env, None)
+        .unwrap()
+        .into_iter()
+        .map(|candidate| candidate.locator)
+        .collect();
+    assert_eq!(locators.len(), 2, "{locators:?}");
+    assert!(
+        locators
+            .iter()
+            .all(|locator| !locator.ends_with("journal.jsonl")),
+        "{locators:?}"
+    );
+}
+
+/// `<claude root>/transcripts/` is not a Claude Code transcript root. What
+/// lands there is oh-my-opencode's Claude-hook compatibility log of an
+/// *OpenCode* session: named by the OpenCode `ses_*` id, `user` / `tool_use` /
+/// `tool_result` lines with top-level `content` / `tool_*` fields, and no
+/// `sessionId`, `cwd`, model or assistant turn. The OpenCode adapter already
+/// indexes that session from OpenCode's own store, so Claude discovery neither
+/// lists nor watches the directory (#208).
+#[test]
+fn claude_discovery_ignores_the_opencode_wrapper_transcripts_root() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    write(
+        &home.path().join(".claude/projects/app/s1.jsonl"),
+        CLAUDE_BODY,
+    );
+    write(
+        &home
+            .path()
+            .join(".claude/transcripts/ses_0123456789abcdefghijklmno.jsonl"),
+        concat!(
+            r#"{"type":"user","timestamp":"2026-04-01T10:00:00.000Z","content":"Wrapped prompt"}"#,
+            "\n",
+            r#"{"type":"tool_use","timestamp":"2026-04-01T10:00:01.000Z","tool_name":"read","tool_input":{"filePath":"/src/main.rs"}}"#,
+            "\n",
+        ),
+    );
+
+    let env = env_at(&conn, home.path());
+    let locators: Vec<String> = ClaudeProvider
+        .enumerate(&env, None)
+        .unwrap()
+        .into_iter()
+        .chain(ClaudeProvider.fingerprint_inputs(&env).unwrap())
+        .map(|candidate| candidate.locator)
+        .collect();
+    assert!(
+        locators
+            .iter()
+            .all(|locator| !locator.contains("/.claude/transcripts/")),
+        "{locators:?}"
+    );
+
+    let roots = crate::ProviderRoots::from_home(
+        home.path().to_path_buf(),
+        home.path().join("opencode.db"),
+    );
+    let watched: Vec<PathBuf> = provider_watch_roots("claude", &roots)
+        .into_iter()
+        .map(|root| root.path)
+        .collect();
+    assert_eq!(
+        watched,
+        vec![home.path().join(".claude/projects")],
+        "Claude watches only <claude root>/projects; transcripts/ is excluded on \
+         purpose (#208, see the claude bullet in docs/session-catalog.md)"
+    );
+}
+
+/// A shallow rescan replaces the directory's activity end and model list.
+/// `logs/unified.jsonl` is not that directory: a later log row raises the end
+/// again, a model only the log named is appended, and a model the new
+/// directory snapshot does not name stays gone. A directory end later than
+/// the log still wins.
+#[test]
+fn a_grok_shallow_rescan_keeps_a_later_log_time_and_log_only_models() {
+    let conn = catalog();
+    conn.execute_batch(
+        "INSERT INTO grok_unified_usage \
+         (row_key, session_id, ts_ms, model, usage_json, locator, line_offset) VALUES \
+         ('early', 'grok-cat', 1000, 'log-early', '{}', 'loc', 0), \
+         ('dup', 'grok-cat', 2000, 'from-summary', '{}', 'loc', 5), \
+         ('late', 'grok-cat', 5000, 'log-late', '{}', 'loc', 10), \
+         ('timeless', 'grok-cat', NULL, 'log-timeless', '{}', 'loc', 20);",
+    )
+    .unwrap();
+    let shallow = |last: Option<i64>, models: &[&str]| ShallowSession {
+        source: "grok".into(),
+        session_id: "grok-cat".into(),
+        last_activity_ms: last,
+        models: models.iter().map(|model| (*model).to_string()).collect(),
+        discovery_state: "shallow".into(),
+        ..Default::default()
+    };
+    let earlier = upsert_shallow_session(&conn, &shallow(Some(100), &["from-summary"])).unwrap();
+    assert_eq!(earlier.last_activity_ms, Some(5000));
+    assert_eq!(
+        earlier.models,
+        vec![
+            "from-summary".to_string(),
+            "log-early".to_string(),
+            "log-late".to_string(),
+            "log-timeless".to_string()
+        ]
+    );
+
+    conn.execute(
+        "UPDATE sessions SET models_json = ? WHERE source = 'grok' AND session_id = 'grok-cat'",
+        params![r#"["from-summary","log-early","dir-only"]"#],
+    )
+    .unwrap();
+    let later = upsert_shallow_session(&conn, &shallow(Some(9000), &["from-summary"])).unwrap();
+    assert_eq!(later.last_activity_ms, Some(9000));
+    assert_eq!(
+        later.models,
+        vec![
+            "from-summary".to_string(),
+            "log-early".to_string(),
+            "log-late".to_string(),
+            "log-timeless".to_string()
+        ]
+    );
+}
+
+/// Discovery asks this once per candidate whose session id the path does not
+/// name. Served from the primary key to satisfy its ORDER BY, it walked every
+/// observation of the source per candidate: O(files x sessions) on every pass
+/// (#42, #215). It has to be a search on the locator index.
+#[test]
+fn observed_session_by_locator_is_a_keyed_search() {
+    for analyze in [false, true] {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for i in 0..60 {
+            conn.execute(
+                "INSERT INTO session_observations \
+                 (source, session_id, location, connector_id, connector_instance, \
+                  raw_locator, source_stamp, updated_ms) \
+                 VALUES ('claude', ?1, 'local', 'claude', 'default', ?2, 'stamp', 0)",
+                rusqlite::params![format!("s{i}"), format!("/t/{i}.jsonl")],
+            )
+            .unwrap();
+        }
+        if analyze {
+            conn.execute_batch("ANALYZE").unwrap();
+        }
+        let steps: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {OBSERVED_SESSION_BY_LOCATOR_SQL}"))
+            .unwrap()
+            .query_map(
+                rusqlite::params!["claude", "local", "claude", "default", "/t/7.jsonl"],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let joined = steps.join(" | ");
+        assert!(
+            joined.contains("idx_observation_locator") && joined.contains("raw_locator=?"),
+            "the locator lookup is not a search on its index (analyze={analyze}): {joined}"
+        );
+        let found: String = conn
+            .query_row(
+                OBSERVED_SESSION_BY_LOCATOR_SQL,
+                rusqlite::params!["claude", "local", "claude", "default", "/t/7.jsonl"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(found, "s7");
+    }
+}

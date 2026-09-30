@@ -1,6 +1,7 @@
 //! Validated canonical evidence records accepted from installed source adapters.
 //! Foreign database row ids are retained in observations but never assigned locally.
 use crate::observations::ObservationKey;
+use crate::SessionLocation;
 use anyhow::{ensure, Context, Result};
 use rusqlite::{params_from_iter, Connection};
 use serde::{Deserialize, Serialize};
@@ -123,8 +124,11 @@ impl EvidenceKind {
         // contract is what `read_session` reads back and what a snapshot is
         // compared against, and a column missing here is rejected outright as
         // an unsupported column when it appears in a payload. It stays out of
-        // `required` because it is optional for every source.
-        Self::SessionEvent=>Spec{table:"session_events",columns:"source,session_id,project,project_key,project_key_method,cwd,git_branch,message_id,parent_id,ts_ms,role,kind,text,model,token_json,provider,event_uid,tool_use_id,payload_bytes,payload_truncated,payload_hash,call_index,event_index,result_status,event_source,error_signal,subagent_session_id,agent_id,request_id,provider_message_id,stop_reason,agent_version,is_sidechain,is_meta,turn_id,request_span,raw_kind",required:"source,session_id,ts_ms,role,kind,event_uid",key:"source,session_id,event_uid",derived:"project_key,project_key_method"},
+        // `required` because it is optional for every source. `control_kind`
+        // travels for the same reason: a connector that classified a row is
+        // reporting a fact about it, and a snapshot without the column would
+        // read every control row back as a prompt.
+        Self::SessionEvent=>Spec{table:"session_events",columns:"source,session_id,project,project_key,project_key_method,cwd,git_branch,message_id,parent_id,ts_ms,role,kind,text,model,token_json,provider,event_uid,tool_use_id,payload_bytes,payload_truncated,payload_hash,call_index,event_index,result_status,event_source,error_signal,subagent_session_id,agent_id,request_id,provider_message_id,stop_reason,agent_version,is_sidechain,is_meta,turn_id,request_span,raw_kind,control_kind",required:"source,session_id,ts_ms,role,kind,event_uid",key:"source,session_id,event_uid",derived:"project_key,project_key_method"},
         Self::ToolCall=>Spec{table:"tool_calls",columns:"source,session_id,message_id,tool_use_id,name,target,args_json,is_error,ts_ms",required:"source,session_id,tool_use_id,name",key:"source,session_id,tool_use_id",derived:""},
         Self::FileEdit=>Spec{table:"file_edits",columns:"source,session_id,message_id,tool_use_id,file_path,tool_name,lines_added,lines_removed,structured_patch_json,user_modified,ts_ms,git_branch,cwd",required:"source,session_id,tool_use_id,file_path,tool_name",key:"source,session_id,tool_use_id",derived:""},
         Self::Relationship=>Spec{table:"session_relationships",columns:"source,parent_session_id,relationship_uid,child_session_id,relationship,identity_status,child_agent_type,child_agent_name,child_model,spawn_depth,evidence_kind,evidence_locator,evidence_ref,child_has_events,spawned_at_ms,created_ms,updated_ms,origin_session_id",required:"source,parent_session_id,relationship_uid,relationship,identity_status,evidence_kind,created_ms,updated_ms",key:"source,parent_session_id,relationship_uid",derived:""},
@@ -187,6 +191,7 @@ const ERROR_SIGNALS: &[&str] = &[
     "patch_apply",
     "mcp_err",
     "subagent_status",
+    "tool_status",
     "tool_call_state.status",
 ];
 
@@ -290,6 +295,25 @@ pub fn validate_records(
                         .contains(&record.payload["kind"].as_str().unwrap_or_default()),
                 "INVALID_ARGUMENT: invalid event role or kind"
             );
+            // `control_kind` is a closed vocabulary, and every reader -- the
+            // user-turn page, prompt attribution, the plugin's turn export --
+            // treats any non-null value as authoritative without rechecking
+            // it. A spelling nobody classifies, or a kind on a row the
+            // contract says can never carry one, would silently hide real
+            // evidence, so it is refused here rather than stored.
+            if let Some(value) = record.payload.get("control_kind").filter(|v| !v.is_null()) {
+                ensure!(
+                    value
+                        .as_str()
+                        .is_some_and(|value| crate::ingest::control::ControlKind::parse(value).is_some()),
+                    "INVALID_ARGUMENT: unsupported control_kind value"
+                );
+                ensure!(
+                    record.payload["role"].as_str() == Some("user")
+                        && record.payload["kind"].as_str() == Some("text"),
+                    "INVALID_ARGUMENT: control_kind is only valid on a user text event"
+                );
+            }
             let tool_result = record.payload["kind"].as_str() == Some("tool_result");
             for field in TOOL_RESULT_FIELDS {
                 let Some(value) = record.payload.get(*field).filter(|v| !v.is_null()) else {
@@ -445,6 +469,11 @@ impl EvidenceRecord {
     /// Whether the canonical row still equals this adapter-owned projection.
     /// Local ingestion can write directly; a changed value revokes remote ownership.
     ///
+    /// Crate-private, like the three writes below: each takes a raw
+    /// `rusqlite::Connection`, and an embedder on the default features never
+    /// holds one. Exporting them put `rusqlite` in the crate's public API,
+    /// which `crates/ai-hist/public-api.txt` now forbids.
+    ///
     /// [`Spec::derived`] columns are left out of the comparison. They are
     /// rewritten by `refresh_project_identity` in the same transaction that
     /// stores the snapshot they are compared against, so including them makes
@@ -454,7 +483,7 @@ impl EvidenceRecord {
     /// row it no longer owns. The fields still travel in the record, because a
     /// snapshot should round-trip what the emitting side knew; they are simply
     /// not evidence about who owns the row.
-    pub fn matches_canonical(&self, conn: &Connection) -> Result<bool> {
+    pub(crate) fn matches_canonical(&self, conn: &Connection) -> Result<bool> {
         let spec = self.kind.spec();
         let derived: Vec<&str> = spec.derived.split(',').filter(|c| !c.is_empty()).collect();
         let mut clauses = vec![];
@@ -473,7 +502,7 @@ impl EvidenceRecord {
             |row| row.get(0),
         )?)
     }
-    pub fn exists(&self, conn: &Connection) -> Result<bool> {
+    pub(crate) fn exists(&self, conn: &Connection) -> Result<bool> {
         let (condition, values) = self.key_sql();
         Ok(conn.query_row(
             &format!(
@@ -484,34 +513,55 @@ impl EvidenceRecord {
             |row| row.get(0),
         )?)
     }
-    pub fn remove(&self, conn: &Connection) -> Result<()> {
+    /// Retire this record for the observation at `location`. In a table
+    /// whose rows record which evidence backs them, only that side's share is
+    /// retired: a record the other side also backs stays, as the other side's.
+    pub(crate) fn remove(&self, conn: &Connection, location: SessionLocation) -> Result<()> {
+        let table = self.kind.spec().table;
         let (condition, values) = self.key_sql();
+        if crate::store::EVIDENCE_LOCATION_TABLES.contains(&table) {
+            let params = values
+                .iter()
+                .map(|value| value as &dyn rusqlite::ToSql)
+                .collect::<Vec<_>>();
+            crate::store::retire_evidence_share(conn, table, &condition, &params, location)?;
+            return Ok(());
+        }
         conn.execute(
-            &format!("DELETE FROM {} WHERE {condition}", self.kind.spec().table),
+            &format!("DELETE FROM {table} WHERE {condition}"),
             params_from_iter(values),
         )?;
         Ok(())
     }
-    pub fn write(&self, conn: &Connection) -> Result<()> {
+    /// Write this record for the observation at `location`. In a table whose
+    /// rows record which evidence backs them, the row is stamped with that
+    /// side, and becomes `'both'` where the other side already backs it.
+    pub(crate) fn write(&self, conn: &Connection, location: SessionLocation) -> Result<()> {
         let spec = self.kind.spec();
-        let columns = spec.columns.split(',').collect::<Vec<_>>();
-        let values = columns
+        let located = crate::store::EVIDENCE_LOCATION_TABLES.contains(&spec.table);
+        let mut columns = spec.columns.split(',').collect::<Vec<_>>();
+        let mut values = columns
             .iter()
             .map(|column| sql_value(self.payload.get(*column).unwrap_or(&Value::Null)))
             .collect::<Vec<_>>();
-        let updates = columns
+        let mut updates = columns
             .iter()
             .filter(|column| !spec.key.split(',').any(|key| key == **column))
             .map(|column| format!("{column}=excluded.{column}"))
-            .collect::<Vec<_>>()
-            .join(",");
+            .collect::<Vec<_>>();
+        if located {
+            columns.push("location");
+            values.push(rusqlite::types::Value::Text(location.as_str().to_string()));
+            updates.push(crate::store::location_on_conflict(spec.table));
+        }
         conn.execute(
             &format!(
-                "INSERT INTO {}({}) VALUES({}) ON CONFLICT({}) DO UPDATE SET {updates}",
+                "INSERT INTO {}({}) VALUES({}) ON CONFLICT({}) DO UPDATE SET {}",
                 spec.table,
-                spec.columns,
+                columns.join(","),
                 vec!["?"; columns.len()].join(","),
-                spec.key
+                spec.key,
+                updates.join(",")
             ),
             params_from_iter(values),
         )
@@ -585,6 +635,49 @@ mod tests {
             connector_id: "c".into(),
             connector_instance: "i".into(),
         }
+    }
+
+    /// Which evidence backs one row, through every write and retirement:
+    /// each side stamps itself, meeting the other makes the row `both`, and
+    /// retiring one side's share leaves what the other still backs.
+    #[test]
+    fn evidence_rows_record_which_side_backs_them() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::init_db(&conn).unwrap();
+        let record = EvidenceRecord {
+            kind: EvidenceKind::SessionEvent,
+            payload: json!({
+                "source": "muse", "session_id": "s1", "event_uid": "e1",
+                "ts_ms": 1, "role": "assistant", "kind": "text", "text": "hi",
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            record_id: None,
+            revision_id: None,
+        };
+        let location = |conn: &Connection| -> Option<String> {
+            conn.query_row(
+                "SELECT location FROM session_events WHERE source = 'muse' AND event_uid = 'e1'",
+                [],
+                |row| row.get(0),
+            )
+            .ok()
+        };
+        record.write(&conn, SessionLocation::Local).unwrap();
+        assert_eq!(location(&conn).as_deref(), Some("local"));
+        record.write(&conn, SessionLocation::Local).unwrap();
+        assert_eq!(location(&conn).as_deref(), Some("local"), "same side stays itself");
+        record.write(&conn, SessionLocation::Remote).unwrap();
+        assert_eq!(location(&conn).as_deref(), Some("both"));
+        record.remove(&conn, SessionLocation::Local).unwrap();
+        assert_eq!(location(&conn).as_deref(), Some("remote"), "the remote share stays");
+        record.write(&conn, SessionLocation::Local).unwrap();
+        assert_eq!(location(&conn).as_deref(), Some("both"));
+        record.remove(&conn, SessionLocation::Remote).unwrap();
+        assert_eq!(location(&conn).as_deref(), Some("local"), "the local share stays");
+        record.remove(&conn, SessionLocation::Local).unwrap();
+        assert_eq!(location(&conn), None, "nothing backs it any more");
     }
 
     /// A tool-result event with the fidelity fields a plugin may legitimately
@@ -665,6 +758,78 @@ mod tests {
         }
     }
 
+    /// A user text event as a connector contributes it, with the one field
+    /// each control-kind test below varies.
+    fn user_text_event(control_kind: Value) -> EvidenceRecord {
+        EvidenceRecord {
+            kind: EvidenceKind::SessionEvent,
+            payload: json!({
+                "source": "claude",
+                "session_id": "s1",
+                "ts_ms": 1,
+                "role": "user",
+                "kind": "text",
+                "text": "<task-notification>done</task-notification>",
+                "event_uid": "e1",
+                "control_kind": control_kind,
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            record_id: None,
+            revision_id: None,
+        }
+    }
+
+    #[test]
+    fn a_control_kind_from_the_vocabulary_is_accepted_on_a_user_text_event() {
+        validate(user_text_event(json!("task_notification")))
+            .expect("a documented control kind on a user text row is the contract");
+        validate(user_text_event(Value::Null)).expect("null is a genuine prompt");
+    }
+
+    #[test]
+    fn an_unknown_control_kind_spelling_is_rejected() {
+        for value in [json!("meta_row"), json!("Meta"), json!("")] {
+            let error = validate(user_text_event(value.clone()))
+                .expect_err("a spelling no classifier produces must be refused");
+            assert!(
+                error.to_string().contains("unsupported control_kind value"),
+                "{value}: {error}"
+            );
+        }
+        // A non-string is refused by the column's type check before the
+        // vocabulary is consulted; either way it never reaches the table.
+        assert!(validate(user_text_event(json!(7))).is_err());
+    }
+
+    /// The example from review: an assistant text event with
+    /// `control_kind: "meta"` passed validation and was then dropped from
+    /// turn publishing and attribution as if it were the harness's.
+    #[test]
+    fn a_control_kind_on_an_assistant_or_tool_result_event_is_rejected() {
+        let mut assistant = user_text_event(json!("meta"));
+        assistant.payload.insert("role".into(), json!("assistant"));
+        let error = validate(assistant).expect_err("assistant rows never carry a control kind");
+        assert!(
+            error.to_string().contains("only valid on a user text event"),
+            "{error}"
+        );
+
+        let error = validate(with("control_kind", json!("codex_context_wrapper")))
+            .expect_err("tool results never carry a control kind");
+        assert!(
+            error.to_string().contains("only valid on a user text event"),
+            "{error}"
+        );
+
+        // A user row that is not text either: the classification is about
+        // what the human's turn is, not about a tool result on it.
+        let mut user_tool_result = user_text_event(json!("meta"));
+        user_tool_result.payload.insert("kind".into(), json!("tool_result"));
+        assert!(validate(user_tool_result).is_err());
+    }
+
     #[test]
     fn fidelity_fields_are_rejected_on_a_row_that_is_not_a_tool_result() {
         let mut record = tool_result_event();
@@ -732,7 +897,29 @@ mod tests {
         // an installed adapter contributed claim a parser generation that
         // never ran over it, and the backfill probes that read the column
         // would then skip exactly the rows they exist to repair.
-        const LOCAL_ONLY: &[(&str, &str)] = &[("session_events", "raw_facts_version")];
+        //
+        // `revision` is the change feed's stamp: the position of a row's
+        // last write in this database's own clock. It is set by trigger on
+        // every write and means nothing outside the database it was written
+        // in, so an adapter can neither supply it nor be held to it.
+        const LOCAL_ONLY: &[(&str, &str)] = &[
+            ("session_events", "raw_facts_version"),
+            ("session_events", "revision"),
+            ("tool_calls", "revision"),
+            ("file_edits", "revision"),
+            ("session_relationships", "revision"),
+            ("session_markers", "revision"),
+            ("history", "revision"),
+            ("session_commit_links", "revision"),
+            // Which evidence backs the row. It is this database's own
+            // bookkeeping of who supplied the row, stamped by the writer
+            // (`EvidenceRecord::write` from the observation's location), so an
+            // adapter can neither supply it nor be held to it.
+            ("session_events", "location"),
+            ("tool_calls", "location"),
+            ("file_edits", "location"),
+            ("session_markers", "location"),
+        ];
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         crate::init_db(&conn).unwrap();
         // An exemption for a column that is in fact projected would sit here

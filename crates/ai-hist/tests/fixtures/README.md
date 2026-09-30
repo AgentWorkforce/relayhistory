@@ -7,8 +7,8 @@ string in whichever test the author happened to open.
 `tests/fixture_corpus.rs` stages each fixture below into an isolated provider
 `HOME`, runs the acquisition path a host actually uses — local sync, shallow
 discovery, targeted hydration — and writes a canonical JSON dump of `sessions`,
-`session_events`, `tool_calls`, `file_edits`, `session_relationships` and
-`history` to `tests/snapshots/<source>/<fixture>.json`.
+`session_events`, `tool_calls`, `file_edits`, `session_relationships`,
+`session_markers` and `history` to `tests/snapshots/<source>/<fixture>.json`.
 
 **The snapshots record current behaviour, gaps included.** They are not a
 statement of what relayhistory *should* extract. When a parity issue from
@@ -43,6 +43,15 @@ for them live in `crates/relayburn-sdk/src/reader/{claude,codex,opencode}/tests.
 and the raw-fact assertions among them are ported into `fixture_corpus.rs`.
 Everything marked **relayhistory** was authored here, for a log shape burn's
 corpus does not cover.
+
+The fixture marked **sessionmigrate** is derived from the native corpus in
+[`xhluca/session-migrate`](https://github.com/xhluca/session-migrate)
+(`tests/native_corpus/v1/sources/muse/0.2.1/portable-rich`), licensed **MIT**.
+That transcript was written by the real Muse Code 0.2.1 CLI against a
+credential-free loopback provider and sanitized upstream (system
+instructions and capture paths). Here it is trimmed to the records a parser
+reads plus a sample of the rest; every kept line is byte-identical to the
+upstream file.
 
 ## Determinism
 
@@ -117,6 +126,8 @@ source without deciding which one fails the test.
 | `claude/fork-reconciliation` | burn | `claude/original-session.jsonl`<br>`claude/fork-branch-a.jsonl`<br>`claude/fork-branch-b.jsonl` | two transcripts share one source session id: a fork, not a continuation |
 | `claude/settings-reference` | burn | `claude/settings/oversized-bash-output-length.json` | burn's Claude settings input that sets the Bash output cap; relayhistory reads no settings file, so it is kept for provenance only |
 | `claude/summary-record` | relayhistory | `claude/summary-record.jsonl` | a `type: "summary"` record with a `leafUuid` between two ordinary turns |
+| `claude/system-reminder` | relayhistory | `claude/system-reminder.jsonl` | `<system-reminder>` blocks injected into user content, as a block of their own, inline in a string prompt, and alone on an `isMeta` record |
+| `claude/hook-and-passthrough` | relayhistory | `claude/hook-and-passthrough.jsonl` | a `<user-prompt-submit-hook>` row flagged `isMeta`, a `<bash-input>` / `<bash-stdout>` pass-through pair, and a bare `isMeta` bookkeeping row between two prompts |
 | `claude/sidecar-subagent` | relayhistory | `claude/sidecar-subagent` | a subagent transcript in `<sessionId>/subagents/agent-<id>.jsonl` with its `agent-<id>.meta.json` sidecar, carrying the PARENT's sessionId |
 
 ### `codex`
@@ -146,7 +157,11 @@ source without deciding which one fails the test.
 | `codex/two-unreadable-turns` | relayhistory | `codex/two-unreadable-turns.jsonl` | two unrecovered turns each retain their own unreadable usage refusal |
 | `codex/one-request-three-rows` | relayhistory | `codex/one-request-three-rows.jsonl` | one API call written as reasoning, a tool call and a message is one request, not three |
 | `codex/recovered-span-covers-two-turns` | relayhistory | `codex/recovered-span-covers-two-turns.jsonl` | a readable snapshot recovers a span an unreadable one left open, so its delta measures both turns as one request |
+| `codex/context-wrapper` | relayhistory | `codex/context-wrapper.jsonl` | an `<environment_context>` wrapper the app injects as a user `response_item` ahead of the human's mirrored turn |
 | `codex/two-requests-one-turn` | relayhistory | `codex/two-requests-one-turn.jsonl` | a tool loop makes two API calls inside one turn_id, so the turn is not the request |
+| `codex/fork-human` | relayhistory | `codex/fork-human/parent.jsonl`, `codex/fork-human/child.jsonl` | a human fork (`forked_from_id`, `thread_source: user`) whose rollout replays the parent's `session_meta`, both turns and their cumulative `token_count` before its own turn |
+| `codex/fork-subagent` | relayhistory | `codex/fork-subagent/root.jsonl`, `codex/fork-subagent/subagent.jsonl` | a spawned subagent naming its parent in `source.subagent.thread_spawn.parent_thread_id`, replaying the parent's open turn (with a tool call) and starting its own turn in the thread id's own millisecond |
+| `codex/guardian-review` | relayhistory | `codex/guardian-review/parent.jsonl`, `codex/guardian-review/guardian.jsonl` | a Codex 0.150+ `thread_source: guardian_review` rollout with `parent_thread_id` that opens on a `compaction` item rather than a replay |
 
 ### `cursor`
 
@@ -163,6 +178,14 @@ source without deciding which one fails the test.
 | --- | --- | --- | --- |
 | `grok/full-session` | relayhistory | `grok/full-session` | older Claude-shaped grok directory: per-record timestamps, `tool_use` blocks in `content`, `updates.jsonl` as `file_changed` rows, plus `prompt_context.json`, `signals.json` and `subagents/` |
 | `grok/events-session` | relayhistory | `grok/events-session` | documented Grok Build layout: `chat_history.jsonl` with `tool_calls[]`, ACP `updates.jsonl` with real `agentTimestampMs` times, `compaction_checkpoints/`, `subagents/`, `signals.json` and `prompt_context.json` |
+| `grok/unified-usage` | relayhistory | `grok/unified-usage` | two Grok Build sessions under one Grok home: one covered by the process-wide `logs/unified.jsonl` per-inference usage log (a repeated `eventId`, a pid-scoped model, top-level counters, an exact duplicate row, a row with no session and one for an unindexed session), one not covered and with no `summary.json`, so its model and start time come from `events.jsonl` |
+
+### `muse`
+
+| Fixture | Origin | Corpus files | Quirk it encodes |
+| --- | --- | --- | --- |
+| `muse/cli-capture` | sessionmigrate | `muse/cli-capture` | a transcript the real `muse` CLI (0.2.1) wrote, trimmed to its conversation, tool and lifecycle records: three runs across two resumes, `read_file` calls with one failed outcome, per-step `model_completed` usage, and mirrored reminder task records |
+| `muse/tools-session` | relayhistory | `muse/tools-session` | authored from the documented shape: a permission frame before the metadata, encrypted and readable reasoning, `edit_file`/`write_file` edits, a `bash` result that exits 101, a mirrored subagent task stream, a mid-session model switch, and `subagent/` logs — a worker with its own nested child, and a reminder — linked as delegated children rather than catalogued as sessions |
 
 ### `opencode`
 

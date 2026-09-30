@@ -734,6 +734,9 @@ fn normalize_inner(
             is_meta: None,
             turn_id: None,
             request_span: None,
+            // The control vocabulary covers Claude and Codex wrappers; Devin
+            // marks its synthetic user turns with `is_user_input` instead.
+            control_kind: None,
         };
 
         match role {

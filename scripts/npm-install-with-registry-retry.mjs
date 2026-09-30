@@ -72,22 +72,35 @@ export async function installWithRegistryRetry(args, options = {}) {
     const result = runInstall(args);
     emit(process.stdout, result.stdout);
     emit(process.stderr, result.stderr);
-    if (result.status === 0) return;
 
-    const output = `${result.stdout}\n${result.stderr}`;
-    const retryable = isRegistryVisibilityFailure(output);
+    // npm exits 0 when an optional dependency cannot be fetched yet. Callers
+    // that require that package to actually land pass `confirm`, which returns
+    // a non-empty reason to reject the exit. That miss is the same registry
+    // lag as ETARGET: retry it instead of accepting the half-install.
+    const rejection = result.status === 0 && options.confirm
+      ? options.confirm() || ''
+      : '';
+    if (rejection) emit(process.stderr, `${rejection}\n`);
+    if (result.status === 0 && !rejection) return;
+
+    const output = `${result.stdout}\n${result.stderr}\n${rejection}`;
+    const retryable = Boolean(rejection) || isRegistryVisibilityFailure(output);
     if (!retryable || attempt === attempts) {
-      const reason = retryable
-        ? `npm registry did not expose the requested packages after ${attempts} attempts`
-        : 'npm install failed with a non-registry-visibility error';
+      const reason = rejection
+        ? `${rejection}\nnpm install exited 0 without the required package after ${attempts} attempts`
+        : retryable
+          ? `npm registry did not expose the requested packages after ${attempts} attempts`
+          : 'npm install failed with a non-registry-visibility error';
       const error = new Error(reason);
       error.exitCode = result.status || 1;
       throw error;
     }
 
     log(
-      `npm registry has not exposed all requested packages `
-        + `(attempt ${attempt}/${attempts}); retrying in ${delayMs}ms`,
+      rejection
+        ? `${rejection} (attempt ${attempt}/${attempts}); retrying in ${delayMs}ms`
+        : `npm registry has not exposed all requested packages `
+          + `(attempt ${attempt}/${attempts}); retrying in ${delayMs}ms`,
     );
     reset();
     await sleep(delayMs);

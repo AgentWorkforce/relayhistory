@@ -18,12 +18,85 @@ export interface ListOptions {
   source?: Source;
   project?: string;
   tag?: string;
+  /**
+   * Only rows strictly older than this timestamp.
+   *
+   * @deprecated Not a lossless page boundary: rows sharing the boundary
+   * timestamp are skipped. Page with `after` (or `recentPage` /
+   * `searchPage`), and bound a window with `sinceMs` / `untilMs`. Kept, with
+   * its exclusive semantics unchanged, until the next major version.
+   */
   beforeMs?: number;
+  /** Inclusive lower bound on `timestampMs`. */
+  sinceMs?: number;
+  /** Inclusive upper bound on `timestampMs`; must not be before `sinceMs`. */
+  untilMs?: number;
+  /**
+   * Continue strictly after this row in newest-first
+   * `(timestampMs, id, matchSource)` order: the previous page's
+   * `nextCursor`, or the last row's fields. Applied within the time window.
+   */
+  after?: HistoryCursor;
   limit?: number;
 }
 
+/**
+ * Where a newest-first history read stopped. `matchSource` is required to
+ * continue a search whose last row was a `session_event`; absent means
+ * `history`.
+ */
+export interface HistoryCursor {
+  timestampMs: number;
+  id: number;
+  matchSource?: SearchMatchSource;
+}
+
+/** One page of `recent`, newest first. */
+export interface HistoryPage {
+  entries: HistoryEntry[];
+  /** Present only when a further entry exists. */
+  nextCursor: HistoryCursor | null;
+}
+
+/** One page of `search`, newest first. */
+export interface SearchPage {
+  matches: SearchMatch[];
+  /** Present only when a further match exists. */
+  nextCursor: HistoryCursor | null;
+}
+
+/** Which rows a search matches. See `SearchOptions.role`. */
+export type SearchRole = 'all' | 'user' | 'assistant' | 'prompt';
+
 export interface SearchOptions extends ListOptions {
+  /**
+   * Pass the query to SQLite FTS5 verbatim (`AND`/`OR`/`NOT`, `prefix*`,
+   * `"quoted phrases"`, column filters). A malformed expression rejects with
+   * an actionable error. Without it, words are matched as quoted literal
+   * tokens and all must match; a leading `-` excludes a word.
+   */
   rawFts?: boolean;
+  /**
+   * `all` (default) matches prompts and every session event, `user` prompts
+   * and user-role events, `assistant` only assistant-role events, `prompt`
+   * only prompts. Same as `ai-hist search --role`.
+   */
+  role?: SearchRole;
+}
+
+/** Where a search match was found. */
+export type SearchMatchSource = 'history' | 'session_event';
+
+/**
+ * One `search` result. It is a `HistoryEntry` (the matched text is in
+ * `prompt`) plus its provenance. `id` is unique only within `matchSource`.
+ */
+export interface SearchMatch extends HistoryEntry {
+  matchSource: SearchMatchSource;
+  /** `user` for a prompt; the event's role otherwise. */
+  role: string;
+  /** `history` for a prompt; the event's kind (for example `text`, `tool_result`) otherwise. */
+  kind: string;
 }
 
 export interface SessionOptions {
@@ -288,7 +361,26 @@ export interface SessionEvent {
   isSidechain: boolean | null;
   isMeta: boolean | null;
   turnId: string | null;
+  /**
+   * Why a user-role row is not a human prompt, or null for a genuine prompt
+   * and for every model-output row. Only ever set on a `user` / `text` row;
+   * the row keeps its role, kind and verbatim text.
+   */
+  controlKind: ControlKind | null;
 }
+
+export type ControlKind =
+  | 'slash_command_caveat'
+  | 'slash_command_invocation'
+  | 'slash_command_output'
+  | 'task_notification'
+  | 'hook_output'
+  | 'bash_passthrough_input'
+  | 'bash_passthrough_output'
+  | 'system_reminder'
+  | 'codex_context_wrapper'
+  | 'meta'
+  | 'resume_marker';
 
 export type ToolResultStatus = 'running' | 'completed' | 'errored' | 'cancelled' | 'unknown';
 
@@ -299,7 +391,8 @@ export type ToolResultErrorSignal =
   | 'exit_code'
   | 'patch_apply'
   | 'mcp_err'
-  | 'subagent_status';
+  | 'subagent_status'
+  | 'tool_status';
 
 export interface EventCursor {
   tsMs: number;
@@ -556,6 +649,162 @@ export interface SessionFileEditsPage {
   sessionId: string;
   fileEdits: SessionFileEdit[];
   nextCursor: EvidenceCursor | null;
+}
+
+/**
+ * One record a provider wrote about a session that the normalized event model
+ * cannot carry: a compaction or summary boundary, a provider `system` row, a
+ * non-text content block, an agent lifecycle event. A marker is deliberately
+ * not an event — it has no role, and its `tsMs` is nullable because a
+ * provider may record that something happened without recording when.
+ */
+export interface SessionMarker {
+  id: number;
+  source: Source;
+  sessionId: string;
+  /** Deterministic per record, so a re-parse updates the row in place. */
+  markerUid: string;
+  tsMs: number | null;
+  messageId: string | null;
+  parentId: string | null;
+  turnId: string | null;
+  /**
+   * Classified vocabulary (`compaction_boundary`, `summary`,
+   * `subagent_notification`, ...). A record type no classifier knows is
+   * `unknown`, with the provider-native type kept verbatim in `subkind`.
+   */
+  kind: string;
+  subkind: string | null;
+  /** The provider's own readable text for this marker, when it wrote one. */
+  text: string | null;
+  /** Parsed bounded payload projection, or null when absent or unparseable. */
+  payload: JsonValue | null;
+  /** The stored payload string exactly as indexed, parseable or not. */
+  payloadJson: string | null;
+}
+
+/** Markers page on the evidence keyset: `(tsMs IS NULL, tsMs, id)`. */
+export interface SessionMarkersPage {
+  contractVersion: number;
+  source: Source;
+  sessionId: string;
+  markers: SessionMarker[];
+  nextCursor: EvidenceCursor | null;
+}
+
+/**
+ * The tables the change feed reports, by wire name — the `ChangeKind`
+ * vocabulary of the Rust `SessionStore::changes_since`, and the `kind` a local
+ * export's records carry.
+ */
+export const CHANGE_KINDS = Object.freeze([
+  'session',
+  'session_event',
+  'tool_call',
+  'file_edit',
+  'session_marker',
+  'relationship',
+  'history',
+  'presence',
+  'commit_link',
+  'trajectory',
+  'source_observation',
+  'observation_evidence',
+] as const);
+export type ChangeKind = (typeof CHANGE_KINDS)[number];
+
+/**
+ * A change-feed position. `epoch` is the issuing store's identity as 16 hex
+ * digits (a random 64-bit value, which a number cannot hold exactly); a
+ * watermark from another database is refused with `WATERMARK_AHEAD_OF_STORE`.
+ */
+export interface Watermark {
+  epoch: string;
+  revision: number;
+}
+
+/** One row write or delete, in `(revision, kind, recordKey)` order. */
+export interface FeedChange {
+  kind: ChangeKind;
+  /** Null for a source this build does not know; `sourceName` still names it. */
+  source: Source | null;
+  sourceName: string;
+  /** The parent for a relationship, the id for a trajectory, empty for a prompt with no session. */
+  sessionId: string;
+  recordKey: string;
+  /** The kind's wire name, then the table's uniqueness columns as stored. */
+  key: unknown[];
+  revision: number;
+  op: 'upsert' | 'delete';
+  /** Every stored column but `revision`, in table order; null on a delete. */
+  columns: Record<string, unknown> | null;
+}
+
+/** One bounded page of the change feed. */
+export interface ChangesPage {
+  changes: FeedChange[];
+  /** Where the next page starts; commit it to acknowledge this page. */
+  position: Watermark;
+  /** The store head this page was bounded to. */
+  head: Watermark;
+  /** Nothing at or below `head` is left after `position`. */
+  done: boolean;
+  /** The named cursor the page was read for, if any. */
+  consumer: string | null;
+}
+
+export interface ChangesPageOptions {
+  dbPath?: string;
+  /**
+   * `'start'` replays everything, `'consumer'` resumes the named cursor, a
+   * watermark resumes a position the caller kept. Defaults to `'consumer'`
+   * when `consumer` is set, else `'start'`.
+   */
+  from?: 'start' | 'consumer' | Watermark;
+  /** A named cursor kept inside the store; it moves only on `commitChanges`. */
+  consumer?: string;
+  /** Which kinds to report; every kind when omitted. A named cursor is bound to its kind set. */
+  kinds?: readonly ChangeKind[];
+  /** Restrict to one session. A one-shot read: it cannot name a consumer. */
+  session?: { source: string; sessionId: string };
+  /** Changes per page, 1..10000. */
+  limit?: number;
+}
+
+export interface CommitChangesOptions {
+  dbPath?: string;
+  /** The kind set the cursor is bound to; must match the pages it acknowledges. */
+  kinds?: readonly ChangeKind[];
+}
+
+/** A named cursor as stored after a commit. */
+export interface CommittedCursor {
+  consumer: string;
+  /** Never behind the committed position: a stale commit leaves the cursor where it was. */
+  cursor: Watermark;
+}
+
+/**
+ * What one provider's local parser can record, answered from RelayHistory's
+ * own capability tables rather than from any database — so it is correct
+ * before a first sync and for a database that does not exist yet.
+ *
+ * `evidenceKinds` is the `coverage` a hydration of this source reports;
+ * `fullCoverage` is whether that hydration can ever say `full`.
+ * `relationships` is the same table `getSessionRelationships` returns as
+ * `capabilities`.
+ */
+export interface SourceCapabilities {
+  /** The contract whose `EvidenceKind` vocabulary `evidenceKinds` uses. */
+  hydrationContractVersion: number;
+  /** The contract `relationships` is spelled in. */
+  relationshipContractVersion: number;
+  source: CatalogSource;
+  evidenceKinds: EvidenceKind[];
+  /** The `FULL_SESSION_KINDS` the parser does not produce, in canonical order. */
+  missingEvidenceKinds: EvidenceKind[];
+  fullCoverage: boolean;
+  relationships: RelationshipCapabilities;
 }
 
 /** How a source accounts for the usage one stored record stands for. */

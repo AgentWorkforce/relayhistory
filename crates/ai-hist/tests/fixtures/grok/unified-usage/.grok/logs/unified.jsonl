@@ -1,0 +1,8 @@
+{"ts":"2026-09-20T09:59:59.000Z","pid":4242,"msg":"process started","model_id":"grok-4.5-build"}
+{"ts":"2026-09-20T10:00:01.500Z","pid":4242,"session_id":"grok-uni-0001","eventId":"ev_inf","usage":{"inputTokens":700,"outputTokens":80,"cachedReadTokens":200}}
+{"ts":"2026-09-20T10:00:02.500Z","pid":4242,"session_id":"grok-uni-0001","eventId":"ev_inf","model_id":"grok-4.5-build","usage":{"inputTokens":500,"outputTokens":70,"cachedReadTokens":200,"reasoningTokens":30}}
+{"ts":"2026-09-20T10:00:02.500Z","pid":4242,"session_id":"grok-uni-0001","eventId":"ev_inf","model_id":"grok-4.5-build","usage":{"inputTokens":500,"outputTokens":70,"cachedReadTokens":200,"reasoningTokens":30}}
+{"level":"info","pid":4242,"msg":"heartbeat"}
+{"ts":"2026-09-20T10:01:03.000Z","pid":4242,"session_id":"grok-uni-0001","eventId":"ev_inf2","inputTokens":900,"outputTokens":90,"cachedReadTokens":300,"costUsdTicks":9000,"msg":"inference complete"}
+{"ts":"2026-09-20T10:01:04.000Z","pid":4242,"eventId":"ev_orphan","usage":{"inputTokens":10,"outputTokens":1}}
+{"ts":"2026-09-20T12:00:00.000Z","pid":5151,"session_id":"grok-uni-9999","model_id":"grok-code-fast","usage":{"inputTokens":50,"outputTokens":5}}

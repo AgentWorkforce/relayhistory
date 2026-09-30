@@ -37,7 +37,7 @@ conflict() {
   echo "Version commit does not apply cleanly onto origin/$BRANCH." >&2
   echo "The published tree remains at $VERSION_SHA." >&2
   if [[ -n "${VERSION:-}" ]]; then
-    echo "It is tagged sdk-ts-v$VERSION. Cherry-pick that commit onto $BRANCH; skip_core=true custom_version=$VERSION finishes crate/plugins/probe if they still need this version." >&2
+    echo "It is tagged sdk-ts-v$VERSION. Cherry-pick that commit onto $BRANCH; skip_core=true custom_version=$VERSION finishes crate/plugins if they still need this version." >&2
   fi
   git rebase --abort || true
   git reset --hard "$VERSION_SHA"

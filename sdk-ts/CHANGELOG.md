@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The CLI names a schema migration on stderr while it runs --
+  `Upgrading the ai-hist database to <version>...`, then
+  `Database upgraded in <elapsed>.` -- and only when an open actually
+  migrates an existing database. `onStoreMigration()` delivers the same
+  `started`/`finished`/`failed` events, with the database path, to SDK
+  callers, and `migrateStore()` runs the
+  migration explicitly. Requires native contract 26.
+
+- `searchPage()` and `recentPage()` return one page plus a `nextCursor`
+  `{ timestampMs, id, matchSource? }`. `search()`, `recent()` and both page
+  functions accept `after` (that cursor, or the last row) and inclusive
+  `sinceMs`/`untilMs` (#67). Ordering is a total `(timestampMs, id)` keyset,
+  so tied timestamps page without skips. `beforeMs` is deprecated. Requires
+  native contract 24.
+
+- Add local-socket MCP tools `list_relay_agents`, `relay_status`, `join_relay`,
+  and `leave_relay`. They list live participants and let the calling session
+  make itself reachable or leave again without cloud auth in ai-hist.
+
+- Add `createHandoff()` / `resumeHandoff()` and their default MCP tools. Handoff
+  pointers carry only session identity, one self-describing resume intent, and
+  origin identity; no installed receiver skill is required. Resume performs
+  same-workspace acquisition and composes bounded prompt, event, tool-call,
+  and file-edit pages with independent continuation cursors. The composed
+  intent stays within 4,000 characters by truncating an overflowing caller
+  suffix with `…`.
+
 - Add the `./relay-cli` subpath export: `createRelayCliSurface()` returns a
   `RelayCliSurface` (contract v1, id `relayhistory`) that a host such as
   `agent-relay sessions` mounts. Its command tree and its dispatch are both
@@ -25,6 +52,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exit code and never calls `process.exit`, writes to `process.stdout`/
   `process.stderr`, or installs signal handlers; `main()` is now a thin wrapper
   that owns those. `ai-hist` itself behaves exactly as before.
+
+### Changed
+
+- `search()` runs the same contract as `ai-hist search` and MCP
+  `search_history` (#66). It matches session events as well as prompts and
+  returns `SearchMatch[]`: each is a `HistoryEntry` plus `matchSource`, `role`
+  and `kind`. A new `role` option takes `all` (default), `user`, `assistant`
+  or `prompt`, where `prompt` restores the prompts-only result. `beforeMs` now
+  bounds event matches too, and ties order by `(timestampMs, id)`. Requires
+  native contract 23. MCP `search_history` accepts `before_ms`.
 
 ### Fixed
 

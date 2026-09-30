@@ -71,6 +71,9 @@ import type {
   RequestPageOptions,
   UserTurnsPageOptions,
   SessionUserTurn,
+  SessionMarker,
+  FeedChange,
+  ChangesPageOptions,
   Stats,
   StatsOptions,
   SyncOptions,
@@ -120,6 +123,9 @@ import {
   getSessionFileEditsPage,
   getSessionRequestsPage,
   getSessionUserTurnsPage,
+  getSessionMarkersPage,
+  getChangesPage,
+  commitChanges,
   getSessionChildrenPage,
 } from './operations.js';
 
@@ -334,6 +340,33 @@ export async function* sessionEventsIncludingDescendants(
   }
 }
 
+/**
+ * Lazily walks a session's markers, oldest first, one bounded page at a time.
+ * Undated markers arrive last.
+ */
+export async function* sessionMarkers(
+  source: Source,
+  sessionId: string,
+  options: Omit<EvidencePageOptions, 'after'> = {},
+): AsyncGenerator<SessionMarker> {
+  let after: EvidenceCursor | undefined;
+  do {
+    const page = await getSessionMarkersPage(source, sessionId, { ...options, after });
+    for (const marker of page.markers) yield marker;
+    after = page.nextCursor ?? undefined;
+  } while (after);
+}
+
+export async function getSessionMarkers(
+  source: Source,
+  sessionId: string,
+  options: Omit<EvidencePageOptions, 'after'> = {},
+): Promise<SessionMarker[]> {
+  const markers: SessionMarker[] = [];
+  for await (const marker of sessionMarkers(source, sessionId, options)) markers.push(marker);
+  return markers;
+}
+
 export async function* sessionFileEdits(
   source: Source,
   sessionId: string,
@@ -355,4 +388,35 @@ export async function getSessionFileEdits(
   const edits: SessionFileEdit[] = [];
   for await (const edit of sessionFileEdits(source, sessionId, options)) edits.push(edit);
   return edits;
+}
+
+export interface ChangesSinceOptions extends ChangesPageOptions {
+  /**
+   * With `consumer`: commit each page's position once the loop has consumed
+   * every change of that page, so a consumer that throws mid-page resumes at
+   * that page. Off by default; call `commitChanges` yourself to acknowledge
+   * only what you have durably applied.
+   */
+  commit?: boolean;
+}
+
+/**
+ * Lazily drains the change feed one bounded page at a time until it is
+ * exhausted up to the head each page was bounded to. See `getChangesPage`.
+ */
+export async function* changesSince(options: ChangesSinceOptions = {}): AsyncGenerator<FeedChange> {
+  const { commit = false, ...pageOptions } = options;
+  if (commit && !pageOptions.consumer) {
+    throw new InvalidArgumentError('changesSince: commit needs consumer to name the cursor', 'INVALID_ARGUMENT');
+  }
+  let from = pageOptions.from;
+  for (;;) {
+    const page = await getChangesPage({ ...pageOptions, from });
+    for (const change of page.changes) yield change;
+    if (commit && pageOptions.consumer && page.changes.length > 0) {
+      await commitChanges(pageOptions.consumer, page.position, { dbPath: pageOptions.dbPath, kinds: pageOptions.kinds });
+    }
+    if (page.done) return;
+    from = page.position;
+  }
 }

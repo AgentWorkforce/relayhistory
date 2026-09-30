@@ -47,7 +47,7 @@ consumer whether summing records is meaningful.
 
 | Mode | Sources | What one record is |
 | --- | --- | --- |
-| `per-request` | (none yet) | One API request, reported once |
+| `per-request` | `grok` | One request — for Grok, one inference from `logs/unified.jsonl`, or one turn's `turn_completed.usage` when the log does not cover the session — reported once |
 | `per-message` | `claude` | One assistant message, **copied onto every content block of that message** |
 | `cumulative-delta` | `codex` | A cumulative counter differenced into a per-request delta at parse time |
 | `context-proxy` | (none yet) | Context-window occupancy, not a billed request — never sum |
@@ -55,15 +55,53 @@ consumer whether summing records is meaningful.
 A session summary may report several modes. When it does, its totals mix units
 and should be read per mode rather than as one number.
 
-`cursor`, `grok`, `relay`, `trajectory` and `opencode` record no usage this
-crate can normalize; asking for one is `USAGE_UNKNOWN_SOURCE` rather than a
-zero.
+`cursor`, `relay`, `trajectory` and `opencode` record no usage this crate can
+normalize; asking for one is `USAGE_UNKNOWN_SOURCE` rather than a zero.
 
 ### Claude
 
 `message.usage` is written verbatim into `token_json`. `input_tokens` already
 excludes cache reads and writes, so it is carried through unchanged —
 subtracting them again would under-report ordinary input.
+
+### Grok
+
+Recent Grok Build releases write a per-turn breakdown on `turn_completed`:
+`usage.{inputTokens, outputTokens, cachedReadTokens, reasoningTokens,
+totalTokens, modelUsage}`. It is stored verbatim under `usage` in the turn's
+last assistant event's `token_json`, beside the `context_total_tokens`
+snapshot, and only `usage` is normalized. `inputTokens` includes the
+`cachedReadTokens` subset, so cache reads are subtracted out of input (a cache
+count above a reported input is `USAGE_COUNTER_REGRESSED`, never a clamp; a
+breakdown with no input keeps its cache reads and reports input as not
+covered);
+`outputTokens` includes `reasoningTokens` and stays as written, with reasoning
+reported beside it, as for Codex. `usage.totalTokens` is the provider's total
+(input + output). The context snapshot is a window occupancy, not spend: a
+`token_json` carrying only `context_total_tokens` normalizes to no usage
+evidence, and the two numbers are never added. Spellings accepted for each
+counter follow tokscale's reader (`promptTokens`/`input_tokens`,
+`completionTokens`/`output_tokens`, `cacheReadTokens`/`cache_read_input_tokens`,
+...). `costUsdTicks` is kept in the stored object but not read as a cost.
+
+Grok names none of its API calls, and the breakdown is one per turn, so the
+turn is the request: every assistant row of a turn — thinking, each tool call,
+the prose — carries the turn's index as its `request_span`, and
+`session_requests` groups them as one `request-span` request. A session
+indexed before this is re-read once, by `sync` (the `grok_events_v2` state
+key) and by hydration (parser version 12).
+
+Recent builds also write a per-inference breakdown to the process-wide
+`<GROK_HOME>/logs/unified.jsonl` ([#212](https://github.com/AgentWorkforce/relayhistory/issues/212)).
+Each of its rows is stored as one assistant event with its own request span and
+`token_json = {"usage": <counters>, "source": "logs/unified.jsonl", "pid", "event_id"}`,
+normalized with the same counter lists as `turn_completed.usage`. Coverage is
+decided per turn: a turn with a log row inside its `[turn_start_ms,
+turn_end_ms]` takes its usage from the log, and its breakdown describes the
+same spend a second time, so it is kept under `turn_usage`, which is never
+normalized. A turn the log does not reach keeps its breakdown as `usage`. The
+two representations are never added together, and a turn the log never saw is
+not dropped. A log row with no time cannot be placed, so it covers every turn.
 
 ### Codex
 
@@ -211,6 +249,36 @@ call by the number of records it was split across.
   group. The expected value is 1. Anything higher means the copies disagree,
   which does not establish what the request cost, so the request reports no
   usage and carries the `ambiguous-usage-copies` diagnostic.
+- **Streamed Claude copies are one measurement.** Claude Code can write a
+  response while it is still streaming — one record per content block, each
+  with the same `message.id` and `requestId` and the usage snapshot current
+  when that block was written. The input side (`input_tokens`,
+  `cache_read_input_tokens`, `cache_creation_input_tokens`, `cache_creation`)
+  is the same on every copy; `output_tokens` grows, and `iterations`,
+  `server_tool_use` and `output_tokens_details` appear only on later copies.
+  The parser settles those copies when it stores them, on the key the view
+  groups them by — `requestId`, or `message.id` alone for a transcript that
+  writes no `requestId`. Within the output side, counters take the largest
+  value any copy reports and `iterations` keeps the longest run of entries
+  (the shared entries reconciled, the extra ones kept); a field only some
+  copies carry is kept; and the settled blob is written onto **every** row of
+  the request, including rows an earlier pass stored, so the view still sees
+  one blob. The rule is order-independent, so a copy that arrives out of order
+  never shrinks a stored value. Copies that disagree on the input side, carry
+  an output counter that is not a non-negative integer, or differ in any other
+  field — a reported `cost_usd` included — are not snapshots of one response;
+  they are stored verbatim and the request stays `ambiguous-usage-copies`. Each copy keeps its own event rows: the copies
+  carry different content blocks, not growing text, so nothing is dropped to
+  make the numbers agree. A database indexed before this rule is settled once,
+  from its stored rows, when it is next opened writable.
+- **`<synthetic>` is not a model.** Claude Code writes local API-error and
+  authentication notices as `type: "assistant"` records whose `message.model`
+  is `<synthetic>`, with zeroed usage. They are stored as a `local_notice`
+  marker, never as assistant events, so they are not requests, carry no
+  usage, contribute no model and never become a session's last assistant
+  text. A database indexed before this rule also has the placeholder removed
+  from each session's model list, and an excerpt quoting a notice replaced by
+  the last real assistant text, when it is next opened writable.
 
 Because it is a view rather than a materialized table, it cannot drift from the
 events it is derived from, and there is exactly one implementation of the
@@ -320,7 +388,15 @@ const summary = await getSessionUsage('claude', sessionId);
 for await (const request of sessionRequests('claude', sessionId)) { /* ... */ }
 ```
 
-MCP: `get_session_usage` and `get_session_requests`.
+MCP: `get_session_usage` and `get_session_requests`. CLI: `ai-hist sessions
+usage SOURCE SESSION_ID [--json]` on both the Node and the Rust binary (the
+Rust binary's `--json` wraps the crate's camelCase `SessionUsageSummary` as
+`summary`; the Node CLI prints the SDK's snake_case wire form).
+
+The TypeScript reads cross the native boundary through the `sessionStoreCall`
+JSON dispatcher (`requests`, `usage_summary` ops) over the `SessionStore`
+facade; the typed `getSessionRequestsPage` / `getSessionUsage` native exports
+remain for older callers.
 
 Pages keyset on `(firstTsMs, id)`. The `id` tiebreak is load-bearing: requests
 inside one session routinely share a timestamp, and ordering on the timestamp

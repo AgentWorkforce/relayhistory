@@ -19,6 +19,34 @@
   "origin": "burn",
   "quirk": "one turn: `session_meta`, `turn_context`, `task_started`, a null `token_count`, a populated one, `task_complete`",
   "session_events": [],
+  "session_markers": [
+    {
+      "kind": "task_started",
+      "marker_uid": "2:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_simple_1",
+      "source": "codex",
+      "subkind": "task_started",
+      "text": null,
+      "ts_ms": 1776643200200,
+      "turn_id": "turn_simple_1"
+    },
+    {
+      "kind": "task_complete",
+      "marker_uid": "5:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"duration_ms\":4900}",
+      "session_id": "sess_simple_1",
+      "source": "codex",
+      "subkind": "task_complete",
+      "text": null,
+      "ts_ms": 1776643205100,
+      "turn_id": "turn_simple_1"
+    }
+  ],
   "session_relationships": [],
   "sessions": [
     {

@@ -131,7 +131,7 @@ ai-hist sessions discover
 ai-hist sessions discover --local
 
 # Run every configured discovery adapter: local adapters plus any
-# configured remote connectors (see remote-connectors.md).
+# configured remote connectors (see source-plugins.md).
 ai-hist sessions discover --all --limit 20
 
 # Read back what the catalog holds — no provider file is opened.
@@ -367,7 +367,7 @@ contract:
 
 | Field | Kind | Notes |
 |---|---|---|
-| `source` | observed | `claude`, `codex`, `cursor`, `grok`, `opencode`, `devin`, `relay` |
+| `source` | observed | `claude`, `codex`, `cursor`, `grok`, `muse`, `opencode`, `devin`, `relay` |
 | `session_id` | observed | provider-native; `(source, session_id)` is the primary key, so the same native id under two providers is two rows |
 | `cwd` | observed | working directory the provider recorded |
 | `git_branch` | observed | last branch the provider recorded |
@@ -408,7 +408,7 @@ always wins — a shallow rescan refreshes a `full` row's metadata and stamp but
 never downgrades its state. Local connectors provide full sync today. Claude
 remote rows can become full through targeted teleport-evidence hydration;
 Codex remote rows remain shallow after their available diff is indexed because
-the CLI exposes no transcript export (see [Remote connectors](remote-connectors.md)).
+the CLI exposes no transcript export (see [Remote connectors](source-plugins.md)).
 
 ### Product boundary
 
@@ -427,7 +427,7 @@ Discovery and sync are acquisition operations. Local adapters are always
 available; remote acquisition runs through provider connectors —
 `claude-web` for claude.ai/code web sessions and `codex-cloud` for Codex
 cloud tasks — that are configured by the provider CLI's own stored sign-in
-(see [Remote connectors](remote-connectors.md)). Explicit remote acquisition
+(see [Remote connectors](source-plugins.md)). Explicit remote acquisition
 on a machine with no connector configured returns an error rather than
 silently doing local work. `--all` means every configured adapter: the local
 adapters plus whichever connectors are configured.
@@ -454,8 +454,14 @@ read.
 This table covers *shallow discovery only*. The full-evidence picture — which
 record types each source captures, stores and exposes after `ai-hist sync` —
 is the capture matrix in [ADR: relayhistory owns session
-sourcing](decisions/2026-09-19-relayhistory-owns-session-sourcing.md#capture-matrix),
-which this table must stay consistent with.
+sourcing](decisions/2026-09-19-relayhistory-owns-session-sourcing.md#capture-matrix)
+([#161](https://github.com/AgentWorkforce/relayhistory/issues/161)), which this
+table must stay consistent with. That per-source matrix is the contract of
+record for what a harness's sessions carry. burn is moving to reading evidence
+only through this crate: from burn 5.0.0
+([burn #562](https://github.com/AgentWorkforce/burn/issues/562)) it parses no
+harness logs of its own, and from then on a record type the matrix does not
+mark captured is missing for every consumer, not just for `ai-hist`.
 
 | Source | `session_id` | `cwd` | `git_branch` | `first_activity` | `last_activity` | `first_prompt` | `models` | `originator` | `agent_version` | `repo_url` | `initial_commit` | `workspace_roots` |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
@@ -463,6 +469,7 @@ which this table must stay consistent with.
 | **codex** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | **cursor** | ✓ (dir name) | ✓ (decoded path) | – (never) | ✓ (injected `<timestamp>`) | ✓ (injected `<timestamp>`, else mtime) | ✓ | ✓ (if a build writes `message.model`) | – | – | – | – | – |
 | **grok** | ✓ | ✓ | ✓ | ✓ (`updates.jsonl`, else `summary.json`) | ✓ (`updates.jsonl`, else `summary.json`) | ✓ | ✓ | – | – | – | – | – |
+| **muse** | ✓ (metadata `stream.id`) | ✓ (`workspace_root`) | – (never) | ✓ (metadata `recorded_at`) | ✓ (tail `recorded_at`) | ✓ (first `started` prompt) | ✓ (metadata, then `model_completed`) | – | ✓ (`build.semver`) | – | – | – |
 | **opencode** | ✓ | ✓ (directory / message `path.cwd`) | – | ✓ | ✓ | ✓ | ✓ (`providerID/modelID`) | – | – | – | – | – |
 | **devin** | ✓ | ✓ (`working_directory`) | – | ✓ (`created_at`, seconds→ms) | ✓ (`last_activity_at`, seconds→ms) | ✓ | ✓ (`model` / `generation_model`) | – | – (transcript `agent.version` rides a marker) | – | – | ✓ (`workspace_dirs`) |
 | **relay** | ✓ | – (never) | – | ✓ (synced min ts) | ✓ (synced max ts) | ✓ (earliest synced prompt) | – | – | – | – | – | – |
@@ -492,28 +499,35 @@ keys would silently drop whatever it adds next, which is the failure this
 table exists to end. Either way the bound is the promise the column makes, and
 it holds for every kind.
 
-| `kind` | claude | codex | grok | devin | `subkind` examples |
-|---|---|---|---|---|---|
-| `compaction_boundary` | ✓ `type:"system"`, `subtype:"compact_boundary"` | ✓ top-level `compacted`, `context_compacted` | ✓ | ✓ node `metadata.summarized_from` | `compact_boundary`, `compacted` |
-| `summary` | ✓ `type:"summary"` | – | – | – | `summary` |
-| `subagent_notification` | ✓ system rows with `parent_tool_use_id`; tool results carrying `toolUseResult.agentId` | ✓ `subagent_*` | – | – | `subagent_completed`, `tool_use_result_agent_id`, `subagent_message_complete` |
-| `task_started` | – | ✓ | – | – | `task_started` |
-| `task_complete` | – | ✓ | – | – | `task_complete` |
-| `turn_diff` | – | ✓ | – | – | `turn_diff` |
-| `stream_error` | – | ✓ | – | – | `stream_error` |
-| `tool_begin` | – | ✓ any `*_begin` | – | – | `exec_command_begin`, `patch_apply_begin`, `mcp_tool_call_begin` |
-| `review_mode` | – | ✓ | – | – | `entered_review_mode`, `exited_review_mode` |
-| `unsupported_block` | ✓ any content block with no event `kind`, plus thinking signatures | – | – | – | `image`, `document`, `redacted_thinking`, `server_tool_use`, `thinking_signature` |
-| `encrypted_reasoning` | – | ✓ `response_item/reasoning` | ✓ an opaque reasoning trace with no summary | – | `reasoning` |
-| `tool_replacement` | ✓ `_meta.replaces` / `_meta.collapsedCalls` | – | – | – | `tool_result` |
-| `system` | – | – | ✓ a system preamble, in `text` | ✓ a `role:"system"` node, in `text` | – |
-| `synthetic_turn` | – | – | ✓ a turn the harness wrote, in `text` | ✓ a `user` node with `is_user_input: false`, in `text` | – |
-| `session_title` | – | – | – | ✓ the `sessions.title` the CLI recorded, in `text` | – |
-| `session_meta` | – | – | – | ✓ `backend_type`, `agent_mode`, `model`, `workspace_dirs` and numeric `metadata` in `payload_json` | – |
-| `agent_manifest` | – | – | – | ✓ transcript `agent` envelope and numeric `final_metrics` in `payload_json` | – |
-| `signals` | – | – | ✓ | – | – |
-| `prompt_context` | – | – | ✓ | – | – |
-| `unknown` | ✓ any unclassified record type, plus a `user`/`assistant` record that produced no event at all | ✓ any unclassified payload type, including `agent_reasoning_raw_content` and `agent_reasoning_section_break` | – | ✓ any `chat_message` role the parser does not know | the provider type, verbatim |
+| `kind` | claude | codex | grok | muse | devin | `subkind` examples |
+|---|---|---|---|---|---|---|
+| `compaction_boundary` | ✓ `type:"system"`, `subtype:"compact_boundary"` | ✓ top-level `compacted`, `context_compacted` | ✓ | – | ✓ node `metadata.summarized_from` | `compact_boundary`, `compacted` |
+| `summary` | ✓ `type:"summary"` | – | – | – | – | `summary` |
+| `subagent_notification` | ✓ system rows with `parent_tool_use_id`; tool results carrying `toolUseResult.agentId` | ✓ `subagent_*` | – | – | – | `subagent_completed`, `tool_use_result_agent_id`, `subagent_message_complete` |
+| `task_started` | – | ✓ | – | – | – | `task_started` |
+| `task_complete` | – | ✓ | – | – | – | `task_complete` |
+| `turn_diff` | – | ✓ | – | – | – | `turn_diff` |
+| `stream_error` | – | ✓ | – | – | – | `stream_error` |
+| `tool_begin` | – | ✓ any `*_begin` | – | – | – | `exec_command_begin`, `patch_apply_begin`, `mcp_tool_call_begin` |
+| `review_mode` | – | ✓ | – | – | – | `entered_review_mode`, `exited_review_mode` |
+| `fork_replay_boundary` | – | ✓ one per replayed span in a forked rollout: `parent_id` is the fork parent, `turn_id` the child turn that closed it, `payload_json` carries `first_line`, `last_line`, `replayed_lines`, `closed_by` (`turn_id`, `task_started.started_at`, `undecided`, or null while the span is still open), `inherited_total_tokens`, and `inherited_baseline` (`pending`, `applied`, `dropped`) with `inherited_baseline_basis` (`last_token_usage`, `regression`, `no_evidence`) | – | – | – | `session_meta` |
+| `unsupported_block` | ✓ any content block with no event `kind`, plus thinking signatures | – | – | – | – | `image`, `document`, `redacted_thinking`, `server_tool_use`, `thinking_signature` |
+| `encrypted_reasoning` | – | ✓ `response_item/reasoning` | ✓ an opaque reasoning trace with no summary | ✓ `reasoning_committed` with only `encrypted_content` | – | `reasoning` |
+| `tool_replacement` | ✓ `_meta.replaces` / `_meta.collapsedCalls` | – | – | – | – | `tool_result` |
+| `system` | – | – | ✓ a system preamble, in `text` | – | ✓ a `role:"system"` node, in `text` | – |
+| `synthetic_turn` | – | – | ✓ a turn the harness wrote, in `text` | – | ✓ a `user` node with `is_user_input: false`, in `text` | – |
+| `signals` | – | – | ✓ | – | – | – |
+| `prompt_context` | – | – | ✓ | – | – | – |
+| `local_notice` | ✓ an `assistant` record whose model is `<synthetic>`: a notice Claude Code wrote itself (API error, expired login), text in `text`, `error` and `is_api_error_message` in `payload_json` | – | – | – | – | `synthetic` |
+| `session_title` | – | – | – | – | ✓ the `sessions.title` the CLI recorded, in `text` | – |
+| `session_meta` | – | – | – | – | ✓ `backend_type`, `agent_mode`, `model`, `workspace_dirs` and numeric `metadata` in `payload_json` | – |
+| `agent_manifest` | – | – | – | – | ✓ transcript `agent` envelope and numeric `final_metrics` in `payload_json` | – |
+| `unknown` | ✓ any unclassified record type, plus a `user`/`assistant` record that produced no event at all | ✓ any unclassified payload type, including `agent_reasoning_raw_content` and `agent_reasoning_section_break` | – | – | ✓ any `chat_message` role the parser does not know | the provider type, verbatim |
+| `turn_end` | – | – | – | ✓ run `terminal` (`completed`, `interrupted`, …) in `text` | – | `terminal` |
+| `session_start` | – | – | – | ✓ `session.opened.observed`, `resume` in the payload | – | `session.opened.observed` |
+| `session_resumed` | – | – | – | ✓ | – | `session.resumed` |
+| `session_end` | – | – | – | ✓ `exit_reason` in `text` | – | `session.end` |
+| `model_switch` | – | – | – | ✓ a later metadata record, the new model in `text` | – | `runtime.session.metadata` |
 
 `text` is the provider's own readable prose for a marker, and `payload_json`
 its structure; a marker may carry either, both or neither. Grok records a
@@ -539,6 +553,18 @@ is one more rule to miss. A Claude record that wrote no row falls back to
 SQLite's own `total_changes` does the same: a blank `agent_message` or a
 `*_end` with no `call_id` is stored by nothing, whatever the handler list says.
 
+One Codex span is accounted for as a whole rather than line by line: the
+parent history a forked rollout replays before its own first turn. Those lines
+are the parent's evidence, already indexed under the parent, so they write
+nothing under the child, and the single `fork_replay_boundary` marker above
+stands for all of them. The span opens only at the parent's own `session_meta`
+reappearing in a rollout that named that parent in `forked_from_id` or
+`source.subagent.thread_spawn.parent_thread_id`, and closes at the first turn
+it can attribute to the child or cannot order at all; the rule is
+`codex::ForkReplayGate`, which shallow discovery applies too, so a fork's
+`first_prompt` is its own. See [architecture](architecture.md) for the full
+rule.
+
 Codex keeps one explicit exception list, for lines that are state updates
 rather than records and whose information is stored elsewhere: `session_meta`
 and `turn_context` populate the catalog, `token_count` is folded into the
@@ -550,8 +576,9 @@ text.
 A **user** message is deliberately not on that list, and the reason is the
 lesson the list itself taught. Codex writes a user turn in two representations
 and a deduplicator stores one row for the pair — but only when it accepts the
-turn. It refuses blank text, application-injected control wrappers, and content
-with no `input_text` part, such as an image-only turn. Exempting user messages
+turn. It refuses blank text and content with no `input_text` part, such as an
+image-only turn (an application-injected control wrapper is accepted and stored
+as a `codex_context_wrapper` row, so it writes). Exempting user messages
 by type alone therefore asserted a row had been written when none had, and
 those lines vanished. The exemption is now *earned*: it applies to a mirrored
 twin, where the deduplicator reports that its partner really did write, and
@@ -595,7 +622,11 @@ status, because a fabricated measurement reads exactly like a real one:
 |---|---|---|---|---|---|---|---|
 | **claude** | ✓ (raw `content`) | ✓ (harness markers) | ✓ | ✓ | `tool_result`, `subagent_notification` | `tool_result.is_error`, `subagent_status` | ✓ (system subagent notifications) |
 | **codex** | ✓ (raw `output`) | ✓ (harness markers) | ✓ | ✓ (settled at `task_complete`) | `function_call_output` | `exit_code`, `patch_apply`, `mcp_err` | – (no notification rail) |
-| **cursor**, **grok**, **opencode**, **relay** | – | – | – | – | – | – | – |
+| **cursor** | ✓ (raw block `content`) | ✓ (harness markers) | ✓ | ✓ | `tool_result` | `tool_result.is_error` | – (no notification rail) |
+| **grok** | ✓ (raw line `content`) | ✓ (harness markers) | ✓ | ✓ (`unknown` with neither signal) | `function_call_output` | `tool_result.is_error`, `tool_status` | – (no notification rail) |
+| **opencode** | ✓ (raw part `output`) | ✓ (harness markers) | ✓ | ✓ | `function_call_output` | `exit_code`, `tool_status` | – (no notification rail) |
+| **muse** | ✓ (result `text`) | ✓ (harness markers) | ✓ | ✓ (`tool_batch.effect.terminal`, joined by call id) | `function_call_output` | `tool_batch.effect`, `exit_code` (`bash`) | – |
+| **relay** | – | – | – | – | – | – | – |
 
 `payload_bytes` is the raw UTF-8 length of what the provider handed back —
 a string payload as-is, any other JSON payload stable-stringified with sorted
@@ -613,10 +644,23 @@ Codex reports how a call ended out of band (`exec_command_end`,
 `task_complete`. End of file is **not** a turn boundary: a live rollout's last
 turn can still receive the `exec_command_end` that fails one of its calls after
 the bytes a sync read, so a partial read records the failures it saw and leaves
-anything else `unknown`. Only `task_complete` can call a result a success. The
-remaining providers land with their parity issues; they share the
-`ToolResultFacts::from_payload` helper, so the columns will mean the same thing
-for them.
+anything else `unknown`. Only `task_complete` can call a result a success.
+
+Cursor, Grok and OpenCode measure through the same
+`ToolResultFacts::from_payload` helper, so the columns mean the same thing for
+them. `event_source` says where the result was recorded, and that decides
+whether it is a block of a user turn: a Cursor result is a Claude-shaped
+`tool_result` block inside a message record, so it is `tool_result`; a Grok
+`tool_result` chat line and the `output` of an OpenCode tool part are records
+of their own (OpenCode's lives on the assistant message), so they are
+`function_call_output`, like Codex's, and are not counted among a user turn's
+blocks. `tool_status` is the provider's own terminal status on the call — an
+OpenCode part's `state.status: "error"`, or a failed or cancelled `status` on
+Grok's last ACP update for the call. OpenCode's non-zero `metadata.exit` is
+named `exit_code` in preference to it, and Grok's own `is_error` on the result
+line in preference to the ACP status. A Grok result with neither signal is
+`unknown`, not `completed`: `updates.jsonl` can be missing, and a result line
+alone does not say the call succeeded.
 
 A result with nothing displayable in it — a silent command's empty string, a
 structured payload carrying no text — is still recorded. `payload_bytes = 0` is
@@ -666,6 +710,7 @@ follows.
 | **codex** | ✓ | ✓ | ✓ | ✓ | ✓ when the bounded child search is complete | `full` or `partial` |
 | **cursor** | ✓ | ✓ | ✓ | ✓ | – (never: a `Task` block names no child transcript) | `partial` |
 | **grok** | ✓ | ✓ | ✓ | ✓ | ✓ | `full` |
+| **muse** | ✓ | ✓ | ✓ | ✓ | ✓ | `full` |
 | **opencode** | ✓ | ✓ | ✓ | ✓ | ✓ | `full` |
 | **devin** | ✓ | ✓ | ✓ | ✓ | – (the store records no parent/child session link) | `partial` |
 | **relay** | – | – | – | – | – | targeted hydration unsupported |
@@ -683,6 +728,7 @@ in flight.
 | **claude** | ✓ (`requestId`) | ✓ (`message.stop_reason`) | ✓ (`version` / `sourceVersion`) | ✓ (`isSidechain`) | ✓ (`isMeta`) | – |
 | **codex** | – | – | – | – | – | ✓ (`turn_context.turn_id`, carried to the next `turn_context`) |
 | **opencode** | – | ✓ (`step-finish.reason`, pending event-level parity) | – | – | – | – |
+| **muse** | ✓ (`response_id`) | ✓ (the step's `finish_reason`) | ✓ (`build.semver`) | – | – | ✓ (the run's `run_id`) |
 | **devin** | ✓ (`metadata.request_id`) | ✓ (`metadata.finish_reason`) | ✓ (transcript `agent.version`) | – | – | – |
 | **cursor**, **grok**, **relay** | – | – | – | – | – | – |
 
@@ -736,6 +782,7 @@ Delegation is a separate capability, reported on every relationship result as
 | **opencode** | always | – | ✓ | ✓ |
 | **claude** | sometimes | ✓ | ✓ | ✓ |
 | **grok** | sometimes | ✓ | ✓ | ✓ |
+| **muse** | always | ✓ | ✓ | ✓ |
 | **cursor**, **devin**, **relay** | never | – | – | – |
 
 OpenCode is `always` because a subagent session is a session in its own right
@@ -754,6 +801,13 @@ entry that records a child session id links to a child session in the normal
 sessions tree, and one that does not is stored as unlinked evidence. The id is
 never taken from the entry's file name. A `Task` call inside the transcript
 names no child at all. See ["grok"](#grok).
+
+Muse is `always` because every subagent writes its own
+`subagent/<id>/session.jsonl` beside the parent, and that log's metadata
+record names the child session. The edge is recorded with `evidence_kind =
+"muse_subagent_log"`; the agent type, name and model come from the parent's
+`task_stream_linked` (or `memory_reminder_child_session_linked`) record for
+that log. See ["muse"](#muse).
 
 Cursor is `never` for a different reason from grok, opencode and relay: it does
 record the spawn — a `Task` / `functions.Subagent` tool call, preserved as a
@@ -779,7 +833,28 @@ How each adapter works:
   in the head read and skipped, so a session is emitted once per run and its
   row keeps pointing at its own transcript. A transcript whose complete records
   parse as nothing is reported as a diagnostic rather than published under its
-  file name; an empty one is simply not a session yet.
+  file name; an empty one is simply not a session yet. The subagent workflow
+  journal, `<session>/subagents/**/journal.jsonl`, is excluded by name before
+  anything opens it — here and in the full sync walk alike. It records
+  workflow orchestration (`started` / `result` lines), not a conversation, and
+  no session, event, marker, cursor or continuity row is derived from it.
+  `$CLAUDE_CONFIG_DIR/transcripts/` is deliberately **not** a Claude root —
+  not enumerated, synced, hydrated or watched. Claude Code does not write
+  there; oh-my-opencode's Claude-hook compatibility layer does
+  ([`transcript.ts`](https://github.com/code-yeongyu/oh-my-openagent/blob/dev/packages/omo-opencode/src/hooks/claude-code-hooks/transcript.ts)),
+  one `<OpenCode ses_* id>.jsonl` per *OpenCode* session, as `user` /
+  `tool_use` / `tool_result` lines with top-level `content` and `tool_name` /
+  `tool_input` / `tool_output`, and no `sessionId`, `uuid`, `cwd`, model or
+  usage. A user's census of 5,004 such files in
+  [tokscale#487](https://github.com/junhoyeo/tokscale/issues/487) found no
+  `assistant` line and `usage` in only 15. This is characterized from those
+  sources, not from a local copy of the directory. The session is already
+  indexed, with full evidence, by the **opencode** adapter from OpenCode's own
+  store; reading the copy as `claude` would publish each one twice under two
+  sources with no project identity
+  ([#208](https://github.com/AgentWorkforce/relayhistory/issues/208)). The
+  accepted residual: a user who deletes their OpenCode store but keeps the
+  wrapper transcripts gets those sessions indexed from neither.
 - **codex** — `rollout-*.jsonl` under `$CODEX_HOME/sessions` and
   `$CODEX_HOME/archived_sessions` (defaulting under `~/.codex`). The first line
   is a `session_meta` record, which
@@ -1073,7 +1148,9 @@ How each adapter works:
   timestamps come from the first and last record of `updates.jsonl` when it is
   there, and from `summary.json`'s `created_at` / `updated_at` when it is not.
   Full hydration reads the whole directory — transcript, update stream,
-  signals, compaction checkpoints and subagent metadata. Details below.
+  signals, compaction checkpoints and subagent metadata — plus whatever the
+  Grok home's process-wide `logs/unified.jsonl` usage log gained since the last
+  pass. Details below.
 
   ### What Grok writes, and where relayhistory reads it
 
@@ -1081,7 +1158,12 @@ How each adapter works:
   `chat_history.jsonl`, `system_prompt.txt`, `prompt_context.json`,
   `tool_definitions.json`, `plan.json`, `rewind_points.jsonl`, `signals.json`
   and `feedback.jsonl`, plus the directories `compaction_checkpoints/` and
-  `subagents/`. RelayHistory reads six of those and ignores the rest.
+  `subagents/`; tokscale also reads an `events.jsonl` there. RelayHistory
+  reads six of those, reads `events.jsonl` only when `summary.json` is absent,
+  and ignores the rest. Outside the session directory, the Grok home
+  (`GROK_HOME`, else `~/.grok`) holds `logs/unified.jsonl`, one append-only log
+  every Grok process writes per-inference usage to; it is read as a second
+  Grok source (see "Usage" below).
 
   **`chat_history.jsonl` has the content; `updates.jsonl` has the time.** Grok's
   own guide calls `updates.jsonl` "the authoritative conversation log that
@@ -1131,15 +1213,22 @@ How each adapter works:
   | `tool_result.is_error` | **Inferred** — the failure signal is documented on the ACP `tool_call_update` `status` | Both are read; either marks `tool_calls.is_error` |
   | `reasoning.summary` / `reasoning.encrypted_content` | **Corroborated** ("reasoning is encrypted_content") | The summary is the thinking text; an encrypted-only record becomes an `encrypted_reasoning` marker and is never given invented text |
   | `updates.jsonl` envelope `{timestamp, method, params:{sessionId, update:{sessionUpdate,…}, _meta:{eventId, agentTimestampMs}}}` | **Corroborated** by three independent adapters | The timing source for the join; `eventId` also becomes the event's identity |
+  | `params._meta.eventId` is **not unique** | **Stated by tokscale** ("Grok reuses it across usage records", `sessions/grok.rs`) | The first message group carrying an id keeps `ev:<id>`; each later one is `ev:<id>#<n>` (`#1`, `#2`, …), so two messages never share an identity and an append never renames a stored one |
+  | `params.update._meta.modelId` | **Read by tokscale** (`extract_model_id`); not seen in a public sample | The turn's model: written as `model` in the turn's `token_json` and added to `sessions.models_json` |
+  | `turn_completed.usage.modelUsage` with one key | **Read by tokscale** | The turn's model when no row carried `_meta.modelId`; a map with several keys names no single model |
   | envelope `method` `session/update` **or** `_x.ai/session/update` | **Corroborated** | Both read; the method is not required to be either |
   | kinds `user_message_chunk`, `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `plan`, `turn_completed`, `hook_execution`, `retry_state` | **Corroborated** | The first five and `turn_completed` are read; the rest are counted and reported as `GROK_UPDATES_ROWS_UNREAD` |
   | `timestamp` in epoch **seconds**, `agentTimestampMs` in **milliseconds** | **Corroborated** | A field named `…Ms` is read as milliseconds; a bare `timestamp` is scaled if it is below 10¹² |
   | `turnStartMs` | **Stated in [#167](https://github.com/AgentWorkforce/relayhistory/issues/167)** from burn #489; not seen in a public sample | Read from `params.update`, `params._meta` or the envelope; the turn's fallback time |
   | `turn_completed.totalTokens` | **Stated in #167**, and corroborated as a `turn_completed`-borne total | `token_json = {"context_total_tokens": n, "source": "updates.jsonl"}` on the turn's last assistant message |
-  | `turn_completed.usage.{inputTokens, outputTokens, cachedReadTokens, reasoningTokens, costUsdTicks, modelUsage}` | **Reported by two community adapters for recent builds**, and contradicted by #167's "Grok does not log per-turn input/output tokens" | **Not read.** See "Usage" below |
+  | `turn_completed.usage.{inputTokens, outputTokens, cachedReadTokens, reasoningTokens, costUsdTicks, modelUsage}` | **Reported by two community adapters for recent builds** and read in production by tokscale (`sessions/grok.rs`, commit `d8fd670`), which fixes its semantics: `inputTokens` includes `cachedReadTokens`, `outputTokens` includes `reasoningTokens`, `totalTokens` is input + output | Stored verbatim under `usage` in the turn's `token_json`, beside the context snapshot; normalized as `per-request` usage. See "Usage" below |
   | `summary.json` `info.id`, `info.cwd`, `info.model`, `git_root_dir`, `head_branch`, `created_at`, `updated_at` | **Corroborated** | Identity, project, branch, model and the fallback timestamps |
+  | `summary.json` `current_model_id`, `model_id` | **Read by tokscale** as its model fallback; whether they sit at the top level or under `info` is **unverified**, so both are tried | The session's model when no transcript record or turn named one, after `info.model` |
+  | `events.jsonl` `model_id`, `session_id`, `ts` (first 500 lines) | **Read by tokscale** as the fallback when `summary.json` is missing; that the file exists on current builds is **unverified** | Only when `summary.json` is absent: `model_id` is the model fallback and the earliest `ts` the `created_at` fallback. `session_id` is **not** taken as identity — the directory name already is the session id, and a file appearing later must not rename the session. Lines that do not parse are skipped: this is a metadata fallback, not evidence |
   | `summary.json` parent-session references for forked/restored sessions | **Corroborated** (named in the guide, field spelling unknown) | **Not read yet** — no field name to read |
   | `signals.json` `contextTokensUsed`, `turnCount`, `compactionCount` | **Stated in #167**; the guide says the file holds "token usage and tool/turn counters" | A `signals` marker whose `detail_json` is the file verbatim |
+  | `signals.json` `totalTokensBeforeCompaction` | **Read by tokscale** (`effective_total_from_signals`) | Named in the `signals` marker's text beside `contextTokensUsed`, and kept verbatim in its payload. Not reconciled against anything: reconciling totals across a compaction is accounting, which is burn's. tokscale also reads a model id from this file, under a key nothing public names, so it is not read |
+  | `<GROK_HOME>/logs/unified.jsonl` per-inference rows | **Read in production by tokscale** (`parse_grok_unified_log_file_with_prefix`); the row's field spellings are **inferred** — nothing public shows a row | See "Usage" below |
   | `prompt_context.json` | **Corroborated** ("inputs the system prompt was rendered from") | A `prompt_context` marker with the path, SHA-256 and size. The AGENTS.md body is never copied into the database |
   | `compaction_checkpoints/<entry>` | **Corroborated** as a directory; the entry's own fields are **unverified** | One `compaction_boundary` marker per entry, timed from `created_at`/`timestamp`/`turnStartMs` or the entry's numeric file name, with the parsed file in `detail_json` |
   | `subagents/<entry>` | **Corroborated** as "per-subagent metadata; child sessions live in the normal sessions tree"; the entry's own fields are **unverified** | One `session_relationships` row per entry, `evidence_kind = "grok_subagent_dir"` |
@@ -1153,26 +1242,128 @@ How each adapter works:
   failed is a `file_edits` row whose `tool_calls` row carries `is_error`.
   `Shell` records only its command, so no file is attributed to it.
 
-  ### Usage: a context proxy, never billing
+  ### Usage: a context proxy, plus per-turn usage when the build writes it
 
-  Grok logs **no per-turn input/output token counts** (burn #489). The one
-  token fact recorded here is `updates.jsonl`'s `totalTokens`, stored as
+  Older Grok builds log **no per-turn input/output token counts** (burn #489).
+  The token fact every build records is `updates.jsonl`'s `totalTokens`, stored as
   `{"context_total_tokens": n, "source": "updates.jsonl"}` on that turn's last
   assistant event — its last message, or, for a turn answered entirely with
   tool calls, its last tool use — so a consumer can see both the number and
   what it is. It is a context-window snapshot: it
   **decreases** after a compaction, and summing it across turns is meaningless.
-  Every Grok hydration therefore reports `GROK_USAGE_CONTEXT_PROXY_ONLY`,
-  present or not. Nothing here estimates tokens — that is burn's job, from its
-  own estimator and `xai` pricing.
+  A session with no turn carrying a breakdown therefore reports
+  `GROK_USAGE_CONTEXT_PROXY_ONLY`. Nothing here estimates tokens — that is
+  burn's job, from its own estimator and `xai` pricing.
 
-  Two community adapters report that recent Grok builds *do* write a
-  `turn_completed.usage` breakdown (`inputTokens`, `outputTokens`,
-  `cachedReadTokens`, `reasoningTokens`, `costUsdTicks`, `modelUsage`). That
-  contradicts #167, and neither claim was checked against a real session here,
-  so **nothing is read from it**: recording a number this repo cannot vouch for
-  is exactly the failure this parser exists to stop. Confirming it is the first
-  item on the checklist below.
+  Recent builds *do* write a `turn_completed.usage` breakdown (`inputTokens`,
+  `outputTokens`, `cachedReadTokens`, `reasoningTokens`, `totalTokens`,
+  `costUsdTicks`, `modelUsage`). Two community adapters reported it and
+  tokscale reads it in production, so it is recorded — verbatim, under `usage`
+  in the same `token_json`, beside the snapshot and never added to it — and
+  `crate::usage` normalizes it as `per-request` usage (see
+  `docs/usage-accounting.md`). A `usage` object holding only `totalTokens` is
+  still the snapshot under another name. A session where only some turns carry
+  a breakdown reports `GROK_USAGE_PARTIAL` instead; one where every turn does
+  reports no usage caveat.
+
+  **Per-inference usage from `logs/unified.jsonl`
+  ([#212](https://github.com/AgentWorkforce/relayhistory/issues/212)).**
+  Recent builds write every inference's token breakdown to one process-wide,
+  append-only log in the Grok home, `<GROK_HOME>/logs/unified.jsonl`
+  (`~/.grok/logs/unified.jsonl` when `GROK_HOME` is unset). It is a second
+  Grok source:
+
+  - It is read **incrementally**, from a byte cursor in `transcript_cursors`
+    (the machinery of #173), by every sweep after the session directories and
+    by every Grok hydration — `unchanged` ones included — in an `IMMEDIATE`
+    transaction of its own, before the hydration's stamp check (the session's
+    stamp never moves when the log grows). An unchanged log reads zero bytes;
+    a trailing line with no newline waits for one. The file is in the sweep's
+    stat-only fingerprint and is a watch root of its own, so an append to it
+    wakes live capture.
+  - The log is every session's, so a log that cannot be read — unreadable, or
+    replaced mid-read — never fails a session's hydration: it is reported as
+    `GROK_UNIFIED_LOG_UNREADABLE` for that run (not checkpointed), the cursor
+    stays put, and the next pass retries. A sweep notes it and keeps the
+    source out of its cached fingerprint.
+  - Each usage row is copied into `grok_unified_usage`, the durable copy —
+    the bytes are never read again — and then **materialized** onto the
+    session it names as one `role = "assistant"`, `kind = "text"` event with
+    no text, `raw_kind = "unified_log_usage"`, its own `request_span`, the
+    row's model, and `token_json = {"usage": <counters>, "source":
+    "logs/unified.jsonl", "pid", "event_id"}`. One inference is one
+    `per-request` record, normalized with the same counter lists as
+    `turn_completed.usage`. `costUsdTicks` is kept verbatim and never read as
+    a cost. Only rows with no event yet are inserted, so an append attaches
+    its own rows and leaves every stored event — and the change feed —
+    untouched. A row later than the session's `last_activity_ms` extends it.
+    A later shallow rescan still replaces the directory's activity bound, so
+    compaction can move that end backward; when the log's latest row is later
+    than the directory, that time is restored, and a model only the log named
+    is appended to the directory's list. A model the directory no longer
+    names stays off the row.
+  - Rows attach **by session id**, assumed to equal `summary.json`'s
+    `info.id` (unverified). A row for a session that is not in the catalog yet
+    is **retained** and attached when that session is indexed; one that names
+    no session at all is counted and not attached, because guessing a session
+    from the pid would be invention.
+  - **Retention.** `grok_unified_usage` keeps every row it is given, including
+    rows whose session is not in the catalog — or no longer is. The log is
+    never re-read, so a row deleted here is usage lost for good if the session
+    is indexed (again) later. Each sweep that reads new bytes reports how many
+    stored rows have no catalogued session ("retained for sessions not
+    indexed"), so the backlog is visible; the rows are small (one counter
+    object each).
+  - A row is keyed on a digest of **the whole normalized row**, not on
+    `eventId`: tokscale records that Grok reuses `eventId` across usage
+    records, so an id key would collapse distinct inferences. The same row
+    read twice (after a rotation) lands on the same key.
+  - **Precedence per turn, never addition.** A turn's `turn_completed.usage`
+    is stored with the turn's window (`turn_start_ms`, `turn_end_ms`). When a
+    log row's time falls inside that window, the log has that turn's spend,
+    so the breakdown is moved to `turn_usage`, which nothing normalizes —
+    whether the session was indexed before or after the rows arrived. A turn
+    the log does not reach (a log that started mid-session, or was rotated
+    away) keeps its breakdown as `usage`, so it is neither counted twice nor
+    dropped. A turn whose stream recorded no window cannot be placed either,
+    so a timed log row never covers it and it keeps its own `usage`. A log
+    row with no time cannot be placed in a turn, so its
+    presence covers every turn: a demoted breakdown is still there as
+    `turn_usage`, while an inference counted twice could not be told apart.
+    The context snapshot is never usage in any case. Its turn window is stored
+    beside it even when the turn wrote no breakdown, so a log row inside that
+    window covers the turn.
+  - Hydration's usage caveat for a session the log reaches is decided per
+    turn: none when the log covers every turn; `GROK_USAGE_MIXED_SOURCES`
+    when every turn has usage but some of it comes from `turn_completed.usage`
+    (each turn still counted once); `GROK_USAGE_PARTIAL` when some turn has
+    neither. A session the log does not reach keeps the caveat its
+    `updates.jsonl` earns. Cached diagnostics are cleared when new rows
+    attach, so an `unchanged` read rebuilds them from the stored rows and
+    from the turn census the replacing read recorded. A turn that census
+    counts and that left no token row still counts: it is covered when a
+    timeless log row is stored, and otherwise it is one of the turns
+    `GROK_USAGE_PARTIAL` names. `capability` stays `full` either way — usage
+    is not an evidence kind (hydration contract 3).
+
+  The row shape is **inferred**. tokscale reads a session id, a pid, a model
+  and per-inference input/output/cache counters, and keys rows on
+  `event_id`/`eventId`/`id`/`uuid`/`ctx.event_id`, but nothing public shows
+  the spellings, so the parser looks for each field at the top level and then
+  under `ctx`: the session as `session_id`/`sessionId`, the process as `pid`,
+  the model as `model_id`/`modelId`/`model`, the time as `ts`/`timestamp`,
+  and the counters in a `usage` object — or, failing that, at the row's top
+  level, projected down to the counter keys so the rest of the log line is
+  never stored as usage — with the same key lists `turn_completed.usage` is
+  read with. A row that names a pid and a model and carries no counters (a
+  process start or a model change) sets that process's model for its later
+  rows that name none; the per-pid memory rides in the cursor. tokscale's
+  per-subagent scoping by `(pid, generation, session_id)`, with a conflict
+  state when evidence disagrees, is **not** implemented: its field names are
+  not public, and a row's own session id already scopes it. A terminated row
+  that is not JSON is counted and passed over rather than holding the cursor —
+  the log is Grok's process log, not a session's evidence, and one bad line
+  must not stop every later inference being read.
 
   ### Identity and re-reads
 
@@ -1180,7 +1371,16 @@ How each adapter works:
   is keyed on that update's ACP `eventId` (`ev:<id>`), which survives the
   rebuild Grok performs on a format upgrade; an event that did not is keyed on
   its record index (`r<n>`), which does not. Tool calls and results are keyed
-  on the provider's own call id (`tool:<id>`, `result:<id>`).
+  on the provider's own call id (`tool:<id>`, `result:<id>`). Grok reuses an
+  `eventId` across records: the first message group in stream order to carry
+  an id keeps `ev:<id>`, and each later one is suffixed with its repeat number
+  (`ev:<id>#1`, `ev:<id>#2`, …). Keying both on `ev:<id>` upserted the second
+  message over the first; suffixing only the repeats means an append that
+  reuses an id never renames a message already stored. A session indexed
+  before this is re-read once, by `sync` (the `grok_events_v4` state key) and
+  by hydration (parser version 14). A `logs/unified.jsonl` usage event is
+  keyed `unified:<digest>` and is rebuilt, not cleared, by each replacing
+  read.
 
   **A Grok read is a replacement, not a merge.** Grok rewrites
   `chat_history.jsonl` in place on a format upgrade or a compaction, and prunes
@@ -1194,17 +1394,22 @@ How each adapter works:
   identity shifted when the file was rewritten, sitting in the database
   forever with nothing to distinguish them from live evidence. A relationship
   another session recorded about *this* one is not this session's to delete,
-  and is left alone.
+  and is left alone. "Clears" means the local share only: a row a remote
+  observation also supplied stays, as the remote side's (see
+  [evidence location](#evidence-location)).
 
   The change stamp covers **every file the read consumes**: the transcript, the
   summary and the update stream each keep a readable marker, and
   `signals.json`, `prompt_context.json` and the sorted contents of
   `compaction_checkpoints/` and `subagents/` are folded into one digest (so a
-  session with many checkpoints does not grow an unbounded stamp). Discovery,
-  plain `sync` and targeted hydration all take the same stamp from the same
-  function, so none of them can call a session unchanged on evidence the others
-  would have re-read — a new checkpoint written after the last update row is
-  new evidence, and is read as such.
+  session with many checkpoints does not grow an unbounded stamp).
+  `events.jsonl` joins that digest only when `summary.json` is absent, which
+  is also when its head is read. While the summary is present the file grows
+  with the session and is not consumed, so an append to it leaves the stamp
+  where it is. Discovery, plain `sync` and targeted hydration all take the
+  same stamp from the same function, so none of them can call a session
+  unchanged on evidence the others would have re-read — a new checkpoint
+  written after the last update row is new evidence, and is read as such.
 
   Every read in this path answers in three states: **absent** (nothing to
   record), **malformed but present** (the file's existence is itself evidence,
@@ -1225,13 +1430,15 @@ How each adapter works:
   parsing reader saw, so it is told the same things about them — above all that
   a token count it can see is a context proxy and not billing usage. A
   checkpoint written before those were persisted has none stored, and the usage
-  caveat is rebuilt from the stored `token_json` instead.
+  caveat is rebuilt from the stored `token_json` and, when `logs/unified.jsonl`
+  reaches the session, from the turn census the replacing read recorded.
 
   Grok hydration reports `capability: "full"` because its parser covers every
   evidence kind. The usage caveat travels with it as
-  `GROK_USAGE_CONTEXT_PROXY_ONLY` on parsed and cached reads alike: Grok writes
-  no per-turn billing tokens, and `updates.jsonl`'s running context total is
-  stored as a labelled proxy, never as usage. Capability is defined by
+  `GROK_USAGE_CONTEXT_PROXY_ONLY` (no turn carried a breakdown) or
+  `GROK_USAGE_PARTIAL` (some did) on parsed and cached reads alike:
+  `updates.jsonl`'s running context total is stored as a labelled proxy, never
+  as usage. Capability is defined by
   `coverage` (hydration contract 3); usage is not one of those kinds, so a
   `partial` result that covered every kind would be a contract mismatch the
   SDK rejects. The diagnostic is what tells a cost report not to add the
@@ -1305,14 +1512,11 @@ How each adapter works:
   prompt, which is untrue and also undeletable, since the only session that
   could clean it up is the one that no longer evidences it.
 
-  **Markers are delivered like any other evidence.** `session_markers` is in
-  `delivery::schema::TABLES`, so durable delivery bootstraps and journals it
-  and an export of a Grok session carries its compaction boundaries alongside
-  its events. The entry is **appended** to that list and must stay last:
-  `delivery_jobs.bootstrap_kind` is a persisted index into it, so inserting a
-  row anywhere else silently re-points every in-flight job's bootstrap cursor
-  at a different table. The delivery kind is `session_marker`, in
-  `SUPPORTED_KINDS` and in the TypeScript `HistoryEvidenceKind`.
+  **Markers are exported like any other evidence.** `session_markers` is a
+  change-feed kind and an export kind, so the feed and a local export of a
+  Grok session carry its compaction boundaries alongside its events. The kind
+  is `session_marker`, in `SUPPORTED_KINDS` and in the TypeScript
+  `HistoryEvidenceKind`.
 
   **One rule decides what a JSONL row is, in `ingest::jsonl`.** Two passes read
   the same files — the parse, which turns rows into evidence, and the count,
@@ -1395,14 +1599,27 @@ How each adapter works:
   jq -c 'select(.params._meta.turnStartMs or .params.update.turnStartMs) | {meta: .params._meta, update: .params.update}' "$S/updates.jsonl" | head -2
   # 6. THE IMPORTANT ONE: what a turn_completed actually carries.
   jq -c 'select(.params.update.sessionUpdate=="turn_completed") | .params.update' "$S/updates.jsonl" | head -3
-  #    If that prints inputTokens/outputTokens, this repo is under-recording
-  #    usage on purpose and issue #167 needs correcting — say so there.
+  #    If that prints inputTokens/outputTokens, the build writes the per-turn
+  #    breakdown this parser now records under `usage`. Check that inputTokens
+  #    includes cachedReadTokens and totalTokens is input + output (#212).
   # 7. What signals.json, a compaction checkpoint and a subagent entry hold.
   jq -c . "$S/signals.json"
   jq -c . "$S/compaction_checkpoints/"* | head -2
   jq -c . "$S/subagents/"* | head -2
   # 8. Does summary.json name a parent for a forked or restored session?
   jq -c 'with_entries(select(.key|test("parent|fork|restore";"i")))' "$S/summary.json"
+  # 9. Which model keys summary.json writes, and where (#212).
+  jq -c '{current_model_id, model_id, info_keys: (.info | keys)}' "$S/summary.json"
+  # 10. Does events.jsonl exist, and what does its head carry?
+  head -3 "$S/events.jsonl" | jq -c 'keys'
+  # 11. The unified log: its row keys, whether its session id equals
+  #     summary.json's info.id, and whether eventId repeats across usage rows.
+  U=${GROK_HOME:-~/.grok}/logs/unified.jsonl
+  jq -c 'keys' "$U" | sort | uniq -c | sort -rn | head
+  jq -r '.session_id // .sessionId // .ctx.session_id // empty' "$U" | sort -u | head
+  jq -r '.eventId // .event_id // empty' "$U" | sort | uniq -d | head
+  # 12. Does an update carry _meta.modelId inside params.update?
+  jq -c 'select(.params.update._meta.modelId) | .params.update._meta' "$S/updates.jsonl" | head -2
   ```
 
   Sources consulted (all public, September 2026):
@@ -1432,8 +1649,12 @@ How each adapter works:
     events, and `costUsdTicks` at 10¹⁰ ticks per USD.
   - [telemetry-dev/stats #8](https://github.com/telemetry-dev/stats/pull/8) and
     [BrokkAi/mjolnir #989](https://github.com/BrokkAi/mjolnir/issues/989) — the
-    `turn_completed.usage` breakdown recent builds are reported to write. Read
-    here as a **contradiction to resolve**, not as a licence to record tokens.
+    `turn_completed.usage` breakdown recent builds are reported to write.
+  - [junhoyeo/tokscale](https://github.com/junhoyeo/tokscale) (commit
+    `d8fd670`, `crates/tokscale-core/src/sessions/grok.rs`) — reads that
+    breakdown in production and fixes its semantics (`inputTokens` includes
+    `cachedReadTokens`, `outputTokens` includes `reasoningTokens`), which is
+    what this parser's normalization follows.
   - [paperboytm/spool #512](https://github.com/paperboytm/spool/issues/512) and
     [Ishannaik/agent-sweep #219](https://github.com/Ishannaik/agent-sweep/pull/219)
     — independent confirmation of the directory layout and of
@@ -1445,6 +1666,86 @@ How each adapter works:
     `totalTokens` context proxy that decreases on compaction, the models
     `grok-composer-2.5-fast` and `grok-build`, and the tool-name list.
 
+<a id="muse"></a>
+
+- **muse** — Muse Code (Meta's `muse` CLI) keeps one append-only log per
+  session at `$XDG_DATA_HOME/muse/sessions/YYYY/MM/DD/<session-id>/session.jsonl`
+  (`~/.local/share/muse/sessions/…` when `XDG_DATA_HOME` is unset, on every
+  platform). Record interpretation lives in `crates/ai-hist/src/ingest/muse.rs`
+  so discovery, sync and hydration read it the same way.
+
+  Every line is an envelope `{id, stream: {kind, id}, sequence, recorded_at,
+  payload_type, payload}`, and `recorded_at` is **microseconds** on every
+  record, so no time here is inferred. Identity is the `stream.id` of the
+  `runtime.session.metadata` record — searched for rather than assumed to be
+  line one, because a permission frame can precede it — never the directory
+  name. That record also gives `workspace_root` (the `cwd`), `model_id` and
+  `build.semver`.
+
+  The conversation is `payload_type: "runtime.session"` with
+  `payload.kind: "run"`, keyed by `payload.event.kind`: `started` (the typed
+  prompt, one `history` row), `reasoning_committed`,
+  `assistant_message_committed`, `assistant_tool_calls_committed` (`args` is a
+  JSON *string*), `tool_result_batch_committed`, `model_completed` (per model
+  step: `model`, `usage`, `finish_reason`) and `terminal`. `payload.kind:
+  "task"` is execution bookkeeping and is not read. A call's outcome is the
+  separate `tool_batch.effect.terminal` record, joined by call id; the result
+  text carries no error flag of its own. Only records on the session's own
+  stream are read: subagent and reminder task streams are mirrored into the
+  parent file under a different `stream.id`, and reading them would present
+  every child objective as a prompt somebody typed.
+
+  Usage is recorded as Muse wrote it: each `model_completed.usage` object
+  (`input_tokens` inclusive of the cached prefix, `cache_read_tokens` /
+  `cached_tokens`, `cache_write_tokens`, `output_tokens`, `reasoning_tokens`)
+  goes verbatim into `token_json` on the assistant row that step committed,
+  with its `model` and `finish_reason`, and normalizes as `per-request`. Muse
+  does not write the two in one order — a step that calls tools logs
+  `model_completed` *before* its calls, a step that answers in prose logs it
+  *after* the reply, and one step can commit readable reasoning and then its
+  tool calls. A step is what lies between the model being called and the
+  next `started`, `tool_result_batch_committed` or `terminal` in its run; its
+  first assistant record owns its usage, in whichever direction the step
+  wrote the two. A step that committed
+  nothing keeps its usage off every row and is reported as
+  `MUSE_USAGE_UNATTACHED`. Only newline-terminated records are read, so a
+  live session's half-written last line waits for the next read, and Muse is
+  one of the sources the sweep's destination marker guards: rows lost under
+  an unchanged stamp are restored by the next `sync`.
+  Reasoning Muse kept only encrypted is an `encrypted_reasoning` marker
+  (`MUSE_REASONING_ENCRYPTED`).
+
+  A sync or hydration reads the whole file and **replaces** the session's
+  local evidence, so a re-read after the log grew adds exactly the new turns
+  and duplicates nothing, while a row a remote observation also supplied is
+  left to the remote side (see [evidence location](#evidence-location)).
+
+  **Subagents.** Every child agent — a `subagent_spawn` worker, or a reminder
+  child when Muse is set to save those — writes
+  `subagent/<child-dir>/session.jsonl` beside its parent, and may nest its own
+  `subagent/` below that. These are never enumerated as sessions. Reading a
+  session reads its whole tree: each child is indexed under the session id
+  its **own** metadata record names (never the directory name) and linked to
+  its parent as `delegated`, with `spawn_depth`, the parent's
+  `task_stream_linked` `display.role` (`worker`, `reminder`, …) as
+  `child_agent_type`, its `display.label` as `child_agent_name`, a concrete
+  `display.model` (else the child's own `model_id`) as `child_model`, and the
+  task id as `evidence_ref`. As for a Codex subagent rollout, a child's
+  `history` rows and catalog row are removed — its objective is not a prompt
+  anybody typed — and its events stay addressable through the edge
+  (`sessions tree`, `related_session_ids`). The change stamp covers every
+  child log, so a background subagent that keeps writing after the parent's
+  last record is still re-read; a child whose log disappears loses its edge
+  and its evidence. A reminder linked by `memory_reminder_child_session_linked`
+  but saved only in memory (Muse's default for reminders) has no log and no
+  edge. `MUSE_SUBAGENT_LOG_MISSING` reports `subagent_spawn` calls with no log
+  to link, and `MUSE_SUBAGENT_LOG_UNIDENTIFIED` a log with no session
+  metadata. The shapes were characterized from a transcript
+  the real CLI wrote (`tests/fixtures/muse/cli-capture`, from
+  [xhluca/session-migrate](https://github.com/xhluca/session-migrate)) and
+  cross-checked against the published [Muse Code
+  SDK](https://github.com/meta-models/muse-code-sdk) and independent readers.
+
 - **opencode** — **two storage layouts**, because both are in the field.
   RelayHistory prefers `opencode.db` when the host has it and falls back to the
   legacy JSON tree when it does not; it never reads both, because a host that
@@ -1452,8 +1753,22 @@ How each adapter works:
 
   | Layout | Location | Environment override |
   |---|---|---|
-  | SQLite (current releases) | `~/.local/share/opencode/opencode.db` | `OPENCODE_DB` |
+  | SQLite (current releases) | `~/.local/share/opencode/opencode.db` and every channel database beside it (`opencode-stable.db`, `opencode-nightly.db`, ...) | `OPENCODE_DB` pins one file |
   | Legacy JSON tree (older installs) | `~/.local/share/opencode/storage` | `OPENCODE_STORAGE_DIR` |
+
+  OpenCode writes one SQLite store per release channel: `latest` and `beta`
+  use `opencode.db`, every other channel `opencode-<channel>.db` in the same
+  directory, and all of them are read (`-wal`, `-shm` and `-journal` sidecars
+  are not stores). A session present in more than one store is catalogued,
+  synced and hydrated from the first that holds it — `opencode.db`, then the
+  channel stores in name order — so it is one session with one `raw_path`.
+  Ownership is decided over everything each store holds, including under a
+  discovery limit, and hydration refuses a catalogued copy once an earlier
+  store holds the session (`SESSION_SOURCE_MISMATCH`; rediscover). A store
+  that cannot be opened, or a directory that cannot be listed, is a
+  diagnostic against its path; the remaining stores are still read.
+  Setting `OPENCODE_DB` names exactly one store and its channel siblings are
+  not read; so does `ai-hist sync-opencode --opencode-db <path>`.
 
   The JSON tree is laid out as `session/<scope>/<sessionId>.json`,
   `message/<sessionId>/<messageId>.json` and `part/<messageId>/<partId>.json`.
@@ -1676,10 +1991,13 @@ copy. In the benchmark below, a rescan of 450 unchanged sessions performs
 The `v{N}` prefix is the *scanner* version (`SHALLOW_SCANNER_VERSION`), separate
 from `parser_version` (the full-ingest parser generation). Bumping it
 invalidates every stored stamp, so a scanner taught to extract a new field
-re-reads sources whose bytes never changed. It is at **5**: version 3 shipped
+re-reads sources whose bytes never changed. It is at **8**: version 3 shipped
 the prompt-only Cursor reader, 4 added that provider's injected turn times,
-models and last assistant reply, and 5 qualifies OpenCode model IDs with their
-provider. Without these bumps, unchanged sources would keep serving the older
+models and last assistant reply, 5 qualifies OpenCode model IDs with their
+provider, 6 derives Claude's `first_prompt` from `ingest::control`, 7
+classifies a Codex `guardian_review` thread with a parent as a subagent, and 8
+keeps a Codex fork's replayed parent prompt out of its `first_prompt`. Without
+these bumps, unchanged sources would keep serving the older
 cached shape forever. The cost is one re-read per source, once.
 
 ### Transcript byte cursors
@@ -1747,9 +2065,9 @@ held message is indexed as it stands, reported as
 making progress; the blocks that arrive later land as further rows under their
 own record identity rather than as corrections.
 
-Codex has no per-message completion marker, so its cursor follows the same rule
-burn's `CommittedSnapshot` does: the committed offset and parser state advance
-only at a `task_complete` record. A turn's token accounting is not final until
+Codex has no per-message completion marker, so its cursor commits only at turn
+boundaries: the committed offset and parser state advance only at a
+`task_complete` record. A turn's token accounting is not final until
 the turn is, and committing inside an open turn would freeze a cumulative
 baseline mid-turn. The open turn's events are still indexed as they are read —
 this is an evidence store, and a live session should be visible before its turn
@@ -2013,6 +2331,24 @@ missing-column check in `init_db`, and `schema_is_current` knows about the new
 columns, so a read-only handle over an old database is upgraded instead of
 failing with `no such column`.
 
+<a id="evidence-location"></a>
+
+**Evidence location.** Local and remote evidence for one session share its
+`(source, session_id)` identity and each table's unique key, so one record is
+one row whichever side supplied it. `session_events`, `tool_calls`,
+`file_edits` and `session_markers` therefore carry a per-row `location`:
+`local`, `remote`, or `both`. A local parser's rows default to `local`, remote
+intake (`EvidenceRecord::write`) stamps the observation's location, and an
+upsert that meets the other side's row makes it `both`. A side that retires
+its evidence — a local whole-session re-read, a remote observation dropping a
+record — deletes only the rows it alone backs and hands `both` rows to the
+other side, so neither side can remove what the other still evidences. The
+column is this database's own bookkeeping: it is not part of any adapter
+projection, and is ensured on every open. The `evidence_location_v1` migration
+backfills rows written before it existed: a session known *only* remotely was
+supplied by remote intake and its rows become `remote`; every other row stays
+`local`, which is what a local re-read already assumed of it.
+
 `session_presences` is the location child table. It is keyed by
 `(source, session_id, location)`, where `location` is `local` or `remote`, and
 is joined to the corresponding `sessions` row by `(source, session_id)`.
@@ -2046,7 +2382,9 @@ row. Beside the identity columns (`child_session_id`, nullable, and
 `evidence_locator`, `evidence_ref`, `child_has_events`, `spawned_at_ms`,
 `created_ms`, and `updated_ms`; re-ingestion refreshes mutable fields and
 preserves first-observation time. It is read through
-`idx_session_relationships_parent` and `idx_session_relationships_child`.
+`idx_session_relationships_parent` and `idx_session_relationships_child`;
+the sync walk's per-transcript sidecar probe uses
+`idx_session_relationships_locator` (`source, evidence_locator`).
 Databases written before this shape are rebuilt in place by the
 `session_relationships_v2` marker migration, which copies every existing edge
 forward as an observed `legacy_hydration` row; the marker is required, so an
@@ -2066,44 +2404,95 @@ matrix has record types as rows and sources as columns, so a new or extended
 provider must add or update its source column in the same change, and satisfy
 the record types in [`sourcing-contract.md`](sourcing-contract.md).
 
-Every entry in `SOURCE_CHOICES` must be covered by **exactly one** of:
+### One descriptor per harness
 
-- an adapter in `shallow_providers()` — implement `ShallowSessionProvider`
-  (`enumerate` may stat but not read; `read_shallow` stays inside the head/tail
-  budgets and returns `Ok(None)` for "this candidate is not a session"), or
-- an entry in `DISCOVERY_EXEMPTIONS`, which is machine-readable and carries a
-  reason.
+Every built-in harness is declared once, as a `LocalSource` descriptor in
+[`crates/ai-hist/src/sources/catalog.rs`](../crates/ai-hist/src/sources/catalog.rs).
+These per-source tables are derived from it:
 
-A registry test enforces the pairing, so adding a source without deciding which
-list it belongs to fails the build. Today the only exemption is `trajectory`
-("derived trajectory records, not provider sessions"). It is enforced at both
-ends: `sessions discover --source trajectory` fails with that reason, and
-`sessions list` filters `trajectory` rows out defensively, so a trajectory can
-never be presented as a session.
+| Descriptor field   | Derived from it                                                                    |
+| ------------------ | ---------------------------------------------------------------------------------- |
+| `id`               | `SOURCE_CHOICES` (declaration order)                                               |
+| `discovery`        | `shallow_providers()` (alphabetical by id) and `DISCOVERY_EXEMPTIONS`              |
+| `hydration`        | hydration's source validation and the `ingest_selected` dispatch                   |
+| `transcript_roots` | `validate_provider_path`, the root check for hydrated and hook-captured locators   |
+| `relationships`    | `relationship_capabilities`                                                        |
+| `resume`           | `resume_command`                                                                   |
+| `fixtures`         | the registry test in `fixture_corpus.rs`                                           |
+
+A new harness starts with:
+
+1. **A descriptor** in `sources/catalog.rs`. Its `discovery` is either a
+   `ShallowSessionProvider` adapter (`enumerate` may stat but not read;
+   `read_shallow` stays inside the head/tail budgets and returns `Ok(None)` for
+   "this candidate is not a session") or `Discovery::Exempt(reason)`. The
+   adapter's `evidence_kinds` is the source's declared parser coverage. Its
+   `hydration` names the parser for one selected session (a function taking
+   `SelectedIngest`), `NoConnector(message)` for a catalog source no local
+   parser backs, or `Unsupported`.
+2. **A fixture and a snapshot** (below), in the directory the descriptor's
+   `fixtures` names, which is the source id.
+
+The descriptor does not yet cover everything. These still need their own
+per-source edit:
+
+- the parser itself, the targeted-hydration snapshot branches in
+  `source_snapshot` (`hydrate.rs`), and the full-sync pass in `ingest.rs` that
+  runs the parser;
+- `source_watch_roots` in `ingest.rs`, for anything sync reads beyond the
+  adapter's own `watch_roots` (Claude's and Codex's `history.jsonl`,
+  trajectory roots);
+- the public `Source` enum in `session_store.rs` (`Source::ALL`, `as_str`),
+  which is default API; the registry test checks it names exactly the
+  descriptors. `Source::capabilities` also adds evidence kinds (session
+  markers, prompt history) beyond the adapter's `evidence_kinds`, and states
+  each source's message-id origin, by hand;
+- `HOOK_HARNESSES`, for a harness whose lifecycle hook hands over a
+  transcript path;
+- usage normalization (`NORMALIZABLE_SOURCES` and `source_accounting` in
+  `usage.rs`), for a harness that reports token usage;
+- a `ProviderRoots` field and environment override, if the harness has its own
+  root;
+- the TypeScript `SOURCES` list, MCP enums and resume command in `sdk-ts`.
+
+Exactly one of the adapter or an exemption is required, so a new source always
+carries a decision about whether it is discoverable. Today the only exemption
+is `trajectory` ("derived trajectory records, not provider sessions"). It is
+enforced at both ends: `sessions discover --source trajectory` fails with that
+reason, and `sessions list` filters `trajectory` rows out defensively, so a
+trajectory can never be presented as a session.
 
 The exemption list also travels in the `summary` line as `exempt_sources`, so a
 consumer can tell "this source has no sessions" apart from "this source is not
 discoverable".
 
+A store that holds sessions of an existing source somewhere the built-in parser
+does not read needs no change here: a **local source plugin**
+(`location: 'local'` with declared `roots`) discovers and hydrates it through
+the normalized evidence intake, out of tree. See
+[local source plugins](source-plugins.md#local-source-plugins).
+
 ### Add a fixture and a snapshot
 
 A provider is not added until its log shape is in the checked-in corpus. Add at
-least one fixture under `crates/ai-hist/tests/fixtures/<source>/`, register it
-in the `CORPUS` manifest in `crates/ai-hist/tests/fixture_corpus.rs` with the
-quirk it encodes, list it in `tests/fixtures/README.md`, and commit the
-generated snapshot under `crates/ai-hist/tests/snapshots/<source>/`:
+least one fixture under `crates/ai-hist/tests/fixtures/<source>/` (the
+directory the descriptor's `fixtures` names), register it in the `CORPUS`
+manifest in `crates/ai-hist/tests/fixture_corpus.rs` with the quirk it
+encodes, list it in `tests/fixtures/README.md`, and commit the generated
+snapshot under `crates/ai-hist/tests/snapshots/<source>/`:
 
 ```sh
 UPDATE_SNAPSHOTS=1 cargo test -p ai-hist --all-features --test fixture_corpus
 ```
 
-`every_source_choice_has_a_fixture_or_an_exemption` enforces the same pairing
-the discovery registry does: every `SOURCE_CHOICES` entry has a fixture, or a
-documented fixture exemption for a source that has no provider log on disk
-(`trajectory`, `relay`). `corpus_manifest_covers_every_fixture_file` and
-`corpus_readme_lists_every_fixture_and_quirk` stop a fixture from being added
-without being described, and `no_orphaned_snapshots` stops a snapshot from
-outliving its fixture.
+`every_source_choice_has_a_fixture_or_an_exemption` is the registry test: every
+`SOURCE_CHOICES` value is a descriptor, and every descriptor either names a
+fixture directory holding at least one staged fixture with a committed
+snapshot, or carries a fixture exemption for a source that has no provider log
+on disk (`trajectory`, `relay`). `corpus_manifest_covers_every_fixture_file`
+and `corpus_readme_lists_every_fixture_and_quirk` stop a fixture from being
+added without being described, and `no_orphaned_snapshots` stops a snapshot
+from outliving its fixture.
 
 The snapshots are the *current* extraction, gaps included — they are the
 review artifact for a parser change, not a statement of intent. Facts a
@@ -2157,6 +2546,21 @@ provider's logs contain that relayhistory does not capture yet are written as
   estimate available here is a bytes-per-token heuristic, and a heuristic
   served beside measured values is indistinguishable from a measurement at the
   call site.
+- **Native (napi), markers and capabilities** — through the
+  `sessionStoreCall` JSON dispatcher (see
+  [architecture](architecture.md)), the SDK reads one keyset page of a
+  session's markers — the records the event model cannot carry: compaction
+  and summary boundaries, provider `system` rows, non-text content blocks,
+  agent lifecycle events — with `getSessionMarkersPage(source, sessionId,
+  options?)`, on the same `(tsMs IS NULL, tsMs, id)` order as tool calls and
+  file edits, so an undated marker pages last through a null-timestamp
+  cursor. `kind` is the classified vocabulary and `subkind` the provider's own
+  type; a record no classifier knows is `unknown` with its type intact.
+  `getSourceCapabilities(source)` answers, from the provider tables alone,
+  the evidence kinds a hydration of that source covers, whether it can ever
+  report `full`, and what its records establish about delegation — the same
+  table `getSessionRelationships` returns as `capabilities` — so a consumer
+  can ask before a first sync.
 - **Native (napi), delegation** — `getSessionRelationships(options)` returns one
   session's edges in both directions plus the provider's capabilities;
   `getSessionTree(options)` returns the pre-order descendant tree bounded by
@@ -2168,14 +2572,17 @@ provider's logs contain that relayhistory does not capture yet are written as
   same contract for Node consumers, as do `getSessionRelationships()`,
   `getSessionTree()`, `getSessionChildrenPage()`,
   `getSessionUserTurnsPage()` / `getSessionUserTurns()` / `sessionUserTurns()`,
-  and the `sessionDescendants()`
+  `getSessionMarkersPage()` / `getSessionMarkers()` / `sessionMarkers()`,
+  `getSourceCapabilities()`, and the `sessionDescendants()`
   / `sessionEventsIncludingDescendants()` iterators; see the SDK's own
   documentation for the exact signatures.
 - **MCP** — the stdio server exposes the cache-only listing as a `list_sessions`
   tool, so an agent can enumerate recent sessions without triggering any
-  provider I/O, and delegation topology as the read-only
-  `get_session_relationships` and `get_session_tree` tools. See the MCP
-  package's documentation for their arguments.
+  provider I/O, delegation topology as the read-only
+  `get_session_relationships` and `get_session_tree` tools, markers as
+  `get_session_markers`, and the provider tables as
+  `get_source_capabilities`. See the MCP package's documentation for their
+  arguments.
 
 Whatever the surface, `contract_version` means the same thing: check it, and
 fail loudly on a version you do not know.

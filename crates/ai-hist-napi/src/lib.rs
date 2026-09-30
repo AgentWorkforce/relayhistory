@@ -4,16 +4,19 @@
 //! contains no SQL, provider parsing, migration, or query semantics of its own.
 #![deny(clippy::all)]
 
+pub mod change_feed;
 pub mod export;
+pub mod session_store;
 pub mod sources;
 
 use std::path::{Path, PathBuf};
 
+use ai_hist::history_search::{search_all, search_page as core_search_page, SearchRole, SearchRow};
 use ai_hist::{
     default_db_path, open_db, open_db_readonly, recent as core_recent, relationship_capabilities,
     schema_is_catalog_read_current, schema_is_event_read_current, schema_is_evidence_read_current,
-    schema_is_read_current, schema_is_relationship_read_current, search as core_search,
-    session as core_session, session_children_page as core_session_children_page,
+    schema_is_read_current, schema_is_relationship_read_current, session as core_session,
+    session_children_page as core_session_children_page,
     session_events_page as core_session_events_page,
     session_file_edits_page as core_session_file_edits_page, session_locations,
     session_relationships as core_session_relationships,
@@ -34,13 +37,16 @@ use ai_hist::{
     MAX_CHILDREN_PAGE_LIMIT, MAX_TREE_MAX_DEPTH, MAX_TREE_MAX_NODES,
     SESSION_EVIDENCE_CONTRACT_VERSION, SESSION_RELATIONSHIP_CONTRACT_VERSION,
 };
+use ai_hist::{recent_page as core_recent_page, HistoryCursor};
 use ai_hist::{
     schema_is_usage_read_current, session_requests_page as core_session_requests_page,
     session_usage_summary as core_session_usage_summary, NormalizedUsage as CoreNormalizedUsage,
     SessionRequest as CoreSessionRequest, SessionRequestCursor as CoreRequestCursor,
     SessionUsageSummary as CoreSessionUsageSummary, SESSION_USAGE_CONTRACT_VERSION,
 };
+use napi::{Env, JsFunction};
 use napi_derive::napi;
+use serde::Serialize;
 
 /// Bump whenever native object shapes or semantics require an SDK change.
 /// 16 added `project_key` to catalog rows and session events, plus
@@ -54,7 +60,30 @@ use napi_derive::napi;
 /// 18 was claimed independently by the upstream `provider` field and the
 /// per-request usage surface. The merged addon exposes both shapes, so it is
 /// 19 rather than identifying itself as either incompatible contract 18.
-pub const NATIVE_CONTRACT_VERSION: u32 = 20;
+/// 20 was claimed independently by the `historyExport` bridge, which moved
+/// the upload lifecycle out of the addon, and by the `sessionStoreCall`
+/// dispatcher below. The merged addon exposes both, so it is 21 rather than
+/// answering with a number either incompatible contract 20 already used.
+/// 21 adds the `sessionStoreCall` JSON dispatcher over the `SessionStore`
+/// facade (markers, requests, usage summary, user turns, source
+/// capabilities) and moves the SDK's request, usage and user-turn reads onto
+/// it, alongside contract 20's `historyExport` bridge.
+/// 22: `historyExport` serves snapshots that each hold one read transaction,
+/// emits schema-version-2 records, and no longer accepts the upload-journal
+/// operations (retention and compaction).
+/// 23: `search` runs the shared `history_search::search_all` contract the CLI
+/// uses — prompts and session events, a `role` option, a total
+/// `(timestamp, id)` order — and returns `NativeSearchMatch` rows carrying
+/// `matchSource`, `role` and `kind`.
+/// 24: `search` and `recent` take inclusive `sinceMs`/`untilMs` and a keyset
+/// `after` cursor, and `searchPage`/`recentPage` return a page with a
+/// `nextCursor` computed by over-fetching one row.
+/// 25 adds the change feed to `sessionStoreCall`: `changes` pages
+/// `SessionStore::changes_since` and `commit_changes` moves a named consumer
+/// cursor.
+/// 26 adds `onStoreMigration` and `migrateStore`, so a front end can name
+/// the one-time schema migration after an upgrade instead of appearing hung.
+pub const NATIVE_CONTRACT_VERSION: u32 = 26;
 const DEFAULT_LIMIT: i64 = 50;
 const DEFAULT_EVENT_LIMIT: i64 = 200;
 
@@ -138,6 +167,11 @@ fn parse_scope(scope: Option<String>) -> napi::Result<SessionScope> {
     }
 }
 
+fn parse_search_role(role: Option<&str>) -> napi::Result<SearchRole> {
+    SearchRole::parse(role.unwrap_or("all"))
+        .map_err(|error| native_error("INVALID_ARGUMENT", format!("{error:#}")))
+}
+
 fn scope_name(scope: SessionScope) -> String {
     match scope {
         SessionScope::Local => "local",
@@ -182,6 +216,60 @@ pub fn native_contract_version() -> u32 {
     NATIVE_CONTRACT_VERSION
 }
 
+/// Call `callback` with `"started"`, then `"finished"` or `"failed"`, and the
+/// database's path whenever an open in this process migrates an existing
+/// database. Returns
+/// false when a callback is already registered: the first registration wins.
+///
+/// The callback never keeps the process alive. It runs asynchronously on the
+/// JS thread, so a caller that needs `finished` before exiting waits for it.
+#[napi(
+    ts_args_type = "callback: (event: 'started' | 'finished' | 'failed', dbPath: string | null) => void"
+)]
+pub fn on_store_migration(env: Env, callback: JsFunction) -> napi::Result<bool> {
+    use napi::threadsafe_function::{
+        ErrorStrategy, ThreadSafeCallContext, ThreadsafeFunction, ThreadsafeFunctionCallMode,
+    };
+    let mut notify: ThreadsafeFunction<(&'static str, Option<String>), ErrorStrategy::Fatal> =
+        callback.create_threadsafe_function(
+            0,
+            |ctx: ThreadSafeCallContext<(&'static str, Option<String>)>| {
+                let (event, path) = ctx.value;
+                let path = match path {
+                    Some(path) => ctx.env.create_string(&path)?.into_unknown(),
+                    None => ctx.env.get_null()?.into_unknown(),
+                };
+                Ok(vec![ctx.env.create_string(event)?.into_unknown(), path])
+            },
+        )?;
+    notify.unref(&env)?;
+    Ok(ai_hist::observe_migrations(move |event, path| {
+        let event = match event {
+            ai_hist::MigrationEvent::Started => "started",
+            ai_hist::MigrationEvent::Finished => "finished",
+            ai_hist::MigrationEvent::Failed => "failed",
+        };
+        notify.call(
+            (event, path.map(str::to_string)),
+            ThreadsafeFunctionCallMode::NonBlocking,
+        );
+    }))
+}
+
+/// Run any outstanding schema migration now, creating the database if it
+/// does not exist. The same work the first open of any operation would do.
+#[napi]
+pub async fn migrate_store(db_path: Option<String>) -> napi::Result<()> {
+    let path = crate::db_path(db_path);
+    napi::tokio::task::spawn_blocking(move || {
+        open_db(&path)
+            .map(drop)
+            .map_err(|error| database_error(&path, format!("{error:#}")))
+    })
+    .await
+    .map_err(worker_error)?
+}
+
 /// Optimization profile this addon was compiled with: `release` or `debug`.
 /// Performance measurements are only meaningful against `release`.
 #[napi]
@@ -193,40 +281,147 @@ pub fn native_build_profile() -> String {
     }
 }
 
+/// Where a newest-first history read stopped: its last row's
+/// `(timestampMs, id)` and, for a search match, its `matchSource`.
 #[napi(object)]
+#[derive(Clone)]
+pub struct NativeHistoryCursor {
+    pub timestamp_ms: i64,
+    pub id: i64,
+    /// `history` (the default when absent) or `session_event`.
+    pub match_source: Option<String>,
+}
+
+impl NativeHistoryCursor {
+    fn into_core(self) -> HistoryCursor {
+        HistoryCursor {
+            timestamp_ms: self.timestamp_ms,
+            id: self.id,
+            match_source: self.match_source,
+        }
+    }
+
+    fn from_core(cursor: HistoryCursor) -> Self {
+        Self {
+            timestamp_ms: cursor.timestamp_ms,
+            id: cursor.id,
+            match_source: cursor.match_source,
+        }
+    }
+}
+
+#[napi(object)]
+#[derive(Default)]
 pub struct HistoryQueryOptions {
     pub scope: Option<String>,
     pub db_path: Option<String>,
     pub source: Option<String>,
     pub project: Option<String>,
     pub tag: Option<String>,
+    /// Deprecated: exclusive, so it skips rows tied on the boundary
+    /// timestamp. Page with `after` instead.
     pub before_ms: Option<i64>,
+    /// Inclusive lower timestamp bound.
+    pub since_ms: Option<i64>,
+    /// Inclusive upper timestamp bound.
+    pub until_ms: Option<i64>,
+    /// Continue after this row (the previous page's `nextCursor`).
+    pub after: Option<NativeHistoryCursor>,
     pub limit: Option<i64>,
 }
 
 impl HistoryQueryOptions {
+    /// Build and validate the filter, so an invalid window or cursor is
+    /// `INVALID_ARGUMENT` with the message every surface uses.
     fn filter(&self, limit: i64) -> napi::Result<QueryFilter> {
-        Ok(QueryFilter {
+        let filter = QueryFilter {
             scope: parse_scope(self.scope.clone())?,
             source: self.source.clone(),
             project: self.project.clone(),
             tag: self.tag.clone(),
             before_ms: self.before_ms,
+            since_ms: self.since_ms,
+            until_ms: self.until_ms,
+            after: self.after.clone().map(NativeHistoryCursor::into_core),
             limit,
-        })
+        };
+        filter
+            .validate()
+            .map_err(|error| native_error("INVALID_ARGUMENT", format!("{error:#}")))?;
+        Ok(filter)
     }
 }
 
 #[napi(object)]
+#[derive(Default)]
 pub struct SearchOptions {
     pub scope: Option<String>,
     pub db_path: Option<String>,
     pub source: Option<String>,
     pub project: Option<String>,
     pub tag: Option<String>,
+    /// Deprecated: exclusive, so it skips rows tied on the boundary
+    /// timestamp. Page with `after` instead.
     pub before_ms: Option<i64>,
+    /// Inclusive lower timestamp bound.
+    pub since_ms: Option<i64>,
+    /// Inclusive upper timestamp bound.
+    pub until_ms: Option<i64>,
+    /// Continue after this match (the previous page's `nextCursor`).
+    pub after: Option<NativeHistoryCursor>,
     pub limit: Option<i64>,
     pub raw_fts: Option<bool>,
+    /// `all` (default), `user`, `assistant` or `prompt` — the CLI's `--role`.
+    pub role: Option<String>,
+}
+
+struct SearchRequest {
+    path: PathBuf,
+    terms: Vec<String>,
+    raw_fts: bool,
+    filter: QueryFilter,
+    role: SearchRole,
+}
+
+impl SearchRequest {
+    fn new(query: String, options: Option<SearchOptions>) -> napi::Result<Self> {
+        let options = options.unwrap_or_default();
+        let limit = validate_limit(options.limit, 20, 1_000)?;
+        let role = parse_search_role(options.role.as_deref())?;
+        Ok(Self {
+            path: db_path(options.db_path.clone()),
+            terms: query.split_whitespace().map(str::to_string).collect(),
+            raw_fts: options.raw_fts.unwrap_or(false),
+            filter: HistoryQueryOptions {
+                scope: options.scope,
+                db_path: None,
+                source: options.source,
+                project: options.project,
+                tag: options.tag,
+                before_ms: options.before_ms,
+                since_ms: options.since_ms,
+                until_ms: options.until_ms,
+                after: options.after,
+                limit: None,
+            }
+            .filter(limit)?,
+            role,
+        })
+    }
+}
+
+#[napi(object)]
+pub struct NativeSearchPage {
+    pub matches: Vec<NativeSearchMatch>,
+    /// Present only when a further match exists.
+    pub next_cursor: Option<NativeHistoryCursor>,
+}
+
+#[napi(object)]
+pub struct NativeHistoryPage {
+    pub entries: Vec<NativeHistoryEntry>,
+    /// Present only when a further entry exists.
+    pub next_cursor: Option<NativeHistoryCursor>,
 }
 
 #[napi(object)]
@@ -261,6 +456,48 @@ impl NativeHistoryEntry {
             prompt: entry.prompt,
             timestamp_ms: entry.timestamp_ms,
             locations,
+        })
+    }
+}
+
+/// One `search` match. `id` is unique only within `match_source`: a prompt
+/// is a `history` row, anything else a `session_event` row.
+#[napi(object)]
+pub struct NativeSearchMatch {
+    pub id: i64,
+    pub source: String,
+    pub session_id: Option<String>,
+    pub project: Option<String>,
+    /// The matched text: the prompt for a `history` match, the event text
+    /// otherwise. Named `prompt` so a match is still a history entry.
+    pub prompt: String,
+    pub timestamp_ms: i64,
+    pub locations: Vec<String>,
+    /// `history` or `session_event`.
+    pub match_source: String,
+    /// `user` for a `history` match; the event's role otherwise.
+    pub role: String,
+    /// `history` for a `history` match; the event's kind otherwise.
+    pub kind: String,
+}
+
+impl NativeSearchMatch {
+    fn from_row(conn: &rusqlite::Connection, row: SearchRow) -> anyhow::Result<Self> {
+        let locations = match row.session_id.as_deref() {
+            Some(session_id) => session_locations(conn, &row.source, session_id)?,
+            None => Vec::new(),
+        };
+        Ok(Self {
+            id: row.id,
+            source: row.source,
+            session_id: row.session_id,
+            project: row.project,
+            prompt: row.text,
+            timestamp_ms: row.timestamp_ms,
+            locations,
+            match_source: row.match_source,
+            role: row.role,
+            kind: row.kind,
         })
     }
 }
@@ -315,6 +552,9 @@ pub struct NativeSessionEvent {
     pub is_sidechain: Option<bool>,
     pub is_meta: Option<bool>,
     pub turn_id: Option<String>,
+    /// Why a user-role row is not a human prompt; null for a genuine prompt
+    /// and for every model-output row.
+    pub control_kind: Option<String>,
 }
 
 impl From<CoreSessionEvent> for NativeSessionEvent {
@@ -354,11 +594,14 @@ impl From<CoreSessionEvent> for NativeSessionEvent {
             is_sidechain: event.is_sidechain.map(|value| value != 0),
             is_meta: event.is_meta.map(|value| value != 0),
             turn_id: event.turn_id,
+            control_kind: event.control_kind,
         }
     }
 }
 
 #[napi(object)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EventCursor {
     pub ts_ms: i64,
     pub id: i64,
@@ -458,6 +701,8 @@ impl From<CoreSessionFileEdit> for NativeSessionFileEdit {
 /// explicit JavaScript `null` cannot be converted to `i64` and fails at the
 /// boundary, so the SDK normalizes `null` to `undefined` before calling in.
 #[napi(object)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EvidenceCursor {
     pub ts_ms: Option<i64>,
     pub id: i64,
@@ -471,6 +716,8 @@ pub struct EvidencePageOptions {
 }
 
 #[napi(object)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NativeSessionUserTurnBlock {
     /// `text` or `tool_result`.
     pub kind: String,
@@ -495,6 +742,8 @@ impl From<CoreSessionUserTurnBlock> for NativeSessionUserTurnBlock {
 }
 
 #[napi(object)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NativeSessionUserTurn {
     pub id: i64,
     pub source: String,
@@ -537,6 +786,8 @@ pub struct UserTurnsPageOptions {
 }
 
 #[napi(object)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionUserTurnsPage {
     pub contract_version: u32,
     pub source: String,
@@ -569,6 +820,8 @@ pub struct SessionFileEditsPage {
 /// provider did not report that counter, which is a different fact from a
 /// reported zero and the only thing that makes `coverage` interpretable.
 #[napi(object)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NativeNormalizedUsage {
     pub input_tokens: i64,
     pub output_tokens: i64,
@@ -576,8 +829,10 @@ pub struct NativeNormalizedUsage {
     pub cache_read_tokens: i64,
     pub cache_write_tokens: i64,
     #[napi(js_name = "cacheWrite5mTokens")]
+    #[serde(rename = "cacheWrite5mTokens")]
     pub cache_write5m_tokens: Option<i64>,
     #[napi(js_name = "cacheWrite1hTokens")]
+    #[serde(rename = "cacheWrite1hTokens")]
     pub cache_write1h_tokens: Option<i64>,
     pub provider_total_tokens: Option<i64>,
     pub reported_cost_usd: Option<f64>,
@@ -647,6 +902,8 @@ impl NativeNormalizedUsage {
 }
 
 #[napi(object)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NativeSessionRequest {
     pub id: i64,
     pub source: String,
@@ -710,6 +967,8 @@ impl From<CoreSessionRequest> for NativeSessionRequest {
 }
 
 #[napi(object)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RequestCursor {
     pub ts_ms: i64,
     pub id: i64,
@@ -723,6 +982,8 @@ pub struct RequestPageOptions {
 }
 
 #[napi(object)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionRequestsPage {
     pub contract_version: u32,
     pub source: String,
@@ -739,6 +1000,8 @@ pub struct SessionUsageOptions {
 /// One session's usage rollup. `usage` is absent when the session has no
 /// usage evidence at all — not zeroed, because zero is a claim.
 #[napi(object)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionUsage {
     pub contract_version: u32,
     pub source: String,
@@ -888,42 +1151,56 @@ where
     .map_err(worker_error)?
 }
 
-/// Full-text search of indexed history. Never discovers or syncs implicitly.
+/// Full-text search of indexed prompts and session events. Never discovers or
+/// syncs implicitly. Same contract as `ai-hist search`.
 #[napi]
 pub async fn search(
     query: String,
     options: Option<SearchOptions>,
-) -> napi::Result<Vec<NativeHistoryEntry>> {
-    let options = options.unwrap_or(SearchOptions {
-        scope: None,
-        db_path: None,
-        source: None,
-        project: None,
-        tag: None,
-        before_ms: None,
-        limit: None,
-        raw_fts: None,
-    });
-    let limit = validate_limit(options.limit, 20, 1_000)?;
-    let path = db_path(options.db_path.clone());
-    let filter = QueryFilter {
-        scope: parse_scope(options.scope)?,
-        source: options.source,
-        project: options.project,
-        tag: options.tag,
-        before_ms: options.before_ms,
-        limit,
+) -> napi::Result<Vec<NativeSearchMatch>> {
+    let request = SearchRequest::new(query, options)?;
+    read_database(request.path, Vec::new(), move |conn| {
+        search_all(
+            conn,
+            &request.terms,
+            request.raw_fts,
+            &request.filter,
+            request.role,
+        )?
+        .into_iter()
+        .map(|row| NativeSearchMatch::from_row(conn, row))
+        .collect()
+    })
+    .await
+}
+
+/// One page of `search`, newest first, with the cursor to the next page.
+#[napi]
+pub async fn search_page(
+    query: String,
+    options: Option<SearchOptions>,
+) -> napi::Result<NativeSearchPage> {
+    let request = SearchRequest::new(query, options)?;
+    let empty = NativeSearchPage {
+        matches: Vec::new(),
+        next_cursor: None,
     };
-    let terms = query
-        .split_whitespace()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    let raw_fts = options.raw_fts.unwrap_or(false);
-    read_database(path, Vec::new(), move |conn| {
-        core_search(conn, &terms, raw_fts, &filter)?
-            .into_iter()
-            .map(|entry| NativeHistoryEntry::from_entry(conn, entry))
-            .collect()
+    read_database(request.path, empty, move |conn| {
+        let page = core_search_page(
+            conn,
+            &request.terms,
+            request.raw_fts,
+            &request.filter,
+            request.role,
+        )?;
+        Ok(NativeSearchPage {
+            matches: page
+                .rows
+                .into_iter()
+                .map(|row| NativeSearchMatch::from_row(conn, row))
+                .collect::<anyhow::Result<_>>()?,
+            next_cursor: page.next_cursor.map(NativeHistoryCursor::from_core),
+        })
     })
     .await
 }
@@ -931,15 +1208,7 @@ pub async fn search(
 /// Recent indexed history. Never discovers or syncs implicitly.
 #[napi]
 pub async fn recent(options: Option<HistoryQueryOptions>) -> napi::Result<Vec<NativeHistoryEntry>> {
-    let options = options.unwrap_or(HistoryQueryOptions {
-        scope: None,
-        db_path: None,
-        source: None,
-        project: None,
-        tag: None,
-        before_ms: None,
-        limit: None,
-    });
+    let options = options.unwrap_or_default();
     let limit = validate_limit(options.limit, 20, 1_000)?;
     let path = db_path(options.db_path.clone());
     let filter = options.filter(limit)?;
@@ -948,6 +1217,31 @@ pub async fn recent(options: Option<HistoryQueryOptions>) -> napi::Result<Vec<Na
             .into_iter()
             .map(|entry| NativeHistoryEntry::from_entry(conn, entry))
             .collect()
+    })
+    .await
+}
+
+/// One page of `recent`, newest first, with the cursor to the next page.
+#[napi]
+pub async fn recent_page(options: Option<HistoryQueryOptions>) -> napi::Result<NativeHistoryPage> {
+    let options = options.unwrap_or_default();
+    let limit = validate_limit(options.limit, 20, 1_000)?;
+    let path = db_path(options.db_path.clone());
+    let filter = options.filter(limit)?;
+    let empty = NativeHistoryPage {
+        entries: Vec::new(),
+        next_cursor: None,
+    };
+    read_database(path, empty, move |conn| {
+        let page = core_recent_page(conn, &filter)?;
+        Ok(NativeHistoryPage {
+            entries: page
+                .rows
+                .into_iter()
+                .map(|entry| NativeHistoryEntry::from_entry(conn, entry))
+                .collect::<anyhow::Result<_>>()?,
+            next_cursor: page.next_cursor.map(NativeHistoryCursor::from_core),
+        })
     })
     .await
 }
@@ -1697,10 +1991,6 @@ pub async fn hydrate_session(options: HydrateSessionOptions) -> napi::Result<Hyd
     })
 }
 
-const CATALOG_SOURCES: &[&str] = &[
-    "claude", "codex", "cursor", "grok", "relay", "opencode", "devin",
-];
-
 /// Reject an unusable identity before opening anything, so a typo is an
 /// argument error rather than an empty result that looks like real data.
 fn validate_relationship_identity(source: &str, session_id: &str) -> napi::Result<()> {
@@ -1710,7 +2000,11 @@ fn validate_relationship_identity(source: &str, session_id: &str) -> napi::Resul
             "sessionId must not be empty",
         ));
     }
-    if !CATALOG_SOURCES.contains(&source) {
+    // The catalog sources are the ones hydration accepts, as the harness
+    // registry declares them.
+    if !ai_hist::sources::catalog::local_source(source)
+        .is_some_and(|descriptor| descriptor.is_hydration_source())
+    {
         return Err(native_error(
             "INVALID_ARGUMENT",
             format!("unsupported catalog source '{source}'"),
@@ -1779,6 +2073,8 @@ impl From<CoreSessionRelationship> for NativeSessionRelationship {
 }
 
 #[napi(object)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NativeRelationshipCapabilities {
     pub source: String,
     pub stable_child_identity: String,

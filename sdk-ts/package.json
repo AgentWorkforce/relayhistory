@@ -1,6 +1,6 @@
 {
   "name": "ai-hist",
-  "version": "0.26.0",
+  "version": "0.32.3",
   "description": "Local history ingestion, storage, evidence, SDK, CLI and MCP server.",
   "license": "MIT",
   "private": false,
@@ -55,6 +55,7 @@
     "dist/relay-cli.*",
     "dist/cloud-contract.*",
     "dist/mcp-server.*",
+    "dist/relay-agents.*",
     "README.md",
     "package.json",
     "dist/contracts.*",
@@ -62,6 +63,7 @@
     "dist/pagination.*",
     "dist/git.*",
     "dist/operations.*",
+    "dist/handoff.*",
     "dist/source-contracts.*",
     "dist/source-plugins.*",
     "!dist/*.test.*"

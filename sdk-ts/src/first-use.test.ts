@@ -11,6 +11,9 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 const cli = fileURLToPath(new URL('./cli.js', import.meta.url));
+// Test-only: `node:sqlite` arrived in Node 22 while the SDK still supports Node 20.
+const sqlite = await import('node:sqlite').catch(() => null);
+const needsNodeSqlite = sqlite ? false : 'node:sqlite requires Node >= 22';
 
 type Run = { code: number; stdout: string; stderr: string };
 
@@ -120,10 +123,10 @@ test('--no-bootstrap reports an unbuilt store instead of building or lying', asy
 
 // The usage block is what tells a user bootstrap is the default. Whatever it
 // documents as reading local history must actually accept the opt-out.
-test('the local CLI requires explicit plugin configuration for cloud commands', async () => {
+test('the local CLI has no cloud login command', async () => {
   const shipped = await readFile(fileURLToPath(new URL('../dist/cli.js', import.meta.url)), 'utf8');
   assert.doesNotMatch(shipped, /cloudLoadAuth|enableCloud|cloud-preflight/);
-  const result = await run(['login', '--token', 'fixture-token'], process.env);
+  const result = await run(['login'], process.env);
   assert.equal(result.code, 2);
   assert.match(result.stderr, /unknown command 'login'/);
 });
@@ -138,6 +141,53 @@ test('every documented local-history command accepts --no-bootstrap', async () =
       const result = await run([...command, '--no-bootstrap'], env);
       assert.notEqual(result.code, 2, `${command.join(' ') || 'ai-hist'} rejected --no-bootstrap: ${result.stderr}`);
     }
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+// A migration after an upgrade can run for minutes on a large history; silent,
+// it reads as a hang. The notice fires when an open actually migrates, so a new
+// database, a current one, and a line rejected before its first open all stay
+// quiet and leave the database as it was.
+test('the CLI announces exactly the migrations it runs', { skip: needsNodeSqlite }, async () => {
+  const { home, env } = await emptyHome();
+  const dbPath = join(home, '.local', 'share', 'ai-hist', 'ai-history.db');
+  const pending = (): number => {
+    const database = new sqlite!.DatabaseSync(dbPath, { readOnly: true });
+    const row = database.prepare("SELECT COUNT(*) AS n FROM schema_migrations WHERE name = 'history_fts_update_of_v1'").get() as { n: number };
+    database.close();
+    return row.n === 0 ? 1 : 0;
+  };
+  try {
+    await seedClaudeSession(home);
+    const created = await run(['stats'], env);
+    assert.equal(created.code, 0, created.stderr);
+    assert.doesNotMatch(created.stderr, /Upgrading/);
+
+    const database = new sqlite!.DatabaseSync(dbPath);
+    database.exec("DELETE FROM schema_migrations WHERE name = 'history_fts_update_of_v1'");
+    database.close();
+
+    const badConfig = join(home, 'bad-config.json');
+    await writeFile(badConfig, '{ not json');
+    for (const line of [['sync', '--config', badConfig], ['sync', '--remote']]) {
+      const rejected = await run(line, env);
+      assert.notEqual(rejected.code, 0, line.join(' '));
+      assert.doesNotMatch(rejected.stderr, /Upgrading/, line.join(' '));
+      assert.equal(pending(), 1, `${line.join(' ')} must not migrate`);
+    }
+
+    const upgraded = await run(['stats'], env);
+    assert.equal(upgraded.code, 0, upgraded.stderr);
+    assert.match(upgraded.stderr, /Upgrading the ai-hist database to \d+\.\d+\.\d+/);
+    assert.match(upgraded.stderr, /Database upgraded in \d+s\./);
+    assert.match(upgraded.stdout, /total: 1/);
+    assert.equal(pending(), 0);
+
+    const again = await run(['stats'], env);
+    assert.equal(again.code, 0, again.stderr);
+    assert.doesNotMatch(again.stderr, /Upgrading/);
   } finally {
     await rm(home, { recursive: true, force: true });
   }

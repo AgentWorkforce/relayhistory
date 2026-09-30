@@ -68,6 +68,9 @@ enum Origin {
     Burn,
     /// Authored here, for a log shape burn's corpus does not cover.
     RelayHistory,
+    /// Derived from `xhluca/session-migrate`'s native corpus (MIT): a
+    /// transcript the real harness CLI wrote, kept verbatim line by line.
+    SessionMigrate,
 }
 
 struct Fixture {
@@ -368,6 +371,22 @@ const CORPUS: &[Fixture] = &[
     },
     Fixture {
         source: "claude",
+        name: "system-reminder",
+        layout: Layout::ClaudeTranscript,
+        origin: Origin::RelayHistory,
+        files: &["claude/system-reminder.jsonl"],
+        quirk: "`<system-reminder>` blocks injected into user content, as a block of their own, inline in a string prompt, and alone on an `isMeta` record",
+    },
+    Fixture {
+        source: "claude",
+        name: "hook-and-passthrough",
+        layout: Layout::ClaudeTranscript,
+        origin: Origin::RelayHistory,
+        files: &["claude/hook-and-passthrough.jsonl"],
+        quirk: "a `<user-prompt-submit-hook>` row flagged `isMeta`, a `<bash-input>` / `<bash-stdout>` pass-through pair, and a bare `isMeta` bookkeeping row between two prompts",
+    },
+    Fixture {
+        source: "claude",
         name: "sidecar-subagent",
         layout: Layout::HomeTree,
         origin: Origin::RelayHistory,
@@ -562,11 +581,43 @@ const CORPUS: &[Fixture] = &[
     },
     Fixture {
         source: "codex",
+        name: "context-wrapper",
+        layout: Layout::CodexRollout,
+        origin: Origin::RelayHistory,
+        files: &["codex/context-wrapper.jsonl"],
+        quirk: "an `<environment_context>` wrapper the app injects as a user `response_item` ahead of the human's mirrored turn",
+    },
+    Fixture {
+        source: "codex",
         name: "two-requests-one-turn",
         layout: Layout::CodexRollout,
         origin: Origin::RelayHistory,
         files: &["codex/two-requests-one-turn.jsonl"],
         quirk: "a tool loop makes two API calls inside one turn_id, so the turn is not the request",
+    },
+    Fixture {
+        source: "codex",
+        name: "fork-human",
+        layout: Layout::CodexRollout,
+        origin: Origin::RelayHistory,
+        files: &["codex/fork-human/parent.jsonl", "codex/fork-human/child.jsonl"],
+        quirk: "a human fork (`forked_from_id`, `thread_source: user`) whose rollout replays the parent's `session_meta`, both turns and their cumulative `token_count` before its own turn",
+    },
+    Fixture {
+        source: "codex",
+        name: "fork-subagent",
+        layout: Layout::CodexRollout,
+        origin: Origin::RelayHistory,
+        files: &["codex/fork-subagent/root.jsonl", "codex/fork-subagent/subagent.jsonl"],
+        quirk: "a spawned subagent naming its parent in `source.subagent.thread_spawn.parent_thread_id`, replaying the parent's open turn (with a tool call) and starting its own turn in the thread id's own millisecond",
+    },
+    Fixture {
+        source: "codex",
+        name: "guardian-review",
+        layout: Layout::CodexRollout,
+        origin: Origin::RelayHistory,
+        files: &["codex/guardian-review/parent.jsonl", "codex/guardian-review/guardian.jsonl"],
+        quirk: "a Codex 0.150+ `thread_source: guardian_review` rollout with `parent_thread_id` that opens on a `compaction` item rather than a replay",
     },
     // -- cursor, authored here ---------------------------------------------
     Fixture {
@@ -617,6 +668,31 @@ const CORPUS: &[Fixture] = &[
         origin: Origin::RelayHistory,
         files: &["grok/events-session"],
         quirk: "documented Grok Build layout: `chat_history.jsonl` with `tool_calls[]`, ACP `updates.jsonl` with real `agentTimestampMs` times, `compaction_checkpoints/`, `subagents/`, `signals.json` and `prompt_context.json`",
+    },
+    Fixture {
+        source: "grok",
+        name: "unified-usage",
+        layout: Layout::HomeTree,
+        origin: Origin::RelayHistory,
+        files: &["grok/unified-usage"],
+        quirk: "two Grok Build sessions under one Grok home: one covered by the process-wide `logs/unified.jsonl` per-inference usage log (a repeated `eventId`, a pid-scoped model, top-level counters, an exact duplicate row, a row with no session and one for an unindexed session), one not covered and with no `summary.json`, so its model and start time come from `events.jsonl`",
+    },
+    // -- muse --------------------------------------------------------------
+    Fixture {
+        source: "muse",
+        name: "cli-capture",
+        layout: Layout::HomeTree,
+        origin: Origin::SessionMigrate,
+        files: &["muse/cli-capture"],
+        quirk: "a transcript the real `muse` CLI (0.2.1) wrote, trimmed to its conversation, tool and lifecycle records: three runs across two resumes, `read_file` calls with one failed outcome, per-step `model_completed` usage, and mirrored reminder task records",
+    },
+    Fixture {
+        source: "muse",
+        name: "tools-session",
+        layout: Layout::HomeTree,
+        origin: Origin::RelayHistory,
+        files: &["muse/tools-session"],
+        quirk: "authored from the documented shape: a permission frame before the metadata, encrypted and readable reasoning, `edit_file`/`write_file` edits, a `bash` result that exits 101, a mirrored subagent task stream, a mid-session model switch, and `subagent/` logs — a worker with its own nested child, and a reminder — linked as delegated children rather than catalogued as sessions",
     },
     // -- opencode ----------------------------------------------------------
     Fixture {
@@ -857,7 +933,7 @@ fn build_corpus() -> BTreeMap<String, Value> {
     // `getenv` inside the staging window is the library's own. It is dropped
     // when the build finishes: every snapshot is already in memory by then,
     // and nothing else in this binary reads `HOME`.
-    let root = tempfile::tempdir().expect("corpus temp root");
+    let root = corpus_temp_root();
     let mut snapshots = BTreeMap::new();
     for fixture in CORPUS {
         if fixture.layout == Layout::Reference {
@@ -872,6 +948,30 @@ fn build_corpus() -> BTreeMap<String, Value> {
     snapshots
 }
 
+/// The temp root every fixture `HOME` is staged under, kept short.
+///
+/// Marker payload strings are bounded at [`MARKER_PAYLOAD_FIELD_LIMIT`]
+/// characters, and some of them are absolute paths under `HOME` (Grok's
+/// `prompt_context` marker records where `prompt_context.json` was). Where that
+/// bound cuts such a path depends on how long `HOME` is, so a long temp root
+/// makes the snapshot depend on the machine: `$TMPDIR` on macOS is
+/// `/var/folders/<2>/<28>/T/`, long enough to cut
+/// `…/grok-evt-0001/prompt_context.json` to `…/grok-evt-0001/prom`, while
+/// Linux CI's `/tmp` is not. Staging under `/tmp` on every Unix keeps each
+/// path whole, so the committed (Linux-generated) values hold everywhere, and
+/// [`assert_home_paths_fit_marker_bound`] fails loudly if a platform's root is
+/// still too long rather than letting it read as a parser change.
+fn corpus_temp_root() -> tempfile::TempDir {
+    let builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    return builder.tempdir_in("/tmp").expect("corpus temp root");
+    #[cfg(not(unix))]
+    return builder.tempdir().expect("corpus temp root");
+}
+
+/// Mirrors `ingest::MARKER_PAYLOAD_FIELD_LIMIT`, which is crate-private.
+const MARKER_PAYLOAD_FIELD_LIMIT: usize = 128;
+
 fn capture(fixture: &Fixture, home: &Path) -> Value {
     let opencode_db = home.join(".local/share/opencode/opencode.db");
     std::env::set_var("HOME", home);
@@ -882,6 +982,9 @@ fn capture(fixture: &Fixture, home: &Path) -> Value {
     // fixture run.
     std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
     std::env::remove_var("AI_HIST_DB");
+    // Muse Code's root follows `XDG_DATA_HOME`; the fixture's own `HOME`
+    // layout has to win over whatever the machine running the tests sets.
+    std::env::remove_var("XDG_DATA_HOME");
 
     let db = home.join("ai-history.db");
     let mut notes: Vec<String> = Vec::new();
@@ -966,6 +1069,7 @@ fn capture(fixture: &Fixture, home: &Path) -> Value {
         "tool_calls": dump(&conn, TOOL_CALLS_SQL),
         "file_edits": dump(&conn, FILE_EDITS_SQL),
         "session_relationships": dump(&conn, SESSION_RELATIONSHIPS_SQL),
+        "session_markers": dump(&conn, SESSION_MARKERS_SQL),
         "history": dump(&conn, HISTORY_SQL),
     });
     redact(snapshot, home)
@@ -980,10 +1084,20 @@ const SESSIONS_SQL: &str = "SELECT source, session_id, cwd, git_branch, first_ac
      last_activity_ms, last_assistant_text, raw_path, first_prompt, models_json, \
      originator, agent_version, repo_url, initial_commit, workspace_roots_json, source_stamp, \
      discovery_state FROM sessions ORDER BY source, session_id";
+/// The tool-result fidelity columns (#171) are selected too: they are
+/// measured from the raw provider payload, so a parser change that moves a
+/// byte count, a status or an error signal shows up in the snapshot diff.
 const SESSION_EVENTS_SQL: &str =
     "SELECT source, session_id, project, cwd, git_branch, message_id, \
-     parent_id, ts_ms, role, kind, text, model, token_json, event_uid FROM session_events \
-     ORDER BY source, session_id, ts_ms, event_uid";
+     parent_id, ts_ms, role, kind, text, model, token_json, event_uid, control_kind, \
+     tool_use_id, payload_bytes, payload_truncated, payload_hash, call_index, event_index, \
+     result_status, event_source, error_signal, subagent_session_id, agent_id \
+     FROM session_events ORDER BY source, session_id, ts_ms, event_uid";
+/// `marker_uid` is derived from the provider record, not from insertion
+/// order, so it is a stable key to select and sort by.
+const SESSION_MARKERS_SQL: &str = "SELECT source, session_id, marker_uid, ts_ms, message_id, \
+     parent_id, turn_id, kind, subkind, text, payload_json FROM session_markers \
+     ORDER BY source, session_id, ts_ms IS NULL, ts_ms, marker_uid";
 const TOOL_CALLS_SQL: &str = "SELECT source, session_id, message_id, tool_use_id, name, target, \
      args_json, is_error, ts_ms FROM tool_calls ORDER BY source, session_id, ts_ms, tool_use_id";
 const FILE_EDITS_SQL: &str = "SELECT source, session_id, message_id, tool_use_id, file_path, \
@@ -1041,7 +1155,52 @@ fn redact(value: Value, home: &Path) -> Value {
     // form is `/private/var/...`, so replacing the short one first would leave
     // `/private<home>/…` behind and the long one would then never match.
     homes.sort_by_key(|home| std::cmp::Reverse(home.len()));
+    assert_home_paths_fit_marker_bound(&value, &homes);
     redact_value(value, &homes, false)
+}
+
+/// Fail if a marker payload string that carries the fixture's `HOME` reached
+/// the payload bound.
+///
+/// Such a string was (or may have been) cut at a point set by `HOME`'s length,
+/// which redaction cannot undo: `<home>` replaces the prefix, but the missing
+/// tail stays missing, and the snapshot would then differ between machines for
+/// a reason no parser change explains. See [`corpus_temp_root`].
+fn assert_home_paths_fit_marker_bound(snapshot: &Value, homes: &[String]) {
+    fn walk(value: &Value, homes: &[String], home_len: usize) {
+        match value {
+            Value::String(text) => {
+                let carries_home = homes.iter().any(|home| text.contains(home.as_str()));
+                assert!(
+                    !carries_home || text.chars().count() < MARKER_PAYLOAD_FIELD_LIMIT,
+                    "marker payload path `{text}` reached the {MARKER_PAYLOAD_FIELD_LIMIT}-char \
+                     payload bound, so where it was cut depends on the fixture HOME's length \
+                     ({home_len} chars); stage the corpus under a shorter temp root",
+                );
+            }
+            Value::Array(items) => items.iter().for_each(|item| walk(item, homes, home_len)),
+            Value::Object(map) => map.values().for_each(|item| walk(item, homes, home_len)),
+            _ => {}
+        }
+    }
+    // A HOME at or over the bound would be cut inside itself, and the cut
+    // string would no longer contain it for `walk` to find. Every form is
+    // checked, because the canonical one (`/private/tmp/…` on macOS) is what
+    // ingest may have stored.
+    for home in homes {
+        assert!(
+            home.chars().count() < MARKER_PAYLOAD_FIELD_LIMIT,
+            "fixture HOME `{home}` is at least the {MARKER_PAYLOAD_FIELD_LIMIT}-char marker \
+             payload bound; stage the corpus under a shorter temp root",
+        );
+    }
+    let home_len = homes.iter().map(String::len).min().unwrap_or(0);
+    let markers = snapshot["session_markers"].as_array().into_iter().flatten();
+    for payload in markers.filter_map(|marker| marker["payload_json"].as_str()) {
+        if let Ok(payload) = serde_json::from_str::<Value>(payload) {
+            walk(&payload, homes, home_len);
+        }
+    }
 }
 
 fn redact_value(value: Value, homes: &[String], stamp: bool) -> Value {
@@ -1343,43 +1502,100 @@ fn corpus_readme_lists_every_fixture_and_quirk() {
     }
 }
 
-/// Every `SOURCE_CHOICES` entry has at least one fixture, or a documented
-/// exemption. Adding a provider without a fixture fails here.
+/// The harness registry and the corpus agree: every `LocalSource` descriptor
+/// either names a fixture directory that holds at least one staged fixture
+/// and a committed snapshot, or carries a documented fixture exemption; and
+/// the public `Source` enum names exactly the descriptors. Adding a provider without a
+/// fixture fails here.
 ///
-/// The exemption list mirrors `DISCOVERY_EXEMPTIONS`: a source that is not a
-/// provider session at all has nothing to put in a harness corpus.
+/// A source that is not a provider session at all (a trajectory, a relay row
+/// projected from other sources) has nothing to put in a harness corpus, and
+/// its descriptor says so.
 #[test]
 fn every_source_choice_has_a_fixture_or_an_exemption() {
-    const FIXTURE_EXEMPTIONS: &[(&str, &str)] = &[
-        (
-            "trajectory",
-            "derived trajectory records, not provider sessions",
-        ),
-        (
-            "relay",
-            "projected from already-synced local rows; no provider log on disk to capture",
-        ),
-    ];
-    let covered = CORPUS
+    use ai_hist::sources::catalog::{local_source, local_sources, Fixtures};
+
+    // The public `Source` enum is hand-written (it is default API), so it is
+    // the list that can drift from the registry: it must name exactly the
+    // descriptors, each once.
+    let public = ai_hist::Source::ALL
+        .iter()
+        .map(|source| source.as_str())
+        .collect::<Vec<_>>();
+    let mut public_sorted = public.clone();
+    public_sorted.sort_unstable();
+    public_sorted.dedup();
+    assert_eq!(
+        public_sorted.len(),
+        public.len(),
+        "Source::ALL repeats a source"
+    );
+    let mut descriptors = local_sources()
+        .iter()
+        .map(|descriptor| descriptor.id())
+        .collect::<Vec<_>>();
+    descriptors.sort_unstable();
+    assert_eq!(
+        public_sorted, descriptors,
+        "Source::ALL and the sources/catalog.rs descriptors name different sources"
+    );
+    let staged = CORPUS
         .iter()
         .filter(|fixture| fixture.layout != Layout::Reference)
-        .map(|fixture| fixture.source)
-        .collect::<BTreeSet<_>>();
-    for source in ai_hist::SOURCE_CHOICES {
-        let exempt = FIXTURE_EXEMPTIONS
+        .collect::<Vec<_>>();
+    for fixture in CORPUS {
+        assert!(
+            local_source(fixture.source).is_some(),
+            "{} names a source with no descriptor",
+            snapshot_key(fixture)
+        );
+    }
+    for descriptor in local_sources() {
+        let source = descriptor.id();
+        let covering = staged
             .iter()
-            .find(|(name, _)| name == source)
-            .map(|(_, reason)| *reason);
-        match exempt {
-            Some(reason) => assert!(
-                !reason.is_empty() && !covered.contains(source),
+            .filter(|fixture| fixture.source == source)
+            .collect::<Vec<_>>();
+        match descriptor.fixtures() {
+            Fixtures::Exempt(reason) => assert!(
+                !reason.is_empty() && covering.is_empty(),
                 "{source} is both exempt and covered; pick one"
             ),
-            None => assert!(
-                covered.contains(source),
-                "{source} has no fixture under tests/fixtures/ and no exemption; see \
-                 docs/session-catalog.md 'Adding a provider'"
-            ),
+            Fixtures::Dir(dir) => {
+                // The corpus keys fixtures and snapshots by source id, so the
+                // descriptor's directory must be that id.
+                assert_eq!(
+                    dir, source,
+                    "{source}'s fixture directory must be named after the source"
+                );
+                assert!(
+                    !covering.is_empty(),
+                    "{source} has no fixture under tests/fixtures/{dir} and no exemption; see \
+                     docs/session-catalog.md 'Adding a provider'"
+                );
+                assert!(
+                    fixtures_root().join(dir).is_dir(),
+                    "{source}'s descriptor names tests/fixtures/{dir}, which does not exist"
+                );
+                for fixture in &covering {
+                    for file in fixture.files {
+                        assert!(
+                            file.starts_with(&format!("{dir}/")),
+                            "{} stages {file}, outside its descriptor's fixture directory {dir}",
+                            snapshot_key(fixture)
+                        );
+                    }
+                    let snapshot = snapshots_root()
+                        .join(dir)
+                        .join(format!("{}.json", fixture.name));
+                    assert!(
+                        snapshot.is_file(),
+                        "{} has no committed snapshot at {}",
+                        snapshot_key(fixture),
+                        snapshot.display()
+                    );
+                }
+            }
         }
     }
 }
@@ -1682,6 +1898,224 @@ fn codex_parent_thread_id_becomes_a_delegation_edge() {
     assert_eq!(catalog, vec!["sess_parent_thread_root".to_string()]);
 }
 
+/// The events of one session, as `(role, text)` in stored order.
+fn session_texts(key: &str, session_id: &str) -> Vec<(String, String)> {
+    rows(key, "session_events")
+        .iter()
+        .filter(|event| text(event, "session_id") == session_id)
+        .map(|event| {
+            (
+                text(event, "role").to_string(),
+                text(event, "text").to_string(),
+            )
+        })
+        .collect()
+}
+
+/// The one `fork_replay_boundary` marker a session carries, as its payload.
+fn fork_replay_marker(key: &str, session_id: &str) -> Option<Value> {
+    let markers = rows(key, "session_markers")
+        .iter()
+        .filter(|marker| {
+            text(marker, "session_id") == session_id
+                && text(marker, "kind") == "fork_replay_boundary"
+        })
+        .collect::<Vec<_>>();
+    assert!(markers.len() <= 1, "{markers:?}");
+    markers
+        .first()
+        .map(|marker| serde_json::from_str(text(marker, "payload_json")).expect("marker payload"))
+}
+
+const FORK_HUMAN_PARENT: &str = "019da82f-d400-7000-8000-00000000000a";
+const FORK_HUMAN_CHILD: &str = "019da830-be60-7000-8000-00000000000c";
+
+/// #210: a human fork records a `fork` edge from `forked_from_id`, and the
+/// parent history its rollout replays is not indexed a second time under the
+/// child: two prompts for the parent, one for the child, and the child's
+/// first request charged only what it spent beyond the inherited total.
+#[test]
+fn codex_human_fork_records_lineage_and_gates_the_replay() {
+    let key = "codex/fork-human";
+    let edges = rows(key, "session_relationships");
+    assert_eq!(edges.len(), 1, "{edges:?}");
+    assert_eq!(text(&edges[0], "relationship"), "fork");
+    assert_eq!(text(&edges[0], "parent_session_id"), FORK_HUMAN_PARENT);
+    assert_eq!(text(&edges[0], "child_session_id"), FORK_HUMAN_CHILD);
+    assert_eq!(text(&edges[0], "evidence_ref"), "forked_from_id");
+
+    // A human fork stays a root.
+    let catalog = rows(key, "sessions")
+        .iter()
+        .map(|session| text(session, "session_id").to_string())
+        .collect::<BTreeSet<_>>();
+    assert!(catalog.contains(FORK_HUMAN_CHILD), "{catalog:?}");
+    // Shallow discovery applies the same gate: the child's first prompt is
+    // its own, not the parent's replayed one.
+    let child_row = rows(key, "sessions")
+        .iter()
+        .find(|session| text(session, "session_id") == FORK_HUMAN_CHILD)
+        .expect("child row");
+    assert_eq!(
+        text(child_row, "first_prompt"),
+        "child prompt after the fork"
+    );
+
+    let history = rows(key, "history")
+        .iter()
+        .map(|entry| {
+            (
+                text(entry, "session_id").to_string(),
+                text(entry, "prompt").to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        history,
+        vec![
+            (
+                FORK_HUMAN_PARENT.to_string(),
+                "parent prompt one".to_string()
+            ),
+            (
+                FORK_HUMAN_PARENT.to_string(),
+                "parent prompt two".to_string()
+            ),
+            (
+                FORK_HUMAN_CHILD.to_string(),
+                "child prompt after the fork".to_string()
+            ),
+        ]
+    );
+
+    assert_eq!(
+        session_texts(key, FORK_HUMAN_CHILD),
+        vec![
+            (
+                "user".to_string(),
+                "child prompt after the fork".to_string()
+            ),
+            ("assistant".to_string(), "child answer".to_string()),
+        ],
+        "the child's events hold only its own turn"
+    );
+    let child_usage = rows(key, "session_events")
+        .iter()
+        .filter(|event| text(event, "session_id") == FORK_HUMAN_CHILD)
+        .filter_map(|event| field(event, "token_json").as_str())
+        .map(|raw| serde_json::from_str::<Value>(raw).expect("token json"))
+        .map(|usage| usage["total_tokens"].as_i64().expect("total"))
+        .collect::<Vec<_>>();
+    // Final 3100 minus the inherited 2500.
+    assert_eq!(child_usage, vec![600]);
+
+    let marker = fork_replay_marker(key, FORK_HUMAN_CHILD).expect("replay marker");
+    assert_eq!(marker["parent_session_id"], FORK_HUMAN_PARENT);
+    assert_eq!(marker["first_line"], 1);
+    assert_eq!(marker["replayed_lines"], 13);
+    assert_eq!(marker["closed_by"], "turn_id");
+    assert_eq!(marker["inherited_total_tokens"], 2500);
+    // 3100 == 2500 + last_token_usage 600: the child continued its
+    // parent's counter, as codex-rs seeds it.
+    assert_eq!(marker["inherited_baseline"], "applied");
+    assert_eq!(marker["inherited_baseline_basis"], "last_token_usage");
+    assert!(fork_replay_marker(key, FORK_HUMAN_PARENT).is_none());
+}
+
+/// #210: a spawned subagent names its parent only in
+/// `source.subagent.thread_spawn.parent_thread_id`. It keeps its delegation
+/// edge and gains a `fork` edge, and the parent's open turn it replays -- a
+/// prompt and a tool call -- stays the parent's. Its own first turn begins in
+/// the thread id's own millisecond and is still the child's.
+#[test]
+fn codex_subagent_fork_records_lineage_and_gates_the_replay() {
+    let key = "codex/fork-subagent";
+    let root = "019da866-c280-7000-8000-0000000000a0";
+    let child = "019da867-37b0-7000-8000-0000000000b0";
+    let edges = rows(key, "session_relationships")
+        .iter()
+        .map(|edge| {
+            (
+                text(edge, "relationship").to_string(),
+                text(edge, "parent_session_id").to_string(),
+                text(edge, "child_session_id").to_string(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    assert!(edges.contains(&("delegated".to_string(), root.to_string(), child.to_string())));
+    assert!(edges.contains(&("fork".to_string(), root.to_string(), child.to_string())));
+    let fork = rows(key, "session_relationships")
+        .iter()
+        .find(|edge| text(edge, "relationship") == "fork")
+        .expect("fork edge");
+    assert_eq!(
+        text(fork, "evidence_ref"),
+        "source.subagent.thread_spawn.parent_thread_id"
+    );
+
+    let catalog = rows(key, "sessions")
+        .iter()
+        .map(|session| text(session, "session_id").to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(catalog, vec![root.to_string()], "a subagent stays hidden");
+
+    let child_texts = session_texts(key, child);
+    assert_eq!(
+        child_texts[0],
+        ("user".to_string(), "review retry.rs".to_string())
+    );
+    assert!(
+        child_texts
+            .iter()
+            .all(|(_, text)| !text.contains("review the retry change") && !text.contains("git")),
+        "no replayed parent record reached the child: {child_texts:?}"
+    );
+    let child_calls = rows(key, "tool_calls")
+        .iter()
+        .filter(|call| text(call, "session_id") == child)
+        .map(|call| text(call, "tool_use_id").to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(child_calls, vec!["call_sub_cat".to_string()]);
+
+    let marker = fork_replay_marker(key, child).expect("replay marker");
+    assert_eq!(marker["closed_by"], "turn_id");
+    assert_eq!(
+        marker["closed_by_turn_id"],
+        "019da867-37b0-7000-8000-0000000000b1"
+    );
+}
+
+/// #210: a Codex 0.150+ `guardian_review` thread that names its parent is a
+/// subagent -- hidden from the root catalog, delegated from its parent -- and
+/// it carries no Codex fork field, so it has no `fork` edge and nothing is
+/// gated: its `compaction` opening is not a replay.
+#[test]
+fn codex_guardian_review_is_a_hidden_subagent_without_a_replay() {
+    let key = "codex/guardian-review";
+    let parent = "019da89d-b100-7000-8000-0000000000d0";
+    let guardian = "019da89e-4d40-7000-8000-0000000000e0";
+    let catalog = rows(key, "sessions")
+        .iter()
+        .map(|session| text(session, "session_id").to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(catalog, vec![parent.to_string()]);
+    let edges = rows(key, "session_relationships");
+    assert_eq!(edges.len(), 1, "{edges:?}");
+    assert_eq!(text(&edges[0], "relationship"), "delegated");
+    assert_eq!(text(&edges[0], "child_session_id"), guardian);
+    assert!(fork_replay_marker(key, guardian).is_none());
+    assert_eq!(
+        session_texts(key, guardian),
+        vec![
+            ("user".to_string(), "assess: rm -rf target/".to_string()),
+            (
+                "assistant".to_string(),
+                "low risk: build output only".to_string()
+            ),
+        ]
+    );
+}
+
 /// This transcript carries no `<timestamp>` tag on any turn, so every prompt
 /// in it is stamped from the file's mtime. The prompts themselves are the raw
 /// fact: string content, block-array content and a `<user_query>` wrapper all
@@ -1771,6 +2205,264 @@ fn opencode_sqlite_store_is_read() {
 // Each of these is un-ignored by the issue named in its attribute, which also
 // regenerates the snapshots the change moves.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Control rows as typed evidence (#180). Every row a harness writes into the
+// user role that is not a prompt carries `control_kind`, is absent from
+// `history`, and a slash-command triad is grouped into one marker whose
+// payload is all a consumer needs -- no raw JSON.
+// ---------------------------------------------------------------------------
+
+/// `(event_uid, control_kind)` for every user-role event of a fixture.
+fn user_rows(key: &str) -> Vec<(String, Option<String>)> {
+    rows(key, "session_events")
+        .iter()
+        .filter(|event| text(event, "role") == "user")
+        .map(|event| {
+            (
+                text(event, "event_uid").to_string(),
+                field(event, "control_kind").as_str().map(str::to_string),
+            )
+        })
+        .collect()
+}
+
+fn control_kind_of(key: &str, event_uid: &str) -> Option<String> {
+    user_rows(key)
+        .into_iter()
+        .find(|(uid, _)| uid == event_uid)
+        .unwrap_or_else(|| panic!("{key} has no user row {event_uid}"))
+        .1
+}
+
+fn history_prompts(key: &str) -> Vec<String> {
+    rows(key, "history")
+        .iter()
+        .map(|row| text(row, "prompt").to_string())
+        .collect()
+}
+
+fn slash_command_markers(key: &str) -> Vec<Value> {
+    rows(key, "session_markers")
+        .iter()
+        .filter(|marker| text(marker, "kind") == "slash_command")
+        .map(|marker| {
+            let payload = text(marker, "payload_json");
+            let mut parsed: Value = serde_json::from_str(payload).expect("payload is JSON");
+            parsed["marker_uid"] = json!(text(marker, "marker_uid"));
+            parsed["message_id"] = json!(text(marker, "message_id"));
+            parsed["parent_id"] = field(marker, "parent_id").clone();
+            parsed["ts_ms"] = field(marker, "ts_ms").clone();
+            parsed
+        })
+        .collect()
+}
+
+/// burn: `slash_triads` collapses caveat -> invocation -> output, chained by
+/// `parentUuid`, into one synthetic activity. Here that is one marker per
+/// command, and the three rows keep their own typed kind.
+#[test]
+fn claude_slash_command_triad_is_typed_grouped_and_kept_out_of_history() {
+    let key = "claude/slash-command-triad";
+    for (uid, kind) in [
+        ("u-prompt-1:0", None),
+        ("u-cav-1:0", Some("slash_command_caveat")),
+        ("u-inv-1:0", Some("slash_command_invocation")),
+        ("u-out-1:0", Some("slash_command_output")),
+        ("u-cav-2:0", Some("slash_command_caveat")),
+        ("u-inv-2:0", Some("slash_command_invocation")),
+        ("u-out-2:0", Some("slash_command_output")),
+    ] {
+        assert_eq!(control_kind_of(key, uid).as_deref(), kind, "{uid}");
+    }
+    assert_eq!(history_prompts(key), vec!["hi"]);
+
+    let markers = slash_command_markers(key);
+    assert_eq!(markers.len(), 2, "{markers:?}");
+    let review = &markers[0];
+    assert_eq!(review["marker_uid"], "u-inv-1:slash_command");
+    assert_eq!(review["message_id"], "u-inv-1");
+    assert_eq!(review["parent_id"], "u-cav-1");
+    assert_eq!(review["command_name"], "/review");
+    assert_eq!(review["command_message"], "review is running…");
+    assert_eq!(review["caveat_event_uid"], "u-cav-1:0");
+    assert_eq!(review["invocation_event_uid"], "u-inv-1:0");
+    assert_eq!(review["output_event_uid"], "u-out-1:0");
+    assert_eq!(review["stdout_bytes"], "review summary: no issues".len());
+    // The fixture's commands took no arguments and named no mode, and the
+    // payload says so by omission rather than by a fabricated value.
+    assert!(review.get("command_args").is_none());
+    assert!(review.get("command_mode").is_none());
+    let init = &markers[1];
+    assert_eq!(init["command_name"], "/init");
+    assert_eq!(init["output_event_uid"], "u-out-2:0");
+    assert_eq!(init["stdout_bytes"], "initialization complete".len());
+}
+
+/// burn's three-clause task-notification detector, on `origin.kind`,
+/// `attachment.commandMode` and the wrapper text. The fixture carries one
+/// row of each of the first two; both are typed and neither is a prompt.
+#[test]
+fn claude_task_notifications_are_control_rows_not_prompts() {
+    let key = "claude/task-notification";
+    assert_eq!(
+        control_kind_of(key, "u-tn-1:0").as_deref(),
+        Some("task_notification")
+    );
+    assert_eq!(
+        control_kind_of(key, "u-tn-2:0").as_deref(),
+        Some("task_notification")
+    );
+    assert_eq!(control_kind_of(key, "u-user-1:0"), None);
+    assert_eq!(control_kind_of(key, "u-user-2:0"), None);
+    assert_eq!(
+        history_prompts(key),
+        vec!["please fix the build", "thanks, also add a changelog entry"]
+    );
+    assert!(slash_command_markers(key).is_empty());
+}
+
+/// A `<system-reminder>` in user content is stored as its own row, sharing
+/// the prompt's `message_id`, and the prompt row and `history` carry only
+/// the human's text -- whether the reminder was its own content block, inline
+/// in a string, or the whole of a meta record.
+#[test]
+fn claude_system_reminders_are_rows_of_their_own_beside_the_prompt() {
+    let key = "claude/system-reminder";
+    let events = rows(key, "session_events");
+    let by_uid = |uid: &str| {
+        events
+            .iter()
+            .find(|event| text(event, "event_uid") == uid)
+            .unwrap_or_else(|| panic!("no event {uid}"))
+    };
+    // A reminder block beside a prompt block.
+    let reminder = by_uid("u-rem-1:0:reminder:0");
+    assert_eq!(text(reminder, "control_kind"), "system_reminder");
+    assert_eq!(text(reminder, "message_id"), "u-rem-1");
+    assert!(text(reminder, "text").starts_with("<system-reminder>"));
+    let prompt = by_uid("u-rem-1:1");
+    assert!(field(prompt, "control_kind").is_null());
+    assert_eq!(text(prompt, "message_id"), "u-rem-1");
+    assert_eq!(text(prompt, "text"), "tighten the retry loop");
+    // A reminder inline in a string prompt: the prompt row keeps the
+    // human's text, the reminder row the harness's.
+    assert_eq!(text(by_uid("u-rem-2:0"), "text"), "now add a test for it");
+    assert!(field(by_uid("u-rem-2:0"), "control_kind").is_null());
+    assert_eq!(
+        text(by_uid("u-rem-2:0:reminder:0"), "control_kind"),
+        "system_reminder"
+    );
+    // A meta record that is nothing but a reminder is a reminder row.
+    assert_eq!(
+        text(by_uid("u-rem-3:0:reminder:0"), "control_kind"),
+        "system_reminder"
+    );
+    assert_eq!(
+        history_prompts(key),
+        vec!["tighten the retry loop", "now add a test for it"]
+    );
+    let sessions = rows(key, "sessions");
+    assert_eq!(text(&sessions[0], "first_prompt"), "tighten the retry loop");
+}
+
+#[test]
+fn claude_hook_passthrough_and_meta_rows_are_typed() {
+    let key = "claude/hook-and-passthrough";
+    for (uid, kind) in [
+        ("u-hp-1:0", None),
+        // Flagged `isMeta` too; the hook wrapper is the more specific fact.
+        ("u-hook-1:0", Some("hook_output")),
+        ("u-bash-in:0", Some("bash_passthrough_input")),
+        ("u-bash-out:0", Some("bash_passthrough_output")),
+        ("u-meta-1:0", Some("meta")),
+        ("u-hp-2:0", None),
+    ] {
+        assert_eq!(control_kind_of(key, uid).as_deref(), kind, "{uid}");
+    }
+    assert_eq!(
+        history_prompts(key),
+        vec!["check the working tree", "commit it"]
+    );
+}
+
+/// The bare `/resume <id>` form is a marker naming the prior session, not a
+/// prompt: it is typed, and no longer the session's first prompt.
+#[test]
+fn claude_bare_resume_marker_is_a_control_row() {
+    let key = "claude/resume-marker";
+    assert_eq!(
+        control_kind_of(key, "u-resume-1:0").as_deref(),
+        Some("resume_marker")
+    );
+    assert!(history_prompts(key).is_empty());
+    assert!(field(&rows(key, "sessions")[0], "first_prompt").is_null());
+}
+
+/// Codex's `<environment_context>` wrapper is stored as a typed row rather
+/// than dropped, is not a prompt, and does not become the first prompt.
+#[test]
+fn codex_context_wrapper_is_typed_kept_and_not_a_prompt() {
+    let key = "codex/context-wrapper";
+    let rows = user_rows(key);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(
+        rows[0],
+        (
+            "4:response_item_user_message".to_string(),
+            Some("codex_context_wrapper".to_string())
+        )
+    );
+    assert_eq!(rows[1], ("5:response_item_user_message".to_string(), None));
+    assert_eq!(history_prompts(key), vec!["fix the importer"]);
+    assert_eq!(
+        text(&rows_sessions(key)[0], "first_prompt"),
+        "fix the importer"
+    );
+    // The wrapper line wrote a row, so it is not also an `unknown` marker.
+    assert!(
+        rows_markers(key)
+            .iter()
+            .all(|marker| text(marker, "kind") != "unknown"),
+        "{:?}",
+        rows_markers(key)
+    );
+}
+
+fn rows_sessions(key: &str) -> &[Value] {
+    rows(key, "sessions")
+}
+
+fn rows_markers(key: &str) -> &[Value] {
+    rows(key, "session_markers")
+}
+
+/// The invariant across the whole corpus: `history` is derived from the
+/// same classification as `control_kind`, so no control row's text is a
+/// prompt anywhere, and every untyped user text row of a local Claude or
+/// Codex session is.
+#[test]
+fn history_and_control_kind_agree_in_every_fixture() {
+    for fixture in CORPUS.iter().filter(|fixture| {
+        matches!(fixture.source, "claude" | "codex") && fixture.layout != Layout::Reference
+    }) {
+        let key = snapshot_key(fixture);
+        let prompts = history_prompts(&key);
+        for event in rows(&key, "session_events") {
+            if text(event, "role") != "user" || text(event, "kind") != "text" {
+                continue;
+            }
+            let body = text(event, "text").trim();
+            if !field(event, "control_kind").is_null() {
+                assert!(
+                    !prompts.iter().any(|prompt| prompt == body),
+                    "{key}: control row {} is in history",
+                    text(event, "event_uid")
+                );
+            }
+        }
+    }
+}
 
 /// burn: `simple_turn_parses` — `requestId` and `stop_reason` are raw fields
 /// on every complete Claude assistant record.
@@ -1914,45 +2606,184 @@ fn codex_session_meta_relationship_ids_are_recorded() {
     assert!(parents.contains("sess_fork_base"), "{relationships:?}");
 }
 
+/// The `session_events` rows of a fixture that record a tool result.
+fn tool_results(key: &str) -> Vec<&Value> {
+    rows(key, "session_events")
+        .iter()
+        .filter(|event| text(event, "kind") == "tool_result")
+        .collect()
+}
+
+/// The one tool result a fixture recorded for `tool_use_id`.
+fn tool_result<'a>(key: &'a str, tool_use_id: &str) -> &'a Value {
+    let matching = rows(key, "session_events")
+        .iter()
+        .filter(|event| {
+            text(event, "kind") == "tool_result" && text(event, "tool_use_id") == tool_use_id
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "{key}: results for {tool_use_id}");
+    matching[0]
+}
+
 /// burn: `measure_tool_result_populates_byte_length_and_truncation_flag` — the
 /// size of a tool result is the fact that decides whether it was truncated.
+/// The fixture is 80 000 literal characters with no harness marker, so burn's
+/// own reader reports it untruncated too.
 #[test]
-#[ignore = "closed by #171"]
 fn claude_oversized_tool_result_records_its_byte_length() {
-    let results = rows("claude/oversized-bash-output", "tool_results");
+    let results = tool_results("claude/oversized-bash-output");
     assert_eq!(results.len(), 1, "{results:?}");
-    assert!(
-        field(&results[0], "bytes").as_i64().unwrap_or_default() > 70_000,
-        "{results:?}"
-    );
+    assert_eq!(field(results[0], "payload_bytes").as_i64(), Some(80_000));
+    assert_eq!(field(results[0], "payload_truncated").as_i64(), Some(0));
+    assert_eq!(text(results[0], "event_source"), "tool_result");
+    assert_eq!(text(results[0], "tool_use_id"), "tu_bash_big");
 }
 
 /// burn: the codex shell output fixture is the same fact on the other
 /// provider.
 #[test]
-#[ignore = "closed by #171"]
 fn codex_oversized_shell_output_records_its_byte_length() {
-    let results = rows("codex/oversized-shell-output", "tool_results");
+    let results = tool_results("codex/oversized-shell-output");
     assert_eq!(results.len(), 1, "{results:?}");
-    assert!(
-        field(&results[0], "bytes").as_i64().unwrap_or_default() > 70_000,
-        "{results:?}"
-    );
+    assert_eq!(field(results[0], "payload_bytes").as_i64(), Some(80_000));
+    assert_eq!(field(results[0], "payload_truncated").as_i64(), Some(0));
+    assert_eq!(text(results[0], "event_source"), "function_call_output");
+    assert_eq!(text(results[0], "result_status"), "completed");
 }
 
 /// burn: `user_turn_blocks_text_and_tool_results` — three user records, the
-/// middle two carrying tool_result blocks of very different sizes.
+/// middle two carrying tool_result blocks of very different sizes, one of
+/// them failed by Claude's own `is_error`.
 #[test]
-#[ignore = "closed by #171"]
 fn claude_user_turn_tool_result_blocks_are_indexed_individually() {
-    let results = rows("claude/user-turn-blocks", "tool_results");
+    let key = "claude/user-turn-blocks";
+    let results = tool_results(key);
     assert_eq!(results.len(), 3, "{results:?}");
-    assert!(
-        results
-            .iter()
-            .any(|result| field(result, "is_error").as_i64() == Some(1)),
-        "{results:?}"
+    let indexed = results
+        .iter()
+        .map(|result| {
+            (
+                text(result, "tool_use_id"),
+                field(result, "payload_bytes").as_i64(),
+                field(result, "event_index").as_i64(),
+                field(result, "call_index").as_i64(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        indexed,
+        [
+            ("tu_bash_1", Some(4), Some(0), Some(0)),
+            ("tu_read_1", Some(100), Some(1), Some(0)),
+            ("tu_bash_2", Some(15), Some(2), Some(0)),
+        ]
     );
+    let failed = tool_result(key, "tu_bash_2");
+    assert_eq!(text(failed, "result_status"), "errored");
+    assert_eq!(text(failed, "error_signal"), "tool_result.is_error");
+}
+
+/// burn: codex `user_turn_blocks` — the failing shell call is failed out of
+/// band by `exec_command_end.exit_code`, and the row says which signal did it.
+#[test]
+fn codex_failed_call_names_its_exit_code_signal() {
+    let failed = tool_result("codex/user-turn-blocks", "call_b2");
+    assert_eq!(text(failed, "result_status"), "errored");
+    assert_eq!(text(failed, "error_signal"), "exit_code");
+    assert_eq!(text(failed, "event_source"), "function_call_output");
+    let passed = tool_result("codex/user-turn-blocks", "call_b1");
+    assert_eq!(text(passed, "result_status"), "completed");
+    assert!(field(passed, "error_signal").is_null(), "{passed}");
+}
+
+/// burn: `system_subagent_notification` — the harness line reporting a
+/// delegated child is a result on its own rail, linked to the child.
+#[test]
+fn claude_subagent_notification_links_the_child() {
+    let results = tool_results("claude/system-subagent-notification");
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert_eq!(text(results[0], "event_source"), "subagent_notification");
+    assert_eq!(
+        text(results[0], "subagent_session_id"),
+        "session-system-child"
+    );
+    assert_eq!(text(results[0], "agent_id"), "agent-system-1");
+}
+
+/// `replacement-meta`: both results are content blocks, each linked to the
+/// call it answers.
+#[test]
+fn claude_replacement_meta_results_keep_their_call_linkage() {
+    for id in ["tu_search_1", "tu_read_1"] {
+        let result = tool_result("claude/replacement-meta", id);
+        assert_eq!(text(result, "event_source"), "tool_result");
+        assert_eq!(field(result, "call_index").as_i64(), Some(0));
+    }
+}
+
+/// Cursor writes Claude-shaped result blocks, measured the same way.
+#[test]
+fn cursor_tool_result_records_its_fidelity() {
+    let result = tool_result("cursor/prompt-transcript", "toolu_cursor_1");
+    assert_eq!(field(result, "payload_bytes").as_i64(), Some(2));
+    assert_eq!(text(result, "event_source"), "tool_result");
+    assert_eq!(text(result, "result_status"), "completed");
+    assert_eq!(field(result, "event_index").as_i64(), Some(0));
+}
+
+/// Grok's result line carries its own `is_error`; that is the signal named.
+#[test]
+fn grok_failed_result_names_its_own_error_flag() {
+    let key = "grok/events-session";
+    let failed = tool_result(key, "call_shell_2");
+    assert_eq!(text(failed, "result_status"), "errored");
+    assert_eq!(text(failed, "error_signal"), "tool_result.is_error");
+    assert_eq!(text(failed, "event_source"), "function_call_output");
+    let results = tool_results(key);
+    let indexes = results
+        .iter()
+        .filter_map(|result| field(result, "event_index").as_i64())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(indexes, (0..results.len() as i64).collect());
+}
+
+/// burn: opencode `user_turn_blocks` — a bash part that exited 1 is a failed
+/// call even though the part's own status says `completed`.
+#[test]
+fn opencode_failed_part_names_its_exit_code_signal() {
+    let failed = tool_result("opencode/legacy-json-user-turn-blocks", "call_fail");
+    assert_eq!(text(failed, "result_status"), "errored");
+    assert_eq!(text(failed, "error_signal"), "exit_code");
+    assert_eq!(text(failed, "event_source"), "function_call_output");
+    assert_eq!(
+        field(failed, "payload_bytes").as_i64(),
+        Some("ERROR: tests failed".len() as i64)
+    );
+}
+
+/// Every provider with a tool-result parser records the fidelity facts on
+/// every tool-result row it writes: a null there is a parser that forgot, not
+/// a provider that does not say.
+#[test]
+fn every_parsed_tool_result_carries_its_fidelity() {
+    for fixture in CORPUS.iter().filter(|fixture| {
+        matches!(
+            fixture.source,
+            "claude" | "codex" | "cursor" | "grok" | "opencode"
+        ) && fixture.layout != Layout::Reference
+    }) {
+        let key = snapshot_key(fixture);
+        for result in tool_results(&key) {
+            for column in ["event_source", "result_status", "event_index"] {
+                assert!(
+                    !field(result, column).is_null(),
+                    "{key}: {column} is null on {}",
+                    text(result, "event_uid")
+                );
+            }
+        }
+    }
 }
 
 /// burn: `multi_block_turn_emits_one_inference_with_merged_usage` — the four
@@ -2061,4 +2892,151 @@ fn grok_events_and_real_timestamps_reach_session_events() {
             .all(|entry| field(entry, "timestamp_ms").as_i64() != Some(FIXTURE_MTIME_MS + 1)),
         "prompt timestamps come from the record, not from `created_at + index`: {prompts:?}"
     );
+}
+
+/// A transcript the real Muse CLI wrote: every prompt is a history row at the
+/// microsecond time Muse recorded, every read is a tool call joined to its
+/// result by call id, and the one call whose `tool_batch.effect.terminal`
+/// failed is the one marked as an error.
+#[test]
+fn muse_cli_capture_reaches_history_tools_and_recorded_times() {
+    let prompts = rows("muse/cli-capture", "history");
+    assert_eq!(prompts.len(), 3, "{prompts:?}");
+    assert_eq!(
+        field(&prompts[0], "timestamp_ms").as_i64(),
+        Some(1_788_223_110_680),
+        "the prompt's own `recorded_at`, in milliseconds: {prompts:?}"
+    );
+    let calls = rows("muse/cli-capture", "tool_calls");
+    let failed: Vec<&str> = calls
+        .iter()
+        .filter(|call| field(call, "is_error").as_i64() == Some(1))
+        .map(|call| text(call, "tool_use_id"))
+        .collect();
+    assert_eq!(failed, vec!["call_muse_missing"], "{calls:?}");
+    let events = rows("muse/cli-capture", "session_events");
+    assert!(
+        events
+            .iter()
+            .filter(|event| text(event, "role") == "user")
+            .all(|event| !text(event, "text").starts_with("Role:")),
+        "a mirrored task stream is never a prompt: {events:?}"
+    );
+    // Tool steps log `model_completed` before their calls and prose steps
+    // after their reply; every one of the six steps keeps its usage.
+    let with_usage: Vec<&str> = events
+        .iter()
+        .filter(|event| !field(event, "token_json").is_null())
+        .map(|event| text(event, "kind"))
+        .collect();
+    assert_eq!(
+        with_usage,
+        vec!["tool_use", "tool_use", "tool_use", "text", "text", "text"],
+        "{events:?}"
+    );
+}
+
+/// The authored Muse session: edits reach `file_edits`, a completed `bash`
+/// call whose command exited non-zero is an error, usage lands once per model
+/// step, and every `subagent/` log — a worker, the worker's own child and a
+/// reminder — is linked as a `delegated` child under the id its own metadata
+/// names, without becoming a catalog row or a typed prompt.
+#[test]
+fn muse_tools_session_records_edits_errors_usage_and_linked_subagents() {
+    const PARENT: &str = "muse-a001";
+    const WORKER: &str = "muse-c001";
+    const NESTED: &str = "muse-c002";
+    const REMINDER: &str = "muse-e001";
+    let edits = rows("muse/tools-session", "file_edits");
+    let mut paths: Vec<&str> = edits.iter().map(|edit| text(edit, "file_path")).collect();
+    paths.sort_unstable();
+    assert_eq!(paths, vec!["src/http.rs", "tests/retry.rs"], "{edits:?}");
+    let calls = rows("muse/tools-session", "tool_calls");
+    let bash = calls
+        .iter()
+        .find(|call| text(call, "tool_use_id") == "call_bash")
+        .expect("bash call");
+    assert_eq!(field(bash, "is_error").as_i64(), Some(1), "{bash:?}");
+    let events = rows("muse/tools-session", "session_events");
+    let parent_usage_rows = events
+        .iter()
+        .filter(|event| text(event, "session_id") == PARENT)
+        .filter(|event| !field(event, "token_json").is_null())
+        .count();
+    assert_eq!(
+        parent_usage_rows, 4,
+        "one row per model_completed step: {events:?}"
+    );
+    // Each step's usage sits on that step's first record: step 1's on its
+    // readable reasoning (not on the tool calls the same step committed),
+    // step 2's on its first call, the replies' on the replies.
+    let owners: Vec<(String, i64)> = events
+        .iter()
+        .filter(|event| text(event, "session_id") == PARENT)
+        .filter_map(|event| {
+            let usage: serde_json::Value =
+                serde_json::from_str(field(event, "token_json").as_str()?).ok()?;
+            Some((
+                text(event, "event_uid").to_string(),
+                usage["input_tokens"].as_i64()?,
+            ))
+        })
+        .collect();
+    assert_eq!(
+        owners,
+        vec![
+            ("a001-rec-006".to_string(), 1200),
+            ("tool:call_edit".to_string(), 1500),
+            ("a001-rec-020".to_string(), 1800),
+            ("a001-rec-029".to_string(), 2000),
+        ]
+    );
+
+    let sessions = rows("muse/tools-session", "sessions");
+    assert_eq!(
+        sessions.len(),
+        1,
+        "children are not catalog rows: {sessions:?}"
+    );
+    assert_eq!(
+        text(&sessions[0], "models_json"),
+        r#"["meta/muse-spark-1.3","meta/muse-spark-1.3-contributor"]"#
+    );
+    let history = rows("muse/tools-session", "history");
+    assert!(
+        history.iter().all(|row| text(row, "session_id") == PARENT),
+        "a child's objective is not a typed prompt: {history:?}"
+    );
+
+    let edges = rows("muse/tools-session", "session_relationships");
+    let edge = |child: &str| {
+        edges
+            .iter()
+            .find(|edge| text(edge, "child_session_id") == child)
+            .unwrap_or_else(|| panic!("no edge to {child}: {edges:?}"))
+    };
+    for (child, parent, agent_type, depth) in [
+        (WORKER, PARENT, "worker", 1),
+        (REMINDER, PARENT, "reminder", 1),
+        (NESTED, WORKER, "worker", 2),
+    ] {
+        let edge = edge(child);
+        assert_eq!(text(edge, "parent_session_id"), parent, "{edge:?}");
+        assert_eq!(text(edge, "relationship"), "delegated", "{edge:?}");
+        assert_eq!(text(edge, "child_agent_type"), agent_type, "{edge:?}");
+        assert_eq!(field(edge, "spawn_depth").as_i64(), Some(depth), "{edge:?}");
+        assert_eq!(
+            field(edge, "child_has_events").as_i64(),
+            Some(1),
+            "{edge:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| text(event, "session_id") == child),
+            "the child's events are stored under its own id: {child}"
+        );
+    }
+    assert_eq!(text(edge(NESTED), "child_model"), "meta/muse-glimmer-30b");
+    assert_eq!(text(edge(WORKER), "child_agent_name"), "reviewer");
 }

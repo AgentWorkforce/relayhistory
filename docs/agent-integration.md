@@ -17,7 +17,13 @@ Use these public operations:
 - `discoverSessions()` / MCP `discover_sessions` to refresh shallow provider
   metadata.
 - `search()`, `recent()`, `getSession()`, and `getSessionEventsPage()` for
-  indexed history reads.
+  indexed history reads. `search()`, MCP `search_history` and `ai-hist search`
+  share one contract: prompts and session events, filtered by `role`
+  (`all`, `user`, `assistant`, `prompt`), with each match's `matchSource`,
+  `role` and `kind`. Page them with `searchPage()` / `recentPage()` and the
+  returned `nextCursor` (MCP: pass the last row's `timestampMs`, `id` and
+  `matchSource` as `after`), and bound them with inclusive `sinceMs` /
+  `untilMs`. `beforeMs` is deprecated: it skips rows tied on its timestamp.
 - `getSessionRelationships()` / MCP `get_session_relationships` and
   `getSessionTree()` / MCP `get_session_tree` for delegation topology, plus
   the SDK-only `getSessionChildrenPage()`, `sessionDescendants()`, and
@@ -29,6 +35,17 @@ Use these public operations:
   edits. Both name a session by `source` **and** `sessionId`; provider session
   ids collide, and these pages never merge two providers' records.
 - `sync()` / MCP `sync` for explicit full local ingestion.
+- `createHandoff()` / MCP `create_handoff` and `resumeHandoff()` / MCP
+  `resume_handoff` for workspace-scoped agent handoffs.
+- MCP `list_relay_agents` to list live Agent Relay participants through the
+  local desktop socket. This is presence, not history; it takes optional
+  `query`, `where`, and `include_idle` filters and uses no cloud auth.
+- MCP `relay_status`, `join_relay`, and `leave_relay` to inspect whether the
+  local session hosting the MCP server is reachable, put only that session on the relay (optionally
+  with a public name and description), and remove it again. Joining makes the
+  session reachable by teammates and agents. These use the same local socket,
+  return a non-fatal instruction when desktop is absent, and preserve the
+  desktop's `not_allowed` setting guidance.
 
 Pass `scope` to collection operations when the default local view is not
 enough. The CLI spelling is the mutually exclusive `--local`, `--remote`, and
@@ -38,7 +55,7 @@ lookups are identity-based and scope-independent.
 
 Remote discovery and remote sync run through provider connectors
 (claude.ai/code web sessions and Codex cloud tasks — see
-[Remote connectors](remote-connectors.md)). A `remote`-only request on a
+[Remote connectors](source-plugins.md)). A `remote`-only request on a
 machine with no connector configured fails explicitly, and integrations must
 surface that error rather than retrying locally; an `all` request runs
 whatever is configured and skips remote quietly on absence — `locationsRun`
@@ -51,7 +68,8 @@ observed presences.
 
 The CLI equivalents are `sessions list`, `sessions discover`,
 `sessions hydrate`, `sessions relationships`, `sessions tree`,
-`sessions tools`, `sessions edits`, `search`, `recent`,
+`sessions tools`, `sessions edits`, `sessions markers`, `sessions usage`,
+`search`, `recent`,
 `session`, `events`, `stats`, and `sync`. See
 [Session catalog](session-catalog.md) for discovery and pagination contracts
 and [Architecture](architecture.md) for the process boundary.
@@ -59,6 +77,35 @@ and [Architecture](architecture.md) for the process boundary.
 The old cloud push, login, Pair, hook installer, tag, and trajectory convenience
 commands were removed in 1.0. They are not available through subprocess or
 JavaScript fallbacks; see the [migration guide](native-sdk-migration.md).
+
+## Agent handoffs
+
+`create_handoff(intent)` returns a pointer rather than transcript content. Its
+single `intent` field is a complete receiver prompt of this form:
+
+```text
+Resume this handoff: call resume_handoff(source=codex, session_id=abc) via the ai-hist MCP, then continue: continue the fix
+```
+
+Send that exact value as the Agent Relay DM text and the full pointer as
+structured `kind="handoff"` metadata. Do not add a separate message or text
+field: the cloud validator requires the DM text to equal the pointer's
+`intent`. The receiving agent needs only the prompt and the ai-hist MCP; there
+is no handoff skill to install. It calls `resume_handoff` with the embedded
+identity and continues the original request using the returned prompts,
+events, tool calls, and file edits. If a bounded result has `next_cursor`, pass
+that cursor back unchanged for the next page.
+
+Caller intent accepts up to 4,000 characters. Because the generated resume
+instruction shares that bound, `create_handoff` keeps the instruction intact
+and truncates only an overflowing caller-intent suffix, ending it with `…`.
+
+Before sending the pointer, call `resume_handoff` once yourself as a readiness
+check. Agent Relay desktop owns team upload, so this proves the current
+workspace can already acquire the session rather than sending a pointer ahead
+of its evidence. Resume refreshes the `cloud` connector under the currently
+authenticated workspace and rejects cross-workspace or cross-organization
+sessions.
 
 ## Live capture
 

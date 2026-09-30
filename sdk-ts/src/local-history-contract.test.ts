@@ -142,10 +142,16 @@ test('local discovery, hydration and cached evidence survive malformed commercia
     // These record IDs, event UIDs, raw patches and arguments are the existing
     // evidence contract a future exporter must preserve across retry/restart.
     assert.deepEqual(await readEvidence(), original);
-    const prompts = await search('contractneedle', { dbPath, scope: 'local' });
+    // Search spans prompts and session events; the prompt itself is the
+    // `history` match.
+    const prompts = (await search('contractneedle', { dbPath, scope: 'local' }))
+      .filter((match) => match.matchSource === 'history');
     assert.equal(prompts.length, 1);
     assert.deepEqual(prompts[0].locations, ['local']);
-    assert.deepEqual(await recent({ dbPath, scope: 'local' }), prompts);
+    assert.deepEqual(
+      await recent({ dbPath, scope: 'local' }),
+      prompts.map(({ matchSource: _source, role: _role, kind: _kind, ...entry }) => entry),
+    );
     assert.equal((await stats({ dbPath, scope: 'local' })).total, 1);
   });
 });
@@ -182,7 +188,8 @@ test('OpenCode reports full capability and stores normalized events', { skip: ne
     assert.deepEqual(hydrated.coverage, [...FULL_SESSION_KINDS]);
     assert.equal(hydrated.evidence.prompts, 1);
     assert.equal(hydrated.evidence.events, 1);
-    assert.equal((await search('openeedle', { dbPath, scope: 'local' })).length, 1);
+    assert.equal((await search('openeedle', { dbPath, scope: 'local', role: 'user' }))
+      .filter((match) => match.matchSource === 'history').length, 1);
     assert.equal(
       hydrated.diagnostics.some((item) => item.code === 'HYDRATION_PARTIAL_COVERAGE'),
       false,
@@ -255,6 +262,8 @@ test('per-message raw provider facts reach the SDK unnormalized', async () => {
     );
     assert.deepEqual(events.map((event) => event.isMeta), [null, null, null]);
     assert.deepEqual(events.map((event) => event.turnId), [null, null, null]);
+    // A genuine prompt and model output carry no control kind.
+    assert.deepEqual(events.map((event) => event.controlKind), [null, null, null]);
 
     // A page carries the same shape as the whole-session read.
     const page = await getSessionEventsPage('facts-session', { source: 'claude', dbPath });

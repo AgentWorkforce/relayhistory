@@ -2,17 +2,20 @@
 
 import { realpathSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
+import { resolve as resolvePath } from 'node:path';
 import type { Writable } from 'node:stream';
 import { pathToFileURL } from 'node:url';
 
 import {
-  discoverSessions, ensureLocalStore, formatSessionRow, getSession, getSessionEventsPage, getSessionFileEditsPage,
-  getSessionRelationships, getSessionToolCallsPage, getSessionTree, hydrateSession,
-  listSessionCatalogPage, recent, resumeCommand, search, stats, sync,
+  discoverSessions, ensureLocalStore, formatSessionRow, onStoreMigration, getSession, getSessionEventsPage, getSessionFileEditsPage,
+  getSessionMarkersPage, getSessionRelationships, getSessionToolCallsPage, getSessionTree, getSessionUsage,
+  hydrateSession, listSessionCatalogPage, recent, resumeCommand, search, stats, sync,
   type CatalogCursor, type EvidenceCursor, type HistoryEntry, type LocalStoreReadiness,
-  type SessionFileEditsPage, type SessionRelationship, type SessionScope, type SessionToolCallsPage,
+  type SessionFileEditsPage, type SessionMarkersPage, type SessionRelationship, type SessionScope,
+  type SessionToolCallsPage, type SessionUsage, type SearchRole, type HistoryCursor,
 } from './index.js';
-import { runDeliveryCommand, runHistoryExportCommand, loadHistoryApplicationConfig } from './delivery-cli.js';
+import { runHistoryExportCommand, loadHistoryApplicationConfig } from './delivery-cli.js';
+import { defaultDbPath } from './sdk-common.js';
 
 type Parsed = { positional: string[]; flags: Map<string, Array<string | true>> };
 
@@ -48,8 +51,8 @@ type PackageMetadata = { version?: string };
 
 export const BOOLEAN_FLAGS = new Set(['all', 'by-cwd', 'fts', 'help', 'json', 'local', 'no-bootstrap', 'no-related', 'no-source-connectors', 'no-warning', 'once', 'pretty', 'remote', 'version']);
 export const VALUE_FLAGS = new Set([
-  'config', 'job', 'selection', 'poll-ms', 'timeout-ms', 'base-url', 'interval', 'label', 'max-content', 'out', 'after', 'after-ms', 'after-session-id', 'after-source', 'before-ms', 'db', 'limit',
-  'max-depth', 'max-nodes', 'config', 'source-connector', 'project', 'source', 'tag', 'token', 'tokens',
+  'config', 'selection', 'interval', 'out', 'after', 'after-ms', 'after-session-id', 'after-source', 'before-ms', 'db', 'limit',
+  'max-depth', 'max-nodes', 'config', 'source-connector', 'project', 'role', 'since-ms', 'source', 'tag', 'tokens', 'until-ms',
   // Documented in the usage text and read by `sessions discover`, `sessions
   // hydrate` and `sync`, but absent here, so `parse` rejected it as unknown.
   'acquisition-timeout-ms',
@@ -90,6 +93,96 @@ function isBinEntrypoint(): boolean {
 async function packageVersion(): Promise<string> {
   const contents = await readFile(new URL('../package.json', import.meta.url), 'utf8');
   return (JSON.parse(contents) as PackageMetadata).version ?? 'unknown';
+}
+
+/**
+ * Where the command lines running in this process send their stderr, with how
+ * many running calls share each sink.
+ */
+const migrationSinks = new Map<CliIo, number>();
+/** Start time of each migration announced but not yet ended, by database. */
+const migrationsRunning = new Map<string, number>();
+/** Calls waiting for their database's migration to end, by database. */
+const migrationWaiters = new Map<string, Set<() => void>>();
+
+/** One spelling per database file, whichever path reached it. */
+function databaseKey(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolvePath(path);
+  }
+}
+
+/** The database a command line opens: its `--db`, else the default. */
+function commandDatabase(argv: readonly string[]): string {
+  try {
+    return databaseKey(textFlag(parse([...argv]), 'db') ?? defaultDbPath());
+  } catch {
+    return databaseKey(defaultDbPath());
+  }
+}
+let migrationListener: Promise<unknown> | null = null;
+
+/**
+ * Name a schema migration while it runs, so the first command after an upgrade
+ * does not sit silent for minutes and read as a hang. The native listener is
+ * registered once per process; each event goes to the command lines running
+ * when it fires. Best effort: a missing native package is reported by the
+ * command itself.
+ */
+function listenForMigrations(): Promise<unknown> {
+  migrationListener ??= (async () => {
+    const version = await packageVersion();
+    return onStoreMigration((event, dbPath) => {
+      const key = dbPath === null ? '' : databaseKey(dbPath);
+      if (event === 'started') {
+        migrationsRunning.set(key, Date.now());
+        for (const io of migrationSinks.keys()) {
+          io.stderr(`Upgrading the ai-hist database to ${version}. This runs once and can take a few minutes on a large history...\n`);
+        }
+        return;
+      }
+      const started = migrationsRunning.get(key) ?? Date.now();
+      migrationsRunning.delete(key);
+      // A failed migration is reported by the command whose open it was.
+      if (event === 'finished') {
+        for (const io of migrationSinks.keys()) io.stderr(`Database upgraded in ${formatElapsed(Date.now() - started)}.\n`);
+      }
+      for (const settle of [...(migrationWaiters.get(key) ?? [])]) settle();
+    });
+  })().catch(() => false);
+  return migrationListener;
+}
+
+/**
+ * Wait for the end of a migration of `database` that started, so its last line
+ * is not lost to an exit. Each `started` is followed by a `finished` or
+ * `failed` queued before the migrating call returned, so this takes
+ * milliseconds. The listener never keeps the process alive, so a timer does
+ * while waiting; if it fires, only this wait gives up -- the migration's own
+ * state is left for its terminal event.
+ */
+async function migrationEnded(database: string): Promise<void> {
+  if (!migrationsRunning.has(database)) return;
+  const waiters = migrationWaiters.get(database) ?? new Set<() => void>();
+  migrationWaiters.set(database, waiters);
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(settle, 2_000);
+    function settle(): void {
+      clearTimeout(timer);
+      waiters.delete(settle);
+      if (waiters.size === 0 && migrationWaiters.get(database) === waiters) migrationWaiters.delete(database);
+      resolve();
+    }
+    waiters.add(settle);
+  });
+}
+
+function formatElapsed(ms: number): string {
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
 }
 
 async function maybePrintUpdateNotice(io: CliIo, current: string, args: string[]): Promise<void> {
@@ -206,6 +299,8 @@ function common(args: Parsed) {
     tag: textFlag(args, 'tag'),
     limit: numberFlag(args, 'limit'),
     beforeMs: numberFlag(args, 'before-ms'),
+    sinceMs: numberFlag(args, 'since-ms'),
+    untilMs: numberFlag(args, 'until-ms'),
   };
 }
 
@@ -215,7 +310,7 @@ function snakeCase(key: string): string {
 
 // Parsed provider payloads are data, not RelayHistory field names: their own
 // keys must reach stdout exactly as the provider wrote them.
-const OPAQUE_JSON_KEYS = new Set(['args', 'structuredPatch']);
+const OPAQUE_JSON_KEYS = new Set(['args', 'structuredPatch', 'payload']);
 
 function wireValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(wireValue);
@@ -228,7 +323,12 @@ export function humanLine(value: unknown): string {
   if (!value || typeof value !== 'object') return String(value);
   const row = value as Record<string, unknown>;
   const locations = Array.isArray(row.locations) ? `[${row.locations.join(',')}]` : '';
-  return [row.timestampMs ?? row.lastActivityMs ?? '', row.source ?? '', locations, row.sessionId ?? '', row.project ?? row.cwd ?? '', row.prompt ?? row.firstPrompt ?? '']
+  // A search match that is a session event, not a prompt, says which event it
+  // is, as the Rust CLI labels it: `source:role:kind`.
+  const source = row.matchSource != null && row.matchSource !== 'history'
+    ? `${row.source ?? ''}:${row.role ?? ''}:${row.kind ?? ''}`
+    : row.source ?? '';
+  return [row.timestampMs ?? row.lastActivityMs ?? '', source, locations, row.sessionId ?? '', row.project ?? row.cwd ?? '', row.prompt ?? row.firstPrompt ?? '']
     .filter((item) => item !== '' && item != null)
     .join('  ');
 }
@@ -261,17 +361,16 @@ const USAGE_TEXT = `Usage:
   ai-hist sessions tree SOURCE SESSION_ID [--max-depth N] [--max-nodes N] [--db PATH] [--json]
   ai-hist sessions tools SOURCE SESSION_ID [--limit N] [--after JSON] [--db PATH] [--json]
   ai-hist sessions edits SOURCE SESSION_ID [--limit N] [--after JSON] [--db PATH] [--json]
-  ai-hist search QUERY... [--local | --remote | --all] [--source SOURCE] [--project PATH] [--limit N] [--json]
-  ai-hist recent [N] [--local | --remote | --all] [--source SOURCE] [--project PATH] [--json]
+  ai-hist sessions markers SOURCE SESSION_ID [--limit N] [--after JSON] [--db PATH] [--json]
+  ai-hist sessions usage SOURCE SESSION_ID [--db PATH] [--json]
+  ai-hist search QUERY... [--local | --remote | --all] [--source SOURCE] [--project PATH] [--role all|user|assistant|prompt] [--fts] [--since-ms MS] [--until-ms MS] [--after JSON] [--limit N] [--json]
+  ai-hist recent [N] [--local | --remote | --all] [--source SOURCE] [--project PATH] [--since-ms MS] [--until-ms MS] [--after JSON] [--json]
   ai-hist session SESSION_ID [--source SOURCE] [--json]
   ai-hist events SESSION_ID [--source SOURCE] [--limit N] [--after JSON] [--json]
   ai-hist resume QUERY... [--local | --remote | --all] [--db PATH] [--fts] [--json]
   ai-hist pack QUERY... [--local | --remote | --all] [--source SOURCE] [--project PATH] [--tag TAG] [--limit N] [--tokens N] [--db PATH] [--fts] [--json]
   ai-hist stats [--local | --remote | --all] [--json]
   ai-hist export --selection FILE [--out FILE] [--db PATH]
-  ai-hist delivery enable|drain|run --config FILE [--job ID] [--db PATH]
-  ai-hist delivery status|pause|resume|retry|cancel [--job ID] [--db PATH]
-  ai-hist plugin COMMAND --config FILE -- [ARGS...]
   ai-hist sync [--local | --remote | --all] [--source-connector ID | --no-source-connectors] [--acquisition-timeout-ms N] [--db PATH] [--json]
 
 Every command that reads local history indexes it on first use; pass
@@ -289,6 +388,24 @@ function usage(message?: string): never {
 function cursorFlag<T>(args: Parsed): T | undefined {
   const raw = textFlag(args, 'after');
   return raw ? JSON.parse(raw) as T : undefined;
+}
+
+// `search`/`recent` --json rows are snake_case, so --after takes a row's
+// `timestamp_ms`/`id`/`match_source` or the SDK's camelCase cursor.
+function historyCursorFlag(args: Parsed): HistoryCursor | undefined {
+  const raw = cursorFlag<Record<string, unknown>>(args);
+  if (raw === undefined) return undefined;
+  const timestampMs = raw?.timestampMs ?? raw?.timestamp_ms;
+  const matchSource = raw?.matchSource ?? raw?.match_source;
+  if (!Number.isInteger(timestampMs) || !Number.isInteger(raw.id)) {
+    throw new Error('--after must be a JSON cursor with integer timestamp_ms (or timestampMs) and id');
+  }
+  // Any string is passed on: the native cursor validation rejects an unknown
+  // source with the same INVALID_ARGUMENT the SDK and MCP report.
+  if (matchSource != null && typeof matchSource !== 'string') {
+    throw new Error('--after match_source must be a string');
+  }
+  return { timestampMs: timestampMs as number, id: raw.id as number, ...(matchSource != null ? { matchSource } : {}) } as HistoryCursor;
 }
 
 function catalogCursorFlag(args: Parsed): CatalogCursor | undefined {
@@ -379,6 +496,47 @@ function outputFileEdits(io: CliIo, page: SessionFileEditsPage, json: boolean): 
     ].join('  ').concat('\n'));
   }
   continuationNotice(io, page.nextCursor);
+}
+
+function outputMarkers(io: CliIo, page: SessionMarkersPage, json: boolean): void {
+  if (json) {
+    output(io, page, true);
+    return;
+  }
+  if (page.markers.length === 0) {
+    io.stdout('No markers.\n');
+    return;
+  }
+  for (const marker of page.markers) {
+    io.stdout([
+      marker.tsMs ?? '-', marker.source, marker.kind, marker.subkind ?? '-',
+      marker.messageId ?? '-', marker.text ?? '-',
+    ].join('  ').concat('\n'));
+  }
+  continuationNotice(io, page.nextCursor);
+}
+
+// Usage is provider-reported and never estimated here: an absent total is
+// printed as absent, and cost appears only when the source data carried one.
+function outputUsage(io: CliIo, value: SessionUsage, json: boolean): void {
+  if (json) {
+    output(io, value, true);
+    return;
+  }
+  io.stdout(`${value.source}/${value.sessionId}: ${value.requestCount} of ${value.totalRequestCount} request(s) with usage\n`);
+  if (value.usage) {
+    const usage = value.usage;
+    io.stdout(
+      `tokens: input=${usage.inputTokens} output=${usage.outputTokens}` +
+      ` cache_read=${usage.cacheReadTokens} cache_write=${usage.cacheWriteTokens}` +
+      ` reasoning=${usage.reasoningTokens ?? '-'} provider_total=${usage.providerTotalTokens ?? '-'}\n`,
+    );
+    io.stdout(`accounting: ${usage.accounting}; reported cost: ${usage.reportedCostUsd ?? 'none'}\n`);
+  } else {
+    io.stdout(`tokens: none established${value.overflowed ? ' (overflowed)' : ''}\n`);
+  }
+  if (value.models.length) io.stdout(`models: ${value.models.join(', ')}\n`);
+  for (const diagnostic of value.diagnostics) io.stdout(`diagnostic: ${diagnostic}\n`);
 }
 
 function outputHydration(io: CliIo, value: Awaited<ReturnType<typeof hydrateSession>>, json: boolean): void {
@@ -474,6 +632,7 @@ async function runResume(io: CliIo, args: Parsed, subcommand: string | undefined
   // one row is checked for a usable session id rather than scanning further.
   const rows = await search(query.join(' '), {
     dbPath: textFlag(args, 'db'), scope: scopeFlag(args), rawFts: args.flags.has('fts'), limit: 1,
+    role: 'prompt',
   });
   const entry = rows.find((row) => row.sessionId);
   if (!entry) throw new Error('No session found');
@@ -529,7 +688,7 @@ async function runPack(io: CliIo, args: Parsed, subcommand: string | undefined, 
   // The native Pack command defaults its own limit to 10, distinct from
   // search()'s general-purpose default of 20 — match Pack specifically.
   const rows = await search(queryStr, {
-    ...common(args), limit: numberFlag(args, 'limit') ?? 10, rawFts: args.flags.has('fts'),
+    ...common(args), limit: numberFlag(args, 'limit') ?? 10, rawFts: args.flags.has('fts'), role: 'prompt',
   });
   if (rows.length === 0) {
     if (json) {
@@ -675,11 +834,10 @@ export const FLAG_SPECS: Record<string, { flags: string; description: string }> 
   'after-session-id': { flags: '--after-session-id <id>', description: 'Cursor session id, with --after-source.' },
   'after-source': { flags: '--after-source <source>', description: 'Cursor source, with --after-session-id.' },
   all: { flags: '--all', description: 'Read local and remote history.' },
-  'before-ms': { flags: '--before-ms <ms>', description: 'Only entries older than this epoch-millisecond timestamp.' },
+  'before-ms': { flags: '--before-ms <ms>', description: 'Deprecated: only entries older than this timestamp; skips ties. Use --after.' },
   config: { flags: '--config <file>', description: 'History application config file.' },
   db: { flags: '--db <path>', description: 'History database to read or write.' },
   fts: { flags: '--fts', description: 'Treat the query as raw SQLite full-text syntax.' },
-  job: { flags: '--job <id>', description: 'Act on one delivery job.' },
   json: { flags: '--json', description: 'Emit JSON instead of human-readable text.' },
   limit: { flags: '--limit <n>', description: 'Maximum rows to return.' },
   local: { flags: '--local', description: 'Read only local history (the default).' },
@@ -689,16 +847,17 @@ export const FLAG_SPECS: Record<string, { flags: string; description: string }> 
   'no-related': { flags: '--no-related', description: 'Do not hydrate related sessions.' },
   'no-source-connectors': { flags: '--no-source-connectors', description: 'Disable remote acquisition entirely.' },
   out: { flags: '--out <file>', description: 'Write to this file instead of standard output.' },
-  'poll-ms': { flags: '--poll-ms <ms>', description: 'Delivery poll interval, in milliseconds.' },
   pretty: { flags: '--pretty', description: 'Render aligned, colourized rows.' },
   'by-cwd': { flags: '--by-cwd', description: 'Group projects by working directory instead of canonical project key.' },
   project: { flags: '--project <value>', description: 'Restrict to one project: a canonical project key for `sessions list`, a project path elsewhere.' },
   remote: { flags: '--remote', description: 'Read only remote history.' },
+  role: { flags: '--role <role>', description: 'Match all (default), user, assistant or prompt rows.' },
+  'since-ms': { flags: '--since-ms <ms>', description: 'Only entries at or after this epoch-millisecond timestamp.' },
+  'until-ms': { flags: '--until-ms <ms>', description: 'Only entries at or before this epoch-millisecond timestamp.' },
   selection: { flags: '--selection <file>', description: 'Export selection file.' },
   source: { flags: '--source <source>', description: 'Restrict to one coding-agent source.' },
   'source-connector': { flags: '--source-connector <id>', description: 'Run this remote connector; repeatable.' },
   tag: { flags: '--tag <tag>', description: 'Restrict to entries carrying this tag.' },
-  'timeout-ms': { flags: '--timeout-ms <ms>', description: 'Per-request delivery timeout, in milliseconds.' },
   tokens: { flags: '--tokens <n>', description: 'Approximate token budget for the packed output.' },
 };
 
@@ -715,23 +874,6 @@ export const COMMANDS = new Map<string, CommandSpec>([
     positionals: [0, 0], allowed: ['db', 'json', 'help'], readsLocalStore: true }],
   ['export', { name: 'export', description: 'Export selected history as NDJSON.', surface: ['export'],
     positionals: [0, 0], allowed: ['db', 'selection', 'out'] }],
-  // A config-driven extension hook that needs `-- ARGS` passthrough, not a
-  // user-facing verb: it stays on the bin and off the mounted tree.
-  ['plugin', { name: 'plugin', description: 'Run a configured history plugin command.', surface: null,
-    positionals: [1, null], allowed: ['config'], requires: 'plugin requires a command name' }],
-  ...(Object.entries({
-    enable: 'Create the delivery job declared in the config file.',
-    status: 'Report delivery job status and retention.',
-    drain: 'Deliver everything currently queued, then stop.',
-    run: 'Run the delivery loop until it is cancelled.',
-    pause: 'Stop a delivery job from making progress.',
-    resume: 'Let a paused delivery job make progress again.',
-    retry: 'Clear a delivery job\'s failure and try it again.',
-    cancel: 'Abandon a delivery job.',
-  }) as Array<[string, string]>).map(([action, description]): [string, CommandSpec] => [`delivery ${action}`, {
-    name: `delivery ${action}`, description: `${description} Moved to agent-relay-probe / @relayhistory/capture.`, surface: ['delivery', action],
-    positionals: [0, 0], allowed: ['db', 'config', 'job', 'poll-ms', 'timeout-ms'],
-  }]),
   ['sessions list', { name: 'sessions list', description: 'List indexed sessions from the catalogue.',
     surface: ['list'], positionals: [0, 0], readsLocalStore: true,
     validate: (args) => {
@@ -764,10 +906,16 @@ export const COMMANDS = new Map<string, CommandSpec>([
   ['sessions edits', { name: 'sessions edits', description: 'Page through a session\'s file edits.',
     surface: ['edits'], positionals: [2, 2], args: [{ name: 'source', description: 'Coding-agent source, e.g. claude or codex.', required: true }, { name: 'session-id', description: 'Session identifier.', required: true }], readsLocalStore: true,
     requires: 'sessions edits requires SOURCE and SESSION_ID', allowed: ['after', 'db', 'json', 'limit'] }],
-  ['search', { name: 'search', description: 'Search indexed prompts.', surface: ['search'],
+  ['sessions markers', { name: 'sessions markers', description: 'Page through a session\'s markers: compaction and summary boundaries, provider system rows, non-text blocks.',
+    surface: ['markers'], positionals: [2, 2], args: [{ name: 'source', description: 'Coding-agent source, e.g. claude or codex.', required: true }, { name: 'session-id', description: 'Session identifier.', required: true }], readsLocalStore: true,
+    requires: 'sessions markers requires SOURCE and SESSION_ID', allowed: ['after', 'db', 'json', 'limit'] }],
+  ['sessions usage', { name: 'sessions usage', description: 'Provider-reported token usage rollup for a session; cost is never computed.',
+    surface: ['usage'], positionals: [2, 2], args: [{ name: 'source', description: 'Coding-agent source, e.g. claude or codex.', required: true }, { name: 'session-id', description: 'Session identifier.', required: true }], readsLocalStore: true,
+    requires: 'sessions usage requires SOURCE and SESSION_ID', allowed: ['db', 'json'] }],
+  ['search', { name: 'search', description: 'Search indexed prompts and session events.', surface: ['search'],
     positionals: [1, null], args: [{ name: 'query', description: 'Search terms.', required: true, variadic: true }],
     requires: 'search requires a query', readsLocalStore: true,
-    allowed: ['all', 'before-ms', 'db', 'fts', 'json', 'limit', 'local', 'project', 'remote', 'source', 'tag'] }],
+    allowed: ['after', 'all', 'before-ms', 'db', 'fts', 'json', 'limit', 'local', 'project', 'remote', 'role', 'since-ms', 'source', 'tag', 'until-ms'] }],
   ['recent', { name: 'recent', description: 'Show the most recent prompts.', surface: ['recent'],
     positionals: [0, 1], args: [{ name: 'count', description: 'How many to show.', required: false }],
     readsLocalStore: true,
@@ -777,7 +925,7 @@ export const COMMANDS = new Map<string, CommandSpec>([
         usage(`recent count must be a number (got '${count}')`);
       }
     },
-    allowed: ['all', 'before-ms', 'db', 'json', 'limit', 'local', 'project', 'remote', 'source', 'tag'] }],
+    allowed: ['after', 'all', 'before-ms', 'db', 'json', 'limit', 'local', 'project', 'remote', 'since-ms', 'source', 'tag', 'until-ms'] }],
   // `agent-relay sessions session ID` reads badly, so the mounted spelling is
   // `show`; the original name stays as an alias for existing muscle memory.
   ['session', { name: 'session', description: 'Show one session.', surface: ['show'], surfaceAliases: ['session'],
@@ -811,12 +959,12 @@ export const COMMANDS = new Map<string, CommandSpec>([
 /** Command words consumed before the positional arguments start. */
 function commandWords(command: string | undefined): number {
   if (command === undefined) return 0;
-  return command === 'sessions' || command === 'delivery' ? 2 : 1;
+  return command === 'sessions' ? 2 : 1;
 }
 
 function commandSpec(command: string | undefined, subcommand: string | undefined): CommandSpec | undefined {
   if (command === undefined) return COMMANDS.get('');
-  if (command === 'sessions' || command === 'delivery') return subcommand ? COMMANDS.get(`${command} ${subcommand}`) : undefined;
+  if (command === 'sessions') return subcommand ? COMMANDS.get(`${command} ${subcommand}`) : undefined;
   return COMMANDS.get(command);
 }
 
@@ -832,12 +980,8 @@ function commandSpec(command: string | undefined, subcommand: string | undefined
  * about which commands those are.
  */
 export function usesCancellation(argv: readonly string[]): boolean {
-  // `plugin -- ARGS` passes its tail to a plugin verbatim, and `plugin` is not
-  // cancellable, so stopping at the separator can only ever read less.
-  const boundary = argv.indexOf('--');
-  const core = [...(boundary < 0 ? argv : argv.slice(0, boundary))];
   try {
-    const { positional } = parse(core.map((arg) => arg === '-h' ? '--help' : arg));
+    const { positional } = parse(argv.map((arg) => arg === '-h' ? '--help' : arg));
     return commandSpec(positional[0], positional[1])?.cancellable === true;
   } catch {
     // An argv `parse` refuses is a usage error `dispatch` is about to report.
@@ -848,7 +992,7 @@ export function usesCancellation(argv: readonly string[]): boolean {
 
 function unknownCommandMessage(command: string | undefined, subcommand: string | undefined): string {
   if (command === undefined) return 'invalid usage';
-  if (command === 'sessions' || command === 'delivery') {
+  if (command === 'sessions') {
     if (subcommand === undefined) return `${command} requires a subcommand`;
     return `unknown ${command} subcommand '${subcommand}'`;
   }
@@ -895,12 +1039,7 @@ async function dispatch(argv: readonly string[], io: CliIo, options: RunCliOptio
     if (options.updateNotice) await maybePrintUpdateNotice(io, version, rawArgs);
     return 0;
   }
-  const boundary = rawArgs.indexOf('--');
-  const beforeBoundary = boundary < 0 ? rawArgs : rawArgs.slice(0, boundary);
-  const separator = boundary >= 0 && parse(beforeBoundary).positional[0] === 'plugin' ? boundary : -1;
-  const pluginArgs = separator < 0 ? [] : rawArgs.slice(separator + 1);
-  const coreArgs = separator < 0 ? rawArgs : rawArgs.slice(0, separator);
-  const args = parse(coreArgs.map((arg) => arg === '-h' ? '--help' : arg));
+  const args = parse(rawArgs.map((arg) => arg === '-h' ? '--help' : arg));
   const [command, subcommand, ...rest] = args.positional;
   const json = args.flags.has('json');
 
@@ -911,7 +1050,7 @@ async function dispatch(argv: readonly string[], io: CliIo, options: RunCliOptio
   if (command === 'help' && subcommand === undefined && rest.length === 0) {
     showHelp();
   }
-  if ((command === 'sessions' || command === 'delivery') && subcommand === undefined && args.flags.has('help')) {
+  if (command === 'sessions' && subcommand === undefined && args.flags.has('help')) {
     showHelp();
   }
 
@@ -936,25 +1075,11 @@ async function dispatch(argv: readonly string[], io: CliIo, options: RunCliOptio
   const sessionId = command === 'sessions' ? tail[1] : undefined;
   const recentFallback = command === 'recent' && tail.length > 0 ? Number(tail[0]) : undefined;
   const scope = scopeFlag(args);
-  if (command === 'delivery') {
-    return runDeliveryCommand(subcommand!, io, { dbPath: textFlag(args, 'db'), configPath: textFlag(args, 'config'),
-      jobId: textFlag(args, 'job'), pollIntervalMs: numberFlag(args, 'poll-ms'), requestTimeoutMs: numberFlag(args, 'timeout-ms'),
-      signal: options.signal });
-  }
   if (command === 'export') {
     const selectionPath = textFlag(args, 'selection');
     if (!selectionPath) usage('export requires --selection FILE');
     await runHistoryExportCommand({ dbPath: textFlag(args, 'db'), selectionPath, outputPath: textFlag(args, 'out') },
       options.stdoutStream);
-    return 0;
-  }
-  if (command === 'plugin') {
-    const configPath = textFlag(args, 'config');
-    if (!configPath) usage('plugin requires --config FILE');
-    const { registry } = await loadHistoryApplicationConfig(configPath);
-    const operation = registry.command(tail[0]);
-    if (!operation) usage('configured plugin command not found');
-    output(io, await operation.run([...tail.slice(1), ...pluginArgs]), true);
     return 0;
   }
   const acquisitionPlugins = ['sync','sessions'].includes(command ?? '') && textFlag(args,'config') ? (await loadHistoryApplicationConfig(textFlag(args,'config')!)).registry : undefined;
@@ -1050,12 +1175,27 @@ async function dispatch(argv: readonly string[], io: CliIo, options: RunCliOptio
     }
     return 0;
   }
+  if (command === 'sessions' && subcommand === 'markers') {
+    outputMarkers(io, await getSessionMarkersPage(sessionSource as never, sessionId!, {
+      dbPath: textFlag(args, 'db'), limit: numberFlag(args, 'limit'), after: evidenceCursorFlag(args),
+    }), json);
+    return 0;
+  }
+  if (command === 'sessions' && subcommand === 'usage') {
+    outputUsage(io, await getSessionUsage(sessionSource as never, sessionId!, { dbPath: textFlag(args, 'db') }), json);
+    return 0;
+  }
   if (command === 'search') {
-    output(io, await search([subcommand, ...rest].join(' '), { ...common(args), rawFts: args.flags.has('fts') }), json);
+    output(io, await search([subcommand, ...rest].join(' '), {
+      ...common(args), rawFts: args.flags.has('fts'), role: textFlag(args, 'role') as SearchRole | undefined,
+      after: historyCursorFlag(args),
+    }), json);
     return 0;
   }
   if (command === 'recent') {
-    output(io, await recent({ ...common(args), limit: numberFlag(args, 'limit') ?? recentFallback }), json);
+    output(io, await recent({
+      ...common(args), limit: numberFlag(args, 'limit') ?? recentFallback, after: historyCursorFlag(args),
+    }), json);
     return 0;
   }
   if (command === 'session') {
@@ -1089,7 +1229,7 @@ async function dispatch(argv: readonly string[], io: CliIo, options: RunCliOptio
 /** Knobs the bin owns and a mounted host does not. */
 export interface RunCliOptions {
   /**
-   * Cancels a long-running `delivery drain`/`delivery run`.
+   * Cancels a command whose spec is `cancellable`.
    *
    * The signal handlers that produce it belong to whoever owns the process:
    * the bin installs them, a host passes its own, and `dispatch` installs none.
@@ -1113,9 +1253,13 @@ export interface RunCliOptions {
  *
  * Never calls `process.exit`, never writes to `process.stdout`/`process.stderr`
  * and never installs a signal handler: the caller owns all three. `argv` is the
- * arguments after the program name.
+ * arguments after the program name. A schema migration the command runs is
+ * announced on `io.stderr`; the first call registers the process's one native
+ * migration listener for that (see `onStoreMigration`).
  */
 export async function runCli(argv: readonly string[], io: CliIo, options: RunCliOptions = {}): Promise<number> {
+  await listenForMigrations();
+  migrationSinks.set(io, (migrationSinks.get(io) ?? 0) + 1);
   try {
     return await dispatch(argv, io, options);
   } catch (error: unknown) {
@@ -1127,13 +1271,18 @@ export async function runCli(argv: readonly string[], io: CliIo, options: RunCli
     const value = error as { code?: string; message?: string };
     io.stderr(`ai-hist: ${value.code ? `${value.code}: ` : ''}${value.message ?? String(error)}\n`);
     return 1;
+  } finally {
+    await migrationEnded(commandDatabase(argv));
+    const calls = (migrationSinks.get(io) ?? 1) - 1;
+    if (calls > 0) migrationSinks.set(io, calls);
+    else migrationSinks.delete(io);
   }
 }
 
 /**
  * The `ai-hist` binary: the only place that owns process state.
  *
- * Signal handling lives here rather than in the delivery command so that
+ * Signal handling lives here rather than in a command so that
  * `runCli` stays free of global handlers for hosts that mount it. It is also
  * claimed only for the commands that read it: every other invocation keeps
  * Node's default `SIGINT`/`SIGTERM` behaviour, so Ctrl-C ends it the first

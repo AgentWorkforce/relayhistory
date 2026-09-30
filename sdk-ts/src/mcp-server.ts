@@ -7,22 +7,37 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import {
   discoverSessions, getSession, getSessionEventsPage, getSessionFileEditsPage,
-  getSessionRelationships, getSessionRequestsPage, getSessionToolCallsPage, getSessionTree,
-  getSessionUsage, hydrateSession,
-  listSessionCatalogPage, recent, search, stats, sync,
-  historyDeliveryStatus, historyDeliveryRetention, controlHistoryDelivery,
+  getSessionMarkersPage, getSessionRelationships, getSessionRequestsPage, getSessionToolCallsPage,
+  getSessionTree, getSessionUsage, getSourceCapabilities, hydrateSession,
+  listSessionCatalogPage, recent, search, stats, sync, createHandoff, resumeHandoff,
+  MAX_HANDOFF_INTENT_CHARS,
 } from './index.js';
 
-import type { HistoryPluginRegistry } from './index.js';
+import type { HistoryCursor, HistoryPluginRegistry } from './index.js';
 import { loadHistoryApplicationConfig } from './delivery-cli.js';
+import { joinRelay, leaveRelay, listRelayAgents, relayStatus } from './relay-agents.js';
 
 const READ = { readOnlyHint: true, idempotentHint: true, openWorldHint: false } as const;
 // Acquisition can reach provider services when a remote scope is requested
 // (claude.ai/code web sessions, Codex cloud tasks), so it is open-world.
 const ACQUIRE = { readOnlyHint: false, idempotentHint: true, openWorldHint: true } as const;
-const SOURCE = z.enum(['claude', 'codex', 'cursor', 'grok', 'relay', 'trajectory', 'opencode', 'devin']);
-const CATALOG_SOURCE = z.enum(['claude', 'codex', 'cursor', 'grok', 'relay', 'opencode', 'devin']);
+const LOCAL_ACQUIRE = { readOnlyHint: false, idempotentHint: true, openWorldHint: false } as const;
+// Transport is local, but joining and leaving change externally visible Relay
+// presence, so approval-aware MCP hosts must treat them as open-world.
+const RELAY_MUTATION = { readOnlyHint: false, idempotentHint: true, openWorldHint: true } as const;
+const SOURCE = z.enum(['claude', 'codex', 'cursor', 'grok', 'relay', 'trajectory', 'opencode', 'muse', 'devin']);
+const CATALOG_SOURCE = z.enum(['claude', 'codex', 'cursor', 'grok', 'relay', 'opencode', 'muse', 'devin']);
 const SESSION_SCOPE = z.enum(['local', 'remote', 'all']);
+const SINCE_MS = z.number().int().optional().describe('Inclusive lower bound on timestampMs.');
+const UNTIL_MS = z.number().int().optional().describe('Inclusive upper bound on timestampMs.');
+const HISTORY_AFTER = z.object({
+  timestampMs: z.number().int(), id: z.number().int(), matchSource: z.string().optional()
+    .describe('history or session_event; any other value is rejected by the shared cursor validation.'),
+}).optional().describe('Continue strictly after this row: the last row\'s timestampMs, id and (for search) matchSource.')
+  // The schema leaves matchSource open so an unknown value reaches the native
+  // cursor validation and fails with its INVALID_ARGUMENT, as on every other
+  // surface, instead of a schema error.
+  .transform((after) => after as HistoryCursor | undefined);
 const SOURCE_CONNECTORS = z.array(z.string().min(1)).optional().describe('Explicit configured source-plugin IDs; [] disables remote acquisition.');
 const packageVersion = JSON.parse(
   readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
@@ -46,18 +61,36 @@ async function call(operation: () => Promise<unknown>) {
   }
 }
 
-server.tool('search_history', 'Search already-indexed RelayHistory prompts.', {
+server.tool('search_history',
+  'Full-text search of already-indexed user prompts and session events (assistant text, tool calls and results), '
+  + 'newest first; the same contract as `ai-hist search`. By default each word is matched as a literal token and all '
+  + 'must match; a leading - excludes a word. A query containing AND, OR, NOT, a trailing * or a "quoted phrase" is '
+  + 'passed to SQLite FTS5 as written, and raw_fts: true always does so. Each match carries matchSource '
+  + '(history or session_event), role and kind; id is unique only within matchSource. To page, pass the last '
+  + 'match\'s timestampMs, id and matchSource as after.', {
   query: z.string(), source: SOURCE.optional(), project: z.string().optional(), tag: z.string().optional(),
   scope: SESSION_SCOPE.optional().default('local'),
+  role: z.enum(['all', 'user', 'assistant', 'prompt']).optional().default('all')
+    .describe('all: prompts and every event; user: prompts and user events; assistant: assistant events; prompt: prompts only.'),
+  raw_fts: z.boolean().optional().default(false)
+    .describe('Pass the query to SQLite FTS5 verbatim; a malformed expression is an error.'),
+  before_ms: z.number().int().optional().describe('Deprecated: exclusive, so it skips rows tied on the timestamp. Use after.'),
+  since_ms: SINCE_MS, until_ms: UNTIL_MS, after: HISTORY_AFTER,
   limit: z.number().int().min(1).max(1000).optional().default(20),
-}, READ, ({ query, source, project, tag, scope, limit }) => call(() => search(query, { source, project, tag, scope, limit })));
+}, READ, ({ query, source, project, tag, scope, role, raw_fts, before_ms, since_ms, until_ms, after, limit }) => call(() => search(query, {
+  source, project, tag, scope, role, rawFts: raw_fts, beforeMs: before_ms, sinceMs: since_ms, untilMs: until_ms, after, limit,
+})));
 
-server.tool('recent_history', 'List recent already-indexed history.', {
+server.tool('recent_history', 'List recent already-indexed prompts, newest first by (timestampMs, id). '
+  + 'To page, pass the last row\'s timestampMs and id as after.', {
   source: SOURCE.optional(), project: z.string().optional(), tag: z.string().optional(),
   scope: SESSION_SCOPE.optional().default('local'),
   n: z.number().int().min(1).max(1000).optional().default(20),
-  before_ms: z.number().int().optional(),
-}, READ, ({ source, project, tag, scope, n, before_ms }) => call(() => recent({ source, project, tag, scope, limit: n, beforeMs: before_ms })));
+  before_ms: z.number().int().optional().describe('Deprecated: exclusive, so it skips rows tied on the timestamp. Use after.'),
+  since_ms: SINCE_MS, until_ms: UNTIL_MS, after: HISTORY_AFTER,
+}, READ, ({ source, project, tag, scope, n, before_ms, since_ms, until_ms, after }) => call(() => recent({
+  source, project, tag, scope, limit: n, beforeMs: before_ms, sinceMs: since_ms, untilMs: until_ms, after,
+})));
 
 server.tool('list_sessions', 'Cache-only indexed session catalog listing. This never discovers or syncs.', {
   sources: z.array(CATALOG_SOURCE).optional(), limit: z.number().int().min(1).max(1000).optional().default(20),
@@ -134,9 +167,75 @@ server.tool('get_session_file_edits', 'Get one bounded page of recorded file edi
   after: EVIDENCE_CURSOR.optional(),
 }, READ, ({ source, session_id, limit, after }) => call(() => getSessionFileEditsPage(source, session_id, { limit, after })));
 
+server.tool('create_handoff', 'Create a Relaycast handoff pointer for the caller\'s current session. Its single intent field is a self-describing resume prompt; send that exact intent as the delivery text and the pointer as metadata kind="handoff". Never inline the transcript.', {
+  intent: z.string().min(1).max(MAX_HANDOFF_INTENT_CHARS),
+}, LOCAL_ACQUIRE, ({ intent }) => call(() => createHandoff(intent)));
+
+server.tool('list_relay_agents', 'List live participants currently on Agent Relay, not session history. Reads only the local Agent Relay desktop socket; it uses no cloud client or credential.', {
+  query: z.string().optional(),
+  where: z.enum(['this_computer', 'cloud', 'other_desktop']).optional(),
+  include_idle: z.boolean().optional().default(false),
+}, READ, ({ query, where, include_idle }) => call(() => listRelayAgents({ query, where, includeIdle: include_idle })));
+
+server.tool('relay_status', 'Report whether the local session hosting this MCP server is registered and reachable on Agent Relay. Reads only the local Agent Relay desktop socket.', {}, READ, () => call(() => relayStatus()));
+
+server.tool('join_relay', 'Put the local session hosting this MCP server on Agent Relay so teammates and agents can reach it. Uses only the local Agent Relay desktop socket; optional name and description are public relay metadata.', {
+  name: z.string().min(1).optional(),
+  description: z.string().optional(),
+}, RELAY_MUTATION, ({ name, description }) => call(() => joinRelay({ name, description })));
+
+server.tool('leave_relay', 'Remove the local session hosting this MCP server from Agent Relay. Uses only the local Agent Relay desktop socket.', {}, RELAY_MUTATION, () => call(() => leaveRelay()));
+
+const HANDOFF_CURSOR = z.object({
+  prompt: z.object({ timestampMs: z.number().int(), id: z.number().int() }).optional(),
+  events: z.object({ tsMs: z.number().int(), id: z.number().int() }).optional(),
+  tool_calls: EVIDENCE_CURSOR.optional(),
+  file_edits: EVIDENCE_CURSOR.optional(),
+});
+
+server.tool('resume_handoff', 'Auto-resume a same-workspace handoff in one call: acquire the session and compose prompts, normalized events, tool calls, and file edits. Cross-workspace and cross-organization handoffs are rejected.', {
+  source: CATALOG_SOURCE,
+  session_id: z.string().min(1),
+  limit: z.number().int().min(1).max(1000).optional().default(200),
+  cursor: HANDOFF_CURSOR.optional(),
+  acquisition_timeout_ms: z.number().int().min(1).max(3600000).optional(),
+}, ACQUIRE, ({ source, session_id, limit, cursor, acquisition_timeout_ms }) => call(async () => {
+  const resumed = await resumeHandoff(source, session_id, {
+    limit,
+    cursor: cursor ? {
+      prompt: cursor.prompt,
+      events: cursor.events,
+      toolCalls: cursor.tool_calls,
+      fileEdits: cursor.file_edits,
+    } : undefined,
+    acquisitionTimeoutMs: acquisition_timeout_ms,
+    plugins: configuredSources,
+  });
+  const next = resumed.next_cursor;
+  return {
+    ...resumed,
+    next_cursor: next ? {
+      ...(next.prompt ? { prompt: next.prompt } : {}),
+      ...(next.events ? { events: next.events } : {}),
+      ...(next.toolCalls ? { tool_calls: next.toolCalls } : {}),
+      ...(next.fileEdits ? { file_edits: next.fileEdits } : {}),
+    } : null,
+  };
+}));
+
+server.tool('get_session_markers', 'Get one bounded page of a session\'s markers: the records a provider wrote that are not transcript events, such as compaction and summary boundaries, provider system rows, non-text content blocks and agent lifecycle events. `kind` is the classified vocabulary and `subkind` the provider-native type; an unclassified record is kind `unknown`. `payload_json` is a bounded projection, never an image or document\'s bytes. Undated markers page last.', {
+  source: SOURCE, session_id: z.string().min(1),
+  limit: z.number().int().min(1).max(1000).optional().default(200),
+  after: EVIDENCE_CURSOR.optional(),
+}, READ, ({ source, session_id, limit, after }) => call(() => getSessionMarkersPage(source, session_id, { limit, after })));
+
+server.tool('get_source_capabilities', 'What one provider\'s parser can record, from RelayHistory\'s own capability tables rather than any database: the evidence kinds a hydration of that source covers (and which of the full set it cannot), and what its records establish about delegation. Answers the same before a first sync.', {
+  source: CATALOG_SOURCE,
+}, READ, ({ source }) => call(() => getSourceCapabilities(source)));
+
 const REQUEST_CURSOR = z.object({ tsMs: z.number().int(), id: z.number().int() });
 
-server.tool('get_session_requests', 'Get one bounded page of a session\'s model requests, with usage normalized. One row per API request: Claude\'s per-content-block copies of message.usage are collapsed, so these can be summed where raw events cannot.', {
+server.tool('get_session_requests', 'Get one bounded page of a session\'s model requests, with usage normalized. One row per API request: Claude\'s per-content-block copies of message.usage are collapsed, so these can be summed where raw events cannot. Usage is provider-reported; cost appears only when the source data carried one and is never computed.', {
   source: SOURCE, session_id: z.string().min(1),
   limit: z.number().int().min(1).max(1000).optional().default(200),
   after: REQUEST_CURSOR.optional(),
@@ -157,22 +256,9 @@ server.tool('sync', 'Explicit full provider ingestion into RelayHistory.', {
   acquisition_timeout_ms: z.number().int().min(1).max(3600000).optional(),
 }, ACQUIRE, ({ scope, source_connectors, acquisition_timeout_ms }) => call(() => sync({ scope, sourceConnectors: source_connectors, acquisitionTimeoutMs: acquisition_timeout_ms, plugins: configuredSources })));
 
-server.tool('delivery_status', 'Read durable delivery progress, backlog, failures, and retention usage.', {
-  job_id: z.string().optional(),
-}, READ, ({ job_id }) => call(async () => ({ jobs: await historyDeliveryStatus(job_id), retention: await historyDeliveryRetention() })));
-for (const action of ['pause', 'resume', 'retry'] as const) {
-  server.tool(`delivery_${action}`, `${action} an already enabled delivery job.`, {
-    job_id: z.string().min(1),
-  }, { readOnlyHint: false, idempotentHint: true, openWorldHint: false }, ({ job_id }) => call(() => controlHistoryDelivery(job_id, action)));
-}
-// Only an explicitly named config may load installed modules. No package scan,
-// implicit enablement, credential probing, or background delivery at startup.
+// Only an explicitly named config may load installed modules, and only their
+// source connectors are used. No package scan or implicit enablement at startup.
 if (process.env.AI_HIST_PLUGIN_CONFIG) {
-  const { registry } = await loadHistoryApplicationConfig(process.env.AI_HIST_PLUGIN_CONFIG);
-  configuredSources = registry;
-  for (const tool of registry.registeredTools()) {
-    server.tool(tool.name, tool.description, { input: z.record(z.string(), z.unknown()) }, { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
-      ({ input }) => call(() => tool.run(input)));
-  }
+  configuredSources = (await loadHistoryApplicationConfig(process.env.AI_HIST_PLUGIN_CONFIG)).registry;
 }
 await server.connect(new StdioServerTransport());

@@ -120,7 +120,7 @@ impl RelationshipKinds {
     }
 }
 
-const RELATIONSHIP_COLUMNS: &str = "source, parent_session_id, child_session_id, relationship, \
+pub(crate) const RELATIONSHIP_COLUMNS: &str = "source, parent_session_id, child_session_id, relationship, \
      identity_status, child_agent_type, child_agent_name, child_model, spawn_depth, \
      evidence_kind, evidence_locator, evidence_ref, child_has_events, \
      spawned_at_ms, created_ms, relationship_uid, origin_session_id";
@@ -272,41 +272,20 @@ pub fn relationship_capabilities(source: &str) -> RelationshipCapabilities {
     // and for OpenCode they have different answers. A consumer reads this to
     // tell "the provider does not support it" from "it was not recorded this
     // time"; collapsing the three onto one boolean makes the adapter promise
-    // a field it never writes, which is worse than promising nothing.
-    let (stable_child_identity, agent_type, spawn_time, evidence_locator) = match source {
-        // Every Codex subagent rollout opens with its own thread id, and its
-        // `session_meta` names the subagent type.
-        "codex" => ("always", true, true, true),
-        // An OpenCode subagent session is a session in its own right and its
-        // record names the parent outright, in `session.parentID`, so the
-        // child identity is always stable and never inferred. But OpenCode
-        // records no *type* for that child: the parser writes the spawn time
-        // and the evidence locator, and leaves `child_agent_type` and
-        // `child_agent_name` null because nothing in the provider's records
-        // supplies them.
-        "opencode" => ("always", false, true, true),
-        // Claude subagent transcripts carry the parent's `sessionId`; only
-        // provider versions that also emit a per-child `agentId` give the
-        // child a stable identity.
-        "claude" => ("sometimes", true, true, true),
-        // Grok records a delegation in two places. The `Task` call in the
-        // transcript names no child at all; a `subagents/` metadata entry does
-        // when it carries a session id, and the child session then lives in
-        // the normal sessions tree. The id is never taken from the file name,
-        // so an entry without one stays unlinked evidence.
-        "grok" => ("sometimes", true, true, true),
-        _ => ("never", false, false, false),
-    };
+    // a field it never writes, which is worse than promising nothing. The
+    // per-source answers live on each harness's registry descriptor
+    // (`sources::catalog`), beside the reason for them.
+    let declared = crate::sources::catalog::relationships(source);
     RelationshipCapabilities {
         source: source.to_string(),
-        stable_child_identity: stable_child_identity.to_string(),
-        records_agent_type: agent_type,
-        records_spawn_time: spawn_time,
-        records_evidence_locator: evidence_locator,
+        stable_child_identity: declared.stable_child_identity.to_string(),
+        records_agent_type: declared.records_agent_type,
+        records_spawn_time: declared.records_spawn_time,
+        records_evidence_locator: declared.records_evidence_locator,
     }
 }
 
-fn map_relationship(row: &Row<'_>) -> rusqlite::Result<SessionRelationship> {
+pub(crate) fn map_relationship(row: &Row<'_>) -> rusqlite::Result<SessionRelationship> {
     Ok(SessionRelationship {
         source: row.get(0)?,
         parent_session_id: row.get(1)?,

@@ -1,0 +1,35 @@
+# Build the out-of-tree consumer example against the ai-hist crate that
+# crates.io actually serves — no `[patch]`, no path dependency. The pull
+# request job in ci.yml checks the same example against the workspace crate;
+# this one is what notices a release that does not build for an embedder
+# (a file left out of `include`, a feature that only compiles in-tree, a
+# publish that never happened), which nothing inside the workspace can see.
+name: Published crate consumer
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Daily, 06:17 UTC. Off the hour so it does not queue behind every other
+    # scheduled workflow on the runners.
+    - cron: "17 6 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  published-crate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Not `--locked`: the release script stamps the example's requirement and
+      # lock entry to the version it just published and drops the previous
+      # tarball's checksum, which Cargo fills in on this first resolve.
+      - name: Build and run the consumer against the published crate
+        working-directory: examples/rust-consumer
+        run: cargo run
+      - name: The registry crate was the one built
+        working-directory: examples/rust-consumer
+        run: |
+          cargo tree --prefix none --depth 1 -e normal | tee /dev/stderr \
+            | grep -qE '^ai-hist v[0-9.]+$'

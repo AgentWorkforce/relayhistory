@@ -12,7 +12,6 @@ path = "src/main.rs"
 
 [dependencies]
 ai-hist = { path = "../ai-hist", features = [
-    "export",
     "fs-events",
     "opencode-backup",
     "git-hooks",
@@ -25,10 +24,10 @@ flate2 = "1"
 rusqlite = { version = "0.32", features = ["backup", "bundled", "functions"] }
 serde_json = "1"
 sha2 = "0.10"
+tempfile = "3"
 ureq = { version = "2", features = ["json"] }
 
 [dev-dependencies]
 fs2 = "0.4"
 libc = "0.2"
-tempfile = "3"
 url = "2"

@@ -235,3 +235,83 @@ fn whitespace_provider_roots_child() {
         home.join(".local/share/devin/cli")
     );
 }
+
+/// `GROK_HOME` relocates the per-inference usage log as well as the sessions
+/// tree: `<GROK_HOME>/logs/unified.jsonl` is read, and its rows attach to the
+/// session they name.
+#[test]
+fn grok_home_relocates_the_unified_usage_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let grok = dir.path().join("relocated-grok");
+    let session = grok.join("sessions/%2Fwork%2Fapp/grok-env-0001");
+    write(
+        &session.join("summary.json"),
+        r#"{"info":{"id":"grok-env-0001","cwd":"/work/app"},"created_at":"2026-09-20T03:00:00.000Z"}"#,
+    );
+    write(
+        &session.join("chat_history.jsonl"),
+        concat!(
+            r#"{"type":"user","content":"<user_query>relocated grok session</user_query>"}"#,
+            "\n",
+            r#"{"type":"assistant","content":"done"}"#,
+            "\n",
+        ),
+    );
+    write(
+        &grok.join("logs/unified.jsonl"),
+        concat!(
+            r#"{"ts":"2026-09-20T03:00:01.000Z","pid":1,"session_id":"grok-env-0001","model_id":"grok-4.5-build","usage":{"inputTokens":120,"outputTokens":12}}"#,
+            "\n",
+        ),
+    );
+    // A decoy under the default home that must not be read.
+    write(
+        &dir.path().join("empty-home/.grok/logs/unified.jsonl"),
+        concat!(
+            r#"{"session_id":"grok-env-0001","usage":{"inputTokens":999,"outputTokens":99}}"#,
+            "\n",
+        ),
+    );
+
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "grok_home_relocates_the_unified_usage_log_child",
+            "--nocapture",
+        ])
+        .env("RH_GROK_HOME_DB", dir.path().join("history.db"))
+        .env("HOME", dir.path().join("empty-home"))
+        .env("USERPROFILE", dir.path().join("empty-home"))
+        .env("GROK_HOME", &grok)
+        .env("OPENCODE_DB", dir.path().join("missing-opencode.db"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn grok_home_relocates_the_unified_usage_log_child() {
+    let Some(db) = std::env::var_os("RH_GROK_HOME_DB") else {
+        return;
+    };
+    let db = Path::new(&db);
+    sync_scoped_at(db, SessionScope::Local).unwrap();
+    let conn = open_db(db).unwrap();
+    let usage: Vec<i64> = conn
+        .prepare(
+            "SELECT json_extract(token_json, '$.usage.inputTokens') FROM session_events \
+             WHERE source = 'grok' AND session_id = 'grok-env-0001' \
+             AND json_extract(token_json, '$.source') = 'logs/unified.jsonl'",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(usage, vec![120], "the GROK_HOME log, and only it, was read");
+}

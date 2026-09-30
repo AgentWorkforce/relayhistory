@@ -6,7 +6,7 @@ use rusqlite::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -22,16 +22,9 @@ pub use crate::relationship_graph::{
     SESSION_RELATIONSHIP_CONTRACT_VERSION,
 };
 
-pub const SOURCE_CHOICES: &[&str] = &[
-    "claude",
-    "codex",
-    "cursor",
-    "grok",
-    "relay",
-    "trajectory",
-    "opencode",
-    "devin",
-];
+/// Every built-in source id, in registry order. Derived from the harness
+/// registry (`sources::catalog`); add a source there, not here.
+pub const SOURCE_CHOICES: &[&str] = crate::sources::catalog::SOURCE_CHOICES;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HistoryEntry {
@@ -72,9 +65,112 @@ pub struct QueryFilter {
     pub source: Option<String>,
     pub project: Option<String>,
     pub tag: Option<String>,
+    /// Deprecated exclusive timestamp bound. Rows sharing the boundary
+    /// timestamp are skipped, so it is not a pagination cursor; use `after`.
     pub before_ms: Option<i64>,
+    /// Inclusive lower bound on the row timestamp.
+    pub since_ms: Option<i64>,
+    /// Inclusive upper bound on the row timestamp.
+    pub until_ms: Option<i64>,
+    /// Keyset continuation: only rows strictly after this one in the read's
+    /// `(timestamp DESC, id DESC, match source)` order. Applied in addition
+    /// to the time window.
+    pub after: Option<HistoryCursor>,
     pub limit: i64,
     pub scope: SessionScope,
+}
+
+impl QueryFilter {
+    /// The checks every surface applies before a history read, so an invalid
+    /// window is the same error from the CLI, the SDK and MCP.
+    pub fn validate(&self) -> Result<()> {
+        if let (Some(since), Some(until)) = (self.since_ms, self.until_ms) {
+            anyhow::ensure!(
+                since <= until,
+                "since_ms ({since}) must not be later than until_ms ({until})"
+            );
+        }
+        if let Some(cursor) = &self.after {
+            cursor.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// Where a newest-first history read stopped: the last row it returned.
+///
+/// `recent` rows are always `history` matches, so their cursor may leave
+/// `match_source` unset. A `search` cursor carries the match source of its
+/// row, because a prompt and an event can share `(timestamp_ms, id)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryCursor {
+    pub timestamp_ms: i64,
+    pub id: i64,
+    #[serde(default)]
+    pub match_source: Option<String>,
+}
+
+impl HistoryCursor {
+    pub fn validate(&self) -> Result<()> {
+        match self.match_source.as_deref() {
+            None | Some("history") | Some("session_event") => Ok(()),
+            Some(other) => {
+                anyhow::bail!("cursor match_source must be history or session_event (got {other})")
+            }
+        }
+    }
+
+    /// True when the cursor row is a `history` match (the default).
+    pub fn is_history(&self) -> bool {
+        matches!(self.match_source.as_deref(), None | Some("history"))
+    }
+}
+
+/// One page of a newest-first read, and where the next page starts.
+#[derive(Debug, Clone)]
+pub struct HistoryPage<T> {
+    pub rows: Vec<T>,
+    /// Present only when a further row exists: the read over-fetches one row
+    /// rather than guessing from a full page.
+    pub next_cursor: Option<HistoryCursor>,
+}
+
+/// Append the time-window and keyset predicates shared by every
+/// newest-first history read. `row_is_after_history_tie` says whether a row
+/// in this table sorts after a `history` row with the same
+/// `(timestamp, id)` — true only for `session_events`, whose match source
+/// orders after `history`.
+pub(crate) fn append_window_filters(
+    sql: &mut String,
+    params: &mut Vec<String>,
+    filter: &QueryFilter,
+    ts_column: &str,
+    id_column: &str,
+    row_is_after_history_tie: bool,
+) {
+    if let Some(since_ms) = filter.since_ms {
+        sql.push_str(&format!(" AND {ts_column} >= ?"));
+        params.push(since_ms.to_string());
+    }
+    if let Some(until_ms) = filter.until_ms {
+        sql.push_str(&format!(" AND {ts_column} <= ?"));
+        params.push(until_ms.to_string());
+    }
+    if let Some(cursor) = &filter.after {
+        // Rows at the cursor's (timestamp, id) come after it only when this
+        // table's match source sorts after the cursor's.
+        let id_op = if row_is_after_history_tie && cursor.is_history() {
+            "<="
+        } else {
+            "<"
+        };
+        sql.push_str(&format!(
+            " AND ({ts_column} < ? OR ({ts_column} = ? AND {id_column} {id_op} ?))"
+        ));
+        params.push(cursor.timestamp_ms.to_string());
+        params.push(cursor.timestamp_ms.to_string());
+        params.push(cursor.id.to_string());
+    }
 }
 
 /// Which acquisition surface a query should include.
@@ -220,6 +316,15 @@ CREATE TABLE IF NOT EXISTS session_events (
     request_span TEXT,
     raw_facts_version INTEGER,
     raw_kind TEXT,
+    -- Why a user-role row is not a human prompt: a slash-command triad row,
+    -- a task notification, hook output, a system reminder, Codex context.
+    -- Null for a genuine prompt and for every model-output row. See
+    -- `ingest::control`.
+    control_kind TEXT,
+    -- Which evidence backs this row: 'local' (a local parser read it from
+    -- the provider's own files), 'remote' (a remote observation supplied
+    -- it) or 'both'. See `EVIDENCE_LOCATION_TABLES`.
+    location TEXT NOT NULL DEFAULT 'local' CHECK(location IN ('local', 'remote', 'both')),
     UNIQUE(source, session_id, event_uid)
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS session_events_fts USING fts5(
@@ -241,6 +346,10 @@ CREATE TABLE IF NOT EXISTS session_markers (
     subkind TEXT,
     text TEXT,
     payload_json TEXT,
+    -- Which evidence backs this row: 'local' (a local parser read it from
+    -- the provider's own files), 'remote' (a remote observation supplied
+    -- it) or 'both'. See `EVIDENCE_LOCATION_TABLES`.
+    location TEXT NOT NULL DEFAULT 'local' CHECK(location IN ('local', 'remote', 'both')),
     UNIQUE(source, session_id, marker_uid)
 );
 CREATE TABLE IF NOT EXISTS tool_calls (
@@ -254,6 +363,10 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     args_json TEXT,
     is_error INTEGER,
     ts_ms INTEGER,
+    -- Which evidence backs this row: 'local' (a local parser read it from
+    -- the provider's own files), 'remote' (a remote observation supplied
+    -- it) or 'both'. See `EVIDENCE_LOCATION_TABLES`.
+    location TEXT NOT NULL DEFAULT 'local' CHECK(location IN ('local', 'remote', 'both')),
     UNIQUE(source, session_id, tool_use_id)
 );
 CREATE TABLE IF NOT EXISTS file_edits (
@@ -271,6 +384,10 @@ CREATE TABLE IF NOT EXISTS file_edits (
     ts_ms INTEGER,
     git_branch TEXT,
     cwd TEXT,
+    -- Which evidence backs this row: 'local' (a local parser read it from
+    -- the provider's own files), 'remote' (a remote observation supplied
+    -- it) or 'both'. See `EVIDENCE_LOCATION_TABLES`.
+    location TEXT NOT NULL DEFAULT 'local' CHECK(location IN ('local', 'remote', 'both')),
     UNIQUE(source, session_id, tool_use_id)
 );
 CREATE TABLE IF NOT EXISTS session_commit_links (
@@ -306,10 +423,6 @@ CREATE TABLE IF NOT EXISTS trajectories (
     updated_ms INTEGER NOT NULL,
     timestamp_ms INTEGER NOT NULL
 );
-CREATE VIRTUAL TABLE IF NOT EXISTS trajectory_fts USING fts5(
-    search_text, task_title, task_description, persona_id, project_id,
-    content='trajectories', content_rowid='rowid'
-);
 CREATE TABLE IF NOT EXISTS tags (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL UNIQUE,
@@ -330,7 +443,10 @@ CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
     INSERT INTO history_fts(rowid, prompt, project)
     VALUES (new.id, new.prompt, new.project);
 END;
-CREATE TRIGGER IF NOT EXISTS history_au AFTER UPDATE ON history BEGIN
+-- `UPDATE OF`, for the same reason as `session_events_au` below: the
+-- change feed re-stamps `revision` after each insert, and that touches
+-- nothing the index holds.
+CREATE TRIGGER IF NOT EXISTS history_au AFTER UPDATE OF id, prompt, project ON history BEGIN
     INSERT INTO history_fts(history_fts, rowid, prompt, project)
     VALUES('delete', old.id, old.prompt, old.project);
     INSERT INTO history_fts(rowid, prompt, project)
@@ -344,7 +460,11 @@ CREATE TRIGGER IF NOT EXISTS session_events_ai AFTER INSERT ON session_events BE
     INSERT INTO session_events_fts(rowid, text, role, project)
     VALUES (new.id, new.text, new.role, new.project);
 END;
-CREATE TRIGGER IF NOT EXISTS session_events_au AFTER UPDATE ON session_events BEGIN
+-- `UPDATE OF`, not every update: the change feed re-stamps a row's
+-- `revision` after each insert, and the project-identity pass rewrites
+-- `project_key` in bulk. Neither touches what the index holds, and an
+-- unconditional trigger re-indexed every event twice.
+CREATE TRIGGER IF NOT EXISTS session_events_au AFTER UPDATE OF text, role, project ON session_events BEGIN
     INSERT INTO session_events_fts(session_events_fts, rowid, text, role, project)
     VALUES('delete', old.id, old.text, old.role, old.project);
     INSERT INTO session_events_fts(rowid, text, role, project)
@@ -511,31 +631,20 @@ const REQUIRED_TABLES: &[&str] = &[
     "file_edits",
     "session_commit_links",
     "trajectories",
-    "trajectory_fts",
     "tags",
     "session_tags",
     "sessions",
     "session_presences",
     "session_hydration_checkpoints",
     "transcript_cursors",
+    "grok_unified_usage",
+    "grok_session_turns",
     "session_identity_correlations",
     "session_relationships",
     "session_continuity_evidence",
     "schema_migrations",
     "discovery_skips",
 ];
-#[cfg(feature = "export")]
-const REQUIRED_EXPORT_TABLES: &[&str] = &[
-    "delivery_state",
-    "delivery_journal",
-    "delivery_shadow",
-    "delivery_bootstrap_bounds",
-    "delivery_exclusions",
-    "history_exports",
-    "history_export_pages",
-];
-#[cfg(not(feature = "export"))]
-const REQUIRED_EXPORT_TABLES: &[&str] = &[];
 const REQUIRED_HISTORY_COLUMNS: &[&str] = &["prompt_hash", "git_branch"];
 /// Columns [`init_db`] adds to `sessions` after the original DDL. The shallow
 /// session catalog (`ai-hist sessions list` / `discover`) reads every one of
@@ -640,6 +749,12 @@ const REQUIRED_SESSION_EVENT_COLUMNS: &[(&str, &str)] = &[
     // `type: "system"` subagent notification. Both land in the same `kind`;
     // the normalized `kind` vocabulary is deliberately not widened for it.
     ("raw_kind", "TEXT"),
+    // Why a user-role row is not a human prompt, from the vocabulary in
+    // `ingest::control::ControlKind`. Null on every prompt and every
+    // model-output row. Derived by the parser, not copied off the envelope,
+    // so it is re-stamped by the same raw-facts backfill that repairs the
+    // columns above: a row without it is a row the classifier never saw.
+    ("control_kind", "TEXT"),
 ];
 /// Columns the v2 `session_relationships` shape adds. A v1 row set cannot
 /// represent related evidence whose child has no provider-recorded identity,
@@ -687,13 +802,27 @@ const REQUIRED_INDEXES: &[&str] = &[
     "idx_session_presences_locator",
     "idx_session_relationships_parent",
     "idx_session_relationships_child",
+    // The sync walk's per-transcript "is this a sidecar we already indexed?"
+    // probe keys on the evidence locator.
+    "idx_session_relationships_locator",
     // Continuity reconciliation resolves a transcript's first parent uuid
     // against the record that carries it, across every session. Without this
     // that is a scan of every event on every hydration.
     "idx_session_events_message",
+    // Settling a streamed Claude request's usage reads every row of that
+    // request once per assistant record; without it that is a scan of the
+    // session per record. Also what routes a database stored before the
+    // settlement through the writable open that heals it.
+    "idx_session_events_provider_message",
     "idx_session_continuity_parent_uuid",
     "idx_session_continuity_pending",
     "idx_sessions_project_key",
+    // The identity listing merges every table in `(source, session_id)`
+    // order; the catalog's primary key leads with `session_id`.
+    "idx_sessions_identity",
+    // The project-identity refresh runs on every sweep and every discovery
+    // pass; without this it reads every event row to find none stale.
+    "idx_session_events_project",
 ];
 
 /// Indexes no longer created: nothing queries them, or a replacement covers
@@ -720,6 +849,111 @@ const RETIRED_INDEXES: &[&str] = &[
     "idx_file_edits_page",
 ];
 
+/// Tables an earlier release's export capture watched, each with
+/// `delivery_<table>_{insert,update,delete}` triggers and a
+/// `delivery_identity_<table>` index.
+const CAPTURED_TABLES: &[&str] = &[
+    "history",
+    "session_events",
+    "tool_calls",
+    "file_edits",
+    "sessions",
+    "session_presences",
+    "session_relationships",
+    "session_commit_links",
+    "trajectories",
+    "session_observations",
+    "observation_evidence",
+    "session_markers",
+];
+
+/// Tables whose writes an earlier release charged to a retention budget, each
+/// with `<table>_{cap,count}_*` triggers.
+const RETENTION_ACCOUNTED_TABLES: &[&str] = &[
+    "delivery_journal",
+    "delivery_shadow",
+    "history_export_pages",
+];
+
+/// Every trigger and index an earlier release's export capture created, as
+/// `(type, name)`.
+///
+/// None of them holds state. A capture trigger that outlives its release
+/// still journals every evidence write for any subscription left in the
+/// database, and a cap trigger still aborts that write once the retention
+/// budget is spent, so ingest would fail on a budget nothing reclaims. The
+/// identity indexes only served capture's session seeks and cost every
+/// evidence insert a b-tree write. All of them are dropped.
+///
+/// The capture *tables* are not: `delivery_state`, `delivery_journal`,
+/// `delivery_shadow`, `delivery_bootstrap_bounds`, `history_subscriptions`,
+/// `delivery_exclusions` and the rest stay exactly as they are. Their owner
+/// is the upload daemon that created the subscriptions, and it reads two
+/// facts from them to rebuild an install: `delivery_state.origin_id`, and its
+/// revision floor from `sqlite_sequence` where `name = 'delivery_journal'`.
+/// SQLite deletes a table's `sqlite_sequence` row when the table is dropped,
+/// so dropping the journal would silently reset that floor and every
+/// re-upload would read as already seen. This crate never drops or alters
+/// them.
+fn retired_capture_objects() -> Vec<(&'static str, String)> {
+    let mut objects = Vec::new();
+    for table in CAPTURED_TABLES {
+        for operation in ["insert", "update", "delete"] {
+            objects.push(("trigger", format!("delivery_{table}_{operation}")));
+        }
+        objects.push(("index", format!("delivery_identity_{table}")));
+    }
+    for table in RETENTION_ACCOUNTED_TABLES {
+        for suffix in [
+            "cap_insert",
+            "count_insert",
+            "cap_update",
+            "count_update",
+            "count_delete",
+        ] {
+            objects.push(("trigger", format!("{table}_{suffix}")));
+        }
+    }
+    objects
+}
+
+/// The marker [`retire_export_capture`] records.
+const EXPORT_CAPTURE_RETIRED: &str = "export_capture_retired_v1";
+
+/// Whether any [`retired_capture_objects`] entry still exists: a database an
+/// earlier release opened, before or after this one retired its capture.
+fn retired_capture_present(conn: &Connection) -> Result<bool> {
+    let mut object =
+        conn.prepare_cached("SELECT 1 FROM sqlite_master WHERE type = ? AND name = ? LIMIT 1")?;
+    for (kind, name) in retired_capture_objects() {
+        if object.exists(params![kind, name])? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Drop every [`retired_capture_objects`] entry and record
+/// [`EXPORT_CAPTURE_RETIRED`]. Idempotent: it drops only what exists, so a
+/// database an earlier release re-armed is retired again on its next
+/// writable open. Runs ahead of every other migration, so no migration's
+/// writes reach a capture trigger.
+fn retire_export_capture(conn: &Connection) -> Result<()> {
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY);")?;
+    for (kind, name) in retired_capture_objects() {
+        let statement = match kind {
+            "trigger" => "TRIGGER",
+            _ => "INDEX",
+        };
+        conn.execute_batch(&format!("DROP {statement} IF EXISTS \"{name}\";"))?;
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations (name) VALUES (?1)",
+        [EXPORT_CAPTURE_RETIRED],
+    )?;
+    Ok(())
+}
+
 const REQUIRED_CATALOG_READ_INDEXES: &[&str] = &[
     "idx_sessions_recency",
     "idx_sessions_source_recency",
@@ -736,6 +970,9 @@ const REQUIRED_EVIDENCE_READ_INDEXES: &[&str] = &[
     "idx_session_markers_page",
 ];
 const REQUIRED_SCOPE_READ_INDEXES: &[&str] = &["idx_session_presences_location"];
+/// The catalog's arm of the identity listing. Every other table's arm rides
+/// an index its own reads already require, or its primary key.
+const REQUIRED_IDENTITY_READ_INDEXES: &[&str] = &["idx_sessions_identity"];
 const REQUIRED_RELATIONSHIP_READ_INDEXES: &[&str] = &[
     "idx_session_relationships_parent",
     "idx_session_relationships_child",
@@ -768,11 +1005,55 @@ const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &[
     "session_delete_continuity_reopen_v1",
     "session_events_raw_facts_v1",
     "session_project_key_v1",
+    // The FTS update trigger narrowed to the columns it indexes. `CREATE
+    // TRIGGER IF NOT EXISTS` keeps an existing database's unconditional body,
+    // so the marker is what makes the rebuild happen exactly once.
+    "session_events_fts_update_of_v1",
+    "history_fts_update_of_v1",
+    "evidence_location_v1",
+    EXPORT_CAPTURE_RETIRED,
 ];
-#[cfg(feature = "export")]
-const REQUIRED_EXPORT_MIGRATIONS: &[&str] = &["delivery_v1"];
-#[cfg(not(feature = "export"))]
-const REQUIRED_EXPORT_MIGRATIONS: &[&str] = &[];
+
+/// The Python CLI's full-text index over `trajectories` and the triggers that
+/// maintained it. The Rust schema defines neither and nothing reads the index.
+const RETIRED_TRAJECTORY_INDEX: &[(&str, &str)] = &[
+    ("trigger", "trajectories_ai"),
+    ("trigger", "trajectories_au"),
+    ("trigger", "trajectories_ad"),
+    ("table", "trajectory_fts"),
+];
+
+/// Whether any [`RETIRED_TRAJECTORY_INDEX`] object still exists. Checked by
+/// presence rather than a migration marker, so an object an older client
+/// recreates is retired again on the next writable open.
+fn retired_trajectory_index_present(conn: &Connection) -> Result<bool> {
+    let mut object =
+        conn.prepare_cached("SELECT 1 FROM sqlite_master WHERE type = ? AND name = ? LIMIT 1")?;
+    for (kind, name) in RETIRED_TRAJECTORY_INDEX {
+        if object.exists(params![kind, name])? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Drop every [`RETIRED_TRAJECTORY_INDEX`] object.
+///
+/// `trajectory_fts` is keyed on the implicit rowid of a table with a TEXT
+/// primary key, which a VACUUM may renumber, so on a Python-era database the
+/// index can disagree with its content table. Once it does, the `'delete'` in
+/// `trajectories_au` fails with `SQLITE_CORRUPT_VTAB` on the first UPDATE of
+/// an affected row -- such as the change feed's revision backfill, which rolls
+/// the whole migration back and leaves the database unopenable.
+fn retire_trajectory_index(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS trajectories_ai;
+         DROP TRIGGER IF EXISTS trajectories_au;
+         DROP TRIGGER IF EXISTS trajectories_ad;
+         DROP TABLE IF EXISTS trajectory_fts;",
+    )
+    .context("retiring the trajectory full-text index")
+}
 
 /// Whether this database already has everything [`init_db`] would add.
 ///
@@ -783,18 +1064,8 @@ const REQUIRED_EXPORT_MIGRATIONS: &[&str] = &[];
 /// open (which migrates) when this returns false.
 pub fn schema_is_current(conn: &Connection) -> Result<bool> {
     Ok(schema_has_required_indexes(conn, REQUIRED_INDEXES)?
-        && export_schema_is_current(conn)?
-        && crate::observations::schema_is_current(conn)?)
-}
-
-#[cfg(feature = "export")]
-fn export_schema_is_current(conn: &Connection) -> Result<bool> {
-    crate::export::schema_is_current(conn)
-}
-
-#[cfg(not(feature = "export"))]
-fn export_schema_is_current(_conn: &Connection) -> Result<bool> {
-    Ok(true)
+        && crate::observations::schema_is_current(conn)?
+        && crate::change_feed::schema_is_current(conn)?)
 }
 
 /// Whether read-only APIs can safely and efficiently query this database.
@@ -805,6 +1076,12 @@ pub fn schema_is_read_current(conn: &Connection) -> Result<bool> {
 /// Whether the cache-only catalog can use its sort-free query plans.
 pub fn schema_is_catalog_read_current(conn: &Connection) -> Result<bool> {
     schema_has_required_indexes(conn, REQUIRED_CATALOG_READ_INDEXES)
+}
+
+/// Whether the identity listing can seek the catalog in `(source,
+/// session_id)` order.
+pub fn schema_is_identity_read_current(conn: &Connection) -> Result<bool> {
+    schema_has_required_indexes(conn, REQUIRED_IDENTITY_READ_INDEXES)
 }
 
 /// Whether bounded event pagination has both source-scoped and source-less indexes.
@@ -833,7 +1110,7 @@ pub fn schema_is_usage_read_current(conn: &Connection) -> Result<bool> {
 
 fn schema_has_required_indexes(conn: &Connection, required_indexes: &[&str]) -> Result<bool> {
     let mut table = conn.prepare("SELECT 1 FROM sqlite_master WHERE name = ? LIMIT 1")?;
-    for name in REQUIRED_TABLES.iter().chain(REQUIRED_EXPORT_TABLES.iter()) {
+    for name in REQUIRED_TABLES {
         if !table.exists([*name])? {
             return Ok(false);
         }
@@ -850,10 +1127,7 @@ fn schema_has_required_indexes(conn: &Connection, required_indexes: &[&str]) -> 
         return Ok(false);
     }
     let mut migration = conn.prepare("SELECT 1 FROM schema_migrations WHERE name = ? LIMIT 1")?;
-    for name in REQUIRED_SCHEMA_MIGRATIONS
-        .iter()
-        .chain(REQUIRED_EXPORT_MIGRATIONS.iter())
-    {
+    for name in REQUIRED_SCHEMA_MIGRATIONS {
         if !migration.exists([*name])? {
             return Ok(false);
         }
@@ -928,6 +1202,14 @@ fn schema_has_required_indexes(conn: &Connection, required_indexes: &[&str]) -> 
     {
         return Ok(false);
     }
+    for table in EVIDENCE_LOCATION_TABLES {
+        let has_location: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info(?) WHERE name = 'location'")?
+            .exists([table])?;
+        if !has_location {
+            return Ok(false);
+        }
+    }
     let relationship_columns: HashSet<String> = conn
         .prepare("SELECT name FROM pragma_table_info('session_relationships')")?
         .query_map([], |row| row.get::<_, String>(0))?
@@ -983,18 +1265,62 @@ pub fn open_db_readonly(path: &Path) -> Result<Connection> {
 }
 
 pub fn init_db(conn: &Connection) -> Result<()> {
-    // REPLACE must fire delete triggers so enabled delivery retains preimages.
+    // REPLACE must fire delete triggers so the change feed tombstones the
+    // row it replaces.
     conn.pragma_update(None, "recursive_triggers", true)?;
     init_db_once(conn)
+}
+
+/// Whether [`init_db`] has migration work to do on this database. A leftover
+/// retired index counts as outstanding work: its DROP is a real write.
+fn needs_migration(conn: &Connection) -> Result<bool> {
+    Ok(!schema_is_current(conn)?
+        || retired_indexes_present(conn)?
+        || retired_capture_present(conn)?
+        || retired_trajectory_index_present(conn)?)
+}
+
+/// A schema migration an open in this process runs on an existing database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationEvent {
+    /// The migration holds the write lock and is about to run.
+    Started,
+    /// The migration committed.
+    Finished,
+    /// The migration failed and rolled back; the open reports the error.
+    Failed,
+}
+
+type MigrationObserver = Box<dyn Fn(MigrationEvent, Option<&str>) + Send + Sync>;
+
+static MIGRATION_OBSERVER: std::sync::OnceLock<MigrationObserver> = std::sync::OnceLock::new();
+
+/// Register the process's migration observer, called with each
+/// [`MigrationEvent`] and the database's path.
+///
+/// A migration after an upgrade can run for minutes on a large history, and a
+/// front end that says nothing reads as hung. Events fire only when an open
+/// actually migrates an existing database -- never for a new database, a
+/// current one, or a command that never opens for write -- so a front end
+/// announces exactly the work that happens. The first registration wins;
+/// returns false when an observer is already set.
+pub fn observe_migrations(
+    observer: impl Fn(MigrationEvent, Option<&str>) + Send + Sync + 'static,
+) -> bool {
+    MIGRATION_OBSERVER.set(Box::new(observer)).is_ok()
+}
+
+fn notify_migration(conn: &Connection, event: MigrationEvent) {
+    if let Some(observer) = MIGRATION_OBSERVER.get() {
+        observer(event, conn.path());
+    }
 }
 
 fn init_db_once(conn: &Connection) -> Result<()> {
     // A current database needs no write lock. Besides keeping ordinary opens
     // cheap, this lets sync reach its per-source contention handling when a
-    // different writer already owns the ledger lock. A leftover retired index
-    // counts as outstanding migration work: its DROP is a real write, so it
-    // routes through the serialized pass below instead of this lock-free path.
-    if schema_is_current(conn)? && !retired_indexes_present(conn)? {
+    // different writer already owns the ledger lock.
+    if !needs_migration(conn)? {
         return Ok(());
     }
     enable_wal_for_migration(conn)?;
@@ -1005,11 +1331,38 @@ fn init_db_once(conn: &Connection) -> Result<()> {
     let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     // Another first opener may have completed the migration while this
     // connection waited for the lock.
-    if !schema_is_current(&transaction)? || retired_indexes_present(&transaction)? {
-        init_db_locked(&transaction)?;
+    if !needs_migration(&transaction)? {
+        transaction.commit()?;
+        return Ok(());
     }
-    transaction.commit()?;
-    Ok(())
+    // Creating a database is not an upgrade.
+    let upgrading: bool =
+        transaction.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master)", [], |row| {
+            row.get(0)
+        })?;
+    if upgrading {
+        notify_migration(conn, MigrationEvent::Started);
+    }
+    // Every `Started` ends in exactly one `Finished` or `Failed`, so an
+    // observer waiting on it is never left hanging. Either event fires with the
+    // write lock released: committed, or rolled back by dropping the
+    // transaction before the observer hears of the failure.
+    let migrated = match init_db_locked(&transaction) {
+        Ok(()) => transaction.commit().map_err(anyhow::Error::from),
+        Err(error) => {
+            drop(transaction);
+            Err(error)
+        }
+    };
+    if upgrading {
+        let event = if migrated.is_ok() {
+            MigrationEvent::Finished
+        } else {
+            MigrationEvent::Failed
+        };
+        notify_migration(conn, event);
+    }
+    migrated
 }
 
 /// One observed delegation edge, or one piece of related evidence whose child
@@ -1073,6 +1426,15 @@ CREATE TABLE IF NOT EXISTS session_continuity_evidence (
 "#;
 
 fn init_db_locked(conn: &Connection) -> Result<()> {
+    retire_export_capture(conn)?;
+    // Same shape as the hydration-state trigger below: a body change has to
+    // drop the old trigger before the `IF NOT EXISTS` in SCHEMA re-creates it.
+    if !migration_applied(conn, "session_events_fts_update_of_v1")? {
+        conn.execute_batch("DROP TRIGGER IF EXISTS session_events_au;")?;
+    }
+    if !migration_applied(conn, "history_fts_update_of_v1")? {
+        conn.execute_batch("DROP TRIGGER IF EXISTS history_au;")?;
+    }
     conn.execute_batch(SCHEMA)?;
     // Before the trigger below, whose body deletes from these tables.
     conn.execute_batch(SESSION_RELATIONSHIPS_DDL)?;
@@ -1161,6 +1523,33 @@ CREATE TABLE IF NOT EXISTS transcript_cursors (
     updated_ms INTEGER NOT NULL,
     PRIMARY KEY (source, locator)
 );
+-- Per-inference usage rows read from Grok's process-wide, append-only
+-- `logs/unified.jsonl`. The log is read once, from a byte cursor in
+-- `transcript_cursors`, so these rows are the durable copy: a Grok session
+-- read *replaces* its evidence, and each replacement re-materializes that
+-- session's rows from here as `session_events`. A row for a session not yet
+-- in the catalog waits here until the session is indexed. Keyed on a digest
+-- of the whole row, because Grok reuses `eventId` across usage records.
+CREATE TABLE IF NOT EXISTS grok_unified_usage (
+    row_key TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    ts_ms INTEGER,
+    pid INTEGER,
+    model TEXT,
+    event_id TEXT,
+    usage_json TEXT NOT NULL,
+    locator TEXT NOT NULL,
+    line_offset INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_grok_unified_usage_session
+    ON grok_unified_usage(session_id);
+-- How many turns `updates.jsonl` opened, written by the replacing read.
+-- A cached usage caveat is rebuilt from stored rows after a log append, and
+-- a turn that left no row would otherwise disappear from that count.
+CREATE TABLE IF NOT EXISTS grok_session_turns (
+    session_id TEXT PRIMARY KEY,
+    turns INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS session_identity_correlations (
     source TEXT NOT NULL,
     local_session_id TEXT NOT NULL,
@@ -1232,10 +1621,16 @@ END;
     // The triggers above are current now, including the rebuilt one.
     conn.execute_batch(
         "INSERT OR IGNORE INTO schema_migrations (name) \
-         VALUES ('session_delete_continuity_reopen_v1');",
+         VALUES ('session_delete_continuity_reopen_v1'), \
+                ('session_events_fts_update_of_v1'), \
+                ('history_fts_update_of_v1');",
     )?;
+    // Before the change feed's revision backfill, whose UPDATE of every
+    // trajectory would otherwise fire the Python-era trigger.
+    retire_trajectory_index(conn)?;
     migrate_session_relationships_v2(conn)?;
     migrate_tool_result_fidelity_v1(conn)?;
+    migrate_evidence_location_v1(conn)?;
     // Additive: a v2 table predating continuity gains the one column the
     // continuity kinds need, and a fresh database already has it from the DDL
     // above, so both paths converge on the same shape.
@@ -1361,6 +1756,13 @@ VALUES ('session_presences_local_backfill_v1');
         "CREATE INDEX IF NOT EXISTS idx_sessions_source_recency ON sessions(source, last_activity_ms DESC, session_id)",
         [],
     )?;
+    // The primary key leads with `session_id`; the identity listing merges
+    // every table's identities in `(source, session_id)` order, and needs the
+    // catalog in that order too.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_identity ON sessions(source, session_id)",
+        [],
+    )?;
     // Shallow discovery keys its "has this file changed?" lookup on the raw
     // path, because a transcript's session id is not known until it is read.
     conn.execute(
@@ -1391,6 +1793,13 @@ VALUES ('session_presences_local_backfill_v1');
         "CREATE INDEX IF NOT EXISTS idx_session_relationships_child ON session_relationships(source, child_session_id)",
         [],
     )?;
+    // The sync walk asks, for every Claude transcript it considers, whether a
+    // delegation edge names that file as its evidence. Without this, each
+    // question is a scan of every Claude relationship.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_relationships_locator ON session_relationships(source, evidence_locator)",
+        [],
+    )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_session_continuity_parent_uuid ON session_continuity_evidence(source, first_parent_uuid)",
         [],
@@ -1404,6 +1813,21 @@ VALUES ('session_presences_local_backfill_v1');
     )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_session_events_session ON session_events(source, session_id)",
+        [],
+    )?;
+    // `(source, session_id)` plus the two identity columns, so the project
+    // identity refresh can compare every event of a session with its catalog
+    // row from the index alone instead of reading every event row.
+    //
+    // Beside the bare `(source, session_id)` index rather than replacing it,
+    // though it covers it as a prefix. With no `sqlite_stat1` the planner
+    // ranks an index by how many of its columns a query pins, so a two-column
+    // match on a four-column index loses to a one-column match on
+    // `idx_session_events_role`: replacing it turned every
+    // `source = ? AND session_id = ? AND role = ?` retirement into a scan of
+    // every event with that role, and a cold sync into a quadratic one.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_events_project ON session_events(source, session_id, project_key, project_key_method)",
         [],
     )?;
     // Continuity resolves a transcript's first parent uuid to the session
@@ -1476,138 +1900,45 @@ VALUES ('session_presences_local_backfill_v1');
         "INSERT OR IGNORE INTO schema_migrations (name) VALUES ('session_markers_v1');",
     )?;
     migrate_session_markers_v2(conn)?;
+    // Partial: only rows that name a provider message carry a key. On
+    // `message.id` rather than `requestId` because settlement always names the
+    // message and only sometimes the request: a transcript that writes no
+    // `requestId` is grouped on `message.id` alone.
+    // An earlier revision indexed `request_id` under this name.
+    conn.execute("DROP INDEX IF EXISTS idx_session_events_request", [])?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_events_provider_message \
+         ON session_events(source, session_id, provider_message_id) \
+         WHERE provider_message_id IS NOT NULL",
+        [],
+    )?;
+    // Rows stored before the parser settled streamed Claude requests and
+    // reclassified `<synthetic>` notices. Both repairs read only the stored
+    // rows, so they run here once instead of waiting for every transcript to
+    // be re-read. After the marker migration, whose columns the notices move
+    // into.
+    // v2 because the summary repair joined the pass after a revision had
+    // already recorded v1 without it; every step is idempotent.
+    if !migration_applied(conn, "claude_request_evidence_v2")? {
+        crate::ingest::heal_claude_request_evidence(conn)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (name) VALUES ('claude_request_evidence_v2')",
+            [],
+        )?;
+    }
     // Derived from `session_events`, so it must come after the DDL and the
     // column migrations above, and needs no backfill: the first query over an
     // upgraded database already sees every request its events describe.
     crate::session_usage::ensure_session_requests_view(conn)?;
     crate::observations::init_schema(conn)?;
-    init_export_schema(conn)?;
-    // Only now, with the capture triggers rebuilt and the journal certain to
-    // exist, is the debt the marker migration recorded payable.
-    resolve_marker_journal_backfill(conn)?;
-    Ok(())
-}
-
-#[cfg(feature = "export")]
-fn init_export_schema(conn: &Connection) -> Result<()> {
-    crate::export::init_schema(conn)
-}
-
-#[cfg(not(feature = "export"))]
-fn init_export_schema(_conn: &Connection) -> Result<()> {
-    Ok(())
-}
-
-/// Preserve the pre-migration marker rows for consumers mid-snapshot.
-#[cfg(feature = "export")]
-fn shadow_marker_preimages(conn: &Connection) -> Result<()> {
-    crate::export::shadow_preimages(conn, "session_markers")
-}
-
-/// Without the delivery feature there is no `delivery_shadow` to write to and
-/// no way to build the payload, so a database with a consumer mid-snapshot is
-/// refused rather than migrated.
-///
-/// This is the one place the migration stops instead of deferring, and the
-/// asymmetry is the point. Everywhere else the rows survive, so the work can
-/// wait for a build that can do it. A preimage cannot wait: proceeding would
-/// drop the only copy of a shape a consumer was promised, and no later open
-/// could put it back. A failed open naming the remedy is recoverable; silent
-/// destruction is not.
-///
-/// Only an *unfinished* consumer is owed anything, so an ordinary install --
-/// no delivery tables at all, or no snapshot in flight -- migrates normally.
-#[cfg(not(feature = "export"))]
-fn shadow_marker_preimages(conn: &Connection) -> Result<()> {
-    let subscriptions: bool=conn.query_row("SELECT count(*)=2 FROM sqlite_master WHERE type='table' AND name IN ('history_subscriptions','delivery_bootstrap_bounds')",[],|r|r.get(0))?;
-    if subscriptions {
-        let unread:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM history_subscriptions s JOIN delivery_bootstrap_bounds b ON b.job_id=s.id WHERE s.bootstrap_done=0 AND b.kind='session_marker')",[],|r|r.get(0))?;
-        anyhow::ensure!(!unread,"session_markers migration requires an export-enabled build while an evidence snapshot is in flight; open with the probe or export-enabled ai-hist first");
-    }
-
-    let ready: bool = conn
-        .prepare(
-            "SELECT count(*) = 3 FROM sqlite_master WHERE type = 'table' \
-             AND name IN ('delivery_bootstrap_bounds','delivery_jobs','history_exports')",
-        )?
-        .query_row([], |row| row.get(0))?;
-    if !ready {
-        return Ok(());
-    }
-    // The same union the capture triggers serve: live delivery jobs *and*
-    // unexpired file exports. Asking only about jobs let a database whose only
-    // in-flight consumer was an export migrate and drop the column with no
-    // preimage taken -- the identical unrecoverable loss, reached through the
-    // other half of the set. Spelled out here rather than reusing `CONSUMERS`
-    // because that constant lives in the module this build compiles out.
-    let unfinished: bool = conn
-        .prepare(
-            "SELECT 1 FROM delivery_bootstrap_bounds b \
-             WHERE b.kind = 'session_marker' AND ( \
-               EXISTS(SELECT 1 FROM delivery_jobs j \
-                      WHERE j.id = b.job_id AND j.state <> 'cancelled' \
-                        AND j.bootstrap_done = 0) \
-               OR EXISTS(SELECT 1 FROM history_exports e \
-                         WHERE e.id = b.job_id AND e.bootstrap_done = 0 \
-                           AND e.expires_at_ms > CAST(unixepoch('subsec')*1000 AS INTEGER)) \
-             )",
-        )?
-        .exists([])?;
-    anyhow::ensure!(
-        !unfinished,
-        "session_markers cannot be migrated by a build without the delivery feature while a \
-         delivery snapshot is still in flight: the pre-migration rows would be lost for it \
-         and cannot be recovered afterwards. Open this database once with a delivery-enabled \
-         build, or let the snapshot finish, and retry."
-    );
-    Ok(())
-}
-
-/// Pay off what the marker migration recorded, once the schema can take it.
-///
-/// The migration has to retire the capture triggers -- SQLite validates them
-/// when a column is dropped -- so every write it makes is invisible to
-/// delivery, and so is every marker written afterwards until the triggers come
-/// back. Rebuilt triggers only ever see future writes, and a no-op touch
-/// cannot wake them either: their `WHEN old_payload <> new_payload` guard is
-/// false for a row whose values did not change.
-///
-/// So the gap is closed by journalling the marker table once, here, after
-/// `init_export_schema` has rebuilt the triggers. Every row rather than the
-/// migrated ones, because the gap covers both: in a build without the delivery
-/// feature the migration runs, the triggers stay down for the rest of that
-/// process, and the markers a sync writes in the meantime are captured by
-/// nothing. That build leaves the flag set and the next delivery-enabled open
-/// settles all of it.
-///
-/// The upserts are idempotent at the destination -- they carry the same record
-/// key capture would -- so paying a little more than is strictly owed is the
-/// safe direction, and the alternative is a revision that exists nowhere.
-#[cfg(feature = "export")]
-fn resolve_marker_journal_backfill(conn: &Connection) -> Result<()> {
-    if !migration_applied(conn, "session_markers_v2_journal_pending")? {
-        return Ok(());
-    }
-    crate::export::journal_migrated_rows(conn, "session_markers")?;
-    conn.execute(
-        "DELETE FROM schema_migrations WHERE name = 'session_markers_v2_journal_pending'",
-        [],
-    )?;
-    Ok(())
-}
-
-/// Without the delivery feature there is no journal to write to and no trigger
-/// DDL reachable to rebuild, so the flag is left standing for a build that has
-/// both. Doing nothing is the point: clearing it here would retire a debt
-/// nobody paid.
-#[cfg(not(feature = "export"))]
-fn resolve_marker_journal_backfill(_conn: &Connection) -> Result<()> {
+    // After the observation schema: the stamping triggers draw on its clock.
+    crate::change_feed::init_schema(conn)?;
     Ok(())
 }
 
 /// Whether a named migration has already run, on a database that may predate
 /// the `schema_migrations` table itself.
-fn migration_applied(conn: &Connection, name: &str) -> Result<bool> {
+pub(crate) fn migration_applied(conn: &Connection, name: &str) -> Result<bool> {
     let table: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master \
          WHERE type = 'table' AND name = 'schema_migrations')",
@@ -1723,6 +2054,119 @@ const TOOL_RESULT_FIDELITY_COLUMNS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// The evidence tables whose rows record which evidence backs them.
+///
+/// Local and remote evidence for one session share its `(source,
+/// session_id)` identity and each table's unique key, so one record is one
+/// row whichever side supplied it. Without a per-row location a local parser
+/// re-reading a session could not tell the rows it wrote from rows a remote
+/// observation supplied, and a whole-session replacement deleted both.
+///
+/// `location` is `'local'`, `'remote'` or `'both'`. A writer stamps its own
+/// side — local parsers by the column default, remote intake explicitly — and
+/// an upsert that meets the other side's row makes it `'both'`
+/// ([`location_on_conflict`]). A side retiring its evidence
+/// ([`retire_evidence_share`]) deletes the rows only it backs and hands the
+/// rows both back to the other side, so neither side's re-read can remove
+/// what the other still evidences.
+pub(crate) const EVIDENCE_LOCATION_TABLES: &[&str] = &[
+    "session_events",
+    "tool_calls",
+    "file_edits",
+    "session_markers",
+];
+
+/// The `location = …` assignment for an `ON CONFLICT … DO UPDATE` on one of
+/// [`EVIDENCE_LOCATION_TABLES`]: unchanged when the writer is the side that
+/// already backs the row, `'both'` once the other side does too.
+pub(crate) fn location_on_conflict(table: &str) -> String {
+    format!(
+        "location = CASE WHEN {table}.location = excluded.location \
+         THEN {table}.location ELSE 'both' END"
+    )
+}
+
+/// Retire one side's share of the rows `condition` selects in `table`, one of
+/// [`EVIDENCE_LOCATION_TABLES`]: rows only `side` backs are deleted, and rows
+/// both sides back are left to the other side alone. `condition` is a SQL
+/// boolean over the table's columns; `params` bind its placeholders.
+///
+/// Returns how many rows were deleted.
+pub(crate) fn retire_evidence_share(
+    conn: &Connection,
+    table: &str,
+    condition: &str,
+    params: &[&dyn rusqlite::ToSql],
+    side: SessionLocation,
+) -> Result<usize> {
+    let (own, other) = match side {
+        SessionLocation::Local => ("local", "remote"),
+        SessionLocation::Remote => ("remote", "local"),
+    };
+    // `table` and `condition` come from internal call sites, never from input.
+    let deleted = conn.execute(
+        &format!("DELETE FROM {table} WHERE ({condition}) AND location = '{own}'"),
+        params,
+    )?;
+    conn.execute(
+        &format!(
+            "UPDATE {table} SET location = '{other}' WHERE ({condition}) AND location = 'both'"
+        ),
+        params,
+    )?;
+    Ok(deleted)
+}
+
+/// Add `location` to every table in [`EVIDENCE_LOCATION_TABLES`], once.
+///
+/// Rows that predate the column default to `'local'`, which is what every
+/// local parser wrote. The one case that can be told apart is a session known
+/// *only* remotely: nothing local ever read it, so its rows came from remote
+/// intake, and they are backfilled as `'remote'`. A session known both ways is
+/// ambiguous row by row and stays `'local'`, which is what a local re-read
+/// already assumed about every row before the column existed.
+fn migrate_evidence_location_v1(conn: &Connection) -> Result<()> {
+    // The column is ensured on every open, like every other added column, so
+    // a table rebuilt by a later migration (or by hand) regains it; only the
+    // backfill is once.
+    for table in EVIDENCE_LOCATION_TABLES {
+        ensure_columns(
+            conn,
+            table,
+            &[(
+                "location",
+                "TEXT NOT NULL DEFAULT 'local' CHECK(location IN ('local', 'remote', 'both'))",
+            )],
+        )?;
+    }
+    if migration_applied(conn, "evidence_location_v1")? {
+        return Ok(());
+    }
+    for table in EVIDENCE_LOCATION_TABLES {
+        // `table` comes exclusively from the constant list above.
+        conn.execute(
+            &format!(
+                "UPDATE {table} SET location = 'remote' \
+                 WHERE EXISTS (SELECT 1 FROM session_presences p \
+                               WHERE p.source = {table}.source \
+                                 AND p.session_id = {table}.session_id \
+                                 AND p.location = 'remote') \
+                   AND NOT EXISTS (SELECT 1 FROM session_presences p \
+                                   WHERE p.source = {table}.source \
+                                     AND p.session_id = {table}.session_id \
+                                     AND p.location = 'local')"
+            ),
+            [],
+        )
+        .with_context(|| format!("backfilling {table}.location"))?;
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations (name) VALUES ('evidence_location_v1')",
+        [],
+    )?;
+    Ok(())
+}
+
 fn migrate_tool_result_fidelity_v1(conn: &Connection) -> Result<()> {
     let migrated: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE name = 'session_events_tool_result_fidelity_v1')",
@@ -1774,7 +2218,11 @@ fn ensure_text_columns(conn: &Connection, table: &str, required: &[&str]) -> Res
 /// [`ensure_text_columns`]. `session_events` needs the types because its
 /// raw-fact columns are a mix of TEXT and INTEGER, and the hydration cursor
 /// columns need the defaults.
-fn ensure_columns(conn: &Connection, table: &str, required: &[(&str, &str)]) -> Result<()> {
+pub(crate) fn ensure_columns(
+    conn: &Connection,
+    table: &str,
+    required: &[(&str, &str)],
+) -> Result<()> {
     let existing: HashSet<String> = conn
         .prepare("SELECT name FROM pragma_table_info(?)")?
         .query_map([table], |row| row.get::<_, String>(0))?
@@ -1812,17 +2260,6 @@ fn migrate_session_markers_v2(conn: &Connection) -> Result<()> {
     let has_detail_json: bool = conn
         .prepare("SELECT 1 FROM pragma_table_info('session_markers') WHERE name = 'detail_json'")?
         .exists([])?;
-    if has_detail_json {
-        // Freeze the old shape for anyone mid-snapshot, before anything at all
-        // happens to the table -- ahead of the added columns as well as the
-        // writes, so the preimage is the shape their snapshot was promised
-        // rather than that shape plus some nulls.
-        //
-        // This one is not recoverable later: the journal backfill can be
-        // deferred because the rows survive, but a preimage cannot be
-        // reconstructed once the column it holds is gone.
-        shadow_marker_preimages(conn)?;
-    }
     ensure_columns(
         conn,
         "session_markers",
@@ -1836,27 +2273,6 @@ fn migrate_session_markers_v2(conn: &Connection) -> Result<()> {
         ],
     )?;
     if has_detail_json {
-        // Retire the capture triggers *before* touching a row, not merely
-        // before the column drop.
-        //
-        // They are built from the column list they were created with, so on a
-        // v1 database they know nothing of `payload_json`: the copy below
-        // would run under triggers whose `WHEN old_payload <> new_payload`
-        // guard compares two `json_object`s that both omit the column being
-        // written, so it is false and nothing is journalled at all. A
-        // destination with an active job would never be told that any marker
-        // predating the upgrade had gained a payload, and no part of the
-        // delivery would look wrong. Dropping them first makes that explicit
-        // rather than incidental, and it is required anyway for the column
-        // drop, which SQLite refuses while a dependent trigger names it.
-        //
-        // `IF EXISTS` because a database opened by a build without the
-        // delivery feature has none of them.
-        conn.execute_batch(
-            "DROP TRIGGER IF EXISTS delivery_session_markers_insert; \
-             DROP TRIGGER IF EXISTS delivery_session_markers_update; \
-             DROP TRIGGER IF EXISTS delivery_session_markers_delete;",
-        )?;
         // Bounded on the way across, not copied verbatim. `payload_json` is
         // documented as a projection whose strings and containers are bounded,
         // and every kind the parsers write goes through that bounder -- so a
@@ -1871,7 +2287,6 @@ fn migrate_session_markers_v2(conn: &Connection) -> Result<()> {
             )?
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
-        let mut migrated = Vec::new();
         for (id, detail_json) in legacy {
             // A legacy value that does not parse is dropped rather than stored
             // raw: unparsed text is exactly what the bound exists to keep out.
@@ -1882,35 +2297,8 @@ fn migrate_session_markers_v2(conn: &Connection) -> Result<()> {
                 "UPDATE session_markers SET payload_json = ? WHERE id = ?",
                 params![bounded, id],
             )?;
-            migrated.push(id);
         }
         conn.execute("ALTER TABLE session_markers DROP COLUMN detail_json", [])?;
-        // Record that these rows still owe delivery a revision; do not pay it
-        // here. Two reasons, and each on its own is fatal:
-        //
-        // This runs *before* `init_export_schema`, so `delivery_journal` may
-        // not exist yet -- delivery is opt-in, and a database only ever opened
-        // by builds without the feature has none of its tables. A statement
-        // naming a missing table fails when it is prepared, before any `WHERE`
-        // clause can spare it, so journalling inline turns the most ordinary
-        // upgrade into a failed open.
-        //
-        // And this migration is not feature-gated while the journal is, so a
-        // build without delivery gets here, drops the capture triggers it
-        // cannot rebuild, and can neither journal now nor be made to later.
-        // A flag it leaves set is the one thing that survives it.
-        //
-        // `migrated` is deliberately not recorded with the flag. What is owed
-        // is not "these rows" but "every marker row", because capture is off
-        // from here until the triggers come back -- in a no-delivery process
-        // that is the rest of the run, including markers a sync writes after
-        // this point.
-        let _ = migrated;
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_migrations (name) \
-             VALUES ('session_markers_v2_journal_pending')",
-            [],
-        )?;
     }
     conn.execute(
         "INSERT OR IGNORE INTO schema_migrations (name) VALUES ('session_markers_v2')",
@@ -2111,6 +2499,14 @@ fn append_filters(sql: &mut String, params: &mut Vec<String>, filter: &QueryFilt
         sql.push_str(&format!(" AND {alias}.timestamp_ms < ?"));
         params.push(before_ms.to_string());
     }
+    append_window_filters(
+        sql,
+        params,
+        filter,
+        &format!("{alias}.timestamp_ms"),
+        &format!("{alias}.id"),
+        false,
+    );
 }
 
 fn append_scope_filter(sql: &mut String, scope: SessionScope, alias: &str) {
@@ -2313,12 +2709,13 @@ pub fn search(
     if terms.is_empty() {
         return recent(conn, filter);
     }
+    filter.validate()?;
     let query = build_fts_query(terms, raw_fts);
     let mut sql = "SELECT h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms FROM history_fts f JOIN history h ON f.rowid = h.id WHERE history_fts MATCH ?".to_string();
     let mut params_vec = vec![query];
     append_filters(&mut sql, &mut params_vec, filter, "h");
     append_scope_filter(&mut sql, filter.scope, "h");
-    sql.push_str(" ORDER BY h.timestamp_ms DESC LIMIT ?");
+    sql.push_str(" ORDER BY h.timestamp_ms DESC, h.id DESC LIMIT ?");
     params_vec.push(filter.limit.max(1).to_string());
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
@@ -2329,15 +2726,42 @@ pub fn search(
 }
 
 pub fn recent(conn: &Connection, filter: &QueryFilter) -> Result<Vec<HistoryEntry>> {
+    filter.validate()?;
     let mut sql = "SELECT h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms FROM history h WHERE 1=1".to_string();
     let mut params_vec = Vec::new();
     append_filters(&mut sql, &mut params_vec, filter, "h");
     append_scope_filter(&mut sql, filter.scope, "h");
-    sql.push_str(" ORDER BY h.timestamp_ms DESC LIMIT ?");
+    sql.push_str(" ORDER BY h.timestamp_ms DESC, h.id DESC LIMIT ?");
     params_vec.push(filter.limit.max(1).to_string());
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), row_to_entry)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// One page of [`recent`], newest first, with a cursor to the next page when
+/// one exists.
+pub fn recent_page(conn: &Connection, filter: &QueryFilter) -> Result<HistoryPage<HistoryEntry>> {
+    // One row past the page shows whether another follows; a limit no table
+    // can reach is clamped so that over-fetch cannot overflow.
+    let limit = filter.limit.clamp(1, i64::MAX - 1);
+    let mut rows = recent(
+        conn,
+        &QueryFilter {
+            limit: limit + 1,
+            ..filter.clone()
+        },
+    )?;
+    let next_cursor = if rows.len() as i64 > limit {
+        rows.truncate(limit as usize);
+        rows.last().map(|row| HistoryCursor {
+            timestamp_ms: row.timestamp_ms,
+            id: row.id,
+            match_source: None,
+        })
+    } else {
+        None
+    };
+    Ok(HistoryPage { rows, next_cursor })
 }
 
 pub fn session(
@@ -2355,7 +2779,7 @@ pub fn session(
     let mut sql = "SELECT h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms FROM history h WHERE h.session_id = ?".to_string();
     let mut params_vec = vec![session_id.to_string()];
     append_filters(&mut sql, &mut params_vec, &filter, "h");
-    sql.push_str(" ORDER BY h.timestamp_ms ASC");
+    sql.push_str(" ORDER BY h.timestamp_ms ASC, h.id ASC");
     filter.limit = 0;
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), row_to_entry)?;
@@ -2415,7 +2839,8 @@ pub struct SessionEvent {
     /// `tool_result` / `subagent_notification` / `function_call_output`.
     pub event_source: Option<String>,
     /// Which provider signal set the error: `tool_result.is_error`,
-    /// `exit_code`, `patch_apply`, `mcp_err`, or `subagent_status`.
+    /// `exit_code`, `patch_apply`, `mcp_err`, `subagent_status`, or
+    /// `tool_status`.
     pub error_signal: Option<String>,
     /// Delegated child session this result reports on.
     pub subagent_session_id: Option<String>,
@@ -2442,6 +2867,20 @@ pub struct SessionEvent {
     /// hydrated Codex session arrives with null spans and reads as one request
     /// per row, which is the defect this column exists to prevent.
     pub request_span: Option<String>,
+    /// Why a user-role row is not a human prompt, or `None` for a genuine
+    /// prompt and for every model-output row.
+    ///
+    /// One of `slash_command_caveat`, `slash_command_invocation`,
+    /// `slash_command_output`, `task_notification`, `hook_output`,
+    /// `bash_passthrough_input`, `bash_passthrough_output`,
+    /// `system_reminder`, `codex_context_wrapper`, `meta`, `resume_marker`.
+    /// The row keeps `role = "user"` and `kind = "text"` and its text
+    /// verbatim; this column is what a consumer building human turns, prompt
+    /// roots or an overhead breakdown filters on, so none of them has to
+    /// re-read the transcript to tell a `<task-notification>` from a prompt.
+    /// `None` also on rows written before the column existed, which the next
+    /// plain `sync` re-stamps.
+    pub control_kind: Option<String>,
 }
 
 /// Stable continuation for normalized session events.
@@ -2498,7 +2937,10 @@ pub struct SessionFileEdit {
 ///
 /// 2: `session_events` rows carry per-message raw provider facts and
 /// per-tool-result fidelity, and the user-turn page is available.
-pub const SESSION_EVIDENCE_CONTRACT_VERSION: u32 = 2;
+///
+/// 3: `session_events` rows carry `control_kind`, and the user-turn page
+/// leaves control rows out.
+pub const SESSION_EVIDENCE_CONTRACT_VERSION: u32 = 3;
 
 /// Stable continuation for tool calls and file edits.
 ///
@@ -2568,14 +3010,15 @@ pub struct SessionMarkerPage {
 /// each spelled its own `SELECT` the two drifted the moment a column was
 /// added, and the mismatch only surfaces as a positional `row.get` reading the
 /// wrong field.
-const SESSION_EVENT_COLUMNS: &str =
+pub(crate) const SESSION_EVENT_COLUMNS: &str =
     "id, source, session_id, project, project_key, cwd, git_branch, message_id, parent_id, \
      ts_ms, role, kind, text, model, token_json, provider, event_uid, tool_use_id, payload_bytes, \
      payload_truncated, payload_hash, call_index, event_index, result_status, event_source, \
      error_signal, subagent_session_id, agent_id, request_id, provider_message_id, \
-     stop_reason, agent_version, is_sidechain, is_meta, turn_id, request_span, raw_kind";
+     stop_reason, agent_version, is_sidechain, is_meta, turn_id, request_span, raw_kind, \
+     control_kind";
 
-fn row_to_session_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionEvent> {
+pub(crate) fn row_to_session_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionEvent> {
     Ok(SessionEvent {
         id: row.get(0)?,
         source: row.get(1)?,
@@ -2614,6 +3057,7 @@ fn row_to_session_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionEven
         turn_id: row.get(34)?,
         request_span: row.get(35)?,
         raw_kind: row.get(36)?,
+        control_kind: row.get(37)?,
     })
 }
 
@@ -2634,6 +3078,100 @@ pub fn session_events(
     sql.push_str(" ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC");
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), row_to_session_event)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Every normalized event for one session, oldest first, with the UTF-8
+/// length of its `text` column beside it — and, when `include_text` is
+/// false, without moving the text column out of SQLite at all.
+///
+/// For [`crate::SessionStore::session`]: a hash-only consumer must not pay
+/// to carry transcript text, and dropping it after the row was materialized
+/// is still paying for it.
+pub(crate) fn session_events_sized(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+    include_text: bool,
+) -> Result<Vec<(SessionEvent, Option<i64>)>> {
+    let columns = if include_text {
+        SESSION_EVENT_COLUMNS.to_string()
+    } else {
+        SESSION_EVENT_COLUMNS.replacen(", text, ", ", NULL AS text, ", 1)
+    };
+    let sql = format!(
+        "SELECT {columns}, LENGTH(CAST(text AS BLOB)) FROM session_events \
+         WHERE source = ? AND session_id = ? ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    // The size lands after every event column, so it is addressed by the
+    // statement's own arity rather than a literal: a column added to
+    // `SESSION_EVENT_COLUMNS` would otherwise silently read as the size.
+    let size = stmt.column_count() - 1;
+    let rows = stmt.query_map(rusqlite::params![source, session_id], |row| {
+        Ok((row_to_session_event(row)?, row.get::<_, Option<i64>>(size)?))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// One `history` row as [`crate::SessionStore::session`] reads it: the
+/// stored hash and byte length always, the prompt only when asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PromptRow {
+    pub project: Option<String>,
+    pub timestamp_ms: i64,
+    /// The stored `prompt_hash`; `None` for a row written without one.
+    pub prompt_hash: Option<String>,
+    pub prompt_bytes: i64,
+    /// `None` when the read asked for no text.
+    pub prompt: Option<String>,
+}
+
+/// A session's prompts, oldest first, without moving the prompt column out
+/// of SQLite when `include_text` is false.
+pub(crate) fn session_prompts_sized(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+    include_text: bool,
+) -> Result<Vec<PromptRow>> {
+    let prompt = if include_text { "prompt" } else { "NULL" };
+    let sql = format!(
+        "SELECT project, timestamp_ms, prompt_hash, LENGTH(CAST(prompt AS BLOB)), {prompt} \
+         FROM history WHERE source = ? AND session_id = ? ORDER BY timestamp_ms ASC, id ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params![source, session_id], |row| {
+        Ok(PromptRow {
+            project: row.get(0)?,
+            timestamp_ms: row.get(1)?,
+            prompt_hash: row.get(2)?,
+            prompt_bytes: row.get::<_, Option<i64>>(3)?.unwrap_or(0),
+            prompt: row.get(4)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Every marker of a session, oldest first, on the caller's snapshot, without
+/// moving the `text` column when `include_text` is false.
+pub(crate) fn session_markers_sized(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+    include_text: bool,
+) -> Result<Vec<SessionMarker>> {
+    let columns = if include_text {
+        SESSION_MARKER_COLUMNS.to_string()
+    } else {
+        SESSION_MARKER_COLUMNS.replacen(", text, ", ", NULL AS text, ", 1)
+    };
+    let sql = format!(
+        "SELECT {columns} FROM session_markers WHERE source = ? AND session_id = ? \
+         ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params![source, session_id], row_to_session_marker)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
@@ -2717,15 +3255,17 @@ pub fn session_file_edits(
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-const TOOL_CALL_COLUMNS: &str = "id, source, session_id, message_id, tool_use_id, name, target, \
+pub(crate) const TOOL_CALL_COLUMNS: &str =
+    "id, source, session_id, message_id, tool_use_id, name, target, \
                                  args_json, is_error, ts_ms";
-const FILE_EDIT_COLUMNS: &str =
+pub(crate) const FILE_EDIT_COLUMNS: &str =
     "id, source, session_id, message_id, tool_use_id, file_path, tool_name, lines_added, \
      lines_removed, structured_patch_json, user_modified, ts_ms, git_branch, cwd";
-const SESSION_MARKER_COLUMNS: &str = "id, source, session_id, marker_uid, ts_ms, message_id, \
+pub(crate) const SESSION_MARKER_COLUMNS: &str =
+    "id, source, session_id, marker_uid, ts_ms, message_id, \
                                       parent_id, turn_id, kind, subkind, text, payload_json";
 
-fn row_to_session_marker(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMarker> {
+pub(crate) fn row_to_session_marker(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMarker> {
     Ok(SessionMarker {
         id: row.get(0)?,
         source: row.get(1)?,
@@ -2831,7 +3371,9 @@ pub fn insert_session_marker(
          ON CONFLICT(source, session_id, marker_uid) DO UPDATE SET \
          ts_ms=excluded.ts_ms, message_id=excluded.message_id, parent_id=excluded.parent_id, \
          turn_id=excluded.turn_id, kind=excluded.kind, subkind=excluded.subkind, \
-         text=excluded.text, payload_json=excluded.payload_json",
+         text=excluded.text, payload_json=excluded.payload_json, \
+         location=CASE WHEN session_markers.location = excluded.location \
+           THEN session_markers.location ELSE 'both' END",
         params![
             source,
             session_id,
@@ -2849,7 +3391,7 @@ pub fn insert_session_marker(
     Ok(changed)
 }
 
-fn row_to_tool_call(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionToolCall> {
+pub(crate) fn row_to_tool_call(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionToolCall> {
     Ok(SessionToolCall {
         id: row.get(0)?,
         source: row.get(1)?,
@@ -2864,7 +3406,7 @@ fn row_to_tool_call(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionToolCall
     })
 }
 
-fn row_to_file_edit(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionFileEdit> {
+pub(crate) fn row_to_file_edit(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionFileEdit> {
     Ok(SessionFileEdit {
         id: row.get(0)?,
         source: row.get(1)?,
@@ -3099,8 +3641,13 @@ const USER_TURN_KEY: &str = "COALESCE(NULLIF(message_id, ''), 'event:' || id)";
 /// proven to belong to a user message, so it is left out rather than guessed
 /// at. Those rows are transient: the one-time fidelity backfill pass populates
 /// `event_source` for every transcript it can still read.
-const USER_TURN_ROW_FILTER: &str =
-    "(role = 'user' OR (role = 'tool_result' AND event_source = 'tool_result'))";
+///
+/// A user-role row carrying a `control_kind` is the harness's, not the
+/// human's: a Codex context wrapper would otherwise read as a turn of its own,
+/// and a `<system-reminder>` row split off a prompt would be counted among the
+/// prompt's blocks and bytes.
+const USER_TURN_ROW_FILTER: &str = "((role = 'user' AND control_kind IS NULL) \
+     OR (role = 'tool_result' AND event_source = 'tool_result'))";
 
 /// The message recorded next to a turn, on either side of it.
 ///
@@ -3516,15 +4063,29 @@ pub(crate) fn refresh_session_project_identity(
 /// borrowed repository says more about a session than the directory it
 /// happened to run in.
 fn resolve_missing_project_keys(conn: &Connection) -> Result<usize> {
-    let pending: Vec<(Option<String>, Option<String>)> = conn
-        .prepare(
-            "SELECT DISTINCT cwd, repo_url FROM sessions \
+    // Every reconsidered row, with the key it holds, in one read. The UPDATE
+    // below is keyed on `(cwd, repo_url)`, which no index serves, so asking
+    // "does any row of this pair need it?" in SQL was one scan of the catalog
+    // per distinct directory — O(directories x sessions) on every sync and
+    // every discovery pass, to conclude, almost always, that nothing moves.
+    // The same predicate is evaluated here over the rows already read.
+    type Held = (Option<String>, Option<String>);
+    let mut pending: BTreeMap<(Option<String>, Option<String>), Vec<Held>> = BTreeMap::new();
+    {
+        let mut statement = conn.prepare(
+            "SELECT cwd, repo_url, project_key, project_key_method FROM sessions \
              WHERE (project_key IS NULL \
                     OR project_key_method IN ('path', 'inherited')) \
                AND (cwd IS NOT NULL OR repo_url IS NOT NULL)",
-        )?
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<rusqlite::Result<_>>()?;
+        )?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            pending
+                .entry((row.get(0)?, row.get(1)?))
+                .or_default()
+                .push((row.get(2)?, row.get(3)?));
+        }
+    }
     if pending.is_empty() {
         return Ok(0);
     }
@@ -3548,24 +4109,31 @@ fn resolve_missing_project_keys(conn: &Connection) -> Result<usize> {
                  AND (?2 = 'remote' OR project_key <> ?1)) \
              OR (project_key_method = 'inherited' AND ?2 = 'remote')) \
            AND cwd IS ?3 AND repo_url IS ?4";
-    let mut needed = conn.prepare(&format!(
-        "SELECT 1 FROM sessions WHERE {UPGRADABLE} LIMIT 1"
-    ))?;
     let mut update = conn.prepare(&format!(
         "UPDATE sessions SET project_key = ?1, project_key_method = ?2 WHERE {UPGRADABLE}"
     ))?;
     let mut written = 0;
-    for (cwd, repo_url) in pending {
+    for ((cwd, repo_url), held) in pending {
         let Some((key, method)) =
             crate::project_identity::identity_for(cwd.as_deref(), repo_url.as_deref())
         else {
             continue;
         };
-        let arguments = params![key, method.as_str(), cwd, repo_url];
-        if !needed.exists(arguments)? {
+        // `UPGRADABLE`, row by row, over what the read above returned.
+        let remote = method == crate::project_identity::ProjectKeyMethod::Remote;
+        let needed =
+            held.iter().any(
+                |(held_key, held_method)| match (held_key, held_method.as_deref()) {
+                    (None, _) => true,
+                    (Some(held_key), Some("path")) => remote || held_key != &key,
+                    (Some(_), Some("inherited")) => remote,
+                    _ => false,
+                },
+            );
+        if !needed {
             continue;
         }
-        written += update.execute(arguments)?;
+        written += update.execute(params![key, method.as_str(), cwd, repo_url])?;
     }
     Ok(written)
 }
@@ -3817,21 +4385,21 @@ fn event_key_rank_sql(key: &str, method: &str) -> String {
 /// Ranked exactly as the catalog's merge is: nothing may lower a key's rank,
 /// and an equal rank may only be rewritten when the key itself differs.
 fn denormalize_event_project_keys(conn: &Connection) -> Result<usize> {
-    let incoming = event_key_rank_sql(EVENT_SESSION_KEY_SQL, EVENT_SESSION_METHOD_SQL);
-    let stored = event_key_rank_sql("project_key", "project_key_method");
-    let stale = format!(
-        "{EVENT_SESSION_KEY_SQL} IS NOT NULL \
-           AND (({incoming}) > ({stored}) \
-                OR (({incoming}) = ({stored}) \
-                    AND (project_key IS NULL OR project_key <> {EVENT_SESSION_KEY_SQL})))"
-    );
+    // Driven from the catalog, not from the events. An event with no catalog
+    // row has nothing to be brought in line with (that is pass 4's business),
+    // so the stale set is exactly the join below — and asked this way it is
+    // one catalog scan plus a range seek per session into
+    // `idx_session_events_project`, which carries every column the predicate
+    // reads. Asked from the event side it was a scan of the whole
+    // `session_events` table with three correlated catalog lookups per row,
+    // on every sync and every discovery pass: the largest single reader of a
+    // sweep over an unchanged store (#215).
+    let stale = stale_event_project_keys_sql();
     // Probe first, for the same reason pass 2 does: the ingest path already
     // stamps each event as it inserts it, so this pass normally has nothing to
     // do and must not take the write lock to discover that.
     if !conn
-        .prepare(&format!(
-            "SELECT 1 FROM session_events WHERE {stale} LIMIT 1"
-        ))?
+        .prepare(&format!("SELECT 1 {stale} LIMIT 1"))?
         .exists([])?
     {
         return Ok(0);
@@ -3839,10 +4407,40 @@ fn denormalize_event_project_keys(conn: &Connection) -> Result<usize> {
     Ok(conn.execute(
         &format!(
             "UPDATE session_events SET project_key = {EVENT_SESSION_KEY_SQL}, \
-             project_key_method = {EVENT_SESSION_METHOD_SQL} WHERE {stale}"
+             project_key_method = {EVENT_SESSION_METHOD_SQL} \
+             WHERE id IN (SELECT e.id {stale})"
         ),
         [],
     )?)
+}
+
+/// The `FROM ... WHERE` of pass 3: every event whose key is behind its own
+/// catalog row's, as `e`.
+fn stale_event_project_keys_sql() -> String {
+    let incoming = event_key_rank_sql("s.project_key", "s.project_key_method");
+    let stored = event_key_rank_sql("e.project_key", "e.project_key_method");
+    format!(
+        "FROM sessions s CROSS JOIN session_events e \
+           ON e.source = s.source AND e.session_id = s.session_id \
+         WHERE s.project_key IS NOT NULL \
+           AND (({incoming}) > ({stored}) \
+                OR (({incoming}) = ({stored}) \
+                    AND (e.project_key IS NULL OR e.project_key <> s.project_key)))"
+    )
+}
+
+/// Pass 4's candidates: the events of delegated threads the catalog does not
+/// hold, whose key an ancestor could still improve.
+fn uncataloged_delegated_events_sql() -> String {
+    let joined_rank = event_key_rank_sql("e.project_key", "e.project_key_method");
+    format!(
+        "SELECT DISTINCT e.source, e.session_id \
+         FROM session_relationships r CROSS JOIN session_events e \
+           ON e.source = r.source AND e.session_id = r.child_session_id \
+         WHERE NOT EXISTS (SELECT 1 FROM sessions s \
+                 WHERE s.source = e.source AND s.session_id = e.session_id) \
+           AND ({joined_rank}) <= {EVENT_INHERITED_RANK}"
+    )
 }
 
 /// Events of a session the catalog does not hold rank as `inherited` once this
@@ -3891,10 +4489,11 @@ fn inherit_event_project_keys(conn: &Connection) -> Result<usize> {
                  WHERE r.source = session_events.source \
                    AND r.child_session_id = session_events.session_id)"
     );
+    // The same predicate, reached from the relationship ledger: only a
+    // delegated child can match it, and the ledger names every one. Scanning
+    // the events for them instead read the whole table on every refresh.
     let pending: Vec<(String, String)> = conn
-        .prepare(&format!(
-            "SELECT DISTINCT source, session_id FROM session_events WHERE {candidate}"
-        ))?
+        .prepare(&uncataloged_delegated_events_sql())?
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
     if pending.is_empty() {
@@ -4172,35 +4771,11 @@ pub fn list_tags(conn: &Connection) -> Result<Vec<Tag>> {
 }
 
 pub fn resume_command(entry: &HistoryEntry) -> Option<String> {
-    let sid = entry.session_id.as_ref()?;
-    match entry.source.as_str() {
-        "claude" => Some(entry.project.as_ref().map_or_else(
-            || format!("claude --resume {}", shell_quote(sid)),
-            |p| {
-                format!(
-                    "cd {} && claude --resume {}",
-                    shell_quote(p),
-                    shell_quote(sid)
-                )
-            },
-        )),
-        "codex" => Some(format!("codex resume {}", shell_quote(sid))),
-        "cursor" => Some(entry.project.as_ref().map_or_else(
-            || format!("cursor-agent --resume={}", shell_quote(sid)),
-            |p| {
-                format!(
-                    "cd {} && cursor-agent --resume={}",
-                    shell_quote(p),
-                    shell_quote(sid)
-                )
-            },
-        )),
-        "grok" => Some(entry.project.as_ref().map_or_else(
-            || format!("grok resume {}", shell_quote(sid)),
-            |p| format!("cd {} && grok resume {}", shell_quote(p), shell_quote(sid)),
-        )),
-        _ => None,
-    }
+    crate::sources::catalog::resume_command(
+        &entry.source,
+        entry.session_id.as_ref()?,
+        entry.project.as_deref(),
+    )
 }
 
 pub fn shell_quote(value: &str) -> String {
@@ -4236,6 +4811,58 @@ fn opencode_backup_requested() -> bool {
 /// cost is proportional to the history actually read rather than to the size
 /// of the provider's database.
 pub fn sync_opencode_db(conn: &Connection, opencode_db: &Path) -> Result<usize> {
+    sync_opencode_dbs(conn, &[opencode_db.to_path_buf()])
+}
+
+/// Index every session in each OpenCode store, in order.
+///
+/// OpenCode keeps one database per release channel, and the caller passes
+/// them in [`crate::paths::opencode_db_files`] order. A session present in
+/// more than one is claimed by the first store that holds it — the same rule
+/// discovery applies — so it is indexed once, from the store its catalog row
+/// names, rather than rewritten by each store in turn. One store's failure is
+/// that store's: the rest are still indexed, and the error names every store
+/// that failed.
+pub fn sync_opencode_dbs(conn: &Connection, opencode_dbs: &[PathBuf]) -> Result<usize> {
+    let files: Vec<&Path> = opencode_dbs
+        .iter()
+        .map(PathBuf::as_path)
+        .filter(|path| path.is_file())
+        .collect();
+    let mut inserted = 0;
+    let mut claimed = BTreeSet::new();
+    let mut failures: Vec<anyhow::Error> = Vec::new();
+    for path in crate::ingest::capture_files("opencode", files) {
+        match sync_opencode_db_file(conn, path, &mut claimed) {
+            Ok(count) => inserted += count,
+            Err(error) => {
+                // Cancellation ends the whole sweep, not one store.
+                crate::ingest::check_capture_cancelled()?;
+                failures.push(error);
+            }
+        }
+    }
+    crate::ingest::check_capture_cancelled()?;
+    match failures.len() {
+        0 => Ok(inserted),
+        1 => Err(failures.remove(0)),
+        _ => anyhow::bail!(
+            "{} OpenCode stores could not be fully indexed (the rest were): {}",
+            failures.len(),
+            failures
+                .iter()
+                .map(|error| format!("{error:#}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ),
+    }
+}
+
+fn sync_opencode_db_file(
+    conn: &Connection,
+    opencode_db: &Path,
+    claimed: &mut BTreeSet<String>,
+) -> Result<usize> {
     crate::ingest::check_capture_cancelled()?;
     // `is_file`, the same question `OpencodeLayout::detect` asks. `exists` is
     // true for a directory, and `OPENCODE_DB` is an arbitrary path, so the
@@ -4262,7 +4889,7 @@ pub fn sync_opencode_db(conn: &Connection, opencode_db: &Path) -> Result<usize> 
         src.execute_batch(
             "CREATE INDEX IF NOT EXISTS ai_hist_sync_part_session ON part(session_id);",
         )?;
-        return sync_opencode_sessions_from_source(conn, &src, opencode_db);
+        return sync_opencode_sessions_from_source(conn, &src, opencode_db, claimed);
     }
     let src = Connection::open_with_flags(
         opencode_db,
@@ -4271,7 +4898,7 @@ pub fn sync_opencode_db(conn: &Connection, opencode_db: &Path) -> Result<usize> 
     .with_context(|| format!("opening {}", opencode_db.display()))?;
     src.busy_timeout(std::time::Duration::from_secs(5))?;
     src.execute_batch("BEGIN")?;
-    let result = sync_opencode_sessions_from_source(conn, &src, opencode_db);
+    let result = sync_opencode_sessions_from_source(conn, &src, opencode_db, claimed);
     let _ = src.execute_batch("ROLLBACK");
     result
 }
@@ -4298,7 +4925,7 @@ pub fn sync_opencode_storage_dir(conn: &Connection, storage_dir: &Path) -> Resul
         .iter()
         .map(|dir| format!("{}: {}", dir.path.display(), dir.error))
         .collect();
-    for session_file in listing.sessions {
+    for session_file in crate::ingest::capture_files("opencode", listing.sessions) {
         crate::ingest::check_capture_cancelled()?;
         let indexed =
             crate::ingest::opencode::load_from_json_tree(&session_file).and_then(|loaded| {
@@ -4328,10 +4955,13 @@ pub fn sync_opencode_storage_dir(conn: &Connection, storage_dir: &Path) -> Resul
     Ok(inserted)
 }
 
+/// `claimed` holds the sessions an earlier store already owns; they are
+/// skipped here, and this store's own sessions are added to it.
 fn sync_opencode_sessions_from_source(
     conn: &Connection,
     src: &Connection,
     raw_path: &Path,
+    claimed: &mut BTreeSet<String>,
 ) -> Result<usize> {
     crate::ingest::check_capture_cancelled()?;
     let raw_path = raw_path.to_string_lossy().into_owned();
@@ -4350,6 +4980,9 @@ fn sync_opencode_sessions_from_source(
         crate::ingest::opencode::OpencodeSyncPlan::PerSession => {
             for session_id in crate::ingest::opencode::list_sqlite_session_ids(src)? {
                 crate::ingest::check_capture_cancelled()?;
+                if !claimed.insert(session_id.clone()) {
+                    continue;
+                }
                 let indexed = crate::ingest::opencode::load_from_sqlite(src, &session_id).and_then(
                     |loaded| match loaded {
                         Some(loaded) => {
@@ -4368,13 +5001,27 @@ fn sync_opencode_sessions_from_source(
         crate::ingest::opencode::OpencodeSyncPlan::SinglePass => {
             crate::ingest::check_capture_cancelled()?;
             let load = crate::ingest::opencode::load_all_from_sqlite(src)?;
+            // Decided before anything is written, over every session this
+            // store holds — readable or not — so a session that failed here
+            // is not then indexed from a later store behind this one's back.
+            let already_claimed: BTreeSet<String> = load
+                .failures
+                .iter()
+                .map(|failure| failure.session_id.clone())
+                .chain(load.sessions.iter().map(|loaded| loaded.session.id.clone()))
+                .filter(|session_id| !claimed.insert(session_id.clone()))
+                .collect();
             failures.extend(
                 load.failures
                     .iter()
+                    .filter(|failure| !already_claimed.contains(&failure.session_id))
                     .map(|failure| format!("{}: {}", failure.session_id, failure.error)),
             );
             for loaded in load.sessions {
                 crate::ingest::check_capture_cancelled()?;
+                if already_claimed.contains(&loaded.session.id) {
+                    continue;
+                }
                 match crate::ingest::opencode::normalize(conn, &loaded, &raw_path) {
                     Ok(counts) => inserted += counts.prompts,
                     Err(error) => failures.push(format!("{}: {error:#}", loaded.session.id)),
@@ -4464,6 +5111,168 @@ pub fn import_json(conn: &Connection, entries: &[HistoryEntry]) -> Result<usize>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Python CLI's `trajectory_fts` and the triggers that maintained it,
+    /// verbatim.
+    const PYTHON_TRAJECTORY_INDEX: &str = "
+        CREATE VIRTUAL TABLE trajectory_fts USING fts5(
+            search_text, task_title, task_description, persona_id, project_id,
+            content='trajectories', content_rowid='rowid'
+        );
+        CREATE TRIGGER trajectories_ai AFTER INSERT ON trajectories BEGIN
+            INSERT INTO trajectory_fts(rowid, search_text, task_title, task_description, persona_id, project_id)
+            VALUES (new.rowid, new.search_text, new.task_title, new.task_description, new.persona_id, new.project_id);
+        END;
+        CREATE TRIGGER trajectories_au AFTER UPDATE ON trajectories BEGIN
+            INSERT INTO trajectory_fts(trajectory_fts, rowid, search_text, task_title, task_description, persona_id, project_id)
+            VALUES('delete', old.rowid, old.search_text, old.task_title, old.task_description, old.persona_id, old.project_id);
+            INSERT INTO trajectory_fts(rowid, search_text, task_title, task_description, persona_id, project_id)
+            VALUES (new.rowid, new.search_text, new.task_title, new.task_description, new.persona_id, new.project_id);
+        END;
+        CREATE TRIGGER trajectories_ad AFTER DELETE ON trajectories BEGIN
+            INSERT INTO trajectory_fts(trajectory_fts, rowid, search_text, task_title, task_description, persona_id, project_id)
+            VALUES('delete', old.rowid, old.search_text, old.task_title, old.task_description, old.persona_id, old.project_id);
+        END;";
+
+    fn trajectory_index_objects(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name IN \
+             ('trajectory_fts', 'trajectories_ai', 'trajectories_au', 'trajectories_ad')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_python_era_trajectory_index_out_of_step_does_not_block_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        {
+            let conn = open_db(&path).unwrap();
+            conn.execute_batch(
+                "INSERT INTO trajectories (id, decisions_json, retrospective_json, search_text, \
+                     updated_ms, timestamp_ms) VALUES ('t1', '[]', '{}', 'alpha bravo charlie', 1, 1);
+                 -- Unstamped and unmigrated, so the next open re-runs the
+                 -- change feed's revision backfill over this row.
+                 UPDATE trajectories SET revision = 0;
+                 DELETE FROM schema_migrations WHERE name = 'change_feed_v2';",
+            )
+            .unwrap();
+            conn.execute_batch(PYTHON_TRAJECTORY_INDEX).unwrap();
+            // An index that disagrees with its content row, holding fewer
+            // tokens than the row, so the trigger's 'delete' underflows.
+            conn.execute_batch(
+                "INSERT INTO trajectory_fts(rowid, search_text)
+                 SELECT rowid, 'beta' FROM trajectories WHERE id = 't1';",
+            )
+            .unwrap();
+            // The failure this guards against: any UPDATE of the row trips the
+            // legacy trigger's 'delete' against the mismatched index.
+            let tripped = conn
+                .execute("UPDATE trajectories SET updated_ms = 2 WHERE id = 't1'", [])
+                .unwrap_err();
+            assert!(tripped.to_string().contains("malformed"), "{tripped}");
+        }
+
+        let conn = open_db(&path).unwrap();
+        assert!(schema_is_current(&conn).unwrap());
+        assert_eq!(trajectory_index_objects(&conn), 0);
+        conn.execute("UPDATE trajectories SET updated_ms = 3 WHERE id = 't1'", [])
+            .unwrap();
+    }
+
+    #[test]
+    fn a_trajectory_index_recreated_after_migration_is_retired_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        open_db(&path)
+            .unwrap()
+            .execute_batch(PYTHON_TRAJECTORY_INDEX)
+            .unwrap();
+        let conn = open_db(&path).unwrap();
+        assert_eq!(trajectory_index_objects(&conn), 0);
+    }
+
+    #[test]
+    fn the_migration_observer_hears_every_upgrade_end_but_not_a_creation() {
+        use std::sync::Mutex;
+        static EVENTS: Mutex<Vec<(MigrationEvent, String)>> = Mutex::new(Vec::new());
+        /// Whether the write lock was free when each `Failed` arrived.
+        static LOCK_FREE_ON_FAILURE: Mutex<Vec<bool>> = Mutex::new(Vec::new());
+        observe_migrations(|event, path| {
+            let path = path.unwrap_or_default().to_string();
+            if event == MigrationEvent::Failed {
+                let free = Connection::open(&path).is_ok_and(|conn| {
+                    conn.busy_timeout(Duration::ZERO).is_ok()
+                        && conn.execute_batch("BEGIN IMMEDIATE; ROLLBACK;").is_ok()
+                });
+                LOCK_FREE_ON_FAILURE
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(free);
+            }
+            EVENTS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((event, path));
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        let ours = |events: &[(MigrationEvent, String)]| -> Vec<MigrationEvent> {
+            let path = fs::canonicalize(&path).unwrap();
+            events
+                .iter()
+                .filter(|(_, p)| fs::canonicalize(p).ok().as_ref() == Some(&path))
+                .map(|(event, _)| *event)
+                .collect()
+        };
+
+        drop(open_db(&path).unwrap());
+        drop(open_db(&path).unwrap());
+        assert_eq!(ours(&EVENTS.lock().unwrap()), []);
+
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "DELETE FROM schema_migrations WHERE name = 'history_fts_update_of_v1'",
+                [],
+            )
+            .unwrap();
+        drop(open_db(&path).unwrap());
+        drop(open_db(&path).unwrap());
+        assert_eq!(
+            ours(&EVENTS.lock().unwrap()),
+            [MigrationEvent::Started, MigrationEvent::Finished]
+        );
+
+        // A table squatting on an index's name makes the migration fail after
+        // it started; the observer still hears how it ended.
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "DROP INDEX idx_session_presences_location;
+                 CREATE TABLE idx_session_presences_location (x);",
+            )
+            .unwrap();
+        assert!(open_db(&path).is_err());
+        assert_eq!(
+            ours(&EVENTS.lock().unwrap()),
+            [
+                MigrationEvent::Started,
+                MigrationEvent::Finished,
+                MigrationEvent::Started,
+                MigrationEvent::Failed
+            ]
+        );
+        // The failure is heard only once the migration has rolled back, so an
+        // observer that retries at once is not blocked by it.
+        assert!(LOCK_FREE_ON_FAILURE
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|free| *free));
+    }
 
     #[test]
     fn an_outdated_database_is_not_reported_as_schema_current() {
@@ -6370,6 +7179,61 @@ mod tests {
         assert!(session_markers(&conn, "grok", "kept-1").unwrap().is_empty());
     }
 
+    /// Rows that predate the `location` column were all written as local.
+    /// The one case that can be told apart is a session known only
+    /// remotely: its rows came from remote intake and are backfilled as such.
+    /// A session known both ways stays local, row by row, as before.
+    #[test]
+    fn the_location_backfill_marks_only_remote_only_sessions_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ai-history.db");
+        {
+            let conn = open_db(&db_path).unwrap();
+            for (session, locations) in [
+                ("remote-only", &["remote"][..]),
+                ("both-ways", &["local", "remote"][..]),
+                ("local-only", &["local"][..]),
+            ] {
+                for location in locations {
+                    let location = if *location == "remote" {
+                        SessionLocation::Remote
+                    } else {
+                        SessionLocation::Local
+                    };
+                    crate::mark_session_presence(&conn, "muse", session, location).unwrap();
+                }
+                conn.execute(
+                    "INSERT INTO session_events \
+                     (source, session_id, ts_ms, role, kind, text, event_uid) \
+                     VALUES ('muse', ?, 1, 'assistant', 'text', 'hi', 'e1')",
+                    [session],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "DELETE FROM schema_migrations WHERE name = 'evidence_location_v1'",
+                [],
+            )
+            .unwrap();
+        }
+        let conn = open_db(&db_path).unwrap();
+        let located: Vec<(String, String)> = conn
+            .prepare("SELECT session_id, location FROM session_events ORDER BY session_id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            located,
+            vec![
+                ("both-ways".to_string(), "local".to_string()),
+                ("local-only".to_string(), "local".to_string()),
+                ("remote-only".to_string(), "remote".to_string()),
+            ]
+        );
+    }
+
     /// A database written by the v1 marker code must come forward with its
     /// rows, not be served against columns it does not have.
     ///
@@ -6481,92 +7345,6 @@ mod tests {
         );
     }
 
-    /// The same v1 migration, on a database whose delivery capture is live.
-    ///
-    /// The delivery triggers build their payload with a `json_object` over the
-    /// column list as it stood when they were created, so on a v1 database all
-    /// three name `detail_json`. SQLite validates dependent triggers when a
-    /// column is dropped, so `ALTER TABLE ... DROP COLUMN detail_json` fails
-    /// against them -- and it fails inside `open_db`, which means every open of
-    /// that database errors, not just the first. The migration therefore
-    /// retires the three triggers itself; `init_export_schema` recreates them
-    /// over the new column list later in the same open.
-    ///
-    /// The plain v1 test above cannot catch this: it opens a database whose
-    /// delivery schema was never initialised, so there are no triggers to
-    /// validate against and the drop succeeds.
-    #[cfg(feature = "export")]
-    #[test]
-    fn v1_markers_migrate_forward_on_a_database_with_live_delivery_capture() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("v1-delivery.db");
-        {
-            let conn = open_db(&db_path).unwrap();
-            // Rebuild the v1 table, then let the delivery schema build its
-            // triggers over that shape -- which is what a real v1 database has.
-            conn.execute_batch(
-                "DROP TRIGGER IF EXISTS delivery_session_markers_insert;
-                 DROP TRIGGER IF EXISTS delivery_session_markers_update;
-                 DROP TRIGGER IF EXISTS delivery_session_markers_delete;
-                 DROP TABLE session_markers;
-                 CREATE TABLE session_markers (
-                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                     source TEXT NOT NULL,
-                     session_id TEXT NOT NULL,
-                     marker_uid TEXT NOT NULL,
-                     kind TEXT NOT NULL,
-                     ts_ms INTEGER,
-                     text TEXT,
-                     detail_json TEXT,
-                     UNIQUE(source, session_id, marker_uid)
-                 );
-                 INSERT INTO session_markers
-                     (source, session_id, marker_uid, kind, ts_ms, text, detail_json)
-                 VALUES ('grok', 'v1-d', 'c1', 'compaction_boundary', 11, 'compacted',
-                         '{\"checkpoint\":1}');
-                 DELETE FROM schema_migrations WHERE name = 'session_markers_v2';",
-            )
-            .unwrap();
-            init_export_schema(&conn).unwrap();
-            let trigger: String = conn
-                .query_row(
-                    "SELECT sql FROM sqlite_master WHERE type = 'trigger' \
-                     AND name = 'delivery_session_markers_insert'",
-                    [],
-                    |row| row.get(0),
-                )
-                .expect("the v1 database must really have the trigger this test is about");
-            assert!(
-                trigger.contains("detail_json"),
-                "the setup is only a control if the trigger names the dropped column: {trigger}"
-            );
-        }
-
-        // The whole finding: without the trigger drop this `open_db` fails, and
-        // fails again on every retry, because nothing about it is one-shot.
-        let conn = open_db(&db_path).unwrap();
-        assert!(schema_is_current(&conn).unwrap());
-        let markers = session_markers(&conn, "grok", "v1-d").unwrap();
-        assert_eq!(markers.len(), 1);
-        assert_eq!(
-            markers[0].payload_json.as_deref(),
-            Some("{\"checkpoint\":1}")
-        );
-        // The triggers came back over the new shape, not the old one. A
-        // recreated trigger still naming `detail_json` would deliver a column
-        // that no longer exists.
-        let trigger: String = conn
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE type = 'trigger' \
-                 AND name = 'delivery_session_markers_insert'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("delivery capture must be restored, not left dropped");
-        assert!(trigger.contains("payload_json"), "{trigger}");
-        assert!(!trigger.contains("detail_json"), "{trigger}");
-    }
-
     /// Every marker for a session, not the first page of them.
     ///
     /// This wrapper's contract is "every marker recorded for one session", and
@@ -6627,10 +7405,7 @@ mod tests {
         {
             let conn = open_db(&db_path).unwrap();
             conn.execute_batch(
-                "DROP TRIGGER IF EXISTS delivery_session_markers_insert;
-                 DROP TRIGGER IF EXISTS delivery_session_markers_update;
-                 DROP TRIGGER IF EXISTS delivery_session_markers_delete;
-                 DROP TABLE session_markers;
+                "DROP TABLE session_markers;
                  CREATE TABLE session_markers (
                      id INTEGER PRIMARY KEY AUTOINCREMENT,
                      source TEXT NOT NULL,
@@ -6681,126 +7456,6 @@ mod tests {
         assert_eq!(big.text.as_deref(), Some("prose"));
     }
 
-    /// The common upgrade: a v1 database that has never had delivery at all.
-    ///
-    /// Delivery is opt-in, so its tables exist only if a delivery-enabled build
-    /// has opened this database. The migration runs inside `init_db` *before*
-    /// `init_export_schema`, so anything it writes to `delivery_journal`
-    /// names a table that may not exist yet -- and a statement against a
-    /// missing table fails when it is prepared, whatever its `WHERE` clause
-    /// says. That is a hard failure on open, for the most ordinary install
-    /// there is.
-    #[test]
-    fn a_v1_database_that_never_had_delivery_still_opens() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("v1-no-delivery.db");
-        {
-            let conn = open_db(&db_path).unwrap();
-            conn.execute_batch(
-                "DROP TRIGGER IF EXISTS delivery_session_markers_insert;
-                 DROP TRIGGER IF EXISTS delivery_session_markers_update;
-                 DROP TRIGGER IF EXISTS delivery_session_markers_delete;
-                 DROP TABLE session_markers;
-                 CREATE TABLE session_markers (
-                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                     source TEXT NOT NULL, session_id TEXT NOT NULL,
-                     marker_uid TEXT NOT NULL, kind TEXT NOT NULL,
-                     ts_ms INTEGER, text TEXT, detail_json TEXT,
-                     UNIQUE(source, session_id, marker_uid)
-                 );
-                 INSERT INTO session_markers
-                     (source, session_id, marker_uid, kind, ts_ms, text, detail_json)
-                 VALUES ('grok','v1-nd','c1','compaction_boundary',11,'compacted','{\"c\":1}');
-                 DELETE FROM schema_migrations WHERE name = 'session_markers_v2';",
-            )
-            .unwrap();
-            // Everything the delivery schema creates is removed, so the state
-            // is the self-consistent one a database only ever opened by builds
-            // without the delivery feature is in -- no journal, no jobs, no
-            // capture triggers. Enumerated rather than listed by hand, so this
-            // keeps matching the schema as it grows.
-            let objects: Vec<(String, String)> = conn
-                .prepare(
-                    "SELECT type, name FROM sqlite_master \
-                     WHERE name LIKE 'delivery%' OR name LIKE 'history_export%'",
-                )
-                .unwrap()
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-                .unwrap()
-                .collect::<rusqlite::Result<_>>()
-                .unwrap();
-            for (kind, name) in objects {
-                if kind == "trigger" || kind == "table" || kind == "index" {
-                    conn.execute_batch(&format!("DROP {kind} IF EXISTS \"{name}\";"))
-                        .unwrap();
-                }
-            }
-            // The premise, asserted rather than assumed, and non-vacuous in
-            // both feature configurations: a build without delivery never
-            // creates these, and one with delivery has just had them removed.
-            let left: i64 = conn
-                .query_row(
-                    "SELECT count(*) FROM sqlite_master \
-                     WHERE name LIKE 'delivery%' OR name LIKE 'history_export%'",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(left, 0, "the premise: nothing of delivery is present");
-        }
-
-        let conn = open_db(&db_path).expect("a v1 database without delivery must still open");
-        let markers = session_markers(&conn, "grok", "v1-nd").unwrap();
-        assert_eq!(markers.len(), 1);
-        assert_eq!(markers[0].payload_json.as_deref(), Some("{\"c\":1}"));
-    }
-
-    /// A build without the delivery feature must not silently swallow the debt.
-    ///
-    /// It runs this migration too -- the migration is not feature-gated, and
-    /// cannot be, since the column shape is not optional. It therefore drops
-    /// capture triggers it has no way to rebuild: the trigger DDL lives in the
-    /// delivery module, which is compiled out. Everything it writes afterwards,
-    /// including markers a sync adds later in the same process, is captured by
-    /// nothing.
-    ///
-    /// The flag is what survives that process. This build's whole job is to
-    /// leave it standing.
-    #[cfg(not(feature = "export"))]
-    #[test]
-    fn a_no_delivery_build_leaves_the_marker_journal_debt_for_a_build_that_can_pay_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("v1-nodelivery-build.db");
-        {
-            let conn = open_db(&db_path).unwrap();
-            conn.execute_batch(
-                "DROP TABLE session_markers;
-                 CREATE TABLE session_markers (
-                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                     source TEXT NOT NULL, session_id TEXT NOT NULL,
-                     marker_uid TEXT NOT NULL, kind TEXT NOT NULL,
-                     ts_ms INTEGER, text TEXT, detail_json TEXT,
-                     UNIQUE(source, session_id, marker_uid)
-                 );
-                 INSERT INTO session_markers
-                     (source, session_id, marker_uid, kind, ts_ms, text, detail_json)
-                 VALUES ('grok','v1-nb','c1','compaction_boundary',11,'compacted','{\"c\":1}');
-                 DELETE FROM schema_migrations WHERE name = 'session_markers_v2';",
-            )
-            .unwrap();
-        }
-
-        let conn = open_db(&db_path).unwrap();
-        // The migration ran, so the rows are readable in the new shape...
-        assert!(schema_is_current(&conn).unwrap());
-        assert_eq!(session_markers(&conn, "grok", "v1-nb").unwrap().len(), 1);
-        // ...and the debt is still on the books for a build that can settle it.
-        assert!(
-            migration_applied(&conn, "session_markers_v2_journal_pending").unwrap(),
-            "a build that cannot journal must leave the flag standing"
-        );
-    }
-
     /// The shape every upgraded install actually has.
     ///
     /// The v1 marker table this migration was written against was the one this
@@ -6820,10 +7475,7 @@ mod tests {
         {
             let conn = open_db(&db_path).unwrap();
             conn.execute_batch(
-                "DROP TRIGGER IF EXISTS delivery_session_markers_insert;
-                 DROP TRIGGER IF EXISTS delivery_session_markers_update;
-                 DROP TRIGGER IF EXISTS delivery_session_markers_delete;
-                 DROP TABLE session_markers;
+                "DROP TABLE session_markers;
                  -- main's DDL after #199, column for column.
                  CREATE TABLE session_markers (
                      id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -6879,135 +7531,6 @@ mod tests {
                 .len(),
             1
         );
-    }
-
-    #[cfg(not(feature = "export"))]
-    #[test]
-    fn a_no_export_build_refuses_unread_generic_subscriptions() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE history_subscriptions(id TEXT PRIMARY KEY,bootstrap_done INTEGER); CREATE TABLE delivery_bootstrap_bounds(job_id TEXT,kind TEXT,max_rowid INTEGER); INSERT INTO history_subscriptions VALUES('reader',0); INSERT INTO delivery_bootstrap_bounds VALUES('reader','session_marker',1);").unwrap();
-        let error = shadow_marker_preimages(&conn).unwrap_err();
-        assert!(error.to_string().contains("export-enabled"));
-        conn.execute("UPDATE history_subscriptions SET bootstrap_done=1", [])
-            .unwrap();
-        shadow_marker_preimages(&conn).unwrap();
-    }
-
-    /// An export is a consumer too, and a build that cannot shadow must say so.
-    ///
-    /// `CONSUMERS` -- the set every capture trigger serves -- is live delivery
-    /// jobs **union** unexpired file exports. The refusal in a build without
-    /// the delivery feature asked only about jobs, so a database whose only
-    /// in-flight consumer was an export migrated happily and dropped
-    /// `detail_json` with no preimage taken. The export then resumes and reads
-    /// v2 payloads where its cutoff promised v1 -- the same unrecoverable loss
-    /// the refusal exists to prevent, reached by the other half of the union.
-    #[cfg(not(feature = "export"))]
-    #[test]
-    fn a_no_delivery_build_refuses_to_migrate_under_an_unfinished_export() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("export-consumer.db");
-        let v1 = |conn: &Connection| {
-            conn.execute_batch(
-                "DROP TABLE IF EXISTS session_markers;
-                 CREATE TABLE session_markers (
-                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                     source TEXT NOT NULL, session_id TEXT NOT NULL,
-                     marker_uid TEXT NOT NULL, kind TEXT NOT NULL,
-                     ts_ms INTEGER, text TEXT, detail_json TEXT,
-                     UNIQUE(source, session_id, marker_uid)
-                 );
-                 INSERT INTO session_markers
-                     (source, session_id, marker_uid, kind, ts_ms, text, detail_json)
-                 VALUES ('grok','exp','c1','compaction_boundary',11,'compacted','{\"c\":1}');
-                 DELETE FROM schema_migrations WHERE name = 'session_markers_v2';",
-            )
-            .unwrap();
-        };
-        // The delivery tables as a delivery-enabled build would have left them,
-        // built here by hand because this build cannot create them.
-        let delivery_tables = "
-            CREATE TABLE IF NOT EXISTS delivery_jobs (
-                id TEXT PRIMARY KEY, state TEXT NOT NULL,
-                bootstrap_done INTEGER NOT NULL DEFAULT 0,
-                bootstrap_kind INTEGER NOT NULL DEFAULT 0,
-                bootstrap_rowid INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS history_exports (
-                id TEXT PRIMARY KEY, bootstrap_kind INTEGER NOT NULL DEFAULT 0,
-                bootstrap_rowid INTEGER NOT NULL DEFAULT 0,
-                bootstrap_done INTEGER NOT NULL DEFAULT 0,
-                expires_at_ms INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS delivery_bootstrap_bounds (
-                job_id TEXT NOT NULL, kind TEXT NOT NULL, max_rowid INTEGER NOT NULL,
-                PRIMARY KEY(job_id,kind)
-            );";
-
-        {
-            let conn = open_db(&db_path).unwrap();
-            v1(&conn);
-            conn.execute_batch(delivery_tables).unwrap();
-            let rowid: i64 = conn
-                .query_row("SELECT rowid FROM session_markers", [], |row| row.get(0))
-                .unwrap();
-            // No delivery job at all -- only an unexpired export still reading.
-            conn.execute(
-                "INSERT INTO history_exports \
-                 (id, bootstrap_kind, bootstrap_rowid, bootstrap_done, expires_at_ms) \
-                 VALUES ('e1', 0, 0, 0, ?)",
-                params![now_ms() + 3_600_000],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO delivery_bootstrap_bounds(job_id, kind, max_rowid) \
-                 VALUES ('e1','session_marker',?)",
-                params![rowid],
-            )
-            .unwrap();
-        }
-        let refused =
-            open_db(&db_path).expect_err("an in-flight export must not be migrated out from under");
-        let message = format!("{refused:#}");
-        assert!(
-            message.contains("delivery"),
-            "the refusal must name the remedy: {message}"
-        );
-        // And it must not have destroyed anything on the way to refusing.
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        let kept: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM pragma_table_info('session_markers') \
-                 WHERE name = 'detail_json'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(kept, 1, "refusing must leave the old column in place");
-
-        // Positive control: the same build, the same tables, but the export has
-        // expired -- nobody is owed a preimage, so it migrates normally.
-        let other = dir.path().join("expired-export.db");
-        {
-            let conn = open_db(&other).unwrap();
-            v1(&conn);
-            conn.execute_batch(delivery_tables).unwrap();
-            conn.execute(
-                "INSERT INTO history_exports \
-                 (id, bootstrap_kind, bootstrap_rowid, bootstrap_done, expires_at_ms) \
-                 VALUES ('e1', 0, 0, 0, 1)",
-                [],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO delivery_bootstrap_bounds(job_id, kind, max_rowid) \
-                 VALUES ('e1','session_marker',1)",
-                [],
-            )
-            .unwrap();
-        }
-        let conn = open_db(&other).expect("an expired export owes nothing");
-        assert_eq!(session_markers(&conn, "grok", "exp").unwrap().len(), 1);
     }
 
     /// The unpaged marker read is one snapshot, not one per page.
@@ -7448,63 +7971,6 @@ mod tests {
         }
     }
 
-    /// Delivery is an optional feature, and that is what opens the hole. A
-    /// database can carry delivery tables and capture triggers from a
-    /// delivery-enabled build, then be opened by a `--no-default-features`
-    /// build: that build adds the new `session_events` columns, because the
-    /// migration is not delivery-gated, but it never rebuilds the triggers,
-    /// because `init_export_schema` is compiled out. On the next
-    /// delivery-enabled open the trigger names are all still present, so a
-    /// read-only fast path that checks names alone is satisfied, `init_db`
-    /// never reaches the rebuild, and delivery goes on reporting success while
-    /// the new fields never leave the machine.
-    ///
-    /// So a name is not enough: the payload has to be checked too.
-    ///
-    #[cfg(feature = "export")]
-    #[test]
-    fn a_capture_trigger_missing_provider_is_not_current() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("stale-trigger.db");
-        let conn = open_db(&db_path).unwrap();
-        assert!(schema_is_current(&conn).unwrap());
-
-        let capture_sql = |conn: &Connection| -> String {
-            conn.query_row(
-                "SELECT sql FROM sqlite_master \
-                 WHERE type='trigger' AND name='delivery_session_events_insert'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap()
-        };
-
-        // Rewrite the trigger to the shape a build before these columns left
-        // behind: same name, payload one column short.
-        let omitted = "'provider',NEW.\"provider\"";
-        let sql = capture_sql(&conn);
-        assert!(
-            sql.contains(omitted),
-            "the payload must carry {omitted} before removing it, or this test proves nothing"
-        );
-        let stale_sql = sql.replace(&format!(",{omitted}"), "");
-        assert_ne!(stale_sql, sql);
-        conn.execute_batch("DROP TRIGGER delivery_session_events_insert;")
-            .unwrap();
-        conn.execute_batch(&stale_sql).unwrap();
-
-        assert!(
-            !schema_is_current(&conn).unwrap(),
-            "a trigger whose payload predates a column its table has is not current"
-        );
-
-        // And the writable open repairs it, which is the point of saying so.
-        drop(conn);
-        let conn = open_db(&db_path).unwrap();
-        assert!(capture_sql(&conn).contains(omitted));
-        assert!(schema_is_current(&conn).unwrap());
-    }
-
     #[test]
     fn read_schema_does_not_require_the_discovery_only_raw_path_index() {
         let conn = Connection::open_in_memory().unwrap();
@@ -7722,7 +8188,7 @@ mod tests {
                     [],
                 )
                 .unwrap();
-            drop_session_event_capture_triggers(&legacy);
+            drop_session_requests_view(&legacy);
             for (column, _) in REQUIRED_SESSION_EVENT_COLUMNS {
                 legacy
                     .execute_batch(&format!("ALTER TABLE session_events DROP COLUMN {column};"))
@@ -7763,107 +8229,22 @@ mod tests {
             )
             .unwrap();
         assert_eq!(row, ("kept".to_string(), None, None, None));
-        // A capture trigger created before the migration would go on emitting
-        // the old column list, so delivery would keep succeeding while these
-        // facts never left the machine. Rebuilding it is part of the upgrade.
-        let capture_sql = conn
-            .query_row(
-                "SELECT sql FROM sqlite_master \
-                 WHERE type='trigger' AND name='delivery_session_events_insert'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .ok();
-        if let Some(sql) = capture_sql {
-            for (column, _) in REQUIRED_SESSION_EVENT_COLUMNS {
-                assert!(
-                    sql.contains(*column),
-                    "the rebuilt capture trigger still omits {column}"
-                );
-            }
-        }
     }
 
-    /// Delivery is an optional feature, and that is what opens the hole. A
-    /// database can carry delivery tables and capture triggers from a
-    /// delivery-enabled build, then be opened by a `--no-default-features`
-    /// build: that build adds the new `session_events` columns, because the
-    /// migration is not delivery-gated, but it never rebuilds the triggers,
-    /// because `init_export_schema` is compiled out. On the next
-    /// delivery-enabled open the trigger names are all still present, so a
-    /// read-only fast path that checks names alone is satisfied, `init_db`
-    /// never reaches the rebuild, and delivery goes on reporting success while
-    /// the new fields never leave the machine.
-    ///
-    /// So a name is not enough: the payload has to be checked too.
-    #[cfg(feature = "export")]
-    #[test]
-    fn a_capture_trigger_with_an_outdated_payload_is_not_current() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("stale-trigger.db");
-        let conn = open_db(&db_path).unwrap();
-        assert!(schema_is_current(&conn).unwrap());
-
-        let capture_sql = |conn: &Connection| -> String {
-            conn.query_row(
-                "SELECT sql FROM sqlite_master \
-                 WHERE type='trigger' AND name='delivery_session_events_insert'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap()
-        };
-
-        // Rewrite the trigger to the shape a build before the raw facts left
-        // behind: same name, payload one column short.
-        let omitted = "'turn_id',NEW.\"turn_id\"";
-        let sql = capture_sql(&conn);
-        assert!(
-            sql.contains(omitted),
-            "the payload must carry {omitted} before removing it, or this test proves nothing"
-        );
-        let stale_sql = sql.replace(&format!(",{omitted}"), "");
-        assert_ne!(stale_sql, sql);
-        conn.execute_batch("DROP TRIGGER delivery_session_events_insert;")
-            .unwrap();
-        conn.execute_batch(&stale_sql).unwrap();
-
-        assert!(
-            !schema_is_current(&conn).unwrap(),
-            "a trigger whose payload predates a column its table has is not current"
-        );
-
-        // And the writable open repairs it, which is the point of saying so.
-        drop(conn);
-        let conn = open_db(&db_path).unwrap();
-        assert!(capture_sql(&conn).contains(omitted));
-        assert!(schema_is_current(&conn).unwrap());
-    }
-
-    /// A legacy database predates the raw-fact columns, so its capture triggers
-    /// never referenced them either; SQLite refuses to drop a column a trigger
-    /// still names.
-    fn drop_session_event_capture_triggers(conn: &Connection) {
-        // A pre-usage database also predates the derived request view. Current
-        // SQLite correctly refuses to drop one of its source columns while
-        // that view still references it, so remove the view while recreating
-        // the legacy shape this helper models.
-        conn.execute_batch("DROP VIEW IF EXISTS session_requests;")
-            .unwrap();
-        let names = conn
-            .prepare(
-                "SELECT name FROM sqlite_master \
-                 WHERE type='trigger' AND tbl_name='session_events' AND name LIKE 'delivery_%'",
-            )
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(0))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<String>>>()
-            .unwrap();
-        for name in names {
-            conn.execute_batch(&format!("DROP TRIGGER {name};"))
-                .unwrap();
-        }
+    /// A pre-usage database also predates the derived request view. SQLite
+    /// refuses to drop one of the view's source columns while the view still
+    /// references it, so the legacy shape is modelled without it.
+    /// Also the index over `provider_message_id`, which SQLite will not let a
+    /// column drop leave dangling: a database from before the raw facts had
+    /// neither. Likewise the identity index over `project_key`, which a
+    /// database from before project identity did not have either.
+    fn drop_session_requests_view(conn: &Connection) {
+        conn.execute_batch(
+            "DROP VIEW IF EXISTS session_requests; \
+             DROP INDEX IF EXISTS idx_session_events_provider_message; \
+             DROP INDEX IF EXISTS idx_session_events_project;",
+        )
+        .unwrap();
     }
 
     /// A fresh database and a migrated one must end up with the same
@@ -7876,7 +8257,7 @@ mod tests {
         let legacy_path = dir.path().join("legacy-events.db");
         {
             let legacy = open_db(&legacy_path).unwrap();
-            drop_session_event_capture_triggers(&legacy);
+            drop_session_requests_view(&legacy);
             for (column, _) in REQUIRED_SESSION_EVENT_COLUMNS {
                 legacy
                     .execute_batch(&format!("ALTER TABLE session_events DROP COLUMN {column};"))
@@ -7923,6 +8304,120 @@ mod tests {
         assert_eq!(event.is_sidechain, Some(0));
         assert_eq!(event.is_meta, Some(1));
         assert_eq!(event.turn_id.as_deref(), Some("turn_1"));
+    }
+
+    /// A store with enough rows that a scan and a search are distinguishable,
+    /// planned with and without `sqlite_stat1`.
+    fn planned_store(analyze: bool) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for i in 0..40 {
+            conn.execute(
+                "INSERT INTO sessions (session_id, source, raw_path, project_key, project_key_method) \
+                 VALUES (?1, 'codex', ?2, 'github.com/acme/app', 'remote')",
+                params![format!("s{i}"), format!("/t/{i}.jsonl")],
+            )
+            .unwrap();
+            for n in 0..20 {
+                conn.execute(
+                    "INSERT INTO session_events \
+                     (source, session_id, ts_ms, role, kind, text, event_uid, \
+                      project_key, project_key_method) \
+                     VALUES ('codex', ?1, ?2, ?3, 'text', 'hi', ?4, \
+                             'github.com/acme/app', 'remote')",
+                    params![
+                        format!("s{i}"),
+                        n,
+                        if n % 2 == 0 { "user" } else { "assistant" },
+                        format!("s{i}-e{n}")
+                    ],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO session_relationships \
+                 (source, parent_session_id, relationship_uid, child_session_id, \
+                  relationship, identity_status, evidence_kind, evidence_locator, \
+                  created_ms, updated_ms) \
+                 VALUES ('codex', ?1, ?2, ?2, 'subagent', 'observed', 'rollout', NULL, 0, 0)",
+                params![format!("s{i}"), format!("c{i}")],
+            )
+            .unwrap();
+        }
+        if analyze {
+            conn.execute_batch("ANALYZE").unwrap();
+        }
+        conn
+    }
+
+    fn query_plan(conn: &Connection, sql: &str) -> Vec<String> {
+        conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    /// The identity refresh runs twice per sweep and once per discovery pass,
+    /// over a table that is most of the store. Both event passes have to be
+    /// answered from `idx_session_events_project` and driven from the small
+    /// side of their join — the catalog, the relationship ledger — never by
+    /// reading every event row (#215).
+    #[test]
+    fn project_identity_refresh_never_scans_the_events() {
+        for analyze in [false, true] {
+            let conn = planned_store(analyze);
+            for (name, sql) in [
+                (
+                    "pass 3 probe",
+                    format!("SELECT 1 {} LIMIT 1", stale_event_project_keys_sql()),
+                ),
+                ("pass 4 candidates", uncataloged_delegated_events_sql()),
+            ] {
+                let steps = query_plan(&conn, &sql);
+                let joined = steps.join(" | ");
+                assert!(
+                    !steps.iter().any(|step| step.starts_with("SCAN")
+                        && step.contains("session_events")
+                        || step.starts_with("SCAN e")),
+                    "{name} scans the events (analyze={analyze}): {joined}"
+                );
+                assert!(
+                    joined.contains("COVERING INDEX idx_session_events_project"),
+                    "{name} reads event rows instead of the identity index \
+                     (analyze={analyze}): {joined}"
+                );
+            }
+            // Behaviour, not only the plan: a settled store has nothing stale.
+            assert_eq!(refresh_project_identity(&conn).unwrap(), 0);
+        }
+    }
+
+    /// The identity index covers `(source, session_id)` as a prefix, and that
+    /// is exactly why it must not replace the bare index: with no statistics
+    /// the planner ranks a two-of-four match below a one-of-one match on
+    /// `idx_session_events_role`, and every `source, session_id, role`
+    /// retirement then walked every event with that role — a cold sync went
+    /// quadratic. Keep that retirement a search on the session.
+    #[test]
+    fn a_session_scoped_retirement_seeks_the_session_not_the_role() {
+        for analyze in [false, true] {
+            let conn = planned_store(analyze);
+            for sql in [
+                "DELETE FROM session_events WHERE (source = 'codex' AND session_id = 's1' \
+                 AND role = 'user') AND location = 'local'",
+                "UPDATE session_events SET location = 'remote' WHERE (source = 'codex' \
+                 AND session_id = 's1' AND role = 'user') AND location = 'both'",
+            ] {
+                let joined = query_plan(&conn, sql).join(" | ");
+                assert!(
+                    joined.contains("session_id=?") && !joined.contains("idx_session_events_role"),
+                    "a session-scoped retirement is not keyed on the session \
+                     (analyze={analyze}): {joined}"
+                );
+            }
+        }
     }
 }
 

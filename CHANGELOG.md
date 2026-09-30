@@ -4,6 +4,366 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ## [Unreleased]
 
+### Breaking
+
+- `trajectory_fts` and the Python-era `trajectories_ai/au/ad` triggers are
+  dropped on the next writable open, and are dropped again whenever an older
+  client recreates them. Nothing read the index. On an older database whose
+  index had drifted from `trajectories`, those triggers made the change-feed
+  migration fail with `SQLITE_CORRUPT_VTAB` on every open. `compact` merges
+  two full-text indexes instead of three.
+
+- One search contract for the CLI, the SDK and MCP (#66). The SDK's
+  `search()` and MCP `search_history` now run `history_search::search_all`,
+  the query the CLI's `search` already used. They match session events
+  (assistant text, tool calls and results) as well as prompts, apply the same
+  filters (including `beforeMs`) to both, and order ties by
+  `(timestamp, id, match source)`. Each result is a `SearchMatch`, which is a
+  `HistoryEntry` plus `matchSource` (`history` | `session_event`), `role` and
+  `kind`; `id` is unique only within `matchSource`.
+  - `search` accepts `role`: `all` (default), `user`, `assistant`, or the new
+    `prompt` (prompts only). `resume` and `pack` search with `prompt`, as the
+    native CLI's resume and pack do. `ai-hist search --role` on both CLIs
+    accepts the same four values.
+  - MCP `search_history` gains `role`, `raw_fts` and `before_ms`. Its
+    description now says exactly what a query means instead of "prompts".
+  - A prompt that a hydrated session also recorded as a user text event
+    matches once, as its `history` row. The event is a copy only when it is
+    the same turn -- same session, same timestamp, same text up to
+    surrounding whitespace -- so a later turn repeating the text still
+    matches, and it is dropped only when the prompt is itself a match of the
+    same search (same query, same filters).
+  - An ordinary (non-raw) query matches an event's `text` and `project`, as a
+    prompt's `prompt` and `project`; it no longer matches the indexed `role`,
+    so searching for `assistant` or `user` does not return every event of
+    that role.
+  - The native CLI's `search --json` always emits `role`, `kind` and
+    `match_source`, including on `history` matches.
+- Native contract 22 -> 23: `search` returns `NativeSearchMatch` rows and
+  takes `role`. An SDK paired with an addon of the other contract fails at
+  load with `NATIVE_CONTRACT_MISMATCH`.
+- Keyset pagination and inclusive time windows for history reads (#67).
+  Native contract 23 -> 24.
+  - `search` and `recent` take `sinceMs`/`untilMs` (inclusive) and an
+    `after` cursor `{ timestampMs, id, matchSource? }` on every surface: SDK
+    options, MCP `search_history`/`recent_history` (`since_ms`, `until_ms`,
+    `after`), `--since-ms`/`--until-ms`/`--after` on the TS CLI, and
+    `--since-ms`/`--until-ms`/`--after-ms`/`--after-id` (and
+    `--after-match-source` on `search`) on the native CLI.
+  - New SDK `searchPage()`/`recentPage()` (napi `searchPage`/`recentPage`)
+    return `{ matches | entries, nextCursor }`. `nextCursor` comes from
+    over-fetching one row, and is `null` when nothing further exists.
+  - Every newest-first read orders by `(timestamp, id)`, and the cursor
+    predicate uses the same tuple. Rows sharing a timestamp, such as every
+    prompt of a Cursor transcript, page without skips or repeats.
+    `getSession` orders ties by id.
+  - `sinceMs > untilMs` and a cursor with an unknown `matchSource` are
+    `INVALID_ARGUMENT`, with the same message on every surface.
+  - `beforeMs`/`before_ms`/`--before-ms` keep their exclusive semantics but
+    are deprecated: they skip rows tied on the boundary timestamp.
+- Native contract 24 -> 25. The `sessionStoreCall` dispatcher gains the
+  change feed ops `changes` and `commit_changes`. An SDK paired with an addon
+  of the other contract fails at load with `NATIVE_CONTRACT_MISMATCH`.
+- Native contract 21 -> 22. `historyExport` serves snapshots that each hold
+  one read transaction, emits schema-version-2 records, and no longer accepts
+  the upload-journal operations. An SDK paired with an addon of the other
+  contract fails at load with `NATIVE_CONTRACT_MISMATCH` instead of at the
+  first export call.
+- Uploads are not part of `ai-hist`; team uploads come from the Agent Relay
+  desktop app. The `@relayhistory/capture` package, its seven platform helper
+  packages, the `relayhistory-plugin` crate and the `agent-relay-probe`
+  release assets are no longer built or published from this repository.
+- Removed from the SDK: `deliveryRequest`, `createHistoryDelivery`,
+  `historyDeliveryStatus`, `controlHistoryDelivery`,
+  `historyDeliveryRetention`, `setHistoryDeliveryRetention`,
+  `compactHistoryDelivery`, `drainHistoryDelivery`, `runHistoryDelivery`,
+  `runDeliveryCommand`, and the `HistoryDeliveryOptions`,
+  `DeliveryDrainOptions`, `DeliveryDrainResult` and `DeliveryIo` types. Each
+  function only raised `HISTORY_DELIVERY_MOVED`, which no longer exists.
+- Removed from the native addon: `historyDelivery` and `historyDeliveryDrain`.
+  The native contract version is unchanged; the SDK never called either.
+- Removed from the CLI: `ai-hist delivery enable|drain|run|status|pause|resume|retry|cancel`,
+  `ai-hist plugin COMMAND`, and the `--job`, `--poll-ms`, `--timeout-ms`,
+  `--base-url`, `--label`, `--max-content` and `--token` flags.
+- Removed from the MCP server: `delivery_status`, `delivery_pause`,
+  `delivery_resume` and `delivery_retry`. `AI_HIST_PLUGIN_CONFIG` loads source
+  connectors only; plugins no longer register MCP tools.
+- `HistoryPlugin` loses `commands` and `tools`; `HistoryPluginRegistry` loses
+  `command()` and `registeredTools()`. A plugin contributes `sources` and
+  `destinations`. The history config file loses its `job` field.
+- `ai-hist` keeps no upload capture journal. It creates and maintains no
+  per-table capture triggers, no journal, preimage, bootstrap-bound,
+  subscription or exclusion tables, and no retention budget: an evidence write is never refused with
+  "delivery retention limit exceeded", and sync, hydration and discovery run
+  no retention check. An uploader reads the change feed
+  (`SessionStore::changes_since`). The first writable open of an existing
+  store drops the capture triggers, the `*_cap_*` / `*_count_*` retention
+  triggers and the `delivery_identity_*` indexes (marker
+  `export_capture_retired_v1`), and drops them again whenever an earlier
+  release has re-created one. Every table of that era — `delivery_state`,
+  `delivery_journal` and its `sqlite_sequence` row, `delivery_shadow`,
+  `delivery_bootstrap_bounds`, `delivery_exclusions`, `history_subscriptions`,
+  `history_compaction` — stays as it is, for the upload daemon that reads its
+  origin and revision floor from them.
+- A local export snapshot is one read transaction. `ExportSnapshot` owns a
+  connection and holds a read transaction over the store until it is dropped,
+  so every page reads the store as it stood when the snapshot opened: rows
+  written, rewritten or deleted meanwhile, a new row reusing a deleted rowid
+  included, never change the export. It stores nothing: no
+  `history_exports`, `history_export_pages` or preimage rows. An open snapshot
+  lives in the process that opened it, so `beginHistoryExport` cursors resume
+  within that process until they expire, not across processes. Records are
+  `schema_version` 2: `origin_id` is the store's change-feed epoch (16 hex
+  digits) and `revision` is the row's change-feed revision, so `record_id`
+  (the SHA-256 of the feed's compact-JSON key) and `revision` match the feed
+  for the same row. Exclusions come from the selection's `excluded_sessions`
+  alone.
+- The native `historyExport` bridge accepts `create_export`, `export_page`,
+  `close_export` and `expire_exports`; `retained_bytes`,
+  `set_retention_limit` and `compact_journal` are gone, and so are the
+  `EXPORT_RETENTION_LIMIT` and `DELIVERY_RETENTION_LIMIT` error codes.
+
+- Native contract 19 -> 21. The `ai-hist-native` addon gains
+  `historyExport(requestJson, dbPath)`, which separates snapshot export from
+  the upload entry points the probe now owns, and
+  `sessionStoreCall(op, argsJson)`, one JSON-in/JSON-out dispatcher over the
+  `SessionStore` facade, through which the SDK's `getSessionRequestsPage`,
+  `getSessionUsage` and `getSessionUserTurnsPage` now read. Both additions
+  claimed 20 independently, so the addon carrying both answers with 21 rather
+  than a number either incompatible contract already used. A consumer pairing
+  the new SDK with an older platform package gets the existing
+  `NATIVE_CONTRACT_MISMATCH` error at load, not a missing function at first
+  use. The typed `getSessionRequestsPage` / `getSessionUsage` /
+  `getSessionUserTurnsPage` native exports stay for compatibility until a
+  later major.
+
+### Added
+
+- Grok per-inference usage from `<GROK_HOME>/logs/unified.jsonl` (#212). The
+  process-wide log recent Grok Build releases write is a second Grok source,
+  read from a byte cursor by every sweep and by every Grok hydration before its
+  stamp check, `unchanged` ones included (an unchanged log reads zero bytes),
+  watched as a file of its own and folded into the sweep fingerprint. A log
+  that cannot be read does not fail a hydration; it is reported as
+  `GROK_UNIFIED_LOG_UNREADABLE`. Each usage row is kept in a new
+  `grok_unified_usage` table and stored on the session it names as one
+  text-less assistant event (`raw_kind = "unified_log_usage"`, its own request
+  span) whose `token_json.usage` normalizes as `per-request` usage; an append
+  inserts only its own rows. Rows for a session not indexed yet are retained
+  (and counted in the sweep's note) and attached when it is. Coverage is per
+  turn: a turn with a log row inside its window keeps its
+  `turn_completed.usage` as `turn_usage`, which is not normalized, and a turn
+  the log does not reach keeps its own, so nothing is added twice or dropped.
+  Hydration reports no usage caveat when the log covers every turn,
+  `GROK_USAGE_MIXED_SOURCES` when some turns count their own breakdown, and
+  `GROK_USAGE_PARTIAL` when some have neither. The row shape is inferred from
+  tokscale and documented as such in `docs/session-catalog.md`. Nothing here
+  prices anything: `costUsdTicks` is kept verbatim and never read as a cost.
+- Grok model and metadata fallbacks (#212): a turn's model from
+  `params.update._meta.modelId` or a single-key `turn_completed.usage.modelUsage`
+  (written as `model` in the turn's `token_json` and added to `models_json`);
+  `summary.json` `current_model_id` / `model_id` after `info.model`; and, for a
+  directory with no `summary.json`, the model and start time from the head of
+  `events.jsonl`. `signals.json`'s `totalTokensBeforeCompaction` is named in
+  the `signals` marker.
+- Evidence rows record which side backs them. `session_events`,
+  `tool_calls`, `file_edits` and `session_markers` gain `location`
+  (`local` / `remote` / `both`). Local parsers stamp `local`, remote intake
+  stamps the observation's location, and meeting the other side's row makes
+  it `both`. A local whole-session re-read (Muse, Grok, Cursor, OpenCode, and
+  the per-record Claude and Codex rewrites) now retires only local rows and
+  leaves remote-supplied evidence under the same session id, which it used to
+  delete; a remote observation retiring a record likewise leaves the local
+  share. The `evidence_location_v1` migration adds the column and marks rows
+  of sessions known only remotely as `remote`. The change feed's
+  `Change.columns` carries the new column.
+- Muse Code (Meta's `muse` CLI) is a first-class source, `muse`. Sessions are
+  read from `$XDG_DATA_HOME/muse/sessions/YYYY/MM/DD/<id>/session.jsonl`
+  (`~/.local/share/muse/sessions` by default) by discovery, `sync`,
+  targeted hydration and live capture: typed prompts become `history` rows at
+  the microsecond time Muse recorded them, and each session gets its prose,
+  readable thinking, tool calls and results (status from Muse's own
+  `tool_batch.effect.terminal` outcome, and a non-zero `bash` exit code),
+  `write_file` / `edit_file` edits, per-model-step token usage (normalized as
+  `per-request`), models, CLI version and lifecycle markers (`turn_end`,
+  `session_start`, `session_resumed`, `session_end`, `model_switch`,
+  `encrypted_reasoning`). Subagent and reminder logs
+  (`subagent/<id>/session.jsonl`, at any depth) are indexed under the child's
+  own session id and linked to their parent as `delegated` children, typed
+  from the parent's `task_stream_linked` record; they are not catalogued as
+  sessions and their objectives are not history rows. A Muse hydration
+  reports `full`. `ai-hist resume` prints `muse resume <id>`, and the sync
+  service forwards `XDG_DATA_HOME`.
+- Devin CLI is a first-class source, `devin`. Sessions are read from
+  `$XDG_DATA_HOME/devin/cli/sessions.db` and its `transcripts/`
+  (`~/.local/share/devin/cli` by default) by discovery, `sync`, targeted
+  hydration and live capture. The store is opened read-only under a coherent
+  snapshot, never migrated or written. Each visible session gets its prompts,
+  prose, thinking, tool calls and results, file edits where `tool_call_state`
+  names a path, models, request and finish metadata, and markers (`system`,
+  `synthetic_turn`, `compaction_boundary`, `session_title`, `session_meta`,
+  `agent_manifest`); hidden sessions are skipped. Devin records no
+  delegation, and has no native resume command.
+- Add MCP `list_relay_agents` for live Agent Relay participants. It reads only
+  the local desktop Unix socket, discovers it from `AGENT_RELAY_SOCKET`, the
+  private desktop pointer file, then platform defaults, and reports a missing
+  desktop app as a non-fatal result instead of requiring Relaycast credentials.
+  A connected desktop gets a 15-second response deadline, with an honest
+  `timeout` error rather than the missing-app result if it does not answer.
+- Add MCP `relay_status`, `join_relay`, and `leave_relay` on that same local
+  socket. A calling session can make itself reachable, inspect its registered
+  state, and remove itself without any Relaycast token entering ai-hist.
+
+- Read every OpenCode channel database. OpenCode keeps one SQLite store per
+  release channel — `opencode.db` for `latest`/`beta`, and
+  `opencode-stable.db`, `opencode-nightly.db`, ... beside it — and only
+  `opencode.db` was read, so a user on another channel had no OpenCode history
+  at all. Discovery, `sync`, `sync-opencode`, hydration and live-capture
+  fingerprints now cover every channel store in the directory; a session found
+  in more than one is owned by the first (`opencode.db`, then the channel
+  stores in name order), including under a discovery `--limit`; hydrating a
+  copy an earlier store has since gained is refused with
+  `SESSION_SOURCE_MISMATCH` until rediscovery. A channel store that cannot be
+  opened, or a channel directory that cannot be listed, is reported as a
+  diagnostic (even on a `--limit` page) while the other stores are still read;
+  the sweep does not record its fingerprint over it, and `sync-opencode`
+  indexes what it could read and then fails naming the unlistable directory. `OPENCODE_DB` still names exactly one store,
+  as does `sync-opencode --opencode-db`.
+
+- Record Grok's per-turn usage. Recent Grok Build releases write a
+  `turn_completed.usage` breakdown (`inputTokens`, `outputTokens`,
+  `cachedReadTokens`, `reasoningTokens`, `totalTokens`); it is now stored
+  verbatim under `usage` in the turn's `token_json`, beside the
+  `context_total_tokens` snapshot, and normalized as `per-request` usage with
+  cache reads taken out of input. `source_accounting("grok")` is
+  `per-request` and `NORMALIZABLE_SOURCES` gains `grok`; a Grok record with
+  only the context snapshot normalizes to no usage rather than
+  `USAGE_UNKNOWN_SOURCE`. Hydration reports `GROK_USAGE_CONTEXT_PROXY_ONLY` only
+  when no turn carried a breakdown, `GROK_USAGE_PARTIAL` when some did. A
+  `usage` holding only `totalTokens` is still read as the context snapshot.
+  Every assistant row of a Grok turn now carries the turn index as its
+  `request_span`, so `session_requests` reports one request per turn instead
+  of one per row. Already indexed Grok sessions are re-read once, by `sync`
+  (state key `grok_events_v2`) and by hydration (parser version 12). A cached
+  hydration whose checkpoint predates stored diagnostics never claims full
+  usage coverage. `~/.grok/logs/unified.jsonl` is not read yet (#212).
+
+- Tool-result fidelity now covers Cursor, Grok and OpenCode (#171). Their
+  `tool_result` events carry `payload_bytes`, `payload_hash`,
+  `payload_truncated`, `call_index`, `event_index`, `result_status`,
+  `event_source` and `error_signal`, measured over the raw provider payload
+  through the same helper as Claude and Codex. A Cursor result is a block of
+  its message (`event_source = 'tool_result'`); a Grok `tool_result` line and
+  an OpenCode tool part's `output` are standalone
+  (`event_source = 'function_call_output'`) and so are not counted among a
+  user turn's blocks. `error_signal` gains `tool_status`, the provider's own
+  terminal status on the call (OpenCode `state.status: "error"`, a failed or
+  cancelled Grok ACP update); OpenCode's non-zero `metadata.exit` is reported
+  as `exit_code`. `ToolResultErrorSignal` in the TS SDK and the submitted-record
+  validation accept the new value. `HYDRATION_PARSER_VERSION` is 13 and the
+  `cursor_events_v2` / `grok_events_v2` sync-state keys are retired, so every
+  already indexed Cursor and Grok session re-parses once; OpenCode re-reads on
+  every sync already. The fixture corpus snapshots now include the fidelity
+  columns, and the three corpus tests held `#[ignore = "closed by #171"]`
+  assert them.
+
+- New `ai-hist compact [--json]` returns space the history database holds
+  but no longer uses, and deletes no rows. It merges the three full-text
+  indexes, runs `VACUUM` and truncates the WAL, and afterwards rebuilds
+  `trajectory_fts`, because `VACUUM` may renumber the rowids that index is
+  keyed on. It takes the sync run lock, so a concurrent `sync` or `watch` tick
+  skips instead of stalling behind the rewrite. It refuses with
+  `a sync is running` while one holds the lock. It also refuses up front when
+  the volume lacks room for twice the live pages plus the 512 MiB write
+  floor, because a rewrite that ran out of space midway would repeat #44;
+  that check runs before the database is opened writable (so before any schema
+  migration), and compact refuses when free space cannot be measured at all.
+  When a reader keeps the WAL from being truncated, compact says so
+  (`wal_truncated: false` under `--json`) instead of claiming it. On
+  the 248 MB benchmark store it took 2.8 s and saved 9 MB (#53).
+- `ai-hist doctor` reports `reclaimable` (`reclaimable_bytes` under `--json`),
+  the freelist bytes a `compact` would return. It points at `compact` when at
+  least 64 MiB and a quarter of the file are free pages.
+
+- The SDK reads the revision-stamped change feed (`SessionStore::changes_since`):
+  `getChangesPage` returns one bounded page (`changes`, `position`, `head`,
+  `done`) from `'start'`, a named `consumer` cursor or a kept `Watermark`, with
+  `kinds` and single-`session` filters; `changesSince` iterates it page by
+  page; `commitChanges(consumer, position)` acknowledges a page, forward-only
+  and bound to the cursor's kind set. Each `FeedChange` carries `kind`,
+  `source`/`sourceName`, `sessionId`, `recordKey`, `key`, `revision`, `op` and
+  the row as stored in `columns`; `source` is any known `Source`, trajectory
+  included, and null only for a source this SDK does not know. `done` means
+  nothing the page's filters select is left, so a filtered drain ends on its
+  last match rather than one empty page later. A database written before the
+  feed existed is migrated on its first page instead of refused. Exported with
+  `CHANGE_KINDS` and the `ChangeKind`, `Watermark`, `FeedChange`, `ChangesPage`
+  and `CommittedCursor` types.
+
+- Local source plugins (#177). A `HistorySource` may declare
+  `location: 'local'` with the absolute `roots` it reads; it runs for `local`
+  (the default) and `all` scope beside the built-in parsers, never for
+  `remote`, and its sessions are catalogued with `locations: ['local']`
+  through the same normalized evidence intake as a remote snapshot.
+  Registration refuses a local source without absolute roots, and a discovery
+  that reports a `raw_path` (or an absolute `raw_locator`) outside them is
+  rejected as that connector's diagnostic. A local source that supports none
+  of a request's `sources` is not run for it, and a `relay` session a local
+  source holds hydrates from it even when the built-in adapter has catalogued
+  it too. Remote sources are unchanged and still never run for local or
+  default scope; a request that registers no local source keeps the
+  native-only path. A plugin-backed `sync` at `all` scope now reports the
+  native local pass's diagnostics and completion with its own.
+  `docs/remote-connectors.md` is now `docs/source-plugins.md`.
+
+- Add workspace-scoped agent handoffs through `create_handoff(intent)` and
+  `resume_handoff(source, session_id)`. The sender emits only a session pointer
+  plus one self-describing intent and origin identity; the intent tells the
+  receiving agent to call `resume_handoff` before continuing, with no installed
+  skill required. The final intent stays within 4,000 characters by truncating
+  an overflowing caller-intent suffix with `…`. The receiver refreshes the configured
+  workspace `cloud` source and returns bounded prompts, normalized events, tool
+  calls, and file edits with independent continuation cursors.
+
+- Markers reach the SDK, MCP and both CLIs. `getSessionMarkersPage(source,
+  sessionId, {limit, after})`, the `sessionMarkers()` iterator and
+  `getSessionMarkers()` read one source's session on the evidence keyset
+  `(tsMs IS NULL, tsMs, id)`, so an undated marker pages last through a
+  null-timestamp cursor; each `SessionMarker` carries `kind`, `subkind`,
+  `text`, and the bounded payload both parsed (`payload`) and verbatim
+  (`payloadJson`). MCP: `get_session_markers`. CLI: `ai-hist sessions markers
+  SOURCE SESSION_ID [--limit N] [--after JSON] [--json]` (Node) and `ai-hist
+  sessions markers SOURCE SESSION_ID [--limit N] [--after-id N [--after-ms
+  MS]] [--json]` (Rust).
+- `getSourceCapabilities(source)` and the MCP `get_source_capabilities` tool
+  answer, from the provider tables alone, which evidence kinds a hydration of
+  that source covers, whether it can ever report `full`, and what its records
+  establish about delegation — the same table `getSessionRelationships`
+  returns as `capabilities` — so a consumer can ask before a first sync.
+- `ai-hist sessions usage SOURCE SESSION_ID [--json]` on both CLIs prints the
+  provider-reported rollup: usage is never estimated, and cost appears only
+  when the source data carried one.
+- The `sessionStoreCall` dispatcher answers `markers`, `requests`,
+  `usage_summary`, `user_turns` and `capabilities`; `sdk-ts/src/native.ts`
+  (`SESSION_STORE_OPS`) is the one place in the SDK that spells an op. A new
+  facade read is one arm in the Rust dispatcher and one entry there, not
+  another hand-mirrored native function. Every open goes through
+  `SessionStore`, so the facade owns the schema gate and the typed failure,
+  and `capabilities` is answered from the crate's pure capability tables with
+  no database at all; a missing database answers an empty page without being
+  created. A read opens a read-only store first and reopens writable — which
+  migrates — only when the facade reports a stale schema; any other failure
+  is returned under the facade error's own code (`QUERY_FAILED` as this
+  boundary's `DATABASE_QUERY_FAILED`) rather than retried through a
+  writer-lock-taking open.
+- `ai_hist::Error::StaleSchema` (`DATABASE_STALE_SCHEMA`), with the
+  `Error::is_stale_schema()` predicate over it, is the one `SessionStore`
+  failure a caller that may write has a remedy for: reopening the same path
+  writable migrates it, which is the wrong answer to every other failure. A
+  read-only `SessionStore::open` now also checks the per-request usage schema
+  alongside the event, evidence and relationship ones, so a usage read
+  refuses up front instead of failing inside a query.
+
 ### Live capture
 
 - `ai-hist watch` now wakes on filesystem events over everything a local sweep
@@ -93,6 +453,49 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Session topology
 
+- Record Codex forks from the fields Codex actually writes. A rollout whose
+  `session_meta` carries `forked_from_id` (a human "fork conversation") or
+  `source.subagent.thread_spawn.parent_thread_id` (a spawned subagent) now
+  gets a `fork` edge to that thread, with the field name as `evidence_ref`; a
+  subagent keeps its `delegated` row beside it and a human fork stays a
+  top-level session. A rollout indexed before this re-reads its `session_meta`
+  line once on the next `sync`: `SHALLOW_SCANNER_VERSION` 6 -> 7 moves the
+  sweep generation, so that sync runs even when no source changed, and sends
+  cached discovery rows through the current classifier once. A
+  `thread_source: "guardian_review"` rollout (Codex 0.150+) that names a
+  parent is hidden from the root catalog like any other subagent, and one an
+  earlier build catalogued as a root is reclassified on that same pass.
+  Hydrating a parent with `include_related` also records its spawned
+  children's fork edges.
+
+- Gate the parent history a forked Codex rollout replays (#210). Codex copies
+  the parent's `session_meta`, turns and cumulative `token_count` snapshots
+  into a fork's file before the fork's own first turn, and each copy used to
+  be indexed again under the child: the parent's prompts in the child's
+  `history` and `first_prompt`, its messages and tool calls in the child's
+  events, and its whole token total charged to the child's first request.
+  The span is now recognised from explicit evidence only -- it opens at the
+  parent's own `session_meta` reappearing in a rollout that named that parent
+  in `forked_from_id` or `thread_spawn.parent_thread_id`, and closes at the
+  first turn whose UUIDv7 `turn_id` (else `started_at`) is not earlier than
+  the fork (a legacy `started_at` in the fork's own second counts as
+  unordered), or that nothing can order -- and writes one
+  `fork_replay_boundary` marker instead. The last replayed `token_count` is
+  the child's inherited baseline, unless the child's own counter restarts
+  below it. Shallow discovery applies the same rule to `first_prompt`.
+  Rollouts indexed before this are repaired once: `SHALLOW_SCANNER_VERSION`
+  7 -> 8 moves the sweep generation, and the first `sync` re-reads every
+  unchanged fork rollout (`codex_fork_replay_gate` in the sync state),
+  retiring the rows it had indexed for the replayed lines and rewriting the
+  fork's `first_prompt` and `last_assistant_text` (cleared when the fork has
+  no prompt or answer of its own).
+  That cleanup is one-time and runs in `sync` only: hydration does not repeat
+  it, and an older build still writing to the same database can reinsert the
+  duplicates. Whether the inherited baseline was applied or dropped is
+  decided from the child's first `last_token_usage` and recorded on the
+  marker; a replayed legacy turn that cannot be ordered ends the gate early
+  and the rest of that replay is indexed as before.
+
 - Record fork, resume and continuation relationships, not delegation alone.
   `session_relationships.relationship` now takes `continuation | fork | resume`
   beside `delegated | materialized_local`, and carries `origin_session_id` —
@@ -125,8 +528,444 @@ Notable changes to the native `ai-hist` CLI are documented here.
   table left the old trigger delivering rows that looked complete and were
   missing a field, for the life of the database.
 
+### Session sourcing for burn
+
+- RelayHistory is becoming the sourcing layer for
+  [burn](https://github.com/AgentWorkforce/burn) (#160). Today burn still
+  reads Claude Code, Codex and OpenCode logs with its own readers. Its cutover
+  release (5.0.0, burn #562) removes them: burn will read usage, tool calls,
+  file edits and session topology from `ai-history.db` through the `ai-hist`
+  crate's `SessionStore`, and price and analyze that evidence. What burn users
+  should expect once 5.0.0 ships: one ingest instead of two, and the `ai-hist`
+  database as the source of truth for both tools, so a session `ai-hist` shows
+  is the session burn costs. Cursor and Grok support in burn is planned to
+  come through this crate (burn #560). Pricing, cost, token estimation and
+  activity classification stay in burn. See
+  `docs/decisions/2026-09-19-relayhistory-owns-session-sourcing.md`.
+- CI checks for the boundary (#183, #184), armed by burn's side of the
+  migration. A `burn-contract-drift` job, for changes under `crates/ai-hist/`,
+  builds burn (main, or the `BURN_REF` repository variable) with its `ai-hist`
+  requirement pointed at the pull request's crate and runs burn's relayhistory
+  parity suite, so a change to message ids, timestamps or usage dedup that
+  would move burn's ledger fails here. It reports a notice and passes until
+  burn depends on `ai-hist` (burn #557). A weekly `burn reader tripwire`
+  workflow fails, and opens a tracking issue here, if burn's harness-parser
+  symbols reappear or its parity suite is missing after its cutover tag,
+  `relayburn-sdk-v5.0.0`.
+
+### Changed
+
+- Internal refactor: one-entry harness registry (#177). Each built-in harness
+  is declared once, as a `LocalSource` descriptor in
+  `crates/ai-hist/src/sources/catalog.rs`, and `SOURCE_CHOICES`,
+  `shallow_providers()`, `DISCOVERY_EXEMPTIONS`, hydration's source validation
+  and parser dispatch, `validate_provider_path`'s roots,
+  `relationship_capabilities`, `resume_command` and the native
+  relationship-identity check are derived from it instead of kept as separate
+  lists. Other per-source code (parsers and full sync, sync watch roots,
+  `Source`, usage accounting, the TypeScript source lists) is not yet on the
+  descriptor; `docs/session-catalog.md` "Adding a provider" lists it. The
+  fixture-corpus registry test now checks that `Source::ALL` names exactly the
+  descriptors and that every descriptor has a fixture directory with committed
+  snapshots or a fixture exemption. Behaviour is unchanged, and so is the
+  default Rust API; the descriptors are readable under `unstable-internal` as
+  `ai_hist::sources::catalog`.
+
+### Fixed
+
+- Grok reuses an ACP `eventId` across records, and two messages carrying one
+  id were stored under one `ev:<id>` identity, so the second overwrote the
+  first (#212). The first message carrying an id keeps `ev:<id>`, and each
+  later one is `ev:<id>#1`, `#2`, …, so an append that reuses an id never
+  renames a stored message. The `grok_events_v3` sync-state key is retired
+  for `grok_events_v4`, and the hydration parser version moves 13 -> 14, so
+  every Grok session is re-read once by `sync` and by hydration.
+- `ai-hist export` no longer overwrites the database it is reading from
+  (#73). The destination is checked against the database the command
+  actually opened (`--db` included, not only `AI_HIST_DB`/the default, and
+  for a SQLite `file:` URI the file SQLite resolved it to), for
+  every format (`sqlite`, `jsonl`, `.gz`), after resolving relative
+  spellings, `..`, symlinks and hard links, and its `-wal`/`-shm`/`-journal`
+  sidecars are protected too. A refused export exits non-zero before reading
+  or writing anything.
+- `ai-hist export` stages its output in a temporary file beside the
+  destination and renames it into place once complete, so a failed export
+  leaves an existing destination file untouched. A SQLite export is written
+  as a single self-contained file. Sidecars left at the destination by an
+  earlier database are moved aside before the rename and discarded only once
+  it succeeds, so they can neither be replayed onto the new file nor lost if
+  the replacement fails; a sidecar that cannot be moved aside fails the
+  export. A destination that is a symlink is written through to its target,
+  which is itself checked against the active database.
+- Claude discovery and `sync` no longer treat the subagent workflow journal
+  (`<session>/subagents/**/journal.jsonl`) as a transcript. It is metadata
+  that shares the `.jsonl` extension; it is no longer listed as a discovery
+  candidate, opened, or tracked with a transcript cursor. On the first sync
+  after upgrading, what an earlier build derived from a journal is retracted:
+  its continuity evidence, the `unknown` markers its lines were stored as
+  (matched by session, line identity and record type, so a transcript's own
+  markers are untouched; lines no longer in the journal cannot be matched and
+  are left), and a session `raw_path`, local presence or local observation
+  left pointing at it. The journal's cursor is dropped only after that
+  succeeds, so an interrupted retraction is retried by the next sync.
+  ([#208](https://github.com/AgentWorkforce/relayhistory/issues/208))
+- Claude requests written as streamed snapshots — one record per content block,
+  same `message.id` (and `requestId`, when the transcript writes one),
+  `output_tokens` growing — now report their final usage instead of being
+  refused as `ambiguous-usage-copies`. The parser merges the copies per field
+  (largest output counter wins, `iterations` may gain entries, everything else
+  including a reported cost must agree) and writes the result onto every row
+  of the request; contradictory copies are still refused. Existing databases are settled once on the next writable
+  open. ([#211](https://github.com/AgentWorkforce/relayhistory/issues/211))
+- Claude `<synthetic>` assistant records (local API-error and login notices)
+  are stored as `session_markers` rows of kind `local_notice`, subkind
+  `synthetic`, instead of assistant events: they no longer form a request,
+  appear as a session model, or become `last_assistant_text`. Existing rows
+  move to markers on the next writable open, and the session's `models_json`
+  and a `last_assistant_text` quoting the notice are repaired with them.
+  ([#211](https://github.com/AgentWorkforce/relayhistory/issues/211))
+- A sweep no longer re-runs the Codex project/branch backfill over every
+  Codex session ever indexed. It covers only the sessions whose rollout was
+  re-read or which gained a `history.jsonl` prompt in that sweep, after one
+  full pass per install (recorded as `codex_metadata_backfill` in
+  `.sync-state.json`) for rows an older build left unattributed. Sessions
+  whose backfill a failed or cancelled sweep left unfinished are carried in
+  `codex_metadata_pending` and retried on the next sweep. Before, any
+  change that moved the source fingerprint — one Claude transcript growing —
+  cost an `UPDATE`, a `MIN`/`MAX` scan and a `sessions` upsert per Codex
+  session, and gave every Codex row a new change-feed revision. On 3,000
+  Codex + 300 Claude sessions, the sweep after one Claude append drops from
+  2.9s to 1.0s and re-stamps 0 Codex rows instead of 3,000 (#42).
+- The Claude sync walk's per-transcript "has this path left evidence?" probe
+  is a keyed search again. SQLite, with no statistics to go on, drove it from
+  `session_events` rather than from the one `sessions` row the path names, so
+  every transcript with no row of its own — each subagent sidecar, each new
+  file — scanned every Claude event, once per file per sweep. The probes now
+  pin their join order, and a new `idx_session_relationships_locator` index
+  (created on the next writable open) serves the sidecar probe. On the 100 MB
+  synthetic store, a sync after a 1 KiB append drops from 7.0 s to 2.1 s, and
+  a cold sync from 60 s to 43 s, in the benchmark harness (#215).
+- A sweep over files that have not changed no longer re-reads or re-queries
+  them (#42, #215). Measured on the 100 MB synthetic store, a sync after a
+  1 KiB append (what a `watch` event tick or a periodic Reflex sync runs
+  whenever anything moved) drops from 1.77 s and 838 MiB read to 0.39 s and
+  114 MiB; a `watch` tick with nothing changed reads 22 MiB instead of 28 MiB.
+  - Unchanged Claude transcripts and subagent metadata are skipped on a
+    `stat`, on filesystems known to keep a real change time (APFS, HFS+,
+    ext2/3/4, XFS, Btrfs, ZFS, tmpfs, F2FS). Once a window digest has proven
+    a transcript's cursor and the file's change time is more than three
+    seconds old, the cursor records that change time (`settled`); an
+    unchanged `ctime` — which no writer can restore there, unlike an mtime —
+    then proves the bytes without reading them. Any write, truncate, chmod
+    or rename falls back to the digest. Elsewhere — FAT and exFAT, whose
+    "ctime" is the mtime, any filesystem not on the list, and Windows —
+    nothing settles and every skip keeps the digest. A settle is trusted for
+    six hours, then the file is proven by its digest again, so no miss is
+    permanent. Recording it is best-effort and only replaces the cursor
+    document it was proven from, so it cannot roll back a cursor hydration
+    advanced in between.
+  - Unchanged Cursor transcripts and the flat prompt logs are skipped the
+    same way (`settled` on their byte cursor in `.sync-state.json`), and a
+    Cursor transcript that did not advance is no longer hashed a second time
+    to identify a generation nothing used.
+  - The project-identity refresh no longer reads every event row. The stale
+    event probe is driven from the catalog through a new covering index,
+    `idx_session_events_project`, the
+    delegated-thread pass from the relationship ledger, and the path-key
+    upgrade pass reads the catalog once instead of once per directory. A
+    sweep runs the refresh once instead of twice. The first writable open
+    after upgrading builds the index: about 1.6 s and 78 bytes per event
+    for a million events. Until then the schema is not current, so a
+    read-only CLI or change-feed open falls back to a writable one once.
+  - Discovery's locator lookup is a search on `idx_observation_locator`
+    again; with no `sqlite_stat1`, SQLite served its `ORDER BY` from the
+    primary key and walked every observation of the source per file.
+  - A sweep skips per-source sync-state checkpoints whose state did not
+    change, and an unchanged tick whose change-feed head matches the one
+    recorded with the destination marker (`destination_head`) skips
+    recounting every session's evidence.
+
 ### Rust API
 
+- `Source::Muse` and `ProviderRoots::muse` (the Muse Code sessions directory;
+  `from_env` honours `XDG_DATA_HOME`). Both types are `#[non_exhaustive]`, so
+  this is additive.
+- `Source::Devin` and `ProviderRoots::devin` (the Devin CLI data directory;
+  `from_env` honours `XDG_DATA_HOME`). Additive for the same reason.
+- `ProviderRoots` gains `opencode_db_pinned: bool`. `from_env` sets it when
+  `OPENCODE_DB` is set; `from_home` leaves it `false`, so every OpenCode channel
+  database beside `opencode_db` is read. Set it to read `opencode_db` alone.
+
+- The `export` feature is local export alone: `ExportSnapshot` (`open`,
+  `handle`, `page`, `owns_cursor`, `expired`, `snapshot_id`),
+  `ExportSelection`, `ExportLimits`, `ExportHandle`, `HistoryExportPage`,
+  `HistoryExportRecord`, `SessionIdentity`, `SUPPORTED_KINDS`,
+  `MAX_EXPORT_TTL_MS` and `EXPORT_SCHEMA_VERSION` (now 2). `create_export`,
+  `export_page`, `close_export` and `expire_exports` are replaced by
+  `ExportSnapshot`. Removed: the `export::capture` module (subscriptions, `reserve_revision`,
+  cutoffs, `next_change`, `append_revision`, preimages, `is_shareable`,
+  `shareable` and the rest), `RawRecord`, `make_record`, `snapshot_record`,
+  `DEFAULT_RETENTION_LIMIT_BYTES`, `set_retention_limit`, `retained_bytes`,
+  `RETENTION_HIGH_WATER_PERCENT`, `above_high_water`,
+  `ensure_capture_headroom`, `RetentionLimitReached`,
+  `retention_limit_usage`, `annotate_retention_limit`, `is_retention_limit`,
+  `MAX_COMPACTION_PAGE` and the `compact_journal*` / `compact_to_low_water*`
+  functions. The `delivery` feature alias is gone. Under
+  `unstable-internal`, `storage::session_identities_after` and
+  `storage::session_identity_exists` are gone; `SessionStore::session_identities`
+  and `SessionStore::has_session` are the identity reads. The default-feature
+  surface is unchanged.
+
+- `SessionStore::has_session(&SessionIdentity)` answers whether the store
+  holds anything under one identity, by the same tables and rule as
+  `session_identities`: true exactly when the listing would name it, false for
+  an empty source or session id. It is one indexed existence probe per table,
+  on one snapshot. `storage::session_identity_exists` is the same check, and the
+  listing skips an empty source as it skips an empty session id, so every
+  session an embedder counts is one it can select and drain.
+- `ChangeQuery::session(source, session_id)` restricts a change-feed drain
+  to one session: the same `Change` values the unfiltered drain reports for
+  that session, tombstones included, read through each table's
+  `(source, session_id)` index rather than the whole revision range. It is a
+  one-shot read (a session's backfill), so naming a consumer alongside it is
+  `Error::InvalidArgument`. A prompt with no session belongs to no session's
+  drain, and a trajectory is the session its id names under the `trajectory`
+  source.
+- `SessionStore::session_identities(IdentityQuery { after, limit })` pages
+  every `(source_name, session_id)` the store holds evidence under, catalogued
+  or not: the union of the catalog, prompts, events, tool calls, file edits,
+  markers, relationships (by parent), presences, commit links, connector
+  observations and trajectories. It is a merge of covering index seeks, so no
+  payload is read; each page reads one snapshot, and an empty source or
+  session id is no session. `SessionIdentity` names a stored session, including one
+  under a source this build does not know, and is the type
+  `ChangeQuery::session` holds. `storage::session_identities_after` is the
+  same read, and now covers every one of those tables rather than the catalog,
+  prompts and events alone, and reads each page on one snapshot even on an
+  autocommit connection. `sessions` gains `idx_sessions_identity` on
+  `(source, session_id)`, added by the first writable open; until then a
+  read-only store answers `session_identities` with `StaleSchema`.
+- The change feed reports every evidence table and each row exactly as
+  stored. `ChangeKind` gains `History`, `Presence`, `CommitLink`,
+  `Trajectory`, `SourceObservation` and `ObservationEvidence` (`ALL` lists
+  twelve kinds); their rows are stamped and tombstoned by the same triggers,
+  and a database the six-kind feed reached stamps them once on open, above its
+  head, so a cursor bound to every kind resumes into all of them. A named
+  cursor stored as `*` now spans all twelve kinds. A consumer that passed the
+  six original kinds as an explicit list was stored as `*` too; that list no
+  longer equals `ChangeKind::ALL`, so its resume fails with
+  `ConsumerKindsMismatch` — drain it under a new consumer name, or resync from
+  `Watermark::START`.
+  `EvidenceRow::History(HistoryEntry)` is the typed prompt row and
+  `EvidenceRow::Untyped` marks a kind with none. `Change` gains `columns:
+  Option<StoredRow>` — every column but `revision`, in table order, values as
+  SQLite holds them, read from the live table so a new column is carried
+  without a code change; the export journal's payload is built from the same
+  column list — and `key: Vec<serde_json::Value>`, the record's identity as
+  the journal keys it (`["history", source, timestamp_ms, prompt]`), on
+  upserts and tombstones alike; a prompt's session is not part of its key, so
+  a prompt gaining one is an upsert, never a delete. `Change::source` is `Option<Source>` and
+  `Change::source_name` holds the stored name, so a row from a source this
+  build does not know is carried instead of failing the drain. The `history`
+  FTS update trigger fires only on the columns it indexes.
+- `SessionStore::discover(DiscoveryOptions)` is the shallow catalog sweep:
+  every local provider's sessions from metadata, as `Shallow` rows, hydrating
+  none and taking no `SyncRunLock`. `discover`, `sync` and `hydrate` take an
+  optional `StopToken` (`stop`), and a stopped call is `Error::Cancelled`
+  (`CANCELLED`) at the next provider, file or record boundary.
+  `SyncOptions::progress` takes a `ProgressObserver` receiving content-free
+  `CaptureProgress` per provider file.
+- `SessionStore` is now the whole default surface of the `ai-hist` crate:
+  ten operations, typed evidence, no raw connection, no contract constant
+  (`docs/sourcing-sdk.md`). `open` keeps its shape and `StoreOptions` gains
+  `roots: Option<ProviderRoots>` (`ProviderRoots` is public: `from_env` is
+  the CLI's resolution, `from_home` reads nothing from the environment); the
+  roots are resolved once at `open` and drive `sync`, `hydrate`, `watch` and
+  `Source::capabilities().watch_roots(&roots)` alike. `sync` takes
+  `SyncOptions { force, lock_timeout_ms }` and reports `swept` plus the
+  `changed` `SessionRef`s (catalog rows a sweep created or changed), and a
+  held `SyncRunLock` is `Error::SyncLocked` after the caller's timeout rather
+  than a silent skip. New: `hydrate(&SessionRef, HydrateOptions)` — by id, or
+  by transcript path for the hook fast path — `watch(WatchOptions)` returning
+  a `WatchHandle` iterator of `TickReport`s over the live-capture loop,
+  `sessions(CatalogQuery)` walking the catalog on an internal keyset, and
+  `session(&SessionRef, SessionQuery) -> Option<SessionEvidence>` reading
+  every table for one session on one SQLite snapshot: `prompts`, `messages`
+  (one per `message_id`, with `role`, `request_id`, `provider_message_id`,
+  `stop_reason`, `turn_id`, normalized `usage`, and typed `blocks`),
+  `tool_calls` (`args` parsed), `tool_results` (per-result fidelity),
+  `file_edits` (`structured_patch` parsed), `markers` (`payload` parsed),
+  `relationships` (delegation and continuity, with the side the session is
+  seen from), `requests`, `usage`, `user_turns`, `coverage` and `loaded`. A
+  `Block` carries `control: Option<ControlKind>`, the typed reason a user-role
+  block is not a human prompt, so the facade reports a control row classified
+  rather than dropping it.
+  `SessionQuery { include_text, kinds }` maps onto burn's content modes:
+  `include_text: false` keeps byte lengths and hashes and never moves the
+  `text` column out of SQLite; `kinds` skips the tables a consumer does not
+  need. Every JSON column arrives parsed and the stored string is reachable
+  only through `raw_args()`, `raw_structured_patch()`, `raw_payload()` and
+  `raw_usage()`. `Source::capabilities()` declares, statically, a source's
+  evidence kinds, relationship capabilities, usage accounting mode, whether
+  its message ids are provider-issued or synthesized, whether it hydrates by
+  path, and its watch roots. `Error` is now an enum whose `code()` mirrors the
+  TypeScript native error codes plus `SyncLocked`, `SourceMismatch`,
+  `StaleSchema`, `WatermarkAheadOfStore` and `ConsumerKindsMismatch`; `Display` renders
+  `CODE: message`, and the change feed's failures are variants of the same
+  enum rather than a second classification. Every value type the facade returns
+  — `SessionEvidence` and its parts, `CatalogSession`, the reports and
+  options, `SourceCapabilities`, `Error` — is `#[non_exhaustive]`, `Clone`,
+  `Serialize`, `Deserialize` and `PartialEq`; `CatalogIter` and `WatchHandle`
+  are deliberately not value types (one holds a read snapshot, the other a
+  running thread) and implement none of those.
+  **Removed** the per-kind page methods `SessionStore::session_user_turns_page`,
+  `session_markers_page`, `session_requests_page` and `session_usage`; the
+  same data is `SessionEvidence::user_turns`, `markers`, `requests` and
+  `usage`. A read-only `open` now also checks the marker, relationship and
+  per-request usage schema, so it refuses at open — as the typed
+  `Error::StaleSchema`, naming the remedy — rather than inside a read. `crates/ai-hist/tests/sourcing_api.rs` holds the surface on the
+  crate's default features against the fixture-corpus snapshots.
+- A revision-stamped change feed for incremental downstream ingest:
+  `SessionStore::changes_since(from, ChangeQuery)`. Every row of `sessions`,
+  `session_events`, `tool_calls`, `file_edits`, `session_markers` and
+  `session_relationships` now carries a `revision` drawn from the
+  database-wide `observation_clock`, stamped by triggers on every insert and
+  update so no write site can forget it, and indexed per table. A deleted
+  row leaves a tombstone in `evidence_tombstones` at its own revision, which
+  a later insert of the same key clears. The drain yields `Change { kind,
+  source, session_id, record_key, revision, op }` in `(revision, kind,
+  record_key)` order, where `op` is `Upsert(EvidenceRow)` — the typed row,
+  so no second read is needed — or `Delete`; it is bounded to the head at
+  open, pages through the store in `batch`-sized indexed reads (at most
+  10,000), and exposes `head()` and `position()`. Named consumers keep their
+  progress in `consumer_cursors` inside the store: pass
+  `Watermark::CONSUMER` with `ChangeQuery::consumer` to resume from the last
+  commit, and call `Changes::commit()` to advance — an uncommitted drain
+  moves nothing, so a consumer that fails mid-batch resumes from its last
+  commit, and the cursor only moves forward, so a stale commit from an older
+  drain cannot rewind it (`commit` returns the cursor as stored). A presence
+  arriving or leaving re-stamps its catalog row, since the row's `locations`
+  is derived from `session_presences`. A page is read revision-first, so at
+  most one page of typed rows is resident however many kinds are fed; a
+  drain's start and head come from one read snapshot; and a read-only handle
+  over an unmigrated database reports `Watermark::START` rather than its
+  pre-feed `observation_clock`. Both passes of a page share that snapshot
+  too, and an empty page window steps forward instead of declaring the head,
+  so a writer re-stamping the rows mid-page cannot make a drain skip what is
+  still below its head. A named cursor is bound to the kind set it was
+  committed for (`consumer_cursors.kinds`); resuming or committing it under
+  another filter fails with `Error::ConsumerKindsMismatch`, because a
+  position in an events-only stream has accounted for no relationship,
+  marker or catalog row. `SessionStore::head_revision()` and `SyncReport::head_revision`
+  report the head. A `Watermark` carries the issuing database's `epoch`, a
+  random identity drawn when its feed schema is created
+  (`change_feed_store`), so a watermark from a replaced database fails with
+  `ErrorKind::WatermarkAheadOfStore` even after the replacement has counted
+  past its revision, as does one beyond the head, read through the new
+  `Error::kind()`, and `Changes::commit()` refuses the same way to write a
+  cursor into a database other than the one the drain read; the commit that follows the resync from
+  `Watermark::START` replaces a named cursor stuck beyond the head. A
+  re-parse re-stamps every row it upserts, so a consumer
+  must treat a re-seen `record_key` as a replace, never a duplicate. A
+  message still being written is never in the feed: incremental hydration
+  holds it until it completes, and its blocks then arrive together, once.
+  An existing database is stamped once on its first writable open, so a
+  replay from `Watermark::START` reports everything it already held. The
+  `session_events` FTS update trigger now fires only for `text`, `role` and
+  `project`, so the stamp — and the bulk `project_key` pass — no longer
+  re-index every event. The delivery capture payload leaves `revision` out;
+  it is this database's bookkeeping, not a fact about the record.
+  `ShallowSession` and `SessionRelationship` are re-exported on the default
+  feature set as the rows a catalog or relationship change carries.
+- Type the rows a harness writes into the user role that are not prompts.
+  `session_events` gains `control_kind`, null for a genuine prompt and for
+  model output, and otherwise one of `slash_command_caveat`,
+  `slash_command_invocation`, `slash_command_output`, `task_notification`,
+  `hook_output`, `bash_passthrough_input`, `bash_passthrough_output`,
+  `system_reminder`, `codex_context_wrapper`, `meta`, `resume_marker`. The
+  row keeps its role, kind and verbatim text; the column is what a consumer
+  building human turns, prompt roots or an overhead breakdown filters on.
+  Claude reads `origin.kind` and `attachment.{type, commandMode}` for task
+  notifications, and a slash command's caveat → invocation → output records,
+  chained by `parentUuid`, are grouped into one `session_markers` row of
+  `kind = "slash_command"` whose payload carries `command_name`,
+  `command_message`, `command_args`, `command_mode`, `origin_kind`, the three
+  rows' event uids and `stdout_bytes` — the whole of what an activity
+  classifier reads, with no raw JSON. The pending triad travels in the
+  transcript cursor, so a command split across two hydration passes is still
+  one marker. A `<system-reminder>` block inside a prompt becomes a
+  `system_reminder` row sharing the prompt's `message_id`
+  (`<uid>:reminder:<n>`), recreated from the current text on every re-read so
+  a record rewritten with fewer reminders, or without the block that carried
+  them, loses the rows it no longer has, and
+  the prompt row and `history` carry only the human's text. Codex's `<environment_context>` and sibling wrappers are
+  stored as `codex_context_wrapper` rows instead of falling to an `unknown`
+  marker. `history`, `sessions.first_prompt` and `attribute_usage_to_prompts`
+  all derive from that one classification (`ingest::control`), which
+  replaced the `CLAUDE_CONTROL_PREFIXES` list: a task notification or a bare
+  `/resume <id>` is no longer a `history` row or a first prompt, and the
+  answer to a slash command is charged to the human prompt before it rather
+  than to the command's output row. `session_user_turns_page` leaves control
+  rows out too, so a Codex context wrapper is not a turn and a split reminder
+  is not one of its prompt's blocks; the relayhistory plugin does not publish
+  them as conversation turns, and pads a session's published tail with one
+  empty `system` turn per control row so a session an earlier release
+  published with its control rows as user turns is rewritten index for index
+  on the server, which upserts by `turnIndex` and never trims. Source-evidence
+  validation refuses a `control_kind` outside the vocabulary or on anything
+  but a user text row. `SESSION_EVIDENCE_CONTRACT_VERSION` 2 -> 3 on both the
+  Rust and TypeScript sides, since the session-event row shape changed; the
+  TypeScript `SessionEvent` exposes it as `controlKind` (a `ControlKind`
+  union or null) and the native addon carries it, with no native contract
+  bump because the field is additive. For Claude the full-transcript metadata
+  fold now settles `sessions.first_prompt` on every sync or hydration, null
+  included -- never from a fold superseded by a rewrite under it, which the
+  next pass rescans -- so a title an earlier release took from a row that is control now
+  (a bare `/resume <id>`, a task notification) is replaced on the one-time
+  re-read; `SHALLOW_SCANNER_VERSION` 5 -> 6 sends cached discovery rows
+  through the current classifier once as well. A standalone reminder row the
+  previous parser stored untyped under the block's own uid, and the `unknown`
+  marker it left for a Codex wrapper, are retired by the re-read rather than
+  kept beside the typed rows. `SessionEvent` gains `control_kind`,
+  returned by `session_events` and `session_events_page` and carried by the
+  source-evidence row contract. `HYDRATION_PARSER_VERSION` 10 -> 11 and the
+  raw-facts generation 2 -> 3, so an existing install re-stamps every row
+  once on the next hydration or plain `sync`. That re-read also retires what
+  the previous parser wrote for a record it now stores differently: the
+  `history` row it wrote from the record's whole text (a reminder folded into
+  the prompt, a task notification as a prompt), keyed on this session, the
+  record's timestamp and that text; a row another session's human prompt
+  shares under `history`'s `(source, timestamp, prompt)` key is handed to
+  that session rather than deleted. Continuity reads a `/resume` through the
+  same reminder stripping, so a reminder ahead of the wrapper no longer hides
+  the resume. The fixture corpus snapshots now include `control_kind` and a
+  `session_markers` dump. napi/TS/MCP exposure is not included.
+- Document and prove the embedder surface. `docs/sourcing-sdk.md` is the guide
+  for a Rust consumer of the published crate — `StoreOptions` and
+  `ProviderRoots` resolution, one section per facade operation with its
+  provider I/O, database work and locking, the typed `Error` table against the
+  TypeScript codes, one section per evidence struct with a per-source
+  population table checked against `declared_evidence_kinds` by
+  `tests/sourcing_sdk_doc.rs`, accounting semantics, the change feed, the
+  semver policy, feature flags, the never-list, and which in-tree call sites
+  still need `unstable-internal`. `examples/rust-consumer` is a standalone
+  Cargo project outside the workspace that depends on `ai-hist` from
+  crates.io, stages the fixture corpus into a throwaway `HOME` under explicit
+  `ProviderRoots`, syncs, walks the catalog, prints per-session usage totals
+  by model from `SessionEvidence::requests`, and drains the change feed under
+  a named consumer cursor; CI builds it with `[patch.crates-io]` at the
+  checkout on every pull request and nightly against the published crate. `crates/ai-hist/public-api.txt` snapshots the
+  default-feature public API; `node scripts/check-public-api.mjs` diffs it in
+  CI and rejects any `rusqlite` type in it. `EvidenceRecord::{exists,
+  matches_canonical, remove, write}` — the four methods that took a raw
+  `rusqlite::Connection` on the default features — are crate-private now; they
+  had no caller outside the crate, and they were the only `rusqlite` types in
+  the surface. `Source::ALL` lists every source, since the enum is
+  `#[non_exhaustive]` and a list an embedder keeps by hand cannot learn about
+  a new variant; an in-crate exhaustive `match` and a comparison with
+  `SOURCE_CHOICES` keep it complete. `scripts/set-release-version.mjs` stamps
+  the example's dependency and lock entry, and the release workflow's version
+  commit stages both files, so a release keeps both CI variants honest.
 - Stop dropping the record types neither parser could normalize. A new
   `session_markers` table records compaction and summary boundaries, provider
   `system` rows, non-text content blocks (`image`, `document`,

@@ -24,13 +24,13 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawnSync } from "node:child_process";
-import { createRequire } from "node:module";
+import { execFile, spawnSync } from "node:child_process";
+import { promisify } from "node:util";
 
 import { packageName, platforms, plugins } from "./history-package-contract.mjs";
 import { installWithRegistryRetry, isRegistryVisibilityFailure } from "./npm-install-with-registry-retry.mjs";
@@ -41,8 +41,42 @@ import {
   publicRegistryEnv,
 } from "./npm-host-install.mjs";
 
+const execFileAsync = promisify(execFile);
+
 export { currentPlatform, hostLibc, publicRegistryEnv };
 export const pluginInstallArgs = hostInstallArgs;
+
+/**
+ * Why this runner's helpers are absent after npm exited 0.
+ *
+ * An optional dependency that the registry has not finished releasing is
+ * omitted, and npm still exits 0. The install retry treats a non-empty return
+ * as that miss. An empty string means every host helper is on disk.
+ */
+export function hostHelperInstallRejection(project, platform, libc) {
+  let installedScope = [];
+  try {
+    installedScope = readdirSync(join(project, "node_modules", "@relayhistory")).sort();
+  } catch {
+    installedScope = [];
+  }
+  const missing = [];
+  for (const info of Object.values(plugins)) {
+    const helper = packageName(info, platform);
+    // Stat the file. require.resolve caches a successful lookup for the
+    // process, and a retry deletes node_modules between attempts, so a helper
+    // that was present once would still look installed after a later install
+    // omitted it.
+    const packageJson = join(project, "node_modules", ...helper.split("/"), "package.json");
+    if (!existsSync(packageJson)) missing.push(helper);
+  }
+  if (missing.length === 0) return "";
+  return (
+    `${missing.join(", ")} did not install ` +
+    `(npm libc=${libc ?? "default"}; installed @relayhistory/*: ${installedScope.join(", ") || "none"}). ` +
+    "npm skips an unresolvable optional dependency silently"
+  );
+}
 
 /** Clean project that depends on the published JS packages the way a user does. */
 export function verifyPluginManifest(version) {
@@ -69,16 +103,39 @@ function expectedNames() {
 }
 
 /** Read one exact manifest using a fresh cache on every attempt. */
-function viewed(name, version) {
-  const cache = mkdtempSync(join(tmpdir(), "relayhistory-view-cache-"));
+async function viewed(name, version) {
+  const cache = await mkdtemp(join(tmpdir(), "relayhistory-view-cache-"));
   try {
-    return spawnSync(
-      "npm",
-      ["view", "--prefer-online", "--json", `${name}@${version}`],
-      { encoding: "utf8", env: { ...process.env, npm_config_cache: cache } },
-    );
+    try {
+      const { stdout, stderr } = await execFileAsync(
+        "npm",
+        ["view", "--prefer-online", "--json", `${name}@${version}`],
+        {
+          encoding: "utf8",
+          env: { ...process.env, npm_config_cache: cache },
+          maxBuffer: 4 * 1024 * 1024,
+        },
+      );
+      return { status: 0, signal: null, stdout, stderr };
+    } catch (error) {
+      if (typeof error.code === "number") {
+        return {
+          status: error.code,
+          signal: error.signal ?? null,
+          stdout: error.stdout ?? "",
+          stderr: error.stderr ?? "",
+        };
+      }
+      return {
+        status: null,
+        signal: error.signal ?? null,
+        stdout: error.stdout ?? "",
+        stderr: error.stderr ?? "",
+        error,
+      };
+    }
   } finally {
-    rmSync(cache, { recursive: true, force: true });
+    await rm(cache, { recursive: true, force: true });
   }
 }
 
@@ -86,39 +143,50 @@ function viewed(name, version) {
 export async function waitForPublishedPackages(version, {
   attempts = 60,
   delayMs = 5_000,
+  concurrency = 4,
   runView = viewed,
   sleep = (ms) => new Promise((resolveDelay) => setTimeout(resolveDelay, ms)),
   log = (message) => console.error(message),
 } = {}) {
+  assert.ok(
+    Number.isSafeInteger(concurrency) && concurrency > 0,
+    "concurrency must be positive",
+  );
   const pending = new Set(expectedNames());
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     const missing = [];
-    for (const name of pending) {
-      const result = runView(name, version);
-      const context = `npm view ${name}@${version}`;
-      if (result.error) throw new Error(`${context}: ${result.error.message}`, { cause: result.error });
-      if (result.status !== 0) {
-        const output = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
-        const diagnostic = `${context} failed (exit ${result.status}, signal ${result.signal ?? "none"}):\n${output}`;
-        if (!isRegistryVisibilityFailure(output)) throw new Error(diagnostic);
-        missing.push(diagnostic);
-        continue;
+    const names = [...pending];
+    for (let offset = 0; offset < names.length; offset += concurrency) {
+      const batch = names.slice(offset, offset + concurrency);
+      const results = await Promise.all(
+        batch.map(async (name) => [name, await runView(name, version)]),
+      );
+      for (const [name, result] of results) {
+        const context = `npm view ${name}@${version}`;
+        if (result.error) throw new Error(`${context}: ${result.error.message}`, { cause: result.error });
+        if (result.status !== 0) {
+          const output = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
+          const diagnostic = `${context} failed (exit ${result.status}, signal ${result.signal ?? "none"}):\n${output}`;
+          if (!isRegistryVisibilityFailure(output)) throw new Error(diagnostic);
+          missing.push(diagnostic);
+          continue;
+        }
+        let metadata;
+        try {
+          metadata = JSON.parse(result.stdout);
+        } catch (error) {
+          throw new Error(`${context}: invalid JSON: ${error.message}`, { cause: error });
+        }
+        // npm versions differ: an exact-version view can return an object or a
+        // singleton array. Never accept multiple versions from an exact lookup.
+        const manifests = Array.isArray(metadata) ? metadata : [metadata];
+        assert.equal(manifests.length, 1, `${context}: expected exactly one manifest`);
+        const [manifest] = manifests;
+        assert.ok(manifest && typeof manifest === "object", `${context}: invalid manifest`);
+        assert.equal(manifest.version, version, `${name}: registry returned the wrong version`);
+        assert.ok(manifest.repository?.url, `${name}@${version}: published without repository.url`);
+        pending.delete(name);
       }
-      let metadata;
-      try {
-        metadata = JSON.parse(result.stdout);
-      } catch (error) {
-        throw new Error(`${context}: invalid JSON: ${error.message}`, { cause: error });
-      }
-      // npm versions differ: an exact-version view can return an object or a
-      // singleton array. Never accept multiple versions from an exact lookup.
-      const manifests = Array.isArray(metadata) ? metadata : [metadata];
-      assert.equal(manifests.length, 1, `${context}: expected exactly one manifest`);
-      const [manifest] = manifests;
-      assert.ok(manifest && typeof manifest === "object", `${context}: invalid manifest`);
-      assert.equal(manifest.version, version, `${name}: registry returned the wrong version`);
-      assert.ok(manifest.repository?.url, `${name}@${version}: published without repository.url`);
-      pending.delete(name);
     }
     if (pending.size === 0) return;
     if (attempt === attempts) {
@@ -172,33 +240,22 @@ async function main(version) {
     // Resolves on success and throws on exhaustion — it returns no result to
     // inspect. Reading a `.status` off it crashed this step even when the
     // install had worked.
+    //
+    // A zero exit is not proof the helper landed. npm omits an optional
+    // dependency whose tarball is not fetchable yet and still exits 0, leaving
+    // the two JS packages installed and this runner's helpers absent. That is
+    // the same propagation window as ETARGET, so reject the exit and retry
+    // inside the same budget.
     await installWithRegistryRetry(installArgs, {
       attempts: 60,
       delayMs: 5_000,
       cwd: project,
       env: publicRegistryEnv(),
+      confirm: () => hostHelperInstallRejection(project, platform, libc),
     });
 
-    // npm skips an optionalDependency it cannot resolve and still exits 0, so a
-    // helper missing from the registry produces a silent half-install rather
-    // than a failure. Check this machine's helper actually landed.
-    const require_ = createRequire(join(project, "noop.js"));
-    let installedScope = [];
-    try {
-      installedScope = (await readdir(join(project, "node_modules", "@relayhistory"))).sort();
-    } catch {
-      installedScope = [];
-    }
     for (const info of Object.values(plugins)) {
-      const helper = packageName(info, platform);
-      try {
-        require_.resolve(`${helper}/package.json`);
-        console.log(`  installed ${helper}`);
-      } catch {
-        assert.fail(
-          `${helper} did not install (npm libc=${libc ?? "default"}; installed @relayhistory/*: ${installedScope.join(", ") || "none"}). npm skips an unresolvable optional dependency silently`,
-        );
-      }
+      console.log(`  installed ${packageName(info, platform)}`);
     }
 
     // Installable is not the same as loadable. Import each package and confirm
