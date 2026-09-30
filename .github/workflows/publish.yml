@@ -469,9 +469,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # A real release tags the published tree once publishing and the
-          # registry smoke tests succeed; persist-version then rebases that
-          # commit onto the branch.
+          # A real release tags the published tree once npm accepts every
+          # package; persist-version rebases that commit after verification.
           persist-credentials: true
       - uses: actions/setup-node@v6
         with:
