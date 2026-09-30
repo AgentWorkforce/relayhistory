@@ -22,6 +22,10 @@ ai-hist-native (Node-API, async worker tasks)
 ai-hist TypeScript SDK
         ├── ai-hist Node CLI
         └── ai-hist MCP server
+                └── MCP-only relay presence tools
+                        │ local HTTP over a Unix-domain socket
+                        ▼
+                Agent Relay desktop
 ```
 
 Rust owns provider discovery/parsing, schema creation and migration, direct
@@ -34,8 +38,14 @@ session-relationship contract version 2, and session evidence contract version
 errors, and supplies pagination
 helpers.
 
-The CLI and MCP server import only the SDK's public functions. They do not
-open SQLite, import `ai-hist-native`, scan providers, or invoke another CLI.
+The CLI and the MCP server's history tools import only the SDK's public
+functions. They do not open SQLite, import `ai-hist-native`, scan providers, or
+invoke another CLI. The intentional exception is the MCP-only relay presence
+surface (`list_relay_agents`, `relay_status`, `join_relay`, and `leave_relay`):
+`sdk-ts/src/relay-agents.ts` sends bounded local HTTP requests directly to the
+Agent Relay desktop Unix-domain socket. That module does not enter the history
+SDK/native layers and does not load cloud clients, authentication, tokens, or
+workspace keys.
 
 The native addon exposes two kinds of entry point. The older operations are
 hand-mirrored typed functions with their own option and result objects. Reads

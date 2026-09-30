@@ -642,6 +642,8 @@ const REQUIRED_TABLES: &[&str] = &[
     "session_presences",
     "session_hydration_checkpoints",
     "transcript_cursors",
+    "grok_unified_usage",
+    "grok_session_turns",
     "session_identity_correlations",
     "session_relationships",
     "session_continuity_evidence",
@@ -1441,6 +1443,13 @@ CREATE TABLE IF NOT EXISTS grok_unified_usage (
 );
 CREATE INDEX IF NOT EXISTS idx_grok_unified_usage_session
     ON grok_unified_usage(session_id);
+-- How many turns `updates.jsonl` opened, written by the replacing read.
+-- A cached usage caveat is rebuilt from stored rows after a log append, and
+-- a turn that left no row would otherwise disappear from that count.
+CREATE TABLE IF NOT EXISTS grok_session_turns (
+    session_id TEXT PRIMARY KEY,
+    turns INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS session_identity_correlations (
     source TEXT NOT NULL,
     local_session_id TEXT NOT NULL,

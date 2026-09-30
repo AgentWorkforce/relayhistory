@@ -3913,7 +3913,11 @@ static UPSERT_SESSION_SQL: LazyLock<String> = LazyLock::new(|| {
 /// readers deliberately interpret as `'full'`. Grok is the exception on the
 /// activity bounds: a session directory is a replacement snapshot, so a later
 /// compaction can move the start forward and the end backward. A shallow
-/// rescan of such a row still refreshes its metadata and stamp.
+/// rescan of such a row still refreshes its metadata and stamp. The process
+/// log is not part of that snapshot: after the directory bounds land, a
+/// `logs/unified.jsonl` row later than the directory's end raises
+/// `last_activity_ms`, and a model only the log named is appended. A model
+/// the directory no longer names stays off the row.
 ///
 /// The returned row is what the catalog now holds (including a preserved
 /// `full` state), read back through the write's own `RETURNING` clause so the
@@ -4040,8 +4044,64 @@ fn upsert_shallow_session_in_transaction(
         ],
         row_to_session,
     )?;
+    reconcile_grok_unified_catalog(conn, &mut row)?;
     row.from_cache = false;
     Ok(row)
+}
+
+/// Put `logs/unified.jsonl` back onto a Grok catalog row after the directory
+/// snapshot replaced it.
+///
+/// Shallow discovery replaces Grok's activity end and model list, because the
+/// directory is a snapshot and compaction can move the end backward or drop a
+/// model. The process log is a different source: an inference later than the
+/// directory is still the session's latest activity, and a model only the log
+/// named is still a model the session used. Both are restored here. A model
+/// that was on the previous row and is in neither the directory nor the log
+/// stays gone.
+fn reconcile_grok_unified_catalog(conn: &Connection, row: &mut ShallowSession) -> Result<()> {
+    if row.source != "grok" {
+        return Ok(());
+    }
+    let log_last: Option<i64> = conn.query_row(
+        "SELECT MAX(ts_ms) FROM grok_unified_usage WHERE session_id = ?",
+        params![row.session_id],
+        |found| found.get(0),
+    )?;
+    if let Some(log_last) = log_last {
+        if row.last_activity_ms.is_none_or(|current| log_last > current) {
+            conn.execute(
+                "UPDATE sessions SET last_activity_ms = ? \
+                 WHERE source = 'grok' AND session_id = ?",
+                params![log_last, row.session_id],
+            )?;
+            row.last_activity_ms = Some(log_last);
+        }
+    }
+    let log_models = conn
+        .prepare(
+            "SELECT model FROM grok_unified_usage \
+             WHERE session_id = ? AND model IS NOT NULL \
+             ORDER BY ts_ms IS NULL, ts_ms, line_offset",
+        )?
+        .query_map(params![row.session_id], |found| found.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut models = std::mem::take(&mut row.models);
+    let before = models.len();
+    for model in log_models {
+        if model.is_empty() || models.iter().any(|seen| seen == &model) {
+            continue;
+        }
+        models.push(model);
+    }
+    if models.len() != before {
+        conn.execute(
+            "UPDATE sessions SET models_json = ? WHERE source = 'grok' AND session_id = ?",
+            params![serde_json::to_string(&models)?, row.session_id],
+        )?;
+    }
+    row.models = models;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

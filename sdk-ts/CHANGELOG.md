@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so tied timestamps page without skips. `beforeMs` is deprecated. Requires
   native contract 24.
 
+- Add local-socket MCP tools `list_relay_agents`, `relay_status`, `join_relay`,
+  and `leave_relay`. They list live participants and let the calling session
+  make itself reachable or leave again without cloud auth in ai-hist.
+
 - Add `createHandoff()` / `resumeHandoff()` and their default MCP tools. Handoff
   pointers carry only session identity, one self-describing resume intent, and
   origin identity; no installed receiver skill is required. Resume performs

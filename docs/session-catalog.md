@@ -1291,6 +1291,11 @@ How each adapter works:
     a cost. Only rows with no event yet are inserted, so an append attaches
     its own rows and leaves every stored event — and the change feed —
     untouched. A row later than the session's `last_activity_ms` extends it.
+    A later shallow rescan still replaces the directory's activity bound, so
+    compaction can move that end backward; when the log's latest row is later
+    than the directory, that time is restored, and a model only the log named
+    is appended to the directory's list. A model the directory no longer
+    names stays off the row.
   - Rows attach **by session id**, assumed to equal `summary.json`'s
     `info.id` (unverified). A row for a session that is not in the catalog yet
     is **retained** and attached when that session is indexed; one that names
@@ -1317,16 +1322,21 @@ How each adapter works:
     dropped. A log row with no time cannot be placed in a turn, so its
     presence covers every turn: a demoted breakdown is still there as
     `turn_usage`, while an inference counted twice could not be told apart.
-    The context snapshot is never usage in any case.
+    The context snapshot is never usage in any case. Its turn window is stored
+    beside it even when the turn wrote no breakdown, so a log row inside that
+    window covers the turn.
   - Hydration's usage caveat for a session the log reaches is decided per
     turn: none when the log covers every turn; `GROK_USAGE_MIXED_SOURCES`
     when every turn has usage but some of it comes from `turn_completed.usage`
     (each turn still counted once); `GROK_USAGE_PARTIAL` when some turn has
     neither. A session the log does not reach keeps the caveat its
     `updates.jsonl` earns. Cached diagnostics are cleared when new rows
-    attach, so an `unchanged` read rebuilds them from the stored rows.
-    `capability` stays `full` either way — usage is not an evidence kind
-    (hydration contract 3).
+    attach, so an `unchanged` read rebuilds them from the stored rows and
+    from the turn census the replacing read recorded. A turn that census
+    counts and that left no token row still counts: it is covered when a
+    timeless log row is stored, and otherwise it is one of the turns
+    `GROK_USAGE_PARTIAL` names. `capability` stays `full` either way — usage
+    is not an evidence kind (hydration contract 3).
 
   The row shape is **inferred**. tokscale reads a session id, a pid, a model
   and per-inference input/output/cache counters, and keys rows on
@@ -1382,13 +1392,16 @@ How each adapter works:
 
   The change stamp covers **every file the read consumes**: the transcript, the
   summary and the update stream each keep a readable marker, and
-  `signals.json`, `prompt_context.json`, `events.jsonl` and the sorted contents of
+  `signals.json`, `prompt_context.json` and the sorted contents of
   `compaction_checkpoints/` and `subagents/` are folded into one digest (so a
-  session with many checkpoints does not grow an unbounded stamp). Discovery,
-  plain `sync` and targeted hydration all take the same stamp from the same
-  function, so none of them can call a session unchanged on evidence the others
-  would have re-read — a new checkpoint written after the last update row is
-  new evidence, and is read as such.
+  session with many checkpoints does not grow an unbounded stamp).
+  `events.jsonl` joins that digest only when `summary.json` is absent, which
+  is also when its head is read. While the summary is present the file grows
+  with the session and is not consumed, so an append to it leaves the stamp
+  where it is. Discovery, plain `sync` and targeted hydration all take the
+  same stamp from the same function, so none of them can call a session
+  unchanged on evidence the others would have re-read — a new checkpoint
+  written after the last update row is new evidence, and is read as such.
 
   Every read in this path answers in three states: **absent** (nothing to
   record), **malformed but present** (the file's existence is itself evidence,
@@ -1409,7 +1422,8 @@ How each adapter works:
   parsing reader saw, so it is told the same things about them — above all that
   a token count it can see is a context proxy and not billing usage. A
   checkpoint written before those were persisted has none stored, and the usage
-  caveat is rebuilt from the stored `token_json` instead.
+  caveat is rebuilt from the stored `token_json` and, when `logs/unified.jsonl`
+  reaches the session, from the turn census the replacing read recorded.
 
   Grok hydration reports `capability: "full"` because its parser covers every
   evidence kind. The usage caveat travels with it as

@@ -4026,6 +4026,50 @@ fn grok_state_had_evidence(entry: &Value) -> Option<bool> {
     entry.get("evidence").and_then(Value::as_bool)
 }
 
+/// Whether the indexing run wrote transcript events, as its stamp entry recorded.
+///
+/// Absent on a stamp written before that was recorded. Unified-log usage is
+/// not a transcript: it arrives from `logs/unified.jsonl` and can be the only
+/// event left after the transcript rows are gone.
+fn grok_state_transcript_events(entry: &Value) -> Option<bool> {
+    entry.get("transcript_events").and_then(Value::as_bool)
+}
+
+/// Whether any transcript event is stored for a Grok session.
+///
+/// `raw_kind = 'unified_log_usage'` is a row copied from `logs/unified.jsonl`,
+/// not from the session directory. Counting it would let a missing transcript
+/// look indexed for as long as one inference remained.
+fn grok_transcript_events_exist(conn: &Connection, session_id: &str) -> Result<bool> {
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM session_events \
+         WHERE source = 'grok' AND session_id = ? \
+           AND (raw_kind IS NULL OR raw_kind != 'unified_log_usage') LIMIT 1)",
+        params![session_id],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
+}
+
+/// What the unchanged-stamp skip asks, given what the indexing run recorded.
+///
+/// A run that wrote transcript events is still indexed only while one of
+/// those events remains. Unified-log usage and a sidecar marker are not a
+/// substitute: both survive a transcript that was deleted out from under an
+/// unchanged directory. A run that wrote no transcript events — markers or a
+/// relationship only — is still indexed while that evidence remains.
+fn grok_indexed_evidence_remains(
+    conn: &Connection,
+    session_id: &str,
+    transcript_events: Option<bool>,
+) -> Result<bool> {
+    if transcript_events == Some(true) {
+        grok_transcript_events_exist(conn, session_id)
+    } else {
+        grok_evidence_exists(conn, session_id)
+    }
+}
+
 /// Whether any Grok-owned evidence is stored for a session.
 ///
 /// Every table this ingestion writes, because a Grok session need not produce
@@ -4033,8 +4077,10 @@ fn grok_state_had_evidence(entry: &Value) -> Option<bool> {
 /// reasoning is stored entirely as markers, and one whose transcript is empty
 /// but whose `subagents/` directory names a child has only a relationship.
 /// Asking about a subset would call such a session unindexed on every run.
+/// Unified-log usage is not one of those tables' evidence — see
+/// [`grok_transcript_events_exist`].
 fn grok_evidence_exists(conn: &Connection, session_id: &str) -> Result<bool> {
-    if session_events_exist(conn, "grok", session_id)? {
+    if grok_transcript_events_exist(conn, session_id)? {
         return Ok(true);
     }
     for statement in [
@@ -13365,7 +13411,13 @@ fn sync_grok_with_coverage(
                     accounted += 1;
                     continue;
                 }
-                (Some(id), Some(true) | None) if grok_evidence_exists(conn, id)? => {
+                (Some(id), Some(true) | None)
+                    if grok_indexed_evidence_remains(
+                        conn,
+                        id,
+                        recorded.and_then(grok_state_transcript_events),
+                    )? =>
+                {
                     accounted += 1;
                     continue;
                 }
@@ -13401,7 +13453,15 @@ fn sync_grok_with_coverage(
                 // `evidence` says whether there was any to ask about.
                 grok_state.insert(
                     key,
-                    json!({ "stamp": stamp, "session": session_id, "evidence": had_evidence }),
+                    json!({
+                        "stamp": stamp,
+                        "session": session_id,
+                        "evidence": had_evidence,
+                        // Unified-log rows are not this flag. A later run that
+                        // still has one of them and has lost the transcript
+                        // must re-read; markers alone must not hide that.
+                        "transcript_events": outcome.events > 0,
+                    }),
                 );
             }
             Ok(None) => {
@@ -13654,12 +13714,94 @@ pub(crate) struct GrokUnifiedCoverage {
     pub rows: usize,
     /// Rows attached by this call; zero when nothing was new.
     pub inserted: usize,
-    /// Turns whose `turn_completed.usage` the log covers, kept as `turn_usage`.
+    /// Turns the log covers: a demoted breakdown, or any other turn whose
+    /// window holds a log row (including a context snapshot with no breakdown).
     pub covered_turns: usize,
     /// Turns the log does not cover whose `turn_completed.usage` still counts.
     pub turn_usage_turns: usize,
-    /// Stored turn rows with neither: only the context proxy.
+    /// Turns the log does not cover and that carry no breakdown: a context
+    /// snapshot, or a turn the census recorded that left no row.
     pub proxy_only_turns: usize,
+}
+
+/// How many turns the last replacing read of one Grok session saw.
+fn store_grok_turn_census(conn: &Connection, session_id: &str, turns: usize) -> Result<()> {
+    conn.execute(
+        "INSERT INTO grok_session_turns (session_id, turns) VALUES (?, ?) \
+         ON CONFLICT(session_id) DO UPDATE SET turns = excluded.turns",
+        params![session_id, turns as i64],
+    )?;
+    Ok(())
+}
+
+fn grok_turn_census(conn: &Connection, session_id: &str) -> Result<Option<usize>> {
+    let turns: Option<i64> = conn
+        .query_row(
+            "SELECT turns FROM grok_session_turns WHERE session_id = ?",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(turns.map(|turns| turns.max(0) as usize))
+}
+
+/// Whether one stored turn row's window contains a unified-log timestamp.
+fn unified_timestamp_covers(token: &Value, timestamps: &[Option<i64>]) -> bool {
+    let Some(start) = token.get("turn_start_ms").and_then(Value::as_i64) else {
+        return false;
+    };
+    let Some(end) = token.get("turn_end_ms").and_then(Value::as_i64) else {
+        return false;
+    };
+    timestamps
+        .iter()
+        .flatten()
+        .any(|ts| *ts >= start && *ts <= end)
+}
+
+/// Which of a session's turns `logs/unified.jsonl` covers.
+///
+/// `turn_tokens` are the `updates.jsonl` token objects, one per turn that
+/// left a row. `unified_timestamps` are every stored log row's time (`None`
+/// when the row named none — that row covers every turn). `census_turns` is
+/// how many turns the stream opened, when the replacing read recorded it;
+/// turns it counts that left no row are uncovered unless a timeless log row
+/// covers the session.
+pub(crate) fn classify_grok_turn_coverage(
+    turn_tokens: &[Value],
+    unified_timestamps: &[Option<i64>],
+    census_turns: Option<usize>,
+) -> GrokUnifiedCoverage {
+    let timeless = unified_timestamps.iter().any(Option::is_none);
+    let mut covered = 0usize;
+    let mut own = 0usize;
+    let mut proxy = 0usize;
+    for token in turn_tokens {
+        if timeless
+            || token.get("turn_usage").is_some()
+            || unified_timestamp_covers(token, unified_timestamps)
+        {
+            covered += 1;
+        } else if token.get("usage").is_some() {
+            own += 1;
+        } else {
+            proxy += 1;
+        }
+    }
+    if let Some(turns) = census_turns {
+        let hidden = turns.saturating_sub(covered + own + proxy);
+        if timeless {
+            covered += hidden;
+        } else {
+            proxy += hidden;
+        }
+    }
+    GrokUnifiedCoverage {
+        covered_turns: covered,
+        turn_usage_turns: own,
+        proxy_only_turns: proxy,
+        ..GrokUnifiedCoverage::default()
+    }
 }
 
 /// One stored `grok_unified_usage` row, as materialization reads it.
@@ -13824,25 +13966,41 @@ fn materialize_grok_unified_usage(
              > COALESCE(last_activity_ms, 0)",
         params![session_id],
     )?;
-    let (covered, turn_usage, proxy): (i64, i64, i64) = conn.query_row(
-        "SELECT \
-           COALESCE(SUM(json_type(token_json, '$.turn_usage') IS NOT NULL), 0), \
-           COALESCE(SUM(json_type(token_json, '$.usage') IS NOT NULL), 0), \
-           COALESCE(SUM(json_type(token_json, '$.usage') IS NULL \
-                    AND json_type(token_json, '$.turn_usage') IS NULL), 0) \
-         FROM session_events WHERE source = 'grok' AND session_id = ? \
-         AND token_json IS NOT NULL AND json_valid(token_json) \
-         AND json_extract(token_json, '$.source') = 'updates.jsonl'",
-        params![session_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    )?;
+    let class = grok_turn_coverage(conn, session_id)?;
     Ok(GrokUnifiedCoverage {
         rows: total,
         inserted: rows.len(),
-        covered_turns: covered as usize,
-        turn_usage_turns: turn_usage as usize,
-        proxy_only_turns: proxy as usize,
+        covered_turns: class.covered_turns,
+        turn_usage_turns: class.turn_usage_turns,
+        proxy_only_turns: class.proxy_only_turns,
     })
+}
+
+/// Coverage of one session from the rows already stored: the turn token
+/// objects, the log timestamps, and the turn census when a replacing read
+/// wrote one.
+fn grok_turn_coverage(conn: &Connection, session_id: &str) -> Result<GrokUnifiedCoverage> {
+    let turn_tokens = conn
+        .prepare(
+            "SELECT token_json FROM session_events \
+             WHERE source = 'grok' AND session_id = ? \
+               AND token_json IS NOT NULL AND json_valid(token_json) \
+               AND json_extract(token_json, '$.source') = 'updates.jsonl'",
+        )?
+        .query_map(params![session_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .filter_map(|raw| serde_json::from_str::<Value>(raw).ok())
+        .collect::<Vec<_>>();
+    let unified_timestamps = conn
+        .prepare("SELECT ts_ms FROM grok_unified_usage WHERE session_id = ?")?
+        .query_map(params![session_id], |row| row.get::<_, Option<i64>>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(classify_grok_turn_coverage(
+        &turn_tokens,
+        &unified_timestamps,
+        grok_turn_census(conn, session_id)?,
+    ))
 }
 
 /// What indexing one Grok session directory produced, and what its own records
@@ -14393,9 +14551,6 @@ fn ingest_grok_session(
             }
             continue;
         };
-        if timing.total_tokens.is_none() && timing.usage.is_none() {
-            continue;
-        }
         let mut token_json = serde_json::Map::new();
         if let Some(total) = timing.total_tokens {
             token_json.insert("context_total_tokens".into(), json!(total));
@@ -14403,17 +14558,24 @@ fn ingest_grok_session(
         token_json.insert("source".into(), json!("updates.jsonl"));
         if let Some(usage) = &timing.usage {
             token_json.insert("usage".into(), usage.clone());
-            // The window the per-turn coverage decision is made over. Only
-            // written beside a breakdown, the one fact it decides about.
-            if let Some(start) = timing.start_ms {
-                token_json.insert("turn_start_ms".into(), json!(start));
-            }
-            if let Some(end) = timing.end_ms {
-                token_json.insert("turn_end_ms".into(), json!(end));
-            }
+        }
+        // The window the per-turn coverage decision is made over. A turn that
+        // recorded no breakdown still has one, and a log row inside it is
+        // that turn's usage — stored here so a cached read can see the same
+        // window the parse did.
+        if let Some(start) = timing.start_ms {
+            token_json.insert("turn_start_ms".into(), json!(start));
+        }
+        if let Some(end) = timing.end_ms {
+            token_json.insert("turn_end_ms".into(), json!(end));
         }
         if let Some(model) = &timing.model {
             token_json.insert("model".into(), json!(model));
+        }
+        if token_json.len() == 1 && timing.start_ms.is_none() && timing.end_ms.is_none() {
+            // `source` alone: the turn named no time and no token fact. The
+            // census still counts it; an empty object would not.
+            continue;
         }
         let token_json = Value::Object(token_json).to_string();
         conn.execute(
@@ -14461,7 +14623,10 @@ fn ingest_grok_session(
     )?;
     // After the catalog row exists: the rows attach to a session, not to a
     // directory, and a row that arrived before the session was indexed has
-    // been waiting for exactly this.
+    // been waiting for exactly this. The census lands first so this
+    // materialization, and a later one that only reads the log, can see turns
+    // that left no token row.
+    store_grok_turn_census(conn, sid, outcome.turns)?;
     let coverage = materialize_grok_unified_usage(conn, sid, Some(session.created_ms))?;
     outcome.unified_usage_rows = coverage.rows;
     outcome.unified_coverage = coverage;
@@ -14793,10 +14958,11 @@ const GROK_STAMPED_SIBLINGS: &[&str] = &["summary.json", "updates.jsonl"];
 /// digest rather than appended, so a session with many checkpoints does not
 /// grow an unbounded stamp.
 ///
-/// `events.jsonl` is read only when `summary.json` is absent, but it is
-/// stamped always: whether the summary is there is itself something the stamp
-/// has to notice, and a stamp that covered the file only sometimes would call
-/// a session unchanged across the summary disappearing.
+/// `events.jsonl` is read only when `summary.json` is absent, and it is
+/// digested only then. The file grows with the session; folding it in while
+/// the summary is present re-reads the directory on every append without the
+/// parser consuming the new bytes. `summary.json` has its own marker, so the
+/// summary appearing or disappearing changes the stamp on its own.
 const GROK_DIGESTED_SIBLINGS: &[&str] = &["signals.json", "prompt_context.json", "events.jsonl"];
 
 /// The directories `ingest_grok_session` reads, entry by entry.
@@ -14870,7 +15036,11 @@ pub(crate) fn grok_source_inventory(chat: &Path) -> Result<GrokSourceInventory> 
         bytes += sibling.len() as i64;
     }
     let mut digest = Sha256::new();
+    let summary_present = grok_summary_present(chat)?;
     for sibling in GROK_DIGESTED_SIBLINGS {
+        if *sibling == "events.jsonl" && summary_present {
+            continue;
+        }
         let path = chat.with_file_name(sibling);
         let Some(found) = grok_entry_metadata(&path)? else {
             continue;
@@ -14926,8 +15096,7 @@ pub(crate) fn grok_source_inventory(chat: &Path) -> Result<GrokSourceInventory> 
 /// Grok layout writes subagent transcripts that way.
 pub(crate) fn grok_source_records(chat: &Path) -> Result<i64> {
     let mut records = hydrate::complete_jsonl_records(chat)?;
-    let summary_present = grok_entry_metadata(&chat.with_file_name("summary.json"))?
-        .is_some_and(|found| found.is_file());
+    let summary_present = grok_summary_present(chat)?;
     for name in GROK_STAMPED_SIBLINGS.iter().chain(GROK_DIGESTED_SIBLINGS) {
         let path = chat.with_file_name(name);
         if !grok_entry_metadata(&path)?.is_some_and(|found| found.is_file()) {
@@ -14952,6 +15121,11 @@ pub(crate) fn grok_source_records(chat: &Path) -> Result<i64> {
         }
     }
     Ok(records)
+}
+
+fn grok_summary_present(chat: &Path) -> Result<bool> {
+    Ok(grok_entry_metadata(&chat.with_file_name("summary.json"))?
+        .is_some_and(|found| found.is_file()))
 }
 
 /// The non-blank lines among the first [`grok::EVENTS_HEAD_LINES`] of an
@@ -17351,6 +17525,94 @@ mod tests {
             .unwrap();
         assert_eq!((kind.as_str(), input), ("thinking", Some(10)));
         assert_eq!((outcome.usage_turns, outcome.turns), (1, 1));
+    }
+
+    /// `events.jsonl` grows with the session and is not read while
+    /// `summary.json` is present, so it stays out of the stamp until the
+    /// summary is gone.
+    #[test]
+    fn events_jsonl_does_not_move_the_stamp_while_summary_json_is_present() {
+        let home = tempfile::tempdir().unwrap();
+        let (chat, dir) = grok_stream_fixture(home.path(), "grok-stamp-0001");
+        let with_summary = super::grok_session_stamp(&chat).unwrap();
+        fs::write(
+            dir.join("events.jsonl"),
+            "{\"model_id\":\"grok-x\",\"ts\":\"2026-01-01T00:00:00Z\"}\n",
+        )
+        .unwrap();
+        assert_eq!(super::grok_session_stamp(&chat).unwrap(), with_summary);
+        fs::write(
+            dir.join("events.jsonl"),
+            "{\"model_id\":\"grok-x\"}\n{\"model_id\":\"grok-y\"}\n",
+        )
+        .unwrap();
+        assert_eq!(super::grok_session_stamp(&chat).unwrap(), with_summary);
+
+        fs::remove_file(dir.join("summary.json")).unwrap();
+        let without_summary = super::grok_session_stamp(&chat).unwrap();
+        assert_ne!(without_summary, with_summary);
+        fs::write(dir.join("events.jsonl"), "{\"model_id\":\"grok-z\"}\n").unwrap();
+        assert_ne!(super::grok_session_stamp(&chat).unwrap(), without_summary);
+    }
+
+    #[test]
+    fn classify_grok_turn_coverage_counts_windows_census_and_timeless_rows() {
+        let covered = json!({
+            "source": "updates.jsonl",
+            "turn_start_ms": 10,
+            "turn_end_ms": 20,
+            "context_total_tokens": 1
+        });
+        let own = json!({
+            "source": "updates.jsonl",
+            "turn_start_ms": 30,
+            "turn_end_ms": 40,
+            "usage": {"inputTokens": 1}
+        });
+        let proxy = json!({
+            "source": "updates.jsonl",
+            "context_total_tokens": 2,
+            "turn_start_ms": 50,
+            "turn_end_ms": 60
+        });
+        let class = super::classify_grok_turn_coverage(
+            &[covered.clone(), own.clone(), proxy],
+            &[Some(15)],
+            Some(4),
+        );
+        assert_eq!(
+            (
+                class.covered_turns,
+                class.turn_usage_turns,
+                class.proxy_only_turns
+            ),
+            (1, 1, 2)
+        );
+
+        let demoted = json!({
+            "source": "updates.jsonl",
+            "turn_usage": {"inputTokens": 1},
+            "turn_start_ms": 30
+        });
+        let timeless = super::classify_grok_turn_coverage(&[own, demoted], &[None], Some(3));
+        assert_eq!(
+            (
+                timeless.covered_turns,
+                timeless.turn_usage_turns,
+                timeless.proxy_only_turns
+            ),
+            (3, 0, 0)
+        );
+
+        let no_census = super::classify_grok_turn_coverage(&[covered], &[Some(15)], None);
+        assert_eq!(
+            (
+                no_census.covered_turns,
+                no_census.turn_usage_turns,
+                no_census.proxy_only_turns
+            ),
+            (1, 0, 0)
+        );
     }
 
     /// An `updates.jsonl` that exists and cannot be read is a failure, not an

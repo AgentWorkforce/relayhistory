@@ -243,6 +243,23 @@ The local package has no cloud exports, login CLI or cloud MCP tool. Team
 uploads come from the [Agent Relay desktop app](https://agentrelay.com). Git
 hooks and commit linking remain local SDK operations.
 
+The MCP-only `list_relay_agents` tool lists live relay participants, not
+history. `relay_status` reports whether the local session hosting the MCP server is reachable; `join_relay`
+makes that session reachable by teammates and agents, with optional
+public `name` and `description`; and `leave_relay` removes it. They make short
+local Unix-socket requests to Agent Relay desktop. Roster listing accepts
+optional `query`, `where` (`this_computer`, `cloud`, or `other_desktop`), and
+`include_idle` inputs. Socket discovery checks
+`AGENT_RELAY_SOCKET`, then `~/.agentworkforce/desktop/relay-socket`, then the
+macOS/Linux defaults. No Relaycast client or cloud credential is part of
+ai-hist; when the desktop is absent the tool returns a clear non-fatal result.
+A connected desktop has a 15-second response deadline. If it does not answer in
+that time, the tool reports `timeout` distinctly from an absent app.
+For status, join, and leave, the same missing-desktop result remains non-fatal,
+and a disabled self-registration setting is returned as readable `not_allowed`
+guidance. A mutation that times out after being sent reports an indeterminate
+result and directs the caller to `relay_status`.
+
 Use `exportHistory(selection)` for a bounded historical snapshot or
 `ai-hist export --selection selection.json` for NDJSON stdout. See
 [export](../docs/export.md).
