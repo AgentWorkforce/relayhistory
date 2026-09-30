@@ -1017,7 +1017,42 @@ const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &[
     "history_fts_update_of_v1",
     "evidence_location_v1",
     EXPORT_CAPTURE_RETIRED,
+    TRAJECTORY_TRIGGERS_RETIRED,
 ];
+
+/// Marks a database whose Python-era `trajectories_*` FTS triggers are gone
+/// and whose `trajectory_fts` has been rebuilt from `trajectories`. See
+/// [`retire_trajectory_triggers`].
+const TRAJECTORY_TRIGGERS_RETIRED: &str = "trajectory_fts_triggers_retired_v1";
+
+/// Drop the `trajectories_ai/au/ad` triggers the Python CLI created and
+/// rebuild `trajectory_fts` from its content table, once.
+///
+/// The Rust schema defines no trajectory triggers, yet a database the Python
+/// CLI created still fires them on every trajectory write. `trajectory_fts`
+/// is keyed on the implicit rowid of a table with a TEXT primary key, which a
+/// VACUUM may renumber, so such an index can disagree with its content table.
+/// Once it does, the `'delete'` in `trajectories_au` fails with
+/// `SQLITE_CORRUPT_VTAB` on the first UPDATE of an affected row -- such as the
+/// change feed's revision backfill, which rolls the whole migration back and
+/// leaves the database unopenable.
+fn retire_trajectory_triggers(conn: &Connection) -> Result<()> {
+    if migration_applied(conn, TRAJECTORY_TRIGGERS_RETIRED)? {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS trajectories_ai;
+         DROP TRIGGER IF EXISTS trajectories_au;
+         DROP TRIGGER IF EXISTS trajectories_ad;
+         INSERT INTO trajectory_fts(trajectory_fts) VALUES('rebuild');",
+    )
+    .context("retiring the trajectory FTS triggers")?;
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations (name) VALUES (?)",
+        [TRAJECTORY_TRIGGERS_RETIRED],
+    )?;
+    Ok(())
+}
 
 /// Whether this database already has everything [`init_db`] would add.
 ///
@@ -1525,6 +1560,9 @@ END;
                 ('session_events_fts_update_of_v1'), \
                 ('history_fts_update_of_v1');",
     )?;
+    // Before the change feed's revision backfill, whose UPDATE of every
+    // trajectory would otherwise fire the Python-era trigger.
+    retire_trajectory_triggers(conn)?;
     migrate_session_relationships_v2(conn)?;
     migrate_tool_result_fidelity_v1(conn)?;
     migrate_evidence_location_v1(conn)?;
@@ -5008,6 +5046,83 @@ pub fn import_json(conn: &Connection, entries: &[HistoryEntry]) -> Result<usize>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_python_era_trajectory_index_out_of_step_does_not_block_migration() {
+        let dir = std::env::temp_dir().join(format!(
+            "ai-hist-trajectory-triggers-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.db");
+        let _ = fs::remove_file(&path);
+        {
+            let conn = open_db(&path).unwrap();
+            conn.execute_batch(
+                "INSERT INTO trajectories (id, decisions_json, retrospective_json, search_text, \
+                     updated_ms, timestamp_ms) VALUES ('t1', '[]', '{}', 'alpha bravo charlie', 1, 1);
+                 -- Unstamped and unmigrated, so the next open re-runs the
+                 -- change feed's revision backfill over this row.
+                 UPDATE trajectories SET revision = 0;
+                 DELETE FROM schema_migrations
+                 WHERE name IN ('change_feed_v2', 'trajectory_fts_triggers_retired_v1');
+                 -- An index that disagrees with its content row, holding fewer
+                 -- tokens than the row, so the trigger's 'delete' underflows.
+                 INSERT INTO trajectory_fts(trajectory_fts) VALUES('delete-all');
+                 INSERT INTO trajectory_fts(rowid, search_text)
+                 SELECT rowid, 'beta' FROM trajectories WHERE id = 't1';
+                 -- The Python CLI's triggers, verbatim.
+                 CREATE TRIGGER trajectories_ai AFTER INSERT ON trajectories BEGIN
+                     INSERT INTO trajectory_fts(rowid, search_text, task_title, task_description, persona_id, project_id)
+                     VALUES (new.rowid, new.search_text, new.task_title, new.task_description, new.persona_id, new.project_id);
+                 END;
+                 CREATE TRIGGER trajectories_au AFTER UPDATE ON trajectories BEGIN
+                     INSERT INTO trajectory_fts(trajectory_fts, rowid, search_text, task_title, task_description, persona_id, project_id)
+                     VALUES('delete', old.rowid, old.search_text, old.task_title, old.task_description, old.persona_id, old.project_id);
+                     INSERT INTO trajectory_fts(rowid, search_text, task_title, task_description, persona_id, project_id)
+                     VALUES (new.rowid, new.search_text, new.task_title, new.task_description, new.persona_id, new.project_id);
+                 END;
+                 CREATE TRIGGER trajectories_ad AFTER DELETE ON trajectories BEGIN
+                     INSERT INTO trajectory_fts(trajectory_fts, rowid, search_text, task_title, task_description, persona_id, project_id)
+                     VALUES('delete', old.rowid, old.search_text, old.task_title, old.task_description, old.persona_id, old.project_id);
+                 END;",
+            )
+            .unwrap();
+            // The failure this guards against: any UPDATE of the row trips the
+            // legacy trigger's 'delete' against the mismatched index.
+            let tripped = conn
+                .execute("UPDATE trajectories SET updated_ms = 2 WHERE id = 't1'", [])
+                .unwrap_err();
+            assert!(tripped.to_string().contains("malformed"), "{tripped}");
+        }
+
+        let conn = open_db(&path).unwrap();
+        assert!(schema_is_current(&conn).unwrap());
+        let legacy: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'trigger' AND tbl_name = 'trajectories' \
+                   AND name IN ('trajectories_ai', 'trajectories_au', 'trajectories_ad')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy, 0);
+        conn.execute_batch(
+            "INSERT INTO trajectory_fts(trajectory_fts, rank) VALUES('integrity-check', 1);",
+        )
+        .unwrap();
+        let hit: String = conn
+            .query_row(
+                "SELECT t.id FROM trajectory_fts f JOIN trajectories t ON f.rowid = t.rowid \
+                 WHERE trajectory_fts MATCH 'alpha'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(hit, "t1");
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn an_outdated_database_is_not_reported_as_schema_current() {
