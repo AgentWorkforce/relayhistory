@@ -147,7 +147,7 @@
       "source": "grok",
       "subagent_session_id": null,
       "text": "Reading the client and patching it.",
-      "token_json": "{\"context_total_tokens\":18432,\"source\":\"updates.jsonl\"}",
+      "token_json": "{\"context_total_tokens\":18432,\"source\":\"updates.jsonl\",\"turn_end_ms\":1789560020000,\"turn_start_ms\":1789560000000}",
       "tool_use_id": null,
       "ts_ms": 1789560005000
     },
@@ -455,7 +455,7 @@
       "source": "grok",
       "subagent_session_id": null,
       "text": "The test fails; fixing next.",
-      "token_json": "{\"context_total_tokens\":9210,\"source\":\"updates.jsonl\"}",
+      "token_json": "{\"context_total_tokens\":9210,\"source\":\"updates.jsonl\",\"turn_end_ms\":1789560138000,\"turn_start_ms\":1789560120000}",
       "tool_use_id": null,
       "ts_ms": 1789560137000
     }

@@ -2132,9 +2132,10 @@ fn stored_source_diagnostics(
             );
         }
         // The stored rows say which turns carried a breakdown, not how many
-        // turns `updates.jsonl` opened: a turn with no token fact leaves no
-        // row to count. So the denominator is unknown here, and the caveat
-        // says so rather than claiming full coverage.
+        // turns `updates.jsonl` opened, and this session has no turn census
+        // to supply it: a turn with no token fact leaves no row to count. So
+        // the denominator is unknown here, and the caveat says so rather than
+        // claiming full coverage.
         return Ok(
             grok_usage_diagnostic(context_total_tokens, usage_turns, None)
                 .into_iter()
@@ -2173,27 +2174,27 @@ fn stored_grok_usage(
         .find_map(|token| token.get("context_total_tokens").and_then(Value::as_i64));
     let is_unified =
         |token: &Value| token.get("source").and_then(Value::as_str) == Some("logs/unified.jsonl");
-    let usage_turns = tokens
-        .iter()
-        .filter(|token| token.get("usage").is_some() && !is_unified(token))
-        .count();
     let unified_rows = tokens.iter().filter(|token| is_unified(token)).count();
-    let covered_turns = tokens
+    let turn_tokens = tokens
         .iter()
-        .filter(|token| token.get("turn_usage").is_some())
-        .count();
-    let proxy_only_turns = tokens
-        .iter()
-        .filter(|token| {
-            !is_unified(token) && token.get("usage").is_none() && token.get("turn_usage").is_none()
-        })
-        .count();
+        .filter(|token| token.get("source").and_then(Value::as_str) == Some("updates.jsonl"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let unified_timestamps = conn
+        .prepare("SELECT ts_ms FROM grok_unified_usage WHERE session_id = ?")?
+        .query_map(params![session_id], |row| row.get::<_, Option<i64>>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let coverage = classify_grok_turn_coverage(
+        &turn_tokens,
+        &unified_timestamps,
+        grok_turn_census(conn, session_id)?,
+    );
     Ok((
         context_total_tokens,
-        usage_turns,
+        coverage.turn_usage_turns,
         unified_rows,
-        covered_turns,
-        proxy_only_turns,
+        coverage.covered_turns,
+        coverage.proxy_only_turns,
     ))
 }
 
@@ -3399,16 +3400,17 @@ fn grok_diagnostics(outcome: &GrokIngestOutcome) -> Vec<HydrationDiagnostic> {
     };
     // A session `logs/unified.jsonl` reaches is judged turn by turn; one it
     // does not reach is told what its `updates.jsonl` could and could not
-    // establish. Here the parse knows how many turns there were, so a turn
-    // that left no token row at all still counts as uncovered.
+    // establish. Coverage already includes the turn census, so a turn that
+    // left no token row still counts on this path and on the cached rebuild.
     let mut diagnostics: Vec<HydrationDiagnostic> = if outcome.unified_usage_rows > 0 {
         let coverage = outcome.unified_coverage;
-        let uncovered = outcome
-            .turns
-            .saturating_sub(coverage.covered_turns + coverage.turn_usage_turns);
-        grok_unified_usage_diagnostic(coverage.covered_turns, coverage.turn_usage_turns, uncovered)
-            .into_iter()
-            .collect()
+        grok_unified_usage_diagnostic(
+            coverage.covered_turns,
+            coverage.turn_usage_turns,
+            coverage.proxy_only_turns,
+        )
+        .into_iter()
+        .collect()
     } else {
         grok_usage_diagnostic(
             outcome.context_total_tokens,
@@ -4600,7 +4602,12 @@ mod tests {
         let proxy = grok_token_json(&conn, "grok-uni-0002");
         assert_eq!(
             proxy,
-            vec![json!({"context_total_tokens": 3100, "source": "updates.jsonl"})]
+            vec![json!({
+                "context_total_tokens": 3100,
+                "source": "updates.jsonl",
+                "turn_start_ms": 1_789_902_005_000_i64,
+                "turn_end_ms": 1_789_902_009_000_i64
+            })]
         );
         assert!(crate::usage::normalize_usage("grok", &proxy[0])
             .unwrap()
@@ -4845,6 +4852,193 @@ mod tests {
             )
             .unwrap();
         assert_eq!(last, 1_789_902_020_000);
+    }
+
+    /// A context-only turn whose window holds a log row is covered. The same
+    /// answer comes back from the cached read.
+    #[test]
+    fn a_context_only_turn_inside_the_log_window_is_covered() {
+        let dir = tempfile::tempdir().unwrap();
+        let (grok_home, _, uncovered) = grok_unified_fixture(dir.path());
+        let log = grok_unified_log_path(&grok_home);
+        let mut file = OpenOptions::new().append(true).open(&log).unwrap();
+        file.write_all(
+            b"{\"ts\":\"2026-09-20T11:00:07.000Z\",\"pid\":6000,\"session_id\":\"grok-uni-0002\",\"usage\":{\"inputTokens\":80,\"outputTokens\":8}}\n",
+        )
+        .unwrap();
+        drop(file);
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "grok", "grok-uni-0002", Some(&uncovered));
+        drop(conn);
+        for pass in ["hydrated", "unchanged"] {
+            let result =
+                hydrate_session_at_with_home(&db, &options("grok", "grok-uni-0002"), dir.path())
+                    .unwrap();
+            assert_eq!(result.status, pass);
+            assert!(
+                result
+                    .diagnostics
+                    .iter()
+                    .all(|diagnostic| !diagnostic.code.starts_with("GROK_USAGE")),
+                "{pass}: {:?}",
+                result.diagnostics
+            );
+        }
+    }
+
+    /// A turn that left no token row is still part of the caveat after a log
+    /// append clears the stored diagnostics and the next read rebuilds them.
+    #[test]
+    fn a_turn_with_no_token_row_stays_partial_on_a_cached_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir
+            .path()
+            .join(".grok/sessions/%2Ftmp%2Fhidden/grok-hidden-0001");
+        fs::create_dir_all(&session).unwrap();
+        let chat = session.join("chat_history.jsonl");
+        fs::write(
+            &chat,
+            concat!(
+                r#"{"type":"user","content":"<user_query>one</user_query>"}"#,
+                "\n",
+                r#"{"type":"assistant","content":"answered"}"#,
+                "\n",
+                r#"{"type":"user","content":"<user_query>two</user_query>"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            session.join("summary.json"),
+            r#"{"info":{"id":"grok-hidden-0001","cwd":"/tmp/hidden"},"created_at":"2026-09-20T11:00:00.000Z"}"#,
+        )
+        .unwrap();
+        fs::write(
+            session.join("updates.jsonl"),
+            concat!(
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"eventId":"u1","agentTimestampMs":1789902005000,"turnStartMs":1789902005000}}}"#,
+                "\n",
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"eventId":"a1","agentTimestampMs":1789902008000,"turnStartMs":1789902005000}}}"#,
+                "\n",
+                r#"{"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"turn_completed","totalTokens":100},"_meta":{"agentTimestampMs":1789902009000,"turnStartMs":1789902005000}}}"#,
+                "\n",
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"eventId":"u2","agentTimestampMs":1789902015000,"turnStartMs":1789902015000}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let grok_home = dir.path().join(".grok");
+        let log = grok_unified_log_path(&grok_home);
+        fs::create_dir_all(log.parent().unwrap()).unwrap();
+        fs::write(
+            &log,
+            "{\"ts\":\"2026-09-20T11:00:07.000Z\",\"pid\":6000,\"session_id\":\"grok-hidden-0001\",\"usage\":{\"inputTokens\":80,\"outputTokens\":8}}\n",
+        )
+        .unwrap();
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "grok", "grok-hidden-0001", Some(&chat));
+        drop(conn);
+        let first =
+            hydrate_session_at_with_home(&db, &options("grok", "grok-hidden-0001"), dir.path())
+                .unwrap();
+        assert_eq!(first.status, "hydrated");
+        assert!(
+            first
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "GROK_USAGE_PARTIAL"),
+            "{:?}",
+            first.diagnostics
+        );
+        let conn = open_db(&db).unwrap();
+        let turn_rows = grok_token_json(&conn, "grok-hidden-0001")
+            .into_iter()
+            .filter(|token| token["source"] == "updates.jsonl")
+            .count();
+        let census: i64 = conn
+            .query_row(
+                "SELECT turns FROM grok_session_turns WHERE session_id = 'grok-hidden-0001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        assert_eq!((turn_rows, census), (1, 2));
+
+        let mut file = OpenOptions::new().append(true).open(&log).unwrap();
+        file.write_all(
+            b"{\"ts\":\"2026-09-20T11:00:08.000Z\",\"pid\":6000,\"session_id\":\"grok-hidden-0001\",\"usage\":{\"inputTokens\":1,\"outputTokens\":1}}\n",
+        )
+        .unwrap();
+        drop(file);
+        let again =
+            hydrate_session_at_with_home(&db, &options("grok", "grok-hidden-0001"), dir.path())
+                .unwrap();
+        assert_eq!(again.status, "unchanged");
+        assert!(
+            again
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "GROK_USAGE_PARTIAL"),
+            "{:?}",
+            again.diagnostics
+        );
+    }
+
+    /// Unified-log events and a signals marker are not the transcript. An
+    /// unchanged directory whose transcript rows are gone is read again.
+    #[test]
+    fn a_missing_grok_transcript_is_restored_when_only_unified_usage_remains() {
+        let dir = tempfile::tempdir().unwrap();
+        let (grok_home, _, _) = grok_unified_fixture(dir.path());
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        sync_grok_home(&conn, &mut state, &grok_home, &mut SweepCoverage::default()).unwrap();
+        let prompts = || -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM history WHERE source = 'grok' \
+                 AND session_id = 'grok-uni-0001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert!(prompts() > 0);
+        let markers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_markers WHERE source = 'grok' \
+                 AND session_id = 'grok-uni-0001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(markers > 0, "signals.json must leave a marker");
+        conn.execute(
+            "DELETE FROM session_events WHERE source = 'grok' \
+             AND session_id = 'grok-uni-0001' \
+             AND (raw_kind IS NULL OR raw_kind != 'unified_log_usage')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM history WHERE source = 'grok' AND session_id = 'grok-uni-0001'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(prompts(), 0);
+        let unified: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE source = 'grok' \
+                 AND session_id = 'grok-uni-0001' AND raw_kind = 'unified_log_usage'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(unified > 0);
+        sync_grok_home(&conn, &mut state, &grok_home, &mut SweepCoverage::default()).unwrap();
+        assert!(prompts() > 0, "the transcript was not restored");
     }
 
     /// Review regression: appending one row for a covered session attaches
@@ -5192,8 +5386,8 @@ mod tests {
         assert_eq!(
             tokens,
             vec![
-                r#"{"context_total_tokens":18432,"source":"updates.jsonl"}"#,
-                r#"{"context_total_tokens":9210,"source":"updates.jsonl"}"#,
+                r#"{"context_total_tokens":18432,"source":"updates.jsonl","turn_end_ms":1789560020000,"turn_start_ms":1789560000000}"#,
+                r#"{"context_total_tokens":9210,"source":"updates.jsonl","turn_end_ms":1789560138000,"turn_start_ms":1789560120000}"#,
             ]
         );
 
@@ -5523,7 +5717,7 @@ mod tests {
             recorded,
             vec![(
                 "tool:call_only_1".to_string(),
-                r#"{"context_total_tokens":4242,"source":"updates.jsonl"}"#.to_string(),
+                r#"{"context_total_tokens":4242,"source":"updates.jsonl","turn_end_ms":1789560005000,"turn_start_ms":1789560000000}"#.to_string(),
             )],
             "the turn's only assistant event is its tool use"
         );
@@ -5627,7 +5821,7 @@ mod tests {
         assert_eq!(usage.provider_total_tokens, Some(1100));
         assert_eq!(
             recorded[1],
-            r#"{"context_total_tokens":2100,"source":"updates.jsonl"}"#
+            r#"{"context_total_tokens":2100,"source":"updates.jsonl","turn_end_ms":1789560012000,"turn_start_ms":1789560010000}"#
         );
         assert_eq!(
             crate::usage::normalize_usage_str("grok", &recorded[1]),

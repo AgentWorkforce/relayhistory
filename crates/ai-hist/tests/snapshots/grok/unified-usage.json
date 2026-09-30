@@ -295,7 +295,7 @@
       "source": "grok",
       "subagent_session_id": null,
       "text": "There are two: the retry jitter and the timeout test.",
-      "token_json": "{\"context_total_tokens\":3100,\"source\":\"updates.jsonl\"}",
+      "token_json": "{\"context_total_tokens\":3100,\"source\":\"updates.jsonl\",\"turn_end_ms\":1789902009000,\"turn_start_ms\":1789902005000}",
       "tool_use_id": null,
       "ts_ms": 1789902008000
     }
