@@ -634,6 +634,13 @@ jobs:
       - name: Upgrade npm for OIDC
         if: ${{ !inputs.dry_run }}
         run: npm install -g npm@11.19.1
+      # The version was resolved before the build matrix. Another publisher
+      # may have claimed it while the binaries were compiling; catch that
+      # before this run publishes any of its ten npm packages.
+      - name: Recheck release version availability
+        if: ${{ !inputs.dry_run }}
+        working-directory: .
+        run: node scripts/check-release-version-available.mjs
       - name: Publish
         env:
           DRY_RUN: ${{ inputs.dry_run }}
@@ -709,25 +716,10 @@ jobs:
           set -euo pipefail
           if [ "$DRY_RUN" != "true" ]; then npm publish --access public; fi
 
-      # Confirm all packages are visible before the compatibility gates. This
-      # gives the registry time to converge without retrying every install.
-      - name: Registry visibility gate
-        if: ${{ !inputs.dry_run }}
-        working-directory: .
-        env:
-          REGISTRY_VISIBILITY_ATTEMPTS: 36
-          REGISTRY_VISIBILITY_DELAY_MS: 10000
-        run: |
-          node --input-type=module - "$VERSION" <<'NODE'
-          import { waitForRegistryPackages } from "./scripts/registry-clean-install-smoke.mjs";
-          const attempts = Number(process.env.REGISTRY_VISIBILITY_ATTEMPTS);
-          const delayMs = Number(process.env.REGISTRY_VISIBILITY_DELAY_MS);
-          await waitForRegistryPackages(process.argv[2], { attempts, delayMs });
-          NODE
-
-      # Push the immutable recovery point as soon as npm confirms visibility.
-      # If a later runtime gate fails, skip_core can verify this exact tree and
-      # finish the release without trying to republish immutable npm versions.
+      # npm can accept a publish and keep it in processing for longer than a
+      # registry gate. Save the immutable recovery point after every publish
+      # command succeeds, before waiting for public visibility in verify-core.
+      # A later skip_core run can then resume without republishing the version.
       - name: Tag the published tree
         id: tag-published-tree
         if: ${{ !inputs.dry_run }}
@@ -751,6 +743,7 @@ jobs:
     # the existing tagged release before resuming any downstream mutation.
     if: ${{ !cancelled() && !inputs.dry_run && needs.version.result == 'success' && (inputs.skip_core || needs.publish.result == 'success') }}
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     permissions:
       contents: read
     defaults:
@@ -771,8 +764,10 @@ jobs:
         run: npm install -g npm@11.19.1
       - name: Registry clean-install smoke test
         env:
-          REGISTRY_VISIBILITY_ATTEMPTS: 36
-          REGISTRY_VISIBILITY_DELAY_MS: 10000
+          # npm's post-publish processing can exceed the old six-minute gate.
+          # Keep a bounded wait, then allow skip_core to resume from the tag.
+          REGISTRY_VISIBILITY_ATTEMPTS: 150
+          REGISTRY_VISIBILITY_DELAY_MS: 20000
           NPM_REGISTRY_RETRY_ATTEMPTS: 36
           NPM_REGISTRY_RETRY_DELAY_MS: 10000
         run: node scripts/registry-clean-install-smoke.mjs

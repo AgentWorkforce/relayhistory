@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   coreSmokeManifest,
+  npmViewVersion,
   REGISTRY_RELEASE_PACKAGES,
   waitForRegistryPackages,
 } from './registry-clean-install-smoke.mjs';
@@ -58,5 +59,39 @@ test('waitForRegistryPackages fails with the remaining package names', async () 
     }),
     (error) => error.missing.length === REGISTRY_RELEASE_PACKAGES.length - 1
       && error.missing.includes('ai-hist-mcp'),
+  );
+});
+
+test('npm view treats only E404 as absent and uses the public registry', () => {
+  let args;
+  let options;
+  const absent = npmViewVersion('ai-hist@0.32.1', (commandArgs, commandOptions) => {
+    args = commandArgs;
+    options = commandOptions;
+    return { status: 1, stderr: 'npm error code E404' };
+  });
+  assert.equal(absent, null);
+  assert.ok(args.includes('--prefer-online'));
+  assert.ok(args.includes('--registry=https://registry.npmjs.org/'));
+  assert.equal(options.env.NODE_AUTH_TOKEN, undefined);
+  assert.throws(
+    () => npmViewVersion('ai-hist@0.32.1', () => ({ status: 1, stderr: 'npm error code ENOTFOUND' })),
+    /ENOTFOUND/,
+  );
+});
+
+test('waitForRegistryPackages reports lookup errors separately from missing versions', async () => {
+  await assert.rejects(
+    waitForRegistryPackages('0.32.1', {
+      attempts: 1,
+      log: () => {},
+      view: (spec) => {
+        if (spec === 'ai-hist@0.32.1') throw new Error('ENOTFOUND');
+        return null;
+      },
+    }),
+    (error) => error.missing.length === REGISTRY_RELEASE_PACKAGES.length - 1
+      && error.lookupErrors.length === 1
+      && error.lookupErrors[0].includes('ENOTFOUND'),
   );
 });

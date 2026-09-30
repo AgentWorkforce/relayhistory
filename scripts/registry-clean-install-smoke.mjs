@@ -35,9 +35,20 @@ function positiveInteger(value, fallback, name) {
   return parsed;
 }
 
-function npmViewVersion(spec, view = (args) => spawnSync('npm', args, { encoding: 'utf8' })) {
-  const result = view(['view', spec, 'version']);
-  if ((result.status ?? 1) !== 0) return null;
+export function npmViewVersion(spec, view = (args, options) => spawnSync('npm', args, options)) {
+  const result = view(
+    [
+      'view', spec, 'version', '--registry=https://registry.npmjs.org/',
+      '--prefer-online', '--fetch-retries=0', '--fetch-timeout=10000',
+    ],
+    { encoding: 'utf8', env: publicRegistryEnv(), timeout: 15000 },
+  );
+  if (result.error) throw result.error;
+  if ((result.status ?? 1) !== 0) {
+    const output = `${result.stderr ?? ''}${result.stdout ?? ''}`;
+    if (/\bE404\b/.test(output)) return null;
+    throw new Error(`npm view ${spec} failed: ${output.trim() || `exit ${result.status ?? 'null'}`}`);
+  }
   return String(result.stdout ?? '').trim() || null;
 }
 
@@ -49,24 +60,37 @@ export async function waitForRegistryPackages(version, options = {}) {
   const log = options.log ?? ((message) => console.error(message));
 
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    const missing = REGISTRY_RELEASE_PACKAGES.filter((pkg) => view(`${pkg}@${version}`) !== version);
-    if (missing.length === 0) {
+    const missing = [];
+    const lookupErrors = [];
+    for (const pkg of REGISTRY_RELEASE_PACKAGES) {
+      try {
+        if (view(`${pkg}@${version}`) !== version) missing.push(pkg);
+      } catch (error) {
+        lookupErrors.push(`${pkg}: ${error.message}`);
+      }
+    }
+    if (missing.length === 0 && lookupErrors.length === 0) {
       log(`registry exposes all ${REGISTRY_RELEASE_PACKAGES.length} release packages at ${version}`);
       return;
     }
     if (attempt === attempts) {
       const error = new Error(
-        `registry did not expose all release packages at ${version} after ${attempts} attempts: `
-        + `${missing.join(', ')}`,
+        `registry did not expose all release packages at ${version} after ${attempts} attempts. `
+        + `Missing: ${missing.join(', ') || 'none'}. `
+        + `Lookup errors: ${lookupErrors.join('; ') || 'none'}. `
+        + `The release tag can be resumed with skip_core and custom_version once npm exposes the packages.`,
       );
       error.missing = missing;
+      error.lookupErrors = lookupErrors;
       throw error;
     }
     log(
       `registry missing ${missing.length}/${REGISTRY_RELEASE_PACKAGES.length} package(s) `
+        + `and had ${lookupErrors.length} lookup error(s) `
         + `(attempt ${attempt}/${attempts}); retrying in ${delayMs}ms`,
     );
-    log(missing.join(', '));
+    if (missing.length) log(missing.join(', '));
+    if (lookupErrors.length) log(lookupErrors.join('; '));
     await sleep(delayMs);
   }
 }
