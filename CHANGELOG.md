@@ -6,6 +6,13 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Breaking
 
+- `trajectory_fts` and the Python-era `trajectories_ai/au/ad` triggers are
+  dropped on the next writable open, and are dropped again whenever an older
+  client recreates them. Nothing read the index. On an older database whose
+  index had drifted from `trajectories`, those triggers made the change-feed
+  migration fail with `SQLITE_CORRUPT_VTAB` on every open. `compact` merges
+  two full-text indexes instead of three.
+
 - One search contract for the CLI, the SDK and MCP (#66). The SDK's
   `search()` and MCP `search_history` now run `history_search::search_all`,
   the query the CLI's `search` already used. They match session events
