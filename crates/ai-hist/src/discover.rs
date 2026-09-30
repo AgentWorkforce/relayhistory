@@ -84,7 +84,7 @@ pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 4;
 /// invalidates every stored stamp, so a scanner that learns to extract a new
 /// field re-reads sources whose bytes never changed. `parser_version` keeps its
 /// existing meaning (full-ingest parser generation) and is untouched.
-pub const SHALLOW_SCANNER_VERSION: u32 = 7;
+pub const SHALLOW_SCANNER_VERSION: u32 = 8;
 
 /// Version 2 shipped the classification that hid standalone guardians (see
 /// [`crate::codex_is_subagent`]). Their rollouts never change on disk, so the
@@ -126,6 +126,16 @@ const _: () = assert!(SHALLOW_SCANNER_VERSION > 5);
 /// `session_meta` line once (see `codex_evidence_is_current`), which is what
 /// banks Codex fork lineage and reclassifies those guardians.
 const _: () = assert!(SHALLOW_SCANNER_VERSION > 6);
+
+/// Version 8 applies the forked-rollout replay gate
+/// (`codex::ForkReplayGate`) to a Codex fork's `first_prompt`: a human fork
+/// used to be catalogued under the parent's first prompt, copied into its
+/// file by the replay. A finished fork never changes on disk, so only this
+/// bump sends its cached row through the gate. It also moves the sweep
+/// generation, so the first `sync` after the upgrade runs and its rollout walk
+/// spends the one-time `codex_fork_replay_gate` re-read that retires the
+/// replayed rows an earlier build indexed under each fork.
+const _: () = assert!(SHALLOW_SCANNER_VERSION > 7);
 
 /// Most bytes a shallow head read may consume from one transcript.
 pub const HEAD_SCAN_MAX_BYTES: u64 = 256 * 1024;
@@ -1003,26 +1013,17 @@ pub struct SourceExemption {
 
 /// Sources with no shallow adapter, and why.
 ///
-/// Paired with [`shallow_providers`] by a registry regression test that
-/// asserts every `SOURCE_CHOICES` entry is covered by exactly one of the two
-/// lists — so adding a provider to `SOURCE_CHOICES` fails the build until
-/// someone decides whether it is discoverable.
-pub const DISCOVERY_EXEMPTIONS: &[SourceExemption] = &[SourceExemption {
-    source: "trajectory",
-    reason: "derived trajectory records, not provider sessions",
-}];
+/// Derived from the harness registry (`sources::catalog`): a descriptor whose
+/// discovery is `Exempt` appears here, every other one has an adapter in
+/// [`shallow_providers`]. A registry test asserts every `SOURCE_CHOICES` entry
+/// is covered by exactly one of the two, so a descriptor always carries a
+/// decision about whether it is discoverable.
+pub const DISCOVERY_EXEMPTIONS: &[SourceExemption] = crate::sources::catalog::DISCOVERY_EXEMPTIONS;
 
-/// Every shallow adapter, one per discoverable source.
+/// Every shallow adapter, one per discoverable source, derived from the
+/// harness registry (`sources::catalog`) and ordered by source id.
 pub fn shallow_providers() -> Vec<Box<dyn ShallowSessionProvider>> {
-    vec![
-        Box::new(ClaudeProvider),
-        Box::new(CodexProvider),
-        Box::new(CursorProvider),
-        Box::new(GrokProvider),
-        Box::new(MuseProvider),
-        Box::new(OpencodeProvider::default()),
-        Box::new(RelayProvider),
-    ]
+    crate::sources::catalog::shallow_providers()
 }
 
 /// Declared local evidence coverage for one source, resolved from the shallow
@@ -1291,7 +1292,7 @@ fn text_of(content: Option<&Value>) -> Option<String> {
 // claude
 // ---------------------------------------------------------------------------
 
-struct ClaudeProvider;
+pub(crate) struct ClaudeProvider;
 
 /// The first substantive human turn's excerpt, or `None` for a record that
 /// is not one.
@@ -1542,7 +1543,7 @@ fn read_claude_shallow(
 // codex
 // ---------------------------------------------------------------------------
 
-struct CodexProvider;
+pub(crate) struct CodexProvider;
 
 impl ShallowSessionProvider for CodexProvider {
     fn acquire(
@@ -1628,13 +1629,23 @@ impl ShallowSessionProvider for CodexProvider {
         let mut first_prompt = None;
         let mut first_activity_ms = claude_timestamp(&meta);
         let mut last_activity_ms = first_activity_ms;
-        for line in bounded.head_records() {
+        // A fork's copy of its parent's history is the parent's, so its
+        // prompts are not this session's first prompt -- the same rule the
+        // rollout walk applies to `history`.
+        let mut replay_gate = crate::codex::ForkReplayGate::new(
+            crate::codex::fork_parent_id(payload, session_id),
+            crate::codex::fork_origin_ms(payload, session_id, claude_timestamp(&meta)),
+        );
+        for (index, line) in bounded.head_records().enumerate() {
             let Some(value) = parse_record(line) else {
                 continue;
             };
             if let Some(ts) = claude_timestamp(&value) {
                 first_activity_ms.get_or_insert(ts);
                 last_activity_ms = Some(ts);
+            }
+            if replay_gate.step(index == 0, &value) == crate::codex::ReplayStep::Replay {
+                continue;
             }
             if value.get("type").and_then(Value::as_str) == Some("turn_context") {
                 push_unique(
@@ -1705,7 +1716,7 @@ fn string_list(value: Option<&Value>) -> Vec<String> {
 // cursor
 // ---------------------------------------------------------------------------
 
-struct CursorProvider;
+pub(crate) struct CursorProvider;
 
 impl ShallowSessionProvider for CursorProvider {
     fn acquire(
@@ -1892,7 +1903,7 @@ fn cursor_assistant_text(line: &[u8]) -> Option<String> {
 // grok
 // ---------------------------------------------------------------------------
 
-struct GrokProvider;
+pub(crate) struct GrokProvider;
 
 impl ShallowSessionProvider for GrokProvider {
     fn acquire(
@@ -2082,7 +2093,7 @@ fn grok_update_bounds(
 /// `muse/sessions/YYYY/MM/DD/<session-id>/`. Subagent and reminder children
 /// write their own transcripts under `subagent/` beside the parent; those are
 /// not sessions of their own and are never enumerated.
-struct MuseProvider;
+pub(crate) struct MuseProvider;
 
 impl ShallowSessionProvider for MuseProvider {
     fn acquire(
@@ -2231,7 +2242,7 @@ impl ShallowSessionProvider for MuseProvider {
 /// message after a session seek). Metadata remains available on older schemas,
 /// but prompt/model extraction is omitted when it would require a table scan.
 #[derive(Default)]
-struct OpencodeProvider {
+pub(crate) struct OpencodeProvider {
     pass: Mutex<()>,
     live: Mutex<Option<OpencodeLive>>,
 }
@@ -3144,7 +3155,7 @@ fn opencode_store_generation(path: &Path) -> Result<String> {
 /// `ai-hist sync` already stored in `history` (indexed by
 /// `idx_history_session`). If nothing was ever synced it discovers nothing —
 /// that is the correct answer, not a failure.
-struct RelayProvider;
+pub(crate) struct RelayProvider;
 
 impl ShallowSessionProvider for RelayProvider {
     fn source(&self) -> &'static str {
@@ -3658,6 +3669,21 @@ fn observation_key(
     }
 }
 
+/// The session a candidate's locator was last observed as.
+///
+/// `ORDER BY +session_id`, not `ORDER BY session_id`: with no `sqlite_stat1`
+/// (the crate never runs `ANALYZE`) SQLite otherwise serves the ORDER BY from
+/// the primary key, which pins only `source` for this lookup, and walks every
+/// observation of the source for every candidate — O(files x sessions) on
+/// each discovery pass, and the largest remaining cost of a sweep over an
+/// unchanged store once the identity refresh stopped scanning (#42, #215).
+/// The unary `+` leaves the sort to the at-most-a-few rows
+/// `idx_observation_locator` returns.
+pub(crate) const OBSERVED_SESSION_BY_LOCATOR_SQL: &str = "SELECT session_id FROM session_observations \
+     WHERE source=? AND location=? AND connector_id=? AND connector_instance=? \
+       AND raw_locator=? AND access_state='available' \
+     ORDER BY +session_id LIMIT 1";
+
 fn fetch_observed_candidate(
     conn: &Connection,
     provider: &dyn ShallowSessionProvider,
@@ -3665,7 +3691,7 @@ fn fetch_observed_candidate(
 ) -> Result<Option<ShallowSession>> {
     let id = match candidate.session_id.as_ref() {
         Some(id) => Some(id.clone()),
-        None => conn.query_row("SELECT session_id FROM session_observations WHERE source=? AND location=? AND connector_id=? AND connector_instance=? AND raw_locator=? AND access_state='available' ORDER BY session_id LIMIT 1",params![candidate.source,provider.location().as_str(),provider.connector_id(),provider.connector_instance(),candidate.locator],|r|r.get(0)).optional()?,
+        None => conn.query_row(OBSERVED_SESSION_BY_LOCATOR_SQL,params![candidate.source,provider.location().as_str(),provider.connector_id(),provider.connector_instance(),candidate.locator],|r|r.get(0)).optional()?,
     };
     let Some(id) = id else { return Ok(None) };
     let Some(observation) =
@@ -3887,7 +3913,11 @@ static UPSERT_SESSION_SQL: LazyLock<String> = LazyLock::new(|| {
 /// readers deliberately interpret as `'full'`. Grok is the exception on the
 /// activity bounds: a session directory is a replacement snapshot, so a later
 /// compaction can move the start forward and the end backward. A shallow
-/// rescan of such a row still refreshes its metadata and stamp.
+/// rescan of such a row still refreshes its metadata and stamp. The process
+/// log is not part of that snapshot: after the directory bounds land, a
+/// `logs/unified.jsonl` row later than the directory's end raises
+/// `last_activity_ms`, and a model only the log named is appended. A model
+/// the directory no longer names stays off the row.
 ///
 /// The returned row is what the catalog now holds (including a preserved
 /// `full` state), read back through the write's own `RETURNING` clause so the
@@ -4014,8 +4044,64 @@ fn upsert_shallow_session_in_transaction(
         ],
         row_to_session,
     )?;
+    reconcile_grok_unified_catalog(conn, &mut row)?;
     row.from_cache = false;
     Ok(row)
+}
+
+/// Put `logs/unified.jsonl` back onto a Grok catalog row after the directory
+/// snapshot replaced it.
+///
+/// Shallow discovery replaces Grok's activity end and model list, because the
+/// directory is a snapshot and compaction can move the end backward or drop a
+/// model. The process log is a different source: an inference later than the
+/// directory is still the session's latest activity, and a model only the log
+/// named is still a model the session used. Both are restored here. A model
+/// that was on the previous row and is in neither the directory nor the log
+/// stays gone.
+fn reconcile_grok_unified_catalog(conn: &Connection, row: &mut ShallowSession) -> Result<()> {
+    if row.source != "grok" {
+        return Ok(());
+    }
+    let log_last: Option<i64> = conn.query_row(
+        "SELECT MAX(ts_ms) FROM grok_unified_usage WHERE session_id = ?",
+        params![row.session_id],
+        |found| found.get(0),
+    )?;
+    if let Some(log_last) = log_last {
+        if row.last_activity_ms.is_none_or(|current| log_last > current) {
+            conn.execute(
+                "UPDATE sessions SET last_activity_ms = ? \
+                 WHERE source = 'grok' AND session_id = ?",
+                params![log_last, row.session_id],
+            )?;
+            row.last_activity_ms = Some(log_last);
+        }
+    }
+    let log_models = conn
+        .prepare(
+            "SELECT model FROM grok_unified_usage \
+             WHERE session_id = ? AND model IS NOT NULL \
+             ORDER BY ts_ms IS NULL, ts_ms, line_offset",
+        )?
+        .query_map(params![row.session_id], |found| found.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut models = std::mem::take(&mut row.models);
+    let before = models.len();
+    for model in log_models {
+        if model.is_empty() || models.iter().any(|seen| seen == &model) {
+            continue;
+        }
+        models.push(model);
+    }
+    if models.len() != before {
+        conn.execute(
+            "UPDATE sessions SET models_json = ? WHERE source = 'grok' AND session_id = ?",
+            params![serde_json::to_string(&models)?, row.session_id],
+        )?;
+    }
+    row.models = models;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -4290,7 +4376,26 @@ pub fn discover_sessions_with_provider_refs(
     on_row: impl FnMut(&ShallowSession),
 ) -> Result<DiscoverySummary> {
     let worker_limit = std::thread::available_parallelism().map_or(1, |n| n.get());
-    discover_sessions_with_worker_limit(env, options, providers, on_row, worker_limit)
+    discover_sessions_with_worker_limit(env, options, providers, on_row, worker_limit, true)
+}
+
+/// [`discover_sessions_with_providers`] for the end of a sync sweep, which
+/// refreshes project identity itself immediately afterwards.
+///
+/// The refresh is a pass over every session and event. Discovery's own copy
+/// and the sweep's ran back to back with nothing written in between, so the
+/// second always found nothing to do and cost a sweep as much as the first.
+pub(crate) fn discover_sessions_for_sweep(
+    env: &DiscoveryEnv<'_>,
+    options: &DiscoverOptions,
+    providers: &[Box<dyn ShallowSessionProvider>],
+) -> Result<DiscoverySummary> {
+    let providers = providers
+        .iter()
+        .map(|provider| provider.as_ref())
+        .collect::<Vec<_>>();
+    let worker_limit = std::thread::available_parallelism().map_or(1, |n| n.get());
+    discover_sessions_with_worker_limit(env, options, &providers, |_| {}, worker_limit, false)
 }
 
 // An explicit limit lets regression tests exercise both read paths regardless
@@ -4301,6 +4406,7 @@ fn discover_sessions_with_worker_limit(
     providers: &[&dyn ShallowSessionProvider],
     mut on_row: impl FnMut(&ShallowSession),
     worker_limit: usize,
+    refresh_identity: bool,
 ) -> Result<DiscoverySummary> {
     // A pass is the unit over which the filesystem is treated as fixed, so it
     // is also the unit the project-identity cache may span. A host that stays
@@ -4780,11 +4886,13 @@ fn discover_sessions_with_worker_limit(
     // nothing to upgrade stays read-only. Reporting rather than failing, for
     // the same reason the sync path does: the rows this discovery wrote are
     // already committed, and every key here is derived from them.
-    if let Err(error) = crate::store::refresh_project_identity(env.conn) {
-        eprintln!(
-            "ai-hist: could not refresh canonical project identity after discovery: {error:#} \
-             (project keys stay as they were; the next pass retries)"
-        );
+    if refresh_identity {
+        if let Err(error) = crate::store::refresh_project_identity(env.conn) {
+            eprintln!(
+                "ai-hist: could not refresh canonical project identity after discovery: {error:#} \
+                 (project keys stay as they were; the next pass retries)"
+            );
+        }
     }
     summary.counters = env.counters();
     Ok(summary)

@@ -1,0 +1,79 @@
+# "A second parser reappeared" tripwire (#184). relayhistory is to be the
+# single owner of parsing harness session logs; burn's cutover release (burn
+# #562, the 5.0.0 major) deletes its harness readers and reads evidence
+# through the ai-hist crate instead. After that release is tagged, this fails
+# if burn main's crates/ again contain the parser symbols #562's acceptance
+# greps for (`parse_claude_session`, `parse_codex_session`,
+# `parse_opencode_session`, `notify::`), or if burn has no relayhistory
+# parity suite for relayhistory's contract-drift job to run. Leftover
+# reader/{claude,codex,opencode}.rs file names alone are a warning: #562 keeps
+# reader/{claude,codex}/span_tree.rs and may rename reader/.
+#
+# It keys off the tag `relayburn-sdk-v5.0.0` (burn tags each crate release;
+# the readers live in relayburn-sdk). Until that tag exists the run is a
+# notice and green. If burn names the cutover release differently, set the
+# repository variable BURN_CUTOVER_TAG, or pass `cutover_tag` to a manual run.
+#
+# A failed scheduled run opens, or comments on, one open issue in this
+# repository titled "burn reader tripwire is failing".
+#
+# Weekly and manual only -- not on pull requests: nothing in a relayhistory
+# PR can change the outcome.
+name: burn reader tripwire
+
+on:
+  workflow_dispatch:
+    inputs:
+      cutover_tag:
+        description: "burn tag after which its harness parsers must be gone"
+        required: false
+        default: ""
+  schedule:
+    # Mondays, 07:41 UTC. Off the hour so it does not queue behind every
+    # other scheduled workflow on the runners.
+    - cron: "41 7 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  tripwire:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      # `cargo metadata --no-deps` finds burn's parity suite; nothing is built.
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Shallow-clone burn main
+        run: git clone --depth 1 --no-tags https://github.com/AgentWorkforce/burn.git burn
+      - name: burn has no harness parsers after its cutover release
+        shell: bash
+        env:
+          BURN_CUTOVER_TAG: ${{ inputs.cutover_tag || vars.BURN_CUTOVER_TAG || 'relayburn-sdk-v5.0.0' }}
+        run: |
+          node scripts/burn-guardrails.mjs tripwire --burn-dir burn --cutover-tag "$BURN_CUTOVER_TAG" 2>&1 \
+            | tee tripwire.log
+      - name: Open or update the tracking issue
+        if: failure() && github.event_name == 'schedule'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="burn reader tripwire is failing"
+          log=$(tail -c 50000 tripwire.log 2>/dev/null || echo "(no tripwire output; an earlier step failed)")
+          body=$(printf 'The weekly burn reader tripwire failed: %s\n\n```\n%s\n```\n' "$RUN_URL" "$log")
+          number=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "\"$title\" in:title" --json number,title \
+            --jq "map(select(.title == \"$title\")) | .[0].number // empty")
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi

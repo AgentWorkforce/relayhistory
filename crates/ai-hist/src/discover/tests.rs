@@ -3801,6 +3801,7 @@ fn stopped_serial_and_parallel_discovery_do_not_claim_the_rest_of_the_window() {
                 &[&provider],
                 |_| panic!("cancelled window emitted a row"),
                 worker_limit,
+                true,
             )
         })
         .unwrap_err();
@@ -3990,4 +3991,165 @@ fn claude_discovery_skips_subagent_workflow_journals() {
             .all(|locator| !locator.ends_with("journal.jsonl")),
         "{locators:?}"
     );
+}
+
+/// `<claude root>/transcripts/` is not a Claude Code transcript root. What
+/// lands there is oh-my-opencode's Claude-hook compatibility log of an
+/// *OpenCode* session: named by the OpenCode `ses_*` id, `user` / `tool_use` /
+/// `tool_result` lines with top-level `content` / `tool_*` fields, and no
+/// `sessionId`, `cwd`, model or assistant turn. The OpenCode adapter already
+/// indexes that session from OpenCode's own store, so Claude discovery neither
+/// lists nor watches the directory (#208).
+#[test]
+fn claude_discovery_ignores_the_opencode_wrapper_transcripts_root() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    write(
+        &home.path().join(".claude/projects/app/s1.jsonl"),
+        CLAUDE_BODY,
+    );
+    write(
+        &home
+            .path()
+            .join(".claude/transcripts/ses_0123456789abcdefghijklmno.jsonl"),
+        concat!(
+            r#"{"type":"user","timestamp":"2026-04-01T10:00:00.000Z","content":"Wrapped prompt"}"#,
+            "\n",
+            r#"{"type":"tool_use","timestamp":"2026-04-01T10:00:01.000Z","tool_name":"read","tool_input":{"filePath":"/src/main.rs"}}"#,
+            "\n",
+        ),
+    );
+
+    let env = env_at(&conn, home.path());
+    let locators: Vec<String> = ClaudeProvider
+        .enumerate(&env, None)
+        .unwrap()
+        .into_iter()
+        .chain(ClaudeProvider.fingerprint_inputs(&env).unwrap())
+        .map(|candidate| candidate.locator)
+        .collect();
+    assert!(
+        locators
+            .iter()
+            .all(|locator| !locator.contains("/.claude/transcripts/")),
+        "{locators:?}"
+    );
+
+    let roots = crate::ProviderRoots::from_home(
+        home.path().to_path_buf(),
+        home.path().join("opencode.db"),
+    );
+    let watched: Vec<PathBuf> = provider_watch_roots("claude", &roots)
+        .into_iter()
+        .map(|root| root.path)
+        .collect();
+    assert_eq!(
+        watched,
+        vec![home.path().join(".claude/projects")],
+        "Claude watches only <claude root>/projects; transcripts/ is excluded on \
+         purpose (#208, see the claude bullet in docs/session-catalog.md)"
+    );
+}
+
+/// A shallow rescan replaces the directory's activity end and model list.
+/// `logs/unified.jsonl` is not that directory: a later log row raises the end
+/// again, a model only the log named is appended, and a model the new
+/// directory snapshot does not name stays gone. A directory end later than
+/// the log still wins.
+#[test]
+fn a_grok_shallow_rescan_keeps_a_later_log_time_and_log_only_models() {
+    let conn = catalog();
+    conn.execute_batch(
+        "INSERT INTO grok_unified_usage \
+         (row_key, session_id, ts_ms, model, usage_json, locator, line_offset) VALUES \
+         ('early', 'grok-cat', 1000, 'log-early', '{}', 'loc', 0), \
+         ('dup', 'grok-cat', 2000, 'from-summary', '{}', 'loc', 5), \
+         ('late', 'grok-cat', 5000, 'log-late', '{}', 'loc', 10), \
+         ('timeless', 'grok-cat', NULL, 'log-timeless', '{}', 'loc', 20);",
+    )
+    .unwrap();
+    let shallow = |last: Option<i64>, models: &[&str]| ShallowSession {
+        source: "grok".into(),
+        session_id: "grok-cat".into(),
+        last_activity_ms: last,
+        models: models.iter().map(|model| (*model).to_string()).collect(),
+        discovery_state: "shallow".into(),
+        ..Default::default()
+    };
+    let earlier = upsert_shallow_session(&conn, &shallow(Some(100), &["from-summary"])).unwrap();
+    assert_eq!(earlier.last_activity_ms, Some(5000));
+    assert_eq!(
+        earlier.models,
+        vec![
+            "from-summary".to_string(),
+            "log-early".to_string(),
+            "log-late".to_string(),
+            "log-timeless".to_string()
+        ]
+    );
+
+    conn.execute(
+        "UPDATE sessions SET models_json = ? WHERE source = 'grok' AND session_id = 'grok-cat'",
+        params![r#"["from-summary","log-early","dir-only"]"#],
+    )
+    .unwrap();
+    let later = upsert_shallow_session(&conn, &shallow(Some(9000), &["from-summary"])).unwrap();
+    assert_eq!(later.last_activity_ms, Some(9000));
+    assert_eq!(
+        later.models,
+        vec![
+            "from-summary".to_string(),
+            "log-early".to_string(),
+            "log-late".to_string(),
+            "log-timeless".to_string()
+        ]
+    );
+}
+
+/// Discovery asks this once per candidate whose session id the path does not
+/// name. Served from the primary key to satisfy its ORDER BY, it walked every
+/// observation of the source per candidate: O(files x sessions) on every pass
+/// (#42, #215). It has to be a search on the locator index.
+#[test]
+fn observed_session_by_locator_is_a_keyed_search() {
+    for analyze in [false, true] {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for i in 0..60 {
+            conn.execute(
+                "INSERT INTO session_observations \
+                 (source, session_id, location, connector_id, connector_instance, \
+                  raw_locator, source_stamp, updated_ms) \
+                 VALUES ('claude', ?1, 'local', 'claude', 'default', ?2, 'stamp', 0)",
+                rusqlite::params![format!("s{i}"), format!("/t/{i}.jsonl")],
+            )
+            .unwrap();
+        }
+        if analyze {
+            conn.execute_batch("ANALYZE").unwrap();
+        }
+        let steps: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {OBSERVED_SESSION_BY_LOCATOR_SQL}"))
+            .unwrap()
+            .query_map(
+                rusqlite::params!["claude", "local", "claude", "default", "/t/7.jsonl"],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let joined = steps.join(" | ");
+        assert!(
+            joined.contains("idx_observation_locator") && joined.contains("raw_locator=?"),
+            "the locator lookup is not a search on its index (analyze={analyze}): {joined}"
+        );
+        let found: String = conn
+            .query_row(
+                OBSERVED_SESSION_BY_LOCATOR_SQL,
+                rusqlite::params!["claude", "local", "claude", "default", "/t/7.jsonl"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(found, "s7");
+    }
 }

@@ -1,13 +1,19 @@
 # Production architecture
 
-The local history packages have this production call graph:
+The local history packages have this production call graph. burn, a separate
+repository, is shown beside them because it consumes the published crate rather
+than the Node packages. That edge is the target of burn 5.0.0
+([burn #562](https://github.com/AgentWorkforce/burn/issues/562)); until then
+burn still reads harness logs with its own readers, as the ADR's context
+describes:
 
 ```text
 provider files / SQLite
         │
         ▼
-ai-hist (published Rust crate)
-        │ typed Rust functions
+ai-hist (published Rust crate) ──── SessionStore facade ───▶ burn (cost)
+        │ typed Rust functions         (in-process crates.io
+        │                               dependency, from burn 5.0.0)
         ▼
 ai-hist-native (Node-API, async worker tasks)
         │ typed native objects, plus one JSON dispatcher
@@ -81,6 +87,19 @@ sourcing](decisions/2026-09-19-relayhistory-owns-session-sourcing.md) for the
 decision, the rejected alternatives and the per-source capture matrix, and
 [`sourcing-contract.md`](sourcing-contract.md) for the record types the Rust SDK
 must expose.
+
+Two CI checks will hold the boundary; both are armed by burn's side of the
+migration, not by anything here. The `burn-contract-drift` job in `ci.yml`
+builds burn (main, or the `BURN_REF` repository variable) with its `ai-hist`
+requirement rewritten to a path dependency on the pull request's crate, and
+runs burn's relayhistory parity suite, because the effect of a change to
+message ids, timestamps or usage dedup lives in burn's ledger fingerprints,
+not in this workspace's tests. It runs only for changes under
+`crates/ai-hist/` (and the workspace manifest and the check itself), and is a
+notice until burn depends on `ai-hist` (burn #557). The weekly
+`burn-reader-tripwire.yml` fails if burn's harness-parser symbols reappear, or
+its parity suite is missing, after its cutover release tag
+(`relayburn-sdk-v5.0.0`). Both are driven by `scripts/burn-guardrails.mjs`.
 
 ## Optional services and package boundaries
 
@@ -191,9 +210,8 @@ archive relocation.
 | `getSessionMarkersPage`, `session_markers_page` (`SessionStore::session` carries the same markers untruncated) | none | bounded keyset page over one source's session | empty page; a read-only `SessionStore::open` over a database older than the marker page index is refused, naming the remedy (the native dispatcher then reopens writable and migrates, as the typed reads do) |
 | `getSessionRequestsPage`, `getSessionUsage` | none | bounded keyset page / streamed rollup over the derived request view | empty page / summary with no requests |
 | `getSourceCapabilities` | none | none: answered from the provider capability tables | the same answer |
-| `getChangesPage`, `changesSince`, `SessionStore::changes_since` | none | one bounded page per call: indexed revision-range reads per kind, plus tombstones; a session filter seeks that session's index | empty, finished feed; the file is not created |
+| `getChangesPage`, `changesSince`, `SessionStore::changes_since` | none | one bounded page per call: indexed revision-range reads per kind, plus tombstones; a session filter seeks that session's index | SDK: empty, finished feed; the file is not created. `SessionStore`: not reached, since `SessionStore::open` created the database (writable) or already failed (read-only); a read-only store over a database older than the change-feed schema is refused, naming the remedy |
 | `commitChanges`, `Changes::commit` | named consumer cursor in `consumer_cursors` (forward-only, bound to its kind set) | none | `WATERMARK_AHEAD_OF_STORE`: the position names no store |
-| `SessionStore::changes_since` (no SDK/MCP surface yet) | none | one indexed revision-range read per kind per page, plus one for tombstones; `commit` writes one cursor row | not reached: `SessionStore::open` created the database (writable) or already failed (read-only); a read-only store over a database older than the change-feed schema is refused, naming the remedy |
 | `sync` (`local`, default) | full explicit scan | migrations + ingestion | creates DB |
 | `sync` (`remote`) | explicitly selected source plugins (error when none) | observations, normalized evidence, checkpoints | creates DB |
 | `sync` (`all`) | full local scan + explicitly selected source plugins | migrations + ingestion | creates DB |
@@ -368,8 +386,68 @@ top-level catalog session. Evidence banked before these fields were read is
 re-read once, from the `session_meta` line alone. What is still unobservable is
 a plain `codex resume`: it opens with a fresh `payload.id` and leaves behind
 only a carried-over token baseline, which is a number and not a session, so no
-`resume` row is recorded for it. A forked rollout also replays its parent's
-history before its own turns, and that replay is not yet gated (#210).
+`resume` row is recorded for it.
+
+A forked rollout also **replays its parent's history** before its own turns:
+Codex copies the parent's `session_meta`, its turns' `task_started` /
+`turn_context` / message records and their cumulative `token_count` snapshots
+into the child's file. The rollout walk gates that copy (`ForkReplaySpan` in
+`src/ingest.rs`), and only on explicit evidence:
+
+- The span **opens** at a `session_meta` after the file's first line whose
+  `payload.id` is the parent the opening `session_meta` named in
+  `forked_from_id` or `thread_spawn.parent_thread_id`. A rollout that names no
+  such parent, or a fork that opens on something else (a guardian's
+  `compaction` item), is never gated.
+- It **closes** at the first `task_started` or `turn_context` whose turn is the
+  child's: a UUIDv7 `turn_id` at or after the child thread's own UUIDv7
+  timestamp (else its `session_meta` timestamp), or, for a legacy turn id,
+  `started_at` after the fork's second. A turn nothing orders against the
+  fork -- including a legacy `started_at` in the fork's own second, which
+  second resolution cannot order -- also closes it: undecided is indexed
+  rather than dropped. A `turn_context` with no `turn_id`, or repeating the
+  `turn_id` of a replayed `task_started` before it, takes that verdict, since
+  it describes the turn that record opened. The presence of
+  `task_started` is not used: Codex 0.155 replays the parent's `task_started`
+  records too.
+
+Two limits follow from gating on explicit evidence only. A replayed legacy
+turn with no UUIDv7 id and no `started_at` (or one in the fork's own second)
+closes the span early, and the rest
+of that replay is indexed under the child as before. And a record the child
+writes before its first `task_started` / `turn_context` falls inside the span:
+nothing in it tells it from the parent's copy (codex-rs appends a
+`thread_settings_applied` after the copied prefix, the same shape as the
+parent's own). Every observed build opens a turn with `task_started` before any
+prompt or model output, so what that drops is settings state the child's own
+`turn_context` restates.
+
+Lines inside the span write nothing under the child. One
+`fork_replay_boundary` marker, keyed by the replayed `session_meta`'s line,
+accounts for them (`first_line`, `last_line`, `replayed_lines`, the closing
+turn and the rule that closed it). The last readable `token_count` inside the
+span becomes the child's inherited baseline, so the child's first request is
+charged only what it spent beyond the parent's total. codex-rs seeds a fork's
+usage from the copied history (`record_initial_history` on
+`InitialHistory::Forked` calls `last_token_info_from_rollout`), and each request
+then grows `total_token_usage` by exactly `last_token_usage`; the child's first
+readable snapshot is checked against that: `total == last` means its counter
+restarted and the baseline is dropped, `total == inherited + last` confirms it,
+and without `last_token_usage` only a total below the inherited one drops it.
+The marker records the outcome in `inherited_baseline` (`pending`, `applied`,
+`dropped`) and `inherited_baseline_basis`, and a pending decision rides on the
+cursor. The cursor never commits inside a span, so a live fork read before its
+first own turn re-reads the replay on the next pass; once the child's first
+turn completes it commits past it.
+
+Rows an earlier parser indexed under the child for the replayed lines are
+retired when the span is read, and sync re-reads every unchanged fork rollout
+once (`codex_fork_replay_gate` in the sync state) so an existing install loses
+its duplicates too; that walk also rewrites the fork's `first_prompt`, clearing
+a replayed parent prompt when the fork has none of its own, because the
+shallow writer only fills a missing value. The cleanup is one pass, run by
+`sync` only: an older build still writing to the same database can put the
+duplicates back.
 
 Events use `(ts_ms, id)` keyset pagination. Tool calls and file edits use the
 same keyset shape over `(ts_ms IS NULL, ts_ms, id)`: both tables allow a null

@@ -590,6 +590,30 @@ const CORPUS: &[Fixture] = &[
         files: &["codex/two-requests-one-turn.jsonl"],
         quirk: "a tool loop makes two API calls inside one turn_id, so the turn is not the request",
     },
+    Fixture {
+        source: "codex",
+        name: "fork-human",
+        layout: Layout::CodexRollout,
+        origin: Origin::RelayHistory,
+        files: &["codex/fork-human/parent.jsonl", "codex/fork-human/child.jsonl"],
+        quirk: "a human fork (`forked_from_id`, `thread_source: user`) whose rollout replays the parent's `session_meta`, both turns and their cumulative `token_count` before its own turn",
+    },
+    Fixture {
+        source: "codex",
+        name: "fork-subagent",
+        layout: Layout::CodexRollout,
+        origin: Origin::RelayHistory,
+        files: &["codex/fork-subagent/root.jsonl", "codex/fork-subagent/subagent.jsonl"],
+        quirk: "a spawned subagent naming its parent in `source.subagent.thread_spawn.parent_thread_id`, replaying the parent's open turn (with a tool call) and starting its own turn in the thread id's own millisecond",
+    },
+    Fixture {
+        source: "codex",
+        name: "guardian-review",
+        layout: Layout::CodexRollout,
+        origin: Origin::RelayHistory,
+        files: &["codex/guardian-review/parent.jsonl", "codex/guardian-review/guardian.jsonl"],
+        quirk: "a Codex 0.150+ `thread_source: guardian_review` rollout with `parent_thread_id` that opens on a `compaction` item rather than a replay",
+    },
     // -- cursor, authored here ---------------------------------------------
     Fixture {
         source: "cursor",
@@ -639,6 +663,14 @@ const CORPUS: &[Fixture] = &[
         origin: Origin::RelayHistory,
         files: &["grok/events-session"],
         quirk: "documented Grok Build layout: `chat_history.jsonl` with `tool_calls[]`, ACP `updates.jsonl` with real `agentTimestampMs` times, `compaction_checkpoints/`, `subagents/`, `signals.json` and `prompt_context.json`",
+    },
+    Fixture {
+        source: "grok",
+        name: "unified-usage",
+        layout: Layout::HomeTree,
+        origin: Origin::RelayHistory,
+        files: &["grok/unified-usage"],
+        quirk: "two Grok Build sessions under one Grok home: one covered by the process-wide `logs/unified.jsonl` per-inference usage log (a repeated `eventId`, a pid-scoped model, top-level counters, an exact duplicate row, a row with no session and one for an unindexed session), one not covered and with no `summary.json`, so its model and start time come from `events.jsonl`",
     },
     // -- muse --------------------------------------------------------------
     Fixture {
@@ -1418,43 +1450,100 @@ fn corpus_readme_lists_every_fixture_and_quirk() {
     }
 }
 
-/// Every `SOURCE_CHOICES` entry has at least one fixture, or a documented
-/// exemption. Adding a provider without a fixture fails here.
+/// The harness registry and the corpus agree: every `LocalSource` descriptor
+/// either names a fixture directory that holds at least one staged fixture
+/// and a committed snapshot, or carries a documented fixture exemption; and
+/// the public `Source` enum names exactly the descriptors. Adding a provider without a
+/// fixture fails here.
 ///
-/// The exemption list mirrors `DISCOVERY_EXEMPTIONS`: a source that is not a
-/// provider session at all has nothing to put in a harness corpus.
+/// A source that is not a provider session at all (a trajectory, a relay row
+/// projected from other sources) has nothing to put in a harness corpus, and
+/// its descriptor says so.
 #[test]
 fn every_source_choice_has_a_fixture_or_an_exemption() {
-    const FIXTURE_EXEMPTIONS: &[(&str, &str)] = &[
-        (
-            "trajectory",
-            "derived trajectory records, not provider sessions",
-        ),
-        (
-            "relay",
-            "projected from already-synced local rows; no provider log on disk to capture",
-        ),
-    ];
-    let covered = CORPUS
+    use ai_hist::sources::catalog::{local_source, local_sources, Fixtures};
+
+    // The public `Source` enum is hand-written (it is default API), so it is
+    // the list that can drift from the registry: it must name exactly the
+    // descriptors, each once.
+    let public = ai_hist::Source::ALL
+        .iter()
+        .map(|source| source.as_str())
+        .collect::<Vec<_>>();
+    let mut public_sorted = public.clone();
+    public_sorted.sort_unstable();
+    public_sorted.dedup();
+    assert_eq!(
+        public_sorted.len(),
+        public.len(),
+        "Source::ALL repeats a source"
+    );
+    let mut descriptors = local_sources()
+        .iter()
+        .map(|descriptor| descriptor.id())
+        .collect::<Vec<_>>();
+    descriptors.sort_unstable();
+    assert_eq!(
+        public_sorted, descriptors,
+        "Source::ALL and the sources/catalog.rs descriptors name different sources"
+    );
+    let staged = CORPUS
         .iter()
         .filter(|fixture| fixture.layout != Layout::Reference)
-        .map(|fixture| fixture.source)
-        .collect::<BTreeSet<_>>();
-    for source in ai_hist::SOURCE_CHOICES {
-        let exempt = FIXTURE_EXEMPTIONS
+        .collect::<Vec<_>>();
+    for fixture in CORPUS {
+        assert!(
+            local_source(fixture.source).is_some(),
+            "{} names a source with no descriptor",
+            snapshot_key(fixture)
+        );
+    }
+    for descriptor in local_sources() {
+        let source = descriptor.id();
+        let covering = staged
             .iter()
-            .find(|(name, _)| name == source)
-            .map(|(_, reason)| *reason);
-        match exempt {
-            Some(reason) => assert!(
-                !reason.is_empty() && !covered.contains(source),
+            .filter(|fixture| fixture.source == source)
+            .collect::<Vec<_>>();
+        match descriptor.fixtures() {
+            Fixtures::Exempt(reason) => assert!(
+                !reason.is_empty() && covering.is_empty(),
                 "{source} is both exempt and covered; pick one"
             ),
-            None => assert!(
-                covered.contains(source),
-                "{source} has no fixture under tests/fixtures/ and no exemption; see \
-                 docs/session-catalog.md 'Adding a provider'"
-            ),
+            Fixtures::Dir(dir) => {
+                // The corpus keys fixtures and snapshots by source id, so the
+                // descriptor's directory must be that id.
+                assert_eq!(
+                    dir, source,
+                    "{source}'s fixture directory must be named after the source"
+                );
+                assert!(
+                    !covering.is_empty(),
+                    "{source} has no fixture under tests/fixtures/{dir} and no exemption; see \
+                     docs/session-catalog.md 'Adding a provider'"
+                );
+                assert!(
+                    fixtures_root().join(dir).is_dir(),
+                    "{source}'s descriptor names tests/fixtures/{dir}, which does not exist"
+                );
+                for fixture in &covering {
+                    for file in fixture.files {
+                        assert!(
+                            file.starts_with(&format!("{dir}/")),
+                            "{} stages {file}, outside its descriptor's fixture directory {dir}",
+                            snapshot_key(fixture)
+                        );
+                    }
+                    let snapshot = snapshots_root()
+                        .join(dir)
+                        .join(format!("{}.json", fixture.name));
+                    assert!(
+                        snapshot.is_file(),
+                        "{} has no committed snapshot at {}",
+                        snapshot_key(fixture),
+                        snapshot.display()
+                    );
+                }
+            }
         }
     }
 }
@@ -1755,6 +1844,224 @@ fn codex_parent_thread_id_becomes_a_delegation_edge() {
         .map(|session| text(session, "session_id").to_string())
         .collect::<Vec<_>>();
     assert_eq!(catalog, vec!["sess_parent_thread_root".to_string()]);
+}
+
+/// The events of one session, as `(role, text)` in stored order.
+fn session_texts(key: &str, session_id: &str) -> Vec<(String, String)> {
+    rows(key, "session_events")
+        .iter()
+        .filter(|event| text(event, "session_id") == session_id)
+        .map(|event| {
+            (
+                text(event, "role").to_string(),
+                text(event, "text").to_string(),
+            )
+        })
+        .collect()
+}
+
+/// The one `fork_replay_boundary` marker a session carries, as its payload.
+fn fork_replay_marker(key: &str, session_id: &str) -> Option<Value> {
+    let markers = rows(key, "session_markers")
+        .iter()
+        .filter(|marker| {
+            text(marker, "session_id") == session_id
+                && text(marker, "kind") == "fork_replay_boundary"
+        })
+        .collect::<Vec<_>>();
+    assert!(markers.len() <= 1, "{markers:?}");
+    markers
+        .first()
+        .map(|marker| serde_json::from_str(text(marker, "payload_json")).expect("marker payload"))
+}
+
+const FORK_HUMAN_PARENT: &str = "019da82f-d400-7000-8000-00000000000a";
+const FORK_HUMAN_CHILD: &str = "019da830-be60-7000-8000-00000000000c";
+
+/// #210: a human fork records a `fork` edge from `forked_from_id`, and the
+/// parent history its rollout replays is not indexed a second time under the
+/// child: two prompts for the parent, one for the child, and the child's
+/// first request charged only what it spent beyond the inherited total.
+#[test]
+fn codex_human_fork_records_lineage_and_gates_the_replay() {
+    let key = "codex/fork-human";
+    let edges = rows(key, "session_relationships");
+    assert_eq!(edges.len(), 1, "{edges:?}");
+    assert_eq!(text(&edges[0], "relationship"), "fork");
+    assert_eq!(text(&edges[0], "parent_session_id"), FORK_HUMAN_PARENT);
+    assert_eq!(text(&edges[0], "child_session_id"), FORK_HUMAN_CHILD);
+    assert_eq!(text(&edges[0], "evidence_ref"), "forked_from_id");
+
+    // A human fork stays a root.
+    let catalog = rows(key, "sessions")
+        .iter()
+        .map(|session| text(session, "session_id").to_string())
+        .collect::<BTreeSet<_>>();
+    assert!(catalog.contains(FORK_HUMAN_CHILD), "{catalog:?}");
+    // Shallow discovery applies the same gate: the child's first prompt is
+    // its own, not the parent's replayed one.
+    let child_row = rows(key, "sessions")
+        .iter()
+        .find(|session| text(session, "session_id") == FORK_HUMAN_CHILD)
+        .expect("child row");
+    assert_eq!(
+        text(child_row, "first_prompt"),
+        "child prompt after the fork"
+    );
+
+    let history = rows(key, "history")
+        .iter()
+        .map(|entry| {
+            (
+                text(entry, "session_id").to_string(),
+                text(entry, "prompt").to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        history,
+        vec![
+            (
+                FORK_HUMAN_PARENT.to_string(),
+                "parent prompt one".to_string()
+            ),
+            (
+                FORK_HUMAN_PARENT.to_string(),
+                "parent prompt two".to_string()
+            ),
+            (
+                FORK_HUMAN_CHILD.to_string(),
+                "child prompt after the fork".to_string()
+            ),
+        ]
+    );
+
+    assert_eq!(
+        session_texts(key, FORK_HUMAN_CHILD),
+        vec![
+            (
+                "user".to_string(),
+                "child prompt after the fork".to_string()
+            ),
+            ("assistant".to_string(), "child answer".to_string()),
+        ],
+        "the child's events hold only its own turn"
+    );
+    let child_usage = rows(key, "session_events")
+        .iter()
+        .filter(|event| text(event, "session_id") == FORK_HUMAN_CHILD)
+        .filter_map(|event| field(event, "token_json").as_str())
+        .map(|raw| serde_json::from_str::<Value>(raw).expect("token json"))
+        .map(|usage| usage["total_tokens"].as_i64().expect("total"))
+        .collect::<Vec<_>>();
+    // Final 3100 minus the inherited 2500.
+    assert_eq!(child_usage, vec![600]);
+
+    let marker = fork_replay_marker(key, FORK_HUMAN_CHILD).expect("replay marker");
+    assert_eq!(marker["parent_session_id"], FORK_HUMAN_PARENT);
+    assert_eq!(marker["first_line"], 1);
+    assert_eq!(marker["replayed_lines"], 13);
+    assert_eq!(marker["closed_by"], "turn_id");
+    assert_eq!(marker["inherited_total_tokens"], 2500);
+    // 3100 == 2500 + last_token_usage 600: the child continued its
+    // parent's counter, as codex-rs seeds it.
+    assert_eq!(marker["inherited_baseline"], "applied");
+    assert_eq!(marker["inherited_baseline_basis"], "last_token_usage");
+    assert!(fork_replay_marker(key, FORK_HUMAN_PARENT).is_none());
+}
+
+/// #210: a spawned subagent names its parent only in
+/// `source.subagent.thread_spawn.parent_thread_id`. It keeps its delegation
+/// edge and gains a `fork` edge, and the parent's open turn it replays -- a
+/// prompt and a tool call -- stays the parent's. Its own first turn begins in
+/// the thread id's own millisecond and is still the child's.
+#[test]
+fn codex_subagent_fork_records_lineage_and_gates_the_replay() {
+    let key = "codex/fork-subagent";
+    let root = "019da866-c280-7000-8000-0000000000a0";
+    let child = "019da867-37b0-7000-8000-0000000000b0";
+    let edges = rows(key, "session_relationships")
+        .iter()
+        .map(|edge| {
+            (
+                text(edge, "relationship").to_string(),
+                text(edge, "parent_session_id").to_string(),
+                text(edge, "child_session_id").to_string(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    assert!(edges.contains(&("delegated".to_string(), root.to_string(), child.to_string())));
+    assert!(edges.contains(&("fork".to_string(), root.to_string(), child.to_string())));
+    let fork = rows(key, "session_relationships")
+        .iter()
+        .find(|edge| text(edge, "relationship") == "fork")
+        .expect("fork edge");
+    assert_eq!(
+        text(fork, "evidence_ref"),
+        "source.subagent.thread_spawn.parent_thread_id"
+    );
+
+    let catalog = rows(key, "sessions")
+        .iter()
+        .map(|session| text(session, "session_id").to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(catalog, vec![root.to_string()], "a subagent stays hidden");
+
+    let child_texts = session_texts(key, child);
+    assert_eq!(
+        child_texts[0],
+        ("user".to_string(), "review retry.rs".to_string())
+    );
+    assert!(
+        child_texts
+            .iter()
+            .all(|(_, text)| !text.contains("review the retry change") && !text.contains("git")),
+        "no replayed parent record reached the child: {child_texts:?}"
+    );
+    let child_calls = rows(key, "tool_calls")
+        .iter()
+        .filter(|call| text(call, "session_id") == child)
+        .map(|call| text(call, "tool_use_id").to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(child_calls, vec!["call_sub_cat".to_string()]);
+
+    let marker = fork_replay_marker(key, child).expect("replay marker");
+    assert_eq!(marker["closed_by"], "turn_id");
+    assert_eq!(
+        marker["closed_by_turn_id"],
+        "019da867-37b0-7000-8000-0000000000b1"
+    );
+}
+
+/// #210: a Codex 0.150+ `guardian_review` thread that names its parent is a
+/// subagent -- hidden from the root catalog, delegated from its parent -- and
+/// it carries no Codex fork field, so it has no `fork` edge and nothing is
+/// gated: its `compaction` opening is not a replay.
+#[test]
+fn codex_guardian_review_is_a_hidden_subagent_without_a_replay() {
+    let key = "codex/guardian-review";
+    let parent = "019da89d-b100-7000-8000-0000000000d0";
+    let guardian = "019da89e-4d40-7000-8000-0000000000e0";
+    let catalog = rows(key, "sessions")
+        .iter()
+        .map(|session| text(session, "session_id").to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(catalog, vec![parent.to_string()]);
+    let edges = rows(key, "session_relationships");
+    assert_eq!(edges.len(), 1, "{edges:?}");
+    assert_eq!(text(&edges[0], "relationship"), "delegated");
+    assert_eq!(text(&edges[0], "child_session_id"), guardian);
+    assert!(fork_replay_marker(key, guardian).is_none());
+    assert_eq!(
+        session_texts(key, guardian),
+        vec![
+            ("user".to_string(), "assess: rm -rf target/".to_string()),
+            (
+                "assistant".to_string(),
+                "low risk: build output only".to_string()
+            ),
+        ]
+    );
 }
 
 /// This transcript carries no `<timestamp>` tag on any turn, so every prompt

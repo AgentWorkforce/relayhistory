@@ -20,6 +20,7 @@ ai-hist pack "auth rewrite" --tokens 1500
 - **Never search for an old chat session again.** One local index across every harness. `ai-hist search "the thing I was working on"` finds it, whichever CLI you used.
 - **Hand off work between agents without losing context.** `ai-hist pack "the feature"` produces a compact context pack; `ai-hist resume "the feature"` prints the native resume command. Great for switching from Claude to Codex mid-work, or picking up a teammate's session.
 - **Give your agent access to its own memory via MCP.** Wire `ai-hist-mcp` into Claude Code / Cursor / Codex and the agent can query its own past sessions while it's running — search, session events, tool calls, file edits.
+- **The sourcing layer for [burn](https://github.com/AgentWorkforce/burn).** burn prices and analyzes agent sessions. Today it still ships its own Claude Code, Codex and OpenCode readers; from burn 5.0.0 ([burn #562](https://github.com/AgentWorkforce/burn/issues/562)) it drops them and reads usage, tool calls, file edits and session topology from the same `ai-history.db` through the `ai-hist` crate, so the two tools share one ingest and agree on what a session is. Pricing and cost stay in burn. See the [sourcing ADR](docs/decisions/2026-09-19-relayhistory-owns-session-sourcing.md).
 
 ## Get Started
 

@@ -745,3 +745,137 @@ The next costs, in order, are the global `refresh_project_identity` passes
 incremental tick) and the cold sweep's per-row commits. The CI gate thresholds
 are unchanged: they are baselined per runner class, and these numbers are from
 a developer machine.
+
+### 2026-09-29 read amplification (#42, #215)
+
+The section above attributed CPU. This one attributes **bytes read**, per
+reader, which is what #215 asked for, and removes the largest readers of a
+sweep over files that did not change — the sweep a `watch` event tick (always
+forced) and a periodic Reflex `syncAndPush()` run whenever anything at all
+moved (#42).
+
+**How it was measured.** Apple M4 Pro, macOS, release build, the `full`
+profile's 100 MB store (seed 176, 4,399 files). macOS has no `/proc/self/io`,
+so the harness's `Bytes read` column is empty here; instead each phase ran with
+a `DYLD_INSERT_LIBRARIES` shim that counts the bytes every `read`, `pread` and
+`readv` returned, per file (the same quantity as Linux `rchar`, page cache
+included), and a temporary marker between the sweep's stages. Neither is
+committed. `main` is `f71bc63`.
+
+```bash
+node scripts/benchmark-sync.mjs --profile full --large-session-bytes 1048576
+```
+
+#### Where an incremental sweep's bytes went
+
+After a 1 KiB append to one Claude transcript, by reader:
+
+| Reader | `main` | this change |
+|---|---:|---:|
+| Claude walk: window digests proving each unchanged transcript (two per file) | 89.1 MiB | 0.4 MiB (the appended file) |
+| Cursor: whole-prefix SHA-256 of each unchanged transcript, twice | 35.8 MiB | 0 |
+| Discovery: per-candidate locator lookup (a scan of the source's observations) and its identity refresh | 325.6 MiB | 10.6 MiB |
+| Identity refresh after the sweep (a scan of `session_events`, twice) | 315.2 MiB | 38.8 MiB, once |
+| `.sync-state.json` re-read and merged at each of 9 checkpoints | 11.0 MiB | 2.6 MiB |
+| Destination marker (per-session counts, three times) | 33 MiB | 33 MiB |
+| Facade catalog digest before and after (`SessionStore::sync`) | 15 MiB | 15 MiB |
+| **Total** | **838 MiB (7.7x the store)** | **114 MiB (1.05x)** |
+
+| Phase (harness, same machine) | `main` | this change |
+|---|---:|---:|
+| `cold_sync` | 39.92 s | 30.72 s |
+| `incremental_sync`, first sweep after the cold one | 1.77 s | 0.77 s |
+| `incremental_sync`, every sweep after that | 1.77 s | 0.39 s |
+| `unchanged_sync` | 63.3 ms, 28.4 MiB read | 59.5 ms, 22.3 MiB read |
+| `hydrate_cold` / `hydrate_unchanged` (1 MB) | 154.1 / 2.9 ms | 155.9 / 2.9 ms |
+
+The first sweep after ingestion still proves every file by its digest once and
+records that it did; from the second on, unchanged files cost a `stat`. The
+unchanged row is the source-fingerprint fast path, which never walked files;
+what it lost is the per-session recount (below) — the rest is the harness's own
+row counts and the facade's catalog digest.
+
+What changed, largest first:
+
+1. **The identity refresh stopped reading every event.** Pass 3 (bring each
+   event's key in line with its session's) scanned `session_events` with three
+   correlated catalog lookups per row to find nothing stale. It is now driven
+   from the catalog into `idx_session_events_project`, a covering index on
+   `(source, session_id, project_key, project_key_method)`; pass 4 is driven
+   from the relationship ledger; pass 1 reads the catalog once instead of once
+   per distinct directory (an unindexed `cwd IS ?` probe, O(directories x
+   sessions)). A sweep runs the refresh once, not twice — discovery's copy and
+   the sweep's ran back to back.
+2. **Discovery's locator lookup is a search again.** With no `sqlite_stat1`,
+   SQLite served `ORDER BY session_id` from the primary key and walked every
+   observation of the source for every candidate — O(files x sessions), the
+   shape #42 reported on a 930 MB store. `ORDER BY +session_id` leaves it to
+   `idx_observation_locator`.
+3. **Unchanged transcripts are proven by `ctime`, where it is real.** Size,
+   mtime and inode do not prove bytes (a writer can restore an mtime; a
+   coarse clock can give two writes one tick), which is why every skip hashed
+   a window. On APFS, HFS+, ext2/3/4, XFS, Btrfs, ZFS, tmpfs and F2FS —
+   an allowlist read from `statfs`, cached per device — `ctime` cannot be set
+   from user space, so once a digest has proven a cursor and the file's
+   `ctime` is more than three seconds old (past those filesystems' timestamp
+   granularity, the "racy" case) the cursor records it, and an unchanged
+   `ctime` proves the file without a read. FAT and exFAT report the mtime as
+   the change time, so a same-size rewrite with the mtime restored leaves it
+   equal too; there, on any filesystem not on the list and on Windows,
+   nothing settles and the digest stays. A settle expires after six hours and
+   the digest is taken again, so no miss is permanent. Bound to the prefix
+   hashes it proved, so a cursor that moved is not vouched for; any write,
+   truncate, chmod or rename falls back to the digest. The stamp is written
+   best-effort and compare-and-swap on the document it was proven from. The same `settled` stamp covers
+   Cursor transcripts and the flat prompt logs, whose whole-prefix SHA-256 is
+   now paid once per change rather than once per sweep — and a Cursor
+   transcript that did not advance is no longer hashed a second time to build
+   a generation only an advanced scan uses.
+4. **Checkpoints and the marker skip what cannot have changed.** A per-source
+   checkpoint whose in-memory state is unchanged since the last one is not
+   re-read and merged; a tick whose change-feed head (read before the marker's
+   counts) is the one recorded with the marker skips recounting every
+   session's evidence.
+
+One trap found on the way, and pinned by
+`a_session_scoped_retirement_seeks_the_session_not_the_role`: the covering
+index first *replaced* `idx_session_events_session`, which it covers as a
+prefix. Without statistics the planner then preferred the one-column
+`idx_session_events_role` for `source = ? AND session_id = ? AND role = ?`, and
+the Codex user-message retirement turned a cold sync quadratic (70 s and
+100 GB of reads in the Codex stage alone). Both indexes stay.
+
+#### Where a cold sweep's bytes go
+
+| Reader (cold, this change) | Bytes |
+|---|---:|
+| SQLite pages (DB + WAL) re-read while writing 214 K rows | 2.0 GiB (`main`: 2.5 GiB) |
+| Claude transcripts, 46 MiB on disk | 313 MiB (6.8x) |
+| Codex rollouts, 21 MiB | 92 MiB (4.4x) |
+| Cursor transcripts, 21 MiB | 89 MiB (4.3x) |
+| Grok sessions, 21 MiB | 35 MiB (1.7x) |
+
+A 53 KB Claude transcript is read seven times on its first sweep: the metadata
+fold and the record walk each open it (window digest), read it, and re-hash
+the window at commit, and discovery reads its head. Each digest is a
+deliberate guard — the one at commit is what catches a rewrite during the walk
+— and a first sweep is not what a watch loop pays, so this is recorded, not
+changed. Folding the metadata walk into the record walk would halve it. The
+cold sweep is write-bound regardless: `fsync` and `pwrite` are two thirds of
+the Claude walk's samples, and a 64 MiB page cache moved neither the time nor
+the reads.
+
+#### Decisions, revisited
+
+| Technique | Decision |
+|---|---|
+| `rayon` parallel parse | **Reject.** Unchanged: an incremental sweep now reads 0.4 MiB of provider bytes, and parsing was never more than 1% of anything. |
+| `walkdir` / trusted `file_type()` | **Already adopted.** The walk and the fingerprint's `stat`s are most of what an unchanged sweep has left. |
+| Typed / SIMD JSON | **Reject.** Nothing in the profiles moved it. |
+| Sampled-content fingerprints | **Superseded by `ctime`.** A sample is still a read of every file per sweep; a settled `ctime` proves the whole file with none, and the window digest and whole-prefix hash remain the proof it is taken over. |
+
+The CI gate's `ci-debug` thresholds are not tightened here: they are baselined
+per runner class (`ubuntu-latest`), and these numbers come from a developer
+machine. The gate passes with room (`incremental_sync` 89 ms against an 848 ms
+bound, `unchanged_sync` 17 ms against 140 ms locally); re-baselining on the
+gate's machine class is the follow-up.

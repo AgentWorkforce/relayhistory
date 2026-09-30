@@ -132,6 +132,33 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Added
 
+- Grok per-inference usage from `<GROK_HOME>/logs/unified.jsonl` (#212). The
+  process-wide log recent Grok Build releases write is a second Grok source,
+  read from a byte cursor by every sweep and by every Grok hydration before its
+  stamp check, `unchanged` ones included (an unchanged log reads zero bytes),
+  watched as a file of its own and folded into the sweep fingerprint. A log
+  that cannot be read does not fail a hydration; it is reported as
+  `GROK_UNIFIED_LOG_UNREADABLE`. Each usage row is kept in a new
+  `grok_unified_usage` table and stored on the session it names as one
+  text-less assistant event (`raw_kind = "unified_log_usage"`, its own request
+  span) whose `token_json.usage` normalizes as `per-request` usage; an append
+  inserts only its own rows. Rows for a session not indexed yet are retained
+  (and counted in the sweep's note) and attached when it is. Coverage is per
+  turn: a turn with a log row inside its window keeps its
+  `turn_completed.usage` as `turn_usage`, which is not normalized, and a turn
+  the log does not reach keeps its own, so nothing is added twice or dropped.
+  Hydration reports no usage caveat when the log covers every turn,
+  `GROK_USAGE_MIXED_SOURCES` when some turns count their own breakdown, and
+  `GROK_USAGE_PARTIAL` when some have neither. The row shape is inferred from
+  tokscale and documented as such in `docs/session-catalog.md`. Nothing here
+  prices anything: `costUsdTicks` is kept verbatim and never read as a cost.
+- Grok model and metadata fallbacks (#212): a turn's model from
+  `params.update._meta.modelId` or a single-key `turn_completed.usage.modelUsage`
+  (written as `model` in the turn's `token_json` and added to `models_json`);
+  `summary.json` `current_model_id` / `model_id` after `info.model`; and, for a
+  directory with no `summary.json`, the model and start time from the head of
+  `events.jsonl`. `signals.json`'s `totalTokensBeforeCompaction` is named in
+  the `signals` marker.
 - Evidence rows record which side backs them. `session_events`,
   `tool_calls`, `file_edits` and `session_markers` gain `location`
   (`local` / `remote` / `both`). Local parsers stamp `local`, remote intake
@@ -422,8 +449,35 @@ Notable changes to the native `ai-hist` CLI are documented here.
   parent is hidden from the root catalog like any other subagent, and one an
   earlier build catalogued as a root is reclassified on that same pass.
   Hydrating a parent with `include_related` also records its spawned
-  children's fork edges. The replay of the parent's history inside a forked
-  rollout is not gated yet (#210).
+  children's fork edges.
+
+- Gate the parent history a forked Codex rollout replays (#210). Codex copies
+  the parent's `session_meta`, turns and cumulative `token_count` snapshots
+  into a fork's file before the fork's own first turn, and each copy used to
+  be indexed again under the child: the parent's prompts in the child's
+  `history` and `first_prompt`, its messages and tool calls in the child's
+  events, and its whole token total charged to the child's first request.
+  The span is now recognised from explicit evidence only -- it opens at the
+  parent's own `session_meta` reappearing in a rollout that named that parent
+  in `forked_from_id` or `thread_spawn.parent_thread_id`, and closes at the
+  first turn whose UUIDv7 `turn_id` (else `started_at`) is not earlier than
+  the fork (a legacy `started_at` in the fork's own second counts as
+  unordered), or that nothing can order -- and writes one
+  `fork_replay_boundary` marker instead. The last replayed `token_count` is
+  the child's inherited baseline, unless the child's own counter restarts
+  below it. Shallow discovery applies the same rule to `first_prompt`.
+  Rollouts indexed before this are repaired once: `SHALLOW_SCANNER_VERSION`
+  7 -> 8 moves the sweep generation, and the first `sync` re-reads every
+  unchanged fork rollout (`codex_fork_replay_gate` in the sync state),
+  retiring the rows it had indexed for the replayed lines and rewriting the
+  fork's `first_prompt` and `last_assistant_text` (cleared when the fork has
+  no prompt or answer of its own).
+  That cleanup is one-time and runs in `sync` only: hydration does not repeat
+  it, and an older build still writing to the same database can reinsert the
+  duplicates. Whether the inherited baseline was applied or dropped is
+  decided from the child's first `last_token_usage` and recorded on the
+  marker; a replayed legacy turn that cannot be ordered ends the gate early
+  and the rest of that replay is indexed as before.
 
 - Record fork, resume and continuation relationships, not delegation alone.
   `session_relationships.relationship` now takes `continuation | fork | resume`
@@ -457,8 +511,58 @@ Notable changes to the native `ai-hist` CLI are documented here.
   table left the old trigger delivering rows that looked complete and were
   missing a field, for the life of the database.
 
+### Session sourcing for burn
+
+- RelayHistory is becoming the sourcing layer for
+  [burn](https://github.com/AgentWorkforce/burn) (#160). Today burn still
+  reads Claude Code, Codex and OpenCode logs with its own readers. Its cutover
+  release (5.0.0, burn #562) removes them: burn will read usage, tool calls,
+  file edits and session topology from `ai-history.db` through the `ai-hist`
+  crate's `SessionStore`, and price and analyze that evidence. What burn users
+  should expect once 5.0.0 ships: one ingest instead of two, and the `ai-hist`
+  database as the source of truth for both tools, so a session `ai-hist` shows
+  is the session burn costs. Cursor and Grok support in burn is planned to
+  come through this crate (burn #560). Pricing, cost, token estimation and
+  activity classification stay in burn. See
+  `docs/decisions/2026-09-19-relayhistory-owns-session-sourcing.md`.
+- CI checks for the boundary (#183, #184), armed by burn's side of the
+  migration. A `burn-contract-drift` job, for changes under `crates/ai-hist/`,
+  builds burn (main, or the `BURN_REF` repository variable) with its `ai-hist`
+  requirement pointed at the pull request's crate and runs burn's relayhistory
+  parity suite, so a change to message ids, timestamps or usage dedup that
+  would move burn's ledger fails here. It reports a notice and passes until
+  burn depends on `ai-hist` (burn #557). A weekly `burn reader tripwire`
+  workflow fails, and opens a tracking issue here, if burn's harness-parser
+  symbols reappear or its parity suite is missing after its cutover tag,
+  `relayburn-sdk-v5.0.0`.
+
+### Changed
+
+- Internal refactor: one-entry harness registry (#177). Each built-in harness
+  is declared once, as a `LocalSource` descriptor in
+  `crates/ai-hist/src/sources/catalog.rs`, and `SOURCE_CHOICES`,
+  `shallow_providers()`, `DISCOVERY_EXEMPTIONS`, hydration's source validation
+  and parser dispatch, `validate_provider_path`'s roots,
+  `relationship_capabilities`, `resume_command` and the native
+  relationship-identity check are derived from it instead of kept as separate
+  lists. Other per-source code (parsers and full sync, sync watch roots,
+  `Source`, usage accounting, the TypeScript source lists) is not yet on the
+  descriptor; `docs/session-catalog.md` "Adding a provider" lists it. The
+  fixture-corpus registry test now checks that `Source::ALL` names exactly the
+  descriptors and that every descriptor has a fixture directory with committed
+  snapshots or a fixture exemption. Behaviour is unchanged, and so is the
+  default Rust API; the descriptors are readable under `unstable-internal` as
+  `ai_hist::sources::catalog`.
+
 ### Fixed
 
+- Grok reuses an ACP `eventId` across records, and two messages carrying one
+  id were stored under one `ev:<id>` identity, so the second overwrote the
+  first (#212). The first message carrying an id keeps `ev:<id>`, and each
+  later one is `ev:<id>#1`, `#2`, …, so an append that reuses an id never
+  renames a stored message. The `grok_events_v3` sync-state key is retired
+  for `grok_events_v4`, and the hydration parser version moves 13 -> 14, so
+  every Grok session is re-read once by `sync` and by hydration.
 - `ai-hist export` no longer overwrites the database it is reading from
   (#73). The destination is checked against the database the command
   actually opened (`--db` included, not only `AI_HIST_DB`/the default, and
@@ -524,6 +628,45 @@ Notable changes to the native `ai-hist` CLI are documented here.
   (created on the next writable open) serves the sidecar probe. On the 100 MB
   synthetic store, a sync after a 1 KiB append drops from 7.0 s to 2.1 s, and
   a cold sync from 60 s to 43 s, in the benchmark harness (#215).
+- A sweep over files that have not changed no longer re-reads or re-queries
+  them (#42, #215). Measured on the 100 MB synthetic store, a sync after a
+  1 KiB append (what a `watch` event tick or a periodic Reflex sync runs
+  whenever anything moved) drops from 1.77 s and 838 MiB read to 0.39 s and
+  114 MiB; a `watch` tick with nothing changed reads 22 MiB instead of 28 MiB.
+  - Unchanged Claude transcripts and subagent metadata are skipped on a
+    `stat`, on filesystems known to keep a real change time (APFS, HFS+,
+    ext2/3/4, XFS, Btrfs, ZFS, tmpfs, F2FS). Once a window digest has proven
+    a transcript's cursor and the file's change time is more than three
+    seconds old, the cursor records that change time (`settled`); an
+    unchanged `ctime` — which no writer can restore there, unlike an mtime —
+    then proves the bytes without reading them. Any write, truncate, chmod
+    or rename falls back to the digest. Elsewhere — FAT and exFAT, whose
+    "ctime" is the mtime, any filesystem not on the list, and Windows —
+    nothing settles and every skip keeps the digest. A settle is trusted for
+    six hours, then the file is proven by its digest again, so no miss is
+    permanent. Recording it is best-effort and only replaces the cursor
+    document it was proven from, so it cannot roll back a cursor hydration
+    advanced in between.
+  - Unchanged Cursor transcripts and the flat prompt logs are skipped the
+    same way (`settled` on their byte cursor in `.sync-state.json`), and a
+    Cursor transcript that did not advance is no longer hashed a second time
+    to identify a generation nothing used.
+  - The project-identity refresh no longer reads every event row. The stale
+    event probe is driven from the catalog through a new covering index,
+    `idx_session_events_project`, the
+    delegated-thread pass from the relationship ledger, and the path-key
+    upgrade pass reads the catalog once instead of once per directory. A
+    sweep runs the refresh once instead of twice. The first writable open
+    after upgrading builds the index: about 1.6 s and 78 bytes per event
+    for a million events. Until then the schema is not current, so a
+    read-only CLI or change-feed open falls back to a writable one once.
+  - Discovery's locator lookup is a search on `idx_observation_locator`
+    again; with no `sqlite_stat1`, SQLite served its `ORDER BY` from the
+    primary key and walked every observation of the source per file.
+  - A sweep skips per-source sync-state checkpoints whose state did not
+    change, and an unchanged tick whose change-feed head matches the one
+    recorded with the destination marker (`destination_head`) skips
+    recounting every session's evidence.
 
 ### Rust API
 

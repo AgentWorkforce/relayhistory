@@ -6,7 +6,7 @@ use rusqlite::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -22,16 +22,9 @@ pub use crate::relationship_graph::{
     SESSION_RELATIONSHIP_CONTRACT_VERSION,
 };
 
-pub const SOURCE_CHOICES: &[&str] = &[
-    "claude",
-    "codex",
-    "cursor",
-    "grok",
-    "relay",
-    "trajectory",
-    "opencode",
-    "muse",
-];
+/// Every built-in source id, in registry order. Derived from the harness
+/// registry (`sources::catalog`); add a source there, not here.
+pub const SOURCE_CHOICES: &[&str] = crate::sources::catalog::SOURCE_CHOICES;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HistoryEntry {
@@ -649,6 +642,8 @@ const REQUIRED_TABLES: &[&str] = &[
     "session_presences",
     "session_hydration_checkpoints",
     "transcript_cursors",
+    "grok_unified_usage",
+    "grok_session_turns",
     "session_identity_correlations",
     "session_relationships",
     "session_continuity_evidence",
@@ -830,6 +825,9 @@ const REQUIRED_INDEXES: &[&str] = &[
     // The identity listing merges every table in `(source, session_id)`
     // order; the catalog's primary key leads with `session_id`.
     "idx_sessions_identity",
+    // The project-identity refresh runs on every sweep and every discovery
+    // pass; without this it reads every event row to find none stale.
+    "idx_session_events_project",
 ];
 
 /// Indexes no longer created: nothing queries them, or a replacement covers
@@ -1425,6 +1423,33 @@ CREATE TABLE IF NOT EXISTS transcript_cursors (
     updated_ms INTEGER NOT NULL,
     PRIMARY KEY (source, locator)
 );
+-- Per-inference usage rows read from Grok's process-wide, append-only
+-- `logs/unified.jsonl`. The log is read once, from a byte cursor in
+-- `transcript_cursors`, so these rows are the durable copy: a Grok session
+-- read *replaces* its evidence, and each replacement re-materializes that
+-- session's rows from here as `session_events`. A row for a session not yet
+-- in the catalog waits here until the session is indexed. Keyed on a digest
+-- of the whole row, because Grok reuses `eventId` across usage records.
+CREATE TABLE IF NOT EXISTS grok_unified_usage (
+    row_key TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    ts_ms INTEGER,
+    pid INTEGER,
+    model TEXT,
+    event_id TEXT,
+    usage_json TEXT NOT NULL,
+    locator TEXT NOT NULL,
+    line_offset INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_grok_unified_usage_session
+    ON grok_unified_usage(session_id);
+-- How many turns `updates.jsonl` opened, written by the replacing read.
+-- A cached usage caveat is rebuilt from stored rows after a log append, and
+-- a turn that left no row would otherwise disappear from that count.
+CREATE TABLE IF NOT EXISTS grok_session_turns (
+    session_id TEXT PRIMARY KEY,
+    turns INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS session_identity_correlations (
     source TEXT NOT NULL,
     local_session_id TEXT NOT NULL,
@@ -1685,6 +1710,21 @@ VALUES ('session_presences_local_backfill_v1');
     )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_session_events_session ON session_events(source, session_id)",
+        [],
+    )?;
+    // `(source, session_id)` plus the two identity columns, so the project
+    // identity refresh can compare every event of a session with its catalog
+    // row from the index alone instead of reading every event row.
+    //
+    // Beside the bare `(source, session_id)` index rather than replacing it,
+    // though it covers it as a prefix. With no `sqlite_stat1` the planner
+    // ranks an index by how many of its columns a query pins, so a two-column
+    // match on a four-column index loses to a one-column match on
+    // `idx_session_events_role`: replacing it turned every
+    // `source = ? AND session_id = ? AND role = ?` retirement into a scan of
+    // every event with that role, and a cold sync into a quadratic one.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_events_project ON session_events(source, session_id, project_key, project_key_method)",
         [],
     )?;
     // Continuity resolves a transcript's first parent uuid to the session
@@ -3920,15 +3960,29 @@ pub(crate) fn refresh_session_project_identity(
 /// borrowed repository says more about a session than the directory it
 /// happened to run in.
 fn resolve_missing_project_keys(conn: &Connection) -> Result<usize> {
-    let pending: Vec<(Option<String>, Option<String>)> = conn
-        .prepare(
-            "SELECT DISTINCT cwd, repo_url FROM sessions \
+    // Every reconsidered row, with the key it holds, in one read. The UPDATE
+    // below is keyed on `(cwd, repo_url)`, which no index serves, so asking
+    // "does any row of this pair need it?" in SQL was one scan of the catalog
+    // per distinct directory — O(directories x sessions) on every sync and
+    // every discovery pass, to conclude, almost always, that nothing moves.
+    // The same predicate is evaluated here over the rows already read.
+    type Held = (Option<String>, Option<String>);
+    let mut pending: BTreeMap<(Option<String>, Option<String>), Vec<Held>> = BTreeMap::new();
+    {
+        let mut statement = conn.prepare(
+            "SELECT cwd, repo_url, project_key, project_key_method FROM sessions \
              WHERE (project_key IS NULL \
                     OR project_key_method IN ('path', 'inherited')) \
                AND (cwd IS NOT NULL OR repo_url IS NOT NULL)",
-        )?
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<rusqlite::Result<_>>()?;
+        )?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            pending
+                .entry((row.get(0)?, row.get(1)?))
+                .or_default()
+                .push((row.get(2)?, row.get(3)?));
+        }
+    }
     if pending.is_empty() {
         return Ok(0);
     }
@@ -3952,24 +4006,31 @@ fn resolve_missing_project_keys(conn: &Connection) -> Result<usize> {
                  AND (?2 = 'remote' OR project_key <> ?1)) \
              OR (project_key_method = 'inherited' AND ?2 = 'remote')) \
            AND cwd IS ?3 AND repo_url IS ?4";
-    let mut needed = conn.prepare(&format!(
-        "SELECT 1 FROM sessions WHERE {UPGRADABLE} LIMIT 1"
-    ))?;
     let mut update = conn.prepare(&format!(
         "UPDATE sessions SET project_key = ?1, project_key_method = ?2 WHERE {UPGRADABLE}"
     ))?;
     let mut written = 0;
-    for (cwd, repo_url) in pending {
+    for ((cwd, repo_url), held) in pending {
         let Some((key, method)) =
             crate::project_identity::identity_for(cwd.as_deref(), repo_url.as_deref())
         else {
             continue;
         };
-        let arguments = params![key, method.as_str(), cwd, repo_url];
-        if !needed.exists(arguments)? {
+        // `UPGRADABLE`, row by row, over what the read above returned.
+        let remote = method == crate::project_identity::ProjectKeyMethod::Remote;
+        let needed =
+            held.iter().any(
+                |(held_key, held_method)| match (held_key, held_method.as_deref()) {
+                    (None, _) => true,
+                    (Some(held_key), Some("path")) => remote || held_key != &key,
+                    (Some(_), Some("inherited")) => remote,
+                    _ => false,
+                },
+            );
+        if !needed {
             continue;
         }
-        written += update.execute(arguments)?;
+        written += update.execute(params![key, method.as_str(), cwd, repo_url])?;
     }
     Ok(written)
 }
@@ -4221,21 +4282,21 @@ fn event_key_rank_sql(key: &str, method: &str) -> String {
 /// Ranked exactly as the catalog's merge is: nothing may lower a key's rank,
 /// and an equal rank may only be rewritten when the key itself differs.
 fn denormalize_event_project_keys(conn: &Connection) -> Result<usize> {
-    let incoming = event_key_rank_sql(EVENT_SESSION_KEY_SQL, EVENT_SESSION_METHOD_SQL);
-    let stored = event_key_rank_sql("project_key", "project_key_method");
-    let stale = format!(
-        "{EVENT_SESSION_KEY_SQL} IS NOT NULL \
-           AND (({incoming}) > ({stored}) \
-                OR (({incoming}) = ({stored}) \
-                    AND (project_key IS NULL OR project_key <> {EVENT_SESSION_KEY_SQL})))"
-    );
+    // Driven from the catalog, not from the events. An event with no catalog
+    // row has nothing to be brought in line with (that is pass 4's business),
+    // so the stale set is exactly the join below — and asked this way it is
+    // one catalog scan plus a range seek per session into
+    // `idx_session_events_project`, which carries every column the predicate
+    // reads. Asked from the event side it was a scan of the whole
+    // `session_events` table with three correlated catalog lookups per row,
+    // on every sync and every discovery pass: the largest single reader of a
+    // sweep over an unchanged store (#215).
+    let stale = stale_event_project_keys_sql();
     // Probe first, for the same reason pass 2 does: the ingest path already
     // stamps each event as it inserts it, so this pass normally has nothing to
     // do and must not take the write lock to discover that.
     if !conn
-        .prepare(&format!(
-            "SELECT 1 FROM session_events WHERE {stale} LIMIT 1"
-        ))?
+        .prepare(&format!("SELECT 1 {stale} LIMIT 1"))?
         .exists([])?
     {
         return Ok(0);
@@ -4243,10 +4304,40 @@ fn denormalize_event_project_keys(conn: &Connection) -> Result<usize> {
     Ok(conn.execute(
         &format!(
             "UPDATE session_events SET project_key = {EVENT_SESSION_KEY_SQL}, \
-             project_key_method = {EVENT_SESSION_METHOD_SQL} WHERE {stale}"
+             project_key_method = {EVENT_SESSION_METHOD_SQL} \
+             WHERE id IN (SELECT e.id {stale})"
         ),
         [],
     )?)
+}
+
+/// The `FROM ... WHERE` of pass 3: every event whose key is behind its own
+/// catalog row's, as `e`.
+fn stale_event_project_keys_sql() -> String {
+    let incoming = event_key_rank_sql("s.project_key", "s.project_key_method");
+    let stored = event_key_rank_sql("e.project_key", "e.project_key_method");
+    format!(
+        "FROM sessions s CROSS JOIN session_events e \
+           ON e.source = s.source AND e.session_id = s.session_id \
+         WHERE s.project_key IS NOT NULL \
+           AND (({incoming}) > ({stored}) \
+                OR (({incoming}) = ({stored}) \
+                    AND (e.project_key IS NULL OR e.project_key <> s.project_key)))"
+    )
+}
+
+/// Pass 4's candidates: the events of delegated threads the catalog does not
+/// hold, whose key an ancestor could still improve.
+fn uncataloged_delegated_events_sql() -> String {
+    let joined_rank = event_key_rank_sql("e.project_key", "e.project_key_method");
+    format!(
+        "SELECT DISTINCT e.source, e.session_id \
+         FROM session_relationships r CROSS JOIN session_events e \
+           ON e.source = r.source AND e.session_id = r.child_session_id \
+         WHERE NOT EXISTS (SELECT 1 FROM sessions s \
+                 WHERE s.source = e.source AND s.session_id = e.session_id) \
+           AND ({joined_rank}) <= {EVENT_INHERITED_RANK}"
+    )
 }
 
 /// Events of a session the catalog does not hold rank as `inherited` once this
@@ -4295,10 +4386,11 @@ fn inherit_event_project_keys(conn: &Connection) -> Result<usize> {
                  WHERE r.source = session_events.source \
                    AND r.child_session_id = session_events.session_id)"
     );
+    // The same predicate, reached from the relationship ledger: only a
+    // delegated child can match it, and the ledger names every one. Scanning
+    // the events for them instead read the whole table on every refresh.
     let pending: Vec<(String, String)> = conn
-        .prepare(&format!(
-            "SELECT DISTINCT source, session_id FROM session_events WHERE {candidate}"
-        ))?
+        .prepare(&uncataloged_delegated_events_sql())?
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
     if pending.is_empty() {
@@ -4576,41 +4668,11 @@ pub fn list_tags(conn: &Connection) -> Result<Vec<Tag>> {
 }
 
 pub fn resume_command(entry: &HistoryEntry) -> Option<String> {
-    let sid = entry.session_id.as_ref()?;
-    match entry.source.as_str() {
-        "claude" => Some(entry.project.as_ref().map_or_else(
-            || format!("claude --resume {}", shell_quote(sid)),
-            |p| {
-                format!(
-                    "cd {} && claude --resume {}",
-                    shell_quote(p),
-                    shell_quote(sid)
-                )
-            },
-        )),
-        "codex" => Some(format!("codex resume {}", shell_quote(sid))),
-        "cursor" => Some(entry.project.as_ref().map_or_else(
-            || format!("cursor-agent --resume={}", shell_quote(sid)),
-            |p| {
-                format!(
-                    "cd {} && cursor-agent --resume={}",
-                    shell_quote(p),
-                    shell_quote(sid)
-                )
-            },
-        )),
-        "grok" => Some(entry.project.as_ref().map_or_else(
-            || format!("grok resume {}", shell_quote(sid)),
-            |p| format!("cd {} && grok resume {}", shell_quote(p), shell_quote(sid)),
-        )),
-        // `muse resume <id>` finds the session by id; the `cd` puts the
-        // resumed agent back in the workspace it recorded.
-        "muse" => Some(entry.project.as_ref().map_or_else(
-            || format!("muse resume {}", shell_quote(sid)),
-            |p| format!("cd {} && muse resume {}", shell_quote(p), shell_quote(sid)),
-        )),
-        _ => None,
-    }
+    crate::sources::catalog::resume_command(
+        &entry.source,
+        entry.session_id.as_ref()?,
+        entry.project.as_deref(),
+    )
 }
 
 pub fn shell_quote(value: &str) -> String {
@@ -7909,11 +7971,13 @@ mod tests {
     /// references it, so the legacy shape is modelled without it.
     /// Also the index over `provider_message_id`, which SQLite will not let a
     /// column drop leave dangling: a database from before the raw facts had
-    /// neither.
+    /// neither. Likewise the identity index over `project_key`, which a
+    /// database from before project identity did not have either.
     fn drop_session_requests_view(conn: &Connection) {
         conn.execute_batch(
             "DROP VIEW IF EXISTS session_requests; \
-             DROP INDEX IF EXISTS idx_session_events_provider_message;",
+             DROP INDEX IF EXISTS idx_session_events_provider_message; \
+             DROP INDEX IF EXISTS idx_session_events_project;",
         )
         .unwrap();
     }
@@ -7975,6 +8039,120 @@ mod tests {
         assert_eq!(event.is_sidechain, Some(0));
         assert_eq!(event.is_meta, Some(1));
         assert_eq!(event.turn_id.as_deref(), Some("turn_1"));
+    }
+
+    /// A store with enough rows that a scan and a search are distinguishable,
+    /// planned with and without `sqlite_stat1`.
+    fn planned_store(analyze: bool) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for i in 0..40 {
+            conn.execute(
+                "INSERT INTO sessions (session_id, source, raw_path, project_key, project_key_method) \
+                 VALUES (?1, 'codex', ?2, 'github.com/acme/app', 'remote')",
+                params![format!("s{i}"), format!("/t/{i}.jsonl")],
+            )
+            .unwrap();
+            for n in 0..20 {
+                conn.execute(
+                    "INSERT INTO session_events \
+                     (source, session_id, ts_ms, role, kind, text, event_uid, \
+                      project_key, project_key_method) \
+                     VALUES ('codex', ?1, ?2, ?3, 'text', 'hi', ?4, \
+                             'github.com/acme/app', 'remote')",
+                    params![
+                        format!("s{i}"),
+                        n,
+                        if n % 2 == 0 { "user" } else { "assistant" },
+                        format!("s{i}-e{n}")
+                    ],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO session_relationships \
+                 (source, parent_session_id, relationship_uid, child_session_id, \
+                  relationship, identity_status, evidence_kind, evidence_locator, \
+                  created_ms, updated_ms) \
+                 VALUES ('codex', ?1, ?2, ?2, 'subagent', 'observed', 'rollout', NULL, 0, 0)",
+                params![format!("s{i}"), format!("c{i}")],
+            )
+            .unwrap();
+        }
+        if analyze {
+            conn.execute_batch("ANALYZE").unwrap();
+        }
+        conn
+    }
+
+    fn query_plan(conn: &Connection, sql: &str) -> Vec<String> {
+        conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    /// The identity refresh runs twice per sweep and once per discovery pass,
+    /// over a table that is most of the store. Both event passes have to be
+    /// answered from `idx_session_events_project` and driven from the small
+    /// side of their join — the catalog, the relationship ledger — never by
+    /// reading every event row (#215).
+    #[test]
+    fn project_identity_refresh_never_scans_the_events() {
+        for analyze in [false, true] {
+            let conn = planned_store(analyze);
+            for (name, sql) in [
+                (
+                    "pass 3 probe",
+                    format!("SELECT 1 {} LIMIT 1", stale_event_project_keys_sql()),
+                ),
+                ("pass 4 candidates", uncataloged_delegated_events_sql()),
+            ] {
+                let steps = query_plan(&conn, &sql);
+                let joined = steps.join(" | ");
+                assert!(
+                    !steps.iter().any(|step| step.starts_with("SCAN")
+                        && step.contains("session_events")
+                        || step.starts_with("SCAN e")),
+                    "{name} scans the events (analyze={analyze}): {joined}"
+                );
+                assert!(
+                    joined.contains("COVERING INDEX idx_session_events_project"),
+                    "{name} reads event rows instead of the identity index \
+                     (analyze={analyze}): {joined}"
+                );
+            }
+            // Behaviour, not only the plan: a settled store has nothing stale.
+            assert_eq!(refresh_project_identity(&conn).unwrap(), 0);
+        }
+    }
+
+    /// The identity index covers `(source, session_id)` as a prefix, and that
+    /// is exactly why it must not replace the bare index: with no statistics
+    /// the planner ranks a two-of-four match below a one-of-one match on
+    /// `idx_session_events_role`, and every `source, session_id, role`
+    /// retirement then walked every event with that role — a cold sync went
+    /// quadratic. Keep that retirement a search on the session.
+    #[test]
+    fn a_session_scoped_retirement_seeks_the_session_not_the_role() {
+        for analyze in [false, true] {
+            let conn = planned_store(analyze);
+            for sql in [
+                "DELETE FROM session_events WHERE (source = 'codex' AND session_id = 's1' \
+                 AND role = 'user') AND location = 'local'",
+                "UPDATE session_events SET location = 'remote' WHERE (source = 'codex' \
+                 AND session_id = 's1' AND role = 'user') AND location = 'both'",
+            ] {
+                let joined = query_plan(&conn, sql).join(" | ");
+                assert!(
+                    joined.contains("session_id=?") && !joined.contains("idx_session_events_role"),
+                    "a session-scoped retirement is not keyed on the session \
+                     (analyze={analyze}): {joined}"
+                );
+            }
+        }
     }
 }
 

@@ -235,7 +235,7 @@ server.tool('get_source_capabilities', 'What one provider\'s parser can record, 
 
 const REQUEST_CURSOR = z.object({ tsMs: z.number().int(), id: z.number().int() });
 
-server.tool('get_session_requests', 'Get one bounded page of a session\'s model requests, with usage normalized. One row per API request: Claude\'s per-content-block copies of message.usage are collapsed, so these can be summed where raw events cannot.', {
+server.tool('get_session_requests', 'Get one bounded page of a session\'s model requests, with usage normalized. One row per API request: Claude\'s per-content-block copies of message.usage are collapsed, so these can be summed where raw events cannot. Usage is provider-reported; cost appears only when the source data carried one and is never computed.', {
   source: SOURCE, session_id: z.string().min(1),
   limit: z.number().int().min(1).max(1000).optional().default(200),
   after: REQUEST_CURSOR.optional(),
