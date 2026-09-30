@@ -48,16 +48,24 @@ and `crates/ai-hist-napi/src/lib.rs`).
    publishes nothing. A crates.io-only retry uses `skip_core` with the
    already-published `custom_version`; the job checks out `sdk-ts-v<version>`
    and publishes the crate from that tag.
-5. After the clean registry install and the older-glibc CLI smoke tests pass,
-   `publish` tags the published tree as `sdk-ts-v<version>` and creates the
-   GitHub Release. A separate `persist-version` job rebases the version-only
-   commit onto the current branch tip and pushes, so a merge that landed
-   during publish does not drop the tag. Crate and plugins depend on
-   `publish` (the tag), not on that persist. A rebase conflict still leaves
-   the tag and Release in place; `skip_core` with this `custom_version`
-   finishes anything that did not. The registry smoke installs `ai-hist` as
-   an ordinary dependency with npm's `--libc` set to this runner's family so
-   `ai-hist-native-linux-x64-gnu` (or musl) is selected.
+5. On a real publish, before building and again immediately before publishing,
+   the workflow checks for an existing recovery tag. A tagged version must be
+   resumed with `skip_core` and its `custom_version`, even if npm still
+   returns 404 while processing it. `publish` also checks whether the release
+   version became visible on npm while the build matrix ran. Once all npm publish commands
+   succeed, it tags the published tree as `sdk-ts-v<version>`. `verify-core`
+   waits up to 70 minutes for npm's processing queue, then runs the clean registry
+   install and older-glibc CLI smoke tests. `finalize-core` creates the GitHub
+   Release only after those tests pass. A separate `persist-version` job rebases
+   the version-only commit onto the current branch tip and pushes, so a merge
+   that landed during publish does not drop the tag. Crate and plugins depend
+   on the verified core, not on that persist. If npm accepts a publish but keeps
+   its version in processing beyond the wait, or a later gate fails, rerun with
+   `skip_core` and this `custom_version` once npm exposes the packages. The
+   tag preserves the exact tree without republishing immutable versions. The
+   registry smoke installs `ai-hist` as an ordinary dependency with npm's
+   `--libc` set to this runner's family so `ai-hist-native-linux-x64-gnu`
+   (or musl) is selected.
 6. `plugins` checks out the tagged published tree, packages each helper binary at
    the release version, verifies staged tarballs, verifies the *published* core
    at each plugin's peer minimum, then publishes the seven helpers of each

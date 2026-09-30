@@ -87,6 +87,7 @@ jobs:
           VERSION_TYPE: ${{ inputs.version }}
           CUSTOM_VERSION: ${{ inputs.custom_version }}
           SKIP_CORE: ${{ inputs.skip_core }}
+          DRY_RUN: ${{ inputs.dry_run }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -146,6 +147,15 @@ jobs:
               exit 1
             fi
             echo "Re-running plugins from the tag sdk-ts-v$VERSION"
+          elif [ "$DRY_RUN" != "true" ]; then
+            # npm may still report E404 for a publish it already accepted.
+            # Only real publishes need this guard; a dry run can validate an
+            # already tagged version without changing the registry.
+            matching_tags=$(gh api "repos/${{ github.repository }}/git/matching-refs/tags/sdk-ts-v$VERSION" --jq '.[].ref')
+            if printf '%s\n' "$matching_tags" | grep -Fxq "refs/tags/sdk-ts-v$VERSION"; then
+              echo "Release tag sdk-ts-v$VERSION already exists; resume with skip_core=true and custom_version=$VERSION instead of republishing" >&2
+              exit 1
+            fi
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Release version $VERSION"
@@ -469,9 +479,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # A real release tags the published tree once publishing and the
-          # registry smoke tests succeed; persist-version then rebases that
-          # commit onto the branch.
+          # A real release tags the published tree once npm accepts every
+          # package; persist-version rebases that commit after verification.
           persist-credentials: true
       - uses: actions/setup-node@v6
         with:
@@ -634,6 +643,23 @@ jobs:
       - name: Upgrade npm for OIDC
         if: ${{ !inputs.dry_run }}
         run: npm install -g npm@11.19.1
+      # The version was resolved before the build matrix. Another publisher
+      # may have claimed it while the binaries were compiling; catch that
+      # before this run publishes any of its ten npm packages.
+      - name: Recheck release version availability
+        if: ${{ !inputs.dry_run }}
+        working-directory: .
+        run: |
+          set -euo pipefail
+          # The tag may have appeared while the build matrix was running.
+          # git ls-remote fails closed on transport errors, unlike a lookup
+          # that treats every failed command as an absent tag.
+          tag=$(git ls-remote --tags origin "refs/tags/sdk-ts-v$VERSION")
+          if [ -n "$tag" ]; then
+            echo "Release tag sdk-ts-v$VERSION already exists; resume with skip_core=true and custom_version=$VERSION instead of republishing" >&2
+            exit 1
+          fi
+          node scripts/check-release-version-available.mjs
       - name: Publish
         env:
           DRY_RUN: ${{ inputs.dry_run }}
@@ -709,25 +735,10 @@ jobs:
           set -euo pipefail
           if [ "$DRY_RUN" != "true" ]; then npm publish --access public; fi
 
-      # Confirm all packages are visible before the compatibility gates. This
-      # gives the registry time to converge without retrying every install.
-      - name: Registry visibility gate
-        if: ${{ !inputs.dry_run }}
-        working-directory: .
-        env:
-          REGISTRY_VISIBILITY_ATTEMPTS: 36
-          REGISTRY_VISIBILITY_DELAY_MS: 10000
-        run: |
-          node --input-type=module - "$VERSION" <<'NODE'
-          import { waitForRegistryPackages } from "./scripts/registry-clean-install-smoke.mjs";
-          const attempts = Number(process.env.REGISTRY_VISIBILITY_ATTEMPTS);
-          const delayMs = Number(process.env.REGISTRY_VISIBILITY_DELAY_MS);
-          await waitForRegistryPackages(process.argv[2], { attempts, delayMs });
-          NODE
-
-      # Push the immutable recovery point as soon as npm confirms visibility.
-      # If a later runtime gate fails, skip_core can verify this exact tree and
-      # finish the release without trying to republish immutable npm versions.
+      # npm can accept a publish and keep it in processing for longer than a
+      # registry gate. Save the immutable recovery point after every publish
+      # command succeeds, before waiting for public visibility in verify-core.
+      # A later skip_core run can then resume without republishing the version.
       - name: Tag the published tree
         id: tag-published-tree
         if: ${{ !inputs.dry_run }}
@@ -751,6 +762,7 @@ jobs:
     # the existing tagged release before resuming any downstream mutation.
     if: ${{ !cancelled() && !inputs.dry_run && needs.version.result == 'success' && (inputs.skip_core || needs.publish.result == 'success') }}
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     permissions:
       contents: read
     defaults:
@@ -771,8 +783,11 @@ jobs:
         run: npm install -g npm@11.19.1
       - name: Registry clean-install smoke test
         env:
-          REGISTRY_VISIBILITY_ATTEMPTS: 36
-          REGISTRY_VISIBILITY_DELAY_MS: 10000
+          # npm's post-publish processing can exceed the old six-minute gate.
+          # Keep a bounded wait, then allow skip_core to resume from the tag.
+          REGISTRY_VISIBILITY_ATTEMPTS: 150
+          REGISTRY_VISIBILITY_DELAY_MS: 20000
+          REGISTRY_VISIBILITY_MAX_WAIT_MS: 4200000
           NPM_REGISTRY_RETRY_ATTEMPTS: 36
           NPM_REGISTRY_RETRY_DELAY_MS: 10000
         run: node scripts/registry-clean-install-smoke.mjs

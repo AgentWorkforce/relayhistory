@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   coreSmokeManifest,
+  npmViewVersion,
   REGISTRY_RELEASE_PACKAGES,
   waitForRegistryPackages,
 } from './registry-clean-install-smoke.mjs';
@@ -59,4 +60,60 @@ test('waitForRegistryPackages fails with the remaining package names', async () 
     (error) => error.missing.length === REGISTRY_RELEASE_PACKAGES.length - 1
       && error.missing.includes('ai-hist-mcp'),
   );
+});
+
+test('npm view treats only E404 as absent and uses the public registry', () => {
+  let args;
+  let options;
+  const absent = npmViewVersion('ai-hist@0.32.1', (commandArgs, commandOptions) => {
+    args = commandArgs;
+    options = commandOptions;
+    return { status: 1, stderr: 'npm error code E404' };
+  });
+  assert.equal(absent, null);
+  assert.ok(args.includes('--prefer-online'));
+  assert.ok(args.includes('--registry=https://registry.npmjs.org/'));
+  assert.equal(options.env.NODE_AUTH_TOKEN, undefined);
+  assert.throws(
+    () => npmViewVersion('ai-hist@0.32.1', () => ({ status: 1, stderr: 'npm error code ENOTFOUND' })),
+    /ENOTFOUND/,
+  );
+});
+
+test('waitForRegistryPackages reports lookup errors separately from missing versions', async () => {
+  await assert.rejects(
+    waitForRegistryPackages('0.32.1', {
+      attempts: 1,
+      log: () => {},
+      view: (spec) => {
+        if (spec === 'ai-hist@0.32.1') throw new Error('ENOTFOUND');
+        return null;
+      },
+    }),
+    (error) => error.missing.length === REGISTRY_RELEASE_PACKAGES.length - 1
+      && error.lookupErrors.length === 1
+      && error.lookupErrors[0].includes('ENOTFOUND'),
+  );
+});
+
+test('waitForRegistryPackages stops on elapsed time before the job timeout', async () => {
+  let time = 0;
+  let lookups = 0;
+  const waits = [];
+  await assert.rejects(
+    waitForRegistryPackages('0.32.2', {
+      attempts: 150,
+      delayMs: 20,
+      maxWaitMs: 50,
+      now: () => time,
+      sleep: async (ms) => { waits.push(ms); time += ms; },
+      log: () => {},
+      view: () => { lookups += 1; time += 1; throw new Error('ETIMEDOUT'); },
+    }),
+    (error) => error.lookupErrors.length === REGISTRY_RELEASE_PACKAGES.length
+      && error.message.includes('ETIMEDOUT')
+      && error.message.includes('after 3 attempts'),
+  );
+  assert.equal(lookups, REGISTRY_RELEASE_PACKAGES.length * 3);
+  assert.deepEqual(waits, [20, 10]);
 });
