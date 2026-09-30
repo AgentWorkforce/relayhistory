@@ -23,6 +23,7 @@
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{Map, Value};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -138,6 +139,20 @@ pub(crate) fn table_columns(src: &Connection, table: &str) -> Result<BTreeSet<St
     Ok(columns)
 }
 
+/// `name` when the `sessions` table has that column, else SQL `NULL`.
+///
+/// Only `id` is required of a Devin store; every other `sessions` column is
+/// read as absent when an older or newer CLI did not write it, exactly as
+/// discovery reads it, so a store discovery can list is never one sync or
+/// hydration fails on.
+fn optional_column<'a>(columns: &BTreeSet<String>, name: &'a str) -> &'a str {
+    if columns.contains(name) {
+        name
+    } else {
+        "NULL"
+    }
+}
+
 /// Whether `sessions.db` has the layout this adapter parses.
 ///
 /// Returns `false` rather than erroring on a missing file or absent tables so
@@ -174,18 +189,27 @@ pub(crate) fn load_from_sqlite(
     session_id: &str,
     cli_dir: &Path,
 ) -> Result<Option<DevinSession>> {
-    let has_hidden = table_columns(src, "sessions")?.contains("hidden");
-    let hidden_pred = if has_hidden {
+    let columns = table_columns(src, "sessions")?;
+    let hidden_pred = if columns.contains("hidden") {
         "COALESCE(hidden, 0) = 0"
     } else {
         "1=1"
     };
+    let column = |name| optional_column(&columns, name);
     let info = src
         .query_row(
             &format!(
-                "SELECT id, title, working_directory, backend_type, model, agent_mode, \
-                 created_at, last_activity_at, workspace_dirs, metadata \
-                 FROM sessions WHERE id = ?1 AND {hidden_pred}"
+                "SELECT id, {}, {}, {}, {}, {}, {}, {}, {}, {} \
+                 FROM sessions WHERE id = ?1 AND {hidden_pred}",
+                column("title"),
+                column("working_directory"),
+                column("backend_type"),
+                column("model"),
+                column("agent_mode"),
+                column("created_at"),
+                column("last_activity_at"),
+                column("workspace_dirs"),
+                column("metadata"),
             ),
             params![session_id],
             |row| {
@@ -312,14 +336,16 @@ fn load_transcript_meta(path: &Path) -> Option<DevinTranscriptMeta> {
 
 /// The session ids the sweep should consider — everything not `hidden`.
 pub(crate) fn list_session_ids(src: &Connection) -> Result<Vec<String>> {
-    let hidden_pred = if table_columns(src, "sessions")?.contains("hidden") {
+    let columns = table_columns(src, "sessions")?;
+    let hidden_pred = if columns.contains("hidden") {
         "COALESCE(hidden, 0) = 0"
     } else {
         "1=1"
     };
+    let created_at = optional_column(&columns, "created_at");
     let mut stmt = src.prepare(&format!(
         "SELECT id FROM sessions WHERE id <> '' AND {hidden_pred} \
-         ORDER BY created_at ASC, id ASC"
+         ORDER BY {created_at} ASC, id ASC"
     ))?;
     let mut ids = Vec::new();
     let mut rows = stmt.query([])?;
@@ -384,20 +410,31 @@ pub(crate) fn session_stamp(
     session_id: &str,
     transcripts_dir: &Path,
 ) -> Result<Option<String>> {
-    let hidden_pred = if table_columns(src, "sessions")?.contains("hidden") {
+    let columns = table_columns(src, "sessions")?;
+    let hidden_pred = if columns.contains("hidden") {
         "COALESCE(hidden, 0) = 0"
     } else {
         "1=1"
     };
+    let column = |name| optional_column(&columns, name);
     let head: Option<(i64, i64)> = src
         .query_row(
             &format!(
-                "SELECT COALESCE(last_activity_at, 0), ai_hist_fnv(\
-                 COALESCE(title, '') || '|' || COALESCE(working_directory, '') || '|' || \
-                 COALESCE(workspace_dirs, '') || '|' || COALESCE(model, '') || '|' || \
-                 COALESCE(agent_mode, '') || '|' || COALESCE(backend_type, '') || '|' || \
-                 COALESCE(metadata, '') || '|' || COALESCE(created_at, -1)) \
-                 FROM sessions WHERE id = ?1 AND {hidden_pred}"
+                "SELECT COALESCE({}, 0), ai_hist_fnv(\
+                 COALESCE({}, '') || '|' || COALESCE({}, '') || '|' || \
+                 COALESCE({}, '') || '|' || COALESCE({}, '') || '|' || \
+                 COALESCE({}, '') || '|' || COALESCE({}, '') || '|' || \
+                 COALESCE({}, '') || '|' || COALESCE({}, -1)) \
+                 FROM sessions WHERE id = ?1 AND {hidden_pred}",
+                column("last_activity_at"),
+                column("title"),
+                column("working_directory"),
+                column("workspace_dirs"),
+                column("model"),
+                column("agent_mode"),
+                column("backend_type"),
+                column("metadata"),
+                column("created_at"),
             ),
             params![session_id],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
@@ -458,13 +495,47 @@ fn str_field<'a>(value: Option<&'a Value>, key: &str) -> Option<&'a str> {
         .filter(|s| !s.is_empty())
 }
 
-/// The text of a `content` field that is a plain string.
-fn content_text(message: Option<&Value>) -> Option<&str> {
-    message
-        .and_then(|m| m.get("content"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
+/// The readable text of a `content` field.
+///
+/// The CLI writes a plain string. A parts array — string items, or objects
+/// carrying a string `text` whose `type` is `text` or absent — is read as the
+/// parts' text joined by newlines, so a turn written that way is not lost;
+/// any other part (an image, say) contributes nothing.
+fn content_text(message: Option<&Value>) -> Option<Cow<'_, str>> {
+    match message?.get("content")? {
+        Value::String(text) => Some(Cow::Borrowed(text.trim())),
+        Value::Array(parts) => Some(Cow::Owned(
+            parts
+                .iter()
+                .filter_map(|part| match part {
+                    Value::String(text) => Some(text.as_str()),
+                    Value::Object(part) => part
+                        .get("type")
+                        .is_none_or(|kind| kind == "text")
+                        .then(|| part.get("text").and_then(Value::as_str))
+                        .flatten(),
+                    _ => None,
+                })
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )),
+        _ => None,
+    }
+    .filter(|text| !text.is_empty())
+}
+
+/// The JSON type of a `content` field that is present and not null.
+fn content_type(message: &Value) -> Option<&'static str> {
+    Some(match message.get("content")? {
+        Value::Null => return None,
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    })
 }
 
 /// Map one `tool_call_state` update status onto the canonical vocabulary.
@@ -761,6 +832,7 @@ fn normalize_inner(
                             kind: "synthetic_turn",
                             subkind: Some("user"),
                             text: content_text(Some(message))
+                                .as_deref()
                                 .map(super::truncate_marker_text)
                                 .as_deref(),
                             payload_json: None,
@@ -768,7 +840,7 @@ fn normalize_inner(
                     )?;
                     continue;
                 }
-                if let Some(text) = content_text(Some(message)) {
+                if let Some(text) = content_text(Some(message)).as_deref() {
                     let uid = format!("n{}:text", node.node_id);
                     present_events.insert(uid.clone());
                     super::insert_session_event(
@@ -806,6 +878,31 @@ fn normalize_inner(
                             timestamp_ms: ts,
                         },
                     )?;
+                } else if let Some(content_type) = content_type(message) {
+                    // A turn the human sent whose content holds no text this
+                    // parser can read. It is not a prompt, but it happened:
+                    // record that it did, and in what shape, without copying
+                    // the payload itself.
+                    let uid = format!("n{}:unsupported", node.node_id);
+                    present_markers.insert(uid.clone());
+                    counts.markers += insert_session_marker(
+                        conn,
+                        SOURCE,
+                        session_id,
+                        &NewSessionMarker {
+                            marker_uid: &uid,
+                            ts_ms: Some(ts),
+                            message_id: Some(&message_id),
+                            parent_id: parent_id.as_deref(),
+                            turn_id: None,
+                            kind: "unsupported_block",
+                            subkind: Some("user_content"),
+                            text: None,
+                            payload_json: Some(
+                                &serde_json::json!({ "content_type": content_type }).to_string(),
+                            ),
+                        },
+                    )?;
                 }
             }
             "assistant" | "final_answer" => {
@@ -839,7 +936,7 @@ fn normalize_inner(
                     )?;
                     counts.events += 1;
                 }
-                if let Some(text) = content_text(Some(message)) {
+                if let Some(text) = content_text(Some(message)).as_deref() {
                     let uid = format!("n{}:text", node.node_id);
                     present_events.insert(uid.clone());
                     super::insert_session_event(
@@ -970,6 +1067,7 @@ fn normalize_inner(
                     facts.error_signal = Some(ERROR_SIGNAL_TOOL_STATUS.to_string());
                 }
                 let text = content_text(Some(message));
+                let text = text.as_deref();
                 let uid = format!("n{}:result:{tool_use_id}", node.node_id);
                 present_events.insert(uid.clone());
                 super::insert_session_event(
@@ -1013,6 +1111,7 @@ fn normalize_inner(
                         kind: "system",
                         subkind: None,
                         text: content_text(Some(message))
+                            .as_deref()
                             .map(super::truncate_marker_text)
                             .as_deref(),
                         payload_json: None,
@@ -1035,6 +1134,7 @@ fn normalize_inner(
                         kind: "unknown",
                         subkind: if other.is_empty() { None } else { Some(other) },
                         text: content_text(Some(message))
+                            .as_deref()
                             .map(super::truncate_marker_text)
                             .as_deref(),
                         payload_json: None,

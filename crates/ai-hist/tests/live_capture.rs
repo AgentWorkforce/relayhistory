@@ -1861,7 +1861,7 @@ fn a_sweep_turned_away_by_another_sync_is_retried_not_dropped() {
         let home = home.path().to_path_buf();
         Arc::new(move |force| {
             // Exactly what the CLI's watch tick does.
-            pin_devin_root(&home);
+            pin_devin_root();
             let tick = ai_hist::sync_tick_at_with_home(&db, &home, SyncOutput::Silent, force)?;
             let _ = ticks.send(tick);
             Ok(ai_hist::watch::TickOutcome::from(tick))
@@ -1976,7 +1976,7 @@ fn a_sweep_that_failed_is_retried_not_dropped() {
         let db = db.clone();
         let home = home.path().to_path_buf();
         Arc::new(move |force| {
-            pin_devin_root(&home);
+            pin_devin_root();
             let outcome = ai_hist::sync_tick_at_with_home(&db, &home, SyncOutput::Silent, force)
                 .map(ai_hist::watch::TickOutcome::from);
             let _ = ticks.send(outcome.is_ok());
@@ -3882,19 +3882,32 @@ fn a_stamp_from_another_parser_generation_does_not_skip_the_sweep() {
 // helpers
 // ---------------------------------------------------------------------------
 
-/// The Devin root is resolved through `XDG_DATA_HOME`, a process-wide variable
-/// many development machines have set. Left alone it would point a synthetic
-/// home's sweep at the developer's real store — a live database whose
-/// fingerprint moves on every tick and disarms the fast path forever. Pin it
-/// under the test home so the sweep sees only what the test wrote. Concurrent
-/// tests may interleave their own pins; every such target is a nonexistent
-/// directory under a tempdir, which reads as "no Devin store" either way.
-fn pin_devin_root(home: &Path) {
-    std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+/// The Devin and Muse roots are resolved through `XDG_DATA_HOME`, a
+/// process-wide variable many development machines have set. Left alone it
+/// would point a synthetic home's sweep at the developer's real store — a live
+/// database whose fingerprint moves on every tick and disarms the fast path
+/// forever.
+///
+/// It is written once per process, to one directory that never exists, which
+/// reads as "no store" for every test. Re-pinning it per test instead raced:
+/// parallel tests rewrote the variable while another test's sweep (or SQLite,
+/// through libc `getenv`) was reading it, and a test's sweep could resolve
+/// another test's roots. No test here reads an XDG-derived root under its own
+/// home; the ones that need a Muse or Devin root build `ProviderRoots`
+/// explicitly.
+fn pin_devin_root() {
+    static PINNED: std::sync::Once = std::sync::Once::new();
+    PINNED.call_once(|| {
+        let absent = std::env::temp_dir().join(format!(
+            "ai-hist-live-capture-no-xdg-data-{}",
+            std::process::id()
+        ));
+        std::env::set_var("XDG_DATA_HOME", absent);
+    });
 }
 
 fn sync_tick(db: &Path, home: &Path, force: bool) -> ai_hist::SyncTick {
-    pin_devin_root(home);
+    pin_devin_root();
     ai_hist::sync_tick_at_with_home(db, home, SyncOutput::Silent, force).expect("sync tick")
 }
 

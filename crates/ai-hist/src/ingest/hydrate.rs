@@ -1619,6 +1619,15 @@ fn source_snapshot(
             )
         })?;
         let path = PathBuf::from(locator);
+        // A store that is gone is unavailable, not a provenance mismatch:
+        // either the row names the configured path itself, or there is no
+        // configured store left for it to have been superseded by.
+        if !path.is_file() && (path == configured_path || !configured_path.is_file()) {
+            return Err(hydration_error(
+                "SESSION_SOURCE_UNAVAILABLE",
+                format!("Devin source {} is unavailable", path.display()),
+            ));
+        }
         // The catalog locator is the store path itself, so a row can only
         // name the configured `sessions.db` — anything else is provenance a
         // rediscovery must re-establish, never a path to open.

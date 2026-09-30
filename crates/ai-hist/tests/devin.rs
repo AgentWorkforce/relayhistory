@@ -1509,3 +1509,128 @@ fn devin_retired_stamp_stays_out_of_the_persisted_state() {
         "a retired stamp stays retired on the next sync"
     );
 }
+
+#[test]
+fn devin_store_without_optional_session_columns_still_syncs() {
+    // Only `id` is required of `sessions`: discovery already reads every
+    // other column as absent, so sync must not fail the sweep over them.
+    let _lock = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let cli_dir = devin_cli_dir(home);
+    fs::create_dir_all(&cli_dir).unwrap();
+    let conn = Connection::open(cli_dir.join("sessions.db")).unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE sessions (id TEXT PRIMARY KEY);
+        CREATE TABLE message_nodes (
+          row_id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
+          node_id INTEGER NOT NULL, parent_node_id INTEGER,
+          chat_message TEXT NOT NULL, created_at INTEGER NOT NULL, metadata TEXT);
+        CREATE TABLE tool_call_state (
+          session_id TEXT NOT NULL, tool_call_id TEXT NOT NULL,
+          tool_call_json TEXT, tool_call_update_json TEXT,
+          PRIMARY KEY (session_id, tool_call_id));
+        INSERT INTO sessions (id) VALUES ('devin-bare');
+        INSERT INTO message_nodes (session_id, node_id, parent_node_id, chat_message, created_at)
+        VALUES ('devin-bare', 0, NULL, '{"role":"user","content":"bare prompt"}', 1776643201);
+        "#,
+    )
+    .unwrap();
+    drop(conn);
+    let _env = EnvGuard::set(home);
+    let db = home.join("history.db");
+
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+
+    let conn = open_db(&db).unwrap();
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM history WHERE source='devin' AND session_id='devin-bare' \
+             AND prompt='bare prompt'"
+        ),
+        1
+    );
+}
+
+#[test]
+fn devin_user_turns_with_non_string_content_are_kept() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    stage_devin_db(
+        home,
+        r#"
+        INSERT INTO sessions
+          (id, working_directory, backend_type, model, agent_mode, created_at,
+           last_activity_at, title, workspace_dirs, hidden, metadata)
+        VALUES ('devin-parts', '/work/repo', 'devin', 'test-model', 'normal',
+                1776643200, 1776643203, NULL, NULL, 0, NULL);
+        INSERT INTO message_nodes
+          (session_id, node_id, parent_node_id, chat_message, created_at, metadata)
+        VALUES
+          ('devin-parts', 0, NULL,
+           '{"message_id":"u0","role":"user","content":[{"type":"text","text":"look at this"},{"type":"image","data":"AAAA"},"and this"]}',
+           1776643201, NULL),
+          ('devin-parts', 1, 0,
+           '{"message_id":"u1","role":"user","content":[{"type":"image","data":"AAAA"}]}',
+           1776643202, NULL);
+        "#,
+    );
+    let _env = EnvGuard::set(home);
+    let db = home.join("history.db");
+
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+
+    let conn = open_db(&db).unwrap();
+    // The text parts of a parts array are the prompt; other parts are not.
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM history WHERE source='devin' \
+             AND prompt='look at this\nand this'"
+        ),
+        1
+    );
+    // A turn with no readable text is recorded by shape, never by payload.
+    let markers = session_markers(&conn, "devin", "devin-parts").unwrap();
+    let unsupported: Vec<_> = markers
+        .iter()
+        .filter(|m| m.kind == "unsupported_block")
+        .collect();
+    assert_eq!(unsupported.len(), 1, "{markers:?}");
+    assert_eq!(unsupported[0].subkind.as_deref(), Some("user_content"));
+    assert_eq!(
+        unsupported[0].payload_json.as_deref(),
+        Some(r#"{"content_type":"array"}"#)
+    );
+}
+
+#[test]
+fn devin_hydration_of_a_deleted_store_is_unavailable_not_a_mismatch() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let store = stage_devin_db(home, BASE_SESSION_SQL);
+    let _env = EnvGuard::set(home);
+    let db = home.join("history.db");
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+
+    fs::remove_file(&store).unwrap();
+    let error = hydrate_session_at(
+        &db,
+        &HydrateSessionOptions {
+            source: "devin".into(),
+            session_id: "devin-test".into(),
+            scope: SessionScope::Local,
+            include_related: false,
+        },
+    )
+    .unwrap_err();
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("SESSION_SOURCE_UNAVAILABLE"),
+        "a deleted store is unavailable: {message}"
+    );
+}
