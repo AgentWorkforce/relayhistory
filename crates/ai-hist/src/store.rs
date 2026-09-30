@@ -1271,17 +1271,47 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     init_db_once(conn)
 }
 
-/// Whether [`init_db`] has migration work to do on this database.
-///
-/// Read-only, so a front end can ask before opening for write and tell its
-/// user that the first open after an upgrade is a one-time migration rather
-/// than a hang. A leftover retired index counts as outstanding work: its DROP
-/// is a real write.
-pub fn needs_migration(conn: &Connection) -> Result<bool> {
+/// Whether [`init_db`] has migration work to do on this database. A leftover
+/// retired index counts as outstanding work: its DROP is a real write.
+fn needs_migration(conn: &Connection) -> Result<bool> {
     Ok(!schema_is_current(conn)?
         || retired_indexes_present(conn)?
         || retired_capture_present(conn)?
         || retired_trajectory_index_present(conn)?)
+}
+
+/// A schema migration an open in this process runs on an existing database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationEvent {
+    /// The migration holds the write lock and is about to run.
+    Started,
+    /// The migration committed.
+    Finished,
+}
+
+type MigrationObserver = Box<dyn Fn(MigrationEvent, Option<&str>) + Send + Sync>;
+
+static MIGRATION_OBSERVER: std::sync::OnceLock<MigrationObserver> = std::sync::OnceLock::new();
+
+/// Register the process's migration observer, called with each
+/// [`MigrationEvent`] and the database's path.
+///
+/// A migration after an upgrade can run for minutes on a large history, and a
+/// front end that says nothing reads as hung. Events fire only when an open
+/// actually migrates an existing database -- never for a new database, a
+/// current one, or a command that never opens for write -- so a front end
+/// announces exactly the work that happens. The first registration wins;
+/// returns false when an observer is already set.
+pub fn observe_migrations(
+    observer: impl Fn(MigrationEvent, Option<&str>) + Send + Sync + 'static,
+) -> bool {
+    MIGRATION_OBSERVER.set(Box::new(observer)).is_ok()
+}
+
+fn notify_migration(conn: &Connection, event: MigrationEvent) {
+    if let Some(observer) = MIGRATION_OBSERVER.get() {
+        observer(event, conn.path());
+    }
 }
 
 fn init_db_once(conn: &Connection) -> Result<()> {
@@ -1299,10 +1329,23 @@ fn init_db_once(conn: &Connection) -> Result<()> {
     let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     // Another first opener may have completed the migration while this
     // connection waited for the lock.
-    if needs_migration(&transaction)? {
-        init_db_locked(&transaction)?;
+    if !needs_migration(&transaction)? {
+        transaction.commit()?;
+        return Ok(());
     }
+    // Creating a database is not an upgrade.
+    let upgrading: bool =
+        transaction.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master)", [], |row| {
+            row.get(0)
+        })?;
+    if upgrading {
+        notify_migration(conn, MigrationEvent::Started);
+    }
+    init_db_locked(&transaction)?;
     transaction.commit()?;
+    if upgrading {
+        notify_migration(conn, MigrationEvent::Finished);
+    }
     Ok(())
 }
 
@@ -5136,11 +5179,29 @@ mod tests {
     }
 
     #[test]
-    fn needs_migration_is_true_only_until_init_db_runs() {
+    fn the_migration_observer_hears_an_upgrade_but_not_a_creation() {
+        use std::sync::Mutex;
+        static EVENTS: Mutex<Vec<(MigrationEvent, String)>> = Mutex::new(Vec::new());
+        observe_migrations(|event, path| {
+            EVENTS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((event, path.unwrap_or_default().to_string()));
+        });
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("history.db");
+        let ours = |events: &[(MigrationEvent, String)]| -> Vec<MigrationEvent> {
+            let path = fs::canonicalize(&path).unwrap();
+            events
+                .iter()
+                .filter(|(_, p)| fs::canonicalize(p).ok().as_ref() == Some(&path))
+                .map(|(event, _)| *event)
+                .collect()
+        };
+
         drop(open_db(&path).unwrap());
-        assert!(!needs_migration(&open_db_readonly(&path).unwrap()).unwrap());
+        drop(open_db(&path).unwrap());
+        assert_eq!(ours(&EVENTS.lock().unwrap()), []);
 
         Connection::open(&path)
             .unwrap()
@@ -5149,10 +5210,12 @@ mod tests {
                 [],
             )
             .unwrap();
-        assert!(needs_migration(&open_db_readonly(&path).unwrap()).unwrap());
-
         drop(open_db(&path).unwrap());
-        assert!(!needs_migration(&open_db_readonly(&path).unwrap()).unwrap());
+        drop(open_db(&path).unwrap());
+        assert_eq!(
+            ours(&EVENTS.lock().unwrap()),
+            [MigrationEvent::Started, MigrationEvent::Finished]
+        );
     }
 
     #[test]

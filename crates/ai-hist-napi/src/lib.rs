@@ -13,10 +13,10 @@ use std::path::{Path, PathBuf};
 
 use ai_hist::history_search::{search_all, search_page as core_search_page, SearchRole, SearchRow};
 use ai_hist::{
-    default_db_path, needs_migration, open_db, open_db_readonly, recent as core_recent,
-    relationship_capabilities, schema_is_catalog_read_current, schema_is_event_read_current,
-    schema_is_evidence_read_current, schema_is_read_current, schema_is_relationship_read_current,
-    session as core_session, session_children_page as core_session_children_page,
+    default_db_path, open_db, open_db_readonly, recent as core_recent, relationship_capabilities,
+    schema_is_catalog_read_current, schema_is_event_read_current, schema_is_evidence_read_current,
+    schema_is_read_current, schema_is_relationship_read_current, session as core_session,
+    session_children_page as core_session_children_page,
     session_events_page as core_session_events_page,
     session_file_edits_page as core_session_file_edits_page, session_locations,
     session_relationships as core_session_relationships,
@@ -44,6 +44,7 @@ use ai_hist::{
     SessionRequest as CoreSessionRequest, SessionRequestCursor as CoreRequestCursor,
     SessionUsageSummary as CoreSessionUsageSummary, SESSION_USAGE_CONTRACT_VERSION,
 };
+use napi::{Env, JsFunction};
 use napi_derive::napi;
 use serde::Serialize;
 
@@ -80,7 +81,7 @@ use serde::Serialize;
 /// 25 adds the change feed to `sessionStoreCall`: `changes` pages
 /// `SessionStore::changes_since` and `commit_changes` moves a named consumer
 /// cursor.
-/// 26 adds `storeNeedsMigration` and `migrateStore`, so a front end can name
+/// 26 adds `onStoreMigration` and `migrateStore`, so a front end can name
 /// the one-time schema migration after an upgrade instead of appearing hung.
 pub const NATIVE_CONTRACT_VERSION: u32 = 26;
 const DEFAULT_LIMIT: i64 = 50;
@@ -215,24 +216,30 @@ pub fn native_contract_version() -> u32 {
     NATIVE_CONTRACT_VERSION
 }
 
-/// Whether opening the database would first run a schema migration. Read-only;
-/// never migrates.
+/// Call `callback` with `"started"` and `"finished"` whenever an open in
+/// this process migrates an existing database. Returns false when a callback
+/// is already registered: the first registration wins.
 ///
-/// Advisory, so it never fails: an absent or empty file is a database about to
-/// be created, which is not an upgrade, and a file the check cannot read is
-/// left for the operation's own open to report.
-#[napi]
-pub async fn store_needs_migration(db_path: Option<String>) -> napi::Result<bool> {
-    let path = crate::db_path(db_path);
-    napi::tokio::task::spawn_blocking(move || {
-        let populated = std::fs::metadata(&path).is_ok_and(|meta| meta.len() > 0);
-        populated
-            && open_db_readonly(&path)
-                .and_then(|conn| needs_migration(&conn))
-                .unwrap_or(false)
-    })
-    .await
-    .map_err(worker_error)
+/// The callback never keeps the process alive, and it is called
+/// asynchronously on the JS thread while the migrating operation is still
+/// pending.
+#[napi(ts_args_type = "callback: (event: 'started' | 'finished') => void")]
+pub fn on_store_migration(env: Env, callback: JsFunction) -> napi::Result<bool> {
+    use napi::threadsafe_function::{
+        ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode,
+    };
+    let mut notify: ThreadsafeFunction<&'static str, ErrorStrategy::Fatal> = callback
+        .create_threadsafe_function(0, |ctx| {
+            ctx.env.create_string(ctx.value).map(|event| vec![event])
+        })?;
+    notify.unref(&env)?;
+    Ok(ai_hist::observe_migrations(move |event, _path| {
+        let event = match event {
+            ai_hist::MigrationEvent::Started => "started",
+            ai_hist::MigrationEvent::Finished => "finished",
+        };
+        notify.call(event, ThreadsafeFunctionCallMode::NonBlocking);
+    }))
 }
 
 /// Run any outstanding schema migration now, creating the database if it

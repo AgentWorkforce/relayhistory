@@ -52,7 +52,7 @@ interface NativeBinding {
   getSessionTree(options: object): Promise<UnknownRecord>;
   getSessionChildrenPage(options: object): Promise<UnknownRecord>;
   sync(options?: object): Promise<UnknownRecord>;
-  storeNeedsMigration(dbPath?: string): Promise<boolean>;
+  onStoreMigration(callback: (event: 'started' | 'finished') => void): boolean;
   migrateStore(dbPath?: string): Promise<void>;
 }
 

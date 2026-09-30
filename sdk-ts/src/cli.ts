@@ -6,7 +6,7 @@ import type { Writable } from 'node:stream';
 import { pathToFileURL } from 'node:url';
 
 import {
-  discoverSessions, ensureLocalStore, formatSessionRow, storeNeedsMigration, getSession, getSessionEventsPage, getSessionFileEditsPage,
+  discoverSessions, ensureLocalStore, formatSessionRow, onStoreMigration, getSession, getSessionEventsPage, getSessionFileEditsPage,
   getSessionMarkersPage, getSessionRelationships, getSessionToolCallsPage, getSessionTree, getSessionUsage,
   hydrateSession, listSessionCatalogPage, recent, resumeCommand, search, stats, sync,
   type CatalogCursor, type EvidenceCursor, type HistoryEntry, type LocalStoreReadiness,
@@ -94,17 +94,27 @@ async function packageVersion(): Promise<string> {
 }
 
 /**
- * Name a pending schema migration, so the first command after an upgrade does
- * not sit silent for minutes and read as a hang.
- *
- * Announces only: the migration itself still runs at the command's first
- * open, after every check the command makes, so a line that is rejected never
- * migrates.
+ * Name a schema migration while it runs, so the first command after an upgrade
+ * does not sit silent for minutes and read as a hang. Best effort: a missing
+ * native package is reported by the command itself.
  */
-async function announcePendingUpgrade(io: CliIo, dbPath: string | undefined): Promise<void> {
-  if (!(await storeNeedsMigration({ dbPath }))) return;
+async function announceMigrations(io: CliIo): Promise<void> {
   const version = await packageVersion();
-  io.stderr(`Upgrading the ai-hist database to ${version}. This runs once and can take a few minutes on a large history...\n`);
+  let started = 0;
+  await onStoreMigration((event) => {
+    if (event === 'started') {
+      started = Date.now();
+      io.stderr(`Upgrading the ai-hist database to ${version}. This runs once and can take a few minutes on a large history...\n`);
+    } else {
+      io.stderr(`Database upgraded in ${formatElapsed(Date.now() - started)}.\n`);
+    }
+  }).catch(() => false);
+}
+
+function formatElapsed(ms: number): string {
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
 }
 
 async function maybePrintUpdateNotice(io: CliIo, current: string, args: string[]): Promise<void> {
@@ -1000,18 +1010,11 @@ async function dispatch(argv: readonly string[], io: CliIo, options: RunCliOptio
   if (command === 'export') {
     const selectionPath = textFlag(args, 'selection');
     if (!selectionPath) usage('export requires --selection FILE');
-    await runHistoryExportCommand({
-      dbPath: textFlag(args, 'db'), selectionPath, outputPath: textFlag(args, 'out'),
-      // Export checks its output path itself, so the notice waits for those
-      // checks rather than announcing an upgrade a rejected line never runs.
-      beforeOpen: () => announcePendingUpgrade(io, textFlag(args, 'db')),
-    }, options.stdoutStream);
+    await runHistoryExportCommand({ dbPath: textFlag(args, 'db'), selectionPath, outputPath: textFlag(args, 'out') },
+      options.stdoutStream);
     return 0;
   }
   const acquisitionPlugins = ['sync','sessions'].includes(command ?? '') && textFlag(args,'config') ? (await loadHistoryApplicationConfig(textFlag(args,'config')!)).registry : undefined;
-  // Every scope: a remote-scoped read still opens the local store, and that
-  // open migrates.
-  await announcePendingUpgrade(io, textFlag(args, 'db'));
   let readiness: LocalStoreReadiness | null = null;
   if (spec.readsLocalStore) {
     readiness = await ensureLocalStore({
@@ -1221,6 +1224,7 @@ async function main(): Promise<void> {
     process.once('SIGINT', stop);
     process.once('SIGTERM', stop);
   }
+  await announceMigrations(io);
   try {
     process.exitCode = await runCli(argv, io, {
       signal: cancellable ? abort.signal : undefined,

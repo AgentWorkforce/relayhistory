@@ -1217,17 +1217,20 @@ export interface LocalStoreReadiness {
 }
 
 /**
- * Whether the first open of the local database would run a schema migration.
+ * Listen for schema migrations this process runs on an existing database.
  *
- * True once after an upgrade that changes the schema; that migration can take
- * minutes on a large history, so a front end asks first and tells its user.
- * False when the database does not exist yet. Read-only.
+ * A migration after an upgrade can take minutes on a large history. `listener`
+ * hears `started` when an open takes the write lock to migrate and `finished`
+ * when it commits -- never for a new or current database, or for a call that
+ * is rejected before it opens -- so a front end announces exactly the work
+ * that happens. One listener per process: resolves false when one is already
+ * registered.
  */
-export async function storeNeedsMigration(options: { dbPath?: string } = {}): Promise<boolean> {
-  return nativeCall((native) => native.storeNeedsMigration(options.dbPath));
+export async function onStoreMigration(listener: (event: 'started' | 'finished') => void): Promise<boolean> {
+  return nativeCall(async (native) => native.onStoreMigration(listener));
 }
 
-/** Run any outstanding schema migration now. See `storeNeedsMigration`. */
+/** Run any outstanding schema migration now, creating the database if it does not exist. */
 export async function migrateStore(options: { dbPath?: string } = {}): Promise<void> {
   return nativeCall((native) => native.migrateStore(options.dbPath));
 }

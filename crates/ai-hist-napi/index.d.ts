@@ -22,14 +22,15 @@ export declare function applySourceEvidence(requestJson: string): Promise<string
 /** Contract version implemented by this native addon. */
 export declare function nativeContractVersion(): number
 /**
- * Whether opening the database would first run a schema migration. Read-only;
- * never migrates.
+ * Call `callback` with `"started"` and `"finished"` whenever an open in
+ * this process migrates an existing database. Returns false when a callback
+ * is already registered: the first registration wins.
  *
- * Advisory, so it never fails: an absent or empty file is a database about to
- * be created, which is not an upgrade, and a file the check cannot read is
- * left for the operation's own open to report.
+ * The callback never keeps the process alive, and it is called
+ * asynchronously on the JS thread while the migrating operation is still
+ * pending.
  */
-export declare function storeNeedsMigration(dbPath?: string | undefined | null): Promise<boolean>
+export declare function onStoreMigration(callback: (event: 'started' | 'finished') => void): boolean
 /**
  * Run any outstanding schema migration now, creating the database if it
  * does not exist. The same work the first open of any operation would do.

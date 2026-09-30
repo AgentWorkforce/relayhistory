@@ -24,11 +24,7 @@ async function write(stream: Writable, chunk: string): Promise<void> {
   await new Promise<void>((resolve, reject) => stream.write(chunk, (error) => error ? reject(error) : resolve()));
 }
 export async function runHistoryExportCommand(
-  options: {
-    dbPath?: string; selectionPath: string; outputPath?: string;
-    /** Runs once the output path is known to be safe, before the database is opened. */
-    beforeOpen?: () => Promise<void>;
-  },
+  options: { dbPath?: string; selectionPath: string; outputPath?: string },
   /** Destination when no `--out` is given. Required unless `outputPath` is set. */
   stdoutStream?: Writable,
 ): Promise<void> {
@@ -62,7 +58,6 @@ export async function runHistoryExportCommand(
   if (!temporary && !stdoutStream) {
     throw new InvalidArgumentError('export without --out requires a destination stream', 'INVALID_ARGUMENT');
   }
-  await options.beforeOpen?.();
   const stream: Writable = temporary ? createWriteStream(temporary, { flags: 'wx', mode: 0o600 }) : stdoutStream!;
   // Stream errors (e.g. a closed pipe) must exit nonzero, not become uncaught
   // events or a false claim that the full export completed.
