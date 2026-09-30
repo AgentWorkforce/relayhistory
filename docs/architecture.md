@@ -402,15 +402,18 @@ into the child's file. The rollout walk gates that copy (`ForkReplaySpan` in
 - It **closes** at the first `task_started` or `turn_context` whose turn is the
   child's: a UUIDv7 `turn_id` at or after the child thread's own UUIDv7
   timestamp (else its `session_meta` timestamp), or, for a legacy turn id,
-  `started_at` at or after the fork's second. A turn nothing orders against the
-  fork also closes it — undecided is indexed rather than dropped. A
-  `turn_context` with no `turn_id` takes the verdict of the `task_started`
-  before it, since it describes the turn that record opened. The presence of
+  `started_at` after the fork's second. A turn nothing orders against the
+  fork -- including a legacy `started_at` in the fork's own second, which
+  second resolution cannot order -- also closes it: undecided is indexed
+  rather than dropped. A `turn_context` with no `turn_id`, or repeating the
+  `turn_id` of a replayed `task_started` before it, takes that verdict, since
+  it describes the turn that record opened. The presence of
   `task_started` is not used: Codex 0.155 replays the parent's `task_started`
   records too.
 
 Two limits follow from gating on explicit evidence only. A replayed legacy
-turn with no UUIDv7 id and no `started_at` closes the span early, and the rest
+turn with no UUIDv7 id and no `started_at` (or one in the fork's own second)
+closes the span early, and the rest
 of that replay is indexed under the child as before. And a record the child
 writes before its first `task_started` / `turn_context` falls inside the span:
 nothing in it tells it from the parent's copy (codex-rs appends a

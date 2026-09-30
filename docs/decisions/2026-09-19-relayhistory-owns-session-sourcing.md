@@ -290,7 +290,8 @@ one `fork_replay_boundary` marker instead of re-indexing the parent's prompts,
 events and token baseline under the child
 ([#210](https://github.com/AgentWorkforce/relayhistory/issues/210)). The `✓`
 is for spans the evidence can bound: a replayed legacy turn with no UUIDv7 id
-and no `started_at` is undecided, and an undecided span falls back to indexing
+and no `started_at` (or a `started_at` in the fork's own second) is undecided,
+and an undecided span falls back to indexing
 the rest of the replay under the child, as before the gate. A plain
 `codex resume` writes no identity to record, so there is nothing further to
 capture.

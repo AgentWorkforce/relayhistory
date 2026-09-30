@@ -434,7 +434,8 @@ Notable changes to the native `ai-hist` CLI are documented here.
   parent's own `session_meta` reappearing in a rollout that named that parent
   in `forked_from_id` or `thread_spawn.parent_thread_id`, and closes at the
   first turn whose UUIDv7 `turn_id` (else `started_at`) is not earlier than
-  the fork, or that nothing can order -- and writes one
+  the fork (a legacy `started_at` in the fork's own second counts as
+  unordered), or that nothing can order -- and writes one
   `fork_replay_boundary` marker instead. The last replayed `token_count` is
   the child's inherited baseline, unless the child's own counter restarts
   below it. Shallow discovery applies the same rule to `first_prompt`.
@@ -442,7 +443,8 @@ Notable changes to the native `ai-hist` CLI are documented here.
   7 -> 8 moves the sweep generation, and the first `sync` re-reads every
   unchanged fork rollout (`codex_fork_replay_gate` in the sync state),
   retiring the rows it had indexed for the replayed lines and rewriting the
-  fork's `first_prompt` (cleared when the fork has no prompt of its own).
+  fork's `first_prompt` and `last_assistant_text` (cleared when the fork has
+  no prompt or answer of its own).
   That cleanup is one-time and runs in `sync` only: hydration does not repeat
   it, and an older build still writing to the same database can reinsert the
   duplicates. Whether the inherited baseline was applied or dropped is

@@ -214,8 +214,10 @@ pub(crate) enum ForkedTurnOwner {
 ///   own model output had to request, and erring the other way would drop the
 ///   child's evidence rather than keep a duplicate.
 /// - a legacy (non-v7) `turn_id` falls back to `task_started.started_at`
-///   (unix seconds): earlier than the fork's second is a replay, the same
-///   second or later is the child's.
+///   (unix seconds): earlier than the fork's second is a replay, a later
+///   second is the child's. The fork's own second is undecided: a parent turn
+///   can start earlier in the same second the fork happens, so second
+///   resolution cannot order the two.
 /// - anything else is [`ForkedTurnOwner::Undecided`], and the caller stops
 ///   gating rather than guess.
 ///
@@ -235,10 +237,11 @@ pub(crate) fn forked_turn_owner(
         };
     }
     if let Some(started_at) = started_at {
-        return if started_at < fork_origin_ms.div_euclid(1000) {
-            ForkedTurnOwner::Replay
-        } else {
-            ForkedTurnOwner::Child("task_started.started_at")
+        let fork_second = fork_origin_ms.div_euclid(1000);
+        return match started_at.cmp(&fork_second) {
+            std::cmp::Ordering::Less => ForkedTurnOwner::Replay,
+            std::cmp::Ordering::Greater => ForkedTurnOwner::Child("task_started.started_at"),
+            std::cmp::Ordering::Equal => ForkedTurnOwner::Undecided,
         };
     }
     ForkedTurnOwner::Undecided
@@ -324,8 +327,8 @@ pub(crate) enum ReplayStep {
 /// Known limits, each resolved toward indexing rather than dropping:
 ///
 /// - A replayed turn nothing can order -- a legacy (non-v7) `turn_id` with no
-///   `started_at` -- closes the span, so the rest of that replay is indexed
-///   under the child as before.
+///   `started_at`, or a `started_at` in the fork's own second -- closes the
+///   span, so the rest of that replay is indexed under the child as before.
 /// - A record the child writes *before* its first `task_started` or
 ///   `turn_context` is inside the span and is not indexed. Nothing in such a
 ///   record distinguishes it from the parent's copied history (the envelope
@@ -339,12 +342,14 @@ pub(crate) struct ForkReplayGate {
     parent: Option<String>,
     origin_ms: Option<i64>,
     replaying: bool,
-    /// Whether the last `task_started` inside the span was judged a replay.
-    /// A `turn_context` that carries no `turn_id` describes the turn its
-    /// `task_started` opened, so it takes that verdict instead of being
-    /// undecided -- which would close the span in the middle of the parent's
-    /// history.
-    in_replayed_turn: bool,
+    /// The turn the last `task_started` inside the span opened, when that
+    /// `task_started` was judged a replay (`Some(None)` for one without a
+    /// `turn_id`). A `turn_context` that carries no `turn_id`, or repeats this
+    /// one, describes that same turn, so it takes that verdict instead of
+    /// being undecided -- a legacy turn's `turn_context` carries no
+    /// `started_at` to order it by, and undecided would close the span in the
+    /// middle of the parent's history.
+    replayed_turn: Option<Option<String>>,
 }
 
 impl ForkReplayGate {
@@ -355,7 +360,7 @@ impl ForkReplayGate {
             parent: parent.filter(|_| origin_ms.is_some()),
             origin_ms,
             replaying: false,
-            in_replayed_turn: false,
+            replayed_turn: None,
         }
     }
 
@@ -375,7 +380,7 @@ impl ForkReplayGate {
                 return ReplayStep::Outside;
             }
             self.replaying = true;
-            self.in_replayed_turn = false;
+            self.replayed_turn = None;
             return ReplayStep::Replay;
         }
         let payload_type = payload.and_then(|p| p.get("type")).and_then(Value::as_str);
@@ -391,14 +396,18 @@ impl ForkReplayGate {
             .and_then(|p| p.get("started_at"))
             .and_then(Value::as_i64);
         let is_task_started = line_type == Some("event_msg");
-        if !is_task_started && turn_id.is_none() && self.in_replayed_turn {
-            return ReplayStep::Replay;
+        if !is_task_started {
+            if let Some(replayed) = &self.replayed_turn {
+                if turn_id.is_none() || turn_id == replayed.as_deref() {
+                    return ReplayStep::Replay;
+                }
+            }
         }
         let basis = match forked_turn_owner(turn_id, started_at, self.origin_ms.unwrap_or_default())
         {
             ForkedTurnOwner::Replay => {
                 if is_task_started {
-                    self.in_replayed_turn = true;
+                    self.replayed_turn = Some(turn_id.map(str::to_string));
                 }
                 return ReplayStep::Replay;
             }
@@ -406,7 +415,7 @@ impl ForkReplayGate {
             ForkedTurnOwner::Undecided => "undecided",
         };
         self.replaying = false;
-        self.in_replayed_turn = false;
+        self.replayed_turn = None;
         ReplayStep::Closed {
             turn_id: turn_id.map(str::to_string),
             basis,
@@ -474,6 +483,52 @@ mod tests {
     }
 
     #[test]
+    fn a_legacy_turn_context_repeating_its_replayed_turn_stays_in_the_span() {
+        let child = "01a0c210-ec76-71c2-8585-47285eab37cc";
+        let origin = uuid_v7_ms(child).unwrap();
+        let second = origin / 1000;
+        let mut gate = ForkReplayGate::new(Some("parent".to_string()), Some(origin));
+        let rec = |kind: &str, payload: Value| json!({"type": kind, "payload": payload});
+        assert_eq!(
+            gate.step(false, &rec("session_meta", json!({"id": "parent"}))),
+            ReplayStep::Replay
+        );
+        assert_eq!(
+            gate.step(
+                false,
+                &rec(
+                    "event_msg",
+                    json!({"type": "task_started", "turn_id": "legacy-1", "started_at": second - 100})
+                )
+            ),
+            ReplayStep::Replay
+        );
+        // Same turn, no `started_at` of its own: it inherits the replay verdict.
+        assert_eq!(
+            gate.step(false, &rec("turn_context", json!({"turn_id": "legacy-1"}))),
+            ReplayStep::Replay
+        );
+        assert_eq!(
+            gate.step(
+                false,
+                &rec(
+                    "event_msg",
+                    json!({"type": "agent_message", "message": "parent answer"})
+                )
+            ),
+            ReplayStep::Replay
+        );
+        // A distinct turn nothing orders still closes the span.
+        assert_eq!(
+            gate.step(false, &rec("turn_context", json!({"turn_id": "legacy-2"}))),
+            ReplayStep::Closed {
+                turn_id: Some("legacy-2".to_string()),
+                basis: "undecided"
+            }
+        );
+    }
+
+    #[test]
     fn forked_turn_owner_orders_turns_against_the_fork() {
         let origin = uuid_v7_ms("01a0c210-ec76-71c2-8585-47285eab37cc").unwrap();
         // The parent's turns, copied into the child's file.
@@ -497,8 +552,13 @@ mod tests {
             forked_turn_owner(Some("turn-legacy"), Some(second - 1), origin),
             ForkedTurnOwner::Replay
         );
+        // The fork's own second cannot order a turn against the fork.
         assert_eq!(
             forked_turn_owner(Some("turn-legacy"), Some(second), origin),
+            ForkedTurnOwner::Undecided
+        );
+        assert_eq!(
+            forked_turn_owner(Some("turn-legacy"), Some(second + 1), origin),
             ForkedTurnOwner::Child("task_started.started_at")
         );
         assert_eq!(

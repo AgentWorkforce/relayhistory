@@ -3639,6 +3639,17 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                             params![outcome.first_prompt, meta.session_id],
                         )?;
                     }
+                    // The same holds for the last assistant answer: the
+                    // upsert above only overwrites it with a value, so a fork
+                    // with no answer of its own would keep the parent's
+                    // replayed answer an earlier build stored.
+                    if outcome.saw_fork_replay && outcome.last_assistant_text.is_none() {
+                        conn.execute(
+                            "UPDATE sessions SET last_assistant_text = NULL \
+                             WHERE source = 'codex' AND session_id = ?",
+                            params![meta.session_id],
+                        )?;
+                    }
                 }
             }
             seen.insert(
@@ -32623,11 +32634,12 @@ mod codex_fork_replay_tests {
         assert_eq!(token_totals(&conn, CHILD), vec![250]);
     }
 
-    /// A fork that never ran a turn of its own has no first prompt. The walk
-    /// clears the parent's prompt an earlier build stored from the replay;
+    /// A fork that never ran a turn of its own has no first prompt and no
+    /// answer. The walk clears the parent's prompt and answer an earlier build
+    /// stored from the replay;
     /// the shallow writer never nulls a value, so it cannot.
     #[test]
-    fn the_walk_clears_a_replayed_first_prompt_on_a_fork_with_no_prompt_of_its_own() {
+    fn the_walk_clears_a_replayed_prompt_and_answer_on_a_fork_with_none_of_its_own() {
         let dir = tempfile::tempdir().unwrap();
         let day = dir.path().join(".codex/sessions/2026/04/20");
         fs::create_dir_all(&day).unwrap();
@@ -32640,20 +32652,23 @@ mod codex_fork_replay_tests {
         let mut state = Map::new();
         sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
         conn.execute(
-            "UPDATE sessions SET first_prompt = 'parent prompt' \
+            "UPDATE sessions SET first_prompt = 'parent prompt', \
+             last_assistant_text = 'parent answer' \
              WHERE source = 'codex' AND session_id = ?",
             [CHILD],
         )
         .unwrap();
         state.remove(CODEX_FORK_REPLAY_KEY);
         sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
-        let first_prompt: Option<String> = conn
+        let (first_prompt, last_assistant_text): (Option<String>, Option<String>) = conn
             .query_row(
-                "SELECT first_prompt FROM sessions WHERE source = 'codex' AND session_id = ?",
+                "SELECT first_prompt, last_assistant_text FROM sessions \
+                 WHERE source = 'codex' AND session_id = ?",
                 [CHILD],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
         assert_eq!(first_prompt, None);
+        assert_eq!(last_assistant_text, None);
     }
 }
