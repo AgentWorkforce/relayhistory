@@ -1271,17 +1271,24 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     init_db_once(conn)
 }
 
+/// Whether [`init_db`] has migration work to do on this database.
+///
+/// Read-only, so a front end can ask before opening for write and tell its
+/// user that the first open after an upgrade is a one-time migration rather
+/// than a hang. A leftover retired index counts as outstanding work: its DROP
+/// is a real write.
+pub fn needs_migration(conn: &Connection) -> Result<bool> {
+    Ok(!schema_is_current(conn)?
+        || retired_indexes_present(conn)?
+        || retired_capture_present(conn)?
+        || retired_trajectory_index_present(conn)?)
+}
+
 fn init_db_once(conn: &Connection) -> Result<()> {
     // A current database needs no write lock. Besides keeping ordinary opens
     // cheap, this lets sync reach its per-source contention handling when a
-    // different writer already owns the ledger lock. A leftover retired index
-    // counts as outstanding migration work: its DROP is a real write, so it
-    // routes through the serialized pass below instead of this lock-free path.
-    if schema_is_current(conn)?
-        && !retired_indexes_present(conn)?
-        && !retired_capture_present(conn)?
-        && !retired_trajectory_index_present(conn)?
-    {
+    // different writer already owns the ledger lock.
+    if !needs_migration(conn)? {
         return Ok(());
     }
     enable_wal_for_migration(conn)?;
@@ -1292,11 +1299,7 @@ fn init_db_once(conn: &Connection) -> Result<()> {
     let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     // Another first opener may have completed the migration while this
     // connection waited for the lock.
-    if !schema_is_current(&transaction)?
-        || retired_indexes_present(&transaction)?
-        || retired_capture_present(&transaction)?
-        || retired_trajectory_index_present(&transaction)?
-    {
+    if needs_migration(&transaction)? {
         init_db_locked(&transaction)?;
     }
     transaction.commit()?;
@@ -5130,6 +5133,26 @@ mod tests {
             .unwrap();
         let conn = open_db(&path).unwrap();
         assert_eq!(trajectory_index_objects(&conn), 0);
+    }
+
+    #[test]
+    fn needs_migration_is_true_only_until_init_db_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        drop(open_db(&path).unwrap());
+        assert!(!needs_migration(&open_db_readonly(&path).unwrap()).unwrap());
+
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "DELETE FROM schema_migrations WHERE name = 'history_fts_update_of_v1'",
+                [],
+            )
+            .unwrap();
+        assert!(needs_migration(&open_db_readonly(&path).unwrap()).unwrap());
+
+        drop(open_db(&path).unwrap());
+        assert!(!needs_migration(&open_db_readonly(&path).unwrap()).unwrap());
     }
 
     #[test]

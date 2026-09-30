@@ -6,7 +6,7 @@ import type { Writable } from 'node:stream';
 import { pathToFileURL } from 'node:url';
 
 import {
-  discoverSessions, ensureLocalStore, formatSessionRow, getSession, getSessionEventsPage, getSessionFileEditsPage,
+  discoverSessions, ensureLocalStore, formatSessionRow, migrateStore, storeNeedsMigration, getSession, getSessionEventsPage, getSessionFileEditsPage,
   getSessionMarkersPage, getSessionRelationships, getSessionToolCallsPage, getSessionTree, getSessionUsage,
   hydrateSession, listSessionCatalogPage, recent, resumeCommand, search, stats, sync,
   type CatalogCursor, type EvidenceCursor, type HistoryEntry, type LocalStoreReadiness,
@@ -91,6 +91,25 @@ function isBinEntrypoint(): boolean {
 async function packageVersion(): Promise<string> {
   const contents = await readFile(new URL('../package.json', import.meta.url), 'utf8');
   return (JSON.parse(contents) as PackageMetadata).version ?? 'unknown';
+}
+
+/**
+ * Run a pending schema migration up front, named, so the first command after
+ * an upgrade does not sit silent for minutes and read as a hang.
+ */
+async function upgradeStore(io: CliIo, dbPath: string | undefined): Promise<void> {
+  if (!(await storeNeedsMigration({ dbPath }))) return;
+  const version = await packageVersion();
+  io.stderr(`Upgrading the ai-hist database to ${version}. This runs once and can take a few minutes on a large history...\n`);
+  const started = Date.now();
+  await migrateStore({ dbPath });
+  io.stderr(`Database upgraded in ${formatElapsed(Date.now() - started)}.\n`);
+}
+
+function formatElapsed(ms: number): string {
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
 }
 
 async function maybePrintUpdateNotice(io: CliIo, current: string, args: string[]): Promise<void> {
@@ -986,10 +1005,15 @@ async function dispatch(argv: readonly string[], io: CliIo, options: RunCliOptio
   if (command === 'export') {
     const selectionPath = textFlag(args, 'selection');
     if (!selectionPath) usage('export requires --selection FILE');
-    await runHistoryExportCommand({ dbPath: textFlag(args, 'db'), selectionPath, outputPath: textFlag(args, 'out') },
-      options.stdoutStream);
+    await runHistoryExportCommand({
+      dbPath: textFlag(args, 'db'), selectionPath, outputPath: textFlag(args, 'out'),
+      // Export checks its output path itself; a line it rejects must leave the
+      // database untouched, so the upgrade waits for those checks.
+      beforeOpen: () => upgradeStore(io, textFlag(args, 'db')),
+    }, options.stdoutStream);
     return 0;
   }
+  if (scope !== 'remote') await upgradeStore(io, textFlag(args, 'db'));
   const acquisitionPlugins = ['sync','sessions'].includes(command ?? '') && textFlag(args,'config') ? (await loadHistoryApplicationConfig(textFlag(args,'config')!)).registry : undefined;
   let readiness: LocalStoreReadiness | null = null;
   if (spec.readsLocalStore) {

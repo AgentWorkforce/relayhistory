@@ -13,10 +13,10 @@ use std::path::{Path, PathBuf};
 
 use ai_hist::history_search::{search_all, search_page as core_search_page, SearchRole, SearchRow};
 use ai_hist::{
-    default_db_path, open_db, open_db_readonly, recent as core_recent, relationship_capabilities,
-    schema_is_catalog_read_current, schema_is_event_read_current, schema_is_evidence_read_current,
-    schema_is_read_current, schema_is_relationship_read_current, session as core_session,
-    session_children_page as core_session_children_page,
+    default_db_path, needs_migration, open_db, open_db_readonly, recent as core_recent,
+    relationship_capabilities, schema_is_catalog_read_current, schema_is_event_read_current,
+    schema_is_evidence_read_current, schema_is_read_current, schema_is_relationship_read_current,
+    session as core_session, session_children_page as core_session_children_page,
     session_events_page as core_session_events_page,
     session_file_edits_page as core_session_file_edits_page, session_locations,
     session_relationships as core_session_relationships,
@@ -80,7 +80,9 @@ use serde::Serialize;
 /// 25 adds the change feed to `sessionStoreCall`: `changes` pages
 /// `SessionStore::changes_since` and `commit_changes` moves a named consumer
 /// cursor.
-pub const NATIVE_CONTRACT_VERSION: u32 = 25;
+/// 26 adds `storeNeedsMigration` and `migrateStore`, so a front end can name
+/// the one-time schema migration after an upgrade instead of appearing hung.
+pub const NATIVE_CONTRACT_VERSION: u32 = 26;
 const DEFAULT_LIMIT: i64 = 50;
 const DEFAULT_EVENT_LIMIT: i64 = 200;
 
@@ -211,6 +213,38 @@ fn source_connector_selection(
 #[napi]
 pub fn native_contract_version() -> u32 {
     NATIVE_CONTRACT_VERSION
+}
+
+/// Whether opening the database would first run a schema migration. False
+/// when the database does not exist yet: creating one is not an upgrade.
+/// Read-only; never migrates.
+#[napi]
+pub async fn store_needs_migration(db_path: Option<String>) -> napi::Result<bool> {
+    let path = crate::db_path(db_path);
+    napi::tokio::task::spawn_blocking(move || {
+        if !path.exists() {
+            return Ok(false);
+        }
+        open_db_readonly(&path)
+            .and_then(|conn| needs_migration(&conn))
+            .map_err(|error| database_error(&path, format!("{error:#}")))
+    })
+    .await
+    .map_err(worker_error)?
+}
+
+/// Run any outstanding schema migration now, creating the database if it
+/// does not exist. The same work the first open of any operation would do.
+#[napi]
+pub async fn migrate_store(db_path: Option<String>) -> napi::Result<()> {
+    let path = crate::db_path(db_path);
+    napi::tokio::task::spawn_blocking(move || {
+        open_db(&path)
+            .map(drop)
+            .map_err(|error| database_error(&path, format!("{error:#}")))
+    })
+    .await
+    .map_err(worker_error)?
 }
 
 /// Optimization profile this addon was compiled with: `release` or `debug`.

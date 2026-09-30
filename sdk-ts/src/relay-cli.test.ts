@@ -11,6 +11,7 @@ import { assertSurfaceConforms, walkCommands, type RelayCliIo } from '@agent-rel
 
 import { BOOLEAN_FLAGS, COMMANDS, FLAG_SPECS, HOST_OWNED_FLAGS, VALUE_FLAGS } from './cli.js';
 import { createRelayCliSurface, __testing } from './relay-cli.js';
+import { migrateStore } from './index.js';
 import type { RelayhistoryCloudClient } from './cloud-contract.js';
 
 /**
@@ -44,6 +45,9 @@ async function historyFixture(): Promise<{ root: string; db: string }> {
   const root = await mkdtemp(join(tmpdir(), 'relayhistory-surface-delivery-'));
   const db = join(root, 'history.db');
   await writeFile(db, gunzipSync(await readFile(new URL('../fixtures/offline-history.db.gz', import.meta.url))));
+  // The fixture is a snapshot of an older schema; bring it current so a test
+  // sees its command's output rather than the one-time upgrade notice.
+  await migrateStore({ dbPath: db });
   return { root, db };
 }
 

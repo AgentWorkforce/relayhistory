@@ -1216,6 +1216,22 @@ export interface LocalStoreReadiness {
   bootstrap: BootstrapLocalResult | null;
 }
 
+/**
+ * Whether the first open of the local database would run a schema migration.
+ *
+ * True once after an upgrade that changes the schema; that migration can take
+ * minutes on a large history, so a front end asks first and tells its user.
+ * False when the database does not exist yet. Read-only.
+ */
+export async function storeNeedsMigration(options: { dbPath?: string } = {}): Promise<boolean> {
+  return nativeCall((native) => native.storeNeedsMigration(options.dbPath));
+}
+
+/** Run any outstanding schema migration now. See `storeNeedsMigration`. */
+export async function migrateStore(options: { dbPath?: string } = {}): Promise<void> {
+  return nativeCall((native) => native.migrateStore(options.dbPath));
+}
+
 export interface EnsureLocalStoreOptions {
   dbPath?: string;
   /** Only `local` and `all` read the local database; `remote` skips the check. */

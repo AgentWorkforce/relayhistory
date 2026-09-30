@@ -11,6 +11,9 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 const cli = fileURLToPath(new URL('./cli.js', import.meta.url));
+// Test-only: `node:sqlite` arrived in Node 22 while the SDK still supports Node 20.
+const sqlite = await import('node:sqlite').catch(() => null);
+const needsNodeSqlite = sqlite ? false : 'node:sqlite requires Node >= 22';
 
 type Run = { code: number; stdout: string; stderr: string };
 
@@ -138,6 +141,35 @@ test('every documented local-history command accepts --no-bootstrap', async () =
       const result = await run([...command, '--no-bootstrap'], env);
       assert.notEqual(result.code, 2, `${command.join(' ') || 'ai-hist'} rejected --no-bootstrap: ${result.stderr}`);
     }
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+// A migration after an upgrade can run for minutes on a large history; silent,
+// it reads as a hang. Creating a database is not an upgrade and says nothing.
+test('a pending schema migration is announced once, and a new database is not', { skip: needsNodeSqlite }, async () => {
+  const { home, env } = await emptyHome();
+  try {
+    await seedClaudeSession(home);
+    const created = await run(['stats'], env);
+    assert.equal(created.code, 0, created.stderr);
+    assert.doesNotMatch(created.stderr, /Upgrading/);
+
+    const dbPath = join(home, '.local', 'share', 'ai-hist', 'ai-history.db');
+    const database = new sqlite!.DatabaseSync(dbPath);
+    database.exec("DELETE FROM schema_migrations WHERE name = 'history_fts_update_of_v1'");
+    database.close();
+
+    const upgraded = await run(['stats'], env);
+    assert.equal(upgraded.code, 0, upgraded.stderr);
+    assert.match(upgraded.stderr, /Upgrading the ai-hist database to \d+\.\d+\.\d+/);
+    assert.match(upgraded.stderr, /Database upgraded in \d+s\./);
+    assert.match(upgraded.stdout, /total: 1/);
+
+    const again = await run(['stats'], env);
+    assert.equal(again.code, 0, again.stderr);
+    assert.doesNotMatch(again.stderr, /Upgrading/);
   } finally {
     await rm(home, { recursive: true, force: true });
   }

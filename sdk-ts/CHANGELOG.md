@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The CLI announces a pending schema migration before it runs:
+  `Upgrading the ai-hist database to <version>...`, then
+  `Database upgraded in <elapsed>.` on stderr. `storeNeedsMigration()` and
+  `migrateStore()` expose the same check and migration to SDK callers.
+  Requires native contract 26.
+
 - `searchPage()` and `recentPage()` return one page plus a `nextCursor`
   `{ timestampMs, id, matchSource? }`. `search()`, `recent()` and both page
   functions accept `after` (that cursor, or the last row) and inclusive

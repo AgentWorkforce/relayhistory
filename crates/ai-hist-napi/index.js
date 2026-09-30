@@ -310,7 +310,7 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { historyExport, sessionStoreCall, getSourceObservation, applySourceObservations, applySourceEvidence, nativeContractVersion, nativeBuildProfile, search, searchPage, recent, recentPage, getSession, getSessionEventsPage, getSessionToolCallsPage, getSessionUserTurnsPage, getSessionFileEditsPage, getSessionRequestsPage, getSessionUsage, stats, listSessionCatalogPage, listSessionCatalog, discoverSessions, hydrateSession, getSessionRelationships, getSessionTree, getSessionChildrenPage, sync, syncLocal, installGitHooks, linkGitCommit } = nativeBinding
+const { historyExport, sessionStoreCall, getSourceObservation, applySourceObservations, applySourceEvidence, nativeContractVersion, storeNeedsMigration, migrateStore, nativeBuildProfile, search, searchPage, recent, recentPage, getSession, getSessionEventsPage, getSessionToolCallsPage, getSessionUserTurnsPage, getSessionFileEditsPage, getSessionRequestsPage, getSessionUsage, stats, listSessionCatalogPage, listSessionCatalog, discoverSessions, hydrateSession, getSessionRelationships, getSessionTree, getSessionChildrenPage, sync, syncLocal, installGitHooks, linkGitCommit } = nativeBinding
 
 module.exports.historyExport = historyExport
 module.exports.sessionStoreCall = sessionStoreCall
@@ -318,6 +318,8 @@ module.exports.getSourceObservation = getSourceObservation
 module.exports.applySourceObservations = applySourceObservations
 module.exports.applySourceEvidence = applySourceEvidence
 module.exports.nativeContractVersion = nativeContractVersion
+module.exports.storeNeedsMigration = storeNeedsMigration
+module.exports.migrateStore = migrateStore
 module.exports.nativeBuildProfile = nativeBuildProfile
 module.exports.search = search
 module.exports.searchPage = searchPage
