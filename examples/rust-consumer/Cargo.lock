@@ -16,7 +16,7 @@ dependencies = [
 
 [[package]]
 name = "ai-hist"
-version = "0.31.0"
+version = "0.32.3"
 dependencies = [
  "anyhow",
  "chrono",
