@@ -46,11 +46,16 @@ test("plugins publish from a matrix and verify afterwards", () => {
 });
 
 test("full core smoke checks gate release finalization and downstream publication", () => {
+  const version = jobBlock(publish, "version", "build");
+  assert.match(version, /matching-refs\/tags\/sdk-ts-v\$VERSION/);
+  assert.match(version, /resume with skip_core=true and custom_version=\$VERSION/);
+
   const corePublish = jobBlock(publish, "publish", "verify-core");
   const preflight = corePublish.indexOf("name: Recheck release version availability");
   const publishStep = corePublish.indexOf("name: Publish\n");
   const tag = corePublish.indexOf("name: Tag the published tree");
   assert.ok(preflight >= 0 && preflight < publishStep, "version recheck must precede publication");
+  assert.match(corePublish, /git ls-remote --tags origin "refs\/tags\/sdk-ts-v\$VERSION"/);
   assert.ok(publishStep < tag, "successful publication must create a recovery tag");
   assert.doesNotMatch(corePublish, /name: Registry visibility gate/);
   assert.doesNotMatch(corePublish, /name: Registry clean-install smoke test/);
@@ -61,6 +66,7 @@ test("full core smoke checks gate release finalization and downstream publicatio
   assert.match(verification, /inputs\.skip_core \|\| needs\.publish\.result == 'success'/);
   assert.match(verification, /name: Registry clean-install smoke test/);
   assert.match(verification, /REGISTRY_VISIBILITY_ATTEMPTS: 150/);
+  assert.match(verification, /REGISTRY_VISIBILITY_MAX_WAIT_MS: 4200000/);
   assert.match(verification, /name: Registry CLI smoke test on older glibc/);
 
   const finalization = jobBlock(publish, "finalize-core", "persist-version");

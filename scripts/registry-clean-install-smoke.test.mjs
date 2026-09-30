@@ -95,3 +95,25 @@ test('waitForRegistryPackages reports lookup errors separately from missing vers
       && error.lookupErrors[0].includes('ENOTFOUND'),
   );
 });
+
+test('waitForRegistryPackages stops on elapsed time before the job timeout', async () => {
+  let time = 0;
+  let lookups = 0;
+  const waits = [];
+  await assert.rejects(
+    waitForRegistryPackages('0.32.2', {
+      attempts: 150,
+      delayMs: 20,
+      maxWaitMs: 50,
+      now: () => time,
+      sleep: async (ms) => { waits.push(ms); time += ms; },
+      log: () => {},
+      view: () => { lookups += 1; time += 1; throw new Error('ETIMEDOUT'); },
+    }),
+    (error) => error.lookupErrors.length === REGISTRY_RELEASE_PACKAGES.length
+      && error.message.includes('ETIMEDOUT')
+      && error.message.includes('after 3 attempts'),
+  );
+  assert.equal(lookups, REGISTRY_RELEASE_PACKAGES.length * 3);
+  assert.deepEqual(waits, [20, 10]);
+});

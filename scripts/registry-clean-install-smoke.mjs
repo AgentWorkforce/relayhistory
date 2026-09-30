@@ -35,6 +35,7 @@ function positiveInteger(value, fallback, name) {
   return parsed;
 }
 
+/** Read one exact version from the public registry; only E404 means absent. */
 export function npmViewVersion(spec, view = (args, options) => spawnSync('npm', args, options)) {
   const result = view(
     [
@@ -47,17 +48,22 @@ export function npmViewVersion(spec, view = (args, options) => spawnSync('npm', 
   if ((result.status ?? 1) !== 0) {
     const output = `${result.stderr ?? ''}${result.stdout ?? ''}`;
     if (/\bE404\b/.test(output)) return null;
-    throw new Error(`npm view ${spec} failed: ${output.trim() || `exit ${result.status ?? 'null'}`}`);
+    const detail = output.trim().split('\n').slice(0, 5).join(' | ');
+    throw new Error(`npm view ${spec} failed: ${detail || `exit ${result.status ?? 'null'}`}`);
   }
   return String(result.stdout ?? '').trim() || null;
 }
 
+/** Wait for the complete core release, bounded by attempts and elapsed time. */
 export async function waitForRegistryPackages(version, options = {}) {
   const attempts = options.attempts ?? DEFAULT_VISIBILITY_ATTEMPTS;
   const delayMs = options.delayMs ?? DEFAULT_VISIBILITY_DELAY_MS;
+  const maxWaitMs = options.maxWaitMs ?? Infinity;
   const view = options.view ?? npmViewVersion;
   const sleep = options.sleep ?? ((ms) => new Promise((resolveDelay) => setTimeout(resolveDelay, ms)));
   const log = options.log ?? ((message) => console.error(message));
+  const now = options.now ?? Date.now;
+  const started = now();
 
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     const missing = [];
@@ -73,9 +79,11 @@ export async function waitForRegistryPackages(version, options = {}) {
       log(`registry exposes all ${REGISTRY_RELEASE_PACKAGES.length} release packages at ${version}`);
       return;
     }
-    if (attempt === attempts) {
+    const elapsedMs = now() - started;
+    if (attempt === attempts || elapsedMs >= maxWaitMs) {
       const error = new Error(
-        `registry did not expose all release packages at ${version} after ${attempts} attempts. `
+        `registry did not expose all release packages at ${version} after ${attempt} attempts `
+        + `and ${Math.ceil(elapsedMs / 1000)}s. `
         + `Missing: ${missing.join(', ') || 'none'}. `
         + `Lookup errors: ${lookupErrors.join('; ') || 'none'}. `
         + `The release tag can be resumed with skip_core and custom_version once npm exposes the packages.`,
@@ -84,14 +92,15 @@ export async function waitForRegistryPackages(version, options = {}) {
       error.lookupErrors = lookupErrors;
       throw error;
     }
+    const waitMs = Math.min(delayMs, maxWaitMs - elapsedMs);
     log(
       `registry missing ${missing.length}/${REGISTRY_RELEASE_PACKAGES.length} package(s) `
         + `and had ${lookupErrors.length} lookup error(s) `
-        + `(attempt ${attempt}/${attempts}); retrying in ${delayMs}ms`,
+        + `(attempt ${attempt}/${attempts}); retrying in ${waitMs}ms`,
     );
     if (missing.length) log(missing.join(', '));
     if (lookupErrors.length) log(lookupErrors.join('; '));
-    await sleep(delayMs);
+    await sleep(waitMs);
   }
 }
 
@@ -175,12 +184,14 @@ export async function registryCleanInstallSmoke(options) {
   const repoRoot = resolve(options.repoRoot ?? join(dirname(fileURLToPath(import.meta.url)), '..'));
   const visibilityAttempts = options.visibilityAttempts ?? DEFAULT_VISIBILITY_ATTEMPTS;
   const visibilityDelayMs = options.visibilityDelayMs ?? DEFAULT_VISIBILITY_DELAY_MS;
+  const visibilityMaxWaitMs = options.visibilityMaxWaitMs;
   const installAttempts = options.installAttempts ?? DEFAULT_INSTALL_ATTEMPTS;
   const installDelayMs = options.installDelayMs ?? DEFAULT_INSTALL_DELAY_MS;
 
   await waitForRegistryPackages(version, {
     attempts: visibilityAttempts,
     delayMs: visibilityDelayMs,
+    maxWaitMs: visibilityMaxWaitMs,
     view: options.view,
     sleep: options.sleep,
     log: options.log,
@@ -259,6 +270,13 @@ if (invokedPath === modulePath) {
         DEFAULT_VISIBILITY_DELAY_MS,
         'REGISTRY_VISIBILITY_DELAY_MS',
       ),
+      visibilityMaxWaitMs: process.env.REGISTRY_VISIBILITY_MAX_WAIT_MS === undefined
+        ? undefined
+        : positiveInteger(
+          process.env.REGISTRY_VISIBILITY_MAX_WAIT_MS,
+          undefined,
+          'REGISTRY_VISIBILITY_MAX_WAIT_MS',
+        ),
       installAttempts: positiveInteger(
         process.env.NPM_REGISTRY_RETRY_ATTEMPTS,
         DEFAULT_INSTALL_ATTEMPTS,

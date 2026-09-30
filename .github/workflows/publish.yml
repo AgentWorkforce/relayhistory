@@ -146,6 +146,14 @@ jobs:
               exit 1
             fi
             echo "Re-running plugins from the tag sdk-ts-v$VERSION"
+          else
+            # npm may still report E404 for a publish it already accepted.
+            # A tag is stronger evidence that this workflow finished publishing.
+            matching_tags=$(gh api "repos/${{ github.repository }}/git/matching-refs/tags/sdk-ts-v$VERSION" --jq '.[].ref')
+            if printf '%s\n' "$matching_tags" | grep -Fxq "refs/tags/sdk-ts-v$VERSION"; then
+              echo "Release tag sdk-ts-v$VERSION already exists; resume with skip_core=true and custom_version=$VERSION instead of republishing" >&2
+              exit 1
+            fi
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Release version $VERSION"
@@ -639,7 +647,17 @@ jobs:
       - name: Recheck release version availability
         if: ${{ !inputs.dry_run }}
         working-directory: .
-        run: node scripts/check-release-version-available.mjs
+        run: |
+          set -euo pipefail
+          # The tag may have appeared while the build matrix was running.
+          # git ls-remote fails closed on transport errors, unlike a lookup
+          # that treats every failed command as an absent tag.
+          tag=$(git ls-remote --tags origin "refs/tags/sdk-ts-v$VERSION")
+          if [ -n "$tag" ]; then
+            echo "Release tag sdk-ts-v$VERSION already exists; resume with skip_core=true and custom_version=$VERSION instead of republishing" >&2
+            exit 1
+          fi
+          node scripts/check-release-version-available.mjs
       - name: Publish
         env:
           DRY_RUN: ${{ inputs.dry_run }}
@@ -767,6 +785,7 @@ jobs:
           # Keep a bounded wait, then allow skip_core to resume from the tag.
           REGISTRY_VISIBILITY_ATTEMPTS: 150
           REGISTRY_VISIBILITY_DELAY_MS: 20000
+          REGISTRY_VISIBILITY_MAX_WAIT_MS: 4200000
           NPM_REGISTRY_RETRY_ATTEMPTS: 36
           NPM_REGISTRY_RETRY_DELAY_MS: 10000
         run: node scripts/registry-clean-install-smoke.mjs

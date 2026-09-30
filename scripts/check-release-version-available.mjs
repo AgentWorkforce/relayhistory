@@ -7,6 +7,7 @@ import {
   REGISTRY_RELEASE_PACKAGES,
 } from './registry-clean-install-smoke.mjs';
 
+/** Refuse versions already visible on npm just before the first publish. */
 export function checkReleaseVersionAvailable(version, view = npmViewVersion) {
   if (!/^\d+\.\d+\.\d+$/.test(version)) {
     throw new Error(`expected a stable semver release version, received ${version}`);
