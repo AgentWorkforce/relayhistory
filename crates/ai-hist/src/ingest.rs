@@ -13676,6 +13676,9 @@ fn materialize_grok_unified_usage(
         }
     }
     // Per turn: demote a turn's breakdown only when the log reaches into it.
+    // A turn with no recorded window cannot be placed, so a timed row never
+    // covers it; only a timeless row (which covers every turn) does. Otherwise
+    // it keeps its own `usage`, and `classify_grok_turn_coverage` counts it so.
     conn.execute(
         "UPDATE session_events SET token_json = json_set(json_remove(token_json, '$.usage'), \
          '$.turn_usage', json(json_extract(token_json, '$.usage'))) \
@@ -13683,9 +13686,7 @@ fn materialize_grok_unified_usage(
          AND token_json IS NOT NULL AND json_valid(token_json) \
          AND json_extract(token_json, '$.source') = 'updates.jsonl' \
          AND json_type(token_json, '$.usage') IS NOT NULL \
-         AND (json_type(token_json, '$.turn_start_ms') IS NULL \
-           OR json_type(token_json, '$.turn_end_ms') IS NULL \
-           OR EXISTS (SELECT 1 FROM grok_unified_usage u WHERE u.session_id = ?1 \
+         AND (EXISTS (SELECT 1 FROM grok_unified_usage u WHERE u.session_id = ?1 \
                 AND u.ts_ms IS NULL) \
            OR EXISTS (SELECT 1 FROM grok_unified_usage u WHERE u.session_id = ?1 \
                 AND u.ts_ms BETWEEN json_extract(token_json, '$.turn_start_ms') \
@@ -17294,6 +17295,91 @@ mod tests {
         assert_ne!(without_summary, with_summary);
         fs::write(dir.join("events.jsonl"), "{\"model_id\":\"grok-z\"}\n").unwrap();
         assert_ne!(super::grok_session_stamp(&chat).unwrap(), without_summary);
+    }
+
+    /// A timed log row covers only the turn whose window holds it. A turn
+    /// with no recorded window keeps its own `usage` rather than losing it
+    /// to a row that belongs to another turn; a timeless row still covers it.
+    #[test]
+    fn a_windowless_grok_turn_keeps_its_usage_unless_a_timeless_row_covers_it() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (session_id, source, cwd) VALUES ('g', 'grok', '/tmp/g')",
+            [],
+        )
+        .unwrap();
+        let windowed = json!({
+            "source": "updates.jsonl",
+            "turn_start_ms": 10,
+            "turn_end_ms": 20,
+            "usage": {"inputTokens": 5}
+        });
+        let windowless = json!({
+            "source": "updates.jsonl",
+            "usage": {"inputTokens": 7}
+        });
+        for (uid, token) in [("t1", &windowed), ("t2", &windowless)] {
+            conn.execute(
+                "INSERT INTO session_events \
+                 (source, session_id, ts_ms, role, kind, event_uid, token_json) \
+                 VALUES ('grok', 'g', 15, 'assistant', 'text', ?, ?)",
+                params![uid, token.to_string()],
+            )
+            .unwrap();
+        }
+        let insert_row = |key: &str, ts: Option<i64>| {
+            conn.execute(
+                "INSERT INTO grok_unified_usage \
+                 (row_key, session_id, ts_ms, usage_json, locator, line_offset) \
+                 VALUES (?, 'g', ?, '{\"inputTokens\":3}', 'unified.jsonl', 0)",
+                params![key, ts],
+            )
+            .unwrap();
+        };
+        let token = |uid: &str| -> Value {
+            let raw: String = conn
+                .query_row(
+                    "SELECT token_json FROM session_events \
+                     WHERE session_id = 'g' AND event_uid = ?",
+                    params![uid],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            serde_json::from_str(&raw).unwrap()
+        };
+
+        insert_row("timed", Some(15));
+        let coverage = super::materialize_grok_unified_usage(&conn, "g", None).unwrap();
+        assert!(token("t1").get("usage").is_none());
+        assert!(token("t1").get("turn_usage").is_some());
+        assert_eq!(
+            token("t2")["usage"]["inputTokens"],
+            7,
+            "a windowless turn keeps its usage"
+        );
+        assert!(token("t2").get("turn_usage").is_none());
+        assert_eq!(
+            (
+                coverage.covered_turns,
+                coverage.turn_usage_turns,
+                coverage.proxy_only_turns
+            ),
+            (1, 1, 0)
+        );
+
+        insert_row("timeless", None);
+        let coverage = super::materialize_grok_unified_usage(&conn, "g", None).unwrap();
+        assert!(token("t2").get("usage").is_none());
+        assert_eq!(token("t2")["turn_usage"]["inputTokens"], 7);
+        assert_eq!(
+            (
+                coverage.covered_turns,
+                coverage.turn_usage_turns,
+                coverage.proxy_only_turns
+            ),
+            (2, 0, 0)
+        );
     }
 
     #[test]
