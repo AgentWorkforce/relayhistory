@@ -216,29 +216,39 @@ pub fn native_contract_version() -> u32 {
     NATIVE_CONTRACT_VERSION
 }
 
-/// Call `callback` with `"started"` and `"finished"` whenever an open in
-/// this process migrates an existing database. Returns false when a callback
-/// is already registered: the first registration wins.
+/// Call `callback` with `"started"` or `"finished"` and the database's path
+/// whenever an open in this process migrates an existing database. Returns
+/// false when a callback is already registered: the first registration wins.
 ///
-/// The callback never keeps the process alive, and it is called
-/// asynchronously on the JS thread while the migrating operation is still
-/// pending.
-#[napi(ts_args_type = "callback: (event: 'started' | 'finished') => void")]
+/// The callback never keeps the process alive. It runs asynchronously on the
+/// JS thread, so a caller that needs `finished` before exiting waits for it.
+#[napi(ts_args_type = "callback: (event: 'started' | 'finished', dbPath: string | null) => void")]
 pub fn on_store_migration(env: Env, callback: JsFunction) -> napi::Result<bool> {
     use napi::threadsafe_function::{
-        ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode,
+        ErrorStrategy, ThreadSafeCallContext, ThreadsafeFunction, ThreadsafeFunctionCallMode,
     };
-    let mut notify: ThreadsafeFunction<&'static str, ErrorStrategy::Fatal> = callback
-        .create_threadsafe_function(0, |ctx| {
-            ctx.env.create_string(ctx.value).map(|event| vec![event])
-        })?;
+    let mut notify: ThreadsafeFunction<(&'static str, Option<String>), ErrorStrategy::Fatal> =
+        callback.create_threadsafe_function(
+            0,
+            |ctx: ThreadSafeCallContext<(&'static str, Option<String>)>| {
+                let (event, path) = ctx.value;
+                let path = match path {
+                    Some(path) => ctx.env.create_string(&path)?.into_unknown(),
+                    None => ctx.env.get_null()?.into_unknown(),
+                };
+                Ok(vec![ctx.env.create_string(event)?.into_unknown(), path])
+            },
+        )?;
     notify.unref(&env)?;
-    Ok(ai_hist::observe_migrations(move |event, _path| {
+    Ok(ai_hist::observe_migrations(move |event, path| {
         let event = match event {
             ai_hist::MigrationEvent::Started => "started",
             ai_hist::MigrationEvent::Finished => "finished",
         };
-        notify.call(event, ThreadsafeFunctionCallMode::NonBlocking);
+        notify.call(
+            (event, path.map(str::to_string)),
+            ThreadsafeFunctionCallMode::NonBlocking,
+        );
     }))
 }
 

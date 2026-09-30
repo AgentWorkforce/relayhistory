@@ -1221,12 +1221,15 @@ export interface LocalStoreReadiness {
  *
  * A migration after an upgrade can take minutes on a large history. `listener`
  * hears `started` when an open takes the write lock to migrate and `finished`
- * when it commits -- never for a new or current database, or for a call that
- * is rejected before it opens -- so a front end announces exactly the work
- * that happens. One listener per process: resolves false when one is already
- * registered.
+ * when it commits, each with the database's path -- never for a new or current
+ * database, or for a call that is rejected before it opens -- so a front end
+ * announces exactly the work that happens. Events arrive asynchronously, so
+ * `finished` can land just after the migrating call resolves. One listener per
+ * process: resolves false when one is already registered.
  */
-export async function onStoreMigration(listener: (event: 'started' | 'finished') => void): Promise<boolean> {
+export async function onStoreMigration(
+  listener: (event: 'started' | 'finished', dbPath: string | null) => void,
+): Promise<boolean> {
   return nativeCall(async (native) => native.onStoreMigration(listener));
 }
 

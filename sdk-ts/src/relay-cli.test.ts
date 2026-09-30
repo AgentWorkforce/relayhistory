@@ -458,6 +458,27 @@ test('importing the surface does not run the bin', async () => {
 // The mount must carry everything `runCli` needs, not just argv
 // ---------------------------------------------------------------------------
 
+// A mounted command reaches `runCli` without the bin's `main`, and the host's
+// stderr sink is the only place its user can see a long migration named.
+test('a mounted command announces the migration it runs on the host stderr', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'relayhistory-surface-upgrade-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const db = join(root, 'history.db');
+  await writeFile(db, gunzipSync(await readFile(new URL('../fixtures/offline-history.db.gz', import.meta.url))));
+  const selectionPath = join(root, 'selection.json');
+  await writeFile(selectionPath, JSON.stringify({
+    all_sources: false, sources: ['claude'], sessions: [], kinds: ['history'], excluded_sessions: [],
+  }));
+
+  const io = capture();
+  const code = await createRelayCliSurface().run(['export', '--selection', selectionPath, '--db', db], io);
+
+  assert.equal(code, 0, io.err);
+  assert.match(io.err, /Upgrading the ai-hist database to \d+\.\d+\.\d+/);
+  assert.match(io.err, /Database upgraded in \d+s\./);
+  assert.equal(io.out.trim().split('\n').length, 3);
+});
+
 test('mounted export with no --out streams NDJSON to the host, as bytes', async (t) => {
   const { root, db } = await historyFixture();
   t.after(() => rm(root, { recursive: true, force: true }));

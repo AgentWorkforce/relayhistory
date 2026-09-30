@@ -22,15 +22,14 @@ export declare function applySourceEvidence(requestJson: string): Promise<string
 /** Contract version implemented by this native addon. */
 export declare function nativeContractVersion(): number
 /**
- * Call `callback` with `"started"` and `"finished"` whenever an open in
- * this process migrates an existing database. Returns false when a callback
- * is already registered: the first registration wins.
+ * Call `callback` with `"started"` or `"finished"` and the database's path
+ * whenever an open in this process migrates an existing database. Returns
+ * false when a callback is already registered: the first registration wins.
  *
- * The callback never keeps the process alive, and it is called
- * asynchronously on the JS thread while the migrating operation is still
- * pending.
+ * The callback never keeps the process alive. It runs asynchronously on the
+ * JS thread, so a caller that needs `finished` before exiting waits for it.
  */
-export declare function onStoreMigration(callback: (event: 'started' | 'finished') => void): boolean
+export declare function onStoreMigration(callback: (event: 'started' | 'finished', dbPath: string | null) => void): boolean
 /**
  * Run any outstanding schema migration now, creating the database if it
  * does not exist. The same work the first open of any operation would do.

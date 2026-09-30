@@ -93,22 +93,57 @@ async function packageVersion(): Promise<string> {
   return (JSON.parse(contents) as PackageMetadata).version ?? 'unknown';
 }
 
+/** Where the command lines running in this process send their stderr. */
+const migrationSinks = new Set<CliIo>();
+/** Start time of each migration announced but not yet finished, by database. */
+const migrationsRunning = new Map<string, number>();
+let migrationsSettled: (() => void) | null = null;
+let migrationListener: Promise<unknown> | null = null;
+
 /**
  * Name a schema migration while it runs, so the first command after an upgrade
- * does not sit silent for minutes and read as a hang. Best effort: a missing
- * native package is reported by the command itself.
+ * does not sit silent for minutes and read as a hang. The native listener is
+ * registered once per process; each event goes to the command lines running
+ * when it fires. Best effort: a missing native package is reported by the
+ * command itself.
  */
-async function announceMigrations(io: CliIo): Promise<void> {
-  const version = await packageVersion();
-  let started = 0;
-  await onStoreMigration((event) => {
-    if (event === 'started') {
-      started = Date.now();
-      io.stderr(`Upgrading the ai-hist database to ${version}. This runs once and can take a few minutes on a large history...\n`);
-    } else {
-      io.stderr(`Database upgraded in ${formatElapsed(Date.now() - started)}.\n`);
+function listenForMigrations(): Promise<unknown> {
+  migrationListener ??= (async () => {
+    const version = await packageVersion();
+    return onStoreMigration((event, dbPath) => {
+      const key = dbPath ?? '';
+      if (event === 'started') {
+        migrationsRunning.set(key, Date.now());
+        for (const io of migrationSinks) {
+          io.stderr(`Upgrading the ai-hist database to ${version}. This runs once and can take a few minutes on a large history...\n`);
+        }
+        return;
+      }
+      const started = migrationsRunning.get(key) ?? Date.now();
+      migrationsRunning.delete(key);
+      for (const io of migrationSinks) io.stderr(`Database upgraded in ${formatElapsed(Date.now() - started)}.\n`);
+      if (migrationsRunning.size === 0) migrationsSettled?.();
+    });
+  })().catch(() => false);
+  return migrationListener;
+}
+
+/**
+ * Wait for the `finished` of any migration that started, so the notice is not
+ * lost to an exit. It was queued before the migrating call returned, so this
+ * takes milliseconds; the bound only covers a migration that failed.
+ */
+async function migrationsFinished(): Promise<void> {
+  if (migrationsRunning.size === 0) return;
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(settle, 2_000);
+    function settle(): void {
+      clearTimeout(timer);
+      migrationsSettled = null;
+      resolve();
     }
-  }).catch(() => false);
+    migrationsSettled = settle;
+  });
 }
 
 function formatElapsed(ms: number): string {
@@ -1185,9 +1220,13 @@ export interface RunCliOptions {
  *
  * Never calls `process.exit`, never writes to `process.stdout`/`process.stderr`
  * and never installs a signal handler: the caller owns all three. `argv` is the
- * arguments after the program name.
+ * arguments after the program name. A schema migration the command runs is
+ * announced on `io.stderr`; the first call registers the process's one native
+ * migration listener for that (see `onStoreMigration`).
  */
 export async function runCli(argv: readonly string[], io: CliIo, options: RunCliOptions = {}): Promise<number> {
+  await listenForMigrations();
+  migrationSinks.add(io);
   try {
     return await dispatch(argv, io, options);
   } catch (error: unknown) {
@@ -1199,6 +1238,9 @@ export async function runCli(argv: readonly string[], io: CliIo, options: RunCli
     const value = error as { code?: string; message?: string };
     io.stderr(`ai-hist: ${value.code ? `${value.code}: ` : ''}${value.message ?? String(error)}\n`);
     return 1;
+  } finally {
+    await migrationsFinished();
+    migrationSinks.delete(io);
   }
 }
 
@@ -1224,7 +1266,6 @@ async function main(): Promise<void> {
     process.once('SIGINT', stop);
     process.once('SIGTERM', stop);
   }
-  await announceMigrations(io);
   try {
     process.exitCode = await runCli(argv, io, {
       signal: cancellable ? abort.signal : undefined,
