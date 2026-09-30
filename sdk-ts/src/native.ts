@@ -19,7 +19,7 @@ import {
   ConnectorFailureError,
 } from './sdk-common.js';
 
-export const NATIVE_CONTRACT_VERSION = 25;
+export const NATIVE_CONTRACT_VERSION = 26;
 type UnknownRecord = Record<string, unknown>;
 
 interface NativeBinding {
@@ -52,6 +52,8 @@ interface NativeBinding {
   getSessionTree(options: object): Promise<UnknownRecord>;
   getSessionChildrenPage(options: object): Promise<UnknownRecord>;
   sync(options?: object): Promise<UnknownRecord>;
+  onStoreMigration(callback: (event: 'started' | 'finished' | 'failed', dbPath: string | null) => void): boolean;
+  migrateStore(dbPath?: string): Promise<void>;
 }
 
 const SUPPORTED_PLATFORMS = new Set([

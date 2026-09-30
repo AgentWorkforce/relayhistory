@@ -44,6 +44,7 @@ use ai_hist::{
     SessionRequest as CoreSessionRequest, SessionRequestCursor as CoreRequestCursor,
     SessionUsageSummary as CoreSessionUsageSummary, SESSION_USAGE_CONTRACT_VERSION,
 };
+use napi::{Env, JsFunction};
 use napi_derive::napi;
 use serde::Serialize;
 
@@ -80,7 +81,9 @@ use serde::Serialize;
 /// 25 adds the change feed to `sessionStoreCall`: `changes` pages
 /// `SessionStore::changes_since` and `commit_changes` moves a named consumer
 /// cursor.
-pub const NATIVE_CONTRACT_VERSION: u32 = 25;
+/// 26 adds `onStoreMigration` and `migrateStore`, so a front end can name
+/// the one-time schema migration after an upgrade instead of appearing hung.
+pub const NATIVE_CONTRACT_VERSION: u32 = 26;
 const DEFAULT_LIMIT: i64 = 50;
 const DEFAULT_EVENT_LIMIT: i64 = 200;
 
@@ -211,6 +214,60 @@ fn source_connector_selection(
 #[napi]
 pub fn native_contract_version() -> u32 {
     NATIVE_CONTRACT_VERSION
+}
+
+/// Call `callback` with `"started"`, then `"finished"` or `"failed"`, and the
+/// database's path whenever an open in this process migrates an existing
+/// database. Returns
+/// false when a callback is already registered: the first registration wins.
+///
+/// The callback never keeps the process alive. It runs asynchronously on the
+/// JS thread, so a caller that needs `finished` before exiting waits for it.
+#[napi(
+    ts_args_type = "callback: (event: 'started' | 'finished' | 'failed', dbPath: string | null) => void"
+)]
+pub fn on_store_migration(env: Env, callback: JsFunction) -> napi::Result<bool> {
+    use napi::threadsafe_function::{
+        ErrorStrategy, ThreadSafeCallContext, ThreadsafeFunction, ThreadsafeFunctionCallMode,
+    };
+    let mut notify: ThreadsafeFunction<(&'static str, Option<String>), ErrorStrategy::Fatal> =
+        callback.create_threadsafe_function(
+            0,
+            |ctx: ThreadSafeCallContext<(&'static str, Option<String>)>| {
+                let (event, path) = ctx.value;
+                let path = match path {
+                    Some(path) => ctx.env.create_string(&path)?.into_unknown(),
+                    None => ctx.env.get_null()?.into_unknown(),
+                };
+                Ok(vec![ctx.env.create_string(event)?.into_unknown(), path])
+            },
+        )?;
+    notify.unref(&env)?;
+    Ok(ai_hist::observe_migrations(move |event, path| {
+        let event = match event {
+            ai_hist::MigrationEvent::Started => "started",
+            ai_hist::MigrationEvent::Finished => "finished",
+            ai_hist::MigrationEvent::Failed => "failed",
+        };
+        notify.call(
+            (event, path.map(str::to_string)),
+            ThreadsafeFunctionCallMode::NonBlocking,
+        );
+    }))
+}
+
+/// Run any outstanding schema migration now, creating the database if it
+/// does not exist. The same work the first open of any operation would do.
+#[napi]
+pub async fn migrate_store(db_path: Option<String>) -> napi::Result<()> {
+    let path = crate::db_path(db_path);
+    napi::tokio::task::spawn_blocking(move || {
+        open_db(&path)
+            .map(drop)
+            .map_err(|error| database_error(&path, format!("{error:#}")))
+    })
+    .await
+    .map_err(worker_error)?
 }
 
 /// Optimization profile this addon was compiled with: `release` or `debug`.

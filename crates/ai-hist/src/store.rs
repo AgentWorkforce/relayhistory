@@ -1271,17 +1271,56 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     init_db_once(conn)
 }
 
+/// Whether [`init_db`] has migration work to do on this database. A leftover
+/// retired index counts as outstanding work: its DROP is a real write.
+fn needs_migration(conn: &Connection) -> Result<bool> {
+    Ok(!schema_is_current(conn)?
+        || retired_indexes_present(conn)?
+        || retired_capture_present(conn)?
+        || retired_trajectory_index_present(conn)?)
+}
+
+/// A schema migration an open in this process runs on an existing database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationEvent {
+    /// The migration holds the write lock and is about to run.
+    Started,
+    /// The migration committed.
+    Finished,
+    /// The migration failed and rolled back; the open reports the error.
+    Failed,
+}
+
+type MigrationObserver = Box<dyn Fn(MigrationEvent, Option<&str>) + Send + Sync>;
+
+static MIGRATION_OBSERVER: std::sync::OnceLock<MigrationObserver> = std::sync::OnceLock::new();
+
+/// Register the process's migration observer, called with each
+/// [`MigrationEvent`] and the database's path.
+///
+/// A migration after an upgrade can run for minutes on a large history, and a
+/// front end that says nothing reads as hung. Events fire only when an open
+/// actually migrates an existing database -- never for a new database, a
+/// current one, or a command that never opens for write -- so a front end
+/// announces exactly the work that happens. The first registration wins;
+/// returns false when an observer is already set.
+pub fn observe_migrations(
+    observer: impl Fn(MigrationEvent, Option<&str>) + Send + Sync + 'static,
+) -> bool {
+    MIGRATION_OBSERVER.set(Box::new(observer)).is_ok()
+}
+
+fn notify_migration(conn: &Connection, event: MigrationEvent) {
+    if let Some(observer) = MIGRATION_OBSERVER.get() {
+        observer(event, conn.path());
+    }
+}
+
 fn init_db_once(conn: &Connection) -> Result<()> {
     // A current database needs no write lock. Besides keeping ordinary opens
     // cheap, this lets sync reach its per-source contention handling when a
-    // different writer already owns the ledger lock. A leftover retired index
-    // counts as outstanding migration work: its DROP is a real write, so it
-    // routes through the serialized pass below instead of this lock-free path.
-    if schema_is_current(conn)?
-        && !retired_indexes_present(conn)?
-        && !retired_capture_present(conn)?
-        && !retired_trajectory_index_present(conn)?
-    {
+    // different writer already owns the ledger lock.
+    if !needs_migration(conn)? {
         return Ok(());
     }
     enable_wal_for_migration(conn)?;
@@ -1292,15 +1331,38 @@ fn init_db_once(conn: &Connection) -> Result<()> {
     let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     // Another first opener may have completed the migration while this
     // connection waited for the lock.
-    if !schema_is_current(&transaction)?
-        || retired_indexes_present(&transaction)?
-        || retired_capture_present(&transaction)?
-        || retired_trajectory_index_present(&transaction)?
-    {
-        init_db_locked(&transaction)?;
+    if !needs_migration(&transaction)? {
+        transaction.commit()?;
+        return Ok(());
     }
-    transaction.commit()?;
-    Ok(())
+    // Creating a database is not an upgrade.
+    let upgrading: bool =
+        transaction.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master)", [], |row| {
+            row.get(0)
+        })?;
+    if upgrading {
+        notify_migration(conn, MigrationEvent::Started);
+    }
+    // Every `Started` ends in exactly one `Finished` or `Failed`, so an
+    // observer waiting on it is never left hanging. Either event fires with the
+    // write lock released: committed, or rolled back by dropping the
+    // transaction before the observer hears of the failure.
+    let migrated = match init_db_locked(&transaction) {
+        Ok(()) => transaction.commit().map_err(anyhow::Error::from),
+        Err(error) => {
+            drop(transaction);
+            Err(error)
+        }
+    };
+    if upgrading {
+        let event = if migrated.is_ok() {
+            MigrationEvent::Finished
+        } else {
+            MigrationEvent::Failed
+        };
+        notify_migration(conn, event);
+    }
+    migrated
 }
 
 /// One observed delegation edge, or one piece of related evidence whose child
@@ -5130,6 +5192,86 @@ mod tests {
             .unwrap();
         let conn = open_db(&path).unwrap();
         assert_eq!(trajectory_index_objects(&conn), 0);
+    }
+
+    #[test]
+    fn the_migration_observer_hears_every_upgrade_end_but_not_a_creation() {
+        use std::sync::Mutex;
+        static EVENTS: Mutex<Vec<(MigrationEvent, String)>> = Mutex::new(Vec::new());
+        /// Whether the write lock was free when each `Failed` arrived.
+        static LOCK_FREE_ON_FAILURE: Mutex<Vec<bool>> = Mutex::new(Vec::new());
+        observe_migrations(|event, path| {
+            let path = path.unwrap_or_default().to_string();
+            if event == MigrationEvent::Failed {
+                let free = Connection::open(&path).is_ok_and(|conn| {
+                    conn.busy_timeout(Duration::ZERO).is_ok()
+                        && conn.execute_batch("BEGIN IMMEDIATE; ROLLBACK;").is_ok()
+                });
+                LOCK_FREE_ON_FAILURE
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(free);
+            }
+            EVENTS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((event, path));
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        let ours = |events: &[(MigrationEvent, String)]| -> Vec<MigrationEvent> {
+            let path = fs::canonicalize(&path).unwrap();
+            events
+                .iter()
+                .filter(|(_, p)| fs::canonicalize(p).ok().as_ref() == Some(&path))
+                .map(|(event, _)| *event)
+                .collect()
+        };
+
+        drop(open_db(&path).unwrap());
+        drop(open_db(&path).unwrap());
+        assert_eq!(ours(&EVENTS.lock().unwrap()), []);
+
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "DELETE FROM schema_migrations WHERE name = 'history_fts_update_of_v1'",
+                [],
+            )
+            .unwrap();
+        drop(open_db(&path).unwrap());
+        drop(open_db(&path).unwrap());
+        assert_eq!(
+            ours(&EVENTS.lock().unwrap()),
+            [MigrationEvent::Started, MigrationEvent::Finished]
+        );
+
+        // A table squatting on an index's name makes the migration fail after
+        // it started; the observer still hears how it ended.
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "DROP INDEX idx_session_presences_location;
+                 CREATE TABLE idx_session_presences_location (x);",
+            )
+            .unwrap();
+        assert!(open_db(&path).is_err());
+        assert_eq!(
+            ours(&EVENTS.lock().unwrap()),
+            [
+                MigrationEvent::Started,
+                MigrationEvent::Finished,
+                MigrationEvent::Started,
+                MigrationEvent::Failed
+            ]
+        );
+        // The failure is heard only once the migration has rolled back, so an
+        // observer that retries at once is not blocked by it.
+        assert!(LOCK_FREE_ON_FAILURE
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|free| *free));
     }
 
     #[test]

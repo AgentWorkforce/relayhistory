@@ -1216,6 +1216,29 @@ export interface LocalStoreReadiness {
   bootstrap: BootstrapLocalResult | null;
 }
 
+/**
+ * Listen for schema migrations this process runs on an existing database.
+ *
+ * A migration after an upgrade can take minutes on a large history. `listener`
+ * hears `started` when an open takes the write lock to migrate, then
+ * `finished` when it commits or `failed` when it rolls back, each with the
+ * database's path -- never for a new or current
+ * database, or for a call that is rejected before it opens -- so a front end
+ * announces exactly the work that happens. Events arrive asynchronously, so
+ * the last one can land just after the migrating call settles. One listener per
+ * process: resolves false when one is already registered.
+ */
+export async function onStoreMigration(
+  listener: (event: 'started' | 'finished' | 'failed', dbPath: string | null) => void,
+): Promise<boolean> {
+  return nativeCall(async (native) => native.onStoreMigration(listener));
+}
+
+/** Run any outstanding schema migration now, creating the database if it does not exist. */
+export async function migrateStore(options: { dbPath?: string } = {}): Promise<void> {
+  return nativeCall((native) => native.migrateStore(options.dbPath));
+}
+
 export interface EnsureLocalStoreOptions {
   dbPath?: string;
   /** Only `local` and `all` read the local database; `remote` skips the check. */

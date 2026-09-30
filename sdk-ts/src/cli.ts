@@ -2,11 +2,12 @@
 
 import { realpathSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
+import { resolve as resolvePath } from 'node:path';
 import type { Writable } from 'node:stream';
 import { pathToFileURL } from 'node:url';
 
 import {
-  discoverSessions, ensureLocalStore, formatSessionRow, getSession, getSessionEventsPage, getSessionFileEditsPage,
+  discoverSessions, ensureLocalStore, formatSessionRow, onStoreMigration, getSession, getSessionEventsPage, getSessionFileEditsPage,
   getSessionMarkersPage, getSessionRelationships, getSessionToolCallsPage, getSessionTree, getSessionUsage,
   hydrateSession, listSessionCatalogPage, recent, resumeCommand, search, stats, sync,
   type CatalogCursor, type EvidenceCursor, type HistoryEntry, type LocalStoreReadiness,
@@ -14,6 +15,7 @@ import {
   type SessionToolCallsPage, type SessionUsage, type SearchRole, type HistoryCursor,
 } from './index.js';
 import { runHistoryExportCommand, loadHistoryApplicationConfig } from './delivery-cli.js';
+import { defaultDbPath } from './sdk-common.js';
 
 type Parsed = { positional: string[]; flags: Map<string, Array<string | true>> };
 
@@ -91,6 +93,96 @@ function isBinEntrypoint(): boolean {
 async function packageVersion(): Promise<string> {
   const contents = await readFile(new URL('../package.json', import.meta.url), 'utf8');
   return (JSON.parse(contents) as PackageMetadata).version ?? 'unknown';
+}
+
+/**
+ * Where the command lines running in this process send their stderr, with how
+ * many running calls share each sink.
+ */
+const migrationSinks = new Map<CliIo, number>();
+/** Start time of each migration announced but not yet ended, by database. */
+const migrationsRunning = new Map<string, number>();
+/** Calls waiting for their database's migration to end, by database. */
+const migrationWaiters = new Map<string, Set<() => void>>();
+
+/** One spelling per database file, whichever path reached it. */
+function databaseKey(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolvePath(path);
+  }
+}
+
+/** The database a command line opens: its `--db`, else the default. */
+function commandDatabase(argv: readonly string[]): string {
+  try {
+    return databaseKey(textFlag(parse([...argv]), 'db') ?? defaultDbPath());
+  } catch {
+    return databaseKey(defaultDbPath());
+  }
+}
+let migrationListener: Promise<unknown> | null = null;
+
+/**
+ * Name a schema migration while it runs, so the first command after an upgrade
+ * does not sit silent for minutes and read as a hang. The native listener is
+ * registered once per process; each event goes to the command lines running
+ * when it fires. Best effort: a missing native package is reported by the
+ * command itself.
+ */
+function listenForMigrations(): Promise<unknown> {
+  migrationListener ??= (async () => {
+    const version = await packageVersion();
+    return onStoreMigration((event, dbPath) => {
+      const key = dbPath === null ? '' : databaseKey(dbPath);
+      if (event === 'started') {
+        migrationsRunning.set(key, Date.now());
+        for (const io of migrationSinks.keys()) {
+          io.stderr(`Upgrading the ai-hist database to ${version}. This runs once and can take a few minutes on a large history...\n`);
+        }
+        return;
+      }
+      const started = migrationsRunning.get(key) ?? Date.now();
+      migrationsRunning.delete(key);
+      // A failed migration is reported by the command whose open it was.
+      if (event === 'finished') {
+        for (const io of migrationSinks.keys()) io.stderr(`Database upgraded in ${formatElapsed(Date.now() - started)}.\n`);
+      }
+      for (const settle of [...(migrationWaiters.get(key) ?? [])]) settle();
+    });
+  })().catch(() => false);
+  return migrationListener;
+}
+
+/**
+ * Wait for the end of a migration of `database` that started, so its last line
+ * is not lost to an exit. Each `started` is followed by a `finished` or
+ * `failed` queued before the migrating call returned, so this takes
+ * milliseconds. The listener never keeps the process alive, so a timer does
+ * while waiting; if it fires, only this wait gives up -- the migration's own
+ * state is left for its terminal event.
+ */
+async function migrationEnded(database: string): Promise<void> {
+  if (!migrationsRunning.has(database)) return;
+  const waiters = migrationWaiters.get(database) ?? new Set<() => void>();
+  migrationWaiters.set(database, waiters);
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(settle, 2_000);
+    function settle(): void {
+      clearTimeout(timer);
+      waiters.delete(settle);
+      if (waiters.size === 0 && migrationWaiters.get(database) === waiters) migrationWaiters.delete(database);
+      resolve();
+    }
+    waiters.add(settle);
+  });
+}
+
+function formatElapsed(ms: number): string {
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
 }
 
 async function maybePrintUpdateNotice(io: CliIo, current: string, args: string[]): Promise<void> {
@@ -1161,9 +1253,13 @@ export interface RunCliOptions {
  *
  * Never calls `process.exit`, never writes to `process.stdout`/`process.stderr`
  * and never installs a signal handler: the caller owns all three. `argv` is the
- * arguments after the program name.
+ * arguments after the program name. A schema migration the command runs is
+ * announced on `io.stderr`; the first call registers the process's one native
+ * migration listener for that (see `onStoreMigration`).
  */
 export async function runCli(argv: readonly string[], io: CliIo, options: RunCliOptions = {}): Promise<number> {
+  await listenForMigrations();
+  migrationSinks.set(io, (migrationSinks.get(io) ?? 0) + 1);
   try {
     return await dispatch(argv, io, options);
   } catch (error: unknown) {
@@ -1175,6 +1271,11 @@ export async function runCli(argv: readonly string[], io: CliIo, options: RunCli
     const value = error as { code?: string; message?: string };
     io.stderr(`ai-hist: ${value.code ? `${value.code}: ` : ''}${value.message ?? String(error)}\n`);
     return 1;
+  } finally {
+    await migrationEnded(commandDatabase(argv));
+    const calls = (migrationSinks.get(io) ?? 1) - 1;
+    if (calls > 0) migrationSinks.set(io, calls);
+    else migrationSinks.delete(io);
   }
 }
 
