@@ -48,11 +48,11 @@ and `crates/ai-hist-napi/src/lib.rs`).
    publishes nothing. A crates.io-only retry uses `skip_core` with the
    already-published `custom_version`; the job checks out `sdk-ts-v<version>`
    and publishes the crate from that tag.
-5. Before building and again immediately before publishing, the workflow checks
-   for an existing recovery tag. A tagged version must be resumed with
-   `skip_core` and its `custom_version`, even if npm still returns 404 while
-   processing it. `publish` also checks whether the release version became
-   visible on npm while the build matrix ran. Once all npm publish commands
+5. On a real publish, before building and again immediately before publishing,
+   the workflow checks for an existing recovery tag. A tagged version must be
+   resumed with `skip_core` and its `custom_version`, even if npm still
+   returns 404 while processing it. `publish` also checks whether the release
+   version became visible on npm while the build matrix ran. Once all npm publish commands
    succeed, it tags the published tree as `sdk-ts-v<version>`. `verify-core`
    waits up to 70 minutes for npm's processing queue, then runs the clean registry
    install and older-glibc CLI smoke tests. `finalize-core` creates the GitHub

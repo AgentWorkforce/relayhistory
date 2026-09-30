@@ -47,7 +47,7 @@ test("plugins publish from a matrix and verify afterwards", () => {
 
 test("full core smoke checks gate release finalization and downstream publication", () => {
   const version = jobBlock(publish, "version", "build");
-  assert.match(version, /matching-refs\/tags\/sdk-ts-v\$VERSION/);
+  assert.match(version, /elif \[ "\$DRY_RUN" != "true" \]; then[\s\S]*matching-refs\/tags\/sdk-ts-v\$VERSION/);
   assert.match(version, /resume with skip_core=true and custom_version=\$VERSION/);
 
   const corePublish = jobBlock(publish, "publish", "verify-core");

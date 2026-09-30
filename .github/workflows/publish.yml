@@ -87,6 +87,7 @@ jobs:
           VERSION_TYPE: ${{ inputs.version }}
           CUSTOM_VERSION: ${{ inputs.custom_version }}
           SKIP_CORE: ${{ inputs.skip_core }}
+          DRY_RUN: ${{ inputs.dry_run }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -146,9 +147,10 @@ jobs:
               exit 1
             fi
             echo "Re-running plugins from the tag sdk-ts-v$VERSION"
-          else
+          elif [ "$DRY_RUN" != "true" ]; then
             # npm may still report E404 for a publish it already accepted.
-            # A tag is stronger evidence that this workflow finished publishing.
+            # Only real publishes need this guard; a dry run can validate an
+            # already tagged version without changing the registry.
             matching_tags=$(gh api "repos/${{ github.repository }}/git/matching-refs/tags/sdk-ts-v$VERSION" --jq '.[].ref')
             if printf '%s\n' "$matching_tags" | grep -Fxq "refs/tags/sdk-ts-v$VERSION"; then
               echo "Release tag sdk-ts-v$VERSION already exists; resume with skip_core=true and custom_version=$VERSION instead of republishing" >&2
