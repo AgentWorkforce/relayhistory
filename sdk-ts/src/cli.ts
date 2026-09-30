@@ -2,6 +2,7 @@
 
 import { realpathSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
+import { resolve as resolvePath } from 'node:path';
 import type { Writable } from 'node:stream';
 import { pathToFileURL } from 'node:url';
 
@@ -14,6 +15,7 @@ import {
   type SessionToolCallsPage, type SessionUsage, type SearchRole, type HistoryCursor,
 } from './index.js';
 import { runHistoryExportCommand, loadHistoryApplicationConfig } from './delivery-cli.js';
+import { defaultDbPath } from './sdk-common.js';
 
 type Parsed = { positional: string[]; flags: Map<string, Array<string | true>> };
 
@@ -100,8 +102,26 @@ async function packageVersion(): Promise<string> {
 const migrationSinks = new Map<CliIo, number>();
 /** Start time of each migration announced but not yet ended, by database. */
 const migrationsRunning = new Map<string, number>();
-/** Calls waiting for every running migration to end. */
-const migrationWaiters = new Set<() => void>();
+/** Calls waiting for their database's migration to end, by database. */
+const migrationWaiters = new Map<string, Set<() => void>>();
+
+/** One spelling per database file, whichever path reached it. */
+function databaseKey(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolvePath(path);
+  }
+}
+
+/** The database a command line opens: its `--db`, else the default. */
+function commandDatabase(argv: readonly string[]): string {
+  try {
+    return databaseKey(textFlag(parse([...argv]), 'db') ?? defaultDbPath());
+  } catch {
+    return databaseKey(defaultDbPath());
+  }
+}
 let migrationListener: Promise<unknown> | null = null;
 
 /**
@@ -115,7 +135,7 @@ function listenForMigrations(): Promise<unknown> {
   migrationListener ??= (async () => {
     const version = await packageVersion();
     return onStoreMigration((event, dbPath) => {
-      const key = dbPath ?? '';
+      const key = dbPath === null ? '' : databaseKey(dbPath);
       if (event === 'started') {
         migrationsRunning.set(key, Date.now());
         for (const io of migrationSinks.keys()) {
@@ -129,34 +149,33 @@ function listenForMigrations(): Promise<unknown> {
       if (event === 'finished') {
         for (const io of migrationSinks.keys()) io.stderr(`Database upgraded in ${formatElapsed(Date.now() - started)}.\n`);
       }
-      if (migrationsRunning.size === 0) for (const settle of [...migrationWaiters]) settle();
+      for (const settle of [...(migrationWaiters.get(key) ?? [])]) settle();
     });
   })().catch(() => false);
   return migrationListener;
 }
 
 /**
- * Wait for the end of every migration that started, so its last line is not
- * lost to an exit. Each `started` is followed by a `finished` or `failed`
- * queued before the migrating call returned, so this takes milliseconds. The
- * listener never keeps the process alive, so a timer does while waiting; if it
- * fires, the migrations it waited on are forgotten rather than delaying every
- * later call.
+ * Wait for the end of a migration of `database` that started, so its last line
+ * is not lost to an exit. Each `started` is followed by a `finished` or
+ * `failed` queued before the migrating call returned, so this takes
+ * milliseconds. The listener never keeps the process alive, so a timer does
+ * while waiting; if it fires, only this wait gives up -- the migration's own
+ * state is left for its terminal event.
  */
-async function migrationsEnded(): Promise<void> {
-  if (migrationsRunning.size === 0) return;
-  const awaited = [...migrationsRunning.keys()];
+async function migrationEnded(database: string): Promise<void> {
+  if (!migrationsRunning.has(database)) return;
+  const waiters = migrationWaiters.get(database) ?? new Set<() => void>();
+  migrationWaiters.set(database, waiters);
   await new Promise<void>((resolve) => {
-    const timer = setTimeout(() => {
-      for (const key of awaited) migrationsRunning.delete(key);
-      settle();
-    }, 2_000);
+    const timer = setTimeout(settle, 2_000);
     function settle(): void {
       clearTimeout(timer);
-      migrationWaiters.delete(settle);
+      waiters.delete(settle);
+      if (waiters.size === 0 && migrationWaiters.get(database) === waiters) migrationWaiters.delete(database);
       resolve();
     }
-    migrationWaiters.add(settle);
+    waiters.add(settle);
   });
 }
 
@@ -1253,7 +1272,7 @@ export async function runCli(argv: readonly string[], io: CliIo, options: RunCli
     io.stderr(`ai-hist: ${value.code ? `${value.code}: ` : ''}${value.message ?? String(error)}\n`);
     return 1;
   } finally {
-    await migrationsEnded();
+    await migrationEnded(commandDatabase(argv));
     const calls = (migrationSinks.get(io) ?? 1) - 1;
     if (calls > 0) migrationSinks.set(io, calls);
     else migrationSinks.delete(io);

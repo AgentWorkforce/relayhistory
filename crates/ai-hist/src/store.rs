@@ -1344,8 +1344,16 @@ fn init_db_once(conn: &Connection) -> Result<()> {
         notify_migration(conn, MigrationEvent::Started);
     }
     // Every `Started` ends in exactly one `Finished` or `Failed`, so an
-    // observer waiting on it is never left hanging.
-    let migrated = init_db_locked(&transaction).and_then(|()| Ok(transaction.commit()?));
+    // observer waiting on it is never left hanging. Either event fires with the
+    // write lock released: committed, or rolled back by dropping the
+    // transaction before the observer hears of the failure.
+    let migrated = match init_db_locked(&transaction) {
+        Ok(()) => transaction.commit().map_err(anyhow::Error::from),
+        Err(error) => {
+            drop(transaction);
+            Err(error)
+        }
+    };
     if upgrading {
         let event = if migrated.is_ok() {
             MigrationEvent::Finished
@@ -5190,11 +5198,24 @@ mod tests {
     fn the_migration_observer_hears_every_upgrade_end_but_not_a_creation() {
         use std::sync::Mutex;
         static EVENTS: Mutex<Vec<(MigrationEvent, String)>> = Mutex::new(Vec::new());
+        /// Whether the write lock was free when each `Failed` arrived.
+        static LOCK_FREE_ON_FAILURE: Mutex<Vec<bool>> = Mutex::new(Vec::new());
         observe_migrations(|event, path| {
+            let path = path.unwrap_or_default().to_string();
+            if event == MigrationEvent::Failed {
+                let free = Connection::open(&path).is_ok_and(|conn| {
+                    conn.busy_timeout(Duration::ZERO).is_ok()
+                        && conn.execute_batch("BEGIN IMMEDIATE; ROLLBACK;").is_ok()
+                });
+                LOCK_FREE_ON_FAILURE
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(free);
+            }
             EVENTS
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push((event, path.unwrap_or_default().to_string()));
+                .push((event, path));
         });
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("history.db");
@@ -5244,6 +5265,13 @@ mod tests {
                 MigrationEvent::Failed
             ]
         );
+        // The failure is heard only once the migration has rolled back, so an
+        // observer that retries at once is not blocked by it.
+        assert!(LOCK_FREE_ON_FAILURE
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|free| *free));
     }
 
     #[test]
