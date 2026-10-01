@@ -54,7 +54,7 @@ use crate::store::{
     default_db_path, open_db, open_db_readonly, prompt_hash, schema_is_event_read_current,
     schema_is_evidence_read_current, schema_is_relationship_read_current,
     schema_is_usage_read_current, session_events_sized, session_file_edits, session_markers_sized,
-    session_prompts_sized, session_tool_calls, session_user_turns_page, PromptRow, SessionEvent,
+    session_prompts_sized, session_tool_calls, session_user_turns_all, PromptRow, SessionEvent,
     SessionFileEdit, SessionMarker, SessionScope, SessionToolCall, SessionUserTurn,
 };
 use crate::usage::{normalize_usage_str, source_accounting, NormalizedUsage, UsageAccounting};
@@ -2640,23 +2640,13 @@ impl Relationship {
     }
 }
 
-/// Every user turn, walking the bounded page internally.
+/// Every user turn, in one pass rather than one regrouping per page.
 fn all_user_turns(
     conn: &Connection,
     source: &str,
     session_id: &str,
 ) -> Result<Vec<SessionUserTurn>, Error> {
-    let mut turns = Vec::new();
-    let mut cursor = None;
-    loop {
-        let page = session_user_turns_page(conn, source, session_id, 1_000, cursor.as_ref())
-            .map_err(Error::query)?;
-        turns.extend(page.user_turns);
-        match page.next_cursor {
-            Some(next) => cursor = Some(next),
-            None => return Ok(turns),
-        }
-    }
+    session_user_turns_all(conn, source, session_id).map_err(Error::query)
 }
 
 /// Every model request, walking the bounded page internally.
