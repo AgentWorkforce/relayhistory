@@ -1826,19 +1826,28 @@ fn sync_basic(
 /// short wait to return.
 pub(crate) const WAL_TRUNCATE_BYTES: u64 = WAL_WARN_BYTES / 16;
 
-/// How long an escalated `TRUNCATE` may wait for a reader or writer before it
-/// gives up. Every other connection's writes queue behind it while it waits,
-/// so this is the most a pinned reader can stall them per sweep.
+/// How long an escalated `TRUNCATE` may wait for another connection's
+/// transaction to end before it gives up. Every other connection's writes
+/// queue behind it while it waits, so this is the most a reader open as a
+/// sweep ends can stall them.
+///
+/// It bounds the *wait*, not the copy: a `TRUNCATE` copies outstanding frames
+/// into the database under the WAL write lock too, and that grows with what
+/// is outstanding. [`checkpoint_after_sweep`] keeps the copy small by
+/// escalating only after a `PASSIVE` pass has already copied every frame, so
+/// all that is left to copy is a transaction another connection committed in
+/// between.
 const WAL_TRUNCATE_BUSY_BUDGET: Duration = Duration::from_millis(100);
 
 /// What the post-sweep checkpoint did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SweepCheckpoint {
-    /// Whether the WAL was past the threshold and a `TRUNCATE` was attempted.
+    /// Whether a `TRUNCATE` was attempted: the `PASSIVE` pass caught up and
+    /// the WAL was still past the threshold.
     pub(crate) escalated: bool,
     /// Whether every frame was folded back and, when escalated, the WAL was
-    /// reset. `false` when a reader pinning an older snapshot was in the way
-    /// or the checkpoint could not run at all.
+    /// reset. `false` when another connection's open transaction was in the
+    /// way or the checkpoint could not run at all.
     pub(crate) complete: bool,
     /// The WAL file's size once the checkpoint returned.
     pub(crate) wal_bytes: u64,
@@ -1847,14 +1856,23 @@ pub(crate) struct SweepCheckpoint {
 /// Checkpoint the WAL after a sweep without making other connections wait.
 ///
 /// `PASSIVE` first: it copies what it can and never takes the write lock or
-/// waits on a reader, so a reader active as the sweep ends costs nobody
-/// anything. Only when the WAL file is still past `truncate_above` does it
-/// escalate to `TRUNCATE`, under a [`WAL_TRUNCATE_BUSY_BUDGET`] busy budget
-/// rather than the connection's ~30 s retry handler: a `TRUNCATE` holds the
-/// WAL write lock while it waits for readers to leave, and every other writer
-/// — an embedder's own tables included — would queue behind it for as long
-/// as the handler kept retrying (#336). An escalation that runs out of budget
-/// is reported, not claimed, and the next sweep tries again.
+/// waits on anyone, so a reader active as the sweep ends costs nobody
+/// anything. It escalates to `TRUNCATE` only when that pass caught up — every
+/// frame copied — and the WAL file is still past `truncate_above`, under a
+/// [`WAL_TRUNCATE_BUSY_BUDGET`] busy budget rather than the connection's
+/// ~30 s retry handler: a `TRUNCATE` holds the WAL write lock while it waits
+/// for readers to leave, and every other writer — an embedder's own tables
+/// included — would queue behind it for as long as the handler kept retrying
+/// (#336).
+///
+/// Not escalating after a short pass matters as much as the budget. The
+/// frames a pass leaves behind are the ones an open transaction's snapshot
+/// predates, and they can be a long-lived reader's whole backlog (156 MB has
+/// been seen). Were that reader to leave while an escalated call waited on
+/// it, the `TRUNCATE` would copy the backlog under the write lock, for as long
+/// as the copy and its fsync take. The next sweep's `PASSIVE` copies it
+/// instead, without the lock. Either way the shortfall is reported, not
+/// claimed, and the next sweep tries again.
 pub(crate) fn checkpoint_after_sweep(
     conn: &Connection,
     db_path: &Path,
@@ -1865,22 +1883,22 @@ pub(crate) fn checkpoint_after_sweep(
             .map(|m| m.len())
             .unwrap_or(0)
     };
-    let mut escalated = false;
-    let mut outcome = wal_checkpoint(conn, "PASSIVE");
-    if wal_len() > truncate_above {
-        escalated = true;
-        outcome = match crate::store::ShortBusyBudget::new(conn, WAL_TRUNCATE_BUSY_BUDGET) {
-            Ok(_budget) => wal_checkpoint(conn, "TRUNCATE"),
-            Err(error) => Err(error.to_string()),
-        };
-    }
-    let complete = match outcome {
-        // `log_frames` is -1 when the database is not in WAL mode at all.
-        Ok((busy, log_frames, checkpointed_frames))
-            if busy != 0 || checkpointed_frames < log_frames =>
-        {
+    let complete = match wal_checkpoint(conn, "PASSIVE") {
+        // Another connection holds the checkpoint lock, so nothing was
+        // copied; `log_frames` is -1 here.
+        Ok((busy, _, _)) if busy != 0 => {
             sync_note!(
-                "  [wal] checkpoint incomplete: {checkpointed_frames}/{log_frames} frames; another reader is active"
+                "  [wal] checkpoint deferred: another connection is checkpointing; the next sweep retries"
+            );
+            false
+        }
+        // An open transaction on another connection began before the last
+        // commit, so the frames after its snapshot stay. A writer
+        // mid-transaction does not cause this; its frames are not committed.
+        Ok((_, log_frames, checkpointed_frames)) if checkpointed_frames < log_frames => {
+            sync_note!(
+                "  [wal] checkpoint partial: {checkpointed_frames}/{log_frames} frames; the rest are \
+                 newer than another connection's open transaction and wait for the next sweep"
             );
             false
         }
@@ -1890,8 +1908,34 @@ pub(crate) fn checkpoint_after_sweep(
             false
         }
     };
+    if !complete || wal_len() <= truncate_above {
+        return SweepCheckpoint {
+            escalated: false,
+            complete,
+            wal_bytes: wal_len(),
+        };
+    }
+    let truncated = match crate::store::ShortBusyBudget::new(conn, WAL_TRUNCATE_BUSY_BUDGET) {
+        Ok(_budget) => wal_checkpoint(conn, "TRUNCATE"),
+        Err(error) => Err(error.to_string()),
+    };
+    let complete = match truncated {
+        Ok((busy, _, _)) if busy != 0 => {
+            sync_note!(
+                "  [wal] WAL not reset: another connection's transaction outlasted the {} ms \
+                 budget; the next sweep retries",
+                WAL_TRUNCATE_BUSY_BUDGET.as_millis()
+            );
+            false
+        }
+        Ok(_) => true,
+        Err(error) => {
+            sync_note!("  [wal] WAL reset skipped: {error}");
+            false
+        }
+    };
     SweepCheckpoint {
-        escalated,
+        escalated: true,
         complete,
         wal_bytes: wal_len(),
     }
@@ -34800,17 +34844,17 @@ mod post_sweep_checkpoint_tests {
     }
 
     /// The escalated checkpoint is the only one that takes the write lock.
-    /// With a reader pinned it may hold that lock for its short budget and
-    /// no longer: a third connection's `BEGIN IMMEDIATE`, issued while it
-    /// waits, gets the lock in well under a second rather than after the
-    /// production handler's ~30 s (#336).
+    /// A reader whose snapshot is current lets the `PASSIVE` pass catch up,
+    /// so the call escalates, and the reset must then wait for that reader
+    /// to leave. It may hold the lock for its short budget and no longer: a
+    /// third connection's `BEGIN IMMEDIATE`, issued while it waits, gets the
+    /// lock in well under a second rather than after the production
+    /// handler's ~30 s (#336).
     #[test]
     fn an_escalated_checkpoint_blocked_by_a_reader_does_not_stall_other_writers() {
         let dir = tempfile::tempdir().unwrap();
-        let (db_path, conn) = store_with_wal(dir.path(), 200);
+        let (db_path, conn) = store_with_wal(dir.path(), 250);
         let reader = pin_reader(&db_path);
-        // Frames the reader's snapshot cannot see, so a reset must wait on it.
-        grow_wal(&conn, 50, 200);
 
         let (started_tx, started_rx) = mpsc::channel();
         let checkpoint_path = db_path.clone();
@@ -34880,9 +34924,65 @@ mod post_sweep_checkpoint_tests {
         assert_eq!(wal_len(&db_path), 0);
     }
 
+    /// The busy budget bounds a `TRUNCATE`'s wait, not its copy: frames are
+    /// copied into the database under the WAL write lock. So a reader that
+    /// held back tens of MB and lets go just after the `PASSIVE` pass must
+    /// not hand that backlog to a `TRUNCATE` to copy under the lock: the
+    /// short pass does not escalate, a third connection's `BEGIN IMMEDIATE`
+    /// issued as the reader leaves is not held up, and the next sweep's
+    /// `PASSIVE` copies the backlog without the lock and then truncates.
+    #[test]
+    fn a_large_backlog_released_mid_checkpoint_is_not_copied_under_the_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, conn) = store_with_wal(dir.path(), 50);
+        let reader = pin_reader(&db_path);
+        // ~30 MB of frames the reader's snapshot cannot see.
+        grow_wal(&conn, 12_000, 50);
+        let backlog = wal_len(&db_path);
+        assert!(
+            backlog > 20 * 1024 * 1024,
+            "backlog is only {backlog} bytes"
+        );
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let checkpoint_path = db_path.clone();
+        let checkpointer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let started = Instant::now();
+            let outcome = checkpoint_after_sweep(&conn, &checkpoint_path, 0);
+            (outcome, started.elapsed(), conn)
+        });
+        started_rx.recv().unwrap();
+        // Inside the 100 ms an escalated call would wait on the reader.
+        std::thread::sleep(Duration::from_millis(30));
+        reader.execute_batch("COMMIT;").unwrap();
+
+        let writer = Connection::open(&db_path).unwrap();
+        writer.busy_timeout(Duration::from_secs(60)).unwrap();
+        let asked = Instant::now();
+        writer.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        let waited = asked.elapsed();
+        writer.execute_batch("ROLLBACK;").unwrap();
+        let (outcome, took, conn) = checkpointer.join().unwrap();
+        assert!(
+            waited < Duration::from_secs(1),
+            "a writer waited {waited:?} behind a {backlog}-byte checkpoint copy"
+        );
+        assert!(
+            took < Duration::from_secs(2),
+            "the checkpoint took {took:?}"
+        );
+        assert!(!outcome.escalated, "a short pass must not escalate");
+        assert!(!outcome.complete);
+
+        let next = checkpoint_after_sweep(&conn, &db_path, 0);
+        assert!(next.escalated && next.complete);
+        assert_eq!(next.wal_bytes, 0);
+    }
+
     /// Repeated sweeps under a reader that never lets go: every checkpoint
-    /// says it could not finish, none claims a reset, and the first one after
-    /// the reader leaves truncates the WAL.
+    /// says it could not finish, none escalates or claims a reset, and the
+    /// first one after the reader leaves truncates the WAL.
     #[test]
     fn a_persistent_reader_is_reported_every_sweep_and_the_next_quiet_one_truncates() {
         let dir = tempfile::tempdir().unwrap();
@@ -34894,7 +34994,7 @@ mod post_sweep_checkpoint_tests {
             let started = Instant::now();
             let outcome = checkpoint_after_sweep(&conn, &db_path, 0);
             assert!(started.elapsed() < Duration::from_secs(2));
-            assert!(outcome.escalated);
+            assert!(!outcome.escalated, "round {round} escalated a short pass");
             assert!(!outcome.complete, "round {round} claimed a checkpoint");
             assert!(outcome.wal_bytes > 0);
             sizes.push(outcome.wal_bytes);
@@ -34905,7 +35005,7 @@ mod post_sweep_checkpoint_tests {
         );
         reader.execute_batch("COMMIT;").unwrap();
         let outcome = checkpoint_after_sweep(&conn, &db_path, 0);
-        assert!(outcome.complete);
+        assert!(outcome.escalated && outcome.complete);
         assert_eq!(outcome.wal_bytes, 0);
     }
 

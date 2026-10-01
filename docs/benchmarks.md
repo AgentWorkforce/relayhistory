@@ -1042,9 +1042,19 @@ under the sweep connection's ~30 s busy handler. A `TRUNCATE` takes the WAL
 write lock and then waits for readers to leave, so one read open as a sweep
 finished held every other writer — an embedder's own tables included — for
 the handler's full budget. The sweep now checkpoints `PASSIVE` (no write
-lock, no waiting) and escalates to `TRUNCATE` only when the WAL is still past
-4 MiB (`WAL_WARN_BYTES / 16`, SQLite's own auto-checkpoint size), under a
-100 ms busy budget for that one call.
+lock, no waiting) and escalates to `TRUNCATE` only when that pass copied
+every frame and the WAL is still past 4 MiB (`WAL_WARN_BYTES / 16`, SQLite's
+own auto-checkpoint size), under a 100 ms busy budget for that one call.
+
+The budget bounds the `TRUNCATE`'s wait, not its copy, which also runs under
+the write lock. An earlier revision escalated after a short pass too: with
+82.8 MB of frames held back by a reader that left 30 ms into the escalated
+call, a third connection's `BEGIN IMMEDIATE` waited 70–80 ms behind the copy
+(macOS, where `fsync` is not a full flush; the cost grows with the backlog
+and the disk). Escalating only after a full pass leaves the `TRUNCATE` just
+what another connection committed in between: the same case now waits
+40 µs, and the next sweep's `PASSIVE` copies the backlog without the lock
+before truncating (50–80 ms, nobody waiting).
 
 **How it was measured.** A scratch driver (not committed) through the public
 `SessionStore` over the harness's `full` store (seed 176, 100 MB, 1,776
@@ -1056,23 +1066,24 @@ every 20 ms throughout and records its slowest lock wait.
 
 | 8 forced sweeps, 100 MB store | base, no reader | this change, no reader | base, pinned reader | this change, pinned reader |
 |---|---:|---:|---:|---:|
-| Mean sweep | 0.25 s | 0.24 s | 32.45 s | 0.33 s |
-| Slowest `BEGIN IMMEDIATE` on a third connection | 12 ms | 1.5 ms | 32.4 s | 150 ms |
+| Mean sweep | 0.25 s | 0.23 s | 32.45 s | 0.25 s |
+| Slowest `BEGIN IMMEDIATE` on a third connection | 12 ms | 1.5 ms | 32.4 s | 0.06 ms |
 | Lock waits over 1 s | 0 | 0 | 8 (every sweep) | 0 |
 | WAL after the cold sync | 0 | 0 | 0 | 0 |
-| WAL after sweep 8 | 0 | 3.0 MB (steady) | 5.9 MB | 5.9 MB |
+| WAL after sweep 8 | 0 | 3.1 MB (steady) | 5.9 MB | 5.9 MB |
 
 - With no reader the WAL no longer drops to zero after each small sweep: it
-  stays at its high-water mark below 4 MiB (3.0 MB here, unchanged across all
+  stays at its high-water mark below 4 MiB (3.1 MB here, unchanged across all
   8 sweeps) and SQLite reuses it from the start. A sweep that leaves more than
   4 MiB — the cold sync above — is still truncated to zero.
 - With a reader pinned for the whole run neither version can fold back the
   frames the reader may still need, so the WAL grows by what each sweep
-  writes either way; `[wal] checkpoint incomplete` reports it and the next
+  writes either way; `[wal] checkpoint partial` reports it and the next
   quiet sweep truncates it. The difference is only who waits: before, every
-  sweep and every other writer, for ~32 s; now, nobody past the escalated
-  call's 100 ms (the 150 ms worst case includes the writer's own backoff
-  granularity).
+  sweep and every other writer, for ~32 s; now nobody, because a pass the
+  reader cuts short never escalates. A reader whose snapshot is current
+  still lets the pass finish, and the escalated reset then waits on it for
+  at most its 100 ms (93–133 ms for a third connection in the unit test).
 - `compact` keeps its `TRUNCATE` with the full busy handler: it is an explicit
   maintenance action that already holds the sync lock and rewrites the file
   with `VACUUM`, so a wait there is expected.

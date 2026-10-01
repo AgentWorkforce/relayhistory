@@ -603,10 +603,14 @@ Notable changes to the native `ai-hist` CLI are documented here.
   while it waits for readers to leave, so an embedder writing its own tables
   beside the watch (relay-desktop's change-feed drain) waited behind it. The
   sweep now checkpoints `PASSIVE`, which never takes the write lock or waits
-  on a reader, and escalates to `TRUNCATE` only when the WAL is still past
-  4 MiB, with a 100 ms busy budget for that one call. An escalation a reader
-  blocks is reported as `[wal] checkpoint incomplete` and retried by the next
-  sweep, as before; the WAL-size warning is unchanged. Under a quiet store
+  on a reader, and escalates to `TRUNCATE` only when that pass copied every
+  frame and the WAL is still past 4 MiB, with a 100 ms busy budget for that
+  one call. Escalating only after a full pass keeps the `TRUNCATE`'s own
+  copy, which also runs under the write lock, down to what another
+  connection committed in between, never a reader's backlog. A short pass or
+  a reset a reader blocks is reported (`[wal] checkpoint partial`,
+  `[wal] WAL not reset`) and retried by the next sweep; the WAL-size warning
+  is unchanged. Under a quiet store
   the WAL file now stays at up to 4 MiB between sweeps instead of being
   truncated to zero every time; SQLite reuses it from the start. `compact`
   keeps its `TRUNCATE`: it is an explicit maintenance action.
