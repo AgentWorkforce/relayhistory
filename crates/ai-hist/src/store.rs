@@ -809,6 +809,9 @@ const REQUIRED_INDEXES: &[&str] = &[
     // against the record that carries it, across every session. Without this
     // that is a scan of every event on every hydration.
     "idx_session_events_message",
+    // ... and the uid half of the same lookup, for the rows the message id
+    // cannot find.
+    "idx_session_events_claude_uid_unmatched",
     // Settling a streamed Claude request's usage reads every row of that
     // request once per assistant record; without it that is a scan of the
     // session per record. Also what routes a database stored before the
@@ -1835,6 +1838,26 @@ VALUES ('session_presences_local_backfill_v1');
     // across every session rather than within one.
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_session_events_message ON session_events(source, message_id)",
+        [],
+    )?;
+    // The other half of that lookup: a Claude record can resolve through its
+    // first block's uid, `<uuid>:0`, as well as its message id. Searching the
+    // uid without a session is not something the `(source, session_id,
+    // event_uid)` key can do, and asking both in one OR left every pending
+    // transcript scanning every Claude event on every sweep. Partial, and on
+    // only the rows the message-id search cannot already see -- a block-0 uid
+    // that does not extend the row's own message id -- so it is empty on a
+    // store the parser wrote and costs an insert nothing. The `WHERE` is
+    // spelled exactly as `continuity::SESSION_HOLDING_CLAUDE_UID_SQL` spells
+    // it, which is how SQLite proves the index applies. `source` leads
+    // although the `WHERE` pins it: without statistics the planner ranks an
+    // index by how many equalities it matches, and one on `event_uid` alone
+    // tied with every `(source, ...)` index and lost.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_events_claude_uid_unmatched \
+         ON session_events(source, event_uid) \
+         WHERE source = 'claude' AND substr(event_uid, -2) = ':0' \
+           AND (message_id IS NULL OR event_uid <> message_id || ':0')",
         [],
     )?;
     conn.execute(
