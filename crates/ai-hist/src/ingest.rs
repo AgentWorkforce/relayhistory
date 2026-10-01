@@ -869,26 +869,44 @@ type HoldingField = fn(&mut SessionHoldings) -> &mut u64;
 /// Every session the marker is answerable for, keyed by the hash the marker
 /// stores.
 fn session_holdings(conn: &Connection) -> Result<BTreeMap<u64, SessionHoldings>> {
+    session_holdings_naming(conn, None)
+}
+
+/// [`session_holdings`], also collecting into `named` every `(source,
+/// session_id)` that holds a catalog row or an event -- the sessions the
+/// shortfall can name -- from the same grouped reads, so naming them costs no
+/// second walk of `session_events`.
+fn session_holdings_naming(
+    conn: &Connection,
+    mut named: Option<&mut HashSet<(String, String)>>,
+) -> Result<BTreeMap<u64, SessionHoldings>> {
     let mut holdings: BTreeMap<u64, SessionHoldings> = BTreeMap::new();
-    let counted: [(&str, HoldingField); 4] = [
+    // The third field: whether the group names a session. The event and
+    // catalog groups do, the structured-evidence ones do not -- those two are
+    // the tables a shortfall has always named sessions by.
+    let counted: [(&str, HoldingField, bool); 4] = [
         (
             "SELECT source, session_id, COUNT(*) FROM session_events",
             |held| &mut held.events,
+            true,
         ),
         (
             "SELECT source, session_id, COUNT(*) FROM tool_calls",
             |held| &mut held.tool_calls,
+            false,
         ),
         (
             "SELECT source, session_id, COUNT(*) FROM file_edits",
             |held| &mut held.file_edits,
+            false,
         ),
         (
             "SELECT source, session_id, COUNT(*) FROM sessions",
             |held| &mut held.catalog,
+            true,
         ),
     ];
-    for (select, field) in counted {
+    for (select, field, names) in counted {
         let mut statement = conn.prepare(&format!(
             "{select} WHERE source IN (SELECT value FROM json_each(?)) \
              GROUP BY source, session_id"
@@ -907,6 +925,9 @@ fn session_holdings(conn: &Connection) -> Result<BTreeMap<u64, SessionHoldings>>
             // here could reintroduce the masking this marker exists to catch.
             let key = discover::fingerprint_hash("session-events", &source, &session_id);
             *field(holdings.entry(key).or_default()) = count;
+            if let Some(named) = named.as_deref_mut().filter(|_| names) {
+                named.insert((source, session_id));
+            }
         }
     }
     Ok(holdings)
@@ -1068,30 +1089,28 @@ fn destination_shortfall(conn: &Connection, stored: &str) -> Result<SweepRepairs
         return Ok(SweepRepairs::all());
     };
     let mut repairs = SweepRepairs::default();
-    let current = session_holdings(conn)?;
     // Named from the *session* side rather than from the evidence, because a
     // session whose catalog row and events are both gone has no row left to be
     // found by. The union of the two tables the sweep reaches it through is
-    // what keeps it nameable.
+    // what keeps it nameable -- and the grouped reads that count the holdings
+    // already visit both, so they collect the names too. Asking for them in a
+    // separate `UNION` walked every event a second time on every sweep.
+    let mut named: HashSet<(String, String)> = HashSet::new();
+    let current = session_holdings_naming(conn, Some(&mut named))?;
     // A Muse subagent has no catalog row of its own, so once every event of
     // it is gone neither table above can name it; the edge its parent's log
     // recorded still does, and naming it is what sends the parent back to
     // re-read the tree.
     let mut statement = conn.prepare(
-        "SELECT source, session_id FROM sessions \
-         WHERE source IN (SELECT value FROM json_each(?1)) \
-         UNION \
-         SELECT source, session_id FROM session_events \
-         WHERE source IN (SELECT value FROM json_each(?1)) \
-         UNION \
-         SELECT source, child_session_id FROM session_relationships \
+        "SELECT source, child_session_id FROM session_relationships \
          WHERE source = 'muse' AND evidence_kind = 'muse_subagent_log' \
            AND child_session_id IS NOT NULL",
     )?;
-    let mut rows = statement.query([repairable_event_sources()])?;
+    let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
-        let source: String = row.get(0)?;
-        let session_id: String = row.get(1)?;
+        named.insert((row.get(0)?, row.get(1)?));
+    }
+    for (source, session_id) in named {
         let key = discover::fingerprint_hash("session-events", &source, &session_id);
         let Some(before) = stored.sessions.get(&key) else {
             continue;
