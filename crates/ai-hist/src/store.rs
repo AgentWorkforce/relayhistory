@@ -3084,6 +3084,17 @@ pub(crate) fn row_to_session_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<
     })
 }
 
+/// The order every whole-session event read uses: oldest first, rows sharing
+/// a timestamp in insertion order.
+///
+/// `session_events.ts_ms` is `NOT NULL` and has been since the table was
+/// first created, so the `ts_ms IS NULL` leading term the evidence tables use
+/// is a constant here. Spelling it anyway cost a temp b-tree sort of every
+/// row the read returns, text included: the leading term is an expression
+/// `idx_session_events_source_page` and `idx_session_events_page` do not
+/// carry, so they could not deliver the order. Without it they do.
+const SESSION_EVENT_ORDER: &str = "ORDER BY ts_ms ASC, id ASC";
+
 /// All normalized events for one session, oldest first. Rows sharing a
 /// timestamp keep insertion order via the rowid tiebreaker.
 pub fn session_events(
@@ -3098,7 +3109,8 @@ pub fn session_events(
         sql.push_str(" AND source = ?");
         params_vec.push(source.to_string());
     }
-    sql.push_str(" ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC");
+    sql.push(' ');
+    sql.push_str(SESSION_EVENT_ORDER);
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), row_to_session_event)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -3122,10 +3134,7 @@ pub(crate) fn session_events_sized(
     } else {
         SESSION_EVENT_COLUMNS.replacen(", text, ", ", NULL AS text, ", 1)
     };
-    let sql = format!(
-        "SELECT {columns}, LENGTH(CAST(text AS BLOB)) FROM session_events \
-         WHERE source = ? AND session_id = ? ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC"
-    );
+    let sql = session_events_sized_sql(&columns);
     let mut stmt = conn.prepare(&sql)?;
     // The size lands after every event column, so it is addressed by the
     // statement's own arity rather than a literal: a column added to
@@ -3135,6 +3144,14 @@ pub(crate) fn session_events_sized(
         Ok((row_to_session_event(row)?, row.get::<_, Option<i64>>(size)?))
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// [`session_events_sized`]'s statement, shared with its query-plan test.
+fn session_events_sized_sql(columns: &str) -> String {
+    format!(
+        "SELECT {columns}, LENGTH(CAST(text AS BLOB)) FROM session_events \
+         WHERE source = ? AND session_id = ? {SESSION_EVENT_ORDER}"
+    )
 }
 
 /// One `history` row as [`crate::SessionStore::session`] reads it: the
@@ -8541,6 +8558,83 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap()
+    }
+
+    fn bound_query_plan(conn: &Connection, sql: &str, params: &[&dyn rusqlite::ToSql]) -> String {
+        conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map(params, |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join(" | ")
+    }
+
+    /// A whole-session event read is delivered in order by the page index
+    /// rather than sorted. `ts_ms` is `NOT NULL`, so the `ts_ms IS NULL`
+    /// term the evidence tables need was a constant here, and it alone made
+    /// SQLite copy every row -- text included -- into a temp b-tree to sort
+    /// it (#215).
+    #[test]
+    fn whole_session_event_reads_are_delivered_in_index_order() {
+        for analyze in [false, true] {
+            let conn = planned_store(analyze);
+            let with_source = format!(
+                "SELECT {SESSION_EVENT_COLUMNS} FROM session_events \
+                 WHERE session_id = ?1 AND source = ?2 {SESSION_EVENT_ORDER}"
+            );
+            let without_source = format!(
+                "SELECT {SESSION_EVENT_COLUMNS} FROM session_events \
+                 WHERE session_id = ?1 {SESSION_EVENT_ORDER}"
+            );
+            let sized = session_events_sized_sql(SESSION_EVENT_COLUMNS);
+            for (name, plan, index) in [
+                (
+                    "session_events with a source",
+                    bound_query_plan(&conn, &with_source, &[&"s1", &"codex"]),
+                    "idx_session_events_source_page",
+                ),
+                (
+                    "session_events without one",
+                    bound_query_plan(&conn, &without_source, &[&"s1"]),
+                    "idx_session_events_page",
+                ),
+                (
+                    "session_events_sized",
+                    bound_query_plan(&conn, &sized, &[&"codex", &"s1"]),
+                    "idx_session_events_source_page",
+                ),
+            ] {
+                assert!(
+                    !plan.contains("TEMP B-TREE"),
+                    "{name} sorts its rows (analyze={analyze}): {plan}"
+                );
+                assert!(
+                    plan.contains(index),
+                    "{name} is not read through {index} (analyze={analyze}): {plan}"
+                );
+            }
+            // The order itself, not only the plan: oldest first, ties by id.
+            conn.execute(
+                "INSERT INTO session_events (source, session_id, ts_ms, role, kind, text, event_uid) \
+                 VALUES ('codex', 's1', -1, 'user', 'text', 'early', 'early')",
+                [],
+            )
+            .unwrap();
+            let read = session_events(&conn, "s1", Some("codex")).unwrap();
+            let sized = session_events_sized(&conn, "codex", "s1", false).unwrap();
+            assert_eq!(
+                read.first().map(|event| event.event_uid.as_str()),
+                Some("early")
+            );
+            assert!(read
+                .windows(2)
+                .all(|pair| (pair[0].ts_ms, pair[0].id) < (pair[1].ts_ms, pair[1].id)));
+            assert_eq!(
+                read.iter().map(|event| event.id).collect::<Vec<_>>(),
+                sized.iter().map(|(event, _)| event.id).collect::<Vec<_>>()
+            );
+        }
     }
 
     /// The identity refresh runs twice per sweep and once per discovery pass,
