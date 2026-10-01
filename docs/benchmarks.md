@@ -879,3 +879,107 @@ per runner class (`ubuntu-latest`), and these numbers come from a developer
 machine. The gate passes with room (`incremental_sync` 89 ms against an 848 ms
 bound, `unchanged_sync` 17 ms against 140 ms locally); re-baselining on the
 gate's machine class is the follow-up.
+
+### 2026-10-01 sweep tick and cold-sweep write cost (#215)
+
+A `watch` driven by filesystem events (200 ms debounce) forces a sweep for
+every transcript append, so a forced tick's cost is the floor of
+write-to-cloud latency, and the cold sweep's write cost bounds a first
+install's backfill. This section measures five candidate fixes against both,
+keeps the ones that paid, and records the rest with their numbers.
+
+**How it was measured.** Apple M4 Pro, macOS, release build, the `full`
+profile's 100 MB store (seed 176, 4,399 files, 3,518 sessions), the harness
+run with `--repeat 2`. The harness's `incremental_sync` is the first sweep
+after the cold one; a steady-state `watch` tick is measured separately by a
+scratch driver (not committed) that opens the harness's database through
+`SessionStore`, settles it with two forced syncs, then times `sync` with and
+without `force` and after appending a 1 KiB record (unique uuid each time),
+median of seven, three interleaved rounds of the base and this change.
+Attribution is by macOS `sample` of that driver, frames aggregated
+inclusively. Base is `7533d65` (#310).
+
+```bash
+node scripts/benchmark-sync.mjs --profile full --large-session-bytes 1048576 --repeat 2
+```
+
+| Phase (harness) | base | this change |
+|---|---:|---:|
+| `cold_sync` | 37.34 s (5,743 rec/s) | 13.44 s (15,950 rec/s) |
+| `incremental_sync` (first sweep after the cold one) | 729.6 ms | 663.9 ms |
+| `unchanged_sync` | 60.0 ms | 51.8 ms |
+| `hydrate_cold` / `hydrate_unchanged` (1 MB) | 163.5 / 3.0 ms | 157.4 / 2.9 ms |
+| Peak RSS, `cold_sync` | 38.5 MiB | 37.5 MiB |
+
+| Steady-state tick (driver, median) | base | this change |
+|---|---:|---:|
+| unchanged, not forced | 50.6 ms | 46.5 ms |
+| unchanged, forced (an fs event that changed nothing a sweep reads) | 337.8 ms | 301.3 ms |
+| forced, after a 1 KiB Claude append | 363.8 ms | 332.6 ms |
+| forced, after a 1 KiB append to a 2 MB Codex rollout | 728 ms | 466 ms |
+
+#### Where a cold sweep's time went
+
+| Frame (inclusive share of the cold sync's samples) | base | units | + in-memory journal |
+|---|---:|---:|---:|
+| `fsync` | 49% | 8% | 12% |
+| `pwrite` | 22% | 36% | 10% |
+| of which statement-journal spills (`subjournalPageIfRequired`) | — | 30% | 3% |
+| WAL checkpoint | 21% | 9% | 12% |
+| Cold sync (driver, same store) | 38.1 s | 20.8 s | 14.2 s |
+
+The base column samples the first 25 s of the run, which is the Claude walk;
+the other two cover the whole sweep. Every column is the same store and the
+same driver.
+
+Every evidence row was its own autocommit at `synchronous = FULL`: one WAL
+`fsync` per statement, several per record. Writing a transcript as one
+transaction removed most of those, and exposed the next cost: inside a
+transaction every upsert whose triggers write keeps a statement journal so
+it can be undone alone, and past 64 KiB SQLite spills it to a temporary file
+-- `pwrite`s of pages discarded when the statement ends. The sweep's
+connection now keeps temporary files in memory (`temp_store = MEMORY`); they
+hold nothing durable. What remains of a cold sweep is SQLite's own b-tree and
+FTS5 work: FTS5 flushes its pending terms at every statement savepoint, about
+a quarter of each event insert's samples.
+
+The 2026-09-28 prototype of "one transaction per Claude transcript" measured
+−6% against the CLI; with Codex in the same units, the in-memory statement
+journal, and the harness rather than the CLI, it is −64%.
+
+#### Decisions
+
+| Candidate | Decision | Numbers |
+|---|---|---|
+| Continuity's parent-record lookup (`session_holding_record`): `message_id = ? OR event_uid = ?` scanned every event of the source, per pending transcript, per sweep | **Fixed.** Two keyed searches, lowest answer wins; the uid half on a new partial index, `idx_session_events_claude_uid_unmatched`, holding only the rows the message search cannot see (empty on a store this parser wrote). Plan tests with and without `ANALYZE`; equivalence test against the old query. | 17 ms → <0.1 ms per pending transcript on 75,601 Claude events (linear in events before). The benchmark store has no pending evidence, so its phases do not move. Building the index on an existing store: 0.76 s for 214 K events, once. |
+| Whole-session event reads ordered on `ts_ms IS NULL, ts_ms, id` | **Fixed.** `ts_ms` is `NOT NULL` in every schema this table has had (Rust and the Python original), so the order is `ts_ms, id`, delivered by `idx_session_events_source_page` / `idx_session_events_page` instead of a temp b-tree of full rows. Plan test. | Not on the sweep path; a read of `SessionStore::session` no longer copies every row, text included, into a sort. |
+| Autocommit Claude and Codex writes | **Fixed.** One `BEGIN IMMEDIATE` unit per Claude transcript (chunked every 2,000 records) and per Codex rollout (unchunked: the parser-upgrade repair needs it whole), cursors inside the unit, `.sync-state.json` still checkpointed after the source. `synchronous` deliberately unchanged -- that is a durability decision for its own review. | Cold 37.3 s → 13.4 s together with the in-memory journal; Codex append tick 728 → 466 ms. |
+| Per-event `sessions` subselects and per-event `session_presences` insert in `insert_session_event_with_provenance` | **Deferred.** After the units, all `sessions`/presence seeks under the event insert are under 4% of a cold sweep's samples (presence alone 0.8%), and hoisting the subselects needs invalidation whenever a walk writes the catalog row mid-transcript (Codex writes events before its session). Not worth the risk at this size. | ≤ 4% of cold; 0% of a tick. |
+| `catalog_fingerprint` before and after every sync and watch tick | **Fixed.** The digest records the change-feed head it was read at; an unmoved head (every catalog insert/update/delete moves it through the feed's triggers) skips the after-scan. `changed` is still computed from row digests whenever anything was written, so it is exact. | 3% of a forced append tick still pays it (the head moved); an unchanged tick does not. |
+| (Found while measuring) the destination shortfall named sessions with `sessions UNION session_events`, a second walk of every event per swept tick | **Fixed.** The grouped holdings reads collect the names; only the Muse arm is still queried. Same named set. | Forced unchanged tick 346 → 320 ms on the same database. |
+
+#### Where a forced tick goes now
+
+After a 1 KiB Claude append, share of the tick's samples:
+
+| Frame (inclusive) | Share |
+|---|---:|
+| Shallow discovery (`discover_sessions_for_sweep`) | 34% |
+| of which per-candidate catalog and observation lookups (`fetch_observed_candidate`, each statement prepared per call) | 16% |
+| of which Grok enumeration | 12% |
+| of which the path-key upgrade (`upgrade_cached_project_identity`) | 9% |
+| Project-identity refresh | 13% |
+| Directory walk (`collect_matching_files`) | 13% |
+| `.sync-state.json` checkpoints (`SweepCheckpoints::save`) | 9% |
+| Source fingerprint (`source_fingerprint_with`) | 8% |
+| Grok session inventory (`grok_source_inventory`) | 6% |
+| Destination marker: shortfall at the start and recount at the end | 7% |
+| Catalog digest (`catalog_row_digests`; the head moved) | 3% |
+| Ingesting the appended record | 0.3% |
+
+None of it is the appended bytes. These are filed as their own issues rather
+than widened into this change; see the pull request.
+
+The CI gate's `ci-debug` thresholds are not re-baselined: they are baselined
+per runner class (`ubuntu-latest`), these numbers come from a developer
+machine, and every gated phase moved in the safe direction.

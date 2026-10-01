@@ -560,6 +560,20 @@ Notable changes to the native `ai-hist` CLI are documented here.
   snapshots or a fixture exemption. Behaviour is unchanged, and so is the
   default Rust API; the descriptors are readable under `unstable-internal` as
   `ai_hist::sources::catalog`.
+- `sync` (and every `watch` tick) writes each Claude transcript and each Codex
+  rollout as one `BEGIN IMMEDIATE` transaction instead of one autocommit per
+  statement, as Cursor, Grok, Muse and hydration already did. A Claude
+  transcript's transaction is committed and reopened every 2,000 records, so a
+  very large one never holds the writer lock for its whole read; a Codex
+  rollout stays one transaction, which its parser-upgrade repair relies on.
+  Cursors are written inside the transaction, after the rows they vouch for,
+  so a transcript that fails part way now leaves nothing behind instead of a
+  prefix of its rows, and the next sync reads it whole. `PRAGMA synchronous`
+  is unchanged; the sweep's own connection keeps temporary files (statement
+  journals, sorts) in memory, which holds nothing durable. On the 100 MB
+  synthetic store a cold sync drops from 37.3 s to 13.4 s, and a forced tick
+  after a 1 KiB append to a 2 MB Codex rollout from 728 ms to 466 ms. Part of
+  #215.
 
 ### Fixed
 
@@ -575,6 +589,31 @@ Notable changes to the native `ai-hist` CLI are documented here.
   1,000-turn page; the same session takes about 35 ms. Results, ordering,
   fallback `event:<id>` identities, cursors and the single read snapshot are
   unchanged; no schema or index change.
+- Continuity reconciliation no longer scans every event of a source for each
+  pending transcript on every sync. Resolving a transcript's parent record
+  asked `message_id = ? OR event_uid = ?`, which no index could serve, and a
+  parent nothing has indexed keeps its transcript pending for good. It is now
+  two indexed searches with the same answer, the second on a new partial
+  index, `idx_session_events_claude_uid_unmatched`, which holds only the rows
+  the first search cannot see and is empty on a database this parser wrote.
+  The next writable open builds it (0.76 s for 214,000 events). On 75,000
+  Claude events the lookup drops from 17 ms to under 0.1 ms. Part of #215.
+- Reading a whole session's events (`session_events`, and
+  `SessionStore::session` with events selected) no longer sorts them in a
+  temporary b-tree. The order spelled `ts_ms IS NULL` first, which no index
+  carries; `session_events.ts_ms` has always been `NOT NULL`, so the order is
+  now `ts_ms, id` and is read straight from the page index. Same rows, same
+  order. Part of #215.
+- A `watch` tick or `SessionStore::sync` that wrote nothing to the catalog no
+  longer digests every catalog row to compute `changed`: the digest records
+  the change-feed head it was read at, and an unmoved head proves the catalog
+  is the same. When anything was written the rows are compared as before, so
+  `changed` still names exactly the sessions whose catalog columns moved. And
+  naming the sessions the destination marker says are short no longer walks
+  every event a second time; the grouped reads that count them collect the
+  names. A forced tick on the 100 MB synthetic store drops from 338 ms to
+  301 ms unchanged, and from 364 ms to 333 ms after a 1 KiB Claude append.
+  Part of #215.
 - Grok reuses an ACP `eventId` across records, and two messages carrying one
   id were stored under one `ev:<id>` identity, so the second overwrote the
   first (#212). The first message carrying an id keeps `ev:<id>`, and each
