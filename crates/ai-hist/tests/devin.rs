@@ -1634,3 +1634,126 @@ fn devin_hydration_of_a_deleted_store_is_unavailable_not_a_mismatch() {
         "a deleted store is unavailable: {message}"
     );
 }
+
+/// Fresh discovery, sync, and cached discovery share the normalizer's parts rules.
+#[test]
+fn devin_array_prompt_previews_follow_normalized_text() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    for initially_previewed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let store = stage_devin_db(home, BASE_SESSION_SQL);
+        let _env = EnvGuard::set(home);
+        let db = home.join("history.db");
+        let conn = open_db(&db).unwrap();
+        let discover = || {
+            let env = DiscoveryEnv::with_roots(
+                &conn,
+                home.to_path_buf(),
+                home.join("missing-opencode.db"),
+            );
+            discover_sessions_with_env(
+                &env,
+                &DiscoverOptions {
+                    scope: SessionScope::Local,
+                    sources: vec!["devin".into()],
+                    limit: None,
+                },
+                |_| {},
+            )
+            .unwrap();
+        };
+        let preview = || -> Option<String> {
+            conn.query_row("SELECT first_prompt FROM sessions WHERE source='devin' AND session_id='devin-test'",
+                [], |row| row.get(0)).unwrap()
+        };
+        if initially_previewed {
+            discover();
+            assert_eq!(preview().as_deref(), Some("first prompt"));
+        }
+        let provider = Connection::open(&store).unwrap();
+        for (content, expected) in [
+            (
+                serde_json::json!([null, 7, false, "  ", {"type":"image", "text":"skip"},
+                {"type":null,"text":"skip"}, {"type":"text","text":42},
+                {"type":"text","text":"  fix login  "}, "\tthen test\n", {"text":"\u{2003}ship it\u{2003}"}]),
+                "fix login\nthen test\nship it".to_string(),
+            ),
+            (
+                serde_json::json!(["é".repeat(5000), "unreachable"]),
+                "é".repeat(4096),
+            ),
+        ] {
+            let message = serde_json::json!({"message_id":"u0","role":"user","content":content});
+            provider
+                .execute(
+                    "UPDATE message_nodes SET chat_message=? WHERE node_id=0",
+                    [message.to_string()],
+                )
+                .unwrap();
+            discover();
+            assert_eq!(
+                preview(),
+                (!expected.is_empty()).then_some(expected.clone())
+            );
+            sync_scoped_at(&db, SessionScope::Local).unwrap();
+            assert_eq!(
+                preview(),
+                (!expected.is_empty()).then_some(expected.clone())
+            );
+            if !expected.is_empty() {
+                let prompt: String = conn.query_row("SELECT prompt FROM history WHERE source='devin' AND session_id='devin-test'", [], |row| row.get(0)).unwrap();
+                assert_eq!(prompt.chars().take(4096).collect::<String>(), expected);
+            }
+        }
+    }
+}
+
+/// Failure after deleting evidence must restore the whole local view and checkpoint.
+#[test]
+fn devin_retirement_rolls_back_on_catalog_failure() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let store = stage_devin_db(home, BASE_SESSION_SQL);
+    let _env = EnvGuard::set(home);
+    let db = home.join("history.db");
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+    let conn = open_db(&db).unwrap();
+    let tables = [
+        "history",
+        "session_events",
+        "session_markers",
+        "sessions",
+        "session_observations",
+        "session_presences",
+    ];
+    let holdings = || {
+        tables.map(|table| {
+            count(
+                &conn,
+                &format!("SELECT COUNT(*) FROM {table} WHERE source='devin'"),
+            )
+        })
+    };
+    let before = holdings();
+    conn.execute_batch(
+        "CREATE TRIGGER fail_devin_retirement BEFORE DELETE ON sessions
+        WHEN OLD.source='devin' BEGIN SELECT RAISE(ABORT, 'injected retirement failure'); END;",
+    )
+    .unwrap();
+    let provider = Connection::open(store).unwrap();
+    provider
+        .execute("UPDATE sessions SET hidden=1", [])
+        .unwrap();
+    let _ = sync_scoped_at(&db, SessionScope::Local);
+    assert_eq!(
+        holdings(),
+        before,
+        "a failed retirement must not leave partial evidence"
+    );
+    conn.execute_batch("DROP TRIGGER fail_devin_retirement")
+        .unwrap();
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+    assert_eq!(holdings(), [0; 6], "the next sweep retries retirement");
+}

@@ -721,14 +721,15 @@ const DESTINATION_HEAD_KEY: &str = "destination_head";
 
 /// The destination's change-feed head, as `epoch:revision`.
 ///
-/// Every insert, update and delete on the tables the marker counts —
-/// `sessions`, `session_events`, `tool_calls`, `file_edits` — advances the
-/// database-wide revision through the change-feed triggers, and the epoch is
-/// drawn once per database. So a head equal to the one read *before* the
-/// marker was taken proves no row the marker counted has been written or
-/// deleted since, and the marker is still exact. A head that moved says
-/// nothing either way — the hook fast path and hydration add rows between
-/// sweeps — and the tick falls back to comparing the counts.
+/// Every insert and delete on the tables the marker counts — `sessions`,
+/// `session_events`, `tool_calls`, `file_edits` — and every update that
+/// changes one of their rows advances the database-wide revision through the
+/// change-feed triggers, and the epoch is drawn once per database. So a head
+/// equal to the one read *before* the marker was taken proves no row the
+/// marker counted has been added, changed or deleted since, and the marker is
+/// still exact. A head that moved says nothing either way — the hook fast
+/// path and hydration add rows between sweeps — and the tick falls back to
+/// comparing the counts.
 ///
 /// Before this, every unchanged tick recounted every session's evidence to
 /// confirm what the head already said (#42).
@@ -874,42 +875,61 @@ type HoldingField = fn(&mut SessionHoldings) -> &mut u64;
 /// Every session the marker is answerable for, keyed by the hash the marker
 /// stores.
 fn session_holdings(conn: &Connection) -> Result<BTreeMap<u64, SessionHoldings>> {
+    session_holdings_naming(conn, None)
+}
+
+/// [`session_holdings`], also collecting into `named` every `(source,
+/// session_id)` that holds a catalog row or an event -- the sessions the
+/// shortfall can name -- from the same grouped reads, so naming them costs no
+/// second walk of `session_events`.
+fn session_holdings_naming(
+    conn: &Connection,
+    mut named: Option<&mut HashSet<(String, String)>>,
+) -> Result<BTreeMap<u64, SessionHoldings>> {
     let mut holdings: BTreeMap<u64, SessionHoldings> = BTreeMap::new();
     let sources = repairable_event_sources();
     let history_sources = replayable_history_sources();
-    let counted: [(&str, bool, HoldingField); 6] = [
+    // Count and name repair targets in the same grouped reads. Replayable
+    // stores can also be named by surviving history or marker rows.
+    let counted: [(&str, bool, HoldingField, bool); 6] = [
         (
             "SELECT source, session_id, COUNT(*) FROM session_events",
             false,
             |held| &mut held.events,
+            true,
         ),
         (
             "SELECT source, session_id, COUNT(*) FROM tool_calls",
             false,
             |held| &mut held.tool_calls,
+            false,
         ),
         (
             "SELECT source, session_id, COUNT(*) FROM file_edits",
             false,
             |held| &mut held.file_edits,
+            false,
         ),
         (
             "SELECT source, session_id, COUNT(*) FROM history",
             true,
             |held| &mut held.history,
+            true,
         ),
         (
             "SELECT source, session_id, COUNT(*) FROM session_markers",
             true,
             |held| &mut held.markers,
+            true,
         ),
         (
             "SELECT source, session_id, COUNT(*) FROM sessions",
             false,
             |held| &mut held.catalog,
+            true,
         ),
     ];
-    for (select, is_history, field) in counted {
+    for (select, is_history, field, names) in counted {
         // `history.session_id` is nullable; per-session holdings and markers
         // should only promise rows that are actually tied to a session.
         let extra = if is_history {
@@ -942,6 +962,9 @@ fn session_holdings(conn: &Connection) -> Result<BTreeMap<u64, SessionHoldings>>
             // here could reintroduce the masking this marker exists to catch.
             let key = discover::fingerprint_hash("session-events", &source, &session_id);
             *field(holdings.entry(key).or_default()) = count;
+            if let Some(named) = named.as_deref_mut().filter(|_| names) {
+                named.insert((source, session_id));
+            }
         }
     }
     Ok(holdings)
@@ -1111,38 +1134,26 @@ fn destination_shortfall(conn: &Connection, stored: &str) -> Result<SweepRepairs
         return Ok(SweepRepairs::all());
     };
     let mut repairs = SweepRepairs::default();
-    let current = session_holdings(conn)?;
     // Named from the *session* side rather than from the evidence, because a
     // session whose catalog row and events are both gone has no row left to be
-    // found by. The union of the tables the sweep reaches it through is what
-    // keeps it nameable. `history` and `session_markers` are included for the
-    // replayable store-backed sources, so a session holding only those rows
-    // (e.g. an OpenCode prompt-only session) is still named as a repair target.
+    // found by. Catalog, event, history and marker groups collect the names
+    // while counting holdings, avoiding another walk of those same tables.
+    let mut named: HashSet<(String, String)> = HashSet::new();
+    let current = session_holdings_naming(conn, Some(&mut named))?;
     // A Muse subagent has no catalog row of its own, so once every event of
     // it is gone neither table above can name it; the edge its parent's log
     // recorded still does, and naming it is what sends the parent back to
     // re-read the tree.
     let mut statement = conn.prepare(
-        "SELECT source, session_id FROM sessions \
-         WHERE source IN (SELECT value FROM json_each(?1)) \
-         UNION \
-         SELECT source, session_id FROM session_events \
-         WHERE source IN (SELECT value FROM json_each(?1)) \
-         UNION \
-         SELECT source, session_id FROM history \
-         WHERE session_id IS NOT NULL AND source IN (SELECT value FROM json_each(?2)) \
-         UNION \
-         SELECT source, session_id FROM session_markers \
-         WHERE source IN (SELECT value FROM json_each(?2)) \
-         UNION \
-         SELECT source, child_session_id FROM session_relationships \
+        "SELECT source, child_session_id FROM session_relationships \
          WHERE source = 'muse' AND evidence_kind = 'muse_subagent_log' \
            AND child_session_id IS NOT NULL",
     )?;
-    let mut rows = statement.query([repairable_event_sources(), replayable_history_sources()])?;
+    let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
-        let source: String = row.get(0)?;
-        let session_id: String = row.get(1)?;
+        named.insert((row.get(0)?, row.get(1)?));
+    }
+    for (source, session_id) in named {
         let key = discover::fingerprint_hash("session-events", &source, &session_id);
         let Some(before) = stored.sessions.get(&key) else {
             continue;
@@ -1453,6 +1464,20 @@ fn sync_basic(
     // one pass, and a long-lived host (watch, the Node addon, a desktop app)
     // runs many passes without restarting.
     crate::project_identity::begin_acquisition_pass();
+    // The sweep writes a transcript at a time (`SweepWrite`), and inside a
+    // transaction every upsert that fires a trigger keeps a statement journal
+    // so it can be undone alone. Past 64 KiB SQLite spills that journal to a
+    // temporary file, and on a cold sweep those spills were 30% of the
+    // samples: `pwrite`s of pages that are discarded when the statement
+    // ends. In memory they are never written. Nothing durable is a temporary
+    // file -- they are deleted when the statement or connection ends -- so
+    // this moves no commit. Set here rather than in `open_db` because it also
+    // keeps temp b-trees and sorts in memory, and the sweep's are bounded by
+    // the catalog where a migration's `CREATE INDEX` is not. Best effort: it
+    // cannot change inside a transaction, and the sweep is correct without it.
+    if let Err(error) = conn.pragma_update(None, "temp_store", "MEMORY") {
+        sync_note!("  [sync] in-memory temp store unavailable: {error:#}");
+    }
     if roots.use_env_roots {
         for (var, root) in [
             ("CLAUDE_CONFIG_DIR", &roots.claude),
@@ -1831,38 +1856,175 @@ fn sync_basic(
         }
     }
     let total: i64 = conn.query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))?;
-    // Fold the WAL back into the database now that the writes are done. Best
-    // effort: a concurrent reader pinning an old snapshot blocks a full
-    // checkpoint, and that is not a reason to fail a sync that did its work.
+    // Fold the WAL back into the database now that the writes are done.
     // Left unchecked the WAL grows without bound (156MB observed in the wild).
-    match conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, i64>(2)?,
-        ))
-    }) {
-        Ok((busy, log_frames, checkpointed_frames)) if busy != 0 => {
-            sync_note!(
-                "  [wal] checkpoint incomplete: {checkpointed_frames}/{log_frames} frames; another reader is active"
-            );
-        }
-        Ok(_) => {}
-        Err(err) => sync_note!("  [wal] checkpoint skipped: {err}"),
-    }
-    let wal_bytes = fs::metadata(wal_path(db_path))
-        .map(|m| m.len())
-        .unwrap_or(0);
-    if wal_bytes > WAL_WARN_BYTES {
+    let checkpoint = checkpoint_after_sweep(conn, db_path, WAL_TRUNCATE_BYTES);
+    if checkpoint.wal_bytes > WAL_WARN_BYTES {
         eprintln!(
             "ai-hist: WAL is {} after checkpointing -- a long-lived reader is \
              pinning an old snapshot; run `ai-hist doctor`",
-            human_bytes(wal_bytes)
+            human_bytes(checkpoint.wal_bytes)
         );
     }
     sync_note!("  [rust-sync] +{total_inserted} rows");
     sync_note!("  Total: {total} entries");
     Ok(true)
+}
+
+/// WAL size past which the post-sweep checkpoint escalates from `PASSIVE` to
+/// `TRUNCATE` and hands the file's space back.
+///
+/// A sixteenth of [`WAL_WARN_BYTES`]: 4 MiB, the size SQLite's own
+/// auto-checkpoint lets the WAL reach (1000 pages of 4 KiB) before it folds
+/// it back. Below it the file is ordinary steady state that the next writer
+/// reuses from the start once a passive checkpoint has caught up; above it a
+/// sweep wrote more than SQLite would have kept, and the space is worth a
+/// short wait to return.
+pub(crate) const WAL_TRUNCATE_BYTES: u64 = WAL_WARN_BYTES / 16;
+
+/// How long an escalated `TRUNCATE` may wait for another connection's
+/// transaction to end before it gives up. Every other connection's writes
+/// queue behind it while it waits, so this is the most a reader open as a
+/// sweep ends can stall them.
+///
+/// It bounds the *wait*, not the copy: a `TRUNCATE` copies outstanding frames
+/// into the database under the WAL write lock too, and that grows with what
+/// is outstanding. [`checkpoint_after_sweep`] keeps the copy small by
+/// escalating only after a `PASSIVE` pass has already copied every frame, so
+/// all that is left to copy is a transaction another connection committed in
+/// between.
+const WAL_TRUNCATE_BUSY_BUDGET: Duration = Duration::from_millis(100);
+
+/// What the post-sweep checkpoint did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SweepCheckpoint {
+    /// Whether a `TRUNCATE` was attempted: the `PASSIVE` pass caught up and
+    /// the WAL was still past the threshold.
+    pub(crate) escalated: bool,
+    /// Whether every frame was folded back and, when escalated, the WAL was
+    /// reset. `false` when another connection's open transaction was in the
+    /// way or the checkpoint could not run at all.
+    pub(crate) complete: bool,
+    /// The WAL file's size once the checkpoint returned.
+    pub(crate) wal_bytes: u64,
+}
+
+/// Checkpoint the WAL after a sweep without making other connections wait.
+///
+/// `PASSIVE` first: it copies what it can and never takes the write lock or
+/// waits on anyone, so a reader active as the sweep ends costs nobody
+/// anything. It escalates to `TRUNCATE` only when that pass caught up — every
+/// frame copied — and the WAL file is still past `truncate_above`, under a
+/// [`WAL_TRUNCATE_BUSY_BUDGET`] busy budget rather than the connection's
+/// ~30 s retry handler: a `TRUNCATE` holds the WAL write lock while it waits
+/// for readers to leave, and every other writer — an embedder's own tables
+/// included — would queue behind it for as long as the handler kept retrying
+/// (#336).
+///
+/// Not escalating after a short pass matters as much as the budget. The
+/// frames a pass leaves behind are the ones an open transaction's snapshot
+/// predates, and they can be a long-lived reader's whole backlog (156 MB has
+/// been seen). Were that reader to leave while an escalated call waited on
+/// it, the `TRUNCATE` would copy the backlog under the write lock, for as long
+/// as the copy and its fsync take. The next sweep's `PASSIVE` copies it
+/// instead, without the lock. Either way the shortfall is reported, not
+/// claimed, and the next sweep tries again.
+pub(crate) fn checkpoint_after_sweep(
+    conn: &Connection,
+    db_path: &Path,
+    truncate_above: u64,
+) -> SweepCheckpoint {
+    let wal_len = || {
+        fs::metadata(wal_path(db_path))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    };
+    let complete = match wal_checkpoint(conn, "PASSIVE") {
+        // Another connection holds the checkpoint lock, so nothing was
+        // copied; `log_frames` is -1 here.
+        Ok((busy, _, _)) if busy != 0 => {
+            sync_note!(
+                "  [wal] checkpoint deferred: another connection is checkpointing; the next sweep retries"
+            );
+            false
+        }
+        // An open transaction on another connection began before the last
+        // commit, so the frames after its snapshot stay. A writer
+        // mid-transaction does not cause this; its frames are not committed.
+        Ok((_, log_frames, checkpointed_frames)) if checkpointed_frames < log_frames => {
+            sync_note!(
+                "  [wal] checkpoint partial: {checkpointed_frames}/{log_frames} frames; the rest are \
+                 newer than another connection's open transaction and wait for the next sweep"
+            );
+            false
+        }
+        Ok(_) => true,
+        Err(error) => {
+            sync_note!("  [wal] checkpoint skipped: {error}");
+            false
+        }
+    };
+    #[cfg(test)]
+    run_after_passive_checkpoint_hook();
+    if !complete || wal_len() <= truncate_above {
+        return SweepCheckpoint {
+            escalated: false,
+            complete,
+            wal_bytes: wal_len(),
+        };
+    }
+    let truncated = match crate::store::ShortBusyBudget::new(conn, WAL_TRUNCATE_BUSY_BUDGET) {
+        Ok(_budget) => wal_checkpoint(conn, "TRUNCATE"),
+        Err(error) => Err(error.to_string()),
+    };
+    let complete = match truncated {
+        Ok((busy, _, _)) if busy != 0 => {
+            sync_note!(
+                "  [wal] WAL not reset: another connection's transaction outlasted the {} ms \
+                 budget; the next sweep retries",
+                WAL_TRUNCATE_BUSY_BUDGET.as_millis()
+            );
+            false
+        }
+        Ok(_) => true,
+        Err(error) => {
+            sync_note!("  [wal] WAL reset skipped: {error}");
+            false
+        }
+    };
+    SweepCheckpoint {
+        escalated: true,
+        complete,
+        wal_bytes: wal_len(),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Runs on this thread between the `PASSIVE` pass and the escalation
+    /// decision, so a test can change what other connections hold at exactly
+    /// that point instead of racing a sleep against the checkpoint.
+    static AFTER_PASSIVE_CHECKPOINT: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_after_passive_checkpoint_hook() {
+    AFTER_PASSIVE_CHECKPOINT.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook();
+        }
+    });
+}
+
+/// One `PRAGMA wal_checkpoint(<mode>)`: `(busy, log frames, checkpointed
+/// frames)`. SQLite reports a reader that blocked it as `busy = 1` in the row,
+/// not as an error.
+fn wal_checkpoint(conn: &Connection, mode: &str) -> std::result::Result<(i64, i64, i64), String> {
+    conn.query_row(&format!("PRAGMA wal_checkpoint({mode})"), [], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+    })
+    .map_err(|error| error.to_string())
 }
 
 /// Whether this sweep knows enough to make its source and destination state a
@@ -2839,6 +3001,112 @@ fn save_sync_state(path: &Path, state: &Map<String, Value>) -> Result<()> {
 /// large backlog in one transaction would instead hold the write lock for
 /// minutes and starve everyone else.
 const JSONL_CHUNK_LINES: usize = 2_000;
+
+/// One write transaction over a transcript's worth of sweep work.
+///
+/// The global Claude and Codex walks used to write in autocommit, which at the
+/// default `synchronous = FULL` is one WAL `fsync` per statement -- several
+/// per record, and two thirds of a cold sweep's samples. Every other provider
+/// already writes a unit at a time (Cursor per source, Grok per session
+/// directory, Muse per session, hydration per session); this is the same
+/// thing for the two that did not.
+///
+/// It changes when rows become visible, not what is durable: each commit is
+/// as durable as an autocommit was, the change-feed revisions are stamped by
+/// the same per-row triggers, and every cursor these walks publish is written
+/// inside the transaction, after the rows it vouches for, so a crash leaves
+/// the rows and their cursor together or neither. `.sync-state.json` is still
+/// checkpointed only after the source finishes, so a stamp never runs ahead of
+/// the commit it describes.
+///
+/// `IMMEDIATE`, so the writer lock is taken before the first read of a
+/// cursor rather than on the first write, where a deferred transaction that
+/// raced a hydration would fail to upgrade instead of waiting behind it. A
+/// caller that is already inside a transaction keeps its own boundaries:
+/// nothing here begins, commits or rolls back on its behalf.
+///
+/// Bounded as the ADR on direct writers requires: [`SweepWrite::record`]
+/// commits and reopens every [`JSONL_CHUNK_LINES`] records, so a very large
+/// transcript holds the lock for one chunk at a time, not for its whole read.
+/// A chunk committed ahead of the transcript's cursor is what autocommit did
+/// for every statement; the re-read that follows upserts over it.
+pub(crate) struct SweepWrite<'c> {
+    conn: &'c Connection,
+    /// Whether this guard opened the transaction and so owns its boundaries.
+    owned: bool,
+    records: usize,
+}
+
+impl<'c> SweepWrite<'c> {
+    pub(crate) fn begin(conn: &'c Connection) -> Result<Self> {
+        let owned = conn.is_autocommit();
+        if owned {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+        }
+        Ok(Self {
+            conn,
+            owned,
+            records: 0,
+        })
+    }
+
+    /// One record is about to be read. Past the chunk size, commit what is
+    /// written and open the next chunk.
+    pub(crate) fn record(&mut self) -> Result<()> {
+        if !self.owned {
+            return Ok(());
+        }
+        self.records += 1;
+        if self.records < JSONL_CHUNK_LINES {
+            return Ok(());
+        }
+        self.records = 0;
+        self.conn.execute_batch("COMMIT")?;
+        if let Err(error) = self.conn.execute_batch("BEGIN IMMEDIATE") {
+            // Committed and not reopened: there is nothing left to own, and
+            // the walk ends on the error rather than writing in autocommit.
+            self.owned = false;
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn commit(mut self) -> Result<()> {
+        if !self.owned {
+            return Ok(());
+        }
+        let committed = self.conn.execute_batch("COMMIT");
+        // Whether or not COMMIT succeeded the guard no longer owns a
+        // transaction: a successful commit ended it, and a failed one is
+        // ended here. SQLite can refuse a COMMIT (a busy commit, say) and
+        // leave the transaction open, and the sweep goes on to the next
+        // provider on this same connection. Left open, that transaction
+        // would swallow the next provider's writes and let it publish
+        // cursors for rows that vanish when the connection closes.
+        self.owned = false;
+        if let Err(error) = committed {
+            if !self.conn.is_autocommit() {
+                let _ = self.conn.execute_batch("ROLLBACK");
+            }
+            return Err(error.into());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SweepWrite<'_> {
+    fn drop(&mut self) {
+        // An error or a cancellation unwound past the guard: nothing of the
+        // open chunk is kept. Chunks a Claude transcript committed before it
+        // stay (its catalog row and the rows of those chunks), but its cursor
+        // was never published, so the next sweep reads the file again and
+        // its upserts converge on the same rows. SQLite may already have
+        // rolled back on its own.
+        if self.owned && !self.conn.is_autocommit() {
+            let _ = self.conn.execute_batch("ROLLBACK");
+        }
+    }
+}
 
 /// A byte cursor is valid only for the file generation that produced it.
 /// `observed_at_ns` orders overlapping writers across rotations, while the
@@ -3873,6 +4141,12 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                 continue;
             };
             scanned += 1;
+            // Everything this rollout writes is one write unit, committed
+            // before its stamp enters `seen`: the stamp is the walk's claim
+            // that these rows landed. Not chunked: a parser-upgrade repair
+            // relies on the whole rollout being one transaction (see
+            // `repair_codex_rollout_user_messages`).
+            let write = SweepWrite::begin(conn)?;
             if meta.is_subagent {
                 // Earlier syncs (before subagent detection) registered these
                 // threads: their map entries feed backfill_codex_metadata and
@@ -3904,10 +4178,19 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                     outcome
                 }
                 Err(error) => {
-                    // Cleanup was attempted above. Preserve the ingestion
-                    // failure as the primary diagnostic if both operations
-                    // fail, since it explains why this rollout made no
-                    // progress and is what a retry must address.
+                    // The rollout's unit is discarded, cleanup included, so
+                    // the cleanup is applied again on its own: a stale root
+                    // registration is wrong whether or not this rollout's
+                    // events could be written, and before the walk wrote
+                    // per rollout it was kept regardless. Preserve the
+                    // ingestion failure as the primary diagnostic if both
+                    // operations fail, since it explains why this rollout
+                    // made no progress and is what a retry must address.
+                    drop(write);
+                    if meta.is_subagent {
+                        let _ = cleanup_codex_subagent_history(conn, &meta.session_id);
+                        let _ = cleanup_codex_subagent_registration(conn, &meta.session_id);
+                    }
                     return Err(error);
                 }
             };
@@ -3968,6 +4251,7 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                     }
                 }
             }
+            write.commit()?;
             seen.insert(
                 key,
                 json!({ "stamp": stamp, "session": meta.session_id, "subagent": meta.is_subagent }),
@@ -4789,24 +5073,31 @@ fn repair_codex_rollout_user_messages(
     // One bounded transaction per rollout makes an interrupted parser upgrade
     // leave either the old user rows or the fully rebuilt ones. Assistant,
     // tool, and file-edit evidence is retained and idempotently upserted.
-    let tx = conn.unchecked_transaction()?;
+    // The sweep's own per-rollout `SweepWrite` is that transaction when it is
+    // open, and it never commits part way through a rollout.
+    let tx = conn
+        .is_autocommit()
+        .then(|| conn.unchecked_transaction())
+        .transpose()?;
     crate::store::retire_evidence_share(
-        &tx,
+        conn,
         "session_events",
         "source = 'codex' AND session_id = ? AND role = 'user'",
         params![meta.session_id.as_str()],
         SessionLocation::Local,
     )?;
     if meta.is_subagent {
-        cleanup_codex_subagent_history(&tx, &meta.session_id)?;
+        cleanup_codex_subagent_history(conn, &meta.session_id)?;
     } else {
-        tx.execute(
+        conn.execute(
             "DELETE FROM history WHERE source = 'codex' AND session_id = ?",
             [meta.session_id.as_str()],
         )?;
     }
-    let outcome = ingest_codex_rollout(&tx, path, meta)?;
-    tx.commit()?;
+    let outcome = ingest_codex_rollout(conn, path, meta)?;
+    if let Some(tx) = tx {
+        tx.commit()?;
+    }
     Ok(outcome)
 }
 
@@ -6527,6 +6818,10 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
                     continue;
                 }
             };
+        // Everything this transcript writes from here -- the fold's cursor,
+        // the catalog row, the records and their cursor, the relationship and
+        // continuity rows -- is one write unit. The fold above only read.
+        let mut write = SweepWrite::begin(conn)?;
         scan_cursor.claude.get_or_insert_with(Default::default).scan = scan;
         transcript_cursor::store_cursor(conn, &scan_key, &scan_cursor)?;
         if let Some(meta) = scanned_meta {
@@ -6545,7 +6840,13 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
                 // The sync walk reports its reads through its own counters, not
                 // through a hydration result, so the byte count is dropped here.
                 let (evidence, _) = hydrate::claude_subagent_evidence(path.clone(), &meta);
-                hydrate::ingest_claude_subagent(conn, &meta.session_id, &evidence)?;
+                hydrate::ingest_claude_subagent_batched(
+                    conn,
+                    &meta.session_id,
+                    &evidence,
+                    &mut || write.record(),
+                )?;
+                write.commit()?;
                 continue;
             }
             upsert_session(
@@ -6570,7 +6871,12 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
             if !scan_superseded {
                 set_claude_first_prompt(conn, &meta)?;
             }
-            incremental::ingest_claude_transcript_at_locator(conn, &path, None)?;
+            incremental::ingest_claude_transcript_at_locator_batched(
+                conn,
+                &path,
+                None,
+                &mut || write.record(),
+            )?;
             if scan_superseded {
                 transcript_cursor::forget_locator_cursor(conn, "claude", &path)?;
             }
@@ -6593,6 +6899,7 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
             }
             upserted += 1;
         }
+        write.commit()?;
     }
 
     if walked_every_known_root {
@@ -10062,7 +10369,7 @@ fn insert_session_event_with_provenance(
     let blank = ToolResultFacts::default();
     let tool_result_facts = tool_result_facts.unwrap_or(&blank);
     // Stamp `project_key` as the row is inserted rather than sweeping for it
-    // afterwards. An UPDATE over `session_events` re-stamps the row's
+    // afterwards. An UPDATE that changes a `session_events` row re-stamps its
     // change-feed revision, so a sweep would report a second upsert for every
     // event of every session on every sync.
     //
@@ -16191,22 +16498,41 @@ fn upsert_trajectory(conn: &Connection, row: &TrajectoryRow) -> Result<()> {
             row.timestamp_ms,
         ],
     )?;
+    let entry = HistoryEntry {
+        id: 0,
+        source: "trajectory".into(),
+        session_id: Some(row.id.clone()),
+        project: row.project_id.clone(),
+        prompt_hash: Some(prompt_hash(&row.search_text)),
+        prompt: row.search_text.clone(),
+        timestamp_ms: row.timestamp_ms,
+    };
+    // Every other row this trajectory filed goes; the one it files again, if
+    // it is already there, stays, so re-reading an unchanged trajectory is
+    // not a delete and an insert -- a tombstone and a new change-feed
+    // revision -- of the same prompt. A row from before `prompt_hash` was
+    // stored is the same prompt too: it is kept and given its hash in place,
+    // one update, once.
+    let params = params![
+        row.id,
+        entry.timestamp_ms,
+        entry.prompt,
+        entry.project,
+        entry.prompt_hash
+    ];
     conn.execute(
-        "DELETE FROM history WHERE source = 'trajectory' AND session_id = ?",
-        [&row.id],
+        "DELETE FROM history WHERE source = 'trajectory' AND session_id = ?1 \
+         AND NOT (timestamp_ms = ?2 AND prompt = ?3 AND project IS ?4 \
+                  AND (prompt_hash IS NULL OR prompt_hash IS ?5))",
+        params,
     )?;
-    insert_history(
-        conn,
-        &HistoryEntry {
-            id: 0,
-            source: "trajectory".into(),
-            session_id: Some(row.id.clone()),
-            project: row.project_id.clone(),
-            prompt_hash: Some(prompt_hash(&row.search_text)),
-            prompt: row.search_text.clone(),
-            timestamp_ms: row.timestamp_ms,
-        },
+    conn.execute(
+        "UPDATE history SET prompt_hash = ?5 \
+         WHERE source = 'trajectory' AND session_id = ?1 AND timestamp_ms = ?2 \
+           AND prompt = ?3 AND project IS ?4 AND prompt_hash IS NULL",
+        params,
     )?;
+    insert_history(conn, &entry)?;
     Ok(())
 }
 
@@ -33678,6 +34004,88 @@ mod capture_progress_tests {
         assert_eq!(count(), 20);
     }
 
+    /// Re-reading a trajectory whose prompt has not changed keeps its
+    /// `history` row -- no tombstone, no new change-feed revision -- and one
+    /// whose prompt changed replaces it.
+    #[test]
+    fn re_reading_an_unchanged_trajectory_keeps_its_prompt_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::store::init_db(&conn).unwrap();
+        let row = |search_text: &str| TrajectoryRow {
+            id: "traj-1".into(),
+            version: Some(1),
+            persona_id: None,
+            project_id: Some("/p".into()),
+            task_title: Some("t".into()),
+            task_description: None,
+            status: Some("active".into()),
+            started_at: None,
+            completed_at: None,
+            decisions_json: "[]".into(),
+            retrospective_json: "{}".into(),
+            search_text: search_text.into(),
+            path: "/t/traj-1.json".into(),
+            updated_ms: 1,
+            timestamp_ms: 1,
+        };
+        let prompts = || -> Vec<(i64, String, i64)> {
+            conn.prepare(
+                "SELECT id, prompt, revision FROM history WHERE source = 'trajectory' ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        };
+        let tombstones = || -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM evidence_tombstones WHERE kind = 'history'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        upsert_trajectory(&conn, &row("alpha")).unwrap();
+        let first = prompts();
+        assert_eq!(first.len(), 1);
+        upsert_trajectory(&conn, &row("alpha")).unwrap();
+        assert_eq!(prompts(), first, "the same row at the same revision");
+        assert_eq!(tombstones(), 0);
+
+        upsert_trajectory(&conn, &row("beta")).unwrap();
+        let replaced = prompts();
+        assert_eq!(replaced.len(), 1);
+        assert_eq!(replaced[0].1, "beta");
+        assert_eq!(tombstones(), 1, "the old prompt is a delete");
+
+        // A row written before `prompt_hash` was stored is the same prompt:
+        // it keeps its id, gains its hash in one update, and is then left
+        // alone.
+        conn.execute(
+            "UPDATE history SET prompt_hash = NULL WHERE source = 'trajectory'",
+            [],
+        )
+        .unwrap();
+        let legacy = prompts();
+        upsert_trajectory(&conn, &row("beta")).unwrap();
+        let backfilled = prompts();
+        assert_eq!(backfilled.len(), 1);
+        assert_eq!(backfilled[0].0, legacy[0].0, "the same row");
+        assert!(backfilled[0].2 > legacy[0].2, "one update, for the hash");
+        assert_eq!(tombstones(), 1, "no delete");
+        let hash: Option<String> = conn
+            .query_row(
+                "SELECT prompt_hash FROM history WHERE source = 'trajectory'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hash, Some(prompt_hash("beta")));
+        upsert_trajectory(&conn, &row("beta")).unwrap();
+        assert_eq!(prompts(), backfilled);
+    }
+
     #[test]
     fn cancellation_interrupts_both_trajectory_directory_walks() {
         let home = tempfile::tempdir().unwrap();
@@ -34336,5 +34744,450 @@ mod codex_fork_replay_tests {
             .unwrap();
         assert_eq!(first_prompt, None);
         assert_eq!(last_assistant_text, None);
+    }
+}
+
+#[cfg(test)]
+mod sweep_write_tests {
+    use super::*;
+    use crate::store::init_db;
+
+    fn count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    /// A sweep unit is invisible until it commits, commits every
+    /// `JSONL_CHUNK_LINES` records rather than holding the writer lock for a
+    /// whole large transcript, and leaves nothing behind when it is dropped.
+    #[test]
+    fn a_sweep_write_is_one_bounded_unit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode = WAL; CREATE TABLE t (x INTEGER);")
+            .unwrap();
+        let reader = Connection::open(&path).unwrap();
+
+        let mut write = SweepWrite::begin(&writer).unwrap();
+        assert!(!writer.is_autocommit());
+        writer.execute("INSERT INTO t VALUES (1)", []).unwrap();
+        for _ in 1..JSONL_CHUNK_LINES {
+            write.record().unwrap();
+        }
+        assert_eq!(count(&reader), 0, "visible before the unit committed");
+        write.record().unwrap();
+        assert_eq!(count(&reader), 1, "a full chunk is committed");
+        assert!(!writer.is_autocommit(), "and the next chunk is open");
+        writer.execute("INSERT INTO t VALUES (2)", []).unwrap();
+        write.commit().unwrap();
+        assert!(writer.is_autocommit());
+        assert_eq!(count(&reader), 2);
+
+        // Dropped part way -- an error or a cancellation -- it rolls back.
+        let write = SweepWrite::begin(&writer).unwrap();
+        writer.execute("INSERT INTO t VALUES (3)", []).unwrap();
+        drop(write);
+        assert!(writer.is_autocommit());
+        assert_eq!(count(&reader), 2);
+    }
+
+    /// Inside a transaction the caller owns (hydration's), a sweep unit
+    /// neither commits a chunk nor ends the transaction.
+    #[test]
+    fn a_sweep_write_inside_a_callers_transaction_keeps_its_boundaries() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (x INTEGER);").unwrap();
+        let outer = conn.unchecked_transaction().unwrap();
+        let mut write = SweepWrite::begin(&conn).unwrap();
+        conn.execute("INSERT INTO t VALUES (1)", []).unwrap();
+        for _ in 0..JSONL_CHUNK_LINES * 2 {
+            write.record().unwrap();
+        }
+        write.commit().unwrap();
+        assert!(!conn.is_autocommit(), "the caller's transaction was ended");
+        let write = SweepWrite::begin(&conn).unwrap();
+        drop(write);
+        assert!(
+            !conn.is_autocommit(),
+            "the caller's transaction was rolled back"
+        );
+        outer.rollback().unwrap();
+        assert_eq!(count(&conn), 0);
+    }
+
+    /// A Claude transcript the walk cannot finish leaves neither part of its
+    /// rows nor a cursor claiming them: the next walk reads it whole.
+    #[test]
+    fn a_claude_transcript_that_fails_part_way_is_not_half_indexed() {
+        let home = tempfile::tempdir().unwrap();
+        let project = home.path().join(".claude/projects/app");
+        fs::create_dir_all(&project).unwrap();
+        let transcript = project.join("s1.jsonl");
+        fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"user","uuid":"u1","sessionId":"s1","cwd":"/tmp/app","timestamp":"2026-09-20T00:00:00.000Z","message":{"role":"user","content":"first"}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"s1","cwd":"/tmp/app","timestamp":"2026-09-20T00:00:01.000Z","message":{"id":"msg_1","role":"assistant","model":"claude-opus-4-7","stop_reason":"end_turn","content":[{"type":"text","text":"second"}]}}"#, "\n",
+                r#"{"type":"user","uuid":"u2","parentUuid":"a1","sessionId":"s1","cwd":"/tmp/app","timestamp":"2026-09-20T00:00:02.000Z","message":{"role":"user","content":"boom"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_third BEFORE INSERT ON session_events \
+             WHEN NEW.text = 'boom' BEGIN SELECT RAISE(FAIL, 'injected'); END;",
+        )
+        .unwrap();
+        let root = home.path().join(".claude/projects");
+        let mut state = Map::new();
+        let error = super::sync_claude_session_metadata(&conn, &mut state, &root)
+            .expect_err("the trigger fails the third record");
+        assert!(format!("{error:#}").contains("injected"));
+        assert!(conn.is_autocommit());
+        assert!(!super::session_events_exist(&conn, "claude", "s1").unwrap());
+        assert!(
+            transcript_cursor::known_locators(&conn, "claude")
+                .unwrap()
+                .is_empty(),
+            "a cursor survived a transcript that was not indexed"
+        );
+
+        conn.execute_batch("DROP TRIGGER fail_third").unwrap();
+        super::sync_claude_session_metadata(&conn, &mut state, &root).unwrap();
+        let texts: Vec<String> = conn
+            .prepare(
+                "SELECT text FROM session_events WHERE source = 'claude' AND session_id = 's1' \
+                 ORDER BY ts_ms, id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(texts, vec!["first", "second", "boom"]);
+    }
+}
+
+#[cfg(test)]
+mod post_sweep_checkpoint_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    fn wal_len(db_path: &Path) -> u64 {
+        fs::metadata(wal_path(db_path))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    }
+
+    /// A store whose WAL holds `rows` uncheckpointed inserts, written through
+    /// the production connection so the production busy handler is on it.
+    fn store_with_wal(dir: &Path, rows: usize) -> (PathBuf, Connection) {
+        let db_path = dir.join("ai-history.db");
+        let conn = open_db(&db_path).unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        conn.execute_batch("PRAGMA wal_autocheckpoint = 0;")
+            .unwrap();
+        grow_wal(&conn, rows, 0);
+        (db_path, conn)
+    }
+
+    fn grow_wal(conn: &Connection, rows: usize, offset: usize) {
+        let text = "x".repeat(2_000);
+        let tx = conn.unchecked_transaction().unwrap();
+        for i in offset..offset + rows {
+            tx.execute(
+                "INSERT INTO history (source, session_id, prompt, timestamp_ms) \
+                 VALUES ('claude', ?1, ?2, ?3)",
+                rusqlite::params![format!("s{}", i % 10), format!("{text} n{i}"), i as i64],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+
+    /// A second connection holding a read snapshot, the way an embedder's
+    /// change-feed drain does while a tick finishes.
+    fn pin_reader(db_path: &Path) -> Connection {
+        let reader = Connection::open(db_path).unwrap();
+        reader.execute_batch("BEGIN;").unwrap();
+        let _: i64 = reader
+            .query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))
+            .unwrap();
+        reader
+    }
+
+    /// The escalated checkpoint is the only one that takes the write lock.
+    /// A reader whose snapshot is current lets the `PASSIVE` pass catch up,
+    /// so the call escalates, and the reset must then wait for that reader
+    /// to leave. It may hold the lock for its short budget and no longer: a
+    /// third connection's `BEGIN IMMEDIATE`, issued while it waits, gets the
+    /// lock in well under a second rather than after the production
+    /// handler's ~30 s (#336).
+    #[test]
+    fn an_escalated_checkpoint_blocked_by_a_reader_does_not_stall_other_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, conn) = store_with_wal(dir.path(), 250);
+        let reader = pin_reader(&db_path);
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let checkpoint_path = db_path.clone();
+        let checkpointer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let started = Instant::now();
+            // Threshold 0: always escalate, which is the path that can block.
+            let outcome = checkpoint_after_sweep(&conn, &checkpoint_path, 0);
+            let budget_while_held: i64 = conn
+                .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+                .unwrap();
+            (outcome, started.elapsed(), budget_while_held)
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+
+        let writer = Connection::open(&db_path).unwrap();
+        writer.busy_timeout(Duration::from_secs(10)).unwrap();
+        let asked = Instant::now();
+        writer.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        let waited = asked.elapsed();
+        writer.execute_batch("ROLLBACK;").unwrap();
+
+        let (outcome, took, busy_timeout_after) = checkpointer.join().unwrap();
+        assert!(
+            waited < Duration::from_secs(1),
+            "a writer waited {waited:?} behind the post-sweep checkpoint"
+        );
+        assert!(
+            took < Duration::from_secs(2),
+            "the checkpoint took {took:?}"
+        );
+        assert!(outcome.escalated);
+        assert!(
+            !outcome.complete,
+            "a reset the reader blocked is not claimed"
+        );
+        assert!(outcome.wal_bytes > 0);
+        // `sqlite3_busy_handler` zeroes the reported timeout: the short
+        // budget is gone and the production retry handler is back.
+        assert_eq!(busy_timeout_after, 0);
+        drop(reader);
+    }
+
+    /// With nobody reading, a WAL past the threshold is reset to nothing; one
+    /// under it is folded back passively and left for the next writer to
+    /// reuse from the start.
+    #[test]
+    fn a_quiet_store_is_checkpointed_and_truncated_only_past_the_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, conn) = store_with_wal(dir.path(), 200);
+        let before = wal_len(&db_path);
+        assert!(before > 0);
+
+        let passive = checkpoint_after_sweep(&conn, &db_path, before);
+        assert!(!passive.escalated);
+        assert!(passive.complete);
+        assert_eq!(
+            passive.wal_bytes, before,
+            "a passive checkpoint keeps the file"
+        );
+
+        let truncated = checkpoint_after_sweep(&conn, &db_path, before - 1);
+        assert!(truncated.escalated);
+        assert!(truncated.complete);
+        assert_eq!(truncated.wal_bytes, 0);
+        assert_eq!(wal_len(&db_path), 0);
+    }
+
+    /// The busy budget bounds a `TRUNCATE`'s wait, not its copy: frames are
+    /// copied into the database under the WAL write lock. So a reader that
+    /// held back tens of MB and lets go just after the `PASSIVE` pass must
+    /// not hand that backlog to a `TRUNCATE` to copy under the lock: the
+    /// short pass does not escalate, a third connection's `BEGIN IMMEDIATE`
+    /// issued as the reader leaves is not held up, and the next sweep's
+    /// `PASSIVE` copies the backlog without the lock and then truncates.
+    ///
+    /// The reader is released from inside the checkpoint, after the pass
+    /// and before the escalation decision, through the test-only hook: the
+    /// pass has certainly seen the pinned snapshot, and the decision
+    /// certainly runs with the reader gone, whatever the scheduler does.
+    #[test]
+    fn a_large_backlog_released_mid_checkpoint_is_not_copied_under_the_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, conn) = store_with_wal(dir.path(), 50);
+        let reader = pin_reader(&db_path);
+        // ~30 MB of frames the reader's snapshot cannot see.
+        grow_wal(&conn, 12_000, 50);
+        let backlog = wal_len(&db_path);
+        assert!(
+            backlog > 20 * 1024 * 1024,
+            "backlog is only {backlog} bytes"
+        );
+
+        // The pass reports here, then waits until the reader is gone.
+        let (passed_tx, passed_rx) = mpsc::channel::<()>();
+        let (released_tx, released_rx) = mpsc::channel::<()>();
+        let checkpoint_path = db_path.clone();
+        let checkpointer = std::thread::spawn(move || {
+            AFTER_PASSIVE_CHECKPOINT.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    passed_tx.send(()).unwrap();
+                    released_rx.recv().unwrap();
+                }));
+            });
+            let started = Instant::now();
+            let outcome = checkpoint_after_sweep(&conn, &checkpoint_path, 0);
+            let took = started.elapsed();
+            AFTER_PASSIVE_CHECKPOINT.with(|hook| hook.borrow_mut().take());
+            (outcome, took, conn)
+        });
+        passed_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the passive pass ran");
+        reader.execute_batch("COMMIT;").unwrap();
+        released_tx.send(()).unwrap();
+
+        let writer = Connection::open(&db_path).unwrap();
+        writer.busy_timeout(Duration::from_secs(60)).unwrap();
+        let asked = Instant::now();
+        writer.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        let waited = asked.elapsed();
+        writer.execute_batch("ROLLBACK;").unwrap();
+        let (outcome, took, conn) = checkpointer.join().unwrap();
+        assert!(
+            waited < Duration::from_secs(1),
+            "a writer waited {waited:?} behind a {backlog}-byte checkpoint copy"
+        );
+        assert!(
+            took < Duration::from_secs(2),
+            "the checkpoint took {took:?}"
+        );
+        assert!(!outcome.escalated, "a short pass must not escalate");
+        assert!(!outcome.complete);
+
+        let next = checkpoint_after_sweep(&conn, &db_path, 0);
+        assert!(next.escalated && next.complete);
+        assert_eq!(next.wal_bytes, 0);
+    }
+
+    /// Repeated sweeps under a reader that never lets go: every checkpoint
+    /// says it could not finish, none escalates or claims a reset, and the
+    /// first one after the reader leaves truncates the WAL.
+    #[test]
+    fn a_persistent_reader_is_reported_every_sweep_and_the_next_quiet_one_truncates() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, conn) = store_with_wal(dir.path(), 50);
+        let reader = pin_reader(&db_path);
+        let mut sizes = Vec::new();
+        for round in 1..=3 {
+            grow_wal(&conn, 50, round * 50);
+            let started = Instant::now();
+            let outcome = checkpoint_after_sweep(&conn, &db_path, 0);
+            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(!outcome.escalated, "round {round} escalated a short pass");
+            assert!(!outcome.complete, "round {round} claimed a checkpoint");
+            assert!(outcome.wal_bytes > 0);
+            sizes.push(outcome.wal_bytes);
+        }
+        assert!(
+            sizes.windows(2).all(|pair| pair[0] <= pair[1]),
+            "the pinned snapshot keeps every frame: {sizes:?}"
+        );
+        reader.execute_batch("COMMIT;").unwrap();
+        let outcome = checkpoint_after_sweep(&conn, &db_path, 0);
+        assert!(outcome.escalated && outcome.complete);
+        assert_eq!(outcome.wal_bytes, 0);
+    }
+
+    fn claude_transcript(home: &Path, session_id: &str, turns: std::ops::Range<usize>) {
+        let dir = home.join(".claude/projects/-work-checkpoint");
+        fs::create_dir_all(&dir).unwrap();
+        let mut body = String::new();
+        for turn in turns {
+            for (role, kind) in [("user", "u"), ("assistant", "a")] {
+                let line = json!({
+                    "type": role, "uuid": format!("{session_id}-{kind}{turn}"),
+                    "sessionId": session_id, "cwd": "/work/checkpoint",
+                    "timestamp": format!("2026-04-20T00:{:02}:{:02}.000Z", turn / 60, turn % 60),
+                    "message": { "role": role, "content": format!("{role} turn {turn}") },
+                });
+                body.push_str(&format!("{line}\n"));
+            }
+        }
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(format!("{session_id}.jsonl")))
+            .unwrap();
+        io::Write::write_all(&mut file, body.as_bytes()).unwrap();
+    }
+
+    /// End to end: an embedder reads beside a forced sweep and writes its own
+    /// table throughout. The sweep finishes promptly and no write waits on it
+    /// for long — before #336 the sweep's closing `TRUNCATE` sat on the write
+    /// lock for the production handler's ~30 s whenever a read was active.
+    #[test]
+    fn a_sweep_ending_under_a_pinned_reader_does_not_stall_an_embedders_writes() {
+        let home = tempfile::tempdir().unwrap();
+        let db_path = home.path().join("history.db");
+        claude_transcript(home.path(), "checkpoint-a", 0..20);
+        assert!(
+            sync_exclusive_with_home(&db_path, home.path(), true)
+                .unwrap()
+                .swept
+        );
+        open_db(&db_path)
+            .unwrap()
+            .execute_batch("CREATE TABLE IF NOT EXISTS embedder_uploads (n INTEGER);")
+            .unwrap();
+        claude_transcript(home.path(), "checkpoint-a", 20..40);
+        let reader = pin_reader(&db_path);
+
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let writer_stop = stop.clone();
+        let writer_path = db_path.clone();
+        let writer = std::thread::spawn(move || {
+            let conn = Connection::open(&writer_path).unwrap();
+            conn.busy_timeout(Duration::from_secs(60)).unwrap();
+            let mut slowest = Duration::ZERO;
+            let mut writes = 0;
+            while !writer_stop.load(AtomicOrdering::Relaxed) {
+                let asked = Instant::now();
+                conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+                slowest = slowest.max(asked.elapsed());
+                conn.execute("INSERT INTO embedder_uploads VALUES (?1)", [writes])
+                    .unwrap();
+                conn.execute_batch("COMMIT;").unwrap();
+                writes += 1;
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            (slowest, writes)
+        });
+
+        let started = Instant::now();
+        let tick = sync_exclusive_with_home(&db_path, home.path(), true).unwrap();
+        let took = started.elapsed();
+        // Let the writer land at least one write after the sweep returned.
+        std::thread::sleep(Duration::from_millis(50));
+        stop.store(true, AtomicOrdering::Relaxed);
+        let (slowest, writes) = writer.join().unwrap();
+        drop(reader);
+
+        assert!(tick.swept);
+        assert!(writes > 0);
+        assert!(took < Duration::from_secs(15), "the sweep took {took:?}");
+        // Generous for CI: the sweep's own short write units also take the
+        // lock; the regression this guards is a ~30 s wait.
+        assert!(
+            slowest < Duration::from_secs(5),
+            "an embedder write waited {slowest:?} for the lock"
+        );
+        assert!(
+            wal_len(&db_path) <= WAL_WARN_BYTES,
+            "the WAL stays bounded after the sweep"
+        );
     }
 }

@@ -3272,19 +3272,38 @@ impl ShallowSessionProvider for DevinProvider {
         let Some(seed) = snapshot.sessions.get(&candidate.locator).cloned() else {
             return Ok(None);
         };
-        // The excerpt is cut in SQL: `content` can hold a whole pasted file,
-        // and materializing it to take the first characters would break the
-        // bounded-read promise. `is_user_input <> 0` keeps the provider's own
-        // synthetic turns out of the catalog's first prompt.
+        // Cut excerpts in SQL so pasted files never cross into the shallow
+        // reader. Text parts follow the normalizer's ordering, whitespace and
+        // type rules. The running length bounds the aggregate to the parts
+        // needed for one excerpt, even when an array contains many large parts.
         let first_prompt = {
-            let sql = "SELECT substr(json_extract(chat_message, '$.content'), 1, ?) \
-                 FROM message_nodes \
-                 WHERE session_id = ? AND json_valid(chat_message) \
-                 AND json_extract(chat_message, '$.role') = 'user' \
-                 AND COALESCE(json_extract(chat_message, '$.metadata.is_user_input'), 1) <> 0 \
-                 AND json_type(chat_message, '$.content') = 'text' \
-                 AND trim(substr(json_extract(chat_message, '$.content'), 1, ?), ?) <> '' \
-                 ORDER BY node_id ASC LIMIT 1";
+            let sql = "WITH prompts AS (
+                SELECT node_id, row_id, CASE json_type(chat_message, '$.content')
+                  WHEN 'text' THEN substr(trim(json_extract(chat_message, '$.content'), ?3), 1, ?1)
+                  WHEN 'array' THEN (
+                    SELECT substr(group_concat(text, char(10)), 1, ?1) FROM (
+                      SELECT text, COALESCE(SUM(length(text) + 1) OVER (
+                        ORDER BY key ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                      ), 0) AS preceding_chars FROM (
+                        SELECT key, substr(trim(CASE
+                          WHEN type = 'text' THEN value
+                          WHEN type = 'object' THEN CASE
+                            WHEN (json_type(value, '$.type') IS NULL
+                                  OR json_extract(value, '$.type') = 'text')
+                              AND json_type(value, '$.text') = 'text'
+                            THEN json_extract(value, '$.text') END
+                          END, ?3), 1, ?1) AS text
+                        FROM json_each(chat_message, '$.content')
+                        WHERE text <> '' ORDER BY key LIMIT ?1
+                      )
+                    ) WHERE preceding_chars < ?1
+                  ) END AS prompt
+                FROM message_nodes
+                WHERE session_id = ?2 AND json_valid(chat_message)
+                  AND json_extract(chat_message, '$.role') = 'user'
+                  AND COALESCE(json_extract(chat_message, '$.metadata.is_user_input'), 1) <> 0
+              ) SELECT prompt FROM prompts WHERE prompt <> ''
+                ORDER BY node_id ASC, row_id ASC LIMIT 1";
             scan.note_query();
             let prompt = {
                 let mut stmt = conn.prepare_cached(sql)?;
@@ -3292,7 +3311,6 @@ impl ShallowSessionProvider for DevinProvider {
                     params![
                         EXCERPT_MAX_CHARS as i64,
                         &candidate.locator,
-                        EXCERPT_MAX_CHARS as i64,
                         EXCERPT_TRIM_WHITESPACE
                     ],
                     |row| row.get::<_, String>(0),

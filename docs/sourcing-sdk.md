@@ -266,7 +266,10 @@ SQLite snapshot, taken at the first row and held until the iterator is dropped
 — the order key is `last_activity_ms`, which a concurrent sync moves, and pages
 on separate snapshots would skip or repeat a session that moved across the
 cursor. A WAL reader blocks no writer but pins the WAL while it lives, so drain
-or drop the iterator promptly. `CatalogQuery { scope,
+or drop the iterator promptly. (A sweep that ends while it is open checkpoints
+passively; only a WAL past 4 MiB whose frames are all copied is truncated, and
+that waits on a reader for at most 100 ms, holding other writers back no
+longer than that — #336.) `CatalogQuery { scope,
 sources, project_key, before_ms, page_size }` — `sources: None` is every
 source, `Some(vec![])` an allowlist that admits none and yields no rows. `CatalogSession` is the typed
 catalog row — `source: Source`, `project_key`, `discovery_state`, the

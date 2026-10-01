@@ -1829,7 +1829,14 @@ How each adapter works:
   `~/.local/share/devin/cli/sessions.db`), plus its per-session transcript
   exports at `transcripts/<session-id>.json`. There is no provider-specific
   override variable; `XDG_DATA_HOME` is the documented mechanism and moves the
-  whole data directory.
+  whole data directory. Optional transcript filenames must stay within that
+  store's transcript directory; path-like identities and escaping symlinks
+  contribute no transcript metadata. Hidden or deleted sessions retire their
+  local evidence and catalog projection atomically.
+
+  Shallow prompt previews accept both strings and text-parts arrays, using the
+  same text filtering, trimming and ordering as ingestion, with a bounded SQL
+  excerpt. In-place changes from strings to arrays refresh cached previews.
 
   The database is the authoritative record. `sessions` carries the identity
   (`id`, a stable string like `curved-headlight`), `working_directory`,

@@ -124,6 +124,23 @@ pub(crate) fn transcripts_dir(cli_dir: &Path) -> PathBuf {
     cli_dir.join("transcripts")
 }
 
+/// Resolve an optional transcript only within this store's transcript directory.
+/// Provider identities are filenames, never paths; symlinks outside the
+/// directory are ignored without preventing database evidence ingestion.
+fn transcript_path(transcripts: &Path, session_id: &str) -> Option<PathBuf> {
+    if session_id.is_empty()
+        || session_id == "."
+        || session_id == ".."
+        || session_id.contains(['/', '\\'])
+        || session_id.contains(':')
+    {
+        return None;
+    }
+    let root = std::fs::canonicalize(transcripts).ok()?;
+    let path = std::fs::canonicalize(root.join(format!("{session_id}.json"))).ok()?;
+    path.starts_with(&root).then_some(path)
+}
+
 fn seconds_to_ms(seconds: Option<i64>) -> Option<i64> {
     seconds.map(|s| s.saturating_mul(1000))
 }
@@ -275,8 +292,8 @@ pub(crate) fn load_from_sqlite(
     drop(rows);
     drop(stmt);
 
-    let transcript =
-        load_transcript_meta(&transcripts_dir(cli_dir).join(format!("{session_id}.json")));
+    let transcript = transcript_path(&transcripts_dir(cli_dir), session_id)
+        .and_then(|path| load_transcript_meta(&path));
     Ok(Some(DevinSession {
         info,
         nodes,
@@ -470,10 +487,10 @@ pub(crate) fn session_stamp(
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap_or((0, 0, 0));
-    let transcript_stamp =
-        super::file_stamp_and_modified(&transcripts_dir.join(format!("{session_id}.json")))
-            .map(|(stamp, _)| stamp)
-            .unwrap_or_else(|_| "absent".to_string());
+    let transcript_stamp = transcript_path(transcripts_dir, session_id)
+        .and_then(|path| super::file_stamp_and_modified(&path).ok())
+        .map(|(stamp, _)| stamp)
+        .unwrap_or_else(|| "absent".to_string());
     Ok(Some(format!(
         "{last_activity}:{head_digest}:{node_count}:{node_max}:{node_rows}:{node_digest}:{tool_count}:{tool_rows}:{tool_digest}|{transcript_stamp}"
     )))
@@ -1572,6 +1589,19 @@ fn reassign_shared_prompts(
 /// canonical tables, so the canonical rows removed here are always the local
 /// pass's own output.
 fn retire_session(conn: &Connection, session_id: &str) -> Result<()> {
+    conn.execute_batch("SAVEPOINT ai_hist_devin_retirement")?;
+    let result = retire_session_inner(conn, session_id);
+    if result.is_ok() {
+        conn.execute_batch("RELEASE ai_hist_devin_retirement")?;
+    } else {
+        conn.execute_batch(
+            "ROLLBACK TO ai_hist_devin_retirement; RELEASE ai_hist_devin_retirement",
+        )?;
+    }
+    result
+}
+
+fn retire_session_inner(conn: &Connection, session_id: &str) -> Result<()> {
     let has_remote: bool = conn.query_row(
         "SELECT EXISTS(\
            SELECT 1 FROM session_presences \
@@ -1786,14 +1816,15 @@ fn sync_devin_from_source(
     // and retirement repeats every pass. `forget_unobserved_paths` records
     // the drop for the merge, which deletes it from disk. Its return value
     // gates file-walk generations; a routine retirement is not a shortfall.
-    let _ = super::forget_unobserved_paths(
-        state,
-        &mut devin_state,
-        SYNC_STATE_KEY,
-        gone.iter().cloned().collect(),
-    );
     for session_id in &gone {
         retire_session(conn, session_id)?;
+        // Publish checkpoint removal only after the whole retirement commits.
+        let _ = super::forget_unobserved_paths(
+            state,
+            &mut devin_state,
+            SYNC_STATE_KEY,
+            vec![session_id.clone()],
+        );
     }
     let mut inserted = 0usize;
     let mut failures: Vec<String> = Vec::new();
@@ -1899,4 +1930,40 @@ pub(crate) fn sync_devin_session(
     })();
     let _ = src.execute_batch("ROLLBACK");
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transcript_paths_are_confined_to_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcripts = dir.path().join("transcripts");
+        std::fs::create_dir(&transcripts).unwrap();
+        std::fs::write(transcripts.join("valid.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("outside.json"), "{}").unwrap();
+        assert!(transcript_path(&transcripts, "valid").is_some());
+        for id in [
+            "",
+            ".",
+            "..",
+            "../outside",
+            "nested/../../outside",
+            "..\\outside",
+        ] {
+            assert!(transcript_path(&transcripts, id).is_none(), "{id}");
+        }
+        let absolute = dir.path().join("outside");
+        assert!(transcript_path(&transcripts, absolute.to_str().unwrap()).is_none());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                dir.path().join("outside.json"),
+                transcripts.join("escape.json"),
+            )
+            .unwrap();
+            assert!(transcript_path(&transcripts, "escape").is_none());
+        }
+    }
 }

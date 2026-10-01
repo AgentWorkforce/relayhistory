@@ -1259,22 +1259,83 @@ fn map_evidence(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContinuityEvidence>
 ///
 /// `message_id` is the record's own uuid; `event_uid` appends a block index to
 /// it. Both are checked so a record whose uuid only ever reached the uid still
-/// resolves.
+/// resolves, and the answer is the lowest session id either names.
+///
+/// Asked as two keyed searches rather than one `message_id = ? OR event_uid =
+/// ?` predicate. The OR fits neither index, so SQLite answered it by walking
+/// every event of the source — once per pending transcript, on every sweep,
+/// for as long as the transcript stays pending, which for a parent uuid
+/// nothing has indexed is for ever (#215). The uid half only has to find what
+/// the message half cannot: a row whose uid is `<uuid>:0` but whose
+/// `message_id` is not that uuid. That is what
+/// `idx_session_events_claude_uid_unmatched` holds, so on a store where every
+/// row's uid extends its own message id the index is empty and costs no write.
 fn session_holding_record(
     conn: &Connection,
     source: &str,
     record_uuid: &str,
 ) -> Result<Option<String>> {
-    Ok(conn
-        .query_row(
-            "SELECT session_id FROM session_events \
-             WHERE source = ? AND (message_id = ?2 OR event_uid = ?2 || ':0') \
-             ORDER BY session_id ASC LIMIT 1",
-            params![source, record_uuid],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?)
+    let lowest = |sql: &str| -> Result<Option<String>> {
+        Ok(conn
+            .prepare_cached(sql)?
+            .query_row(params![source, record_uuid], |row| row.get::<_, String>(0))
+            .optional()?)
+    };
+    let by_message = lowest(SESSION_HOLDING_MESSAGE_SQL)?;
+    // Only Claude records a parent uuid today, and the partial index is
+    // Claude's; another source keeps the same answer through the unindexed
+    // form rather than a different one.
+    let by_uid = if source == "claude" {
+        lowest(&session_holding_claude_uid_sql())?
+    } else {
+        lowest(SESSION_HOLDING_UID_SQL)?
+    };
+    // `min` over `String` is a byte-wise comparison, which is the `BINARY`
+    // collation the single query ordered by.
+    Ok(match (by_message, by_uid) {
+        (Some(message), Some(uid)) => Some(message.min(uid)),
+        (message, uid) => message.or(uid),
+    })
 }
+
+/// The message half of [`session_holding_record`], a search on
+/// `idx_session_events_message`. `+session_id` keeps the planner from
+/// walking `idx_session_events_session` in session order to satisfy the
+/// `ORDER BY`, which without statistics it prefers and which visits every
+/// event of the source until one matches.
+pub(crate) const SESSION_HOLDING_MESSAGE_SQL: &str = "SELECT session_id FROM session_events \
+     WHERE source = ?1 AND message_id = ?2 ORDER BY +session_id ASC LIMIT 1";
+
+/// The rows `idx_session_events_claude_uid_unmatched` covers: a Claude
+/// block-0 uid that does not extend the row's own message id, which is the
+/// only shape the message half of [`session_holding_record`] cannot see.
+/// This one spelling builds both the index's `WHERE` (in `store::init_db`)
+/// and the lookup below, because SQLite proves a partial index applies by
+/// matching the query's terms against the index's, and a drift between the
+/// two would silently turn the lookup back into a scan of every Claude
+/// event per transcript per sweep.
+pub(crate) const CLAUDE_UID_UNMATCHED_PREDICATE: &str = "source = 'claude' \
+     AND substr(event_uid, -2) = ':0' \
+     AND (message_id IS NULL OR event_uid <> message_id || ':0')";
+
+/// The uid half for Claude: only rows the message half cannot see, spelled
+/// with exactly the terms of `idx_session_events_claude_uid_unmatched`'s
+/// `WHERE` ([`CLAUDE_UID_UNMATCHED_PREDICATE`]) so SQLite can prove the
+/// partial index applies. `?1` is left unreferenced so both halves bind the
+/// same parameters.
+pub(crate) fn session_holding_claude_uid_sql() -> String {
+    format!(
+        "SELECT session_id FROM session_events \
+         WHERE {CLAUDE_UID_UNMATCHED_PREDICATE} AND event_uid = ?2 || ':0' \
+         ORDER BY +session_id ASC LIMIT 1"
+    )
+}
+
+/// The uid half for any other source. No source but Claude records a parent
+/// uuid, so this is not reached today; it keeps the lookup's meaning if one
+/// ever does.
+const SESSION_HOLDING_UID_SQL: &str = "SELECT session_id FROM session_events \
+     WHERE source = ?1 AND event_uid = ?2 || ':0' ORDER BY +session_id ASC LIMIT 1";
 
 fn session_has_events(conn: &Connection, source: &str, session_id: &str) -> Result<bool> {
     Ok(conn.query_row(
@@ -1456,6 +1517,133 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/claude")
             .join(name)
+    }
+
+    /// A Claude store large enough that a scan and a search plan differently,
+    /// planned with and without `sqlite_stat1`.
+    fn claude_events_store(analyze: bool) -> (tempfile::TempDir, Connection) {
+        let (dir, conn) = database();
+        for session in 0..40 {
+            for record in 0..10 {
+                for block in 0..2 {
+                    let uuid = format!("s{session}-r{record}");
+                    conn.execute(
+                        "INSERT INTO session_events \
+                         (source, session_id, message_id, ts_ms, role, kind, text, event_uid) \
+                         VALUES ('claude', ?1, ?2, ?3, 'assistant', 'text', 'hi', ?4)",
+                        params![
+                            format!("s{session}"),
+                            uuid,
+                            record,
+                            format!("{uuid}:{block}")
+                        ],
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        if analyze {
+            conn.execute_batch("ANALYZE").unwrap();
+        }
+        (dir, conn)
+    }
+
+    /// The pending-evidence lookup runs once per pending transcript on every
+    /// sweep. Asked as `message_id = ? OR event_uid = ?` it fitted no index
+    /// and walked every event of the source each time (#215); both halves
+    /// must now be searches, whatever the statistics say.
+    #[test]
+    fn the_parent_record_lookup_is_two_searches_not_a_scan() {
+        for analyze in [false, true] {
+            let (_dir, conn) = claude_events_store(analyze);
+            for (name, sql, index) in [
+                (
+                    "message half",
+                    SESSION_HOLDING_MESSAGE_SQL,
+                    "idx_session_events_message",
+                ),
+                (
+                    "uid half",
+                    session_holding_claude_uid_sql().as_str(),
+                    "idx_session_events_claude_uid_unmatched",
+                ),
+            ] {
+                let plan = conn
+                    .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                    .unwrap()
+                    .query_map(params!["claude", "s3-r4"], |row| row.get::<_, String>(3))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+                    .join(" | ");
+                assert!(
+                    plan.contains(index) && !plan.contains("SCAN"),
+                    "the {name} is not a search on {index} (analyze={analyze}): {plan}"
+                );
+            }
+        }
+    }
+
+    /// Splitting the lookup must not change its answer: the lowest session
+    /// holding the record by either its message id or its first block's uid.
+    #[test]
+    fn the_split_parent_record_lookup_answers_what_the_single_query_did() {
+        let (_dir, conn) = claude_events_store(false);
+        // Rows only the uid can find: a block-0 uid whose message id is
+        // absent or names something else.
+        conn.execute_batch(
+            "INSERT INTO session_events \
+               (source, session_id, message_id, ts_ms, role, kind, text, event_uid) VALUES \
+               ('claude', 'zz-only-uid', NULL, 1, 'user', 'text', 'x', 'orphan:0'), \
+               ('claude', 'a-uid-wins', 'other', 1, 'user', 'text', 'x', 's7-r2:0'), \
+               ('claude', 'zz-message', 'shared', 1, 'user', 'text', 'x', 'm:5'), \
+               ('claude', 'b-uid', 'elsewhere', 1, 'user', 'text', 'x', 'shared:0'), \
+               ('codex', 'codex-session', NULL, 1, 'user', 'text', 'x', 'orphan:0');",
+        )
+        .unwrap();
+        let single = |source: &str, uuid: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT session_id FROM session_events \
+                 WHERE source = ? AND (message_id = ?2 OR event_uid = ?2 || ':0') \
+                 ORDER BY session_id ASC LIMIT 1",
+                params![source, uuid],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+        };
+        for (source, uuid) in [
+            ("claude", "s3-r4"),
+            ("claude", "orphan"),
+            ("claude", "s7-r2"),
+            ("claude", "shared"),
+            ("claude", "absent"),
+            ("codex", "orphan"),
+            ("codex", "absent"),
+        ] {
+            assert_eq!(
+                session_holding_record(&conn, source, uuid).unwrap(),
+                single(source, uuid),
+                "{source} {uuid}"
+            );
+        }
+        assert_eq!(
+            session_holding_record(&conn, "claude", "s7-r2").unwrap().as_deref(),
+            Some("a-uid-wins")
+        );
+        // The parser's own rows never enter the partial index.
+        let indexed: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM session_events \
+                     INDEXED BY idx_session_events_claude_uid_unmatched \
+                     WHERE {CLAUDE_UID_UNMATCHED_PREDICATE}"
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 3);
     }
 
     fn database() -> (tempfile::TempDir, Connection) {

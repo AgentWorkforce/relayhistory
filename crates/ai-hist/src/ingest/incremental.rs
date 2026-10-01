@@ -107,6 +107,29 @@ pub(crate) fn ingest_claude_transcript_incremental(
     attributed_session_id: Option<&str>,
     cursor: &mut TranscriptCursorState,
 ) -> Result<IncrementalPass> {
+    ingest_claude_transcript_incremental_batched(
+        conn,
+        path,
+        attributed_session_id,
+        cursor,
+        &mut || Ok(()),
+    )
+}
+
+/// [`ingest_claude_transcript_incremental`], calling `between_records` before
+/// each record is read.
+///
+/// Nothing is half-written at that point, so it is where a caller holding a
+/// write transaction over the pass can commit and reopen it to keep the
+/// transaction bounded -- the sweep's [`super::SweepWrite::record`]. A caller
+/// whose transaction must stay whole (hydration) uses the plain form.
+pub(crate) fn ingest_claude_transcript_incremental_batched(
+    conn: &Connection,
+    path: &Path,
+    attributed_session_id: Option<&str>,
+    cursor: &mut TranscriptCursorState,
+    between_records: &mut dyn FnMut() -> Result<()>,
+) -> Result<IncrementalPass> {
     let saved_claude = cursor.claude.clone().unwrap_or_default();
     let mut reader = TranscriptReader::open(path, cursor.file.as_ref(), saved_claude.resume_from)?;
     let mut pass = IncrementalPass {
@@ -173,6 +196,10 @@ pub(crate) fn ingest_claude_transcript_incremental(
         let Some(kind) = reader.next_line(&mut line)? else {
             break;
         };
+        // One record is in hand: the callback runs per record, not for the
+        // end-of-file probe, so a transcript of exactly 1,999 records does
+        // not pay a commit for a record that is not there.
+        between_records()?;
         if let ReadRecord::Oversized { terminated } = kind {
             // Skipped, not held: the ceiling exists so one record cannot cost
             // the file's size in memory, and holding it to decide would be
@@ -417,11 +444,24 @@ fn flush_deferred(
 }
 
 /// Read a Claude transcript through a locator-keyed cursor, loading and
-/// storing it around the pass. Used for sidecars and for the global sync walk.
+/// storing it around the pass. Used for sidecars and for the global sync walk,
+/// both of which now go through the batched form.
+#[cfg(test)]
 pub(crate) fn ingest_claude_transcript_at_locator(
     conn: &Connection,
     path: &Path,
     attributed_session_id: Option<&str>,
+) -> Result<IncrementalPass> {
+    ingest_claude_transcript_at_locator_batched(conn, path, attributed_session_id, &mut || Ok(()))
+}
+
+/// [`ingest_claude_transcript_at_locator`] with the record-boundary callback
+/// of [`ingest_claude_transcript_incremental_batched`].
+pub(crate) fn ingest_claude_transcript_at_locator_batched(
+    conn: &Connection,
+    path: &Path,
+    attributed_session_id: Option<&str>,
+    between_records: &mut dyn FnMut() -> Result<()>,
 ) -> Result<IncrementalPass> {
     let locator = path.to_string_lossy().to_string();
     let key = CursorKey::Locator {
@@ -429,8 +469,13 @@ pub(crate) fn ingest_claude_transcript_at_locator(
         locator: &locator,
     };
     let mut cursor = load_cursor(conn, &key)?;
-    let pass =
-        ingest_claude_transcript_incremental(conn, path, attributed_session_id, &mut cursor)?;
+    let pass = ingest_claude_transcript_incremental_batched(
+        conn,
+        path,
+        attributed_session_id,
+        &mut cursor,
+        between_records,
+    )?;
     store_cursor(conn, &key, &cursor)?;
     Ok(pass)
 }

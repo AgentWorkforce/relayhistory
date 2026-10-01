@@ -331,6 +331,15 @@ fn upsert_inner(
         ["shallow", "full"].contains(&observation.discovery_state.as_str()),
         "invalid observation discovery state"
     );
+    // An observation that changes nothing but `updated_ms` is not written:
+    // a sweep or hydration re-observes every session it re-reads, and the
+    // rewrite was a new change-feed revision -- and an upload -- for a row
+    // nothing had changed (#215). `updated_ms` is the time the observation
+    // last changed. Nor does it take a new observation revision: that
+    // revision fences a concurrent acquisition (`SOURCE_REVISION_CONFLICT`),
+    // and an observation that did not change is no reason to fail one -- nor
+    // to move the change feed's head, which shares its clock (#329). The
+    // projection still runs, as before.
     let preview_set = match previews {
         PreviewWrite::Replace => {
             "first_prompt=excluded.first_prompt,last_assistant_text=excluded.last_assistant_text"
@@ -339,7 +348,11 @@ fn upsert_inner(
             "first_prompt=session_observations.first_prompt,last_assistant_text=session_observations.last_assistant_text"
         }
     };
-    conn.execute(
+    let preview_changed = match previews {
+        PreviewWrite::Replace => " OR session_observations.first_prompt IS NOT excluded.first_prompt OR session_observations.last_assistant_text IS NOT excluded.last_assistant_text",
+        PreviewWrite::Preserve => "",
+    };
+    let written = conn.execute(
         &format!(
             "INSERT INTO session_observations( \
              source,session_id,location,connector_id,connector_instance,raw_locator,source_stamp, \
@@ -348,7 +361,11 @@ fn upsert_inner(
              ON CONFLICT(source,session_id,location,connector_id,connector_instance) DO UPDATE SET \
              raw_locator=excluded.raw_locator,source_stamp=excluded.source_stamp, \
              discovery_state=CASE WHEN session_observations.discovery_state='full' THEN 'full' ELSE excluded.discovery_state END, \
-             access_state=excluded.access_state,updated_ms=excluded.updated_ms,{preview_set}"
+             access_state=excluded.access_state,updated_ms=excluded.updated_ms,{preview_set} \
+             WHERE session_observations.raw_locator IS NOT excluded.raw_locator \
+             OR session_observations.source_stamp IS NOT excluded.source_stamp \
+             OR (session_observations.discovery_state<>'full' AND session_observations.discovery_state IS NOT excluded.discovery_state) \
+             OR session_observations.access_state IS NOT excluded.access_state{preview_changed}"
         ),
         params![
             k.source,
@@ -366,7 +383,10 @@ fn upsert_inner(
         ],
     )?;
     refresh_projection(conn, k)?;
-    bump_revision(conn, k)
+    if written > 0 {
+        bump_revision(conn, k)?;
+    }
+    Ok(())
 }
 
 /// Withdrawal is an access change, not deletion of cached evidence or provenance.
@@ -659,6 +679,93 @@ mod tests {
             last_assistant_text: None,
         }
     }
+    /// Observing a session again with nothing new writes nothing: the row
+    /// keeps the `updated_ms` of its last change and its change-feed
+    /// revision. A change to any observed field is written and stamped.
+    #[test]
+    fn an_unchanged_reobservation_writes_nothing() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let conn = crate::open_db(&dir.path().join("history.db"))?;
+        let first = observation("a", "account1");
+        let key = first.key.clone();
+        upsert(&conn, &first)?;
+        let row = |conn: &Connection| -> Result<(i64, i64, String)> {
+            Ok(conn.query_row(
+                "SELECT updated_ms, revision, discovery_state FROM session_observations",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?)
+        };
+        let before = row(&conn)?;
+        let fence = revision(&conn, &key)?;
+        let head = crate::change_feed::read_head(&conn)?;
+        upsert(
+            &conn,
+            &SessionObservation {
+                updated_ms: 9,
+                ..first.clone()
+            },
+        )?;
+        assert_eq!(row(&conn)?, before);
+        assert_eq!(
+            revision(&conn, &key)?,
+            fence,
+            "an unchanged observation does not fence out a concurrent acquisition"
+        );
+        assert_eq!(crate::change_feed::read_head(&conn)?, head);
+
+        upsert(
+            &conn,
+            &SessionObservation {
+                discovery_state: "full".into(),
+                updated_ms: 10,
+                ..first.clone()
+            },
+        )?;
+        let full = row(&conn)?;
+        assert_eq!(full.0, 10);
+        assert!(full.1 > before.1);
+        assert_eq!(full.2, "full");
+        let changed = revision(&conn, &key)?;
+        assert_ne!(changed, fence, "a changed observation takes a new revision");
+        // `full` is sticky: a shallow re-observation is no change.
+        upsert(
+            &conn,
+            &SessionObservation {
+                updated_ms: 11,
+                ..first
+            },
+        )?;
+        assert_eq!(row(&conn)?, full);
+        assert_eq!(revision(&conn, &key)?, changed);
+        Ok(())
+    }
+
+    #[test]
+    fn preview_changes_advance_revisions_only_when_replaced() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let conn = crate::open_db(&dir.path().join("history.db"))?;
+        let mut value = observation("a", "account1");
+        upsert(&conn, &value)?;
+        let initial = revision(&conn, &value.key)?;
+        value.first_prompt = Some("new prompt".into());
+        upsert(&conn, &value)?;
+        let changed = revision(&conn, &value.key)?;
+        assert_ne!(changed, initial);
+        upsert(&conn, &value)?;
+        assert_eq!(revision(&conn, &value.key)?, changed);
+        value.first_prompt = None;
+        upsert_preserving_previews(&conn, &value)?;
+        assert_eq!(revision(&conn, &value.key)?, changed);
+        let prompt: String = conn.query_row(
+            "SELECT first_prompt FROM session_observations", [], |row| row.get(0),
+        )?;
+        assert_eq!(prompt, "new prompt");
+        upsert(&conn, &value)?;
+        assert_ne!(revision(&conn, &value.key)?, changed);
+        Ok(())
+    }
+
     #[test]
     fn independent_observations_and_checkpoints_survive_order_withdrawal_and_reopen() -> Result<()>
     {
