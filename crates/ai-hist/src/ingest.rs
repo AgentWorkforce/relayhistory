@@ -16305,22 +16305,31 @@ fn upsert_trajectory(conn: &Connection, row: &TrajectoryRow) -> Result<()> {
             row.timestamp_ms,
         ],
     )?;
+    let entry = HistoryEntry {
+        id: 0,
+        source: "trajectory".into(),
+        session_id: Some(row.id.clone()),
+        project: row.project_id.clone(),
+        prompt_hash: Some(prompt_hash(&row.search_text)),
+        prompt: row.search_text.clone(),
+        timestamp_ms: row.timestamp_ms,
+    };
+    // Every other row this trajectory filed goes; the one it files again, if
+    // it is already there exactly, stays, so re-reading an unchanged
+    // trajectory is not a delete and an insert -- a tombstone and a new
+    // change-feed revision -- of the same prompt.
     conn.execute(
-        "DELETE FROM history WHERE source = 'trajectory' AND session_id = ?",
-        [&row.id],
+        "DELETE FROM history WHERE source = 'trajectory' AND session_id = ?1 \
+         AND NOT (timestamp_ms = ?2 AND prompt = ?3 AND project IS ?4 AND prompt_hash IS ?5)",
+        params![
+            row.id,
+            entry.timestamp_ms,
+            entry.prompt,
+            entry.project,
+            entry.prompt_hash
+        ],
     )?;
-    insert_history(
-        conn,
-        &HistoryEntry {
-            id: 0,
-            source: "trajectory".into(),
-            session_id: Some(row.id.clone()),
-            project: row.project_id.clone(),
-            prompt_hash: Some(prompt_hash(&row.search_text)),
-            prompt: row.search_text.clone(),
-            timestamp_ms: row.timestamp_ms,
-        },
-    )?;
+    insert_history(conn, &entry)?;
     Ok(())
 }
 
@@ -33788,6 +33797,62 @@ mod capture_progress_tests {
         assert!((1..20).contains(&count()));
         backfill_codex_metadata(&conn, &cwds, &HashMap::new()).unwrap();
         assert_eq!(count(), 20);
+    }
+
+    /// Re-reading a trajectory whose prompt has not changed keeps its
+    /// `history` row -- no tombstone, no new change-feed revision -- and one
+    /// whose prompt changed replaces it.
+    #[test]
+    fn re_reading_an_unchanged_trajectory_keeps_its_prompt_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::store::init_db(&conn).unwrap();
+        let row = |search_text: &str| TrajectoryRow {
+            id: "traj-1".into(),
+            version: Some(1),
+            persona_id: None,
+            project_id: Some("/p".into()),
+            task_title: Some("t".into()),
+            task_description: None,
+            status: Some("active".into()),
+            started_at: None,
+            completed_at: None,
+            decisions_json: "[]".into(),
+            retrospective_json: "{}".into(),
+            search_text: search_text.into(),
+            path: "/t/traj-1.json".into(),
+            updated_ms: 1,
+            timestamp_ms: 1,
+        };
+        let prompts = || -> Vec<(i64, String, i64)> {
+            conn.prepare(
+                "SELECT id, prompt, revision FROM history WHERE source = 'trajectory' ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        };
+        let tombstones = || -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM evidence_tombstones WHERE kind = 'history'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        upsert_trajectory(&conn, &row("alpha")).unwrap();
+        let first = prompts();
+        assert_eq!(first.len(), 1);
+        upsert_trajectory(&conn, &row("alpha")).unwrap();
+        assert_eq!(prompts(), first, "the same row at the same revision");
+        assert_eq!(tombstones(), 0);
+
+        upsert_trajectory(&conn, &row("beta")).unwrap();
+        let replaced = prompts();
+        assert_eq!(replaced.len(), 1);
+        assert_eq!(replaced[0].1, "beta");
+        assert_eq!(tombstones(), 1, "the old prompt is a delete");
     }
 
     #[test]
