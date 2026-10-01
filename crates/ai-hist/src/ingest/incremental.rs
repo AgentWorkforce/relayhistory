@@ -192,11 +192,14 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
     let mut unterminated: Option<(u64, usize)> = None;
     let mut line = String::new();
     loop {
-        between_records()?;
         let line_start = reader.position();
         let Some(kind) = reader.next_line(&mut line)? else {
             break;
         };
+        // One record is in hand: the callback runs per record, not for the
+        // end-of-file probe, so a transcript of exactly 1,999 records does
+        // not pay a commit for a record that is not there.
+        between_records()?;
         if let ReadRecord::Oversized { terminated } = kind {
             // Skipped, not held: the ceiling exists so one record cannot cost
             // the file's size in memory, and holding it to decide would be

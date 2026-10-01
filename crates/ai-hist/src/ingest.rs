@@ -2902,9 +2902,12 @@ impl<'c> SweepWrite<'c> {
 
 impl Drop for SweepWrite<'_> {
     fn drop(&mut self) {
-        // An error or a cancellation unwound past the guard: nothing of this
-        // unit is kept, and its cursor was never published, so the next sweep
-        // reads it again. SQLite may already have rolled back on its own.
+        // An error or a cancellation unwound past the guard: nothing of the
+        // open chunk is kept. Chunks a Claude transcript committed before it
+        // stay (its catalog row and the rows of those chunks), but its cursor
+        // was never published, so the next sweep reads the file again and
+        // its upserts converge on the same rows. SQLite may already have
+        // rolled back on its own.
         if self.owned && !self.conn.is_autocommit() {
             let _ = self.conn.execute_batch("ROLLBACK");
         }
