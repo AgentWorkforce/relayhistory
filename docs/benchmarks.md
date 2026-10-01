@@ -1012,13 +1012,15 @@ compares every upsert's `columns` with the map.
 
 What is left, and why it stays:
 
-- The fixture corpus's forced-tick changes are real: five session ids are
-  claimed by two transcripts each, and every forced sweep rewrites the
-  catalog, presence and observation rows from whichever it read last. Filed
-  as its own issue.
-- The base corpus's two other forced-tick changes, and the three per append,
-  were relationships re-recorded with a new `updated_ms` and nothing else;
-  the relationship and observation upserts now skip such a write.
+- The fixture corpus's remaining forced-tick changes are real: five session
+  ids are each claimed by two top-level transcripts, and every forced sweep
+  rewrites the catalog, presence and observation rows from whichever it read
+  last (#328). A subagent sidecar, which carries its parent's session id, is
+  read as the parent's related transcript and does not do this.
+- The fixture corpus's two other forced-tick changes (17 → 15), and the three
+  per append (22 → 19), were relationships re-recorded with a new
+  `updated_ms` and nothing else; the relationship and observation upserts
+  now skip such a write.
 - The two Codex events a hydration still re-reports are written with no
   usage and patched a record later -- a real change and a change back.
 - Grok replaces a session's evidence wholesale on every re-read, so every

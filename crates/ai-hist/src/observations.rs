@@ -264,11 +264,17 @@ fn upsert_inner(conn: &Connection, observation: &SessionObservation) -> Result<(
     // a sweep or hydration re-observes every session it re-reads, and the
     // rewrite was a new change-feed revision -- and an upload -- for a row
     // nothing had changed (#215). `updated_ms` is the time the observation
-    // last changed. The projection and the observation revision below still
-    // run, as before.
-    conn.execute("INSERT INTO session_observations(source,session_id,location,connector_id,connector_instance,raw_locator,source_stamp,discovery_state,access_state,updated_ms) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source,session_id,location,connector_id,connector_instance) DO UPDATE SET raw_locator=excluded.raw_locator,source_stamp=excluded.source_stamp,discovery_state=CASE WHEN session_observations.discovery_state='full' THEN 'full' ELSE excluded.discovery_state END,access_state=excluded.access_state,updated_ms=excluded.updated_ms WHERE session_observations.raw_locator IS NOT excluded.raw_locator OR session_observations.source_stamp IS NOT excluded.source_stamp OR (session_observations.discovery_state<>'full' AND session_observations.discovery_state IS NOT excluded.discovery_state) OR session_observations.access_state IS NOT excluded.access_state",params![k.source,k.session_id,k.location.as_str(),k.connector_id,k.connector_instance,observation.raw_locator,observation.source_stamp,observation.discovery_state,observation.access_state,observation.updated_ms])?;
+    // last changed. Nor does it take a new observation revision: that
+    // revision fences a concurrent acquisition (`SOURCE_REVISION_CONFLICT`),
+    // and an observation that did not change is no reason to fail one -- nor
+    // to move the change feed's head, which shares its clock (#329). The
+    // projection still runs, as before.
+    let written = conn.execute("INSERT INTO session_observations(source,session_id,location,connector_id,connector_instance,raw_locator,source_stamp,discovery_state,access_state,updated_ms) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source,session_id,location,connector_id,connector_instance) DO UPDATE SET raw_locator=excluded.raw_locator,source_stamp=excluded.source_stamp,discovery_state=CASE WHEN session_observations.discovery_state='full' THEN 'full' ELSE excluded.discovery_state END,access_state=excluded.access_state,updated_ms=excluded.updated_ms WHERE session_observations.raw_locator IS NOT excluded.raw_locator OR session_observations.source_stamp IS NOT excluded.source_stamp OR (session_observations.discovery_state<>'full' AND session_observations.discovery_state IS NOT excluded.discovery_state) OR session_observations.access_state IS NOT excluded.access_state",params![k.source,k.session_id,k.location.as_str(),k.connector_id,k.connector_instance,observation.raw_locator,observation.source_stamp,observation.discovery_state,observation.access_state,observation.updated_ms])?;
     refresh_projection(conn, k)?;
-    bump_revision(conn, k)
+    if written > 0 {
+        bump_revision(conn, k)?;
+    }
+    Ok(())
 }
 
 /// Withdrawal is an access change, not deletion of cached evidence or provenance.
@@ -567,6 +573,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let conn = crate::open_db(&dir.path().join("history.db"))?;
         let first = observation("a", "account1");
+        let key = first.key.clone();
         upsert(&conn, &first)?;
         let row = |conn: &Connection| -> Result<(i64, i64, String)> {
             Ok(conn.query_row(
@@ -576,6 +583,8 @@ mod tests {
             )?)
         };
         let before = row(&conn)?;
+        let fence = revision(&conn, &key)?;
+        let head = crate::change_feed::read_head(&conn)?;
         upsert(
             &conn,
             &SessionObservation {
@@ -584,6 +593,12 @@ mod tests {
             },
         )?;
         assert_eq!(row(&conn)?, before);
+        assert_eq!(
+            revision(&conn, &key)?,
+            fence,
+            "an unchanged observation does not fence out a concurrent acquisition"
+        );
+        assert_eq!(crate::change_feed::read_head(&conn)?, head);
 
         upsert(
             &conn,
@@ -597,6 +612,8 @@ mod tests {
         assert_eq!(full.0, 10);
         assert!(full.1 > before.1);
         assert_eq!(full.2, "full");
+        let changed = revision(&conn, &key)?;
+        assert_ne!(changed, fence, "a changed observation takes a new revision");
         // `full` is sticky: a shallow re-observation is no change.
         upsert(
             &conn,
@@ -606,6 +623,7 @@ mod tests {
             },
         )?;
         assert_eq!(row(&conn)?, full);
+        assert_eq!(revision(&conn, &key)?, changed);
         Ok(())
     }
 

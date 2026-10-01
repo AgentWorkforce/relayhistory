@@ -16315,19 +16315,29 @@ fn upsert_trajectory(conn: &Connection, row: &TrajectoryRow) -> Result<()> {
         timestamp_ms: row.timestamp_ms,
     };
     // Every other row this trajectory filed goes; the one it files again, if
-    // it is already there exactly, stays, so re-reading an unchanged
-    // trajectory is not a delete and an insert -- a tombstone and a new
-    // change-feed revision -- of the same prompt.
+    // it is already there, stays, so re-reading an unchanged trajectory is
+    // not a delete and an insert -- a tombstone and a new change-feed
+    // revision -- of the same prompt. A row from before `prompt_hash` was
+    // stored is the same prompt too: it is kept and given its hash in place,
+    // one update, once.
+    let params = params![
+        row.id,
+        entry.timestamp_ms,
+        entry.prompt,
+        entry.project,
+        entry.prompt_hash
+    ];
     conn.execute(
         "DELETE FROM history WHERE source = 'trajectory' AND session_id = ?1 \
-         AND NOT (timestamp_ms = ?2 AND prompt = ?3 AND project IS ?4 AND prompt_hash IS ?5)",
-        params![
-            row.id,
-            entry.timestamp_ms,
-            entry.prompt,
-            entry.project,
-            entry.prompt_hash
-        ],
+         AND NOT (timestamp_ms = ?2 AND prompt = ?3 AND project IS ?4 \
+                  AND (prompt_hash IS NULL OR prompt_hash IS ?5))",
+        params,
+    )?;
+    conn.execute(
+        "UPDATE history SET prompt_hash = ?5 \
+         WHERE source = 'trajectory' AND session_id = ?1 AND timestamp_ms = ?2 \
+           AND prompt = ?3 AND project IS ?4 AND prompt_hash IS NULL",
+        params,
     )?;
     insert_history(conn, &entry)?;
     Ok(())
@@ -33853,6 +33863,32 @@ mod capture_progress_tests {
         assert_eq!(replaced.len(), 1);
         assert_eq!(replaced[0].1, "beta");
         assert_eq!(tombstones(), 1, "the old prompt is a delete");
+
+        // A row written before `prompt_hash` was stored is the same prompt:
+        // it keeps its id, gains its hash in one update, and is then left
+        // alone.
+        conn.execute(
+            "UPDATE history SET prompt_hash = NULL WHERE source = 'trajectory'",
+            [],
+        )
+        .unwrap();
+        let legacy = prompts();
+        upsert_trajectory(&conn, &row("beta")).unwrap();
+        let backfilled = prompts();
+        assert_eq!(backfilled.len(), 1);
+        assert_eq!(backfilled[0].0, legacy[0].0, "the same row");
+        assert!(backfilled[0].2 > legacy[0].2, "one update, for the hash");
+        assert_eq!(tombstones(), 1, "no delete");
+        let hash: Option<String> = conn
+            .query_row(
+                "SELECT prompt_hash FROM history WHERE source = 'trajectory'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hash, Some(prompt_hash("beta")));
+        upsert_trajectory(&conn, &row("beta")).unwrap();
+        assert_eq!(prompts(), backfilled);
     }
 
     #[test]

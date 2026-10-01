@@ -1136,6 +1136,11 @@ fn a_forced_sweep_over_unchanged_files_reports_nothing() {
     ] {
         home.stage_claude(fixture);
     }
+    // The sidecar carries its parent's session id, as Claude subagent
+    // transcripts do. It is read as the parent's related transcript, not as
+    // a second claim on the catalog row, so it must not churn either. Two
+    // top-level transcripts that claim one session id do still churn on
+    // every forced tick (#328); none is staged here.
     let sidecar = fixtures_root().join("claude/sidecar-subagent/.claude/projects/corpus");
     let corpus = home.claude_transcript("claude-sidecar-parent.jsonl");
     fs::copy(sidecar.join("claude-sidecar-parent.jsonl"), &corpus).unwrap();

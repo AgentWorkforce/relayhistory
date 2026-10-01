@@ -7885,8 +7885,6 @@ mod tests {
                      VALUES ('claude', 'legacy-1', 42, 'user', 'text', 'hi', 'e1');",
                 )
                 .unwrap();
-            // An older database's update trigger predates the column too.
-            crate::change_feed::release_update_guard(&legacy, "session_events").unwrap();
             legacy
                 .execute("ALTER TABLE session_events DROP COLUMN project_key", [])
                 .unwrap();
