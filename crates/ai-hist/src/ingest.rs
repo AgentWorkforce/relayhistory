@@ -2878,9 +2878,23 @@ impl<'c> SweepWrite<'c> {
     }
 
     pub(crate) fn commit(mut self) -> Result<()> {
-        if self.owned {
-            self.owned = false;
-            self.conn.execute_batch("COMMIT")?;
+        if !self.owned {
+            return Ok(());
+        }
+        let committed = self.conn.execute_batch("COMMIT");
+        // Whether or not COMMIT succeeded the guard no longer owns a
+        // transaction: a successful commit ended it, and a failed one is
+        // ended here. SQLite can refuse a COMMIT (a busy commit, say) and
+        // leave the transaction open, and the sweep goes on to the next
+        // provider on this same connection. Left open, that transaction
+        // would swallow the next provider's writes and let it publish
+        // cursors for rows that vanish when the connection closes.
+        self.owned = false;
+        if let Err(error) = committed {
+            if !self.conn.is_autocommit() {
+                let _ = self.conn.execute_batch("ROLLBACK");
+            }
+            return Err(error.into());
         }
         Ok(())
     }
