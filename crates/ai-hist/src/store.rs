@@ -3673,15 +3673,17 @@ const USER_TURN_NAMED_BEFORE: &str = "SELECT NULLIF(message_id, '') FROM session
 
 /// Every event of one session from a position onwards, in `(ts_ms, id)`
 /// order, with whether it is a user-turn block. One range seek on
-/// `idx_session_events_source_page`; the block columns are only computed for
-/// block rows, so a large tool result's text is never read just to be passed
-/// over.
+/// `idx_session_events_source_page`; the byte length is only computed for
+/// block rows at or before the page's last block timestamp (the fifth
+/// parameter), so a large tool result's text is never read just to be passed
+/// over, whether it sits inside the page's span or in the rows read past it
+/// while locating the following named message.
 fn user_turn_stream_sql() -> String {
     format!(
         "SELECT id, ts_ms, NULLIF(message_id, ''), \
                 CASE WHEN {USER_TURN_ROW_FILTER} THEN 1 ELSE 0 END, \
                 role, kind, tool_use_id, result_status, \
-                CASE WHEN {USER_TURN_ROW_FILTER} THEN {USER_TURN_BYTE_LEN} END \
+                CASE WHEN ts_ms <= ? AND {USER_TURN_ROW_FILTER} THEN {USER_TURN_BYTE_LEN} END \
          FROM session_events \
          WHERE source = ? AND session_id = ? AND (ts_ms, id) >= (?, ?) \
          ORDER BY ts_ms ASC, id ASC"
@@ -3898,7 +3900,13 @@ fn fill_user_turns(
     };
 
     let mut stream = conn.prepare(&user_turn_stream_sql())?;
-    let mut rows = stream.query(params![source, session_id, first.ts_ms, first.id])?;
+    let mut rows = stream.query(params![
+        last_block_ts,
+        source,
+        session_id,
+        first.ts_ms,
+        first.id
+    ])?;
     // Turns whose anchor has been reached, still waiting for the named
     // message that follows them. Every turn has its own key, so a named row
     // releases all of them but at most the one it belongs to.
