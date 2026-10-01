@@ -563,6 +563,18 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Fixed
 
+- Reading a session's user turns no longer scans the whole session once per
+  turn (#307). `session_user_turns_page`, and `SessionStore::session`
+  whenever session events are selected (including `include_text: false`),
+  read each turn's blocks with a filter on the computed turn key, which no
+  index could serve, plus two neighbour lookups per turn, so a page cost
+  turns x events: about 100 s for a 50,000-event session's 15,000 turns.
+  A page now reads its blocks and both neighbouring message ids in one range
+  pass over the session in `(ts_ms, id)` order, and `SessionStore::session`
+  reads every turn in one pass instead of regrouping the session per
+  1,000-turn page; the same session takes about 35 ms. Results, ordering,
+  fallback `event:<id>` identities, cursors and the single read snapshot are
+  unchanged; no schema or index change.
 - Grok reuses an ACP `eventId` across records, and two messages carrying one
   id were stored under one `ev:<id>` identity, so the second overwrote the
   first (#212). The first message carrying an id keeps `ev:<id>`, and each
