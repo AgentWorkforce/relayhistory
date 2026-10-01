@@ -1848,16 +1848,18 @@ VALUES ('session_presences_local_backfill_v1');
     // only the rows the message-id search cannot already see -- a block-0 uid
     // that does not extend the row's own message id -- so it is empty on a
     // store the parser wrote and costs an insert nothing. The `WHERE` is
-    // spelled exactly as `continuity::SESSION_HOLDING_CLAUDE_UID_SQL` spells
-    // it, which is how SQLite proves the index applies. `source` leads
-    // although the `WHERE` pins it: without statistics the planner ranks an
-    // index by how many equalities it matches, and one on `event_uid` alone
-    // tied with every `(source, ...)` index and lost.
+    // `continuity::CLAUDE_UID_UNMATCHED_PREDICATE`, the same text the lookup
+    // is built from, which is how SQLite proves the index applies. `source`
+    // leads although the `WHERE` pins it: without statistics the planner
+    // ranks an index by how many equalities it matches, and one on
+    // `event_uid` alone tied with every `(source, ...)` index and lost.
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_session_events_claude_uid_unmatched \
-         ON session_events(source, event_uid) \
-         WHERE source = 'claude' AND substr(event_uid, -2) = ':0' \
-           AND (message_id IS NULL OR event_uid <> message_id || ':0')",
+        &format!(
+            "CREATE INDEX IF NOT EXISTS idx_session_events_claude_uid_unmatched \
+             ON session_events(source, event_uid) \
+             WHERE {}",
+            crate::continuity::CLAUDE_UID_UNMATCHED_PREDICATE
+        ),
         [],
     )?;
     conn.execute(

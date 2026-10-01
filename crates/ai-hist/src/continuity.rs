@@ -1285,11 +1285,11 @@ fn session_holding_record(
     // Only Claude records a parent uuid today, and the partial index is
     // Claude's; another source keeps the same answer through the unindexed
     // form rather than a different one.
-    let by_uid = lowest(if source == "claude" {
-        SESSION_HOLDING_CLAUDE_UID_SQL
+    let by_uid = if source == "claude" {
+        lowest(&session_holding_claude_uid_sql())?
     } else {
-        SESSION_HOLDING_UID_SQL
-    })?;
+        lowest(SESSION_HOLDING_UID_SQL)?
+    };
     // `min` over `String` is a byte-wise comparison, which is the `BINARY`
     // collation the single query ordered by.
     Ok(match (by_message, by_uid) {
@@ -1306,15 +1306,30 @@ fn session_holding_record(
 pub(crate) const SESSION_HOLDING_MESSAGE_SQL: &str = "SELECT session_id FROM session_events \
      WHERE source = ?1 AND message_id = ?2 ORDER BY +session_id ASC LIMIT 1";
 
+/// The rows `idx_session_events_claude_uid_unmatched` covers: a Claude
+/// block-0 uid that does not extend the row's own message id, which is the
+/// only shape the message half of [`session_holding_record`] cannot see.
+/// This one spelling builds both the index's `WHERE` (in `store::init_db`)
+/// and the lookup below, because SQLite proves a partial index applies by
+/// matching the query's terms against the index's, and a drift between the
+/// two would silently turn the lookup back into a scan of every Claude
+/// event per transcript per sweep.
+pub(crate) const CLAUDE_UID_UNMATCHED_PREDICATE: &str = "source = 'claude' \
+     AND substr(event_uid, -2) = ':0' \
+     AND (message_id IS NULL OR event_uid <> message_id || ':0')";
+
 /// The uid half for Claude: only rows the message half cannot see, spelled
 /// with exactly the terms of `idx_session_events_claude_uid_unmatched`'s
-/// `WHERE` so SQLite can prove the partial index applies. `?1` is left
-/// unreferenced so both halves bind the same parameters.
-pub(crate) const SESSION_HOLDING_CLAUDE_UID_SQL: &str = "SELECT session_id FROM session_events \
-     WHERE source = 'claude' AND substr(event_uid, -2) = ':0' \
-       AND (message_id IS NULL OR event_uid <> message_id || ':0') \
-       AND event_uid = ?2 || ':0' \
-     ORDER BY +session_id ASC LIMIT 1";
+/// `WHERE` ([`CLAUDE_UID_UNMATCHED_PREDICATE`]) so SQLite can prove the
+/// partial index applies. `?1` is left unreferenced so both halves bind the
+/// same parameters.
+pub(crate) fn session_holding_claude_uid_sql() -> String {
+    format!(
+        "SELECT session_id FROM session_events \
+         WHERE {CLAUDE_UID_UNMATCHED_PREDICATE} AND event_uid = ?2 || ':0' \
+         ORDER BY +session_id ASC LIMIT 1"
+    )
+}
 
 /// The uid half for any other source. No source but Claude records a parent
 /// uuid, so this is not reached today; it keeps the lookup's meaning if one
@@ -1549,7 +1564,7 @@ mod tests {
                 ),
                 (
                     "uid half",
-                    SESSION_HOLDING_CLAUDE_UID_SQL,
+                    session_holding_claude_uid_sql().as_str(),
                     "idx_session_events_claude_uid_unmatched",
                 ),
             ] {
@@ -1619,9 +1634,11 @@ mod tests {
         // The parser's own rows never enter the partial index.
         let indexed: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM session_events INDEXED BY idx_session_events_claude_uid_unmatched \
-                 WHERE source = 'claude' AND substr(event_uid, -2) = ':0' \
-                   AND (message_id IS NULL OR event_uid <> message_id || ':0')",
+                &format!(
+                    "SELECT COUNT(*) FROM session_events \
+                     INDEXED BY idx_session_events_claude_uid_unmatched \
+                     WHERE {CLAUDE_UID_UNMATCHED_PREDICATE}"
+                ),
                 [],
                 |row| row.get(0),
             )

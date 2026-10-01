@@ -1405,9 +1405,11 @@ const CATALOG_FINGERPRINT_COLUMNS: &str = "source_stamp, last_activity_ms, first
      workspace_roots_json";
 
 /// The change-feed head, or `None` when this store's feed (and with it the
-/// guarantee that every catalog write moves the head) is not in place.
+/// guarantee that every catalog write moves the head) is not in place. The
+/// check is the narrow one for the catalog's own triggers, not the whole
+/// feed schema: this runs on every tick, and a sweep reads it twice.
 fn catalog_head(conn: &Connection) -> Result<Option<crate::change_feed::Watermark>, Error> {
-    if !crate::change_feed::schema_is_current(conn).map_err(Error::query)? {
+    if !crate::change_feed::catalog_writes_move_the_head(conn).map_err(Error::query)? {
         return Ok(None);
     }
     crate::change_feed::read_head(conn)

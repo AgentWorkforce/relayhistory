@@ -1659,6 +1659,32 @@ fn trigger_names(kind: ChangeKind) -> [String; 3] {
     ]
 }
 
+/// Whether every write to the catalog (`sessions`) moves the database-wide
+/// clock: the clock and the feed's identity exist, and the three `sessions`
+/// triggers that bump it are installed. This is the one guarantee a catalog
+/// digest keyed on the head needs, checked in five schema lookups rather than
+/// the full [`schema_is_current`] walk over every feed table, since it runs
+/// on every tick, forced or not.
+pub(crate) fn catalog_writes_move_the_head(conn: &Connection) -> Result<bool> {
+    let mut object = conn.prepare_cached("SELECT 1 FROM sqlite_master WHERE name = ? LIMIT 1")?;
+    for name in ["observation_clock", "change_feed_store"] {
+        if !object.exists([name])? {
+            return Ok(false);
+        }
+    }
+    for trigger in trigger_names(ChangeKind::Session) {
+        if !object.exists([trigger])? {
+            return Ok(false);
+        }
+    }
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM change_feed_store WHERE singleton = 1)",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
 /// Whether this database has everything [`init_schema`] would add.
 pub(crate) fn schema_is_current(conn: &Connection) -> Result<bool> {
     let mut object = conn.prepare("SELECT 1 FROM sqlite_master WHERE name = ? LIMIT 1")?;

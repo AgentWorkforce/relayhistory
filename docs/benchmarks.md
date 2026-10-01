@@ -920,7 +920,7 @@ node scripts/benchmark-sync.mjs --profile full --large-session-bytes 1048576 --r
 
 #### Where a cold sweep's time went
 
-| Frame (inclusive share of the cold sync's samples) | base | units | + in-memory journal |
+| Frame (inclusive share of the cold sync's samples) | base | per-transcript transactions | + in-memory journal |
 |---|---:|---:|---:|
 | `fsync` | 49% | 8% | 12% |
 | `pwrite` | 22% | 36% | 10% |
@@ -944,7 +944,7 @@ FTS5 work: FTS5 flushes its pending terms at every statement savepoint, about
 a quarter of each event insert's samples.
 
 The 2026-09-28 prototype of "one transaction per Claude transcript" measured
-−6% against the CLI; with Codex in the same units, the in-memory statement
+−6% against the CLI; with Codex in the same per-transcript transactions, the in-memory statement
 journal, and the harness rather than the CLI, it is −64%.
 
 #### Decisions
@@ -954,9 +954,9 @@ journal, and the harness rather than the CLI, it is −64%.
 | Continuity's parent-record lookup (`session_holding_record`): `message_id = ? OR event_uid = ?` scanned every event of the source, per pending transcript, per sweep | **Fixed.** Two keyed searches, lowest answer wins; the uid half on a new partial index, `idx_session_events_claude_uid_unmatched`, holding only the rows the message search cannot see (empty on a store this parser wrote). Plan tests with and without `ANALYZE`; equivalence test against the old query. | 17 ms → <0.1 ms per pending transcript on 75,601 Claude events (linear in events before). The benchmark store has no pending evidence, so its phases do not move. Building the index on an existing store: 0.76 s for 214 K events, once. |
 | Whole-session event reads ordered on `ts_ms IS NULL, ts_ms, id` | **Fixed.** `ts_ms` is `NOT NULL` in every schema this table has had (Rust and the Python original), so the order is `ts_ms, id`, delivered by `idx_session_events_source_page` / `idx_session_events_page` instead of a temp b-tree of full rows. Plan test. | Not on the sweep path; a read of `SessionStore::session` no longer copies every row, text included, into a sort. |
 | Autocommit Claude and Codex writes | **Fixed.** One `BEGIN IMMEDIATE` unit per Claude transcript (chunked every 2,000 records) and per Codex rollout (unchunked: the parser-upgrade repair needs it whole), cursors inside the unit, `.sync-state.json` still checkpointed after the source. `synchronous` deliberately unchanged -- that is a durability decision for its own review. | Cold 37.3 s → 13.4 s together with the in-memory journal; Codex append tick 728 → 466 ms. |
-| Per-event `sessions` subselects and per-event `session_presences` insert in `insert_session_event_with_provenance` | **Deferred.** After the units, all `sessions`/presence seeks under the event insert are under 4% of a cold sweep's samples (presence alone 0.8%), and hoisting the subselects needs invalidation whenever a walk writes the catalog row mid-transcript (Codex writes events before its session). Not worth the risk at this size. | ≤ 4% of cold; 0% of a tick. |
+| Per-event `sessions` subselects and per-event `session_presences` insert in `insert_session_event_with_provenance` | **Deferred.** After the per-transcript transactions, all `sessions`/presence seeks under the event insert are under 4% of a cold sweep's samples (presence alone 0.8%), and hoisting the subselects needs invalidation whenever a walk writes the catalog row mid-transcript (Codex writes events before its session). Not worth the risk at this size. | ≤ 4% of cold; 0% of a tick. |
 | `catalog_fingerprint` before and after every sync and watch tick | **Fixed.** The digest records the change-feed head it was read at; an unmoved head (every catalog insert/update/delete moves it through the feed's triggers) skips the after-scan. `changed` is still computed from row digests whenever anything was written, so it is exact. | 3% of a forced append tick still pays it (the head moved); an unchanged tick does not. |
-| (Found while measuring) the destination shortfall named sessions with `sessions UNION session_events`, a second walk of every event per swept tick | **Fixed.** The grouped holdings reads collect the names; only the Muse arm is still queried. Same named set. | Forced unchanged tick 346 → 320 ms on the same database. |
+| (Found while measuring) the destination shortfall named sessions with `sessions UNION session_events`, a second walk of every event per swept tick | **Fixed.** The grouped holdings reads collect the names; only the Muse arm is still queried. Same named set. | Forced unchanged tick 346 → 320 ms in the single-run attribution pass on the same database (the median-of-seven table above, which includes this fix, reads 337.8 → 301.3 ms for the same scenario). |
 
 #### Where a forced tick goes now
 
