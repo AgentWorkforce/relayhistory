@@ -1400,6 +1400,20 @@ fn sync_basic(
     // one pass, and a long-lived host (watch, the Node addon, a desktop app)
     // runs many passes without restarting.
     crate::project_identity::begin_acquisition_pass();
+    // The sweep writes a transcript at a time (`SweepWrite`), and inside a
+    // transaction every upsert that fires a trigger keeps a statement journal
+    // so it can be undone alone. Past 64 KiB SQLite spills that journal to a
+    // temporary file, and on a cold sweep those spills were 30% of the
+    // samples: `pwrite`s of pages that are discarded when the statement
+    // ends. In memory they are never written. Nothing durable is a temporary
+    // file -- they are deleted when the statement or connection ends -- so
+    // this moves no commit. Set here rather than in `open_db` because it also
+    // keeps temp b-trees and sorts in memory, and the sweep's are bounded by
+    // the catalog where a migration's `CREATE INDEX` is not. Best effort: it
+    // cannot change inside a transaction, and the sweep is correct without it.
+    if let Err(error) = conn.pragma_update(None, "temp_store", "MEMORY") {
+        sync_note!("  [sync] in-memory temp store unavailable: {error:#}");
+    }
     if roots.use_env_roots {
         for (var, root) in [
             ("CLAUDE_CONFIG_DIR", &roots.claude),
@@ -2775,6 +2789,95 @@ fn save_sync_state(path: &Path, state: &Map<String, Value>) -> Result<()> {
 /// minutes and starve everyone else.
 const JSONL_CHUNK_LINES: usize = 2_000;
 
+/// One write transaction over a transcript's worth of sweep work.
+///
+/// The global Claude and Codex walks used to write in autocommit, which at the
+/// default `synchronous = FULL` is one WAL `fsync` per statement -- several
+/// per record, and two thirds of a cold sweep's samples. Every other provider
+/// already writes a unit at a time (Cursor per source, Grok per session
+/// directory, Muse per session, hydration per session); this is the same
+/// thing for the two that did not.
+///
+/// It changes when rows become visible, not what is durable: each commit is
+/// as durable as an autocommit was, the change-feed revisions are stamped by
+/// the same per-row triggers, and every cursor these walks publish is written
+/// inside the transaction, after the rows it vouches for, so a crash leaves
+/// the rows and their cursor together or neither. `.sync-state.json` is still
+/// checkpointed only after the source finishes, so a stamp never runs ahead of
+/// the commit it describes.
+///
+/// `IMMEDIATE`, so the writer lock is taken before the first read of a
+/// cursor rather than on the first write, where a deferred transaction that
+/// raced a hydration would fail to upgrade instead of waiting behind it. A
+/// caller that is already inside a transaction keeps its own boundaries:
+/// nothing here begins, commits or rolls back on its behalf.
+///
+/// Bounded as the ADR on direct writers requires: [`SweepWrite::record`]
+/// commits and reopens every [`JSONL_CHUNK_LINES`] records, so a very large
+/// transcript holds the lock for one chunk at a time, not for its whole read.
+/// A chunk committed ahead of the transcript's cursor is what autocommit did
+/// for every statement; the re-read that follows upserts over it.
+pub(crate) struct SweepWrite<'c> {
+    conn: &'c Connection,
+    /// Whether this guard opened the transaction and so owns its boundaries.
+    owned: bool,
+    records: usize,
+}
+
+impl<'c> SweepWrite<'c> {
+    pub(crate) fn begin(conn: &'c Connection) -> Result<Self> {
+        let owned = conn.is_autocommit();
+        if owned {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+        }
+        Ok(Self {
+            conn,
+            owned,
+            records: 0,
+        })
+    }
+
+    /// One record is about to be read. Past the chunk size, commit what is
+    /// written and open the next chunk.
+    pub(crate) fn record(&mut self) -> Result<()> {
+        if !self.owned {
+            return Ok(());
+        }
+        self.records += 1;
+        if self.records < JSONL_CHUNK_LINES {
+            return Ok(());
+        }
+        self.records = 0;
+        self.conn.execute_batch("COMMIT")?;
+        if let Err(error) = self.conn.execute_batch("BEGIN IMMEDIATE") {
+            // Committed and not reopened: there is nothing left to own, and
+            // the walk ends on the error rather than writing in autocommit.
+            self.owned = false;
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn commit(mut self) -> Result<()> {
+        if self.owned {
+            self.owned = false;
+            self.conn.execute_batch("COMMIT")?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SweepWrite<'_> {
+    fn drop(&mut self) {
+        // An error or a cancellation unwound past the guard: nothing of this
+        // unit is kept, and its cursor was never published, so the next sweep
+        // reads it again. SQLite may already have rolled back on its own.
+        if self.owned && !self.conn.is_autocommit() {
+            let _ = self.conn.execute_batch("ROLLBACK");
+        }
+    }
+}
+
 /// A byte cursor is valid only for the file generation that produced it.
 /// `observed_at_ns` orders overlapping writers across rotations, while the
 /// identity and start metadata let writers recognize the same generation.
@@ -3808,6 +3911,12 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                 continue;
             };
             scanned += 1;
+            // Everything this rollout writes is one write unit, committed
+            // before its stamp enters `seen`: the stamp is the walk's claim
+            // that these rows landed. Not chunked: a parser-upgrade repair
+            // relies on the whole rollout being one transaction (see
+            // `repair_codex_rollout_user_messages`).
+            let write = SweepWrite::begin(conn)?;
             if meta.is_subagent {
                 // Earlier syncs (before subagent detection) registered these
                 // threads: their map entries feed backfill_codex_metadata and
@@ -3839,10 +3948,19 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                     outcome
                 }
                 Err(error) => {
-                    // Cleanup was attempted above. Preserve the ingestion
-                    // failure as the primary diagnostic if both operations
-                    // fail, since it explains why this rollout made no
-                    // progress and is what a retry must address.
+                    // The rollout's unit is discarded, cleanup included, so
+                    // the cleanup is applied again on its own: a stale root
+                    // registration is wrong whether or not this rollout's
+                    // events could be written, and before the walk wrote
+                    // per rollout it was kept regardless. Preserve the
+                    // ingestion failure as the primary diagnostic if both
+                    // operations fail, since it explains why this rollout
+                    // made no progress and is what a retry must address.
+                    drop(write);
+                    if meta.is_subagent {
+                        let _ = cleanup_codex_subagent_history(conn, &meta.session_id);
+                        let _ = cleanup_codex_subagent_registration(conn, &meta.session_id);
+                    }
                     return Err(error);
                 }
             };
@@ -3903,6 +4021,7 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                     }
                 }
             }
+            write.commit()?;
             seen.insert(
                 key,
                 json!({ "stamp": stamp, "session": meta.session_id, "subagent": meta.is_subagent }),
@@ -4724,24 +4843,31 @@ fn repair_codex_rollout_user_messages(
     // One bounded transaction per rollout makes an interrupted parser upgrade
     // leave either the old user rows or the fully rebuilt ones. Assistant,
     // tool, and file-edit evidence is retained and idempotently upserted.
-    let tx = conn.unchecked_transaction()?;
+    // The sweep's own per-rollout `SweepWrite` is that transaction when it is
+    // open, and it never commits part way through a rollout.
+    let tx = conn
+        .is_autocommit()
+        .then(|| conn.unchecked_transaction())
+        .transpose()?;
     crate::store::retire_evidence_share(
-        &tx,
+        conn,
         "session_events",
         "source = 'codex' AND session_id = ? AND role = 'user'",
         params![meta.session_id.as_str()],
         SessionLocation::Local,
     )?;
     if meta.is_subagent {
-        cleanup_codex_subagent_history(&tx, &meta.session_id)?;
+        cleanup_codex_subagent_history(conn, &meta.session_id)?;
     } else {
-        tx.execute(
+        conn.execute(
             "DELETE FROM history WHERE source = 'codex' AND session_id = ?",
             [meta.session_id.as_str()],
         )?;
     }
-    let outcome = ingest_codex_rollout(&tx, path, meta)?;
-    tx.commit()?;
+    let outcome = ingest_codex_rollout(conn, path, meta)?;
+    if let Some(tx) = tx {
+        tx.commit()?;
+    }
     Ok(outcome)
 }
 
@@ -6462,6 +6588,10 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
                     continue;
                 }
             };
+        // Everything this transcript writes from here -- the fold's cursor,
+        // the catalog row, the records and their cursor, the relationship and
+        // continuity rows -- is one write unit. The fold above only read.
+        let mut write = SweepWrite::begin(conn)?;
         scan_cursor.claude.get_or_insert_with(Default::default).scan = scan;
         transcript_cursor::store_cursor(conn, &scan_key, &scan_cursor)?;
         if let Some(meta) = scanned_meta {
@@ -6480,7 +6610,13 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
                 // The sync walk reports its reads through its own counters, not
                 // through a hydration result, so the byte count is dropped here.
                 let (evidence, _) = hydrate::claude_subagent_evidence(path.clone(), &meta);
-                hydrate::ingest_claude_subagent(conn, &meta.session_id, &evidence)?;
+                hydrate::ingest_claude_subagent_batched(
+                    conn,
+                    &meta.session_id,
+                    &evidence,
+                    &mut || write.record(),
+                )?;
+                write.commit()?;
                 continue;
             }
             upsert_session(
@@ -6505,7 +6641,12 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
             if !scan_superseded {
                 set_claude_first_prompt(conn, &meta)?;
             }
-            incremental::ingest_claude_transcript_at_locator(conn, &path, None)?;
+            incremental::ingest_claude_transcript_at_locator_batched(
+                conn,
+                &path,
+                None,
+                &mut || write.record(),
+            )?;
             if scan_superseded {
                 transcript_cursor::forget_locator_cursor(conn, "claude", &path)?;
             }
@@ -6528,6 +6669,7 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
             }
             upserted += 1;
         }
+        write.commit()?;
     }
 
     if walked_every_known_root {
@@ -34269,5 +34411,129 @@ mod codex_fork_replay_tests {
             .unwrap();
         assert_eq!(first_prompt, None);
         assert_eq!(last_assistant_text, None);
+    }
+}
+
+#[cfg(test)]
+mod sweep_write_tests {
+    use super::*;
+    use crate::store::init_db;
+
+    fn count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    /// A sweep unit is invisible until it commits, commits every
+    /// `JSONL_CHUNK_LINES` records rather than holding the writer lock for a
+    /// whole large transcript, and leaves nothing behind when it is dropped.
+    #[test]
+    fn a_sweep_write_is_one_bounded_unit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode = WAL; CREATE TABLE t (x INTEGER);")
+            .unwrap();
+        let reader = Connection::open(&path).unwrap();
+
+        let mut write = SweepWrite::begin(&writer).unwrap();
+        assert!(!writer.is_autocommit());
+        writer.execute("INSERT INTO t VALUES (1)", []).unwrap();
+        for _ in 1..JSONL_CHUNK_LINES {
+            write.record().unwrap();
+        }
+        assert_eq!(count(&reader), 0, "visible before the unit committed");
+        write.record().unwrap();
+        assert_eq!(count(&reader), 1, "a full chunk is committed");
+        assert!(!writer.is_autocommit(), "and the next chunk is open");
+        writer.execute("INSERT INTO t VALUES (2)", []).unwrap();
+        write.commit().unwrap();
+        assert!(writer.is_autocommit());
+        assert_eq!(count(&reader), 2);
+
+        // Dropped part way -- an error or a cancellation -- it rolls back.
+        let write = SweepWrite::begin(&writer).unwrap();
+        writer.execute("INSERT INTO t VALUES (3)", []).unwrap();
+        drop(write);
+        assert!(writer.is_autocommit());
+        assert_eq!(count(&reader), 2);
+    }
+
+    /// Inside a transaction the caller owns (hydration's), a sweep unit
+    /// neither commits a chunk nor ends the transaction.
+    #[test]
+    fn a_sweep_write_inside_a_callers_transaction_keeps_its_boundaries() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (x INTEGER);").unwrap();
+        let outer = conn.unchecked_transaction().unwrap();
+        let mut write = SweepWrite::begin(&conn).unwrap();
+        conn.execute("INSERT INTO t VALUES (1)", []).unwrap();
+        for _ in 0..JSONL_CHUNK_LINES * 2 {
+            write.record().unwrap();
+        }
+        write.commit().unwrap();
+        assert!(!conn.is_autocommit(), "the caller's transaction was ended");
+        let write = SweepWrite::begin(&conn).unwrap();
+        drop(write);
+        assert!(
+            !conn.is_autocommit(),
+            "the caller's transaction was rolled back"
+        );
+        outer.rollback().unwrap();
+        assert_eq!(count(&conn), 0);
+    }
+
+    /// A Claude transcript the walk cannot finish leaves neither part of its
+    /// rows nor a cursor claiming them: the next walk reads it whole.
+    #[test]
+    fn a_claude_transcript_that_fails_part_way_is_not_half_indexed() {
+        let home = tempfile::tempdir().unwrap();
+        let project = home.path().join(".claude/projects/app");
+        fs::create_dir_all(&project).unwrap();
+        let transcript = project.join("s1.jsonl");
+        fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"user","uuid":"u1","sessionId":"s1","cwd":"/tmp/app","timestamp":"2026-09-20T00:00:00.000Z","message":{"role":"user","content":"first"}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"s1","cwd":"/tmp/app","timestamp":"2026-09-20T00:00:01.000Z","message":{"id":"msg_1","role":"assistant","model":"claude-opus-4-7","stop_reason":"end_turn","content":[{"type":"text","text":"second"}]}}"#, "\n",
+                r#"{"type":"user","uuid":"u2","parentUuid":"a1","sessionId":"s1","cwd":"/tmp/app","timestamp":"2026-09-20T00:00:02.000Z","message":{"role":"user","content":"boom"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_third BEFORE INSERT ON session_events \
+             WHEN NEW.text = 'boom' BEGIN SELECT RAISE(FAIL, 'injected'); END;",
+        )
+        .unwrap();
+        let root = home.path().join(".claude/projects");
+        let mut state = Map::new();
+        let error = super::sync_claude_session_metadata(&conn, &mut state, &root)
+            .expect_err("the trigger fails the third record");
+        assert!(format!("{error:#}").contains("injected"));
+        assert!(conn.is_autocommit());
+        assert!(!super::session_events_exist(&conn, "claude", "s1").unwrap());
+        assert!(
+            transcript_cursor::known_locators(&conn, "claude")
+                .unwrap()
+                .is_empty(),
+            "a cursor survived a transcript that was not indexed"
+        );
+
+        conn.execute_batch("DROP TRIGGER fail_third").unwrap();
+        super::sync_claude_session_metadata(&conn, &mut state, &root).unwrap();
+        let texts: Vec<String> = conn
+            .prepare(
+                "SELECT text FROM session_events WHERE source = 'claude' AND session_id = 's1' \
+                 ORDER BY ts_ms, id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(texts, vec!["first", "second", "boom"]);
     }
 }

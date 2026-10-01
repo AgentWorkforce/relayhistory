@@ -2568,6 +2568,18 @@ pub(crate) fn ingest_claude_subagent(
     parent_session_id: &str,
     evidence: &ClaudeSubagentEvidence,
 ) -> Result<IngestOutcome> {
+    ingest_claude_subagent_batched(conn, parent_session_id, evidence, &mut || Ok(()))
+}
+
+/// [`ingest_claude_subagent`] with the sidecar's record walk calling
+/// `between_records` at each record boundary; see
+/// [`incremental::ingest_claude_transcript_incremental_batched`].
+pub(crate) fn ingest_claude_subagent_batched(
+    conn: &Connection,
+    parent_session_id: &str,
+    evidence: &ClaudeSubagentEvidence,
+    between_records: &mut dyn FnMut() -> Result<()>,
+) -> Result<IngestOutcome> {
     let locator = evidence.path.to_string_lossy().to_string();
     let mut outcome = IngestOutcome::default();
     // The `agent-*.meta.json` beside the transcript is the only record of the
@@ -2604,10 +2616,11 @@ pub(crate) fn ingest_claude_subagent(
     }
     match evidence.agent_id.as_deref() {
         Some(agent_id) => {
-            outcome.absorb(incremental::ingest_claude_transcript_at_locator(
+            outcome.absorb(incremental::ingest_claude_transcript_at_locator_batched(
                 conn,
                 &evidence.path,
                 Some(agent_id),
+                between_records,
             )?);
             cleanup_subagent_registration(conn, "claude", agent_id)?;
             record_relationship(
@@ -2631,10 +2644,11 @@ pub(crate) fn ingest_claude_subagent(
             )?;
         }
         None => {
-            outcome.absorb(incremental::ingest_claude_transcript_at_locator(
+            outcome.absorb(incremental::ingest_claude_transcript_at_locator_batched(
                 conn,
                 &evidence.path,
                 None,
+                between_records,
             )?);
             record_relationship(
                 conn,
