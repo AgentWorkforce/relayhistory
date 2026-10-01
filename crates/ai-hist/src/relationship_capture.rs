@@ -116,6 +116,81 @@ pub(crate) fn record_relationship_replacing_child_model(
     record_relationship_with_child_model_mode(conn, observed, true)
 }
 
+/// What re-observing an edge writes over the stored one, column by column:
+/// `(column, new value)`, the value an expression over `excluded` (this
+/// observation) and `session_relationships` (the stored row). `?19` is
+/// whether a missing child model is an observed removal.
+///
+/// One list because it is used twice: as the `DO UPDATE SET`, and as the
+/// upsert's `WHERE`, which skips the update when no column would change. A
+/// sweep or hydration re-reads every relationship of every transcript it
+/// re-reads, and without the `WHERE` each one rewrote `updated_ms` with
+/// `now` and nothing else -- a new change-feed revision, and an upload, for
+/// an edge nothing had changed (#215). `updated_ms` is therefore the time the
+/// edge last changed, and `created_ms` the time it was first seen.
+const RELATIONSHIP_REOBSERVED: &[(&str, &str)] = &[
+    ("child_session_id", "excluded.child_session_id"),
+    ("relationship", "excluded.relationship"),
+    ("identity_status", "excluded.identity_status"),
+    (
+        "child_agent_type",
+        "COALESCE(excluded.child_agent_type, session_relationships.child_agent_type)",
+    ),
+    (
+        "child_agent_name",
+        "COALESCE(excluded.child_agent_name, session_relationships.child_agent_name)",
+    ),
+    (
+        "child_model",
+        "CASE WHEN ?19 THEN excluded.child_model \
+         ELSE COALESCE(excluded.child_model, session_relationships.child_model) END",
+    ),
+    (
+        "spawn_depth",
+        "COALESCE(excluded.spawn_depth, session_relationships.spawn_depth)",
+    ),
+    ("evidence_kind", "excluded.evidence_kind"),
+    (
+        "evidence_locator",
+        "COALESCE(excluded.evidence_locator, session_relationships.evidence_locator)",
+    ),
+    (
+        "evidence_ref",
+        "COALESCE(excluded.evidence_ref, session_relationships.evidence_ref)",
+    ),
+    ("child_has_events", "excluded.child_has_events"),
+    (
+        "spawned_at_ms",
+        "COALESCE(excluded.spawned_at_ms, session_relationships.spawned_at_ms)",
+    ),
+    ("origin_session_id", "excluded.origin_session_id"),
+];
+
+static RECORD_RELATIONSHIP_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let assignments = RELATIONSHIP_REOBSERVED
+        .iter()
+        .map(|(column, value)| format!("{column} = {value}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let changed = RELATIONSHIP_REOBSERVED
+        .iter()
+        .map(|(column, value)| format!("({value}) IS NOT session_relationships.{column}"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    format!(
+        "INSERT INTO session_relationships \
+         (source, parent_session_id, relationship_uid, child_session_id, relationship, \
+          identity_status, child_agent_type, child_agent_name, child_model, spawn_depth, \
+          evidence_kind, evidence_locator, evidence_ref, child_has_events, \
+          spawned_at_ms, created_ms, updated_ms, origin_session_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
+                 ?17, ?18) \
+         ON CONFLICT(source, parent_session_id, relationship_uid) DO UPDATE SET \
+           {assignments}, updated_ms = excluded.updated_ms \
+         WHERE {changed}"
+    )
+});
+
 fn record_relationship_with_child_model_mode(
     conn: &Connection,
     observed: &ObservedRelationship<'_>,
@@ -141,30 +216,8 @@ fn record_relationship_with_child_model_mode(
             ],
         )?;
     }
-    conn.execute(
-        "INSERT INTO session_relationships \
-         (source, parent_session_id, relationship_uid, child_session_id, relationship, \
-          identity_status, child_agent_type, child_agent_name, child_model, spawn_depth, \
-          evidence_kind, evidence_locator, evidence_ref, child_has_events, \
-          spawned_at_ms, created_ms, updated_ms, origin_session_id) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-         ON CONFLICT(source, parent_session_id, relationship_uid) DO UPDATE SET \
-           child_session_id = excluded.child_session_id, \
-           relationship     = excluded.relationship, \
-           identity_status  = excluded.identity_status, \
-           child_agent_type = COALESCE(excluded.child_agent_type, session_relationships.child_agent_type), \
-           child_agent_name = COALESCE(excluded.child_agent_name, session_relationships.child_agent_name), \
-           child_model      = CASE WHEN ? THEN excluded.child_model \
-                                   ELSE COALESCE(excluded.child_model, session_relationships.child_model) END, \
-           spawn_depth      = COALESCE(excluded.spawn_depth,      session_relationships.spawn_depth), \
-           evidence_kind    = excluded.evidence_kind, \
-           evidence_locator = COALESCE(excluded.evidence_locator, session_relationships.evidence_locator), \
-           evidence_ref     = COALESCE(excluded.evidence_ref,     session_relationships.evidence_ref), \
-           child_has_events = excluded.child_has_events, \
-           spawned_at_ms    = COALESCE(excluded.spawned_at_ms,    session_relationships.spawned_at_ms), \
-           origin_session_id = excluded.origin_session_id, \
-           updated_ms       = excluded.updated_ms",
-        params![
+    conn.prepare_cached(&RECORD_RELATIONSHIP_SQL)?
+        .execute(params![
             observed.source,
             observed.parent_session_id,
             observed.relationship_uid(),
@@ -184,8 +237,7 @@ fn record_relationship_with_child_model_mode(
             now,
             observed.origin_session_id,
             replace_child_model,
-        ],
-    )?;
+        ])?;
     Ok(())
 }
 
@@ -259,8 +311,48 @@ mod tests {
             .unwrap();
         assert_eq!(row.0, 1);
         assert_eq!(row.1, created);
-        assert!(row.2 > created);
+        // It changed nothing, so nothing was written: `updated_ms` is when
+        // the edge last changed, and an unchanged re-read is no change-feed
+        // revision.
+        assert_eq!(row.2, created);
         assert_eq!(row.3.as_deref(), Some("Plan"));
+
+        // An observation that does change the edge is written, and stamped.
+        let revision = |conn: &Connection| -> i64 {
+            conn.query_row("SELECT revision FROM session_relationships", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+        };
+        let before = revision(&conn);
+        record_relationship(
+            &conn,
+            &observed("root", Some("child"), "/tmp/agent-child.jsonl"),
+        )
+        .unwrap();
+        assert_eq!(
+            revision(&conn),
+            before,
+            "an unchanged re-read takes no revision"
+        );
+        record_relationship(
+            &conn,
+            &ObservedRelationship {
+                child_model: Some("opus"),
+                ..observed("root", Some("child"), "/tmp/agent-child.jsonl")
+            },
+        )
+        .unwrap();
+        let (updated, model): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT updated_ms, child_model FROM session_relationships",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(updated > created);
+        assert_eq!(model.as_deref(), Some("opus"));
+        assert!(revision(&conn) > before);
     }
 
     #[test]

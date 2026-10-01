@@ -260,7 +260,13 @@ fn upsert_inner(conn: &Connection, observation: &SessionObservation) -> Result<(
         ["shallow", "full"].contains(&observation.discovery_state.as_str()),
         "invalid observation discovery state"
     );
-    conn.execute("INSERT INTO session_observations(source,session_id,location,connector_id,connector_instance,raw_locator,source_stamp,discovery_state,access_state,updated_ms) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source,session_id,location,connector_id,connector_instance) DO UPDATE SET raw_locator=excluded.raw_locator,source_stamp=excluded.source_stamp,discovery_state=CASE WHEN session_observations.discovery_state='full' THEN 'full' ELSE excluded.discovery_state END,access_state=excluded.access_state,updated_ms=excluded.updated_ms",params![k.source,k.session_id,k.location.as_str(),k.connector_id,k.connector_instance,observation.raw_locator,observation.source_stamp,observation.discovery_state,observation.access_state,observation.updated_ms])?;
+    // An observation that changes nothing but `updated_ms` is not written:
+    // a sweep or hydration re-observes every session it re-reads, and the
+    // rewrite was a new change-feed revision -- and an upload -- for a row
+    // nothing had changed (#215). `updated_ms` is the time the observation
+    // last changed. The projection and the observation revision below still
+    // run, as before.
+    conn.execute("INSERT INTO session_observations(source,session_id,location,connector_id,connector_instance,raw_locator,source_stamp,discovery_state,access_state,updated_ms) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source,session_id,location,connector_id,connector_instance) DO UPDATE SET raw_locator=excluded.raw_locator,source_stamp=excluded.source_stamp,discovery_state=CASE WHEN session_observations.discovery_state='full' THEN 'full' ELSE excluded.discovery_state END,access_state=excluded.access_state,updated_ms=excluded.updated_ms WHERE session_observations.raw_locator IS NOT excluded.raw_locator OR session_observations.source_stamp IS NOT excluded.source_stamp OR (session_observations.discovery_state<>'full' AND session_observations.discovery_state IS NOT excluded.discovery_state) OR session_observations.access_state IS NOT excluded.access_state",params![k.source,k.session_id,k.location.as_str(),k.connector_id,k.connector_instance,observation.raw_locator,observation.source_stamp,observation.discovery_state,observation.access_state,observation.updated_ms])?;
     refresh_projection(conn, k)?;
     bump_revision(conn, k)
 }
@@ -553,6 +559,56 @@ mod tests {
             updated_ms: 1,
         }
     }
+    /// Observing a session again with nothing new writes nothing: the row
+    /// keeps the `updated_ms` of its last change and its change-feed
+    /// revision. A change to any observed field is written and stamped.
+    #[test]
+    fn an_unchanged_reobservation_writes_nothing() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let conn = crate::open_db(&dir.path().join("history.db"))?;
+        let first = observation("a", "account1");
+        upsert(&conn, &first)?;
+        let row = |conn: &Connection| -> Result<(i64, i64, String)> {
+            Ok(conn.query_row(
+                "SELECT updated_ms, revision, discovery_state FROM session_observations",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?)
+        };
+        let before = row(&conn)?;
+        upsert(
+            &conn,
+            &SessionObservation {
+                updated_ms: 9,
+                ..first.clone()
+            },
+        )?;
+        assert_eq!(row(&conn)?, before);
+
+        upsert(
+            &conn,
+            &SessionObservation {
+                discovery_state: "full".into(),
+                updated_ms: 10,
+                ..first.clone()
+            },
+        )?;
+        let full = row(&conn)?;
+        assert_eq!(full.0, 10);
+        assert!(full.1 > before.1);
+        assert_eq!(full.2, "full");
+        // `full` is sticky: a shallow re-observation is no change.
+        upsert(
+            &conn,
+            &SessionObservation {
+                updated_ms: 11,
+                ..first
+            },
+        )?;
+        assert_eq!(row(&conn)?, full);
+        Ok(())
+    }
+
     #[test]
     fn independent_observations_and_checkpoints_survive_order_withdrawal_and_reopen() -> Result<()>
     {
