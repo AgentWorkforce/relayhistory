@@ -1184,10 +1184,15 @@ fn a_forced_sweep_over_unchanged_files_reports_nothing() {
         assert_eq!(store.head_revision().unwrap(), head, "forced tick {round}");
     }
 
-    // One complete turn appended to one transcript.
+    // One complete turn appended to one transcript. Its time is one no
+    // fixture uses: `resume-marker.jsonl`, which resumes this session, starts
+    // at 2026-04-21, and a shared value would make its edge's
+    // `spawned_at_ms` look as if the append had moved it. The edge is
+    // re-recorded on this tick (its parent changed) and must not be
+    // re-reported: nothing about it changed.
     let mut contents = fs::read_to_string(&simple).unwrap();
     contents.push_str(
-        r#"{"parentUuid":null,"isSidechain":false,"type":"user","message":{"role":"user","content":"and again"},"uuid":"u-tick-1","timestamp":"2026-04-21T00:00:00.000Z","cwd":"/tmp/project","sessionId":"11111111-1111-1111-1111-111111111111","version":"2.1.96"}"#,
+        r#"{"parentUuid":null,"isSidechain":false,"type":"user","message":{"role":"user","content":"and again"},"uuid":"u-tick-1","timestamp":"2026-04-22T00:00:00.000Z","cwd":"/tmp/project","sessionId":"11111111-1111-1111-1111-111111111111","version":"2.1.96"}"#,
     );
     contents.push('\n');
     fs::write(&simple, contents).unwrap();
