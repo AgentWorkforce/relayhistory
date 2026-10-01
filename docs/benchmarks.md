@@ -1034,3 +1034,45 @@ change (one run each, within run-to-run noise), and the `--gate` subset
 passes. `schema_is_current` now also reads each fed table's column list and
 its update trigger's text: 24 schema reads, under the 10 ms resolution of a
 `sqlite3` CLI timing of the same queries, process start included.
+
+### 2026-10-01 the post-sweep checkpoint and a pinned reader (#336)
+
+Every sweep, every watch tick included, ended with `wal_checkpoint(TRUNCATE)`
+under the sweep connection's ~30 s busy handler. A `TRUNCATE` takes the WAL
+write lock and then waits for readers to leave, so one read open as a sweep
+finished held every other writer — an embedder's own tables included — for
+the handler's full budget. The sweep now checkpoints `PASSIVE` (no write
+lock, no waiting) and escalates to `TRUNCATE` only when the WAL is still past
+4 MiB (`WAL_WARN_BYTES / 16`, SQLite's own auto-checkpoint size), under a
+100 ms busy budget for that one call.
+
+**How it was measured.** A scratch driver (not committed) through the public
+`SessionStore` over the harness's `full` store (seed 176, 100 MB, 1,776
+sessions, release build, Apple M4 Pro): one cold sync, then 8 forced syncs,
+each after appending an 8 KiB turn to one Claude transcript. A second
+connection optionally holds a read transaction open from after the cold sync
+to the end; a third runs `BEGIN IMMEDIATE; INSERT; COMMIT` into its own table
+every 20 ms throughout and records its slowest lock wait.
+
+| 8 forced sweeps, 100 MB store | base, no reader | this change, no reader | base, pinned reader | this change, pinned reader |
+|---|---:|---:|---:|---:|
+| Mean sweep | 0.25 s | 0.24 s | 32.45 s | 0.33 s |
+| Slowest `BEGIN IMMEDIATE` on a third connection | 12 ms | 1.5 ms | 32.4 s | 150 ms |
+| Lock waits over 1 s | 0 | 0 | 8 (every sweep) | 0 |
+| WAL after the cold sync | 0 | 0 | 0 | 0 |
+| WAL after sweep 8 | 0 | 3.0 MB (steady) | 5.9 MB | 5.9 MB |
+
+- With no reader the WAL no longer drops to zero after each small sweep: it
+  stays at its high-water mark below 4 MiB (3.0 MB here, unchanged across all
+  8 sweeps) and SQLite reuses it from the start. A sweep that leaves more than
+  4 MiB — the cold sync above — is still truncated to zero.
+- With a reader pinned for the whole run neither version can fold back the
+  frames the reader may still need, so the WAL grows by what each sweep
+  writes either way; `[wal] checkpoint incomplete` reports it and the next
+  quiet sweep truncates it. The difference is only who waits: before, every
+  sweep and every other writer, for ~32 s; now, nobody past the escalated
+  call's 100 ms (the 150 ms worst case includes the writer's own backoff
+  granularity).
+- `compact` keeps its `TRUNCATE` with the full busy handler: it is an explicit
+  maintenance action that already holds the sync lock and rewrites the file
+  with `VACUUM`, so a wait there is expected.

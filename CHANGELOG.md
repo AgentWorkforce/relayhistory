@@ -596,6 +596,20 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Fixed
 
+- A sweep no longer stalls every other writer for up to ~30 s when a read is
+  active as it finishes (#336). Each sweep, including every
+  `SessionStore::watch` tick, ended with `wal_checkpoint(TRUNCATE)` under the
+  connection's ~30 s busy handler; a `TRUNCATE` holds the WAL write lock
+  while it waits for readers to leave, so an embedder writing its own tables
+  beside the watch (relay-desktop's change-feed drain) waited behind it. The
+  sweep now checkpoints `PASSIVE`, which never takes the write lock or waits
+  on a reader, and escalates to `TRUNCATE` only when the WAL is still past
+  4 MiB, with a 100 ms busy budget for that one call. An escalation a reader
+  blocks is reported as `[wal] checkpoint incomplete` and retried by the next
+  sweep, as before; the WAL-size warning is unchanged. Under a quiet store
+  the WAL file now stays at up to 4 MiB between sweeps instead of being
+  truncated to zero every time; SQLite reuses it from the start. `compact`
+  keeps its `TRUNCATE`: it is an explicit maintenance action.
 - Reading a session's user turns no longer scans the whole session once per
   turn (#307). `session_user_turns_page`, and `SessionStore::session`
   whenever session events are selected (including `include_text: false`),
