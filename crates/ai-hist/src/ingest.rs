@@ -1800,38 +1800,111 @@ fn sync_basic(
         }
     }
     let total: i64 = conn.query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))?;
-    // Fold the WAL back into the database now that the writes are done. Best
-    // effort: a concurrent reader pinning an old snapshot blocks a full
-    // checkpoint, and that is not a reason to fail a sync that did its work.
+    // Fold the WAL back into the database now that the writes are done.
     // Left unchecked the WAL grows without bound (156MB observed in the wild).
-    match conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, i64>(2)?,
-        ))
-    }) {
-        Ok((busy, log_frames, checkpointed_frames)) if busy != 0 => {
-            sync_note!(
-                "  [wal] checkpoint incomplete: {checkpointed_frames}/{log_frames} frames; another reader is active"
-            );
-        }
-        Ok(_) => {}
-        Err(err) => sync_note!("  [wal] checkpoint skipped: {err}"),
-    }
-    let wal_bytes = fs::metadata(wal_path(db_path))
-        .map(|m| m.len())
-        .unwrap_or(0);
-    if wal_bytes > WAL_WARN_BYTES {
+    let checkpoint = checkpoint_after_sweep(conn, db_path, WAL_TRUNCATE_BYTES);
+    if checkpoint.wal_bytes > WAL_WARN_BYTES {
         eprintln!(
             "ai-hist: WAL is {} after checkpointing -- a long-lived reader is \
              pinning an old snapshot; run `ai-hist doctor`",
-            human_bytes(wal_bytes)
+            human_bytes(checkpoint.wal_bytes)
         );
     }
     sync_note!("  [rust-sync] +{total_inserted} rows");
     sync_note!("  Total: {total} entries");
     Ok(true)
+}
+
+/// WAL size past which the post-sweep checkpoint escalates from `PASSIVE` to
+/// `TRUNCATE` and hands the file's space back.
+///
+/// A sixteenth of [`WAL_WARN_BYTES`]: 4 MiB, the size SQLite's own
+/// auto-checkpoint lets the WAL reach (1000 pages of 4 KiB) before it folds
+/// it back. Below it the file is ordinary steady state that the next writer
+/// reuses from the start once a passive checkpoint has caught up; above it a
+/// sweep wrote more than SQLite would have kept, and the space is worth a
+/// short wait to return.
+pub(crate) const WAL_TRUNCATE_BYTES: u64 = WAL_WARN_BYTES / 16;
+
+/// How long an escalated `TRUNCATE` may wait for a reader or writer before it
+/// gives up. Every other connection's writes queue behind it while it waits,
+/// so this is the most a pinned reader can stall them per sweep.
+const WAL_TRUNCATE_BUSY_BUDGET: Duration = Duration::from_millis(100);
+
+/// What the post-sweep checkpoint did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SweepCheckpoint {
+    /// Whether the WAL was past the threshold and a `TRUNCATE` was attempted.
+    pub(crate) escalated: bool,
+    /// Whether every frame was folded back and, when escalated, the WAL was
+    /// reset. `false` when a reader pinning an older snapshot was in the way
+    /// or the checkpoint could not run at all.
+    pub(crate) complete: bool,
+    /// The WAL file's size once the checkpoint returned.
+    pub(crate) wal_bytes: u64,
+}
+
+/// Checkpoint the WAL after a sweep without making other connections wait.
+///
+/// `PASSIVE` first: it copies what it can and never takes the write lock or
+/// waits on a reader, so a reader active as the sweep ends costs nobody
+/// anything. Only when the WAL file is still past `truncate_above` does it
+/// escalate to `TRUNCATE`, under a [`WAL_TRUNCATE_BUSY_BUDGET`] busy budget
+/// rather than the connection's ~30 s retry handler: a `TRUNCATE` holds the
+/// WAL write lock while it waits for readers to leave, and every other writer
+/// — an embedder's own tables included — would queue behind it for as long
+/// as the handler kept retrying (#336). An escalation that runs out of budget
+/// is reported, not claimed, and the next sweep tries again.
+pub(crate) fn checkpoint_after_sweep(
+    conn: &Connection,
+    db_path: &Path,
+    truncate_above: u64,
+) -> SweepCheckpoint {
+    let wal_len = || {
+        fs::metadata(wal_path(db_path))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    };
+    let mut escalated = false;
+    let mut outcome = wal_checkpoint(conn, "PASSIVE");
+    if wal_len() > truncate_above {
+        escalated = true;
+        outcome = match crate::store::ShortBusyBudget::new(conn, WAL_TRUNCATE_BUSY_BUDGET) {
+            Ok(_budget) => wal_checkpoint(conn, "TRUNCATE"),
+            Err(error) => Err(error.to_string()),
+        };
+    }
+    let complete = match outcome {
+        // `log_frames` is -1 when the database is not in WAL mode at all.
+        Ok((busy, log_frames, checkpointed_frames))
+            if busy != 0 || checkpointed_frames < log_frames =>
+        {
+            sync_note!(
+                "  [wal] checkpoint incomplete: {checkpointed_frames}/{log_frames} frames; another reader is active"
+            );
+            false
+        }
+        Ok(_) => true,
+        Err(error) => {
+            sync_note!("  [wal] checkpoint skipped: {error}");
+            false
+        }
+    };
+    SweepCheckpoint {
+        escalated,
+        complete,
+        wal_bytes: wal_len(),
+    }
+}
+
+/// One `PRAGMA wal_checkpoint(<mode>)`: `(busy, log frames, checkpointed
+/// frames)`. SQLite reports a reader that blocked it as `busy = 1` in the row,
+/// not as an error.
+fn wal_checkpoint(conn: &Connection, mode: &str) -> std::result::Result<(i64, i64, i64), String> {
+    conn.query_row(&format!("PRAGMA wal_checkpoint({mode})"), [], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+    })
+    .map_err(|error| error.to_string())
 }
 
 /// Whether this sweep knows enough to make its source and destination state a
@@ -34673,5 +34746,255 @@ mod sweep_write_tests {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(texts, vec!["first", "second", "boom"]);
+    }
+}
+
+#[cfg(test)]
+mod post_sweep_checkpoint_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    fn wal_len(db_path: &Path) -> u64 {
+        fs::metadata(wal_path(db_path))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    }
+
+    /// A store whose WAL holds `rows` uncheckpointed inserts, written through
+    /// the production connection so the production busy handler is on it.
+    fn store_with_wal(dir: &Path, rows: usize) -> (PathBuf, Connection) {
+        let db_path = dir.join("ai-history.db");
+        let conn = open_db(&db_path).unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        conn.execute_batch("PRAGMA wal_autocheckpoint = 0;")
+            .unwrap();
+        grow_wal(&conn, rows, 0);
+        (db_path, conn)
+    }
+
+    fn grow_wal(conn: &Connection, rows: usize, offset: usize) {
+        let text = "x".repeat(2_000);
+        let tx = conn.unchecked_transaction().unwrap();
+        for i in offset..offset + rows {
+            tx.execute(
+                "INSERT INTO history (source, session_id, prompt, timestamp_ms) \
+                 VALUES ('claude', ?1, ?2, ?3)",
+                rusqlite::params![format!("s{}", i % 10), format!("{text} n{i}"), i as i64],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+
+    /// A second connection holding a read snapshot, the way an embedder's
+    /// change-feed drain does while a tick finishes.
+    fn pin_reader(db_path: &Path) -> Connection {
+        let reader = Connection::open(db_path).unwrap();
+        reader.execute_batch("BEGIN;").unwrap();
+        let _: i64 = reader
+            .query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))
+            .unwrap();
+        reader
+    }
+
+    /// The escalated checkpoint is the only one that takes the write lock.
+    /// With a reader pinned it may hold that lock for its short budget and
+    /// no longer: a third connection's `BEGIN IMMEDIATE`, issued while it
+    /// waits, gets the lock in well under a second rather than after the
+    /// production handler's ~30 s (#336).
+    #[test]
+    fn an_escalated_checkpoint_blocked_by_a_reader_does_not_stall_other_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, conn) = store_with_wal(dir.path(), 200);
+        let reader = pin_reader(&db_path);
+        // Frames the reader's snapshot cannot see, so a reset must wait on it.
+        grow_wal(&conn, 50, 200);
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let checkpoint_path = db_path.clone();
+        let checkpointer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let started = Instant::now();
+            // Threshold 0: always escalate, which is the path that can block.
+            let outcome = checkpoint_after_sweep(&conn, &checkpoint_path, 0);
+            let budget_while_held: i64 = conn
+                .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+                .unwrap();
+            (outcome, started.elapsed(), budget_while_held)
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+
+        let writer = Connection::open(&db_path).unwrap();
+        writer.busy_timeout(Duration::from_secs(10)).unwrap();
+        let asked = Instant::now();
+        writer.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        let waited = asked.elapsed();
+        writer.execute_batch("ROLLBACK;").unwrap();
+
+        let (outcome, took, busy_timeout_after) = checkpointer.join().unwrap();
+        assert!(
+            waited < Duration::from_secs(1),
+            "a writer waited {waited:?} behind the post-sweep checkpoint"
+        );
+        assert!(
+            took < Duration::from_secs(2),
+            "the checkpoint took {took:?}"
+        );
+        assert!(outcome.escalated);
+        assert!(
+            !outcome.complete,
+            "a reset the reader blocked is not claimed"
+        );
+        assert!(outcome.wal_bytes > 0);
+        // `sqlite3_busy_handler` zeroes the reported timeout: the short
+        // budget is gone and the production retry handler is back.
+        assert_eq!(busy_timeout_after, 0);
+        drop(reader);
+    }
+
+    /// With nobody reading, a WAL past the threshold is reset to nothing; one
+    /// under it is folded back passively and left for the next writer to
+    /// reuse from the start.
+    #[test]
+    fn a_quiet_store_is_checkpointed_and_truncated_only_past_the_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, conn) = store_with_wal(dir.path(), 200);
+        let before = wal_len(&db_path);
+        assert!(before > 0);
+
+        let passive = checkpoint_after_sweep(&conn, &db_path, before);
+        assert!(!passive.escalated);
+        assert!(passive.complete);
+        assert_eq!(
+            passive.wal_bytes, before,
+            "a passive checkpoint keeps the file"
+        );
+
+        let truncated = checkpoint_after_sweep(&conn, &db_path, before - 1);
+        assert!(truncated.escalated);
+        assert!(truncated.complete);
+        assert_eq!(truncated.wal_bytes, 0);
+        assert_eq!(wal_len(&db_path), 0);
+    }
+
+    /// Repeated sweeps under a reader that never lets go: every checkpoint
+    /// says it could not finish, none claims a reset, and the first one after
+    /// the reader leaves truncates the WAL.
+    #[test]
+    fn a_persistent_reader_is_reported_every_sweep_and_the_next_quiet_one_truncates() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, conn) = store_with_wal(dir.path(), 50);
+        let reader = pin_reader(&db_path);
+        let mut sizes = Vec::new();
+        for round in 1..=3 {
+            grow_wal(&conn, 50, round * 50);
+            let started = Instant::now();
+            let outcome = checkpoint_after_sweep(&conn, &db_path, 0);
+            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(outcome.escalated);
+            assert!(!outcome.complete, "round {round} claimed a checkpoint");
+            assert!(outcome.wal_bytes > 0);
+            sizes.push(outcome.wal_bytes);
+        }
+        assert!(
+            sizes.windows(2).all(|pair| pair[0] <= pair[1]),
+            "the pinned snapshot keeps every frame: {sizes:?}"
+        );
+        reader.execute_batch("COMMIT;").unwrap();
+        let outcome = checkpoint_after_sweep(&conn, &db_path, 0);
+        assert!(outcome.complete);
+        assert_eq!(outcome.wal_bytes, 0);
+    }
+
+    fn claude_transcript(home: &Path, session_id: &str, turns: std::ops::Range<usize>) {
+        let dir = home.join(".claude/projects/-work-checkpoint");
+        fs::create_dir_all(&dir).unwrap();
+        let mut body = String::new();
+        for turn in turns {
+            for (role, kind) in [("user", "u"), ("assistant", "a")] {
+                let line = json!({
+                    "type": role, "uuid": format!("{session_id}-{kind}{turn}"),
+                    "sessionId": session_id, "cwd": "/work/checkpoint",
+                    "timestamp": format!("2026-04-20T00:{:02}:{:02}.000Z", turn / 60, turn % 60),
+                    "message": { "role": role, "content": format!("{role} turn {turn}") },
+                });
+                body.push_str(&format!("{line}\n"));
+            }
+        }
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(format!("{session_id}.jsonl")))
+            .unwrap();
+        io::Write::write_all(&mut file, body.as_bytes()).unwrap();
+    }
+
+    /// End to end: an embedder reads beside a forced sweep and writes its own
+    /// table throughout. The sweep finishes promptly and no write waits on it
+    /// for long — before #336 the sweep's closing `TRUNCATE` sat on the write
+    /// lock for the production handler's ~30 s whenever a read was active.
+    #[test]
+    fn a_sweep_ending_under_a_pinned_reader_does_not_stall_an_embedders_writes() {
+        let home = tempfile::tempdir().unwrap();
+        let db_path = home.path().join("history.db");
+        claude_transcript(home.path(), "checkpoint-a", 0..20);
+        assert!(
+            sync_exclusive_with_home(&db_path, home.path(), true)
+                .unwrap()
+                .swept
+        );
+        open_db(&db_path)
+            .unwrap()
+            .execute_batch("CREATE TABLE IF NOT EXISTS embedder_uploads (n INTEGER);")
+            .unwrap();
+        claude_transcript(home.path(), "checkpoint-a", 20..40);
+        let reader = pin_reader(&db_path);
+
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let writer_stop = stop.clone();
+        let writer_path = db_path.clone();
+        let writer = std::thread::spawn(move || {
+            let conn = Connection::open(&writer_path).unwrap();
+            conn.busy_timeout(Duration::from_secs(60)).unwrap();
+            let mut slowest = Duration::ZERO;
+            let mut writes = 0;
+            while !writer_stop.load(AtomicOrdering::Relaxed) {
+                let asked = Instant::now();
+                conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+                slowest = slowest.max(asked.elapsed());
+                conn.execute("INSERT INTO embedder_uploads VALUES (?1)", [writes])
+                    .unwrap();
+                conn.execute_batch("COMMIT;").unwrap();
+                writes += 1;
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            (slowest, writes)
+        });
+
+        let started = Instant::now();
+        let tick = sync_exclusive_with_home(&db_path, home.path(), true).unwrap();
+        let took = started.elapsed();
+        // Let the writer land at least one write after the sweep returned.
+        std::thread::sleep(Duration::from_millis(50));
+        stop.store(true, AtomicOrdering::Relaxed);
+        let (slowest, writes) = writer.join().unwrap();
+        drop(reader);
+
+        assert!(tick.swept);
+        assert!(writes > 0);
+        assert!(took < Duration::from_secs(15), "the sweep took {took:?}");
+        // Generous for CI: the sweep's own short write units also take the
+        // lock; the regression this guards is a ~30 s wait.
+        assert!(
+            slowest < Duration::from_secs(5),
+            "an embedder write waited {slowest:?} for the lock"
+        );
+        assert!(
+            wal_len(&db_path) <= WAL_WARN_BYTES,
+            "the WAL stays bounded after the sweep"
+        );
     }
 }

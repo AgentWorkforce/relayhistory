@@ -539,6 +539,34 @@ fn configure_busy_retry(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// A short busy budget for the calls made while it lives, in place of the
+/// production retry sequence.
+///
+/// SQLite keeps one busy handler per connection, and `busy_timeout` replaces
+/// it, so this swaps the ~30 s [`busy_retry_handler`] out for a plain timeout
+/// and puts it back when dropped. It cannot read back what was installed
+/// before — SQLite has no getter for a busy handler — so it is only for
+/// connections opened through [`open_db`] or [`open_db_readonly`], which is
+/// what it restores.
+pub(crate) struct ShortBusyBudget<'a> {
+    conn: &'a Connection,
+}
+
+impl<'a> ShortBusyBudget<'a> {
+    pub(crate) fn new(conn: &'a Connection, budget: Duration) -> Result<Self> {
+        conn.busy_timeout(budget)?;
+        Ok(Self { conn })
+    }
+}
+
+impl Drop for ShortBusyBudget<'_> {
+    fn drop(&mut self) {
+        // Best effort, like discovery's scoped `synchronous`: installing a
+        // busy handler only fails on a connection being torn down.
+        let _ = configure_busy_retry(self.conn);
+    }
+}
+
 fn sqlite_lock_error(error: &rusqlite::Error) -> bool {
     matches!(
         error,
