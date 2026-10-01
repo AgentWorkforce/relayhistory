@@ -574,6 +574,25 @@ Notable changes to the native `ai-hist` CLI are documented here.
   synthetic store a cold sync drops from 37.3 s to 13.4 s, and a forced tick
   after a 1 KiB append to a 2 MB Codex rollout from 728 ms to 466 ms. Part of
   #215.
+- The change feed stamps a new `revision` on an update only when the update
+  changed at least one of the row's columns. Every re-read -- a hydration of a
+  session the sweep already indexed, a forced sweep, a relationship or
+  connector observation recorded again -- rewrote rows with the values they
+  already held, and each rewrite was a new revision that `changes_since`
+  reported and relay-desktop's probe uploaded again. The update triggers'
+  guard is generated from each table's live column list, so a column a
+  migration adds is guarded once the next writable open rebuilds it; a store
+  whose triggers predate the guard is migrated on that open.
+  `session_relationships.updated_ms` and `session_observations.updated_ms`
+  are now the time the row last changed: an upsert that would change only
+  that stamp is skipped. A presence updated in place (a new `source_stamp`)
+  no longer re-reports its session's catalog row, whose `locations` it cannot
+  change. Measured on the 100 MB synthetic store: hydrating a Claude session
+  the sweep already indexed reports 2 changes instead of 117 (115 of them
+  identical to what the feed already held), a Codex one 2 instead of 27, and
+  a fixture-corpus forced tick no longer re-reports relationships. Inserts,
+  deletes, tombstones and `SyncReport::changed` / `TickReport::changed` are
+  unchanged. Part of #215.
 
 ### Fixed
 

@@ -983,3 +983,52 @@ than widened into this change; see the pull request.
 The CI gate's `ci-debug` thresholds are not re-baselined: they are baselined
 per runner class (`ubuntu-latest`), these numbers come from a developer
 machine, and every gated phase moved in the safe direction.
+
+### 2026-10-01 change-feed changes for unchanged rows (#215)
+
+relay-desktop's probe uploads whatever `changes_since` reports, so a change
+for a row whose content did not move is paid again in transport, scrubbing,
+digesting and the cloud's projection lock. This counts the changes each
+operation emits and how many carry a row identical, column for column, to the
+one the feed last reported for that key.
+
+**How it was measured.** A scratch driver (not committed) over the harness's
+`full` store (seed 176, 100 MB, 3,518 sessions, release build) and over the
+checked-in fixture corpus staged into one home (51 sessions, with sidecars,
+forks, resumes, markers and Codex rollouts). It replays the feed from `START`
+into a map, then after each operation drains from the head before it and
+compares every upsert's `columns` with the map.
+
+| Operation | 100 MB store, base | this change | fixture corpus, base | this change |
+|---|---:|---:|---:|---:|
+| Forced tick, nothing changed | 0 | 0 | 17 (0 identical) | 15 (0 identical) |
+| Forced tick after a 1 KiB Claude append | 4 (0 identical) | 4 | 22 (0 identical) | 19 |
+| First hydration of a Claude session the sweep indexed | 117 (115 identical) | 2 | 8 (5 identical) | 2 |
+| First hydration of a Codex session the sweep indexed | 27 (25 identical) | 2 | 8 (6 identical) | 4 (2 identical) |
+| Repeat hydration (`unchanged`) | 0 | 0 | 0 | 0 |
+| `refresh_project_identity` after a sync | 0 | 0 | 0 | 0 |
+| `UPDATE sessions SET project_key = project_key` | 3,518 (all identical) | 0 | 51 (all identical) | 0 |
+| Forced tick after one Grok chat line | 40 (36 identical but for `id`) | 40 (36) | — | — |
+
+What is left, and why it stays:
+
+- The fixture corpus's forced-tick changes are real: five session ids are
+  claimed by two transcripts each, and every forced sweep rewrites the
+  catalog, presence and observation rows from whichever it read last. Filed
+  as its own issue.
+- The base corpus's two other forced-tick changes, and the three per append,
+  were relationships re-recorded with a new `updated_ms` and nothing else;
+  the relationship and observation upserts now skip such a write.
+- The two Codex events a hydration still re-reports are written with no
+  usage and patched a record later -- a real change and a change back.
+- Grok replaces a session's evidence wholesale on every re-read, so every
+  row comes back under a new `id`: a delete and an insert, not an update the
+  guard can see. Filed with the other delete-and-reinsert writers.
+
+Cost: the guard adds no work to an insert, and on an update it replaces the
+trigger body with a column comparison whenever nothing changed. The probe's
+cold sync of the 100 MB store took 15.2 s on the base and 15.4 s with this
+change (one run each, within run-to-run noise), and the `--gate` subset
+passes. `schema_is_current` now also reads each fed table's column list and
+its update trigger's text: 24 schema reads, under the 10 ms resolution of a
+`sqlite3` CLI timing of the same queries, process start included.
