@@ -1908,6 +1908,8 @@ pub(crate) fn checkpoint_after_sweep(
             false
         }
     };
+    #[cfg(test)]
+    run_after_passive_checkpoint_hook();
     if !complete || wal_len() <= truncate_above {
         return SweepCheckpoint {
             escalated: false,
@@ -1939,6 +1941,24 @@ pub(crate) fn checkpoint_after_sweep(
         complete,
         wal_bytes: wal_len(),
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Runs on this thread between the `PASSIVE` pass and the escalation
+    /// decision, so a test can change what other connections hold at exactly
+    /// that point instead of racing a sleep against the checkpoint.
+    static AFTER_PASSIVE_CHECKPOINT: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_after_passive_checkpoint_hook() {
+    AFTER_PASSIVE_CHECKPOINT.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook();
+        }
+    });
 }
 
 /// One `PRAGMA wal_checkpoint(<mode>)`: `(busy, log frames, checkpointed
@@ -34931,6 +34951,11 @@ mod post_sweep_checkpoint_tests {
     /// short pass does not escalate, a third connection's `BEGIN IMMEDIATE`
     /// issued as the reader leaves is not held up, and the next sweep's
     /// `PASSIVE` copies the backlog without the lock and then truncates.
+    ///
+    /// The reader is released from inside the checkpoint, after the pass
+    /// and before the escalation decision, through the test-only hook: the
+    /// pass has certainly seen the pinned snapshot, and the decision
+    /// certainly runs with the reader gone, whatever the scheduler does.
     #[test]
     fn a_large_backlog_released_mid_checkpoint_is_not_copied_under_the_write_lock() {
         let dir = tempfile::tempdir().unwrap();
@@ -34944,18 +34969,28 @@ mod post_sweep_checkpoint_tests {
             "backlog is only {backlog} bytes"
         );
 
-        let (started_tx, started_rx) = mpsc::channel();
+        // The pass reports here, then waits until the reader is gone.
+        let (passed_tx, passed_rx) = mpsc::channel::<()>();
+        let (released_tx, released_rx) = mpsc::channel::<()>();
         let checkpoint_path = db_path.clone();
         let checkpointer = std::thread::spawn(move || {
-            started_tx.send(()).unwrap();
+            AFTER_PASSIVE_CHECKPOINT.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    passed_tx.send(()).unwrap();
+                    released_rx.recv().unwrap();
+                }));
+            });
             let started = Instant::now();
             let outcome = checkpoint_after_sweep(&conn, &checkpoint_path, 0);
-            (outcome, started.elapsed(), conn)
+            let took = started.elapsed();
+            AFTER_PASSIVE_CHECKPOINT.with(|hook| hook.borrow_mut().take());
+            (outcome, took, conn)
         });
-        started_rx.recv().unwrap();
-        // Inside the 100 ms an escalated call would wait on the reader.
-        std::thread::sleep(Duration::from_millis(30));
+        passed_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the passive pass ran");
         reader.execute_batch("COMMIT;").unwrap();
+        released_tx.send(()).unwrap();
 
         let writer = Connection::open(&db_path).unwrap();
         writer.busy_timeout(Duration::from_secs(60)).unwrap();
