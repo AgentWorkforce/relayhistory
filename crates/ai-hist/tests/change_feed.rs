@@ -667,7 +667,8 @@ fn a_column_a_table_gains_is_carried_verbatim() {
     writer
         .execute_batch("ALTER TABLE tool_calls ADD COLUMN review_note TEXT;")
         .unwrap();
-    drop(ai_hist::open_db(&home.db()).unwrap());
+    // A fresh writable open runs the migration pass that rebuilds the guard.
+    drop(home.store());
     writer
         .execute_batch(
             "UPDATE tool_calls SET review_note = 'looked fine' \
