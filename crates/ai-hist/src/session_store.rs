@@ -54,7 +54,7 @@ use crate::store::{
     default_db_path, open_db, open_db_readonly, prompt_hash, schema_is_event_read_current,
     schema_is_evidence_read_current, schema_is_relationship_read_current,
     schema_is_usage_read_current, session_events_sized, session_file_edits, session_markers_sized,
-    session_prompts_sized, session_tool_calls, session_user_turns_page, PromptRow, SessionEvent,
+    session_prompts_sized, session_tool_calls, session_user_turns_all, PromptRow, SessionEvent,
     SessionFileEdit, SessionMarker, SessionScope, SessionToolCall, SessionUserTurn,
 };
 use crate::usage::{normalize_usage_str, source_accounting, NormalizedUsage, UsageAccounting};
@@ -1138,19 +1138,27 @@ impl SessionStore {
 }
 
 /// The catalog digest at the end of a locked section, and what moved since
-/// `before` — taken on **every** locked tick, swept or not.
+/// `before` — checked on **every** locked tick, swept or not.
 ///
 /// A hydration does not take the sync lock, so it can commit a catalog row
 /// while a sweep is deciding, from an unchanged source fingerprint, that
-/// there is nothing to do. Skipping the after-digest on such a tick would
-/// leave that row unreported for as long as the sources stay quiet; the
-/// digest costs one indexed scan of the catalog, which an unswept tick can
-/// afford.
+/// there is nothing to do. Skipping the check on such a tick would leave that
+/// row unreported for as long as the sources stay quiet. What the check costs
+/// is one read of the change-feed head when nothing was written since
+/// `before` — the head proves the catalog is the one `before` digested — and
+/// a scan of the catalog, a SHA-256 per row, only when something was.
 fn changes_under_lock(
     conn: &Connection,
     before: &CatalogFingerprint,
 ) -> Result<(CatalogFingerprint, Vec<SessionRef>), Error> {
-    let after = catalog_fingerprint(conn)?;
+    let head = catalog_head(conn)?;
+    if head.is_some() && head == before.head {
+        return Ok((before.clone(), Vec::new()));
+    }
+    let after = CatalogFingerprint {
+        head,
+        rows: Arc::new(catalog_row_digests(conn)?),
+    };
     let changed = catalog_changes(before, &after);
     Ok((after, changed))
 }
@@ -1367,14 +1375,27 @@ pub struct SyncReport {
 }
 
 /// One digest per catalog row over every column [`SyncReport::changed`]
-/// covers, keyed by `(source, session_id)`.
+/// covers, keyed by `(source, session_id)`, and the change-feed head it was
+/// read at.
 ///
 /// A digest rather than the values: the point is to notice that a row moved,
 /// not to keep two copies of the catalog, and a fixed 32 bytes per row makes
-/// the before/after maps the same size whatever the row holds. Once every
-/// catalog write stamps a revision column (the change feed's `revision`), this
-/// collapses to reading that one column.
-type CatalogFingerprint = BTreeMap<(String, String), [u8; 32]>;
+/// the before/after maps the same size whatever the row holds.
+///
+/// The head is what lets an unchanged tick skip the scan. Every insert and
+/// delete of a `sessions` row, and every update that changes one of its
+/// columns, moves the database-wide clock (the change feed's triggers), so a
+/// head equal to the one a digest was read at proves no row it covers has
+/// changed since. The rows stay the answer to
+/// *what* changed: a moved head says something was written, not that a
+/// covered column was, and `changed` reports only rows whose digest moved.
+/// `head` is `None` on a store whose feed is not installed, and such a digest
+/// is always recomputed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CatalogFingerprint {
+    head: Option<crate::change_feed::Watermark>,
+    rows: Arc<BTreeMap<(String, String), [u8; 32]>>,
+}
 
 /// The catalog columns the digest covers: everything a sweep, shallow
 /// discovery or the identity refresh can write, except the two text
@@ -1384,7 +1405,31 @@ const CATALOG_FINGERPRINT_COLUMNS: &str = "source_stamp, last_activity_ms, first
      raw_path, models_json, originator, agent_version, repo_url, initial_commit, \
      workspace_roots_json";
 
+/// The change-feed head, or `None` when this store's feed (and with it the
+/// guarantee that every catalog write moves the head) is not in place. The
+/// check is the narrow one for the catalog's own triggers, not the whole
+/// feed schema: this runs on every tick, and a sweep reads it twice.
+fn catalog_head(conn: &Connection) -> Result<Option<crate::change_feed::Watermark>, Error> {
+    if !crate::change_feed::catalog_writes_move_the_head(conn).map_err(Error::query)? {
+        return Ok(None);
+    }
+    crate::change_feed::read_head(conn)
+        .map(Some)
+        .map_err(Error::query)
+}
+
 fn catalog_fingerprint(conn: &Connection) -> Result<CatalogFingerprint, Error> {
+    // The head first: a write that lands between the two reads is then in
+    // the rows *and* past the head, so the next comparison rescans rather
+    // than trusting rows that already moved on.
+    let head = catalog_head(conn)?;
+    Ok(CatalogFingerprint {
+        head,
+        rows: Arc::new(catalog_row_digests(conn)?),
+    })
+}
+
+fn catalog_row_digests(conn: &Connection) -> Result<BTreeMap<(String, String), [u8; 32]>, Error> {
     use sha2::{Digest, Sha256};
     let mut stmt = conn
         .prepare(&format!(
@@ -1426,14 +1471,15 @@ fn catalog_fingerprint(conn: &Connection) -> Result<CatalogFingerprint, Error> {
             ))
         })
         .map_err(Error::sql)?;
-    rows.collect::<Result<CatalogFingerprint, _>>()
+    rows.collect::<Result<BTreeMap<_, _>, _>>()
         .map_err(Error::sql)
 }
 
 fn catalog_changes(before: &CatalogFingerprint, after: &CatalogFingerprint) -> Vec<SessionRef> {
     after
+        .rows
         .iter()
-        .filter(|(key, stamp)| before.get(*key) != Some(*stamp))
+        .filter(|(key, stamp)| before.rows.get(*key) != Some(*stamp))
         .filter_map(|((source, session_id), _)| {
             Source::parse(source).map(|source| SessionRef::id(source, session_id.clone()))
         })
@@ -2640,23 +2686,13 @@ impl Relationship {
     }
 }
 
-/// Every user turn, walking the bounded page internally.
+/// Every user turn, in one pass rather than one regrouping per page.
 fn all_user_turns(
     conn: &Connection,
     source: &str,
     session_id: &str,
 ) -> Result<Vec<SessionUserTurn>, Error> {
-    let mut turns = Vec::new();
-    let mut cursor = None;
-    loop {
-        let page = session_user_turns_page(conn, source, session_id, 1_000, cursor.as_ref())
-            .map_err(Error::query)?;
-        turns.extend(page.user_turns);
-        match page.next_cursor {
-            Some(next) => cursor = Some(next),
-            None => return Ok(turns),
-        }
-    }
+    session_user_turns_all(conn, source, session_id).map_err(Error::query)
 }
 
 /// Every model request, walking the bounded page internally.
@@ -3140,6 +3176,58 @@ mod tests {
             following.changed
         );
         watch.stop();
+    }
+
+    /// The after-digest is skipped only when the change-feed head proves the
+    /// catalog has not been written since `before`, and `changed` still
+    /// reports exactly the rows whose covered columns moved (#215).
+    #[test]
+    fn an_unwritten_catalog_is_not_rescanned_and_changes_stay_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ai-history.db");
+        store_at(&db);
+        let conn = open_db(&db).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sessions (session_id, source, discovery_state) \
+             VALUES ('one', 'claude', 'full'), ('two', 'codex', 'full')",
+        )
+        .unwrap();
+        let before = catalog_fingerprint(&conn).unwrap();
+        assert!(before.head.is_some(), "the feed is installed by open_db");
+
+        // Nothing written: the baseline itself comes back, unscanned.
+        let (after, changed) = changes_under_lock(&conn, &before).unwrap();
+        assert!(changed.is_empty());
+        assert!(
+            Arc::ptr_eq(&after.rows, &before.rows),
+            "the catalog was rescanned"
+        );
+
+        // A write to a column the digest does not cover moves the head, so
+        // the catalog is rescanned -- and nothing is reported.
+        conn.execute_batch("UPDATE sessions SET first_prompt = 'hello' WHERE session_id = 'one'")
+            .unwrap();
+        let (after, changed) = changes_under_lock(&conn, &before).unwrap();
+        assert_ne!(after.head, before.head);
+        assert!(!Arc::ptr_eq(&after.rows, &before.rows));
+        assert!(
+            changed.is_empty(),
+            "an excerpt is not a catalog change: {changed:?}"
+        );
+
+        // A covered column is reported, and only that row.
+        conn.execute_batch("UPDATE sessions SET cwd = '/elsewhere' WHERE session_id = 'two'")
+            .unwrap();
+        let (_, changed) = changes_under_lock(&conn, &after).unwrap();
+        assert_eq!(changed, vec![SessionRef::id(Source::Codex, "two")]);
+
+        // A store without the feed has no head to trust and always rescans.
+        let unfed = CatalogFingerprint {
+            head: None,
+            ..before.clone()
+        };
+        let (rescanned, _) = changes_under_lock(&conn, &unfed).unwrap();
+        assert!(!Arc::ptr_eq(&rescanned.rows, &unfed.rows));
     }
 
     /// A tick that fails keeps the rolling baseline, so the rows it (or

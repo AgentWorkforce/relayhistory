@@ -7,8 +7,8 @@
 //! themselves, which is the one thing a consumer must never need to do.
 
 use ai_hist::{
-    Change, ChangeKind, ChangeOp, ChangeQuery, EvidenceRow, SessionQuery, SessionRef, SessionStore,
-    Source, StoreOptions, Watermark,
+    Change, ChangeKind, ChangeOp, ChangeQuery, EvidenceRow, HydrateOptions, SessionQuery,
+    SessionRef, SessionStore, Source, StoreOptions, SyncOptions, Watermark,
 };
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags};
@@ -649,6 +649,12 @@ fn a_history_prompt_reaches_the_feed_with_its_stored_row() {
 /// A column a table gains after the feed was built is carried as soon as it
 /// exists, with every other column exactly as stored: JSON text stays text,
 /// integers stay integers, NULL stays null.
+///
+/// An update is stamped only when it changes a column the table's update
+/// guard names, and the guard is rebuilt over the live column list by the
+/// migration pass -- the same pass that adds a column in this crate. A column
+/// added from outside it is guarded from the next writable open on, which is
+/// what the reopen below stands for.
 #[test]
 fn a_column_a_table_gains_is_carried_verbatim() {
     let home = Home::new();
@@ -659,9 +665,13 @@ fn a_column_a_table_gains_is_carried_verbatim() {
     let head = store.head_revision().unwrap();
     let writer = home.raw_writer();
     writer
+        .execute_batch("ALTER TABLE tool_calls ADD COLUMN review_note TEXT;")
+        .unwrap();
+    // A fresh writable open runs the migration pass that rebuilds the guard.
+    drop(home.store());
+    writer
         .execute_batch(
-            "ALTER TABLE tool_calls ADD COLUMN review_note TEXT; \
-             UPDATE tool_calls SET review_note = 'looked fine' \
+            "UPDATE tool_calls SET review_note = 'looked fine' \
                  WHERE rowid = (SELECT MIN(rowid) FROM tool_calls);",
         )
         .unwrap();
@@ -1105,4 +1115,142 @@ fn a_session_drain_reads_one_session_of_many() {
         "the same identities as a three-table UNION: {:?}",
         started.elapsed()
     );
+}
+
+/// What a watch tick hands an uploader that drains the feed: a forced sweep
+/// over files that have not changed re-reads them and rewrites rows with the
+/// values they already hold, and none of that may reach the feed. A
+/// transcript that grew reports its new records and its own catalog,
+/// presence and observation rows, and nothing of any other session; a
+/// hydration of a session the sweep already indexed reports only what it
+/// changed (#215).
+#[test]
+fn a_forced_sweep_over_unchanged_files_reports_nothing() {
+    let home = Home::new();
+    let simple = home.stage_claude("simple-turn.jsonl");
+    for fixture in [
+        "multi-block-turn.jsonl",
+        "edit-revert.jsonl",
+        "compact-boundary.jsonl",
+        "resume-marker.jsonl",
+    ] {
+        home.stage_claude(fixture);
+    }
+    // The sidecar carries its parent's session id, as Claude subagent
+    // transcripts do. It is read as the parent's related transcript, not as
+    // a second claim on the catalog row, so it must not churn either. Two
+    // top-level transcripts that claim one session id do still churn on
+    // every forced tick (#328); none is staged here.
+    let sidecar = fixtures_root().join("claude/sidecar-subagent/.claude/projects/corpus");
+    let corpus = home.claude_transcript("claude-sidecar-parent.jsonl");
+    fs::copy(sidecar.join("claude-sidecar-parent.jsonl"), &corpus).unwrap();
+    let subagents = corpus.with_extension("").join("subagents");
+    fs::create_dir_all(&subagents).unwrap();
+    for file in ["agent-plan01.jsonl", "agent-plan01.meta.json"] {
+        fs::copy(
+            sidecar.join("claude-sidecar-parent/subagents").join(file),
+            subagents.join(file),
+        )
+        .unwrap();
+    }
+    for fixture in [
+        "compaction.jsonl",
+        "with-tool-call.jsonl",
+        "with-spawn-agent.jsonl",
+    ] {
+        home.stage_codex(fixture);
+    }
+    let store = home.store();
+    let mut forced = SyncOptions::default();
+    forced.force = true;
+    store.sync(SyncOptions::default()).unwrap();
+    store.sync(forced.clone()).unwrap();
+    let kinds: BTreeSet<ChangeKind> = drain(&store, Watermark::START)
+        .iter()
+        .map(|change| change.kind)
+        .collect();
+    for kind in [
+        ChangeKind::SessionEvent,
+        ChangeKind::ToolCall,
+        ChangeKind::FileEdit,
+        ChangeKind::SessionMarker,
+        ChangeKind::Relationship,
+        ChangeKind::Presence,
+        ChangeKind::SourceObservation,
+    ] {
+        assert!(kinds.contains(&kind), "the corpus writes {kind:?}");
+    }
+
+    for round in 0..2 {
+        let head = store.head_revision().unwrap();
+        store.sync(forced.clone()).unwrap();
+        let delta = drain(&store, head);
+        assert!(delta.is_empty(), "forced tick {round}: {delta:?}");
+        assert_eq!(store.head_revision().unwrap(), head, "forced tick {round}");
+    }
+
+    // One complete turn appended to one transcript. Its time is one no
+    // fixture uses: `resume-marker.jsonl`, which resumes this session, starts
+    // at 2026-04-21, and a shared value would make its edge's
+    // `spawned_at_ms` look as if the append had moved it. The edge is
+    // re-recorded on this tick (its parent changed) and must not be
+    // re-reported: nothing about it changed.
+    let mut contents = fs::read_to_string(&simple).unwrap();
+    contents.push_str(
+        r#"{"parentUuid":null,"isSidechain":false,"type":"user","message":{"role":"user","content":"and again"},"uuid":"u-tick-1","timestamp":"2026-04-22T00:00:00.000Z","cwd":"/tmp/project","sessionId":"11111111-1111-1111-1111-111111111111","version":"2.1.96"}"#,
+    );
+    contents.push('\n');
+    fs::write(&simple, contents).unwrap();
+    let head = store.head_revision().unwrap();
+    store.sync(forced.clone()).unwrap();
+    let delta = drain(&store, head);
+    let others: Vec<&Change> = delta
+        .iter()
+        .filter(|change| change.session_id != "11111111-1111-1111-1111-111111111111")
+        .collect();
+    assert!(others.is_empty(), "only the grown session: {others:?}");
+    let reported: BTreeSet<ChangeKind> = delta.iter().map(|change| change.kind).collect();
+    assert!(
+        reported.is_subset(&BTreeSet::from([
+            ChangeKind::SessionEvent,
+            ChangeKind::History,
+            ChangeKind::Session,
+            ChangeKind::Presence,
+            ChangeKind::SourceObservation,
+        ])),
+        "the new record and the grown session's own rows: {delta:?}"
+    );
+    assert!(delta.iter().any(|change| matches!(
+        &change.op,
+        ChangeOp::Upsert(EvidenceRow::SessionEvent(event)) if event.event_uid.starts_with("u-tick-1")
+    )));
+
+    // A hydration over the sweep's rows rewrites every record it re-reads
+    // -- events, tool calls, the sidecar's relationship, the presence --
+    // with the values the sweep stored: none of them is reported. What it
+    // does change is the catalog row's parser stamp and the observation's
+    // discovery state. (Codex is not here: its re-read writes an event's
+    // usage as NULL and patches it back a record later, a real change and a
+    // real change back; see the pull request's deferred list.)
+    for session in [
+        SessionRef::id(Source::Claude, "claude-sidecar-parent"),
+        SessionRef::id(Source::Claude, "22222222-2222-2222-2222-222222222222"),
+    ] {
+        let head = store.head_revision().unwrap();
+        store.hydrate(&session, HydrateOptions::default()).unwrap();
+        let delta = drain(&store, head);
+        let evidence: Vec<&Change> = delta
+            .iter()
+            .filter(|change| {
+                !matches!(
+                    change.kind,
+                    ChangeKind::Session | ChangeKind::SourceObservation
+                )
+            })
+            .collect();
+        assert!(
+            evidence.is_empty(),
+            "{session:?}: a re-read of indexed records reports none of them: {evidence:?}"
+        );
+    }
 }

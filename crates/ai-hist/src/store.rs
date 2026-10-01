@@ -539,6 +539,34 @@ fn configure_busy_retry(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// A short busy budget for the calls made while it lives, in place of the
+/// production retry sequence.
+///
+/// SQLite keeps one busy handler per connection, and `busy_timeout` replaces
+/// it, so this swaps the ~30 s [`busy_retry_handler`] out for a plain timeout
+/// and puts it back when dropped. It cannot read back what was installed
+/// before — SQLite has no getter for a busy handler — so it is only for
+/// connections opened through [`open_db`] or [`open_db_readonly`], which is
+/// what it restores.
+pub(crate) struct ShortBusyBudget<'a> {
+    conn: &'a Connection,
+}
+
+impl<'a> ShortBusyBudget<'a> {
+    pub(crate) fn new(conn: &'a Connection, budget: Duration) -> Result<Self> {
+        conn.busy_timeout(budget)?;
+        Ok(Self { conn })
+    }
+}
+
+impl Drop for ShortBusyBudget<'_> {
+    fn drop(&mut self) {
+        // Best effort, like discovery's scoped `synchronous`: installing a
+        // busy handler only fails on a connection being torn down.
+        let _ = configure_busy_retry(self.conn);
+    }
+}
+
 fn sqlite_lock_error(error: &rusqlite::Error) -> bool {
     matches!(
         error,
@@ -809,6 +837,9 @@ const REQUIRED_INDEXES: &[&str] = &[
     // against the record that carries it, across every session. Without this
     // that is a scan of every event on every hydration.
     "idx_session_events_message",
+    // ... and the uid half of the same lookup, for the rows the message id
+    // cannot find.
+    "idx_session_events_claude_uid_unmatched",
     // Settling a streamed Claude request's usage reads every row of that
     // request once per assistant record; without it that is a scan of the
     // session per record. Also what routes a database stored before the
@@ -1837,6 +1868,28 @@ VALUES ('session_presences_local_backfill_v1');
         "CREATE INDEX IF NOT EXISTS idx_session_events_message ON session_events(source, message_id)",
         [],
     )?;
+    // The other half of that lookup: a Claude record can resolve through its
+    // first block's uid, `<uuid>:0`, as well as its message id. Searching the
+    // uid without a session is not something the `(source, session_id,
+    // event_uid)` key can do, and asking both in one OR left every pending
+    // transcript scanning every Claude event on every sweep. Partial, and on
+    // only the rows the message-id search cannot already see -- a block-0 uid
+    // that does not extend the row's own message id -- so it is empty on a
+    // store the parser wrote and costs an insert nothing. The `WHERE` is
+    // `continuity::CLAUDE_UID_UNMATCHED_PREDICATE`, the same text the lookup
+    // is built from, which is how SQLite proves the index applies. `source`
+    // leads although the `WHERE` pins it: without statistics the planner
+    // ranks an index by how many equalities it matches, and one on
+    // `event_uid` alone tied with every `(source, ...)` index and lost.
+    conn.execute(
+        &format!(
+            "CREATE INDEX IF NOT EXISTS idx_session_events_claude_uid_unmatched \
+             ON session_events(source, event_uid) \
+             WHERE {}",
+            crate::continuity::CLAUDE_UID_UNMATCHED_PREDICATE
+        ),
+        [],
+    )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_session_events_source_page ON session_events(source, session_id, ts_ms, id)",
         [],
@@ -2298,6 +2351,10 @@ fn migrate_session_markers_v2(conn: &Connection) -> Result<()> {
                 params![bounded, id],
             )?;
         }
+        // SQLite refuses to drop a column a trigger names, and the change
+        // feed's update guard names every column; `init_schema` rebuilds it
+        // from the remaining ones at the end of this pass.
+        crate::change_feed::release_update_guard(conn, "session_markers")?;
         conn.execute("ALTER TABLE session_markers DROP COLUMN detail_json", [])?;
     }
     conn.execute(
@@ -3061,6 +3118,17 @@ pub(crate) fn row_to_session_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<
     })
 }
 
+/// The order every whole-session event read uses: oldest first, rows sharing
+/// a timestamp in insertion order.
+///
+/// `session_events.ts_ms` is `NOT NULL` and has been since the table was
+/// first created, so the `ts_ms IS NULL` leading term the evidence tables use
+/// is a constant here. Spelling it anyway cost a temp b-tree sort of every
+/// row the read returns, text included: the leading term is an expression
+/// `idx_session_events_source_page` and `idx_session_events_page` do not
+/// carry, so they could not deliver the order. Without it they do.
+const SESSION_EVENT_ORDER: &str = "ORDER BY ts_ms ASC, id ASC";
+
 /// All normalized events for one session, oldest first. Rows sharing a
 /// timestamp keep insertion order via the rowid tiebreaker.
 pub fn session_events(
@@ -3075,7 +3143,8 @@ pub fn session_events(
         sql.push_str(" AND source = ?");
         params_vec.push(source.to_string());
     }
-    sql.push_str(" ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC");
+    sql.push(' ');
+    sql.push_str(SESSION_EVENT_ORDER);
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), row_to_session_event)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -3099,10 +3168,7 @@ pub(crate) fn session_events_sized(
     } else {
         SESSION_EVENT_COLUMNS.replacen(", text, ", ", NULL AS text, ", 1)
     };
-    let sql = format!(
-        "SELECT {columns}, LENGTH(CAST(text AS BLOB)) FROM session_events \
-         WHERE source = ? AND session_id = ? ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC"
-    );
+    let sql = session_events_sized_sql(&columns);
     let mut stmt = conn.prepare(&sql)?;
     // The size lands after every event column, so it is addressed by the
     // statement's own arity rather than a literal: a column added to
@@ -3112,6 +3178,14 @@ pub(crate) fn session_events_sized(
         Ok((row_to_session_event(row)?, row.get::<_, Option<i64>>(size)?))
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// [`session_events_sized`]'s statement, shared with its query-plan test.
+fn session_events_sized_sql(columns: &str) -> String {
+    format!(
+        "SELECT {columns}, LENGTH(CAST(text AS BLOB)) FROM session_events \
+         WHERE source = ? AND session_id = ? {SESSION_EVENT_ORDER}"
+    )
 }
 
 /// One `history` row as [`crate::SessionStore::session`] reads it: the
@@ -3651,8 +3725,9 @@ const USER_TURN_ROW_FILTER: &str = "((role = 'user' AND control_kind IS NULL) \
 
 /// The message recorded next to a turn, on either side of it.
 ///
-/// The neighbour is looked for from the turn's *first* block in `(ts_ms, id)`
-/// order, and every row sharing that turn's key is excluded, so the turn's own
+/// The neighbour is looked for from the turn's *anchor* -- its earliest
+/// `(ts_ms, id)` position, the same one the page is ordered and continued on
+/// -- and every row sharing that turn's key is excluded, so the turn's own
 /// later blocks can never be reported as the message that follows it. The
 /// search is over every event of the session, not only user-side ones: what
 /// precedes a human turn is normally the assistant message it answers, which
@@ -3660,8 +3735,55 @@ const USER_TURN_ROW_FILTER: &str = "((role = 'user' AND control_kind IS NULL) \
 /// the answer, so the search passes over it to the nearest row that can be --
 /// reporting `NULL` there would say "no message borders this turn" about a
 /// session that has one, and an empty id would be worse.
-const USER_TURN_NEIGHBOUR_SELECT: &str = "SELECT NULLIF(message_id, '') FROM session_events \
-     WHERE source = ? AND session_id = ? AND NULLIF(message_id, '') IS NOT NULL";
+///
+/// This statement only seeds that search: it finds the nearest named message
+/// before a position, optionally skipping one id, walking
+/// `idx_session_events_source_page` backwards from the position. Everything
+/// after it is resolved from the one ordered pass in [`fill_user_turns`].
+const USER_TURN_NAMED_BEFORE: &str = "SELECT NULLIF(message_id, '') FROM session_events \
+     WHERE source = ? AND session_id = ? AND (ts_ms, id) < (?, ?) \
+       AND NULLIF(message_id, '') IS NOT NULL AND message_id <> ? \
+     ORDER BY ts_ms DESC, id DESC LIMIT 1";
+
+/// Every event of one session from a position onwards, in `(ts_ms, id)`
+/// order, with whether it is a user-turn block. One range seek on
+/// `idx_session_events_source_page`; the byte length is only computed for
+/// block rows at or before the page's last block timestamp (the fifth
+/// parameter), so a large tool result's text is never read just to be passed
+/// over, whether it sits inside the page's span or in the rows read past it
+/// while locating the following named message.
+fn user_turn_stream_sql() -> String {
+    format!(
+        "SELECT id, ts_ms, NULLIF(message_id, ''), \
+                CASE WHEN {USER_TURN_ROW_FILTER} THEN 1 ELSE 0 END, \
+                role, kind, tool_use_id, result_status, \
+                CASE WHEN ts_ms <= ? AND {USER_TURN_ROW_FILTER} THEN {USER_TURN_BYTE_LEN} END \
+         FROM session_events \
+         WHERE source = ? AND session_id = ? AND (ts_ms, id) >= (?, ?) \
+         ORDER BY ts_ms ASC, id ASC"
+    )
+}
+
+/// The turn headers: one row per turn key, with the turn's anchor
+/// `(MIN(ts_ms), MIN(id))`, its provider message id, and the timestamp of its
+/// last block, which is where the block pass may stop reading.
+fn user_turn_header_sql(after: bool, limited: bool) -> String {
+    let mut sql = format!(
+        "SELECT {USER_TURN_KEY} AS turn_key, MIN(ts_ms) AS turn_ts, MIN(id) AS turn_id, \
+         MIN(NULLIF(message_id, '')) AS turn_message_id, MAX(ts_ms) AS turn_last_ts \
+         FROM session_events \
+         WHERE source = ? AND session_id = ? AND {USER_TURN_ROW_FILTER} \
+         GROUP BY turn_key"
+    );
+    if after {
+        sql.push_str(" HAVING turn_ts > ? OR (turn_ts = ? AND turn_id > ?)");
+    }
+    sql.push_str(" ORDER BY turn_ts ASC, turn_id ASC");
+    if limited {
+        sql.push_str(" LIMIT ?");
+    }
+    sql
+}
 
 /// One bounded page of user turns for one session, oldest first.
 ///
@@ -3690,7 +3812,29 @@ pub fn session_user_turns_page(
     after: Option<&SessionEventCursor>,
 ) -> Result<SessionUserTurnPage> {
     let limit = limit.clamp(1, 1_000);
-    // The turn headers and each turn's blocks are separate statements, and a
+    read_user_turns(conn, source, session_id, Some(limit), after)
+}
+
+/// Every user turn of one session, in page order, read in one pass.
+///
+/// Exactly the concatenation of every [`session_user_turns_page`] page, but
+/// without regrouping the whole session once per thousand turns.
+pub(crate) fn session_user_turns_all(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+) -> Result<Vec<SessionUserTurn>> {
+    Ok(read_user_turns(conn, source, session_id, None, None)?.user_turns)
+}
+
+fn read_user_turns(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+    limit: Option<i64>,
+    after: Option<&SessionEventCursor>,
+) -> Result<SessionUserTurnPage> {
+    // The turn headers and the turns' blocks are separate statements, and a
     // sync writing to this database between them would hand back a header
     // whose blocks had moved or vanished -- an empty `blocks` array on a turn
     // that has them, and a cursor that has already advanced past it. One
@@ -3704,113 +3848,35 @@ pub fn session_user_turns_page(
         .is_autocommit()
         .then(|| conn.unchecked_transaction())
         .transpose()?;
-    let mut sql = format!(
-        "SELECT {USER_TURN_KEY} AS turn_key, MIN(ts_ms) AS turn_ts, MIN(id) AS turn_id, \
-         MIN(NULLIF(message_id, '')) AS turn_message_id \
-         FROM session_events \
-         WHERE source = ? AND session_id = ? AND {USER_TURN_ROW_FILTER} \
-         GROUP BY turn_key"
-    );
+    let sql = user_turn_header_sql(after.is_some(), limit.is_some());
     let mut params_vec: Vec<rusqlite::types::Value> =
         vec![source.to_string().into(), session_id.to_string().into()];
     if let Some(cursor) = after {
-        sql.push_str(" HAVING turn_ts > ? OR (turn_ts = ? AND turn_id > ?)");
         params_vec.push(cursor.ts_ms.into());
         params_vec.push(cursor.ts_ms.into());
         params_vec.push(cursor.id.into());
     }
-    sql.push_str(" ORDER BY turn_ts ASC, turn_id ASC LIMIT ?");
-    params_vec.push((limit + 1).into());
+    if let Some(limit) = limit {
+        params_vec.push((limit + 1).into());
+    }
 
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, i64>(2)?,
-            row.get::<_, Option<String>>(3)?,
-        ))
+        Ok(UserTurnHeader {
+            key: row.get(0)?,
+            ts_ms: row.get(1)?,
+            id: row.get(2)?,
+            message_id: row.get(3)?,
+            last_ts_ms: row.get(4)?,
+        })
     })?;
-    let mut turns = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-    let has_more = turns.len() > limit as usize;
-    if has_more {
-        turns.truncate(limit as usize);
+    let mut headers = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    let has_more = limit.is_some_and(|limit| headers.len() > limit as usize);
+    if let Some(limit) = limit {
+        headers.truncate(limit as usize);
     }
 
-    let mut user_turns = Vec::with_capacity(turns.len());
-    let mut block_stmt = conn.prepare(&format!(
-        "SELECT role, kind, tool_use_id, {USER_TURN_BYTE_LEN}, result_status \
-         FROM session_events \
-         WHERE source = ? AND session_id = ? AND {USER_TURN_ROW_FILTER} \
-           AND {USER_TURN_KEY} = ? \
-         ORDER BY ts_ms ASC, id ASC"
-    ))?;
-    let mut preceding_stmt = conn.prepare(&format!(
-        "{USER_TURN_NEIGHBOUR_SELECT} AND {USER_TURN_KEY} <> ? \
-           AND (ts_ms < ? OR (ts_ms = ? AND id < ?)) \
-         ORDER BY ts_ms DESC, id DESC LIMIT 1"
-    ))?;
-    let mut following_stmt = conn.prepare(&format!(
-        "{USER_TURN_NEIGHBOUR_SELECT} AND {USER_TURN_KEY} <> ? \
-           AND (ts_ms > ? OR (ts_ms = ? AND id > ?)) \
-         ORDER BY ts_ms ASC, id ASC LIMIT 1"
-    ))?;
-    for (turn_key, ts_ms, id, message_id) in turns {
-        let blocks = block_stmt
-            .query_map(params![source, session_id, turn_key], |row| {
-                let role: String = row.get(0)?;
-                let kind: String = row.get(1)?;
-                let tool_use_id: Option<String> = row.get(2)?;
-                let byte_len: i64 = row.get(3)?;
-                let result_status: Option<String> = row.get(4)?;
-                let is_tool_result = role == "tool_result" || kind == "tool_result";
-                Ok(SessionUserTurnBlock {
-                    kind: if is_tool_result {
-                        "tool_result"
-                    } else {
-                        "text"
-                    }
-                    .to_string(),
-                    tool_use_id: is_tool_result.then_some(tool_use_id).flatten(),
-                    byte_len,
-                    // `is_error` has three states and the statuses have
-                    // five, so the collapse has to keep "known" separate
-                    // from "not yet known". `cancelled` is terminal and
-                    // stated by the provider: it did not succeed, and
-                    // reporting null would make it read exactly like a
-                    // result still in flight. The status itself stays on the
-                    // event for a consumer that needs to tell a cancellation
-                    // from a failure.
-                    is_error: match result_status.as_deref() {
-                        Some("errored" | "cancelled") => Some(1),
-                        Some("completed") => Some(0),
-                        _ => None,
-                    },
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let neighbour = |stmt: &mut rusqlite::Statement<'_>| -> Result<Option<String>> {
-            Ok(stmt
-                .query_row(
-                    params![source, session_id, &turn_key, ts_ms, ts_ms, id],
-                    |row| row.get::<_, Option<String>>(0),
-                )
-                .optional()?
-                .flatten())
-        };
-        let preceding_message_id = neighbour(&mut preceding_stmt)?;
-        let following_message_id = neighbour(&mut following_stmt)?;
-        user_turns.push(SessionUserTurn {
-            id,
-            source: source.to_string(),
-            session_id: session_id.to_string(),
-            message_id,
-            preceding_message_id,
-            following_message_id,
-            ts_ms,
-            blocks,
-        });
-    }
+    let user_turns = fill_user_turns(conn, source, session_id, &headers)?;
 
     let next_cursor = has_more.then(|| {
         let last = user_turns.last().expect("non-empty page");
@@ -3828,6 +3894,181 @@ pub fn session_user_turns_page(
         user_turns,
         next_cursor,
     })
+}
+
+struct UserTurnHeader {
+    key: String,
+    ts_ms: i64,
+    id: i64,
+    message_id: Option<String>,
+    last_ts_ms: i64,
+}
+
+/// The blocks and neighbours of a page of turns, from one ordered pass.
+///
+/// Every block of every turn on the page lies at or after the page's first
+/// anchor (a turn's anchor is the minimum of its own rows) and at or before
+/// the latest `last_ts_ms`, so one range read of the session in
+/// `(ts_ms, id)` order sees all of them, already in block order. The same
+/// pass resolves both neighbours: walking forward, the nearest named message
+/// before an anchor is the last one seen unless it is the turn's own, in
+/// which case it is the last *different* one seen; and the nearest after is
+/// the first named row past the anchor that is not the turn's own. Only the
+/// state before the first anchor is read separately, by two backward seeks.
+///
+/// This replaced one block read and two neighbour reads per turn, the block
+/// read filtering on the computed turn key -- which no index can serve, so
+/// each one walked the whole session and a page cost turns x events (#307).
+fn fill_user_turns(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+    headers: &[UserTurnHeader],
+) -> Result<Vec<SessionUserTurn>> {
+    let mut user_turns: Vec<SessionUserTurn> = headers
+        .iter()
+        .map(|header| SessionUserTurn {
+            id: header.id,
+            source: source.to_string(),
+            session_id: session_id.to_string(),
+            message_id: header.message_id.clone(),
+            preceding_message_id: None,
+            following_message_id: None,
+            ts_ms: header.ts_ms,
+            blocks: Vec::new(),
+        })
+        .collect();
+    let Some(first) = headers.first() else {
+        return Ok(user_turns);
+    };
+    let last_block_ts = headers
+        .iter()
+        .map(|header| header.last_ts_ms)
+        .max()
+        .expect("non-empty page");
+    let by_key: std::collections::HashMap<&str, usize> = headers
+        .iter()
+        .enumerate()
+        .map(|(index, header)| (header.key.as_str(), index))
+        .collect();
+
+    // The named messages before the first anchor: the nearest one, and the
+    // nearest one that differs from it. Those two are all the backward search
+    // from any anchor can need, because every row between them and the anchor
+    // is either unnamed or carries the nearest one's id.
+    let mut before_stmt = conn.prepare_cached(USER_TURN_NAMED_BEFORE)?;
+    let mut named_before = |skip: &str| -> Result<Option<String>> {
+        Ok(before_stmt
+            .query_row(
+                params![source, session_id, first.ts_ms, first.id, skip],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    };
+    // `message_id <> ''` excludes nothing a named row can carry.
+    let mut last_named = named_before("")?;
+    let mut previous_named = match &last_named {
+        Some(last) => named_before(last)?,
+        None => None,
+    };
+
+    let mut stream = conn.prepare(&user_turn_stream_sql())?;
+    let mut rows = stream.query(params![
+        last_block_ts,
+        source,
+        session_id,
+        first.ts_ms,
+        first.id
+    ])?;
+    // Turns whose anchor has been reached, still waiting for the named
+    // message that follows them. Every turn has its own key, so a named row
+    // releases all of them but at most the one it belongs to.
+    let mut awaiting_following: Vec<usize> = Vec::new();
+    let mut next_anchor = 0;
+    while let Some(row) = rows.next()? {
+        let id: i64 = row.get(0)?;
+        let ts_ms: i64 = row.get(1)?;
+        let at = (ts_ms, id);
+        if next_anchor == headers.len() && awaiting_following.is_empty() && ts_ms > last_block_ts {
+            break;
+        }
+        // Rows strictly before an anchor have all been seen once the first
+        // row at or past it arrives.
+        while let Some(header) = headers.get(next_anchor) {
+            if (header.ts_ms, header.id) > at {
+                break;
+            }
+            user_turns[next_anchor].preceding_message_id = match &last_named {
+                Some(last) if *last != header.key => Some(last.clone()),
+                _ => previous_named.clone(),
+            };
+            awaiting_following.push(next_anchor);
+            next_anchor += 1;
+        }
+        let message_id: Option<String> = row.get(2)?;
+        if let Some(message_id) = &message_id {
+            awaiting_following.retain(|&index| {
+                let header = &headers[index];
+                if (header.ts_ms, header.id) < at && header.key != *message_id {
+                    user_turns[index].following_message_id = Some(message_id.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            if last_named.as_deref() != Some(message_id.as_str()) {
+                previous_named = last_named.replace(message_id.clone());
+            }
+        }
+        if row.get::<_, i64>(3)? == 1 {
+            let key = match &message_id {
+                Some(message_id) => std::borrow::Cow::Borrowed(message_id.as_str()),
+                None => std::borrow::Cow::Owned(format!("event:{id}")),
+            };
+            if let Some(&index) = by_key.get(key.as_ref()) {
+                user_turns[index].blocks.push(user_turn_block(
+                    &row.get::<_, String>(4)?,
+                    &row.get::<_, String>(5)?,
+                    row.get(6)?,
+                    row.get(8)?,
+                    row.get::<_, Option<String>>(7)?.as_deref(),
+                ));
+            }
+        }
+    }
+    Ok(user_turns)
+}
+
+fn user_turn_block(
+    role: &str,
+    kind: &str,
+    tool_use_id: Option<String>,
+    byte_len: i64,
+    result_status: Option<&str>,
+) -> SessionUserTurnBlock {
+    let is_tool_result = role == "tool_result" || kind == "tool_result";
+    SessionUserTurnBlock {
+        kind: if is_tool_result {
+            "tool_result"
+        } else {
+            "text"
+        }
+        .to_string(),
+        tool_use_id: is_tool_result.then_some(tool_use_id).flatten(),
+        byte_len,
+        // `is_error` has three states and the statuses have five, so the
+        // collapse has to keep "known" separate from "not yet known".
+        // `cancelled` is terminal and stated by the provider: it did not
+        // succeed, and reporting null would make it read exactly like a result
+        // still in flight. The status itself stays on the event for a consumer
+        // that needs to tell a cancellation from a failure.
+        is_error: match result_status {
+            Some("errored" | "cancelled") => Some(1),
+            Some("completed") => Some(0),
+            _ => None,
+        },
+    }
 }
 
 pub fn stats(conn: &Connection, tag: Option<&str>) -> Result<Stats> {
@@ -5615,13 +5856,7 @@ mod tests {
                     false
                 }),
             );
-            let sql = format!(
-                "SELECT {USER_TURN_KEY} AS turn_key, MIN(ts_ms) AS turn_ts, MIN(id) AS turn_id, \
-                 MIN(NULLIF(message_id, '')) AS turn_message_id \
-                 FROM session_events \
-                 WHERE source = ? AND session_id = ? AND {USER_TURN_ROW_FILTER} \
-                 GROUP BY turn_key ORDER BY turn_ts ASC, turn_id ASC LIMIT ?"
-            );
+            let sql = user_turn_header_sql(false, true);
             let mut stmt = probe.prepare(&sql).unwrap();
             let rows = stmt
                 .query_map(rusqlite::params!["claude", "s1", 101], |row| {
@@ -8189,6 +8424,8 @@ mod tests {
                 )
                 .unwrap();
             drop_session_requests_view(&legacy);
+            // An older database's update trigger predates the columns too.
+            crate::change_feed::release_update_guard(&legacy, "session_events").unwrap();
             for (column, _) in REQUIRED_SESSION_EVENT_COLUMNS {
                 legacy
                     .execute_batch(&format!("ALTER TABLE session_events DROP COLUMN {column};"))
@@ -8258,6 +8495,8 @@ mod tests {
         {
             let legacy = open_db(&legacy_path).unwrap();
             drop_session_requests_view(&legacy);
+            // An older database's update trigger predates the columns too.
+            crate::change_feed::release_update_guard(&legacy, "session_events").unwrap();
             for (column, _) in REQUIRED_SESSION_EVENT_COLUMNS {
                 legacy
                     .execute_batch(&format!("ALTER TABLE session_events DROP COLUMN {column};"))
@@ -8357,6 +8596,83 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap()
+    }
+
+    fn bound_query_plan(conn: &Connection, sql: &str, params: &[&dyn rusqlite::ToSql]) -> String {
+        conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map(params, |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join(" | ")
+    }
+
+    /// A whole-session event read is delivered in order by the page index
+    /// rather than sorted. `ts_ms` is `NOT NULL`, so the `ts_ms IS NULL`
+    /// term the evidence tables need was a constant here, and it alone made
+    /// SQLite copy every row -- text included -- into a temp b-tree to sort
+    /// it (#215).
+    #[test]
+    fn whole_session_event_reads_are_delivered_in_index_order() {
+        for analyze in [false, true] {
+            let conn = planned_store(analyze);
+            let with_source = format!(
+                "SELECT {SESSION_EVENT_COLUMNS} FROM session_events \
+                 WHERE session_id = ?1 AND source = ?2 {SESSION_EVENT_ORDER}"
+            );
+            let without_source = format!(
+                "SELECT {SESSION_EVENT_COLUMNS} FROM session_events \
+                 WHERE session_id = ?1 {SESSION_EVENT_ORDER}"
+            );
+            let sized = session_events_sized_sql(SESSION_EVENT_COLUMNS);
+            for (name, plan, index) in [
+                (
+                    "session_events with a source",
+                    bound_query_plan(&conn, &with_source, &[&"s1", &"codex"]),
+                    "idx_session_events_source_page",
+                ),
+                (
+                    "session_events without one",
+                    bound_query_plan(&conn, &without_source, &[&"s1"]),
+                    "idx_session_events_page",
+                ),
+                (
+                    "session_events_sized",
+                    bound_query_plan(&conn, &sized, &[&"codex", &"s1"]),
+                    "idx_session_events_source_page",
+                ),
+            ] {
+                assert!(
+                    !plan.contains("TEMP B-TREE"),
+                    "{name} sorts its rows (analyze={analyze}): {plan}"
+                );
+                assert!(
+                    plan.contains(index),
+                    "{name} is not read through {index} (analyze={analyze}): {plan}"
+                );
+            }
+            // The order itself, not only the plan: oldest first, ties by id.
+            conn.execute(
+                "INSERT INTO session_events (source, session_id, ts_ms, role, kind, text, event_uid) \
+                 VALUES ('codex', 's1', -1, 'user', 'text', 'early', 'early')",
+                [],
+            )
+            .unwrap();
+            let read = session_events(&conn, "s1", Some("codex")).unwrap();
+            let sized = session_events_sized(&conn, "codex", "s1", false).unwrap();
+            assert_eq!(
+                read.first().map(|event| event.event_uid.as_str()),
+                Some("early")
+            );
+            assert!(read
+                .windows(2)
+                .all(|pair| (pair[0].ts_ms, pair[0].id) < (pair[1].ts_ms, pair[1].id)));
+            assert_eq!(
+                read.iter().map(|event| event.id).collect::<Vec<_>>(),
+                sized.iter().map(|(event, _)| event.id).collect::<Vec<_>>()
+            );
+        }
     }
 
     /// The identity refresh runs twice per sweep and once per discovery pass,
@@ -8477,6 +8793,427 @@ mod scoped_project_identity_tests {
                 refresh_session_project_identity(&conn, "codex", "root").unwrap(),
                 0
             );
+        }
+    }
+}
+
+/// The user-turn page reads its blocks and neighbours in one ordered pass
+/// instead of three statements per turn (#307). These pin the result to the
+/// per-turn statements it replaced, and the cost to the session's size.
+#[cfg(test)]
+mod user_turn_pass_tests {
+    use super::*;
+
+    /// The implementation before #307, verbatim in its SQL: one header
+    /// grouping, then per turn a block read on the computed key and two
+    /// neighbour reads. Slow, and the definition the single pass must match.
+    fn reference_page(
+        conn: &Connection,
+        source: &str,
+        session_id: &str,
+        limit: i64,
+        after: Option<&SessionEventCursor>,
+    ) -> SessionUserTurnPage {
+        let limit = limit.clamp(1, 1_000);
+        let mut sql = format!(
+            "SELECT {USER_TURN_KEY} AS turn_key, MIN(ts_ms) AS turn_ts, MIN(id) AS turn_id, \
+             MIN(NULLIF(message_id, '')) AS turn_message_id \
+             FROM session_events \
+             WHERE source = ? AND session_id = ? AND {USER_TURN_ROW_FILTER} \
+             GROUP BY turn_key"
+        );
+        let mut params_vec: Vec<rusqlite::types::Value> =
+            vec![source.to_string().into(), session_id.to_string().into()];
+        if let Some(cursor) = after {
+            sql.push_str(" HAVING turn_ts > ? OR (turn_ts = ? AND turn_id > ?)");
+            params_vec.push(cursor.ts_ms.into());
+            params_vec.push(cursor.ts_ms.into());
+            params_vec.push(cursor.id.into());
+        }
+        sql.push_str(" ORDER BY turn_ts ASC, turn_id ASC LIMIT ?");
+        params_vec.push((limit + 1).into());
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let mut turns = stmt
+            .query_map(rusqlite::params_from_iter(params_vec), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let has_more = turns.len() > limit as usize;
+        turns.truncate(limit as usize);
+        let neighbour_select = "SELECT NULLIF(message_id, '') FROM session_events \
+             WHERE source = ? AND session_id = ? AND NULLIF(message_id, '') IS NOT NULL";
+        let mut block_stmt = conn
+            .prepare(&format!(
+                "SELECT role, kind, tool_use_id, {USER_TURN_BYTE_LEN}, result_status \
+                 FROM session_events \
+                 WHERE source = ? AND session_id = ? AND {USER_TURN_ROW_FILTER} \
+                   AND {USER_TURN_KEY} = ? \
+                 ORDER BY ts_ms ASC, id ASC"
+            ))
+            .unwrap();
+        let mut preceding_stmt = conn
+            .prepare(&format!(
+                "{neighbour_select} AND {USER_TURN_KEY} <> ? \
+                   AND (ts_ms < ? OR (ts_ms = ? AND id < ?)) \
+                 ORDER BY ts_ms DESC, id DESC LIMIT 1"
+            ))
+            .unwrap();
+        let mut following_stmt = conn
+            .prepare(&format!(
+                "{neighbour_select} AND {USER_TURN_KEY} <> ? \
+                   AND (ts_ms > ? OR (ts_ms = ? AND id > ?)) \
+                 ORDER BY ts_ms ASC, id ASC LIMIT 1"
+            ))
+            .unwrap();
+        let mut user_turns = Vec::new();
+        for (turn_key, ts_ms, id, message_id) in turns {
+            let blocks = block_stmt
+                .query_map(params![source, session_id, turn_key], |row| {
+                    Ok(user_turn_block(
+                        &row.get::<_, String>(0)?,
+                        &row.get::<_, String>(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get::<_, Option<String>>(4)?.as_deref(),
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let neighbour = |stmt: &mut rusqlite::Statement<'_>| -> Option<String> {
+                stmt.query_row(
+                    params![source, session_id, &turn_key, ts_ms, ts_ms, id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .unwrap()
+                .flatten()
+            };
+            let preceding_message_id = neighbour(&mut preceding_stmt);
+            let following_message_id = neighbour(&mut following_stmt);
+            user_turns.push(SessionUserTurn {
+                id,
+                source: source.to_string(),
+                session_id: session_id.to_string(),
+                message_id,
+                preceding_message_id,
+                following_message_id,
+                ts_ms,
+                blocks,
+            });
+        }
+        let next_cursor = has_more.then(|| {
+            let last = user_turns.last().expect("non-empty page");
+            SessionEventCursor {
+                ts_ms: last.ts_ms,
+                id: last.id,
+            }
+        });
+        SessionUserTurnPage {
+            user_turns,
+            next_cursor,
+        }
+    }
+
+    /// A small deterministic generator; the crate has no `rand`.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self, bound: u64) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 33) % bound
+        }
+    }
+
+    /// A session built to break every shortcut the single pass could take:
+    /// timestamps that tie and run against insertion order (so a turn's
+    /// anchor pairs one row's timestamp with another row's id), one message's
+    /// blocks interleaved with other messages, unnamed and empty ids, a
+    /// literal `event:<id>` message id colliding with an unnamed row's
+    /// fallback key, harness rows that share a turn's id without being one of
+    /// its blocks, and a neighbouring session under the same source.
+    fn seed_adversarial(conn: &Connection, seed: u64, rows: usize) {
+        let mut rng = Lcg(seed);
+        for session in ["s", "other"] {
+            for n in 0..rows {
+                let message_id: Option<String> = match rng.next(10) {
+                    0 => None,
+                    1 => Some(String::new()),
+                    2 => Some(format!("event:{}", rng.next(rows as u64 * 2) + 1)),
+                    _ => Some(format!("m{}", rng.next(8))),
+                };
+                let (role, kind) = match rng.next(6) {
+                    0 | 1 => ("user", "text"),
+                    2 => ("assistant", "text"),
+                    3 => ("assistant", "tool_use"),
+                    _ => ("tool_result", "tool_result"),
+                };
+                let event_source = match rng.next(4) {
+                    0 => None,
+                    1 => Some("subagent_notification"),
+                    _ => Some("tool_result"),
+                };
+                let control_kind = (rng.next(5) == 0).then_some("system_reminder");
+                let payload_bytes = (rng.next(2) == 0).then(|| rng.next(500) as i64);
+                let result_status =
+                    ["errored", "cancelled", "completed", "running"][rng.next(4) as usize];
+                conn.execute(
+                    "INSERT INTO session_events \
+                     (source, session_id, message_id, ts_ms, role, kind, text, event_uid, \
+                      tool_use_id, payload_bytes, result_status, event_source, control_kind) \
+                     VALUES ('claude', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    params![
+                        session,
+                        message_id,
+                        rng.next(rows as u64 / 3 + 1) as i64,
+                        role,
+                        kind,
+                        "x".repeat(rng.next(40) as usize),
+                        format!("{session}-{n}"),
+                        (rng.next(3) > 0).then(|| format!("tu{n}")),
+                        payload_bytes,
+                        result_status,
+                        event_source,
+                        control_kind,
+                    ],
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    fn all_reference_pages(conn: &Connection, limit: i64) -> Vec<SessionUserTurnPage> {
+        let mut pages = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = reference_page(conn, "claude", "s", limit, cursor.as_ref());
+            cursor = page.next_cursor.clone();
+            pages.push(page);
+            if cursor.is_none() {
+                return pages;
+            }
+        }
+    }
+
+    #[test]
+    fn the_single_pass_matches_the_per_turn_statements_it_replaced() {
+        for seed in 0..40 {
+            let conn = Connection::open_in_memory().unwrap();
+            init_db(&conn).unwrap();
+            seed_adversarial(&conn, seed, 30 + (seed as usize % 7) * 20);
+            for limit in [1, 2, 3, 7, 1_000] {
+                let expected = all_reference_pages(&conn, limit);
+                let mut cursor = None;
+                for (index, want) in expected.iter().enumerate() {
+                    let got = session_user_turns_page(&conn, "claude", "s", limit, cursor.as_ref())
+                        .unwrap();
+                    assert_eq!(&got, want, "seed {seed}, limit {limit}, page {index}");
+                    cursor = got.next_cursor;
+                }
+            }
+            let whole: Vec<SessionUserTurn> = all_reference_pages(&conn, 1_000)
+                .into_iter()
+                .flat_map(|page| page.user_turns)
+                .collect();
+            assert!(!whole.is_empty(), "seed {seed} produced no turns");
+            assert_eq!(
+                session_user_turns_all(&conn, "claude", "s").unwrap(),
+                whole,
+                "seed {seed}, whole session"
+            );
+        }
+    }
+
+    /// A session of `exchanges` Claude-shaped exchanges, ten events and three
+    /// user turns each: a prompt, an assistant message with two calls, one
+    /// user message carrying both results, another call and its result, and
+    /// a closing assistant message. `named: false` stores every id empty, the
+    /// shape of rows indexed before providers named their messages: each
+    /// user-side row is then a turn of its own, and no row can be anyone's
+    /// neighbour, which is the case a forward or backward search for one
+    /// walks the furthest on.
+    fn seed_exchanges(conn: &Connection, exchanges: usize, named: bool) {
+        let tx = conn.unchecked_transaction().unwrap();
+        let mut insert = tx
+            .prepare(
+                "INSERT INTO session_events \
+                 (source, session_id, message_id, ts_ms, role, kind, text, event_uid, \
+                  tool_use_id, result_status, event_source) \
+                 VALUES ('claude', 'big', ?1, ?2, ?3, ?4, 'body', ?5, ?6, ?7, ?8)",
+            )
+            .unwrap();
+        let shape: [(&str, &str, &str); 10] = [
+            ("u", "user", "text"),
+            ("a", "assistant", "text"),
+            ("a", "assistant", "tool_use"),
+            ("a", "assistant", "tool_use"),
+            ("r", "tool_result", "tool_result"),
+            ("r", "tool_result", "tool_result"),
+            ("b", "assistant", "tool_use"),
+            ("q", "tool_result", "tool_result"),
+            ("c", "assistant", "text"),
+            ("c", "assistant", "text"),
+        ];
+        let mut n = 0i64;
+        for exchange in 0..exchanges {
+            for (prefix, role, kind) in shape {
+                let is_result = kind == "tool_result";
+                insert
+                    .execute(params![
+                        if named {
+                            format!("{prefix}{exchange}")
+                        } else {
+                            String::new()
+                        },
+                        n,
+                        role,
+                        kind,
+                        format!("e{n}"),
+                        (kind != "text").then(|| format!("t{n}")),
+                        is_result.then_some("completed"),
+                        is_result.then_some("tool_result"),
+                    ])
+                    .unwrap();
+                n += 1;
+            }
+        }
+        drop(insert);
+        tx.commit().unwrap();
+    }
+
+    /// SQLite virtual-machine steps `read` costs: a count of work done that
+    /// does not depend on how fast the machine running the test is.
+    fn vm_steps<T>(conn: &Connection, read: impl FnOnce() -> T) -> (u64, T) {
+        // `progress_handler` wants a `Send + 'static` closure, so it counts
+        // into an atomic it shares with this frame.
+        let steps = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let tick = std::sync::Arc::clone(&steps);
+        conn.progress_handler(
+            1,
+            Some(move || {
+                tick.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                false
+            }),
+        );
+        let value = read();
+        conn.progress_handler(0, None::<fn() -> bool>);
+        (steps.load(std::sync::atomic::Ordering::Relaxed), value)
+    }
+
+    /// The cost of a page grows with the session once, not once per turn on
+    /// it: a full page of 1,000 turns costs about what a page of one does,
+    /// because both regroup the session once and the blocks of the larger
+    /// page come from the same ordered pass. Per-turn statements made the
+    /// full page cost a thousand session walks.
+    #[test]
+    fn a_full_page_costs_about_what_a_one_turn_page_costs() {
+        for named in [true, false] {
+            let conn = Connection::open_in_memory().unwrap();
+            init_db(&conn).unwrap();
+            // 20,000 events: 6,000 named turns, or 8,000 unnamed ones.
+            seed_exchanges(&conn, 2_000, named);
+            let (one, page) = vm_steps(&conn, || {
+                session_user_turns_page(&conn, "claude", "big", 1, None).unwrap()
+            });
+            assert_eq!(page.user_turns.len(), 1);
+            let (full, page) = vm_steps(&conn, || {
+                session_user_turns_page(&conn, "claude", "big", 1_000, None).unwrap()
+            });
+            assert_eq!(page.user_turns.len(), 1_000);
+            eprintln!("user-turn page named={named} one={one} full={full}");
+            assert!(
+                full < one * 3,
+                "a 1,000-turn page cost {full} steps against {one} for one turn \
+                 (named={named}): block or neighbour reads are running per turn"
+            );
+        }
+    }
+
+    /// Reading every turn of a session is linear in it: twenty times the
+    /// events is about twenty times the work, never twenty times the turns
+    /// times twenty times the events. Covers named messages and unnamed ones.
+    #[test]
+    fn reading_every_turn_scales_with_the_session_not_turns_times_events() {
+        for named in [true, false] {
+            let mut costs = Vec::new();
+            for exchanges in [100, 2_000] {
+                let conn = Connection::open_in_memory().unwrap();
+                init_db(&conn).unwrap();
+                seed_exchanges(&conn, exchanges, named);
+                let (steps, turns) = vm_steps(&conn, || {
+                    session_user_turns_all(&conn, "claude", "big").unwrap()
+                });
+                let per_exchange = if named { 3 } else { 4 };
+                assert_eq!(turns.len(), exchanges * per_exchange);
+                // Neighbours and blocks really were resolved, not skipped.
+                let middle = &turns[turns.len() / 2];
+                assert_eq!(middle.preceding_message_id.is_some(), named);
+                assert!(!middle.blocks.is_empty());
+                costs.push(steps);
+            }
+            eprintln!("user-turn whole-session named={named} steps={costs:?}");
+            // 20x the events; quadratic would be 400x.
+            assert!(
+                costs[1] < costs[0] * 30,
+                "20x the events cost {}x the work (named={named})",
+                costs[1] / costs[0].max(1)
+            );
+        }
+    }
+
+    fn query_plan(conn: &Connection, sql: &str) -> String {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        // Unbound parameters plan as NULL; the shape is what matters.
+        let mut rows = stmt.raw_query();
+        let mut steps = Vec::new();
+        while let Some(row) = rows.next().unwrap() {
+            steps.push(row.get::<_, String>(3).unwrap());
+        }
+        steps.join(" | ")
+    }
+
+    /// Both statements of the pass seek the session's page index on
+    /// `(ts_ms, id)` and read in its order, with and without `sqlite_stat1`
+    /// (nothing here runs `ANALYZE`): no scan of the session from its start,
+    /// no sort, and no lookup keyed on the computed turn key, which no index
+    /// can serve.
+    #[test]
+    fn the_block_pass_seeks_the_page_index_with_and_without_statistics() {
+        for analyze in [false, true] {
+            let conn = Connection::open_in_memory().unwrap();
+            init_db(&conn).unwrap();
+            seed_exchanges(&conn, 50, true);
+            seed_adversarial(&conn, 7, 200);
+            if analyze {
+                conn.execute_batch("ANALYZE").unwrap();
+            }
+            for (name, sql) in [
+                ("stream", user_turn_stream_sql()),
+                ("named before", USER_TURN_NAMED_BEFORE.to_string()),
+            ] {
+                let plan = query_plan(&conn, &sql);
+                assert!(
+                    plan.contains(
+                        "SEARCH session_events USING INDEX idx_session_events_source_page \
+                         (source=? AND session_id=? AND ts_ms"
+                    ),
+                    "{name} does not seek the page index from its position \
+                     (analyze={analyze}): {plan}"
+                );
+                assert!(
+                    !plan.contains("TEMP B-TREE"),
+                    "{name} sorts instead of reading in index order (analyze={analyze}): {plan}"
+                );
+            }
         }
     }
 }

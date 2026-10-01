@@ -560,9 +560,97 @@ Notable changes to the native `ai-hist` CLI are documented here.
   snapshots or a fixture exemption. Behaviour is unchanged, and so is the
   default Rust API; the descriptors are readable under `unstable-internal` as
   `ai_hist::sources::catalog`.
+- `sync` (and every `watch` tick) writes each Claude transcript and each Codex
+  rollout as one `BEGIN IMMEDIATE` transaction instead of one autocommit per
+  statement, as Cursor, Grok, Muse and hydration already did. A Claude
+  transcript's transaction is committed and reopened every 2,000 records, so a
+  very large one never holds the writer lock for its whole read; a Codex
+  rollout stays one transaction, which its parser-upgrade repair relies on.
+  Cursors are written inside the transaction, after the rows they vouch for,
+  so a transcript that fails part way now leaves nothing behind instead of a
+  prefix of its rows, and the next sync reads it whole. `PRAGMA synchronous`
+  is unchanged; the sweep's own connection keeps temporary files (statement
+  journals, sorts) in memory, which holds nothing durable. On the 100 MB
+  synthetic store a cold sync drops from 37.3 s to 13.4 s, and a forced tick
+  after a 1 KiB append to a 2 MB Codex rollout from 728 ms to 466 ms. Part of
+  #215.
+- The change feed stamps a new `revision` on an update only when the update
+  changed at least one of the row's columns. Every re-read -- a hydration of a
+  session the sweep already indexed, a forced sweep, a relationship or
+  connector observation recorded again -- rewrote rows with the values they
+  already held, and each rewrite was a new revision that `changes_since`
+  reported and relay-desktop's probe uploaded again. The update triggers'
+  guard is generated from each table's live column list, so a column a
+  migration adds is guarded once the next writable open rebuilds it; a store
+  whose triggers predate the guard is migrated on that open.
+  `session_relationships.updated_ms` and `session_observations.updated_ms`
+  are now the time the row last changed: an upsert that would change only
+  that stamp is skipped. A presence updated in place (a new `source_stamp`)
+  no longer re-reports its session's catalog row, whose `locations` it cannot
+  change. Measured on the 100 MB synthetic store: hydrating a Claude session
+  the sweep already indexed reports 2 changes instead of 117 (115 of them
+  identical to what the feed already held), a Codex one 2 instead of 27, and
+  a fixture-corpus forced tick no longer re-reports relationships. Inserts,
+  deletes, tombstones and `SyncReport::changed` / `TickReport::changed` are
+  unchanged. Part of #215.
 
 ### Fixed
 
+- A sweep no longer stalls every other writer for up to ~30 s when a read is
+  active as it finishes (#336). Each sweep, including every
+  `SessionStore::watch` tick, ended with `wal_checkpoint(TRUNCATE)` under the
+  connection's ~30 s busy handler; a `TRUNCATE` holds the WAL write lock
+  while it waits for readers to leave, so an embedder writing its own tables
+  beside the watch (relay-desktop's change-feed drain) waited behind it. The
+  sweep now checkpoints `PASSIVE`, which never takes the write lock or waits
+  on a reader, and escalates to `TRUNCATE` only when that pass copied every
+  frame and the WAL is still past 4 MiB, with a 100 ms busy budget for that
+  one call. Escalating only after a full pass keeps the `TRUNCATE`'s own
+  copy, which also runs under the write lock, down to what another
+  connection committed in between, never a reader's backlog. A short pass or
+  a reset a reader blocks is reported (`[wal] checkpoint partial`,
+  `[wal] WAL not reset`) and retried by the next sweep; the WAL-size warning
+  is unchanged. Under a quiet store
+  the WAL file now stays at up to 4 MiB between sweeps instead of being
+  truncated to zero every time; SQLite reuses it from the start. `compact`
+  keeps its `TRUNCATE`: it is an explicit maintenance action.
+- Reading a session's user turns no longer scans the whole session once per
+  turn (#307). `session_user_turns_page`, and `SessionStore::session`
+  whenever session events are selected (including `include_text: false`),
+  read each turn's blocks with a filter on the computed turn key, which no
+  index could serve, plus two neighbour lookups per turn, so a page cost
+  turns x events: about 100 s for a 50,000-event session's 15,000 turns.
+  A page now reads its blocks and both neighbouring message ids in one range
+  pass over the session in `(ts_ms, id)` order, and `SessionStore::session`
+  reads every turn in one pass instead of regrouping the session per
+  1,000-turn page; the same session takes about 35 ms. Results, ordering,
+  fallback `event:<id>` identities, cursors and the single read snapshot are
+  unchanged; no schema or index change.
+- Continuity reconciliation no longer scans every event of a source for each
+  pending transcript on every sync. Resolving a transcript's parent record
+  asked `message_id = ? OR event_uid = ?`, which no index could serve, and a
+  parent nothing has indexed keeps its transcript pending for good. It is now
+  two indexed searches with the same answer, the second on a new partial
+  index, `idx_session_events_claude_uid_unmatched`, which holds only the rows
+  the first search cannot see and is empty on a database this parser wrote.
+  The next writable open builds it (0.76 s for 214,000 events). On 75,000
+  Claude events the lookup drops from 17 ms to under 0.1 ms. Part of #215.
+- Reading a whole session's events (`session_events`, and
+  `SessionStore::session` with events selected) no longer sorts them in a
+  temporary b-tree. The order spelled `ts_ms IS NULL` first, which no index
+  carries; `session_events.ts_ms` has always been `NOT NULL`, so the order is
+  now `ts_ms, id` and is read straight from the page index. Same rows, same
+  order. Part of #215.
+- A `watch` tick or `SessionStore::sync` that wrote nothing to the catalog no
+  longer digests every catalog row to compute `changed`: the digest records
+  the change-feed head it was read at, and an unmoved head proves the catalog
+  is the same. When anything was written the rows are compared as before, so
+  `changed` still names exactly the sessions whose catalog columns moved. And
+  naming the sessions the destination marker says are short no longer walks
+  every event a second time; the grouped reads that count them collect the
+  names. A forced tick on the 100 MB synthetic store drops from 338 ms to
+  301 ms unchanged, and from 364 ms to 333 ms after a 1 KiB Claude append.
+  Part of #215.
 - Grok reuses an ACP `eventId` across records, and two messages carrying one
   id were stored under one `ev:<id>` identity, so the second overwrote the
   first (#212). The first message carrying an id keeps `ev:<id>`, and each
