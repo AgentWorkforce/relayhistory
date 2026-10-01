@@ -3,16 +3,18 @@
 //! A downstream consumer that materialises its own view of the ledger — burn's
 //! watch loop, say — needs "what changed since my last tick" without
 //! rescanning every session. This module answers that with one monotonic
-//! revision per row write, drawn from the database-wide `observation_clock`,
+//! revision per row change, drawn from the database-wide `observation_clock`,
 //! and a pull cursor over it:
 //!
 //! - Every row of `sessions`, `session_events`, `tool_calls`, `file_edits`,
 //!   `session_markers`, `session_relationships`, `history`,
 //!   `session_presences`, `session_commit_links`, `trajectories`,
 //!   `session_observations` and `observation_evidence` carries a `revision`.
-//!   A trigger stamps the current clock on every insert and every update, so
-//!   a re-parse that upserts a row it already holds re-stamps it: consumers
-//!   must treat a re-seen key as a replace, never as a duplicate.
+//!   A trigger stamps the current clock on every insert, and on every update
+//!   that changes at least one of the row's columns ([`stamped_columns`]), so
+//!   a re-parse that upserts a row it already holds, unchanged, leaves it at
+//!   the revision it had and the feed reports nothing for it. A re-seen key
+//!   still means a replace, never a duplicate: consumers must treat it so.
 //! - An upsert carries the row twice over: typed, where the kind has a typed
 //!   row, and as stored ([`StoredRow`]) -- every column but `revision`, read
 //!   from the live table, values as SQLite holds them -- so an embedder can
@@ -1659,7 +1661,116 @@ fn trigger_names(kind: ChangeKind) -> [String; 3] {
     ]
 }
 
-/// Whether every write to the catalog (`sessions`) moves the database-wide
+/// The columns of `table` an update must change to take a new revision:
+/// every column [`stored_columns`] carries, which is every column but
+/// `revision` itself, read from the live schema.
+///
+/// Read from the live schema rather than a list in code because columns are
+/// added over time (`ensure_columns`, the `REQUIRED_*_COLUMNS` lists): a
+/// column a migration adds is guarded as soon as [`init_schema`] regenerates
+/// the trigger, which [`schema_is_current`] makes it do on the open after the
+/// column appears.
+///
+/// No column is left out, so a consumer that replays the feed holds every
+/// table exactly, column for column. Each column was considered:
+///
+/// - The two that are only "when this database last wrote the row" --
+///   `session_relationships.updated_ms` and `session_observations.updated_ms`
+///   -- were the ones a re-read rewrote with `now` and nothing else. Leaving
+///   them out here would have made a consumer's copy drift from the table;
+///   instead their writers (`record_relationship`, `observations::upsert`)
+///   skip an upsert that changes nothing else, so the stamp is the time of the
+///   last change and an unchanged re-read writes nothing.
+/// - `trajectories.updated_ms` is the trajectory file's mtime, a fact about
+///   the source; a trajectory is re-read only when its stamp moves.
+/// - `session_relationships.created_ms` and
+///   `session_commit_links.created_at_ms` are written once; no upsert
+///   rewrites them.
+/// - `sessions.source_stamp` / `discovery_state` / `parser_version` and the
+///   presence and observation stamps move only when the source moved or the
+///   parser changed, and the catalog digest behind `SyncReport::changed`
+///   relies on every write to one of them moving the head.
+pub(crate) fn stamped_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    stored_columns(conn, table)
+}
+
+/// The `WHEN` clause of `table`'s update trigger.
+///
+/// `NEW.revision = OLD.revision` is what stops the trigger re-firing on its
+/// own stamp under `recursive_triggers` (the stamp changes `revision` and
+/// only that). The rest is what makes an upsert that rewrites a row with the
+/// values it already holds leave it alone: `IS NOT` rather than `<>`, so a
+/// NULL becoming a value, or a value becoming NULL, is a change. A change of
+/// identity changes a key column, so it is always stamped.
+///
+/// Generated from the live column list; [`update_trigger_is_current`]
+/// compares an installed trigger against it, so the text here is also the
+/// fingerprint that decides when a trigger is rebuilt.
+fn update_guard(conn: &Connection, table: &str) -> Result<String> {
+    let columns = stamped_columns(conn, table)?;
+    anyhow::ensure!(
+        !columns.is_empty(),
+        "change feed: {table} has no columns to guard its update trigger with"
+    );
+    let changed = columns
+        .iter()
+        .map(|column| format!("NEW.{column} IS NOT OLD.{column}"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    Ok(format!(
+        "WHEN NEW.{REVISION_COLUMN} = OLD.{REVISION_COLUMN} AND ({changed})"
+    ))
+}
+
+/// The guard of the presence trigger that re-stamps a session when one of
+/// its presences moves. The catalog row derives `locations` from which
+/// presences *exist*, so an update that keeps a presence's identity -- a new
+/// `source_stamp` or `raw_locator` on every append -- cannot change the row
+/// the feed reports for the session, and re-stamping it would report it
+/// unchanged. The presence row itself is stamped by its own kind's trigger.
+const PRESENCE_MOVED_GUARD: &str = "WHEN NEW.revision = OLD.revision AND \
+     (OLD.source IS NOT NEW.source OR OLD.session_id IS NOT NEW.session_id \
+      OR OLD.location IS NOT NEW.location)";
+
+/// The stored text of trigger `name`, or `None` when it does not exist.
+fn trigger_sql(conn: &Connection, name: &str) -> Result<Option<String>> {
+    Ok(conn
+        .prepare_cached("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?")?
+        .query_row([name], |row| row.get::<_, Option<String>>(0))
+        .optional()?
+        .flatten())
+}
+
+/// Whether trigger `name` exists and carries `guard`. SQLite keeps a
+/// trigger's text as written past its first keywords, so the guard is found
+/// verbatim in a trigger built from it, and a trigger built before a column
+/// was added -- or before the guard existed at all -- does not contain it.
+fn update_trigger_is_current(conn: &Connection, name: &str, guard: &str) -> Result<bool> {
+    Ok(trigger_sql(conn, name)?.is_some_and(|sql| sql.contains(guard)))
+}
+
+/// Drop `table`'s change-feed update trigger, ahead of an `ALTER TABLE ...
+/// DROP COLUMN` on it.
+///
+/// The trigger's guard names every column of its table, and SQLite refuses to
+/// drop a column a trigger names. The migration pass that drops the column
+/// recreates the trigger from the remaining columns in [`init_schema`], which
+/// runs last in the same pass; until then, updates to `table` take no
+/// revision, so nothing between the two may update it. A table the feed does
+/// not stamp is left alone.
+pub(crate) fn release_update_guard(conn: &Connection, table: &str) -> Result<()> {
+    if let Some(kind) = ChangeKind::ALL
+        .iter()
+        .find(|kind| kind.table().name == table)
+    {
+        let [_, update, _] = trigger_names(*kind);
+        conn.execute_batch(&format!("DROP TRIGGER IF EXISTS {update};"))?;
+    }
+    Ok(())
+}
+
+/// Whether every write that changes the catalog (`sessions`) -- an insert, a
+/// delete, an update that changes a column -- moves the database-wide
 /// clock: the clock and the feed's identity exist, and the three `sessions`
 /// triggers that bump it are installed. This is the one guarantee a catalog
 /// digest keyed on the head needs, checked in five schema lookups rather than
@@ -1712,10 +1823,17 @@ pub(crate) fn schema_is_current(conn: &Connection) -> Result<bool> {
         if !object.exists([table.revision_index()])? {
             return Ok(false);
         }
-        for trigger in trigger_names(*kind) {
+        let [insert, update, delete] = trigger_names(*kind);
+        for trigger in [insert, delete] {
             if !object.exists([trigger])? {
                 return Ok(false);
             }
+        }
+        // The update trigger must also guard on the table's columns as they
+        // are now: one built before a column was added would let an update
+        // that changes only that column go unreported.
+        if !update_trigger_is_current(conn, &update, &update_guard(conn, table.name)?)? {
+            return Ok(false);
         }
         let stamped: bool = conn.query_row(
             &format!(
@@ -1733,6 +1851,9 @@ pub(crate) fn schema_is_current(conn: &Connection) -> Result<bool> {
         if !object.exists([*trigger])? {
             return Ok(false);
         }
+    }
+    if !update_trigger_is_current(conn, PRESENCE_TRIGGERS[1], PRESENCE_MOVED_GUARD)? {
+        return Ok(false);
     }
     let bound: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('consumer_cursors') WHERE name = ?)",
@@ -1855,10 +1976,19 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
         let moved = table.identity_changed_sql();
         // The update trigger's own stamp changes `revision`, and only that,
         // so `NEW.revision = OLD.revision` is what stops it re-firing under
-        // `recursive_triggers` — and what makes an external write that leaves
-        // the stamp alone (every upsert in this crate) take a new one. A
-        // change of identity is a delete of the old one and an upsert of the
-        // new, each at its own revision.
+        // `recursive_triggers`; the rest of the guard is what makes an
+        // external write that leaves the stamp alone (every upsert in this
+        // crate) take a new one only when it changed a stamped column. See
+        // `update_guard`. A change of identity is a delete of the old one and
+        // an upsert of the new, each at its own revision.
+        //
+        // The guard is generated from the live column list, so a trigger
+        // built before a column was added -- or before the guard existed --
+        // is rebuilt here rather than kept by `IF NOT EXISTS`.
+        let guard = update_guard(conn, name)?;
+        if !update_trigger_is_current(conn, &update, &guard)? {
+            conn.execute_batch(&format!("DROP TRIGGER IF EXISTS {update};"))?;
+        }
         conn.execute_batch(&format!(
             "CREATE TRIGGER IF NOT EXISTS {insert} AFTER INSERT ON {name} BEGIN
                  UPDATE observation_clock SET version = version + 1 WHERE singleton = 1;
@@ -1870,7 +2000,7 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
                      AND record_key = {new_record};
              END;
              CREATE TRIGGER IF NOT EXISTS {update} AFTER UPDATE ON {name}
-             WHEN NEW.{REVISION_COLUMN} = OLD.{REVISION_COLUMN} BEGIN
+             {guard} BEGIN
                  UPDATE observation_clock SET version = version + 1 WHERE singleton = 1 \
                      AND ({moved});
                  INSERT OR REPLACE INTO evidence_tombstones \
@@ -1896,11 +2026,12 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
         ))?;
     }
     // A direct write of `revision` does not re-fire the sessions update
-    // trigger (its guard is `NEW.revision = OLD.revision`), so this is one
-    // stamp, not two. The update trigger carries the same guard, so a
-    // presence's own stamp does not re-stamp its session a second time. A
-    // key change is a presence leaving one session and arriving at another;
-    // both rows are stamped.
+    // trigger (its guard requires `NEW.revision = OLD.revision`), so this is
+    // one stamp, not two. The update trigger carries the same guard, so a
+    // presence's own stamp does not re-stamp its session a second time, and
+    // it fires only when the presence's identity moves (see
+    // `PRESENCE_MOVED_GUARD`): a key change is a presence leaving one session
+    // or location and arriving at another, and both sessions are stamped.
     let stamp_session = |row: &str| {
         format!(
             "UPDATE observation_clock SET version = version + 1 WHERE singleton = 1;
@@ -1914,6 +2045,9 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
     let [insert, update, delete] = PRESENCE_TRIGGERS else {
         unreachable!("three presence triggers")
     };
+    if !update_trigger_is_current(conn, update, PRESENCE_MOVED_GUARD)? {
+        conn.execute_batch(&format!("DROP TRIGGER IF EXISTS {update};"))?;
+    }
     conn.execute_batch(&format!(
         "CREATE TRIGGER IF NOT EXISTS {insert} \
              AFTER INSERT ON session_presences BEGIN
@@ -1921,7 +2055,7 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
          END;
          CREATE TRIGGER IF NOT EXISTS {update} \
              AFTER UPDATE ON session_presences \
-             WHEN NEW.{REVISION_COLUMN} = OLD.{REVISION_COLUMN} BEGIN
+             {PRESENCE_MOVED_GUARD} BEGIN
              {stamp_new}
              UPDATE observation_clock SET version = version + 1 WHERE singleton = 1 \
                  AND (OLD.source IS NOT NEW.source OR OLD.session_id IS NOT NEW.session_id);
@@ -2129,6 +2263,290 @@ mod tests {
             })
             .unwrap();
         assert_eq!(tombstones, 0);
+    }
+
+    /// One row of every fed kind, with a value in most columns.
+    const EVERY_KIND_FIXTURE: &str = r#"
+INSERT INTO sessions (session_id, source, cwd, models_json, workspace_roots_json)
+    VALUES ('s1', 'claude', '/p', '["opus"]', 'not json');
+INSERT INTO sessions (session_id, source) VALUES ('s2', 'claude');
+INSERT INTO session_events (source, session_id, message_id, ts_ms, role, kind, text, event_uid,
+    token_json, project_key_method, raw_facts_version)
+    VALUES ('claude', 's1', 'm1', 10, 'assistant', 'text', 'one', 'e1', '{"input":3}', 'git', 2);
+INSERT INTO tool_calls (source, session_id, tool_use_id, name, args_json, is_error)
+    VALUES ('claude', 's1', 't1', 'Bash', '{"command":"ls"}', 0);
+INSERT INTO file_edits (source, session_id, tool_use_id, file_path, tool_name, lines_added)
+    VALUES ('claude', 's1', 't2', '/p/a.rs', 'Edit', 3);
+INSERT INTO session_markers (source, session_id, marker_uid, kind, payload_json)
+    VALUES ('claude', 's1', 'mk1', 'compaction', '{"trigger":"auto"}');
+INSERT INTO session_relationships (source, parent_session_id, relationship_uid,
+    child_session_id, relationship, identity_status, evidence_kind, child_has_events,
+    created_ms, updated_ms)
+    VALUES ('claude', 's1', 'r1', 's2', 'delegated', 'observed', 'sidecar', 1, 1, 2);
+INSERT INTO history (source, session_id, project, prompt, timestamp_ms)
+    VALUES ('claude', 's1', '/p', 'hello', 1000);
+INSERT INTO history (source, session_id, prompt, timestamp_ms)
+    VALUES ('codex', NULL, 'no session yet', 2000);
+INSERT INTO session_presences (source, session_id, location, raw_locator)
+    VALUES ('claude', 's1', 'local', '/p/s1.jsonl');
+INSERT INTO session_commit_links (source, session_id, repo, commit_sha, match_method,
+    confidence, files_json, created_at_ms)
+    VALUES ('claude', 's1', 'repo', 'abc123', 'trailer', 0.75, '["a.rs"]', 1);
+INSERT INTO trajectories (id, version, status, decisions_json, retrospective_json,
+    search_text, updated_ms, timestamp_ms)
+    VALUES ('traj-1', 1, 'active', '[]', '{}', 'x', 1, 1);
+INSERT INTO session_observations (source, session_id, location, connector_id,
+    connector_instance, updated_ms)
+    VALUES ('claude', 's1', 'remote', 'conn', 'default', 1);
+INSERT INTO observation_evidence (source, session_id, location, connector_id,
+    connector_instance, evidence_uid, payload_json)
+    VALUES ('claude', 's1', 'remote', 'conn', 'default', 'ev1', '{"a":1}');
+"#;
+
+    fn tombstone_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM evidence_tombstones", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    }
+
+    /// An upsert that rewrites a row with the values it already holds -- what
+    /// every re-parse does to the rows it re-reads -- takes no revision and
+    /// reports nothing; one that changes any column, a NULL becoming a value
+    /// or a value becoming NULL included, takes exactly one.
+    #[test]
+    fn an_update_that_changes_nothing_takes_no_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, conn) = store(dir.path());
+        insert_event(&conn, "s1", "e1", "one");
+        let head = store.head_revision().unwrap();
+
+        insert_event(&conn, "s1", "e1", "one");
+        conn.execute(
+            "UPDATE session_events SET text = text, model = model WHERE event_uid = 'e1'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            store.head_revision().unwrap(),
+            head,
+            "no change, no revision"
+        );
+        assert!(drain(store.changes_since(head, ChangeQuery::default()).unwrap()).is_empty());
+
+        let changed = |sql: &str| {
+            let before = store.head_revision().unwrap();
+            conn.execute(sql, []).unwrap();
+            let delta = drain(store.changes_since(before, ChangeQuery::default()).unwrap());
+            assert_eq!(delta.len(), 1, "{sql}: {delta:?}");
+            assert!(matches!(delta[0].op, ChangeOp::Upsert(_)), "{sql}");
+            assert_eq!(delta[0].record_key, "e1", "{sql}");
+            delta[0].columns.clone().unwrap()
+        };
+        let row = changed("UPDATE session_events SET text = 'two' WHERE event_uid = 'e1'");
+        assert_eq!(row.get("text"), Some(&Value::from("two")));
+        let row = changed("UPDATE session_events SET model = 'opus' WHERE event_uid = 'e1'");
+        assert_eq!(
+            row.get("model"),
+            Some(&Value::from("opus")),
+            "NULL to a value"
+        );
+        let row = changed("UPDATE session_events SET model = NULL WHERE event_uid = 'e1'");
+        assert_eq!(row.get("model"), Some(&Value::Null), "a value to NULL");
+        // The comparison is on the value as stored: `'7'` bound to an
+        // INTEGER column is stored as 7, so writing 7 over it is no change.
+        changed("UPDATE session_events SET payload_bytes = '7' WHERE event_uid = 'e1'");
+        let head = store.head_revision().unwrap();
+        conn.execute(
+            "UPDATE session_events SET payload_bytes = 7 WHERE event_uid = 'e1'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            store.head_revision().unwrap(),
+            head,
+            "'7' stored in an INTEGER column is 7: the same value"
+        );
+
+        // A no-op leaves tombstones alone; a change of identity still
+        // tombstones the old key and reports the new one.
+        assert_eq!(tombstone_count(&conn), 0);
+        let head = store.head_revision().unwrap();
+        conn.execute(
+            "UPDATE session_events SET event_uid = event_uid WHERE event_uid = 'e1'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(store.head_revision().unwrap(), head);
+        assert_eq!(tombstone_count(&conn), 0);
+        conn.execute(
+            "UPDATE session_events SET event_uid = 'e2' WHERE event_uid = 'e1'",
+            [],
+        )
+        .unwrap();
+        let delta = drain(store.changes_since(head, ChangeQuery::default()).unwrap());
+        assert_eq!(delta.len(), 2, "{delta:?}");
+        assert_eq!(delta[0].op, ChangeOp::Delete);
+        assert_eq!(delta[0].record_key, "e1");
+        assert!(matches!(delta[1].op, ChangeOp::Upsert(_)));
+        assert_eq!(delta[1].record_key, "e2");
+    }
+
+    /// Every fed table, not only the events: a rewrite of each row with its
+    /// own values reports nothing, and the presence a re-read re-marks does
+    /// not re-report its session either.
+    #[test]
+    fn no_fed_table_restamps_a_row_rewritten_with_its_own_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, conn) = store(dir.path());
+        conn.execute_batch(EVERY_KIND_FIXTURE).unwrap();
+        let head = store.head_revision().unwrap();
+        for kind in ChangeKind::ALL {
+            let table = kind.table().name;
+            let columns = stamped_columns(&conn, table).unwrap();
+            let rewrite = columns
+                .iter()
+                .map(|column| format!("{column} = {column}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let written = conn
+                .execute(&format!("UPDATE {table} SET {rewrite}"), [])
+                .unwrap();
+            assert!(written > 0, "{table} holds a row to rewrite");
+        }
+        assert_eq!(
+            store.head_revision().unwrap(),
+            head,
+            "{:?}",
+            drain(store.changes_since(head, ChangeQuery::default()).unwrap())
+        );
+
+        // A presence updated in place keeps the session's `locations`; it is
+        // reported as a presence, and the session row is not re-reported.
+        conn.execute(
+            "UPDATE session_presences SET source_stamp = 'moved' WHERE session_id = 's1'",
+            [],
+        )
+        .unwrap();
+        let delta = drain(store.changes_since(head, ChangeQuery::default()).unwrap());
+        assert_eq!(
+            delta.iter().map(|change| change.kind).collect::<Vec<_>>(),
+            vec![ChangeKind::Presence],
+            "{delta:?}"
+        );
+        // A presence moving to another location is a change to the row the
+        // session reports, and re-reports it.
+        let head = store.head_revision().unwrap();
+        conn.execute(
+            "UPDATE session_presences SET location = 'remote' WHERE session_id = 's1'",
+            [],
+        )
+        .unwrap();
+        let delta = drain(store.changes_since(head, ChangeQuery::default()).unwrap());
+        assert!(
+            delta.iter().any(|change| change.kind == ChangeKind::Session
+                && matches!(&change.op, ChangeOp::Upsert(EvidenceRow::Session(session))
+                    if session.locations == vec!["remote".to_string()])),
+            "{delta:?}"
+        );
+    }
+
+    /// The update guard names the table's columns as they were when it was
+    /// built. A column a later migration adds must be guarded too, or an
+    /// update that changes only that column would go unreported: the schema
+    /// is not current until the trigger is rebuilt, and the next writable
+    /// open rebuilds it. A trigger from before the guard existed is rebuilt
+    /// the same way.
+    #[test]
+    fn a_column_added_after_the_trigger_is_guarded_after_the_next_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ai-history.db");
+        let (store, conn) = store(dir.path());
+        insert_event(&conn, "s1", "e1", "one");
+        assert!(schema_is_current(&conn).unwrap());
+        let [_, update, _] = trigger_names(ChangeKind::SessionEvent);
+        let built = trigger_sql(&conn, &update).unwrap().unwrap();
+        assert!(!built.contains("added_later"));
+
+        crate::store::ensure_columns(&conn, "session_events", &[("added_later", "TEXT")]).unwrap();
+        assert!(
+            !schema_is_current(&conn).unwrap(),
+            "a guard that does not name every column is not current"
+        );
+        drop(conn);
+        let conn = open_db(&db).unwrap();
+        assert!(schema_is_current(&conn).unwrap());
+        let rebuilt = trigger_sql(&conn, &update).unwrap().unwrap();
+        assert!(
+            rebuilt.contains("NEW.added_later IS NOT OLD.added_later"),
+            "{rebuilt}"
+        );
+        // Only the guard moved: the insert and delete triggers, and every
+        // other kind's update trigger, are the ones that were there.
+        let head = store.head_revision().unwrap();
+        conn.execute(
+            "UPDATE session_events SET added_later = 'x' WHERE event_uid = 'e1'",
+            [],
+        )
+        .unwrap();
+        let delta = drain(store.changes_since(head, ChangeQuery::default()).unwrap());
+        assert_eq!(delta.len(), 1, "{delta:?}");
+        assert_eq!(
+            delta[0].columns.as_ref().unwrap().get("added_later"),
+            Some(&Value::from("x"))
+        );
+
+        // A database whose update triggers predate the guard: the old body
+        // re-stamped every update. The open replaces it.
+        conn.execute_batch(&format!(
+            "DROP TRIGGER {update};
+             CREATE TRIGGER {update} AFTER UPDATE ON session_events
+             WHEN NEW.revision = OLD.revision BEGIN
+                 UPDATE observation_clock SET version = version + 1 WHERE singleton = 1;
+                 UPDATE session_events SET revision = \
+                     (SELECT version FROM observation_clock WHERE singleton = 1) \
+                     WHERE rowid = NEW.rowid;
+             END;"
+        ))
+        .unwrap();
+        assert!(!schema_is_current(&conn).unwrap());
+        drop(conn);
+        let conn = open_db(&db).unwrap();
+        assert!(schema_is_current(&conn).unwrap());
+        let head = store.head_revision().unwrap();
+        insert_event(&conn, "s1", "e1", "one");
+        assert_eq!(store.head_revision().unwrap(), head);
+    }
+
+    /// A column the migration pass drops must first leave the guard, which
+    /// SQLite would otherwise refuse; the pass's last step puts the guard
+    /// back over the columns that remain.
+    #[test]
+    fn a_released_guard_lets_a_column_go_and_comes_back_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ai-history.db");
+        let (_store, conn) = store(dir.path());
+        crate::store::ensure_columns(&conn, "session_markers", &[("doomed", "TEXT")]).unwrap();
+        drop(conn);
+        let conn = open_db(&db).unwrap();
+        let [_, update, _] = trigger_names(ChangeKind::SessionMarker);
+        assert!(trigger_sql(&conn, &update)
+            .unwrap()
+            .unwrap()
+            .contains("NEW.doomed"));
+        assert!(conn
+            .execute("ALTER TABLE session_markers DROP COLUMN doomed", [])
+            .is_err());
+        release_update_guard(&conn, "session_markers").unwrap();
+        conn.execute("ALTER TABLE session_markers DROP COLUMN doomed", [])
+            .unwrap();
+        drop(conn);
+        let conn = open_db(&db).unwrap();
+        assert!(schema_is_current(&conn).unwrap());
+        assert!(!trigger_sql(&conn, &update)
+            .unwrap()
+            .unwrap()
+            .contains("doomed"));
     }
 
     #[test]
@@ -3697,45 +4115,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let (store, conn) = store(dir.path());
-        conn.execute_batch(
-            r#"
-INSERT INTO sessions (session_id, source, cwd, models_json, workspace_roots_json)
-    VALUES ('s1', 'claude', '/p', '["opus"]', 'not json');
-INSERT INTO sessions (session_id, source) VALUES ('s2', 'claude');
-INSERT INTO session_events (source, session_id, message_id, ts_ms, role, kind, text, event_uid,
-    token_json, project_key_method, raw_facts_version)
-    VALUES ('claude', 's1', 'm1', 10, 'assistant', 'text', 'one', 'e1', '{"input":3}', 'git', 2);
-INSERT INTO tool_calls (source, session_id, tool_use_id, name, args_json, is_error)
-    VALUES ('claude', 's1', 't1', 'Bash', '{"command":"ls"}', 0);
-INSERT INTO file_edits (source, session_id, tool_use_id, file_path, tool_name, lines_added)
-    VALUES ('claude', 's1', 't2', '/p/a.rs', 'Edit', 3);
-INSERT INTO session_markers (source, session_id, marker_uid, kind, payload_json)
-    VALUES ('claude', 's1', 'mk1', 'compaction', '{"trigger":"auto"}');
-INSERT INTO session_relationships (source, parent_session_id, relationship_uid,
-    child_session_id, relationship, identity_status, evidence_kind, child_has_events,
-    created_ms, updated_ms)
-    VALUES ('claude', 's1', 'r1', 's2', 'delegated', 'observed', 'sidecar', 1, 1, 2);
-INSERT INTO history (source, session_id, project, prompt, timestamp_ms)
-    VALUES ('claude', 's1', '/p', 'hello', 1000);
-INSERT INTO history (source, session_id, prompt, timestamp_ms)
-    VALUES ('codex', NULL, 'no session yet', 2000);
-INSERT INTO session_presences (source, session_id, location, raw_locator)
-    VALUES ('claude', 's1', 'local', '/p/s1.jsonl');
-INSERT INTO session_commit_links (source, session_id, repo, commit_sha, match_method,
-    confidence, files_json, created_at_ms)
-    VALUES ('claude', 's1', 'repo', 'abc123', 'trailer', 0.75, '["a.rs"]', 1);
-INSERT INTO trajectories (id, version, status, decisions_json, retrospective_json,
-    search_text, updated_ms, timestamp_ms)
-    VALUES ('traj-1', 1, 'active', '[]', '{}', 'x', 1, 1);
-INSERT INTO session_observations (source, session_id, location, connector_id,
-    connector_instance, updated_ms)
-    VALUES ('claude', 's1', 'remote', 'conn', 'default', 1);
-INSERT INTO observation_evidence (source, session_id, location, connector_id,
-    connector_instance, evidence_uid, payload_json)
-    VALUES ('claude', 's1', 'remote', 'conn', 'default', 'ev1', '{"a":1}');
-"#,
-        )
-        .unwrap();
+        conn.execute_batch(EVERY_KIND_FIXTURE).unwrap();
         let inserted = check(&store, &conn, "inserts");
         let every: BTreeSet<ChangeKind> = ChangeKind::ALL.iter().copied().collect();
         assert_eq!(

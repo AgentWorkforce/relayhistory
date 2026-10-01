@@ -2323,6 +2323,10 @@ fn migrate_session_markers_v2(conn: &Connection) -> Result<()> {
                 params![bounded, id],
             )?;
         }
+        // SQLite refuses to drop a column a trigger names, and the change
+        // feed's update guard names every column; `init_schema` rebuilds it
+        // from the remaining ones at the end of this pass.
+        crate::change_feed::release_update_guard(conn, "session_markers")?;
         conn.execute("ALTER TABLE session_markers DROP COLUMN detail_json", [])?;
     }
     conn.execute(
@@ -7881,6 +7885,8 @@ mod tests {
                      VALUES ('claude', 'legacy-1', 42, 'user', 'text', 'hi', 'e1');",
                 )
                 .unwrap();
+            // An older database's update trigger predates the column too.
+            crate::change_feed::release_update_guard(&legacy, "session_events").unwrap();
             legacy
                 .execute("ALTER TABLE session_events DROP COLUMN project_key", [])
                 .unwrap();
@@ -8392,6 +8398,8 @@ mod tests {
                 )
                 .unwrap();
             drop_session_requests_view(&legacy);
+            // An older database's update trigger predates the columns too.
+            crate::change_feed::release_update_guard(&legacy, "session_events").unwrap();
             for (column, _) in REQUIRED_SESSION_EVENT_COLUMNS {
                 legacy
                     .execute_batch(&format!("ALTER TABLE session_events DROP COLUMN {column};"))
@@ -8461,6 +8469,8 @@ mod tests {
         {
             let legacy = open_db(&legacy_path).unwrap();
             drop_session_requests_view(&legacy);
+            // An older database's update trigger predates the columns too.
+            crate::change_feed::release_update_guard(&legacy, "session_events").unwrap();
             for (column, _) in REQUIRED_SESSION_EVENT_COLUMNS {
                 legacy
                     .execute_batch(&format!("ALTER TABLE session_events DROP COLUMN {column};"))

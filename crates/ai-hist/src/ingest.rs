@@ -720,14 +720,15 @@ const DESTINATION_HEAD_KEY: &str = "destination_head";
 
 /// The destination's change-feed head, as `epoch:revision`.
 ///
-/// Every insert, update and delete on the tables the marker counts —
-/// `sessions`, `session_events`, `tool_calls`, `file_edits` — advances the
-/// database-wide revision through the change-feed triggers, and the epoch is
-/// drawn once per database. So a head equal to the one read *before* the
-/// marker was taken proves no row the marker counted has been written or
-/// deleted since, and the marker is still exact. A head that moved says
-/// nothing either way — the hook fast path and hydration add rows between
-/// sweeps — and the tick falls back to comparing the counts.
+/// Every insert and delete on the tables the marker counts — `sessions`,
+/// `session_events`, `tool_calls`, `file_edits` — and every update that
+/// changes one of their rows advances the database-wide revision through the
+/// change-feed triggers, and the epoch is drawn once per database. So a head
+/// equal to the one read *before* the marker was taken proves no row the
+/// marker counted has been added, changed or deleted since, and the marker is
+/// still exact. A head that moved says nothing either way — the hook fast
+/// path and hydration add rows between sweeps — and the tick falls back to
+/// comparing the counts.
 ///
 /// Before this, every unchanged tick recounted every session's evidence to
 /// confirm what the head already said (#42).
@@ -10175,7 +10176,7 @@ fn insert_session_event_with_provenance(
     let blank = ToolResultFacts::default();
     let tool_result_facts = tool_result_facts.unwrap_or(&blank);
     // Stamp `project_key` as the row is inserted rather than sweeping for it
-    // afterwards. An UPDATE over `session_events` re-stamps the row's
+    // afterwards. An UPDATE that changes a `session_events` row re-stamps its
     // change-feed revision, so a sweep would report a second upsert for every
     // event of every session on every sync.
     //

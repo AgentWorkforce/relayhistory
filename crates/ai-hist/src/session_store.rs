@@ -1382,10 +1382,11 @@ pub struct SyncReport {
 /// not to keep two copies of the catalog, and a fixed 32 bytes per row makes
 /// the before/after maps the same size whatever the row holds.
 ///
-/// The head is what lets an unchanged tick skip the scan. Every insert,
-/// update and delete of a `sessions` row moves the database-wide clock (the
-/// change feed's triggers), so a head equal to the one a digest was read at
-/// proves no row it covers has changed since. The rows stay the answer to
+/// The head is what lets an unchanged tick skip the scan. Every insert and
+/// delete of a `sessions` row, and every update that changes one of its
+/// columns, moves the database-wide clock (the change feed's triggers), so a
+/// head equal to the one a digest was read at proves no row it covers has
+/// changed since. The rows stay the answer to
 /// *what* changed: a moved head says something was written, not that a
 /// covered column was, and `changed` reports only rows whose digest moved.
 /// `head` is `None` on a store whose feed is not installed, and such a digest
