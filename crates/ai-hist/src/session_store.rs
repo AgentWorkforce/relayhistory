@@ -879,6 +879,7 @@ impl SessionStore {
         // cannot be what holds the sender open.
         let reports = Arc::new(Mutex::new(Some(reports)));
         let close_reports = reports.clone();
+        let tick_reports = reports.clone();
         let stop = opts.stop.clone().unwrap_or_default();
         let tick_stop = stop.clone();
 
@@ -913,6 +914,12 @@ impl SessionStore {
                                 None => catalog_fingerprint(conn).map_err(anyhow::Error::from)?,
                             };
                             swept_from = Some(before.clone());
+                            #[cfg(test)]
+                            if cancel_diff_fault(&db_path) {
+                                // Stop once the baseline is taken, so the
+                                // sweep is cancelled with a baseline to diff.
+                                tick_stop.stop();
+                            }
                             Ok(before)
                         },
                         |conn, before, _tick| {
@@ -941,23 +948,39 @@ impl SessionStore {
                     // since the last report" this field already promises.
                     if error.chain().any(|cause| cause.is::<CaptureCancelled>()) {
                         if let Some(before) = swept_from {
-                            let diff = open_db_readonly(&db_path)
-                                .map_err(Error::sync)
-                                .and_then(|conn| changes_under_lock(&conn, &before));
+                            let diff =
+                                open_db_readonly(&db_path)
+                                    .map_err(Error::sync)
+                                    .and_then(|conn| {
+                                        #[cfg(test)]
+                                        if cancel_diff_fault(&db_path) {
+                                            return Err(Error::sync(anyhow::anyhow!(
+                                                "injected diff failure"
+                                            )));
+                                        }
+                                        changes_under_lock(&conn, &before)
+                                    });
                             match diff {
                                 Ok((after, changed)) => {
                                     *base = Some(after);
                                     *tick_pending.lock().expect("watch pending") = changed;
                                 }
-                                // Surfaced rather than swallowed: reported as
-                                // a failed tick (an `Err` on the stream), not
-                                // as a clean cancellation that silently lost
-                                // the rows.
+                                // Surfaced rather than swallowed, and without
+                                // giving up the cancellation: the failure goes
+                                // onto the stream as its own `Err`, ahead of
+                                // the cancelled report, and the cancellation
+                                // is still what this tick returns, so the loop
+                                // ends as it was asked to.
                                 Err(diff_error) => {
-                                    return Err(anyhow::anyhow!(
-                                        "watch tick cancelled after committing changes that could \
-                                         not be read back for its report: {diff_error}"
-                                    ));
+                                    if let Some(sender) =
+                                        &*tick_reports.lock().expect("watch reports")
+                                    {
+                                        let _ = sender.send(Err(Error::sync(anyhow::anyhow!(
+                                            "watch tick cancelled after committing changes \
+                                             that could not be read back for its report: \
+                                             {diff_error}"
+                                        ))));
+                                    }
                                 }
                             }
                         }
@@ -1810,6 +1833,21 @@ impl Default for WatchOptions {
             stop: None,
         }
     }
+}
+
+/// Database paths whose watch ticks stop themselves once their baseline is
+/// taken and then fail the cancellation diff — the one way to reach that path
+/// deterministically from a test.
+#[cfg(test)]
+static CANCEL_DIFF_FAULTS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn cancel_diff_fault(db_path: &Path) -> bool {
+    CANCEL_DIFF_FAULTS
+        .lock()
+        .expect("cancel diff faults")
+        .iter()
+        .any(|path| path == db_path)
 }
 
 /// The sending half of a watch's report stream.
@@ -3002,6 +3040,61 @@ mod tests {
             committed.difference(&reported).count(),
             committed.len()
         );
+    }
+
+    /// A cancellation whose diff cannot be read still ends the loop: the
+    /// failure arrives as its own `Err`, the cancelled report follows, and the
+    /// stream ends without anyone calling `stop`.
+    #[test]
+    fn a_cancellation_whose_diff_fails_still_ends_the_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ai-history.db");
+        let project = dir.path().join(".claude/projects/p");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("00000000-0000-4000-8000-000000000001.jsonl"),
+            "{\"type\":\"user\",\"sessionId\":\"00000000-0000-4000-8000-000000000001\",\
+             \"cwd\":\"/tmp/x\",\"timestamp\":\"2026-09-19T10:00:00.000Z\",\
+             \"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+        let store = store_at(&db);
+        CANCEL_DIFF_FAULTS.lock().unwrap().push(db.clone());
+        let watch = store
+            .watch(WatchOptions {
+                use_fs_events: false,
+                poll_interval_ms: 600_000,
+                immediate: true,
+                ..WatchOptions::default()
+            })
+            .unwrap();
+        let (sender, received) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for item in watch {
+                let _ = sender.send(item);
+            }
+        });
+        let mut items = Vec::new();
+        while let Ok(item) = received.recv_timeout(Duration::from_secs(30)) {
+            items.push(item);
+        }
+        let ended = reader.is_finished();
+        CANCEL_DIFF_FAULTS
+            .lock()
+            .unwrap()
+            .retain(|path| path != &db);
+        assert!(ended, "the loop must end on the cancellation: {items:?}");
+        reader.join().unwrap();
+        assert_eq!(items.len(), 2, "{items:?}");
+        match &items[0] {
+            Err(error) => assert!(
+                error.to_string().contains("could not be read back"),
+                "{error}"
+            ),
+            Ok(report) => panic!("expected the diff failure first, got {report:?}"),
+        }
+        let cancelled = items[1].as_ref().expect("then the cancelled report");
+        assert!(cancelled.cancelled);
     }
 
     /// `next()` blocks on the channel, not on a poll of the loop's thread,
