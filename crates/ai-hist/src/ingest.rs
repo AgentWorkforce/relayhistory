@@ -1038,10 +1038,55 @@ struct DestinationSnapshot {
     /// The sessions [`Self::advanced`] recounted, and whether each can still
     /// be named by its own rows. Kept only while `named` is `None`.
     recounted: HashMap<(String, String), bool>,
-    /// The highest prompt id when the snapshot was taken, read after the
-    /// head: a replayable prompt above the head with an id at or below it
-    /// was changed in place, not appended.
-    history_max_id: Option<i64>,
+    /// The prompt log when the snapshot was taken, read after the head; see
+    /// [`PromptBaseline`].
+    prompts: PromptBaseline,
+}
+
+/// The highest prompt id when a snapshot was taken, and how many replayable
+/// prompts had an id at or below it -- read in one statement.
+///
+/// A prompt's session is not part of its identity, so a prompt that moved or
+/// was deleted leaves nothing naming the session it lost. Ids are
+/// `AUTOINCREMENT`, never reused, so every prompt the snapshot counted has an
+/// id at or below `max_id`, and no later prompt does. A replayable prompt
+/// above the head with an id at or below `max_id` was changed in place; one
+/// of them gone shows as fewer such prompts than `counted`, even when a
+/// prompt with the same identity was inserted again (which clears its
+/// tombstone). Anything else above the head is a new prompt, which only adds
+/// to the session it names.
+#[derive(Debug, Clone, Copy)]
+struct PromptBaseline {
+    max_id: i64,
+    counted: i64,
+}
+
+impl PromptBaseline {
+    fn take(conn: &Connection) -> Result<Self> {
+        let (max_id, counted) = conn
+            .prepare_cached(
+                "SELECT m, (SELECT COUNT(*) FROM history WHERE id <= m \
+                     AND source IN (SELECT value FROM json_each(?1))) \
+                 FROM (SELECT COALESCE(MAX(id), 0) AS m FROM history)",
+            )?
+            .query_row([replayable_history_sources()], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?;
+        Ok(Self { max_id, counted })
+    }
+
+    /// Whether every replayable prompt the snapshot counted is still there.
+    fn intact(&self, conn: &Connection) -> Result<bool> {
+        let still: i64 = conn
+            .prepare_cached(
+                "SELECT COUNT(*) FROM history WHERE id <= ?1 \
+                 AND source IN (SELECT value FROM json_each(?2))",
+            )?
+            .query_row(params![self.max_id, replayable_history_sources()], |row| {
+                row.get(0)
+            })?;
+        Ok(still == self.counted)
+    }
 }
 
 impl DestinationSnapshot {
@@ -1051,14 +1096,14 @@ impl DestinationSnapshot {
     fn take(conn: &Connection) -> Result<Self> {
         let head = crate::change_feed::read_head(conn).ok();
         let mut named = HashSet::new();
-        let history_max_id = history_max_id(conn)?;
+        let prompts = PromptBaseline::take(conn)?;
         let holdings = session_holdings_naming(conn, Some(&mut named))?;
         Ok(Self {
             head,
             holdings,
             named: Some(named),
             recounted: HashMap::new(),
-            history_max_id,
+            prompts,
         })
     }
 
@@ -1080,7 +1125,7 @@ impl DestinationSnapshot {
             holdings: stored.sessions.clone(),
             named: None,
             recounted: HashMap::new(),
-            history_max_id: history_max_id(conn).ok()?,
+            prompts: PromptBaseline::take(conn).ok()?,
         })
     }
 
@@ -1106,8 +1151,7 @@ impl DestinationSnapshot {
             return Ok(None);
         }
         if to.revision > from.revision {
-            let Some(touched) = sessions_written_since(conn, from.revision, self.history_max_id)?
-            else {
+            let Some(touched) = sessions_written_since(conn, from.revision, &self.prompts)? else {
                 return Ok(None);
             };
             for (source, session_id) in touched {
@@ -1151,13 +1195,6 @@ impl DestinationSnapshot {
     }
 }
 
-/// The highest prompt id, or `None` for an empty prompt log.
-fn history_max_id(conn: &Connection) -> Result<Option<i64>> {
-    Ok(conn
-        .prepare_cached("SELECT MAX(id) FROM history")?
-        .query_row([], |row| row.get(0))?)
-}
-
 /// The sweep-end snapshot: `start` carried forward when the feed allows it,
 /// otherwise a full count.
 fn current_destination(
@@ -1182,7 +1219,7 @@ fn current_destination(
 fn sessions_written_since(
     conn: &Connection,
     revision: u64,
-    history_max_id: Option<i64>,
+    prompts: &PromptBaseline,
 ) -> Result<Option<HashSet<(String, String)>>> {
     let revision = i64::try_from(revision).unwrap_or(i64::MAX);
     let sources = repairable_event_sources();
@@ -1197,13 +1234,9 @@ fn sessions_written_since(
         touched.insert(session);
         *read <= DESTINATION_RECOUNT_ROW_LIMIT && touched.len() <= DESTINATION_RECOUNT_LIMIT
     };
-    // A prompt's session is not part of its identity, so a prompt that moved
-    // between sessions, or was deleted, leaves nothing naming the session it
-    // left. A replayable source's prompt deleted, or changed in place (its id
-    // is not above the highest the snapshot saw), sends the end of the sweep
-    // back to a full count. An appended prompt -- a new id, since the ids are
-    // `AUTOINCREMENT` and never reused -- only adds to the session it names.
-    // Prompts of other sources are not counted and do not matter.
+    // A replayable prompt deleted or changed in place sends the end of the
+    // sweep back to a full count; a new one is recounted like any row (see
+    // `PromptBaseline`). Prompts of other sources are not counted.
     let prompt_removed: bool = conn
         .prepare_cached(
             "SELECT EXISTS (SELECT 1 FROM evidence_tombstones WHERE kind = 'history' \
@@ -1220,17 +1253,31 @@ fn sessions_written_since(
         )?;
         let mut rows = statement.query(params![revision, history_sources.clone(), rows_limit])?;
         let mut read = 0usize;
+        let mut appended = false;
         while let Some(row) = rows.next()? {
-            let id: i64 = row.get(0)?;
-            if history_max_id.is_none_or(|max| id <= max) {
+            // Every row counts toward the limit, sessionless ones too: past
+            // it the scan stops and cannot vouch for what it did not read.
+            read += 1;
+            if read > DESTINATION_RECOUNT_ROW_LIMIT {
                 return Ok(None);
             }
+            let id: i64 = row.get(0)?;
+            if id <= prompts.max_id {
+                return Ok(None);
+            }
+            appended = true;
             let Some(session_id) = row.get::<_, Option<String>>(2)? else {
                 continue;
             };
-            if !note(&mut touched, &mut read, (row.get(1)?, session_id)) {
+            touched.insert((row.get(1)?, session_id));
+            if touched.len() > DESTINATION_RECOUNT_LIMIT {
                 return Ok(None);
             }
+        }
+        // A new prompt may be an old one deleted and inserted again under
+        // another session, which leaves no tombstone behind.
+        if appended && !prompts.intact(conn)? {
+            return Ok(None);
         }
     }
     for (table, kind) in SESSION_KEYED_HOLDINGS {
@@ -17496,6 +17543,63 @@ mod tests {
         conn.execute("DELETE FROM history WHERE source = 'devin'", [])
             .unwrap();
         assert!(start.advanced(&conn).unwrap().is_none(), "a deleted prompt");
+
+        // Deleted and inserted again with the same identity under another
+        // session: the insert clears the tombstone and the row has a new id,
+        // so it looks appended, but the session it left is short.
+        conn.execute(
+            "INSERT INTO history (source, session_id, prompt, timestamp_ms) \
+             VALUES ('devin', 'h', 'again', 7)",
+            [],
+        )
+        .unwrap();
+        let tombstones = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM evidence_tombstones WHERE kind = 'history'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let before = tombstones(&conn);
+        let start = DestinationSnapshot::take(&conn).unwrap();
+        conn.execute(
+            "DELETE FROM history WHERE source = 'devin' AND prompt = 'again'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO history (source, session_id, prompt, timestamp_ms) \
+             VALUES ('devin', 'h3', 'again', 7)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            tombstones(&conn),
+            before,
+            "the re-insert cleared the tombstone"
+        );
+        assert!(
+            start.advanced(&conn).unwrap().is_none(),
+            "a re-inserted prompt"
+        );
+
+        // More sessionless prompts than the scan reads: what lies past the
+        // limit cannot be vouched for, sessionless rows or not.
+        let start = DestinationSnapshot::take(&conn).unwrap();
+        conn.execute_batch(&format!(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {}) \
+             INSERT INTO history (source, session_id, prompt, timestamp_ms) \
+                 SELECT 'devin', NULL, 'p' || i, 100 + i FROM n; \
+             INSERT INTO history (source, session_id, prompt, timestamp_ms) \
+                 VALUES ('devin', 'late', 'late', 1);",
+            DESTINATION_RECOUNT_ROW_LIMIT + 1
+        ))
+        .unwrap();
+        assert!(
+            start.advanced(&conn).unwrap().is_none(),
+            "past the row limit"
+        );
 
         // A prompt of a source whose history is not counted does not matter.
         let start = DestinationSnapshot::take(&conn).unwrap();
