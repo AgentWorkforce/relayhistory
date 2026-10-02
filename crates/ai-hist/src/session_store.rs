@@ -1090,18 +1090,24 @@ impl SessionStore {
                 .map(|(event, bytes)| ToolResult::from_event(event, *bytes))
                 .collect();
             evidence.user_turns = all_user_turns(&tx, name, &session_id)?;
+        }
+        // Read once and shared: the requests take their tool use ids from the
+        // same rows when both kinds are selected.
+        let tool_call_rows = if wants(EvidenceKind::ToolCall) {
+            Some(session_tool_calls(&tx, &session_id, Some(name)).map_err(Error::query)?)
+        } else {
+            None
+        };
+        if wants(EvidenceKind::SessionEvent) {
             // Every request and the usage rollup from one evaluation of the
             // grouped view, rather than one per 1,000-request page plus one
             // more for the summary (#311).
             (evidence.requests, evidence.usage) =
-                session_requests_all(&tx, name, &session_id).map_err(Error::query)?;
+                session_requests_all(&tx, name, &session_id, tool_call_rows.as_deref())
+                    .map_err(Error::query)?;
         }
-        if wants(EvidenceKind::ToolCall) {
-            evidence.tool_calls = session_tool_calls(&tx, &session_id, Some(name))
-                .map_err(Error::query)?
-                .into_iter()
-                .map(ToolCall::from_row)
-                .collect();
+        if let Some(rows) = tool_call_rows {
+            evidence.tool_calls = rows.into_iter().map(ToolCall::from_row).collect();
         }
         if wants(EvidenceKind::FileEdit) {
             evidence.file_edits = session_file_edits(&tx, &session_id, Some(name))

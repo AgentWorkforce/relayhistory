@@ -13,6 +13,7 @@
 //! it recorded neither. It is namespace-qualified (`request-id:req_1`),
 //! because those namespaces are separate and can carry the same text, and
 //! [`RequestKeySource`] names the namespace so nobody has to parse the key.
+use crate::store::SessionToolCall;
 use crate::usage::{normalize_usage_str, NormalizedUsage, UsageAccounting};
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension};
@@ -551,10 +552,15 @@ pub fn session_requests_page(
 /// the summary, which made a whole-session read superlinear (#311). Callers
 /// supply the read snapshot: [`crate::SessionStore::session`] already holds
 /// one across every table it reads.
+///
+/// `tool_calls` is the session's tool calls when the caller has already read
+/// them (in [`crate::store::session_tool_calls`] order); the tool use ids are
+/// then taken from those rows instead of reading the table a second time.
 pub(crate) fn session_requests_all(
     conn: &Connection,
     source: &str,
     session_id: &str,
+    tool_calls: Option<&[SessionToolCall]>,
 ) -> Result<(Vec<SessionRequest>, Option<SessionUsageSummary>)> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {REQUEST_COLUMNS} FROM session_requests \
@@ -565,7 +571,10 @@ pub(crate) fn session_requests_all(
         .query_map(rusqlite::params![source, session_id], row_to_raw_request)?
         .collect::<rusqlite::Result<_>>()?;
     drop(stmt);
-    let tool_use_ids = tool_use_ids_for(conn, source, session_id, &raw)?;
+    let tool_use_ids = match tool_calls {
+        Some(rows) => tool_use_ids_from_rows(rows, &raw),
+        None => tool_use_ids_for(conn, source, session_id, &raw)?,
+    };
     let mut fold = UsageFold::default();
     let requests = raw
         .into_iter()
@@ -655,6 +664,42 @@ fn tool_use_ids_for(
         }
     }
     Ok(out)
+}
+
+/// [`tool_use_ids_for`] over tool-call rows already read in
+/// `session_tool_calls` order (`ts_ms IS NULL, ts_ms, id`). That order puts
+/// undated calls last where `tool_use_ids_for` puts them first (SQLite sorts
+/// NULL lowest), so each message's undated ids are moved to the front to give
+/// the same `(ts_ms, id)` order.
+fn tool_use_ids_from_rows(
+    rows: &[SessionToolCall],
+    requests: &[RawRequest],
+) -> HashMap<String, Vec<String>> {
+    let wanted: HashSet<&str> = requests
+        .iter()
+        .flat_map(|raw| raw.message_ids.iter().map(String::as_str))
+        .collect();
+    let mut buckets: HashMap<&str, (Vec<String>, Vec<String>)> = HashMap::new();
+    for row in rows {
+        let Some(message_id) = row.message_id.as_deref() else {
+            continue;
+        };
+        if !wanted.contains(message_id) {
+            continue;
+        }
+        let (undated, dated) = buckets.entry(message_id).or_default();
+        match row.ts_ms {
+            None => undated.push(row.tool_use_id.clone()),
+            Some(_) => dated.push(row.tool_use_id.clone()),
+        }
+    }
+    buckets
+        .into_iter()
+        .map(|(message_id, (mut undated, dated))| {
+            undated.extend(dated);
+            (message_id.to_string(), undated)
+        })
+        .collect()
 }
 
 /// Provider-neutral usage rollup for one session, or `None` when the session
@@ -1670,7 +1715,7 @@ mod tests {
             let conn = db();
             seed_adversarial_requests(&conn, seed, 40 + (seed as usize % 9) * 25);
             for source in ["claude", "codex"] {
-                let (all, summary) = session_requests_all(&conn, source, "s").unwrap();
+                let (all, summary) = session_requests_all(&conn, source, "s", None).unwrap();
                 for limit in [1, 2, 7, 1_000] {
                     assert_eq!(
                         all,
@@ -1683,8 +1728,16 @@ mod tests {
                     session_usage_summary(&conn, source, "s").unwrap(),
                     "seed {seed}, {source} summary"
                 );
+                // Tool use ids taken from rows the caller already read match
+                // the ones read from the table, undated calls included.
+                let rows = crate::store::session_tool_calls(&conn, "s", Some(source)).unwrap();
+                assert_eq!(
+                    (all, summary),
+                    session_requests_all(&conn, source, "s", Some(&rows)).unwrap(),
+                    "seed {seed}, {source} shared tool-call rows"
+                );
             }
-            let (all, _) = session_requests_all(&conn, "claude", "s").unwrap();
+            let (all, _) = session_requests_all(&conn, "claude", "s", None).unwrap();
             assert!(
                 all.iter().any(|request| !request.tool_use_ids.is_empty()),
                 "seed {seed} attached no tool calls"
@@ -1753,7 +1806,7 @@ mod tests {
             let conn = db();
             seed_requests(&conn, exchanges);
             let (steps, (requests, summary)) = vm_steps(&conn, || {
-                session_requests_all(&conn, "claude", "big").unwrap()
+                session_requests_all(&conn, "claude", "big", None).unwrap()
             });
             assert_eq!(requests.len(), exchanges);
             assert_eq!(requests[exchanges / 2].tool_use_ids.len(), 3);
