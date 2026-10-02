@@ -662,6 +662,7 @@ handle.
 | claude | ✓ | ✓ | ✓ | ✓ | ✓ | per-message |
 | codex | ✓ | ✓ | ✓ | ✓ | ✓ | cumulative-delta |
 | cursor | ✓ | ✓ | ✓ | ✓ | — | none |
+| devin | ✓ | ✓ | ✓ | ✓ | — | none |
 | grok | ✓ | ✓ | ✓ | ✓ | ✓ | per-request |
 | muse | ✓ | ✓ | ✓ | ✓ | ✓ | per-request |
 | opencode | ✓ | ✓ | ✓ | ✓ | ✓ | none |

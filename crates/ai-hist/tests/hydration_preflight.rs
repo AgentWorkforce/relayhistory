@@ -19,6 +19,7 @@ fn commercial_only_or_unconfigured_provider_hydration_leaves_fresh_database_abse
         .env_remove("CLAUDE_CONFIG_DIR")
         .env_remove("CODEX_HOME")
         .env_remove("GROK_HOME")
+        .env("XDG_DATA_HOME", dir.path().join("xdg"))
         .env("RELAYHISTORY_HOME", auth)
         .env(
             "RELAYHISTORY_CLAUDE_CREDENTIALS",

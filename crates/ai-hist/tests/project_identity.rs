@@ -123,6 +123,7 @@ fn canonical_keys_merge_checkouts_and_delegated_children_inherit_them() {
     std::env::set_var("USERPROFILE", home);
     std::env::set_var("OPENCODE_DB", home.join("missing-opencode.db"));
     std::env::set_var("TRAJECTORY_ROOT", home.join("missing-trajectories"));
+    std::env::set_var("XDG_DATA_HOME", home.join("missing-xdg"));
     std::env::remove_var("AI_HIST_DB");
     let db = home.join("history.db");
 

@@ -22,6 +22,7 @@ export const SOURCES = Object.freeze([
   'trajectory',
   'opencode',
   'muse',
+  'devin',
 ] as const);
 
 export type Source = (typeof SOURCES)[number];

@@ -318,6 +318,7 @@ pub enum Source {
     #[serde(rename = "opencode")]
     OpenCode,
     Muse,
+    Devin,
 }
 
 impl Source {
@@ -337,6 +338,7 @@ impl Source {
         Self::Trajectory,
         Self::OpenCode,
         Self::Muse,
+        Self::Devin,
     ];
 
     /// Canonical lowercase identifier stored in the ledger.
@@ -350,6 +352,7 @@ impl Source {
             Self::Trajectory => "trajectory",
             Self::OpenCode => "opencode",
             Self::Muse => "muse",
+            Self::Devin => "devin",
         }
     }
 
@@ -386,7 +389,7 @@ impl Source {
         // write them are the ones an embedder needs listed.
         if matches!(
             self,
-            Self::Claude | Self::Codex | Self::Grok | Self::OpenCode | Self::Muse
+            Self::Claude | Self::Codex | Self::Grok | Self::OpenCode | Self::Muse | Self::Devin
         ) && !evidence_kinds.contains(&EvidenceKind::SessionMarker)
         {
             evidence_kinds.push(EvidenceKind::SessionMarker);
@@ -409,6 +412,9 @@ impl Source {
                 // Muse: the record's own envelope `id` for prose and
                 // lifecycle, `tool:{call id}` / `result:{call id}` for tools.
                 Self::Muse => MessageIdOrigin::Mixed,
+                // Devin: the chat message's own `message_id`, else
+                // `n{node id}` from its `message_nodes` row.
+                Self::Devin => MessageIdOrigin::Mixed,
                 Self::Relay | Self::Trajectory => MessageIdOrigin::None,
             },
             hydrates_by_path: HOOK_HARNESSES.contains(&name),
@@ -2734,7 +2740,8 @@ mod tests {
                 | Source::Relay
                 | Source::Trajectory
                 | Source::OpenCode
-                | Source::Muse => Source::ALL.contains(source),
+                | Source::Muse
+                | Source::Devin => Source::ALL.contains(source),
             };
             assert!(listed, "{source:?} is missing from Source::ALL");
         }

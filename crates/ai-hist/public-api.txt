@@ -174,6 +174,7 @@ pub ai_hist::SessionScope::Remote
 pub ai_hist::Source::Claude
 pub ai_hist::Source::Codex
 pub ai_hist::Source::Cursor
+pub ai_hist::Source::Devin
 pub ai_hist::Source::Grok
 pub ai_hist::Source::Muse
 pub ai_hist::Source::OpenCode
@@ -458,6 +459,7 @@ pub ai_hist::Prompt::timestamp_ms: i64
 #[non_exhaustive] pub struct ai_hist::ProviderRoots
 pub ai_hist::ProviderRoots::claude: std::path::PathBuf
 pub ai_hist::ProviderRoots::codex: std::path::PathBuf
+pub ai_hist::ProviderRoots::devin: std::path::PathBuf
 pub ai_hist::ProviderRoots::grok: std::path::PathBuf
 pub ai_hist::ProviderRoots::home: std::path::PathBuf
 pub ai_hist::ProviderRoots::muse: std::path::PathBuf

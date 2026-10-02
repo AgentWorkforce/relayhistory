@@ -34,6 +34,7 @@ struct HomeLayout {
     grok: PathBuf,
     muse: PathBuf,
     opencode_db: PathBuf,
+    devin: PathBuf,
 }
 
 impl HomeLayout {
@@ -46,6 +47,7 @@ impl HomeLayout {
             grok: home.join(".grok"),
             muse: home.join(".local/share/muse/sessions"),
             opencode_db: home.join(".local/share/opencode/opencode.db"),
+            devin: home.join(".local/share/devin/cli"),
         }
     }
 
@@ -57,6 +59,7 @@ impl HomeLayout {
             grok: &self.grok,
             muse: &self.muse,
             opencode_db: &self.opencode_db,
+            devin: &self.devin,
         }
     }
 }
@@ -553,6 +556,7 @@ fn configured_provider_roots_move_the_watch_roots() {
         grok: PathBuf::from("/tmp/relayhistory-relocated/grok"),
         muse: PathBuf::from("/tmp/relayhistory-relocated/xdg-data/muse/sessions"),
         opencode_db: PathBuf::from("/tmp/relayhistory-relocated/opencode/opencode.db"),
+        devin: PathBuf::from("/tmp/relayhistory-relocated/devin/cli"),
     };
     let roots = ai_hist::discover::watch_roots(&shallow_providers(), &layout.roots());
 
@@ -567,6 +571,8 @@ fn configured_provider_roots_move_the_watch_roots() {
             .parent()
             .expect("opencode dir")
             .to_path_buf(),
+        layout.devin.clone(),
+        layout.devin.join("transcripts"),
     ] {
         assert!(
             roots.iter().any(|root| root.path == expected),
@@ -1855,7 +1861,9 @@ fn a_sweep_turned_away_by_another_sync_is_retried_not_dropped() {
         let home = home.path().to_path_buf();
         Arc::new(move |force| {
             // Exactly what the CLI's watch tick does.
-            let tick = ai_hist::sync_tick_at_with_home(&db, &home, SyncOutput::Silent, force)?;
+            let roots =
+                ai_hist::ProviderRoots::from_home(home.clone(), home.join("missing-opencode.db"));
+            let tick = ai_hist::sync_tick_at_with_roots(&db, &roots, SyncOutput::Silent, force)?;
             let _ = ticks.send(tick);
             Ok(ai_hist::watch::TickOutcome::from(tick))
         })
@@ -1969,7 +1977,9 @@ fn a_sweep_that_failed_is_retried_not_dropped() {
         let db = db.clone();
         let home = home.path().to_path_buf();
         Arc::new(move |force| {
-            let outcome = ai_hist::sync_tick_at_with_home(&db, &home, SyncOutput::Silent, force)
+            let roots =
+                ai_hist::ProviderRoots::from_home(home.clone(), home.join("missing-opencode.db"));
+            let outcome = ai_hist::sync_tick_at_with_roots(&db, &roots, SyncOutput::Silent, force)
                 .map(ai_hist::watch::TickOutcome::from);
             let _ = ticks.send(outcome.is_ok());
             outcome
@@ -3584,7 +3594,7 @@ fn a_negative_count_in_the_marker_does_not_license_a_skip() {
     let corrupted = marker
         .split(' ')
         .map(|part| match part.split_once('=') {
-            Some((session, _)) => format!("{session}=-1.-1.-1.-1"),
+            Some((session, _)) => format!("{session}=-1.-1.-1.-1.-1.-1"),
             None => part.to_string(),
         })
         .collect::<Vec<_>>()
@@ -3619,26 +3629,27 @@ fn a_negative_count_in_the_marker_does_not_license_a_skip() {
 fn an_unreadable_destination_marker_sweeps_instead_of_panicking() {
     for marker in [
         serde_json::Value::from(""),
-        serde_json::Value::from("v4"),
+        serde_json::Value::from("v5"),
         // Shaped like this build's marker, and wrong in one way each.
-        serde_json::Value::from("v4 n1"),
-        serde_json::Value::from("v4 nx abcdef0123456789=1.0.0.1"),
-        serde_json::Value::from("v4 n1 notanentry"),
-        serde_json::Value::from("v4 n1 zzzz=1.2.3.4"),
-        serde_json::Value::from("v4 n1 abcdef0123456789=1.2.3"),
-        serde_json::Value::from("v4 n1 abcdef0123456789=1.2.3.4.5"),
-        serde_json::Value::from("v4 n1 abcdef0123456789=1.x.3.4"),
+        serde_json::Value::from("v5 n1"),
+        serde_json::Value::from("v5 nx abcdef0123456789=1.0.0.0.0.1"),
+        serde_json::Value::from("v5 n1 notanentry"),
+        serde_json::Value::from("v5 n1 zzzz=1.2.3.4.5.6"),
+        serde_json::Value::from("v5 n1 abcdef0123456789=1.2.3"),
+        serde_json::Value::from("v5 n1 abcdef0123456789=1.2.3.4.5.6.7"),
+        serde_json::Value::from("v5 n1 abcdef0123456789=1.x.3.4.5.6"),
         // Truncated: the count is what makes this distinguishable from a
         // database that legitimately holds fewer sessions.
-        serde_json::Value::from("v4 n2 abcdef0123456789=1.0.0.1"),
+        serde_json::Value::from("v5 n2 abcdef0123456789=1.0.0.0.0.1"),
         // A negative count is the dangerous one: under a `>=` comparison it is
         // satisfied by every current value, so a corrupt marker would license
         // a skip over missing evidence rather than a sweep.
-        serde_json::Value::from("v4 n1 abcdef0123456789=-1.0.0.1"),
-        serde_json::Value::from("v4 n1 abcdef0123456789=0.0.0.-1"),
+        serde_json::Value::from("v5 n1 abcdef0123456789=-1.0.0.0.0.1"),
+        serde_json::Value::from("v5 n1 abcdef0123456789=0.0.0.0.0.-1"),
         // An entry repeated is not something the grouped reads can produce.
-        serde_json::Value::from("v4 n2 abcdef0123456789=1.0.0.1 abcdef0123456789=2.0.0.1"),
+        serde_json::Value::from("v5 n2 abcdef0123456789=1.0.0.0.0.1 abcdef0123456789=2.0.0.0.0.1"),
         // Markers from the shapes this one replaced.
+        serde_json::Value::from("v4 n1 abcdef0123456789=1.0.0.1"),
         serde_json::Value::from("v3 s1 h1"),
         serde_json::Value::from("v2 s1:e1:r1:h1"),
         serde_json::Value::from(":::"),
@@ -3874,7 +3885,9 @@ fn a_stamp_from_another_parser_generation_does_not_skip_the_sweep() {
 // ---------------------------------------------------------------------------
 
 fn sync_tick(db: &Path, home: &Path, force: bool) -> ai_hist::SyncTick {
-    ai_hist::sync_tick_at_with_home(db, home, SyncOutput::Silent, force).expect("sync tick")
+    let roots =
+        ai_hist::ProviderRoots::from_home(home.to_path_buf(), home.join("missing-opencode.db"));
+    ai_hist::sync_tick_at_with_roots(db, &roots, SyncOutput::Silent, force).expect("sync tick")
 }
 
 fn rehydrate(db: &Path, home: &Path, session_id: &str) -> ai_hist::HydrateSessionResult {

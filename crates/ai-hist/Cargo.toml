@@ -125,3 +125,7 @@ required-features = ["unstable-internal"]
 [[test]]
 name = "claude_rewrite_retention"
 required-features = ["unstable-internal"]
+
+[[test]]
+name = "devin"
+required-features = ["unstable-internal"]

@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "session_id": "fixture-devin-session",
+  "agent": {
+    "name": "fixture-agent",
+    "version": "3000.0.0",
+    "model_name": "fixture-model-1",
+    "extra": {},
+    "tool_definitions": []
+  },
+  "final_metrics": {
+    "num_turns": 2,
+    "num_tool_calls": 2
+  },
+  "steps": []
+}

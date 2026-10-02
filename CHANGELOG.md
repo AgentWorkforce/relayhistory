@@ -194,6 +194,16 @@ Notable changes to the native `ai-hist` CLI are documented here.
   sessions and their objectives are not history rows. A Muse hydration
   reports `full`. `ai-hist resume` prints `muse resume <id>`, and the sync
   service forwards `XDG_DATA_HOME`.
+- Devin CLI is a first-class source, `devin`. Sessions are read from
+  `$XDG_DATA_HOME/devin/cli/sessions.db` and its `transcripts/`
+  (`~/.local/share/devin/cli` by default) by discovery, `sync`, targeted
+  hydration and live capture. The store is opened read-only under a coherent
+  snapshot, never migrated or written. Each visible session gets its prompts,
+  prose, thinking, tool calls and results, file edits where `tool_call_state`
+  names a path, models, request and finish metadata, and markers (`system`,
+  `synthetic_turn`, `compaction_boundary`, `session_title`, `session_meta`,
+  `agent_manifest`); hidden sessions are skipped. Devin records no
+  delegation, and has no native resume command.
 - Add MCP `list_relay_agents` for live Agent Relay participants. It reads only
   the local desktop Unix socket, discovers it from `AGENT_RELAY_SOCKET`, the
   private desktop pointer file, then platform defaults, and reports a missing
@@ -768,6 +778,8 @@ Notable changes to the native `ai-hist` CLI are documented here.
 - `Source::Muse` and `ProviderRoots::muse` (the Muse Code sessions directory;
   `from_env` honours `XDG_DATA_HOME`). Both types are `#[non_exhaustive]`, so
   this is additive.
+- `Source::Devin` and `ProviderRoots::devin` (the Devin CLI data directory;
+  `from_env` honours `XDG_DATA_HOME`). Additive for the same reason.
 - `ProviderRoots` gains `opencode_db_pinned: bool`. `from_env` sets it when
   `OPENCODE_DB` is set; `from_home` leaves it `false`, so every OpenCode channel
   database beside `opencode_db` is read. Set it to read `opencode_db` alone.

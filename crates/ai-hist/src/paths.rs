@@ -174,6 +174,20 @@ pub fn opencode_storage_dir(home: &Path) -> PathBuf {
         .unwrap_or_else(|| home.join(".local/share/opencode/storage"))
 }
 
+/// The Devin CLI data directory: `$XDG_DATA_HOME/devin/cli`, defaulting to
+/// `~/.local/share/devin/cli`. It holds `sessions.db` plus the per-session
+/// `transcripts/<id>.json` exports.
+pub fn devin_cli_dir(home: &Path) -> PathBuf {
+    env_dir("XDG_DATA_HOME")
+        .map(|data| data.join("devin").join("cli"))
+        .unwrap_or_else(|| devin_cli_dir_under(home))
+}
+
+/// [`devin_cli_dir`] with nothing read from the environment.
+pub(crate) fn devin_cli_dir_under(home: &Path) -> PathBuf {
+    home.join(".local/share/devin/cli")
+}
+
 /// Where every local provider keeps its sessions.
 ///
 /// One value, resolved once, drives `sync`, `hydrate`, `watch` and the
@@ -181,12 +195,12 @@ pub fn opencode_storage_dir(home: &Path) -> PathBuf {
 /// watched, or a session the sweep catalogued cannot be hydrated afterwards.
 /// Build it with [`ProviderRoots::from_env`] (the CLI's rules: the process
 /// environment's `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME`,
-/// `XDG_DATA_HOME` (for Muse Code), `OPENCODE_DB`, `OPENCODE_STORAGE_DIR` and `TRAJECTORY_ROOT` override the
+/// `XDG_DATA_HOME` (for Muse Code and Devin), `OPENCODE_DB`, `OPENCODE_STORAGE_DIR` and `TRAJECTORY_ROOT` override the
 /// defaults under `home`) or [`ProviderRoots::from_home`] (the defaults under
 /// `home`, with nothing read from the environment — what a test or an
 /// embedder with its own layout wants). The environment is read **once**,
 /// here; nothing on the sync, hydrate or watch paths consults it again.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct ProviderRoots {
     /// The home the file-backed providers are rooted at.
@@ -199,6 +213,8 @@ pub struct ProviderRoots {
     pub grok: PathBuf,
     /// Muse Code session logs (`~/.local/share/muse/sessions`).
     pub muse: PathBuf,
+    /// Devin CLI data directory (`sessions.db` plus `transcripts/`).
+    pub devin: PathBuf,
     /// The OpenCode SQLite store. Unless [`Self::opencode_db_pinned`], every
     /// channel database beside it (`opencode-stable.db`,
     /// `opencode-nightly.db`, ...) is read as well.
@@ -225,6 +241,49 @@ pub struct ProviderRoots {
     pub use_env_roots: bool,
 }
 
+#[derive(Deserialize)]
+struct ProviderRootsWire {
+    home: PathBuf,
+    claude: PathBuf,
+    codex: PathBuf,
+    grok: PathBuf,
+    muse: PathBuf,
+    #[serde(default)]
+    devin: Option<PathBuf>,
+    opencode_db: PathBuf,
+    #[serde(default)]
+    opencode_db_pinned: bool,
+    opencode_storage_dir: PathBuf,
+    trajectory_roots: Option<Vec<PathBuf>>,
+    use_env_roots: bool,
+}
+
+#[doc(hidden)]
+impl<'de> Deserialize<'de> for ProviderRoots {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ProviderRootsWire::deserialize(deserializer)?;
+        let devin = wire
+            .devin
+            .unwrap_or_else(|| devin_cli_dir_under(&wire.home));
+        Ok(Self {
+            home: wire.home,
+            claude: wire.claude,
+            codex: wire.codex,
+            grok: wire.grok,
+            muse: wire.muse,
+            devin,
+            opencode_db: wire.opencode_db,
+            opencode_db_pinned: wire.opencode_db_pinned,
+            opencode_storage_dir: wire.opencode_storage_dir,
+            trajectory_roots: wire.trajectory_roots,
+            use_env_roots: wire.use_env_roots,
+        })
+    }
+}
+
 impl ProviderRoots {
     /// Roots under `home`, with the process environment's provider overrides
     /// applied — the CLI's resolution.
@@ -234,6 +293,7 @@ impl ProviderRoots {
             codex: codex_home(&home),
             grok: grok_home(&home),
             muse: muse_sessions_dir(&home),
+            devin: devin_cli_dir(&home),
             opencode_db: opencode_db_path(&home),
             opencode_db_pinned: env_dir("OPENCODE_DB").is_some(),
             opencode_storage_dir: opencode_storage_dir(&home),
@@ -255,6 +315,7 @@ impl ProviderRoots {
             codex: home.join(".codex"),
             grok: home.join(".grok"),
             muse: default_muse_sessions_dir(&home),
+            devin: devin_cli_dir_under(&home),
             home,
             opencode_db,
             opencode_db_pinned: false,
@@ -297,6 +358,26 @@ pub fn home_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn roots_serialized_before_devin_gain_the_default_under_their_home() {
+        let roots: ProviderRoots = serde_json::from_value(serde_json::json!({
+            "home": "/tmp/legacy-home",
+            "claude": "/tmp/legacy-home/.claude",
+            "codex": "/tmp/legacy-home/.codex",
+            "grok": "/tmp/legacy-home/.grok",
+            "muse": "/tmp/legacy-home/.local/share/muse/sessions",
+            "opencode_db": "/tmp/legacy-home/.local/share/opencode/opencode.db",
+            "opencode_storage_dir": "/tmp/legacy-home/.local/share/opencode/storage",
+            "trajectory_roots": null,
+            "use_env_roots": false
+        }))
+        .unwrap();
+        assert_eq!(
+            roots.devin,
+            PathBuf::from("/tmp/legacy-home/.local/share/devin/cli")
+        );
+    }
 
     #[test]
     fn opencode_db_filenames_match_the_channel_rule() {
@@ -403,6 +484,7 @@ mod tests {
                 "join(\".codex",
                 "join(\".grok",
                 "join(\".local/share/muse",
+                "join(\".local/share/devin",
             ] {
                 assert!(
                     !production.contains(literal),

@@ -200,6 +200,11 @@ struct SourceSnapshot {
     /// Top-level Claude bytes captured by the lifecycle hook before catalog
     /// writes. Ordinary hydration leaves this absent and reads by path.
     claude_transcript: Option<ClaudeTranscriptSnapshot>,
+    /// Devin rows captured under the same SQLite read transaction that
+    /// produced `stamp`. Keeping the loaded session here prevents targeted
+    /// hydration from reopening the WAL at a newer generation before it
+    /// normalizes the evidence.
+    devin_session: Option<crate::ingest::devin::DevinSession>,
     /// For OpenCode: which of the provider's two layouts this locator was
     /// validated against. Carried rather than re-derived, because the only
     /// thing that can be re-derived from a path is its spelling — and
@@ -389,9 +394,10 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
     };
     let local_observation = observations::get(&conn, &local_key)?;
     if let Some(observation) = &local_observation {
-        // OpenCode enumerates by session id, while its local parser needs the
-        // separately recorded provider database path from the catalog.
-        if options.source != "opencode" {
+        // OpenCode and Devin enumerate by session id, while their local
+        // parsers need the separately recorded provider database path from
+        // the catalog.
+        if !matches!(options.source.as_str(), "opencode" | "devin") {
             target.locator = observation.raw_locator.clone();
         }
         target.discovery_state = Some(observation.discovery_state.clone());
@@ -412,7 +418,7 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
     } else {
         Vec::new()
     };
-    let snapshot = source_snapshot(&conn, options, &target, roots, claude_snapshot)?;
+    let mut snapshot = source_snapshot(&conn, options, &target, roots, claude_snapshot)?;
     let previous = observations::checkpoint(&conn, &local_key)?.map(|checkpoint| {
         (
             checkpoint.source_stamp,
@@ -494,6 +500,16 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
         );
     }
 
+    // A Devin stamp is content-sensitive and sufficient for the unchanged
+    // shortcut, so do not parse and retain every provider row until a pass is
+    // actually needed. The changed path captures a fresh stamp and all rows
+    // inside one read transaction; if a writer committed after the cheap
+    // probe, both the checkpoint stamp and normalized evidence move to that
+    // newer generation together.
+    if options.source == "devin" {
+        capture_devin_session(&mut snapshot, options, &roots.devin)?;
+    }
+
     // The content pass, on the one path that has already read every one of
     // these files anyway. Taken *before* the writer lock: it re-reads every
     // byte of the session's files, and doing that inside the transaction
@@ -533,6 +549,7 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
             snapshot.path.as_deref(),
             &snapshot.claude_subagents,
             snapshot.claude_transcript.as_ref(),
+            snapshot.devin_session.as_ref(),
             &mut cursor,
             records_parsed,
             snapshot.opencode_layout,
@@ -593,7 +610,30 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
         // a resume position without the checkpoint it belongs to would describe
         // evidence nothing recorded.
         store_cursor(&tx, &cursor_key, &cursor)?;
-        let local_observation=local_observation.unwrap_or(SessionObservation{key:local_key,raw_locator:target.locator.clone(),source_stamp:tx.query_row("SELECT source_stamp FROM session_presences WHERE source=? AND session_id=? AND location='local'",params![options.source,options.session_id],|row|row.get(0)).optional()?.flatten(),discovery_state:"shallow".into(),access_state:"available".into(),updated_ms:now_ms()});
+        let local_observation = local_observation.unwrap_or_else(|| SessionObservation {
+            key: local_key,
+            raw_locator: target.locator.clone(),
+            source_stamp: tx
+                .query_row(
+                    "SELECT source_stamp FROM session_presences \
+                     WHERE source=? AND session_id=? AND location='local'",
+                    params![options.source, options.session_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .ok()
+                .flatten()
+                .flatten(),
+            // A newly created local observation must not inherit shared catalog
+            // previews. Those columns are location-agnostic; they may have come
+            // from a remote observation or another connector. Start with no local
+            // preview provenance unless local discovery itself supplied it later.
+            discovery_state: "shallow".into(),
+            access_state: "available".into(),
+            updated_ms: now_ms(),
+            first_prompt: None,
+            last_assistant_text: None,
+        });
         save_observation_progress(
             &tx,
             &local_observation,
@@ -1399,7 +1439,7 @@ fn catalog_target(conn: &Connection, options: &HydrateSessionOptions) -> Result<
     };
     let row = conn
         .query_row(
-            "SELECT CASE WHEN s.source='opencode' AND p.location='local' THEN s.raw_path ELSE p.raw_locator END, COALESCE(p.discovery_state, s.discovery_state) \
+            "SELECT CASE WHEN s.source IN ('opencode','devin') AND p.location='local' THEN s.raw_path ELSE p.raw_locator END, COALESCE(p.discovery_state, s.discovery_state) \
              FROM sessions s JOIN session_presences p \
                ON p.source = s.source AND p.session_id = s.session_id AND p.location = ? \
              WHERE s.source = ? AND s.session_id = ?",
@@ -1577,11 +1617,80 @@ fn source_snapshot(
             records: SnapshotRecords::Counted(0),
             path: Some(path),
             claude_transcript: None,
+            devin_session: None,
             claude_subagents: Vec::new(),
             scanned_bytes: 0,
             scanned_superseded: false,
             stamped_cursors: Vec::new(),
             opencode_layout: Some(OpencodeIngestLayout::Sqlite),
+            codex_relationship_complete: true,
+        });
+    }
+    if options.source == "devin" {
+        let configured_dir = &roots.devin;
+        let configured_path = crate::ingest::devin::sessions_db_path(configured_dir);
+        let locator = target.locator.as_deref().ok_or_else(|| {
+            hydration_error(
+                "SESSION_SOURCE_UNAVAILABLE",
+                "Devin catalog row has no store provenance; run discoverSessions() again",
+            )
+        })?;
+        let path = PathBuf::from(locator);
+        // A store that is gone is unavailable, not a provenance mismatch:
+        // either the row names the configured path itself, or there is no
+        // configured store left for it to have been superseded by.
+        if !path.is_file() && (path == configured_path || !configured_path.is_file()) {
+            return Err(hydration_error(
+                "SESSION_SOURCE_UNAVAILABLE",
+                format!("Devin source {} is unavailable", path.display()),
+            ));
+        }
+        // The catalog locator is the store path itself, so a row can only
+        // name the configured `sessions.db` — anything else is provenance a
+        // rediscovery must re-establish, never a path to open.
+        let resolved = fs::canonicalize(&path).ok();
+        if resolved.is_none() || resolved != fs::canonicalize(&configured_path).ok() {
+            return Err(hydration_error(
+                "SESSION_SOURCE_MISMATCH",
+                format!(
+                    "Devin catalog store {} does not match configured store {}",
+                    path.display(),
+                    configured_path.display()
+                ),
+            ));
+        }
+        let mut src = crate::store::open_db_readonly(&path)?;
+        crate::ingest::devin::register_stamp_fn(&src)?;
+        let snapshot = src.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
+        let stamp = crate::ingest::devin::session_stamp(
+            &snapshot,
+            &options.session_id,
+            &crate::ingest::devin::transcripts_dir(configured_dir),
+        )?
+        .ok_or_else(|| {
+            hydration_error(
+                "SESSION_SOURCE_UNAVAILABLE",
+                format!(
+                    "Devin session '{}' no longer exists or is hidden",
+                    options.session_id
+                ),
+            )
+        })?;
+        snapshot.commit()?;
+        return Ok(SourceSnapshot {
+            stamp,
+            bytes: 0,
+            // A changed pass replaces this with the count of the rows it
+            // captures. An unchanged pass reads the stored checkpoint count.
+            records: SnapshotRecords::Counted(0),
+            path: Some(path),
+            claude_transcript: None,
+            devin_session: None,
+            claude_subagents: Vec::new(),
+            scanned_bytes: 0,
+            scanned_superseded: false,
+            stamped_cursors: Vec::new(),
+            opencode_layout: None,
             codex_relationship_complete: true,
         });
     }
@@ -1737,6 +1846,7 @@ fn source_snapshot(
         records,
         path: Some(path),
         claude_transcript: captured_claude,
+        devin_session: None,
         claude_subagents: subagents,
         scanned_bytes,
         scanned_superseded,
@@ -1746,6 +1856,61 @@ fn source_snapshot(
         opencode_layout: None,
         codex_relationship_complete,
     })
+}
+
+/// Capture the Devin rows a changed targeted-hydration pass will normalize.
+///
+/// The stamp is recomputed in the same SQLite snapshot as the rows. This is
+/// deliberately separate from the cheap probe in [`source_snapshot`]: an
+/// unchanged hydration must not parse and retain the complete session merely
+/// to discover that its content-sensitive stamp still matches.
+fn capture_devin_session(
+    target: &mut SourceSnapshot,
+    options: &HydrateSessionOptions,
+    configured_dir: &Path,
+) -> Result<()> {
+    let path = target.path.as_deref().ok_or_else(|| {
+        hydration_error(
+            "SESSION_SOURCE_UNAVAILABLE",
+            "Devin snapshot has no provider store path",
+        )
+    })?;
+    let mut src = crate::store::open_db_readonly(path)?;
+    crate::ingest::devin::register_stamp_fn(&src)?;
+    let snapshot = src.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let stamp = crate::ingest::devin::session_stamp(
+        &snapshot,
+        &options.session_id,
+        &crate::ingest::devin::transcripts_dir(configured_dir),
+    )?
+    .ok_or_else(|| {
+        hydration_error(
+            "SESSION_SOURCE_UNAVAILABLE",
+            format!(
+                "Devin session '{}' no longer exists or is hidden",
+                options.session_id
+            ),
+        )
+    })?;
+    let loaded =
+        crate::ingest::devin::load_from_sqlite(&snapshot, &options.session_id, configured_dir)?
+            .ok_or_else(|| {
+                hydration_error(
+                    "SESSION_SOURCE_UNAVAILABLE",
+                    format!(
+                        "Devin session '{}' no longer exists or is hidden",
+                        options.session_id
+                    ),
+                )
+            })?;
+    let records = 1_i64
+        .saturating_add(i64::try_from(loaded.nodes.len()).unwrap_or(i64::MAX))
+        .saturating_add(i64::try_from(loaded.tools.len()).unwrap_or(i64::MAX));
+    snapshot.commit()?;
+    target.stamp = stamp;
+    target.records = SnapshotRecords::Counted(records);
+    target.devin_session = Some(loaded);
+    Ok(())
 }
 
 /// What the skip path decided about this session's cursors, and what deciding
@@ -1946,6 +2111,7 @@ fn opencode_json_tree_snapshot(
         path: Some(session_file.to_path_buf()),
         claude_subagents: Vec::new(),
         claude_transcript: None,
+        devin_session: None,
         scanned_bytes: 0,
         scanned_superseded: false,
         stamped_cursors: Vec::new(),
@@ -2252,6 +2418,7 @@ pub(crate) struct SelectedIngest<'a> {
     pub(crate) path: Option<&'a Path>,
     pub(crate) claude_subagents: &'a [ClaudeSubagentEvidence],
     pub(crate) claude_snapshot: Option<&'a ClaudeTranscriptSnapshot>,
+    pub(crate) devin_session: Option<&'a crate::ingest::devin::DevinSession>,
     pub(crate) cursor: &'a mut TranscriptCursorState,
     pub(crate) records: i64,
     pub(crate) opencode_layout: Option<OpencodeIngestLayout>,
@@ -2300,6 +2467,7 @@ fn ingest_selected(
     path: Option<&Path>,
     claude_subagents: &[ClaudeSubagentEvidence],
     claude_snapshot: Option<&ClaudeTranscriptSnapshot>,
+    devin_session: Option<&crate::ingest::devin::DevinSession>,
     cursor: &mut TranscriptCursorState,
     records: i64,
     opencode_layout: Option<OpencodeIngestLayout>,
@@ -2317,6 +2485,7 @@ fn ingest_selected(
         path,
         claude_subagents,
         claude_snapshot,
+        devin_session,
         cursor,
         records,
         opencode_layout,
@@ -2395,6 +2564,28 @@ pub(crate) fn ingest_selected_opencode(ctx: SelectedIngest<'_>) -> Result<Select
     // Not `whole_file()`, which also reports the path's size as bytes
     // read: OpenCode's locator can be a directory, whose length is not
     // a count of anything.
+    Ok((
+        IngestOutcome {
+            records: ctx.records,
+            ..Default::default()
+        },
+        Vec::new(),
+        None,
+    ))
+}
+
+pub(crate) fn ingest_selected_devin(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
+    // `path` is the `sessions.db` whose provenance `source_snapshot`
+    // verified; its parent is the Devin CLI data directory that also holds
+    // `transcripts/`.
+    let path = ctx.file();
+    let loaded = ctx.devin_session.ok_or_else(|| {
+        hydration_error(
+            "SESSION_SOURCE_UNAVAILABLE",
+            "Devin snapshot was not captured for targeted hydration",
+        )
+    })?;
+    crate::ingest::devin::normalize(ctx.conn, loaded, &path.to_string_lossy())?;
     Ok((
         IngestOutcome {
             records: ctx.records,
@@ -4048,7 +4239,7 @@ pub(crate) fn save_observation_progress(
     if full {
         observation.discovery_state = "full".into();
     }
-    observations::upsert(conn, &observation)?;
+    observations::upsert_preserving_previews(conn, &observation)?;
     observations::write_checkpoint(
         conn,
         &observation.key,
@@ -4311,6 +4502,110 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap();
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn devin_changed_after_the_probe_refreshes_stamp_and_rows_together() {
+        let home = tempfile::tempdir().unwrap();
+        let cli_dir = home.path().join(".local/share/devin/cli");
+        fs::create_dir_all(&cli_dir).unwrap();
+        let provider_path = cli_dir.join("sessions.db");
+        let provider = Connection::open(&provider_path).unwrap();
+        provider.pragma_update(None, "journal_mode", "WAL").unwrap();
+        provider
+            .execute_batch(
+                r#"
+                CREATE TABLE sessions (
+                  id TEXT PRIMARY KEY, last_activity_at INTEGER, hidden INTEGER DEFAULT 0
+                );
+                CREATE TABLE message_nodes (
+                  row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  session_id TEXT NOT NULL, node_id INTEGER NOT NULL,
+                  parent_node_id INTEGER, chat_message TEXT,
+                  created_at INTEGER, metadata TEXT
+                );
+                INSERT INTO sessions (id, last_activity_at) VALUES ('snapshot', 1);
+                INSERT INTO message_nodes
+                  (session_id, node_id, chat_message, created_at)
+                VALUES
+                  ('snapshot', 1,
+                   '{"message_id":"u1","role":"user","content":"captured","metadata":{"is_user_input":true}}',
+                   1);
+                "#,
+            )
+            .unwrap();
+
+        let db = home.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "devin", "snapshot", Some(&provider_path));
+        let roots = crate::ProviderRoots::from_home(
+            home.path().to_path_buf(),
+            home.path().join("missing-opencode.db"),
+        );
+        let request = options("devin", "snapshot");
+        let target = CatalogTarget {
+            locator: Some(provider_path.to_string_lossy().into_owned()),
+            discovery_state: Some("shallow".into()),
+        };
+        let mut snapshot = source_snapshot(&conn, &request, &target, &roots, None).unwrap();
+        let probed_stamp = snapshot.stamp.clone();
+        assert!(
+            snapshot.devin_session.is_none(),
+            "the unchanged-path probe must not parse or retain provider rows"
+        );
+
+        // A writer commits after the cheap stamp probe. The changed-path
+        // capture must advance the stamp and rows to this generation together.
+        provider
+            .execute_batch(
+                r#"
+                UPDATE message_nodes SET chat_message =
+                  '{"message_id":"u1","role":"user","content":"newer","metadata":{"is_user_input":true}}'
+                  WHERE session_id = 'snapshot';
+                UPDATE sessions SET last_activity_at = 2 WHERE id = 'snapshot';
+                "#,
+            )
+            .unwrap();
+        capture_devin_session(&mut snapshot, &request, &roots.devin).unwrap();
+        assert_ne!(snapshot.stamp, probed_stamp);
+
+        // A still newer generation after capture must not leak into the
+        // normalization paired with the captured stamp.
+        provider
+            .execute_batch(
+                r#"
+                UPDATE message_nodes SET chat_message =
+                  '{"message_id":"u1","role":"user","content":"latest","metadata":{"is_user_input":true}}'
+                  WHERE session_id = 'snapshot';
+                UPDATE sessions SET last_activity_at = 3 WHERE id = 'snapshot';
+                "#,
+            )
+            .unwrap();
+
+        let mut cursor = TranscriptCursorState::default();
+        let records = snapshot.records.count().unwrap();
+        ingest_selected(
+            &conn,
+            &request,
+            &target,
+            snapshot.path.as_deref(),
+            &snapshot.claude_subagents,
+            snapshot.claude_transcript.as_ref(),
+            snapshot.devin_session.as_ref(),
+            &mut cursor,
+            records,
+            snapshot.opencode_layout,
+        )
+        .unwrap();
+
+        let indexed: String = conn
+            .query_row(
+                "SELECT text FROM session_events WHERE source='devin' AND session_id='snapshot'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, "newer");
     }
 
     #[cfg(unix)]
@@ -12097,6 +12392,8 @@ mod tests {
             discovery_state: "shallow".into(),
             access_state: "available".into(),
             updated_ms: 1,
+            first_prompt: None,
+            last_assistant_text: None,
         };
         observations::upsert(&conn, &observed).unwrap();
         let options = HydrateSessionOptions {
@@ -12172,6 +12469,8 @@ mod tests {
             discovery_state: "shallow".into(),
             access_state: "available".into(),
             updated_ms: 1,
+            first_prompt: None,
+            last_assistant_text: None,
         };
         for location in [SessionLocation::Local, SessionLocation::Remote] {
             let observed = observation(location);

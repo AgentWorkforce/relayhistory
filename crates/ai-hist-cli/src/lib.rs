@@ -452,7 +452,7 @@ enum SessionsAction {
     /// content blocks, agent lifecycle events. Same `(ts_ms IS NULL, ts_ms,
     /// id)` keyset as tool calls and file edits; undated markers page last.
     Markers {
-        /// Coding-agent source (claude, codex, cursor, grok, muse, relay, opencode).
+        /// Coding-agent source (claude, codex, cursor, grok, muse, relay, opencode, devin).
         source: String,
         /// Native session identifier within that source.
         session_id: String,
@@ -476,7 +476,7 @@ enum SessionsAction {
     /// and cost is never computed: `reported_cost_usd` appears only when the
     /// source data carried one.
     Usage {
-        /// Coding-agent source (claude, codex, cursor, grok, muse, relay, opencode).
+        /// Coding-agent source (claude, codex, cursor, grok, muse, relay, opencode, devin).
         source: String,
         /// Native session identifier within that source.
         session_id: String,
@@ -514,7 +514,7 @@ enum SessionsAction {
 enum LearnAction {
     /// Distill local session history into decision/finding/reflection events.
     Distill {
-        /// Only distill sessions from this source (claude, codex, cursor, grok, muse, relay, opencode).
+        /// Only distill sessions from this source (claude, codex, cursor, grok, muse, relay, opencode, devin).
         #[arg(long)]
         source: Option<String>,
         /// Distill one session id.
