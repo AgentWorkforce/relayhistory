@@ -609,7 +609,10 @@ Notable changes to the native `ai-hist` CLI are documented here.
 - Export pages stream rows instead of fetching their whole scan budget up
   front. A page stops reading the moment it is full, so rows past its
   boundary are no longer decoded, discarded and decoded again by the next
-  page, and a row the selection leaves out is never decoded at all. With one
+  page. At most one row per page is decoded twice: the one whose record
+  would overflow the byte limit, which the next page serves. A row outside
+  the selection, or in an excluded session, is never decoded; a relationship
+  is still decoded before its child endpoint is checked. With one
   record per page and a 10,000-row scan budget, exporting 3,000 rows drops
   from 10.8 s to 0.08 s; a 50k-event export with the default limits from
   0.72 s to 0.46 s. Snapshots, cursors, retries and the scan budget are

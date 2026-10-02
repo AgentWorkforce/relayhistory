@@ -178,12 +178,11 @@ fn selected(selection: &ExportSelection, source: &str, session: Option<&str>) ->
             .any(|id| id.source == source && Some(id.session_id.as_str()) == session)
 }
 
-/// Whether a row leaves the snapshot. A relationship names two sessions, so
-/// it is left out when either endpoint is excluded.
-fn row_excluded(selection: &ExportSelection, row: &change_feed::LiveRow) -> bool {
-    if excluded(selection, &row.source, row.session.as_deref()) {
-        return true;
-    }
+/// Whether a decoded row leaves the snapshot through its *second* session. A
+/// relationship names two sessions, so it is left out when either endpoint is
+/// excluded; the row's own session is checked before it is decoded, so only
+/// the child endpoint is left to check here.
+fn child_excluded(selection: &ExportSelection, row: &change_feed::LiveRow) -> bool {
     row.columns
         .get("child_session_id")
         .and_then(|child| child.as_str())
@@ -381,7 +380,7 @@ impl ExportSnapshot {
                             && !excluded(&self.selection, &row.source, row.session.as_deref())
                         {
                             let live = row.decode()?;
-                            if !row_excluded(&self.selection, &live) {
+                            if !child_excluded(&self.selection, &live) {
                                 let record = make_record(&self.origin_id, kind, live)?;
                                 let size = serde_json::to_vec(&record)?.len()
                                     + usize::from(!page.records.is_empty());
