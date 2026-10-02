@@ -1304,9 +1304,49 @@ fn sweep_only_fingerprint_inputs(roots: &crate::ProviderRoots) -> Vec<Candidate>
 /// loop started; [`crate::watch::WatchLoop::with_roots_refresh`] does exactly
 /// that on each backstop tick.
 pub fn sync_watch_roots(home: &Path, opencode_db: &Path) -> Vec<discover::WatchRoot> {
-    let mut provider_roots = crate::ProviderRoots::from_env(home.to_path_buf());
-    provider_roots.opencode_db = opencode_db.to_path_buf();
+    let provider_roots = with_opencode_db(
+        crate::ProviderRoots::from_env(home.to_path_buf()),
+        opencode_db,
+    );
     sync_watch_roots_with_provider_roots(&provider_roots)
+}
+
+/// `roots` with its OpenCode database replaced by `opencode_db`.
+///
+/// Pinned-ness belongs to the path, not to the environment: `from_env` pins
+/// the database `OPENCODE_DB` names, and a caller passing some other path is
+/// not reading that pinned file. The pin is kept only when the path is the
+/// one it was set for; otherwise the channel databases beside the new path
+/// stay evidence, which over-watches at worst rather than missing their
+/// writes until the backstop.
+fn with_opencode_db(mut roots: crate::ProviderRoots, opencode_db: &Path) -> crate::ProviderRoots {
+    roots.opencode_db_pinned = roots.opencode_db_pinned && roots.opencode_db == opencode_db;
+    roots.opencode_db = opencode_db.to_path_buf();
+    roots
+}
+
+#[cfg(test)]
+mod opencode_watch_pin_tests {
+    use super::with_opencode_db;
+    use std::path::Path;
+
+    #[test]
+    fn the_opencode_pin_follows_the_path_it_was_set_for() {
+        let mut roots = crate::ProviderRoots::from_home("/home/u".into(), "/data/oc.db".into());
+        roots.opencode_db_pinned = true;
+        assert!(
+            with_opencode_db(roots.clone(), Path::new("/data/oc.db")).opencode_db_pinned,
+            "the pinned path itself stays pinned"
+        );
+        let moved = with_opencode_db(roots.clone(), Path::new("/elsewhere/opencode.db"));
+        assert!(
+            !moved.opencode_db_pinned,
+            "another path is not the pinned one"
+        );
+        assert_eq!(moved.opencode_db, Path::new("/elsewhere/opencode.db"));
+        roots.opencode_db_pinned = false;
+        assert!(!with_opencode_db(roots, Path::new("/data/oc.db")).opencode_db_pinned);
+    }
 }
 
 pub(crate) fn sync_watch_roots_with_provider_roots(

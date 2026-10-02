@@ -1346,11 +1346,6 @@ fn an_attached_loop_re_derives_its_roots_on_the_backstop_not_the_interval() {
     }
 }
 
-/// The flat logs are single files, and the directory holding one is full of
-/// things a sweep never reads — `~/.claude/settings.json`, the credentials
-/// file, whatever the next harness release adds. Watching the parent as a
-/// *directory* root makes every one of those writes a forced sweep, which is
-/// the expensive kind that bypasses the fingerprint.
 /// `OPENCODE_DB` naming a file in a busy directory: a log written beside the
 /// database must not force a sweep, while a commit to the database's WAL — and
 /// a channel database appearing beside it — still must (#335).
@@ -1409,6 +1404,11 @@ fn a_write_beside_the_opencode_database_does_not_force_a_sweep() {
     );
 }
 
+/// The flat logs are single files, and the directory holding one is full of
+/// things a sweep never reads — `~/.claude/settings.json`, the credentials
+/// file, whatever the next harness release adds. Watching the parent as a
+/// *directory* root makes every one of those writes a forced sweep, which is
+/// the expensive kind that bypasses the fingerprint.
 #[cfg(feature = "fs-events")]
 #[test]
 fn a_file_beside_the_flat_log_does_not_force_a_sweep() {
