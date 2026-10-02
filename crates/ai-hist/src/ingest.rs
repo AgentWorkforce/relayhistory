@@ -1177,6 +1177,10 @@ impl DestinationSnapshot {
                     }
                 }
             }
+            // Re-baseline against the new head, read after `to` as in
+            // [`Self::take`]: a later advance must judge prompts written
+            // since this one against what is here now, not the first count.
+            self.prompts = PromptBaseline::take(conn)?;
         }
         self.head = Some(to);
         Ok(Some(self))
@@ -17517,6 +17521,39 @@ mod tests {
             .as_ref()
             .unwrap()
             .contains(&("opencode".into(), "new".into())));
+    }
+
+    /// A second advance judges prompts against the baseline the first one
+    /// left, so a prompt appended in between and then moved to another
+    /// session (delete, insert again: tombstone cleared, new id) is caught.
+    #[test]
+    fn a_second_advance_rebaselines_appended_prompts() {
+        let (_dir, conn) = holdings_store();
+        let start = DestinationSnapshot::take(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO history (source, session_id, prompt, timestamp_ms) \
+             VALUES ('devin', 'h', 'hello', 5)",
+            [],
+        )
+        .unwrap();
+        let carried = start
+            .advanced(&conn)
+            .unwrap()
+            .expect("an appended prompt is vouched for");
+        conn.execute("DELETE FROM history WHERE source = 'devin'", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO history (source, session_id, prompt, timestamp_ms) \
+             VALUES ('devin', 'h2', 'hello', 5)",
+            [],
+        )
+        .unwrap();
+        match carried.advanced(&conn).unwrap() {
+            None => {}
+            Some(again) => {
+                assert_same_destination(&again, &DestinationSnapshot::take(&conn).unwrap())
+            }
+        }
     }
 
     /// What the feed cannot vouch for sends the end of the sweep back to a
