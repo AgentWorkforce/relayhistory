@@ -318,10 +318,17 @@ test('export refuses the live WAL and SHM sidecars and leaves committed rows rea
       const walHardLink = join(root, 'wal-hardlink');
       await link(`${dbPath}-wal`, walHardLink);
       const {runHistoryExportCommand} = await import('./delivery-cli.js');
-      for (const outputPath of [`${dbPath}-wal`, `${dbPath}-shm`, `${dbPath}-journal`,
-        join(alias, 'history.db-wal'), join(alias, 'history.db-shm'), walHardLink]) {
-        await assert.rejects(runHistoryExportCommand({ dbPath, outputPath, selectionPath }), /active history database/, outputPath);
+      // The native store opens SQLite URI filenames, so a `file:` --db names
+      // the same database and must protect the same sidecars.
+      const encoded = dbPath.split('/').map(encodeURIComponent).join('/');
+      for (const db of [dbPath, `file:${dbPath}`, `file://${encoded}?mode=rwc`, `file://localhost${encoded}#x`]) {
+        for (const outputPath of [`${dbPath}-wal`, `${dbPath}-shm`, `${dbPath}-journal`,
+          join(alias, 'history.db-wal'), join(alias, 'history.db-shm'), walHardLink]) {
+          await assert.rejects(runHistoryExportCommand({ dbPath: db, outputPath, selectionPath }), /active history database/, `${db} -> ${outputPath}`);
+        }
       }
+      await assert.rejects(runHistoryExportCommand({ dbPath: `file://elsewhere${dbPath}`, outputPath: join(root, 'x.ndjson'), selectionPath }),
+        /unsupported SQLite URI authority/);
       const reader = new sqlite.DatabaseSync(dbPath, { readOnly: true });
       try {
         assert.deepEqual({ ...reader.prepare('SELECT value FROM export_guard_probe').get() as object }, { value: 'committed' });
@@ -330,7 +337,11 @@ test('export refuses the live WAL and SHM sidecars and leaves committed rows rea
       const outputPath = join(root, 'export.ndjson');
       await writeFile(outputPath, 'stale');
       await runHistoryExportCommand({ dbPath, outputPath, selectionPath });
-      assert.notEqual(await readFile(outputPath, 'utf8'), 'stale');
+      const exported = await readFile(outputPath, 'utf8');
+      assert.notEqual(exported, 'stale');
+      // ...and a URI --db really does export the same database.
+      await runHistoryExportCommand({ dbPath: `file:${dbPath}`, outputPath, selectionPath });
+      assert.equal((await readFile(outputPath, 'utf8')).split('\n').length, exported.split('\n').length);
     } finally { writer.close(); }
   });
 });

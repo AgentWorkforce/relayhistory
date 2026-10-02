@@ -20,6 +20,33 @@ export async function loadHistoryApplicationConfig(path: string) {
   return { config, registry: await loadHistoryPlugins(config.plugins, { baseDirectory: dirname(absolute) }) };
 }
 
+/**
+ * The file on disk SQLite opens for `dbPath`. The native store opens with URI
+ * filenames enabled, so `file:/tmp/history.db` names `/tmp/history.db`, not a
+ * relative path beginning `file:`. Mirrors SQLite's own URI rules: the scheme
+ * is the literal lowercase `file:`, an authority may only be empty or
+ * `localhost`, the query and fragment are not part of the path, and the path
+ * is percent-decoded. Anything else is an ordinary filesystem path.
+ */
+function sqliteDatabaseFile(dbPath: string): string {
+  if (!dbPath.startsWith('file:')) return resolve(dbPath);
+  let path = dbPath.slice('file:'.length);
+  const end = path.search(/[?#]/);
+  if (end >= 0) path = path.slice(0, end);
+  if (path.startsWith('//')) {
+    const slash = path.indexOf('/', 2);
+    const authority = slash < 0 ? path.slice(2) : path.slice(2, slash);
+    if (authority !== '' && authority.toLowerCase() !== 'localhost') {
+      throw new InvalidArgumentError(`unsupported SQLite URI authority: ${authority}`, 'INVALID_ARGUMENT');
+    }
+    path = slash < 0 ? '' : path.slice(slash);
+  }
+  try { path = decodeURIComponent(path); }
+  catch { throw new InvalidArgumentError('invalid percent-encoding in SQLite URI', 'INVALID_ARGUMENT'); }
+  if (path === '') throw new InvalidArgumentError('SQLite URI names no database file', 'INVALID_ARGUMENT');
+  return resolve(path);
+}
+
 async function write(stream: Writable, chunk: string): Promise<void> {
   await new Promise<void>((resolve, reject) => stream.write(chunk, (error) => error ? reject(error) : resolve()));
 }
@@ -47,7 +74,7 @@ export async function runHistoryExportCommand(
   const assertSafeOutput = async () => {
     if (!options.outputPath) return;
     const target = resolve(options.outputPath);
-    const database = resolve(options.dbPath ?? defaultDbPath());
+    const database = sqliteDatabaseFile(options.dbPath ?? defaultDbPath());
     const metadata = async (path: string) => stat(path).catch((error: NodeJS.ErrnoException) => {
       if (error.code === 'ENOENT') return null;
       throw error;
