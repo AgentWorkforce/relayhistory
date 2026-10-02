@@ -316,17 +316,25 @@ test('an abandoned export snapshot is released when its TTL elapses, with no fur
       // Never closed and never paged again: only its TTL can release it.
       await beginHistoryExport(${JSON.stringify(selection)}, { dbPath: ${JSON.stringify(dbPath)}, ttlMs: 1_500 });
       process.stdout.write('ready\\n');
-      setTimeout(() => {}, 10_000);`], { stdio: ['ignore', 'pipe', 'inherit'] });
+      setTimeout(() => {}, 10_000);`], { stdio: ['ignore', 'pipe', 'pipe'] });
+    // Listeners go on before anything else can run, and the wait is bounded,
+    // so a holder that fails or never reports cannot hang the suite.
+    let stderr = '';
+    holder.stderr.on('data', (chunk: Buffer) => { stderr += String(chunk); });
+    let timer: NodeJS.Timeout | undefined;
+    const ready = new Promise<void>((resolve, reject) => {
+      holder.stdout.on('data', (chunk: Buffer) => { if (String(chunk).includes('ready')) resolve(); });
+      holder.on('error', reject);
+      holder.on('exit', (code, signal) => reject(new Error(`snapshot holder exited early (${code ?? signal}): ${stderr}`)));
+      timer = setTimeout(() => reject(new Error(`snapshot holder never became ready: ${stderr}`)), 20_000);
+    });
     try {
       writer.exec('PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS ttl_probe(n INTEGER);');
       const checkpoint = (n: number) => {
         writer.exec(`INSERT INTO ttl_probe VALUES (${n})`);
         return writer.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get() as { busy: number };
       };
-      await new Promise<void>((resolve, reject) => {
-        holder.stdout.on('data', (chunk: Buffer) => { if (String(chunk).includes('ready')) resolve(); });
-        holder.on('exit', (code) => reject(new Error(`snapshot holder exited early with ${code}`)));
-      });
+      try { await ready; } finally { clearTimeout(timer); }
       assert.equal(checkpoint(1).busy, 1, 'a live snapshot holds the checkpoint back');
       await pause(3_000);
       assert.equal(holder.exitCode, null, 'the holder process is still running');
