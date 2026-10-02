@@ -758,8 +758,11 @@ pub ai_hist::SyncReport::changed: alloc::vec::Vec<ai_hist::SessionRef>
 pub ai_hist::SyncReport::head_revision: u64
 pub ai_hist::SyncReport::swept: bool
 #[non_exhaustive] pub struct ai_hist::TickReport
+pub ai_hist::TickReport::cancelled: bool
 pub ai_hist::TickReport::changed: alloc::vec::Vec<ai_hist::SessionRef>
 pub ai_hist::TickReport::contended: bool
+pub ai_hist::TickReport::elapsed_ms: u64
+pub ai_hist::TickReport::first_event_age_ms: core::option::Option<u64>
 pub ai_hist::TickReport::forced: bool
 pub ai_hist::TickReport::skipped_unchanged: bool
 pub ai_hist::TickReport::swept: bool
@@ -816,6 +819,7 @@ pub ai_hist::WatchOptions::debounce_ms: u64
 pub ai_hist::WatchOptions::immediate: bool
 pub ai_hist::WatchOptions::poll_interval_ms: u64
 pub ai_hist::WatchOptions::slow_poll_ms: u64
+pub ai_hist::WatchOptions::stop: core::option::Option<ai_hist::StopToken>
 pub ai_hist::WatchOptions::use_fs_events: bool
 impl core::default::Default for ai_hist::WatchOptions
 pub fn ai_hist::WatchOptions::default() -> Self

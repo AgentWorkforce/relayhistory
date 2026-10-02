@@ -801,6 +801,24 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Rust API
 
+- `SessionStore::watch` ticks can be cancelled (#333). `WatchOptions::stop:
+  Option<StopToken>` (serde-skipped, like `SyncOptions::stop`) is installed
+  around every tick's sweep, and `WatchStop::stop` / dropping the handle now
+  cancel the sweep in flight at its next provider, file or record boundary
+  instead of waiting it out. A cancelled tick arrives as a `TickReport` with
+  the new `cancelled` field set, neither swept nor an error, and the loop ends
+  after it.
+- `TickReport::elapsed_ms` (the sweep's wall time) and
+  `TickReport::first_event_age_ms` (for a filesystem-event tick, how long
+  before the report the first event behind it arrived, counted from the
+  oldest change a deferred or retried tick stands for) (#334). Measured on a
+  300-session store: sweep 40 ms, first-event age 245 ms, so the 200 ms
+  debounce window is most of the write-to-report latency.
+- `WatchHandle::next` / `next_timeout` block on the report channel instead
+  of waking every 50 ms to check the loop's thread (#332): the loop's thread
+  closes the channel when it ends. An idle watch consumer went from about 19
+  to about 1 process wakeups a second.
+
 - `Source::Muse` and `ProviderRoots::muse` (the Muse Code sessions directory;
   `from_env` honours `XDG_DATA_HOME`). Both types are `#[non_exhaustive]`, so
   this is additive.

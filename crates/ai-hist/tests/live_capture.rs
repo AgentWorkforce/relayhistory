@@ -284,6 +284,99 @@ fn a_change_during_the_sweep_drives_another_tick() {
     );
 }
 
+/// A report carries the sweep's wall time and, for a change-driven tick, when
+/// the first change behind it arrived — so a consumer can split capture lag
+/// into the debounce window, the sweep and the hand-off.
+#[test]
+fn a_report_times_its_sweep_and_its_first_event() {
+    let (sender, reports) = mpsc::channel::<ai_hist::watch::TickReport>();
+    let watch = Arc::new(
+        WatchLoop::new(Arc::new(|_| {
+            std::thread::sleep(Duration::from_millis(60));
+            Ok(TickOutcome::default())
+        }))
+        .with_immediate(false)
+        .with_fs_events(false)
+        .with_poll_interval_ms(600_000)
+        .with_debounce_ms(100)
+        .on_report(Arc::new(move |report| {
+            let _ = sender.send(*report);
+        })),
+    );
+    let runner = watch.clone();
+    let thread = std::thread::spawn(move || runner.run().expect("run"));
+
+    let signalled = std::time::Instant::now();
+    watch.notify_change();
+    let report = reports.recv_timeout(ARRIVES_WITHIN).expect("a tick");
+    assert!(report.forced && !report.cancelled);
+    assert!(
+        report.elapsed >= Duration::from_millis(60),
+        "elapsed is the sweep's wall time: {:?}",
+        report.elapsed
+    );
+    let first = report.first_event_at.expect("a change drove this tick");
+    assert!(
+        first >= signalled,
+        "the window opens at the signal, not before"
+    );
+    assert!(
+        first.elapsed() >= Duration::from_millis(160),
+        "the first event waited out the window and the sweep: {:?}",
+        first.elapsed()
+    );
+
+    // A manual tick has no event behind it.
+    watch.tick();
+    let manual = reports.recv_timeout(ARRIVES_WITHIN).expect("manual tick");
+    assert_eq!(manual.first_event_at, None);
+
+    watch.stop();
+    thread.join().unwrap();
+}
+
+/// A tick cancelled through the capture stop token is neither swept nor
+/// failed, is not retried, and ends the loop: cancellation only ever means
+/// "stop".
+#[test]
+fn a_cancelled_tick_is_reported_and_ends_the_loop() {
+    let (sender, reports) = mpsc::channel::<ai_hist::watch::TickReport>();
+    let failures = Arc::new(AtomicUsize::new(0));
+    let failed = failures.clone();
+    let watch = Arc::new(
+        WatchLoop::new(Arc::new(|_| {
+            Err(anyhow::Error::new(ai_hist::CaptureCancelled).context("sweeping claude"))
+        }))
+        .with_immediate(false)
+        .with_fs_events(false)
+        .with_poll_interval_ms(600_000)
+        .with_debounce_ms(20)
+        .on_report(Arc::new(move |report| {
+            let _ = sender.send(*report);
+        }))
+        .on_error(Arc::new(move |_| {
+            failed.fetch_add(1, Ordering::SeqCst);
+        })),
+    );
+    let runner = watch.clone();
+    let thread = std::thread::spawn(move || runner.run().expect("run"));
+    watch.notify_change();
+    let report = reports.recv_timeout(ARRIVES_WITHIN).expect("a report");
+    assert!(report.cancelled);
+    assert!(!report.outcome.swept && !report.outcome.contended);
+    // `run` returns on its own: nobody called `stop`.
+    thread.join().unwrap();
+    assert_eq!(
+        failures.load(Ordering::SeqCst),
+        0,
+        "a cancellation is not a failure"
+    );
+    assert!(
+        reports.try_recv().is_err(),
+        "a cancelled forced tick is not retried"
+    );
+}
+
 #[test]
 fn the_polling_backstop_does_not_force_the_scan() {
     let running = RunningLoop::reporting(|watch| {
