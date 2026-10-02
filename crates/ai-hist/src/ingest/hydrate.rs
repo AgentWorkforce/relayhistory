@@ -418,7 +418,7 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
     } else {
         Vec::new()
     };
-    let snapshot = source_snapshot(&conn, options, &target, roots, claude_snapshot)?;
+    let mut snapshot = source_snapshot(&conn, options, &target, roots, claude_snapshot)?;
     let previous = observations::checkpoint(&conn, &local_key)?.map(|checkpoint| {
         (
             checkpoint.source_stamp,
@@ -498,6 +498,16 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
             cached_diagnostics,
             snapshot.codex_relationship_complete,
         );
+    }
+
+    // A Devin stamp is content-sensitive and sufficient for the unchanged
+    // shortcut, so do not parse and retain every provider row until a pass is
+    // actually needed. The changed path captures a fresh stamp and all rows
+    // inside one read transaction; if a writer committed after the cheap
+    // probe, both the checkpoint stamp and normalized evidence move to that
+    // newer generation together.
+    if options.source == "devin" {
+        capture_devin_session(&mut snapshot, options, &roots.devin)?;
     }
 
     // The content pass, on the one path that has already read every one of
@@ -1651,10 +1661,6 @@ fn source_snapshot(
         }
         let mut src = crate::store::open_db_readonly(&path)?;
         crate::ingest::devin::register_stamp_fn(&src)?;
-        // Stamp and all rows handed to the normalizer describe one provider
-        // generation. Without carrying the loaded session out of this read
-        // transaction, the parser can reopen the WAL after a writer commits
-        // and checkpoint newer evidence under the older stamp.
         let snapshot = src.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
         let stamp = crate::ingest::devin::session_stamp(
             &snapshot,
@@ -1670,28 +1676,16 @@ fn source_snapshot(
                 ),
             )
         })?;
-        let loaded =
-            crate::ingest::devin::load_from_sqlite(&snapshot, &options.session_id, configured_dir)?
-                .ok_or_else(|| {
-                    hydration_error(
-                        "SESSION_SOURCE_UNAVAILABLE",
-                        format!(
-                            "Devin session '{}' no longer exists or is hidden",
-                            options.session_id
-                        ),
-                    )
-                })?;
-        let records = 1_i64
-            .saturating_add(i64::try_from(loaded.nodes.len()).unwrap_or(i64::MAX))
-            .saturating_add(i64::try_from(loaded.tools.len()).unwrap_or(i64::MAX));
         snapshot.commit()?;
         return Ok(SourceSnapshot {
             stamp,
             bytes: 0,
-            records: SnapshotRecords::Counted(records),
+            // A changed pass replaces this with the count of the rows it
+            // captures. An unchanged pass reads the stored checkpoint count.
+            records: SnapshotRecords::Counted(0),
             path: Some(path),
             claude_transcript: None,
-            devin_session: Some(loaded),
+            devin_session: None,
             claude_subagents: Vec::new(),
             scanned_bytes: 0,
             scanned_superseded: false,
@@ -1862,6 +1856,61 @@ fn source_snapshot(
         opencode_layout: None,
         codex_relationship_complete,
     })
+}
+
+/// Capture the Devin rows a changed targeted-hydration pass will normalize.
+///
+/// The stamp is recomputed in the same SQLite snapshot as the rows. This is
+/// deliberately separate from the cheap probe in [`source_snapshot`]: an
+/// unchanged hydration must not parse and retain the complete session merely
+/// to discover that its content-sensitive stamp still matches.
+fn capture_devin_session(
+    target: &mut SourceSnapshot,
+    options: &HydrateSessionOptions,
+    configured_dir: &Path,
+) -> Result<()> {
+    let path = target.path.as_deref().ok_or_else(|| {
+        hydration_error(
+            "SESSION_SOURCE_UNAVAILABLE",
+            "Devin snapshot has no provider store path",
+        )
+    })?;
+    let mut src = crate::store::open_db_readonly(path)?;
+    crate::ingest::devin::register_stamp_fn(&src)?;
+    let snapshot = src.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let stamp = crate::ingest::devin::session_stamp(
+        &snapshot,
+        &options.session_id,
+        &crate::ingest::devin::transcripts_dir(configured_dir),
+    )?
+    .ok_or_else(|| {
+        hydration_error(
+            "SESSION_SOURCE_UNAVAILABLE",
+            format!(
+                "Devin session '{}' no longer exists or is hidden",
+                options.session_id
+            ),
+        )
+    })?;
+    let loaded =
+        crate::ingest::devin::load_from_sqlite(&snapshot, &options.session_id, configured_dir)?
+            .ok_or_else(|| {
+                hydration_error(
+                    "SESSION_SOURCE_UNAVAILABLE",
+                    format!(
+                        "Devin session '{}' no longer exists or is hidden",
+                        options.session_id
+                    ),
+                )
+            })?;
+    let records = 1_i64
+        .saturating_add(i64::try_from(loaded.nodes.len()).unwrap_or(i64::MAX))
+        .saturating_add(i64::try_from(loaded.tools.len()).unwrap_or(i64::MAX));
+    snapshot.commit()?;
+    target.stamp = stamp;
+    target.records = SnapshotRecords::Counted(records);
+    target.devin_session = Some(loaded);
+    Ok(())
 }
 
 /// What the skip path decided about this session's cursors, and what deciding
@@ -4456,7 +4505,7 @@ mod tests {
     }
 
     #[test]
-    fn devin_targeted_ingest_uses_the_rows_captured_with_its_stamp() {
+    fn devin_changed_after_the_probe_refreshes_stamp_and_rows_together() {
         let home = tempfile::tempdir().unwrap();
         let cli_dir = home.path().join(".local/share/devin/cli");
         fs::create_dir_all(&cli_dir).unwrap();
@@ -4498,11 +4547,15 @@ mod tests {
             locator: Some(provider_path.to_string_lossy().into_owned()),
             discovery_state: Some("shallow".into()),
         };
-        let snapshot = source_snapshot(&conn, &request, &target, &roots, None).unwrap();
+        let mut snapshot = source_snapshot(&conn, &request, &target, &roots, None).unwrap();
+        let probed_stamp = snapshot.stamp.clone();
+        assert!(
+            snapshot.devin_session.is_none(),
+            "the unchanged-path probe must not parse or retain provider rows"
+        );
 
-        // Commit a newer WAL generation after the stamp and rows were
-        // captured but before normalization. Reopening the provider here
-        // would index "newer" under the stamp that describes "captured".
+        // A writer commits after the cheap stamp probe. The changed-path
+        // capture must advance the stamp and rows to this generation together.
         provider
             .execute_batch(
                 r#"
@@ -4510,6 +4563,21 @@ mod tests {
                   '{"message_id":"u1","role":"user","content":"newer","metadata":{"is_user_input":true}}'
                   WHERE session_id = 'snapshot';
                 UPDATE sessions SET last_activity_at = 2 WHERE id = 'snapshot';
+                "#,
+            )
+            .unwrap();
+        capture_devin_session(&mut snapshot, &request, &roots.devin).unwrap();
+        assert_ne!(snapshot.stamp, probed_stamp);
+
+        // A still newer generation after capture must not leak into the
+        // normalization paired with the captured stamp.
+        provider
+            .execute_batch(
+                r#"
+                UPDATE message_nodes SET chat_message =
+                  '{"message_id":"u1","role":"user","content":"latest","metadata":{"is_user_input":true}}'
+                  WHERE session_id = 'snapshot';
+                UPDATE sessions SET last_activity_at = 3 WHERE id = 'snapshot';
                 "#,
             )
             .unwrap();
@@ -4537,7 +4605,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(indexed, "captured");
+        assert_eq!(indexed, "newer");
     }
 
     #[cfg(unix)]
