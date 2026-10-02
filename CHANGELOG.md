@@ -560,8 +560,10 @@ Notable changes to the native `ai-hist` CLI are documented here.
   identity, length and mtime; while the file is still that one, a checkpoint
   merges only the changed keys (and, inside a stamp map, only the changed
   entries) into its copy instead of re-reading, re-parsing and re-merging the
-  whole file. A file another writer replaced is read and merged in full as
-  before. The Devin and `history.jsonl` checkpoints now go through the same
+  whole file. Unix only: elsewhere there is no inode to identify the file,
+  and a checkpoint with something to write reads and merges it in full as
+  before. A file another writer replaced, or a checkpoint after a failed
+  write, is read and merged in full. The Devin and `history.jsonl` checkpoints now go through the same
   path, so an unchanged Devin source no longer re-reads the state every tick.
   On the 100 MB benchmark store this takes checkpoints from ~15% of a forced
   tick to ~3%.

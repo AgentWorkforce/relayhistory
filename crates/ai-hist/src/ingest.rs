@@ -2435,13 +2435,22 @@ fn checkpoint_sync_state(path: &Path, state: &Map<String, Value>) -> bool {
 /// the changed entries -- are merged into it before it is written back. A
 /// stamp that moved (another sweep, a hydration checkpoint) falls back to the
 /// full read, merge and write every checkpoint used to do.
+///
+/// Two things send a checkpoint to that full path even when the state has
+/// nothing new for the copy: a previous write that failed (`dirty`: the copy
+/// was folded ahead of a file that never received it, so it no longer
+/// describes the file and the failed checkpoint must be retried), and a file
+/// whose stamp no longer matches (someone replaced it; the state is folded
+/// back in, as any full checkpoint would).
 struct SweepCheckpoints<'a> {
     path: &'a Path,
-    /// The document on disk as of `stamp`.
+    /// The document on disk as of `stamp`, unless `dirty`.
     disk: Map<String, Value>,
-    /// The file `disk` was read from or written to; `None` when unknown, which
-    /// sends the next checkpoint back to the file.
+    /// The file `disk` was read from or written to; `None` when unknown.
     stamp: Option<SyncStateStamp>,
+    /// A write failed after `disk` was folded: the next checkpoint re-reads
+    /// the file and folds the whole state, whatever the delta says.
+    dirty: bool,
 }
 
 impl<'a> SweepCheckpoints<'a> {
@@ -2450,24 +2459,39 @@ impl<'a> SweepCheckpoints<'a> {
             path,
             disk: loaded.clone(),
             stamp,
+            dirty: false,
         }
     }
 
     fn save(&mut self, state: &Map<String, Value>) {
-        let Some(delta) = sync_state_delta(&self.disk, state) else {
-            return;
-        };
-        if let Err(err) = self.write(state, &delta) {
-            // Whatever `disk` now holds may not be what the file holds.
-            self.stamp = None;
-            eprintln!("ai-hist: could not checkpoint sync state: {err:#}");
+        let delta = sync_state_delta(&self.disk, state);
+        if delta.is_none() && !self.dirty {
+            // Nothing new for the copy. Still cheap to ask whether the file
+            // is the one the copy describes: one `stat`. Without a stamp
+            // (non-Unix) this is the old "unchanged state, skip" rule.
+            let replaced = self
+                .stamp
+                .is_some_and(|stamp| SyncStateStamp::at(self.path) != Some(stamp));
+            if !replaced {
+                return;
+            }
+        }
+        let delta = delta.unwrap_or_default();
+        match self.write(state, &delta) {
+            Ok(()) => self.dirty = false,
+            Err(err) => {
+                // Whatever `disk` now holds may not be what the file holds.
+                self.stamp = None;
+                self.dirty = true;
+                eprintln!("ai-hist: could not checkpoint sync state: {err:#}");
+            }
         }
     }
 
     fn write(&mut self, state: &Map<String, Value>, delta: &Map<String, Value>) -> Result<()> {
         let _lock = SyncStateLock::acquire(self.path)?;
         let current = SyncStateStamp::at(self.path);
-        let changed = if current.is_some() && current == self.stamp {
+        let changed = if !self.dirty && current.is_some() && current == self.stamp {
             fold_sync_state(&mut self.disk, delta, state)
         } else {
             let (on_disk, stamp) = load_sync_state_stamped(self.path);
@@ -24672,6 +24696,59 @@ mod tests {
             saved[CURSOR_SYNC_STATE_KEY]["/c/1.jsonl"],
             typed_cursor(5, 1)
         );
+    }
+
+    /// A checkpoint whose write failed is retried by the next one even when
+    /// the state has not changed since: the in-memory copy was folded ahead
+    /// of a file that never received it, so the copy cannot vouch for it.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_sweep_checkpoint_is_retried_by_the_next_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".sync-state.json");
+        let mut on_disk = Map::new();
+        on_disk.insert("codex_rollouts_v6".into(), many_stamps(5, "a"));
+        save_sync_state(&path, &on_disk).unwrap();
+
+        let (mut state, stamp) = load_sync_state_stamped(&path);
+        let mut checkpoints = SweepCheckpoints::new(&path, &state, stamp);
+        state.insert("claude".into(), typed_cursor(180, 1));
+
+        // The rename onto a directory fails; the rows behind the cursor are
+        // committed, so the cursor must land on a later checkpoint.
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        checkpoints.save(&state);
+        fs::remove_dir(&path).unwrap();
+        save_sync_state(&path, &on_disk).unwrap();
+
+        checkpoints.save(&state);
+        let saved = load_sync_state(&path).unwrap();
+        assert_eq!(saved.get("claude"), Some(&typed_cursor(180, 1)));
+        assert_eq!(saved["codex_rollouts_v6"], on_disk["codex_rollouts_v6"]);
+    }
+
+    /// A file replaced behind the sweep's back is merged into by the next
+    /// checkpoint even when the sweep has nothing new to say, so a writer
+    /// that dropped the sweep's keys does not keep them dropped.
+    #[cfg(unix)]
+    #[test]
+    fn a_replaced_state_file_is_merged_even_without_a_delta() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".sync-state.json");
+        let (mut state, stamp) = load_sync_state_stamped(&path);
+        let mut checkpoints = SweepCheckpoints::new(&path, &state, stamp);
+        state.insert("source_fingerprint".into(), json!("ours"));
+        checkpoints.save(&state);
+
+        let mut theirs = Map::new();
+        theirs.insert("other-writer".into(), json!(1));
+        save_sync_state(&path, &theirs).unwrap();
+
+        checkpoints.save(&state);
+        let saved = load_sync_state(&path).unwrap();
+        assert_eq!(saved["source_fingerprint"], json!("ours"));
+        assert_eq!(saved["other-writer"], json!(1));
     }
 
     #[test]
