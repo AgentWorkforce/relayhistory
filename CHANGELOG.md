@@ -555,6 +555,18 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Changed
 
+- The end of a sweep no longer counts every repairable session twice (#321).
+  The start-of-sweep shortfall check already counts each session's evidence;
+  the end-of-sweep re-check and the new destination marker now reuse those
+  counts and recount only the sessions the change feed shows were written
+  (revisions and tombstones above the head read before the start counts). The
+  sweep counts everything again when the feed cannot vouch: no head, a
+  different epoch, a changed prompt of a replayable source (a prompt's session
+  is not part of its identity), or more than 256 sessions / 20,000 rows
+  written. Same marker and same outstanding set; on the 100 MB benchmark
+  store a forced tick no longer spends ~3% of its time on the two extra
+  counts.
+
 - Internal refactor: one-entry harness registry (#177). Each built-in harness
   is declared once, as a `LocalSource` descriptor in
   `crates/ai-hist/src/sources/catalog.rs`, and `SOURCE_CHOICES`,

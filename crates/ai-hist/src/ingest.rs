@@ -870,7 +870,11 @@ impl SessionHoldings {
 /// session_id)` key, merged in memory — not six correlated subqueries per
 /// session.
 fn destination_generation(conn: &Connection) -> Result<String> {
-    let holdings = session_holdings(conn)?;
+    Ok(destination_marker(&session_holdings(conn)?))
+}
+
+/// [`destination_generation`]'s encoding of already counted holdings.
+fn destination_marker(holdings: &BTreeMap<u64, SessionHoldings>) -> String {
     // The entry count comes first so that a truncated marker is detectable.
     // Without it, a marker cut short reads as a *shorter* one — and an empty
     // database legitimately produces no entries at all, so "no entries" could
@@ -882,7 +886,7 @@ fn destination_generation(conn: &Connection) -> Result<String> {
             held.events, held.tool_calls, held.file_edits, held.history, held.markers, held.catalog
         ));
     }
-    Ok(marker)
+    marker
 }
 
 /// Which count in [`SessionHoldings`] one grouped read fills in.
@@ -984,6 +988,254 @@ fn session_holdings_naming(
         }
     }
     Ok(holdings)
+}
+
+/// The most sessions [`DestinationSnapshot::advanced`] recounts one at a
+/// time. Past it, the grouped reads of a full count are cheaper than that
+/// many keyed counts, and a sweep that wrote this much is not a tick.
+const DESTINATION_RECOUNT_LIMIT: usize = 256;
+
+/// The most changed rows [`sessions_written_since`] reads, per table, to name
+/// the sessions to recount.
+const DESTINATION_RECOUNT_ROW_LIMIT: usize = 20_000;
+
+/// The tables [`SessionHoldings`] counts whose rows carry their session in
+/// their identity, with the change-feed kind their tombstones are filed
+/// under. `history` is counted too, but a prompt's session is not part of its
+/// identity: moving one between sessions leaves no trace of the session it
+/// left, so it is handled apart (see [`sessions_written_since`]).
+const SESSION_KEYED_HOLDINGS: &[(&str, &str)] = &[
+    ("sessions", "session"),
+    ("session_events", "session_event"),
+    ("tool_calls", "tool_call"),
+    ("file_edits", "file_edit"),
+    ("session_markers", "session_marker"),
+];
+
+/// What the destination held when it was counted, the change-feed head read
+/// just *before* the counts, and the sessions the shortfall can name.
+///
+/// The start of a sweep counts every repairable session to find the ones the
+/// stored marker says are short. The end of the sweep needs the same counts
+/// again -- to check nothing is still short, and to write the next marker --
+/// and on a tick almost none of them moved. [`Self::advanced`] gets there by
+/// recounting only the sessions the change feed says were written since the
+/// head this snapshot was taken at, instead of counting every session twice
+/// more (#321).
+struct DestinationSnapshot {
+    head: Option<crate::change_feed::Watermark>,
+    holdings: BTreeMap<u64, SessionHoldings>,
+    named: HashSet<(String, String)>,
+}
+
+impl DestinationSnapshot {
+    /// A full count. The head is read first: a write that lands between the
+    /// two is then both in the counts and above the head, which can only
+    /// cost a recount later, never hide a loss.
+    fn take(conn: &Connection) -> Result<Self> {
+        let head = crate::change_feed::read_head(conn).ok();
+        let mut named = HashSet::new();
+        let holdings = session_holdings_naming(conn, Some(&mut named))?;
+        Ok(Self {
+            head,
+            holdings,
+            named,
+        })
+    }
+
+    /// The snapshot as of now, or `None` when the change feed cannot say
+    /// which sessions moved since this one was taken -- no head, another
+    /// epoch, a prompt that changed under a replayable source, or more
+    /// sessions than [`DESTINATION_RECOUNT_LIMIT`] -- and the caller must
+    /// count everything again.
+    ///
+    /// Exact for the same reason the head fast path in [`sources_unchanged`]
+    /// is: every insert, identity move and delete on a counted table stamps a
+    /// revision above the head (a delete or move as a tombstone naming the
+    /// session it left), so a session with nothing above the head holds what
+    /// it held when this snapshot counted it.
+    fn advanced(mut self, conn: &Connection) -> Result<Option<Self>> {
+        let Some(from) = self.head else {
+            return Ok(None);
+        };
+        let Ok(to) = crate::change_feed::read_head(conn) else {
+            return Ok(None);
+        };
+        if to.epoch != from.epoch || to.revision < from.revision {
+            return Ok(None);
+        }
+        if to.revision > from.revision {
+            let Some(touched) = sessions_written_since(conn, from.revision)? else {
+                return Ok(None);
+            };
+            for (source, session_id) in touched {
+                let held = session_holding(conn, &source, &session_id)?;
+                let key = discover::fingerprint_hash("session-events", &source, &session_id);
+                let names =
+                    held.events > 0 || held.history > 0 || held.markers > 0 || held.catalog > 0;
+                if held == SessionHoldings::default() {
+                    self.holdings.remove(&key);
+                } else {
+                    self.holdings.insert(key, held);
+                }
+                let session = (source, session_id);
+                if names {
+                    self.named.insert(session);
+                } else {
+                    self.named.remove(&session);
+                }
+            }
+        }
+        self.head = Some(to);
+        Ok(Some(self))
+    }
+
+    /// The head as the sync state stores it, `epoch:revision`, or empty.
+    fn head_value(&self) -> String {
+        self.head
+            .map(|head| format!("{}:{}", head.epoch, head.revision))
+            .unwrap_or_default()
+    }
+
+    /// The destination marker these holdings encode.
+    fn marker(&self) -> String {
+        destination_marker(&self.holdings)
+    }
+}
+
+/// The sweep-end snapshot: `start` carried forward when the feed allows it,
+/// otherwise a full count.
+fn current_destination(
+    conn: &Connection,
+    start: Option<DestinationSnapshot>,
+) -> Result<DestinationSnapshot> {
+    if let Some(start) = start {
+        match start.advanced(conn) {
+            Ok(Some(current)) => return Ok(current),
+            Ok(None) => {}
+            Err(error) => {
+                sync_note!("  [sync] could not carry the destination counts forward: {error:#}");
+            }
+        }
+    }
+    DestinationSnapshot::take(conn)
+}
+
+/// Every repairable `(source, session_id)` with a counted row inserted,
+/// changed or deleted above `revision`; `None` when that cannot be told
+/// exactly or is too many to recount one by one.
+fn sessions_written_since(
+    conn: &Connection,
+    revision: u64,
+) -> Result<Option<HashSet<(String, String)>>> {
+    let revision = i64::try_from(revision).unwrap_or(i64::MAX);
+    let sources = repairable_event_sources();
+    let history_sources = replayable_history_sources();
+    // A prompt that changed session leaves no tombstone naming the one it
+    // left, so a replayable source's prompt changing at all sends the end of
+    // the sweep back to a full count. Prompts of other sources are not
+    // counted and do not matter.
+    let prompt_moved: bool = conn
+        .prepare_cached(
+            "SELECT EXISTS (SELECT 1 FROM history WHERE revision > ?1 \
+                 AND +source IN (SELECT value FROM json_each(?2))) \
+             OR EXISTS (SELECT 1 FROM evidence_tombstones WHERE kind = 'history' \
+                 AND revision > ?1 AND +source IN (SELECT value FROM json_each(?2)))",
+        )?
+        .query_row(params![revision, history_sources], |row| row.get(0))?;
+    if prompt_moved {
+        return Ok(None);
+    }
+    let mut touched = HashSet::new();
+    // Rows, not sessions: a sweep that wrote more than this is not a tick,
+    // and reading every one of its rows to name sessions would cost what the
+    // full count does.
+    let rows_limit = i64::try_from(DESTINATION_RECOUNT_ROW_LIMIT + 1).unwrap_or(i64::MAX);
+    for (table, kind) in SESSION_KEYED_HOLDINGS {
+        for sql in [
+            &rows_written_since_sql(table),
+            &rows_removed_since_sql(kind),
+        ] {
+            let mut statement = conn.prepare_cached(sql)?;
+            let mut rows = statement.query(params![revision, sources.clone(), rows_limit])?;
+            let mut read = 0usize;
+            while let Some(row) = rows.next()? {
+                read += 1;
+                if read > DESTINATION_RECOUNT_ROW_LIMIT {
+                    return Ok(None);
+                }
+                touched.insert((row.get::<_, String>(0)?, row.get::<_, String>(1)?));
+                if touched.len() > DESTINATION_RECOUNT_LIMIT {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+    Ok(Some(touched))
+}
+
+/// The `(source, session_id)` of every row of `table` stamped above `?1`.
+///
+/// `+source` keeps the planner on the revision index: offered the session
+/// index, it walks every row of the source to read them in `(source,
+/// session_id)` order, which is the scan this replaces. Deduplicated by the
+/// caller rather than with `DISTINCT` for the same reason.
+fn rows_written_since_sql(table: &str) -> String {
+    format!(
+        "SELECT source, session_id FROM {table} WHERE revision > ?1 \
+         AND +source IN (SELECT value FROM json_each(?2)) LIMIT ?3"
+    )
+}
+
+/// [`rows_written_since_sql`] for the tombstones of one feed kind.
+fn rows_removed_since_sql(kind: &str) -> String {
+    format!(
+        "SELECT source, session_id FROM evidence_tombstones \
+         WHERE kind = '{kind}' AND revision > ?1 \
+         AND +source IN (SELECT value FROM json_each(?2)) LIMIT ?3"
+    )
+}
+
+/// One session's [`SessionHoldings`], counted the way the grouped reads of
+/// [`session_holdings_naming`] count it, through each table's session index.
+fn session_holding(conn: &Connection, source: &str, session_id: &str) -> Result<SessionHoldings> {
+    let repairable = REPAIRABLE_EVENT_SOURCES.contains(&source);
+    let replayable = REPLAYABLE_HISTORY_SOURCES.contains(&source);
+    let count = |sql: &str, applies: bool| -> Result<u64> {
+        if !applies {
+            return Ok(0);
+        }
+        let count: i64 = conn
+            .prepare_cached(sql)?
+            .query_row(params![source, session_id], |row| row.get(0))?;
+        Ok(u64::try_from(count).unwrap_or(0))
+    };
+    Ok(SessionHoldings {
+        events: count(
+            "SELECT COUNT(*) FROM session_events WHERE source = ?1 AND session_id = ?2",
+            repairable,
+        )?,
+        tool_calls: count(
+            "SELECT COUNT(*) FROM tool_calls WHERE source = ?1 AND session_id = ?2",
+            repairable,
+        )?,
+        file_edits: count(
+            "SELECT COUNT(*) FROM file_edits WHERE source = ?1 AND session_id = ?2",
+            repairable,
+        )?,
+        history: count(
+            "SELECT COUNT(*) FROM history WHERE source = ?1 AND session_id = ?2",
+            replayable,
+        )?,
+        markers: count(
+            "SELECT COUNT(*) FROM session_markers WHERE source = ?1 AND session_id = ?2",
+            replayable,
+        )?,
+        catalog: count(
+            "SELECT COUNT(*) FROM sessions WHERE source = ?1 AND session_id = ?2",
+            repairable,
+        )?,
+    })
 }
 
 /// A destination marker, or `None` for anything this build did not write.
@@ -1118,20 +1370,53 @@ impl SweepRepairs {
 }
 
 /// The shortfall against whatever marker the sync state currently holds.
+#[cfg(test)]
 fn destination_shortfall_against(
     conn: &Connection,
     state: &Map<String, Value>,
 ) -> Result<SweepRepairs> {
+    destination_shortfall_counted(conn, state, None).map(|(repairs, _)| repairs)
+}
+
+/// The shortfall against whatever marker the sync state currently holds,
+/// also handing back the counts it was computed from (when it counted at
+/// all), so the end of the sweep can carry them forward instead of counting
+/// again. `start` is a snapshot to carry forward rather than take afresh; see
+/// [`current_destination`].
+fn destination_shortfall_counted(
+    conn: &Connection,
+    state: &Map<String, Value>,
+    start: Option<DestinationSnapshot>,
+) -> Result<(SweepRepairs, Option<DestinationSnapshot>)> {
     let Some(stored) = state.get(DESTINATION_GENERATION_KEY) else {
-        return Ok(SweepRepairs::default());
+        return Ok((SweepRepairs::default(), start));
     };
     let Some(stored) = stored.as_str() else {
-        return Ok(SweepRepairs::all());
+        return Ok((SweepRepairs::all(), start));
     };
-    destination_shortfall(conn, stored)
+    let Some(stored) = parse_destination_marker(stored) else {
+        // A value that is present but unreadable cannot name the short
+        // sessions. Re-read every repairable session instead. Treating it as
+        // an empty set would let the sweep checkpoint today's reduced
+        // holdings over the malformed marker and permanently ratify any
+        // short, still-nonempty session.
+        return Ok((SweepRepairs::all(), start));
+    };
+    let current = current_destination(conn, start)?;
+    let repairs = destination_shortfall_in(conn, &stored, &current)?;
+    Ok((repairs, Some(current)))
 }
 
 /// Which sessions hold less than the stored marker recorded.
+#[cfg(test)]
+fn destination_shortfall(conn: &Connection, stored: &str) -> Result<SweepRepairs> {
+    let Some(stored) = parse_destination_marker(stored) else {
+        return Ok(SweepRepairs::all());
+    };
+    destination_shortfall_in(conn, &stored, &DestinationSnapshot::take(conn)?)
+}
+
+/// Which sessions in `current` hold less than `stored` recorded.
 ///
 /// The marker keys sessions by hash, which is enough to *detect* a loss but
 /// not to name one. The names come back from the destination itself: every
@@ -1140,22 +1425,18 @@ fn destination_shortfall_against(
 /// repair. A session with nothing left at all cannot be named this way, and
 /// does not need to be — an empty session already fails the existence check
 /// the skip is guarded by.
-fn destination_shortfall(conn: &Connection, stored: &str) -> Result<SweepRepairs> {
-    let Some(stored) = parse_destination_marker(stored) else {
-        // Absence is handled by `destination_shortfall_against`; a value that
-        // is present but unreadable cannot name the short sessions. Re-read
-        // every repairable session instead. Treating it as an empty set would
-        // let the sweep checkpoint today's reduced holdings over the malformed
-        // marker and permanently ratify any short, still-nonempty session.
-        return Ok(SweepRepairs::all());
-    };
+fn destination_shortfall_in(
+    conn: &Connection,
+    stored: &DestinationMarker,
+    current: &DestinationSnapshot,
+) -> Result<SweepRepairs> {
     let mut repairs = SweepRepairs::default();
     // Named from the *session* side rather than from the evidence, because a
     // session whose catalog row and events are both gone has no row left to be
     // found by. Catalog, event, history and marker groups collect the names
     // while counting holdings, avoiding another walk of those same tables.
-    let mut named: HashSet<(String, String)> = HashSet::new();
-    let current = session_holdings_naming(conn, Some(&mut named))?;
+    let mut named = current.named.clone();
+    let current = &current.holdings;
     // A Muse subagent has no catalog row of its own, so once every event of
     // it is gone neither table above can name it; the edge its parent's log
     // recorded still does, and naming it is what sends the parent back to
@@ -1577,13 +1858,16 @@ fn sync_basic(
     // Named before anything is written, because the sweep below is what
     // repairs them and it decides per session whether its unchanged stamp
     // licenses a skip. A failure here costs the repair, not the sweep.
-    let (repairs, repair_plan_known) = match destination_shortfall_against(conn, &state) {
-        Ok(repairs) => (repairs, true),
-        Err(error) => {
-            sync_note!("  [sync] could not name the sessions to repair: {error:#}");
-            (SweepRepairs::default(), false)
-        }
-    };
+    // The counts it was taken from are kept: the end of the sweep needs them
+    // again, and recounts only the sessions the sweep wrote (#321).
+    let (repairs, repair_plan_known, mut destination) =
+        match destination_shortfall_counted(conn, &state, None) {
+            Ok((repairs, counted)) => (repairs, true, counted),
+            Err(error) => {
+                sync_note!("  [sync] could not name the sessions to repair: {error:#}");
+                (SweepRepairs::default(), false, None)
+            }
+        };
     if repairs.repairs_all() {
         sync_note!("  [sync] destination marker unreadable; repairing all replayable sessions");
     } else if !repairs.is_empty() {
@@ -1818,8 +2102,11 @@ fn sync_basic(
         // recover instead of forcing full sweeps forever.
         Some(SweepRepairs::default())
     } else {
-        match destination_shortfall_against(conn, &state) {
-            Ok(outstanding) => Some(outstanding),
+        match destination_shortfall_counted(conn, &state, destination.take()) {
+            Ok((outstanding, counted)) => {
+                destination = counted;
+                Some(outstanding)
+            }
             Err(error) => {
                 sync_note!("  [sync] could not re-check the destination: {error:#}");
                 None
@@ -1853,15 +2140,22 @@ fn sync_basic(
             // The head is read *before* the counts. A write that lands between
             // the two then shows as a head that moved, which only costs the
             // next tick a recount; read after, a delete in that gap would be
-            // under a head that vouches for counts taken before it.
-            let head = destination_head(conn).unwrap_or_else(|error| {
-                sync_note!("  [sync] destination head unavailable: {error:#}");
-                String::new()
-            });
-            let destination = destination_generation(conn).unwrap_or_else(|error| {
-                sync_note!("  [sync] destination generation unavailable: {error:#}");
-                String::new()
-            });
+            // under a head that vouches for counts taken before it. Carried
+            // forward from the counts the sweep already holds (#321), the
+            // head is the one the recount of the written sessions started
+            // from, which keeps the same order.
+            let (head, destination) = match current_destination(conn, destination.take()) {
+                Ok(current) => {
+                    if current.head.is_none() {
+                        sync_note!("  [sync] destination head unavailable");
+                    }
+                    (current.head_value(), current.marker())
+                }
+                Err(error) => {
+                    sync_note!("  [sync] destination generation unavailable: {error:#}");
+                    (String::new(), String::new())
+                }
+            };
             state.insert(SOURCE_FINGERPRINT_KEY.to_string(), Value::from(fingerprint));
             state.insert(
                 DESTINATION_GENERATION_KEY.to_string(),
@@ -16802,6 +17096,197 @@ mod tests {
         cleanup_codex_subagent_registration(&conn, "child").unwrap();
         let repairs = destination_shortfall(&conn, &marker).unwrap();
         assert!(repairs.contains("codex", "child"));
+    }
+
+    fn holdings_store() -> (tempfile::TempDir, Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open_db(&dir.path().join("ai-history.db")).unwrap();
+        for (source, session) in [
+            ("claude", "a"),
+            ("claude", "b"),
+            ("claude", "c"),
+            ("codex", "d"),
+            ("codex", "e"),
+            ("devin", "h"),
+        ] {
+            conn.execute(
+                "INSERT INTO sessions (session_id, source, cwd) VALUES (?2, ?1, '/tmp/p')",
+                params![source, session],
+            )
+            .unwrap();
+            for uid in 0..3 {
+                conn.execute(
+                    "INSERT INTO session_events \
+                     (source, session_id, ts_ms, role, kind, text, event_uid) \
+                     VALUES (?1, ?2, 1, 'assistant', 'text', 'x', ?3)",
+                    params![source, session, format!("{session}-{uid}")],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO tool_calls (source, session_id, message_id, tool_use_id, name) \
+                 VALUES (?1, ?2, 'm', ?3, 'Bash')",
+                params![source, session, format!("{session}-tool")],
+            )
+            .unwrap();
+        }
+        // Not a repairable source: never counted, whatever happens to it.
+        conn.execute(
+            "INSERT INTO session_events (source, session_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('cursor', 'z', 1, 'user', 'text', 'x', 'z-0')",
+            [],
+        )
+        .unwrap();
+        (dir, conn)
+    }
+
+    fn assert_same_destination(carried: &DestinationSnapshot, full: &DestinationSnapshot) {
+        assert_eq!(carried.holdings, full.holdings);
+        assert_eq!(carried.named, full.named);
+        assert_eq!(carried.marker(), full.marker());
+        assert_eq!(carried.head_value(), full.head_value());
+    }
+
+    /// Carrying the start-of-sweep counts forward through the change feed
+    /// lands on exactly what counting everything again does (#321): growth,
+    /// a deleted tool call, a deleted catalog row, a session emptied of every
+    /// row, events moved to another session and a brand-new session.
+    #[test]
+    fn carried_destination_counts_match_a_full_recount() {
+        let (_dir, conn) = holdings_store();
+        let start = DestinationSnapshot::take(&conn).unwrap();
+        assert!(start.head.is_some());
+
+        conn.execute(
+            "INSERT INTO session_events (source, session_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('claude', 'a', 2, 'assistant', 'text', 'new', 'a-new')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM tool_calls WHERE source = 'claude' AND session_id = 'b'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM sessions WHERE source = 'claude' AND session_id = 'c'",
+            [],
+        )
+        .unwrap();
+        for table in ["sessions", "session_events", "tool_calls"] {
+            conn.execute(
+                &format!("DELETE FROM {table} WHERE source = 'codex' AND session_id = 'd'"),
+                [],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "UPDATE session_events SET session_id = 'e2' WHERE source = 'codex' AND session_id = 'e'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tool_calls (source, session_id, message_id, tool_use_id, name) \
+             VALUES ('claude', 'f', 'm', 'f-tool', 'Read')",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM session_events WHERE source = 'cursor'", [])
+            .unwrap();
+
+        let carried = start
+            .advanced(&conn)
+            .unwrap()
+            .expect("the feed can say what moved");
+        let full = DestinationSnapshot::take(&conn).unwrap();
+        assert_same_destination(&carried, &full);
+        assert!(!carried.named.contains(&("codex".into(), "d".into())));
+        assert!(carried.named.contains(&("codex".into(), "e2".into())));
+
+        // Nothing written since: the snapshot is already current.
+        let again = carried.advanced(&conn).unwrap().unwrap();
+        assert_same_destination(&again, &full);
+    }
+
+    /// Naming the written sessions reads the revision indexes, not a walk of
+    /// every row of the source through its session index, with or without
+    /// planner statistics.
+    #[test]
+    fn naming_the_written_sessions_reads_the_revision_indexes() {
+        let (_dir, conn) = holdings_store();
+        for analyzed in [false, true] {
+            if analyzed {
+                conn.execute_batch("ANALYZE").unwrap();
+            }
+            for (table, kind) in SESSION_KEYED_HOLDINGS {
+                for (sql, index) in [
+                    (
+                        rows_written_since_sql(table),
+                        format!("idx_{table}_revision"),
+                    ),
+                    (
+                        rows_removed_since_sql(kind),
+                        "idx_evidence_tombstones_kind_revision".to_string(),
+                    ),
+                ] {
+                    let plan: Vec<String> = conn
+                        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                        .unwrap()
+                        .query_map(params![0, "[\"claude\"]", 10], |row| row.get(3))
+                        .unwrap()
+                        .collect::<rusqlite::Result<_>>()
+                        .unwrap();
+                    assert!(
+                        plan.iter().any(|step| step.contains(&index)),
+                        "{table} (analyzed: {analyzed}): {plan:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// What the feed cannot vouch for sends the end of the sweep back to a
+    /// full count: a replayable source's prompt (whose session is not part of
+    /// its identity), and more sessions than are worth recounting one by one.
+    #[test]
+    fn carried_destination_counts_fall_back_when_the_feed_cannot_vouch() {
+        let (_dir, conn) = holdings_store();
+        let start = DestinationSnapshot::take(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO history (source, session_id, prompt, timestamp_ms) \
+             VALUES ('devin', 'h', 'hello', 5)",
+            [],
+        )
+        .unwrap();
+        assert!(start.advanced(&conn).unwrap().is_none());
+
+        // A prompt of a source whose history is not counted does not matter.
+        let start = DestinationSnapshot::take(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO history (source, session_id, prompt, timestamp_ms) \
+             VALUES ('claude', 'a', 'hello', 6)",
+            [],
+        )
+        .unwrap();
+        let carried = start
+            .advanced(&conn)
+            .unwrap()
+            .expect("claude prompts are not counted");
+        assert_same_destination(&carried, &DestinationSnapshot::take(&conn).unwrap());
+
+        let start = DestinationSnapshot::take(&conn).unwrap();
+        for session in 0..=DESTINATION_RECOUNT_LIMIT {
+            conn.execute(
+                "INSERT INTO sessions (session_id, source, cwd) VALUES (?1, 'claude', '/tmp/p')",
+                params![format!("bulk-{session}")],
+            )
+            .unwrap();
+        }
+        assert!(start.advanced(&conn).unwrap().is_none());
+        // ...and the full count the sweep falls back to is still right.
+        let current =
+            current_destination(&conn, Some(DestinationSnapshot::take(&conn).unwrap())).unwrap();
+        assert_same_destination(&current, &DestinationSnapshot::take(&conn).unwrap());
     }
 
     #[test]
