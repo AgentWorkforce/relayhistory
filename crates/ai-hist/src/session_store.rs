@@ -1001,6 +1001,7 @@ impl SessionStore {
             .with_poll_interval_ms(opts.poll_interval_ms)
             .with_slow_poll_ms(opts.slow_poll_ms)
             .with_immediate(opts.immediate)
+            .with_leading_edge(opts.leading_edge)
             .on_report(Arc::new(move |report| {
                 let changed = std::mem::take(&mut *report_pending.lock().expect("watch pending"));
                 let tick = TickReport {
@@ -1811,6 +1812,13 @@ pub struct WatchOptions {
     pub use_fs_events: bool,
     /// Run one sweep before parking. Default `true`.
     pub immediate: bool,
+    /// Sweep a filesystem event that finds the loop quiet right away (after
+    /// a 10 ms settle that gathers one write's backend callbacks) instead of
+    /// after `debounce_ms`. Events inside the window that sweep opens
+    /// coalesce into one trailing tick when it closes, so a burst costs at
+    /// most two sweeps and sustained writes tick once per `debounce_ms`.
+    /// `false` restores the trailing-only window. Default `true`.
+    pub leading_edge: bool,
     /// Cancels the tick in flight at its next provider, file or record
     /// boundary, and ends the loop: a cancelled tick arrives as a
     /// [`TickReport`] with `cancelled` set, then the iterator ends. Stopping
@@ -1830,6 +1838,7 @@ impl Default for WatchOptions {
             slow_poll_ms: crate::watch::DEFAULT_SLOW_POLL_MS,
             use_fs_events: true,
             immediate: true,
+            leading_edge: true,
             stop: None,
         }
     }

@@ -9,7 +9,8 @@
 //! * **Filesystem events** (preferred): a recursive watcher over the providers'
 //!   [`watch_roots`](crate::discover::watch_roots) wakes the loop on a real
 //!   write. A burst of events collapses into one tick through the
-//!   [`WatchLoop::debounce_ms`] window, and a slow poll at
+//!   [`WatchLoop::debounce_ms`] window — swept on its leading edge when the
+//!   loop was quiet ([`WatchLoop::leading_edge`]) — and a slow poll at
 //!   [`WatchLoop::slow_poll_ms`] backstops the platforms where events are
 //!   silently unreliable (network mounts, some container filesystems).
 //! * **Polling** (fallback): when no roots are watchable, when the crate was
@@ -113,6 +114,14 @@ fn deadline_after(now: Instant, millis: u64) -> Instant {
 /// interactive pause feels live, long enough to collapse the event burst from
 /// one tool result appending a multi-line transcript update.
 pub const DEFAULT_DEBOUNCE_MS: u64 = 200;
+/// How long a leading-edge tick waits before it sweeps.
+///
+/// Not a debounce: one write reaches the loop as several backend callbacks
+/// (FSEvents delivers a create or an append as two or three, within about a
+/// millisecond), and a tick that swept on the first of them would leave the
+/// rest to drive a trailing sweep for the same write. A few milliseconds
+/// gathers one write's callbacks without being perceptible.
+pub const LEADING_EDGE_SETTLE_MS: u64 = 10;
 /// Default slow polling backstop while the filesystem-event driver is active.
 pub const DEFAULT_SLOW_POLL_MS: u64 = 30_000;
 /// Default cadence for the pure polling driver.
@@ -322,6 +331,11 @@ struct WakeState {
     /// and wants the watch back.
     registration_lost: bool,
     stopped: bool,
+    /// When the coalescing window opened by the last change-driven tick
+    /// closes. A change arriving after it finds the loop quiet and, with the
+    /// leading edge on, is swept at once; one arriving before it waits for
+    /// it and becomes the window's one trailing tick.
+    window_until: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -434,7 +448,12 @@ impl WatchInner {
     /// Block until a change signal arrives, `timeout` elapses, or the loop is
     /// stopped. A change signal is followed by the debounce window, so further
     /// events landing inside it roll into the same tick.
-    fn wait_for_wake(&self, timeout: Duration, debounce: Duration) -> Option<Wake> {
+    fn wait_for_wake(
+        &self,
+        timeout: Duration,
+        debounce: Duration,
+        leading_edge: bool,
+    ) -> Option<Wake> {
         let mut wake = self.wake.lock().expect("watch wake state");
         loop {
             if wake.stopped {
@@ -448,6 +467,23 @@ impl WatchInner {
                 return Some(Wake::from(TickTrigger::RegistrationLost));
             }
             if wake.pending.is_some() {
+                // With the leading edge on, a change that finds the loop quiet
+                // — no change-driven tick in the last window — is swept after
+                // only the settle, and the window opens with that sweep: what
+                // lands inside it is its one trailing tick, at the window's
+                // close. A burst therefore costs at most a leading and a
+                // trailing sweep, an isolated write is swept within a few
+                // milliseconds, and sustained writes tick once per window.
+                // Without it every change waits out the full window.
+                let now = Instant::now();
+                let window = if leading_edge {
+                    match wake.window_until {
+                        Some(until) if until > now => until - now,
+                        _ => debounce.min(Duration::from_millis(LEADING_EDGE_SETTLE_MS)),
+                    }
+                } else {
+                    debounce
+                };
                 drop(wake);
                 // Cut short by a lost registration, because on a busy tree
                 // this window is where the loop spends nearly all of its
@@ -456,7 +492,7 @@ impl WatchInner {
                 // the watch is put back, which is the whole of the gap a
                 // short session occupies. The bit itself is left set; the
                 // caller takes it and reconciles before it sweeps.
-                self.sleep_through_debounce(debounce);
+                self.sleep_through_debounce(window);
                 let mut wake = self.wake.lock().expect("watch wake state");
                 if wake.stopped {
                     return None;
@@ -474,6 +510,9 @@ impl WatchInner {
                 // sweep, sets the bit again, so sustained writes keep a steady
                 // window-plus-sweep cadence instead of waiting for quiet.
                 let first_event_at = wake.pending.take();
+                if leading_edge {
+                    wake.window_until = Instant::now().checked_add(debounce);
+                }
                 return Some(Wake {
                     trigger: TickTrigger::FsEvent,
                     first_event_at,
@@ -678,6 +717,11 @@ pub struct WatchLoop {
     pub roots: Vec<WatchRoot>,
     /// Run one sweep before parking.
     pub immediate: bool,
+    /// Sweep a change that finds the loop quiet at once (after
+    /// [`LEADING_EDGE_SETTLE_MS`]) instead of after the debounce window;
+    /// changes inside the window that sweep opens coalesce into one trailing
+    /// tick. Default `true`.
+    pub leading_edge: bool,
     roots_refresh: Option<RootsFn>,
     on_driver: Option<DriverSink>,
     inner: Arc<WatchInner>,
@@ -695,6 +739,7 @@ impl WatchLoop {
             use_fs_events: true,
             roots: Vec::new(),
             immediate: true,
+            leading_edge: true,
             roots_refresh: None,
             on_driver: None,
             inner: Arc::new(WatchInner {
@@ -737,6 +782,11 @@ impl WatchLoop {
 
     pub fn with_immediate(mut self, immediate: bool) -> Self {
         self.immediate = immediate;
+        self
+    }
+
+    pub fn with_leading_edge(mut self, leading_edge: bool) -> Self {
+        self.leading_edge = leading_edge;
         self
     }
 
@@ -903,7 +953,10 @@ impl WatchLoop {
                 // the backstop, up to `--interval` away.
                 idle = idle.min(at.saturating_duration_since(Instant::now()));
             }
-            let Some(wake) = self.inner.wait_for_wake(idle, debounce) else {
+            let Some(wake) = self
+                .inner
+                .wait_for_wake(idle, debounce, self.leading_edge)
+            else {
                 break;
             };
             let trigger = wake.trigger;

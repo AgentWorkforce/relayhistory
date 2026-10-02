@@ -801,6 +801,17 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Rust API
 
+- `WatchOptions::leading_edge` (default `true`), plus `WatchLoop::leading_edge`
+  and `with_leading_edge`. A filesystem event that finds the watch loop quiet
+  is swept after a 10 ms settle (`watch::LEADING_EDGE_SETTLE_MS`) instead of
+  after the debounce window. Events inside the window that sweep opens
+  coalesce into one trailing tick at its close. `ai-hist watch` gets the new
+  default. On a 300-session store, write to `TickReport`: p50 259 -> 65 ms,
+  p95 267 -> 100 ms. A three-line turn costs 2 sweeps instead of 1, and
+  sustained writes tick once per window instead of once per window plus
+  sweep (12 -> 16 ticks over 3 s). Set it to `false` for the old
+  trailing-only window.
+
 - `SessionStore::watch` ticks can be cancelled (#333). `WatchOptions::stop:
   Option<StopToken>` (serde-skipped, like `SyncOptions::stop`) is installed
   around every tick's sweep, and `WatchStop::stop` / dropping the handle now

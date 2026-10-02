@@ -245,7 +245,12 @@ before the hook ran is an answer.
 The `ai-hist watch` loop on its own thread, as an iterator of `TickReport`s.
 Filesystem events over the providers' roots drive it when the crate is built
 with the `fs-events` feature and `WatchOptions::use_fs_events` is on; it polls
-at `poll_interval_ms` otherwise, with a `slow_poll_ms` backstop either way. A
+at `poll_interval_ms` otherwise, with a `slow_poll_ms` backstop either way.
+With `WatchOptions::leading_edge` (the default), a filesystem event that
+finds the loop quiet is swept after a 10 ms settle, not after `debounce_ms`.
+Events inside the window that sweep opens coalesce into one trailing tick
+when the window closes, so a burst costs at most two sweeps, and sustained
+writes tick once per `debounce_ms`. A
 tick is the same locked `sync`; one that finds the lock held reports
 `contended` and is retried by the loop rather than counted as done. A failed
 sweep arrives as an `Err` and the loop keeps running; the rolling catalog
