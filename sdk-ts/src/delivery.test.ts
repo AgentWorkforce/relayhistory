@@ -314,9 +314,9 @@ test('an abandoned export snapshot is released when its TTL elapses, with no fur
     const holder = spawn(process.execPath, ['--input-type=module', '-e', `
       import { beginHistoryExport } from ${JSON.stringify(sdkModule)};
       // Never closed and never paged again: only its TTL can release it.
-      await beginHistoryExport(${JSON.stringify(selection)}, { dbPath: ${JSON.stringify(dbPath)}, ttlMs: 300 });
+      await beginHistoryExport(${JSON.stringify(selection)}, { dbPath: ${JSON.stringify(dbPath)}, ttlMs: 1_500 });
       process.stdout.write('ready\\n');
-      setTimeout(() => {}, 5_000);`], { stdio: ['ignore', 'pipe', 'inherit'] });
+      setTimeout(() => {}, 10_000);`], { stdio: ['ignore', 'pipe', 'inherit'] });
     try {
       writer.exec('PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS ttl_probe(n INTEGER);');
       const checkpoint = (n: number) => {
@@ -328,7 +328,7 @@ test('an abandoned export snapshot is released when its TTL elapses, with no fur
         holder.on('exit', (code) => reject(new Error(`snapshot holder exited early with ${code}`)));
       });
       assert.equal(checkpoint(1).busy, 1, 'a live snapshot holds the checkpoint back');
-      await pause(1_000);
+      await pause(3_000);
       assert.equal(holder.exitCode, null, 'the holder process is still running');
       assert.equal(checkpoint(2).busy, 0, 'the expired snapshot still holds its read transaction');
     } finally { holder.kill(); writer.close(); }

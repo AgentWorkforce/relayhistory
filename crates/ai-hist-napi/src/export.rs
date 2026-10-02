@@ -37,6 +37,8 @@ static OPEN: Mutex<Vec<core::ExportSnapshot>> = Mutex::new(Vec::new());
 /// earliest one expires.
 static REAPER_WAKE: Condvar = Condvar::new();
 static REAPER: Once = Once::new();
+/// Longest the reaper sleeps while a snapshot is open; see `start_reaper`.
+const REAPER_MAX_WAIT_MS: u64 = 1_000;
 
 fn open_snapshots() -> std::sync::MutexGuard<'static, Vec<core::ExportSnapshot>> {
     OPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -85,7 +87,15 @@ fn start_reaper() {
                             .wait(open)
                             .unwrap_or_else(|poisoned| poisoned.into_inner()),
                         Some(at) => {
-                            let wait = u64::try_from(at.saturating_sub(now).max(1)).unwrap_or(1);
+                            // Expiry is a wall-clock instant but the wait is
+                            // a monotonic duration, so a clock that jumps
+                            // forward would otherwise leave an expired
+                            // snapshot open for up to its whole TTL. Waking
+                            // at least once a second while anything is open
+                            // re-reads the wall clock; it costs nothing when
+                            // no snapshot is open.
+                            let wait =
+                                at.saturating_sub(now).clamp(1, REAPER_MAX_WAIT_MS as i64) as u64;
                             REAPER_WAKE
                                 .wait_timeout(open, Duration::from_millis(wait))
                                 .map_or_else(|poisoned| poisoned.into_inner().0, |(guard, _)| guard)
