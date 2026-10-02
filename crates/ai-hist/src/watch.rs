@@ -79,10 +79,20 @@ const LOST_REGISTRATION_RECHECK_MS: u64 = 250;
 /// again, before backing off.
 ///
 /// Short, because the usual holder is a manual `sync` that is about to finish
-/// and the change is still owed; backed off from there so a long-running
-/// holder is not asked four times a second for minutes — the retry is a
-/// `try_lock` and a return, but it is also a log line each time.
+/// and the change is still owed.
 const CONTENDED_SWEEP_RETRY_MS: u64 = 250;
+
+/// The longest an owed sweep waits between attempts at a held lock.
+///
+/// Low, because the wait is paid by the change: a write made while another
+/// process sweeps is read no sooner than the first retry after that sweep
+/// releases the lock. A retry is one `try_lock` and a return, so asking once
+/// a second for as long as a holder keeps the lock costs nothing worth
+/// trading for capture latency. It used to be the slow backstop (30–60 s),
+/// reached after a handful of contended *event* ticks, which left the last
+/// writes of a burst unread for up to a minute after the lock was free
+/// (#364).
+const CONTENDED_SWEEP_RETRY_MAX_MS: u64 = 1_000;
 
 /// The longest any configurable interval may be.
 ///
@@ -1040,9 +1050,14 @@ impl WatchLoop {
             // have been: the change it is standing in for is still unread, so
             // the fingerprint it would be compared against still cannot be
             // trusted.
+            // Whether this tick is the owed retry itself, as opposed to a new
+            // event that happens to arrive while one is owed: only the retry
+            // backs off.
+            let mut is_retry = false;
             let wake = match retry_force {
                 Some((at, since)) if Instant::now() >= at => {
                     retry_force = None;
+                    is_retry = true;
                     Wake {
                         trigger: TickTrigger::FsEvent,
                         // The oldest change this sweep now covers.
@@ -1080,10 +1095,23 @@ impl WatchLoop {
                     (Some(a), Some(b)) => Some(a.min(b)),
                     (a, b) => a.or(b),
                 };
-                retry_force = Some((deadline_after(Instant::now(), retry_backoff), since));
-                retry_backoff = retry_backoff
-                    .saturating_mul(2)
-                    .min(self.slow_poll_ms.max(CONTENDED_SWEEP_RETRY_MS));
+                // Backed off per attempt of the owed retry, never per event: a
+                // burst of contended events is one owed change, and letting
+                // each of them double the wait (and push the deadline later)
+                // is what stalled capture until the backstop. A new event
+                // keeps the earlier of the two deadlines.
+                let next = deadline_after(Instant::now(), retry_backoff);
+                let at = match retry_force {
+                    Some((held, _)) if !is_retry => held.min(next),
+                    _ => next,
+                };
+                retry_force = Some((at, since));
+                if is_retry {
+                    retry_backoff = retry_backoff
+                        .saturating_mul(2)
+                        .min(CONTENDED_SWEEP_RETRY_MAX_MS.min(self.slow_poll_ms))
+                        .max(CONTENDED_SWEEP_RETRY_MS.min(self.slow_poll_ms));
+                }
             } else if trigger.forces_scan() {
                 // A forced sweep got through. Whatever was owed is paid, and
                 // the next contention starts from the short cadence again.

@@ -453,6 +453,69 @@ fn without_the_leading_edge_a_change_waits_out_the_window() {
     assert!(signalled.elapsed() >= Duration::from_millis(400));
 }
 
+/// A burst of writes while another process holds the sync lock is one owed
+/// change, and it is read within about a second of the lock coming free —
+/// not at the backstop (#364). Each contended *event* tick used to double the
+/// owed retry's backoff and push its deadline later, so ten events during a
+/// three-second foreign sweep left the change waiting the whole 60 s
+/// backstop after the lock was released.
+#[test]
+fn writes_owed_behind_a_held_lock_are_swept_soon_after_it_is_released() {
+    use std::sync::atomic::AtomicBool;
+
+    let held = Arc::new(AtomicBool::new(true));
+    let (sender, swept) = mpsc::channel::<std::time::Instant>();
+    let tick: TickFn = {
+        let held = held.clone();
+        Arc::new(move |force| {
+            if held.load(Ordering::SeqCst) {
+                // Another process holds the store's lock: nothing was read.
+                return Ok(TickOutcome {
+                    contended: true,
+                    ..TickOutcome::default()
+                });
+            }
+            if force {
+                let _ = sender.send(std::time::Instant::now());
+            }
+            Ok(TickOutcome {
+                swept: true,
+                ..TickOutcome::default()
+            })
+        })
+    };
+    let running = RunningLoop::start(
+        |watch| {
+            watch
+                .with_immediate(false)
+                .with_fs_events(false)
+                .with_debounce_ms(50)
+                // The probe's backstop: an owed change must never wait for it.
+                .with_poll_interval_ms(60_000)
+                .with_slow_poll_ms(60_000)
+        },
+        tick,
+    );
+
+    // Ten writes over three seconds, every one of them turned away.
+    for _ in 0..10 {
+        running.watch.notify_change();
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    assert!(swept.try_recv().is_err(), "nothing can be swept while held");
+
+    held.store(false, Ordering::SeqCst);
+    let released = std::time::Instant::now();
+    let at = swept
+        .recv_timeout(ARRIVES_WITHIN)
+        .expect("the owed change was never swept after the lock was released");
+    let waited = at.duration_since(released);
+    assert!(
+        waited < Duration::from_millis(1_500),
+        "the owed change waited {waited:?} after the lock was free"
+    );
+}
+
 #[test]
 fn the_polling_backstop_does_not_force_the_scan() {
     let running = RunningLoop::reporting(|watch| {
