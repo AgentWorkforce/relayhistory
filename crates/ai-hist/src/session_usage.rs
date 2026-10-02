@@ -17,7 +17,7 @@ use crate::usage::{normalize_usage_str, NormalizedUsage, UsageAccounting};
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Bump whenever the request row / summary shapes, ordering, or cursor
 /// semantics require an SDK change.
@@ -462,6 +462,9 @@ fn resolve_usage(raw: &RawRequest) -> ResolvedUsage {
 ///
 /// Both `source` and `session_id` are required: provider session ids collide
 /// across providers, and an id-only page would interleave two sessions.
+// Only the napi crate pages requests (through `unstable-internal`);
+// `SessionStore::session` reads them all with `session_requests_all`.
+#[cfg_attr(not(feature = "unstable-internal"), allow(dead_code))]
 pub fn session_requests_page(
     conn: &Connection,
     source: &str,
@@ -525,31 +528,7 @@ pub fn session_requests_page(
         .into_iter()
         .map(|raw| {
             let resolved = resolve_usage(&raw);
-            let mut ids = Vec::new();
-            for message_id in &raw.message_ids {
-                if let Some((_, found)) = tool_use_ids.iter().find(|(key, _)| key == message_id) {
-                    ids.extend(found.iter().cloned());
-                }
-            }
-            SessionRequest {
-                id: raw.id,
-                request_key_source: RequestKeySource::parse(&raw.request_key_source)
-                    .unwrap_or(RequestKeySource::RecordId),
-                source: raw.source,
-                session_id: raw.session_id,
-                request_key: raw.request_key,
-                message_ids: raw.message_ids,
-                model: raw.model,
-                provider: raw.provider,
-                first_ts_ms: raw.first_ts_ms,
-                last_ts_ms: raw.last_ts_ms,
-                usage: resolved.usage,
-                usage_error: resolved.error,
-                tool_use_ids: ids,
-                has_thinking: raw.has_thinking,
-                event_count: raw.event_count,
-                diagnostics: resolved.diagnostics,
-            }
+            build_request(raw, resolved, &tool_use_ids)
         })
         .collect();
     // Read-only: release an internally created snapshot explicitly. Dropping
@@ -563,42 +542,116 @@ pub fn session_requests_page(
     })
 }
 
-/// Tool use ids for the message ids on one page, in one query.
+/// Every request of one session and its usage rollup, from **one**
+/// evaluation of the grouped view and one read of its tool calls.
+///
+/// Exactly the concatenation of every [`session_requests_page`] page, plus
+/// what [`session_usage_summary`] returns. Walking the pages instead regroups
+/// the whole session once per 1,000 requests and evaluates the view again for
+/// the summary, which made a whole-session read superlinear (#311). Callers
+/// supply the read snapshot: [`crate::SessionStore::session`] already holds
+/// one across every table it reads.
+pub(crate) fn session_requests_all(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+) -> Result<(Vec<SessionRequest>, Option<SessionUsageSummary>)> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {REQUEST_COLUMNS} FROM session_requests \
+         WHERE source = ?1 AND session_id = ?2 \
+         ORDER BY first_ts_ms ASC, id ASC"
+    ))?;
+    let raw: Vec<RawRequest> = stmt
+        .query_map(rusqlite::params![source, session_id], row_to_raw_request)?
+        .collect::<rusqlite::Result<_>>()?;
+    drop(stmt);
+    let tool_use_ids = tool_use_ids_for(conn, source, session_id, &raw)?;
+    let mut fold = UsageFold::default();
+    let requests = raw
+        .into_iter()
+        .map(|raw| {
+            let resolved = resolve_usage(&raw);
+            fold.push(&raw, &resolved);
+            build_request(raw, resolved, &tool_use_ids)
+        })
+        .collect();
+    Ok((requests, fold.finish(source, session_id)))
+}
+
+/// One request row with its usage resolved and its tool use ids attached.
+fn build_request(
+    raw: RawRequest,
+    resolved: ResolvedUsage,
+    tool_use_ids: &HashMap<String, Vec<String>>,
+) -> SessionRequest {
+    let mut ids = Vec::new();
+    for message_id in &raw.message_ids {
+        if let Some(found) = tool_use_ids.get(message_id) {
+            ids.extend(found.iter().cloned());
+        }
+    }
+    SessionRequest {
+        id: raw.id,
+        request_key_source: RequestKeySource::parse(&raw.request_key_source)
+            .unwrap_or(RequestKeySource::RecordId),
+        source: raw.source,
+        session_id: raw.session_id,
+        request_key: raw.request_key,
+        message_ids: raw.message_ids,
+        model: raw.model,
+        provider: raw.provider,
+        first_ts_ms: raw.first_ts_ms,
+        last_ts_ms: raw.last_ts_ms,
+        usage: resolved.usage,
+        usage_error: resolved.error,
+        tool_use_ids: ids,
+        has_thinking: raw.has_thinking,
+        event_count: raw.event_count,
+        diagnostics: resolved.diagnostics,
+    }
+}
+
+/// Tool use ids for the message ids of `requests`, in one query, keyed by
+/// message id and ordered `(ts_ms, id)` within each.
 ///
 /// Kept out of the view deliberately: a correlated subquery per group would
 /// rescan the session's tool calls once per request, and adding an index to
 /// `tool_calls` to avoid that would cost a b-tree on every write for a field
-/// only this page reads.
+/// only this page reads. The rows are read in `(ts_ms, id)` order and bucketed
+/// here rather than sorted by `message_id` in SQL, and looked up by hash: a
+/// per-request linear search of the page's buckets made a 1,000-request page
+/// cost requests × message ids.
 fn tool_use_ids_for(
     conn: &Connection,
     source: &str,
     session_id: &str,
-    page: &[RawRequest],
-) -> Result<Vec<(String, Vec<String>)>> {
-    let wanted: BTreeSet<&str> = page
+    requests: &[RawRequest],
+) -> Result<HashMap<String, Vec<String>>> {
+    let wanted: HashSet<&str> = requests
         .iter()
         .flat_map(|raw| raw.message_ids.iter().map(String::as_str))
         .collect();
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
     if wanted.is_empty() {
-        return Ok(Vec::new());
+        return Ok(out);
     }
     let mut stmt = conn.prepare(
         "SELECT message_id, tool_use_id FROM tool_calls \
          WHERE source = ?1 AND session_id = ?2 AND message_id IS NOT NULL \
-         ORDER BY message_id, ts_ms, id",
+         ORDER BY ts_ms, id",
     )?;
-    let mut out: Vec<(String, Vec<String>)> = Vec::new();
-    let rows = stmt.query_map(rusqlite::params![source, session_id], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
-    for row in rows {
-        let (message_id, tool_use_id) = row?;
-        if !wanted.contains(message_id.as_str()) {
+    let mut rows = stmt.query(rusqlite::params![source, session_id])?;
+    while let Some(row) = rows.next()? {
+        let message_id = row.get_ref(0)?.as_str()?;
+        if !wanted.contains(message_id) {
             continue;
         }
-        match out.last_mut() {
-            Some((key, ids)) if *key == message_id => ids.push(tool_use_id),
-            _ => out.push((message_id, vec![tool_use_id])),
+        let tool_use_id: String = row.get(1)?;
+        match out.get_mut(message_id) {
+            Some(ids) => ids.push(tool_use_id),
+            None => {
+                out.insert(message_id.to_string(), vec![tool_use_id]);
+            }
         }
     }
     Ok(out)
@@ -612,6 +665,7 @@ fn tool_use_ids_for(
 /// counted once per content block. Memory is bounded: the statement is
 /// streamed and folded into a fixed-size accumulator, so a session with a
 /// hundred thousand events costs the same as one with ten.
+#[cfg_attr(not(feature = "unstable-internal"), allow(dead_code))]
 pub fn session_usage_summary(
     conn: &Connection,
     source: &str,
@@ -623,100 +677,141 @@ pub fn session_usage_summary(
          ORDER BY first_ts_ms ASC, id ASC"
     ))?;
     let mut rows = stmt.query(rusqlite::params![source, session_id])?;
+    let mut fold = UsageFold::default();
+    while let Some(row) = rows.next()? {
+        let raw = row_to_raw_request(row)?;
+        let resolved = resolve_usage(&raw);
+        fold.push(&raw, &resolved);
+    }
+    Ok(fold.finish(source, session_id))
+}
 
-    let mut total: Option<NormalizedUsage> = None;
-    let mut overflowed = false;
-    let mut request_count: u64 = 0;
-    let mut total_request_count: u64 = 0;
-    let mut accounting: BTreeSet<UsageAccounting> = BTreeSet::new();
-    let mut diagnostics: BTreeSet<UsageDiagnostic> = BTreeSet::new();
-    let mut models: BTreeSet<String> = BTreeSet::new();
-    let mut first_ts_ms = i64::MAX;
-    let mut last_ts_ms = i64::MIN;
+/// The fixed-size accumulator behind [`SessionUsageSummary`], fed one request
+/// at a time in `(first_ts_ms, id)` order.
+struct UsageFold {
+    total: Option<NormalizedUsage>,
+    overflowed: bool,
+    request_count: u64,
+    total_request_count: u64,
+    accounting: BTreeSet<UsageAccounting>,
+    diagnostics: BTreeSet<UsageDiagnostic>,
+    models: BTreeSet<String>,
+    first_ts_ms: i64,
+    last_ts_ms: i64,
     // Whether any contributor reported a split / a cost at all. Comparing
     // these against the folded total is what tells "nobody reported it" from
     // "some did and the fold could not combine them".
-    let mut saw_cache_write_split = false;
-    let mut saw_reported_cost = false;
+    saw_cache_write_split: bool,
+    saw_reported_cost: bool,
+}
 
-    while let Some(row) = rows.next()? {
-        let raw = row_to_raw_request(row)?;
-        total_request_count = total_request_count.saturating_add(1);
-        first_ts_ms = first_ts_ms.min(raw.first_ts_ms);
-        last_ts_ms = last_ts_ms.max(raw.last_ts_ms);
-        if let Some(model) = raw.model.as_deref().filter(|model| !model.is_empty()) {
-            models.insert(model.to_string());
+impl Default for UsageFold {
+    fn default() -> Self {
+        Self {
+            total: None,
+            overflowed: false,
+            request_count: 0,
+            total_request_count: 0,
+            accounting: BTreeSet::new(),
+            diagnostics: BTreeSet::new(),
+            models: BTreeSet::new(),
+            first_ts_ms: i64::MAX,
+            last_ts_ms: i64::MIN,
+            saw_cache_write_split: false,
+            saw_reported_cost: false,
         }
-        let resolved = resolve_usage(&raw);
-        diagnostics.extend(resolved.diagnostics.iter().copied());
-        let Some(usage) = resolved.usage else {
-            continue;
+    }
+}
+
+impl UsageFold {
+    fn push(&mut self, raw: &RawRequest, resolved: &ResolvedUsage) {
+        self.total_request_count = self.total_request_count.saturating_add(1);
+        self.first_ts_ms = self.first_ts_ms.min(raw.first_ts_ms);
+        self.last_ts_ms = self.last_ts_ms.max(raw.last_ts_ms);
+        if let Some(model) = raw.model.as_deref().filter(|model| !model.is_empty()) {
+            if !self.models.contains(model) {
+                self.models.insert(model.to_string());
+            }
+        }
+        self.diagnostics
+            .extend(resolved.diagnostics.iter().copied());
+        let Some(usage) = resolved.usage.as_ref() else {
+            return;
         };
-        saw_cache_write_split |=
+        self.saw_cache_write_split |=
             usage.cache_write_5m_tokens.is_some() || usage.cache_write_1h_tokens.is_some();
-        saw_reported_cost |= usage.reported_cost_usd.is_some();
-        request_count = request_count.saturating_add(1);
-        accounting.insert(usage.accounting);
-        total = match total {
-            None => Some(usage),
-            Some(running) => match running.checked_add(&usage) {
+        self.saw_reported_cost |= usage.reported_cost_usd.is_some();
+        self.request_count = self.request_count.saturating_add(1);
+        self.accounting.insert(usage.accounting);
+        self.total = match self.total.take() {
+            None => Some(usage.clone()),
+            Some(running) => match running.checked_add(usage) {
                 Some(sum) => Some(sum),
                 None => {
-                    overflowed = true;
+                    self.overflowed = true;
                     Some(running)
                 }
             },
         };
     }
-    // Nothing was recorded for this session at all. A caller asking about a
-    // session that does not exist and one asking about a session whose usage
-    // is unreadable deserve different answers; only the first is nothing.
-    if total_request_count == 0 {
-        return Ok(None);
-    }
-    // A total is only reported when it means what it appears to mean.
-    let unresolved_identity = diagnostics.contains(&UsageDiagnostic::UnresolvedRequestIdentity);
-    if let Some(folded) = &total {
-        // Either bucket, not both. A contributor that omits only the 1h
-        // bucket leaves the 5m one populated, and requiring both to vanish
-        // reported that half-split as a complete one.
-        if saw_cache_write_split
-            && (folded.cache_write_5m_tokens.is_none() || folded.cache_write_1h_tokens.is_none())
-        {
-            diagnostics.insert(UsageDiagnostic::PartialCacheWriteSplit);
+
+    fn finish(mut self, source: &str, session_id: &str) -> Option<SessionUsageSummary> {
+        // Nothing was recorded for this session at all. A caller asking about
+        // a session that does not exist and one asking about a session whose
+        // usage is unreadable deserve different answers; only the first is
+        // nothing.
+        if self.total_request_count == 0 {
+            return None;
         }
-        if saw_reported_cost && folded.reported_cost_usd.is_none() {
-            diagnostics.insert(UsageDiagnostic::PartialReportedCost);
+        // A total is only reported when it means what it appears to mean.
+        let unresolved_identity = self
+            .diagnostics
+            .contains(&UsageDiagnostic::UnresolvedRequestIdentity);
+        if let Some(folded) = &self.total {
+            // Either bucket, not both. A contributor that omits only the 1h
+            // bucket leaves the 5m one populated, and requiring both to
+            // vanish reported that half-split as a complete one.
+            if self.saw_cache_write_split
+                && (folded.cache_write_5m_tokens.is_none()
+                    || folded.cache_write_1h_tokens.is_none())
+            {
+                self.diagnostics
+                    .insert(UsageDiagnostic::PartialCacheWriteSplit);
+            }
+            if self.saw_reported_cost && folded.reported_cost_usd.is_none() {
+                self.diagnostics
+                    .insert(UsageDiagnostic::PartialReportedCost);
+            }
         }
+        let usage = match (self.overflowed, unresolved_identity) {
+            // Requests that may be per record cannot be added into a
+            // per-request total. Reporting the sum anyway is exactly the
+            // multiplied figure this grouping exists to prevent.
+            (false, false) => self.total,
+            _ => None,
+        };
+        Some(SessionUsageSummary {
+            source: source.to_string(),
+            session_id: session_id.to_string(),
+            usage,
+            request_count: self.request_count,
+            total_request_count: self.total_request_count,
+            accounting: self.accounting.into_iter().collect(),
+            models: self.models.into_iter().collect(),
+            first_ts_ms: if self.first_ts_ms == i64::MAX {
+                0
+            } else {
+                self.first_ts_ms
+            },
+            last_ts_ms: if self.last_ts_ms == i64::MIN {
+                0
+            } else {
+                self.last_ts_ms
+            },
+            diagnostics: self.diagnostics.into_iter().collect(),
+            overflowed: self.overflowed,
+        })
     }
-    let usage = match (overflowed, unresolved_identity) {
-        // Requests that may be per record cannot be added into a per-request
-        // total. Reporting the sum anyway is exactly the multiplied figure
-        // this grouping exists to prevent.
-        (false, false) => total,
-        _ => None,
-    };
-    Ok(Some(SessionUsageSummary {
-        source: source.to_string(),
-        session_id: session_id.to_string(),
-        usage,
-        request_count,
-        total_request_count,
-        accounting: accounting.into_iter().collect(),
-        models: models.into_iter().collect(),
-        first_ts_ms: if first_ts_ms == i64::MAX {
-            0
-        } else {
-            first_ts_ms
-        },
-        last_ts_ms: if last_ts_ms == i64::MIN {
-            0
-        } else {
-            last_ts_ms
-        },
-        diagnostics: diagnostics.into_iter().collect(),
-        overflowed,
-    }))
 }
 
 #[cfg(test)]
@@ -1471,5 +1566,206 @@ mod tests {
         assert!(session_usage_summary(&conn, "claude", "s1")
             .unwrap()
             .is_some());
+    }
+
+    /// Deterministic xorshift, so a failing seed reproduces.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self, bound: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % bound
+        }
+    }
+
+    /// A session mixing every request-key namespace, shared and tied
+    /// timestamps, disagreeing and unnormalizable usage copies, model and
+    /// provider conflicts, tool calls on shared and unknown message ids, and a
+    /// sibling session and source that must not leak in.
+    fn seed_adversarial_requests(conn: &Connection, seed: u64, rows: usize) {
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let usages = [
+            Some(r#"{"input_tokens":1,"output_tokens":2}"#),
+            Some(r#"{"input_tokens":5,"output_tokens":1,"cache_read_input_tokens":3}"#),
+            Some(CLAUDE_USAGE),
+            Some("not json"),
+            None,
+        ];
+        for n in 0..rows {
+            let (source, session) = match rng.next(10) {
+                0 => ("codex", "s"),
+                1 => ("claude", "other"),
+                _ => ("claude", "s"),
+            };
+            let role = ["assistant", "assistant", "assistant", "user"][rng.next(4) as usize];
+            let kind = ["text", "thinking", "tool_use"][rng.next(3) as usize];
+            let message_id = match rng.next(8) {
+                0 => String::new(),
+                1 => format!("m,{}", rng.next(4)),
+                _ => format!("m{}", rng.next(rows as u64 / 3 + 1)),
+            };
+            let request = |rng: &mut Rng, prefix: &str| {
+                (rng.next(2) == 0).then(|| format!("{prefix}{}", rng.next(rows as u64 / 4 + 1)))
+            };
+            let request_id = request(&mut rng, "r");
+            let provider_message_id = request(&mut rng, "p");
+            let request_span = request(&mut rng, "x");
+            let ts_ms = rng.next(rows as u64 / 5 + 1) as i64;
+            conn.execute(
+                "INSERT INTO session_events \
+                 (source, session_id, message_id, request_id, provider_message_id, request_span, \
+                  ts_ms, role, kind, text, model, provider, token_json, event_uid) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'x', ?10, ?11, ?12, ?13)",
+                rusqlite::params![
+                    source,
+                    session,
+                    message_id,
+                    request_id,
+                    provider_message_id,
+                    request_span,
+                    ts_ms,
+                    role,
+                    kind,
+                    ["model-a", "model-b", ""][rng.next(3) as usize],
+                    (rng.next(4) == 0).then_some(["openai", "anthropic"][rng.next(2) as usize]),
+                    usages[rng.next(usages.len() as u64) as usize],
+                    format!("e{n}"),
+                ],
+            )
+            .unwrap();
+            if rng.next(3) == 0 {
+                conn.execute(
+                    "INSERT INTO tool_calls (source, session_id, message_id, tool_use_id, name, ts_ms) \
+                     VALUES (?1, ?2, ?3, ?4, 'Bash', ?5)",
+                    rusqlite::params![
+                        source,
+                        session,
+                        (rng.next(6) > 0).then(|| message_id.clone()),
+                        format!("tu{n}"),
+                        (rng.next(5) > 0).then(|| rng.next(rows as u64 / 5 + 1) as i64),
+                    ],
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    fn every_page(conn: &Connection, source: &str, limit: i64) -> Vec<SessionRequest> {
+        let mut requests = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = session_requests_page(conn, source, "s", limit, cursor.as_ref()).unwrap();
+            requests.extend(page.requests);
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => return requests,
+            }
+        }
+    }
+
+    #[test]
+    fn the_single_pass_matches_every_page_and_the_summary() {
+        for seed in 0..40 {
+            let conn = db();
+            seed_adversarial_requests(&conn, seed, 40 + (seed as usize % 9) * 25);
+            for source in ["claude", "codex"] {
+                let (all, summary) = session_requests_all(&conn, source, "s").unwrap();
+                for limit in [1, 2, 7, 1_000] {
+                    assert_eq!(
+                        all,
+                        every_page(&conn, source, limit),
+                        "seed {seed}, {source}, limit {limit}"
+                    );
+                }
+                assert_eq!(
+                    summary,
+                    session_usage_summary(&conn, source, "s").unwrap(),
+                    "seed {seed}, {source} summary"
+                );
+            }
+            let (all, _) = session_requests_all(&conn, "claude", "s").unwrap();
+            assert!(
+                all.iter().any(|request| !request.tool_use_ids.is_empty()),
+                "seed {seed} attached no tool calls"
+            );
+        }
+    }
+
+    /// SQLite virtual-machine steps `read` costs: a count of work that does
+    /// not depend on how fast the machine running the test is.
+    fn vm_steps<T>(conn: &Connection, read: impl FnOnce() -> T) -> (u64, T) {
+        let steps = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let tick = std::sync::Arc::clone(&steps);
+        conn.progress_handler(
+            1,
+            Some(move || {
+                tick.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                false
+            }),
+        );
+        let value = read();
+        conn.progress_handler(0, None::<fn() -> bool>);
+        (steps.load(std::sync::atomic::Ordering::Relaxed), value)
+    }
+
+    /// `exchanges` Claude-shaped API calls: three records of one request id,
+    /// each its own record uuid with the same usage copy, and a tool call.
+    fn seed_requests(conn: &Connection, exchanges: usize) {
+        let tx = conn.unchecked_transaction().unwrap();
+        for exchange in 0..exchanges {
+            for block in 0..3 {
+                let n = exchange * 3 + block;
+                tx.execute(
+                    "INSERT INTO session_events \
+                     (source, session_id, message_id, request_id, ts_ms, role, kind, text, \
+                      model, token_json, event_uid) \
+                     VALUES ('claude', 'big', ?1, ?2, ?3, 'assistant', 'tool_use', 'x', \
+                      'model-a', ?4, ?5)",
+                    rusqlite::params![
+                        format!("m{n}"),
+                        format!("req{exchange}"),
+                        n as i64,
+                        CLAUDE_USAGE,
+                        format!("e{n}")
+                    ],
+                )
+                .unwrap();
+                tx.execute(
+                    "INSERT INTO tool_calls (source, session_id, message_id, tool_use_id, name, ts_ms) \
+                     VALUES ('claude', 'big', ?1, ?2, 'Bash', ?3)",
+                    rusqlite::params![format!("m{n}"), format!("tu{n}"), n as i64],
+                )
+                .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+    }
+
+    /// Reading every request of a session is linear in it: twenty times the
+    /// requests is about twenty times the work. Walking 1,000-request pages
+    /// regrouped the whole session once per page (and once more for the
+    /// summary), which is quadratic.
+    #[test]
+    fn reading_every_request_scales_with_the_session_not_pages_times_events() {
+        let mut costs = Vec::new();
+        for exchanges in [500, 10_000] {
+            let conn = db();
+            seed_requests(&conn, exchanges);
+            let (steps, (requests, summary)) = vm_steps(&conn, || {
+                session_requests_all(&conn, "claude", "big").unwrap()
+            });
+            assert_eq!(requests.len(), exchanges);
+            assert_eq!(requests[exchanges / 2].tool_use_ids.len(), 3);
+            assert_eq!(summary.unwrap().request_count, exchanges as u64);
+            costs.push(steps);
+        }
+        eprintln!("session requests whole-session steps={costs:?}");
+        // 20x the requests; one regrouping per page would be ~200x here.
+        assert!(
+            costs[1] < costs[0] * 30,
+            "20x the requests cost {}x the work",
+            costs[1] / costs[0].max(1)
+        );
     }
 }

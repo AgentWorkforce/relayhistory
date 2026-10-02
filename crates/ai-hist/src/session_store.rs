@@ -46,9 +46,7 @@ use crate::paths::home_dir;
 pub use crate::paths::ProviderRoots;
 use crate::relationship_graph::{self, RelationshipCapabilities, SessionRelationship};
 use crate::remote::SourceConnectorSelection;
-use crate::session_usage::{
-    session_requests_page, session_usage_summary, SessionRequest, SessionUsageSummary,
-};
+use crate::session_usage::{session_requests_all, SessionRequest, SessionUsageSummary};
 use crate::source_evidence::EvidenceKind;
 use crate::store::{
     default_db_path, open_db, open_db_readonly, prompt_hash, schema_is_event_read_current,
@@ -1092,8 +1090,11 @@ impl SessionStore {
                 .map(|(event, bytes)| ToolResult::from_event(event, *bytes))
                 .collect();
             evidence.user_turns = all_user_turns(&tx, name, &session_id)?;
-            evidence.requests = all_requests(&tx, name, &session_id)?;
-            evidence.usage = session_usage_summary(&tx, name, &session_id).map_err(Error::query)?;
+            // Every request and the usage rollup from one evaluation of the
+            // grouped view, rather than one per 1,000-request page plus one
+            // more for the summary (#311).
+            (evidence.requests, evidence.usage) =
+                session_requests_all(&tx, name, &session_id).map_err(Error::query)?;
         }
         if wants(EvidenceKind::ToolCall) {
             evidence.tool_calls = session_tool_calls(&tx, &session_id, Some(name))
@@ -2699,25 +2700,6 @@ fn all_user_turns(
     session_id: &str,
 ) -> Result<Vec<SessionUserTurn>, Error> {
     session_user_turns_all(conn, source, session_id).map_err(Error::query)
-}
-
-/// Every model request, walking the bounded page internally.
-fn all_requests(
-    conn: &Connection,
-    source: &str,
-    session_id: &str,
-) -> Result<Vec<SessionRequest>, Error> {
-    let mut requests = Vec::new();
-    let mut cursor = None;
-    loop {
-        let page = session_requests_page(conn, source, session_id, 1_000, cursor.as_ref())
-            .map_err(Error::query)?;
-        requests.extend(page.requests);
-        match page.next_cursor {
-            Some(next) => cursor = Some(next),
-            None => return Ok(requests),
-        }
-    }
 }
 
 #[cfg(test)]
