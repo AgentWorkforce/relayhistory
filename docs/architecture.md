@@ -538,11 +538,14 @@ Three rules a consumer must hold:
   revisions from zero, so a revision alone cannot tell a replacement database
   from the one it replaced. A `Watermark` also carries the issuing database's
   `epoch`, an identity drawn when its feed schema is created
-  (`change_feed_store`). The store also fingerprints the exact stored-column
-  sets each upsert exports. A migration that changes one rotates the epoch and
+  (`change_feed_store`). The store also fingerprints each current kind's exact
+  exported column names and declared SQLite types. A migration that changes an
+  existing kind rotates the epoch and
   clears in-database named cursors atomically: otherwise an unchanged row
   would keep its revision while acquiring different semantic JSON. This is a
-  stream reset, so every consumer replays the new shape.
+  store-wide stream reset, so every consumer replays the new shape. Adding a
+  newly fed kind does not rotate the epoch: its rows are stamped above the old
+  head and established consumers encounter them on their ordinary resume path.
   `SessionStore::head_revision` reports the head with it; a stored watermark
   with another epoch, or beyond the head, fails with
   `ErrorKind::WatermarkAheadOfStore`, and the recovery is a full resync from

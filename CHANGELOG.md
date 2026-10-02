@@ -606,11 +606,13 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Fixed
 
-- Change-feed origins now rotate when the exact stored-column set exported for
-  evidence changes. The store persists a fingerprint of that schema beside
-  its epoch; an upgrade from a pre-fingerprint database, or a later additive
-  or subtractive exported-table migration, atomically selects a new epoch and
+- Change-feed origins now rotate when an existing evidence kind's exact
+  exported column names or declared SQLite types change. The store persists a
+  fingerprint per kind beside its epoch; an upgrade from a pre-fingerprint
+  database, or a later shape-changing exported-table migration, atomically selects a new epoch and
   clears revision-only named cursors so consumers replay from the start.
+  Adding a newly fed kind keeps the epoch because its rows are backfilled above
+  the prior head.
   Previously the `location` migration changed the canonical JSON and remote
   digest of existing evidence without moving its revision or origin, causing
   durable receivers to return `409 delivery_conflict` forever. Explicit old

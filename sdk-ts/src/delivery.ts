@@ -40,7 +40,15 @@ const MAX_DELIVERY_CONFLICTS = 100;
 /** Canonical delivery JSON: object key order is ignored and array order is
  * significant, matching the durable receiver's digest contract. */
 export function canonicalDeliveryJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonicalDeliveryJson).join(',')}]`;
+  if (Array.isArray(value)) {
+    const items = Array.from({ length: value.length }, (_, index) => {
+      const item = value[index];
+      return item === undefined || typeof item === 'function' || typeof item === 'symbol'
+        ? 'null'
+        : canonicalDeliveryJson(item);
+    });
+    return `[${items.join(',')}]`;
+  }
   if (object(value)) {
     return `{${Object.keys(value).sort().map((key) =>
       `${JSON.stringify(key)}:${canonicalDeliveryJson(value[key])}`).join(',')}}`;

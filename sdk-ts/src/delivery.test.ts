@@ -79,6 +79,16 @@ test('only an exact 409 delivery_conflict response enables recovery', () => {
     conflict, conflicts: [], conflictCount: 1 } }), undefined);
 });
 
+test('delivery digests match JSON wire semantics for sparse arrays', () => {
+  const sparse = Array<number>(2);
+  sparse[0] = 1;
+  const batch = conflictBatch();
+  const record = { ...batch.records[1], payload: { sparse } };
+  const onWire = JSON.parse(JSON.stringify(record));
+  assert.deepEqual(onWire.payload.sparse, [1, null]);
+  assert.equal(deliveryRecordDigest(record), deliveryRecordDigest(onWire));
+});
+
 test('a proven record conflict quarantines only the poison revision and drains later records', () => {
   const batch = conflictBatch(); const record = batch.records[1];
   const conflict = {

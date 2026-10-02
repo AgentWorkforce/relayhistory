@@ -138,9 +138,11 @@ Conflict recovery must never synthesize a higher revision at delivery time.
 When re-derivation changes a semantic record, the producer first commits that
 change to the local store and the change feed issues its higher revision. A
 mapping-only change uses a new mapping version/generation. In particular, the
-change feed fingerprints the exact stored-column sets it exports; an additive
-or subtractive schema migration rotates the feed epoch atomically and clears
-revision-only named cursors before the new shape is replayed. External
+change feed fingerprints each current kind's exact exported column names and
+declared SQLite types. A shape change to an existing kind rotates the feed
+epoch atomically and clears revision-only named cursors before the new shape is
+replayed. Adding a newly fed kind keeps the epoch because its existing rows are
+stamped above the prior head and reached by normal cursor resumption. External
 watermarks from the prior epoch are refused and must resync from start. This is
 the repair for schema additions such as `location`, which change canonical
 record digests without writing each existing row.

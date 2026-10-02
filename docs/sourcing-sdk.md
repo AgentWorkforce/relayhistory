@@ -477,8 +477,10 @@ committed for: draining or committing it under another filter is
 semantic export stream that issued it; one from another database/export shape,
 or one past the head, is `Error::WatermarkAheadOfStore` — the stream was reset
 or replaced, and the only recovery is a resync from `Watermark::START`, which
-names no store. An exported stored-column change rotates the epoch and clears
-named cursors atomically even though existing row revisions stay put; a named
+names no store. An exported column-name or declared-type change to an existing
+kind rotates the epoch and clears named cursors atomically even though existing
+row revisions stay put. A newly fed kind is backfilled above the old head and
+does not rotate the epoch; a named
 cursor past the head names no revision of this store, so that resync's commit
 replaces it.
 `head_revision()` reports

@@ -62,7 +62,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -559,21 +559,43 @@ pub(crate) fn stored_columns(conn: &Connection, table: &str) -> Result<Vec<Strin
         .collect())
 }
 
-fn export_schema_digest(conn: &Connection) -> Result<String> {
-    let schema = ChangeKind::ALL
+fn export_schema_digests(conn: &Connection) -> Result<BTreeMap<String, String>> {
+    ChangeKind::ALL
         .iter()
         .map(|kind| {
             let table = kind.table().name;
-            Ok((table, stored_columns(conn, table)?))
+            let columns = conn
+                .prepare_cached("SELECT name, type FROM pragma_table_info(?1) ORDER BY cid")?
+                .query_map([table], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .filter(|(column, _)| column != REVISION_COLUMN)
+                .collect::<Vec<_>>();
+            let digest = format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&(
+                    "relayhistory-change-feed-kind-export-schema-v2",
+                    table,
+                    columns
+                ))?)
+            );
+            Ok((kind.as_str().to_string(), digest))
         })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(format!(
-        "{:x}",
-        Sha256::digest(serde_json::to_vec(&(
-            "relayhistory-change-feed-export-schema-v1",
-            schema
-        ))?)
-    ))
+        .collect()
+}
+
+fn exported_kind_changed(stored: &str, current: &BTreeMap<String, String>) -> bool {
+    let Ok(stored) = serde_json::from_str::<BTreeMap<String, String>>(stored) else {
+        // The unreleased v1 branch stored one opaque all-kind digest. There is
+        // no safe way to distinguish an added kind from a changed existing
+        // kind in that format, so preserve its conservative rotation.
+        return true;
+    };
+    current
+        .iter()
+        .any(|(kind, digest)| stored.get(kind).is_some_and(|prior| prior != digest))
 }
 
 fn feed_identity_exists(conn: &Connection) -> Result<bool> {
@@ -600,16 +622,21 @@ fn feed_identity_exists(conn: &Connection) -> Result<bool> {
 /// old semantic stream but store no epoch, so they are cleared atomically and
 /// resume with a full replay just like an external stale-epoch watermark.
 fn reconcile_export_schema(conn: &Connection, identity_existed: bool) -> Result<()> {
-    let current = export_schema_digest(conn)?;
+    let current = export_schema_digests(conn)?;
     let stored: Option<String> = conn.query_row(
         &format!("SELECT {EXPORT_SCHEMA_DIGEST_COLUMN} FROM change_feed_store WHERE singleton=1"),
         [],
         |row| row.get(0),
     )?;
-    if stored.as_deref() == Some(current.as_str()) {
+    let encoded = serde_json::to_string(&current)?;
+    if stored.as_deref() == Some(encoded.as_str()) {
         return Ok(());
     }
-    if identity_existed {
+    if identity_existed
+        && stored
+            .as_deref()
+            .is_none_or(|stored| exported_kind_changed(stored, &current))
+    {
         // Epochs are odd signed SQLite integers interpreted as their u64 bit
         // pattern. Adding two always selects a different odd value; spell the
         // maximum case explicitly so SQLite never promotes on overflow.
@@ -623,7 +650,7 @@ fn reconcile_export_schema(conn: &Connection, identity_existed: bool) -> Result<
     }
     conn.execute(
         &format!("UPDATE change_feed_store SET {EXPORT_SCHEMA_DIGEST_COLUMN}=? WHERE singleton=1"),
-        [current],
+        [encoded],
     )?;
     Ok(())
 }
@@ -3047,6 +3074,27 @@ INSERT INTO observation_evidence (source, session_id, location, connector_id,
                 .as_ref()
                 .and_then(|columns| columns.get("export_shape_probe")),
             Some(&Value::from("local"))
+        );
+    }
+
+    #[test]
+    fn schema_fingerprints_include_types_and_do_not_rotate_for_a_new_kind() {
+        let mut stored = BTreeMap::from([
+            ("session".to_string(), "name-and-type-v1".to_string()),
+            ("history".to_string(), "history-v1".to_string()),
+        ]);
+        let mut current = stored.clone();
+        current.insert("new_kind".to_string(), "new-kind-v1".to_string());
+        assert!(
+            !exported_kind_changed(&serde_json::to_string(&stored).unwrap(), &current),
+            "a newly fed kind is backfilled above the existing head and must not rotate the origin"
+        );
+
+        stored.insert("session".to_string(), "name-text-v1".to_string());
+        current.insert("session".to_string(), "name-blob-v1".to_string());
+        assert!(
+            exported_kind_changed(&serde_json::to_string(&stored).unwrap(), &current),
+            "a declared-type change can alter the JSON value SQLite reads from an unchanged row"
         );
     }
 
