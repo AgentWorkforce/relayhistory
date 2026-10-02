@@ -38,6 +38,7 @@ impl EnvGuard {
                 "OPENCODE_STORAGE_DIR",
                 Some(home.join("missing-opencode-storage")),
             ),
+            ("TRAJECTORY_ROOT", Some(home.join("missing-trajectories"))),
             ("AI_HIST_DB", None),
         ];
         let saved = vars
@@ -1511,9 +1512,10 @@ fn devin_retired_stamp_stays_out_of_the_persisted_state() {
 }
 
 #[test]
-fn devin_store_without_optional_session_columns_still_syncs() {
-    // Only `id` is required of `sessions`: discovery already reads every
-    // other column as absent, so sync must not fail the sweep over them.
+fn devin_store_without_optional_table_or_session_columns_still_syncs() {
+    // Only `sessions`, `sessions.id`, and `message_nodes` are required:
+    // older stores predate tool_call_state, and discovery already reads every
+    // other session column as absent, so sync must not reject either shape.
     let _lock = ENV_LOCK.lock().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path();
@@ -1527,10 +1529,6 @@ fn devin_store_without_optional_session_columns_still_syncs() {
           row_id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
           node_id INTEGER NOT NULL, parent_node_id INTEGER,
           chat_message TEXT NOT NULL, created_at INTEGER NOT NULL, metadata TEXT);
-        CREATE TABLE tool_call_state (
-          session_id TEXT NOT NULL, tool_call_id TEXT NOT NULL,
-          tool_call_json TEXT, tool_call_update_json TEXT,
-          PRIMARY KEY (session_id, tool_call_id));
         INSERT INTO sessions (id) VALUES ('devin-bare');
         INSERT INTO message_nodes (session_id, node_id, parent_node_id, chat_message, created_at)
         VALUES ('devin-bare', 0, NULL, '{"role":"user","content":"bare prompt"}', 1776643201);
@@ -1575,7 +1573,10 @@ fn devin_user_turns_with_non_string_content_are_kept() {
            1776643201, NULL),
           ('devin-parts', 1, 0,
            '{"message_id":"u1","role":"user","content":[{"type":"image","data":"AAAA"}]}',
-           1776643202, NULL);
+           1776643202, NULL),
+          ('devin-parts', 2, 1,
+           '{"message_id":"u2","role":"user","content":null}',
+           1776643203, NULL);
         "#,
     );
     let _env = EnvGuard::set(home);
@@ -1599,12 +1600,105 @@ fn devin_user_turns_with_non_string_content_are_kept() {
         .iter()
         .filter(|m| m.kind == "unsupported_block")
         .collect();
-    assert_eq!(unsupported.len(), 1, "{markers:?}");
-    assert_eq!(unsupported[0].subkind.as_deref(), Some("user_content"));
+    assert_eq!(unsupported.len(), 2, "{markers:?}");
+    assert!(unsupported
+        .iter()
+        .all(|marker| marker.subkind.as_deref() == Some("user_content")));
+    let payloads = unsupported
+        .iter()
+        .filter_map(|marker| marker.payload_json.as_deref())
+        .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
-        unsupported[0].payload_json.as_deref(),
-        Some(r#"{"content_type":"array"}"#)
+        payloads,
+        std::collections::BTreeSet::from([
+            r#"{"content_type":"array"}"#,
+            r#"{"content_type":"null"}"#,
+        ])
     );
+}
+
+#[test]
+fn devin_compaction_boundaries_survive_malformed_and_synthetic_nodes() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    stage_devin_db(
+        home,
+        r#"
+        INSERT INTO sessions
+          (id, working_directory, backend_type, model, agent_mode, created_at,
+           last_activity_at, title, workspace_dirs, hidden, metadata)
+        VALUES ('devin-compaction', '/work/repo', 'devin', 'test-model', 'normal',
+                1776643200, 1776643202, NULL, NULL, 0, NULL);
+        INSERT INTO message_nodes
+          (session_id, node_id, parent_node_id, chat_message, created_at, metadata)
+        VALUES
+          ('devin-compaction', 0, NULL, '{broken', 1776643201,
+           '{"summarized_from":["old-0"]}'),
+          ('devin-compaction', 1, 0,
+           '{"message_id":"u1","role":"user","content":"injected","metadata":{"is_user_input":false}}',
+           1776643202, '{"summarized_from":["old-1"]}');
+        "#,
+    );
+    let _env = EnvGuard::set(home);
+    let db = home.join("history.db");
+
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+
+    let conn = open_db(&db).unwrap();
+    let markers = session_markers(&conn, "devin", "devin-compaction").unwrap();
+    assert_eq!(
+        markers
+            .iter()
+            .filter(|marker| marker.kind == "compaction_boundary")
+            .count(),
+        2,
+        "both early-exit nodes must retain their node-level boundary: {markers:?}"
+    );
+    assert!(markers.iter().any(|marker| marker.kind == "malformed_node"));
+    assert!(markers.iter().any(|marker| marker.kind == "synthetic_turn"));
+}
+
+#[test]
+fn devin_discovery_ignores_non_string_generation_models() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let store = stage_devin_db(home, BASE_SESSION_SQL);
+    let provider = Connection::open(&store).unwrap();
+    provider
+        .execute(
+            "UPDATE message_nodes SET chat_message = ?1 WHERE session_id='devin-test' AND node_id=1",
+            [serde_json::json!({
+                "message_id": "a0",
+                "role": "assistant",
+                "content": "answer",
+                "metadata": {"generation_model": {"unexpected": true}}
+            })
+            .to_string()],
+        )
+        .unwrap();
+    drop(provider);
+    let db = home.join("history.db");
+    let conn = open_db(&db).unwrap();
+    let env = DiscoveryEnv::with_roots(&conn, home.to_path_buf(), home.join("opencode.db"));
+    discover_sessions_with_env(
+        &env,
+        &DiscoverOptions {
+            scope: SessionScope::Local,
+            sources: vec!["devin".into()],
+            limit: None,
+        },
+        |_| {},
+    )
+    .unwrap();
+    let models: String = conn
+        .query_row(
+            "SELECT models_json FROM sessions WHERE source='devin' AND session_id='devin-test'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(models, r#"["test-model"]"#);
 }
 
 #[test]

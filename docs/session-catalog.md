@@ -1854,8 +1854,9 @@ How each adapter works:
   `final_answer` nodes; one assistant/tool_use event and `tool_calls` row per
   `tool_calls[]` entry, keyed on the provider's call `id`; one
   tool_result event per `tool` node, joined to its call by `tool_call_id` and
-  carrying `result_status` from `tool_call_state.status` (`completed`,
-  `failed`, `running`/in-progress); and a `file_edits` row only where the
+  carrying a canonical `result_status` mapped from
+  `tool_call_state.status` (`completed` → `completed`, `failed` → `errored`,
+  `running`/`in_progress` → `running`); and a `file_edits` row only where the
   provider exposes the file — `kind: "edit"` with a `locations`/`content`
   path, or an edit-named tool carrying a path argument. `role:"system"` nodes
   become `system` markers; node `metadata.summarized_from` becomes a
@@ -1867,8 +1868,9 @@ How each adapter works:
   `backend_type`/`agent_mode`/`model`/`workspace_dirs` and the numeric fields
   of `sessions.metadata` a `session_meta` marker, and the transcript's
   `agent` envelope (`name`, `version`, `model_name`) plus numeric
-  `final_metrics` an `agent_manifest` marker. The transcript's `steps` are
-  never read — they duplicate `message_nodes` in poorer form.
+  `final_metrics` an `agent_manifest` marker. The JSON parser traverses the
+  transcript's `steps`, but they are not materialized or indexed — they
+  duplicate `message_nodes` in poorer form.
 
   Sessions the CLI marks `hidden` are never enumerated or ingested.
   `chat_message` or tool-state JSON that does not parse is skipped per record
@@ -1888,10 +1890,11 @@ How each adapter works:
   database.
 
   Incremental sync stamps each session on
-  `last_activity_at`, the message-node count and max row id, the tool-state
-  count and payload size, and the transcript file's own stamp — an unchanged
-  session is not re-read, and a session whose rows vanished underneath a
-  matching stamp is rebuilt rather than skipped.
+  `last_activity_at`, a session-metadata checksum, the message-node
+  count/row-id/content checksum, the tool-state count/row-id/payload checksum,
+  and the transcript file's own stamp — an unchanged session is not re-read,
+  and a session whose rows vanished underneath a matching stamp is rebuilt
+  rather than skipped.
 - **relay** — a **network** source with no local transcript, and discovery must
   work offline. The adapter therefore derives rows only from `history` rows a
   previous `ai-hist sync` already stored locally; it opens no socket. If nothing

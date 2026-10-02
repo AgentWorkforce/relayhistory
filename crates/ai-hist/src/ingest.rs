@@ -332,11 +332,27 @@ pub fn sync_tick_at_with_home(
     output: SyncOutput,
     force: bool,
 ) -> Result<SyncTick> {
+    let roots = crate::ProviderRoots::from_env(home.to_path_buf());
+    sync_tick_at_with_roots(db_path, &roots, output, force)
+}
+
+/// One live-capture tick against already resolved provider roots.
+///
+/// This is the environment-independent counterpart to
+/// [`sync_tick_at_with_home`]: embedders and tests that already resolved their
+/// provider layout do not need to mutate process-wide environment variables
+/// merely to run the same locked watch tick.
+pub fn sync_tick_at_with_roots(
+    db_path: &Path,
+    roots: &crate::ProviderRoots,
+    output: SyncOutput,
+    force: bool,
+) -> Result<SyncTick> {
     SYNC_QUIET.store(
         matches!(output, SyncOutput::Silent),
         AtomicOrdering::Relaxed,
     );
-    sync_exclusive_with_home(db_path, home, force)
+    sync_exclusive_with_roots(db_path, roots, force)
 }
 
 /// One live-capture tick. Local scope only: remote connectors are not driven

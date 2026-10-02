@@ -10,10 +10,10 @@ import {
   getSessionMarkersPage, getSessionRelationships, getSessionRequestsPage, getSessionToolCallsPage,
   getSessionTree, getSessionUsage, getSourceCapabilities, hydrateSession,
   listSessionCatalogPage, recent, search, stats, sync, createHandoff, resumeHandoff,
-  MAX_HANDOFF_INTENT_CHARS,
+  CATALOG_SOURCES, MAX_HANDOFF_INTENT_CHARS, SOURCES,
 } from './index.js';
 
-import type { HistoryCursor, HistoryPluginRegistry } from './index.js';
+import type { CatalogSource, HistoryCursor, HistoryPluginRegistry } from './index.js';
 import { loadHistoryApplicationConfig } from './delivery-cli.js';
 import { joinRelay, leaveRelay, listRelayAgents, relayStatus } from './relay-agents.js';
 
@@ -25,8 +25,10 @@ const LOCAL_ACQUIRE = { readOnlyHint: false, idempotentHint: true, openWorldHint
 // Transport is local, but joining and leaving change externally visible Relay
 // presence, so approval-aware MCP hosts must treat them as open-world.
 const RELAY_MUTATION = { readOnlyHint: false, idempotentHint: true, openWorldHint: true } as const;
-const SOURCE = z.enum(['claude', 'codex', 'cursor', 'grok', 'relay', 'trajectory', 'opencode', 'muse', 'devin']);
-const CATALOG_SOURCE = z.enum(['claude', 'codex', 'cursor', 'grok', 'relay', 'opencode', 'muse', 'devin']);
+const SOURCE = z.enum(SOURCES);
+const CATALOG_SOURCE = z.enum(
+  CATALOG_SOURCES as [CatalogSource, ...CatalogSource[]],
+);
 const SESSION_SCOPE = z.enum(['local', 'remote', 'all']);
 const SINCE_MS = z.number().int().optional().describe('Inclusive lower bound on timestampMs.');
 const UNTIL_MS = z.number().int().optional().describe('Inclusive upper bound on timestampMs.');

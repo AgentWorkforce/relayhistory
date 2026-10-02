@@ -3345,6 +3345,7 @@ impl ShallowSessionProvider for DevinProvider {
                      FROM message_nodes \
                      WHERE session_id = ? AND json_valid(chat_message) \
                      AND json_extract(chat_message, '$.role') IN ('assistant', 'final_answer') \
+                     AND json_type(chat_message, '$.metadata.generation_model') = 'text' \
                      AND NULLIF(json_extract(chat_message, '$.metadata.generation_model'), '') IS NOT NULL \
                      ORDER BY node_id ASC LIMIT 1",
                 )?;

@@ -200,7 +200,7 @@ pub(crate) fn devin_cli_dir_under(home: &Path) -> PathBuf {
 /// `home`, with nothing read from the environment — what a test or an
 /// embedder with its own layout wants). The environment is read **once**,
 /// here; nothing on the sync, hydrate or watch paths consults it again.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct ProviderRoots {
     /// The home the file-backed providers are rooted at.
@@ -239,6 +239,49 @@ pub struct ProviderRoots {
     /// say when a configured root does not exist rather than silently
     /// scanning nothing.
     pub use_env_roots: bool,
+}
+
+#[derive(Deserialize)]
+struct ProviderRootsWire {
+    home: PathBuf,
+    claude: PathBuf,
+    codex: PathBuf,
+    grok: PathBuf,
+    muse: PathBuf,
+    #[serde(default)]
+    devin: Option<PathBuf>,
+    opencode_db: PathBuf,
+    #[serde(default)]
+    opencode_db_pinned: bool,
+    opencode_storage_dir: PathBuf,
+    trajectory_roots: Option<Vec<PathBuf>>,
+    use_env_roots: bool,
+}
+
+#[doc(hidden)]
+impl<'de> Deserialize<'de> for ProviderRoots {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ProviderRootsWire::deserialize(deserializer)?;
+        let devin = wire
+            .devin
+            .unwrap_or_else(|| devin_cli_dir_under(&wire.home));
+        Ok(Self {
+            home: wire.home,
+            claude: wire.claude,
+            codex: wire.codex,
+            grok: wire.grok,
+            muse: wire.muse,
+            devin,
+            opencode_db: wire.opencode_db,
+            opencode_db_pinned: wire.opencode_db_pinned,
+            opencode_storage_dir: wire.opencode_storage_dir,
+            trajectory_roots: wire.trajectory_roots,
+            use_env_roots: wire.use_env_roots,
+        })
+    }
 }
 
 impl ProviderRoots {
@@ -315,6 +358,26 @@ pub fn home_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn roots_serialized_before_devin_gain_the_default_under_their_home() {
+        let roots: ProviderRoots = serde_json::from_value(serde_json::json!({
+            "home": "/tmp/legacy-home",
+            "claude": "/tmp/legacy-home/.claude",
+            "codex": "/tmp/legacy-home/.codex",
+            "grok": "/tmp/legacy-home/.grok",
+            "muse": "/tmp/legacy-home/.local/share/muse/sessions",
+            "opencode_db": "/tmp/legacy-home/.local/share/opencode/opencode.db",
+            "opencode_storage_dir": "/tmp/legacy-home/.local/share/opencode/storage",
+            "trajectory_roots": null,
+            "use_env_roots": false
+        }))
+        .unwrap();
+        assert_eq!(
+            roots.devin,
+            PathBuf::from("/tmp/legacy-home/.local/share/devin/cli")
+        );
+    }
 
     #[test]
     fn opencode_db_filenames_match_the_channel_rule() {

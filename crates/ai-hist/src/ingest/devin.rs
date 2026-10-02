@@ -46,6 +46,7 @@ const SYNC_STATE_KEY: &str = "devin_sessions_v1";
 const ERROR_SIGNAL_TOOL_STATUS: &str = "tool_call_state.status";
 
 /// One row of the provider's `sessions` table.
+#[derive(Debug)]
 pub(crate) struct DevinSessionInfo {
     pub id: String,
     pub title: Option<String>,
@@ -63,6 +64,7 @@ pub(crate) struct DevinSessionInfo {
 }
 
 /// One `message_nodes` row with its JSON documents already parsed.
+#[derive(Debug)]
 pub(crate) struct DevinNode {
     pub node_id: i64,
     pub parent_node_id: Option<i64>,
@@ -75,13 +77,14 @@ pub(crate) struct DevinNode {
 }
 
 /// One `tool_call_state` row: the original call plus its latest update.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(crate) struct DevinToolState {
     pub call: Option<Value>,
     pub update: Option<Value>,
 }
 
 /// Everything [`normalize`] needs, loaded inside one read snapshot.
+#[derive(Debug)]
 pub(crate) struct DevinSession {
     pub info: DevinSessionInfo,
     pub nodes: Vec<DevinNode>,
@@ -91,6 +94,7 @@ pub(crate) struct DevinSession {
 }
 
 /// The fields of `transcripts/<id>.json` this store indexes.
+#[derive(Debug)]
 pub(crate) struct DevinTranscriptMeta {
     pub agent_name: Option<String>,
     pub agent_version: Option<String>,
@@ -176,7 +180,10 @@ fn optional_column<'a>(columns: &BTreeSet<String>, name: &'a str) -> &'a str {
 /// discovery and sync can treat "no Devin install" and "not a Devin store"
 /// the same way: nothing to read.
 pub(crate) fn is_devin_store(src: &Connection) -> bool {
-    for table in ["sessions", "message_nodes", "tool_call_state"] {
+    // Older Devin stores predate `tool_call_state`. Sessions and messages are
+    // still complete, readable evidence there; tool state is an optional
+    // enrichment and loads as an empty map when the table is absent.
+    for table in ["sessions", "message_nodes"] {
         let exists: Option<i64> = src
             .query_row(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
@@ -275,22 +282,22 @@ pub(crate) fn load_from_sqlite(
     drop(stmt);
 
     let mut tools = BTreeMap::new();
-    let mut stmt = src.prepare(
-        "SELECT tool_call_id, tool_call_json, tool_call_update_json \
-         FROM tool_call_state WHERE session_id = ?1 ORDER BY rowid ASC",
-    )?;
-    let mut rows = stmt.query(params![session_id])?;
-    while let Some(row) = rows.next()? {
-        tools.insert(
-            row.get::<_, String>(0)?,
-            DevinToolState {
-                call: parse_json_column(row.get::<_, Option<String>>(1)?),
-                update: parse_json_column(row.get::<_, Option<String>>(2)?),
-            },
-        );
+    if !table_columns(src, "tool_call_state")?.is_empty() {
+        let mut stmt = src.prepare(
+            "SELECT tool_call_id, tool_call_json, tool_call_update_json \
+             FROM tool_call_state WHERE session_id = ?1 ORDER BY rowid ASC",
+        )?;
+        let mut rows = stmt.query(params![session_id])?;
+        while let Some(row) = rows.next()? {
+            tools.insert(
+                row.get::<_, String>(0)?,
+                DevinToolState {
+                    call: parse_json_column(row.get::<_, Option<String>>(1)?),
+                    update: parse_json_column(row.get::<_, Option<String>>(2)?),
+                },
+            );
+        }
     }
-    drop(rows);
-    drop(stmt);
 
     let transcript = transcript_path(&transcripts_dir(cli_dir), session_id)
         .and_then(|path| load_transcript_meta(&path));
@@ -543,10 +550,10 @@ fn content_text(message: Option<&Value>) -> Option<Cow<'_, str>> {
     .filter(|text| !text.is_empty())
 }
 
-/// The JSON type of a `content` field that is present and not null.
+/// The JSON type of a `content` field that is present.
 fn content_type(message: &Value) -> Option<&'static str> {
     Some(match message.get("content")? {
-        Value::Null => return None,
+        Value::Null => "null",
         Value::Bool(_) => "boolean",
         Value::Number(_) => "number",
         Value::String(_) => "string",
@@ -678,7 +685,6 @@ fn edit_file_path<'a>(
     match (kind, exposes_path) {
         (Some("edit"), Some(path)) => Some(path),
         (Some("edit"), None) => None,
-        (_, Some(_)) if matches!(kind, Some("edit")) => unreachable!(),
         // No recorded kind: trust an edit-shaped tool name only when the
         // provider also recorded a path.
         (None, Some(path)) if name.contains("edit") || name.contains("write") => Some(path),
@@ -763,6 +769,35 @@ fn normalize_inner(
             .parent_node_id
             .and_then(|parent| node_message_ids.get(&parent))
             .cloned();
+        // Node metadata survives even when the message document is malformed
+        // or the user turn is synthetic. Record the boundary before either
+        // branch can continue past the role-specific normalization below.
+        if let Some(summarized) = node
+            .node_metadata
+            .as_ref()
+            .and_then(|m| m.get("summarized_from"))
+            .filter(|v| !v.is_null())
+        {
+            let uid = format!("n{}:compaction", node.node_id);
+            present_markers.insert(uid.clone());
+            let payload = super::marker_payload(vec![("summarized_from", summarized.clone())]);
+            counts.markers += insert_session_marker(
+                conn,
+                SOURCE,
+                session_id,
+                &NewSessionMarker {
+                    marker_uid: &uid,
+                    ts_ms: Some(ts),
+                    message_id: Some(&message_id),
+                    parent_id: parent_id.as_deref(),
+                    turn_id: None,
+                    kind: "compaction_boundary",
+                    subkind: None,
+                    text: None,
+                    payload_json: payload.as_deref(),
+                },
+            )?;
+        }
         let Some(message) = node.message.as_ref() else {
             counts.malformed_nodes += 1;
             // Record the gap under the node's own message id: children that
@@ -1158,34 +1193,6 @@ fn normalize_inner(
                     },
                 )?;
             }
-        }
-
-        // Node-level metadata that is not part of the message document.
-        if let Some(summarized) = node
-            .node_metadata
-            .as_ref()
-            .and_then(|m| m.get("summarized_from"))
-            .filter(|v| !v.is_null())
-        {
-            let uid = format!("n{}:compaction", node.node_id);
-            present_markers.insert(uid.clone());
-            let payload = super::marker_payload(vec![("summarized_from", summarized.clone())]);
-            counts.markers += insert_session_marker(
-                conn,
-                SOURCE,
-                session_id,
-                &NewSessionMarker {
-                    marker_uid: &uid,
-                    ts_ms: Some(ts),
-                    message_id: Some(&message_id),
-                    parent_id: parent_id.as_deref(),
-                    turn_id: None,
-                    kind: "compaction_boundary",
-                    subkind: None,
-                    text: None,
-                    payload_json: payload.as_deref(),
-                },
-            )?;
         }
     }
 
@@ -1908,28 +1915,6 @@ fn sync_devin_from_source(
         bail!("devin sessions unreadable: {}", failures.join(", "));
     }
     Ok(inserted)
-}
-
-/// Re-index one session for targeted hydration. Returns the prompt count.
-pub(crate) fn sync_devin_session(
-    conn: &Connection,
-    cli_dir: &Path,
-    session_id: &str,
-) -> Result<usize> {
-    let db_path = sessions_db_path(cli_dir);
-    let src = open_db_readonly(&db_path)
-        .with_context(|| format!("open devin store {}", db_path.display()))?;
-    src.execute_batch("PRAGMA query_only = ON; BEGIN DEFERRED")?;
-    let result = (|| -> Result<usize> {
-        let Some(loaded) = load_from_sqlite(&src, session_id, cli_dir)? else {
-            bail!("devin session {session_id} not found");
-        };
-        let raw_path = db_path.to_string_lossy().to_string();
-        let counts = normalize(conn, &loaded, &raw_path)?;
-        Ok(counts.prompts)
-    })();
-    let _ = src.execute_batch("ROLLBACK");
-    result
 }
 
 #[cfg(test)]

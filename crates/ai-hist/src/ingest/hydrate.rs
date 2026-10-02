@@ -200,6 +200,11 @@ struct SourceSnapshot {
     /// Top-level Claude bytes captured by the lifecycle hook before catalog
     /// writes. Ordinary hydration leaves this absent and reads by path.
     claude_transcript: Option<ClaudeTranscriptSnapshot>,
+    /// Devin rows captured under the same SQLite read transaction that
+    /// produced `stamp`. Keeping the loaded session here prevents targeted
+    /// hydration from reopening the WAL at a newer generation before it
+    /// normalizes the evidence.
+    devin_session: Option<crate::ingest::devin::DevinSession>,
     /// For OpenCode: which of the provider's two layouts this locator was
     /// validated against. Carried rather than re-derived, because the only
     /// thing that can be re-derived from a path is its spelling — and
@@ -534,6 +539,7 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
             snapshot.path.as_deref(),
             &snapshot.claude_subagents,
             snapshot.claude_transcript.as_ref(),
+            snapshot.devin_session.as_ref(),
             &mut cursor,
             records_parsed,
             snapshot.opencode_layout,
@@ -1601,6 +1607,7 @@ fn source_snapshot(
             records: SnapshotRecords::Counted(0),
             path: Some(path),
             claude_transcript: None,
+            devin_session: None,
             claude_subagents: Vec::new(),
             scanned_bytes: 0,
             scanned_superseded: false,
@@ -1642,10 +1649,15 @@ fn source_snapshot(
                 ),
             ));
         }
-        let src = crate::store::open_db_readonly(&path)?;
+        let mut src = crate::store::open_db_readonly(&path)?;
         crate::ingest::devin::register_stamp_fn(&src)?;
+        // Stamp and all rows handed to the normalizer describe one provider
+        // generation. Without carrying the loaded session out of this read
+        // transaction, the parser can reopen the WAL after a writer commits
+        // and checkpoint newer evidence under the older stamp.
+        let snapshot = src.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
         let stamp = crate::ingest::devin::session_stamp(
-            &src,
+            &snapshot,
             &options.session_id,
             &crate::ingest::devin::transcripts_dir(configured_dir),
         )?
@@ -1658,30 +1670,28 @@ fn source_snapshot(
                 ),
             )
         })?;
-        // records_parsed must reflect the provider rows the pass reads: the
-        // session row, its message_nodes, and whatever tool_call_state holds.
-        // `tool_call_state` predates nothing — an older store may lack it, so
-        // its count is best-effort like the stamp's.
-        let nodes: i64 = src
-            .query_row(
-                "SELECT COUNT(*) FROM message_nodes WHERE session_id = ?1",
-                params![options.session_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        let tools: i64 = src
-            .query_row(
-                "SELECT COUNT(*) FROM tool_call_state WHERE session_id = ?1",
-                params![options.session_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
+        let loaded =
+            crate::ingest::devin::load_from_sqlite(&snapshot, &options.session_id, configured_dir)?
+                .ok_or_else(|| {
+                    hydration_error(
+                        "SESSION_SOURCE_UNAVAILABLE",
+                        format!(
+                            "Devin session '{}' no longer exists or is hidden",
+                            options.session_id
+                        ),
+                    )
+                })?;
+        let records = 1_i64
+            .saturating_add(i64::try_from(loaded.nodes.len()).unwrap_or(i64::MAX))
+            .saturating_add(i64::try_from(loaded.tools.len()).unwrap_or(i64::MAX));
+        snapshot.commit()?;
         return Ok(SourceSnapshot {
             stamp,
             bytes: 0,
-            records: SnapshotRecords::Counted(1 + nodes + tools),
+            records: SnapshotRecords::Counted(records),
             path: Some(path),
             claude_transcript: None,
+            devin_session: Some(loaded),
             claude_subagents: Vec::new(),
             scanned_bytes: 0,
             scanned_superseded: false,
@@ -1842,6 +1852,7 @@ fn source_snapshot(
         records,
         path: Some(path),
         claude_transcript: captured_claude,
+        devin_session: None,
         claude_subagents: subagents,
         scanned_bytes,
         scanned_superseded,
@@ -2051,6 +2062,7 @@ fn opencode_json_tree_snapshot(
         path: Some(session_file.to_path_buf()),
         claude_subagents: Vec::new(),
         claude_transcript: None,
+        devin_session: None,
         scanned_bytes: 0,
         scanned_superseded: false,
         stamped_cursors: Vec::new(),
@@ -2357,6 +2369,7 @@ pub(crate) struct SelectedIngest<'a> {
     pub(crate) path: Option<&'a Path>,
     pub(crate) claude_subagents: &'a [ClaudeSubagentEvidence],
     pub(crate) claude_snapshot: Option<&'a ClaudeTranscriptSnapshot>,
+    pub(crate) devin_session: Option<&'a crate::ingest::devin::DevinSession>,
     pub(crate) cursor: &'a mut TranscriptCursorState,
     pub(crate) records: i64,
     pub(crate) opencode_layout: Option<OpencodeIngestLayout>,
@@ -2405,6 +2418,7 @@ fn ingest_selected(
     path: Option<&Path>,
     claude_subagents: &[ClaudeSubagentEvidence],
     claude_snapshot: Option<&ClaudeTranscriptSnapshot>,
+    devin_session: Option<&crate::ingest::devin::DevinSession>,
     cursor: &mut TranscriptCursorState,
     records: i64,
     opencode_layout: Option<OpencodeIngestLayout>,
@@ -2422,6 +2436,7 @@ fn ingest_selected(
         path,
         claude_subagents,
         claude_snapshot,
+        devin_session,
         cursor,
         records,
         opencode_layout,
@@ -2515,8 +2530,13 @@ pub(crate) fn ingest_selected_devin(ctx: SelectedIngest<'_>) -> Result<SelectedI
     // verified; its parent is the Devin CLI data directory that also holds
     // `transcripts/`.
     let path = ctx.file();
-    let cli_dir = path.parent().unwrap_or(path);
-    crate::ingest::devin::sync_devin_session(ctx.conn, cli_dir, &ctx.options.session_id)?;
+    let loaded = ctx.devin_session.ok_or_else(|| {
+        hydration_error(
+            "SESSION_SOURCE_UNAVAILABLE",
+            "Devin snapshot was not captured for targeted hydration",
+        )
+    })?;
+    crate::ingest::devin::normalize(ctx.conn, loaded, &path.to_string_lossy())?;
     Ok((
         IngestOutcome {
             records: ctx.records,
@@ -4433,6 +4453,91 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap();
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn devin_targeted_ingest_uses_the_rows_captured_with_its_stamp() {
+        let home = tempfile::tempdir().unwrap();
+        let cli_dir = home.path().join(".local/share/devin/cli");
+        fs::create_dir_all(&cli_dir).unwrap();
+        let provider_path = cli_dir.join("sessions.db");
+        let provider = Connection::open(&provider_path).unwrap();
+        provider.pragma_update(None, "journal_mode", "WAL").unwrap();
+        provider
+            .execute_batch(
+                r#"
+                CREATE TABLE sessions (
+                  id TEXT PRIMARY KEY, last_activity_at INTEGER, hidden INTEGER DEFAULT 0
+                );
+                CREATE TABLE message_nodes (
+                  row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  session_id TEXT NOT NULL, node_id INTEGER NOT NULL,
+                  parent_node_id INTEGER, chat_message TEXT,
+                  created_at INTEGER, metadata TEXT
+                );
+                INSERT INTO sessions (id, last_activity_at) VALUES ('snapshot', 1);
+                INSERT INTO message_nodes
+                  (session_id, node_id, chat_message, created_at)
+                VALUES
+                  ('snapshot', 1,
+                   '{"message_id":"u1","role":"user","content":"captured","metadata":{"is_user_input":true}}',
+                   1);
+                "#,
+            )
+            .unwrap();
+
+        let db = home.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "devin", "snapshot", Some(&provider_path));
+        let roots = crate::ProviderRoots::from_home(
+            home.path().to_path_buf(),
+            home.path().join("missing-opencode.db"),
+        );
+        let request = options("devin", "snapshot");
+        let target = CatalogTarget {
+            locator: Some(provider_path.to_string_lossy().into_owned()),
+            discovery_state: Some("shallow".into()),
+        };
+        let snapshot = source_snapshot(&conn, &request, &target, &roots, None).unwrap();
+
+        // Commit a newer WAL generation after the stamp and rows were
+        // captured but before normalization. Reopening the provider here
+        // would index "newer" under the stamp that describes "captured".
+        provider
+            .execute_batch(
+                r#"
+                UPDATE message_nodes SET chat_message =
+                  '{"message_id":"u1","role":"user","content":"newer","metadata":{"is_user_input":true}}'
+                  WHERE session_id = 'snapshot';
+                UPDATE sessions SET last_activity_at = 2 WHERE id = 'snapshot';
+                "#,
+            )
+            .unwrap();
+
+        let mut cursor = TranscriptCursorState::default();
+        let records = snapshot.records.count().unwrap();
+        ingest_selected(
+            &conn,
+            &request,
+            &target,
+            snapshot.path.as_deref(),
+            &snapshot.claude_subagents,
+            snapshot.claude_transcript.as_ref(),
+            snapshot.devin_session.as_ref(),
+            &mut cursor,
+            records,
+            snapshot.opencode_layout,
+        )
+        .unwrap();
+
+        let indexed: String = conn
+            .query_row(
+                "SELECT text FROM session_events WHERE source='devin' AND session_id='snapshot'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, "captured");
     }
 
     #[cfg(unix)]
