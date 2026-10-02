@@ -154,6 +154,28 @@ test('all reported record conflicts are quarantined in one deterministic recover
   assert.deepEqual(recoverDeliveryConflict(batch, response), recovery);
 });
 
+test('receiver collation order is accepted without a conflicting UTF-16 sort check', () => {
+  const original = conflictBatch();
+  const records = original.records.slice(1).map((record, index) => ({
+    ...record, record_id: index === 0 ? "\uE000" : "\u{10000}",
+  }));
+  const batch = { ...original, records };
+  const conflicts = records.map((record, index) => ({
+    type: 'record_revision' as const, originId: batch.origin_id, recordId: record.record_id,
+    submittedRevisionId: record.revision_id, submittedRevision: record.revision,
+    submittedDigest: deliveryRecordDigest(record), currentRevisionId: `current-${index}`,
+    currentRevision: record.revision, currentDigest: String(index + 3).repeat(64),
+  }));
+  // PostgreSQL byte/collation order can put U+E000 before U+10000, while JS
+  // UTF-16 comparison puts the astral character first. Ordering is the
+  // receiver's concern; actionable identity validation must be collation-free.
+  const response = parseDeliveryConflict(409, { error: { code: 'delivery_conflict',
+    message: 'conflict', conflict: conflicts[0], conflicts, conflictCount: 2 } });
+  assert.ok(response);
+  assert.deepEqual(recoverDeliveryConflict(batch, response).quarantinedRevisionIds,
+    records.map((record) => record.revision_id));
+});
+
 test('plugin registration is inert, per-client, and rejects collisions atomically', async () => {
   await fixture(async () => {
     let calls = 0;

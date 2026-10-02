@@ -116,18 +116,14 @@ export function parseDeliveryConflict(status: number, body: unknown): DeliveryCo
       || !positiveRevision(value.error.conflictCount)
       || value.error.conflictCount < value.error.conflicts.length) return undefined;
     const conflicts: DeliveryRecordRevisionConflict[] = [];
+    const revisionIds = new Set<string>();
     for (const candidate of value.error.conflicts) {
       const parsed = parseConflict(candidate);
-      if (parsed?.type !== 'record_revision') return undefined;
+      if (parsed?.type !== 'record_revision' || revisionIds.has(parsed.submittedRevisionId)) return undefined;
+      revisionIds.add(parsed.submittedRevisionId);
       conflicts.push(parsed);
     }
-    const outOfOrder = conflicts.some((candidate, index) => index > 0
-      && (candidate.recordId < conflicts[index - 1].recordId
-        || (candidate.recordId === conflicts[index - 1].recordId
-          && (candidate.submittedRevision < conflicts[index - 1].submittedRevision
-            || (candidate.submittedRevision === conflicts[index - 1].submittedRevision
-              && candidate.submittedRevisionId <= conflicts[index - 1].submittedRevisionId)))));
-    if (outOfOrder || JSON.stringify(conflicts[0]) !== JSON.stringify(conflict)) return undefined;
+    if (JSON.stringify(conflicts[0]) !== JSON.stringify(conflict)) return undefined;
     error = { code: 'delivery_conflict', message: value.error.message, conflict,
       conflicts, conflictCount: value.error.conflictCount };
   }

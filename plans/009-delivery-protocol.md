@@ -92,10 +92,14 @@ different content. The revisions must be equal and the digests different.
 
 `conflicts` contains the first 100 conflicts in deterministic
 `(record_id, revision, revision_id)` order, `conflictCount` is the total, and
-`conflict` repeats its first entry for a stable discriminator. A client may
-quarantine only the returned records whose origin, record ID, revision ID,
-revision, and recomputed submitted digest all match. If the count exceeds the
-bounded list, the retry can receive the next set. It retries the remaining
+`conflict` repeats its first entry for a stable discriminator. Clients must not
+independently validate that order with a language-level string comparator:
+database collation and client string ordering can differ. They instead validate
+the list bound, unique submitted revision identities, and exact equality between
+`conflict` and the first list entry. A client may quarantine only the returned
+records whose origin, record ID, revision ID, revision, and recomputed submitted
+digest all match. If the count exceeds the bounded list, the retry can receive
+the next set. It retries the remaining
 records under a deterministic child batch ID and durably records all reported
 quarantines with its queue transition. This
 lets records behind the poison record drain without weakening record-level
