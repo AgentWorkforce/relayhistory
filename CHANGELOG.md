@@ -789,6 +789,12 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Rust API
 
+- The `unstable-internal` `storage` module is removed (#309). Its eight
+  raw-SQL readers (`history_after`, `trajectories_after`, `commit_links_after`,
+  `changed_file_sessions_after`, `session_metadata`, `session_project`,
+  `pending_event_sessions`, `latest_history_for_session`) and their row types
+  served the retired capture plugin and had no remaining callers. It was never
+  part of the default surface; no table or data changes.
 - `Source::Muse` and `ProviderRoots::muse` (the Muse Code sessions directory;
   `from_env` honours `XDG_DATA_HOME`). Both types are `#[non_exhaustive]`, so
   this is additive.
