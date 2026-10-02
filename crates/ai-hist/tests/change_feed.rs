@@ -667,15 +667,20 @@ fn a_column_a_table_gains_is_carried_verbatim() {
     writer
         .execute_batch("ALTER TABLE tool_calls ADD COLUMN review_note TEXT;")
         .unwrap();
-    // A fresh writable open runs the migration pass that rebuilds the guard.
-    drop(home.store());
+    // A fresh writable open runs the migration pass that rebuilds the guard
+    // and rotates the semantic export stream before any changed-shape row is
+    // delivered under its old revision.
+    let migrated = home.store();
+    let migrated_head = migrated.head_revision().unwrap();
+    assert_eq!(migrated_head.revision, head.revision);
+    assert_ne!(migrated_head.epoch, head.epoch);
     writer
         .execute_batch(
             "UPDATE tool_calls SET review_note = 'looked fine' \
                  WHERE rowid = (SELECT MIN(rowid) FROM tool_calls);",
         )
         .unwrap();
-    let changes = only(&store, head, ChangeKind::ToolCall);
+    let changes = only(&migrated, migrated_head, ChangeKind::ToolCall);
     assert_eq!(changes.len(), 1, "{changes:?}");
     let columns = changes[0].columns.as_ref().unwrap();
     assert_eq!(
@@ -698,7 +703,7 @@ fn a_column_a_table_gains_is_carried_verbatim() {
 
     // The session row carries every catalog column, `parser_version`
     // included, and its JSON columns unparsed.
-    let sessions = only(&store, Watermark::START, ChangeKind::Session);
+    let sessions = only(&migrated, Watermark::START, ChangeKind::Session);
     let catalog = sessions[0].columns.as_ref().unwrap();
     assert!(catalog.get("parser_version").is_some_and(Value::is_i64));
     assert!(catalog

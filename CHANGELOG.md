@@ -606,6 +606,16 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Fixed
 
+- Change-feed origins now rotate when the exact stored-column set exported for
+  evidence changes. The store persists a fingerprint of that schema beside
+  its epoch; an upgrade from a pre-fingerprint database, or a later additive
+  or subtractive exported-table migration, atomically selects a new epoch and
+  clears revision-only named cursors so consumers replay from the start.
+  Previously the `location` migration changed the canonical JSON and remote
+  digest of existing evidence without moving its revision or origin, causing
+  durable receivers to return `409 delivery_conflict` forever. Explicit old
+  watermarks are now refused as stale, while unchanged current schemas keep
+  their epoch and cursor progress.
 - A sweep no longer stalls every other writer for up to ~30 s when a read is
   active as it finishes (#336). Each sweep, including every
   `SessionStore::watch` tick, ended with `wal_checkpoint(TRUNCATE)` under the

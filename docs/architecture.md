@@ -537,15 +537,20 @@ Three rules a consumer must hold:
 - **A watermark this store never issued is a reset.** Every database counts
   revisions from zero, so a revision alone cannot tell a replacement database
   from the one it replaced. A `Watermark` also carries the issuing database's
-  `epoch`, a random identity drawn once when its feed schema is created
-  (`change_feed_store`). `SessionStore::head_revision` reports the head with
-  it; a stored watermark with another epoch, or beyond the head, fails with
+  `epoch`, an identity drawn when its feed schema is created
+  (`change_feed_store`). The store also fingerprints the exact stored-column
+  sets each upsert exports. A migration that changes one rotates the epoch and
+  clears in-database named cursors atomically: otherwise an unchanged row
+  would keep its revision while acquiring different semantic JSON. This is a
+  stream reset, so every consumer replays the new shape.
+  `SessionStore::head_revision` reports the head with it; a stored watermark
+  with another epoch, or beyond the head, fails with
   `ErrorKind::WatermarkAheadOfStore`, and the recovery is a full resync from
   `Watermark::START`, which names no store. `Changes::commit()` checks the
   same two things against the database it writes into, so a drain whose
   path was replaced under it cannot plant its position as the replacement's
-  cursor. A copy of a database keeps its epoch, so a restore from backup is
-  caught by the revision check alone, while the restored store is still
+  cursor. A copy of a database keeps its current epoch, so a restore from
+  backup is caught by the revision check alone, while the restored store is still
   behind the watermark. A named cursor
   past the head names no revision of this store, so the resync's commit
   replaces it: the one commit that moves a cursor back.

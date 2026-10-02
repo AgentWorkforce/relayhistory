@@ -249,8 +249,11 @@ is total whatever the timestamps say. Each `Upsert` carries the typed row, so
 a consumer needs no second read. Two obligations on the consumer, both
 documented in [`architecture.md`](architecture.md#change-feed): a re-seen
 `record_key` is a replace, and a watermark the store did not issue — another
-database's epoch, or a revision ahead of `head_revision` — means the store was
-reset or replaced and the consumer must resync from `Watermark::START`. A named
+database/export-shape epoch, or a revision ahead of `head_revision` — means the
+semantic stream was reset or replaced and the consumer must resync from
+`Watermark::START`. A stored-column change rotates the epoch even when row
+revisions do not move, so consumers never reuse an equal revision with a new
+semantic payload. A named
 cursor is bound to the kind set it was committed for; a consumer that filters
 keeps one name per filter. Requests
 (section 7) are not fed as rows of their own — `session_requests` is a view —

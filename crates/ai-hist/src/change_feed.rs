@@ -61,6 +61,7 @@ use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -82,6 +83,12 @@ const MIGRATION: &str = "change_feed_v2";
 
 /// The column a named cursor records its kind set in.
 const KINDS_COLUMN: &str = "kinds";
+
+/// Fingerprint of the exact stored columns an upsert exports. A schema
+/// migration can change a record's semantic JSON without writing the row and
+/// therefore without advancing its revision. Persisting this alongside the
+/// epoch lets the migration pass give that new semantic stream a new origin.
+const EXPORT_SCHEMA_DIGEST_COLUMN: &str = "export_schema_digest";
 
 /// The kind set a drain reports, normalized so two drains asking for the
 /// same kinds in any order or with repeats spell it the same way.
@@ -135,10 +142,11 @@ fn kinds_mismatch(name: &str, stored: &str, offered: &str) -> Error {
 /// complete position and `revision > watermark` is the whole resume
 /// predicate. Across stores it is not: every database counts from zero, so a
 /// replacement database reuses the revisions of the one it replaced. `epoch`
-/// names the database -- a random identity drawn when its feed schema was
-/// created -- and [`SessionStore::changes_since`] refuses a watermark issued
-/// by another one, however far that store has since counted. A consumer
-/// persists both fields, as the store returned them.
+/// names the semantic export stream -- initially a random identity drawn when
+/// its feed schema is created, and rotated if a migration changes the stored
+/// column set an unchanged row exports. [`SessionStore::changes_since`]
+/// refuses a watermark issued by another stream, however far the store has
+/// since counted. A consumer persists both fields, as the store returned them.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
 )]
@@ -549,6 +557,75 @@ pub(crate) fn stored_columns(conn: &Connection, table: &str) -> Result<Vec<Strin
         .into_iter()
         .filter(|column| column != REVISION_COLUMN)
         .collect())
+}
+
+fn export_schema_digest(conn: &Connection) -> Result<String> {
+    let schema = ChangeKind::ALL
+        .iter()
+        .map(|kind| {
+            let table = kind.table().name;
+            Ok((table, stored_columns(conn, table)?))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&(
+            "relayhistory-change-feed-export-schema-v1",
+            schema
+        ))?)
+    ))
+}
+
+fn feed_identity_exists(conn: &Connection) -> Result<bool> {
+    let table: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='change_feed_store')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !table {
+        return Ok(false);
+    }
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM change_feed_store WHERE singleton=1)",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+/// Reconcile the exported row shape with the origin that names it. Existing
+/// feeds without a fingerprint predate this guard and rotate once: they may
+/// already have delivered an older column set. Later shape changes rotate
+/// exactly when the fingerprint changes. In-database named cursors name the
+/// old semantic stream but store no epoch, so they are cleared atomically and
+/// resume with a full replay just like an external stale-epoch watermark.
+fn reconcile_export_schema(conn: &Connection, identity_existed: bool) -> Result<()> {
+    let current = export_schema_digest(conn)?;
+    let stored: Option<String> = conn.query_row(
+        &format!("SELECT {EXPORT_SCHEMA_DIGEST_COLUMN} FROM change_feed_store WHERE singleton=1"),
+        [],
+        |row| row.get(0),
+    )?;
+    if stored.as_deref() == Some(current.as_str()) {
+        return Ok(());
+    }
+    if identity_existed {
+        // Epochs are odd signed SQLite integers interpreted as their u64 bit
+        // pattern. Adding two always selects a different odd value; spell the
+        // maximum case explicitly so SQLite never promotes on overflow.
+        conn.execute_batch(
+            "UPDATE change_feed_store
+             SET epoch = CASE WHEN epoch = 9223372036854775807
+                              THEN -9223372036854775807 ELSE epoch + 2 END
+             WHERE singleton=1;
+             DELETE FROM consumer_cursors;",
+        )?;
+    }
+    conn.execute(
+        &format!("UPDATE change_feed_store SET {EXPORT_SCHEMA_DIGEST_COLUMN}=? WHERE singleton=1"),
+        [current],
+    )?;
+    Ok(())
 }
 
 /// A record exactly as its table stores it: every column but `revision`, in
@@ -1818,6 +1895,26 @@ pub(crate) fn schema_is_current(conn: &Connection) -> Result<bool> {
     if !identified {
         return Ok(false);
     }
+    let fingerprinted: bool = conn.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('change_feed_store') WHERE name='{EXPORT_SCHEMA_DIGEST_COLUMN}')"
+        ),
+        [],
+        |row| row.get(0),
+    )?;
+    if !fingerprinted {
+        return Ok(false);
+    }
+    let fingerprinted: bool = conn.query_row(
+        &format!(
+            "SELECT {EXPORT_SCHEMA_DIGEST_COLUMN} IS NOT NULL FROM change_feed_store WHERE singleton=1"
+        ),
+        [],
+        |row| row.get(0),
+    )?;
+    if !fingerprinted {
+        return Ok(false);
+    }
     for kind in ChangeKind::ALL {
         let table = kind.table();
         if !object.exists([table.revision_index()])? {
@@ -1873,6 +1970,7 @@ pub(crate) fn schema_is_current(conn: &Connection) -> Result<bool> {
 /// schema has created the clock the triggers draw from. Idempotent: a current
 /// database passes through on `IF NOT EXISTS` checks and one marker read.
 pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
+    let identity_existed = feed_identity_exists(conn)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS evidence_tombstones (
              kind TEXT NOT NULL,
@@ -1892,17 +1990,23 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
          );
          CREATE TABLE IF NOT EXISTS change_feed_store (
              singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-             epoch INTEGER NOT NULL
+             epoch INTEGER NOT NULL,
+             export_schema_digest TEXT
          );",
     )?;
     // The database's identity in every watermark it issues; see
-    // `Watermark::epoch`. Drawn once, when the feed schema is first created,
-    // and never changed: a nonzero random value, so a fresh database -- which
-    // counts its revisions from zero again -- cannot pass for the one it
-    // replaced.
+    // `Watermark::epoch`. Initially a nonzero random value, so a fresh
+    // database -- which counts its revisions from zero again -- cannot pass
+    // for the one it replaced. `reconcile_export_schema` also rotates it when
+    // a migration changes the semantic JSON exported for an unchanged row.
     conn.execute(
         "INSERT OR IGNORE INTO change_feed_store (singleton, epoch) VALUES (1, random() | 1)",
         [],
+    )?;
+    ensure_columns(
+        conn,
+        "change_feed_store",
+        &[(EXPORT_SCHEMA_DIGEST_COLUMN, "TEXT")],
     )?;
     // A cursor is a position in one kind set's stream; see `KindSet`. A
     // database that created the table before the column existed gains it
@@ -2073,6 +2177,7 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
         "INSERT OR IGNORE INTO schema_migrations (name) VALUES (?)",
         [MIGRATION],
     )?;
+    reconcile_export_schema(conn, identity_existed)?;
     Ok(())
 }
 
@@ -2873,6 +2978,75 @@ INSERT INTO observation_evidence (source, session_id, location, connector_id,
                 .map(|change| change.record_key.as_str())
                 .collect::<Vec<_>>(),
             vec!["new3", "new4"]
+        );
+    }
+
+    /// Adding a stored column changes an exported record's canonical JSON
+    /// without touching the row or its revision. Reusing the old origin would
+    /// therefore produce an equal-revision/different-digest conflict at a
+    /// durable receiver. The migration pass gives the changed export shape a
+    /// new origin and resets named cursors so every consumer replays it.
+    #[test]
+    fn an_exported_column_change_rotates_the_epoch_and_replays_named_consumers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (initial_store, conn) = store(dir.path());
+        insert_event(&conn, "s1", "e1", "before");
+        let old_head = initial_store.head_revision().unwrap();
+        let query = || ChangeQuery::default().consumer("delivery");
+        let mut first = initial_store
+            .changes_since(Watermark::CONSUMER, query())
+            .unwrap();
+        while first.next().is_some() {}
+        assert_eq!(first.commit().unwrap(), old_head);
+
+        // Stands in for an additive crate migration such as `location`: the
+        // row now serializes differently, but no row write advanced it.
+        conn.execute_batch(
+            "ALTER TABLE session_events ADD COLUMN export_shape_probe TEXT NOT NULL DEFAULT 'local';",
+        )
+        .unwrap();
+        let unchanged_revision: i64 = conn
+            .query_row(
+                "SELECT revision FROM session_events WHERE event_uid='e1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unchanged_revision as u64, old_head.revision);
+        drop(first);
+        drop(conn);
+        drop(initial_store);
+
+        let (migrated, conn) = store(dir.path());
+        let new_head = migrated.head_revision().unwrap();
+        assert_eq!(new_head.revision, old_head.revision);
+        assert_ne!(new_head.epoch, old_head.epoch);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM consumer_cursors", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "a revision-only named cursor cannot survive an epoch rotation"
+        );
+        assert!(matches!(
+            migrated
+                .changes_since(old_head, ChangeQuery::default())
+                .expect_err("the old semantic stream must be refused"),
+            Error::WatermarkAheadOfStore(_)
+        ));
+        let replay = drain(
+            migrated
+                .changes_since(Watermark::CONSUMER, query())
+                .unwrap(),
+        );
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].revision, old_head.revision);
+        assert_eq!(
+            replay[0]
+                .columns
+                .as_ref()
+                .and_then(|columns| columns.get("export_shape_probe")),
+            Some(&Value::from("local"))
         );
     }
 

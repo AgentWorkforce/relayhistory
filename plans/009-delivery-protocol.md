@@ -41,9 +41,97 @@ identical canonical record digests are idempotent; conflicting reuse is HTTP409.
 Tombstones retain their revision fence so delayed upserts cannot resurrect them.
 Digests cover the submitted semantic record before service transformations.
 
+`409 delivery_conflict` is recovery authority only in this exact error family.
+As with `cursor_not_found`, the client must require both HTTP 409 and
+`error.code`; another status, code, malformed body, or detail that does not
+match the submitted batch is not permission to skip data. A record-revision
+conflict returns the first conflicting record in deterministic
+`(record_id, revision, revision_id)` order:
+
+```json
+{
+  "error": {
+    "code": "delivery_conflict",
+    "message": "Delivery record revision was reused with different content",
+    "conflict": {
+      "type": "record_revision",
+      "originId": "submitted origin_id",
+      "recordId": "submitted record_id",
+      "submittedRevisionId": "submitted revision_id",
+      "submittedRevision": 42,
+      "submittedDigest": "64 lowercase SHA-256 hex characters",
+      "currentRevisionId": "durably stored revision_id",
+      "currentRevision": 42,
+      "currentDigest": "64 lowercase SHA-256 hex characters"
+    }
+  },
+  "correlationId": "receiver diagnostic id"
+}
+```
+
+The authenticated tenant is deliberately absent from the body: it scopes the
+lookup but is never learned from an error. `submittedDigest` is the canonical
+digest the receiver computed for the normalized submitted record, and the
+current fields describe its durable equal-revision fence. The revisions must
+be equal and the digests different. A client may quarantine only the exact
+record whose origin, record ID, revision ID, revision, and recomputed submitted
+digest all match. It retries the remaining records under a deterministic child
+batch ID and durably records the quarantine with its queue transition. This
+lets records behind the poison record drain without weakening record-level
+idempotency. A singleton conflict completes locally as one quarantined record;
+it is not retried forever.
+
 A receipt is identified by authenticated tenant + origin + batch ID and includes
 a canonical request digest and exact revision outcomes. The same batch ID with
 different content fails409. A valid duplicate returns its original receipt.
+Batch-ID reuse is distinct and identifies no offending record:
+
+```json
+{
+  "error": {
+    "code": "delivery_conflict",
+    "message": "Delivery batch identity was reused with different content",
+    "conflict": {
+      "type": "batch_id",
+      "originId": "submitted origin_id",
+      "batchId": "submitted batch_id",
+      "submittedDigest": "64 lowercase SHA-256 hex characters",
+      "currentDigest": "64 lowercase SHA-256 hex characters"
+    }
+  },
+  "correlationId": "receiver diagnostic id"
+}
+```
+
+After validating the submitted batch digest, a client retries the same immutable
+records under a deterministic recovery batch ID derived from a domain tag, the
+origin, parent batch ID, submitted batch digest, and ordered revision IDs. It
+does not quarantine a record for a batch-ID conflict. Record-level revision
+guards make the re-keyed retry safe after a lost response.
+
+Conflict recovery must never synthesize a higher revision at delivery time.
+When re-derivation changes a semantic record, the producer first commits that
+change to the local store and the change feed issues its higher revision. A
+mapping-only change uses a new mapping version/generation. In particular, the
+change feed fingerprints the exact stored-column sets it exports; an additive
+or subtractive schema migration rotates the feed epoch atomically and clears
+revision-only named cursors before the new shape is replayed. External
+watermarks from the prior epoch are refused and must resync from start. This is
+the repair for schema additions such as `location`, which change canonical
+record digests without writing each existing row.
+
+Repository ownership is split deliberately. RelayHistory owns the change-feed
+origin/revision semantics and the TypeScript wire/recovery helpers in this
+repository. The hosted producer of this error is
+`AgentWorkforce/relayhistory-cloud` (`packages/relayhistory/src/lib/delivery.ts`
+and its transactional delivery migration); it must return the detail above
+from the same serialized decision that detects the conflict. The durable queue
+consumer is `AgentWorkforce/relay-desktop` (`probe/src/destination.rs` and
+`probe/src/delivery/`); it must persist quarantine/re-key progress, expose an
+accurate conflict state, and own the end-to-end no-head-of-line-stall test.
+Pure SDK tests here prove classification, validation, and deterministic plans;
+they are not a substitute for that queue integration test.
+
 Persist record changes and receipt atomically using the database's actual
 transactional facilities. Never implement read-then-write ordering in JavaScript
 without a database guard. Concurrent overlapping batches must serialize safely.
