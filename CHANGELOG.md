@@ -555,6 +555,15 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Changed
 
+- The project-identity refresh at the end of each sync now brings events in
+  line with their session's key only for sessions written since the previous
+  refresh in the same process (#319). It used to walk every event of every
+  keyed session on every tick. Sessions are scoped by the change feed's
+  revisions. The first refresh of a database in a process still covers the
+  whole catalog, as does one after a failure or after the database was
+  replaced. On a 140,000-event store a forced tick spends 1.7% of its time
+  here, down from 11%, and takes about 40 ms less.
+
 - Internal refactor: one-entry harness registry (#177). Each built-in harness
   is declared once, as a `LocalSource` descriptor in
   `crates/ai-hist/src/sources/catalog.rs`, and `SOURCE_CHOICES`,
