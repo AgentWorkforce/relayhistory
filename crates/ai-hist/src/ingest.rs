@@ -13756,9 +13756,8 @@ fn sync_grok_with_coverage(
     // decide whether the source failed would fail it forever over one
     // unreadable sibling.
     let mut accounted = 0;
-    // The enumeration and the stamps below are the ones the source
-    // fingerprint already took this sweep, and the ones discovery reuses
-    // after it (#317).
+    // The enumeration is the one the source fingerprint already made this
+    // sweep; the stamps below are read fresh and reused by discovery (#317).
     for chat in capture_files(
         "grok",
         crate::discover::sweep_inventory::grok_transcripts(root)?,
@@ -13770,7 +13769,7 @@ fn sync_grok_with_coverage(
         // counted as looked at, so the run says so — a stamp that fails
         // closed and is then reported as nothing at all is the silence the
         // strictness exists to prevent.
-        let stamp = match crate::discover::sweep_inventory::grok_stamp_and_modified(&chat) {
+        let stamp = match crate::discover::sweep_inventory::restamp_grok(&chat) {
             Ok((stamp, _)) => stamp,
             Err(error) => {
                 if error.is::<CaptureCancelled>() {
