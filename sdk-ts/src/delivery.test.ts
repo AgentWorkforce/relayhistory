@@ -13,7 +13,8 @@ import { promisify } from 'node:util';
 import { gunzipSync } from 'node:zlib';
 import {
   beginHistoryExport, closeHistoryExport,
-  DEFAULT_DELIVERY_LIMITS, deliveryBatchDigest, deliveryRecordDigest, exportHistory,
+  canonicalDeliveryJson, DEFAULT_DELIVERY_LIMITS, deliveryBatchDigest, deliveryDigest,
+  deliveryRecordDigest, exportHistory,
   HistoryDeliveryError, HistoryPluginRegistry, loadHistoryPlugins, readHistoryExportPage,
   parseDeliveryConflict, recoverDeliveryConflict,
   type HistoryDestination, type HistoryExportBatch, type HistoryExportSelection,
@@ -99,6 +100,16 @@ test('delivery digests omit object values JSON does not put on the wire', () => 
   const onWire = JSON.parse(JSON.stringify(record));
   assert.deepEqual(onWire.payload, { kept: 'value', array: [null, null, null] });
   assert.equal(deliveryRecordDigest(record), deliveryRecordDigest(onWire));
+});
+
+test('delivery digest Unicode key ordering matches the protocol fixture', () => {
+  const value = { '\uE000': 1, '\u{10000}': 2 };
+  const canonical = canonicalDeliveryJson(value);
+  assert.equal(canonical, '{"\u{10000}":2,"\uE000":1}');
+  assert.equal(Buffer.from(canonical, 'utf8').toString('hex'),
+    '7b22f0908080223a322c22ee8080223a317d');
+  assert.equal(deliveryDigest(value),
+    '9d4cdc71dda603c42f9b21d88d0c2ffc31a76cd1bd461d7359406cf169845f1e');
 });
 
 test('a proven record conflict quarantines only the poison revision and drains later records', () => {
