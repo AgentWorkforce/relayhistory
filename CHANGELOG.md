@@ -555,6 +555,14 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Changed
 
+- Cheaper sweep ticks: the free-space check before a sweep is one `statvfs`
+  call on Unix instead of spawning `df`, and the per-transcript existence
+  probes a sweep asks about every unchanged Claude transcript and Codex
+  rollout (cursor lookups, sidecar, continuity, fidelity and raw-fact
+  probes), and the per-session ancestor lookup of the cached project-identity
+  upgrade, reuse prepared statements instead of compiling their SQL each
+  time. On the 100 MB benchmark store this is ~10% of a forced tick's CPU.
+
 - Internal refactor: one-entry harness registry (#177). Each built-in harness
   is declared once, as a `LocalSource` descriptor in
   `crates/ai-hist/src/sources/catalog.rs`, and `SOURCE_CHOICES`,

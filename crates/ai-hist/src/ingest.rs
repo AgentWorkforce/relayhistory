@@ -4498,7 +4498,8 @@ fn grok_catalog_row_exists(conn: &Connection, session_id: &str) -> Result<bool> 
 }
 
 fn session_events_exist(conn: &Connection, source: &str, session_id: &str) -> Result<bool> {
-    let exists: i64 = conn.query_row(
+    let exists: i64 = cached_query_row(
+        conn,
         "SELECT EXISTS(SELECT 1 FROM session_events WHERE source = ? AND session_id = ? LIMIT 1)",
         params![source, session_id],
         |row| row.get(0),
@@ -4520,7 +4521,8 @@ fn codex_session_evidence_exists(conn: &Connection, session_id: &str) -> Result<
 }
 
 fn session_markers_exist(conn: &Connection, source: &str, session_id: &str) -> Result<bool> {
-    let exists: i64 = conn.query_row(
+    let exists: i64 = cached_query_row(
+        conn,
         "SELECT EXISTS(SELECT 1 FROM session_markers WHERE source = ? AND session_id = ? LIMIT 1)",
         params![source, session_id],
         |row| row.get(0),
@@ -6990,6 +6992,20 @@ const CLAUDE_SIDECAR_EVIDENCE_SQL: &str = "SELECT EXISTS(
             LIMIT 1
         )";
 
+/// `Connection::query_row` through the connection's statement cache.
+///
+/// The sweep asks the same handful of existence probes about every
+/// transcript it finds unchanged, thousands per tick on a large archive, and
+/// `query_row` compiles its SQL afresh each time: on the benchmark store the
+/// re-preparing cost more than the lookups themselves.
+fn cached_query_row<T, P, F>(conn: &Connection, sql: &str, params: P, f: F) -> rusqlite::Result<T>
+where
+    P: rusqlite::Params,
+    F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+{
+    conn.prepare_cached(sql)?.query_row(params, f)
+}
+
 /// Whether an unchanged subagent sidecar has already been ingested.
 ///
 /// A sidecar is deliberately never registered as a session, so the catalog
@@ -7007,9 +7023,12 @@ fn claude_sidecar_evidence_exists(conn: &Connection, path: &Path) -> Result<bool
     // and no events. Asking only about events reads that as "this file left
     // nothing behind", so an unchanged sidecar is re-parsed on every sync
     // forever while the sync reports itself perfectly normal.
-    let exists: i64 = conn.query_row(CLAUDE_SIDECAR_EVIDENCE_SQL, [locator.as_ref()], |row| {
-        row.get(0)
-    })?;
+    let exists: i64 = cached_query_row(
+        conn,
+        CLAUDE_SIDECAR_EVIDENCE_SQL,
+        [locator.as_ref()],
+        |row| row.get(0),
+    )?;
     Ok(exists != 0)
 }
 
@@ -7038,7 +7057,7 @@ fn claude_transcript_needs_repair(
         return Ok(false);
     }
     let raw_path = path.to_string_lossy();
-    let mut statement = conn.prepare(
+    let mut statement = conn.prepare_cached(
         "SELECT session_id FROM sessions \
          WHERE source = 'claude' AND raw_path = ?1 \
          UNION \
@@ -7080,7 +7099,8 @@ fn claude_transcript_needs_repair(
 /// the ones with nothing to gain, and would discard the selective-repair state
 /// the codex generations carry.
 fn tool_results_lack_fidelity(conn: &Connection, source: &str, session_id: &str) -> Result<bool> {
-    let lacking: i64 = conn.query_row(
+    let lacking: i64 = cached_query_row(
+        conn,
         "SELECT EXISTS(
             SELECT 1 FROM session_events
             WHERE source = ? AND session_id = ? AND kind = 'tool_result'
@@ -7122,7 +7142,8 @@ fn codex_continuity_evidence_exists(conn: &Connection, path: &Path) -> Result<bo
 /// a row — the condition clears after one read and never fires again.
 fn claude_transcript_lacks_continuity_evidence(conn: &Connection, path: &Path) -> Result<bool> {
     let locator = path.to_string_lossy();
-    let exists: i64 = conn.query_row(
+    let exists: i64 = cached_query_row(
+        conn,
         "SELECT EXISTS(SELECT 1 FROM session_continuity_evidence \
          WHERE source = 'claude' AND locator = ? LIMIT 1)",
         [locator.as_ref()],
@@ -7200,7 +7221,8 @@ const CLAUDE_LACKS_TOOL_RESULT_FIDELITY_SQL: &str = "SELECT
 /// The fidelity question for a Claude transcript, which the walk knows by path.
 fn claude_transcript_lacks_tool_result_fidelity(conn: &Connection, path: &Path) -> Result<bool> {
     let raw_path = path.to_string_lossy();
-    let lacking: i64 = conn.query_row(
+    let lacking: i64 = cached_query_row(
+        conn,
         CLAUDE_LACKS_TOOL_RESULT_FIDELITY_SQL,
         [raw_path.as_ref()],
         |row| row.get(0),
@@ -7242,7 +7264,8 @@ const CLAUDE_LACKS_RAW_FACTS_SQL: &str = "SELECT
 /// re-read, its events keeping null facts for good.
 fn claude_transcript_lacks_raw_facts(conn: &Connection, path: &Path) -> Result<bool> {
     let raw_path = path.to_string_lossy();
-    let lacking: i64 = conn.query_row(
+    let lacking: i64 = cached_query_row(
+        conn,
         CLAUDE_LACKS_RAW_FACTS_SQL,
         params![raw_path.as_ref(), RAW_MESSAGE_FACTS_VERSION],
         |row| row.get(0),
@@ -7283,7 +7306,8 @@ const CLAUDE_TRANSCRIPT_EVENTS_SQL: &str = "SELECT EXISTS(
 /// that; the cost simply never converges.
 fn claude_transcript_events_exist(conn: &Connection, path: &Path) -> Result<bool> {
     let raw_path = path.to_string_lossy();
-    let exists: i64 = conn.query_row(
+    let exists: i64 = cached_query_row(
+        conn,
         CLAUDE_TRANSCRIPT_EVENTS_SQL,
         [raw_path.as_ref(), raw_path.as_ref()],
         |row| row.get(0),
