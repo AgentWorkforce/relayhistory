@@ -19,7 +19,7 @@ Two repositories parse the same harness logs today, with no shared code.
 | Cursor      | `ingest_cursor_transcript` (`src/ingest.rs`)    | not supported                                                                                 |
 | Grok        | `ingest_grok_session` (`src/ingest.rs`)         | not supported                                                                                 |
 | Muse Code   | `ingest_muse_session` (`src/ingest.rs`)         | not supported                                                                                 |
-| Devin       | `ingest_selected_devin` (`src/ingest/hydrate.rs`) | not supported                                                                               |
+| Devin       | `sync_devin_db` (`src/ingest/devin.rs`)         | not supported                                                                                 |
 
 burn has no dependency on relayhistory. relayhistory already defers cost to
 burn by name (the upload plugin's `convergence.rs` — "Input excludes
