@@ -134,3 +134,40 @@ fn an_unknown_cursor_match_source_is_the_shared_invalid_argument() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// `resume` takes the newest match that names a session: a newer prompt
+/// recorded without a session id must not hide an older resumable one.
+#[test]
+fn resume_skips_newer_matches_without_a_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = temp.path().join("history.db");
+    let rows = temp.path().join("seed.jsonl");
+    std::fs::write(
+        &rows,
+        concat!(
+            r#"{"source":"claude","session_id":"s-old","project":"/p","prompt":"needle resumable","timestamp_ms":1000}"#,
+            "\n",
+            r#"{"source":"claude","project":"/p","prompt":"needle orphan","timestamp_ms":2000}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let output = run(ai_hist(&temp, &db).arg("import").arg(&rows));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = run(ai_hist(&temp, &db).args(["resume", "needle", "--json"]));
+    assert!(
+        output.status.success(),
+        "stdout {} stderr {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let entry: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|_| panic!("not JSON: {}", String::from_utf8_lossy(&output.stdout)));
+    assert_eq!(entry["session_id"], "s-old", "got {entry}");
+    assert_eq!(entry["prompt"], "needle resumable", "got {entry}");
+}
