@@ -624,13 +624,13 @@ mod compact_tests {
         db_path
     }
 
-    /// `statvfs` reports the figure `df -P` did. Free space moves under a
+    /// `statfs`/`statvfs` report the figure `df -P` did. Free space moves under a
     /// running test suite, so the two are compared loosely.
     #[cfg(unix)]
     #[test]
     fn free_bytes_agrees_with_df() {
         let dir = tempfile::tempdir().unwrap();
-        let measured = free_bytes(&dir.path().join("not-yet.db")).expect("statvfs answers");
+        let measured = free_bytes(&dir.path().join("not-yet.db")).expect("statfs/statvfs answers");
         let out = std::process::Command::new("df")
             .arg("-Pk")
             .arg(dir.path())
@@ -653,7 +653,7 @@ mod compact_tests {
         let tolerance = (df / 20).max(2 << 30);
         assert!(
             measured.abs_diff(df) <= tolerance,
-            "statvfs {measured} vs df {df}"
+            "free_bytes {measured} vs df {df}"
         );
         assert!(free_bytes(Path::new("/definitely/not/a/dir/db")).is_none());
     }
