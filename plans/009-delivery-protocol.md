@@ -90,6 +90,21 @@ durable fence or an earlier submitted identity at that revision. The latter
 preserves rejection of two records inside one batch that reuse a revision with
 different content. The revisions must be equal and the digests different.
 
+The digest byte contract is shared and normative for the SDK and every hosted
+receiver. Before hashing a record, normalize an empty `session_id` to JSON
+`null`. Canonical JSON sorts object keys lexicographically, omits object members
+whose values JSON would omit (`undefined`, functions, and symbols), preserves
+array order, and represents those same non-values or sparse positions inside an
+array as JSON `null`. Hash the canonical JSON's UTF-8 bytes with SHA-256 and
+encode the digest as 64 lowercase hexadecimal characters. A record digest is
+the digest of that normalized record. A batch digest is the digest of canonical
+JSON for `{ "protocolVersion": 1, "batch": <normalized batch> }`, where every
+record in the batch receives the same empty-session normalization. The
+TypeScript `canonicalDeliveryJson`, `deliveryRecordDigest`, and
+`deliveryBatchDigest` helpers implement this contract; a receiver must produce
+the same bytes rather than relying on its platform's default object ordering or
+JSON spelling.
+
 `conflicts` contains the first 100 conflicts in deterministic
 `(record_id, revision, revision_id)` order, `conflictCount` is the total, and
 `conflict` repeats its first entry for a stable discriminator. Clients must not
