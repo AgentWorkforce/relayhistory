@@ -1036,8 +1036,12 @@ struct DestinationSnapshot {
     /// from the stored marker, which carries hashes only.
     named: Option<HashSet<(String, String)>>,
     /// The sessions [`Self::advanced`] recounted, and whether each can still
-    /// be named by its own rows.
+    /// be named by its own rows. Kept only while `named` is `None`.
     recounted: HashMap<(String, String), bool>,
+    /// The highest prompt id when the snapshot was taken, read after the
+    /// head: a replayable prompt above the head with an id at or below it
+    /// was changed in place, not appended.
+    history_max_id: Option<i64>,
 }
 
 impl DestinationSnapshot {
@@ -1047,12 +1051,14 @@ impl DestinationSnapshot {
     fn take(conn: &Connection) -> Result<Self> {
         let head = crate::change_feed::read_head(conn).ok();
         let mut named = HashSet::new();
+        let history_max_id = history_max_id(conn)?;
         let holdings = session_holdings_naming(conn, Some(&mut named))?;
         Ok(Self {
             head,
             holdings,
             named: Some(named),
             recounted: HashMap::new(),
+            history_max_id,
         })
     }
 
@@ -1066,11 +1072,15 @@ impl DestinationSnapshot {
     ) -> Option<Self> {
         let stored_head = stored_head.filter(|head| !head.is_empty())?;
         let head = crate::change_feed::read_head(conn).ok()?;
-        (format!("{}:{}", head.epoch, head.revision) == stored_head).then(|| Self {
+        if format!("{}:{}", head.epoch, head.revision) != stored_head {
+            return None;
+        }
+        Some(Self {
             head: Some(head),
             holdings: stored.sessions.clone(),
             named: None,
             recounted: HashMap::new(),
+            history_max_id: history_max_id(conn).ok()?,
         })
     }
 
@@ -1096,7 +1106,8 @@ impl DestinationSnapshot {
             return Ok(None);
         }
         if to.revision > from.revision {
-            let Some(touched) = sessions_written_since(conn, from.revision)? else {
+            let Some(touched) = sessions_written_since(conn, from.revision, self.history_max_id)?
+            else {
                 return Ok(None);
             };
             for (source, session_id) in touched {
@@ -1110,14 +1121,17 @@ impl DestinationSnapshot {
                     self.holdings.insert(key, held);
                 }
                 let session = (source, session_id);
-                if let Some(named) = self.named.as_mut() {
-                    if names {
-                        named.insert(session.clone());
-                    } else {
+                match self.named.as_mut() {
+                    Some(named) if names => {
+                        named.insert(session);
+                    }
+                    Some(named) => {
                         named.remove(&session);
                     }
+                    None => {
+                        self.recounted.insert(session, names);
+                    }
                 }
-                self.recounted.insert(session, names);
             }
         }
         self.head = Some(to);
@@ -1135,6 +1149,13 @@ impl DestinationSnapshot {
     fn marker(&self) -> String {
         destination_marker(&self.holdings)
     }
+}
+
+/// The highest prompt id, or `None` for an empty prompt log.
+fn history_max_id(conn: &Connection) -> Result<Option<i64>> {
+    Ok(conn
+        .prepare_cached("SELECT MAX(id) FROM history")?
+        .query_row([], |row| row.get(0))?)
 }
 
 /// The sweep-end snapshot: `start` carried forward when the feed allows it,
@@ -1161,45 +1182,74 @@ fn current_destination(
 fn sessions_written_since(
     conn: &Connection,
     revision: u64,
+    history_max_id: Option<i64>,
 ) -> Result<Option<HashSet<(String, String)>>> {
     let revision = i64::try_from(revision).unwrap_or(i64::MAX);
     let sources = repairable_event_sources();
     let history_sources = replayable_history_sources();
-    // A prompt that changed session leaves no tombstone naming the one it
-    // left, so a replayable source's prompt changing at all sends the end of
-    // the sweep back to a full count. Prompts of other sources are not
-    // counted and do not matter.
-    let prompt_moved: bool = conn
-        .prepare_cached(
-            "SELECT EXISTS (SELECT 1 FROM history WHERE revision > ?1 \
-                 AND +source IN (SELECT value FROM json_each(?2))) \
-             OR EXISTS (SELECT 1 FROM evidence_tombstones WHERE kind = 'history' \
-                 AND revision > ?1 AND +source IN (SELECT value FROM json_each(?2)))",
-        )?
-        .query_row(params![revision, history_sources], |row| row.get(0))?;
-    if prompt_moved {
-        return Ok(None);
-    }
     let mut touched = HashSet::new();
     // Rows, not sessions: a sweep that wrote more than this is not a tick,
     // and reading every one of its rows to name sessions would cost what the
     // full count does.
     let rows_limit = i64::try_from(DESTINATION_RECOUNT_ROW_LIMIT + 1).unwrap_or(i64::MAX);
+    let note = |touched: &mut HashSet<(String, String)>, read: &mut usize, session| {
+        *read += 1;
+        touched.insert(session);
+        *read <= DESTINATION_RECOUNT_ROW_LIMIT && touched.len() <= DESTINATION_RECOUNT_LIMIT
+    };
+    // A prompt's session is not part of its identity, so a prompt that moved
+    // between sessions, or was deleted, leaves nothing naming the session it
+    // left. A replayable source's prompt deleted, or changed in place (its id
+    // is not above the highest the snapshot saw), sends the end of the sweep
+    // back to a full count. An appended prompt -- a new id, since the ids are
+    // `AUTOINCREMENT` and never reused -- only adds to the session it names.
+    // Prompts of other sources are not counted and do not matter.
+    let prompt_removed: bool = conn
+        .prepare_cached(
+            "SELECT EXISTS (SELECT 1 FROM evidence_tombstones WHERE kind = 'history' \
+                 AND revision > ?1 AND +source IN (SELECT value FROM json_each(?2)))",
+        )?
+        .query_row(params![revision, history_sources.clone()], |row| row.get(0))?;
+    if prompt_removed {
+        return Ok(None);
+    }
+    {
+        let mut statement = conn.prepare_cached(
+            "SELECT id, source, session_id FROM history WHERE revision > ?1 \
+             AND +source IN (SELECT value FROM json_each(?2)) LIMIT ?3",
+        )?;
+        let mut rows = statement.query(params![revision, history_sources.clone(), rows_limit])?;
+        let mut read = 0usize;
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            if history_max_id.is_none_or(|max| id <= max) {
+                return Ok(None);
+            }
+            let Some(session_id) = row.get::<_, Option<String>>(2)? else {
+                continue;
+            };
+            if !note(&mut touched, &mut read, (row.get(1)?, session_id)) {
+                return Ok(None);
+            }
+        }
+    }
     for (table, kind) in SESSION_KEYED_HOLDINGS {
+        // Markers are counted for the replayable sources only, and a busy
+        // Claude or Codex transcript writes plenty of them.
+        let counted = if *table == "session_markers" {
+            &history_sources
+        } else {
+            &sources
+        };
         for sql in [
             &rows_written_since_sql(table),
             &rows_removed_since_sql(kind),
         ] {
             let mut statement = conn.prepare_cached(sql)?;
-            let mut rows = statement.query(params![revision, sources.clone(), rows_limit])?;
+            let mut rows = statement.query(params![revision, counted.clone(), rows_limit])?;
             let mut read = 0usize;
             while let Some(row) = rows.next()? {
-                read += 1;
-                if read > DESTINATION_RECOUNT_ROW_LIMIT {
-                    return Ok(None);
-                }
-                touched.insert((row.get::<_, String>(0)?, row.get::<_, String>(1)?));
-                if touched.len() > DESTINATION_RECOUNT_LIMIT {
+                if !note(&mut touched, &mut read, (row.get(0)?, row.get(1)?)) {
                     return Ok(None);
                 }
             }
@@ -17385,20 +17435,67 @@ mod tests {
         assert!(repairs.contains("claude", "b"));
     }
 
+    /// A replayable source's appended prompt is carried forward like any
+    /// other row: it only adds to the session it names. A Claude marker is
+    /// not counted and is not even read.
+    #[test]
+    fn an_appended_replayable_prompt_is_carried_forward() {
+        let (_dir, conn) = holdings_store();
+        conn.execute(
+            "INSERT INTO history (source, session_id, prompt, timestamp_ms) \
+             VALUES ('devin', 'h', 'first', 4)",
+            [],
+        )
+        .unwrap();
+        let start = DestinationSnapshot::take(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO history (source, session_id, prompt, timestamp_ms) \
+             VALUES ('devin', 'h', 'hello', 5), ('opencode', 'new', 'hi', 6)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_markers (source, session_id, marker_uid, kind, subkind) \
+             VALUES ('claude', 'a', 'm-1', 'compaction', 'boundary')",
+            [],
+        )
+        .unwrap();
+        let carried = start
+            .advanced(&conn)
+            .unwrap()
+            .expect("an appended prompt is vouched for");
+        assert_same_destination(&carried, &DestinationSnapshot::take(&conn).unwrap());
+        assert!(carried
+            .named
+            .as_ref()
+            .unwrap()
+            .contains(&("opencode".into(), "new".into())));
+    }
+
     /// What the feed cannot vouch for sends the end of the sweep back to a
-    /// full count: a replayable source's prompt (whose session is not part of
-    /// its identity), and more sessions than are worth recounting one by one.
+    /// full count: a replayable source's prompt changed in place or deleted
+    /// (its session is not part of its identity), and more sessions than are
+    /// worth recounting one by one.
     #[test]
     fn carried_destination_counts_fall_back_when_the_feed_cannot_vouch() {
         let (_dir, conn) = holdings_store();
-        let start = DestinationSnapshot::take(&conn).unwrap();
         conn.execute(
             "INSERT INTO history (source, session_id, prompt, timestamp_ms) \
              VALUES ('devin', 'h', 'hello', 5)",
             [],
         )
         .unwrap();
-        assert!(start.advanced(&conn).unwrap().is_none());
+        let start = DestinationSnapshot::take(&conn).unwrap();
+        conn.execute(
+            "UPDATE history SET session_id = 'h2' WHERE source = 'devin'",
+            [],
+        )
+        .unwrap();
+        assert!(start.advanced(&conn).unwrap().is_none(), "a moved prompt");
+        let start = DestinationSnapshot::take(&conn).unwrap();
+        conn.execute("DELETE FROM history WHERE source = 'devin'", [])
+            .unwrap();
+        assert!(start.advanced(&conn).unwrap().is_none(), "a deleted prompt");
 
         // A prompt of a source whose history is not counted does not matter.
         let start = DestinationSnapshot::take(&conn).unwrap();

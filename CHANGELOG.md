@@ -563,8 +563,9 @@ Notable changes to the native `ai-hist` CLI are documented here.
   start's holdings and recount only the sessions the change feed shows were
   written (row revisions and tombstones above the start head). The sweep
   counts everything again when the feed cannot vouch: no head, a different
-  epoch, a changed prompt of a replayable source (a prompt's session is not
-  part of its identity), or more than 256 sessions / 20,000 rows written.
+  epoch, a replayable source's prompt changed in place or deleted (a prompt's
+  session is not part of its identity; an appended prompt is carried), or
+  more than 256 sessions / 20,000 rows written.
   Same marker and same outstanding set; on the 100 MB benchmark store the
   destination checks go from ~5% of a forced tick to ~0.1%.
 
