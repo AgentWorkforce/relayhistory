@@ -14,7 +14,7 @@ pub(crate) fn wal_path(db_path: &Path) -> PathBuf {
 /// Free bytes on the filesystem holding `path`.
 ///
 /// Every sweep asks this before it writes, and the sweep is a watch tick:
-/// on Unix it is one `statvfs` call rather than spawning `df`, which cost a
+/// on Unix it is one `statfs`/`statvfs` call rather than spawning `df`, which cost a
 /// forced tick several milliseconds of `posix_spawn` and pipe reads. `df -P`
 /// reports `f_bavail` -- the blocks an unprivileged writer may use -- so the
 /// figure is the same one.
@@ -28,7 +28,28 @@ pub(crate) fn free_bytes(path: &Path) -> Option<u64> {
     free_bytes_at(&target)
 }
 
-#[cfg(unix)]
+/// Apple's `statvfs` reports block counts as 32-bit `fsblkcnt_t`, so a volume
+/// with more than 2^32 free blocks (16 TiB at 4 KiB) wraps to a small number
+/// and would trip the free-space floor. Its `statfs` carries 64-bit counts.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn free_bytes_at(target: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(target.as_os_str().as_bytes()).ok()?;
+    let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `path` is a valid NUL-terminated string and `stats` points to
+    // writable memory of the right size; `statfs` initializes it on success.
+    let rc = unsafe { libc::statfs(path.as_ptr(), stats.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    // SAFETY: `statfs` returned 0, so the struct is initialized.
+    let stats = unsafe { stats.assume_init() };
+    stats.f_bavail.checked_mul(u64::from(stats.f_bsize))
+}
+
+/// `statvfs`, whose block counts are 64-bit on Linux and the other Unixes
+/// this builds for.
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
 fn free_bytes_at(target: &Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(target.as_os_str().as_bytes()).ok()?;
@@ -615,6 +636,12 @@ mod compact_tests {
             .arg(dir.path())
             .output()
             .unwrap();
+        assert!(
+            out.status.success(),
+            "df -Pk failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
         let text = String::from_utf8_lossy(&out.stdout);
         let df: u64 = text
             .lines()

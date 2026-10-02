@@ -7183,7 +7183,8 @@ fn claude_transcript_lacks_continuity_evidence(conn: &Connection, path: &Path) -
 /// with nothing to gain, and would discard the selective-repair state the
 /// codex generations carry.
 fn events_lack_raw_facts(conn: &Connection, source: &str, session_id: &str) -> Result<bool> {
-    let lacking: i64 = conn.query_row(
+    let lacking: i64 = cached_query_row(
+        conn,
         "SELECT EXISTS(
             SELECT 1 FROM session_events e
             WHERE e.source = ? AND e.session_id = ?

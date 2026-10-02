@@ -555,7 +555,7 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Changed
 
-- Cheaper sweep ticks: the free-space check before a sweep is one `statvfs`
+- Cheaper sweep ticks: the free-space check before a sweep is one `statfs`/`statvfs`
   call on Unix instead of spawning `df`, and the per-transcript existence
   probes a sweep asks about every unchanged Claude transcript and Codex
   rollout (cursor lookups, sidecar, continuity, fidelity and raw-fact
