@@ -326,7 +326,11 @@ fn a_report_times_its_sweep_and_its_first_event() {
         first.elapsed()
     );
 
-    // A manual tick has no event behind it.
+    // A manual tick has no event behind it. The report above is sent before
+    // the change tick releases its slot, so a first `tick()` may join that
+    // run rather than start one; the second always starts its own. Either
+    // way the next report is a manual one.
+    watch.tick();
     watch.tick();
     let manual = reports.recv_timeout(ARRIVES_WITHIN).expect("manual tick");
     assert_eq!(manual.first_event_at, None);

@@ -264,7 +264,11 @@ too large to name an instant simply waits without one. Each report carries
 `elapsed_ms`, the sweep's wall time, and, for a filesystem-event tick,
 `first_event_age_ms`: how long before the report the first event behind it
 arrived, so capture lag splits into the debounce window, the sweep and the
-hand-off.
+hand-off. It counts from the oldest change the tick covers, so it also
+includes any time that change spent deferred behind a sweep already in
+flight and waiting out contention retries for the sync lock; it is not just
+the debounce window plus `elapsed_ms`. A cancelled tick's `changed` still
+lists what its sweep committed before the stop.
 
 ### `sessions`
 

@@ -996,6 +996,14 @@ impl WatchLoop {
                         },
                     }
                 }
+                // A forced wake before the retry is due sweeps the change the
+                // retry stands for as well, so it reports from the older of
+                // the two; otherwise a sweep that gets through drops the
+                // retry and its arrival time with it.
+                Some((_, Some(since))) if wake.trigger.forces_scan() => Wake {
+                    first_event_at: Some(wake.first_event_at.map_or(since, |at| at.min(since))),
+                    ..wake
+                },
                 _ => wake,
             };
             let trigger = wake.trigger;

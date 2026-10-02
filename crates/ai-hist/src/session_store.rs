@@ -898,15 +898,22 @@ impl SessionStore {
             // change another process made in between is a change since the
             // last report either way — and a fresh read otherwise.
             let mut base = tick_baseline.lock().expect("watch baseline");
-            let (outcome, changed) = with_capture_token(tick_stop.clone(), || {
+            // The baseline this sweep compares against, kept outside it so a
+            // cancelled sweep can still say what it committed (below).
+            let mut swept_from: Option<CatalogFingerprint> = None;
+            let result = with_capture_token(tick_stop.clone(), || {
                 rolling_tick(&mut base, |previous| {
                     let outcome = sync_facade_tick(
                         &db_path,
                         &tick_roots,
                         force,
-                        |conn| match previous {
-                            Some(before) => Ok(before),
-                            None => catalog_fingerprint(conn).map_err(anyhow::Error::from),
+                        |conn| {
+                            let before = match previous {
+                                Some(before) => before,
+                                None => catalog_fingerprint(conn).map_err(anyhow::Error::from)?,
+                            };
+                            swept_from = Some(before.clone());
+                            Ok(before)
                         },
                         |conn, before, _tick| {
                             let (after, changed) = changes_under_lock(conn, &before)?;
@@ -915,9 +922,37 @@ impl SessionStore {
                     )?;
                     Ok(outcome.map(|(tick, (after, changed))| (tick, after, changed)))
                 })
-            })?;
-            *tick_pending.lock().expect("watch pending") = changed;
-            Ok(outcome)
+            });
+            match result {
+                Ok((outcome, changed)) => {
+                    *tick_pending.lock().expect("watch pending") = changed;
+                    Ok(outcome)
+                }
+                Err(error) => {
+                    // A stop can land after the sweep committed chunks, or
+                    // after it finished and rolled the baseline forward — the
+                    // capture scope re-checks the token on the way out. The
+                    // loop ends on a cancellation, so this is the last chance
+                    // to report those rows: diff the catalog against the
+                    // baseline the sweep started from, roll it forward, and
+                    // let the cancelled report carry the result. Best effort
+                    // and outside the sync lock, which is no worse than the
+                    // "changed since the last report" this field already
+                    // promises.
+                    if error.chain().any(|cause| cause.is::<CaptureCancelled>()) {
+                        if let Some(before) = swept_from {
+                            let diff = open_db(&db_path)
+                                .map_err(Error::sync)
+                                .and_then(|conn| changes_under_lock(&conn, &before));
+                            if let Ok((after, changed)) = diff {
+                                *base = Some(after);
+                                *tick_pending.lock().expect("watch pending") = changed;
+                            }
+                        }
+                    }
+                    Err(error)
+                }
+            }
         });
 
         let report_sink = reports.clone();
@@ -1790,7 +1825,8 @@ pub struct TickReport {
     pub contended: bool,
     /// The sweep was cancelled through [`WatchOptions::stop`] or
     /// [`WatchStop::stop`] before it finished: neither swept nor failed. The
-    /// loop ends after it.
+    /// loop ends after it. `changed` still lists whatever the sweep committed
+    /// before the stop landed.
     pub cancelled: bool,
     /// Wall time of this tick's sweep in milliseconds, the attempt at the
     /// sync lock included (a tick never waits for the lock).
@@ -2865,6 +2901,90 @@ mod tests {
         let started = Instant::now();
         assert!(watch.next_timeout(Duration::from_secs(30)).is_none());
         assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// A stop that lands while the sweep is committing rows must not lose
+    /// them: whatever the catalog holds when the loop ends was reported by
+    /// some tick, the cancelled one included. The stop is timed off the first
+    /// committed row, so on most runs it lands mid-sweep; a run where the
+    /// sweep wins the race still has to satisfy the same invariant.
+    #[test]
+    fn a_cancelled_watch_tick_reports_what_it_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ai-history.db");
+        for index in 0..150 {
+            let project = dir.path().join(format!(".claude/projects/p{}", index % 10));
+            std::fs::create_dir_all(&project).unwrap();
+            let id = format!("00000000-0000-4000-8000-{index:012}");
+            let body: String = (0..30)
+                .map(|n| {
+                    format!(
+                        "{{\"type\":\"user\",\"sessionId\":\"{id}\",\"cwd\":\"/tmp/{id}\",\
+                         \"timestamp\":\"2026-09-19T10:{:02}:00.000Z\",\
+                         \"message\":{{\"role\":\"user\",\"content\":\"prompt {n}\"}}}}\n",
+                        n % 60
+                    )
+                })
+                .collect();
+            std::fs::write(project.join(format!("{id}.jsonl")), body).unwrap();
+        }
+        let store = store_at(&db);
+        let token = StopToken::new();
+        let stopper = std::thread::spawn({
+            let token = token.clone();
+            let db = db.clone();
+            move || {
+                let deadline = Instant::now() + Duration::from_secs(60);
+                while Instant::now() < deadline {
+                    let rows = open_db_readonly(&db)
+                        .ok()
+                        .and_then(|conn| {
+                            conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| {
+                                row.get::<_, i64>(0)
+                            })
+                            .ok()
+                        })
+                        .unwrap_or(0);
+                    if rows > 0 {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                token.stop();
+            }
+        });
+        let watch = store
+            .watch(WatchOptions {
+                use_fs_events: false,
+                poll_interval_ms: 600_000,
+                immediate: true,
+                stop: Some(token),
+                ..WatchOptions::default()
+            })
+            .unwrap();
+        let mut reported = std::collections::BTreeSet::new();
+        for tick in watch {
+            let tick = tick.expect("a cancellation is not an error");
+            reported.extend(tick.changed);
+        }
+        stopper.join().unwrap();
+        let conn = open_db_readonly(&db).unwrap();
+        let mut statement = conn
+            .prepare("SELECT session_id FROM sessions WHERE source = 'claude'")
+            .unwrap();
+        let committed: std::collections::BTreeSet<SessionRef> = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|id| SessionRef::id(Source::Claude, id.unwrap()))
+            .collect();
+        assert!(!committed.is_empty(), "the sweep committed nothing");
+        assert_eq!(
+            committed.difference(&reported).count(),
+            0,
+            "{} of {} committed sessions were never reported",
+            committed.difference(&reported).count(),
+            committed.len()
+        );
     }
 
     /// `next()` blocks on the channel, not on a poll of the loop's thread,
