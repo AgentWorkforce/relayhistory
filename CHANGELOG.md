@@ -606,6 +606,15 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Fixed
 
+- Export pages stream rows instead of fetching their whole scan budget up
+  front. A page stops reading the moment it is full, so rows past its
+  boundary are no longer decoded, discarded and decoded again by the next
+  page, and a row the selection leaves out is never decoded at all. With one
+  record per page and a 10,000-row scan budget, exporting 3,000 rows drops
+  from 10.8 s to 0.08 s; a 50k-event export with the default limits from
+  0.72 s to 0.46 s. Snapshots, cursors, retries and the scan budget are
+  unchanged (#308).
+
 - Change-feed schema reconciliation now fingerprints each evidence kind's
   exact exported column names and declared SQLite types. The one-time upgrade
   from a pre-fingerprint database restamps every existing kind above the

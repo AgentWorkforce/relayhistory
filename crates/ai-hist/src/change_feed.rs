@@ -804,7 +804,6 @@ fn stored_value(value: ValueRef<'_>) -> Value {
 #[cfg(feature = "export")]
 /// One row of a fed table, as a local export snapshot reads it.
 pub(crate) struct LiveRow {
-    pub rowid: i64,
     pub source: String,
     /// The stored session, `None` for a prompt that names none.
     pub session: Option<String>,
@@ -815,14 +814,56 @@ pub(crate) struct LiveRow {
 }
 
 #[cfg(feature = "export")]
-/// At most `limit` rows of `kind`'s table past rowid `after`, in rowid order:
-/// one range of the table's own b-tree.
-pub(crate) fn rows_by_rowid(
+/// One row of a fed table while it is being visited: the cheap identity
+/// fields are decoded, the stored columns only on [`RowidRow::decode`].
+pub(crate) struct RowidRow<'r, 's> {
+    pub rowid: i64,
+    pub source: String,
+    /// The stored session, `None` for a prompt that names none.
+    pub session: Option<String>,
+    row: &'r rusqlite::Row<'s>,
+    names: &'r [Arc<str>],
+    table: &'r FedTable,
+    kind: ChangeKind,
+}
+
+#[cfg(feature = "export")]
+impl RowidRow<'_, '_> {
+    /// The whole row, every stored column converted to an owned value.
+    pub(crate) fn decode(&self) -> Result<LiveRow> {
+        let mut columns = Vec::with_capacity(self.names.len());
+        for (offset, name) in self.names.iter().enumerate() {
+            columns.push((
+                Arc::clone(name),
+                stored_value(self.row.get_ref(4 + offset)?),
+            ));
+        }
+        let columns = StoredRow { columns };
+        let revision: Option<i64> = self.row.get(3)?;
+        Ok(LiveRow {
+            source: self.source.clone(),
+            session: self.session.clone(),
+            key: self.table.key_from_row(self.kind, &columns),
+            revision: revision.unwrap_or(0).max(0) as u64,
+            columns,
+        })
+    }
+}
+
+#[cfg(feature = "export")]
+/// Visit at most `limit` rows of `kind`'s table past rowid `after`, in rowid
+/// order: one range of the table's own b-tree. `visit` returns whether to go
+/// on; the statement stops stepping as soon as it says no, and a row's stored
+/// columns are converted only when it asks for them, so a caller that fills
+/// up early, or passes over rows it does not select, neither reads nor
+/// decodes the rest of the budget (#308). Returns how many rows were visited.
+pub(crate) fn visit_rows_by_rowid(
     conn: &Connection,
     kind: ChangeKind,
     after: i64,
     limit: usize,
-) -> Result<Vec<LiveRow>> {
+    mut visit: impl FnMut(RowidRow<'_, '_>) -> Result<bool>,
+) -> Result<usize> {
     let table = kind.table();
     let stored = stored_columns(conn, table.name)?;
     let names: Vec<Arc<str>> = stored
@@ -842,35 +883,27 @@ pub(crate) fn rows_by_rowid(
             .join(", "),
     );
     let mut statement = conn.prepare_cached(&sql)?;
-    let rows = statement.query_map(
-        rusqlite::params![after, limit.min(i64::MAX as usize) as i64],
-        |row| {
-            let mut columns = Vec::with_capacity(names.len());
-            for (offset, name) in names.iter().enumerate() {
-                columns.push((Arc::clone(name), stored_value(row.get_ref(4 + offset)?)));
-            }
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-                StoredRow { columns },
-            ))
-        },
-    )?;
-    let mut live = Vec::new();
-    for row in rows {
-        let (rowid, source, session, revision, columns) = row?;
-        live.push(LiveRow {
-            rowid,
-            source,
-            session,
-            key: table.key_from_row(kind, &columns),
-            revision: revision.unwrap_or(0).max(0) as u64,
-            columns,
-        });
+    let mut rows = statement.query(rusqlite::params![
+        after,
+        limit.min(i64::MAX as usize) as i64
+    ])?;
+    let mut visited = 0;
+    while let Some(row) = rows.next()? {
+        visited += 1;
+        let go_on = visit(RowidRow {
+            rowid: row.get(0)?,
+            source: row.get(1)?,
+            session: row.get(2)?,
+            row,
+            names: &names,
+            table: &table,
+            kind,
+        })?;
+        if !go_on {
+            break;
+        }
     }
-    Ok(live)
+    Ok(visited)
 }
 
 /// The typed row an upsert carries, per kind, so no second read is needed.
