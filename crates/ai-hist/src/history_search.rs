@@ -373,7 +373,6 @@ fn search_branch(
         }
     }
     if walk && index_exists(conn, ts_index)? {
-        let mut read: Option<(Option<i64>, usize)> = None;
         for (step, window) in WALK_WINDOWS.iter().copied().enumerate() {
             let floor = recent_window_floor(conn, branch, filter, window)?;
             // Rows tied on the floor's timestamp all join the window, and the
@@ -385,31 +384,26 @@ fn search_branch(
                     break;
                 }
             }
-            // A smaller tie can still stretch a window over the next one's
-            // rows; the same floor is the same window, already read.
-            let found = match read {
-                Some((read_floor, found)) if read_floor == floor => found,
-                _ => {
-                    let rows = walk_window(
-                        conn,
-                        branch,
-                        fts_match.as_ref(),
-                        filter_sql,
-                        &filter_params,
-                        filter,
-                        raw_fts,
-                        floor,
-                    )?;
-                    // A window that holds every eligible row is the whole
-                    // search.
-                    if floor.is_none() || rows.len() as i64 >= limit {
-                        record_walk(true);
-                        return Ok(rows);
-                    }
-                    read = Some((floor, rows.len()));
-                    rows.len()
-                }
-            };
+            // The tie check bounds this window's rows at or above its floor to
+            // fewer than twice the window, and each window in WALK_WINDOWS is
+            // larger than that, so every step's floor is strictly older than
+            // the last and each window is read once.
+            let rows = walk_window(
+                conn,
+                branch,
+                fts_match.as_ref(),
+                filter_sql,
+                &filter_params,
+                filter,
+                raw_fts,
+                floor,
+            )?;
+            // A window that holds every eligible row is the whole search.
+            if floor.is_none() || rows.len() as i64 >= limit {
+                record_walk(true);
+                return Ok(rows);
+            }
+            let found = rows.len();
             // Grow the window while it could still fill the page: matches at
             // a rate that could fill the last window (with 4x slack, as they
             // cluster by session), or none yet in only the first, which a
