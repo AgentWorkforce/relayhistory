@@ -593,9 +593,9 @@ fn exported_kind_changed(stored: &str, current: &BTreeMap<String, String>) -> bo
         // kind in that format, so preserve its conservative rotation.
         return true;
     };
-    current
+    stored
         .iter()
-        .any(|(kind, digest)| stored.get(kind).is_some_and(|prior| prior != digest))
+        .any(|(kind, prior)| current.get(kind).is_none_or(|current| current != prior))
 }
 
 fn feed_identity_exists(conn: &Connection) -> Result<bool> {
@@ -3095,6 +3095,19 @@ INSERT INTO observation_evidence (source, session_id, location, connector_id,
         assert!(
             exported_kind_changed(&serde_json::to_string(&stored).unwrap(), &current),
             "a declared-type change can alter the JSON value SQLite reads from an unchanged row"
+        );
+
+        let stored = BTreeMap::from([
+            ("session".to_string(), "session-v1".to_string()),
+            ("retired_kind".to_string(), "retired-kind-v1".to_string()),
+        ]);
+        let current = BTreeMap::from([
+            ("session".to_string(), "session-v1".to_string()),
+            ("renamed_kind".to_string(), "retired-kind-v1".to_string()),
+        ]);
+        assert!(
+            exported_kind_changed(&serde_json::to_string(&stored).unwrap(), &current),
+            "removing or renaming a fed kind must rotate the origin even when a new kind has the same schema digest"
         );
     }
 
