@@ -1516,6 +1516,9 @@ fn sync_basic(
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(".sync-state.json");
+    // The source fingerprint, the Grok walk and the discovery pass below
+    // share one enumeration and one stamp per Grok session directory (#317).
+    let _grok_inventory = discover::sweep_inventory::SweepInventory::begin();
     if let Err(error) = cleanup_stale_sync_state_temps(&state_path) {
         eprintln!(
             "ai-hist: could not clean stale sync-state temp files beside {}: {error:#}",
@@ -13751,9 +13754,12 @@ fn sync_grok_with_coverage(
     // decide whether the source failed would fail it forever over one
     // unreadable sibling.
     let mut accounted = 0;
+    // The enumeration and the stamps below are the ones the source
+    // fingerprint already took this sweep, and the ones discovery reuses
+    // after it (#317).
     for chat in capture_files(
         "grok",
-        collect_matching_files(root, "chat_history", "jsonl")?,
+        crate::discover::sweep_inventory::grok_transcripts(root)?,
     ) {
         check_capture_cancelled()?;
         let key = chat.to_string_lossy().to_string();
@@ -13762,8 +13768,8 @@ fn sync_grok_with_coverage(
         // counted as looked at, so the run says so — a stamp that fails
         // closed and is then reported as nothing at all is the silence the
         // strictness exists to prevent.
-        let stamp = match grok_session_stamp(&chat) {
-            Ok(stamp) => stamp,
+        let stamp = match crate::discover::sweep_inventory::grok_stamp_and_modified(&chat) {
+            Ok((stamp, _)) => stamp,
             Err(error) => {
                 if error.is::<CaptureCancelled>() {
                     return Err(error);
@@ -15349,6 +15355,7 @@ fn truncate_marker_text(text: &str) -> String {
     text.chars().take(512).collect()
 }
 
+#[cfg(test)]
 fn grok_session_stamp(chat: &Path) -> Result<String> {
     Ok(grok_source_inventory(chat)?.stamp)
 }

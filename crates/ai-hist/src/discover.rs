@@ -1957,14 +1957,12 @@ impl ShallowSessionProvider for GrokProvider {
         env: &DiscoveryEnv<'_>,
         _requested_limit: Option<usize>,
     ) -> Result<Vec<Candidate>> {
+        // Inside a sweep, one enumeration and one stamp per session directory
+        // serve the fingerprint, the walk and this pass alike (#317).
         file_candidates(
             "grok",
-            crate::collect_matching_files(
-                &env.grok_home.join("sessions"),
-                "chat_history",
-                "jsonl",
-            )?,
-            crate::grok_session_stamp_and_modified,
+            sweep_inventory::grok_transcripts(&env.grok_home.join("sessions"))?,
+            sweep_inventory::grok_stamp_and_modified,
         )
     }
 
@@ -5419,3 +5417,5 @@ pub fn discover_sessions_collect(
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) mod sweep_inventory;

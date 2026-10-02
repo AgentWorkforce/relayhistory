@@ -555,6 +555,14 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Changed
 
+- A forced sync now walks and stamps the Grok session tree once instead of
+  three times (#317). The three passes were the source fingerprint, the Grok
+  walk and the discovery pass that ends the sweep, and they now share one
+  enumeration and one stamp per session directory. Stamps are taken before
+  the walk, as the fingerprint's always were, so a directory that changes
+  mid-sweep is read again on the next pass. On a store with 879 Grok sessions
+  a forced tick takes about 50 ms (14%) less.
+
 - Internal refactor: one-entry harness registry (#177). Each built-in harness
   is declared once, as a `LocalSource` descriptor in
   `crates/ai-hist/src/sources/catalog.rs`, and `SOURCE_CHOICES`,
