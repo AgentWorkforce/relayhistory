@@ -557,13 +557,15 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 - `search` (CLI, SDK, MCP) returns a common term's newest matches without
   reading every match. A query matching thousands of rows walks the timestamp
-  index over the newest 20,000 rows that pass the time window and cursor,
-  testing each against the FTS5 index by rowid and stopping at `limit`; only
-  when that window holds fewer than `limit` matches does it fall back to
-  sorting every match, as before. On a 500k-event store a common term drops
-  from ~240 ms to ~3 ms, and a role, source, project or tag filter on it from
-  100-320 ms to 1-8 ms. A `user` or `assistant` search with a term also
-  narrows the index scan to that role's events. Results are unchanged.
+  index over the newest 2,000, then (if that probe matched anything) 20,000
+  rows that pass the time window and cursor -- exactly that many, ties broken
+  by id -- testing each against the FTS5 index by rowid and stopping at
+  `limit`. Only when the window holds fewer than `limit` matches does it fall
+  back to sorting every match, as before. On a 500k-event store a common term
+  drops from ~240 ms to ~3 ms, a role, source or tag filter on it from
+  100-320 ms to 1-8 ms, and a filter no recent row passes costs the same as
+  before. A `user` or `assistant` search with a term also narrows the index
+  scan to that role's events. Results are unchanged.
 
 - Internal refactor: one-entry harness registry (#177). Each built-in harness
   is declared once, as a `LocalSource` descriptor in
