@@ -1140,7 +1140,20 @@ impl DestinationSnapshot {
     /// revision above the head (a delete or move as a tombstone naming the
     /// session it left), so a session with nothing above the head holds what
     /// it held when this snapshot counted it.
-    fn advanced(mut self, conn: &Connection) -> Result<Option<Self>> {
+    fn advanced(self, conn: &Connection) -> Result<Option<Self>> {
+        // One read snapshot for the head, the recounts and the new prompt
+        // baseline, so a writer in another process cannot land between them
+        // (a prompt deleted after the head read would otherwise drop out of
+        // the baseline while the carried counts still hold it). A savepoint
+        // nests inside a caller's transaction and opens a deferred one
+        // otherwise; this only reads, so releasing it commits nothing.
+        conn.execute_batch("SAVEPOINT destination_advance")?;
+        let advanced = self.advanced_in_snapshot(conn);
+        conn.execute_batch("RELEASE destination_advance")?;
+        advanced
+    }
+
+    fn advanced_in_snapshot(mut self, conn: &Connection) -> Result<Option<Self>> {
         let Some(from) = self.head else {
             return Ok(None);
         };
@@ -1177,10 +1190,18 @@ impl DestinationSnapshot {
                     }
                 }
             }
-            // Re-baseline against the new head, read after `to` as in
-            // [`Self::take`]: a later advance must judge prompts written
-            // since this one against what is here now, not the first count.
-            self.prompts = PromptBaseline::take(conn)?;
+            // Re-baseline against the new head (same snapshot) so a later
+            // advance judges prompts written since this one against what is
+            // here now, not the first count. Only when a prompt was added:
+            // ids are never reused, so an unchanged maximum means no prompt
+            // was inserted, and a deleted one has already sent this advance
+            // back to a full count -- the baseline still holds.
+            let max_id: i64 = conn
+                .prepare_cached("SELECT COALESCE(MAX(id), 0) FROM history")?
+                .query_row([], |row| row.get(0))?;
+            if max_id != self.prompts.max_id {
+                self.prompts = PromptBaseline::take(conn)?;
+            }
         }
         self.head = Some(to);
         Ok(Some(self))
