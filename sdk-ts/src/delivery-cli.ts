@@ -37,6 +37,13 @@ export async function runHistoryExportCommand(
       return resolve(await canonicalTarget(parent), basename(path));
     }
   };
+  // SQLite keeps committed state in `<db>-wal` (its index in `<db>-shm`, and
+  // `<db>-journal` in rollback mode), so replacing a sidecar corrupts the
+  // database just as replacing the main file would. Each is compared by
+  // canonical path — for both the path as given and its resolved form, since a
+  // symlinked database's sidecars may sit beside either — and by inode. The
+  // check runs again just before the final rename, so a sidecar that appears
+  // while exporting is still caught.
   const assertSafeOutput = async () => {
     if (!options.outputPath) return;
     const target = resolve(options.outputPath);
@@ -45,11 +52,19 @@ export async function runHistoryExportCommand(
       if (error.code === 'ENOENT') return null;
       throw error;
     });
-    const [targetPath, databasePath, targetStat, databaseStat] = await Promise.all([
-      canonicalTarget(target), canonicalTarget(database), metadata(target), metadata(database),
+    const [targetPath, databasePath, targetStat] = await Promise.all([
+      canonicalTarget(target), canonicalTarget(database), metadata(target),
     ]);
-    if (targetPath === databasePath || (targetStat && databaseStat && targetStat.dev === databaseStat.dev && targetStat.ino === databaseStat.ino)) {
-      throw new InvalidArgumentError('export output must not replace the active history database', 'INVALID_ARGUMENT');
+    const protectedPaths = [...new Set(['', '-wal', '-shm', '-journal']
+      .flatMap((suffix) => [database + suffix, databasePath + suffix]))];
+    const protectedTargets = await Promise.all(protectedPaths.map(async (path) => ({
+      canonical: await canonicalTarget(path), stat: await metadata(path),
+    })));
+    for (const candidate of protectedTargets) {
+      if (targetPath === candidate.canonical
+        || (targetStat && candidate.stat && targetStat.dev === candidate.stat.dev && targetStat.ino === candidate.stat.ino)) {
+        throw new InvalidArgumentError('export output must not replace the active history database', 'INVALID_ARGUMENT');
+      }
     }
   };
   await assertSafeOutput();

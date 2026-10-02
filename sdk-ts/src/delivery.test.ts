@@ -298,6 +298,43 @@ test('export rejects aliases through symlinked parents before creating a new dat
   });
 });
 
+test('export refuses the live WAL and SHM sidecars and leaves committed rows readable', async (t) => {
+  // node:sqlite ships unflagged from Node 22.5; on older runtimes the
+  // path-only guard is still covered by the alias tests above.
+  const sqlite = await import('node:sqlite' as string).catch(() => null) as
+    | { DatabaseSync: new (path: string, options?: { readOnly?: boolean }) => {
+        exec(sql: string): void; prepare(sql: string): { get(): unknown }; close(): void } }
+    | null;
+  if (!sqlite) { t.skip('node:sqlite is unavailable on this runtime'); return; }
+  await fixture(async (dbPath, root) => {
+    const selectionPath = join(root, 'selection.json');
+    await writeFile(selectionPath, JSON.stringify(selection));
+    const alias = join(root, 'alias'); await symlink(root, alias, 'dir');
+    // A live writer whose committed row exists only in the WAL.
+    const writer = new sqlite.DatabaseSync(dbPath);
+    try {
+      writer.exec('PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;');
+      writer.exec('CREATE TABLE export_guard_probe(value TEXT); INSERT INTO export_guard_probe VALUES (\'committed\');');
+      const walHardLink = join(root, 'wal-hardlink');
+      await link(`${dbPath}-wal`, walHardLink);
+      const {runHistoryExportCommand} = await import('./delivery-cli.js');
+      for (const outputPath of [`${dbPath}-wal`, `${dbPath}-shm`, `${dbPath}-journal`,
+        join(alias, 'history.db-wal'), join(alias, 'history.db-shm'), walHardLink]) {
+        await assert.rejects(runHistoryExportCommand({ dbPath, outputPath, selectionPath }), /active history database/, outputPath);
+      }
+      const reader = new sqlite.DatabaseSync(dbPath, { readOnly: true });
+      try {
+        assert.deepEqual({ ...reader.prepare('SELECT value FROM export_guard_probe').get() as object }, { value: 'committed' });
+      } finally { reader.close(); }
+      // An ordinary existing output file is still replaced.
+      const outputPath = join(root, 'export.ndjson');
+      await writeFile(outputPath, 'stale');
+      await runHistoryExportCommand({ dbPath, outputPath, selectionPath });
+      assert.notEqual(await readFile(outputPath, 'utf8'), 'stale');
+    } finally { writer.close(); }
+  });
+});
+
 test('an expired export snapshot is released when its cursor returns', async () => {
   await fixture(async dbPath => {
     const snapshot = await beginHistoryExport(selection, { dbPath });

@@ -606,6 +606,12 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Fixed
 
+- `ai-hist export --out` refuses the history database's SQLite sidecars
+  (`-wal`, `-shm`, `-journal`) as well as the database file itself, by path,
+  directory alias and inode, both before exporting and again before the final
+  rename. Exporting onto a live WAL previously replaced committed database
+  state with NDJSON and left readers failing with a disk I/O error (#305).
+
 - Change-feed schema reconciliation now fingerprints each evidence kind's
   exact exported column names and declared SQLite types. The one-time upgrade
   from a pre-fingerprint database restamps every existing kind above the
