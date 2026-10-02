@@ -579,12 +579,6 @@ Notable changes to the native `ai-hist` CLI are documented here.
   `getSession` read each session's locations once per result set, not once
   per row.
 
-### Fixed (search)
-
-- `ai-hist resume <query>` resumes the newest match that names a session. It
-  used to read only the single newest match and report "No session found"
-  when that prompt had no session id, even when an older match did.
-
 - Internal refactor: one-entry harness registry (#177). Each built-in harness
   is declared once, as a `LocalSource` descriptor in
   `crates/ai-hist/src/sources/catalog.rs`, and `SOURCE_CHOICES`,
@@ -635,6 +629,11 @@ Notable changes to the native `ai-hist` CLI are documented here.
   unchanged. Part of #215.
 
 ### Fixed
+
+- `ai-hist resume <query>` resumes the newest match that names a session. It
+  used to read only the single newest match and report "No session found"
+  when that prompt had no session id, even when an older match did; the
+  session-id requirement is now part of the search query.
 
 - Change-feed schema reconciliation now fingerprints each evidence kind's
   exact exported column names and declared SQLite types. The one-time upgrade

@@ -2782,38 +2782,18 @@ pub fn search(
 }
 
 /// The newest prompt matching a search that names a session, so it can be
-/// resumed. Pages through older matches past any prompt recorded without a
-/// session id, instead of giving up when the newest match has none.
+/// resumed. The session-id predicate is part of the query, so prompts
+/// recorded without a session id never hide an older resumable match.
 pub fn latest_resumable_match(
     conn: &Connection,
     terms: &[String],
     raw_fts: bool,
     filter: &QueryFilter,
 ) -> Result<Option<HistoryEntry>> {
-    let mut page_filter = QueryFilter {
-        limit: 50,
-        ..filter.clone()
-    };
-    loop {
-        let page = crate::history_search::search_page(
-            conn,
-            terms,
-            raw_fts,
-            &page_filter,
-            crate::history_search::SearchRole::Prompt,
-        )?;
-        if let Some(row) = page
-            .rows
-            .into_iter()
-            .find(|row| row.session_id.as_deref().is_some_and(|id| !id.is_empty()))
-        {
-            return Ok(Some(prompt_entry(row)));
-        }
-        match page.next_cursor {
-            Some(cursor) => page_filter.after = Some(cursor),
-            None => return Ok(None),
-        }
-    }
+    Ok(
+        crate::history_search::latest_prompt_with_session(conn, terms, raw_fts, filter)?
+            .map(prompt_entry),
+    )
 }
 
 fn prompt_entry(row: crate::history_search::SearchRow) -> HistoryEntry {

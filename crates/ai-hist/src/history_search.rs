@@ -120,11 +120,41 @@ pub fn search_page(
     Ok(HistoryPage { rows, next_cursor })
 }
 
+/// The newest prompt matching a search that names a session (non-empty
+/// session id), or `None`: what `resume` needs, in one query.
+pub fn latest_prompt_with_session(
+    conn: &Connection,
+    terms: &[String],
+    raw_fts: bool,
+    filter: &QueryFilter,
+) -> Result<Option<SearchRow>> {
+    let filter = QueryFilter {
+        limit: 1,
+        ..filter.clone()
+    };
+    filter.validate()?;
+    Ok(
+        search_history_rows_where(conn, terms, raw_fts, &filter, true)?
+            .into_iter()
+            .next(),
+    )
+}
+
 fn search_history_rows(
     conn: &Connection,
     terms: &[String],
     raw_fts: bool,
     filter: &QueryFilter,
+) -> Result<Vec<SearchRow>> {
+    search_history_rows_where(conn, terms, raw_fts, filter, false)
+}
+
+fn search_history_rows_where(
+    conn: &Connection,
+    terms: &[String],
+    raw_fts: bool,
+    filter: &QueryFilter,
+    with_session: bool,
 ) -> Result<Vec<SearchRow>> {
     let fts_match = (!terms.is_empty()).then(|| {
         let query = crate::build_fts_query(terms, raw_fts);
@@ -136,6 +166,9 @@ fn search_history_rows(
     let mut filter_sql = String::new();
     let mut filter_params = Vec::new();
     append_history_search_filters(&mut filter_sql, &mut filter_params, filter, "h");
+    if with_session {
+        filter_sql.push_str(" AND h.session_id IS NOT NULL AND h.session_id != ''");
+    }
     search_branch(
         conn,
         &HISTORY_BRANCH,
@@ -1430,5 +1463,40 @@ mod tests {
         assert_eq!(pages, 20);
         let (served, fell_back) = WALK_OUTCOMES.with(|outcomes| outcomes.get());
         assert!(served > 0 && fell_back > 0, "served {served}, fell back {fell_back}");
+    }
+
+    #[test]
+    fn the_latest_prompt_with_a_session_skips_newer_session_less_prompts() {
+        let conn = walk_fixture();
+        // Newer prompts than any fixture row, none naming a session.
+        for index in 0..10 {
+            insert_history(
+                &conn,
+                &HistoryEntry {
+                    id: 0,
+                    source: "claude".into(),
+                    session_id: if index % 2 == 0 { None } else { Some(String::new()) },
+                    project: Some("/work/alpha".into()),
+                    prompt: format!("needle orphan {index}"),
+                    prompt_hash: None,
+                    timestamp_ms: 9_000 + index,
+                },
+            )
+            .unwrap();
+        }
+        let terms = ["needle".to_string()];
+        for walk in [true, false] {
+            let read = || {
+                latest_prompt_with_session(&conn, &terms, false, &QueryFilter::default()).unwrap()
+            };
+            let found = if walk { read() } else { sorted_reference(read) };
+            let expected = search_all(&conn, &terms, false, &filter(1_000), SearchRole::Prompt)
+                .unwrap()
+                .into_iter()
+                .find(|row| row.session_id.as_deref().is_some_and(|id| !id.is_empty()))
+                .unwrap();
+            let found = found.expect("a resumable prompt");
+            assert_eq!((found.id, found.timestamp_ms), (expected.id, expected.timestamp_ms));
+        }
     }
 }

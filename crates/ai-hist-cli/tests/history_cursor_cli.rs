@@ -142,16 +142,19 @@ fn resume_skips_newer_matches_without_a_session() {
     let temp = tempfile::tempdir().unwrap();
     let db = temp.path().join("history.db");
     let rows = temp.path().join("seed.jsonl");
-    std::fs::write(
-        &rows,
-        concat!(
-            r#"{"source":"claude","session_id":"s-old","project":"/p","prompt":"needle resumable","timestamp_ms":1000}"#,
-            "\n",
-            r#"{"source":"claude","project":"/p","prompt":"needle orphan","timestamp_ms":2000}"#,
-            "\n",
-        ),
-    )
-    .unwrap();
+    // More newer session-less matches than any single page of matches holds.
+    let mut seed = String::from(
+        r#"{"source":"claude","session_id":"s-old","project":"/p","prompt":"needle resumable","timestamp_ms":1000}"#,
+    );
+    seed.push('\n');
+    for index in 0..120 {
+        seed.push_str(&format!(
+            r#"{{"source":"claude","project":"/p","prompt":"needle orphan {index}","timestamp_ms":{}}}"#,
+            2_000 + index
+        ));
+        seed.push('\n');
+    }
+    std::fs::write(&rows, seed).unwrap();
     let output = run(ai_hist(&temp, &db).arg("import").arg(&rows));
     assert!(
         output.status.success(),
