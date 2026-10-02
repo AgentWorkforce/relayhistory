@@ -3162,6 +3162,71 @@ INSERT INTO observation_evidence (source, session_id, location, connector_id,
         .is_empty());
     }
 
+    /// The release before per-kind fingerprints already has a feed identity
+    /// and delivered rows, but gains this nullable column during migration.
+    /// Its first open must restamp every existing kind exactly once above the
+    /// prior head without invalidating either external or named cursors.
+    #[test]
+    fn an_existing_feed_with_no_fingerprint_restamps_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (initial_store, conn) = store(dir.path());
+        insert_event(&conn, "s1", "e1", "event");
+        conn.execute(
+            "INSERT INTO history (source, session_id, prompt, timestamp_ms) \
+             VALUES ('claude', 's1', 'prompt', 1)",
+            [],
+        )
+        .unwrap();
+        let old_head = initial_store.head_revision().unwrap();
+        let query = || ChangeQuery::default().consumer("delivery");
+        let mut first = initial_store
+            .changes_since(Watermark::CONSUMER, query())
+            .unwrap();
+        while first.next().is_some() {}
+        assert_eq!(first.commit().unwrap(), old_head);
+
+        conn.execute(
+            &format!(
+                "UPDATE change_feed_store SET {EXPORT_SCHEMA_DIGEST_COLUMN}=NULL \
+                 WHERE singleton=1"
+            ),
+            [],
+        )
+        .unwrap();
+        drop(first);
+        drop(conn);
+        drop(initial_store);
+
+        let (migrated, conn) = store(dir.path());
+        let new_head = migrated.head_revision().unwrap();
+        assert_eq!(new_head.epoch, old_head.epoch);
+        assert_eq!(new_head.revision, old_head.revision + 2);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM consumer_cursors", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        let resumed = drain(
+            migrated
+                .changes_since(Watermark::CONSUMER, query())
+                .unwrap(),
+        );
+        assert_eq!(resumed.len(), 2);
+        assert_eq!(
+            resumed
+                .iter()
+                .map(|change| change.kind)
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([ChangeKind::SessionEvent, ChangeKind::History])
+        );
+        drop(conn);
+        drop(migrated);
+
+        let (reopened, _) = store(dir.path());
+        assert_eq!(reopened.head_revision().unwrap(), new_head);
+    }
+
     #[test]
     fn export_schema_fingerprints_include_declared_column_types() {
         let text = vec![("value".to_string(), "TEXT".to_string())];
