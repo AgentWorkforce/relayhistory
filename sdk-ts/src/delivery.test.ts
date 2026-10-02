@@ -298,6 +298,24 @@ test('export rejects aliases through symlinked parents before creating a new dat
   });
 });
 
+test('a file: URI --db is percent-decoded as SQLite decodes it before the output guard', async () => {
+  await fixture(async (dbPath, root) => {
+    const selectionPath = join(root, 'selection.json');
+    await writeFile(selectionPath, JSON.stringify(selection));
+    // SQLite opens `%41` as `A` and keeps the malformed `%ZZ` literal.
+    const literal = join(root, 'hist%ZZA.db');
+    await cp(dbPath, literal);
+    const uri = `file:${join(root, 'hist%ZZ%41.db')}`;
+    const {runHistoryExportCommand} = await import('./delivery-cli.js');
+    for (const outputPath of [literal, `${literal}-wal`, `${literal}-shm`]) {
+      await assert.rejects(runHistoryExportCommand({ dbPath: uri, outputPath, selectionPath }), /active history database/, outputPath);
+    }
+    const outputPath = join(root, 'export.ndjson');
+    await runHistoryExportCommand({ dbPath: uri, outputPath, selectionPath });
+    assert.ok((await readFile(outputPath, 'utf8')).length > 0);
+  });
+});
+
 test('export refuses the live WAL and SHM sidecars and leaves committed rows readable', async (t) => {
   // node:sqlite ships unflagged from Node 22.5; on older runtimes the
   // path-only guard is still covered by the alias tests above.

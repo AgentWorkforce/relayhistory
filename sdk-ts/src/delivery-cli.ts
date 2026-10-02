@@ -21,6 +21,30 @@ export async function loadHistoryApplicationConfig(path: string) {
 }
 
 /**
+ * Percent-decode a URI path the way SQLite's `sqlite3ParseUri` does: a `%`
+ * followed by two hex digits is that byte, anything else (`%ZZ`, a trailing
+ * `%`) stays literal, and a decoded `%00` ends the path. The bytes are then
+ * read as UTF-8, as SQLite passes them to the filesystem.
+ */
+function sqliteUriDecode(path: string): string {
+  const input = Buffer.from(path, 'utf8');
+  const out: number[] = [];
+  const hex = (byte: number) => Number.parseInt(String.fromCharCode(byte), 16);
+  for (let i = 0; i < input.length; i += 1) {
+    if (input[i] === 0x25 && i + 2 < input.length
+      && !Number.isNaN(hex(input[i + 1])) && !Number.isNaN(hex(input[i + 2]))) {
+      const octet = hex(input[i + 1]) * 16 + hex(input[i + 2]);
+      if (octet === 0) break;
+      out.push(octet);
+      i += 2;
+    } else {
+      out.push(input[i]);
+    }
+  }
+  return Buffer.from(out).toString('utf8');
+}
+
+/**
  * The file on disk SQLite opens for `dbPath`. The native store opens with URI
  * filenames enabled, so `file:/tmp/history.db` names `/tmp/history.db`, not a
  * relative path beginning `file:`. Mirrors SQLite's own URI rules: the scheme
@@ -41,8 +65,7 @@ function sqliteDatabaseFile(dbPath: string): string {
     }
     path = slash < 0 ? '' : path.slice(slash);
   }
-  try { path = decodeURIComponent(path); }
-  catch { throw new InvalidArgumentError('invalid percent-encoding in SQLite URI', 'INVALID_ARGUMENT'); }
+  path = sqliteUriDecode(path);
   if (path === '') throw new InvalidArgumentError('SQLite URI names no database file', 'INVALID_ARGUMENT');
   return resolve(path);
 }
