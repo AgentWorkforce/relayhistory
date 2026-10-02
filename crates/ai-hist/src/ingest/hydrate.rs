@@ -113,7 +113,10 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 3;
 /// same repair `sync` gets from retiring `grok_events_v3`. The
 /// `logs/unified.jsonl` usage needs no re-parse: every Grok hydration reads
 /// the log before its stamp check.
-const HYDRATION_PARSER_VERSION: i64 = 14;
+///
+/// Version 15 recovers Codex desktop assistant response items from unchanged
+/// captures that previous parsers skipped.
+const HYDRATION_PARSER_VERSION: i64 = 15;
 
 #[derive(Debug, Clone)]
 pub struct HydrateSessionOptions {

@@ -82,6 +82,47 @@ pub(crate) fn user_message(value: &Value) -> Option<HumanMessage> {
     })
 }
 
+/// Assistant prose is present in desktop rollouts as response items even when
+/// no event_msg mirror exists. Only output_text is prose; never decode encrypted
+/// reasoning or treat tool envelopes as assistant messages.
+pub(crate) struct AssistantMessage {
+    pub text: String,
+    pub format: HumanMessageFormat,
+    pub message_id: Option<String>,
+}
+
+pub(crate) fn assistant_message(value: &Value) -> Option<AssistantMessage> {
+    let payload = value.get("payload")?;
+    let (text, format) = match (value.get("type")?.as_str()?, payload.get("type")?.as_str()?) {
+        ("event_msg", "agent_message") => (
+            payload.get("message")?.as_str()?.to_string(),
+            HumanMessageFormat::EventMessage,
+        ),
+        ("response_item", "message") if payload.get("role")?.as_str()? == "assistant" => (
+            payload
+                .get("content")?
+                .as_array()?
+                .iter()
+                .filter(|part| part.get("type").and_then(Value::as_str) == Some("output_text"))
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            HumanMessageFormat::ResponseItem,
+        ),
+        _ => return None,
+    };
+    let text = text.trim();
+    (!text.is_empty()).then(|| AssistantMessage {
+        text: text.to_string(),
+        format,
+        message_id: payload
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string),
+    })
+}
+
 pub(crate) fn is_control_context(prompt: &str) -> bool {
     let value = prompt.trim_start();
     [

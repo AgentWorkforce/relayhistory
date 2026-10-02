@@ -4,6 +4,12 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- Codex Desktop assistant replies stored only as response items now appear in
+  session history. Mirrored CLI/desktop encodings are stored once, and unchanged
+  captures are re-read on upgrade to recover previously missing replies.
+
 ### Breaking
 
 - `trajectory_fts` and the Python-era `trajectories_ai/au/ad` triggers are
