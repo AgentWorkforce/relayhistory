@@ -4235,23 +4235,15 @@ static REFRESHED_THROUGH: std::sync::LazyLock<std::sync::Mutex<BTreeMap<Refreshe
 
 /// The feed epoch and head revision of `conn`'s database, or `None` when it
 /// has no change feed (or no file) to scope by.
+///
+/// The database is named by its canonical path, the identity the sync lock
+/// uses, so two spellings of one file share a remembered point; and the head
+/// is the change feed's own single-statement read of epoch and revision.
 fn feed_position(conn: &Connection) -> Option<(RefreshedStore, i64)> {
-    let path = PathBuf::from(conn.path().filter(|path| !path.is_empty())?);
-    let epoch: i64 = conn
-        .query_row(
-            "SELECT epoch FROM change_feed_store WHERE singleton = 1",
-            [],
-            |row| row.get(0),
-        )
-        .ok()?;
-    let head: i64 = conn
-        .query_row(
-            "SELECT version FROM observation_clock WHERE singleton = 1",
-            [],
-            |row| row.get(0),
-        )
-        .ok()?;
-    Some(((path, epoch), head))
+    let path = Path::new(conn.path().filter(|path| !path.is_empty())?);
+    let path = crate::ingest::canonical_db_identity(path).ok()?;
+    let head = crate::change_feed::read_head(conn).ok()?;
+    Some(((path, head.epoch as i64), head.revision as i64))
 }
 
 /// [`refresh_project_identity`] for the end of a sweep, scoped to what was

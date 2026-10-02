@@ -2073,7 +2073,7 @@ impl Drop for SyncRunLock {
     }
 }
 
-fn canonical_db_identity(db_path: &Path) -> Result<PathBuf> {
+pub(crate) fn canonical_db_identity(db_path: &Path) -> Result<PathBuf> {
     if db_path.exists() {
         return fs::canonicalize(db_path)
             .with_context(|| format!("canonicalizing database path {}", db_path.display()));
