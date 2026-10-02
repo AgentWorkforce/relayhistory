@@ -45,8 +45,7 @@ Digests cover the submitted semantic record before service transformations.
 As with `cursor_not_found`, the client must require both HTTP 409 and
 `error.code`; another status, code, malformed body, or detail that does not
 match the submitted batch is not permission to skip data. A record-revision
-conflict returns the first conflicting record in deterministic
-`(record_id, revision, revision_id)` order:
+conflict returns a bounded deterministic conflict set:
 
 ```json
 {
@@ -60,10 +59,24 @@ conflict returns the first conflicting record in deterministic
       "submittedRevisionId": "submitted revision_id",
       "submittedRevision": 42,
       "submittedDigest": "64 lowercase SHA-256 hex characters",
-      "currentRevisionId": "durably stored revision_id",
+      "currentRevisionId": "comparison revision_id",
       "currentRevision": 42,
       "currentDigest": "64 lowercase SHA-256 hex characters"
-    }
+    },
+    "conflicts": [
+      {
+        "type": "record_revision",
+        "originId": "submitted origin_id",
+        "recordId": "submitted record_id",
+        "submittedRevisionId": "submitted revision_id",
+        "submittedRevision": 42,
+        "submittedDigest": "64 lowercase SHA-256 hex characters",
+        "currentRevisionId": "comparison revision_id",
+        "currentRevision": 42,
+        "currentDigest": "64 lowercase SHA-256 hex characters"
+      }
+    ],
+    "conflictCount": 1
   },
   "correlationId": "receiver diagnostic id"
 }
@@ -71,12 +84,20 @@ conflict returns the first conflicting record in deterministic
 
 The authenticated tenant is deliberately absent from the body: it scopes the
 lookup but is never learned from an error. `submittedDigest` is the canonical
-digest the receiver computed for the normalized submitted record, and the
-current fields describe its durable equal-revision fence. The revisions must
-be equal and the digests different. A client may quarantine only the exact
-record whose origin, record ID, revision ID, revision, and recomputed submitted
-digest all match. It retries the remaining records under a deterministic child
-batch ID and durably records the quarantine with its queue transition. This
+digest the receiver computed for the normalized submitted record. The current
+fields describe the equal-revision identity used for comparison: either its
+durable fence or an earlier submitted identity at that revision. The latter
+preserves rejection of two records inside one batch that reuse a revision with
+different content. The revisions must be equal and the digests different.
+
+`conflicts` contains the first 100 conflicts in deterministic
+`(record_id, revision, revision_id)` order, `conflictCount` is the total, and
+`conflict` repeats its first entry for a stable discriminator. A client may
+quarantine only the returned records whose origin, record ID, revision ID,
+revision, and recomputed submitted digest all match. If the count exceeds the
+bounded list, the retry can receive the next set. It retries the remaining
+records under a deterministic child batch ID and durably records all reported
+quarantines with its queue transition. This
 lets records behind the poison record drain without weakening record-level
 idempotency. A singleton conflict completes locally as one quarantined record;
 it is not retried forever.

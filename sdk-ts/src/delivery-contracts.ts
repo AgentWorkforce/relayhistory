@@ -50,7 +50,8 @@ export interface DeliveryAcknowledgment {
 }
 
 /** A 409 `delivery_conflict` is actionable only when the receiver identifies
- * the exact durable identity that disagreed with the submitted content. The
+ * the exact submitted and comparison identities that disagree. The comparison
+ * is either durable or an earlier identity in the same submitted batch. The
  * authenticated tenant is intentionally absent: transport authentication,
  * not an error body, establishes that scope. */
 export interface DeliveryRecordRevisionConflict {
@@ -73,11 +74,18 @@ export interface DeliveryBatchIdConflict {
 }
 export type DeliveryConflict = DeliveryRecordRevisionConflict | DeliveryBatchIdConflict;
 export interface DeliveryConflictResponse {
-  error: {
+  error: ({
     code: 'delivery_conflict';
     message: string;
-    conflict: DeliveryConflict;
-  };
+  } & ({
+    conflict: DeliveryRecordRevisionConflict;
+    /** First bounded page of conflicts in deterministic order. */
+    conflicts: DeliveryRecordRevisionConflict[];
+    /** Total conflicts, including any beyond the bounded list. */
+    conflictCount: number;
+  } | {
+    conflict: DeliveryBatchIdConflict;
+  }));
   /** Receiver-generated diagnostic only; never part of conflict identity. */
   correlationId?: string;
 }

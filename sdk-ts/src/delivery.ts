@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { RelayHistoryError } from './sdk-common.js';
 import type {
   DeliveryConflict, DeliveryConflictRecovery, DeliveryConflictResponse, DeliveryFailure,
+  DeliveryRecordRevisionConflict,
   HistoryExportBatch, HistoryExportRecord,
 } from './delivery-contracts.js';
 export * from './delivery-contracts.js';
@@ -34,6 +35,7 @@ function digestValue(value: unknown): value is string {
 function positiveRevision(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) > 0;
 }
+const MAX_DELIVERY_CONFLICTS = 100;
 
 /** Canonical delivery JSON: object key order is ignored and array order is
  * significant, matching the durable receiver's digest contract. */
@@ -104,7 +106,32 @@ export function parseDeliveryConflict(status: number, body: unknown): DeliveryCo
   const conflict = parseConflict(value.error.conflict);
   if (!conflict) return undefined;
   if (value.correlationId !== undefined && typeof value.correlationId !== 'string') return undefined;
-  return { error: { code: 'delivery_conflict', message: value.error.message, conflict },
+  let error: DeliveryConflictResponse['error'];
+  if (conflict.type === 'batch_id') {
+    if (Object.hasOwn(value.error, 'conflicts') || Object.hasOwn(value.error, 'conflictCount')) return undefined;
+    error = { code: 'delivery_conflict', message: value.error.message, conflict };
+  } else {
+    if (!Array.isArray(value.error.conflicts) || value.error.conflicts.length < 1
+      || value.error.conflicts.length > MAX_DELIVERY_CONFLICTS
+      || !positiveRevision(value.error.conflictCount)
+      || value.error.conflictCount < value.error.conflicts.length) return undefined;
+    const conflicts: DeliveryRecordRevisionConflict[] = [];
+    for (const candidate of value.error.conflicts) {
+      const parsed = parseConflict(candidate);
+      if (parsed?.type !== 'record_revision') return undefined;
+      conflicts.push(parsed);
+    }
+    const outOfOrder = conflicts.some((candidate, index) => index > 0
+      && (candidate.recordId < conflicts[index - 1].recordId
+        || (candidate.recordId === conflicts[index - 1].recordId
+          && (candidate.submittedRevision < conflicts[index - 1].submittedRevision
+            || (candidate.submittedRevision === conflicts[index - 1].submittedRevision
+              && candidate.submittedRevisionId <= conflicts[index - 1].submittedRevisionId)))));
+    if (outOfOrder || JSON.stringify(conflicts[0]) !== JSON.stringify(conflict)) return undefined;
+    error = { code: 'delivery_conflict', message: value.error.message, conflict,
+      conflicts, conflictCount: value.error.conflictCount };
+  }
+  return { error,
     ...(typeof value.correlationId === 'string' ? { correlationId: value.correlationId } : {}) };
 }
 
@@ -117,7 +144,7 @@ function recoveryBatch(parent: Readonly<HistoryExportBatch>, records: HistoryExp
   return { ...parent, batch_id, records };
 }
 
-/** Turn a receiver-proven conflict into deterministic queue progress. This
+/** Turn receiver-proven conflicts into deterministic queue progress. This
  * helper does not invent a higher record revision. A semantic re-derivation
  * must first be committed to the source store, whose change feed supplies the
  * higher revision; otherwise a retry could overwrite a durable equal-revision
@@ -133,12 +160,28 @@ export function recoverDeliveryConflict(
     }
     return { quarantinedRevisionIds: [], retryBatch: recoveryBatch(batch, [...batch.records]) };
   }
-  const matching = batch.records.filter((record) => record.record_id === conflict.recordId
-    && record.revision_id === conflict.submittedRevisionId && record.revision === conflict.submittedRevision);
-  if (matching.length !== 1 || conflict.submittedDigest !== deliveryRecordDigest(matching[0])) {
-    throw new TypeError('delivery record conflict does not match submitted content');
+  if (!('conflicts' in response.error)) {
+    throw new TypeError('delivery record conflict is missing its conflict set');
   }
-  const records = batch.records.filter((record) => record !== matching[0]);
-  return { quarantinedRevisionIds: [matching[0].revision_id],
+  const recordError = response.error;
+  if (recordError.conflictCount < recordError.conflicts.length
+    || recordError.conflictCount > batch.records.length) {
+    throw new TypeError('delivery conflict count does not match submitted batch');
+  }
+  const quarantined = new Set<string>();
+  for (const item of recordError.conflicts) {
+    if (item.originId !== batch.origin_id) {
+      throw new TypeError('delivery conflict origin does not match submitted batch');
+    }
+    const matching = batch.records.filter((record) => record.record_id === item.recordId
+      && record.revision_id === item.submittedRevisionId && record.revision === item.submittedRevision);
+    if (matching.length !== 1 || item.submittedDigest !== deliveryRecordDigest(matching[0])
+      || quarantined.has(matching[0].revision_id)) {
+      throw new TypeError('delivery record conflict does not match submitted content');
+    }
+    quarantined.add(matching[0].revision_id);
+  }
+  const records = batch.records.filter((record) => !quarantined.has(record.revision_id));
+  return { quarantinedRevisionIds: [...quarantined],
     retryBatch: records.length === 0 ? null : recoveryBatch(batch, records) };
 }

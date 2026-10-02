@@ -66,23 +66,29 @@ test('only an exact 409 delivery_conflict response enables recovery', () => {
     recordId: record.record_id, submittedRevisionId: record.revision_id, submittedRevision: record.revision,
     submittedDigest: deliveryRecordDigest(record), currentRevisionId: 'durable-revision',
     currentRevision: record.revision, currentDigest: 'a'.repeat(64) };
-  const body = JSON.stringify({ error: { code: 'delivery_conflict', message: 'conflict', conflict }, correlationId: 'request' });
+  const body = JSON.stringify({ error: { code: 'delivery_conflict', message: 'conflict',
+    conflict, conflicts: [conflict], conflictCount: 1 }, correlationId: 'request' });
   assert.deepEqual(parseDeliveryConflict(409, body)?.error.conflict, conflict);
   assert.equal(parseDeliveryConflict(400, body), undefined);
   assert.equal(parseDeliveryConflict(409, body.replace('delivery_conflict', 'cursor_not_found')), undefined);
   assert.equal(parseDeliveryConflict(409, '{'), undefined);
   assert.equal(parseDeliveryConflict(409, { error: { code: 'delivery_conflict', message: 'conflict',
-    conflict: { ...conflict, currentRevision: conflict.currentRevision + 1 } } }), undefined);
+    conflict: { ...conflict, currentRevision: conflict.currentRevision + 1 },
+    conflicts: [conflict], conflictCount: 1 } }), undefined);
+  assert.equal(parseDeliveryConflict(409, { error: { code: 'delivery_conflict', message: 'conflict',
+    conflict, conflicts: [], conflictCount: 1 } }), undefined);
 });
 
 test('a proven record conflict quarantines only the poison revision and drains later records', () => {
   const batch = conflictBatch(); const record = batch.records[1];
-  const response = parseDeliveryConflict(409, { error: { code: 'delivery_conflict', message: 'conflict', conflict: {
+  const conflict = {
     type: 'record_revision', originId: batch.origin_id, recordId: record.record_id,
     submittedRevisionId: record.revision_id, submittedRevision: record.revision,
     submittedDigest: deliveryRecordDigest(record), currentRevisionId: 'durable-revision',
     currentRevision: record.revision, currentDigest: 'b'.repeat(64),
-  } } });
+  } as const;
+  const response = parseDeliveryConflict(409, { error: { code: 'delivery_conflict', message: 'conflict',
+    conflict, conflicts: [conflict], conflictCount: 1 } });
   assert.ok(response);
   const first = recoverDeliveryConflict(batch, response);
   const replay = recoverDeliveryConflict(batch, response);
@@ -94,8 +100,11 @@ test('a proven record conflict quarantines only the poison revision and drains l
     'records behind the conflict remain deliverable');
   assert.deepEqual(first.retryBatch?.records.map((item) => item.revision), [1, 3],
     'recovery must not invent record revisions');
-  assert.throws(() => recoverDeliveryConflict(batch, { ...response, error: { ...response.error,
-    conflict: { ...response.error.conflict, submittedDigest: 'c'.repeat(64) } } }), /does not match submitted content/);
+  const changed = { ...conflict, submittedDigest: 'c'.repeat(64) };
+  const changedResponse = parseDeliveryConflict(409, { error: { code: 'delivery_conflict',
+    message: 'conflict', conflict: changed, conflicts: [changed], conflictCount: 1 } });
+  assert.ok(changedResponse);
+  assert.throws(() => recoverDeliveryConflict(batch, changedResponse), /does not match submitted content/);
 });
 
 test('a batch-id conflict deterministically rekeys the whole immutable batch', () => {
@@ -115,15 +124,34 @@ test('a batch-id conflict deterministically rekeys the whole immutable batch', (
 test('a singleton record conflict completes as quarantine without another request', () => {
   const original = conflictBatch(); const batch = { ...original, records: [original.records[1]] };
   const record = batch.records[0];
-  const response = parseDeliveryConflict(409, { error: { code: 'delivery_conflict', message: 'conflict', conflict: {
+  const conflict = {
     type: 'record_revision', originId: batch.origin_id, recordId: record.record_id,
     submittedRevisionId: record.revision_id, submittedRevision: record.revision,
     submittedDigest: deliveryRecordDigest(record), currentRevisionId: 'durable-revision',
     currentRevision: record.revision, currentDigest: 'e'.repeat(64),
-  } } })!;
+  } as const;
+  const response = parseDeliveryConflict(409, { error: { code: 'delivery_conflict', message: 'conflict',
+    conflict, conflicts: [conflict], conflictCount: 1 } })!;
   assert.deepEqual(recoverDeliveryConflict(batch, response), {
     quarantinedRevisionIds: ['revision-1'], retryBatch: null,
   });
+});
+
+test('all reported record conflicts are quarantined in one deterministic recovery', () => {
+  const batch = conflictBatch();
+  const conflicts = batch.records.slice(1).map((record, index) => ({
+    type: 'record_revision' as const, originId: batch.origin_id, recordId: record.record_id,
+    submittedRevisionId: record.revision_id, submittedRevision: record.revision,
+    submittedDigest: deliveryRecordDigest(record), currentRevisionId: `durable-${index}`,
+    currentRevision: record.revision, currentDigest: String(index + 1).repeat(64),
+  }));
+  const response = parseDeliveryConflict(409, { error: { code: 'delivery_conflict',
+    message: 'conflict', conflict: conflicts[0], conflicts, conflictCount: conflicts.length } });
+  assert.ok(response);
+  const recovery = recoverDeliveryConflict(batch, response);
+  assert.deepEqual(recovery.quarantinedRevisionIds, ['revision-1', 'revision-2']);
+  assert.deepEqual(recovery.retryBatch?.records.map((record) => record.revision_id), ['revision-0']);
+  assert.deepEqual(recoverDeliveryConflict(batch, response), recovery);
 });
 
 test('plugin registration is inert, per-client, and rejects collisions atomically', async () => {
