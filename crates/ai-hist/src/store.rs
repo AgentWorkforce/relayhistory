@@ -4829,7 +4829,7 @@ fn lendable_ancestor_key(
         return Ok((None, false));
     }
     let parents: Vec<ParentIdentityRow> = conn
-        .prepare(
+        .prepare_cached(
             "SELECT r.parent_session_id, \
                     (SELECT p.project_key FROM sessions p \
                      WHERE p.source = r.source AND p.session_id = r.parent_session_id), \
