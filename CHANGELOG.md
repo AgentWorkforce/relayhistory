@@ -607,9 +607,10 @@ Notable changes to the native `ai-hist` CLI are documented here.
 ### Fixed
 
 - Change-feed schema reconciliation now fingerprints each evidence kind's
-  exact exported column names and declared SQLite types. An upgrade from a
-  pre-fingerprint database, or a later shape-changing migration, restamps only
-  rows of the affected kind above the current head. Adding a newly fed kind
+  exact exported column names and declared SQLite types. The one-time upgrade
+  from a pre-fingerprint database restamps every existing kind above the
+  current head because it has no per-kind baseline. Later shape-changing
+  migrations restamp only rows of the affected kind. Adding a newly fed kind
   simply records its fingerprint after its normal backfill, so external
   watermarks and named cursors resume without replaying unrelated kinds.
   Retiring a kind remains the one store-wide reset because there is no live
