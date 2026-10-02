@@ -1022,10 +1022,22 @@ const SESSION_KEYED_HOLDINGS: &[(&str, &str)] = &[
 /// recounting only the sessions the change feed says were written since the
 /// head this snapshot was taken at, instead of counting every session twice
 /// more (#321).
+///
+/// When nothing has been written since the stored marker was taken, the
+/// start of the sweep does not count at all: the stored marker *is* the
+/// current holdings ([`Self::from_stored`]). Such a snapshot does not know
+/// every session's name, only those it recounts, which is all the end of the
+/// sweep needs -- every session it did not recount still holds exactly what
+/// the stored marker says.
 struct DestinationSnapshot {
     head: Option<crate::change_feed::Watermark>,
     holdings: BTreeMap<u64, SessionHoldings>,
-    named: HashSet<(String, String)>,
+    /// Every session the shortfall can name, or `None` for a snapshot read
+    /// from the stored marker, which carries hashes only.
+    named: Option<HashSet<(String, String)>>,
+    /// The sessions [`Self::advanced`] recounted, and whether each can still
+    /// be named by its own rows.
+    recounted: HashMap<(String, String), bool>,
 }
 
 impl DestinationSnapshot {
@@ -1039,7 +1051,26 @@ impl DestinationSnapshot {
         Ok(Self {
             head,
             holdings,
-            named,
+            named: Some(named),
+            recounted: HashMap::new(),
+        })
+    }
+
+    /// The stored marker as the current holdings, when the change-feed head
+    /// has not moved since it was taken -- the same proof
+    /// [`sources_unchanged`] skips a whole sweep on. `None` otherwise.
+    fn from_stored(
+        conn: &Connection,
+        stored: &DestinationMarker,
+        stored_head: Option<&str>,
+    ) -> Option<Self> {
+        let stored_head = stored_head.filter(|head| !head.is_empty())?;
+        let head = crate::change_feed::read_head(conn).ok()?;
+        (format!("{}:{}", head.epoch, head.revision) == stored_head).then(|| Self {
+            head: Some(head),
+            holdings: stored.sessions.clone(),
+            named: None,
+            recounted: HashMap::new(),
         })
     }
 
@@ -1079,11 +1110,14 @@ impl DestinationSnapshot {
                     self.holdings.insert(key, held);
                 }
                 let session = (source, session_id);
-                if names {
-                    self.named.insert(session);
-                } else {
-                    self.named.remove(&session);
+                if let Some(named) = self.named.as_mut() {
+                    if names {
+                        named.insert(session.clone());
+                    } else {
+                        named.remove(&session);
+                    }
                 }
+                self.recounted.insert(session, names);
             }
         }
         self.head = Some(to);
@@ -1402,6 +1436,13 @@ fn destination_shortfall_counted(
         // short, still-nonempty session.
         return Ok((SweepRepairs::all(), start));
     };
+    if start.is_none() {
+        let stored_head = state.get(DESTINATION_HEAD_KEY).and_then(Value::as_str);
+        if let Some(current) = DestinationSnapshot::from_stored(conn, &stored, stored_head) {
+            // Nothing written since the marker: it covers itself.
+            return Ok((SweepRepairs::default(), Some(current)));
+        }
+    }
     let current = current_destination(conn, start)?;
     let repairs = destination_shortfall_in(conn, &stored, &current)?;
     Ok((repairs, Some(current)))
@@ -1435,8 +1476,7 @@ fn destination_shortfall_in(
     // session whose catalog row and events are both gone has no row left to be
     // found by. Catalog, event, history and marker groups collect the names
     // while counting holdings, avoiding another walk of those same tables.
-    let mut named = current.named.clone();
-    let current = &current.holdings;
+    let mut muse_children = HashSet::new();
     // A Muse subagent has no catalog row of its own, so once every event of
     // it is gone neither table above can name it; the edge its parent's log
     // recorded still does, and naming it is what sends the parent back to
@@ -1448,8 +1488,21 @@ fn destination_shortfall_in(
     )?;
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
-        named.insert((row.get(0)?, row.get(1)?));
+        muse_children.insert((row.get::<_, String>(0)?, row.get::<_, String>(1)?));
     }
+    let named: HashSet<(String, String)> = match &current.named {
+        Some(named) => named.union(&muse_children).cloned().collect(),
+        // Read from the stored marker: every session it did not recount still
+        // holds what the marker says, so only the recounted ones can be short,
+        // and of those only the ones a full count could have named.
+        None => current
+            .recounted
+            .iter()
+            .filter(|(session, names)| **names || muse_children.contains(*session))
+            .map(|(session, _)| session.clone())
+            .collect(),
+    };
+    let current = &current.holdings;
     for (source, session_id) in named {
         let key = discover::fingerprint_hash("session-events", &source, &session_id);
         let Some(before) = stored.sessions.get(&key) else {
@@ -17200,8 +17253,16 @@ mod tests {
             .expect("the feed can say what moved");
         let full = DestinationSnapshot::take(&conn).unwrap();
         assert_same_destination(&carried, &full);
-        assert!(!carried.named.contains(&("codex".into(), "d".into())));
-        assert!(carried.named.contains(&("codex".into(), "e2".into())));
+        assert!(!carried
+            .named
+            .as_ref()
+            .unwrap()
+            .contains(&("codex".into(), "d".into())));
+        assert!(carried
+            .named
+            .as_ref()
+            .unwrap()
+            .contains(&("codex".into(), "e2".into())));
 
         // Nothing written since: the snapshot is already current.
         let again = carried.advanced(&conn).unwrap().unwrap();
@@ -17216,8 +17277,25 @@ mod tests {
         let (_dir, conn) = holdings_store();
         for analyzed in [false, true] {
             if analyzed {
-                conn.execute_batch("ANALYZE").unwrap();
+                // Statistics over a handful of rows rightly prefer a scan; the
+                // question is what a real catalog gets.
+                conn.execute_batch(
+                    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000) \
+                     INSERT INTO sessions (session_id, source, cwd) \
+                         SELECT 'bulk-' || i, 'claude', '/tmp/p' FROM n; \
+                     WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000) \
+                     INSERT INTO session_events \
+                         (source, session_id, ts_ms, role, kind, text, event_uid) \
+                         SELECT 'claude', 'bulk-' || i, 1, 'user', 'text', 'x', 'bulk-' || i FROM n; \
+                     WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000) \
+                     INSERT INTO tool_calls (source, session_id, message_id, tool_use_id, name) \
+                         SELECT 'claude', 'bulk-' || i, 'm', 'bulk-' || i, 'Bash' FROM n; \
+                     ANALYZE;",
+                )
+                .unwrap();
             }
+            // A tick asks about the last few revisions, not all of them.
+            let head = crate::change_feed::read_head(&conn).unwrap().revision as i64;
             for (table, kind) in SESSION_KEYED_HOLDINGS {
                 for (sql, index) in [
                     (
@@ -17232,7 +17310,7 @@ mod tests {
                     let plan: Vec<String> = conn
                         .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
                         .unwrap()
-                        .query_map(params![0, "[\"claude\"]", 10], |row| row.get(3))
+                        .query_map(params![head, "[\"claude\"]", 10], |row| row.get(3))
                         .unwrap()
                         .collect::<rusqlite::Result<_>>()
                         .unwrap();
@@ -17243,6 +17321,68 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A sweep that starts where the stored marker was taken -- the head has
+    /// not moved -- does not count at all, and still reaches the same
+    /// shortfall and the same next marker as counting everything: a short
+    /// session is named, a session emptied of every row is not (a full count
+    /// cannot name it either), and a session that only grew is fine.
+    #[test]
+    fn a_sweep_starting_at_the_stored_marker_matches_a_full_count() {
+        let (_dir, conn) = holdings_store();
+        let marker = destination_generation(&conn).unwrap();
+        let mut state = Map::new();
+        state.insert(
+            DESTINATION_GENERATION_KEY.into(),
+            Value::from(marker.clone()),
+        );
+        state.insert(
+            DESTINATION_HEAD_KEY.into(),
+            Value::from(destination_head(&conn).unwrap()),
+        );
+
+        let (repairs, start) = destination_shortfall_counted(&conn, &state, None).unwrap();
+        assert!(repairs.is_empty());
+        let start = start.unwrap();
+        assert!(start.named.is_none(), "read from the marker, not counted");
+
+        conn.execute(
+            "DELETE FROM session_events WHERE source = 'claude' AND event_uid = 'b-0'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_events (source, session_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('claude', 'a', 2, 'assistant', 'text', 'new', 'a-new')",
+            [],
+        )
+        .unwrap();
+        for table in ["sessions", "session_events", "tool_calls"] {
+            conn.execute(
+                &format!("DELETE FROM {table} WHERE source = 'codex' AND session_id = 'd'"),
+                [],
+            )
+            .unwrap();
+        }
+
+        let (outstanding, current) =
+            destination_shortfall_counted(&conn, &state, Some(start)).unwrap();
+        let expected = destination_shortfall(&conn, &marker).unwrap();
+        assert_eq!(outstanding.sessions, expected.sessions);
+        assert!(outstanding.contains("claude", "b"));
+        assert!(!outstanding.contains("codex", "d"));
+        assert!(!outstanding.contains("claude", "a"));
+        let current = current.unwrap();
+        let full = DestinationSnapshot::take(&conn).unwrap();
+        assert_eq!(current.holdings, full.holdings);
+        assert_eq!(current.marker(), full.marker());
+        assert_eq!(current.head_value(), full.head_value());
+
+        // A head that moved before the sweep began is counted, not trusted.
+        let (repairs, start) = destination_shortfall_counted(&conn, &state, None).unwrap();
+        assert!(start.unwrap().named.is_some());
+        assert!(repairs.contains("claude", "b"));
     }
 
     /// What the feed cannot vouch for sends the end of the sweep back to a
