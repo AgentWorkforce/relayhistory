@@ -50,8 +50,13 @@ export function canonicalDeliveryJson(value: unknown): string {
     return `[${items.join(',')}]`;
   }
   if (object(value)) {
-    return `{${Object.keys(value).sort().map((key) =>
-      `${JSON.stringify(key)}:${canonicalDeliveryJson(value[key])}`).join(',')}}`;
+    const entries = Object.keys(value).sort().flatMap((key) => {
+      const item = value[key];
+      return item === undefined || typeof item === 'function' || typeof item === 'symbol'
+        ? []
+        : [`${JSON.stringify(key)}:${canonicalDeliveryJson(item)}`];
+    });
+    return `{${entries.join(',')}}`;
   }
   const encoded = JSON.stringify(value);
   if (encoded === undefined) throw new TypeError('delivery values must be JSON serializable');

@@ -89,6 +89,18 @@ test('delivery digests match JSON wire semantics for sparse arrays', () => {
   assert.equal(deliveryRecordDigest(record), deliveryRecordDigest(onWire));
 });
 
+test('delivery digests omit object values JSON does not put on the wire', () => {
+  const batch = conflictBatch();
+  const record = { ...batch.records[1], payload: {
+    kept: 'value', omittedUndefined: undefined,
+    omittedFunction: () => 'value', omittedSymbol: Symbol('value'),
+    array: [undefined, () => 'value', Symbol('value')],
+  } };
+  const onWire = JSON.parse(JSON.stringify(record));
+  assert.deepEqual(onWire.payload, { kept: 'value', array: [null, null, null] });
+  assert.equal(deliveryRecordDigest(record), deliveryRecordDigest(onWire));
+});
+
 test('a proven record conflict quarantines only the poison revision and drains later records', () => {
   const batch = conflictBatch(); const record = batch.records[1];
   const conflict = {

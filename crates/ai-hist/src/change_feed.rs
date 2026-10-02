@@ -2060,33 +2060,31 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
             table.name,
             &[(REVISION_COLUMN, "INTEGER NOT NULL DEFAULT 0")],
         )?;
-        if backfill {
-            // Rows written before their table was fed are stamped once, in
-            // rowid order, each above everything stamped before it, so a
-            // replay from START reports the whole store and a cursor that
-            // predates the kind still receives every one of its rows. The
-            // table's triggers do not exist yet, so this UPDATE stamps
-            // exactly what it names; a table fed already holds no unstamped
-            // row and is left alone.
-            conn.execute(
-                &format!(
-                    "UPDATE {name} SET {REVISION_COLUMN} = rowid + \
-                     (SELECT version FROM observation_clock WHERE singleton = 1) \
-                     WHERE {REVISION_COLUMN} = 0",
-                    name = table.name
-                ),
-                [],
-            )?;
-            conn.execute(
-                &format!(
-                    "UPDATE observation_clock SET version = MAX(version, \
-                     COALESCE((SELECT MAX({REVISION_COLUMN}) FROM {name}), 0)) \
-                     WHERE singleton = 1",
-                    name = table.name
-                ),
-                [],
-            )?;
-        }
+        // Rows written before their table was fed are stamped once, in rowid
+        // order, each above everything stamped before it. This is deliberately
+        // not gated only by the fixed `change_feed_v2` marker: a later release
+        // can add a ChangeKind to an already-v2 store. Existing fed tables have
+        // no zero revisions, so reopening them is a no-op; a newly fed table's
+        // existing rows become visible above the old head without rotating the
+        // origin. A revision-only UPDATE does not fire the feed update trigger.
+        conn.execute(
+            &format!(
+                "UPDATE {name} SET {REVISION_COLUMN} = rowid + \
+                 (SELECT version FROM observation_clock WHERE singleton = 1) \
+                 WHERE {REVISION_COLUMN} = 0",
+                name = table.name
+            ),
+            [],
+        )?;
+        conn.execute(
+            &format!(
+                "UPDATE observation_clock SET version = MAX(version, \
+                 COALESCE((SELECT MAX({REVISION_COLUMN}) FROM {name}), 0)) \
+                 WHERE singleton = 1",
+                name = table.name
+            ),
+            [],
+        )?;
         conn.execute(
             &format!(
                 "CREATE INDEX IF NOT EXISTS {index} ON {name}({REVISION_COLUMN})",
@@ -4015,6 +4013,72 @@ INSERT INTO observation_evidence (source, session_id, location, connector_id,
         })
         .unwrap();
         assert_eq!(all(&store), changes);
+    }
+
+    /// Adding a kind after the fixed v2 migration marker has already landed
+    /// still stamps rows that the older build could not report. The per-kind
+    /// schema map makes that expansion non-rotating, so an all-kinds consumer
+    /// resumes into the new kind above its prior head.
+    #[test]
+    fn an_established_v2_store_backfills_a_new_kind_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (initial_store, conn) = store(dir.path());
+        insert_event(&conn, "s1", "e1", "before");
+        let query = || ChangeQuery::default().consumer("all");
+        let mut initial = initial_store
+            .changes_since(Watermark::CONSUMER, query())
+            .unwrap();
+        while initial.next().is_some() {}
+        let committed = initial.commit().unwrap();
+
+        let mut old_digests = export_schema_digests(&conn).unwrap();
+        old_digests.remove(ChangeKind::History.as_str());
+        conn.execute(
+            &format!(
+                "UPDATE change_feed_store SET {EXPORT_SCHEMA_DIGEST_COLUMN}=? WHERE singleton=1"
+            ),
+            [serde_json::to_string(&old_digests).unwrap()],
+        )
+        .unwrap();
+        for trigger in trigger_names(ChangeKind::History) {
+            conn.execute_batch(&format!("DROP TRIGGER {trigger};"))
+                .unwrap();
+        }
+        let history = ChangeKind::History.table();
+        conn.execute_batch(&format!(
+            "DROP INDEX {index}; ALTER TABLE {name} DROP COLUMN {REVISION_COLUMN};",
+            index = history.revision_index(),
+            name = history.name
+        ))
+        .unwrap();
+        conn.execute(
+            "INSERT INTO history (source, session_id, prompt, timestamp_ms) \
+             VALUES ('claude', 's1', 'after', 1000)",
+            [],
+        )
+        .unwrap();
+        assert!(migration_applied(&conn, MIGRATION).unwrap());
+        drop(initial);
+        drop(conn);
+        drop(initial_store);
+
+        let (expanded, conn) = store(dir.path());
+        let resumed = drain(
+            expanded
+                .changes_since(Watermark::CONSUMER, query())
+                .unwrap(),
+        );
+        assert_eq!(resumed.len(), 1, "{resumed:?}");
+        assert_eq!(resumed[0].kind, ChangeKind::History);
+        assert_eq!(resumed[0].record_key, "[1000,\"after\"]");
+        assert!(resumed[0].revision > committed.revision);
+        assert_eq!(expanded.head_revision().unwrap().epoch, committed.epoch);
+        let stamped = resumed[0].revision;
+        drop(conn);
+        drop(expanded);
+
+        let (reopened, _) = store(dir.path());
+        assert_eq!(reopened.head_revision().unwrap().revision, stamped);
     }
 
     /// A store the feed reached before it reported every kind: the kinds it
