@@ -66,6 +66,11 @@ function sqliteDatabaseFile(dbPath: string): string {
     path = slash < 0 ? '' : path.slice(slash);
   }
   path = sqliteUriDecode(path);
+  // `file:///C:/x/history.db` carries the path `/C:/x/history.db`; SQLite's
+  // Windows VFS drops the slash before a drive letter, and so must we, or
+  // resolve() reads it as a path on the current drive. (A UNC host is an
+  // authority, which SQLite refuses and so is refused above.)
+  if (process.platform === 'win32' && /^\/[A-Za-z]:/.test(path)) path = path.slice(1);
   if (path === '') throw new InvalidArgumentError('SQLite URI names no database file', 'INVALID_ARGUMENT');
   return resolve(path);
 }

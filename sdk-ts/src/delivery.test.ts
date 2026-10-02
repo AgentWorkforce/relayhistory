@@ -8,7 +8,7 @@ import { access, cp, link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } fr
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { gunzipSync } from 'node:zlib';
 import {
@@ -338,8 +338,10 @@ test('export refuses the live WAL and SHM sidecars and leaves committed rows rea
       const {runHistoryExportCommand} = await import('./delivery-cli.js');
       // The native store opens SQLite URI filenames, so a `file:` --db names
       // the same database and must protect the same sidecars.
-      const encoded = dbPath.split('/').map(encodeURIComponent).join('/');
-      for (const db of [dbPath, `file:${dbPath}`, `file://${encoded}?mode=rwc`, `file://localhost${encoded}#x`]) {
+      // pathToFileURL gives the platform's well-formed URI (`file:///C:/…` on
+      // Windows); the localhost form inserts the authority into it.
+      const url = pathToFileURL(dbPath).href;
+      for (const db of [dbPath, `file:${dbPath}`, `${url}?mode=rwc`, `${url.replace('file://', 'file://localhost')}#x`]) {
         for (const outputPath of [`${dbPath}-wal`, `${dbPath}-shm`, `${dbPath}-journal`,
           join(alias, 'history.db-wal'), join(alias, 'history.db-shm'), walHardLink]) {
           await assert.rejects(runHistoryExportCommand({ dbPath: db, outputPath, selectionPath }), /active history database/, `${db} -> ${outputPath}`);
