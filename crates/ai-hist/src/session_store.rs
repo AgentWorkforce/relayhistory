@@ -44,6 +44,7 @@ use crate::ingest::{
 };
 use crate::paths::home_dir;
 pub use crate::paths::ProviderRoots;
+use crate::read_pool::{PooledConnection, ReadPool};
 use crate::relationship_graph::{self, RelationshipCapabilities, SessionRelationship};
 use crate::remote::SourceConnectorSelection;
 use crate::session_usage::{
@@ -599,8 +600,11 @@ impl SessionRef {
 
 /// The single public entry point for embedding `ai-hist` from Rust.
 ///
-/// A handle is cheap: it holds the database path and the open options, and
-/// opens a connection per call. `sync`, `hydrate` and `watch` take the same
+/// A handle is cheap: it holds the database path, the open options and a few
+/// idle read connections its clones share, so a read reuses a connection
+/// whose schema is already parsed rather than opening one per call (one to
+/// the same file only: a database replaced under the handle is reopened).
+/// Writes open their own connection per call. `sync`, `hydrate` and `watch` take the same
 /// `SyncRunLock` and per-session hydration locks the CLI and the napi addon
 /// take, so an embedder is one more writer *implementation* of the same
 /// discipline, never a second one — see the ADR's store-shape section.
@@ -609,6 +613,7 @@ pub struct SessionStore {
     db_path: PathBuf,
     roots: ProviderRoots,
     read_only: bool,
+    readers: Arc<ReadPool>,
 }
 
 impl SessionStore {
@@ -645,6 +650,7 @@ impl SessionStore {
             db_path,
             roots,
             read_only: opts.read_only,
+            readers: Arc::default(),
         })
     }
 
@@ -664,8 +670,10 @@ impl SessionStore {
         self.read_only
     }
 
-    fn read_conn(&self) -> Result<Connection, Error> {
-        open_db_readonly(&self.db_path).map_err(|error| Error::DatabaseOpen(format!("{error:#}")))
+    /// A read-only connection to this store, reused across calls; see
+    /// [`ReadPool`].
+    pub(crate) fn read_conn(&self) -> Result<PooledConnection, Error> {
+        self.readers.get(&self.db_path)
     }
 
     // -- sync ---------------------------------------------------------------
@@ -687,7 +695,7 @@ impl SessionStore {
         Ok(SyncReport {
             swept: tick.swept,
             changed,
-            head_revision: crate::change_feed::head_revision_at(&self.db_path)?.revision,
+            head_revision: self.head_revision()?.revision,
         })
     }
 
@@ -2004,7 +2012,7 @@ impl CatalogSession {
 /// The iterator [`SessionStore::sessions`] returns. Holds one read snapshot
 /// of the catalog from its first row until it is dropped.
 pub struct CatalogIter {
-    conn: Result<Connection, Error>,
+    conn: Result<PooledConnection, Error>,
     options: CatalogListOptions,
     buffer: VecDeque<ShallowSession>,
     cursor: Option<CatalogCursor>,

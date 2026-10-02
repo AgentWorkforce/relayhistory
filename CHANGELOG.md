@@ -606,6 +606,17 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Fixed
 
+- A `SessionStore` handle reuses its read connections instead of opening a
+  new one, and re-parsing the whole schema, on every call (#366). A handle
+  and its clones keep up to four idle read-only connections, reused only
+  while the path still names the same file (device and inode), so a database
+  replaced under the handle is reopened. Schema gates a reused connection has
+  passed are remembered until `PRAGMA schema_version` changes. Writes keep
+  opening their own connection under the existing locks. Per call:
+  `head_revision` 1.5 ms -> 5 us, `changes_since` with an empty tail
+  2.8 ms -> 11 us, `session` 1.25 ms -> 0.26 ms, `has_session` 0.89 ms ->
+  3 us, `session_identities` 1.3 ms -> 0.09 ms.
+
 - Change-feed schema reconciliation now fingerprints each evidence kind's
   exact exported column names and declared SQLite types. The one-time upgrade
   from a pre-fingerprint database restamps every existing kind above the

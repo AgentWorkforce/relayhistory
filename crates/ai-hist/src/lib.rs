@@ -39,6 +39,7 @@ workspace_mod!(watch);
 mod change_feed;
 mod file_lock;
 mod jsonl_temp;
+mod read_pool;
 mod session_identities;
 mod session_store;
 mod session_usage;
