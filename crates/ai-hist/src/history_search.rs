@@ -282,14 +282,15 @@ const EVENT_BRANCH: SearchBranch = SearchBranch {
 /// [`RECENT_WINDOW`] so small fixtures cross both.
 const MATCH_SORT_CAP: i64 = if cfg!(test) { 3 } else { 5_000 };
 
-/// How many of the newest rows a search reads in timestamp order before it
-/// falls back to sorting every match. See [`search_branch`].
-const RECENT_WINDOW: i64 = if cfg!(test) { 6 } else { 20_000 };
-
-/// The first, smaller window a walk reads. When too few of its rows match to
-/// expect [`RECENT_WINDOW`] to fill the page, the search falls back without
-/// reading the rest.
-const PROBE_WINDOW: i64 = if cfg!(test) { 3 } else { 2_000 };
+/// The growing windows a walk reads, in newest rows that pass the time
+/// window and cursor; the last is the most it reads before it falls back to
+/// sorting every match. See [`search_branch`].
+const WALK_WINDOWS: [i64; 3] = if cfg!(test) {
+    [2, 3, 6]
+} else {
+    [2_000, 6_000, 20_000]
+};
+const RECENT_WINDOW: i64 = WALK_WINDOWS[WALK_WINDOWS.len() - 1];
 
 #[cfg(test)]
 thread_local! {
@@ -332,8 +333,8 @@ fn walk_allowed() -> bool {
 /// timestamp index instead, testing each row against the FTS5 index by rowid
 /// and stopping at `limit`.
 ///
-/// The walk is bounded to the newest [`RECENT_WINDOW`] rows that pass the
-/// time window and cursor, read after a [`PROBE_WINDOW`] probe. Those rows are
+/// The walk reads the newest rows that pass the time window and cursor in
+/// growing [`WALK_WINDOWS`], up to [`RECENT_WINDOW`] of them. Those rows are
 /// a prefix of the result order, so when `limit` matches are found among them
 /// they are exactly the first `limit` of the full search; otherwise (a term
 /// only older sessions use, or a filter few rows pass) the search falls back
@@ -372,41 +373,59 @@ fn search_branch(
         }
     }
     if walk && index_exists(conn, ts_index)? {
-        let walk = |window| {
-            walk_window(
-                conn,
-                branch,
-                fts_match.as_ref(),
-                filter_sql,
-                &filter_params,
-                filter,
-                raw_fts,
-                window,
-            )
-        };
-        // A window that holds every eligible row is the whole search.
-        let (rows, bounded) = walk(PROBE_WINDOW)?;
-        let filled = !bounded || rows.len() as i64 >= limit;
-        // Read the full window only when the probe found matches at a rate
-        // that could fill the page there (with 4x slack, as matches cluster
-        // by session): a filter nothing recent passes, or a term the newest
-        // rows do not use, costs the small probe instead of the whole window.
-        let promising =
-            !rows.is_empty() && rows.len() as i64 * (RECENT_WINDOW / PROBE_WINDOW) * 4 >= limit;
-        if filled {
-            record_walk(true);
-            return Ok(rows);
-        }
-        if promising {
-            let (rows, bounded) = walk(RECENT_WINDOW)?;
-            let filled = !bounded || rows.len() as i64 >= limit;
-            record_walk(filled);
-            if filled {
-                return Ok(rows);
+        let mut read: Option<(Option<i64>, usize)> = None;
+        for (step, window) in WALK_WINDOWS.iter().copied().enumerate() {
+            let floor = recent_window_floor(conn, branch, filter, window)?;
+            // Rows tied on the floor's timestamp all join the window, and the
+            // walk tests every one to order the tie by id. A tie as large as
+            // the window itself (a bulk import stamped with one time) would
+            // make the walk cost more than sorting every match, so fall back.
+            if let Some(floor) = floor {
+                if tie_reaches(conn, branch, floor, window)? {
+                    break;
+                }
             }
-        } else {
-            record_walk(false);
+            // A smaller tie can still stretch a window over the next one's
+            // rows; the same floor is the same window, already read.
+            let found = match read {
+                Some((read_floor, found)) if read_floor == floor => found,
+                _ => {
+                    let rows = walk_window(
+                        conn,
+                        branch,
+                        fts_match.as_ref(),
+                        filter_sql,
+                        &filter_params,
+                        filter,
+                        raw_fts,
+                        floor,
+                    )?;
+                    // A window that holds every eligible row is the whole
+                    // search.
+                    if floor.is_none() || rows.len() as i64 >= limit {
+                        record_walk(true);
+                        return Ok(rows);
+                    }
+                    read = Some((floor, rows.len()));
+                    rows.len()
+                }
+            };
+            // Grow the window while it could still fill the page: matches at
+            // a rate that could fill the last window (with 4x slack, as they
+            // cluster by session), or none yet in only the first, which a
+            // fresh session without the term can account for. Two windows with
+            // no match -- a filter nothing recent passes, a term the newest
+            // rows do not use -- fall back after a few thousand rows.
+            let grow = if found == 0 {
+                step == 0
+            } else {
+                found as i64 * (RECENT_WINDOW / window) * 4 >= limit
+            };
+            if !grow {
+                break;
+            }
         }
+        record_walk(false);
     }
 
     let mut params_vec = Vec::new();
@@ -438,13 +457,14 @@ fn index_exists(conn: &Connection, name: &str) -> Result<bool> {
         .exists([name])?)
 }
 
-/// The branch's matches among the newest `window` rows that pass the time
-/// window and cursor, at most `limit` of them, and whether that window was
-/// bounded (`false` when fewer rows pass, so the walk read every one).
+/// The branch's matches, at most `limit` of them, among the rows at or after
+/// `floor` that pass the time window and cursor (every such row when `floor`
+/// is `None`). See [`recent_window_floor`].
 ///
-/// The window is an exact prefix of the `(timestamp DESC, id DESC)` order:
-/// it ends at the `window`-th row itself, tie-break included, so `limit`
-/// matches found in it are the search's first `limit`.
+/// The window is every row at or after the `window`-th row's timestamp: a
+/// prefix of the `(timestamp DESC, id DESC)` order, so `limit` matches found
+/// in it are the search's first `limit`. Rows tied with that timestamp extend
+/// it past `window`; breaking the tie by id would sort the whole tie.
 fn walk_window(
     conn: &Connection,
     branch: &SearchBranch,
@@ -453,8 +473,8 @@ fn walk_window(
     filter_params: &[String],
     filter: &QueryFilter,
     raw_fts: bool,
-    window: i64,
-) -> Result<(Vec<SearchRow>, bool)> {
+    floor: Option<i64>,
+) -> Result<Vec<SearchRow>> {
     let SearchBranch {
         table,
         alias,
@@ -464,8 +484,13 @@ fn walk_window(
         columns,
         ..
     } = branch;
-    let floor = recent_window_floor(conn, branch, filter, window)?;
-    let mut sql = format!("SELECT {columns} FROM {table} {alias} INDEXED BY {ts_index} WHERE 1=1");
+    // The walk orders ids only: rows tied on the floor's timestamp are sorted
+    // by id, and a sorter of ids is cheap where one of full rows (event text
+    // included) is not. The page's rows are read once it is chosen.
+    let mut sql = format!(
+        "SELECT {columns} FROM {table} {alias} WHERE {alias}.id IN (\
+         SELECT {alias}.id FROM {table} {alias} INDEXED BY {ts_index} WHERE 1=1"
+    );
     let mut params_vec = Vec::new();
     if let Some(query) = fts_match {
         sql.push_str(&format!(
@@ -473,32 +498,47 @@ fn walk_window(
         ));
         params_vec.push(query.probe.clone());
     }
-    if let Some((floor_ts, floor_id)) = floor {
-        sql.push_str(&format!(
-            " AND {alias}.{ts_column} >= ? AND ({alias}.{ts_column} > ? OR {alias}.id >= ?)"
-        ));
-        params_vec.push(floor_ts.to_string());
-        params_vec.push(floor_ts.to_string());
-        params_vec.push(floor_id.to_string());
+    if let Some(floor) = floor {
+        sql.push_str(&format!(" AND {alias}.{ts_column} >= ?"));
+        params_vec.push(floor.to_string());
     }
     sql.push_str(filter_sql);
     params_vec.extend(filter_params.iter().cloned());
     sql.push_str(&format!(
-        " ORDER BY {alias}.{ts_column} DESC, {alias}.id DESC LIMIT ?"
+        " ORDER BY {alias}.{ts_column} DESC, {alias}.id DESC LIMIT ?) \
+         ORDER BY {alias}.{ts_column} DESC, {alias}.id DESC"
     ));
     params_vec.push(filter.limit.max(1).to_string());
-    let rows = query_branch_rows(conn, branch, &sql, params_vec, raw_fts)?;
-    Ok((rows, floor.is_some()))
+    query_branch_rows(conn, branch, &sql, params_vec, raw_fts)
 }
 
-/// The `(timestamp, id)` of the `window`-th newest row that passes the
+/// Whether at least `window` rows share timestamp `ts`: an index-only count
+/// that stops at `window`.
+fn tie_reaches(conn: &Connection, branch: &SearchBranch, ts: i64, window: i64) -> Result<bool> {
+    let SearchBranch {
+        table,
+        alias,
+        ts_column,
+        ts_index,
+        ..
+    } = branch;
+    let tied: i64 = conn
+        .prepare_cached(&format!(
+            "SELECT count(*) FROM (SELECT 1 FROM {table} {alias} INDEXED BY {ts_index} \
+             WHERE {alias}.{ts_column} = ? LIMIT ?)"
+        ))?
+        .query_row(params![ts, window], |row| row.get(0))?;
+    Ok(tied >= window)
+}
+
+/// The timestamp of the `window`-th newest row that passes the
 /// search's time window and cursor, or `None` when fewer rows pass.
 fn recent_window_floor(
     conn: &Connection,
     branch: &SearchBranch,
     filter: &QueryFilter,
     window: i64,
-) -> Result<Option<(i64, i64)>> {
+) -> Result<Option<i64>> {
     let SearchBranch {
         table,
         alias,
@@ -509,7 +549,7 @@ fn recent_window_floor(
     } = branch;
     let ts = format!("{alias}.{ts_column}");
     let mut sql =
-        format!("SELECT {ts}, {alias}.id FROM {table} {alias} INDEXED BY {ts_index} WHERE 1=1");
+        format!("SELECT {ts} FROM {table} {alias} INDEXED BY {ts_index} WHERE 1=1");
     let mut params_vec = Vec::new();
     if let Some(before_ms) = filter.before_ms {
         sql.push_str(&format!(" AND {ts} < ?"));
@@ -524,13 +564,13 @@ fn recent_window_floor(
         *after_history_tie,
     );
     sql.push_str(&format!(
-        " ORDER BY {ts} DESC, {alias}.id DESC LIMIT 1 OFFSET ?"
+        " ORDER BY {ts} DESC LIMIT 1 OFFSET ?"
     ));
     params_vec.push((window - 1).to_string());
     Ok(conn
         .prepare(&sql)?
         .query_row(rusqlite::params_from_iter(params_vec), |row| {
-            Ok((row.get(0)?, row.get(1)?))
+            row.get(0)
         })
         .optional()?)
 }
