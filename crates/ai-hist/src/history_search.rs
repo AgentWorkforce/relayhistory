@@ -381,7 +381,7 @@ fn search_branch(
             // the window itself (a bulk import stamped with one time) would
             // make the walk cost more than sorting every match, so fall back.
             if let Some(floor) = floor {
-                if tie_reaches(conn, branch, floor, window)? {
+                if tie_reaches(conn, branch, filter, floor, window)? {
                     break;
                 }
             }
@@ -512,22 +512,27 @@ fn walk_window(
     query_branch_rows(conn, branch, &sql, params_vec, raw_fts)
 }
 
-/// Whether at least `window` rows share timestamp `ts`: an index-only count
-/// that stops at `window`.
-fn tie_reaches(conn: &Connection, branch: &SearchBranch, ts: i64, window: i64) -> Result<bool> {
-    let SearchBranch {
-        table,
-        alias,
-        ts_column,
-        ts_index,
-        ..
-    } = branch;
+/// Whether at least `window` rows that pass the search's time window and
+/// cursor share timestamp `ts`: an index-only count that stops at `window`.
+/// Rows a cursor already passed are not counted, so a deep page inside a large
+/// tie walks only the tied rows it still has to order.
+fn tie_reaches(
+    conn: &Connection,
+    branch: &SearchBranch,
+    filter: &QueryFilter,
+    ts: i64,
+    window: i64,
+) -> Result<bool> {
+    let column = format!("{}.{}", branch.alias, branch.ts_column);
+    let (mut sql, mut params_vec) = eligible_rows(branch, filter, &column);
+    sql.push_str(&format!(" AND {column} = ?"));
+    params_vec.push(ts.to_string());
     let tied: i64 = conn
-        .prepare_cached(&format!(
-            "SELECT count(*) FROM (SELECT 1 FROM {table} {alias} INDEXED BY {ts_index} \
-             WHERE {alias}.{ts_column} = ? LIMIT ?)"
-        ))?
-        .query_row(params![ts, window], |row| row.get(0))?;
+        .prepare(&format!("SELECT count(*) FROM ({sql} LIMIT ?)"))?
+        .query_row(
+            rusqlite::params_from_iter(params_vec.into_iter().chain([window.to_string()])),
+            |row| row.get(0),
+        )?;
     Ok(tied >= window)
 }
 
@@ -539,40 +544,45 @@ fn recent_window_floor(
     filter: &QueryFilter,
     window: i64,
 ) -> Result<Option<i64>> {
+    let column = format!("{}.{}", branch.alias, branch.ts_column);
+    let (mut sql, mut params_vec) = eligible_rows(branch, filter, &column);
+    sql.push_str(&format!(" ORDER BY {column} DESC LIMIT 1 OFFSET ?"));
+    params_vec.push((window - 1).to_string());
+    Ok(conn
+        .prepare(&sql)?
+        .query_row(rusqlite::params_from_iter(params_vec), |row| row.get(0))
+        .optional()?)
+}
+
+/// `SELECT <ts>` over the branch's timestamp index, restricted to the rows
+/// that pass the search's time window and cursor.
+fn eligible_rows(
+    branch: &SearchBranch,
+    filter: &QueryFilter,
+    column: &str,
+) -> (String, Vec<String>) {
     let SearchBranch {
         table,
         alias,
-        ts_column,
         ts_index,
         after_history_tie,
         ..
     } = branch;
-    let ts = format!("{alias}.{ts_column}");
-    let mut sql =
-        format!("SELECT {ts} FROM {table} {alias} INDEXED BY {ts_index} WHERE 1=1");
+    let mut sql = format!("SELECT {column} FROM {table} {alias} INDEXED BY {ts_index} WHERE 1=1");
     let mut params_vec = Vec::new();
     if let Some(before_ms) = filter.before_ms {
-        sql.push_str(&format!(" AND {ts} < ?"));
+        sql.push_str(&format!(" AND {column} < ?"));
         params_vec.push(before_ms.to_string());
     }
     append_window_filters(
         &mut sql,
         &mut params_vec,
         filter,
-        &ts,
+        column,
         &format!("{alias}.id"),
         *after_history_tie,
     );
-    sql.push_str(&format!(
-        " ORDER BY {ts} DESC LIMIT 1 OFFSET ?"
-    ));
-    params_vec.push((window - 1).to_string());
-    Ok(conn
-        .prepare(&sql)?
-        .query_row(rusqlite::params_from_iter(params_vec), |row| {
-            row.get(0)
-        })
-        .optional()?)
+    (sql, params_vec)
 }
 
 fn query_branch_rows(
@@ -1377,5 +1387,54 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("Invalid raw FTS5 MATCH expression"), "got: {error}");
+    }
+
+    #[test]
+    fn deep_pages_inside_a_large_tie_match_the_sorted_reference() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // Ten events share the newest timestamp: more than any test window,
+        // so a page that starts at the tie falls back, while a deep page
+        // whose cursor has passed most of it walks the rest.
+        let insert = |index: i64, ts: i64| {
+            conn.execute(
+                "INSERT INTO session_events \
+                 (source, session_id, project, message_id, ts_ms, role, kind, text, event_uid) \
+                 VALUES ('claude', 's1', '/work', 'm', ?, 'assistant', 'text', ?, ?)",
+                params![ts, format!("needle {index}"), format!("e{index}")],
+            )
+            .unwrap();
+        };
+        for index in 0..10 {
+            insert(index, 5_000);
+        }
+        for index in 10..20 {
+            insert(index, 1_000 + index);
+        }
+        WALK_OUTCOMES.with(|outcomes| outcomes.set((0, 0)));
+        let terms = ["needle".to_string()];
+        let mut after = None;
+        let mut pages = 0;
+        loop {
+            let filter = QueryFilter {
+                limit: 1,
+                after: after.clone(),
+                ..Default::default()
+            };
+            let expected = sorted_reference(|| {
+                search_page(&conn, &terms, false, &filter, SearchRole::Assistant).unwrap()
+            });
+            let actual = search_page(&conn, &terms, false, &filter, SearchRole::Assistant).unwrap();
+            assert_eq!(keys(&actual.rows), keys(&expected.rows), "page {pages}");
+            assert_eq!(actual.next_cursor, expected.next_cursor, "page {pages}");
+            pages += 1;
+            match actual.next_cursor {
+                Some(cursor) => after = Some(cursor),
+                None => break,
+            }
+        }
+        assert_eq!(pages, 20);
+        let (served, fell_back) = WALK_OUTCOMES.with(|outcomes| outcomes.get());
+        assert!(served > 0 && fell_back > 0, "served {served}, fell back {fell_back}");
     }
 }
