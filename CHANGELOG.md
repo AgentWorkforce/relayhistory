@@ -810,7 +810,8 @@ Notable changes to the native `ai-hist` CLI are documented here.
   p95 267 -> 100 ms. A three-line turn costs 2 sweeps instead of 1, and
   sustained writes tick once per window instead of once per window plus
   sweep (12 -> 16 ticks over 3 s). Set it to `false` for the old
-  trailing-only window.
+  trailing-only window; `ai-hist watch --no-leading-edge` does the same.
+  Older serialized `WatchOptions` without the field load with it on.
 
 - `SessionStore::watch` ticks can be cancelled (#333). `WatchOptions::stop:
   Option<StopToken>` (serde-skipped, like `SyncOptions::stop`) is installed

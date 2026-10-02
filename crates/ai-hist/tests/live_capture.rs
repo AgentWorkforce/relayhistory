@@ -211,6 +211,9 @@ fn a_burst_of_change_signals_collapses_into_the_debounce_window() {
             .with_fs_events(false)
             .with_poll_interval_ms(600_000)
             .with_debounce_ms(300)
+            // The trailing-only window; the leading edge's leading + trailing
+            // shape is `a_quiet_change_is_swept_on_the_leading_edge_…`.
+            .with_leading_edge(false)
     });
 
     for _ in 0..100 {

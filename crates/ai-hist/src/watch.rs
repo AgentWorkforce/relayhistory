@@ -511,7 +511,10 @@ impl WatchInner {
                 // window-plus-sweep cadence instead of waiting for quiet.
                 let first_event_at = wake.pending.take();
                 if leading_edge {
-                    wake.window_until = Instant::now().checked_add(debounce);
+                    // Bounded like every other interval here: the public
+                    // field can be set past `MAX_INTERVAL_MS` directly.
+                    wake.window_until = Instant::now()
+                        .checked_add(debounce.min(Duration::from_millis(MAX_INTERVAL_MS)));
                 }
                 return Some(Wake {
                     trigger: TickTrigger::FsEvent,
