@@ -4425,13 +4425,15 @@ fn grok_state_transcript_events(entry: &Value) -> Option<bool> {
 /// not from the session directory. Counting it would let a missing transcript
 /// look indexed for as long as one inference remained.
 fn grok_transcript_events_exist(conn: &Connection, session_id: &str) -> Result<bool> {
-    let exists: i64 = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM session_events \
-         WHERE source = 'grok' AND session_id = ? \
-           AND (raw_kind IS NULL OR raw_kind != 'unified_log_usage') LIMIT 1)",
-        params![session_id],
-        |row| row.get(0),
-    )?;
+    // Cached: the unchanged-stamp skip asks this for every Grok session on
+    // every forced sweep.
+    let exists: i64 = conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM session_events \
+             WHERE source = 'grok' AND session_id = ? \
+               AND (raw_kind IS NULL OR raw_kind != 'unified_log_usage') LIMIT 1)",
+        )?
+        .query_row(params![session_id], |row| row.get(0))?;
     Ok(exists != 0)
 }
 
