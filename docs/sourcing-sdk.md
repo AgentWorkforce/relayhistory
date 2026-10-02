@@ -215,8 +215,8 @@ feed's `revision`), the digest can become a read of that one column.
 
 ### `hydrate`
 
-`SessionRef::Id { source, session_id }` hydrates a catalogued session the way
-`ai-hist sessions hydrate` does (a session never discovered is `Error::SessionNotFound`).
+`SessionRef::Id { source, session_id }` hydrates a catalogued session the way the npm
+CLI's `ai-hist sessions hydrate` does (a session never discovered is `Error::SessionNotFound`).
 `SessionRef::Path { source, path }` is the hook fast path: the transcript is
 read by locator before any catalog row exists, and it is accepted only for
 sources whose `SourceCapabilities::hydrates_by_path` is true (Claude Code
