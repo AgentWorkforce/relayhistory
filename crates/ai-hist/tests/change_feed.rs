@@ -668,12 +668,28 @@ fn a_column_a_table_gains_is_carried_verbatim() {
         .execute_batch("ALTER TABLE tool_calls ADD COLUMN review_note TEXT;")
         .unwrap();
     // A fresh writable open runs the migration pass that rebuilds the guard
-    // and rotates the semantic export stream before any changed-shape row is
-    // delivered under its old revision.
+    // and restamps only the changed-shape kind above the old head. The store
+    // identity stays stable so consumers can resume without replaying any
+    // unrelated kind.
     let migrated = home.store();
     let migrated_head = migrated.head_revision().unwrap();
-    assert_eq!(migrated_head.revision, head.revision);
-    assert_ne!(migrated_head.epoch, head.epoch);
+    assert_eq!(migrated_head.epoch, head.epoch);
+    let restamped = only(&migrated, head, ChangeKind::ToolCall);
+    assert_eq!(
+        migrated_head.revision,
+        head.revision + restamped.len() as u64
+    );
+    assert_eq!(
+        restamped.len(),
+        stored_rows(&home.raw(), "tool_calls").len(),
+        "every changed-shape row is delivered once above the old head"
+    );
+    assert!(restamped.iter().all(|change| {
+        change
+            .columns
+            .as_ref()
+            .is_some_and(|columns| columns.get("review_note") == Some(&Value::Null))
+    }));
     writer
         .execute_batch(
             "UPDATE tool_calls SET review_note = 'looked fine' \
