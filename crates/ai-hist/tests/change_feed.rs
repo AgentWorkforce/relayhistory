@@ -667,15 +667,36 @@ fn a_column_a_table_gains_is_carried_verbatim() {
     writer
         .execute_batch("ALTER TABLE tool_calls ADD COLUMN review_note TEXT;")
         .unwrap();
-    // A fresh writable open runs the migration pass that rebuilds the guard.
-    drop(home.store());
+    // A fresh writable open runs the migration pass that rebuilds the guard
+    // and restamps only the changed-shape kind above the old head. The store
+    // identity stays stable so consumers can resume without replaying any
+    // unrelated kind.
+    let migrated = home.store();
+    let migrated_head = migrated.head_revision().unwrap();
+    assert_eq!(migrated_head.epoch, head.epoch);
+    let restamped = only(&migrated, head, ChangeKind::ToolCall);
+    assert_eq!(
+        migrated_head.revision,
+        head.revision + restamped.len() as u64
+    );
+    assert_eq!(
+        restamped.len(),
+        stored_rows(&home.raw(), "tool_calls").len(),
+        "every changed-shape row is delivered once above the old head"
+    );
+    assert!(restamped.iter().all(|change| {
+        change
+            .columns
+            .as_ref()
+            .is_some_and(|columns| columns.get("review_note") == Some(&Value::Null))
+    }));
     writer
         .execute_batch(
             "UPDATE tool_calls SET review_note = 'looked fine' \
                  WHERE rowid = (SELECT MIN(rowid) FROM tool_calls);",
         )
         .unwrap();
-    let changes = only(&store, head, ChangeKind::ToolCall);
+    let changes = only(&migrated, migrated_head, ChangeKind::ToolCall);
     assert_eq!(changes.len(), 1, "{changes:?}");
     let columns = changes[0].columns.as_ref().unwrap();
     assert_eq!(
@@ -698,7 +719,7 @@ fn a_column_a_table_gains_is_carried_verbatim() {
 
     // The session row carries every catalog column, `parser_version`
     // included, and its JSON columns unparsed.
-    let sessions = only(&store, Watermark::START, ChangeKind::Session);
+    let sessions = only(&migrated, Watermark::START, ChangeKind::Session);
     let catalog = sessions[0].columns.as_ref().unwrap();
     assert!(catalog.get("parser_version").is_some_and(Value::is_i64));
     assert!(catalog

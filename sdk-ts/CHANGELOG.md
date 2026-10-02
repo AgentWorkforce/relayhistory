@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add the typed `DeliveryConflictResponse` contract plus canonical digest,
+  strict HTTP-409 parsing, and deterministic recovery-plan helpers. Recovery
+  validates every receiver-reported submitted identity/digest before
+  quarantining the bounded conflict set, distinguishes batch-ID reuse (which
+  re-keys the whole batch), and
+  never invents a higher record revision.
 - The CLI names a schema migration on stderr while it runs --
   `Upgrading the ai-hist database to <version>...`, then
   `Database upgraded in <elapsed>.` -- and only when an open actually

@@ -475,9 +475,14 @@ commit cannot rewind it. A named cursor is bound to the kind set it was first
 committed for: draining or committing it under another filter is
 `Error::ConsumerKindsMismatch`. A `Watermark` carries the `epoch` of the
 database that issued it; one from another database, or one past the head, is
-`Error::WatermarkAheadOfStore` — the database was reset or replaced, and the
-only recovery is a resync from `Watermark::START`, which names no store; a named cursor past the head
-names no revision of this store, so that resync's commit replaces it.
+`Error::WatermarkAheadOfStore` — the store was reset or replaced, and the only
+recovery is a resync from `Watermark::START`, which names no store. An exported
+column-name or declared-type change restamps only rows of the affected kind
+above the old head, preserving the epoch and named cursors. A newly fed kind is
+backfilled above the old head and records its fingerprint without replay; a named
+cursor past the head names no revision of this store, so that resync's commit
+replaces it. Retiring a fed kind rotates the epoch because no live table
+remains whose rows can be restamped to communicate the removal.
 `head_revision()` reports
 the head on its own, and `SyncReport::head_revision` reports it after a sweep.
 A read-only handle drains the feed but cannot commit a cursor, and a commit

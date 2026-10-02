@@ -13,8 +13,10 @@ import { promisify } from 'node:util';
 import { gunzipSync } from 'node:zlib';
 import {
   beginHistoryExport, closeHistoryExport,
-  DEFAULT_DELIVERY_LIMITS, exportHistory,
+  canonicalDeliveryJson, DEFAULT_DELIVERY_LIMITS, deliveryBatchDigest, deliveryDigest,
+  deliveryRecordDigest, exportHistory,
   HistoryDeliveryError, HistoryPluginRegistry, loadHistoryPlugins, readHistoryExportPage,
+  parseDeliveryConflict, recoverDeliveryConflict,
   type HistoryDestination, type HistoryExportBatch, type HistoryExportSelection,
 } from './index.js';
 
@@ -47,6 +49,180 @@ function registry(value: HistoryDestination, instanceId = 'one'): HistoryPluginR
   result.register({ destinations: [{ instanceId, destination: value }] });
   return result;
 }
+
+function conflictBatch(): HistoryExportBatch {
+  const records = ['before', 'poison', 'after'].map((text, index) => ({
+    schema_version: 1, origin_id: 'origin', record_id: `record-${index}`,
+    revision_id: `revision-${index}`, revision: index + 1, kind: 'history' as const,
+    source: 'claude', session_id: index === 0 ? '' : 'session', operation: 'upsert' as const,
+    payload: { text, nested: index },
+  }));
+  return { schema_version: 1, origin_id: 'origin', batch_id: 'batch', job_id: 'job', generation: 1,
+    destination_id: 'fixture', instance_id: 'one', account_id: 'relayhistory:account', mapping_version: '1', records };
+}
+
+test('only an exact 409 delivery_conflict response enables recovery', () => {
+  const batch = conflictBatch(); const record = batch.records[1];
+  const conflict = { type: 'record_revision' as const, originId: batch.origin_id,
+    recordId: record.record_id, submittedRevisionId: record.revision_id, submittedRevision: record.revision,
+    submittedDigest: deliveryRecordDigest(record), currentRevisionId: 'durable-revision',
+    currentRevision: record.revision, currentDigest: 'a'.repeat(64) };
+  const body = JSON.stringify({ error: { code: 'delivery_conflict', message: 'conflict',
+    conflict, conflicts: [conflict], conflictCount: 1 }, correlationId: 'request' });
+  assert.deepEqual(parseDeliveryConflict(409, body)?.error.conflict, conflict);
+  assert.equal(parseDeliveryConflict(400, body), undefined);
+  assert.equal(parseDeliveryConflict(409, body.replace('delivery_conflict', 'cursor_not_found')), undefined);
+  assert.equal(parseDeliveryConflict(409, '{'), undefined);
+  assert.equal(parseDeliveryConflict(409, { error: { code: 'delivery_conflict', message: 'conflict',
+    conflict: { ...conflict, currentRevision: conflict.currentRevision + 1 },
+    conflicts: [conflict], conflictCount: 1 } }), undefined);
+  assert.equal(parseDeliveryConflict(409, { error: { code: 'delivery_conflict', message: 'conflict',
+    conflict, conflicts: [], conflictCount: 1 } }), undefined);
+});
+
+test('delivery digests match JSON wire semantics for sparse arrays', () => {
+  const sparse = Array<number>(2);
+  sparse[0] = 1;
+  const batch = conflictBatch();
+  const record = { ...batch.records[1], payload: { sparse } };
+  const onWire = JSON.parse(JSON.stringify(record));
+  assert.deepEqual(onWire.payload.sparse, [1, null]);
+  assert.equal(deliveryRecordDigest(record), deliveryRecordDigest(onWire));
+});
+
+test('delivery digests omit object values JSON does not put on the wire', () => {
+  const batch = conflictBatch();
+  const record = { ...batch.records[1], payload: {
+    kept: 'value', omittedUndefined: undefined,
+    omittedFunction: () => 'value', omittedSymbol: Symbol('value'),
+    array: [undefined, () => 'value', Symbol('value')],
+  } };
+  const onWire = JSON.parse(JSON.stringify(record));
+  assert.deepEqual(onWire.payload, { kept: 'value', array: [null, null, null] });
+  assert.equal(deliveryRecordDigest(record), deliveryRecordDigest(onWire));
+});
+
+test('delivery digest Unicode key ordering matches the protocol fixture', () => {
+  const value = { '\uE000': 1, '\u{10000}': 2 };
+  const canonical = canonicalDeliveryJson(value);
+  assert.equal(canonical, '{"\u{10000}":2,"\uE000":1}');
+  assert.equal(Buffer.from(canonical, 'utf8').toString('hex'),
+    '7b22f0908080223a322c22ee8080223a317d');
+  assert.equal(deliveryDigest(value),
+    '9d4cdc71dda603c42f9b21d88d0c2ffc31a76cd1bd461d7359406cf169845f1e');
+});
+
+test('a proven record conflict quarantines only the poison revision and drains later records', () => {
+  const batch = conflictBatch(); const record = batch.records[1];
+  const conflict = {
+    type: 'record_revision', originId: batch.origin_id, recordId: record.record_id,
+    submittedRevisionId: record.revision_id, submittedRevision: record.revision,
+    submittedDigest: deliveryRecordDigest(record), currentRevisionId: 'durable-revision',
+    currentRevision: record.revision, currentDigest: 'b'.repeat(64),
+  } as const;
+  const response = parseDeliveryConflict(409, { error: { code: 'delivery_conflict', message: 'conflict',
+    conflict, conflicts: [conflict], conflictCount: 1 } });
+  assert.ok(response);
+  const first = recoverDeliveryConflict(batch, response);
+  const replay = recoverDeliveryConflict(batch, response);
+  assert.deepEqual(first, replay, 'recovery must be deterministic across a lost response');
+  assert.deepEqual(first.quarantinedRevisionIds, ['revision-1']);
+  assert.deepEqual(first.retryBatch?.records.map((item) => item.revision_id), ['revision-0', 'revision-2']);
+  assert.notEqual(first.retryBatch?.batch_id, batch.batch_id);
+  assert.deepEqual(ack(first.retryBatch!).accepted_revision_ids, ['revision-0', 'revision-2'],
+    'records behind the conflict remain deliverable');
+  assert.deepEqual(first.retryBatch?.records.map((item) => item.revision), [1, 3],
+    'recovery must not invent record revisions');
+  const changed = { ...conflict, submittedDigest: 'c'.repeat(64) };
+  const changedResponse = parseDeliveryConflict(409, { error: { code: 'delivery_conflict',
+    message: 'conflict', conflict: changed, conflicts: [changed], conflictCount: 1 } });
+  assert.ok(changedResponse);
+  assert.throws(() => recoverDeliveryConflict(batch, changedResponse), /does not match submitted content/);
+});
+
+test('a batch-id conflict deterministically rekeys the whole immutable batch', () => {
+  const batch = conflictBatch();
+  const response = parseDeliveryConflict(409, { error: { code: 'delivery_conflict', message: 'conflict', conflict: {
+    type: 'batch_id', originId: batch.origin_id, batchId: batch.batch_id,
+    submittedDigest: deliveryBatchDigest(batch), currentDigest: 'd'.repeat(64),
+  } } });
+  assert.ok(response);
+  const recovery = recoverDeliveryConflict(batch, response);
+  assert.deepEqual(recovery.quarantinedRevisionIds, []);
+  assert.deepEqual(recovery.retryBatch?.records, batch.records);
+  assert.notEqual(recovery.retryBatch?.batch_id, batch.batch_id);
+  assert.equal(recoverDeliveryConflict(batch, response).retryBatch?.batch_id, recovery.retryBatch?.batch_id);
+});
+
+test('a singleton record conflict completes as quarantine without another request', () => {
+  const original = conflictBatch(); const batch = { ...original, records: [original.records[1]] };
+  const record = batch.records[0];
+  const conflict = {
+    type: 'record_revision', originId: batch.origin_id, recordId: record.record_id,
+    submittedRevisionId: record.revision_id, submittedRevision: record.revision,
+    submittedDigest: deliveryRecordDigest(record), currentRevisionId: 'durable-revision',
+    currentRevision: record.revision, currentDigest: 'e'.repeat(64),
+  } as const;
+  const response = parseDeliveryConflict(409, { error: { code: 'delivery_conflict', message: 'conflict',
+    conflict, conflicts: [conflict], conflictCount: 1 } })!;
+  assert.deepEqual(recoverDeliveryConflict(batch, response), {
+    quarantinedRevisionIds: ['revision-1'], retryBatch: null,
+  });
+});
+
+test('all reported record conflicts are quarantined in one deterministic recovery', () => {
+  const batch = conflictBatch();
+  const conflicts = batch.records.slice(1).map((record, index) => ({
+    type: 'record_revision' as const, originId: batch.origin_id, recordId: record.record_id,
+    submittedRevisionId: record.revision_id, submittedRevision: record.revision,
+    submittedDigest: deliveryRecordDigest(record), currentRevisionId: `durable-${index}`,
+    currentRevision: record.revision, currentDigest: String(index + 1).repeat(64),
+  }));
+  const response = parseDeliveryConflict(409, { error: { code: 'delivery_conflict',
+    message: 'conflict', conflict: conflicts[0], conflicts, conflictCount: conflicts.length } });
+  assert.ok(response);
+  const recovery = recoverDeliveryConflict(batch, response);
+  assert.deepEqual(recovery.quarantinedRevisionIds, ['revision-1', 'revision-2']);
+  assert.deepEqual(recovery.retryBatch?.records.map((record) => record.revision_id), ['revision-0']);
+  assert.deepEqual(recoverDeliveryConflict(batch, response), recovery);
+});
+
+test('receiver collation order is accepted without a conflicting UTF-16 sort check', () => {
+  const original = conflictBatch();
+  const records = original.records.slice(1).map((record, index) => ({
+    ...record, record_id: index === 0 ? "\uE000" : "\u{10000}",
+  }));
+  const batch = { ...original, records };
+  const conflicts = records.map((record, index) => ({
+    type: 'record_revision' as const, originId: batch.origin_id, recordId: record.record_id,
+    submittedRevisionId: record.revision_id, submittedRevision: record.revision,
+    submittedDigest: deliveryRecordDigest(record), currentRevisionId: `current-${index}`,
+    currentRevision: record.revision, currentDigest: String(index + 3).repeat(64),
+  }));
+  // PostgreSQL byte/collation order can put U+E000 before U+10000, while JS
+  // UTF-16 comparison puts the astral character first. Ordering is the
+  // receiver's concern; actionable identity validation must be collation-free.
+  const response = parseDeliveryConflict(409, { error: { code: 'delivery_conflict',
+    message: 'conflict', conflict: conflicts[0], conflicts, conflictCount: 2 } });
+  assert.ok(response);
+  assert.deepEqual(recoverDeliveryConflict(batch, response).quarantinedRevisionIds,
+    records.map((record) => record.revision_id));
+});
+
+test('delivery digests serialize sparse array slots exactly as wire nulls', () => {
+  const sparse = Array<string>(2);
+  sparse[0] = 'present';
+  const wire = JSON.parse(JSON.stringify({ values: sparse }));
+  const record = { ...conflictBatch().records[0], payload: { values: sparse } };
+  const received = { ...record, payload: wire };
+  assert.equal(deliveryRecordDigest(record), deliveryRecordDigest(received));
+
+  const trailingHole = Array<string>(1);
+  const trailing = { ...record, payload: { values: trailingHole } };
+  const trailingWire = { ...trailing, payload: JSON.parse(JSON.stringify(trailing.payload)) };
+  assert.equal(deliveryRecordDigest(trailing), deliveryRecordDigest(trailingWire),
+    'a trailing hole must not collapse to an empty array');
+});
 
 test('plugin registration is inert, per-client, and rejects collisions atomically', async () => {
   await fixture(async () => {

@@ -48,8 +48,58 @@ export interface DeliveryAcknowledgment {
   /** A receipt for future processing is not durable acceptance. */
   acceptance_level: 'durable' | 'indexed';
 }
+
+/** A 409 `delivery_conflict` is actionable only when the receiver identifies
+ * the exact submitted and comparison identities that disagree. The comparison
+ * is either durable or an earlier identity in the same submitted batch. The
+ * authenticated tenant is intentionally absent: transport authentication,
+ * not an error body, establishes that scope. */
+export interface DeliveryRecordRevisionConflict {
+  type: 'record_revision';
+  originId: string;
+  recordId: string;
+  submittedRevisionId: string;
+  submittedRevision: number;
+  submittedDigest: string;
+  currentRevisionId: string;
+  currentRevision: number;
+  currentDigest: string;
+}
+export interface DeliveryBatchIdConflict {
+  type: 'batch_id';
+  originId: string;
+  batchId: string;
+  submittedDigest: string;
+  currentDigest: string;
+}
+export type DeliveryConflict = DeliveryRecordRevisionConflict | DeliveryBatchIdConflict;
+export interface DeliveryConflictResponse {
+  error: ({
+    code: 'delivery_conflict';
+    message: string;
+  } & ({
+    conflict: DeliveryRecordRevisionConflict;
+    /** First bounded page of conflicts in deterministic order. */
+    conflicts: DeliveryRecordRevisionConflict[];
+    /** Total conflicts, including any beyond the bounded list. */
+    conflictCount: number;
+  } | {
+    conflict: DeliveryBatchIdConflict;
+  }));
+  /** Receiver-generated diagnostic only; never part of conflict identity. */
+  correlationId?: string;
+}
+export interface DeliveryConflictRecovery {
+  /** Records that may be skipped only because the receiver proved their exact
+   * identity and submitted digest conflicted. Empty for batch-ID reuse. */
+  quarantinedRevisionIds: string[];
+  /** A deterministic retry with a new batch identity, or null when the only
+   * submitted record was quarantined. */
+  retryBatch: HistoryExportBatch | null;
+}
 export type DeliveryFailure = 'transient' | 'rate_limited' | 'authentication_required'
-  | 'permission_denied' | 'invalid_payload' | 'unsupported_evidence' | 'mapping_version_mismatch';
+  | 'permission_denied' | 'invalid_payload' | 'unsupported_evidence' | 'mapping_version_mismatch'
+  | 'delivery_conflict';
 export interface DeliveryStatus {
   job_id: string; config: DeliveryJobConfig; generation: number; state: 'active' | 'paused' | 'blocked' | 'cancelled';
   bootstrap_complete: boolean; journal_cursor: number; acknowledged_cursor: number;

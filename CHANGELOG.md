@@ -606,6 +606,20 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Fixed
 
+- Change-feed schema reconciliation now fingerprints each evidence kind's
+  exact exported column names and declared SQLite types. The one-time upgrade
+  from a pre-fingerprint database restamps every existing kind above the
+  current head because it has no per-kind baseline. Later shape-changing
+  migrations restamp only rows of the affected kind. Adding a newly fed kind
+  simply records its fingerprint after its normal backfill, so external
+  watermarks and named cursors resume without replaying unrelated kinds.
+  Retiring a kind remains the one store-wide reset because there is no live
+  table left to restamp and communicate its removal.
+  Previously the `location` migration changed the canonical JSON and remote
+  digest of existing evidence without moving its revision or origin, causing
+  durable receivers to return `409 delivery_conflict` forever. Explicit old
+  watermarks are now refused as stale, while unchanged current schemas keep
+  their epoch and cursor progress.
 - A sweep no longer stalls every other writer for up to ~30 s when a read is
   active as it finishes (#336). Each sweep, including every
   `SessionStore::watch` tick, ended with `wal_checkpoint(TRUNCATE)` under the
