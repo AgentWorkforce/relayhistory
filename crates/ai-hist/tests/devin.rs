@@ -1683,6 +1683,10 @@ fn devin_array_prompt_previews_follow_normalized_text() {
                 serde_json::json!(["é".repeat(5000), "unreachable"]),
                 "é".repeat(4096),
             ),
+            (
+                serde_json::json!(["a".repeat(4095), "boundary"]),
+                format!("{}\n", "a".repeat(4095)),
+            ),
         ] {
             let message = serde_json::json!({"message_id":"u0","role":"user","content":content});
             provider

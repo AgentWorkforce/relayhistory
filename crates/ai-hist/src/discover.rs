@@ -3285,18 +3285,19 @@ impl ShallowSessionProvider for DevinProvider {
                       SELECT text, COALESCE(SUM(length(text) + 1) OVER (
                         ORDER BY key ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
                       ), 0) AS preceding_chars FROM (
-                        SELECT key, substr(trim(CASE
-                          WHEN type = 'text' THEN value
-                          WHEN type = 'object' THEN CASE
-                            WHEN (json_type(value, '$.type') IS NULL
-                                  OR json_extract(value, '$.type') = 'text')
-                              AND json_type(value, '$.text') = 'text'
-                            THEN json_extract(value, '$.text') END
-                          END, ?3), 1, ?1) AS text
-                        FROM json_each(chat_message, '$.content')
-                        WHERE text <> '' ORDER BY key LIMIT ?1
+                        SELECT key, text FROM (
+                          SELECT key, substr(trim(CASE
+                            WHEN type = 'text' THEN value
+                            WHEN type = 'object' THEN CASE
+                              WHEN (json_type(value, '$.type') IS NULL
+                                    OR json_extract(value, '$.type') = 'text')
+                                AND json_type(value, '$.text') = 'text'
+                              THEN json_extract(value, '$.text') END
+                            END, ?3), 1, ?1) AS text
+                          FROM json_each(chat_message, '$.content')
+                        ) WHERE text <> '' ORDER BY key LIMIT ?1
                       )
-                    ) WHERE preceding_chars < ?1
+                    ) WHERE preceding_chars <= ?1
                   ) END AS prompt
                 FROM message_nodes
                 WHERE session_id = ?2 AND json_valid(chat_message)
@@ -3318,9 +3319,11 @@ impl ShallowSessionProvider for DevinProvider {
                 .optional()?
             };
             scan.note_records(u64::from(prompt.is_some()));
-            prompt
-                .map(|text| excerpt(&text))
-                .filter(|text| !text.is_empty())
+            // Both SQL branches already trim provider text and cap the result.
+            // Do not trim the joined excerpt again: when an earlier part fills
+            // 4,095 characters, the separator before the next part is the
+            // meaningful 4,096th character and must remain observable.
+            prompt.filter(|text| !text.is_empty())
         };
         let mut models = Vec::new();
         push_unique(&mut models, seed.model.as_deref());
