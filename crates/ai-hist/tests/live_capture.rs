@@ -1350,6 +1350,64 @@ fn an_attached_loop_re_derives_its_roots_on_the_backstop_not_the_interval() {
 /// file, whatever the next harness release adds. Watching the parent as a
 /// *directory* root makes every one of those writes a forced sweep, which is
 /// the expensive kind that bypasses the fingerprint.
+/// `OPENCODE_DB` naming a file in a busy directory: a log written beside the
+/// database must not force a sweep, while a commit to the database's WAL — and
+/// a channel database appearing beside it — still must (#335).
+#[cfg(feature = "fs-events")]
+#[test]
+fn a_write_beside_the_opencode_database_does_not_force_a_sweep() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let db = home.path().join("opencode.db");
+    std::fs::write(&db, b"").expect("seed the database");
+
+    let running = RunningLoop::reporting({
+        let home = home.path().to_path_buf();
+        let db = db.clone();
+        move |watch| {
+            watch
+                .with_immediate(false)
+                .with_fs_events(true)
+                .with_roots(ai_hist::sync_watch_roots(&home, &db))
+                .with_debounce_ms(100)
+                .with_poll_interval_ms(600_000)
+                .with_slow_poll_ms(600_000)
+        }
+    });
+    assert_eq!(running.watch.driver(), Some(WatchDriver::FsEvents));
+    // FSEvents replays the seeding above right after the stream starts.
+    running.settle("after attaching");
+
+    for line in 0..5 {
+        use std::io::Write;
+        let mut log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(home.path().join("collector-stderr.log"))
+            .expect("open the log");
+        writeln!(log, "line {line}").expect("write the log");
+    }
+    assert_eq!(
+        running.ticks.recv_timeout(Duration::from_millis(800)),
+        Err(RecvTimeoutError::Timeout),
+        "a log beside the OpenCode database must not force a sweep"
+    );
+
+    std::fs::write(home.path().join("opencode.db-wal"), b"commit").expect("write the WAL");
+    assert_eq!(
+        running.next_tick(),
+        Ok(true),
+        "a commit to the database's WAL must still force a sweep"
+    );
+    running.settle("after the WAL write");
+
+    std::fs::write(home.path().join("opencode-nightly.db"), b"").expect("a channel store");
+    assert_eq!(
+        running.next_tick(),
+        Ok(true),
+        "a channel database appearing beside it must still force a sweep"
+    );
+}
+
 #[cfg(feature = "fs-events")]
 #[test]
 fn a_file_beside_the_flat_log_does_not_force_a_sweep() {

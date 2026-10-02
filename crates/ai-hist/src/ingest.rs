@@ -1367,7 +1367,7 @@ fn merge_watch_roots(mut roots: Vec<discover::WatchRoot>) -> Vec<discover::Watch
         if later.path != first.path {
             return false;
         }
-        first.depth = first.depth.max(later.depth);
+        first.widen(later);
         true
     });
     roots

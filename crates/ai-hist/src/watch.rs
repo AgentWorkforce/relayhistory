@@ -1807,6 +1807,66 @@ mod tests {
         ));
     }
 
+    /// OpenCode's directory root admits its stores and nothing else beside
+    /// them, so an `OPENCODE_DB` in a busy directory is not a sweep per write
+    /// to its neighbours (#335).
+    #[test]
+    fn the_opencode_root_admits_only_its_stores() {
+        let home = PathBuf::from("/home/u");
+        let roots = crate::discover::provider_watch_roots(
+            "opencode",
+            &crate::ProviderRoots::from_home(home.clone(), home.join("my-opencode.sqlite")),
+        );
+        assert_eq!(roots.len(), 1, "{roots:?}");
+        assert_eq!(roots[0].path, home);
+        for store in [
+            "my-opencode.sqlite",
+            "my-opencode.sqlite-wal",
+            "my-opencode.sqlite-shm",
+            "my-opencode.sqlite-journal",
+            "opencode.db",
+            "opencode-nightly.db-wal",
+        ] {
+            assert!(
+                event_matches_roots(&home.join(store), &roots),
+                "{store} is a store the sweep reads"
+            );
+        }
+        for neighbour in [
+            "collector-stderr.log",
+            ".zsh_history",
+            "opencode.db.bak",
+            "my-opencode.sqlite.tmp",
+        ] {
+            assert!(
+                !event_matches_roots(&home.join(neighbour), &roots),
+                "{neighbour} is not a store and must not force a sweep"
+            );
+        }
+        // The directory itself still counts: its removal and recreation is
+        // how a registration is lost and put back.
+        assert!(event_matches_roots(&home, &roots));
+        assert!(!event_matches_roots(&home.join("storage/session/x.json"), &roots));
+    }
+
+    /// A second, unfiltered claim on the same directory widens the filter
+    /// away rather than narrowing the other claim.
+    #[test]
+    fn an_unfiltered_claim_on_the_same_directory_admits_everything() {
+        let mut filtered = WatchRoot::directory_of(
+            "/home/u",
+            crate::discover::WatchEntries::OpencodeStores {
+                primary: "opencode.db".into(),
+            },
+        );
+        filtered.widen(&WatchRoot::directory("/home/u"));
+        assert_eq!(filtered.entries, crate::discover::WatchEntries::All);
+        assert!(event_matches_roots(
+            Path::new("/home/u/anything.log"),
+            &[filtered]
+        ));
+    }
+
     /// The two depths coexist: a path below a non-recursive root is still
     /// covered when some other root is recursive over it.
     #[test]

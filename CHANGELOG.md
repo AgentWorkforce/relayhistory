@@ -606,6 +606,14 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Fixed
 
+- Live capture: a write beside the OpenCode database no longer forces a
+  sweep (#335). OpenCode's watch root is still the database's directory,
+  but only the configured database, the channel databases
+  (`opencode-<channel>.db`) and their `-wal`, `-shm` and `-journal` siblings
+  count as evidence there. With `OPENCODE_DB` in a busy directory, a log
+  appended every 50 ms beside it drove 44 forced sweeps and 708 ms of CPU in
+  10 s; it now drives none (37 ms of CPU). `SourceCapabilities::watch_roots`
+  still advertises the directory, which covers more than the loop admits.
 - Change-feed schema reconciliation now fingerprints each evidence kind's
   exact exported column names and declared SQLite types. The one-time upgrade
   from a pre-fingerprint database restamps every existing kind above the
