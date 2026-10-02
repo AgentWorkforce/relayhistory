@@ -84,10 +84,11 @@ const MIGRATION: &str = "change_feed_v2";
 /// The column a named cursor records its kind set in.
 const KINDS_COLUMN: &str = "kinds";
 
-/// Fingerprint of the exact stored columns an upsert exports. A schema
-/// migration can change a record's semantic JSON without writing the row and
-/// therefore without advancing its revision. Persisting this alongside the
-/// epoch lets the migration pass give that new semantic stream a new origin.
+/// JSON map of each fed kind to the fingerprint of the exact stored column
+/// names and declared types its upserts export. A schema migration can change
+/// a record's semantic JSON without writing the row and therefore without
+/// advancing its revision. Persisting the per-kind map lets the migration pass
+/// restamp only rows whose exported representation changed.
 const EXPORT_SCHEMA_DIGEST_COLUMN: &str = "export_schema_digest";
 
 /// The kind set a drain reports, normalized so two drains asking for the
@@ -142,11 +143,13 @@ fn kinds_mismatch(name: &str, stored: &str, offered: &str) -> Error {
 /// complete position and `revision > watermark` is the whole resume
 /// predicate. Across stores it is not: every database counts from zero, so a
 /// replacement database reuses the revisions of the one it replaced. `epoch`
-/// names the semantic export stream -- initially a random identity drawn when
-/// its feed schema is created, and rotated if a migration changes the stored
-/// column set an unchanged row exports. [`SessionStore::changes_since`]
-/// refuses a watermark issued by another stream, however far the store has
-/// since counted. A consumer persists both fields, as the store returned them.
+/// names the database -- a random identity drawn when its feed schema was
+/// created. An export-schema migration restamps only affected rows above the
+/// current head, so the database identity stays stable and both named and
+/// external cursors resume without replaying unrelated kinds.
+/// [`SessionStore::changes_since`] refuses a watermark issued by another
+/// database, however far that store has since counted. A consumer persists
+/// both fields, as the store returned them.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
 )]
@@ -559,43 +562,45 @@ pub(crate) fn stored_columns(conn: &Connection, table: &str) -> Result<Vec<Strin
         .collect())
 }
 
+fn stored_column_schema(conn: &Connection, table: &str) -> Result<Vec<(String, String)>> {
+    let columns = conn
+        .prepare_cached("SELECT name, type FROM pragma_table_info(?1) ORDER BY cid")?
+        .query_map([table], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(columns
+        .into_iter()
+        .filter(|(column, _)| column != REVISION_COLUMN)
+        .collect())
+}
+
+fn export_schema_digest(schema: &[(String, String)]) -> Result<String> {
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&(
+            "relayhistory-change-feed-export-schema-v2",
+            schema
+        ))?)
+    ))
+}
+
 fn export_schema_digests(conn: &Connection) -> Result<BTreeMap<String, String>> {
     ChangeKind::ALL
         .iter()
         .map(|kind| {
-            let table = kind.table().name;
-            let columns = conn
-                .prepare_cached("SELECT name, type FROM pragma_table_info(?1) ORDER BY cid")?
-                .query_map([table], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-                .into_iter()
-                .filter(|(column, _)| column != REVISION_COLUMN)
-                .collect::<Vec<_>>();
-            let digest = format!(
-                "{:x}",
-                Sha256::digest(serde_json::to_vec(&(
-                    "relayhistory-change-feed-kind-export-schema-v2",
-                    table,
-                    columns
-                ))?)
-            );
+            let schema = stored_column_schema(conn, kind.table().name)?;
+            let digest = export_schema_digest(&schema)?;
             Ok((kind.as_str().to_string(), digest))
         })
         .collect()
 }
 
-fn exported_kind_changed(stored: &str, current: &BTreeMap<String, String>) -> bool {
-    let Ok(stored) = serde_json::from_str::<BTreeMap<String, String>>(stored) else {
-        // The unreleased v1 branch stored one opaque all-kind digest. There is
-        // no safe way to distinguish an added kind from a changed existing
-        // kind in that format, so preserve its conservative rotation.
-        return true;
-    };
-    stored
-        .iter()
-        .any(|(kind, prior)| current.get(kind).is_none_or(|current| current != prior))
+fn exported_kind_removed(
+    previous: &BTreeMap<String, String>,
+    current: &BTreeMap<String, String>,
+) -> bool {
+    previous.keys().any(|kind| !current.contains_key(kind))
 }
 
 fn feed_identity_exists(conn: &Connection) -> Result<bool> {
@@ -615,12 +620,51 @@ fn feed_identity_exists(conn: &Connection) -> Result<bool> {
     .map_err(Into::into)
 }
 
-/// Reconcile the exported row shape with the origin that names it. Existing
-/// feeds without a fingerprint predate this guard and rotate once: they may
-/// already have delivered an older column set. Later shape changes rotate
-/// exactly when the fingerprint changes. In-database named cursors name the
-/// old semantic stream but store no epoch, so they are cleared atomically and
-/// resume with a full replay just like an external stale-epoch watermark.
+fn restamp_exported_rows(conn: &Connection, kind: ChangeKind) -> Result<()> {
+    let table = kind.table().name;
+    let count: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+        row.get(0)
+    })?;
+    if count == 0 {
+        return Ok(());
+    }
+    let base: i64 = conn.query_row(
+        "SELECT version FROM observation_clock WHERE singleton=1",
+        [],
+        |row| row.get(0),
+    )?;
+    let head = base
+        .checked_add(count)
+        .context("change-feed revision overflow while restamping an exported schema")?;
+    conn.execute(
+        &format!(
+            "WITH ranked(rowid, ordinal) AS (
+                 SELECT rowid, ROW_NUMBER() OVER (ORDER BY rowid) FROM {table}
+             )
+             UPDATE {table}
+             SET {REVISION_COLUMN} = ?1 + (
+                 SELECT ordinal FROM ranked WHERE ranked.rowid = {table}.rowid
+             )"
+        ),
+        [base],
+    )?;
+    conn.execute(
+        "UPDATE observation_clock SET version=?1 WHERE singleton=1",
+        [head],
+    )?;
+    Ok(())
+}
+
+/// Reconcile each kind's exported row shape. Existing feeds without a
+/// fingerprint may already have delivered the older representation, so every
+/// existing kind is restamped once above the current head. Later changes
+/// restamp only the affected kind. A newly introduced kind has no prior
+/// fingerprint and is recorded without restamping: the feed-version migration
+/// that introduced it already backfilled its rows above the old head.
+///
+/// Keeping the store epoch and cursor rows intact is deliberate. Both external
+/// watermarks and named cursors can resume normally and observe the affected
+/// rows at their new revisions; unrelated kinds are never replayed.
 fn reconcile_export_schema(conn: &Connection, identity_existed: bool) -> Result<()> {
     let current = export_schema_digests(conn)?;
     let stored: Option<String> = conn.query_row(
@@ -628,18 +672,19 @@ fn reconcile_export_schema(conn: &Connection, identity_existed: bool) -> Result<
         [],
         |row| row.get(0),
     )?;
-    let encoded = serde_json::to_string(&current)?;
-    if stored.as_deref() == Some(encoded.as_str()) {
+    let previous = stored
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<BTreeMap<String, String>>(value).ok());
+    if previous.as_ref() == Some(&current) {
         return Ok(());
     }
-    if identity_existed
-        && stored
-            .as_deref()
-            .is_none_or(|stored| exported_kind_changed(stored, &current))
-    {
-        // Epochs are odd signed SQLite integers interpreted as their u64 bit
-        // pattern. Adding two always selects a different odd value; spell the
-        // maximum case explicitly so SQLite never promotes on overflow.
+    let removed = previous
+        .as_ref()
+        .is_some_and(|previous| exported_kind_removed(previous, &current));
+    if identity_existed && removed {
+        // A removed kind has no live table left to restamp and emit. Reset the
+        // semantic stream so a full reconciliation can remove that retired
+        // material. Ordinary shape changes never take this store-wide path.
         conn.execute_batch(
             "UPDATE change_feed_store
              SET epoch = CASE WHEN epoch = 9223372036854775807
@@ -647,10 +692,22 @@ fn reconcile_export_schema(conn: &Connection, identity_existed: bool) -> Result<
              WHERE singleton=1;
              DELETE FROM consumer_cursors;",
         )?;
+    } else if identity_existed {
+        for kind in ChangeKind::ALL {
+            let changed = match previous.as_ref() {
+                Some(previous) => previous
+                    .get(kind.as_str())
+                    .is_some_and(|digest| Some(digest) != current.get(kind.as_str())),
+                None => true,
+            };
+            if changed {
+                restamp_exported_rows(conn, *kind)?;
+            }
+        }
     }
     conn.execute(
         &format!("UPDATE change_feed_store SET {EXPORT_SCHEMA_DIGEST_COLUMN}=? WHERE singleton=1"),
-        [encoded],
+        [serde_json::to_string(&current)?],
     )?;
     Ok(())
 }
@@ -2022,10 +2079,10 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
          );",
     )?;
     // The database's identity in every watermark it issues; see
-    // `Watermark::epoch`. Initially a nonzero random value, so a fresh
-    // database -- which counts its revisions from zero again -- cannot pass
-    // for the one it replaced. `reconcile_export_schema` also rotates it when
-    // a migration changes the semantic JSON exported for an unchanged row.
+    // `Watermark::epoch`. A nonzero random value, so a fresh database -- which
+    // counts its revisions from zero again -- cannot pass for the one it
+    // replaced. Export-schema changes keep this identity and restamp only the
+    // affected rows above the current head.
     conn.execute(
         "INSERT OR IGNORE INTO change_feed_store (singleton, epoch) VALUES (1, random() | 1)",
         [],
@@ -3007,22 +3064,45 @@ INSERT INTO observation_evidence (source, session_id, location, connector_id,
     }
 
     /// Adding a stored column changes an exported record's canonical JSON
-    /// without touching the row or its revision. Reusing the old origin would
-    /// therefore produce an equal-revision/different-digest conflict at a
-    /// durable receiver. The migration pass gives the changed export shape a
-    /// new origin and resets named cursors so every consumer replays it.
+    /// without touching the row or its revision. The migration pass restamps
+    /// only that kind above the old head: external watermarks and named
+    /// cursors resume normally, while unrelated kinds are never replayed.
     #[test]
-    fn an_exported_column_change_rotates_the_epoch_and_replays_named_consumers() {
+    fn an_exported_column_change_restamps_only_the_affected_kind() {
         let dir = tempfile::tempdir().unwrap();
         let (initial_store, conn) = store(dir.path());
         insert_event(&conn, "s1", "e1", "before");
+        conn.execute(
+            "INSERT INTO history (source, session_id, prompt, timestamp_ms) \
+             VALUES ('claude', 's1', 'unrelated', 1)",
+            [],
+        )
+        .unwrap();
         let old_head = initial_store.head_revision().unwrap();
         let query = || ChangeQuery::default().consumer("delivery");
+        let history_query = || {
+            ChangeQuery::default()
+                .kinds([ChangeKind::History])
+                .consumer("history-only")
+        };
         let mut first = initial_store
             .changes_since(Watermark::CONSUMER, query())
             .unwrap();
         while first.next().is_some() {}
         assert_eq!(first.commit().unwrap(), old_head);
+        let mut history = initial_store
+            .changes_since(Watermark::CONSUMER, history_query())
+            .unwrap();
+        while history.next().is_some() {}
+        assert_eq!(history.commit().unwrap(), old_head);
+
+        let old_event_revision: i64 = conn
+            .query_row(
+                "SELECT revision FROM session_events WHERE event_uid='e1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
 
         // Stands in for an additive crate migration such as `location`: the
         // row now serializes differently, but no row write advanced it.
@@ -3037,35 +3117,36 @@ INSERT INTO observation_evidence (source, session_id, location, connector_id,
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(unchanged_revision as u64, old_head.revision);
+        assert_eq!(unchanged_revision, old_event_revision);
         drop(first);
         drop(conn);
         drop(initial_store);
 
         let (migrated, conn) = store(dir.path());
         let new_head = migrated.head_revision().unwrap();
-        assert_eq!(new_head.revision, old_head.revision);
-        assert_ne!(new_head.epoch, old_head.epoch);
+        assert_eq!(new_head.revision, old_head.revision + 1);
+        assert_eq!(new_head.epoch, old_head.epoch);
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM consumer_cursors", [], |row| row
                 .get::<_, i64>(0))
                 .unwrap(),
-            0,
-            "a revision-only named cursor cannot survive an epoch rotation"
+            2,
+            "schema reconciliation preserves named cursors"
         );
-        assert!(matches!(
+        let external = drain(
             migrated
                 .changes_since(old_head, ChangeQuery::default())
-                .expect_err("the old semantic stream must be refused"),
-            Error::WatermarkAheadOfStore(_)
-        ));
+                .unwrap(),
+        );
+        assert_eq!(external.len(), 1);
+        assert_eq!(external[0].kind, ChangeKind::SessionEvent);
         let replay = drain(
             migrated
                 .changes_since(Watermark::CONSUMER, query())
                 .unwrap(),
         );
         assert_eq!(replay.len(), 1);
-        assert_eq!(replay[0].revision, old_head.revision);
+        assert_eq!(replay[0].revision, new_head.revision);
         assert_eq!(
             replay[0]
                 .columns
@@ -3073,39 +3154,118 @@ INSERT INTO observation_evidence (source, session_id, location, connector_id,
                 .and_then(|columns| columns.get("export_shape_probe")),
             Some(&Value::from("local"))
         );
+        assert!(drain(
+            migrated
+                .changes_since(Watermark::CONSUMER, history_query())
+                .unwrap()
+        )
+        .is_empty());
     }
 
     #[test]
-    fn schema_fingerprints_include_types_and_do_not_rotate_for_a_new_kind() {
-        let mut stored = BTreeMap::from([
-            ("session".to_string(), "name-and-type-v1".to_string()),
-            ("history".to_string(), "history-v1".to_string()),
-        ]);
-        let mut current = stored.clone();
-        current.insert("new_kind".to_string(), "new-kind-v1".to_string());
-        assert!(
-            !exported_kind_changed(&serde_json::to_string(&stored).unwrap(), &current),
-            "a newly fed kind is backfilled above the existing head and must not rotate the origin"
+    fn export_schema_fingerprints_include_declared_column_types() {
+        let text = vec![("value".to_string(), "TEXT".to_string())];
+        let integer = vec![("value".to_string(), "INTEGER".to_string())];
+        assert_ne!(
+            export_schema_digest(&text).unwrap(),
+            export_schema_digest(&integer).unwrap(),
+            "an affinity change can change SQLite's exported JSON value type"
         );
+    }
 
-        stored.insert("session".to_string(), "name-text-v1".to_string());
-        current.insert("session".to_string(), "name-blob-v1".to_string());
-        assert!(
-            exported_kind_changed(&serde_json::to_string(&stored).unwrap(), &current),
-            "a declared-type change can alter the JSON value SQLite reads from an unchanged row"
+    /// A kind absent from a previously stored map is newly introduced, not a
+    /// changed schema. Its feed migration already stamped its rows above the
+    /// old head, so reconciliation records the new fingerprint without
+    /// rotating the origin, clearing cursors, or replaying old rows.
+    #[test]
+    fn a_new_kind_fingerprint_does_not_replay_existing_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let (initial_store, conn) = store(dir.path());
+        insert_event(&conn, "s1", "e1", "before");
+        let old_head = initial_store.head_revision().unwrap();
+        let query = || ChangeQuery::default().consumer("delivery");
+        let mut first = initial_store
+            .changes_since(Watermark::CONSUMER, query())
+            .unwrap();
+        while first.next().is_some() {}
+        first.commit().unwrap();
+
+        let stored: String = conn
+            .query_row(
+                &format!(
+                    "SELECT {EXPORT_SCHEMA_DIGEST_COLUMN} FROM change_feed_store WHERE singleton=1"
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut map: BTreeMap<String, String> = serde_json::from_str(&stored).unwrap();
+        map.remove(ChangeKind::SessionEvent.as_str());
+        conn.execute(
+            &format!(
+                "UPDATE change_feed_store SET {EXPORT_SCHEMA_DIGEST_COLUMN}=? WHERE singleton=1"
+            ),
+            [serde_json::to_string(&map).unwrap()],
+        )
+        .unwrap();
+        init_schema(&conn).unwrap();
+        assert_eq!(initial_store.head_revision().unwrap(), old_head);
+        assert!(drain(
+            initial_store
+                .changes_since(Watermark::CONSUMER, query())
+                .unwrap()
+        )
+        .is_empty());
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM consumer_cursors", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
         );
+    }
 
-        let stored = BTreeMap::from([
-            ("session".to_string(), "session-v1".to_string()),
-            ("retired_kind".to_string(), "retired-kind-v1".to_string()),
-        ]);
-        let current = BTreeMap::from([
-            ("session".to_string(), "session-v1".to_string()),
-            ("renamed_kind".to_string(), "retired-kind-v1".to_string()),
-        ]);
-        assert!(
-            exported_kind_changed(&serde_json::to_string(&stored).unwrap(), &current),
-            "removing or renaming a fed kind must rotate the origin even when a new kind has the same schema digest"
+    #[test]
+    fn a_removed_kind_fingerprint_resets_the_semantic_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let (initial_store, conn) = store(dir.path());
+        insert_event(&conn, "s1", "e1", "before");
+        let old_head = initial_store.head_revision().unwrap();
+        let query = || ChangeQuery::default().consumer("delivery");
+        let mut first = initial_store
+            .changes_since(Watermark::CONSUMER, query())
+            .unwrap();
+        while first.next().is_some() {}
+        first.commit().unwrap();
+
+        let stored: String = conn
+            .query_row(
+                &format!(
+                    "SELECT {EXPORT_SCHEMA_DIGEST_COLUMN} FROM change_feed_store WHERE singleton=1"
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut map: BTreeMap<String, String> = serde_json::from_str(&stored).unwrap();
+        map.insert("retired_kind".to_string(), "retired-schema".to_string());
+        assert!(exported_kind_removed(
+            &map,
+            &export_schema_digests(&conn).unwrap()
+        ));
+        conn.execute(
+            &format!(
+                "UPDATE change_feed_store SET {EXPORT_SCHEMA_DIGEST_COLUMN}=? WHERE singleton=1"
+            ),
+            [serde_json::to_string(&map).unwrap()],
+        )
+        .unwrap();
+        init_schema(&conn).unwrap();
+        assert_ne!(initial_store.head_revision().unwrap().epoch, old_head.epoch);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM consumer_cursors", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
         );
     }
 

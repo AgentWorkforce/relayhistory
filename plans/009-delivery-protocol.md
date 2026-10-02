@@ -163,13 +163,14 @@ When re-derivation changes a semantic record, the producer first commits that
 change to the local store and the change feed issues its higher revision. A
 mapping-only change uses a new mapping version/generation. In particular, the
 change feed fingerprints each current kind's exact exported column names and
-declared SQLite types. A shape change to an existing kind rotates the feed
-epoch atomically and clears revision-only named cursors before the new shape is
-replayed. Adding a newly fed kind keeps the epoch because its existing rows are
-stamped above the prior head and reached by normal cursor resumption. External
-watermarks from the prior epoch are refused and must resync from start. This is
-the repair for schema additions such as `location`, which change canonical
-record digests without writing each existing row.
+declared SQLite types. A shape change to an existing kind restamps only that
+kind's rows above the old head. Adding a newly fed kind records its fingerprint
+after its rows are backfilled above the prior head. Existing external
+watermarks and named cursors therefore resume into the new shape without
+replaying unrelated kinds. This is the repair for schema additions such as
+`location`, which change canonical record digests without an ordinary row
+write. Removing a fed kind is the exceptional store-wide epoch reset because
+there is no surviving row stream that can communicate the removal.
 
 Repository ownership is split deliberately. RelayHistory owns the change-feed
 origin/revision semantics and the TypeScript wire/recovery helpers in this

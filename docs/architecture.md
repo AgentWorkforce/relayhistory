@@ -540,12 +540,12 @@ Three rules a consumer must hold:
   `epoch`, an identity drawn when its feed schema is created
   (`change_feed_store`). The store also fingerprints each current kind's exact
   exported column names and declared SQLite types. A migration that changes an
-  existing kind rotates the epoch and
-  clears in-database named cursors atomically: otherwise an unchanged row
-  would keep its revision while acquiring different semantic JSON. This is a
-  store-wide stream reset, so every consumer replays the new shape. Adding a
-  newly fed kind does not rotate the epoch: its rows are stamped above the old
-  head and established consumers encounter them on their ordinary resume path.
+  existing kind restamps only rows of that kind above the old head: otherwise
+  an unchanged row would keep its revision while acquiring different semantic
+  JSON. The epoch and named cursors remain stable, and unrelated kinds are not
+replayed. A newly fed kind is stamped above the old head and records its
+fingerprint without resetting established consumers. Retiring a fed kind is
+the exceptional epoch reset because no live table remains to restamp.
   `SessionStore::head_revision` reports the head with it; a stored watermark
   with another epoch, or beyond the head, fails with
   `ErrorKind::WatermarkAheadOfStore`, and the recovery is a full resync from

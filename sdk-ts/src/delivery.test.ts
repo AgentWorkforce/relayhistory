@@ -209,6 +209,21 @@ test('receiver collation order is accepted without a conflicting UTF-16 sort che
     records.map((record) => record.revision_id));
 });
 
+test('delivery digests serialize sparse array slots exactly as wire nulls', () => {
+  const sparse = Array<string>(2);
+  sparse[0] = 'present';
+  const wire = JSON.parse(JSON.stringify({ values: sparse }));
+  const record = { ...conflictBatch().records[0], payload: { values: sparse } };
+  const received = { ...record, payload: wire };
+  assert.equal(deliveryRecordDigest(record), deliveryRecordDigest(received));
+
+  const trailingHole = Array<string>(1);
+  const trailing = { ...record, payload: { values: trailingHole } };
+  const trailingWire = { ...trailing, payload: JSON.parse(JSON.stringify(trailing.payload)) };
+  assert.equal(deliveryRecordDigest(trailing), deliveryRecordDigest(trailingWire),
+    'a trailing hole must not collapse to an empty array');
+});
+
 test('plugin registration is inert, per-client, and rejects collisions atomically', async () => {
   await fixture(async () => {
     let calls = 0;
