@@ -5192,6 +5192,27 @@ fn ingest_codex_rollout_at_locator(
     } else {
         transcript_cursor::TranscriptCursorState::default()
     };
+    // The reader's own validation hashes a bounded window at each end of the
+    // committed prefix (see `transcript_cursor`), so an in-place edit strictly
+    // between those windows that keeps the file's length would pass it. A
+    // changed stamp alone does not prove an append, so resume only when the
+    // file also grew past the size it had when the cursor was written: an
+    // append-only writer always grows it, an in-place edit that keeps the
+    // length never does. Anything else re-reads from byte zero.
+    //
+    // What is still assumed: an in-place edit inside that gap *and* an append
+    // in the same interval between two passes. Codex appends to its rollouts
+    // and never rewrites them, which is the same trade the Claude walk's
+    // cursor already makes.
+    if let Some(file) = cursor.file.as_ref() {
+        let grew = path
+            .metadata()
+            .map(|now| now.len() > file.size)
+            .unwrap_or(false);
+        if !grew {
+            cursor = transcript_cursor::TranscriptCursorState::default();
+        }
+    }
     let (outcome, _) = ingest_codex_rollout_incremental(conn, path, meta, &mut cursor)?;
     transcript_cursor::store_cursor(conn, &key, &cursor)?;
     Ok(outcome)
@@ -26653,6 +26674,84 @@ mod tests {
             ),
             vec![vec![Some("run 1".to_string())]]
         );
+    }
+
+    /// A rollout edited in place, with its length kept, is re-read from zero
+    /// rather than resumed past the change. The edit sits strictly between
+    /// the two validation windows of a committed prefix larger than both, the
+    /// one place the cursor's own bounded check cannot see.
+    #[test]
+    fn a_same_length_edit_inside_a_large_codex_prefix_is_not_resumed_past() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("codex");
+        let day = root.join("sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-2026-04-20T05-00-00-sess_edit.jsonl");
+        let event = |at: String, payload: Value| {
+            format!(
+                "{}\n",
+                json!({"timestamp": at, "type": "event_msg", "payload": payload})
+            )
+        };
+        let mut text = format!(
+            "{}\n",
+            json!({"timestamp": "2026-04-20T05:00:00.000Z", "type": "session_meta",
+                   "payload": {"id": "sess_edit", "cwd": "/tmp/project"}})
+        );
+        // Well past two 64 KiB windows of committed turns.
+        let filler = "x".repeat(2_000);
+        for n in 0..200u32 {
+            let at = |s: u32| format!("2026-04-20T05:{:02}:{:02}.000Z", n / 60, s + (n % 60) % 50);
+            let marker = if n == 100 { "MIDDLE-ORIGINAL" } else { "plain" };
+            text.push_str(&event(
+                at(1),
+                json!({"type": "user_message", "message": format!("run {n} {marker} {filler}")}),
+            ));
+            text.push_str(&event(
+                at(2),
+                json!({"type": "agent_message", "message": format!("done {n}")}),
+            ));
+            text.push_str(&event(
+                at(3),
+                json!({"type": "task_complete", "turn_id": format!("t{n}")}),
+            ));
+        }
+        fs::write(&rollout, &text).unwrap();
+        assert!(text.len() > 4 * transcript_cursor::PREFIX_WINDOW_BYTES as usize);
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        state.insert("codex_rollouts_v6".into(), json!({}));
+        sync_codex(&conn, &mut state, &root).unwrap();
+        let committed: i64 = conn
+            .query_row(
+                "SELECT committed_offset FROM transcript_cursors WHERE source = 'codex'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            committed as usize,
+            text.len(),
+            "the walk committed the whole file"
+        );
+
+        // Same length, a byte in the middle, and an mtime that moves forward.
+        let edited = text.replace("MIDDLE-ORIGINAL", "MIDDLE-REWRITTN");
+        assert_eq!(edited.len(), text.len());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&rollout, &edited).unwrap();
+        sync_codex(&conn, &mut state, &root).unwrap();
+        let rewritten: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events \
+                 WHERE source = 'codex' AND text LIKE '%MIDDLE-REWRITTN%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rewritten, 1, "the walk resumed past an in-place edit");
     }
 
     /// An install already at the recorded generation must still re-read its
