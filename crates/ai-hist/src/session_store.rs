@@ -3075,10 +3075,15 @@ mod tests {
             }
         });
         let mut items = Vec::new();
-        while let Ok(item) = received.recv_timeout(Duration::from_secs(30)) {
-            items.push(item);
-        }
-        let ended = reader.is_finished();
+        // The reader drops its sender only once the watch iterator has ended,
+        // so `Disconnected` is the loop ending; a timeout is the failure.
+        let ended = loop {
+            match received.recv_timeout(Duration::from_secs(30)) {
+                Ok(item) => items.push(item),
+                Err(mpsc::RecvTimeoutError::Disconnected) => break true,
+                Err(mpsc::RecvTimeoutError::Timeout) => break false,
+            }
+        };
         CANCEL_DIFF_FAULTS
             .lock()
             .unwrap()
