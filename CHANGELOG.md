@@ -555,6 +555,17 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Changed
 
+- A sweep's `.sync-state.json` checkpoints fold only what they changed
+  (#320). The sweep keeps the document it last read or wrote with that file's
+  identity, length and mtime; while the file is still that one, a checkpoint
+  merges only the changed keys (and, inside a stamp map, only the changed
+  entries) into its copy instead of re-reading, re-parsing and re-merging the
+  whole file. A file another writer replaced is read and merged in full as
+  before. The Devin and `history.jsonl` checkpoints now go through the same
+  path, so an unchanged Devin source no longer re-reads the state every tick.
+  On the 100 MB benchmark store this takes checkpoints from ~15% of a forced
+  tick to ~3%.
+
 - Internal refactor: one-entry harness registry (#177). Each built-in harness
   is declared once, as a `LocalSource` descriptor in
   `crates/ai-hist/src/sources/catalog.rs`, and `SOURCE_CHOICES`,
