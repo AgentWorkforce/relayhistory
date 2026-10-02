@@ -1849,6 +1849,57 @@ mod tests {
         assert!(!event_matches_roots(&home.join("storage/session/x.json"), &roots));
     }
 
+    /// A configured database whose own name ends in a sidecar suffix is still
+    /// matched, sidecars included, and a pinned database admits no channel
+    /// database beside it.
+    #[test]
+    fn the_opencode_filter_matches_the_configured_name_exactly() {
+        let home = PathBuf::from("/home/u");
+        let mut roots_for = crate::ProviderRoots::from_home(home.clone(), home.join("state-wal"));
+        let roots = crate::discover::provider_watch_roots("opencode", &roots_for);
+        for store in ["state-wal", "state-wal-wal", "state-wal-shm", "opencode.db"] {
+            assert!(
+                event_matches_roots(&home.join(store), &roots),
+                "{store} must be admitted"
+            );
+        }
+        assert!(!event_matches_roots(&home.join("state"), &roots));
+
+        roots_for.opencode_db = home.join("pinned.db");
+        roots_for.opencode_db_pinned = true;
+        let pinned = crate::discover::provider_watch_roots("opencode", &roots_for);
+        for store in ["pinned.db", "pinned.db-wal", "pinned.db-journal"] {
+            assert!(
+                event_matches_roots(&home.join(store), &pinned),
+                "{store} is the pinned store"
+            );
+        }
+        for channel in ["opencode.db", "opencode-nightly.db", "opencode-nightly.db-wal"] {
+            assert!(
+                !event_matches_roots(&home.join(channel), &pinned),
+                "{channel} is not read when the database is pinned"
+            );
+        }
+    }
+
+    /// A configured name that is not UTF-8 keeps its sidecars.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_opencode_name_keeps_its_sidecars() {
+        use std::os::unix::ffi::OsStrExt;
+        let home = PathBuf::from("/home/u");
+        let name = std::ffi::OsStr::from_bytes(b"open\xffcode.db");
+        let roots = crate::discover::provider_watch_roots(
+            "opencode",
+            &crate::ProviderRoots::from_home(home.clone(), home.join(name)),
+        );
+        let mut wal = name.to_os_string();
+        wal.push("-wal");
+        assert!(event_matches_roots(&home.join(name), &roots));
+        assert!(event_matches_roots(&home.join(&wal), &roots));
+        assert!(!event_matches_roots(&home.join("other.log"), &roots));
+    }
+
     /// A second, unfiltered claim on the same directory widens the filter
     /// away rather than narrowing the other claim.
     #[test]
@@ -1857,6 +1908,7 @@ mod tests {
             "/home/u",
             crate::discover::WatchEntries::OpencodeStores {
                 primary: "opencode.db".into(),
+                channels: true,
             },
         );
         filtered.widen(&WatchRoot::directory("/home/u"));

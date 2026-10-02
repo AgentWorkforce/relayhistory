@@ -546,6 +546,10 @@ pub struct ProviderRoots<'a> {
     pub devin: &'a Path,
     /// Path to the opencode database.
     pub opencode_db: &'a Path,
+    /// Whether `opencode_db` is the only OpenCode database read, so the
+    /// channel databases beside it are not evidence. See
+    /// [`crate::ProviderRoots::opencode_db_pinned`].
+    pub opencode_db_pinned: bool,
 }
 
 /// One path the live-capture watcher monitors, and how deeply.
@@ -588,30 +592,52 @@ pub enum WatchEntries {
     /// Every direct entry.
     #[default]
     All,
-    /// OpenCode's SQLite stores: the configured database file `primary`,
-    /// every channel database (`opencode.db`, `opencode-<channel>.db`), and
-    /// each one's `-wal`, `-shm` and `-journal` siblings.
-    OpencodeStores { primary: std::ffi::OsString },
+    /// OpenCode's SQLite stores: the configured database file `primary`
+    /// and its `-wal`, `-shm` and `-journal` siblings, plus — when
+    /// `channels` is set — every channel database (`opencode.db`,
+    /// `opencode-<channel>.db`) and its siblings. `channels` is off when
+    /// `OPENCODE_DB` pins the one database the sweep reads.
+    OpencodeStores {
+        primary: std::ffi::OsString,
+        channels: bool,
+    },
 }
+
+/// The SQLite sidecars that move with a database file.
+const SQLITE_SIDECARS: [&str; 3] = ["-wal", "-shm", "-journal"];
 
 impl WatchEntries {
     /// Whether an entry named `name` is one this filter admits.
     fn admits(&self, name: &std::ffi::OsStr) -> bool {
-        let primary = match self {
+        let (primary, channels) = match self {
             WatchEntries::All => return true,
-            WatchEntries::OpencodeStores { primary } => primary,
+            WatchEntries::OpencodeStores { primary, channels } => (primary, *channels),
         };
+        // The configured name and its sidecars first, compared as `OsStr`
+        // rather than stripped as text: the configured file may itself end in
+        // `-wal` (or not be UTF-8 at all), and suffix-stripping the event
+        // name would then never come back to it.
+        if name == primary.as_os_str()
+            || SQLITE_SIDECARS.iter().any(|suffix| {
+                let mut sidecar = primary.clone();
+                sidecar.push(suffix);
+                name == sidecar.as_os_str()
+            })
+        {
+            return true;
+        }
+        if !channels {
+            return false;
+        }
+        // Channel database names are ASCII by construction.
         let Some(name) = name.to_str() else {
-            // A name that is not UTF-8 is neither OpenCode's nor a channel's;
-            // the configured name is compared byte for byte below.
-            return name == primary.as_os_str();
+            return false;
         };
-        let store = ["-wal", "-shm", "-journal"]
+        let store = SQLITE_SIDECARS
             .iter()
             .find_map(|suffix| name.strip_suffix(suffix))
             .unwrap_or(name);
-        std::ffi::OsStr::new(store) == primary.as_os_str()
-            || crate::paths::is_opencode_db_filename(store)
+        crate::paths::is_opencode_db_filename(store)
     }
 
     /// The filter covering both claims on one path: anything wider than a
@@ -2612,6 +2638,9 @@ impl ShallowSessionProvider for OpencodeProvider {
                     dir,
                     WatchEntries::OpencodeStores {
                         primary: name.to_os_string(),
+                        // A pinned database is the only store the sweep
+                        // reads, so a channel database beside it is noise.
+                        channels: !roots.opencode_db_pinned,
                     },
                 )]
             })
@@ -4166,6 +4195,7 @@ pub(crate) fn provider_watch_roots(source: &str, roots: &crate::ProviderRoots) -
             muse: &roots.muse,
             devin: &roots.devin,
             opencode_db: &roots.opencode_db,
+            opencode_db_pinned: roots.opencode_db_pinned,
         },
     )
 }

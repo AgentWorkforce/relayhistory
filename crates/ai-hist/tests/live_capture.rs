@@ -59,6 +59,7 @@ impl HomeLayout {
             grok: &self.grok,
             muse: &self.muse,
             opencode_db: &self.opencode_db,
+            opencode_db_pinned: false,
             devin: &self.devin,
         }
     }
