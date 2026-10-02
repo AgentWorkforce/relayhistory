@@ -935,18 +935,30 @@ impl SessionStore {
                     // loop ends on a cancellation, so this is the last chance
                     // to report those rows: diff the catalog against the
                     // baseline the sweep started from, roll it forward, and
-                    // let the cancelled report carry the result. Best effort
-                    // and outside the sync lock, which is no worse than the
-                    // "changed since the last report" this field already
-                    // promises.
+                    // let the cancelled report carry the result. A read-only
+                    // connection outside the sync lock: the diff writes
+                    // nothing, and a reader is no worse than the "changed
+                    // since the last report" this field already promises.
                     if error.chain().any(|cause| cause.is::<CaptureCancelled>()) {
                         if let Some(before) = swept_from {
-                            let diff = open_db(&db_path)
+                            let diff = open_db_readonly(&db_path)
                                 .map_err(Error::sync)
                                 .and_then(|conn| changes_under_lock(&conn, &before));
-                            if let Ok((after, changed)) = diff {
-                                *base = Some(after);
-                                *tick_pending.lock().expect("watch pending") = changed;
+                            match diff {
+                                Ok((after, changed)) => {
+                                    *base = Some(after);
+                                    *tick_pending.lock().expect("watch pending") = changed;
+                                }
+                                // Surfaced rather than swallowed: reported as
+                                // a failed tick (an `Err` on the stream), not
+                                // as a clean cancellation that silently lost
+                                // the rows.
+                                Err(diff_error) => {
+                                    return Err(anyhow::anyhow!(
+                                        "watch tick cancelled after committing changes that could \
+                                         not be read back for its report: {diff_error}"
+                                    ));
+                                }
                             }
                         }
                     }
@@ -2930,6 +2942,16 @@ mod tests {
         }
         let store = store_at(&db);
         let token = StopToken::new();
+        let watch = store
+            .watch(WatchOptions {
+                use_fs_events: false,
+                poll_interval_ms: 600_000,
+                immediate: true,
+                stop: Some(token.clone()),
+                ..WatchOptions::default()
+            })
+            .unwrap();
+        let loop_stop = watch.stopper();
         let stopper = std::thread::spawn({
             let token = token.clone();
             let db = db.clone();
@@ -2950,18 +2972,13 @@ mod tests {
                     }
                     std::thread::sleep(Duration::from_millis(1));
                 }
+                // The caller's token is what cancels a sweep in flight. If
+                // the sweep already finished, the loop is idle on a 600 s
+                // poll and only `WatchStop` wakes it, so stop through both.
                 token.stop();
+                loop_stop.stop();
             }
         });
-        let watch = store
-            .watch(WatchOptions {
-                use_fs_events: false,
-                poll_interval_ms: 600_000,
-                immediate: true,
-                stop: Some(token),
-                ..WatchOptions::default()
-            })
-            .unwrap();
         let mut reported = std::collections::BTreeSet::new();
         for tick in watch {
             let tick = tick.expect("a cancellation is not an error");
