@@ -2715,10 +2715,12 @@ fn compact(db_path: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// How `watch` should be driven. Both knobs exist because filesystem change
-/// notifications are not uniformly trustworthy: `--no-fsevents` is the escape
-/// hatch for a filesystem that lies, and the debounce window is how long a
-/// burst of events is allowed to collapse for.
+/// How `watch` should be driven. `--no-fsevents` is the escape hatch for a
+/// filesystem whose change notifications lie; the debounce window is how long
+/// a burst of events is allowed to collapse for; and `--no-leading-edge`
+/// makes every event-driven sweep wait out that window, instead of sweeping a
+/// change that finds the loop quiet at once — fewer sweeps under bursty
+/// writes, at the cost of latency.
 struct WatchDrivers {
     use_fs_events: bool,
     debounce_ms: u64,
