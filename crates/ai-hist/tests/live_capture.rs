@@ -136,11 +136,12 @@ impl RunningLoop {
     /// next write and nothing before it.
     ///
     /// One `fs::write` is not one filesystem event: creating a file yields a
-    /// create *and* a modify, and an event landing after the debounce window
-    /// has opened deliberately re-arms it, so a single write legitimately
-    /// drives more than one forced tick. An assertion that nothing happens
-    /// has to start from quiet, or it reads the previous write's second tick
-    /// as the thing it was watching for.
+    /// create *and* a modify. Events inside one debounce window are one tick,
+    /// but a backend can deliver the tail of a write after the window has
+    /// closed — while its sweep runs — and that legitimately re-arms the next
+    /// tick. An assertion that nothing happens has to start from quiet, or it
+    /// reads the previous write's trailing tick as the thing it was watching
+    /// for.
     ///
     /// The same applies right after the loop attaches. macOS FSEvents
     /// replays the changes made just *before* a stream was registered — the
@@ -324,7 +325,7 @@ impl Gate {
 
 /// A change that lands while a manual tick holds the slot must not be lost.
 ///
-/// The wake state is cleared when the debounce window opens, so by the time
+/// The wake state is cleared when the debounce window closes, so by the time
 /// the driver tries to claim the slot the event is no longer recorded
 /// anywhere. Dropping the tick there — which is the right answer for a
 /// backstop tick, and was being applied to both — loses a real change until
@@ -2018,7 +2019,7 @@ fn a_sweep_turned_away_by_another_sync_is_retried_not_dropped() {
 /// for is recorded nowhere else.
 ///
 /// The sibling of the contended case, one door further along: the wake state
-/// was cleared when the debounce window opened, so an `Err` out of the tick —
+/// was cleared when the debounce window closed, so an `Err` out of the tick —
 /// SQLite returning a transient I/O error, a provider that could not be read,
 /// a sync-state write that failed — takes the only record of the change with
 /// it. The loop logs the error and goes back to waiting, and the next chance

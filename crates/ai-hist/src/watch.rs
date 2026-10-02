@@ -490,7 +490,7 @@ impl WatchInner {
     ///
     /// A **forced** tick is not dropped, because it is evidence that something
     /// changed: the wake state was already cleared when the debounce window
-    /// opened, so returning here would lose that change until the backstop —
+    /// closed, so returning here would lose that change until the backstop —
     /// up to `--interval` later, which may be an hour. It is remembered
     /// instead, and [`InFlight::drop`] re-posts it the moment the run in
     /// flight finishes. Repeats coalesce into the one bit, so a busy tree
@@ -566,7 +566,7 @@ impl WatchInner {
                 // A sweep that failed covered nothing, exactly as a contended
                 // one covered nothing, and the change it was for is recorded
                 // nowhere else: the wake state was cleared when the debounce
-                // window opened. An error is not an answer about the change,
+                // window closed. An error is not an answer about the change,
                 // so it is owed and retried on the same bounded cadence rather
                 // than logged and forgotten until the backstop.
                 forced
@@ -822,7 +822,7 @@ impl WatchLoop {
             if let Some(at) = retry_force {
                 // A change whose sweep never ran. Nothing else will bring the
                 // loop back for it: the wake state was cleared when its
-                // debounce window opened, so without this the next visit is
+                // debounce window closed, so without this the next visit is
                 // the backstop, up to `--interval` away.
                 idle = idle.min(at.saturating_duration_since(Instant::now()));
             }
