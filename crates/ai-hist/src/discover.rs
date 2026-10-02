@@ -84,7 +84,7 @@ pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 4;
 /// invalidates every stored stamp, so a scanner that learns to extract a new
 /// field re-reads sources whose bytes never changed. `parser_version` keeps its
 /// existing meaning (full-ingest parser generation) and is untouched.
-pub const SHALLOW_SCANNER_VERSION: u32 = 8;
+pub const SHALLOW_SCANNER_VERSION: u32 = 9;
 
 /// Version 2 shipped the classification that hid standalone guardians (see
 /// [`crate::codex_is_subagent`]). Their rollouts never change on disk, so the
@@ -136,6 +136,13 @@ const _: () = assert!(SHALLOW_SCANNER_VERSION > 6);
 /// spends the one-time `codex_fork_replay_gate` re-read that retires the
 /// replayed rows an earlier build indexed under each fork.
 const _: () = assert!(SHALLOW_SCANNER_VERSION > 7);
+
+/// Version 8's Devin array-preview reader trimmed after truncation, so an
+/// excerpt whose 4,096th character was the joining newline was cached one
+/// character short. Version 9 preserves that boundary newline. The provider
+/// database does not change when the reader is upgraded, so only this bump
+/// forces unchanged Devin sessions through the corrected shallow reader.
+const _: () = assert!(SHALLOW_SCANNER_VERSION > 8);
 
 /// Most bytes a shallow head read may consume from one transcript.
 pub const HEAD_SCAN_MAX_BYTES: u64 = 256 * 1024;

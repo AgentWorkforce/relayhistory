@@ -1713,6 +1713,80 @@ fn devin_array_prompt_previews_follow_normalized_text() {
     }
 }
 
+/// A scanner upgrade refreshes previews cached by the pre-fix reader.
+#[test]
+fn devin_array_prompt_boundary_fix_invalidates_cached_preview() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let store = stage_devin_db(home, BASE_SESSION_SQL);
+    let db = home.join("history.db");
+    let conn = open_db(&db).unwrap();
+    let provider = Connection::open(&store).unwrap();
+    let message = serde_json::json!({
+        "message_id": "u0",
+        "role": "user",
+        "content": ["a".repeat(4095), "boundary"]
+    });
+    provider
+        .execute(
+            "UPDATE message_nodes SET chat_message=? WHERE node_id=0",
+            [message.to_string()],
+        )
+        .unwrap();
+    drop(provider);
+    let discover = || {
+        let env =
+            DiscoveryEnv::with_roots(&conn, home.to_path_buf(), home.join("missing-opencode.db"));
+        discover_sessions_with_env(
+            &env,
+            &DiscoverOptions {
+                scope: SessionScope::Local,
+                sources: vec!["devin".into()],
+                limit: None,
+            },
+            |_| {},
+        )
+        .unwrap();
+    };
+    let preview = || -> String {
+        conn.query_row(
+            "SELECT first_prompt FROM sessions WHERE source='devin' AND session_id='devin-test'",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .unwrap()
+        .unwrap_or_default()
+    };
+
+    discover();
+    assert_eq!(preview(), format!("{}\n", "a".repeat(4095)));
+
+    // Recreate a row cached by scanner v8: the provider bytes and raw stamp
+    // are unchanged, but that scanner stripped a boundary newline from the
+    // stored preview. A newer scanner version must force one shallow re-read.
+    conn.execute_batch(
+        "UPDATE sessions SET first_prompt='stale-preview',
+            source_stamp='v8:' || substr(source_stamp, instr(source_stamp, ':') + 1)
+         WHERE source='devin' AND session_id='devin-test';
+         UPDATE session_observations
+         SET first_prompt='stale-preview',
+             source_stamp='v8:' || substr(source_stamp, instr(source_stamp, ':') + 1)
+         WHERE source='devin' AND session_id='devin-test' AND location='local';
+         UPDATE session_presences
+         SET source_stamp='v8:' || substr(source_stamp, instr(source_stamp, ':') + 1)
+         WHERE source='devin' AND session_id='devin-test' AND location='local';",
+    )
+    .unwrap();
+    assert_eq!(preview(), "stale-preview");
+
+    discover();
+    assert_eq!(
+        preview(),
+        format!("{}\n", "a".repeat(4095)),
+        "the scanner-version bump must refresh a v8 cached preview"
+    );
+}
+
 /// Failure after deleting evidence must restore the whole local view and checkpoint.
 #[test]
 fn devin_retirement_rolls_back_on_catalog_failure() {
