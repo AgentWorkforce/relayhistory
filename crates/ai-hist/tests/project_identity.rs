@@ -1291,10 +1291,15 @@ fn a_forced_sweep_upgrades_an_unchanged_session_whose_checkout_gained_an_origin(
     let home = temp.path().join("home");
     let checkout_dir = checkout(temp.path(), "later-repo", None);
     let line = |uuid: &str, role: &str| {
-        format!(
-            r#"{{"sessionId":"sess-up","uuid":"{uuid}","cwd":"{cwd}","type":"{role}","timestamp":"2026-09-19T10:00:00.000Z","message":{{"role":"{role}","content":"{uuid} text"}}}}"#,
-            cwd = checkout_dir.display()
-        )
+        serde_json::json!({
+            "sessionId": "sess-up",
+            "uuid": uuid,
+            "cwd": checkout_dir.to_string_lossy(),
+            "type": role,
+            "timestamp": "2026-09-19T10:00:00.000Z",
+            "message": {"role": role, "content": format!("{uuid} text")},
+        })
+        .to_string()
     };
     write(
         &home.join(".claude/projects/later-repo/sess-up.jsonl"),
