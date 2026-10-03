@@ -277,8 +277,10 @@ so every result reports it:
 |---|---|---|---|---|
 | `codex` | always | yes | yes | yes |
 | `claude` | sometimes (only versions that emit a per-child `agentId`) | yes | yes | yes |
+| `grok` | sometimes (only `subagents/` entries carrying a session id) | yes | yes | yes |
+| `opencode` | always | no | yes | yes |
 | `muse` | always | yes | yes | yes |
-| `cursor`, `grok`, `opencode`, `relay` | never | no | no | no |
+| `cursor`, `devin`, `relay` | never | no | no | no |
 
 A linked child's events are stored under the child's own session id and are
 never flattened into the parent. The delegated instruction that started a
@@ -535,15 +537,23 @@ Three rules a consumer must hold:
 - **A watermark this store never issued is a reset.** Every database counts
   revisions from zero, so a revision alone cannot tell a replacement database
   from the one it replaced. A `Watermark` also carries the issuing database's
-  `epoch`, a random identity drawn once when its feed schema is created
-  (`change_feed_store`). `SessionStore::head_revision` reports the head with
-  it; a stored watermark with another epoch, or beyond the head, fails with
+  `epoch`, an identity drawn when its feed schema is created
+  (`change_feed_store`). The store also fingerprints each current kind's exact
+  exported column names and declared SQLite types. A migration that changes an
+  existing kind restamps only rows of that kind above the old head: otherwise
+  an unchanged row would keep its revision while acquiring different semantic
+  JSON. The epoch and named cursors remain stable, and unrelated kinds are not
+replayed. A newly fed kind is stamped above the old head and records its
+fingerprint without resetting established consumers. Retiring a fed kind is
+the exceptional epoch reset because no live table remains to restamp.
+  `SessionStore::head_revision` reports the head with it; a stored watermark
+  with another epoch, or beyond the head, fails with
   `ErrorKind::WatermarkAheadOfStore`, and the recovery is a full resync from
   `Watermark::START`, which names no store. `Changes::commit()` checks the
   same two things against the database it writes into, so a drain whose
   path was replaced under it cannot plant its position as the replacement's
-  cursor. A copy of a database keeps its epoch, so a restore from backup is
-  caught by the revision check alone, while the restored store is still
+  cursor. A copy of a database keeps its current epoch, so a restore from
+  backup is caught by the revision check alone, while the restored store is still
   behind the watermark. A named cursor
   past the head names no revision of this store, so the resync's commit
   replaces it: the one commit that moves a cursor back.

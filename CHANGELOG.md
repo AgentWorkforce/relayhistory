@@ -8,7 +8,9 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 - Codex Desktop assistant replies stored only as response items now appear in
   session history. Mirrored CLI/desktop encodings are stored once, and unchanged
-  captures are re-read on upgrade to recover previously missing replies.
+  captures are re-read on upgrade to recover previously missing replies, including
+  when the source fingerprint is unchanged. Assistant message IDs stay line-derived;
+  payload IDs are preserved separately as provider message IDs.
 
 ### Breaking
 
@@ -200,6 +202,16 @@ Notable changes to the native `ai-hist` CLI are documented here.
   sessions and their objectives are not history rows. A Muse hydration
   reports `full`. `ai-hist resume` prints `muse resume <id>`, and the sync
   service forwards `XDG_DATA_HOME`.
+- Devin CLI is a first-class source, `devin`. Sessions are read from
+  `$XDG_DATA_HOME/devin/cli/sessions.db` and its `transcripts/`
+  (`~/.local/share/devin/cli` by default) by discovery, `sync`, targeted
+  hydration and live capture. The store is opened read-only under a coherent
+  snapshot, never migrated or written. Each visible session gets its prompts,
+  prose, thinking, tool calls and results, file edits where `tool_call_state`
+  names a path, models, request and finish metadata, and markers (`system`,
+  `synthetic_turn`, `compaction_boundary`, `session_title`, `session_meta`,
+  `agent_manifest`); hidden sessions are skipped. Devin records no
+  delegation, and has no native resume command.
 - Add MCP `list_relay_agents` for live Agent Relay participants. It reads only
   the local desktop Unix socket, discovers it from `AGENT_RELAY_SOCKET`, the
   private desktop pointer file, then platform defaults, and reports a missing
@@ -551,6 +563,102 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Changed
 
+- A sweep's `.sync-state.json` checkpoints fold only what they changed
+  (#320). The sweep keeps the document it last read or wrote with that file's
+  identity, length and mtime; while the file is still that one, a checkpoint
+  merges only the changed keys (and, inside a stamp map, only the changed
+  entries) into its copy instead of re-reading, re-parsing and re-merging the
+  whole file. Unix only: elsewhere there is no inode to identify the file,
+  and a checkpoint with something to write reads and merges it in full as
+  before. A file another writer replaced, or a checkpoint after a failed
+  write, is read and merged in full. The Devin and `history.jsonl` checkpoints now go through the same
+  path, so an unchanged Devin source no longer re-reads the state every tick.
+  On the 100 MB benchmark store this takes checkpoints from ~15% of a forced
+  tick to ~3%.
+
+- `search` (CLI, SDK, MCP) returns a common term's newest matches without
+  reading every match. A query matching at least 5,000 rows walks the
+  timestamp index over growing windows of the newest rows that pass the time
+  window and cursor (2,000, 6,000, then 20,000), testing each row against the
+  FTS5 index by rowid and stopping at `limit`. A window is every row at or
+  after its N-th row's timestamp, so rows tied on that timestamp extend it.
+  The walk serves the page when a window fills it. It grows to the next window
+  while the matches so far could fill the last one at their rate (with 4x
+  slack), or when only the first window has come up empty. It falls back to
+  sorting every match, as before, after two empty windows, after the last
+  window, or when one timestamp ties a whole window's worth of rows. On a
+  500k-event store a common term drops from ~240 ms to ~3 ms, and a role,
+  source or tag filter on it from 100-320 ms to 1-8 ms. A filter no recent row
+  passes, or a large timestamp tie, costs the same as before. A `user` or
+  `assistant` search with a term also narrows the index scan to that role's
+  events. Results are unchanged.
+
+- A sweep no longer counts every repairable session's evidence three times
+  (#321). When the change-feed head has not moved since the stored
+  destination marker was taken (the proof the unforced fast path already
+  trusts), the start of the sweep reads the marker as the current holdings
+  instead of counting. The end-of-sweep re-check and the new marker reuse the
+  start's holdings and recount only the sessions the change feed shows were
+  written (row revisions and tombstones above the start head). The sweep
+  counts everything again when the feed cannot vouch: no head, a different
+  epoch, a replayable source's prompt changed in place or deleted (a prompt's
+  session is not part of its identity; an appended prompt is carried), or
+  more than 256 sessions / 20,000 rows written.
+  Same marker and same outstanding set; on the 100 MB benchmark store the
+  destination checks go from ~5% of a forced tick to ~0.1%.
+
+- The project-identity refresh at the end of each sync now brings events in
+  line with their session's key only for sessions written since the previous
+  refresh in the same process (#319). It used to walk every event of every
+  keyed session on every tick. Sessions are scoped by the change feed's
+  revisions. The first refresh of a database in a process still covers the
+  whole catalog, as does one after a failure or after the database was
+  replaced. On a 140,000-event store a forced tick spends 1.7% of its time
+  here, down from 11%, and takes about 40 ms less.
+
+- Cheaper sweep ticks: the free-space check before a sweep is one `statfs`/`statvfs`
+  call on Unix instead of spawning `df`, and the per-transcript existence
+  probes a sweep asks about every unchanged Claude transcript and Codex
+  rollout (cursor lookups, sidecar, continuity, fidelity and raw-fact
+  probes), and the per-session ancestor lookup of the cached project-identity
+  upgrade, reuse prepared statements instead of compiling their SQL each
+  time. On the 100 MB benchmark store this is ~10% of a forced tick's CPU.
+
+- A forced sync now walks the Grok session tree once instead of three times,
+  and stamps each session directory twice instead of three times (#317). The
+  source fingerprint, the Grok walk and the discovery pass at the end of the
+  sweep share one enumeration. The walk still reads its own fresh stamp, so a
+  directory that becomes unreadable mid-sweep is reported in that sweep, and
+  discovery reuses the walk's stamps. On a store with 879 Grok sessions a
+  forced tick takes about 45 ms (13%) less.
+
+- `resume` and `pack` search prompts through the same `prompt`-role search
+  (`store::search` now delegates to `history_search`), so they get the same
+  speedup: a common term with `--limit 1` drops from ~10 ms to ~0.2 ms on 49k
+  prompts. The SDK's `search`, `searchPage`, `recent`, `recentPage` and
+  `getSession` read each session's locations once per result set, not once
+  per row.
+
+- When a Codex rollout grows, sync now reads only the appended turns instead
+  of re-parsing the whole file (#315). It resumes through the same
+  locator-keyed cursor that hydration keeps for Codex child rollouts. The
+  cursor advances only at a `task_complete` boundary, and it is stored in the
+  same transaction as the rows it describes. A rollout re-reads from byte
+  zero, as before, when its session or subagent classification changed, when
+  its evidence is gone, when the destination marker names it, or while a
+  one-time backfill is pending. On a 2 MB rollout, a forced tick after a
+  1 KiB append spends about 15 ms on it instead of about 75 ms.
+
+- A forced sync tick that finds nothing new costs about 20% less on a large
+  store (#316, #318). Shallow discovery checks whether each candidate file
+  has changed with a cached stamp query, plus a cached locator lookup when
+  the candidate's session id is not yet known. It used to prepare up to three
+  queries and decode the full observation and catalog row each time. During a sweep
+  it also stops re-resolving the project identity of every unchanged row,
+  because the identity refresh the sweep runs straight afterwards stores the
+  same key. `sessions discover` still resolves each streamed row before
+  emitting it.
+
 - Internal refactor: one-entry harness registry (#177). Each built-in harness
   is declared once, as a `LocalSource` descriptor in
   `crates/ai-hist/src/sources/catalog.rs`, and `SOURCE_CHOICES`,
@@ -602,6 +710,103 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Fixed
 
+- `ai-hist export --out` refuses the history database's SQLite sidecars
+  (`-wal`, `-shm`, `-journal`) as well as the database file itself, by path,
+  directory alias and inode, both before exporting and again before the final
+  rename. A SQLite `file:` URI `--db` is resolved to the file it opens before
+  the guard is derived, preserving raw filename bytes on Unix. Exporting onto
+  a live WAL previously replaced committed database state with NDJSON and left
+  readers failing with a disk I/O error (#305).
+
+- `SessionStore::session` reads a session's requests and usage summary from
+  one evaluation of the grouped `session_requests` view instead of one per
+  1,000-request page plus one more for the summary, and attaches tool use ids
+  by hash rather than a per-request linear search of the page. A 50k-event
+  Claude session read drops from ~1.9 s to ~0.23 s; walking
+  `session_requests_page` to the end drops from ~1.9 s to ~1.1 s. Output is
+  unchanged (#311).
+
+- Live capture: writes made while another process holds the sync lock are
+  swept within about a second of its release, not at the backstop (#364).
+  The owed retry backed off once per contended *event* tick, up to
+  `slow_poll_ms`, and each new event pushed its deadline later, so a burst
+  during a long foreign sweep could wait 30-60 s after the lock was free. It
+  now backs off only per attempt of the owed retry (250 ms doubling to a
+  1 s cap), a new event keeps the earlier deadline, and a forced sweep that
+  gets through resets it. This cadence is independent of `slow_poll_ms`,
+  including a zero backstop in polling mode, so short backstops cannot turn
+  a held sync lock into a stream of immediate retries.
+- Live capture: one write is one forced sweep again. The debounce window
+  re-armed on the events inside it, so a write the backend reported in more
+  than one callback — FSEvents does for a create or a multi-line append —
+  ran a second, redundant forced sweep after the window (a three-line turn
+  went from 2.0 to 1.0 forced sweeps). The window now clears when it closes;
+  a write during the sweep still drives the next tick. This also removes the
+  macOS flakes in the `live_capture` FSEvents tests (#324, #331), together
+  with letting those tests settle after attaching, because FSEvents replays
+  changes made just before a stream registers.
+- `ai-hist` built with `unstable-internal` but without `fs-events` (the napi
+  addon's `--all-features` build) is clippy-clean again: the event-matching
+  helpers and backend-only stubs in `watch.rs` are gated on `fs-events`.
+
+- Export pages stream rows instead of fetching their whole scan budget up
+  front. A page stops reading the moment it is full, so rows past its
+  boundary are no longer decoded, discarded and decoded again by the next
+  page. At most one row per page is decoded twice: the one whose record
+  would overflow the byte limit, which the next page serves. A row outside
+  the selection, or in an excluded session, is never decoded; a relationship
+  is still decoded before its child endpoint is checked. With one
+  record per page and a 10,000-row scan budget, exporting 3,000 rows drops
+  from 10.8 s to 0.08 s; a 50k-event export with the default limits from
+  0.72 s to 0.46 s. Snapshots, cursors, retries and the scan budget are
+  unchanged (#308).
+
+- An abandoned export snapshot is released when its TTL elapses, not when
+  some later export call happens to sweep. A process-wide native thread
+  sleeps until the earliest expiry and ends the snapshot's read transaction,
+  so a long-lived SDK host no longer holds WAL checkpoints back indefinitely.
+  The thread holds no event-loop handle, so it never keeps Node alive (#306).
+
+- Live capture: a write beside the OpenCode database no longer forces a
+  sweep (#335). OpenCode's watch root is still the database's directory,
+  but only the configured database, the channel databases
+  (`opencode-<channel>.db`) and their `-wal`, `-shm` and `-journal` siblings
+  count as evidence there. With `OPENCODE_DB` in a busy directory, a log
+  appended every 50 ms beside it drove 44 forced sweeps and 708 ms of CPU in
+  10 s; it now drives none (37 ms of CPU). `SourceCapabilities::watch_roots`
+  still advertises the directory, which covers more than the loop admits.
+
+- `ai-hist resume <query>` resumes the newest match that names a session. It
+  used to read only the single newest match and report "No session found"
+  when that prompt had no session id, even when an older match did; the
+  session-id requirement is now part of the search query.
+
+- A `SessionStore` handle reuses its read connections instead of opening a
+  new one, and re-parsing the whole schema, on every call (#366). A handle
+  and its clones keep up to four idle read-only connections, reused only
+  while the path still names the same file (Unix device/inode or Windows file
+  identity), including SQLite `file:` URI paths, so a database
+  replaced under the handle is reopened. Schema gates a reused connection has
+  passed are remembered until `PRAGMA schema_version` changes. Writes keep
+  opening their own connection under the existing locks. Per-call measurements
+  on Apple Silicon: `head_revision` 1.5 ms -> 5 us, `changes_since` with an empty tail
+  2.8 ms -> 11 us, `session` 1.25 ms -> 0.26 ms, `has_session` 0.89 ms ->
+  3 us, `session_identities` 1.3 ms -> 0.09 ms.
+
+- Change-feed schema reconciliation now fingerprints each evidence kind's
+  exact exported column names and declared SQLite types. The one-time upgrade
+  from a pre-fingerprint database restamps every existing kind above the
+  current head because it has no per-kind baseline. Later shape-changing
+  migrations restamp only rows of the affected kind. Adding a newly fed kind
+  simply records its fingerprint after its normal backfill, so external
+  watermarks and named cursors resume without replaying unrelated kinds.
+  Retiring a kind remains the one store-wide reset because there is no live
+  table left to restamp and communicate its removal.
+  Previously the `location` migration changed the canonical JSON and remote
+  digest of existing evidence without moving its revision or origin, causing
+  durable receivers to return `409 delivery_conflict` forever. Explicit old
+  watermarks are now refused as stale, while unchanged current schemas keep
+  their epoch and cursor progress.
 - A sweep no longer stalls every other writer for up to ~30 s when a read is
   active as it finishes (#336). Each sweep, including every
   `SessionStore::watch` tick, ended with `wal_checkpoint(TRUNCATE)` under the
@@ -771,9 +976,48 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Rust API
 
+- The `unstable-internal` `storage` module is removed (#309). Its eight
+  raw-SQL readers (`history_after`, `trajectories_after`, `commit_links_after`,
+  `changed_file_sessions_after`, `session_metadata`, `session_project`,
+  `pending_event_sessions`, `latest_history_for_session`) and their row types
+  served the retired capture plugin and had no remaining callers. It was never
+  part of the default surface; no table or data changes.
+
+- `WatchOptions::leading_edge` (default `true`), plus `WatchLoop::leading_edge`
+  and `with_leading_edge`. A filesystem event that finds the watch loop quiet
+  is swept after a 10 ms settle (`watch::LEADING_EDGE_SETTLE_MS`) instead of
+  after the debounce window. Events inside the window that sweep opens
+  coalesce into one trailing tick at its close. `ai-hist watch` gets the new
+  default. On a 300-session store, write to `TickReport`: p50 259 -> 65 ms,
+  p95 267 -> 100 ms. A three-line turn costs 2 sweeps instead of 1, and
+  sustained writes tick once per window instead of once per window plus
+  sweep (12 -> 16 ticks over 3 s). Set it to `false` for the old
+  trailing-only window; `ai-hist watch --no-leading-edge` does the same.
+  Older serialized `WatchOptions` without the field load with it on.
+
+- `SessionStore::watch` ticks can be cancelled (#333). `WatchOptions::stop:
+  Option<StopToken>` (serde-skipped, like `SyncOptions::stop`) is installed
+  around every tick's sweep, and `WatchStop::stop` / dropping the handle now
+  cancel the sweep in flight at its next provider, file or record boundary
+  instead of waiting it out. A cancelled tick arrives as a `TickReport` with
+  the new `cancelled` field set, neither swept nor an error, and the loop ends
+  after it.
+- `TickReport::elapsed_ms` (the sweep's wall time) and
+  `TickReport::first_event_age_ms` (for a filesystem-event tick, how long
+  before the report the first event behind it arrived, counted from the
+  oldest change a deferred or retried tick stands for) (#334). Measured on a
+  300-session store: sweep 40 ms, first-event age 245 ms, so the 200 ms
+  debounce window is most of the write-to-report latency.
+- `WatchHandle::next` / `next_timeout` block on the report channel instead
+  of waking every 50 ms to check the loop's thread (#332): the loop's thread
+  closes the channel when it ends. An idle watch consumer went from about 19
+  to about 1 process wakeups a second.
+
 - `Source::Muse` and `ProviderRoots::muse` (the Muse Code sessions directory;
   `from_env` honours `XDG_DATA_HOME`). Both types are `#[non_exhaustive]`, so
   this is additive.
+- `Source::Devin` and `ProviderRoots::devin` (the Devin CLI data directory;
+  `from_env` honours `XDG_DATA_HOME`). Additive for the same reason.
 - `ProviderRoots` gains `opencode_db_pinned: bool`. `from_env` sets it when
   `OPENCODE_DB` is set; `from_home` leaves it `false`, so every OpenCode channel
   database beside `opencode_db` is read. Set it to read `opencode_db` alone.

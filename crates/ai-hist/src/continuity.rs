@@ -459,10 +459,12 @@ fn codex_thread_spawn_parent(payload: &serde_json::Map<String, Value>) -> Option
 /// one `session_meta` line clears it: the new row always carries the key.
 pub(crate) fn codex_evidence_is_current(conn: &Connection, locator: &str) -> Result<bool> {
     Ok(conn
-        .query_row(
+        .prepare_cached(
             "SELECT instr(explicit_targets_json, '\"fork_refs\"') > 0 \
              FROM session_continuity_evidence \
              WHERE source = 'codex' AND locator = ? LIMIT 1",
+        )?
+        .query_row(
             [locator],
             |row| row.get::<_, bool>(0),
         )
@@ -477,11 +479,13 @@ pub(crate) fn codex_evidence_is_current(conn: &Connection, locator: &str) -> Res
 /// the only unchanged rollouts the one-time replay repair has to re-read.
 pub(crate) fn codex_evidence_names_fork(conn: &Connection, locator: &str) -> Result<bool> {
     Ok(conn
-        .query_row(
+        .prepare_cached(
             "SELECT EXISTS(SELECT 1 FROM json_each(explicit_targets_json, '$.fork_refs')) \
              FROM session_continuity_evidence \
              WHERE source = 'codex' AND locator = ? AND json_valid(explicit_targets_json) \
              LIMIT 1",
+        )?
+        .query_row(
             [locator],
             |row| row.get::<_, bool>(0),
         )

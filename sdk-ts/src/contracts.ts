@@ -392,7 +392,8 @@ export type ToolResultErrorSignal =
   | 'patch_apply'
   | 'mcp_err'
   | 'subagent_status'
-  | 'tool_status';
+  | 'tool_status'
+  | 'tool_call_state.status';
 
 export interface EventCursor {
   tsMs: number;

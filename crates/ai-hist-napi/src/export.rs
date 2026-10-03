@@ -3,7 +3,8 @@
 use ai_hist::export as core;
 use napi_derive::napi;
 use serde::Deserialize;
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
 #[derive(Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
@@ -32,9 +33,84 @@ const MAX_EXPORT_REQUEST_BYTES: usize = 6 * 65_536 + 4_096;
 /// Most snapshots open at once across every store.
 const MAX_OPEN_EXPORTS: usize = 32;
 static OPEN: Mutex<Vec<core::ExportSnapshot>> = Mutex::new(Vec::new());
+/// Signalled whenever a snapshot is added, so the reaper recomputes when the
+/// earliest one expires.
+static REAPER_WAKE: Condvar = Condvar::new();
+/// Whether the reaper thread is running.
+static REAPER_STARTED: Mutex<bool> = Mutex::new(false);
+/// Longest the reaper sleeps while a snapshot is open; see `start_reaper`.
+const REAPER_MAX_WAIT_MS: u64 = 1_000;
 
 fn open_snapshots() -> std::sync::MutexGuard<'static, Vec<core::ExportSnapshot>> {
     OPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The wall clock in Unix milliseconds: the clock the SDK stamps `now_ms`
+/// with (`Date.now()`), so a snapshot's `expires_at_ms` means the same
+/// instant here.
+fn wall_clock_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
+/// Start, once per process, the thread that releases snapshots when their
+/// TTL elapses.
+///
+/// Without it an abandoned snapshot -- a paging handle the caller dropped
+/// without closing -- kept its read transaction until some later export call
+/// happened to sweep, and in a long-lived host that might be never: WAL
+/// checkpoints could not pass its view and the WAL grew without bound
+/// (#306). The thread sleeps until the earliest expiry (or until a new
+/// snapshot arrives) and holds no libuv handle, so it never keeps an
+/// otherwise finished Node process alive. Explicit close, cursor replay and
+/// the RPC-driven sweeps are unchanged; this only adds a deadline nobody has
+/// to call.
+fn start_reaper() {
+    let mut started = REAPER_STARTED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if *started {
+        return;
+    }
+    // Recorded only once a thread is really running: a failed spawn is
+    // retried on the next create, and until then the RPC-driven sweeps
+    // still release expired snapshots, exactly as before.
+    *started = std::thread::Builder::new()
+        .name("ai-hist-export-reaper".into())
+        .spawn(|| {
+            let mut open = open_snapshots();
+            loop {
+                let now = wall_clock_ms();
+                expire(&mut open, now, usize::MAX);
+                let next = open
+                    .iter()
+                    .map(|snapshot| snapshot.handle().expires_at_ms)
+                    .min();
+                open = match next {
+                    None => REAPER_WAKE
+                        .wait(open)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                    Some(at) => {
+                        // Expiry is a wall-clock instant but the wait is
+                        // a monotonic duration, so a clock that jumps
+                        // forward would otherwise leave an expired
+                        // snapshot open for up to its whole TTL. Waking
+                        // at least once a second while anything is open
+                        // re-reads the wall clock; it costs nothing when
+                        // no snapshot is open.
+                        let wait =
+                            at.saturating_sub(now).clamp(1, REAPER_MAX_WAIT_MS as i64) as u64;
+                        REAPER_WAKE
+                            .wait_timeout(open, Duration::from_millis(wait))
+                            .map_or_else(|poisoned| poisoned.into_inner().0, |(guard, _)| guard)
+                    }
+                };
+            }
+        })
+        .is_ok();
 }
 
 /// Close up to `limit` snapshots expired at `now_ms`, returning how many.
@@ -87,6 +163,9 @@ pub async fn history_export(request_json: String, db_path: Option<String>) -> na
                         "maximum open exports reached; close or expire old snapshots"
                     );
                     open.push(snapshot);
+                    drop(open);
+                    start_reaper();
+                    REAPER_WAKE.notify_all();
                     serde_json::to_value(handle)?
                 }
                 Request::ExportPage { cursor, now_ms } => {

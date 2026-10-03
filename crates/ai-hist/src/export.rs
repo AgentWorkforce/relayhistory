@@ -178,12 +178,11 @@ fn selected(selection: &ExportSelection, source: &str, session: Option<&str>) ->
             .any(|id| id.source == source && Some(id.session_id.as_str()) == session)
 }
 
-/// Whether a row leaves the snapshot. A relationship names two sessions, so
-/// it is left out when either endpoint is excluded.
-fn row_excluded(selection: &ExportSelection, row: &change_feed::LiveRow) -> bool {
-    if excluded(selection, &row.source, row.session.as_deref()) {
-        return true;
-    }
+/// Whether a decoded row leaves the snapshot through its *second* session. A
+/// relationship names two sessions, so it is left out when either endpoint is
+/// excluded; the row's own session is checked before it is decoded, so only
+/// the child endpoint is left to check here.
+fn child_excluded(selection: &ExportSelection, row: &change_feed::LiveRow) -> bool {
     row.columns
         .get("child_session_id")
         .and_then(|child| child.as_str())
@@ -356,49 +355,62 @@ impl ExportSnapshot {
         let mut kind_index = self.kind_index;
         let mut after = self.after;
         let mut scanned = 0;
-        'kinds: while kind_index < SUPPORTED_KINDS.len()
+        let mut full = false;
+        while !full
+            && kind_index < SUPPORTED_KINDS.len()
             && scanned < self.limits.max_scan_records
             && page.records.len() < self.limits.max_batch_records
         {
             let name = SUPPORTED_KINDS[kind_index];
-            let rows = if self.selection.kinds.iter().any(|kind| kind == name) {
-                change_feed::rows_by_rowid(
+            let kind = change_kind(name)?;
+            // Rows stream through one at a time and the read stops the moment
+            // the page is full, so a row past the page boundary is neither
+            // read nor decoded until the page that serves it (#308).
+            let visited = if self.selection.kinds.iter().any(|kind| kind == name) {
+                change_feed::visit_rows_by_rowid(
                     &self.conn,
-                    change_kind(name)?,
+                    kind,
                     after,
                     self.limits.max_scan_records - scanned,
+                    |row| {
+                        let rowid = row.rowid;
+                        // Decided on the row's identity alone, so a row the
+                        // selection leaves out is never decoded.
+                        if selected(&self.selection, &row.source, row.session.as_deref())
+                            && !excluded(&self.selection, &row.source, row.session.as_deref())
+                        {
+                            let live = row.decode()?;
+                            if !child_excluded(&self.selection, &live) {
+                                let record = make_record(&self.origin_id, kind, live)?;
+                                let size = serde_json::to_vec(&record)?.len()
+                                    + usize::from(!page.records.is_empty());
+                                if bytes + size > self.limits.max_batch_bytes {
+                                    ensure!(
+                                        !page.records.is_empty(),
+                                        "export record exceeds configured page byte limit"
+                                    );
+                                    full = true;
+                                    return Ok(false);
+                                }
+                                bytes += size;
+                                page.records.push(record);
+                            }
+                        }
+                        scanned += 1;
+                        after = rowid;
+                        if page.records.len() >= self.limits.max_batch_records {
+                            full = true;
+                            return Ok(false);
+                        }
+                        Ok(true)
+                    },
                 )?
             } else {
-                Vec::new()
+                0
             };
-            if rows.is_empty() {
+            if visited == 0 {
                 kind_index += 1;
                 after = 0;
-                continue;
-            }
-            for row in rows {
-                let rowid = row.rowid;
-                if selected(&self.selection, &row.source, row.session.as_deref())
-                    && !row_excluded(&self.selection, &row)
-                {
-                    let record = make_record(&self.origin_id, change_kind(name)?, row)?;
-                    let size =
-                        serde_json::to_vec(&record)?.len() + usize::from(!page.records.is_empty());
-                    if bytes + size > self.limits.max_batch_bytes {
-                        ensure!(
-                            !page.records.is_empty(),
-                            "export record exceeds configured page byte limit"
-                        );
-                        break 'kinds;
-                    }
-                    bytes += size;
-                    page.records.push(record);
-                }
-                scanned += 1;
-                after = rowid;
-                if page.records.len() >= self.limits.max_batch_records {
-                    break 'kinds;
-                }
             }
         }
         if kind_index >= SUPPORTED_KINDS.len() {

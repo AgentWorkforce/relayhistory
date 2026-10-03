@@ -2611,7 +2611,7 @@ pub fn mark_session_presence(
 /// An empty result is intentionally distinct from `local`: it means no
 /// provenance row was recorded (for example, by an older writer).
 pub fn session_locations(conn: &Connection, source: &str, session_id: &str) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT location FROM session_presences \
          WHERE source = ? AND session_id = ? \
          ORDER BY CASE location WHEN 'local' THEN 0 ELSE 1 END",
@@ -2757,6 +2757,9 @@ pub fn insert_history_at_location(
     Ok(inserted)
 }
 
+/// Prompts matching a search, newest first: the `prompt` role of
+/// [`crate::history_search::search_all`], the read `resume` and `pack` make.
+/// With no terms it is [`recent`].
 pub fn search(
     conn: &Connection,
     terms: &[String],
@@ -2766,20 +2769,43 @@ pub fn search(
     if terms.is_empty() {
         return recent(conn, filter);
     }
-    filter.validate()?;
-    let query = build_fts_query(terms, raw_fts);
-    let mut sql = "SELECT h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms FROM history_fts f JOIN history h ON f.rowid = h.id WHERE history_fts MATCH ?".to_string();
-    let mut params_vec = vec![query];
-    append_filters(&mut sql, &mut params_vec, filter, "h");
-    append_scope_filter(&mut sql, filter.scope, "h");
-    sql.push_str(" ORDER BY h.timestamp_ms DESC, h.id DESC LIMIT ?");
-    params_vec.push(filter.limit.max(1).to_string());
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt
-        .query_map(rusqlite::params_from_iter(params_vec), row_to_entry)
-        .map_err(|error| raw_fts_query_error(raw_fts, error))?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|error| raw_fts_query_error(raw_fts, error))
+    Ok(crate::history_search::search_all(
+        conn,
+        terms,
+        raw_fts,
+        filter,
+        crate::history_search::SearchRole::Prompt,
+    )?
+    .into_iter()
+    .map(prompt_entry)
+    .collect())
+}
+
+/// The newest prompt matching a search that names a session, so it can be
+/// resumed. The session-id predicate is part of the query, so prompts
+/// recorded without a session id never hide an older resumable match.
+pub fn latest_resumable_match(
+    conn: &Connection,
+    terms: &[String],
+    raw_fts: bool,
+    filter: &QueryFilter,
+) -> Result<Option<HistoryEntry>> {
+    Ok(
+        crate::history_search::latest_prompt_with_session(conn, terms, raw_fts, filter)?
+            .map(prompt_entry),
+    )
+}
+
+fn prompt_entry(row: crate::history_search::SearchRow) -> HistoryEntry {
+    HistoryEntry {
+        id: row.id,
+        source: row.source,
+        session_id: row.session_id,
+        project: row.project,
+        prompt: row.text,
+        prompt_hash: None,
+        timestamp_ms: row.timestamp_ms,
+    }
 }
 
 pub fn recent(conn: &Connection, filter: &QueryFilter) -> Result<Vec<HistoryEntry>> {
@@ -4218,6 +4244,81 @@ pub fn refresh_project_identity(conn: &Connection) -> Result<usize> {
     Ok(written)
 }
 
+/// Which database a remembered refresh belongs to: the file, and the change
+/// feed's epoch, which a database recreated at the same path does not share.
+type RefreshedStore = (PathBuf, i64);
+
+/// The change-feed revision each database's last successful
+/// [`refresh_project_identity_after_sweep`] in this process started at.
+///
+/// Every row a refresh can find out of line was written, by some process,
+/// after the last refresh that left everything in line: the feed's triggers
+/// stamp every insert and every update that changes a column, `project_key`
+/// and `project_key_method` included, with a revision above that point. So the
+/// denormalizing pass needs to look only at sessions holding such a row.
+static REFRESHED_THROUGH: std::sync::LazyLock<std::sync::Mutex<BTreeMap<RefreshedStore, i64>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// The feed epoch and head revision of `conn`'s database, or `None` when it
+/// has no change feed (or no file) to scope by.
+///
+/// The database is named by its canonical path, the identity the sync lock
+/// uses, so two spellings of one file share a remembered point; and the head
+/// is the change feed's own single-statement read of epoch and revision.
+fn feed_position(conn: &Connection) -> Option<(RefreshedStore, i64)> {
+    let path = Path::new(conn.path().filter(|path| !path.is_empty())?);
+    let path = crate::ingest::canonical_db_identity(path).ok()?;
+    let head = crate::change_feed::read_head(conn).ok()?;
+    Some(((path, head.epoch as i64), head.revision as i64))
+}
+
+/// [`refresh_project_identity`] for the end of a sweep, scoped to what was
+/// written since the previous one.
+///
+/// Passes 1, 2 and 4 run in full: they read the catalog and the relationship
+/// ledger rather than the events, and pass 1 is how a checkout that gained an
+/// `origin` reaches sessions whose transcripts never change. Pass 3 is the
+/// one whose cost grew with the event table -- its probe walks every event of
+/// every keyed session through `idx_session_events_project`, about 50 ms on a
+/// 140,000-event store, on every tick (#319) -- and it is scoped here to the
+/// sessions whose catalog row or events carry a revision above the point the
+/// previous refresh of this database started at. Rows passes 1 and 2 rewrite
+/// just now carry such a revision too, so they are in that set.
+///
+/// The first refresh of a database in a process runs pass 3 in full, as does
+/// one whose feed epoch changed or whose head went backwards (a database
+/// replaced under the process). A failed refresh forgets the point, so the
+/// next one is full again.
+pub(crate) fn refresh_project_identity_after_sweep(conn: &Connection) -> Result<usize> {
+    let position = feed_position(conn);
+    let since = position.as_ref().and_then(|(store, head)| {
+        let remembered = REFRESHED_THROUGH.lock().ok()?.get(store).copied()?;
+        (remembered <= *head).then_some(remembered)
+    });
+    let refreshed = (|| {
+        let mut written = resolve_missing_project_keys(conn)?;
+        written += inherit_project_keys(conn)?;
+        written += match since {
+            Some(since) => denormalize_event_project_keys_since(conn, since)?,
+            None => denormalize_event_project_keys(conn)?,
+        };
+        written += inherit_event_project_keys(conn)?;
+        Ok(written)
+    })();
+    if let Some((store, head)) = position {
+        if let Ok(mut remembered) = REFRESHED_THROUGH.lock() {
+            match refreshed {
+                // The head read before any pass ran: a row written while the
+                // passes ran, by this refresh or by anyone else, sits above it
+                // and is looked at next time.
+                Ok(_) => remembered.insert(store, head),
+                Err(_) => remembered.remove(&store),
+            };
+        }
+    }
+    refreshed
+}
+
 /// Reconcile one hydrated session and its delegation descendants with indexed
 /// identity lookups. Ancestor resolution uses the same cycle-safe ranking walk
 /// as the global maintenance pass; unrelated events are never examined.
@@ -4655,6 +4756,48 @@ fn denormalize_event_project_keys(conn: &Connection) -> Result<usize> {
     )?)
 }
 
+/// Pass 3 over the sessions whose catalog row or events were written above
+/// revision `since`.
+///
+/// Every event that can be out of line with its session is in that set when
+/// the previous refresh left everything in line at `since`: staleness is born
+/// only of a session's key moving or of an event being written, and both
+/// stamp a revision. Each session costs a primary-key seek and a range of
+/// `idx_session_events_project`, so a tick that touched one session reads one
+/// session's events rather than every event in the store.
+fn denormalize_event_project_keys_since(conn: &Connection, since: i64) -> Result<usize> {
+    let touched: Vec<(String, String)> = conn
+        .prepare(
+            "SELECT source, session_id FROM sessions WHERE revision > ?1 \
+             UNION SELECT source, session_id FROM session_events WHERE revision > ?1",
+        )?
+        .query_map([since], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    if touched.is_empty() {
+        return Ok(0);
+    }
+    let stale = format!(
+        "{} AND s.source = ?1 AND s.session_id = ?2",
+        stale_event_project_keys_sql()
+    );
+    let mut probe = conn.prepare(&format!("SELECT 1 {stale} LIMIT 1"))?;
+    let mut update = conn.prepare(&format!(
+        "UPDATE session_events SET project_key = {EVENT_SESSION_KEY_SQL}, \
+         project_key_method = {EVENT_SESSION_METHOD_SQL} \
+         WHERE id IN (SELECT e.id {stale})"
+    ))?;
+    let mut written = 0;
+    for (source, session_id) in touched {
+        // Probe first, as the full pass does: the ingest path stamps events
+        // as it writes them, so this normally finds nothing and must not take
+        // the write lock to learn that.
+        if probe.exists(params![source, session_id])? {
+            written += update.execute(params![source, session_id])?;
+        }
+    }
+    Ok(written)
+}
+
 /// The `FROM ... WHERE` of pass 3: every event whose key is behind its own
 /// catalog row's, as `e`.
 fn stale_event_project_keys_sql() -> String {
@@ -4829,7 +4972,7 @@ fn lendable_ancestor_key(
         return Ok((None, false));
     }
     let parents: Vec<ParentIdentityRow> = conn
-        .prepare(
+        .prepare_cached(
             "SELECT r.parent_session_id, \
                     (SELECT p.project_key FROM sessions p \
                      WHERE p.source = r.source AND p.session_id = r.parent_session_id), \
@@ -8734,6 +8877,88 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The post-sweep refresh looks only at sessions written since the last
+    /// one, and still brings every such session's events in line: a session
+    /// whose key moved, an event written without a key, and a session
+    /// catalogued after its events.
+    #[test]
+    fn the_post_sweep_refresh_is_scoped_to_what_changed_and_misses_none_of_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = open_db(&temp.path().join("scoped.db")).unwrap();
+        let event_key = |id: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT project_key FROM session_events WHERE event_uid = ?",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let insert_event = |session: &str, uid: &str, key: Option<&str>| {
+            conn.execute(
+                "INSERT INTO session_events (source, session_id, event_uid, ts_ms, role, kind, \
+                 text, project_key, project_key_method) \
+                 VALUES ('codex', ?1, ?2, 1, 'user', 'text', 'hi', ?3, \
+                         CASE WHEN ?3 IS NULL THEN NULL ELSE 'path' END)",
+                params![session, uid, key],
+            )
+            .unwrap();
+        };
+        for session in ["a", "b"] {
+            conn.execute(
+                "INSERT INTO sessions (source, session_id, project_key, project_key_method, \
+                 last_activity_ms, discovery_state) VALUES ('codex', ?1, ?2, 'path', 1, 'full')",
+                params![session, format!("/work/{session}")],
+            )
+            .unwrap();
+        }
+        insert_event("a", "a1", None);
+        insert_event("b", "b1", None);
+
+        // The first refresh in the process has nothing to scope by: full.
+        assert_eq!(refresh_project_identity_after_sweep(&conn).unwrap(), 2);
+        assert_eq!(event_key("a1").as_deref(), Some("/work/a"));
+        assert_eq!(event_key("b1").as_deref(), Some("/work/b"));
+        assert_eq!(refresh_project_identity_after_sweep(&conn).unwrap(), 0);
+
+        // A key that moves, an event written bare, a session catalogued after
+        // its events: all stamped above the previous refresh, all found.
+        conn.execute(
+            "UPDATE sessions SET project_key = 'github.com/acme/a', project_key_method = 'remote' \
+             WHERE session_id = 'a'",
+            [],
+        )
+        .unwrap();
+        insert_event("b", "b2", None);
+        insert_event("c", "c1", None);
+        conn.execute(
+            "INSERT INTO sessions (source, session_id, project_key, project_key_method, \
+             last_activity_ms, discovery_state) VALUES ('codex', 'c', '/work/c', 'path', 1, 'full')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(refresh_project_identity_after_sweep(&conn).unwrap(), 3);
+        assert_eq!(event_key("a1").as_deref(), Some("github.com/acme/a"));
+        assert_eq!(event_key("b2").as_deref(), Some("/work/b"));
+        assert_eq!(event_key("c1").as_deref(), Some("/work/c"));
+        assert_eq!(refresh_project_identity_after_sweep(&conn).unwrap(), 0);
+
+        // And the scope really is the changed rows. An event put out of line
+        // under an old revision (the update trigger leaves a write that sets
+        // `revision` itself alone) is invisible to the scoped pass, and found
+        // by the full one -- which is why the first refresh of a process, and
+        // any after a failed one, stays full.
+        conn.execute(
+            "UPDATE session_events SET project_key = NULL, revision = 1 \
+             WHERE event_uid = 'b1'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(refresh_project_identity_after_sweep(&conn).unwrap(), 0);
+        assert_eq!(event_key("b1"), None);
+        assert_eq!(refresh_project_identity(&conn).unwrap(), 1);
+        assert_eq!(event_key("b1").as_deref(), Some("/work/b"));
     }
 }
 

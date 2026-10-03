@@ -84,7 +84,7 @@ pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 4;
 /// invalidates every stored stamp, so a scanner that learns to extract a new
 /// field re-reads sources whose bytes never changed. `parser_version` keeps its
 /// existing meaning (full-ingest parser generation) and is untouched.
-pub const SHALLOW_SCANNER_VERSION: u32 = 8;
+pub const SHALLOW_SCANNER_VERSION: u32 = 9;
 
 /// Version 2 shipped the classification that hid standalone guardians (see
 /// [`crate::codex_is_subagent`]). Their rollouts never change on disk, so the
@@ -136,6 +136,13 @@ const _: () = assert!(SHALLOW_SCANNER_VERSION > 6);
 /// spends the one-time `codex_fork_replay_gate` re-read that retires the
 /// replayed rows an earlier build indexed under each fork.
 const _: () = assert!(SHALLOW_SCANNER_VERSION > 7);
+
+/// Version 8's Devin array-preview reader trimmed after truncation, so an
+/// excerpt whose 4,096th character was the joining newline was cached one
+/// character short. Version 9 preserves that boundary newline. The provider
+/// database does not change when the reader is upgraded, so only this bump
+/// forces unchanged Devin sessions through the corrected shallow reader.
+const _: () = assert!(SHALLOW_SCANNER_VERSION > 8);
 
 /// Most bytes a shallow head read may consume from one transcript.
 pub const HEAD_SCAN_MAX_BYTES: u64 = 256 * 1024;
@@ -324,6 +331,8 @@ pub struct DiscoveryEnv<'a> {
     pub grok_home: PathBuf,
     /// Muse Code session logs.
     pub muse_sessions: PathBuf,
+    /// Devin CLI data directory (`sessions.db` plus `transcripts/`).
+    pub devin_dir: PathBuf,
     /// Path to the opencode database.
     pub opencode_db: PathBuf,
     /// Whether `opencode_db` is the only OpenCode database to read, rather
@@ -354,6 +363,7 @@ impl<'a> DiscoveryEnv<'a> {
             codex_home: roots.codex,
             grok_home: roots.grok,
             muse_sessions: roots.muse,
+            devin_dir: roots.devin,
             opencode_db: roots.opencode_db,
             opencode_db_pinned: roots.opencode_db_pinned,
             opencode_storage_dir: roots.opencode_storage_dir,
@@ -383,10 +393,12 @@ impl<'a> DiscoveryEnv<'a> {
             .map(|parent| parent.join("storage"))
             .unwrap_or_else(|| home.join(".local/share/opencode/storage"));
         let muse = crate::paths::default_muse_sessions_dir(&home);
+        let devin = crate::paths::devin_cli_dir_under(&home);
         Self::with_provider_roots(
             conn,
             crate::ProviderRoots {
                 muse,
+                devin,
                 home,
                 claude: claude_config_dir,
                 codex: codex_home,
@@ -398,6 +410,13 @@ impl<'a> DiscoveryEnv<'a> {
                 use_env_roots: false,
             },
         )
+    }
+
+    /// Point the Devin CLI data directory somewhere other than the default.
+    #[must_use]
+    pub fn with_devin_dir(mut self, devin_dir: PathBuf) -> Self {
+        self.devin_dir = devin_dir;
+        self
     }
 
     /// Point the legacy JSON tree somewhere other than beside the database.
@@ -425,6 +444,7 @@ impl<'a> DiscoveryEnv<'a> {
             codex_home: &self.codex_home,
             grok_home: &self.grok_home,
             muse_sessions: &self.muse_sessions,
+            devin_dir: &self.devin_dir,
             opencode_db: &self.opencode_db,
             opencode_db_pinned: self.opencode_db_pinned,
             opencode_storage_dir: &self.opencode_storage_dir,
@@ -469,6 +489,8 @@ pub struct ScanEnv<'a> {
     pub grok_home: &'a Path,
     /// Muse Code session logs.
     pub muse_sessions: &'a Path,
+    /// Devin CLI data directory (`sessions.db` plus `transcripts/`).
+    pub devin_dir: &'a Path,
     /// Path to the opencode database.
     pub opencode_db: &'a Path,
     /// Whether `opencode_db` is the only OpenCode database to read.
@@ -520,8 +542,14 @@ pub struct ProviderRoots<'a> {
     pub grok: &'a Path,
     /// Muse Code session logs.
     pub muse: &'a Path,
+    /// Devin CLI data directory (`sessions.db` plus `transcripts/`).
+    pub devin: &'a Path,
     /// Path to the opencode database.
     pub opencode_db: &'a Path,
+    /// Whether `opencode_db` is the only OpenCode database read, so the
+    /// channel databases beside it are not evidence. See
+    /// [`crate::ProviderRoots::opencode_db_pinned`].
+    pub opencode_db_pinned: bool,
 }
 
 /// One path the live-capture watcher monitors, and how deeply.
@@ -543,6 +571,84 @@ pub struct WatchRoot {
     /// asked — see [`WatchRoot::resolve`]. `None` until then, and for a root
     /// whose registration path does not exist yet.
     pub canonical: Option<PathBuf>,
+    /// Which of a [`WatchDepth::Directory`] root's entries count. Ignored at
+    /// the other depths.
+    pub entries: WatchEntries,
+}
+
+/// Which entries of a [`WatchDepth::Directory`] root are evidence.
+///
+/// A directory root exists for a provider that cannot be watched as one file
+/// — OpenCode's database is rewritten in place with SQLite's `-wal`, `-shm`
+/// and `-journal` siblings beside it, and channel databases appear next to
+/// it — but every write to any *other* entry of that directory would still
+/// force a sweep. When `OPENCODE_DB` names a file in a busy directory (its
+/// own log beside it, `$HOME` itself) that is a sweep per write, forever: one
+/// measured collector made 197 forced, fruitless ticks in 90 s of idle time
+/// (#335). The filter keeps the one registration and admits only the names
+/// the sweep reads.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum WatchEntries {
+    /// Every direct entry.
+    #[default]
+    All,
+    /// OpenCode's SQLite stores: the configured database file `primary`
+    /// and its `-wal`, `-shm` and `-journal` siblings, plus — when
+    /// `channels` is set — every channel database (`opencode.db`,
+    /// `opencode-<channel>.db`) and its siblings. `channels` is off when
+    /// `OPENCODE_DB` pins the one database the sweep reads.
+    OpencodeStores {
+        primary: std::ffi::OsString,
+        channels: bool,
+    },
+}
+
+/// The SQLite sidecars that move with a database file.
+const SQLITE_SIDECARS: [&str; 3] = ["-wal", "-shm", "-journal"];
+
+impl WatchEntries {
+    /// Whether an entry named `name` is one this filter admits.
+    fn admits(&self, name: &std::ffi::OsStr) -> bool {
+        let (primary, channels) = match self {
+            WatchEntries::All => return true,
+            WatchEntries::OpencodeStores { primary, channels } => (primary, *channels),
+        };
+        // The configured name and its sidecars first, compared as `OsStr`
+        // rather than stripped as text: the configured file may itself end in
+        // `-wal` (or not be UTF-8 at all), and suffix-stripping the event
+        // name would then never come back to it.
+        if name == primary.as_os_str()
+            || SQLITE_SIDECARS.iter().any(|suffix| {
+                let mut sidecar = primary.clone();
+                sidecar.push(suffix);
+                name == sidecar.as_os_str()
+            })
+        {
+            return true;
+        }
+        if !channels {
+            return false;
+        }
+        // Channel database names are ASCII by construction.
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        let store = SQLITE_SIDECARS
+            .iter()
+            .find_map(|suffix| name.strip_suffix(suffix))
+            .unwrap_or(name);
+        crate::paths::is_opencode_db_filename(store)
+    }
+
+    /// The filter covering both claims on one path: anything wider than a
+    /// single filter is every entry.
+    fn widen(&self, other: &WatchEntries) -> WatchEntries {
+        if self == other {
+            self.clone()
+        } else {
+            WatchEntries::All
+        }
+    }
 }
 
 /// How much of a [`WatchRoot`]'s path is watched.
@@ -605,6 +711,7 @@ impl WatchRoot {
             path: watch_path(&path.into()),
             depth: WatchDepth::Tree,
             canonical: None,
+            entries: WatchEntries::All,
         }
     }
 
@@ -614,7 +721,30 @@ impl WatchRoot {
             path: watch_path(&path.into()),
             depth: WatchDepth::Directory,
             canonical: None,
+            entries: WatchEntries::All,
         }
+    }
+
+    /// Watch only this directory's own entries that `entries` admits.
+    pub fn directory_of(path: impl Into<PathBuf>, entries: WatchEntries) -> Self {
+        Self {
+            entries,
+            ..Self::directory(path)
+        }
+    }
+
+    /// Fold another claim on the same path into this one: the wider depth,
+    /// and the wider entry filter.
+    pub fn widen(&mut self, other: &WatchRoot) {
+        // A filter belongs to the directory depth; a deeper claim carries
+        // every entry with it.
+        self.entries = match (self.depth, other.depth) {
+            (WatchDepth::Directory, WatchDepth::Directory) => self.entries.widen(&other.entries),
+            (WatchDepth::Directory, WatchDepth::File) => self.entries.clone(),
+            (WatchDepth::File, WatchDepth::Directory) => other.entries.clone(),
+            _ => WatchEntries::All,
+        };
+        self.depth = self.depth.max(other.depth);
     }
 
     /// Watch only this one file, through its parent directory.
@@ -623,6 +753,7 @@ impl WatchRoot {
             path: watch_path(&path.into()),
             depth: WatchDepth::File,
             canonical: None,
+            entries: WatchEntries::All,
         }
     }
 
@@ -719,7 +850,13 @@ impl WatchRoot {
     fn covers_as(&self, root: &Path, path: &Path) -> bool {
         match self.depth {
             WatchDepth::Tree => path.starts_with(root),
-            WatchDepth::Directory => path == root || path.parent() == Some(root),
+            WatchDepth::Directory => {
+                path == root
+                    || (path.parent() == Some(root)
+                        && path
+                            .file_name()
+                            .is_some_and(|name| self.entries.admits(name)))
+            }
             WatchDepth::File => path == root,
         }
     }
@@ -737,28 +874,25 @@ pub fn watch_roots(
     providers: &[Box<dyn ShallowSessionProvider>],
     roots: &ProviderRoots<'_>,
 ) -> Vec<WatchRoot> {
-    let mut widest: BTreeMap<PathBuf, WatchDepth> = BTreeMap::new();
+    let mut widest: BTreeMap<PathBuf, WatchRoot> = BTreeMap::new();
     let mut order = Vec::new();
     for provider in providers {
         for root in provider.watch_roots(roots) {
             match widest.get_mut(&root.path) {
-                Some(depth) => *depth = (*depth).max(root.depth),
+                Some(held) => held.widen(&root),
                 None => {
-                    widest.insert(root.path.clone(), root.depth);
-                    order.push(root.path);
+                    order.push(root.path.clone());
+                    widest.insert(root.path.clone(), root);
                 }
             }
         }
     }
     order
         .into_iter()
-        .map(|path| {
-            let depth = widest[&path];
-            WatchRoot {
-                path,
-                depth,
-                canonical: None,
-            }
+        .filter_map(|path| widest.remove(&path))
+        .map(|root| WatchRoot {
+            canonical: None,
+            ..root
         })
         .collect()
 }
@@ -1933,14 +2067,12 @@ impl ShallowSessionProvider for GrokProvider {
         env: &DiscoveryEnv<'_>,
         _requested_limit: Option<usize>,
     ) -> Result<Vec<Candidate>> {
+        // Inside a sweep, one enumeration and one stamp per session directory
+        // serve the fingerprint, the walk and this pass alike (#317).
         file_candidates(
             "grok",
-            crate::collect_matching_files(
-                &env.grok_home.join("sessions"),
-                "chat_history",
-                "jsonl",
-            )?,
-            crate::grok_session_stamp_and_modified,
+            sweep_inventory::grok_transcripts(&env.grok_home.join("sessions"))?,
+            sweep_inventory::grok_stamp_and_modified,
         )
     }
 
@@ -2352,7 +2484,7 @@ impl ScanEnv<'_> {
 /// SQLite opening the file and RelayHistory computing the source stamp.
 fn open_opencode_snapshot(scan: &ScanEnv<'_>, store: &Path) -> Result<OpencodeReadSnapshot> {
     for _ in 0..3 {
-        let generation_before = opencode_store_generation(store)?;
+        let generation_before = sqlite_store_generation(store)?;
         let conn = open_db_readonly(store)?;
         scan.note_open();
         conn.execute_batch("PRAGMA query_only = ON; BEGIN DEFERRED")?;
@@ -2363,7 +2495,7 @@ fn open_opencode_snapshot(scan: &ScanEnv<'_>, store: &Path) -> Result<OpencodeRe
         let part_by_session = has_leading_index(&conn, "part", "session_id")?;
         let part_by_message = has_leading_index(&conn, "part", "message_id")?;
         let schema_version: i64 = conn.query_row("PRAGMA schema_version", [], |row| row.get(0))?;
-        let generation_after = opencode_store_generation(store)?;
+        let generation_after = sqlite_store_generation(store)?;
         if generation_before != generation_after {
             continue;
         }
@@ -2442,6 +2574,19 @@ fn table_columns(conn: &Connection, table: &str) -> Result<BTreeSet<String>> {
         .collect::<rusqlite::Result<BTreeSet<String>>>()?)
 }
 
+/// Holds the pass lock and ends the retained read snapshot when the pass
+/// ends, so a WAL-mode provider database is not pinned open between passes.
+struct OpencodePassGuard<'a> {
+    _pass: MutexGuard<'a, ()>,
+    live: &'a Mutex<Option<OpencodeLive>>,
+}
+
+impl Drop for OpencodePassGuard<'_> {
+    fn drop(&mut self) {
+        *self.live.lock().expect("opencode live snapshot lock") = None;
+    }
+}
+
 impl ShallowSessionProvider for OpencodeProvider {
     fn begin_discovery_pass(&self) -> Result<Option<Box<dyn DiscoveryPassGuard + '_>>> {
         let pass = self.pass.lock().expect("opencode discovery pass lock");
@@ -2450,7 +2595,10 @@ impl ShallowSessionProvider for OpencodeProvider {
         // the pass lock prevents a concurrent call from replacing the state
         // between enumeration and reads.
         *self.live.lock().expect("opencode live snapshot lock") = None;
-        Ok(Some(Box::new(pass)))
+        Ok(Some(Box::new(OpencodePassGuard {
+            _pass: pass,
+            live: &self.live,
+        })))
     }
 
     fn acquire(
@@ -2474,11 +2622,26 @@ impl ShallowSessionProvider for OpencodeProvider {
         // siblings move with it, so the directory is what actually sees every
         // write. Its own entries are enough — opencode keeps unrelated state
         // in subdirectories, and waking on those would cost a fingerprint walk
-        // each time.
+        // each time — and only the store files among them: `OPENCODE_DB` can
+        // name a file in a busy directory, and every other write there would
+        // otherwise be a forced sweep (#335).
+        let Some(name) = roots.opencode_db.file_name() else {
+            return Vec::new();
+        };
         roots
             .opencode_db
             .parent()
-            .map(|dir| vec![WatchRoot::directory(dir)])
+            .map(|dir| {
+                vec![WatchRoot::directory_of(
+                    dir,
+                    WatchEntries::OpencodeStores {
+                        primary: name.to_os_string(),
+                        // A pinned database is the only store the sweep
+                        // reads, so a channel database beside it is noise.
+                        channels: !roots.opencode_db_pinned,
+                    },
+                )]
+            })
             .unwrap_or_default()
     }
 
@@ -2924,6 +3087,418 @@ fn enumerate_opencode_snapshot(
         .collect())
 }
 
+/// Devin CLI's `sessions.db`, read through the same coherent-snapshot pattern
+/// as [`OpencodeProvider`]. Devin ids are stable strings (`curved-headlight`),
+/// so the id itself is the catalog locator; the store path rides in
+/// `raw_path` for hydration's provenance check.
+#[derive(Default)]
+pub(crate) struct DevinProvider {
+    pass: Mutex<()>,
+    live: Mutex<Option<DevinReadSnapshot>>,
+}
+
+#[derive(Clone)]
+struct DevinSessionSeed {
+    working_directory: Option<String>,
+    workspace_roots: Vec<String>,
+    created_ms: Option<i64>,
+    last_activity_ms: Option<i64>,
+    model: Option<String>,
+}
+
+/// One run's pinned read of `sessions.db` and the seeds enumeration filled.
+struct DevinReadSnapshot {
+    conn: Connection,
+    store_identity: String,
+    session_columns: BTreeSet<String>,
+    sessions: BTreeMap<String, DevinSessionSeed>,
+}
+
+impl DevinProvider {
+    fn snapshot(&self, scan: &ScanEnv<'_>) -> Result<MutexGuard<'_, Option<DevinReadSnapshot>>> {
+        let mut guard = self.live.lock().expect("devin live snapshot lock");
+        if guard.is_none() && crate::ingest::devin::sessions_db_path(scan.devin_dir).is_file() {
+            *guard = Some(open_devin_snapshot(scan)?);
+        }
+        Ok(guard)
+    }
+}
+
+/// Open `sessions.db` read-only under a deferred transaction whose filesystem
+/// generation was stable across the open — the WAL-safe read contract the
+/// ingest path uses as well.
+fn open_devin_snapshot(scan: &ScanEnv<'_>) -> Result<DevinReadSnapshot> {
+    let db = crate::ingest::devin::sessions_db_path(scan.devin_dir);
+    for _ in 0..3 {
+        let generation_before = sqlite_store_generation(&db)?;
+        let conn = open_db_readonly(&db)?;
+        scan.note_open();
+        conn.execute_batch("PRAGMA query_only = ON; BEGIN DEFERRED")?;
+        // The stamp function lives on the connection, so it must be
+        // registered on the retained snapshot too — candidates stamp from the
+        // same content-sensitive tuple sync and hydration use.
+        crate::ingest::devin::register_stamp_fn(&conn)?;
+        // An existing but partially initialized sessions.db is not a Devin
+        // store: sync returns empty for it, and discovery must too rather
+        // than failing the whole pass. Empty `session_columns` short-circuits
+        // `enumerate` before it can name a table that does not exist.
+        let session_columns = if crate::ingest::devin::is_devin_store(&conn) {
+            table_columns(&conn, "sessions")?
+        } else {
+            BTreeSet::new()
+        };
+        let schema_version: i64 = conn.query_row("PRAGMA schema_version", [], |row| row.get(0))?;
+        let generation_after = sqlite_store_generation(&db)?;
+        if generation_before != generation_after {
+            continue;
+        }
+        return Ok(DevinReadSnapshot {
+            conn,
+            store_identity: format!("{generation_before}:{schema_version}"),
+            session_columns,
+            sessions: BTreeMap::new(),
+        });
+    }
+    anyhow::bail!(
+        "Devin database {} was repeatedly replaced while discovery opened it",
+        db.display()
+    )
+}
+
+/// Holds the pass lock and ends the retained read snapshot when the pass
+/// ends. Without the drop a `BEGIN DEFERRED` reader stays open between
+/// passes, which pins a WAL-mode provider database and blocks checkpointing.
+struct DevinPassGuard<'a> {
+    _pass: MutexGuard<'a, ()>,
+    live: &'a Mutex<Option<DevinReadSnapshot>>,
+}
+
+impl Drop for DevinPassGuard<'_> {
+    fn drop(&mut self) {
+        *self.live.lock().expect("devin live snapshot lock") = None;
+    }
+}
+
+impl ShallowSessionProvider for DevinProvider {
+    fn begin_discovery_pass(&self) -> Result<Option<Box<dyn DiscoveryPassGuard + '_>>> {
+        let pass = self.pass.lock().expect("devin discovery pass lock");
+        *self.live.lock().expect("devin live snapshot lock") = None;
+        Ok(Some(Box::new(DevinPassGuard {
+            _pass: pass,
+            live: &self.live,
+        })))
+    }
+
+    fn acquire(
+        &self,
+        _home: &Path,
+        _observation: &crate::observations::SessionObservation,
+    ) -> Result<crate::sources::AcquiredEvidence> {
+        Ok(crate::sources::AcquiredEvidence::LocalFiles)
+    }
+
+    fn source(&self) -> &'static str {
+        "devin"
+    }
+
+    /// Devin produces history, events, tool calls and file edits; its
+    /// markers are added by `Source::capabilities`, as for every parser that
+    /// writes them. It records no parent/child session relationships, so
+    /// `Relationship` stays undeclared rather than claimed.
+    fn evidence_kinds(&self) -> &'static [EvidenceKind] {
+        &[
+            EvidenceKind::History,
+            EvidenceKind::SessionEvent,
+            EvidenceKind::ToolCall,
+            EvidenceKind::FileEdit,
+        ]
+    }
+
+    fn watch_roots(&self, roots: &ProviderRoots<'_>) -> Vec<WatchRoot> {
+        // `sessions.db` is rewritten in place and its -wal/-shm siblings sit
+        // beside it, so the directory sees every write. `transcripts/` is the
+        // one subdirectory whose files are evidence.
+        [
+            WatchRoot::directory(roots.devin),
+            WatchRoot::directory(crate::ingest::devin::transcripts_dir(roots.devin)),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    /// Enumeration is one SQL query; the watch fast path stats instead.
+    /// `sessions.db` and its WAL/SHM siblings move on every commit, and each
+    /// transcript file is stat-only — no transcript is opened here.
+    fn fingerprint_inputs(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
+        let db = crate::ingest::devin::sessions_db_path(&env.devin_dir);
+        let mut out = Vec::new();
+        for suffix in ["", "-wal", "-shm"] {
+            let mut path = db.clone().into_os_string();
+            path.push(suffix);
+            let path = PathBuf::from(path);
+            let Ok((stamp, recency_hint_ms)) = crate::file_stamp_and_modified(&path) else {
+                continue;
+            };
+            out.push(Candidate {
+                source: "devin",
+                locator: path.to_string_lossy().into_owned(),
+                session_id: None,
+                recency_hint_ms,
+                stamp,
+            });
+        }
+        let transcripts = crate::ingest::devin::transcripts_dir(&env.devin_dir);
+        if let Ok(entries) = std::fs::read_dir(&transcripts) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                let Ok((stamp, recency_hint_ms)) = crate::file_stamp_and_modified(&path) else {
+                    continue;
+                };
+                out.push(Candidate {
+                    source: "devin",
+                    locator: path.to_string_lossy().into_owned(),
+                    session_id: None,
+                    recency_hint_ms,
+                    stamp,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    fn enumerate(
+        &self,
+        env: &DiscoveryEnv<'_>,
+        requested_limit: Option<usize>,
+    ) -> Result<Vec<Candidate>> {
+        let scan = env.scan();
+        let mut guard = self.snapshot(&scan)?;
+        let Some(snapshot) = guard.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let columns = &snapshot.session_columns;
+        if !columns.contains("id") {
+            return Ok(Vec::new());
+        }
+        let column = |name: &str| {
+            if columns.contains(name) {
+                name.to_string()
+            } else {
+                "NULL".to_string()
+            }
+        };
+        let hidden_pred = if columns.contains("hidden") {
+            "COALESCE(hidden, 0) = 0"
+        } else {
+            "1=1"
+        };
+        let recency_order = if columns.contains("last_activity_at") {
+            "last_activity_at DESC, id ASC"
+        } else {
+            "id ASC"
+        };
+        let sqlite_limit = requested_limit
+            .map(i64::try_from)
+            .transpose()
+            .context("Devin discovery limit exceeds SQLite's signed 64-bit range")?;
+        let limit_sql = sqlite_limit.map(|_| " LIMIT ?").unwrap_or_default();
+        // Devin records timestamps in epoch seconds; the catalog stores
+        // milliseconds, so both bounds are converted in SQL.
+        let sql = format!(
+            "SELECT id, {}, {}, {}, {}, {} FROM sessions \
+             WHERE id IS NOT NULL AND id <> '' AND {hidden_pred} \
+             ORDER BY {recency_order}{limit_sql}",
+            column("working_directory"),
+            column("workspace_dirs"),
+            column("created_at"),
+            column("last_activity_at"),
+            column("model"),
+        );
+        let mut stmt = snapshot.conn.prepare(&sql)?;
+        scan.note_query();
+        let collect = |row: &rusqlite::Row<'_>| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        };
+        let rows = match sqlite_limit {
+            Some(limit) => stmt
+                .query_map([limit], collect)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            None => stmt
+                .query_map([], collect)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        };
+        scan.note_records(rows.len() as u64);
+        snapshot.sessions = rows
+            .iter()
+            .map(|(id, cwd, dirs, created, updated, model)| {
+                (
+                    id.clone(),
+                    DevinSessionSeed {
+                        working_directory: cwd.clone(),
+                        workspace_roots: dirs
+                            .as_deref()
+                            .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+                            .unwrap_or_default(),
+                        created_ms: created.map(|s| s.saturating_mul(1000)),
+                        last_activity_ms: updated.map(|s| s.saturating_mul(1000)),
+                        model: model.clone(),
+                    },
+                )
+            })
+            .collect();
+        // The stamp must be content-sensitive: `store_identity` only tracks
+        // database replacement and schema generation, and created/updated
+        // timestamps do not move on an in-place `chat_message` rewrite. Reuse
+        // the sync/hydration stamp so a cached first_prompt, model, workspace
+        // or cwd is refreshed whenever the evidence behind it changed.
+        let transcripts = crate::ingest::devin::transcripts_dir(scan.devin_dir);
+        Ok(rows
+            .into_iter()
+            .map(|(id, _cwd, _dirs, created, updated, _model)| {
+                let content_stamp = crate::ingest::devin::session_stamp(
+                    &snapshot.conn,
+                    &id,
+                    &transcripts,
+                )
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| {
+                    format!("{}:{}", created.unwrap_or(0), updated.unwrap_or(0))
+                });
+                Candidate {
+                    source: "devin",
+                    locator: id.clone(),
+                    session_id: Some(id),
+                    recency_hint_ms: updated
+                        .or(created)
+                        .map(|s| s.saturating_mul(1000)),
+                    stamp: format!("{}:{}", snapshot.store_identity, content_stamp),
+                }
+            })
+            .collect())
+    }
+
+    fn read_shallow(
+        &self,
+        scan: &ScanEnv<'_>,
+        _catalog: Option<&Connection>,
+        candidate: &Candidate,
+    ) -> Result<Option<ShallowSession>> {
+        let guard = self.live.lock().expect("devin live snapshot lock");
+        let Some(snapshot) = guard.as_ref() else {
+            return Ok(None);
+        };
+        let conn = &snapshot.conn;
+        let Some(seed) = snapshot.sessions.get(&candidate.locator).cloned() else {
+            return Ok(None);
+        };
+        // Cut excerpts in SQL so pasted files never cross into the shallow
+        // reader. Text parts follow the normalizer's ordering, whitespace and
+        // type rules. The running length bounds the aggregate to the parts
+        // needed for one excerpt, even when an array contains many large parts.
+        let first_prompt = {
+            let sql = "WITH prompts AS (
+                SELECT node_id, row_id, CASE json_type(chat_message, '$.content')
+                  WHEN 'text' THEN substr(trim(json_extract(chat_message, '$.content'), ?3), 1, ?1)
+                  WHEN 'array' THEN (
+                    SELECT substr(group_concat(text, char(10)), 1, ?1) FROM (
+                      SELECT text, COALESCE(SUM(length(text) + 1) OVER (
+                        ORDER BY key ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                      ), 0) AS preceding_chars FROM (
+                        SELECT key, text FROM (
+                          SELECT key, substr(trim(CASE
+                            WHEN type = 'text' THEN value
+                            WHEN type = 'object' THEN CASE
+                              WHEN (json_type(value, '$.type') IS NULL
+                                    OR json_extract(value, '$.type') = 'text')
+                                AND json_type(value, '$.text') = 'text'
+                              THEN json_extract(value, '$.text') END
+                            END, ?3), 1, ?1) AS text
+                          FROM json_each(chat_message, '$.content')
+                        ) WHERE text <> '' ORDER BY key LIMIT ?1
+                      )
+                    ) WHERE preceding_chars <= ?1
+                  ) END AS prompt
+                FROM message_nodes
+                WHERE session_id = ?2 AND json_valid(chat_message)
+                  AND json_extract(chat_message, '$.role') = 'user'
+                  AND COALESCE(json_extract(chat_message, '$.metadata.is_user_input'), 1) <> 0
+              ) SELECT prompt FROM prompts WHERE prompt <> ''
+                ORDER BY node_id ASC, row_id ASC LIMIT 1";
+            scan.note_query();
+            let prompt = {
+                let mut stmt = conn.prepare_cached(sql)?;
+                stmt.query_row(
+                    params![
+                        EXCERPT_MAX_CHARS as i64,
+                        &candidate.locator,
+                        EXCERPT_TRIM_WHITESPACE
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+            };
+            scan.note_records(u64::from(prompt.is_some()));
+            // Both SQL branches already trim provider text and cap the result.
+            // Do not trim the joined excerpt again: when an earlier part fills
+            // 4,095 characters, the separator before the next part is the
+            // meaningful 4,096th character and must remain observable.
+            prompt.filter(|text| !text.is_empty())
+        };
+        let mut models = Vec::new();
+        push_unique(&mut models, seed.model.as_deref());
+        {
+            // The first assistant `generation_model` is the model that
+            // actually answered, which can differ from the session's
+            // configured model.
+            scan.note_query();
+            let generated = {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT json_extract(chat_message, '$.metadata.generation_model') \
+                     FROM message_nodes \
+                     WHERE session_id = ? AND json_valid(chat_message) \
+                     AND json_extract(chat_message, '$.role') IN ('assistant', 'final_answer') \
+                     AND json_type(chat_message, '$.metadata.generation_model') = 'text' \
+                     AND NULLIF(json_extract(chat_message, '$.metadata.generation_model'), '') IS NOT NULL \
+                     ORDER BY node_id ASC LIMIT 1",
+                )?;
+                stmt.query_row([&candidate.locator], |row| row.get::<_, String>(0))
+                    .optional()?
+            };
+            scan.note_records(u64::from(generated.is_some()));
+            push_unique(&mut models, generated.as_deref());
+        }
+        Ok(Some(ShallowSession {
+            source: "devin".into(),
+            session_id: candidate.locator.clone(),
+            cwd: seed.working_directory,
+            first_activity_ms: seed.created_ms,
+            last_activity_ms: seed.last_activity_ms.or(seed.created_ms),
+            first_prompt,
+            models,
+            workspace_roots: seed.workspace_roots,
+            // The concrete store that produced this identity; hydration
+            // verifies it before reading.
+            raw_path: Some(
+                crate::ingest::devin::sessions_db_path(scan.devin_dir)
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            ..Default::default()
+        }))
+    }
+}
+
 /// Enumerate the legacy tree's `session/<scope>/ses_*.json` files.
 ///
 /// The tree has no index, so both the stamp and the recency hint are computed
@@ -3123,7 +3698,7 @@ fn file_generation_time(metadata: &fs::Metadata) -> u128 {
 }
 
 #[cfg(unix)]
-fn opencode_store_generation(path: &Path) -> Result<String> {
+fn sqlite_store_generation(path: &Path) -> Result<String> {
     use std::os::unix::fs::MetadataExt;
     let metadata = fs::metadata(path)?;
     Ok(format!(
@@ -3135,7 +3710,7 @@ fn opencode_store_generation(path: &Path) -> Result<String> {
 }
 
 #[cfg(not(unix))]
-fn opencode_store_generation(path: &Path) -> Result<String> {
+fn sqlite_store_generation(path: &Path) -> Result<String> {
     let metadata = fs::metadata(path)?;
     Ok(format!(
         "{}:{}",
@@ -3616,7 +4191,9 @@ pub(crate) fn provider_watch_roots(source: &str, roots: &crate::ProviderRoots) -
             codex: &roots.codex,
             grok: &roots.grok,
             muse: &roots.muse,
+            devin: &roots.devin,
             opencode_db: &roots.opencode_db,
+            opencode_db_pinned: roots.opencode_db_pinned,
         },
     )
 }
@@ -3684,29 +4261,63 @@ pub(crate) const OBSERVED_SESSION_BY_LOCATOR_SQL: &str = "SELECT session_id FROM
        AND raw_locator=? AND access_state='available' \
      ORDER BY +session_id LIMIT 1";
 
-fn fetch_observed_candidate(
+/// The stamp a candidate's session was last observed at through this
+/// adapter, with the session's id.
+///
+/// `None` unless that observation is `available` and the session is still
+/// catalogued -- the two conditions under which an unmoved stamp lets the
+/// candidate be served from the catalog instead of read.
+///
+/// One prepared-once statement per question rather than a fetch of the whole
+/// observation and the whole catalog row: this runs for every candidate file
+/// on every discovery pass, a sweep's included, and those per-call prepares
+/// and row decodes were 16% of a forced tick (#316). A caller that streams the
+/// row reads it afterwards, only for candidates that matched.
+fn observed_candidate_stamp(
     conn: &Connection,
     provider: &dyn ShallowSessionProvider,
     candidate: &Candidate,
-) -> Result<Option<ShallowSession>> {
+) -> Result<Option<(String, Option<String>)>> {
     let id = match candidate.session_id.as_ref() {
         Some(id) => Some(id.clone()),
-        None => conn.query_row(OBSERVED_SESSION_BY_LOCATOR_SQL,params![candidate.source,provider.location().as_str(),provider.connector_id(),provider.connector_instance(),candidate.locator],|r|r.get(0)).optional()?,
+        None => conn
+            .prepare_cached(OBSERVED_SESSION_BY_LOCATOR_SQL)?
+            .query_row(
+                params![
+                    candidate.source,
+                    provider.location().as_str(),
+                    provider.connector_id(),
+                    provider.connector_instance(),
+                    candidate.locator
+                ],
+                |r| r.get(0),
+            )
+            .optional()?,
     };
     let Some(id) = id else { return Ok(None) };
-    let Some(observation) =
-        crate::observations::get(conn, &observation_key(provider, candidate.source, &id))?
-    else {
-        return Ok(None);
-    };
-    if observation.access_state != "available" {
-        return Ok(None);
-    }
-    let Some(mut row) = fetch_catalog_row(conn, candidate.source, &id)? else {
-        return Ok(None);
-    };
-    row.source_stamp = observation.source_stamp;
-    Ok(Some(row))
+    let key = observation_key(provider, candidate.source, &id);
+    key.validate()?;
+    let stamp = conn
+        .prepare_cached(
+            "SELECT o.source_stamp FROM session_observations o \
+             WHERE o.source = ?1 AND o.session_id = ?2 AND o.location = ?3 \
+               AND o.connector_id = ?4 AND o.connector_instance = ?5 \
+               AND o.access_state = 'available' \
+               AND EXISTS (SELECT 1 FROM sessions s \
+                     WHERE s.source = ?1 AND s.session_id = ?2)",
+        )?
+        .query_row(
+            params![
+                key.source,
+                key.session_id,
+                key.location.as_str(),
+                key.connector_id,
+                key.connector_instance
+            ],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?;
+    Ok(stamp.map(|stamp| (id, stamp)))
 }
 
 /// Whether this source was already examined at this exact stamp and found not
@@ -3722,7 +4333,22 @@ fn is_known_non_session(
     locator: &str,
     stamp: &str,
 ) -> Result<bool> {
-    let known:Option<String>=conn.query_row("SELECT stamp FROM observation_discovery_skips WHERE source=? AND location=? AND connector_id=? AND connector_instance=? AND locator=?",params![source,provider.location().as_str(),provider.connector_id(),provider.connector_instance(),locator],|r|r.get(0)).optional()?;
+    let known: Option<String> = conn
+        .prepare_cached(
+            "SELECT stamp FROM observation_discovery_skips WHERE source=? AND location=? \
+             AND connector_id=? AND connector_instance=? AND locator=?",
+        )?
+        .query_row(
+            params![
+                source,
+                provider.location().as_str(),
+                provider.connector_id(),
+                provider.connector_instance(),
+                locator
+            ],
+            |r| r.get(0),
+        )
+        .optional()?;
     Ok(known.as_deref() == Some(stamp))
 }
 
@@ -3906,18 +4532,20 @@ static UPSERT_SESSION_SQL: LazyLock<String> = LazyLock::new(|| {
 
 /// Write a shallow row into the catalog, returning the merged row as stored.
 ///
-/// Never nulls out a value the catalog already holds, never lowers
-/// `first_activity_ms` past what a fuller pass observed for append-only
-/// providers, and never downgrades a fully indexed row to `'shallow'` —
-/// including a row from a database that predates `discovery_state`, whose NULL
-/// readers deliberately interpret as `'full'`. Grok is the exception on the
-/// activity bounds: a session directory is a replacement snapshot, so a later
-/// compaction can move the start forward and the end backward. A shallow
-/// rescan of such a row still refreshes its metadata and stamp. The process
-/// log is not part of that snapshot: after the directory bounds land, a
-/// `logs/unified.jsonl` row later than the directory's end raises
-/// `last_activity_ms`, and a model only the log named is appended. A model
-/// the directory no longer names stays off the row.
+/// Preview columns (`first_prompt`, `last_assistant_text`) are preserved when
+/// a shallow pass does not supply a value, because a shallow pass does not read
+/// the transcript and therefore cannot authoritatively clear one. Other values
+/// are merged defensively — never lowers `first_activity_ms` past what a fuller
+/// pass observed for append-only providers, and never downgrades a fully
+/// indexed row to `'shallow'` — including a row from a database that predates
+/// `discovery_state`, whose NULL readers deliberately interpret as `'full'`.
+/// Grok is the exception on the activity bounds: a session directory is a
+/// replacement snapshot, so a later compaction can move the start forward and the
+/// end backward. A shallow rescan of such a row still refreshes its metadata
+/// and stamp. The process log is not part of that snapshot: after the
+/// directory bounds land, a `logs/unified.jsonl` row later than the
+/// directory's end raises `last_activity_ms`, and a model only the log named
+/// is appended. A model the directory no longer names stays off the row.
 ///
 /// The returned row is what the catalog now holds (including a preserved
 /// `full` state), read back through the write's own `RETURNING` clause so the
@@ -4376,7 +5004,14 @@ pub fn discover_sessions_with_provider_refs(
     on_row: impl FnMut(&ShallowSession),
 ) -> Result<DiscoverySummary> {
     let worker_limit = std::thread::available_parallelism().map_or(1, |n| n.get());
-    discover_sessions_with_worker_limit(env, options, providers, on_row, worker_limit, true)
+    discover_sessions_with_worker_limit(
+        env,
+        options,
+        providers,
+        on_row,
+        worker_limit,
+        IdentityRefresh::Streamed,
+    )
 }
 
 /// [`discover_sessions_with_providers`] for the end of a sync sweep, which
@@ -4395,7 +5030,30 @@ pub(crate) fn discover_sessions_for_sweep(
         .map(|provider| provider.as_ref())
         .collect::<Vec<_>>();
     let worker_limit = std::thread::available_parallelism().map_or(1, |n| n.get());
-    discover_sessions_with_worker_limit(env, options, &providers, |_| {}, worker_limit, false)
+    discover_sessions_with_worker_limit(
+        env,
+        options,
+        &providers,
+        |_| {},
+        worker_limit,
+        IdentityRefresh::Sweep,
+    )
+}
+
+/// Who brings project identity up to date around a discovery pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentityRefresh {
+    /// Rows are streamed to the caller. Each cached row is upgraded before it
+    /// is streamed (see [`upgrade_cached_project_identity`]), and the pass
+    /// ends with the whole-catalog refresh.
+    Streamed,
+    /// The sweep: no row is streamed, and the sweep runs the refresh itself
+    /// right after the pass. That refresh stores exactly the key the per-row
+    /// upgrade would have -- the upgrade exists only so a *streamed* row
+    /// agrees with it -- so upgrading every cached row here as well was the
+    /// same resolution and ancestor walk twice, once per candidate file, on
+    /// every tick (#318).
+    Sweep,
 }
 
 // An explicit limit lets regression tests exercise both read paths regardless
@@ -4406,7 +5064,7 @@ fn discover_sessions_with_worker_limit(
     providers: &[&dyn ShallowSessionProvider],
     mut on_row: impl FnMut(&ShallowSession),
     worker_limit: usize,
-    refresh_identity: bool,
+    identity: IdentityRefresh,
 ) -> Result<DiscoverySummary> {
     // A pass is the unit over which the filesystem is treated as fixed, so it
     // is also the unit the project-identity cache may span. A host that stays
@@ -4565,15 +5223,34 @@ fn discover_sessions_with_worker_limit(
             }
             let provider = providers[*provider_index];
             let expected = stored_stamp(&candidate.stamp);
-            let cached = fetch_observed_candidate(conn, provider, candidate)?;
-            if let Some(mut cached) =
-                cached.filter(|row| row.source_stamp.as_deref() == Some(&expected))
-            {
-                // Before the row is queued for emission, not after the pass:
-                // `on_row` streams these to the caller as they are decided, so
-                // correcting the catalog at the end of the pass would still
-                // have handed every consumer the stale key.
-                upgrade_cached_project_identity(conn, &mut cached)?;
+            let unchanged = match observed_candidate_stamp(conn, provider, candidate)? {
+                Some((id, stamp)) if stamp.as_deref() == Some(expected.as_str()) => {
+                    match identity {
+                        // Nothing is streamed, so the row itself is not needed.
+                        IdentityRefresh::Sweep => Some(WindowEntry::Unchanged),
+                        IdentityRefresh::Streamed => {
+                            match fetch_catalog_row(conn, candidate.source, &id)? {
+                                Some(mut cached) => {
+                                    cached.source_stamp = stamp;
+                                    // Before the row is queued for emission,
+                                    // not after the pass: `on_row` streams
+                                    // these to the caller as they are decided,
+                                    // so correcting the catalog at the end of
+                                    // the pass would still have handed every
+                                    // consumer the stale key.
+                                    upgrade_cached_project_identity(conn, &mut cached)?;
+                                    Some(WindowEntry::Cached(cached))
+                                }
+                                // Dropped from the catalog since the lookup
+                                // above: not cached after all.
+                                None => None,
+                            }
+                        }
+                    }
+                }
+                _ => None,
+            };
+            if let Some(unchanged) = unchanged {
                 env.note_skipped();
                 summary.skipped_unchanged += 1;
                 if let Some(entry) = summary.providers.get_mut(candidate.source) {
@@ -4583,7 +5260,7 @@ fn discover_sessions_with_worker_limit(
                         .skipped_unchanged += 1;
                 }
                 potential += 1;
-                entries.push(WindowEntry::Cached(cached));
+                entries.push(unchanged);
                 continue;
             }
             // A source already examined and found not to be a session (a codex
@@ -4705,6 +5382,7 @@ fn discover_sessions_with_worker_limit(
                 break 'apply;
             }
             let (candidate, provider, expected, result) = match entry {
+                WindowEntry::Unchanged => continue,
                 WindowEntry::Cached(row) => {
                     let key = (row.source.clone(), row.session_id.clone());
                     if !emitted_sessions.contains(&key) {
@@ -4799,6 +5477,12 @@ fn discover_sessions_with_worker_limit(
                     discovery_state: session.discovery_state.clone(),
                     access_state: "available".into(),
                     updated_ms: now_ms(),
+                    // The shared catalog row cannot say which location a
+                    // preview came from — each observation keeps its own, so
+                    // a location retiring later restores the survivor's text
+                    // instead of nulling it.
+                    first_prompt: session.first_prompt.clone(),
+                    last_assistant_text: session.last_assistant_text.clone(),
                 },
             ) {
                 window_error = Some(error);
@@ -4886,7 +5570,7 @@ fn discover_sessions_with_worker_limit(
     // nothing to upgrade stays read-only. Reporting rather than failing, for
     // the same reason the sync path does: the rows this discovery wrote are
     // already committed, and every key here is derived from them.
-    if refresh_identity {
+    if identity == IdentityRefresh::Streamed {
         if let Err(error) = crate::store::refresh_project_identity(env.conn) {
             eprintln!(
                 "ai-hist: could not refresh canonical project identity after discovery: {error:#} \
@@ -4936,6 +5620,9 @@ impl Drop for RelaxedSynchronous<'_> {
 enum WindowEntry<'c> {
     /// Stamp matched the catalog: emit the cached row, read nothing.
     Cached(ShallowSession),
+    /// Stamp matched the catalog during a sweep, which streams nothing: read
+    /// nothing, emit nothing.
+    Unchanged,
     /// Needs a shallow read. `result` is filled by the parallel phase for
     /// filesystem providers; a `None` result is read serially at apply time.
     Read {
@@ -4958,3 +5645,5 @@ pub fn discover_sessions_collect(
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) mod sweep_inventory;

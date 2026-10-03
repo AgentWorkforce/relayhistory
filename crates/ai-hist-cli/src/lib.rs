@@ -1,10 +1,10 @@
 use ai_hist::{
-    default_db_path, import_json, insert_history, normalize_tag_name, open_db, open_db_readonly,
-    prompt_hash, recent, resume_command, schema_is_current, search, session, session_events,
-    session_file_edits, session_markers_page, session_tool_calls, session_usage_summary,
-    untag_session, HistoryEntry, ProjectGrouping, QueryFilter, SessionEvidenceCursor,
-    SessionMarkerPage, SessionUsageSummary, SESSION_EVIDENCE_CONTRACT_VERSION,
-    SESSION_USAGE_CONTRACT_VERSION, SOURCE_CHOICES,
+    default_db_path, import_json, insert_history, latest_resumable_match, normalize_tag_name,
+    open_db, open_db_readonly, prompt_hash, recent, resume_command, schema_is_current, search,
+    session, session_events, session_file_edits, session_markers_page, session_tool_calls,
+    session_usage_summary, untag_session, HistoryEntry, ProjectGrouping, QueryFilter,
+    SessionEvidenceCursor, SessionMarkerPage, SessionUsageSummary,
+    SESSION_EVIDENCE_CONTRACT_VERSION, SESSION_USAGE_CONTRACT_VERSION, SOURCE_CHOICES,
 };
 pub use ai_hist::{SessionLocation, SessionScope};
 use anyhow::{Context, Result};
@@ -297,6 +297,11 @@ enum Command {
         /// Milliseconds of filesystem events to collapse into one sweep.
         #[arg(long, default_value_t = ai_hist::watch::DEFAULT_DEBOUNCE_MS)]
         debounce_ms: u64,
+        /// Wait out the debounce window before every event-driven sweep,
+        /// instead of sweeping a change that finds the loop quiet at once.
+        /// Fewer sweeps under bursty writes, at the cost of latency.
+        #[arg(long)]
+        no_leading_edge: bool,
     },
     /// Ingest one agent session from a lifecycle hook payload on stdin.
     ///
@@ -452,7 +457,7 @@ enum SessionsAction {
     /// content blocks, agent lifecycle events. Same `(ts_ms IS NULL, ts_ms,
     /// id)` keyset as tool calls and file edits; undated markers page last.
     Markers {
-        /// Coding-agent source (claude, codex, cursor, grok, muse, relay, opencode).
+        /// Coding-agent source (claude, codex, cursor, grok, muse, relay, opencode, devin).
         source: String,
         /// Native session identifier within that source.
         session_id: String,
@@ -476,7 +481,7 @@ enum SessionsAction {
     /// and cost is never computed: `reported_cost_usd` appears only when the
     /// source data carried one.
     Usage {
-        /// Coding-agent source (claude, codex, cursor, grok, muse, relay, opencode).
+        /// Coding-agent source (claude, codex, cursor, grok, muse, relay, opencode, devin).
         source: String,
         /// Native session identifier within that source.
         session_id: String,
@@ -514,7 +519,7 @@ enum SessionsAction {
 enum LearnAction {
     /// Distill local session history into decision/finding/reflection events.
     Distill {
-        /// Only distill sessions from this source (claude, codex, cursor, grok, muse, relay, opencode).
+        /// Only distill sessions from this source (claude, codex, cursor, grok, muse, relay, opencode, devin).
         #[arg(long)]
         source: Option<String>,
         /// Distill one session id.
@@ -689,6 +694,7 @@ pub fn run() -> Result<()> {
             interval,
             no_fsevents,
             debounce_ms,
+            no_leading_edge,
         } => {
             if scope.resolve() == SessionScope::Remote {
                 remote::ensure_selected_remote_connectors_configured_for("sync", &[], &connectors)?;
@@ -701,6 +707,7 @@ pub fn run() -> Result<()> {
                 WatchDrivers {
                     use_fs_events: !*no_fsevents,
                     debounce_ms: *debounce_ms,
+                    leading_edge: !*no_leading_edge,
                 },
             );
         }
@@ -974,19 +981,17 @@ pub fn run() -> Result<()> {
             json,
         } => {
             let requested_scope = scope.resolve();
-            let rows = search(
+            // The newest match that names a session: a newer prompt recorded
+            // without one must not hide an older resumable match.
+            let entry = latest_resumable_match(
                 &conn,
                 &query,
                 fts,
                 &QueryFilter {
                     scope: requested_scope,
-                    limit: 1,
                     ..Default::default()
                 },
             )?;
-            let entry = rows
-                .into_iter()
-                .find(|e| e.session_id.as_ref().is_some_and(|s| !s.is_empty()));
             if let Some(entry) = entry {
                 let (locations, cmd) = local_resume_details(&conn, &entry)?;
                 let locally_available =
@@ -2708,13 +2713,16 @@ fn compact(db_path: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// How `watch` should be driven. Both knobs exist because filesystem change
-/// notifications are not uniformly trustworthy: `--no-fsevents` is the escape
-/// hatch for a filesystem that lies, and the debounce window is how long a
-/// burst of events is allowed to collapse for.
+/// How `watch` should be driven. `--no-fsevents` is the escape hatch for a
+/// filesystem whose change notifications lie; the debounce window is how long
+/// a burst of events is allowed to collapse for; and `--no-leading-edge`
+/// makes every event-driven sweep wait out that window, instead of sweeping a
+/// change that finds the loop quiet at once — fewer sweeps under bursty
+/// writes, at the cost of latency.
 struct WatchDrivers {
     use_fs_events: bool,
     debounce_ms: u64,
+    leading_edge: bool,
 }
 
 fn watch_loop(db_path: &Path, interval: u64, scope: SessionScope) -> Result<()> {
@@ -2726,6 +2734,7 @@ fn watch_loop(db_path: &Path, interval: u64, scope: SessionScope) -> Result<()> 
         WatchDrivers {
             use_fs_events: true,
             debounce_ms: ai_hist::watch::DEFAULT_DEBOUNCE_MS,
+            leading_edge: true,
         },
     )
 }
@@ -2749,6 +2758,7 @@ fn watch_loop_with_connectors(
         .with_roots(roots)
         .with_fs_events(drivers.use_fs_events)
         .with_debounce_ms(drivers.debounce_ms)
+        .with_leading_edge(drivers.leading_edge)
         .with_poll_interval_ms(interval.saturating_mul(1000))
         .with_immediate(true)
         .on_error(Arc::new(|error| eprintln!("Error: {error:#}")))

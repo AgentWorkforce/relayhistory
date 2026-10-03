@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add the typed `DeliveryConflictResponse` contract plus canonical digest,
+  strict HTTP-409 parsing, and deterministic recovery-plan helpers. Recovery
+  validates every receiver-reported submitted identity/digest before
+  quarantining the bounded conflict set, distinguishes batch-ID reuse (which
+  re-keys the whole batch), and
+  never invents a higher record revision.
 - The CLI names a schema migration on stderr while it runs --
   `Upgrading the ai-hist database to <version>...`, then
   `Database upgraded in <elapsed>.` -- and only when an open actually
@@ -55,6 +61,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The Node CLI no longer recognises `--once` or `--interval`, which were left
+  over from the removed polling commands. No command accepted them, so they now
+  fail as an unknown option instead of "does not accept".
 - `search()` runs the same contract as `ai-hist search` and MCP
   `search_history` (#66). It matches session events as well as prompts and
   returns `SearchMatch[]`: each is a `HistoryEntry` plus `matchSource`, `role`

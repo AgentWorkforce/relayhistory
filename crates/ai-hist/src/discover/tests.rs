@@ -3801,7 +3801,7 @@ fn stopped_serial_and_parallel_discovery_do_not_claim_the_rest_of_the_window() {
                 &[&provider],
                 |_| panic!("cancelled window emitted a row"),
                 worker_limit,
-                true,
+                IdentityRefresh::Streamed,
             )
         })
         .unwrap_err();

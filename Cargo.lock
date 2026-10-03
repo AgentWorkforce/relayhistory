@@ -56,7 +56,6 @@ dependencies = [
  "chrono",
  "clap",
  "flate2",
- "fs2",
  "libc",
  "rusqlite",
  "serde_json",

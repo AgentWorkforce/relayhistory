@@ -123,6 +123,7 @@ fn canonical_keys_merge_checkouts_and_delegated_children_inherit_them() {
     std::env::set_var("USERPROFILE", home);
     std::env::set_var("OPENCODE_DB", home.join("missing-opencode.db"));
     std::env::set_var("TRAJECTORY_ROOT", home.join("missing-trajectories"));
+    std::env::set_var("XDG_DATA_HOME", home.join("missing-xdg"));
     std::env::remove_var("AI_HIST_DB");
     let db = home.join("history.db");
 
@@ -1273,4 +1274,70 @@ fn a_cycle_elsewhere_does_not_cost_a_child_its_grounded_key() {
         Some("github.com/acme/ring")
     );
     assert_eq!(refresh_project_identity(&conn).unwrap(), 0);
+}
+
+/// A sweep upgrades a session served unchanged from the catalog.
+///
+/// Discovery does not re-resolve a cached row's key during a sweep (#318):
+/// nothing is streamed there, and the refresh the sweep runs straight after
+/// stores the same answer. This pins that the refresh really does: a
+/// transcript whose bytes never move, in a directory that later gains an
+/// `origin`, must move from its path key to the remote on the next forced
+/// sweep -- row and events both.
+#[test]
+#[allow(clippy::field_reassign_with_default)]
+fn a_forced_sweep_upgrades_an_unchanged_session_whose_checkout_gained_an_origin() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let checkout_dir = checkout(temp.path(), "later-repo", None);
+    let line = |uuid: &str, role: &str| {
+        serde_json::json!({
+            "sessionId": "sess-up",
+            "uuid": uuid,
+            "cwd": checkout_dir.to_string_lossy(),
+            "type": role,
+            "timestamp": "2026-09-19T10:00:00.000Z",
+            "message": {"role": role, "content": format!("{uuid} text")},
+        })
+        .to_string()
+    };
+    write(
+        &home.join(".claude/projects/later-repo/sess-up.jsonl"),
+        &format!("{}\n{}\n", line("u1", "user"), line("a1", "assistant")),
+    );
+    let db = temp.path().join("history.db");
+    let mut options = ai_hist::StoreOptions::default();
+    options.db_path = Some(db.clone());
+    options.home = Some(home.clone());
+    let store = ai_hist::SessionStore::open(options).unwrap();
+    let mut force = ai_hist::SyncOptions::default();
+    force.force = true;
+    store.sync(force.clone()).unwrap();
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(
+        session_key(&conn, "claude", "sess-up").1.as_deref(),
+        Some(ProjectKeyMethod::PathFallback.as_str())
+    );
+
+    fs::write(
+        checkout_dir.join(".git/config"),
+        "[remote \"origin\"]\n\turl = git@github.com:acme/later.git\n",
+    )
+    .unwrap();
+    store.sync(force).unwrap();
+    assert_eq!(
+        session_key(&conn, "claude", "sess-up"),
+        (
+            Some("github.com/acme/later".to_string()),
+            Some(ProjectKeyMethod::Remote.as_str().to_string())
+        ),
+    );
+    let events = event_keys(&conn, "claude", "sess-up");
+    assert!(!events.is_empty());
+    assert!(
+        events
+            .iter()
+            .all(|key| key.as_deref() == Some("github.com/acme/later")),
+        "events kept the path key: {events:?}"
+    );
 }

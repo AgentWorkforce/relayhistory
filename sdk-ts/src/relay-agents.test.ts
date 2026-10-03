@@ -268,8 +268,8 @@ test('falls back when a socket cannot connect before the deadline', {
   await writeFile(pointer, `${healthy}\n`);
 
   // Keep a real socket listening while preventing its process from accepting.
-  // Filling the kernel backlog makes the next connection either wait or report
-  // EAGAIN, depending on the Unix kernel; both are pre-request unavailability.
+  // Filling the kernel backlog makes the next connection wait (Linux), report
+  // EAGAIN, or be refused outright (macOS); all are pre-request unavailability.
   const childScript = [
     'const { createServer } = require("node:net");',
     'const server = createServer();',
@@ -293,13 +293,20 @@ test('falls back when a socket cannot connect before the deadline', {
       await new Promise<void>((resolve) => stalledServer.once('exit', () => resolve()));
     }
   });
+  // Linux queues backlog + 1 connections, so two fillers leave the next one
+  // waiting. macOS queues fewer and refuses the rest; a refused filler means
+  // the backlog is already full, so stop filling rather than fail the test.
   for (let index = 0; index < 2; index += 1) {
     const filler = createConnection(stalled);
     fillers.push(filler);
-    await new Promise<void>((resolve, reject) => {
-      filler.once('connect', resolve);
-      filler.once('error', reject);
+    const full = await new Promise<boolean>((resolve, reject) => {
+      filler.once('connect', () => resolve(false));
+      filler.once('error', (error: NodeJS.ErrnoException) => {
+        if (index > 0 && (error.code === 'ECONNREFUSED' || error.code === 'EAGAIN')) resolve(true);
+        else reject(error);
+      });
     });
+    if (full) break;
   }
 
   const result = await listRelayAgents({}, {

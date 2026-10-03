@@ -19,8 +19,8 @@
 //! source plugin (JS) instead, and do not appear here.
 
 use crate::discover::{
-    ClaudeProvider, CodexProvider, CursorProvider, GrokProvider, MuseProvider, OpencodeProvider,
-    RelayProvider, ShallowSessionProvider, SourceExemption,
+    ClaudeProvider, CodexProvider, CursorProvider, DevinProvider, GrokProvider, MuseProvider,
+    OpencodeProvider, RelayProvider, ShallowSessionProvider, SourceExemption,
 };
 use crate::hydrate::{self, IngestSelectedFn};
 use crate::ProviderRoots;
@@ -284,6 +284,18 @@ pub(crate) const LOCAL_SOURCES: &[LocalSource] = &[
             in_project: true,
         }),
         fixtures: Fixtures::Dir("muse"),
+    },
+    LocalSource {
+        id: "devin",
+        discovery: Discovery::Provider(|| Box::new(DevinProvider::default())),
+        hydration: Hydration::Parser(hydrate::ingest_selected_devin),
+        // Devin locators are validated against the configured `sessions.db`
+        // in `source_snapshot`, not against a transcript root.
+        transcript_roots: |_| Vec::new(),
+        // Devin records no parent/child session relationships.
+        relationships: Relationships::NONE,
+        resume: None,
+        fixtures: Fixtures::Dir("devin"),
     },
 ];
 

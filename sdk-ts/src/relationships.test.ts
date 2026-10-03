@@ -15,7 +15,7 @@ import {
  * A full `sync()` walks every provider, so leaving any of these set would let
  * the machine running the tests contribute sessions to a fixture database.
  */
-const STORE_OVERRIDES = ['OPENCODE_DB', 'TRAJECTORY_ROOT', 'RELAYHISTORY_HOME', 'AI_HIST_DB'];
+const STORE_OVERRIDES = ['OPENCODE_DB', 'TRAJECTORY_ROOT', 'RELAYHISTORY_HOME', 'AI_HIST_DB', 'XDG_DATA_HOME'];
 
 /** Runs one case against a private HOME so provider scans see only its fixtures. */
 async function withHome(

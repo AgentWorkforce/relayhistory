@@ -13,7 +13,7 @@
 //! a seek per identity per table that holds it, never a scan.
 
 use crate::session_store::{Error, SessionStore, Source};
-use crate::store::{open_db_readonly, schema_is_identity_read_current};
+use crate::store::schema_is_identity_read_current;
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension};
 
@@ -102,12 +102,14 @@ impl SessionStore {
             0 => DEFAULT_IDENTITY_PAGE,
             limit => limit.min(MAX_IDENTITY_PAGE),
         };
-        let conn = open_db_readonly(self.db_path())
-            .map_err(|error| Error::DatabaseOpen(format!("{error:#}")))?;
+        let mut conn = self.read_conn()?;
         // The gate is here rather than at `open`, like the change feed's: a
         // read-only store over a database without the catalog's identity
         // index keeps every other read, and is told how to get this one.
-        if !schema_is_identity_read_current(&conn).map_err(Error::query)? {
+        if !conn
+            .gate("session-identity", schema_is_identity_read_current)
+            .map_err(Error::query)?
+        {
             return Err(Error::stale_schema(self.db_path(), "session-identity"));
         }
         let page = identities_after(
@@ -135,8 +137,7 @@ impl SessionStore {
     /// session id is never a session. Each table is one indexed existence
     /// probe, all read on one snapshot; no payload is read.
     pub fn has_session(&self, identity: &SessionIdentity) -> std::result::Result<bool, Error> {
-        let conn = open_db_readonly(self.db_path())
-            .map_err(|error| Error::DatabaseOpen(format!("{error:#}")))?;
+        let conn = self.read_conn()?;
         identity_exists(&conn, &identity.source_name, &identity.session_id).map_err(Error::query)
     }
 }
@@ -316,6 +317,7 @@ mod tests {
     use super::*;
     use crate::session_store::StoreOptions;
     use crate::store::open_db;
+    use crate::store::open_db_readonly;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 

@@ -49,10 +49,10 @@ class CliExit extends Error {
 
 type PackageMetadata = { version?: string };
 
-export const BOOLEAN_FLAGS = new Set(['all', 'by-cwd', 'fts', 'help', 'json', 'local', 'no-bootstrap', 'no-related', 'no-source-connectors', 'no-warning', 'once', 'pretty', 'remote', 'version']);
+export const BOOLEAN_FLAGS = new Set(['all', 'by-cwd', 'fts', 'help', 'json', 'local', 'no-bootstrap', 'no-related', 'no-source-connectors', 'no-warning', 'pretty', 'remote', 'version']);
 export const VALUE_FLAGS = new Set([
-  'config', 'selection', 'interval', 'out', 'after', 'after-ms', 'after-session-id', 'after-source', 'before-ms', 'db', 'limit',
-  'max-depth', 'max-nodes', 'config', 'source-connector', 'project', 'role', 'since-ms', 'source', 'tag', 'tokens', 'until-ms',
+  'config', 'selection', 'out', 'after', 'after-ms', 'after-session-id', 'after-source', 'before-ms', 'db', 'limit',
+  'max-depth', 'max-nodes', 'source-connector', 'project', 'role', 'since-ms', 'source', 'tag', 'tokens', 'until-ms',
   // Documented in the usage text and read by `sessions discover`, `sessions
   // hydrate` and `sync`, but absent here, so `parse` rejected it as unknown.
   'acquisition-timeout-ms',
@@ -810,15 +810,6 @@ export interface CommandSpec {
   cancellable?: true;
 }
 
-function validateInterval(args: Parsed): void {
-  // --interval is seconds; validate before converting so the error names the
-  // unit the caller actually typed rather than a millisecond bound.
-  const seconds = numberFlag(args, 'interval') ?? 60;
-  if (!Number.isSafeInteger(seconds) || seconds < 1 || seconds > 2_147_483) {
-    usage('--interval must be a whole number of seconds between 1 and 2147483');
-  }
-}
-
 /**
  * Every option a command may list in `allowed`, spelled the way help shows it.
  *
@@ -1070,7 +1061,6 @@ async function dispatch(argv: readonly string[], io: CliIo, options: RunCliOptio
   if (tail.length < least) usage(spec.requires);
   if (most !== null && tail.length > most) rejectSurplusPositionals(tail.slice(most), spec.name);
   spec.validate?.(args);
-  const intervalSeconds = numberFlag(args, 'interval') ?? 60;
   const sessionSource = command === 'sessions' ? tail[0] : undefined;
   const sessionId = command === 'sessions' ? tail[1] : undefined;
   const recentFallback = command === 'recent' && tail.length > 0 ? Number(tail[0]) : undefined;

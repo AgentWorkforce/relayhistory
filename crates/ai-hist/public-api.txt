@@ -174,6 +174,7 @@ pub ai_hist::SessionScope::Remote
 pub ai_hist::Source::Claude
 pub ai_hist::Source::Codex
 pub ai_hist::Source::Cursor
+pub ai_hist::Source::Devin
 pub ai_hist::Source::Grok
 pub ai_hist::Source::Muse
 pub ai_hist::Source::OpenCode
@@ -458,6 +459,7 @@ pub ai_hist::Prompt::timestamp_ms: i64
 #[non_exhaustive] pub struct ai_hist::ProviderRoots
 pub ai_hist::ProviderRoots::claude: std::path::PathBuf
 pub ai_hist::ProviderRoots::codex: std::path::PathBuf
+pub ai_hist::ProviderRoots::devin: std::path::PathBuf
 pub ai_hist::ProviderRoots::grok: std::path::PathBuf
 pub ai_hist::ProviderRoots::home: std::path::PathBuf
 pub ai_hist::ProviderRoots::muse: std::path::PathBuf
@@ -756,8 +758,11 @@ pub ai_hist::SyncReport::changed: alloc::vec::Vec<ai_hist::SessionRef>
 pub ai_hist::SyncReport::head_revision: u64
 pub ai_hist::SyncReport::swept: bool
 #[non_exhaustive] pub struct ai_hist::TickReport
+pub ai_hist::TickReport::cancelled: bool
 pub ai_hist::TickReport::changed: alloc::vec::Vec<ai_hist::SessionRef>
 pub ai_hist::TickReport::contended: bool
+pub ai_hist::TickReport::elapsed_ms: u64
+pub ai_hist::TickReport::first_event_age_ms: core::option::Option<u64>
 pub ai_hist::TickReport::forced: bool
 pub ai_hist::TickReport::skipped_unchanged: bool
 pub ai_hist::TickReport::swept: bool
@@ -812,8 +817,10 @@ pub fn ai_hist::WatchHandle::drop(&mut self)
 #[non_exhaustive] pub struct ai_hist::WatchOptions
 pub ai_hist::WatchOptions::debounce_ms: u64
 pub ai_hist::WatchOptions::immediate: bool
+pub ai_hist::WatchOptions::leading_edge: bool
 pub ai_hist::WatchOptions::poll_interval_ms: u64
 pub ai_hist::WatchOptions::slow_poll_ms: u64
+pub ai_hist::WatchOptions::stop: core::option::Option<ai_hist::StopToken>
 pub ai_hist::WatchOptions::use_fs_events: bool
 impl core::default::Default for ai_hist::WatchOptions
 pub fn ai_hist::WatchOptions::default() -> Self

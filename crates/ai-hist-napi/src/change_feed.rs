@@ -21,12 +21,13 @@
 use std::path::PathBuf;
 
 use ai_hist::{
-    open_db_readonly, schema_is_current, Change, ChangeKind, ChangeOp, ChangeQuery, SessionStore,
-    StoreOptions, Watermark, DEFAULT_CHANGE_BATCH, MAX_CHANGE_BATCH,
+    open_db_readonly, schema_is_current, Change, ChangeKind, ChangeOp, ChangeQuery, Watermark,
+    DEFAULT_CHANGE_BATCH, MAX_CHANGE_BATCH,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::session_store::open_store;
 use crate::{database_error, db_path, native_error, validate_identity};
 
 pub const OP_CHANGES: &str = "changes";
@@ -240,13 +241,6 @@ fn parse_from(from: Option<FromArgs>, consumer: bool) -> napi::Result<FeedStart>
 
 fn consumer_name(name: String) -> napi::Result<String> {
     validate_identity(name, "consumer")
-}
-
-fn open_store(path: &std::path::Path, read_only: bool) -> Result<SessionStore, ai_hist::Error> {
-    let mut options = StoreOptions::default();
-    options.db_path = Some(path.to_path_buf());
-    options.read_only = read_only;
-    SessionStore::open(options)
 }
 
 fn facade_error(error: ai_hist::Error) -> napi::Error {
