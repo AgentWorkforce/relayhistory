@@ -578,6 +578,16 @@ Notable changes to the native `ai-hist` CLI are documented here.
   one-time backfill is pending. On a 2 MB rollout, a forced tick after a
   1 KiB append spends about 15 ms on it instead of about 75 ms.
 
+- A forced sync tick that finds nothing new costs about 20% less on a large
+  store (#316, #318). Shallow discovery checks whether each candidate file
+  has changed with a cached stamp query, plus a cached locator lookup when
+  the candidate's session id is not yet known. It used to prepare up to three
+  queries and decode the full observation and catalog row each time. During a sweep
+  it also stops re-resolving the project identity of every unchanged row,
+  because the identity refresh the sweep runs straight afterwards stores the
+  same key. `sessions discover` still resolves each streamed row before
+  emitting it.
+
 - Internal refactor: one-entry harness registry (#177). Each built-in harness
   is declared once, as a `LocalSource` descriptor in
   `crates/ai-hist/src/sources/catalog.rs`, and `SOURCE_CHOICES`,

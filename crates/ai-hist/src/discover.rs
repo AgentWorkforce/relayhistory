@@ -4137,29 +4137,63 @@ pub(crate) const OBSERVED_SESSION_BY_LOCATOR_SQL: &str = "SELECT session_id FROM
        AND raw_locator=? AND access_state='available' \
      ORDER BY +session_id LIMIT 1";
 
-fn fetch_observed_candidate(
+/// The stamp a candidate's session was last observed at through this
+/// adapter, with the session's id.
+///
+/// `None` unless that observation is `available` and the session is still
+/// catalogued -- the two conditions under which an unmoved stamp lets the
+/// candidate be served from the catalog instead of read.
+///
+/// One prepared-once statement per question rather than a fetch of the whole
+/// observation and the whole catalog row: this runs for every candidate file
+/// on every discovery pass, a sweep's included, and those per-call prepares
+/// and row decodes were 16% of a forced tick (#316). A caller that streams the
+/// row reads it afterwards, only for candidates that matched.
+fn observed_candidate_stamp(
     conn: &Connection,
     provider: &dyn ShallowSessionProvider,
     candidate: &Candidate,
-) -> Result<Option<ShallowSession>> {
+) -> Result<Option<(String, Option<String>)>> {
     let id = match candidate.session_id.as_ref() {
         Some(id) => Some(id.clone()),
-        None => conn.query_row(OBSERVED_SESSION_BY_LOCATOR_SQL,params![candidate.source,provider.location().as_str(),provider.connector_id(),provider.connector_instance(),candidate.locator],|r|r.get(0)).optional()?,
+        None => conn
+            .prepare_cached(OBSERVED_SESSION_BY_LOCATOR_SQL)?
+            .query_row(
+                params![
+                    candidate.source,
+                    provider.location().as_str(),
+                    provider.connector_id(),
+                    provider.connector_instance(),
+                    candidate.locator
+                ],
+                |r| r.get(0),
+            )
+            .optional()?,
     };
     let Some(id) = id else { return Ok(None) };
-    let Some(observation) =
-        crate::observations::get(conn, &observation_key(provider, candidate.source, &id))?
-    else {
-        return Ok(None);
-    };
-    if observation.access_state != "available" {
-        return Ok(None);
-    }
-    let Some(mut row) = fetch_catalog_row(conn, candidate.source, &id)? else {
-        return Ok(None);
-    };
-    row.source_stamp = observation.source_stamp;
-    Ok(Some(row))
+    let key = observation_key(provider, candidate.source, &id);
+    key.validate()?;
+    let stamp = conn
+        .prepare_cached(
+            "SELECT o.source_stamp FROM session_observations o \
+             WHERE o.source = ?1 AND o.session_id = ?2 AND o.location = ?3 \
+               AND o.connector_id = ?4 AND o.connector_instance = ?5 \
+               AND o.access_state = 'available' \
+               AND EXISTS (SELECT 1 FROM sessions s \
+                     WHERE s.source = ?1 AND s.session_id = ?2)",
+        )?
+        .query_row(
+            params![
+                key.source,
+                key.session_id,
+                key.location.as_str(),
+                key.connector_id,
+                key.connector_instance
+            ],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?;
+    Ok(stamp.map(|stamp| (id, stamp)))
 }
 
 /// Whether this source was already examined at this exact stamp and found not
@@ -4175,7 +4209,22 @@ fn is_known_non_session(
     locator: &str,
     stamp: &str,
 ) -> Result<bool> {
-    let known:Option<String>=conn.query_row("SELECT stamp FROM observation_discovery_skips WHERE source=? AND location=? AND connector_id=? AND connector_instance=? AND locator=?",params![source,provider.location().as_str(),provider.connector_id(),provider.connector_instance(),locator],|r|r.get(0)).optional()?;
+    let known: Option<String> = conn
+        .prepare_cached(
+            "SELECT stamp FROM observation_discovery_skips WHERE source=? AND location=? \
+             AND connector_id=? AND connector_instance=? AND locator=?",
+        )?
+        .query_row(
+            params![
+                source,
+                provider.location().as_str(),
+                provider.connector_id(),
+                provider.connector_instance(),
+                locator
+            ],
+            |r| r.get(0),
+        )
+        .optional()?;
     Ok(known.as_deref() == Some(stamp))
 }
 
@@ -4831,7 +4880,14 @@ pub fn discover_sessions_with_provider_refs(
     on_row: impl FnMut(&ShallowSession),
 ) -> Result<DiscoverySummary> {
     let worker_limit = std::thread::available_parallelism().map_or(1, |n| n.get());
-    discover_sessions_with_worker_limit(env, options, providers, on_row, worker_limit, true)
+    discover_sessions_with_worker_limit(
+        env,
+        options,
+        providers,
+        on_row,
+        worker_limit,
+        IdentityRefresh::Streamed,
+    )
 }
 
 /// [`discover_sessions_with_providers`] for the end of a sync sweep, which
@@ -4850,7 +4906,30 @@ pub(crate) fn discover_sessions_for_sweep(
         .map(|provider| provider.as_ref())
         .collect::<Vec<_>>();
     let worker_limit = std::thread::available_parallelism().map_or(1, |n| n.get());
-    discover_sessions_with_worker_limit(env, options, &providers, |_| {}, worker_limit, false)
+    discover_sessions_with_worker_limit(
+        env,
+        options,
+        &providers,
+        |_| {},
+        worker_limit,
+        IdentityRefresh::Sweep,
+    )
+}
+
+/// Who brings project identity up to date around a discovery pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentityRefresh {
+    /// Rows are streamed to the caller. Each cached row is upgraded before it
+    /// is streamed (see [`upgrade_cached_project_identity`]), and the pass
+    /// ends with the whole-catalog refresh.
+    Streamed,
+    /// The sweep: no row is streamed, and the sweep runs the refresh itself
+    /// right after the pass. That refresh stores exactly the key the per-row
+    /// upgrade would have -- the upgrade exists only so a *streamed* row
+    /// agrees with it -- so upgrading every cached row here as well was the
+    /// same resolution and ancestor walk twice, once per candidate file, on
+    /// every tick (#318).
+    Sweep,
 }
 
 // An explicit limit lets regression tests exercise both read paths regardless
@@ -4861,7 +4940,7 @@ fn discover_sessions_with_worker_limit(
     providers: &[&dyn ShallowSessionProvider],
     mut on_row: impl FnMut(&ShallowSession),
     worker_limit: usize,
-    refresh_identity: bool,
+    identity: IdentityRefresh,
 ) -> Result<DiscoverySummary> {
     // A pass is the unit over which the filesystem is treated as fixed, so it
     // is also the unit the project-identity cache may span. A host that stays
@@ -5020,15 +5099,34 @@ fn discover_sessions_with_worker_limit(
             }
             let provider = providers[*provider_index];
             let expected = stored_stamp(&candidate.stamp);
-            let cached = fetch_observed_candidate(conn, provider, candidate)?;
-            if let Some(mut cached) =
-                cached.filter(|row| row.source_stamp.as_deref() == Some(&expected))
-            {
-                // Before the row is queued for emission, not after the pass:
-                // `on_row` streams these to the caller as they are decided, so
-                // correcting the catalog at the end of the pass would still
-                // have handed every consumer the stale key.
-                upgrade_cached_project_identity(conn, &mut cached)?;
+            let unchanged = match observed_candidate_stamp(conn, provider, candidate)? {
+                Some((id, stamp)) if stamp.as_deref() == Some(expected.as_str()) => {
+                    match identity {
+                        // Nothing is streamed, so the row itself is not needed.
+                        IdentityRefresh::Sweep => Some(WindowEntry::Unchanged),
+                        IdentityRefresh::Streamed => {
+                            match fetch_catalog_row(conn, candidate.source, &id)? {
+                                Some(mut cached) => {
+                                    cached.source_stamp = stamp;
+                                    // Before the row is queued for emission,
+                                    // not after the pass: `on_row` streams
+                                    // these to the caller as they are decided,
+                                    // so correcting the catalog at the end of
+                                    // the pass would still have handed every
+                                    // consumer the stale key.
+                                    upgrade_cached_project_identity(conn, &mut cached)?;
+                                    Some(WindowEntry::Cached(cached))
+                                }
+                                // Dropped from the catalog since the lookup
+                                // above: not cached after all.
+                                None => None,
+                            }
+                        }
+                    }
+                }
+                _ => None,
+            };
+            if let Some(unchanged) = unchanged {
                 env.note_skipped();
                 summary.skipped_unchanged += 1;
                 if let Some(entry) = summary.providers.get_mut(candidate.source) {
@@ -5038,7 +5136,7 @@ fn discover_sessions_with_worker_limit(
                         .skipped_unchanged += 1;
                 }
                 potential += 1;
-                entries.push(WindowEntry::Cached(cached));
+                entries.push(unchanged);
                 continue;
             }
             // A source already examined and found not to be a session (a codex
@@ -5160,6 +5258,7 @@ fn discover_sessions_with_worker_limit(
                 break 'apply;
             }
             let (candidate, provider, expected, result) = match entry {
+                WindowEntry::Unchanged => continue,
                 WindowEntry::Cached(row) => {
                     let key = (row.source.clone(), row.session_id.clone());
                     if !emitted_sessions.contains(&key) {
@@ -5347,7 +5446,7 @@ fn discover_sessions_with_worker_limit(
     // nothing to upgrade stays read-only. Reporting rather than failing, for
     // the same reason the sync path does: the rows this discovery wrote are
     // already committed, and every key here is derived from them.
-    if refresh_identity {
+    if identity == IdentityRefresh::Streamed {
         if let Err(error) = crate::store::refresh_project_identity(env.conn) {
             eprintln!(
                 "ai-hist: could not refresh canonical project identity after discovery: {error:#} \
@@ -5397,6 +5496,9 @@ impl Drop for RelaxedSynchronous<'_> {
 enum WindowEntry<'c> {
     /// Stamp matched the catalog: emit the cached row, read nothing.
     Cached(ShallowSession),
+    /// Stamp matched the catalog during a sweep, which streams nothing: read
+    /// nothing, emit nothing.
+    Unchanged,
     /// Needs a shallow read. `result` is filled by the parallel phase for
     /// filesystem providers; a `None` result is read serially at apply time.
     Read {
