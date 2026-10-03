@@ -717,8 +717,6 @@ Notable changes to the native `ai-hist` CLI are documented here.
   `session_requests_page` to the end drops from ~1.9 s to ~1.1 s. Output is
   unchanged (#311).
 
-
-
 - Live capture: writes made while another process holds the sync lock are
   swept within about a second of its release, not at the backstop (#364).
   The owed retry backed off once per contended *event* tick, up to
@@ -757,7 +755,6 @@ Notable changes to the native `ai-hist` CLI are documented here.
   sleeps until the earliest expiry and ends the snapshot's read transaction,
   so a long-lived SDK host no longer holds WAL checkpoints back indefinitely.
   The thread holds no event-loop handle, so it never keeps Node alive (#306).
-
 
 - Live capture: a write beside the OpenCode database no longer forces a
   sweep (#335). OpenCode's watch root is still the database's directory,
