@@ -185,6 +185,7 @@ test("keeps entries that landed during the release pending", async () => {
 
   const result = persistRelease(work, "main", releaseStart, { VERSION: "0.21.2" });
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stdout, /conflicts with origin\/main; taking its copy/);
   assert.match(result.stdout, /carrying the 0\.21\.2 cut/);
   git(work, "fetch", "origin", "main");
   assert.equal(git(work, "show", "origin/main:version.txt"), "0.21.2");
@@ -193,4 +194,42 @@ test("keeps entries that landed during the release pending", async () => {
     changelog,
     /## \[Unreleased - Minor\]\n\n### Fixed\n\n- Landed during publish\n\n## \[0\.21\.2\] - 2026-09-21\n\n### Fixed\n\n- Shipped fix\n\n## \[0\.21\.1\]/,
   );
+});
+
+test("keeps an entry git merged cleanly into the released section pending", async () => {
+  const { work, other, startSha } = await stageRepos();
+  const changelog = (pending) =>
+    `# Changelog\n\n## [Unreleased - Patch]\n\n### Fixed\n\n${pending}\n\n## [0.21.1] - 2026-09-20\n\n### Fixed\n\n- Older\n`;
+  await writeFile(join(work, "CHANGELOG.md"), changelog("- Shipped fix"));
+  git(work, "add", "CHANGELOG.md");
+  git(work, "commit", "-m", "fix: shipped");
+  git(work, "push", "origin", "main");
+  git(other, "pull", "origin", "main");
+  const releaseStart = git(work, "rev-parse", "HEAD");
+
+  const cut = spawnSync(
+    process.execPath,
+    [join(scripts, "cut-changelog.mjs"), "--version", "0.21.2", "--date", "2026-09-21"],
+    { cwd: work, encoding: "utf8" },
+  );
+  assert.equal(cut.status, 0, cut.stderr);
+  git(work, "add", "CHANGELOG.md");
+  git(work, "commit", "-m", "chore: release 0.21.2");
+
+  // Same level, one more bullet: git merges this without a conflict.
+  await writeFile(join(other, "CHANGELOG.md"), changelog("- Shipped fix\n- Landed during publish"));
+  git(other, "add", "CHANGELOG.md");
+  git(other, "commit", "-m", "fix: land during publish");
+  git(other, "push", "origin", "main");
+
+  const result = persistRelease(work, "main", releaseStart, { VERSION: "0.21.2" });
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.doesNotMatch(result.stdout, /conflicts/);
+  assert.match(result.stdout, /carrying the 0\.21\.2 cut/);
+  git(work, "fetch", "origin", "main");
+  assert.match(
+    git(work, "show", "origin/main:CHANGELOG.md"),
+    /## \[Unreleased - Patch\]\n\n### Fixed\n\n- Landed during publish\n\n## \[0\.21\.2\] - 2026-09-21\n\n### Fixed\n\n- Shipped fix\n\n## \[0\.21\.1\]/,
+  );
+  assert.equal(git(work, "log", "-1", "--format=%s", "origin/main"), "chore: release 0.21.2");
 });

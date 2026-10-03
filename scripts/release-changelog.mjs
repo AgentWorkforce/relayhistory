@@ -263,12 +263,19 @@ export function carryReleaseCut(upstream, { version, released, start }) {
 
   const startPending = UNRELEASED.exec(start);
   const key = (heading, text) => JSON.stringify([heading, text]);
-  const shipped = new Set(
-    pendingBullets(startPending?.[2] ?? "").map(([heading, text]) => key(heading, text)),
-  );
+  // A count per entry, so a second identical entry that landed meanwhile
+  // still stays pending.
+  const shipped = new Map();
+  for (const [heading, text] of pendingBullets(startPending?.[2] ?? "")) {
+    shipped.set(key(heading, text), (shipped.get(key(heading, text)) ?? 0) + 1);
+  }
   const carried = new Map();
   for (const [heading, text] of pendingBullets(pending[2])) {
-    if (shipped.has(key(heading, text))) continue;
+    const remaining = shipped.get(key(heading, text)) ?? 0;
+    if (remaining > 0) {
+      shipped.set(key(heading, text), remaining - 1);
+      continue;
+    }
     if (!carried.has(heading)) carried.set(heading, []);
     carried.get(heading).push(text);
   }

@@ -22,6 +22,7 @@ import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import {
   TAG_PREFIX,
+  UNRELEASED,
   bodyFromCommitSubjects,
   carryReleaseCut,
   cutChangelog,
@@ -99,7 +100,10 @@ if (previousVersion === version) {
   process.exit(0);
 }
 
-const fallback = previousVersion ? bodyFromCommitSubjects(commitSubjects(previousVersion)) : "";
+// Commit subjects are read only when nothing is curated.
+const curated = Boolean(UNRELEASED.exec(original)?.[2].trim());
+const fallback =
+  previousVersion && !curated ? bodyFromCommitSubjects(commitSubjects(previousVersion)) : "";
 const result = cutChangelog(original, {
   version,
   date,

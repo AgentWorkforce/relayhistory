@@ -11,10 +11,12 @@
 # failed persist. The published tree is assumed to already be tagged; this
 # script only updates the branch.
 #
-# A conflict confined to CHANGELOG.md means entries landed on BRANCH while the
-# release ran: take BRANCH's copy, insert the released section exactly as
-# tagged, and keep the entries BRANCH gained since START_SHA pending (they are
-# not in the release). Any other conflict fails closed.
+# When BRANCH's CHANGELOG.md moved since START_SHA, entries landed while the
+# release ran. Whether git merges them cleanly (possibly into the released
+# section) or conflicts only in CHANGELOG.md, the changelog is rebuilt from
+# BRANCH's copy: the released section exactly as tagged, and the entries BRANCH
+# gained since START_SHA kept pending (they are not in the release). Any other
+# conflict fails closed.
 set -euo pipefail
 
 SCRIPTS=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -40,14 +42,25 @@ if [[ "$VERSION_SHA" == "$START_SHA" ]]; then
   exit 0
 fi
 
-recut_changelog() {
-  [[ "$(git diff --name-only --diff-filter=U)" == "CHANGELOG.md" && -n "${VERSION:-}" ]] || return 1
-  echo "CHANGELOG.md conflicts with origin/$BRANCH; carrying the $VERSION cut onto it"
+# A conflict only in CHANGELOG.md: take BRANCH's copy; reconcile_changelog
+# rebuilds it.
+resolve_changelog_conflict() {
+  [[ "$(git diff --name-only --diff-filter=U)" == "CHANGELOG.md" ]] || return 1
+  echo "CHANGELOG.md conflicts with origin/$BRANCH; taking its copy"
   git checkout --ours -- CHANGELOG.md
-  node "$SCRIPTS/cut-changelog.mjs" --version "$VERSION" \
-    --released-from "$VERSION_SHA" --pending-since "$START_SHA" || return 1
   git add CHANGELOG.md
   GIT_EDITOR=true git rebase --continue
+}
+
+reconcile_changelog() {
+  git diff --quiet "$START_SHA" "$VERSION_SHA" -- CHANGELOG.md && return 0
+  git diff --quiet "$START_SHA" "origin/$BRANCH" -- CHANGELOG.md && return 0
+  echo "origin/$BRANCH changed CHANGELOG.md during the release; carrying the $VERSION cut onto it"
+  git show "origin/$BRANCH:CHANGELOG.md" > CHANGELOG.md
+  node "$SCRIPTS/cut-changelog.mjs" --version "$VERSION" \
+    --released-from "$VERSION_SHA" --pending-since "$START_SHA"
+  git add CHANGELOG.md
+  git diff --cached --quiet || git commit --quiet --amend --no-edit
 }
 
 conflict() {
@@ -70,7 +83,10 @@ while (( attempt <= ATTEMPTS )); do
   fi
   if [[ "$REMOTE_SHA" != "$START_SHA" ]]; then
     echo "origin/$BRANCH advanced from $START_SHA to $REMOTE_SHA; rebasing the version commit"
-    git rebase --onto "origin/$BRANCH" "$START_SHA" || recut_changelog || conflict
+    git rebase --onto "origin/$BRANCH" "$START_SHA" || resolve_changelog_conflict || conflict
+    if [[ -n "${VERSION:-}" ]]; then
+      reconcile_changelog || conflict
+    fi
   fi
   if git push origin "HEAD:refs/heads/$BRANCH"; then
     exit 0

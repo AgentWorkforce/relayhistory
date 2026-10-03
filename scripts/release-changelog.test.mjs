@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   REPOSITORY as REPO,
@@ -17,6 +17,16 @@ import {
 } from "./release-changelog.mjs";
 
 const scripts = dirname(fileURLToPath(import.meta.url));
+const tempDirs = [];
+after(() => {
+  for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
+});
+
+function tempDir(prefix) {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  tempDirs.push(dir);
+  return dir;
+}
 
 function changelog(level = "Minor", body = "### Added\n\n- Feature") {
   const suffix = level ? ` - ${level}` : "";
@@ -131,7 +141,7 @@ function cutCli(dir, version) {
 }
 
 function repoWithCommits(subjects) {
-  const dir = mkdtempSync(join(tmpdir(), "relayhistory-changelog-git-"));
+  const dir = tempDir("relayhistory-changelog-git-");
   const git = (...args) => {
     const result = spawnSync("git", ["-C", dir, ...args], { encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
@@ -170,7 +180,7 @@ describe("cut-changelog.mjs", () => {
   });
 
   it("cuts CHANGELOG.md in the working directory and is idempotent", () => {
-    const dir = mkdtempSync(join(tmpdir(), "relayhistory-changelog-"));
+    const dir = tempDir("relayhistory-changelog-");
     writeFileSync(join(dir, "CHANGELOG.md"), changelog());
     const run = () =>
       spawnSync(process.execPath, [join(scripts, "cut-changelog.mjs"), "--version", "0.35.0", "--date", "2026-10-04"], {
@@ -240,6 +250,14 @@ describe("carryReleaseCut", () => {
     assert.throws(() => assertChangelogSemver(carried, "1.1.0"), /requires a Major release/);
   });
 
+  it("keeps a second identical entry that landed during the release", () => {
+    const upstream = changelog("Patch", "### Fixed\n\n- Shipped fix\n- Shipped fix");
+    assert.match(
+      carryReleaseCut(upstream, { version: "0.34.2", released, start }),
+      /## \[Unreleased - Patch\]\n\n### Fixed\n\n- Shipped fix\n\n## \[0\.34\.2\]/,
+    );
+  });
+
   it("keeps a bullet whose text shipped under another section", () => {
     const upstream = changelog("Patch", "### Fixed\n\n- Shipped fix\n\n### Rust API\n\n- Shipped fix");
     assert.match(
@@ -252,5 +270,28 @@ describe("carryReleaseCut", () => {
     const upstream = changelog("Patch", "### Fixed\n\n- Shipped fix").replace("# Changelog", "# Changelog\n\nEdited intro.");
     const carried = carryReleaseCut(upstream, { version: "0.34.2", released, start });
     assert.match(carried, /Edited intro\.\n\n## \[Unreleased\]\n\n## \[0\.34\.2\] - 2026-10-04\n\n### Fixed\n\n- Shipped fix\n/);
+  });
+});
+
+describe("check-release-changelog.mjs", () => {
+  const check = (dir, ...args) =>
+    spawnSync(process.execPath, [join(scripts, "check-release-changelog.mjs"), ...args], {
+      cwd: dir,
+      encoding: "utf8",
+    });
+
+  it("exits 0 at the pending level, 1 below it, and 2 without --version", () => {
+    const dir = tempDir("relayhistory-changelog-check-");
+    writeFileSync(join(dir, "CHANGELOG.md"), changelog());
+
+    const ok = check(dir, "--version", "0.35.0");
+    assert.equal(ok.status, 0, ok.stderr);
+    assert.match(ok.stdout, /changelog ok: 0\.34\.1 -> 0\.35\.0 \(Minor; pending Minor\)/);
+
+    const low = check(dir, "--version", "0.34.2");
+    assert.equal(low.status, 1);
+    assert.match(low.stderr, /requires a Minor release, but 0\.34\.1 -> 0\.34\.2 is Patch/);
+
+    assert.equal(check(dir).status, 2);
   });
 });
