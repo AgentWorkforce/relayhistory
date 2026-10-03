@@ -112,7 +112,8 @@ use super::*;
 /// stamp map to v4. This branch retired that map, so the same one-time
 /// re-read is expressed here: a cursor is what the skip path consults now, and
 /// discarding the old ones is what makes the pass happen.
-pub(crate) const TRANSCRIPT_CURSOR_VERSION: u32 = 3;
+// Version 4 replays Codex desktop replies skipped by the previous parser.
+pub(crate) const TRANSCRIPT_CURSOR_VERSION: u32 = 4;
 
 /// How much of the committed region each end of the validation window covers.
 pub(crate) const PREFIX_WINDOW_BYTES: u64 = 64 * 1024;

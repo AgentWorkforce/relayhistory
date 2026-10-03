@@ -40,6 +40,10 @@ pub const SESSION_USAGE_CONTRACT_VERSION: u32 = 3;
 /// from a source that spreads requests across records is reported with the
 /// `unresolved-request-identity` diagnostic rather than quietly summed.
 ///
+/// Codex payload message IDs identify individual output items, not the API
+/// call shared with reasoning and tools. Its request span therefore takes
+/// precedence over `provider_message_id`; an explicit `request_id` still wins.
+///
 /// The key is **namespace-qualified** — `request-id:req_1`, not `req_1` —
 /// because those three namespaces are separate and can carry the same text. A
 /// bare value grouped one call whose `request_id` is `msg_1` together with an
@@ -72,12 +76,14 @@ SELECT
     e.session_id AS session_id,
     CASE
         WHEN NULLIF(e.request_id, '') IS NOT NULL THEN 'request-id:' || e.request_id
+        WHEN e.source = 'codex' AND NULLIF(e.request_span, '') IS NOT NULL THEN 'request-span:' || e.request_span
         WHEN NULLIF(e.provider_message_id, '') IS NOT NULL THEN 'provider-message-id:' || e.provider_message_id
         WHEN NULLIF(e.request_span, '') IS NOT NULL THEN 'request-span:' || e.request_span
         ELSE 'record-id:' || e.message_id
     END AS request_key,
     CASE
         WHEN NULLIF(e.request_id, '') IS NOT NULL THEN 'request-id'
+        WHEN e.source = 'codex' AND NULLIF(e.request_span, '') IS NOT NULL THEN 'request-span'
         WHEN NULLIF(e.provider_message_id, '') IS NOT NULL THEN 'provider-message-id'
         WHEN NULLIF(e.request_span, '') IS NOT NULL THEN 'request-span'
         ELSE 'record-id'
@@ -100,6 +106,7 @@ WHERE e.role = 'assistant'
   AND e.message_id <> ''
 GROUP BY e.source, e.session_id, CASE
         WHEN NULLIF(e.request_id, '') IS NOT NULL THEN 'request-id:' || e.request_id
+        WHEN e.source = 'codex' AND NULLIF(e.request_span, '') IS NOT NULL THEN 'request-span:' || e.request_span
         WHEN NULLIF(e.provider_message_id, '') IS NOT NULL THEN 'provider-message-id:' || e.provider_message_id
         WHEN NULLIF(e.request_span, '') IS NOT NULL THEN 'request-span:' || e.request_span
         ELSE 'record-id:' || e.message_id
@@ -142,7 +149,7 @@ pub enum RequestKeySource {
     /// The span between two usage snapshots, for a provider that delimits
     /// its requests without naming them.
     ///
-    /// Codex records no request id and no message id, but it reports a
+    /// Codex records no request id; output-item IDs do not identify calls. It reports a
     /// cumulative `token_count` after each API call, so one snapshot ends one
     /// request and every assistant row since the previous snapshot belongs to
     /// it. Without this the rows of one call — `agent_reasoning`, each
@@ -942,6 +949,105 @@ mod tests {
         assert_eq!(usage.input_tokens, 3);
         assert_eq!(usage.output_tokens, 43);
         assert_eq!(usage.cache_write_1h_tokens, Some(4773));
+    }
+
+    #[test]
+    fn codex_output_ids_do_not_split_a_request_span() {
+        let conn = db();
+        for (uid, kind, provider_id) in [
+            ("reasoning", "thinking", None),
+            ("tool", "tool_use", None),
+            ("reply", "text", Some("reply-1")),
+        ] {
+            event(
+                &conn,
+                "codex",
+                "s1",
+                uid,
+                1000,
+                "assistant",
+                kind,
+                None,
+                None,
+                uid,
+            );
+            conn.execute(
+                "UPDATE session_events SET request_span = '0', provider_message_id = ?1 WHERE source = 'codex' AND event_uid = ?2",
+                rusqlite::params![provider_id, uid],
+            ).unwrap();
+        }
+        let page = session_requests_page(&conn, "codex", "s1", 50, None).unwrap();
+        assert_eq!(page.requests.len(), 1);
+        assert_eq!(page.requests[0].request_key, "request-span:0");
+        assert_eq!(
+            page.requests[0].request_key_source,
+            RequestKeySource::RequestSpan
+        );
+        assert_eq!(page.requests[0].event_count, 3);
+        assert!(page.requests[0].has_thinking);
+        for event in crate::store::session_events(&conn, "s1", Some("codex")).unwrap() {
+            assert_eq!(
+                crate::usage::request_key(&event),
+                page.requests[0].request_key
+            );
+        }
+
+        // An explicit request ID still outranks the span for every provider.
+        conn.execute(
+            "UPDATE session_events SET request_id = 'req-1' WHERE source = 'codex'",
+            [],
+        )
+        .unwrap();
+        let page = session_requests_page(&conn, "codex", "s1", 50, None).unwrap();
+        assert_eq!(page.requests.len(), 1);
+        assert_eq!(page.requests[0].request_key, "request-id:req-1");
+        assert_eq!(
+            page.requests[0].request_key_source,
+            RequestKeySource::RequestId
+        );
+
+        for event in crate::store::session_events(&conn, "s1", Some("codex")).unwrap() {
+            assert_eq!(
+                crate::usage::request_key(&event),
+                page.requests[0].request_key
+            );
+        }
+
+        // Other providers continue to prefer their message identity to a span.
+        for source in ["claude", "opencode", "grok"] {
+            event(
+                &conn,
+                source,
+                "s1",
+                "provider-id",
+                1000,
+                "assistant",
+                "text",
+                None,
+                None,
+                "reply",
+            );
+            conn.execute(
+                "UPDATE session_events SET request_span = '0' WHERE source = ?1",
+                [source],
+            )
+            .unwrap();
+            let page = session_requests_page(&conn, source, "s1", 50, None).unwrap();
+            assert_eq!(
+                page.requests[0].request_key,
+                "provider-message-id:provider-id"
+            );
+            assert_eq!(
+                page.requests[0].request_key_source,
+                RequestKeySource::ProviderMessageId
+            );
+            for event in crate::store::session_events(&conn, "s1", Some(source)).unwrap() {
+                assert_eq!(
+                    crate::usage::request_key(&event),
+                    page.requests[0].request_key
+                );
+            }
+        }
     }
 
     #[test]

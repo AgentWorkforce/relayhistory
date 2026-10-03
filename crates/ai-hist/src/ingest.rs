@@ -770,7 +770,7 @@ fn destination_head(conn: &Connection) -> Result<String> {
 /// generations belong in the stamp.
 const SWEEP_PARSER_GENERATIONS: &[&str] = &[
     "claude_sessions_v3",
-    "codex_rollouts_v5",
+    "codex_rollouts_v7",
     GROK_SYNC_STATE_KEY,
 ];
 
@@ -3101,7 +3101,7 @@ impl Drop for SyncStateLock {
 /// once per source against the whole state map, and `codex_rollouts_v4` is still
 /// *read* by this version to seed the v5 migration. Sweeping unconditionally
 /// would drop it during an earlier source's checkpoint, before
-/// `sync_codex_rollouts` has written `codex_rollouts_v6`; a crash or an
+/// `sync_codex_rollouts` has written `codex_rollouts_v7`; a crash or an
 /// overlapping sync in that window would find neither map and force a full
 /// re-read of the archive. Requiring the successor in the same write closes that
 /// gap: the old map only leaves disk once its replacement is on the way there.
@@ -3327,11 +3327,12 @@ fn forget_unobserved_paths(
 }
 
 const RETIRED_SYNC_STATE_KEYS: &[(&str, &str)] = &[
-    ("codex_rollouts", "codex_rollouts_v6"),
-    ("codex_rollout_user_messages_v2", "codex_rollouts_v6"),
-    ("codex_rollouts_v3", "codex_rollouts_v6"),
-    ("codex_rollouts_v4", "codex_rollouts_v6"),
-    ("codex_rollouts_v5", "codex_rollouts_v6"),
+    ("codex_rollouts", "codex_rollouts_v7"),
+    ("codex_rollout_user_messages_v2", "codex_rollouts_v7"),
+    ("codex_rollouts_v3", "codex_rollouts_v7"),
+    ("codex_rollouts_v4", "codex_rollouts_v7"),
+    ("codex_rollouts_v5", "codex_rollouts_v7"),
+    ("codex_rollouts_v6", "codex_rollouts_v7"),
     ("claude_sessions_v3", "claude_sessions_v4"),
     ("cursor", CURSOR_SYNC_STATE_KEY),
     ("cursor_events_v1", CURSOR_SYNC_STATE_KEY),
@@ -4590,19 +4591,12 @@ fn sync_codex_sources(
 ///
 /// Replaces the earlier split walks (state keys `codex_rollouts` and
 /// `codex_rollout_user_messages_v2`) with one stamp map. The current
-/// `codex_rollouts_v6` generation adds `session_markers`: lifecycle,
-/// compaction and streaming-failure lines that earlier versions parsed and
-/// discarded. There is no way to recover a marker from a database -- only from
-/// the rollout -- so unlike the v4 -> v5 upgrade, which could invalidate just
-/// the entries it knew were stale, this one has to re-read every file once.
-/// The map therefore starts empty and `codex_rollouts_v5` is retired, rather
-/// than being carried forward with stamps that would skip exactly the files
-/// that need re-reading. Earlier generations repaired the user-message parser
-/// and reclassified `source.subagent` markers. Each per-file record carries the
-/// session id and classification so a wiped database or an older
-/// standalone-guardian classification forces the necessary re-ingestion even
-/// when the file stamp is unchanged. (session cwds, session branches, prompts
-/// inserted).
+/// `codex_rollouts_v7` generation recovers desktop assistant response items.
+/// Earlier generations captured markers (v6), repaired user messages and
+/// reclassified subagents. Old stamps cannot be carried forward: unchanged
+/// files must be read once to recover the replies the old parser skipped.
+/// Each per-file record carries its session id and classification so a wiped
+/// database or an older guardian classification also forces re-ingestion.
 type CodexRolloutWalk = (HashMap<String, String>, HashMap<String, String>, usize);
 
 /// Reconcile the catalog registration for a locally observed subagent.
@@ -4727,18 +4721,17 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
 ) -> Result<CodexRolloutWalk> {
     let mut cwds = load_state_string_map(state, "codex_session_cwds");
     let mut branches = load_state_string_map(state, "codex_session_branches");
+    let has_v7 = state.contains_key("codex_rollouts_v7");
     let has_v6 = state.contains_key("codex_rollouts_v6");
     let has_v5 = state.contains_key("codex_rollouts_v5");
     let has_v4 = state.contains_key("codex_rollouts_v4");
     // v4 and v5 both already repaired user-message parsing, so an upgrade from
     // either must not redo it; only a database that predates them needs it.
-    let repair_user_messages = !has_v6 && !has_v5 && !has_v4;
-    // Deliberately seeded from v6 alone. Carrying a v5 map forward would keep
-    // a matching stamp for every rollout, and the fast path below would then
-    // skip precisely the unchanged files whose markers are missing -- an
-    // upgrade that reports a clean, fully-synced run and writes nothing.
+    let repair_user_messages = !has_v7 && !has_v6 && !has_v5 && !has_v4;
+    // v7 recovers desktop assistant response items. Old stamps must not skip
+    // unchanged rollouts that the prior parser uploaded without replies.
     let mut seen = state
-        .get("codex_rollouts_v6")
+        .get("codex_rollouts_v7")
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
@@ -4793,7 +4786,7 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
         // question is asked per path, not per root.
         if known_here {
             let missing = unobserved_known_paths(&seen, &root, &rollouts);
-            if !forget_unobserved_paths(state, &mut seen, "codex_rollouts_v6", missing) {
+            if !forget_unobserved_paths(state, &mut seen, "codex_rollouts_v7", missing) {
                 walked_every_known_root = false;
             }
         }
@@ -5084,10 +5077,10 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
     // Only the unreadable rollouts the state already knew about count against
     // the pass; one it never indexed has nothing to repair.
     unreadable.retain(|key| seen.contains_key(key));
-    if !forget_unobserved_paths(state, &mut seen, "codex_rollouts_v6", unreadable) {
+    if !forget_unobserved_paths(state, &mut seen, "codex_rollouts_v7", unreadable) {
         walked_every_known_root = false;
     }
-    state.insert("codex_rollouts_v6".to_string(), Value::Object(seen));
+    state.insert("codex_rollouts_v7".to_string(), Value::Object(seen));
     if walked_every_known_root {
         record_fidelity_backfill(state, CODEX_FIDELITY_GENERATION_KEY);
     }
@@ -6082,6 +6075,9 @@ fn ingest_codex_rollout_incremental(
     // why it is part of the resume state rather than a plain local.
     let mut turn_id: Option<String> = resume.turn_id.clone();
     let mut saw_model_output = resume.saw_model_output;
+    // Mirrors are adjacent physical records. Keep the index too so malformed
+    // or oversized lines cannot make two separate equal replies look adjacent.
+    let mut previous_assistant: Option<(usize, codex::HumanMessageFormat, String)> = None;
     let mut human_messages =
         codex::HumanMessageDeduper::restore(resume.previous_human_message.clone());
     // Codex reports how a call ended out of band — `exec_command_end`,
@@ -6325,6 +6321,78 @@ fn ingest_codex_rollout_incremental(
             }
             continue;
         }
+        if let Some(message) = codex::assistant_message(&value) {
+            let mirrored =
+                previous_assistant
+                    .as_ref()
+                    .is_some_and(|(previous_index, format, text)| {
+                        *previous_index + 1 == index
+                            && *format != message.format
+                            && *text == message.text
+                    });
+            if mirrored {
+                previous_assistant = None;
+                unwritten_line = None;
+                continue;
+            }
+            // Old parsers stored only event_msg replies. When its mirror came
+            // first, retain the already-uploaded native ID on upgrade. Fresh
+            // captures keep the first representation; subsequent parses make
+            // the same choice. This is one indexed lookup, never a session scan.
+            let existing_mirror = message.format == codex::HumanMessageFormat::ResponseItem
+                && conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM session_events WHERE source='codex' AND session_id=?1 AND event_uid=?2 AND role='assistant' AND kind='text' AND text=?3)",
+                    params![session_id, format!("{}:agent_message", index + 1), message.text],
+                    |row| row.get::<_, bool>(0),
+                )?;
+            if existing_mirror {
+                previous_assistant = None;
+                unwritten_line = None;
+                continue;
+            }
+            let suffix = match message.format {
+                codex::HumanMessageFormat::EventMessage => "agent_message",
+                codex::HumanMessageFormat::ResponseItem => "response_item_assistant_message",
+            };
+            let uid = format!("{index}:{suffix}");
+            // Codex message identities stay line-derived across parser upgrades.
+            // Preserve a payload ID as evidence without changing the ledger key.
+            let token_json = pending_usage.take().map(PendingCodexUsage::into_token_json);
+            insert_session_event(
+                conn,
+                "codex",
+                session_id,
+                cwd,
+                cwd,
+                branch,
+                &uid,
+                None,
+                ts_ms,
+                "assistant",
+                "text",
+                Some(&message.text),
+                model.as_deref(),
+                token_json.as_deref(),
+                RequestIdentity {
+                    provider_message_id: message.message_id.as_deref(),
+                    ..RequestIdentity::default()
+                },
+                &uid,
+                None,
+                RawMessageFacts {
+                    turn_id: turn_id.as_deref(),
+                    request_span: Some(request_span.to_string().as_str()),
+                    ..RawMessageFacts::default()
+                },
+            )?;
+            outcome.events += 1;
+            untokened_assistant_uid = token_json.is_none().then(|| uid.clone());
+            outcome.last_assistant_text = Some(message.text.chars().take(4096).collect());
+            saw_model_output = true;
+            previous_assistant = Some((index, message.format, message.text));
+            continue;
+        }
+        previous_assistant = None;
         match line_type {
             "turn_context" => {
                 if let Some(m) = payload_str("model") {
@@ -6337,35 +6405,8 @@ fn ingest_codex_rollout_incremental(
             }
             "event_msg" => match payload_type {
                 "user_message" => {}
-                "agent_message" => {
-                    if let Some(message) = payload_str("message").filter(|m| !m.trim().is_empty()) {
-                        let uid = format!("{index}:agent_message");
-                        let token_json =
-                            pending_usage.take().map(PendingCodexUsage::into_token_json);
-                        insert_codex_event(
-                            conn,
-                            session_id,
-                            cwd,
-                            branch,
-                            ts_ms,
-                            "assistant",
-                            "text",
-                            message.trim(),
-                            &uid,
-                            &uid,
-                            model.as_deref(),
-                            token_json.as_deref(),
-                            None,
-                            turn_id.as_deref(),
-                            Some(request_span.to_string().as_str()),
-                        )?;
-                        outcome.events += 1;
-                        untokened_assistant_uid = token_json.is_none().then(|| uid.clone());
-                        outcome.last_assistant_text =
-                            Some(message.trim().chars().take(4096).collect());
-                        saw_model_output = true;
-                    }
-                }
+                // Non-empty assistant prose was handled above.
+                "agent_message" => {}
                 "agent_reasoning" => {
                     if let Some(reasoning) = payload_str("text").filter(|t| !t.trim().is_empty()) {
                         let uid = format!("{index}:agent_reasoning");
@@ -6836,9 +6877,8 @@ fn ingest_codex_rollout_incremental(
                 // Readable reasoning arrives as event_msg/agent_reasoning;
                 // this row is encrypted, but it still marks model output.
                 "reasoning" => saw_model_output = true,
-                // Assistant `response_item` messages still duplicate the
-                // readable event_msg stream, but mark model output for token
-                // baselines. User messages were handled canonically above.
+                // Text was stored above. Non-text assistant content still
+                // marks model output for token baselines.
                 "message" if payload_str("role") == Some("assistant") => saw_model_output = true,
                 _ => {}
             },
@@ -7203,8 +7243,7 @@ fn flush_unwritten_codex_line(
 /// elsewhere: `session_meta` and `turn_context` populate the session catalog,
 /// `token_count` is folded into the adjacent assistant event's `token_json`,
 /// `thread_settings_applied` only carries the model forward, a `*_delta` is a
-/// fragment of an event recorded whole, and an assistant `message` is the
-/// mirrored twin of the `agent_message` that stores the text.
+/// fragment of an event recorded whole, while assistant messages are stored above (including desktop-only replies).
 ///
 /// A *user* message is deliberately not on this list. The deduplicator stores
 /// one row for Codex's two representations of a turn, but only when it accepts
@@ -7219,7 +7258,7 @@ fn flush_unwritten_codex_line(
 fn codex_line_is_state_only(
     line_type: &str,
     payload_type: &str,
-    payload: &Map<String, Value>,
+    _payload: &Map<String, Value>,
 ) -> bool {
     match line_type {
         "session_meta" | "turn_context" => true,
@@ -7227,18 +7266,7 @@ fn codex_line_is_state_only(
             matches!(payload_type, "token_count" | "thread_settings_applied")
                 || payload_type.ends_with("_delta")
         }
-        "response_item" => {
-            // An *assistant* `message` is the mirrored twin of the readable
-            // `agent_message` event, which stores the text. A `user` message
-            // is not exempt by type: the deduplicator stores it only when it
-            // accepts it, and it refuses blank text, control wrappers and
-            // content with no `input_text` part. Those are settled by
-            // measurement instead, and a role this does not recognize falls
-            // through to measurement too -- the safe direction.
-            (payload_type == "message"
-                && payload.get("role").and_then(Value::as_str) == Some("assistant"))
-                || payload_type.ends_with("_delta")
-        }
+        "response_item" => payload_type.ends_with("_delta"),
         _ => false,
     }
 }
@@ -22392,7 +22420,7 @@ mod tests {
         // retired keys removed.
         let mut ours = Map::new();
         ours.insert(
-            "codex_rollouts_v6".into(),
+            "codex_rollouts_v7".into(),
             json!({"a.jsonl": {"stamp": "2:2"}}),
         );
         ours.insert("claude_sessions_v4".into(), json!({"s.jsonl": "2:2"}));
@@ -22406,7 +22434,7 @@ mod tests {
             );
         }
         assert_eq!(
-            saved["codex_rollouts_v6"],
+            saved["codex_rollouts_v7"],
             json!({"a.jsonl": {"stamp": "2:2"}})
         );
         assert_eq!(saved["claude_sessions_v4"], json!({"s.jsonl": "2:2"}));
@@ -22449,14 +22477,14 @@ mod tests {
         // Codex then runs and writes v6 in the same state map.
         let mut after_codex = early.clone();
         after_codex.insert(
-            "codex_rollouts_v6".into(),
+            "codex_rollouts_v7".into(),
             json!({"a.jsonl": {"stamp": "2:2"}}),
         );
         checkpoint_sync_state(&path, &after_codex);
         let saved = load_sync_state(&path).unwrap();
         assert!(!saved.contains_key("codex_rollouts_v5"));
         assert_eq!(
-            saved["codex_rollouts_v6"],
+            saved["codex_rollouts_v7"],
             json!({"a.jsonl": {"stamp": "2:2"}})
         );
     }
@@ -25605,7 +25633,7 @@ mod tests {
         disk.insert("source_fingerprint".into(), json!("old"));
         disk.insert("claude".into(), typed_cursor(100, 1));
         disk.insert("legacy".into(), json!(40));
-        disk.insert("codex_rollouts_v6".into(), many_stamps(50, "a"));
+        disk.insert("codex_rollouts_v7".into(), many_stamps(50, "a"));
         disk.insert("codex_rollouts_v5".into(), many_stamps(3, "retired"));
         disk.insert(
             CURSOR_SYNC_STATE_KEY.into(),
@@ -25618,8 +25646,8 @@ mod tests {
         ours.insert("source_fingerprint".into(), json!("new"));
         ours.insert("claude".into(), typed_cursor(180, 1));
         ours.insert("legacy".into(), json!(30));
-        ours["codex_rollouts_v6"]["/rollouts/7.jsonl"] = json!("b-7");
-        ours["codex_rollouts_v6"]["/rollouts/new.jsonl"] = json!("b-new");
+        ours["codex_rollouts_v7"]["/rollouts/7.jsonl"] = json!("b-7");
+        ours["codex_rollouts_v7"]["/rollouts/new.jsonl"] = json!("b-new");
         ours[CURSOR_SYNC_STATE_KEY]["/c/2.jsonl"] = typed_cursor(12, 1);
         ours.insert("destination_head".into(), json!("e:9"));
         // A run forgets a path it dropped from its own stamp map.
@@ -25635,7 +25663,7 @@ mod tests {
         let delta = sync_state_delta(&disk, &ours).expect("ours changes the disk");
         // Only the changed stamps travel, not the 50-entry map.
         assert_eq!(
-            delta["codex_rollouts_v6"].as_object().unwrap().len(),
+            delta["codex_rollouts_v7"].as_object().unwrap().len(),
             2,
             "{delta:#?}"
         );
@@ -25670,7 +25698,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".sync-state.json");
         let mut on_disk = Map::new();
-        on_disk.insert("codex_rollouts_v6".into(), many_stamps(40, "a"));
+        on_disk.insert("codex_rollouts_v7".into(), many_stamps(40, "a"));
         on_disk.insert("other-writer".into(), json!("kept"));
         save_sync_state(&path, &on_disk).unwrap();
 
@@ -25678,7 +25706,7 @@ mod tests {
         assert!(stamp.is_some() || cfg!(not(unix)));
         let mut checkpoints = SweepCheckpoints::new(&path, &state, stamp);
         state.remove("other-writer");
-        state["codex_rollouts_v6"]["/rollouts/1.jsonl"] = json!("b-1");
+        state["codex_rollouts_v7"]["/rollouts/1.jsonl"] = json!("b-1");
         state.insert("source_fingerprint".into(), json!("f"));
 
         let mut expected = on_disk.clone();
@@ -25710,12 +25738,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".sync-state.json");
         let mut on_disk = Map::new();
-        on_disk.insert("codex_rollouts_v6".into(), many_stamps(10, "a"));
+        on_disk.insert("codex_rollouts_v7".into(), many_stamps(10, "a"));
         save_sync_state(&path, &on_disk).unwrap();
 
         let (mut state, stamp) = load_sync_state_stamped(&path);
         let mut checkpoints = SweepCheckpoints::new(&path, &state, stamp);
-        state["codex_rollouts_v6"]["/rollouts/2.jsonl"] = json!("ours");
+        state["codex_rollouts_v7"]["/rollouts/2.jsonl"] = json!("ours");
         checkpoints.save(&state);
 
         let mut theirs = Map::new();
@@ -25724,7 +25752,7 @@ mod tests {
             json!({"/c/1.jsonl": typed_cursor(5, 1)}),
         );
         theirs.insert(
-            "codex_rollouts_v6".into(),
+            "codex_rollouts_v7".into(),
             json!({"/rollouts/theirs.jsonl": "theirs"}),
         );
         checkpoint_sync_state(&path, &theirs);
@@ -25735,11 +25763,11 @@ mod tests {
         let saved = load_sync_state(&path).unwrap();
         assert_eq!(saved["source_fingerprint"], json!("f"));
         assert_eq!(
-            saved["codex_rollouts_v6"]["/rollouts/2.jsonl"],
+            saved["codex_rollouts_v7"]["/rollouts/2.jsonl"],
             json!("ours")
         );
         assert_eq!(
-            saved["codex_rollouts_v6"]["/rollouts/theirs.jsonl"],
+            saved["codex_rollouts_v7"]["/rollouts/theirs.jsonl"],
             json!("theirs")
         );
         assert_eq!(
@@ -25757,7 +25785,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".sync-state.json");
         let mut on_disk = Map::new();
-        on_disk.insert("codex_rollouts_v6".into(), many_stamps(5, "a"));
+        on_disk.insert("codex_rollouts_v7".into(), many_stamps(5, "a"));
         save_sync_state(&path, &on_disk).unwrap();
 
         let (mut state, stamp) = load_sync_state_stamped(&path);
@@ -25775,7 +25803,7 @@ mod tests {
         checkpoints.save(&state);
         let saved = load_sync_state(&path).unwrap();
         assert_eq!(saved.get("claude"), Some(&typed_cursor(180, 1)));
-        assert_eq!(saved["codex_rollouts_v6"], on_disk["codex_rollouts_v6"]);
+        assert_eq!(saved["codex_rollouts_v7"], on_disk["codex_rollouts_v7"]);
     }
 
     /// A file replaced behind the sweep's back is merged into by the next
@@ -27705,7 +27733,7 @@ mod tests {
         };
         let stamped_paths = |state: &Map<String, Value>| -> Vec<String> {
             state
-                .get("codex_rollouts_v6")
+                .get("codex_rollouts_v7")
                 .and_then(Value::as_object)
                 .map(|map| map.keys().cloned().collect())
                 .unwrap_or_default()
@@ -28004,7 +28032,7 @@ mod tests {
         // An install past the one-time user-message repair, which re-reads
         // every rollout whole by design.
         let mut state = Map::new();
-        state.insert("codex_rollouts_v6".into(), json!({}));
+        state.insert("codex_rollouts_v7".into(), json!({}));
         fs::write(&rollout, format!("{opening}{}{}", user(1), close(1, 100))).unwrap();
         sync_codex(&resumed, &mut state, &root).unwrap();
         let offset = |conn: &Connection| -> i64 {
@@ -28053,7 +28081,7 @@ mod tests {
         let full = Connection::open_in_memory().unwrap();
         init_db(&full).unwrap();
         let mut fresh = Map::new();
-        fresh.insert("codex_rollouts_v6".into(), json!({}));
+        fresh.insert("codex_rollouts_v7".into(), json!({}));
         sync_codex(&full, &mut fresh, &root).unwrap();
         assert_eq!(behind(&full), 1);
 
@@ -28151,7 +28179,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let mut state = Map::new();
-        state.insert("codex_rollouts_v6".into(), json!({}));
+        state.insert("codex_rollouts_v7".into(), json!({}));
         sync_codex(&conn, &mut state, &root).unwrap();
         let committed: i64 = conn
             .query_row(
@@ -28361,7 +28389,7 @@ mod tests {
         };
         let stamped = |state: &Map<String, Value>, path: &std::path::Path| -> bool {
             state
-                .get("codex_rollouts_v6")
+                .get("codex_rollouts_v7")
                 .and_then(Value::as_object)
                 .is_some_and(|map| map.contains_key(path.to_string_lossy().as_ref()))
         };
@@ -30489,7 +30517,7 @@ mod tests {
                 && kinds.iter().any(|kind| kind == "task_started"),
             "the upgrade must re-read the unchanged rollout once: {kinds:?}"
         );
-        assert!(state.get("codex_rollouts_v6").is_some());
+        assert!(state.get("codex_rollouts_v7").is_some());
         assert!(state.get("codex_rollouts_v5").is_none());
 
         let before = marker_kinds(&conn, "codex", "sess-upgrade");
@@ -31812,7 +31840,7 @@ mod tests {
                     }
                 }),
                 r#"{"timestamp":"2026-08-31T10:00:02.100Z","type":"event_msg","payload":{"type":"item_completed"}}"#,
-                r#"{"timestamp":"2026-08-31T10:00:03.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"duplicate assistant stream"}]}}"#,
+                r#"{"timestamp":"2026-08-31T10:00:03.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done."}]}}"#,
                 r#"{"timestamp":"2026-08-31T10:00:03.100Z","type":"event_msg","payload":{"type":"agent_message","message":"Done."}}"#,
             ),
         )
@@ -31855,11 +31883,215 @@ mod tests {
                 (
                     "assistant".into(),
                     "Done.".into(),
-                    "5:agent_message".into(),
+                    "4:response_item_assistant_message".into(),
                     None,
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn unchanged_desktop_rollout_recovers_replies_after_parser_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".codex");
+        fs::create_dir_all(root.join("sessions")).unwrap();
+        let path = root.join("sessions/rollout-upgrade.jsonl");
+        fs::write(&path, concat!(
+            r#"{"timestamp":"2026-09-20T10:00:00Z","type":"session_meta","payload":{"id":"desktop-upgrade","cwd":"/tmp/project"}}"#, "\n",
+            r#"{"timestamp":"2026-09-20T10:00:01Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Recovered reply"}]}}"#, "\n",
+        )).unwrap();
+        let db = dir.path().join("history.db");
+        let roots = crate::ProviderRoots::from_home(
+            dir.path().to_path_buf(),
+            dir.path().join("opencode.db"),
+        );
+        super::sync_exclusive_with_roots(&db, &roots, false).unwrap();
+        let conn = open_db(&db).unwrap();
+        let state_path = dir.path().join(".sync-state.json");
+        let mut state = load_sync_state(&state_path).unwrap();
+        let old_stamps = state.remove("codex_rollouts_v7").unwrap();
+        state.insert("codex_rollouts_v6".into(), old_stamps);
+        conn.execute(
+            "DELETE FROM session_events WHERE session_id='desktop-upgrade'",
+            [],
+        )
+        .unwrap();
+        // Recreate the old build's source fingerprint and destination proof.
+        // The missing reply was never captured, so its absence must not itself
+        // invalidate the destination and accidentally hide a generation bug.
+        let source_part = state[super::SOURCE_FINGERPRINT_KEY]
+            .as_str()
+            .unwrap()
+            .split_once('/')
+            .unwrap()
+            .1
+            .to_string();
+        let old_generations = [
+            "claude_sessions_v3",
+            "codex_rollouts_v5",
+            super::GROK_SYNC_STATE_KEY,
+        ]
+        .join("|");
+        let old_generation = format!(
+            "g{:016x}",
+            crate::discover::fingerprint_hash(
+                "sweep-generation",
+                &crate::discover::SHALLOW_SCANNER_VERSION.to_string(),
+                &old_generations,
+            )
+        );
+        let old_fingerprint = format!("{old_generation}/{source_part}");
+        state.insert(super::SOURCE_FINGERPRINT_KEY.into(), json!(old_fingerprint));
+        state.insert(
+            super::DESTINATION_GENERATION_KEY.into(),
+            json!(super::destination_generation(&conn).unwrap()),
+        );
+        state.insert(
+            super::DESTINATION_HEAD_KEY.into(),
+            json!(super::destination_head(&conn).unwrap()),
+        );
+        assert!(super::sources_unchanged(&conn, &state, &old_fingerprint));
+        fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+
+        // A non-forced sweep must cross the old fingerprint before the rollout
+        // stamp migration can recover the reply. Then the fast path resumes.
+        assert!(
+            super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept
+        );
+        assert_eq!(conn.query_row("SELECT count(*) FROM session_events WHERE session_id='desktop-upgrade' AND text='Recovered reply'", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert!(
+            !super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept
+        );
+    }
+
+    #[test]
+    fn codex_desktop_assistant_responses_survive_sync_and_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-desktop-replies.jsonl");
+        fs::write(&path, concat!(
+            r#"{"timestamp":"2026-09-20T10:00:00Z","type":"session_meta","payload":{"id":"desktop-replies","cwd":"/tmp/project"}}"#, "\n",
+            r#"{"timestamp":"2026-09-20T10:00:01Z","type":"response_item","payload":{"type":"message","role":"assistant","id":"reply-1","content":[{"type":"output_text","text":"I will investigate."}]}}"#, "\n",
+            r#"{"timestamp":"2026-09-20T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{}","call_id":"c1"}}"#, "\n",
+            r#"{"timestamp":"2026-09-20T10:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","id":"reply-2","content":[{"type":"output_text","text":"Fixed."},{"type":"output_text","text":"Tests passed."}]}}"#, "\n",
+            r#"{"timestamp":"2026-09-20T10:00:04Z","type":"event_msg","payload":{"type":"agent_message","id":"event-reply","message":"Mirrored."}}"#, "\n",
+            r#"{"timestamp":"2026-09-20T10:00:04Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Mirrored."}]}}"#, "\n",
+            r#"{"timestamp":"2026-09-20T10:00:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Reverse mirror."}]}}"#, "\n",
+            r#"{"timestamp":"2026-09-20T10:00:05Z","type":"event_msg","payload":{"type":"agent_message","id":"legacy-reply","message":"Reverse mirror."}}"#, "\n",
+            r#"{"timestamp":"2026-09-20T10:00:06Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Fixed."}]}}"#, "\n",
+        )).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let meta = codex_meta(&path);
+        // Simulate a pre-upgrade event-message row, already delivered under its
+        // original ID. Reparse must keep that identity rather than add its twin.
+        insert_codex_event(
+            &conn,
+            &meta.session_id,
+            Some("/tmp/project"),
+            None,
+            parse_iso_ms("2026-09-20T10:00:05Z").unwrap(),
+            "assistant",
+            "text",
+            "Reverse mirror.",
+            "7:agent_message",
+            "7:agent_message",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        for _ in 0..2 {
+            super::ingest_codex_rollout(&conn, &path, &meta).unwrap();
+            let rows: Vec<String> = conn.prepare("SELECT text FROM session_events WHERE role='assistant' AND kind='text' ORDER BY ts_ms, event_uid")
+                .unwrap().query_map([], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+            let requests = crate::session_usage::session_requests_page(
+                &conn,
+                "codex",
+                &meta.session_id,
+                50,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                requests.requests.len(),
+                1,
+                "payload IDs must not split the request span"
+            );
+            assert_eq!(requests.requests[0].request_key, "request-span:0");
+            assert_eq!(requests.requests[0].event_count, 6);
+            let identities: Vec<(String, String, Option<String>)> = conn
+                .prepare("SELECT event_uid, message_id, provider_message_id FROM session_events WHERE role='assistant' AND kind='text' ORDER BY ts_ms, event_uid")
+                .unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap().collect::<rusqlite::Result<_>>().unwrap();
+            assert!(identities
+                .iter()
+                .all(|(uid, message_id, _)| uid == message_id));
+            assert_eq!(
+                identities
+                    .iter()
+                    .map(|(_, _, id)| id.as_deref())
+                    .collect::<Vec<_>>(),
+                vec![
+                    Some("reply-1"),
+                    Some("reply-2"),
+                    Some("event-reply"),
+                    Some("legacy-reply"),
+                    None
+                ]
+            );
+            assert_eq!(
+                rows,
+                vec![
+                    "I will investigate.",
+                    "Fixed.\nTests passed.",
+                    "Mirrored.",
+                    "Reverse mirror.",
+                    "Fixed."
+                ]
+            );
+        }
+        let id: String = conn
+            .query_row(
+                "SELECT event_uid FROM session_events WHERE text='Reverse mirror.'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(id, "7:agent_message");
+    }
+
+    #[test]
+    fn assistant_mirrors_split_between_incremental_passes_stay_single() {
+        for response_first in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("rollout-split-mirror.jsonl");
+            let opening = r#"{"timestamp":"2026-09-20T10:00:00Z","type":"session_meta","payload":{"id":"split-mirror","cwd":"/tmp/project"}}"#;
+            let response = r#"{"timestamp":"2026-09-20T10:00:01Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done."}]}}"#;
+            let event = r#"{"timestamp":"2026-09-20T10:00:01Z","type":"event_msg","payload":{"type":"agent_message","message":"Done."}}"#;
+            let (first, second) = if response_first {
+                (response, event)
+            } else {
+                (event, response)
+            };
+            fs::write(&path, format!("{opening}\n{first}\n")).unwrap();
+            let conn = Connection::open_in_memory().unwrap();
+            init_db(&conn).unwrap();
+            let meta = codex_meta(&path);
+            let mut cursor = transcript_cursor::TranscriptCursorState::default();
+            super::ingest_codex_rollout_incremental(&conn, &path, &meta, &mut cursor).unwrap();
+            let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            std::io::Write::write_all(&mut file, format!("{second}\n").as_bytes()).unwrap();
+            drop(file);
+            super::ingest_codex_rollout_incremental(&conn, &path, &meta, &mut cursor).unwrap();
+            let count: i64 = conn.query_row("SELECT count(*) FROM session_events WHERE session_id='split-mirror' AND role='assistant' AND kind='text'", [], |row| row.get(0)).unwrap();
+            assert_eq!(count, 1, "response_first={response_first}");
+        }
     }
 
     #[test]
@@ -32173,7 +32405,7 @@ mod tests {
             .unwrap();
         assert_eq!(tool_count, 1);
         assert!(state.get("codex_rollouts_v3").is_none());
-        assert!(state.get("codex_rollouts_v6").is_some());
+        assert!(state.get("codex_rollouts_v7").is_some());
 
         super::sync_codex_rollouts_with_repairs(
             &conn,
@@ -32337,7 +32569,7 @@ mod tests {
         let key = rollout.to_string_lossy().to_string();
         let mut state = Map::new();
         state.insert(
-            "codex_rollouts_v6".into(),
+            "codex_rollouts_v7".into(),
             json!({
                 (key): {
                     "stamp": file_stamp(&rollout).unwrap(),
@@ -32392,7 +32624,7 @@ mod tests {
     fn unchanged_subagent_state(rollout: &std::path::Path, session_id: &str) -> Map<String, Value> {
         let mut state = Map::new();
         state.insert(
-            "codex_rollouts_v6".into(),
+            "codex_rollouts_v7".into(),
             json!({
                 rollout.to_string_lossy().to_string(): {
                     "stamp": file_stamp(rollout).unwrap(),
@@ -32463,7 +32695,7 @@ mod tests {
         let key = rollout.to_string_lossy().to_string();
         let mut state = Map::new();
         state.insert(
-            "codex_rollouts_v6".into(),
+            "codex_rollouts_v7".into(),
             json!({
                 (key.clone()): {
                     "stamp": file_stamp(&rollout).unwrap(),
@@ -32500,7 +32732,7 @@ mod tests {
             .unwrap();
         assert_eq!(parent, "parent");
         assert_eq!(
-            state["codex_rollouts_v6"][&key]["subagent"],
+            state["codex_rollouts_v7"][&key]["subagent"],
             json!(true),
             "the stamp map is corrected, so the next pass trusts the right flag"
         );
@@ -32753,7 +32985,7 @@ mod tests {
             &Default::default(),
         )
         .unwrap();
-        // `codex_rollouts_v6` is not seeded from an older map, because a marker
+        // `codex_rollouts_v7` is not seeded from an older map, because a marker
         // exists nowhere but the rollout and a carried-forward stamp would skip
         // the files whose markers are missing. So both non-subagent rollouts are
         // re-read and re-index their one prompt each; the linked guardian stays a
@@ -32805,7 +33037,7 @@ mod tests {
         );
         assert!(state.get("codex_rollouts_v4").is_none());
         let records = state
-            .get("codex_rollouts_v6")
+            .get("codex_rollouts_v7")
             .and_then(Value::as_object)
             .expect("upgraded rollout cache");
         assert_eq!(
@@ -33966,7 +34198,7 @@ mod tests {
         let conn = open_db(&dir.path().join("history.db")).unwrap();
         let mut state = Map::new();
         sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
-        let generation = state.get("codex_rollouts_v6").cloned().unwrap();
+        let generation = state.get("codex_rollouts_v7").cloned().unwrap();
 
         forget_continuity_evidence(&conn);
         conn.execute(
@@ -34000,7 +34232,7 @@ mod tests {
             ("prior-thread".to_string(), Some("forked".to_string()))
         );
         assert_eq!(
-            state.get("codex_rollouts_v6").unwrap(),
+            state.get("codex_rollouts_v7").unwrap(),
             &generation,
             "the stamp map is untouched: this is a repair, not a generation reset"
         );
