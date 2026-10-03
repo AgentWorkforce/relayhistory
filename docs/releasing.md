@@ -33,9 +33,11 @@ and `crates/ai-hist-napi/src/lib.rs`).
 3. `publish` applies that version to every manifest and lockfile — the core
    packages and, whatever the `plugins` input, the plugin manifest
    and plugin crate via `scripts/set-release-version.mjs`, so the tag
-   always carries what the helper matrix built from — prepares the
-   version-only commit, then
-   publishes the platform packages,
+   always carries what the helper matrix built from — checks the release
+   against the pending `CHANGELOG.md` level (`scripts/check-release-changelog.mjs`
+   fails, say, a patch release under `[Unreleased - Minor]`), cuts the
+   changelog (`scripts/cut-changelog.mjs`), prepares the version commit
+   carrying both, then publishes the platform packages,
    `ai-hist-native`, `ai-hist` and `ai-hist-mcp` in that order. The SDK root is
    never published before its platform artifacts, because npm multi-package
    publication is not atomic.
@@ -57,8 +59,10 @@ and `crates/ai-hist-napi/src/lib.rs`).
    waits up to 70 minutes for npm's processing queue, then runs the clean registry
    install and older-glibc CLI smoke tests. `finalize-core` creates the GitHub
    Release only after those tests pass. A separate `persist-version` job rebases
-   the version-only commit onto the current branch tip and pushes, so a merge
-   that landed during publish does not drop the tag. Crate and plugins depend
+   the version commit onto the current branch tip and pushes, so a merge
+   that landed during publish does not drop the tag; if that merge added
+   changelog entries and the rebase conflicts only in `CHANGELOG.md`, it takes
+   the branch's copy and cuts it again for the release. Crate and plugins depend
    on the verified core, not on that persist. If npm accepts a publish but keeps
    its version in processing beyond the wait, or a later gate fails, rerun with
    `skip_core` and this `custom_version` once npm exposes the packages. The

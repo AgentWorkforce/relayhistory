@@ -1,1833 +1,604 @@
 # Changelog
 
-Notable changes to the native `ai-hist` CLI are documented here.
+User-facing release notes for RelayHistory. Every public package — the `ai-hist` npm package and CLI, `ai-hist-native` and its platform packages, `ai-hist-mcp`, the optional history plugins, and the `ai-hist` crate on crates.io — is released in lockstep at one version, tagged `sdk-ts-v<version>`.
+
+This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
 ## [Unreleased]
 
+## [0.34.1] - 2026-10-03
+
 ### Fixed
 
-- Codex Desktop assistant replies stored only as response items now appear in
-  session history. Mirrored CLI/desktop encodings are stored once, and unchanged
-  captures are re-read on upgrade to recover previously missing replies, including
-  when the source fingerprint is unchanged. Assistant message IDs stay line-derived;
-  payload IDs are preserved separately as provider message IDs without splitting
-  the request span shared by reasoning, tool calls, and the reply.
+- Codex Desktop assistant replies stored only as response items now appear in session history; mirrored CLI/desktop encodings are stored once, and existing captures are re-read on upgrade to recover missing replies.
 
-### Breaking
-
-- `trajectory_fts` and the Python-era `trajectories_ai/au/ad` triggers are
-  dropped on the next writable open, and are dropped again whenever an older
-  client recreates them. Nothing read the index. On an older database whose
-  index had drifted from `trajectories`, those triggers made the change-feed
-  migration fail with `SQLITE_CORRUPT_VTAB` on every open. `compact` merges
-  two full-text indexes instead of three.
-
-- One search contract for the CLI, the SDK and MCP (#66). The SDK's
-  `search()` and MCP `search_history` now run `history_search::search_all`,
-  the query the CLI's `search` already used. They match session events
-  (assistant text, tool calls and results) as well as prompts, apply the same
-  filters (including `beforeMs`) to both, and order ties by
-  `(timestamp, id, match source)`. Each result is a `SearchMatch`, which is a
-  `HistoryEntry` plus `matchSource` (`history` | `session_event`), `role` and
-  `kind`; `id` is unique only within `matchSource`.
-  - `search` accepts `role`: `all` (default), `user`, `assistant`, or the new
-    `prompt` (prompts only). `resume` and `pack` search with `prompt`, as the
-    native CLI's resume and pack do. `ai-hist search --role` on both CLIs
-    accepts the same four values.
-  - MCP `search_history` gains `role`, `raw_fts` and `before_ms`. Its
-    description now says exactly what a query means instead of "prompts".
-  - A prompt that a hydrated session also recorded as a user text event
-    matches once, as its `history` row. The event is a copy only when it is
-    the same turn -- same session, same timestamp, same text up to
-    surrounding whitespace -- so a later turn repeating the text still
-    matches, and it is dropped only when the prompt is itself a match of the
-    same search (same query, same filters).
-  - An ordinary (non-raw) query matches an event's `text` and `project`, as a
-    prompt's `prompt` and `project`; it no longer matches the indexed `role`,
-    so searching for `assistant` or `user` does not return every event of
-    that role.
-  - The native CLI's `search --json` always emits `role`, `kind` and
-    `match_source`, including on `history` matches.
-- Native contract 22 -> 23: `search` returns `NativeSearchMatch` rows and
-  takes `role`. An SDK paired with an addon of the other contract fails at
-  load with `NATIVE_CONTRACT_MISMATCH`.
-- Keyset pagination and inclusive time windows for history reads (#67).
-  Native contract 23 -> 24.
-  - `search` and `recent` take `sinceMs`/`untilMs` (inclusive) and an
-    `after` cursor `{ timestampMs, id, matchSource? }` on every surface: SDK
-    options, MCP `search_history`/`recent_history` (`since_ms`, `until_ms`,
-    `after`), `--since-ms`/`--until-ms`/`--after` on the TS CLI, and
-    `--since-ms`/`--until-ms`/`--after-ms`/`--after-id` (and
-    `--after-match-source` on `search`) on the native CLI.
-  - New SDK `searchPage()`/`recentPage()` (napi `searchPage`/`recentPage`)
-    return `{ matches | entries, nextCursor }`. `nextCursor` comes from
-    over-fetching one row, and is `null` when nothing further exists.
-  - Every newest-first read orders by `(timestamp, id)`, and the cursor
-    predicate uses the same tuple. Rows sharing a timestamp, such as every
-    prompt of a Cursor transcript, page without skips or repeats.
-    `getSession` orders ties by id.
-  - `sinceMs > untilMs` and a cursor with an unknown `matchSource` are
-    `INVALID_ARGUMENT`, with the same message on every surface.
-  - `beforeMs`/`before_ms`/`--before-ms` keep their exclusive semantics but
-    are deprecated: they skip rows tied on the boundary timestamp.
-- Native contract 24 -> 25. The `sessionStoreCall` dispatcher gains the
-  change feed ops `changes` and `commit_changes`. An SDK paired with an addon
-  of the other contract fails at load with `NATIVE_CONTRACT_MISMATCH`.
-- Native contract 21 -> 22. `historyExport` serves snapshots that each hold
-  one read transaction, emits schema-version-2 records, and no longer accepts
-  the upload-journal operations. An SDK paired with an addon of the other
-  contract fails at load with `NATIVE_CONTRACT_MISMATCH` instead of at the
-  first export call.
-- Uploads are not part of `ai-hist`; team uploads come from the Agent Relay
-  desktop app. The `@relayhistory/capture` package, its seven platform helper
-  packages, the `relayhistory-plugin` crate and the `agent-relay-probe`
-  release assets are no longer built or published from this repository.
-- Removed from the SDK: `deliveryRequest`, `createHistoryDelivery`,
-  `historyDeliveryStatus`, `controlHistoryDelivery`,
-  `historyDeliveryRetention`, `setHistoryDeliveryRetention`,
-  `compactHistoryDelivery`, `drainHistoryDelivery`, `runHistoryDelivery`,
-  `runDeliveryCommand`, and the `HistoryDeliveryOptions`,
-  `DeliveryDrainOptions`, `DeliveryDrainResult` and `DeliveryIo` types. Each
-  function only raised `HISTORY_DELIVERY_MOVED`, which no longer exists.
-- Removed from the native addon: `historyDelivery` and `historyDeliveryDrain`.
-  The native contract version is unchanged; the SDK never called either.
-- Removed from the CLI: `ai-hist delivery enable|drain|run|status|pause|resume|retry|cancel`,
-  `ai-hist plugin COMMAND`, and the `--job`, `--poll-ms`, `--timeout-ms`,
-  `--base-url`, `--label`, `--max-content` and `--token` flags.
-- Removed from the MCP server: `delivery_status`, `delivery_pause`,
-  `delivery_resume` and `delivery_retry`. `AI_HIST_PLUGIN_CONFIG` loads source
-  connectors only; plugins no longer register MCP tools.
-- `HistoryPlugin` loses `commands` and `tools`; `HistoryPluginRegistry` loses
-  `command()` and `registeredTools()`. A plugin contributes `sources` and
-  `destinations`. The history config file loses its `job` field.
-- `ai-hist` keeps no upload capture journal. It creates and maintains no
-  per-table capture triggers, no journal, preimage, bootstrap-bound,
-  subscription or exclusion tables, and no retention budget: an evidence write is never refused with
-  "delivery retention limit exceeded", and sync, hydration and discovery run
-  no retention check. An uploader reads the change feed
-  (`SessionStore::changes_since`). The first writable open of an existing
-  store drops the capture triggers, the `*_cap_*` / `*_count_*` retention
-  triggers and the `delivery_identity_*` indexes (marker
-  `export_capture_retired_v1`), and drops them again whenever an earlier
-  release has re-created one. Every table of that era — `delivery_state`,
-  `delivery_journal` and its `sqlite_sequence` row, `delivery_shadow`,
-  `delivery_bootstrap_bounds`, `delivery_exclusions`, `history_subscriptions`,
-  `history_compaction` — stays as it is, for the upload daemon that reads its
-  origin and revision floor from them.
-- A local export snapshot is one read transaction. `ExportSnapshot` owns a
-  connection and holds a read transaction over the store until it is dropped,
-  so every page reads the store as it stood when the snapshot opened: rows
-  written, rewritten or deleted meanwhile, a new row reusing a deleted rowid
-  included, never change the export. It stores nothing: no
-  `history_exports`, `history_export_pages` or preimage rows. An open snapshot
-  lives in the process that opened it, so `beginHistoryExport` cursors resume
-  within that process until they expire, not across processes. Records are
-  `schema_version` 2: `origin_id` is the store's change-feed epoch (16 hex
-  digits) and `revision` is the row's change-feed revision, so `record_id`
-  (the SHA-256 of the feed's compact-JSON key) and `revision` match the feed
-  for the same row. Exclusions come from the selection's `excluded_sessions`
-  alone.
-- The native `historyExport` bridge accepts `create_export`, `export_page`,
-  `close_export` and `expire_exports`; `retained_bytes`,
-  `set_retention_limit` and `compact_journal` are gone, and so are the
-  `EXPORT_RETENTION_LIMIT` and `DELIVERY_RETENTION_LIMIT` error codes.
-
-- Native contract 19 -> 21. The `ai-hist-native` addon gains
-  `historyExport(requestJson, dbPath)`, which separates snapshot export from
-  the upload entry points the probe now owns, and
-  `sessionStoreCall(op, argsJson)`, one JSON-in/JSON-out dispatcher over the
-  `SessionStore` facade, through which the SDK's `getSessionRequestsPage`,
-  `getSessionUsage` and `getSessionUserTurnsPage` now read. Both additions
-  claimed 20 independently, so the addon carrying both answers with 21 rather
-  than a number either incompatible contract already used. A consumer pairing
-  the new SDK with an older platform package gets the existing
-  `NATIVE_CONTRACT_MISMATCH` error at load, not a missing function at first
-  use. The typed `getSessionRequestsPage` / `getSessionUsage` /
-  `getSessionUserTurnsPage` native exports stay for compatibility until a
-  later major.
+## [0.34.0] - 2026-10-03
 
 ### Added
 
-- Grok per-inference usage from `<GROK_HOME>/logs/unified.jsonl` (#212). The
-  process-wide log recent Grok Build releases write is a second Grok source,
-  read from a byte cursor by every sweep and by every Grok hydration before its
-  stamp check, `unchanged` ones included (an unchanged log reads zero bytes),
-  watched as a file of its own and folded into the sweep fingerprint. A log
-  that cannot be read does not fail a hydration; it is reported as
-  `GROK_UNIFIED_LOG_UNREADABLE`. Each usage row is kept in a new
-  `grok_unified_usage` table and stored on the session it names as one
-  text-less assistant event (`raw_kind = "unified_log_usage"`, its own request
-  span) whose `token_json.usage` normalizes as `per-request` usage; an append
-  inserts only its own rows. Rows for a session not indexed yet are retained
-  (and counted in the sweep's note) and attached when it is. Coverage is per
-  turn: a turn with a log row inside its window keeps its
-  `turn_completed.usage` as `turn_usage`, which is not normalized, and a turn
-  the log does not reach keeps its own, so nothing is added twice or dropped.
-  Hydration reports no usage caveat when the log covers every turn,
-  `GROK_USAGE_MIXED_SOURCES` when some turns count their own breakdown, and
-  `GROK_USAGE_PARTIAL` when some have neither. The row shape is inferred from
-  tokscale and documented as such in `docs/session-catalog.md`. Nothing here
-  prices anything: `costUsdTicks` is kept verbatim and never read as a cost.
-- Grok model and metadata fallbacks (#212): a turn's model from
-  `params.update._meta.modelId` or a single-key `turn_completed.usage.modelUsage`
-  (written as `model` in the turn's `token_json` and added to `models_json`);
-  `summary.json` `current_model_id` / `model_id` after `info.model`; and, for a
-  directory with no `summary.json`, the model and start time from the head of
-  `events.jsonl`. `signals.json`'s `totalTokensBeforeCompaction` is named in
-  the `signals` marker.
-- Evidence rows record which side backs them. `session_events`,
-  `tool_calls`, `file_edits` and `session_markers` gain `location`
-  (`local` / `remote` / `both`). Local parsers stamp `local`, remote intake
-  stamps the observation's location, and meeting the other side's row makes
-  it `both`. A local whole-session re-read (Muse, Grok, Cursor, OpenCode, and
-  the per-record Claude and Codex rewrites) now retires only local rows and
-  leaves remote-supplied evidence under the same session id, which it used to
-  delete; a remote observation retiring a record likewise leaves the local
-  share. The `evidence_location_v1` migration adds the column and marks rows
-  of sessions known only remotely as `remote`. The change feed's
-  `Change.columns` carries the new column.
-- Muse Code (Meta's `muse` CLI) is a first-class source, `muse`. Sessions are
-  read from `$XDG_DATA_HOME/muse/sessions/YYYY/MM/DD/<id>/session.jsonl`
-  (`~/.local/share/muse/sessions` by default) by discovery, `sync`,
-  targeted hydration and live capture: typed prompts become `history` rows at
-  the microsecond time Muse recorded them, and each session gets its prose,
-  readable thinking, tool calls and results (status from Muse's own
-  `tool_batch.effect.terminal` outcome, and a non-zero `bash` exit code),
-  `write_file` / `edit_file` edits, per-model-step token usage (normalized as
-  `per-request`), models, CLI version and lifecycle markers (`turn_end`,
-  `session_start`, `session_resumed`, `session_end`, `model_switch`,
-  `encrypted_reasoning`). Subagent and reminder logs
-  (`subagent/<id>/session.jsonl`, at any depth) are indexed under the child's
-  own session id and linked to their parent as `delegated` children, typed
-  from the parent's `task_stream_linked` record; they are not catalogued as
-  sessions and their objectives are not history rows. A Muse hydration
-  reports `full`. `ai-hist resume` prints `muse resume <id>`, and the sync
-  service forwards `XDG_DATA_HOME`.
-- Devin CLI is a first-class source, `devin`. Sessions are read from
-  `$XDG_DATA_HOME/devin/cli/sessions.db` and its `transcripts/`
-  (`~/.local/share/devin/cli` by default) by discovery, `sync`, targeted
-  hydration and live capture. The store is opened read-only under a coherent
-  snapshot, never migrated or written. Each visible session gets its prompts,
-  prose, thinking, tool calls and results, file edits where `tool_call_state`
-  names a path, models, request and finish metadata, and markers (`system`,
-  `synthetic_turn`, `compaction_boundary`, `session_title`, `session_meta`,
-  `agent_manifest`); hidden sessions are skipped. Devin records no
-  delegation, and has no native resume command.
-- Add MCP `list_relay_agents` for live Agent Relay participants. It reads only
-  the local desktop Unix socket, discovers it from `AGENT_RELAY_SOCKET`, the
-  private desktop pointer file, then platform defaults, and reports a missing
-  desktop app as a non-fatal result instead of requiring Relaycast credentials.
-  A connected desktop gets a 15-second response deadline, with an honest
-  `timeout` error rather than the missing-app result if it does not answer.
-- Add MCP `relay_status`, `join_relay`, and `leave_relay` on that same local
-  socket. A calling session can make itself reachable, inspect its registered
-  state, and remove itself without any Relaycast token entering ai-hist.
-
-- Read every OpenCode channel database. OpenCode keeps one SQLite store per
-  release channel — `opencode.db` for `latest`/`beta`, and
-  `opencode-stable.db`, `opencode-nightly.db`, ... beside it — and only
-  `opencode.db` was read, so a user on another channel had no OpenCode history
-  at all. Discovery, `sync`, `sync-opencode`, hydration and live-capture
-  fingerprints now cover every channel store in the directory; a session found
-  in more than one is owned by the first (`opencode.db`, then the channel
-  stores in name order), including under a discovery `--limit`; hydrating a
-  copy an earlier store has since gained is refused with
-  `SESSION_SOURCE_MISMATCH` until rediscovery. A channel store that cannot be
-  opened, or a channel directory that cannot be listed, is reported as a
-  diagnostic (even on a `--limit` page) while the other stores are still read;
-  the sweep does not record its fingerprint over it, and `sync-opencode`
-  indexes what it could read and then fails naming the unlistable directory. `OPENCODE_DB` still names exactly one store,
-  as does `sync-opencode --opencode-db`.
-
-- Record Grok's per-turn usage. Recent Grok Build releases write a
-  `turn_completed.usage` breakdown (`inputTokens`, `outputTokens`,
-  `cachedReadTokens`, `reasoningTokens`, `totalTokens`); it is now stored
-  verbatim under `usage` in the turn's `token_json`, beside the
-  `context_total_tokens` snapshot, and normalized as `per-request` usage with
-  cache reads taken out of input. `source_accounting("grok")` is
-  `per-request` and `NORMALIZABLE_SOURCES` gains `grok`; a Grok record with
-  only the context snapshot normalizes to no usage rather than
-  `USAGE_UNKNOWN_SOURCE`. Hydration reports `GROK_USAGE_CONTEXT_PROXY_ONLY` only
-  when no turn carried a breakdown, `GROK_USAGE_PARTIAL` when some did. A
-  `usage` holding only `totalTokens` is still read as the context snapshot.
-  Every assistant row of a Grok turn now carries the turn index as its
-  `request_span`, so `session_requests` reports one request per turn instead
-  of one per row. Already indexed Grok sessions are re-read once, by `sync`
-  (state key `grok_events_v2`) and by hydration (parser version 12). A cached
-  hydration whose checkpoint predates stored diagnostics never claims full
-  usage coverage. `~/.grok/logs/unified.jsonl` is not read yet (#212).
-
-- Tool-result fidelity now covers Cursor, Grok and OpenCode (#171). Their
-  `tool_result` events carry `payload_bytes`, `payload_hash`,
-  `payload_truncated`, `call_index`, `event_index`, `result_status`,
-  `event_source` and `error_signal`, measured over the raw provider payload
-  through the same helper as Claude and Codex. A Cursor result is a block of
-  its message (`event_source = 'tool_result'`); a Grok `tool_result` line and
-  an OpenCode tool part's `output` are standalone
-  (`event_source = 'function_call_output'`) and so are not counted among a
-  user turn's blocks. `error_signal` gains `tool_status`, the provider's own
-  terminal status on the call (OpenCode `state.status: "error"`, a failed or
-  cancelled Grok ACP update); OpenCode's non-zero `metadata.exit` is reported
-  as `exit_code`. `ToolResultErrorSignal` in the TS SDK and the submitted-record
-  validation accept the new value. `HYDRATION_PARSER_VERSION` is 13 and the
-  `cursor_events_v2` / `grok_events_v2` sync-state keys are retired, so every
-  already indexed Cursor and Grok session re-parses once; OpenCode re-reads on
-  every sync already. The fixture corpus snapshots now include the fidelity
-  columns, and the three corpus tests held `#[ignore = "closed by #171"]`
-  assert them.
-
-- New `ai-hist compact [--json]` returns space the history database holds
-  but no longer uses, and deletes no rows. It merges the three full-text
-  indexes, runs `VACUUM` and truncates the WAL, and afterwards rebuilds
-  `trajectory_fts`, because `VACUUM` may renumber the rowids that index is
-  keyed on. It takes the sync run lock, so a concurrent `sync` or `watch` tick
-  skips instead of stalling behind the rewrite. It refuses with
-  `a sync is running` while one holds the lock. It also refuses up front when
-  the volume lacks room for twice the live pages plus the 512 MiB write
-  floor, because a rewrite that ran out of space midway would repeat #44;
-  that check runs before the database is opened writable (so before any schema
-  migration), and compact refuses when free space cannot be measured at all.
-  When a reader keeps the WAL from being truncated, compact says so
-  (`wal_truncated: false` under `--json`) instead of claiming it. On
-  the 248 MB benchmark store it took 2.8 s and saved 9 MB (#53).
-- `ai-hist doctor` reports `reclaimable` (`reclaimable_bytes` under `--json`),
-  the freelist bytes a `compact` would return. It points at `compact` when at
-  least 64 MiB and a quarter of the file are free pages.
-
-- The SDK reads the revision-stamped change feed (`SessionStore::changes_since`):
-  `getChangesPage` returns one bounded page (`changes`, `position`, `head`,
-  `done`) from `'start'`, a named `consumer` cursor or a kept `Watermark`, with
-  `kinds` and single-`session` filters; `changesSince` iterates it page by
-  page; `commitChanges(consumer, position)` acknowledges a page, forward-only
-  and bound to the cursor's kind set. Each `FeedChange` carries `kind`,
-  `source`/`sourceName`, `sessionId`, `recordKey`, `key`, `revision`, `op` and
-  the row as stored in `columns`; `source` is any known `Source`, trajectory
-  included, and null only for a source this SDK does not know. `done` means
-  nothing the page's filters select is left, so a filtered drain ends on its
-  last match rather than one empty page later. A database written before the
-  feed existed is migrated on its first page instead of refused. Exported with
-  `CHANGE_KINDS` and the `ChangeKind`, `Watermark`, `FeedChange`, `ChangesPage`
-  and `CommittedCursor` types.
-
-- Local source plugins (#177). A `HistorySource` may declare
-  `location: 'local'` with the absolute `roots` it reads; it runs for `local`
-  (the default) and `all` scope beside the built-in parsers, never for
-  `remote`, and its sessions are catalogued with `locations: ['local']`
-  through the same normalized evidence intake as a remote snapshot.
-  Registration refuses a local source without absolute roots, and a discovery
-  that reports a `raw_path` (or an absolute `raw_locator`) outside them is
-  rejected as that connector's diagnostic. A local source that supports none
-  of a request's `sources` is not run for it, and a `relay` session a local
-  source holds hydrates from it even when the built-in adapter has catalogued
-  it too. Remote sources are unchanged and still never run for local or
-  default scope; a request that registers no local source keeps the
-  native-only path. A plugin-backed `sync` at `all` scope now reports the
-  native local pass's diagnostics and completion with its own.
-  `docs/remote-connectors.md` is now `docs/source-plugins.md`.
-
-- Add workspace-scoped agent handoffs through `create_handoff(intent)` and
-  `resume_handoff(source, session_id)`. The sender emits only a session pointer
-  plus one self-describing intent and origin identity; the intent tells the
-  receiving agent to call `resume_handoff` before continuing, with no installed
-  skill required. The final intent stays within 4,000 characters by truncating
-  an overflowing caller-intent suffix with `…`. The receiver refreshes the configured
-  workspace `cloud` source and returns bounded prompts, normalized events, tool
-  calls, and file edits with independent continuation cursors.
-
-- Markers reach the SDK, MCP and both CLIs. `getSessionMarkersPage(source,
-  sessionId, {limit, after})`, the `sessionMarkers()` iterator and
-  `getSessionMarkers()` read one source's session on the evidence keyset
-  `(tsMs IS NULL, tsMs, id)`, so an undated marker pages last through a
-  null-timestamp cursor; each `SessionMarker` carries `kind`, `subkind`,
-  `text`, and the bounded payload both parsed (`payload`) and verbatim
-  (`payloadJson`). MCP: `get_session_markers`. CLI: `ai-hist sessions markers
-  SOURCE SESSION_ID [--limit N] [--after JSON] [--json]` (Node) and `ai-hist
-  sessions markers SOURCE SESSION_ID [--limit N] [--after-id N [--after-ms
-  MS]] [--json]` (Rust).
-- `getSourceCapabilities(source)` and the MCP `get_source_capabilities` tool
-  answer, from the provider tables alone, which evidence kinds a hydration of
-  that source covers, whether it can ever report `full`, and what its records
-  establish about delegation — the same table `getSessionRelationships`
-  returns as `capabilities` — so a consumer can ask before a first sync.
-- `ai-hist sessions usage SOURCE SESSION_ID [--json]` on both CLIs prints the
-  provider-reported rollup: usage is never estimated, and cost appears only
-  when the source data carried one.
-- The `sessionStoreCall` dispatcher answers `markers`, `requests`,
-  `usage_summary`, `user_turns` and `capabilities`; `sdk-ts/src/native.ts`
-  (`SESSION_STORE_OPS`) is the one place in the SDK that spells an op. A new
-  facade read is one arm in the Rust dispatcher and one entry there, not
-  another hand-mirrored native function. Every open goes through
-  `SessionStore`, so the facade owns the schema gate and the typed failure,
-  and `capabilities` is answered from the crate's pure capability tables with
-  no database at all; a missing database answers an empty page without being
-  created. A read opens a read-only store first and reopens writable — which
-  migrates — only when the facade reports a stale schema; any other failure
-  is returned under the facade error's own code (`QUERY_FAILED` as this
-  boundary's `DATABASE_QUERY_FAILED`) rather than retried through a
-  writer-lock-taking open.
-- `ai_hist::Error::StaleSchema` (`DATABASE_STALE_SCHEMA`), with the
-  `Error::is_stale_schema()` predicate over it, is the one `SessionStore`
-  failure a caller that may write has a remedy for: reopening the same path
-  writable migrates it, which is the wrong answer to every other failure. A
-  read-only `SessionStore::open` now also checks the per-request usage schema
-  alongside the event, evidence and relationship ones, so a usage read
-  refuses up front instead of failing inside a query.
-
-### Live capture
-
-- `ai-hist watch` now wakes on filesystem events over everything a local sweep
-  reads — the providers' session roots, the flat `~/.claude/history.jsonl` and
-  `~/.codex/history.jsonl` logs, and `.trajectories` directories — with a
-  200 ms debounce and a 30 s slow-poll backstop, falling back to polling when
-  no root can be watched. The flat logs are watched as the single files they
-  are, so their neighbours — `~/.claude/settings.json` and the rest — do not
-  each force a sweep, and re-deriving the root set stays on the backstop once
-  the watcher is attached rather than following a short `--interval`. New flags: `--no-fsevents`, `--debounce-ms`,
-  alongside the existing `--interval`. The watcher backend is behind the
-  optional `fs-events` crate feature, which the CLI enables; a
-  `--no-default-features` build polls.
-- Startup reports the driver **and any root not covered yet** — only where a
-  retry is actually pending. A loop with no filesystem backend at all
-  (`--no-fsevents`, a build without the feature, a watcher that could not be
-  brought up) reports none, because polling covers every root at `--interval`
-  and nothing would ever promote them. Roots that do
-  not exist are retried on the backstop — not on `--interval`, which may be an
-  hour — so a provider installed after `watch` started becomes covered in
-  seconds without a restart, while sweeps keep the cadence that was asked for.
-  Every configurable interval is bounded at seven days where it enters, so an
-  absurd `--debounce-ms` cannot stop capture on the first change event. Watch
-  roots and event paths are resolved to one absolute spelling, and a root also
-  remembers its symlink-resolved spelling, so a root given relatively or
-  reached through a symlink matches the events the watcher reports for it on
-  either backend. A change arriving while a manual `tick()` holds the sweep
-  slot is swept as soon as that tick finishes, rather than waiting for the
-  backstop. A sweep another process's sync lock turned away is likewise kept
-  rather than counted as done: the lock holder may already have walked past
-  the provider that just wrote, so the forced sweep is retried 250 ms later,
-  backing off to the backstop while the lock stays held, and the change is
-  swept as soon as a sync can take it. A forced sweep that *failed* is kept the
-  same way: a transient database error covered nothing either, and logging it
-  and waiting for the backstop loses the change it was woken for.
-  A registration is re-made only when the directory it was made against is
-  gone or has been replaced, so a deleted-and-recreated root is watched again
-  instead of being silently reported as covered, and a live one is not
-  re-registered on every tick. A registration the backend reports as gone is
-  acted on when the report arrives and retried four times a second until it is
-  back, rather than waiting out the backstop — long enough for a whole short
-  session to be written to a recreated directory and cleaned up unseen. That
-  report cuts the debounce window short and is acted on before the sweep the
-  window was opening, because on a busy tree the window is where the loop
-  spends nearly all of its time. The faster retry lasts exactly as long as the
-  recovery does: a root that has *never* existed — a provider that is not
-  installed — stays pending on the backstop and no longer holds the short
-  cadence open for the rest of the run. A root taken on by a refresher while
-  its directory does not exist yet is reported as pending straight away,
-  rather than only once it becomes watchable. Reconciliation runs on an absolute deadline
-  rather than when the wait expires, so a busy session writing every few
-  hundred milliseconds cannot postpone attaching the roots beside it. `watch --remote` installs
-  no local roots, so local writes cannot drive remote connector traffic.
-- `sync` now short-circuits on a stat-only source fingerprint folded over
-  everything the sweep reads — the enumerated transcripts, the Claude subagent
-  `agent-*.meta.json` sidecars, the two flat logs and the trajectory records —
-  recorded in `.sync-state.json`. A tick over unchanged sources opens no files.
-  Filesystem-event ticks force past it, because an event can arrive before the
-  write flushes. A file that could not be read — by the sweep or by discovery,
-  whose per-file failures are non-fatal — leaves the fingerprint stale so the
-  next tick retries it, rather than caching the failure in place.
-- The fingerprint is qualified by the sweep's parser and scanner generations,
-  and paired with a `destination_generation` marker in `.sync-state.json`
-  recorded after each sweep. An upgrade that bumps a generation cannot honour
-  the previous one's stamp, and a session that has *lost* evidence — a
-  half-restored backup, a truncated write — reopens the sweep and is
-  re-ingested, rather than being skipped forever behind sources that will
-  never change again. The marker holds one entry per session, so growth
-  elsewhere cannot answer for a loss; rows arriving between sweeps (the hook
-  fast path, hydration) are growth, not loss, and still skip. Each entry
-  covers the session's events, tool calls, file edits and catalog row, so
-  structured evidence and a lost `sessions` row are guarded on the same terms
-  as the transcript. It covers only what a sweep can put back — Claude
-  transcripts and Codex rollouts — including a delegated subagent, reached by
-  its own id rather than through a catalog row it deliberately never has —
-  and a loss the sweep could not restore leaves the marker and the fingerprint
-  stale rather than recording the shortfall as the new truth.
-- New `ai-hist ingest --hook claude [--quiet] [--json]` reads a Claude Code
-  lifecycle-hook payload from stdin and hydrates exactly the transcript it
-  names — and only if the transcript is the session the payload named. A
-  payload whose two claims disagree (a delayed or replayed hook pairing a live
-  session id with another session's file) is reported as `mismatched` and
-  ingests nothing. It always exits 0, and `--quiet` outranks `--json` so a hook wired
-  with both stays silent. See `docs/agent-integration.md` for the
-  `settings.json` wiring, including why `PreCompact` cannot be replaced by
-  watch mode.
-
-### Session topology
-
-- Record Codex forks from the fields Codex actually writes. A rollout whose
-  `session_meta` carries `forked_from_id` (a human "fork conversation") or
-  `source.subagent.thread_spawn.parent_thread_id` (a spawned subagent) now
-  gets a `fork` edge to that thread, with the field name as `evidence_ref`; a
-  subagent keeps its `delegated` row beside it and a human fork stays a
-  top-level session. A rollout indexed before this re-reads its `session_meta`
-  line once on the next `sync`: `SHALLOW_SCANNER_VERSION` 6 -> 7 moves the
-  sweep generation, so that sync runs even when no source changed, and sends
-  cached discovery rows through the current classifier once. A
-  `thread_source: "guardian_review"` rollout (Codex 0.150+) that names a
-  parent is hidden from the root catalog like any other subagent, and one an
-  earlier build catalogued as a root is reclassified on that same pass.
-  Hydrating a parent with `include_related` also records its spawned
-  children's fork edges.
-
-- Gate the parent history a forked Codex rollout replays (#210). Codex copies
-  the parent's `session_meta`, turns and cumulative `token_count` snapshots
-  into a fork's file before the fork's own first turn, and each copy used to
-  be indexed again under the child: the parent's prompts in the child's
-  `history` and `first_prompt`, its messages and tool calls in the child's
-  events, and its whole token total charged to the child's first request.
-  The span is now recognised from explicit evidence only -- it opens at the
-  parent's own `session_meta` reappearing in a rollout that named that parent
-  in `forked_from_id` or `thread_spawn.parent_thread_id`, and closes at the
-  first turn whose UUIDv7 `turn_id` (else `started_at`) is not earlier than
-  the fork (a legacy `started_at` in the fork's own second counts as
-  unordered), or that nothing can order -- and writes one
-  `fork_replay_boundary` marker instead. The last replayed `token_count` is
-  the child's inherited baseline, unless the child's own counter restarts
-  below it. Shallow discovery applies the same rule to `first_prompt`.
-  Rollouts indexed before this are repaired once: `SHALLOW_SCANNER_VERSION`
-  7 -> 8 moves the sweep generation, and the first `sync` re-reads every
-  unchanged fork rollout (`codex_fork_replay_gate` in the sync state),
-  retiring the rows it had indexed for the replayed lines and rewriting the
-  fork's `first_prompt` and `last_assistant_text` (cleared when the fork has
-  no prompt or answer of its own).
-  That cleanup is one-time and runs in `sync` only: hydration does not repeat
-  it, and an older build still writing to the same database can reinsert the
-  duplicates. Whether the inherited baseline was applied or dropped is
-  decided from the child's first `last_token_usage` and recorded on the
-  marker; a replayed legacy turn that cannot be ordered ends the gate early
-  and the rest of that replay is indexed as before.
-
-- Record fork, resume and continuation relationships, not delegation alone.
-  `session_relationships.relationship` now takes `continuation | fork | resume`
-  beside `delegated | materialized_local`, and carries `origin_session_id` —
-  the conversation a branch came from when the provider names one distinct
-  from the parent. Edges come from explicit provider fields
-  (`continuedFromSessionId`, `forkSessionId`, `sourceSessionId`), a `/resume`
-  or `/continue` the human ran, a transcript's first `parentUuid` resolved
-  against the session that holds that record, or two transcripts carrying one
-  provider session id. Similarity is never used.
-
-  Continuity is cross-file, so each transcript's evidence is banked in a new
-  `session_continuity_evidence` table and reconciliation runs over the stored
-  rows — which is what lets it work during targeted hydration of one file.
-  Evidence that cannot resolve yet keeps a reason and is reported as
-  `RELATIONSHIP_CONTINUITY_UNRESOLVED`; hydrating the file that supplies the
-  missing record resolves it without re-reading the first file. Re-reading a
-  rewritten transcript retracts the edges it no longer establishes.
-
-  `getSessionTree` and `getSessionChildrenPage` take `relationshipKinds`,
-  defaulting to delegation only, so an existing caller's output is unchanged.
-  `getSessionRelationships` reports continuity on its own `continuity` array.
-  Plain `sync` re-reads a transcript once when it has no continuity evidence
-  row, so an upgraded install backfills instead of skipping every unchanged
-  file on the stamp fast path. `HYDRATION_PARSER_VERSION` 4 -> 5;
-  `SESSION_RELATIONSHIP_CONTRACT_VERSION` 1 -> 2; native contract 15 -> 16.
-
-- Rebuild a delivery capture trigger that predates one of its table's columns.
-  The triggers embed their column list and are created `IF NOT EXISTS`, and
-  the schema check compared only their names, so adding a column to a captured
-  table left the old trigger delivering rows that looked complete and were
-  missing a field, for the life of the database.
-
-### Session sourcing for burn
-
-- RelayHistory is becoming the sourcing layer for
-  [burn](https://github.com/AgentWorkforce/burn) (#160). Today burn still
-  reads Claude Code, Codex and OpenCode logs with its own readers. Its cutover
-  release (5.0.0, burn #562) removes them: burn will read usage, tool calls,
-  file edits and session topology from `ai-history.db` through the `ai-hist`
-  crate's `SessionStore`, and price and analyze that evidence. What burn users
-  should expect once 5.0.0 ships: one ingest instead of two, and the `ai-hist`
-  database as the source of truth for both tools, so a session `ai-hist` shows
-  is the session burn costs. Cursor and Grok support in burn is planned to
-  come through this crate (burn #560). Pricing, cost, token estimation and
-  activity classification stay in burn. See
-  `docs/decisions/2026-09-19-relayhistory-owns-session-sourcing.md`.
-- CI checks for the boundary (#183, #184), armed by burn's side of the
-  migration. A `burn-contract-drift` job, for changes under `crates/ai-hist/`,
-  builds burn (main, or the `BURN_REF` repository variable) with its `ai-hist`
-  requirement pointed at the pull request's crate and runs burn's relayhistory
-  parity suite, so a change to message ids, timestamps or usage dedup that
-  would move burn's ledger fails here. It reports a notice and passes until
-  burn depends on `ai-hist` (burn #557). A weekly `burn reader tripwire`
-  workflow fails, and opens a tracking issue here, if burn's harness-parser
-  symbols reappear or its parity suite is missing after its cutover tag,
-  `relayburn-sdk-v5.0.0`.
+- Devin CLI is a first-class source, `devin`, read read-only from `$XDG_DATA_HOME/devin/cli` (default `~/.local/share/devin/cli`) by discovery, `sync`, hydration and live capture, with prompts, replies, thinking, tool calls, file edits, models and markers; hidden sessions are skipped.
+- `ai-hist watch --no-leading-edge` restores the old trailing-only debounce; by default a quiet watch loop now sweeps a filesystem event after a 10 ms settle, cutting write-to-report latency (p50 259 -> 65 ms on a 300-session store).
+- The SDK adds the typed `DeliveryConflictResponse` contract with canonical digest, strict HTTP 409 parsing and deterministic recovery-plan helpers.
 
 ### Changed
 
-- A sweep's `.sync-state.json` checkpoints fold only what they changed
-  (#320). The sweep keeps the document it last read or wrote with that file's
-  identity, length and mtime; while the file is still that one, a checkpoint
-  merges only the changed keys (and, inside a stamp map, only the changed
-  entries) into its copy instead of re-reading, re-parsing and re-merging the
-  whole file. Unix only: elsewhere there is no inode to identify the file,
-  and a checkpoint with something to write reads and merges it in full as
-  before. A file another writer replaced, or a checkpoint after a failed
-  write, is read and merged in full. The Devin and `history.jsonl` checkpoints now go through the same
-  path, so an unchanged Devin source no longer re-reads the state every tick.
-  On the 100 MB benchmark store this takes checkpoints from ~15% of a forced
-  tick to ~3%.
-
-- `search` (CLI, SDK, MCP) returns a common term's newest matches without
-  reading every match. A query matching at least 5,000 rows walks the
-  timestamp index over growing windows of the newest rows that pass the time
-  window and cursor (2,000, 6,000, then 20,000), testing each row against the
-  FTS5 index by rowid and stopping at `limit`. A window is every row at or
-  after its N-th row's timestamp, so rows tied on that timestamp extend it.
-  The walk serves the page when a window fills it. It grows to the next window
-  while the matches so far could fill the last one at their rate (with 4x
-  slack), or when only the first window has come up empty. It falls back to
-  sorting every match, as before, after two empty windows, after the last
-  window, or when one timestamp ties a whole window's worth of rows. On a
-  500k-event store a common term drops from ~240 ms to ~3 ms, and a role,
-  source or tag filter on it from 100-320 ms to 1-8 ms. A filter no recent row
-  passes, or a large timestamp tie, costs the same as before. A `user` or
-  `assistant` search with a term also narrows the index scan to that role's
-  events. Results are unchanged.
-
-- A sweep no longer counts every repairable session's evidence three times
-  (#321). When the change-feed head has not moved since the stored
-  destination marker was taken (the proof the unforced fast path already
-  trusts), the start of the sweep reads the marker as the current holdings
-  instead of counting. The end-of-sweep re-check and the new marker reuse the
-  start's holdings and recount only the sessions the change feed shows were
-  written (row revisions and tombstones above the start head). The sweep
-  counts everything again when the feed cannot vouch: no head, a different
-  epoch, a replayable source's prompt changed in place or deleted (a prompt's
-  session is not part of its identity; an appended prompt is carried), or
-  more than 256 sessions / 20,000 rows written.
-  Same marker and same outstanding set; on the 100 MB benchmark store the
-  destination checks go from ~5% of a forced tick to ~0.1%.
-
-- The project-identity refresh at the end of each sync now brings events in
-  line with their session's key only for sessions written since the previous
-  refresh in the same process (#319). It used to walk every event of every
-  keyed session on every tick. Sessions are scoped by the change feed's
-  revisions. The first refresh of a database in a process still covers the
-  whole catalog, as does one after a failure or after the database was
-  replaced. On a 140,000-event store a forced tick spends 1.7% of its time
-  here, down from 11%, and takes about 40 ms less.
-
-- Cheaper sweep ticks: the free-space check before a sweep is one `statfs`/`statvfs`
-  call on Unix instead of spawning `df`, and the per-transcript existence
-  probes a sweep asks about every unchanged Claude transcript and Codex
-  rollout (cursor lookups, sidecar, continuity, fidelity and raw-fact
-  probes), and the per-session ancestor lookup of the cached project-identity
-  upgrade, reuse prepared statements instead of compiling their SQL each
-  time. On the 100 MB benchmark store this is ~10% of a forced tick's CPU.
-
-- A forced sync now walks the Grok session tree once instead of three times,
-  and stamps each session directory twice instead of three times (#317). The
-  source fingerprint, the Grok walk and the discovery pass at the end of the
-  sweep share one enumeration. The walk still reads its own fresh stamp, so a
-  directory that becomes unreadable mid-sweep is reported in that sweep, and
-  discovery reuses the walk's stamps. On a store with 879 Grok sessions a
-  forced tick takes about 45 ms (13%) less.
-
-- `resume` and `pack` search prompts through the same `prompt`-role search
-  (`store::search` now delegates to `history_search`), so they get the same
-  speedup: a common term with `--limit 1` drops from ~10 ms to ~0.2 ms on 49k
-  prompts. The SDK's `search`, `searchPage`, `recent`, `recentPage` and
-  `getSession` read each session's locations once per result set, not once
-  per row.
-
-- When a Codex rollout grows, sync now reads only the appended turns instead
-  of re-parsing the whole file (#315). It resumes through the same
-  locator-keyed cursor that hydration keeps for Codex child rollouts. The
-  cursor advances only at a `task_complete` boundary, and it is stored in the
-  same transaction as the rows it describes. A rollout re-reads from byte
-  zero, as before, when its session or subagent classification changed, when
-  its evidence is gone, when the destination marker names it, or while a
-  one-time backfill is pending. On a 2 MB rollout, a forced tick after a
-  1 KiB append spends about 15 ms on it instead of about 75 ms.
-
-- A forced sync tick that finds nothing new costs about 20% less on a large
-  store (#316, #318). Shallow discovery checks whether each candidate file
-  has changed with a cached stamp query, plus a cached locator lookup when
-  the candidate's session id is not yet known. It used to prepare up to three
-  queries and decode the full observation and catalog row each time. During a sweep
-  it also stops re-resolving the project identity of every unchanged row,
-  because the identity refresh the sweep runs straight afterwards stores the
-  same key. `sessions discover` still resolves each streamed row before
-  emitting it.
-
-- Internal refactor: one-entry harness registry (#177). Each built-in harness
-  is declared once, as a `LocalSource` descriptor in
-  `crates/ai-hist/src/sources/catalog.rs`, and `SOURCE_CHOICES`,
-  `shallow_providers()`, `DISCOVERY_EXEMPTIONS`, hydration's source validation
-  and parser dispatch, `validate_provider_path`'s roots,
-  `relationship_capabilities`, `resume_command` and the native
-  relationship-identity check are derived from it instead of kept as separate
-  lists. Other per-source code (parsers and full sync, sync watch roots,
-  `Source`, usage accounting, the TypeScript source lists) is not yet on the
-  descriptor; `docs/session-catalog.md` "Adding a provider" lists it. The
-  fixture-corpus registry test now checks that `Source::ALL` names exactly the
-  descriptors and that every descriptor has a fixture directory with committed
-  snapshots or a fixture exemption. Behaviour is unchanged, and so is the
-  default Rust API; the descriptors are readable under `unstable-internal` as
-  `ai_hist::sources::catalog`.
-- `sync` (and every `watch` tick) writes each Claude transcript and each Codex
-  rollout as one `BEGIN IMMEDIATE` transaction instead of one autocommit per
-  statement, as Cursor, Grok, Muse and hydration already did. A Claude
-  transcript's transaction is committed and reopened every 2,000 records, so a
-  very large one never holds the writer lock for its whole read; a Codex
-  rollout stays one transaction, which its parser-upgrade repair relies on.
-  Cursors are written inside the transaction, after the rows they vouch for,
-  so a transcript that fails part way now leaves nothing behind instead of a
-  prefix of its rows, and the next sync reads it whole. `PRAGMA synchronous`
-  is unchanged; the sweep's own connection keeps temporary files (statement
-  journals, sorts) in memory, which holds nothing durable. On the 100 MB
-  synthetic store a cold sync drops from 37.3 s to 13.4 s, and a forced tick
-  after a 1 KiB append to a 2 MB Codex rollout from 728 ms to 466 ms. Part of
-  #215.
-- The change feed stamps a new `revision` on an update only when the update
-  changed at least one of the row's columns. Every re-read -- a hydration of a
-  session the sweep already indexed, a forced sweep, a relationship or
-  connector observation recorded again -- rewrote rows with the values they
-  already held, and each rewrite was a new revision that `changes_since`
-  reported and relay-desktop's probe uploaded again. The update triggers'
-  guard is generated from each table's live column list, so a column a
-  migration adds is guarded once the next writable open rebuilds it; a store
-  whose triggers predate the guard is migrated on that open.
-  `session_relationships.updated_ms` and `session_observations.updated_ms`
-  are now the time the row last changed: an upsert that would change only
-  that stamp is skipped. A presence updated in place (a new `source_stamp`)
-  no longer re-reports its session's catalog row, whose `locations` it cannot
-  change. Measured on the 100 MB synthetic store: hydrating a Claude session
-  the sweep already indexed reports 2 changes instead of 117 (115 of them
-  identical to what the feed already held), a Codex one 2 instead of 27, and
-  a fixture-corpus forced tick no longer re-reports relationships. Inserts,
-  deletes, tombstones and `SyncReport::changed` / `TickReport::changed` are
-  unchanged. Part of #215.
+- `search` (CLI, SDK, MCP) returns a common term's newest matches without reading every match (~240 ms -> ~3 ms on a 500k-event store); results are unchanged.
+- `resume` and `pack` use the same prompt search, and the SDK's `search`, `searchPage`, `recent`, `recentPage` and `getSession` read each session's locations once per result set.
+- Sync reads only the appended turns of a growing Codex rollout instead of re-parsing the whole file.
+- Forced sweep ticks are substantially cheaper on large stores: incremental `.sync-state.json` checkpoints (Unix), change-feed-scoped destination checks and project-identity refresh, a single Grok session-tree walk, cached discovery and probe queries, and `statfs`/`statvfs` instead of spawning `df`.
+- The Node CLI no longer recognises the leftover `--once` and `--interval` flags; they fail as unknown options.
 
 ### Fixed
 
-- `ai-hist export --out` refuses the history database's SQLite sidecars
-  (`-wal`, `-shm`, `-journal`) as well as the database file itself, by path,
-  directory alias and inode, both before exporting and again before the final
-  rename. A SQLite `file:` URI `--db` is resolved to the file it opens before
-  the guard is derived, preserving raw filename bytes on Unix. Exporting onto
-  a live WAL previously replaced committed database state with NDJSON and left
-  readers failing with a disk I/O error (#305).
-
-- `SessionStore::session` reads a session's requests and usage summary from
-  one evaluation of the grouped `session_requests` view instead of one per
-  1,000-request page plus one more for the summary, and attaches tool use ids
-  by hash rather than a per-request linear search of the page. A 50k-event
-  Claude session read drops from ~1.9 s to ~0.23 s; walking
-  `session_requests_page` to the end drops from ~1.9 s to ~1.1 s. Output is
-  unchanged (#311).
-
-- Live capture: writes made while another process holds the sync lock are
-  swept within about a second of its release, not at the backstop (#364).
-  The owed retry backed off once per contended *event* tick, up to
-  `slow_poll_ms`, and each new event pushed its deadline later, so a burst
-  during a long foreign sweep could wait 30-60 s after the lock was free. It
-  now backs off only per attempt of the owed retry (250 ms doubling to a
-  1 s cap), a new event keeps the earlier deadline, and a forced sweep that
-  gets through resets it. This cadence is independent of `slow_poll_ms`,
-  including a zero backstop in polling mode, so short backstops cannot turn
-  a held sync lock into a stream of immediate retries.
-- Live capture: one write is one forced sweep again. The debounce window
-  re-armed on the events inside it, so a write the backend reported in more
-  than one callback — FSEvents does for a create or a multi-line append —
-  ran a second, redundant forced sweep after the window (a three-line turn
-  went from 2.0 to 1.0 forced sweeps). The window now clears when it closes;
-  a write during the sweep still drives the next tick. This also removes the
-  macOS flakes in the `live_capture` FSEvents tests (#324, #331), together
-  with letting those tests settle after attaching, because FSEvents replays
-  changes made just before a stream registers.
-- `ai-hist` built with `unstable-internal` but without `fs-events` (the napi
-  addon's `--all-features` build) is clippy-clean again: the event-matching
-  helpers and backend-only stubs in `watch.rs` are gated on `fs-events`.
-
-- Export pages stream rows instead of fetching their whole scan budget up
-  front. A page stops reading the moment it is full, so rows past its
-  boundary are no longer decoded, discarded and decoded again by the next
-  page. At most one row per page is decoded twice: the one whose record
-  would overflow the byte limit, which the next page serves. A row outside
-  the selection, or in an excluded session, is never decoded; a relationship
-  is still decoded before its child endpoint is checked. With one
-  record per page and a 10,000-row scan budget, exporting 3,000 rows drops
-  from 10.8 s to 0.08 s; a 50k-event export with the default limits from
-  0.72 s to 0.46 s. Snapshots, cursors, retries and the scan budget are
-  unchanged (#308).
-
-- An abandoned export snapshot is released when its TTL elapses, not when
-  some later export call happens to sweep. A process-wide native thread
-  sleeps until the earliest expiry and ends the snapshot's read transaction,
-  so a long-lived SDK host no longer holds WAL checkpoints back indefinitely.
-  The thread holds no event-loop handle, so it never keeps Node alive (#306).
-
-- Live capture: a write beside the OpenCode database no longer forces a
-  sweep (#335). OpenCode's watch root is still the database's directory,
-  but only the configured database, the channel databases
-  (`opencode-<channel>.db`) and their `-wal`, `-shm` and `-journal` siblings
-  count as evidence there. With `OPENCODE_DB` in a busy directory, a log
-  appended every 50 ms beside it drove 44 forced sweeps and 708 ms of CPU in
-  10 s; it now drives none (37 ms of CPU). `SourceCapabilities::watch_roots`
-  still advertises the directory, which covers more than the loop admits.
-
-- `ai-hist resume <query>` resumes the newest match that names a session. It
-  used to read only the single newest match and report "No session found"
-  when that prompt had no session id, even when an older match did; the
-  session-id requirement is now part of the search query.
-
-- A `SessionStore` handle reuses its read connections instead of opening a
-  new one, and re-parsing the whole schema, on every call (#366). A handle
-  and its clones keep up to four idle read-only connections, reused only
-  while the path still names the same file (Unix device/inode or Windows file
-  identity), including SQLite `file:` URI paths, so a database
-  replaced under the handle is reopened. Schema gates a reused connection has
-  passed are remembered until `PRAGMA schema_version` changes. Writes keep
-  opening their own connection under the existing locks. Per-call measurements
-  on Apple Silicon: `head_revision` 1.5 ms -> 5 us, `changes_since` with an empty tail
-  2.8 ms -> 11 us, `session` 1.25 ms -> 0.26 ms, `has_session` 0.89 ms ->
-  3 us, `session_identities` 1.3 ms -> 0.09 ms.
-
-- Change-feed schema reconciliation now fingerprints each evidence kind's
-  exact exported column names and declared SQLite types. The one-time upgrade
-  from a pre-fingerprint database restamps every existing kind above the
-  current head because it has no per-kind baseline. Later shape-changing
-  migrations restamp only rows of the affected kind. Adding a newly fed kind
-  simply records its fingerprint after its normal backfill, so external
-  watermarks and named cursors resume without replaying unrelated kinds.
-  Retiring a kind remains the one store-wide reset because there is no live
-  table left to restamp and communicate its removal.
-  Previously the `location` migration changed the canonical JSON and remote
-  digest of existing evidence without moving its revision or origin, causing
-  durable receivers to return `409 delivery_conflict` forever. Explicit old
-  watermarks are now refused as stale, while unchanged current schemas keep
-  their epoch and cursor progress.
-- A sweep no longer stalls every other writer for up to ~30 s when a read is
-  active as it finishes (#336). Each sweep, including every
-  `SessionStore::watch` tick, ended with `wal_checkpoint(TRUNCATE)` under the
-  connection's ~30 s busy handler; a `TRUNCATE` holds the WAL write lock
-  while it waits for readers to leave, so an embedder writing its own tables
-  beside the watch (relay-desktop's change-feed drain) waited behind it. The
-  sweep now checkpoints `PASSIVE`, which never takes the write lock or waits
-  on a reader, and escalates to `TRUNCATE` only when that pass copied every
-  frame and the WAL is still past 4 MiB, with a 100 ms busy budget for that
-  one call. Escalating only after a full pass keeps the `TRUNCATE`'s own
-  copy, which also runs under the write lock, down to what another
-  connection committed in between, never a reader's backlog. A short pass or
-  a reset a reader blocks is reported (`[wal] checkpoint partial`,
-  `[wal] WAL not reset`) and retried by the next sweep; the WAL-size warning
-  is unchanged. Under a quiet store
-  the WAL file now stays at up to 4 MiB between sweeps instead of being
-  truncated to zero every time; SQLite reuses it from the start. `compact`
-  keeps its `TRUNCATE`: it is an explicit maintenance action.
-- Reading a session's user turns no longer scans the whole session once per
-  turn (#307). `session_user_turns_page`, and `SessionStore::session`
-  whenever session events are selected (including `include_text: false`),
-  read each turn's blocks with a filter on the computed turn key, which no
-  index could serve, plus two neighbour lookups per turn, so a page cost
-  turns x events: about 100 s for a 50,000-event session's 15,000 turns.
-  A page now reads its blocks and both neighbouring message ids in one range
-  pass over the session in `(ts_ms, id)` order, and `SessionStore::session`
-  reads every turn in one pass instead of regrouping the session per
-  1,000-turn page; the same session takes about 35 ms. Results, ordering,
-  fallback `event:<id>` identities, cursors and the single read snapshot are
-  unchanged; no schema or index change.
-- Continuity reconciliation no longer scans every event of a source for each
-  pending transcript on every sync. Resolving a transcript's parent record
-  asked `message_id = ? OR event_uid = ?`, which no index could serve, and a
-  parent nothing has indexed keeps its transcript pending for good. It is now
-  two indexed searches with the same answer, the second on a new partial
-  index, `idx_session_events_claude_uid_unmatched`, which holds only the rows
-  the first search cannot see and is empty on a database this parser wrote.
-  The next writable open builds it (0.76 s for 214,000 events). On 75,000
-  Claude events the lookup drops from 17 ms to under 0.1 ms. Part of #215.
-- Reading a whole session's events (`session_events`, and
-  `SessionStore::session` with events selected) no longer sorts them in a
-  temporary b-tree. The order spelled `ts_ms IS NULL` first, which no index
-  carries; `session_events.ts_ms` has always been `NOT NULL`, so the order is
-  now `ts_ms, id` and is read straight from the page index. Same rows, same
-  order. Part of #215.
-- A `watch` tick or `SessionStore::sync` that wrote nothing to the catalog no
-  longer digests every catalog row to compute `changed`: the digest records
-  the change-feed head it was read at, and an unmoved head proves the catalog
-  is the same. When anything was written the rows are compared as before, so
-  `changed` still names exactly the sessions whose catalog columns moved. And
-  naming the sessions the destination marker says are short no longer walks
-  every event a second time; the grouped reads that count them collect the
-  names. A forced tick on the 100 MB synthetic store drops from 338 ms to
-  301 ms unchanged, and from 364 ms to 333 ms after a 1 KiB Claude append.
-  Part of #215.
-- Grok reuses an ACP `eventId` across records, and two messages carrying one
-  id were stored under one `ev:<id>` identity, so the second overwrote the
-  first (#212). The first message carrying an id keeps `ev:<id>`, and each
-  later one is `ev:<id>#1`, `#2`, …, so an append that reuses an id never
-  renames a stored message. The `grok_events_v3` sync-state key is retired
-  for `grok_events_v4`, and the hydration parser version moves 13 -> 14, so
-  every Grok session is re-read once by `sync` and by hydration.
-- `ai-hist export` no longer overwrites the database it is reading from
-  (#73). The destination is checked against the database the command
-  actually opened (`--db` included, not only `AI_HIST_DB`/the default, and
-  for a SQLite `file:` URI the file SQLite resolved it to), for
-  every format (`sqlite`, `jsonl`, `.gz`), after resolving relative
-  spellings, `..`, symlinks and hard links, and its `-wal`/`-shm`/`-journal`
-  sidecars are protected too. A refused export exits non-zero before reading
-  or writing anything.
-- `ai-hist export` stages its output in a temporary file beside the
-  destination and renames it into place once complete, so a failed export
-  leaves an existing destination file untouched. A SQLite export is written
-  as a single self-contained file. Sidecars left at the destination by an
-  earlier database are moved aside before the rename and discarded only once
-  it succeeds, so they can neither be replayed onto the new file nor lost if
-  the replacement fails; a sidecar that cannot be moved aside fails the
-  export. A destination that is a symlink is written through to its target,
-  which is itself checked against the active database.
-- Claude discovery and `sync` no longer treat the subagent workflow journal
-  (`<session>/subagents/**/journal.jsonl`) as a transcript. It is metadata
-  that shares the `.jsonl` extension; it is no longer listed as a discovery
-  candidate, opened, or tracked with a transcript cursor. On the first sync
-  after upgrading, what an earlier build derived from a journal is retracted:
-  its continuity evidence, the `unknown` markers its lines were stored as
-  (matched by session, line identity and record type, so a transcript's own
-  markers are untouched; lines no longer in the journal cannot be matched and
-  are left), and a session `raw_path`, local presence or local observation
-  left pointing at it. The journal's cursor is dropped only after that
-  succeeds, so an interrupted retraction is retried by the next sync.
-  ([#208](https://github.com/AgentWorkforce/relayhistory/issues/208))
-- Claude requests written as streamed snapshots — one record per content block,
-  same `message.id` (and `requestId`, when the transcript writes one),
-  `output_tokens` growing — now report their final usage instead of being
-  refused as `ambiguous-usage-copies`. The parser merges the copies per field
-  (largest output counter wins, `iterations` may gain entries, everything else
-  including a reported cost must agree) and writes the result onto every row
-  of the request; contradictory copies are still refused. Existing databases are settled once on the next writable
-  open. ([#211](https://github.com/AgentWorkforce/relayhistory/issues/211))
-- Claude `<synthetic>` assistant records (local API-error and login notices)
-  are stored as `session_markers` rows of kind `local_notice`, subkind
-  `synthetic`, instead of assistant events: they no longer form a request,
-  appear as a session model, or become `last_assistant_text`. Existing rows
-  move to markers on the next writable open, and the session's `models_json`
-  and a `last_assistant_text` quoting the notice are repaired with them.
-  ([#211](https://github.com/AgentWorkforce/relayhistory/issues/211))
-- A sweep no longer re-runs the Codex project/branch backfill over every
-  Codex session ever indexed. It covers only the sessions whose rollout was
-  re-read or which gained a `history.jsonl` prompt in that sweep, after one
-  full pass per install (recorded as `codex_metadata_backfill` in
-  `.sync-state.json`) for rows an older build left unattributed. Sessions
-  whose backfill a failed or cancelled sweep left unfinished are carried in
-  `codex_metadata_pending` and retried on the next sweep. Before, any
-  change that moved the source fingerprint — one Claude transcript growing —
-  cost an `UPDATE`, a `MIN`/`MAX` scan and a `sessions` upsert per Codex
-  session, and gave every Codex row a new change-feed revision. On 3,000
-  Codex + 300 Claude sessions, the sweep after one Claude append drops from
-  2.9s to 1.0s and re-stamps 0 Codex rows instead of 3,000 (#42).
-- The Claude sync walk's per-transcript "has this path left evidence?" probe
-  is a keyed search again. SQLite, with no statistics to go on, drove it from
-  `session_events` rather than from the one `sessions` row the path names, so
-  every transcript with no row of its own — each subagent sidecar, each new
-  file — scanned every Claude event, once per file per sweep. The probes now
-  pin their join order, and a new `idx_session_relationships_locator` index
-  (created on the next writable open) serves the sidecar probe. On the 100 MB
-  synthetic store, a sync after a 1 KiB append drops from 7.0 s to 2.1 s, and
-  a cold sync from 60 s to 43 s, in the benchmark harness (#215).
-- A sweep over files that have not changed no longer re-reads or re-queries
-  them (#42, #215). Measured on the 100 MB synthetic store, a sync after a
-  1 KiB append (what a `watch` event tick or a periodic Reflex sync runs
-  whenever anything moved) drops from 1.77 s and 838 MiB read to 0.39 s and
-  114 MiB; a `watch` tick with nothing changed reads 22 MiB instead of 28 MiB.
-  - Unchanged Claude transcripts and subagent metadata are skipped on a
-    `stat`, on filesystems known to keep a real change time (APFS, HFS+,
-    ext2/3/4, XFS, Btrfs, ZFS, tmpfs, F2FS). Once a window digest has proven
-    a transcript's cursor and the file's change time is more than three
-    seconds old, the cursor records that change time (`settled`); an
-    unchanged `ctime` — which no writer can restore there, unlike an mtime —
-    then proves the bytes without reading them. Any write, truncate, chmod
-    or rename falls back to the digest. Elsewhere — FAT and exFAT, whose
-    "ctime" is the mtime, any filesystem not on the list, and Windows —
-    nothing settles and every skip keeps the digest. A settle is trusted for
-    six hours, then the file is proven by its digest again, so no miss is
-    permanent. Recording it is best-effort and only replaces the cursor
-    document it was proven from, so it cannot roll back a cursor hydration
-    advanced in between.
-  - Unchanged Cursor transcripts and the flat prompt logs are skipped the
-    same way (`settled` on their byte cursor in `.sync-state.json`), and a
-    Cursor transcript that did not advance is no longer hashed a second time
-    to identify a generation nothing used.
-  - The project-identity refresh no longer reads every event row. The stale
-    event probe is driven from the catalog through a new covering index,
-    `idx_session_events_project`, the
-    delegated-thread pass from the relationship ledger, and the path-key
-    upgrade pass reads the catalog once instead of once per directory. A
-    sweep runs the refresh once instead of twice. The first writable open
-    after upgrading builds the index: about 1.6 s and 78 bytes per event
-    for a million events. Until then the schema is not current, so a
-    read-only CLI or change-feed open falls back to a writable one once.
-  - Discovery's locator lookup is a search on `idx_observation_locator`
-    again; with no `sqlite_stat1`, SQLite served its `ORDER BY` from the
-    primary key and walked every observation of the source per file.
-  - A sweep skips per-source sync-state checkpoints whose state did not
-    change, and an unchanged tick whose change-feed head matches the one
-    recorded with the destination marker (`destination_head`) skips
-    recounting every session's evidence.
+- `ai-hist export --out` refuses the history database's `-wal`, `-shm` and `-journal` sidecars as well as the database itself (also for `file:` URI `--db`), which previously could corrupt a live store.
+- `ai-hist resume <query>` resumes the newest match that names a session instead of reporting "No session found" when the newest match has no session id.
+- Live capture sweeps writes made while another process holds the sync lock within about a second of its release, instead of up to 30-60 s later.
+- Live capture runs one forced sweep per write again instead of a redundant second sweep for writes reported in several callbacks.
+- Live capture no longer forces sweeps for unrelated files beside the OpenCode database; only the configured and channel databases and their SQLite sidecars count.
+- Change-feed schema reconciliation fingerprints each evidence kind's columns and restamps only affected kinds, fixing durable receivers stuck on `409 delivery_conflict` after the `location` migration; stale explicit watermarks are refused.
+- An abandoned export snapshot is released when its TTL elapses, so long-lived SDK hosts no longer hold WAL checkpoints back; the timer thread never keeps Node alive.
+- Export pages stream rows and stop when full instead of decoding and discarding rows past the page boundary (3,000 one-record pages: 10.8 s -> 0.08 s).
+- `SessionStore::session` reads a session's requests and usage summary in one pass (50k-event session ~1.9 s -> ~0.23 s), and `session_requests_page` is faster to walk.
+- A `SessionStore` handle reuses up to four idle read connections while the path names the same file, making small reads such as `head_revision` and `changes_since` microseconds instead of milliseconds.
 
 ### Rust API
 
-- The `unstable-internal` `storage` module is removed (#309). Its eight
-  raw-SQL readers (`history_after`, `trajectories_after`, `commit_links_after`,
-  `changed_file_sessions_after`, `session_metadata`, `session_project`,
-  `pending_event_sessions`, `latest_history_for_session`) and their row types
-  served the retired capture plugin and had no remaining callers. It was never
-  part of the default surface; no table or data changes.
+- `WatchOptions::leading_edge` (default `true`), `WatchLoop::leading_edge`/`with_leading_edge` and `watch::LEADING_EDGE_SETTLE_MS`; older serialized `WatchOptions` load with it on.
+- `WatchOptions::stop: Option<StopToken>` lets `SessionStore::watch` cancel the sweep in flight; `WatchStop::stop` or dropping the handle cancels it, and the tick reports the new `TickReport::cancelled`.
+- `TickReport::elapsed_ms` and `TickReport::first_event_age_ms` report sweep wall time and event-to-report latency.
+- `WatchHandle::next` / `next_timeout` block on the report channel instead of polling every 50 ms, so idle watch consumers barely wake.
+- `Source::Devin` and `ProviderRoots::devin` (`from_env` honours `XDG_DATA_HOME`).
+- The `unstable-internal` `storage` module and its raw-SQL readers are removed.
 
-- `WatchOptions::leading_edge` (default `true`), plus `WatchLoop::leading_edge`
-  and `with_leading_edge`. A filesystem event that finds the watch loop quiet
-  is swept after a 10 ms settle (`watch::LEADING_EDGE_SETTLE_MS`) instead of
-  after the debounce window. Events inside the window that sweep opens
-  coalesce into one trailing tick at its close. `ai-hist watch` gets the new
-  default. On a 300-session store, write to `TickReport`: p50 259 -> 65 ms,
-  p95 267 -> 100 ms. A three-line turn costs 2 sweeps instead of 1, and
-  sustained writes tick once per window instead of once per window plus
-  sweep (12 -> 16 ticks over 3 s). Set it to `false` for the old
-  trailing-only window; `ai-hist watch --no-leading-edge` does the same.
-  Older serialized `WatchOptions` without the field load with it on.
-
-- `SessionStore::watch` ticks can be cancelled (#333). `WatchOptions::stop:
-  Option<StopToken>` (serde-skipped, like `SyncOptions::stop`) is installed
-  around every tick's sweep, and `WatchStop::stop` / dropping the handle now
-  cancel the sweep in flight at its next provider, file or record boundary
-  instead of waiting it out. A cancelled tick arrives as a `TickReport` with
-  the new `cancelled` field set, neither swept nor an error, and the loop ends
-  after it.
-- `TickReport::elapsed_ms` (the sweep's wall time) and
-  `TickReport::first_event_age_ms` (for a filesystem-event tick, how long
-  before the report the first event behind it arrived, counted from the
-  oldest change a deferred or retried tick stands for) (#334). Measured on a
-  300-session store: sweep 40 ms, first-event age 245 ms, so the 200 ms
-  debounce window is most of the write-to-report latency.
-- `WatchHandle::next` / `next_timeout` block on the report channel instead
-  of waking every 50 ms to check the loop's thread (#332): the loop's thread
-  closes the channel when it ends. An idle watch consumer went from about 19
-  to about 1 process wakeups a second.
-
-- `Source::Muse` and `ProviderRoots::muse` (the Muse Code sessions directory;
-  `from_env` honours `XDG_DATA_HOME`). Both types are `#[non_exhaustive]`, so
-  this is additive.
-- `Source::Devin` and `ProviderRoots::devin` (the Devin CLI data directory;
-  `from_env` honours `XDG_DATA_HOME`). Additive for the same reason.
-- `ProviderRoots` gains `opencode_db_pinned: bool`. `from_env` sets it when
-  `OPENCODE_DB` is set; `from_home` leaves it `false`, so every OpenCode channel
-  database beside `opencode_db` is read. Set it to read `opencode_db` alone.
-
-- The `export` feature is local export alone: `ExportSnapshot` (`open`,
-  `handle`, `page`, `owns_cursor`, `expired`, `snapshot_id`),
-  `ExportSelection`, `ExportLimits`, `ExportHandle`, `HistoryExportPage`,
-  `HistoryExportRecord`, `SessionIdentity`, `SUPPORTED_KINDS`,
-  `MAX_EXPORT_TTL_MS` and `EXPORT_SCHEMA_VERSION` (now 2). `create_export`,
-  `export_page`, `close_export` and `expire_exports` are replaced by
-  `ExportSnapshot`. Removed: the `export::capture` module (subscriptions, `reserve_revision`,
-  cutoffs, `next_change`, `append_revision`, preimages, `is_shareable`,
-  `shareable` and the rest), `RawRecord`, `make_record`, `snapshot_record`,
-  `DEFAULT_RETENTION_LIMIT_BYTES`, `set_retention_limit`, `retained_bytes`,
-  `RETENTION_HIGH_WATER_PERCENT`, `above_high_water`,
-  `ensure_capture_headroom`, `RetentionLimitReached`,
-  `retention_limit_usage`, `annotate_retention_limit`, `is_retention_limit`,
-  `MAX_COMPACTION_PAGE` and the `compact_journal*` / `compact_to_low_water*`
-  functions. The `delivery` feature alias is gone. Under
-  `unstable-internal`, `storage::session_identities_after` and
-  `storage::session_identity_exists` are gone; `SessionStore::session_identities`
-  and `SessionStore::has_session` are the identity reads. The default-feature
-  surface is unchanged.
-
-- `SessionStore::has_session(&SessionIdentity)` answers whether the store
-  holds anything under one identity, by the same tables and rule as
-  `session_identities`: true exactly when the listing would name it, false for
-  an empty source or session id. It is one indexed existence probe per table,
-  on one snapshot. `storage::session_identity_exists` is the same check, and the
-  listing skips an empty source as it skips an empty session id, so every
-  session an embedder counts is one it can select and drain.
-- `ChangeQuery::session(source, session_id)` restricts a change-feed drain
-  to one session: the same `Change` values the unfiltered drain reports for
-  that session, tombstones included, read through each table's
-  `(source, session_id)` index rather than the whole revision range. It is a
-  one-shot read (a session's backfill), so naming a consumer alongside it is
-  `Error::InvalidArgument`. A prompt with no session belongs to no session's
-  drain, and a trajectory is the session its id names under the `trajectory`
-  source.
-- `SessionStore::session_identities(IdentityQuery { after, limit })` pages
-  every `(source_name, session_id)` the store holds evidence under, catalogued
-  or not: the union of the catalog, prompts, events, tool calls, file edits,
-  markers, relationships (by parent), presences, commit links, connector
-  observations and trajectories. It is a merge of covering index seeks, so no
-  payload is read; each page reads one snapshot, and an empty source or
-  session id is no session. `SessionIdentity` names a stored session, including one
-  under a source this build does not know, and is the type
-  `ChangeQuery::session` holds. `storage::session_identities_after` is the
-  same read, and now covers every one of those tables rather than the catalog,
-  prompts and events alone, and reads each page on one snapshot even on an
-  autocommit connection. `sessions` gains `idx_sessions_identity` on
-  `(source, session_id)`, added by the first writable open; until then a
-  read-only store answers `session_identities` with `StaleSchema`.
-- The change feed reports every evidence table and each row exactly as
-  stored. `ChangeKind` gains `History`, `Presence`, `CommitLink`,
-  `Trajectory`, `SourceObservation` and `ObservationEvidence` (`ALL` lists
-  twelve kinds); their rows are stamped and tombstoned by the same triggers,
-  and a database the six-kind feed reached stamps them once on open, above its
-  head, so a cursor bound to every kind resumes into all of them. A named
-  cursor stored as `*` now spans all twelve kinds. A consumer that passed the
-  six original kinds as an explicit list was stored as `*` too; that list no
-  longer equals `ChangeKind::ALL`, so its resume fails with
-  `ConsumerKindsMismatch` — drain it under a new consumer name, or resync from
-  `Watermark::START`.
-  `EvidenceRow::History(HistoryEntry)` is the typed prompt row and
-  `EvidenceRow::Untyped` marks a kind with none. `Change` gains `columns:
-  Option<StoredRow>` — every column but `revision`, in table order, values as
-  SQLite holds them, read from the live table so a new column is carried
-  without a code change; the export journal's payload is built from the same
-  column list — and `key: Vec<serde_json::Value>`, the record's identity as
-  the journal keys it (`["history", source, timestamp_ms, prompt]`), on
-  upserts and tombstones alike; a prompt's session is not part of its key, so
-  a prompt gaining one is an upsert, never a delete. `Change::source` is `Option<Source>` and
-  `Change::source_name` holds the stored name, so a row from a source this
-  build does not know is carried instead of failing the drain. The `history`
-  FTS update trigger fires only on the columns it indexes.
-- `SessionStore::discover(DiscoveryOptions)` is the shallow catalog sweep:
-  every local provider's sessions from metadata, as `Shallow` rows, hydrating
-  none and taking no `SyncRunLock`. `discover`, `sync` and `hydrate` take an
-  optional `StopToken` (`stop`), and a stopped call is `Error::Cancelled`
-  (`CANCELLED`) at the next provider, file or record boundary.
-  `SyncOptions::progress` takes a `ProgressObserver` receiving content-free
-  `CaptureProgress` per provider file.
-- `SessionStore` is now the whole default surface of the `ai-hist` crate:
-  ten operations, typed evidence, no raw connection, no contract constant
-  (`docs/sourcing-sdk.md`). `open` keeps its shape and `StoreOptions` gains
-  `roots: Option<ProviderRoots>` (`ProviderRoots` is public: `from_env` is
-  the CLI's resolution, `from_home` reads nothing from the environment); the
-  roots are resolved once at `open` and drive `sync`, `hydrate`, `watch` and
-  `Source::capabilities().watch_roots(&roots)` alike. `sync` takes
-  `SyncOptions { force, lock_timeout_ms }` and reports `swept` plus the
-  `changed` `SessionRef`s (catalog rows a sweep created or changed), and a
-  held `SyncRunLock` is `Error::SyncLocked` after the caller's timeout rather
-  than a silent skip. New: `hydrate(&SessionRef, HydrateOptions)` — by id, or
-  by transcript path for the hook fast path — `watch(WatchOptions)` returning
-  a `WatchHandle` iterator of `TickReport`s over the live-capture loop,
-  `sessions(CatalogQuery)` walking the catalog on an internal keyset, and
-  `session(&SessionRef, SessionQuery) -> Option<SessionEvidence>` reading
-  every table for one session on one SQLite snapshot: `prompts`, `messages`
-  (one per `message_id`, with `role`, `request_id`, `provider_message_id`,
-  `stop_reason`, `turn_id`, normalized `usage`, and typed `blocks`),
-  `tool_calls` (`args` parsed), `tool_results` (per-result fidelity),
-  `file_edits` (`structured_patch` parsed), `markers` (`payload` parsed),
-  `relationships` (delegation and continuity, with the side the session is
-  seen from), `requests`, `usage`, `user_turns`, `coverage` and `loaded`. A
-  `Block` carries `control: Option<ControlKind>`, the typed reason a user-role
-  block is not a human prompt, so the facade reports a control row classified
-  rather than dropping it.
-  `SessionQuery { include_text, kinds }` maps onto burn's content modes:
-  `include_text: false` keeps byte lengths and hashes and never moves the
-  `text` column out of SQLite; `kinds` skips the tables a consumer does not
-  need. Every JSON column arrives parsed and the stored string is reachable
-  only through `raw_args()`, `raw_structured_patch()`, `raw_payload()` and
-  `raw_usage()`. `Source::capabilities()` declares, statically, a source's
-  evidence kinds, relationship capabilities, usage accounting mode, whether
-  its message ids are provider-issued or synthesized, whether it hydrates by
-  path, and its watch roots. `Error` is now an enum whose `code()` mirrors the
-  TypeScript native error codes plus `SyncLocked`, `SourceMismatch`,
-  `StaleSchema`, `WatermarkAheadOfStore` and `ConsumerKindsMismatch`; `Display` renders
-  `CODE: message`, and the change feed's failures are variants of the same
-  enum rather than a second classification. Every value type the facade returns
-  — `SessionEvidence` and its parts, `CatalogSession`, the reports and
-  options, `SourceCapabilities`, `Error` — is `#[non_exhaustive]`, `Clone`,
-  `Serialize`, `Deserialize` and `PartialEq`; `CatalogIter` and `WatchHandle`
-  are deliberately not value types (one holds a read snapshot, the other a
-  running thread) and implement none of those.
-  **Removed** the per-kind page methods `SessionStore::session_user_turns_page`,
-  `session_markers_page`, `session_requests_page` and `session_usage`; the
-  same data is `SessionEvidence::user_turns`, `markers`, `requests` and
-  `usage`. A read-only `open` now also checks the marker, relationship and
-  per-request usage schema, so it refuses at open — as the typed
-  `Error::StaleSchema`, naming the remedy — rather than inside a read. `crates/ai-hist/tests/sourcing_api.rs` holds the surface on the
-  crate's default features against the fixture-corpus snapshots.
-- A revision-stamped change feed for incremental downstream ingest:
-  `SessionStore::changes_since(from, ChangeQuery)`. Every row of `sessions`,
-  `session_events`, `tool_calls`, `file_edits`, `session_markers` and
-  `session_relationships` now carries a `revision` drawn from the
-  database-wide `observation_clock`, stamped by triggers on every insert and
-  update so no write site can forget it, and indexed per table. A deleted
-  row leaves a tombstone in `evidence_tombstones` at its own revision, which
-  a later insert of the same key clears. The drain yields `Change { kind,
-  source, session_id, record_key, revision, op }` in `(revision, kind,
-  record_key)` order, where `op` is `Upsert(EvidenceRow)` — the typed row,
-  so no second read is needed — or `Delete`; it is bounded to the head at
-  open, pages through the store in `batch`-sized indexed reads (at most
-  10,000), and exposes `head()` and `position()`. Named consumers keep their
-  progress in `consumer_cursors` inside the store: pass
-  `Watermark::CONSUMER` with `ChangeQuery::consumer` to resume from the last
-  commit, and call `Changes::commit()` to advance — an uncommitted drain
-  moves nothing, so a consumer that fails mid-batch resumes from its last
-  commit, and the cursor only moves forward, so a stale commit from an older
-  drain cannot rewind it (`commit` returns the cursor as stored). A presence
-  arriving or leaving re-stamps its catalog row, since the row's `locations`
-  is derived from `session_presences`. A page is read revision-first, so at
-  most one page of typed rows is resident however many kinds are fed; a
-  drain's start and head come from one read snapshot; and a read-only handle
-  over an unmigrated database reports `Watermark::START` rather than its
-  pre-feed `observation_clock`. Both passes of a page share that snapshot
-  too, and an empty page window steps forward instead of declaring the head,
-  so a writer re-stamping the rows mid-page cannot make a drain skip what is
-  still below its head. A named cursor is bound to the kind set it was
-  committed for (`consumer_cursors.kinds`); resuming or committing it under
-  another filter fails with `Error::ConsumerKindsMismatch`, because a
-  position in an events-only stream has accounted for no relationship,
-  marker or catalog row. `SessionStore::head_revision()` and `SyncReport::head_revision`
-  report the head. A `Watermark` carries the issuing database's `epoch`, a
-  random identity drawn when its feed schema is created
-  (`change_feed_store`), so a watermark from a replaced database fails with
-  `ErrorKind::WatermarkAheadOfStore` even after the replacement has counted
-  past its revision, as does one beyond the head, read through the new
-  `Error::kind()`, and `Changes::commit()` refuses the same way to write a
-  cursor into a database other than the one the drain read; the commit that follows the resync from
-  `Watermark::START` replaces a named cursor stuck beyond the head. A
-  re-parse re-stamps every row it upserts, so a consumer
-  must treat a re-seen `record_key` as a replace, never a duplicate. A
-  message still being written is never in the feed: incremental hydration
-  holds it until it completes, and its blocks then arrive together, once.
-  An existing database is stamped once on its first writable open, so a
-  replay from `Watermark::START` reports everything it already held. The
-  `session_events` FTS update trigger now fires only for `text`, `role` and
-  `project`, so the stamp — and the bulk `project_key` pass — no longer
-  re-index every event. The delivery capture payload leaves `revision` out;
-  it is this database's bookkeeping, not a fact about the record.
-  `ShallowSession` and `SessionRelationship` are re-exported on the default
-  feature set as the rows a catalog or relationship change carries.
-- Type the rows a harness writes into the user role that are not prompts.
-  `session_events` gains `control_kind`, null for a genuine prompt and for
-  model output, and otherwise one of `slash_command_caveat`,
-  `slash_command_invocation`, `slash_command_output`, `task_notification`,
-  `hook_output`, `bash_passthrough_input`, `bash_passthrough_output`,
-  `system_reminder`, `codex_context_wrapper`, `meta`, `resume_marker`. The
-  row keeps its role, kind and verbatim text; the column is what a consumer
-  building human turns, prompt roots or an overhead breakdown filters on.
-  Claude reads `origin.kind` and `attachment.{type, commandMode}` for task
-  notifications, and a slash command's caveat → invocation → output records,
-  chained by `parentUuid`, are grouped into one `session_markers` row of
-  `kind = "slash_command"` whose payload carries `command_name`,
-  `command_message`, `command_args`, `command_mode`, `origin_kind`, the three
-  rows' event uids and `stdout_bytes` — the whole of what an activity
-  classifier reads, with no raw JSON. The pending triad travels in the
-  transcript cursor, so a command split across two hydration passes is still
-  one marker. A `<system-reminder>` block inside a prompt becomes a
-  `system_reminder` row sharing the prompt's `message_id`
-  (`<uid>:reminder:<n>`), recreated from the current text on every re-read so
-  a record rewritten with fewer reminders, or without the block that carried
-  them, loses the rows it no longer has, and
-  the prompt row and `history` carry only the human's text. Codex's `<environment_context>` and sibling wrappers are
-  stored as `codex_context_wrapper` rows instead of falling to an `unknown`
-  marker. `history`, `sessions.first_prompt` and `attribute_usage_to_prompts`
-  all derive from that one classification (`ingest::control`), which
-  replaced the `CLAUDE_CONTROL_PREFIXES` list: a task notification or a bare
-  `/resume <id>` is no longer a `history` row or a first prompt, and the
-  answer to a slash command is charged to the human prompt before it rather
-  than to the command's output row. `session_user_turns_page` leaves control
-  rows out too, so a Codex context wrapper is not a turn and a split reminder
-  is not one of its prompt's blocks; the relayhistory plugin does not publish
-  them as conversation turns, and pads a session's published tail with one
-  empty `system` turn per control row so a session an earlier release
-  published with its control rows as user turns is rewritten index for index
-  on the server, which upserts by `turnIndex` and never trims. Source-evidence
-  validation refuses a `control_kind` outside the vocabulary or on anything
-  but a user text row. `SESSION_EVIDENCE_CONTRACT_VERSION` 2 -> 3 on both the
-  Rust and TypeScript sides, since the session-event row shape changed; the
-  TypeScript `SessionEvent` exposes it as `controlKind` (a `ControlKind`
-  union or null) and the native addon carries it, with no native contract
-  bump because the field is additive. For Claude the full-transcript metadata
-  fold now settles `sessions.first_prompt` on every sync or hydration, null
-  included -- never from a fold superseded by a rewrite under it, which the
-  next pass rescans -- so a title an earlier release took from a row that is control now
-  (a bare `/resume <id>`, a task notification) is replaced on the one-time
-  re-read; `SHALLOW_SCANNER_VERSION` 5 -> 6 sends cached discovery rows
-  through the current classifier once as well. A standalone reminder row the
-  previous parser stored untyped under the block's own uid, and the `unknown`
-  marker it left for a Codex wrapper, are retired by the re-read rather than
-  kept beside the typed rows. `SessionEvent` gains `control_kind`,
-  returned by `session_events` and `session_events_page` and carried by the
-  source-evidence row contract. `HYDRATION_PARSER_VERSION` 10 -> 11 and the
-  raw-facts generation 2 -> 3, so an existing install re-stamps every row
-  once on the next hydration or plain `sync`. That re-read also retires what
-  the previous parser wrote for a record it now stores differently: the
-  `history` row it wrote from the record's whole text (a reminder folded into
-  the prompt, a task notification as a prompt), keyed on this session, the
-  record's timestamp and that text; a row another session's human prompt
-  shares under `history`'s `(source, timestamp, prompt)` key is handed to
-  that session rather than deleted. Continuity reads a `/resume` through the
-  same reminder stripping, so a reminder ahead of the wrapper no longer hides
-  the resume. The fixture corpus snapshots now include `control_kind` and a
-  `session_markers` dump. napi/TS/MCP exposure is not included.
-- Document and prove the embedder surface. `docs/sourcing-sdk.md` is the guide
-  for a Rust consumer of the published crate — `StoreOptions` and
-  `ProviderRoots` resolution, one section per facade operation with its
-  provider I/O, database work and locking, the typed `Error` table against the
-  TypeScript codes, one section per evidence struct with a per-source
-  population table checked against `declared_evidence_kinds` by
-  `tests/sourcing_sdk_doc.rs`, accounting semantics, the change feed, the
-  semver policy, feature flags, the never-list, and which in-tree call sites
-  still need `unstable-internal`. `examples/rust-consumer` is a standalone
-  Cargo project outside the workspace that depends on `ai-hist` from
-  crates.io, stages the fixture corpus into a throwaway `HOME` under explicit
-  `ProviderRoots`, syncs, walks the catalog, prints per-session usage totals
-  by model from `SessionEvidence::requests`, and drains the change feed under
-  a named consumer cursor; CI builds it with `[patch.crates-io]` at the
-  checkout on every pull request and nightly against the published crate. `crates/ai-hist/public-api.txt` snapshots the
-  default-feature public API; `node scripts/check-public-api.mjs` diffs it in
-  CI and rejects any `rusqlite` type in it. `EvidenceRecord::{exists,
-  matches_canonical, remove, write}` — the four methods that took a raw
-  `rusqlite::Connection` on the default features — are crate-private now; they
-  had no caller outside the crate, and they were the only `rusqlite` types in
-  the surface. `Source::ALL` lists every source, since the enum is
-  `#[non_exhaustive]` and a list an embedder keeps by hand cannot learn about
-  a new variant; an in-crate exhaustive `match` and a comparison with
-  `SOURCE_CHOICES` keep it complete. `scripts/set-release-version.mjs` stamps
-  the example's dependency and lock entry, and the release workflow's version
-  commit stages both files, so a release keeps both CI variants honest.
-- Stop dropping the record types neither parser could normalize. A new
-  `session_markers` table records compaction and summary boundaries, provider
-  `system` rows, non-text content blocks (`image`, `document`,
-  `redacted_thinking`, thinking `signature`s), tool-replacement metadata, and
-  Codex lifecycle events (`compacted`, `turn_diff`, `stream_error`,
-  `*_begin`, `task_started`/`task_complete`, review mode, `subagent_*`,
-  encrypted `reasoning`). A provider type no classifier knows is stored as
-  `kind = "unknown"` carrying its verbatim type in `subkind` — the table has
-  no CHECK constraint, because a constraint would turn tomorrow's unknown
-  record back into today's silent drop. `payload_json` is always bounded —
-  every string at 128 characters and every container at 32 entries,
-  recursively — so an image or document block contributes its size, never its
-  bytes. Where this parser classifies the record it names the fields it keeps;
-  where the payload is a provider's own document whose keys are theirs (Grok's
-  `signals` sidecar, a compaction checkpoint) the document is bounded whole,
-  because enumerating their keys would silently drop whatever they add next. Read one bounded page with
-  `session_markers_page(conn, source, session_id, limit, after)`, which uses
-  the same `(ts_ms IS NULL, ts_ms, id)` keyset as tool calls and file edits,
-  or, from an embedder on the crate's default features,
-  `SessionStore::session_markers_page` — a marker an embedder can sync and
-  cannot read back is a write-only table for everyone outside this workspace.
-  `SessionEvent` gains `raw_kind`, the provider-native record or block type an
-  event came from, returned by both `session_events` and `session_events_page`
-  and carried by the normalized source-evidence row contract, so a
-  `tool_result` synthesized from a `system` subagent notification stays
-  distinguishable from one that came from a `tool_result` content block.
-  Grok's own markers, added separately, move onto this model: its `detail_json`
-  becomes `payload_json` and its readable `text` keeps a column of its own, so
-  one `kind` reads the same whichever provider wrote it. A database written by
-  the first marker shape is migrated forward by `session_markers_v2`, which
-  copies every payload across before the old column is dropped.
-  `HYDRATION_PARSER_VERSION` is 7 and the global sync state generations advance
-  to `claude_sessions_v4` / `codex_rollouts_v6`, so an existing install re-reads
-  each transcript once — a marker exists nowhere but the transcript, and the
-  parser version alone only invalidates targeted hydration checkpoints.
-  napi/TS/MCP exposure is not included.
-- Record per-tool-result fidelity on `session_events`: `tool_use_id`,
-  `payload_bytes`, `payload_truncated`, `payload_hash`, `call_index`,
-  `event_index`, `result_status`, `event_source`, `error_signal`,
-  `subagent_session_id`, `agent_id`. Bytes and hash are measured over the
-  provider's **raw** payload before the `text` column is materialized — a
-  string as-is, any other JSON stable-stringified with sorted keys — so a
-  measurement here and one taken by relayburn's `stable_stringify` /
-  `content_hash` compare equal. `payload_truncated` records that the harness
-  had already cut the output. Every column is null when the provider does not
-  record it, never a stand-in zero. Claude also indexes `type: "system"`
-  subagent notifications as tool results carrying the delegated child's
-  `subagent_session_id` / `agent_id`; Codex writes results with
-  `result_status = 'unknown'` and settles them from the turn's out-of-band
-  signals (`exit_code`, `patch_apply`, `mcp_err`) at `task_complete`. End of
-  file is not a turn boundary — a live rollout can still report a failure after
-  the bytes a sync read — so a partial read records the failures it saw and
-  leaves the rest `unknown`. A result with no displayable text (a silent
-  command, a structured payload with no text member) is recorded too, with its
-  measured zero-byte payload, rather than dropped. Added by the
-  `session_events_tool_result_fidelity_v1` marker migration, which also adds
-  `session_hydration_checkpoints.last_tool_result_index`; a database written
-  before this shape is routed through the writable open rather than read as
-  current. Plain `sync` runs one recorded backfill pass per provider, re-reading
-  a transcript whose indexed tool results have no `event_index`, so an upgraded
-  install backfills them instead of skipping every unchanged file on the stamp
-  fast path and reporting a successful sync over permanently null columns. The
-  pass is recorded only after a walk that read every file whose recorded stamp
-  would otherwise skip it next time — a failed provider read is propagated
-  rather than silently read as an empty file, and the walk reports that failure
-  after indexing the rest of the tree, so the source is classified as failed
-  instead of reporting a cache it does not have — and that walk reached every
-  rollout root the database has indexed from. The pass is bounded by a recorded generation rather than by
-  "a null row exists",
-  because local and remote observations share `(source, session_id)` and an
-  adapter may contribute a tool result with no fidelity that re-reading the
-  local transcript can never repair.
-  `HYDRATION_PARSER_VERSION` 4 -> 5.
-
-- Validate submitted `session_events` fidelity on the source-adapter boundary:
-  `payload_bytes`, `call_index` and `event_index` must be non-negative,
-  `result_status`, `event_source` and `error_signal` must come from the
-  documented vocabularies, and all of them must be null on a row that is not a
-  tool result. The TypeScript SDK types these as closed unions and casts
-  without re-checking, so an unvalidated synonym would reach consumers looking
-  exactly like a value they were told to expect.
-
-- Add `session_user_turns_page(conn, source, session_id, limit, after)`:
-  one keyset page of user turns, each with the ordered
-  `[{kind, tool_use_id, byte_len, is_error}]` blocks its message carried,
-  derived from `session_events` rather than a second table. A turn is what
-  arrived on one user message, and carries the `preceding_message_id` /
-  `following_message_id` the sourcing contract asks for: the nearest messages
-  recorded either side of it, from either side of the conversation, null only
-  where the session recorded no named message on that side. An event the
-  provider left unnamed is passed over rather than nulling the field -- it is
-  not a message a consumer could reference, and the named message behind it
-  still borders the turn. A block's `is_error` is `true` for a
-  `result_status` of `errored` or `cancelled`, `false` for `completed`, and
-  `null` only while the outcome is genuinely undecided — a terminal status the
-  provider stated is never reported as unknown. Membership is asserted through `event_source`
-  rather than inferred from `role`: only `tool_result` means "a block inside a
-  message", so a Claude subagent notification and a Codex
-  `function_call_output` — both stored with `role = 'tool_result'`, both
-  carrying their own `message_id` — are excluded instead of each becoming a
-  turn of its own. Codex has no in-message grouping, so a Codex turn is the
-  prompt alone; its tool results are read through the event APIs. The turn headers and the per-turn block
-  reads share one deferred read transaction, so a concurrent sync cannot
-  produce a page whose headers and blocks come from different snapshots. `approx_tokens` is
-  deliberately not computed — every estimate available here is a
-  bytes-per-token heuristic, and one served beside measured values is
-  indistinguishable from a measurement at the call site.
-  Carried by `SESSION_EVIDENCE_CONTRACT_VERSION` 2, which the per-message raw
-  provider facts already claimed: both landed unreleased, so 2 means the
-  fidelity columns and the user-turn page as well.
-
-- Refuse a read-only `SessionStore::open` on a database older than the session
-  event shape this version reads, naming the remedy. A writable open migrates;
-  a read-only handle cannot, and the napi read path answers the same mismatch
-  by reopening writable — which a read-only embedder has asked not to happen.
-  Without the check the store opened and the first user-turn read died on
-  `no such column` inside a query.
-
-- Publish `ai-hist` as one crate (the former `ai-hist-core` and
-  `ai-hist-engine` packages). Default features expose `SessionStore`, evidence
-  structs, `Source`, and `Error`. Optional features: `delivery`,
-  `opencode-backup`, `git-hooks`. Workspace crates enable `unstable-internal`
-  for connection-level maintenance APIs. Cargo semver is the Rust contract;
-  the crate version matches the npm release line.
-
-- Add `ai-hist resume <query>` (prints the native resume command for the
-  best-matching session) and `ai-hist pack <query>` (a compact, token-budgeted
-  context block for handing a session to a different agent/tool) to the
-  published npm CLI, matching the existing native Rust CLI's commands.
-
-- Populate `projectId` on every cloud-sync envelope (repo slug from
-  `history.project` or the session cwd's git remote, including relative
-  forms such as `./repo`; the explicit string `unknown` when neither is
-  known). Emit `filesTouched` from `session_file_edits` /
-  `session_file_edits_page`, `session_outcome` envelopes from
-  `session_commit_links` (`shippedAt` from evidence `commit_time_ms`;
-  event ids include source and match method), and re-push revised
-  trajectories through a `(updated_ms, rowid)` keyset. An upgraded client
-  re-upserts previously synced history once (`capture_version` on the
-  cursor). Sessions whose `file_edits` grow after the last prompt
-  envelope republish `filesTouched`.
-
-- Add targeted remote hydration for Claude Code web sessions through the
-  provider's bounded teleport-evidence interface, and partial Codex cloud task
-  hydration through `codex cloud diff`. Hydration contract v2 reports honest
-  `full`, `partial`, and `shallow_only` capabilities, file-edit counts, and
-  stable connector/auth/missing/partial failure codes.
-- Relate a Claude remote session to its materialized local continuation only
-  when the local provider record contains the exact `remoteSessionId`; title or
-  repository similarity never creates a canonical relationship.
-
-- Expose per-tool-result fidelity across the Node boundary. `SessionEvent`
-  gains `toolUseId`, `payloadBytes`, `payloadTruncated`, `payloadHash`,
-  `callIndex`, `eventIndex`, `resultStatus`, `eventSource`, `errorSignal`,
-  `subagentSessionId` and `agentId`, and the new
-  `getSessionUserTurnsPage(source, sessionId, options?)` —
-  with `getSessionUserTurns()` and the `sessionUserTurns()` iterator in the
-  TypeScript SDK — returns one keyset page of user turns and their ordered
-  blocks, each naming the messages either side of it. Native contract
-  16 -> 17 (the project-identity work landed 16 in parallel, so a build
-  carrying both answers with 17); session-evidence contract stays 2 and now
-  covers these fields too.
-
-### Breaking
-
-- Bump the native-addon contract from 17 to 18 for the usage surface below. An older
-  addon is rejected rather than served a shape it does not implement.
-
-### Added
-
-- Normalize token usage in the core crate. `ai_hist::normalize_usage` turns a
-  provider's stored `token_json` into a `NormalizedUsage`: input always
-  excludes cache reads, Anthropic's `cache_creation.ephemeral_5m`/`1h` split is
-  preserved, `provider_total_tokens` is what the provider wrote and is never
-  recomputed, and `reported_cost_usd` appears only when the source data carried
-  a cost. A negative, fractional, non-finite, or out-of-range counter is a
-  `UsageError` with a stable code, never a clamped zero, and a `UsageCoverage`
-  records which counters the provider actually wrote so a reported zero stays
-  distinguishable from silence.
-
-- Capture the provider's own request identity on `session_events`:
-  `request_id` (Claude's `requestId`) and `provider_message_id`
-  (`message.id`), both stored verbatim. The pre-existing `message_id` column
-  holds each JSONL record's `uuid`, and one Claude request is written as
-  several records, so only these establish which rows belong to one API call.
-  Hydration parser version 5 -> 6 so existing sessions backfill them; until a
-  session is re-parsed its requests carry an `unresolved-request-identity`
-  diagnostic and its rollup reports no totals rather than one figure per
-  content block.
-
-- Carry `request_id` and `provider_message_id` through the session-event
-  evidence contract and on the normalized `SessionEvent`, so a remotely
-  hydrated Claude session and a connector supplying normalized events both
-  keep the request identity their records had.
-
-- Add per-request usage records and a session rollup. The `session_requests`
-  view is one row per model request — Claude's per-content-block copies of
-  `message.usage` collapse into one — read with `session_requests_page` /
-  `getSessionRequestsPage` (keyset on `(firstTsMs, id)`) and
-  `session_usage_summary` / `getSessionUsage`, plus the MCP tools
-  `get_session_requests` and `get_session_usage`. Session usage contract 1. A
-  session with no usage evidence reports `null`, not zeros. See
-  [docs/usage-accounting.md](docs/usage-accounting.md).
-
-- Move prompt usage attribution out of the commercial plugin into
-  `ai_hist::attribute_usage_to_prompts`, refusal semantics unchanged; the
-  plugin keeps its wire shape and becomes a thin caller.
-
-### Breaking
-
-- The native-addon contract is now 18 and the session evidence contract is now
-  2: `session_events` rows carry the per-message raw provider facts and the
-  per-tool-result fidelity columns (see Added). Hydration parser version 3 re-parses existing databases once on the
-  next `sessions hydrate` so rows already indexed gain the facts instead of
-  staying null forever, and the `session_events_raw_facts_v1` schema marker is
-  required, so the first read of an existing database is routed through a
-  writable open that migrates it. Delivery capture triggers that were created
-  before a captured table gained a column are now rebuilt rather than left in
-  place by `CREATE TRIGGER IF NOT EXISTS`; without that they would go on
-  reporting successful delivery while silently emitting the old column list.
-  The read-only schema check validates each capture trigger's payload rather
-  than only its name, so a database that gained a column under a
-  `--no-default-features` build — which migrates the table but compiles the
-  rebuild out — is routed through the writable open that rebuilds the trigger
-  instead of passing a fast path the names alone satisfy.
-  `session_events` also gains `raw_facts_version`, stamped by the local parser
-  on every event it writes: plain `sync` runs one recorded backfill pass per
-  provider and reads that column to pick the transcripts to re-read, telling a
-  row indexed before the facts existed from one whose facts the provider never
-  recorded. Without the pass a migrated database skipped every unchanged
-  transcript on the stamp fast path and left the six columns null forever while
-  reporting a successful sync. The pass is bounded by a recorded generation
-  rather than by "an unstamped row exists", because local and remote
-  observations share `(source, session_id)` and an adapter contributes rows
-  through the evidence path, which does not carry the column — re-reading the
-  local transcript can never stamp those. Claude selects sidecar transcripts
-  through `session_relationships.evidence_locator` as well as
-  `sessions.raw_path`, since a subagent sidecar has no catalog row of its own,
-  and the generation is recorded only when this run saw every file the sync
-  state already names, since a walk that could not read them has not
-  backfilled them. Availability is judged per file rather than per root: a
-  partially mounted archive returns some known paths and not others. A known
-  path this run did not see also loses its stamp, so a file that comes back is
-  read afresh instead of skipped on a stamp nothing watched — which is also
-  what keeps a genuinely deleted file cheap, costing one further sync rather
-  than leaving the pass pending forever. The checkpoint merge honours that
-  removal: it folds a run's keys over the state already on disk and cannot
-  express a delete, so the dropped paths are carried as an instruction that the
-  merge applies and then discards, rather than living only in the run's own
-  copy of the map. A transcript this run enumerated but could not read counts
-  as unobserved rather than as an empty file: both parsers read with
-  `unwrap_or_default()`, so a permission change, a swapped-out path or an I/O
-  error would otherwise be stamped as seen and leave that path's rows null for
-  good.
-
-- Hydration contract 3; local hydration no longer claims `full` for
-  prompt-only providers. `capability` is computed from the evidence kinds the
-  selected provider's parser actually produces, declared per adapter as
-  `ShallowSessionProvider::evidence_kinds`, instead of being the literal
-  `"full"` for every local source. `HydrateSessionResult` gains
-  `coverage` (the covered kinds, in canonical order) and a
-  `HYDRATION_PARTIAL_COVERAGE` diagnostic naming what is absent, and
-  `discovery_state` is read back off the catalog row rather than asserted.
-  Cursor, Grok and OpenCode now return `capability: "partial"` with
-  `coverage: ["history"]`; Claude and Codex return `"full"` when related
-  evidence is requested and fully acquired, and `"partial"` without
-  `relationship` when `includeRelated: false`, which never reads delegation
-  evidence. Codex also reports partial relationship coverage when a bounded
-  targeted search leaves newer rollout dates unexamined.
-  Consumers ranking merges on `capability` (`{full, partial, shallow_only}`)
-  will see prompt-only presences drop below full ones, which is the point.
-- Add truthful OpenCode SQL work counters to discovery summaries. The catalog
-  contract is now 3 and the native-addon contract is now 7; `bytes_read` no
-  longer substitutes the OpenCode database file size, and summaries add
-  `provider_queries` plus `records_inspected`.
-- Retire standalone Rust CLI release assets and the curl/source installer.
-  npm now distributes the public TypeScript SDK, Node CLI, MCP server, and
-  mandatory Node-API engine.
-- Rust engine consumers must recompile for the scoped session API. Public
-  catalog/discovery option, page, summary, and row structs now carry scope or
-  location data; that scoped-session change advanced the native/catalog
-  contract versions to 3 and 2 at the time.
-  The legacy-named `list_sessions_local*` and `discover_sessions_local*`
-  wrappers reject non-local options instead of silently rewriting them; use
-  their `*_scoped*` counterparts for `remote` or `all`.
-- Human-readable history and catalog rows now include observed locations, statistics print
-  the selected scope, and discovery summaries distinguish the requested scope
-  from the connector locations that ran. A remote-only resume match no longer
-  prints a local command; JSON reports it as unavailable and readable mode
-  exits with an explanation.
-
-- The native-addon contract also includes Claude subagent transcript identity
-  behavior: transcripts whose records carry an `agentId` are now indexed under
-  that child id instead
-  of the parent's. Hydration parser version 2 re-parses and heals existing
-  databases in place on the next `sessions hydrate`, moving those events —
-  along with the tool calls and file edits derived from them — from the parent
-  to the child rather than duplicating them, so a parent stops reporting a
-  delegated thread's actions as its own. The `session_relationships_v2` schema
-  marker is required, so the first read of an existing database is routed
-  through a writable open that migrates it.
-
-### Added
-
-- Add canonical project identity on every session and event, for every source.
-  `sessions.project_key` / `sessions.project_key_method` and
-  `session_events.project_key` carry the `origin` remote canonicalized to
-  `host/owner/repo`, or the working directory when no remote resolves, with the
-  method recorded as `remote`, `path`, or `inherited`. Two checkouts,
-  worktrees, or subdirectories of one repository now share one key, so a
-  rollup no longer splits `/Users/a/proj` from `/home/b/proj`. The rules live
-  in the new public `ai_hist::project_identity` module and match burn's
-  `crates/relayburn-sdk/src/reader/git.rs` vector for vector, so
-  `burn --group-by project` and a RelayHistory rollup agree on the same
-  checkout; `.git/config` is read directly (including a linked worktree's
-  `gitdir:` pointer) and no `git` subprocess runs. Codex's recorded
-  `session_meta.payload.git.repository_url` is preferred over resolving the
-  working directory. A delegated child whose own directory resolves to nothing
-  canonical inherits its parent's key as a post-pass over
-  `session_relationships`, so it does not depend on the order transcripts are
-  parsed in. Exposed as `projectKey` / `projectKeyMethod` on `CatalogSession`
-  and `projectKey` on `SessionEvent` (catalog contract version 4, native
-  contract version 16); filter with `ai-hist sessions list --project <key>` or
-  `listSessionCatalogPage({ projectKey })`. `ai-hist stats` now groups
-  `top_projects` by the canonical key and reports `grouped_by`; `--by-cwd`
-  restores the previous per-directory grouping. The cloud outbox's `projectId`
-  derivation reads the remote through the same helper instead of shelling out
-  to `git remote get-url`. Git's configuration is read in the scopes and
-  precedence git uses — system, then global (`$GIT_CONFIG_GLOBAL`,
-  `$XDG_CONFIG_HOME/git/config`, `~/.gitconfig`), then the repository's own —
-  with `include.path` and `includeIf` (`gitdir:`, `gitdir/i:`, `onbranch:`)
-  expanded at the position of their own line, so `url.<base>.insteadOf`
-  rewrites apply wherever they are configured, as that command does. A linked
-  worktree reads `config` from the directory `commondir` names and `HEAD` from
-  its own, and its `includeIf` conditions are evaluated against its own git
-  directory — a worktree is on a different branch from the checkout it shares a
-  repository with, which is the point of it. A rewrite is overwhelmingly a global
-  setting, and a reader that stopped at `.git/config` saw `gh:Org/Repo.git` as
-  an unresolvable remote and fell back to a path key. A remote's URL is read as the
-  list git treats it as, so a repository with a mirror configured after its
-  origin keys to the origin (matching `git remote get-url`, not
-  `git config --get`), and an IPv6 authority keeps its brackets instead of
-  being cut at the first colon of its own address. Events of a delegated thread
-  the catalog does not hold take the key of their nearest cataloged *ancestor*,
-  so a subagent that delegates again still rolls up to the repository the work
-  was done for. Existing databases migrate additively and deliberately
-  backfill no keys: a column stays `null` until the next sync or hydration
-  resolves it for real, rather than being stamped with a path key for a
-  checkout that does have a remote. A `path` key is likewise never final —
-  every pass reconsiders it, so a session whose checkout has been deleted
-  picks up the canonical key as soon as a recorded remote makes one available,
-  and a `remote` key is never downgraded. `ai-hist sessions list --project`
-  and `ai-hist stats --by-cwd` are available on the Node CLI as well as the
-  native one.
-
-- Fix three defects in the delivery worker's lease keepalive that let a live
-  claim lapse under load, allowing a second worker to dispatch the same batch:
-  the renewal cadence was measured in requested sleep rather than elapsed time
-  (so it stretched by exactly the factor the machine was overloaded by), each
-  wait was scheduled from the previous renewal instead of the lease's own
-  deadline (so a slow renewal compounded rather than corrected), and a
-  contended `SQLITE_BUSY` write was treated as a lost lease rather than
-  retried while the claim still had time to run.
-
-- Capture the per-message raw facts a provider records on the envelope rather
-  than in the message body. `session_events` gains `request_id`, `stop_reason`,
-  `agent_version`, `is_sidechain`, `is_meta` and `turn_id`, and every one is
-  stored as the provider wrote it -- `stop_reason` in particular is the
-  verbatim wire string and stays null while a turn is still in flight, because
-  its absence is how an in-progress turn is recognized. Claude supplies
-  `requestId`/`request_id`, `message.stop_reason`, `version`/`sourceVersion`,
-  `isSidechain` and `isMeta`; Codex stamps `turn_id` from each `turn_context`
-  onto every record until the next one names a different turn. The fields are
-  exposed on `SessionEvent` in Rust, on `NativeSessionEvent`, and as
-  `requestId`, `stopReason`, `agentVersion`, `isSidechain`, `isMeta` and
-  `turnId` on the SDK's `SessionEvent`. `message.usage` continues to be stored
-  verbatim, so nested `cache_creation.ephemeral_5m_input_tokens` and
-  `ephemeral_1h_input_tokens` survive a round trip; there is now a test that
-  says so.
-
-- Add first-class delegation topology. `session_relationships` gains an
-  identity status (`observed` or `unlinked`), child agent type, name, model and
-  spawn depth, the provider evidence that established the link (kind, file
-  locator, and native reference such as a Claude `toolUseId` or a Codex
-  `parent_thread_id`), the provider's spawn time, and whether the child's
-  events are independently addressable. Read it with the new
-  `getSessionRelationships`, `getSessionTree`, and `getSessionChildrenPage`
-  operations (session-relationship contract version 1), the
-  `ai-hist sessions relationships` and `ai-hist sessions tree` commands, or the
-  `get_session_relationships` and `get_session_tree` MCP tools. Traversal is
-  pre-order, deterministically ordered by `(spawned_at_ms, relationship_uid)`,
-  cycle-safe, and bounded by `max_depth` / `max_nodes`; a tree always contains
-  its root, and a repeated session reached along a second path is reported as a
-  cycle only when the edge points back into its own ancestry. Global `sync` now
-  records Codex delegation too — including a backfill for rollouts an earlier
-  version already ingested — so topology is queryable without targeted
-  hydration, and existing databases migrate automatically through the
-  `session_relationships_v2` marker. A full `sync` also treats a Claude
-  subagent sidecar as delegated evidence rather than a session: it records the
-  same observed row (or, for a sidechain the provider never named, the same
-  unlinked evidence) that targeted hydration records, keeps the child's output
-  under the child, and leaves the parent's own provider locator alone.
-- Add first-class structured access to a hydrated session's recorded tool
-  calls and file edits: `session_tool_calls_page` / `session_file_edits_page`
-  in the Rust engine, `getSessionToolCallsPage` / `getSessionFileEditsPage`
-  (plus the `sessionToolCalls` / `sessionFileEdits` async iterators and the
-  `getSessionToolCalls` / `getSessionFileEdits` collecting conveniences) in the
-  TypeScript SDK, `ai-hist sessions tools` and `ai-hist sessions edits`, and
-  MCP `get_session_tool_calls` / `get_session_file_edits`. Every one of them
-  requires both a source and a session ID, because provider session IDs
-  collide and evidence from two providers must never merge; a source this
-  build has no provider for is rejected rather than answered with an empty
-  page. Pages are keyset
-  paginated over `(ts_ms IS NULL, ts_ms, id)` — undated rows sort last and the
-  cursor's `ts_ms` is nullable — and carry session evidence contract 1.
-  File edit rows now also expose `message_id`, `structured_patch_json`,
-  `git_branch`, and `cwd`. Stored provider JSON reaches the SDK as the raw
-  indexed string and is parsed into `args` / `structuredPatch`; an absent or
-  unparseable value becomes `null` while `argsJson` / `structuredPatchJson`
-  keep the original, so one bad payload cannot fail a page. New
-  `idx_tool_calls_page_v2` and `idx_file_edits_page_v2` indexes back the access
-  path, ordering on `(source, session_id, (ts_ms IS NULL), ts_ms, id)` so a
-  page is read in order rather than sorted; existing databases add them, and
-  drop the superseded `idx_tool_calls_page` / `idx_file_edits_page` and the
-  now-redundant `idx_tool_calls_session` / `idx_file_edits_session`, on their
-  next writable open.
-- `ai-hist events --json` file-edit records additively carry `message_id`,
-  `structured_patch_json`, `git_branch`, and `cwd`.
-- Add remote provider connectors behind the existing `--remote` / `--all`
-  acquisition scopes: `claude-web` lists claude.ai/code web sessions with the
-  OAuth sign-in the Claude Code CLI stored (`~/.claude/.credentials.json`,
-  overridable with `RELAYHISTORY_CLAUDE_CREDENTIALS`; the endpoint moves only
-  via the connector-specific `RELAYHISTORY_CLAUDE_API_BASE_URL`, guarded to
-  https-or-loopback, never via the generic `ANTHROPIC_BASE_URL`), and
-  `codex-cloud` lists Codex cloud tasks through `codex cloud list --json`,
-  paging with `--cursor` inside the CLI's 1–20 `--limit` window
-  (`~/.codex/auth.json` marks it configured). Connector rows land in the
-  shared ledger as shallow catalog rows with a `remote` presence, participate
-  in stamp-guarded rescans, and dedupe against local presences of the same
-  session. `sessions discover --remote`, `sync --remote`, and the remote half
-  of `--all` now execute configured connectors; a remote-only request on a
-  machine with no connector configured keeps failing with the established
-  `no remote provider connectors are configured` error, now naming each
-  connector's reason. Discovery summaries gain `locations_run`, the connector
-  locations that actually executed (the native-addon contract is now 4), and
-  the human summary line reports it in place of the hardcoded `local`. See
-  `docs/remote-connectors.md`.
-- Add transactional targeted session hydration through Rust, N-API, the typed
-  `hydrateSession()` SDK API, `ai-hist sessions hydrate`, and MCP
-  `hydrate_session`. The result reports indexed-through state, evidence counts,
-  related sessions, and bounded-work diagnostics without returning a transcript.
-- Add automatic `session_hydration_checkpoints` and `session_relationships`
-  migrations. Existing databases upgrade in place on their next writable open.
-- Add bounded live OpenCode hydration queries keyed by session ID; targeted
-  hydration never copies or scans the complete OpenCode database.
-- Add a real-catalog hydration benchmark that selects provider-diverse local
-  sessions and reports first-call plus unchanged-checkpoint latency.
-
-- Add a consistent session location scope to collection operations: `--local`,
-  `--remote`, and `--all` are mutually exclusive, with local as the default.
-  Listing, search, recent history, statistics, packs, and resume selection
-  filter one cached session ledger; `all`
-  deduplicates sessions that have both local and remote presences. Direct
-  session/event lookup remains scope-independent. Remote discovery and sync
-  run through the provider connectors introduced above and fail explicitly on
-  a machine where none is configured; `all` acquisition runs local adapters
-  plus every configured connector. Discovery summary `scope` is the requested
-  acquisition scope and `locations_run` names the connector locations that
-  executed, while each history/catalog row's `locations` contains observed
-  presences.
-- Add native search, recent, session, paged events, statistics, discovery,
-  catalog listing, and explicit sync operations. The native-addon contract is
-  now version 4.
-- Add deterministic bounded event pagination using `(ts_ms, id)`.
-
-- Add `ai-hist sessions list` and `ai-hist sessions discover`: a shallow session
-  catalog over every provider. `discover` enumerates candidates cheaply, orders
-  them globally by recency, and reads only bounded head/tail slices of the
-  winners; `list` serves the cached catalog with one indexed query and no
-  provider I/O. Both emit a versioned contract (`contract_version: 2`) —
-  `list --json` as one object, `discover --json` as JSONL rows, diagnostics, and
-  a closing summary with per-provider counts and operation counters. See
-  `docs/session-catalog.md`.
-- Extend the `sessions` catalog table with `first_prompt`, `models_json`,
-  `originator`, `agent_version`, `repo_url`, `initial_commit`,
-  `workspace_roots_json`, `source_stamp`, and `discovery_state`, plus the
-  `idx_sessions_source_last` and `idx_sessions_raw_path` indexes. Existing
-  databases migrate in place on the next open.
-- Add `session_presences(source, session_id, location, raw_locator,
-  source_stamp, discovery_state)`, backfill existing local evidence, and expose
-  each catalog row's aggregated `locations` in catalog contract version 2.
-- Expose `listSessions` and `discoverSessions` from the napi binding, so a Node
-  host can drive the catalog in-process instead of shelling out.
-- The npm-installed `ai-hist --version` reports the SDK package version and can
-  notify interactive users when a newer npm release exists. The best-effort
-  check has a 3-second timeout and is suppressed with `--no-warning` or
-  `RELAYHISTORY_NO_UPDATE_CHECK=1`.
-
-### Breaking
-
-- Remove the legacy Python CLI and the public `ai-hist-python` and
-  `ai-hist-rust` compatibility launchers. `AI_HIST_CLI` is no longer supported;
-  the source-checkout launcher exits with an explanatory error when it is set.
-- Make installation Rust-only. Upgrades remove recognized installer-managed
-  legacy launchers and report both removals and unrecognized files left intact.
+## [0.33.0] - 2026-10-02
 
 ### Changed
 
-- Replace OpenCode shallow discovery's full-database SQLite backup with a
-  coherent transaction on the live read-only database. A limited request
-  fetches at most that many candidate sessions and uses only provider-supplied
-  session/message/part indexes for selected-session metadata. Missing optional
-  schema elements or indexes now omit affected shallow fields instead of
-  scanning or mutating provider tables. WAL appends, busy stores, malformed and
-  partial rows, database replacement, and query-plan/scaling regressions have
-  dedicated coverage.
-- Recognize current Codex Desktop `response_item/message` user turns in both
-  bounded session discovery and full ingestion. Existing Codex rollout indexes
-  are repaired automatically, while adjacent legacy/current mirror records are
-  collapsed without removing intentionally repeated prompts.
-- Replace Python-based installer and end-to-end verification with shell,
-  SQLite, Node.js, and the public Rust CLI interfaces.
-- The earlier OpenCode private-snapshot optimization reduced repeated scans,
-  but has now been superseded by the bounded live read-only path above.
-- Shallow discovery's per-candidate catalog statements (candidate
-  classification, skip markers, the discovery upsert) execute through the
-  prepared-statement cache, and the upsert hands back the merged catalog row
-  via `RETURNING` instead of a second lookup. Discovery's catalog
-  transactions commit at WAL's NORMAL durability, scoped to each transaction
-  and restored before rows are emitted: discovery writes only catalog rows a
-  provider rescan reproduces, while user-created records (tags, commit
-  links) — including any an `on_row` callback writes through the same
-  connection — keep the database's default FULL durability.
-- `init_db` applies the schema in one transaction when the database needs it,
-  and takes no write lock at all when the schema is already current. The
-  unused `idx_sessions_cwd`, `idx_sessions_branch`, `idx_sessions_last`, and
-  `idx_sessions_source_last` indexes are dropped — nothing queries them, and
-  each was one more btree per catalog write.
+- `sync` and `watch` write each Claude transcript and Codex rollout in a transaction, so a failed transcript leaves no partial rows and a cold sync is much faster (37.3 s -> 13.4 s on a 100 MB store).
+- The change feed stamps a new `revision` only when an update actually changes a row, so re-reads, hydration and repeated observations no longer re-report identical rows to `changes_since`; `session_relationships.updated_ms` and `session_observations.updated_ms` now mean the time the row last changed.
+
+### Fixed
+
+- A sweep no longer stalls other writers for up to ~30 s while a read is active: it checkpoints the WAL `PASSIVE` and escalates to `TRUNCATE` only past 4 MiB with a short busy budget (`compact` still truncates).
+- Reading a session's user turns no longer scans the session once per turn (`session_user_turns_page` and `SessionStore::session` on a 50,000-event session: ~100 s -> ~35 ms).
+- Continuity reconciliation no longer scans every event of a source per pending transcript on each sync; the next writable open builds the partial index `idx_session_events_claude_uid_unmatched`.
+- `session_events` and `SessionStore::session` read events in index order instead of sorting them in a temporary b-tree.
+- A `watch` tick or `SessionStore::sync` that wrote nothing skips digesting every catalog row to compute `changed`.
+
+## [0.32.3] - 2026-09-30
+
+### Breaking Changes
+
+- SDK `search()` and MCP `search_history` now run the same search as `ai-hist search`: they match session events (assistant text, tool calls and results) as well as prompts and return `SearchMatch` rows, a `HistoryEntry` plus `matchSource` (`history` | `session_event`), `role` and `kind`.
+- `search` takes `role` (`all` by default, `user`, `assistant`, or `prompt` for the old prompts-only result) on the SDK, MCP and both CLIs' `--role`; `resume` and `pack` search with `prompt`.
+- A prompt that a hydrated session also recorded as the same user turn matches once, as its `history` row, and a non-raw query no longer matches an event's indexed `role`, so searching for `assistant` or `user` does not return every event of that role.
+- `search` and `recent` take inclusive `sinceMs`/`untilMs` and an `after` cursor `{ timestampMs, id, matchSource? }` on every surface (SDK, MCP `since_ms`/`until_ms`/`after`, TS CLI `--since-ms`/`--until-ms`/`--after`, native CLI `--after-ms`/`--after-id`/`--after-match-source`).
+- Newest-first reads order by `(timestamp, id)`, so rows sharing a timestamp page without skips or repeats; `sinceMs > untilMs` or an unknown cursor `matchSource` is `INVALID_ARGUMENT`.
+- Native contract 22 -> 23 -> 24 -> 25 (search matches and `role`, keyset pagination, change-feed ops `changes`/`commit_changes`); an SDK paired with an addon of another contract fails at load with `NATIVE_CONTRACT_MISMATCH`.
+- `trajectory_fts` and the legacy `trajectories_ai/au/ad` triggers are dropped on writable open, fixing a change-feed migration that failed with `SQLITE_CORRUPT_VTAB` on older databases whose index had drifted.
+
+### Added
+
+- SDK `searchPage()` and `recentPage()` return one page plus a `nextCursor` (`null` when nothing further exists).
+- Muse Code (`muse`) is a first-class source: sessions under `$XDG_DATA_HOME/muse/sessions` are discovered, synced, hydrated and live-captured with prompts, prose, thinking, tool calls, file edits, token usage, models and lifecycle markers, subagents link to their parent as `delegated` children, and `ai-hist resume` prints `muse resume <id>`.
+- Grok per-inference usage is read from `<GROK_HOME>/logs/unified.jsonl`, falling back to a turn's own usage where the log does not cover it, with `GROK_UNIFIED_LOG_UNREADABLE`, `GROK_USAGE_MIXED_SOURCES` and `GROK_USAGE_PARTIAL` caveats.
+- Grok sessions recover their model from `_meta.modelId`, `modelUsage`, `summary.json` `current_model_id`/`model_id`, or the head of `events.jsonl` when `summary.json` is missing.
+- The SDK reads the revision-stamped change feed with `getChangesPage()`, `changesSince()` and `commitChanges(consumer, position)`, filtered by `kinds` and session, and exports `CHANGE_KINDS` and the `ChangeKind`, `Watermark`, `FeedChange`, `ChangesPage` and `CommittedCursor` types.
+- Evidence rows (`session_events`, `tool_calls`, `file_edits`, `session_markers`) record `location` (`local` / `remote` / `both`), and a local re-read no longer deletes remote-supplied evidence for the same session.
+- A `HistorySource` plugin can declare `location: 'local'` with absolute `roots` to run beside the built-in parsers for `local` and `all` scope; `docs/remote-connectors.md` is now `docs/source-plugins.md`.
+- MCP `list_relay_agents`, `relay_status`, `join_relay` and `leave_relay` list live Agent Relay participants and let the calling session join or leave over the local desktop socket, without any Relaycast token in ai-hist.
+- The CLI reports a schema migration on stderr while it runs, `onStoreMigration()` delivers the same events to SDK callers, and `migrateStore()` runs the migration explicitly; requires native contract 26.
+
+### Deprecated
+
+- `beforeMs` / `before_ms` / `--before-ms` keep their exclusive semantics but are deprecated in favor of `untilMs` and `after`, since they skip rows tied on the boundary timestamp.
+
+### Fixed
+
+- Forked Codex rollouts no longer re-index the parent's replayed prompts, events and token totals under the child; the first `sync` repairs existing forks once.
+- Grok messages that reuse an ACP `eventId` no longer overwrite each other; every Grok session is re-read once by `sync` and hydration.
+- Syncs over unchanged files skip re-reading and re-querying them, cutting a post-append sync on a 100 MB store from 1.77 s to 0.39 s; the first writable open after upgrading builds the new `idx_session_events_project` index.
+
+### Rust API
+
+- Added `Source::Muse` and `ProviderRoots::muse` (`from_env` honours `XDG_DATA_HOME`).
+
+## [0.31.0] - 2026-09-29
+
+### Added
+
+- OpenCode discovery, `sync`, `sync-opencode`, hydration and live capture read every release-channel database (`opencode.db`, `opencode-stable.db`, `opencode-nightly.db`, ...), not only `opencode.db`; `OPENCODE_DB` and `sync-opencode --opencode-db` still name exactly one store.
+- Grok per-turn usage (`turn_completed.usage`) is stored and normalized as `per-request` usage, `source_accounting("grok")` is `per-request`, and `session_requests` reports one request per Grok turn; indexed Grok sessions re-read once.
+- Cursor, Grok and OpenCode `tool_result` events carry the same fidelity fields as Claude and Codex (`payload_bytes`, `payload_hash`, `result_status`, `error_signal`, ...), and `error_signal` gains `tool_status`; indexed Cursor and Grok sessions re-parse once.
+- New `ai-hist compact [--json]` reclaims unused space in the history database without deleting rows, refusing while a sync runs or when the volume lacks room for the rewrite.
+- `ai-hist doctor` reports `reclaimable` bytes (`reclaimable_bytes` under `--json`) and suggests `compact` when enough of the file is free pages.
+
+### Fixed
+
+- Codex forks (`forked_from_id`) and spawned subagents (`parent_thread_id`) are recorded as `fork` edges, and `guardian_review` subagent rollouts are hidden from the root catalog; indexed rollouts re-read once on the next `sync`.
+- `ai-hist export` refuses to write over the database it is reading (including via `--db`, relative paths, symlinks, hard links and `-wal`/`-shm`/`-journal` sidecars) and exits non-zero before touching anything.
+- `ai-hist export` writes to a temporary file and renames it into place, so a failed export leaves an existing destination untouched.
+- Claude discovery and `sync` no longer index the subagent workflow `journal.jsonl` as a transcript, and evidence earlier builds derived from it is retracted on the next sync.
+- Claude requests written as streamed snapshots report their final usage instead of being refused as `ambiguous-usage-copies`; existing databases are settled on the next writable open.
+- Claude `<synthetic>` assistant records (local API-error and login notices) are stored as `local_notice` markers and no longer count as requests, models or `last_assistant_text`; existing rows are repaired on the next writable open.
+- A sweep no longer re-runs the Codex project/branch backfill over every indexed Codex session, so unrelated source changes no longer re-stamp every Codex row in the change feed.
+- Claude `sync` no longer scans every Claude event per transcript without its own session row, making incremental and cold syncs substantially faster.
+
+### Rust API
+
+- `ProviderRoots` gains `opencode_db_pinned`, set by `from_env` when `OPENCODE_DB` is set, to read `opencode_db` alone instead of every channel database beside it.
+
+## [0.30.0] - 2026-09-28
+
+### Breaking Changes
+
+- Native contract 21 -> 22: an SDK/addon mismatch fails at load with `NATIVE_CONTRACT_MISMATCH`, and `historyExport` accepts only `create_export`, `export_page`, `close_export` and `expire_exports` (the `EXPORT_RETENTION_LIMIT` and `DELIVERY_RETENTION_LIMIT` error codes are gone).
+- Uploads are no longer part of `ai-hist` (team uploads come from the Agent Relay desktop app); `@relayhistory/capture`, its platform helper packages, the `relayhistory-plugin` crate and the `agent-relay-probe` assets are no longer published.
+- The SDK drops `deliveryRequest`, `createHistoryDelivery`, `runHistoryDelivery` and the other `*HistoryDelivery*` functions and types, along with the `HISTORY_DELIVERY_MOVED` error; the native addon drops `historyDelivery` and `historyDeliveryDrain`.
+- The CLI drops `ai-hist delivery ...`, `ai-hist plugin COMMAND` and the `--job`, `--poll-ms`, `--timeout-ms`, `--base-url`, `--label`, `--max-content` and `--token` flags.
+- The MCP server drops `delivery_status`, `delivery_pause`, `delivery_resume` and `delivery_retry`, and `AI_HIST_PLUGIN_CONFIG` loads source connectors only.
+- `HistoryPlugin` loses `commands` and `tools` and `HistoryPluginRegistry` loses `command()` and `registeredTools()`, so plugins contribute only `sources` and `destinations`; the history config file loses `job`.
+- The store keeps no upload capture journal or retention budget, so evidence writes are never refused for retention; the first writable open drops the old capture triggers and indexes, and uploaders read the change feed instead.
+- An export snapshot is one read transaction that sees the store as it stood when opened, `beginHistoryExport` cursors resume only within the process that opened them, and records are `schema_version` 2 with `record_id` and `revision` matching the change feed.
+
+### Added
+
+- `createHandoff()` / `resumeHandoff()` and MCP `create_handoff` / `resume_handoff` hand a session to another agent in the same workspace via a pointer plus a self-describing intent (at most 4,000 characters), with no receiver skill required.
+
+### Rust API
+
+- The `export` feature is local export only: `ExportSnapshot` replaces `create_export`, `export_page`, `close_export` and `expire_exports`, `EXPORT_SCHEMA_VERSION` is 2, the `export::capture` module, retention and compaction APIs and the `delivery` feature alias are removed, and the default-feature surface is unchanged.
+
+## [0.29.0] - 2026-09-25
+
+### Rust API
+
+- `SessionStore::has_session(&SessionIdentity)` reports whether the store holds anything under one identity, by the same tables and rules as `session_identities`.
+- `session_identities` skips an empty source as well as an empty session id, so every listed session can be selected and drained.
+
+## [0.28.0] - 2026-09-25
+
+### Rust API
+
+- `ChangeQuery::session(source, session_id)` restricts a change-feed drain to one session, tombstones included, through per-table indexes; combining it with a named consumer is `Error::InvalidArgument`.
+- `SessionStore::session_identities(IdentityQuery { after, limit })` pages every `(source_name, session_id)` the store holds evidence under, catalogued or not, including sources this build does not know.
+- `storage::session_identities_after` covers every evidence table rather than only the catalog, prompts and events, and reads each page on one snapshot.
+- The first writable open adds `idx_sessions_identity`; until then a read-only store answers `session_identities` with `StaleSchema`.
+
+## [0.27.1] - 2026-09-25
+
+### Rust API
+
+- The change feed covers every evidence table: `ChangeKind` gains `History`, `Presence`, `CommitLink`, `Trajectory`, `SourceObservation` and `ObservationEvidence` (`ChangeKind::ALL` lists twelve), and existing databases stamp the new rows once on open.
+- A named cursor stored as `*` now spans all twelve kinds; a consumer that passed the original six kinds as an explicit list now fails with `ConsumerKindsMismatch` and must drain under a new consumer name or resync from `Watermark::START`.
+- `Change` gains `columns: Option<StoredRow>` (every stored column but `revision`, as SQLite holds it) and `key`, the record's identity, on upserts and tombstones alike; `EvidenceRow::History(HistoryEntry)` types prompt rows and `EvidenceRow::Untyped` marks kinds without a typed row.
+- `Change::source` is now `Option<Source>` with `Change::source_name` holding the stored name, so a row from a source this build does not know no longer fails the drain.
+
+## [0.27.0] - 2026-09-24
+
+### Breaking Changes
+
+- Native contract 19 -> 21: the `ai-hist-native` addon adds `historyExport(requestJson, dbPath)` and the `sessionStoreCall(op, argsJson)` dispatcher, and pairing the new SDK with an older platform package fails at load with `NATIVE_CONTRACT_MISMATCH`.
+
+### Added
+
+- `getSessionMarkersPage(source, sessionId, {limit, after})`, `sessionMarkers()`, `getSessionMarkers()`, MCP `get_session_markers` and `ai-hist sessions markers SOURCE SESSION_ID` on both CLIs read a session's markers (kind, subkind, text and parsed payload), undated markers last.
+- `getSourceCapabilities(source)` and MCP `get_source_capabilities` report which evidence kinds a source's hydration covers, whether it can ever report `full`, and what it establishes about delegation, before any sync.
+- `ai-hist sessions usage SOURCE SESSION_ID [--json]` on both CLIs prints the provider-reported usage rollup; usage is never estimated and cost appears only when the source data carried one.
+- Session events carry `control_kind` (TypeScript `controlKind`), typing harness-written user-role rows that are not prompts: slash-command records, task notifications, hook output, bash passthrough, system reminders, Codex context wrappers, `meta` and resume markers.
+- A Claude slash command's caveat, invocation and output records are grouped into one `session_markers` row of `kind = "slash_command"` carrying the command name, args, mode and output size.
+
+### Changed
+
+- SDK `getSessionRequestsPage`, `getSessionUsage` and `getSessionUserTurnsPage` read through `sessionStoreCall`: a missing database answers an empty page without being created, and failures carry the store's typed codes (`QUERY_FAILED` as `DATABASE_QUERY_FAILED`); the old typed native exports remain until a later major.
+- `history`, `sessions.first_prompt`, user turns and prompt usage attribution exclude control rows: a task notification or bare `/resume <id>` is no longer a history row or session title, `<system-reminder>` blocks become their own rows, and a slash command's answer is charged to the human prompt before it.
+- The relayhistory plugin no longer publishes control rows as conversation turns, and rewrites sessions an earlier release published with them in place.
+- `SESSION_EVIDENCE_CONTRACT_VERSION` 2 -> 3 on the Rust and TypeScript sides; `HYDRATION_PARSER_VERSION` 10 -> 11 and `SHALLOW_SCANNER_VERSION` 5 -> 6 re-read existing sessions once on the next hydration or `sync`, retiring rows the previous parser stored differently.
+
+### Fixed
+
+- A `/resume` preceded by a system reminder is now detected for session continuity.
+
+### Rust API
+
+- `SessionStore` is now the whole default surface of the `ai-hist` crate, with no raw connection or contract constant, documented in `docs/sourcing-sdk.md` with a standalone `examples/rust-consumer` against the published crate.
+- `StoreOptions` gains `roots: Option<ProviderRoots>`, resolved once at `open` and used by `sync`, `hydrate`, `watch` and `Source::capabilities().watch_roots(&roots)`.
+- `SessionStore::discover(DiscoveryOptions)` sweeps every local provider's sessions from metadata as `Shallow` rows without hydrating or taking the `SyncRunLock`.
+- `sync` takes `SyncOptions { force, lock_timeout_ms }` plus a `progress` `ProgressObserver`, reports `swept` and the changed `SessionRef`s, and returns `Error::SyncLocked` after the timeout instead of silently skipping a held lock.
+- `discover`, `sync` and `hydrate` take an optional `StopToken`; a stopped call returns `Error::Cancelled` (`CANCELLED`) at the next provider, file or record boundary.
+- New `hydrate(&SessionRef, HydrateOptions)` (by id or transcript path), `watch(WatchOptions)` returning a `WatchHandle` iterator of `TickReport`s, and `sessions(CatalogQuery)` walking the catalog.
+- `session(&SessionRef, SessionQuery)` returns one session's `SessionEvidence` (prompts, messages, tool calls and results, file edits, markers, relationships, requests, usage, user turns, coverage) on one SQLite snapshot, with JSON columns parsed and `SessionQuery { include_text, kinds }` limiting what is read.
+- `Block::control: Option<ControlKind>` and `SessionEvent::control_kind` classify user-role rows that are not human prompts.
+- `Source::capabilities()` declares a source's evidence kinds, relationship capabilities, usage accounting mode, message-id provenance, path hydration and watch roots; `Source::ALL` lists every source.
+- `Error` is an enum whose `code()` mirrors the TypeScript native error codes plus `SyncLocked`, `SourceMismatch`, `StaleSchema`, `WatermarkAheadOfStore` and `ConsumerKindsMismatch`; `Error::is_stale_schema()` marks the one failure fixed by reopening writable.
+- A read-only `open` also checks the marker, relationship and per-request usage schema, refusing up front with `Error::StaleSchema` instead of failing inside a read.
+- Facade value types are `#[non_exhaustive]`, `Clone`, `Serialize`, `Deserialize` and `PartialEq`; `CatalogIter` and `WatchHandle` are not value types.
+- Removed `SessionStore::session_user_turns_page`, `session_markers_page`, `session_requests_page` and `session_usage`; use the matching `SessionEvidence` fields.
+- `EvidenceRecord::{exists, matches_canonical, remove, write}` are crate-private, leaving no `rusqlite` types in the default public API.
+- `SessionStore::changes_since(from, ChangeQuery)` is a revision-stamped change feed over sessions, events, tool calls, file edits, markers and relationships, yielding typed `Upsert` rows and `Delete` tombstones in revision order.
+- Named consumers resume with `Watermark::CONSUMER` and advance only via `Changes::commit()`; cursors never move backward and are bound to the kind set they were committed for (`ConsumerKindsMismatch` otherwise).
+- A `Watermark` carries its database's `epoch`, so one from a replaced database or beyond the head fails with `ErrorKind::WatermarkAheadOfStore` via `Error::kind()`; `SessionStore::head_revision()` and `SyncReport::head_revision` report the head.
+- Existing databases are stamped once on first writable open so a replay from `Watermark::START` reports everything; a re-parse re-stamps rows, so consumers must treat a re-seen `record_key` as a replace, and incomplete messages are withheld until they finish.
+- `ShallowSession` and `SessionRelationship` are re-exported on the default feature set.
+
+## [0.24.0] - 2026-09-21
+
+### Added
+
+- `ai-hist watch` wakes on filesystem events across every provider session root, the flat `~/.claude/history.jsonl` / `~/.codex/history.jsonl` logs and `.trajectories` directories, with a 200 ms debounce and a 30 s backstop poll; new `--no-fsevents` and `--debounce-ms` flags sit beside `--interval`.
+- The watcher backend is behind the optional `fs-events` crate feature, which the CLI enables; a `--no-default-features` build polls.
+- `ai-hist ingest --hook claude [--quiet] [--json]` reads a Claude Code lifecycle-hook payload from stdin and hydrates only the transcript it names, reporting `mismatched` and ingesting nothing when the payload's session id and file disagree; it always exits 0 (see `docs/agent-integration.md` for wiring).
+
+### Changed
+
+- `ai-hist watch` reports at startup which roots are still pending, and picks up a provider root created after it started (or deleted and recreated) within seconds, without a restart.
+- `sync` skips unchanged sources using a stat-only fingerprint stored in `.sync-state.json`, so a tick over unchanged sources opens no files; filesystem-event ticks always sweep.
+- The sync fingerprint is invalidated by parser upgrades and by lost evidence, so a session that loses rows (a partial backup restore, a truncated write) is re-ingested instead of being skipped indefinitely.
+
+### Fixed
+
+- `ai-hist watch` no longer drops a change that arrives during a manual `tick()`, while another process holds the sync lock, or when a sweep fails; the sweep is retried promptly instead of waiting for the backstop.
+- `ai-hist watch` matches events for roots given as relative paths or reached through symlinks, and clamps every interval to seven days so an absurd `--debounce-ms` cannot stall capture.
+- `watch --remote` no longer watches local roots, so local writes cannot trigger remote connector traffic.
+- A file `sync` could not read leaves the fingerprint stale so the next tick retries it instead of caching the failure.
+
+## [0.23.0] - 2026-09-21
+
+### Rust API
+
+- New `session_markers` table records previously dropped transcript records (compaction and summary boundaries, provider `system` rows, image/document/redacted-thinking blocks, Codex lifecycle events), with unknown provider types stored as `kind = "unknown"` and payloads size-bounded; read with `session_markers_page` or `SessionStore::session_markers_page`.
+- `SessionEvent` gains `raw_kind`, the provider-native record or block type each event came from.
+- Grok markers move onto the shared marker model (`detail_json` becomes `payload_json`), migrated forward by `session_markers_v2`.
+- `HYDRATION_PARSER_VERSION` 7 and new sync generations make an existing install re-read each Claude and Codex transcript once.
+
+## [0.22.1] - 2026-09-21
+
+### Breaking Changes
+
+- Native contract 17 -> 19 for the usage surface and request-identity fields; an older addon is rejected at load.
+
+### Added
+
+- Per-request usage records and a session rollup: `getSessionRequestsPage` / `getSessionUsage` and MCP `get_session_requests` / `get_session_usage` return one row per model request (Claude's per-content-block copies collapsed), and a session with no usage evidence reports `null` rather than zeros.
+- `session_events` capture the provider's request identity as `request_id` and `provider_message_id`, carried through the evidence contract; sessions backfill on re-parse, and until then report an `unresolved-request-identity` diagnostic and no usage totals.
+
+### Rust API
+
+- `ai_hist::normalize_usage` turns stored `token_json` into a `NormalizedUsage` (input excludes cache reads, Anthropic 5m/1h cache-creation split preserved, provider totals never recomputed), rejecting invalid counters with a coded `UsageError` and recording coverage so a reported zero is distinguishable from an absent counter.
+- `ai_hist::attribute_usage_to_prompts` now hosts prompt usage attribution formerly in the commercial plugin, with unchanged semantics.
+- `session_requests_page` and `session_usage_summary` expose per-request usage and the session rollup.
+
+## [0.21.0] - 2026-09-21
+
+### Added
+
+- Session relationships record `continuation`, `fork` and `resume` edges with an `origin_session_id`, derived only from explicit provider evidence (never similarity); unresolved evidence reports `RELATIONSHIP_CONTINUITY_UNRESOLVED` until the missing transcript is hydrated.
+- `getSessionTree` and `getSessionChildrenPage` accept `relationshipKinds` (default delegation only, so existing output is unchanged), and `getSessionRelationships` returns continuity on a separate `continuity` array.
+- `SessionEvent` gains per-tool-result fidelity fields (`toolUseId`, `payloadBytes`, `payloadTruncated`, `payloadHash`, `callIndex`, `eventIndex`, `resultStatus`, `eventSource`, `errorSignal`, `subagentSessionId`, `agentId`), null when the provider did not record them.
+- New `getSessionUserTurnsPage(source, sessionId, options?)`, plus `getSessionUserTurns()` and the `sessionUserTurns()` iterator in the SDK, return user turns with their ordered tool-result blocks and the neighbouring message ids.
+- Native contract 16 -> 17; `SESSION_RELATIONSHIP_CONTRACT_VERSION` 1 -> 2. Plain `sync` re-reads existing transcripts once to backfill continuity and fidelity data.
+
+### Rust API
+
+- `session_events` store per-tool-result fidelity columns, with payload size and hash measured over the raw provider payload so they compare equal to relayburn's `content_hash`; Claude subagent notifications are indexed as tool results, and Codex results settle from turn signals at `task_complete`.
+- Source adapters' submitted fidelity fields are validated against the documented vocabularies and non-negative ranges.
+- New `session_user_turns_page(conn, source, session_id, limit, after)` returns a keyset page of user turns with their tool-result blocks, read from one snapshot.
+- A read-only `SessionStore::open` on a database older than the current event shape fails with an error naming the remedy instead of failing later on `no such column`.
+
+## [0.20.0] - 2026-09-20
+
+### Breaking Changes
+
+- Hydration contract 3: local hydration reports `capability` from the evidence kinds a provider's parser actually produces, adding `coverage` and a `HYDRATION_PARTIAL_COVERAGE` diagnostic; Cursor, Grok and OpenCode now return `partial` with `coverage: ["history"]`, and Claude/Codex return `partial` when related evidence is not requested or not fully acquired.
+- Session evidence contract 1 -> 2 for the per-message raw provider facts below; existing databases are migrated on first open and re-parsed once by `sessions hydrate` and plain `sync`.
+
+### Added
+
+- `SessionEvent` carries per-message provider facts as `requestId`, `stopReason` (verbatim, null while a turn is in flight), `agentVersion`, `isSidechain`, `isMeta` and `turnId`, captured from Claude envelopes and Codex `turn_context`.
+
+### Fixed
+
+- Delivery capture triggers that predate a column on their table are rebuilt rather than kept by `CREATE TRIGGER IF NOT EXISTS` and silently emitting the old column list.
+- `sync` no longer leaves backfilled columns permanently null when a transcript was unreadable or a mount was partially available; such files are re-read on a later sync.
+
+## [0.19.0] - 2026-09-20
+
+### Added
+
+- Every session and event carries a canonical project identity, exposed as `projectKey` / `projectKeyMethod` on `CatalogSession` and `projectKey` on `SessionEvent`: the `origin` remote as `host/owner/repo` (resolved without running `git`, honouring global `insteadOf` rewrites and includes), else the working directory, with delegated children inheriting their parent's key.
+- Checkouts, worktrees and subdirectories of one repository share one key, matching `burn --group-by project`.
+- `ai-hist sessions list --project <key>` and `listSessionCatalogPage({ projectKey })` filter by project, and `ai-hist stats` groups `top_projects` by project key (reporting `grouped_by`), with `--by-cwd` restoring per-directory grouping.
+- Native contract 15 -> 16; catalog contract 4. Existing databases gain the columns without a backfill, and keys fill in on the next sync or hydration.
+
+### Fixed
+
+- The delivery worker's lease keepalive no longer lets a live claim lapse under load (letting a second worker dispatch the same batch); renewals track elapsed time against the lease deadline and retry `SQLITE_BUSY`.
+
+### Rust API
+
+- New public `ai_hist::project_identity` module holds the project-key canonicalization rules.
+
+## [0.18.8] - 2026-09-19
+
+### Rust API
+
+- The Rust engine publishes as one `ai-hist` crate (replacing `ai-hist-core` and `ai-hist-engine`), versioned with the npm release line; default features expose `SessionStore`, evidence structs, `Source`, and `Error`, with optional `delivery`, `opencode-backup`, and `git-hooks` features.
+
+## [0.18.1] - 2026-09-18
+
+### Added
+
+- New `ai-hist/relay-cli` export: `createRelayCliSurface()` returns a `RelayCliSurface` (contract v1, id `relayhistory`) that hosts such as `agent-relay sessions` mount, built from the same command table as the `ai-hist` bin.
+- `createRelayCliSurface({ cloud })` accepts a `@relayhistory/cloud-client` and adds `cloud list|events|search|thread|turns|digest|coverage`; without a client those commands are hidden and running one points to `agent-relay login`.
+
+### Fixed
+
+- The CLI accepts `--acquisition-timeout-ms` for `sessions discover`, `sessions hydrate`, and `sync` instead of failing with `unknown option`.
+- The npm package no longer ships compiled test files.
+
+## [0.16.0] - 2026-09-13
+
+### Breaking Changes
+
+- Native contract 10 -> 11. Cloud auth results include expiry, org, and workspace metadata, and discovery counters include `providerQueries` and `recordsInspected`.
+
+### Changed
+
+- Cloud credentials resolve only through the Rust stage store, so session thread reads use the same eligibility checks and locked, atomic token rotation as native cloud operations.
+- Stage selection honours `RELAYHISTORY_BASE_URL` before `AI_HIST_BASE_URL` and rejects malformed values.
+
+## [0.15.2] - 2026-09-09
+
+### Added
+
+- `getSessionThread()` and MCP `get_session_thread` return a session's cloud-linked lifecycle (shipped commits, pull requests, reviews, incidents, tickets, Slack threads, hotfixes, and follow-up sessions), filterable by `kinds`, `since`, `cursor`, and `limit`.
+
+## [0.14.3] - 2026-09-07
+
+### Added
+
+- The npm CLI adds `ai-hist resume <query>`, which prints the native resume command for the best-matching session, and `ai-hist pack <query>`, which builds a token-budgeted context block for handing a session to another agent.
+
+## [0.14.1] - 2026-09-04
+
+### Changed
+
+- Cloud sync envelopes always carry a `projectId` (repo slug from the history project or the session cwd's git remote, else `unknown`), and sessions publish `filesTouched` from their file edits, republishing it when edits grow.
+- Cloud sync pushes `session_outcome` envelopes from commit links and re-pushes revised trajectories; upgraded clients re-upsert previously synced history once.
+
+## [0.14.0] - 2026-09-02
+
+### Added
+
+- The SDK exports `SOURCES` and `CATALOG_SOURCES` registries with `isSource()` and `isCatalogSource()` guards for validating source input.
+
+## [0.13.0] - 2026-09-02
+
+### Breaking Changes
+
+- Native contract 5 -> 7 and session-catalog contract 2 -> 3.
+- Discovery summaries report OpenCode work as `provider_queries` and `records_inspected`, and `bytes_read` no longer substitutes the OpenCode database file size.
+- Claude subagent transcripts whose records carry an `agentId` are indexed under the child session instead of the parent; the next `sessions hydrate` moves existing events, tool calls, and file edits to the child.
+
+### Added
+
+- Delegation topology: `getSessionRelationships()`, `getSessionTree()`, `getSessionChildrenPage()`, the `sessionDescendants()` and `sessionEventsIncludingDescendants()` iterators, `ai-hist sessions relationships` / `ai-hist sessions tree`, and MCP `get_session_relationships` / `get_session_tree`.
+- Relationships record identity status (`observed` or `unlinked`), child agent type, name, model, spawn depth, provider evidence, and spawn time, and trees are deterministic, cycle-safe, bounded by `max_depth` / `max_nodes`, and always include the root.
+- A full `sync` records Codex delegation (including previously ingested rollouts) and treats Claude subagent sidecars as delegated evidence rather than separate sessions, so topology is queryable without hydration.
+- Targeted hydration works for Claude Code web sessions and, partially, for Codex cloud tasks via `codex cloud diff`; hydration contract v2 reports `full`, `partial`, or `shallow_only` capability, file-edit counts, and stable connector/auth/missing/partial error codes.
+- A remote Claude session is related to its local continuation only when the local record contains the exact `remoteSessionId`.
+
+### Changed
+
+- OpenCode shallow discovery reads the live database in one read-only transaction instead of backing it up, fetches at most `limit` candidates, and omits fields whose optional schema or indexes are missing rather than scanning.
+
+## [0.12.0] - 2026-09-01
+
+### Added
+
+- Paginated tool-call and file-edit access per session: `getSessionToolCallsPage()` / `getSessionFileEditsPage()`, the `sessionToolCalls` / `sessionFileEdits` iterators, `getSessionToolCalls` / `getSessionFileEdits`, `ai-hist sessions tools` / `ai-hist sessions edits`, and MCP `get_session_tool_calls` / `get_session_file_edits` (session evidence contract 1).
+- These operations require both a source and a session ID so providers sharing a session ID never mix, and an unknown source raises `InvalidArgumentError` instead of returning an empty page.
+- Pages sort undated records last with a `{ tsMs: number | null; id }` cursor, and parsed `args` / `structuredPatch` fall back to `null` while `argsJson` / `structuredPatchJson` keep the raw string; `parseStoredJson(raw)` is exported.
+- File-edit records, including `ai-hist events --json`, carry `message_id`, `structured_patch_json`, `git_branch`, and `cwd`.
+
+### Changed
+
+- Native contract 4 -> 5.
+
+## [0.11.0] - 2026-09-01
+
+### Added
+
+- Remote connectors run behind `--remote` / `--all` and `scope: 'remote'`: `claude-web` lists claude.ai/code sessions using the Claude Code CLI sign-in, and `codex-cloud` lists Codex cloud tasks via `codex cloud list --json`.
+- Remote rows land in the shared catalog with a `remote` presence and dedupe against local presences of the same session.
+- `RELAYHISTORY_CLAUDE_CREDENTIALS` overrides the Claude credentials path and `RELAYHISTORY_CLAUDE_API_BASE_URL` (https or loopback only) overrides the endpoint.
+- Discovery results report `locations_run` / `locationsRun`, the connector locations that actually executed.
+
+### Changed
+
+- With no connector configured, remote requests still fail with `no remote provider connectors are configured` (`UNSUPPORTED_OPERATION` in the SDK), now naming each connector's reason.
+- MCP `discover_sessions` and `sync` are declared open-world.
+
+## [0.10.0] - 2026-09-01
+
+### Added
+
+- Targeted session hydration via `hydrateSession()`, `ai-hist sessions hydrate`, and MCP `hydrate_session` reports indexed-through state, evidence counts, related sessions, and diagnostics without returning a transcript (hydration contract 1).
+- OpenCode hydration queries the live database by session ID instead of copying or scanning it.
+- Existing databases gain hydration checkpoint and session relationship tables on their next writable open.
+
+### Changed
+
+- Native contract 3 -> 4.
+
+## [0.9.2] - 2026-08-31
+
+### Changed
+
+- Shallow discovery writes the catalog faster through cached statements, single-step upserts, and relaxed durability for rebuildable catalog rows only.
+- Opening a database with a current schema takes no write lock, and four unused `sessions` indexes are dropped to speed up catalog writes.
+
+## [0.9.1] - 2026-08-31
+
+### Breaking Changes
+
+- Native contract 2 -> 3 and session-catalog contract 1 -> 2.
+- Human-readable history and catalog rows show observed locations, statistics print the selected scope, and a remote-only `resume` match no longer prints a local command.
+
+### Added
+
+- `--local`, `--remote`, and `--all` (SDK `SessionScope`, MCP `scope`) select session location for discovery, listing, search, recent history, statistics, packs, resume, and sync, defaulting to local; `all` deduplicates sessions present in both.
+- Catalog rows report their `local` and/or `remote` `locations`, and catalog pages, discovery, statistics, and sync results echo the applied scope.
+
+### Fixed
+
+- Current Codex Desktop `response_item/message` user turns are recognized in discovery and ingestion, and existing Codex indexes are repaired automatically.
+
+### Rust API
+
+- Catalog and discovery option, page, summary, and row structs carry scope and location data; `list_sessions_local*` and `discover_sessions_local*` reject non-local options, so use the `*_scoped*` variants for `remote` or `all`.
+
+## [0.8.2] - 2026-08-30
+
+### Breaking Changes
+
+- npm now distributes the TypeScript SDK, Node CLI, MCP server, and a mandatory `ai-hist-native` Node-API engine (native contract 2); standalone Rust CLI release assets and the curl/source installer are retired.
+- The synchronous `openAiHist()` / `AiHist` snapshot API is replaced by top-level async native-backed functions.
+- `sql.js`, the JSONL/trajectory fallback scanners, CLI subprocess bridges, and `AI_HIST_RUST_BIN` are removed.
+- Shallow discovery and full sync are explicit operations; cache-only reads never trigger them.
+
+### Added
+
+- Native-backed discovery, catalog pages, session history, paged session events, search, recent history, statistics, and sync, with event pages ordered by `(ts_ms, id)`.
+- Stable errors for unsupported or missing platforms, native load or version mismatches, and database failures.
+- The public `ai-hist` CLI ships from the npm package, with native packages for macOS, glibc and musl Linux, and Windows x64.
+- `ai-hist --version` reports the package version and can notify interactive users of a newer release; disable with `--no-warning` or `RELAYHISTORY_NO_UPDATE_CHECK=1`.
+
+## [0.6.0] - 2026-08-30
+
+### Breaking Changes
+
+- The legacy Python CLI and the `ai-hist-python` / `ai-hist-rust` launchers are removed, and `AI_HIST_CLI` is no longer supported.
+- Installation is Rust-only; upgrades remove recognized legacy launchers and report any unrecognized files left in place.
+
+### Added
+
+- `ai-hist sessions discover` builds a shallow session catalog across providers, reading only bounded slices of the most recent sessions, and `ai-hist sessions list` serves it with no provider I/O (session-catalog contract 1).
+- `listSessionCatalog()` and `listSessionCatalogPage()` return catalog rows (`CatalogSession`) newest first, with a `CatalogCursor` that walks the whole catalog without skipping or repeating tied timestamps.
+- `discoverSessions()` runs discovery and streams rows through `onSession`, throwing `DiscoveryError` with diagnostics, summary, stderr, and exit code when the run fails or reports an unsupported contract version.
+- MCP `list_sessions` returns catalog rows with `nextCursor`, and answers an empty catalog without scanning provider files when no database exists.
+- The napi binding exposes `listSessions` and `discoverSessions` for in-process use.
+- The `sessions` table gains `first_prompt`, `models_json`, `originator`, `agent_version`, `repo_url`, `initial_commit`, `workspace_roots_json`, `source_stamp`, and `discovery_state`; existing databases migrate on open.
+
+### Changed
+
+- Catalog cursors missing `source` or `sessionId` throw a `TypeError`, and a negative `limit` throws a `RangeError`.
+
+### Fixed
+
+- Exceptions thrown by `onSession` or `onDiagnostic` abort discovery and reject the promise instead of escaping as unhandled errors.
+
+## [0.5.0] - 2026-08-20
+
+### Added
+
+- `getSessionEvents(sessionId, { source? })` returns a session's normalized transcript (text, thinking, tool calls, and results) with per-event `tokenUsage`.
+- `getToolCalls(sessionId, { source? })` returns a session's tool calls with typed `isError`.
+
+## [0.4.1] - 2026-07-07
+
+### Added
+
+- `pushToCloud` (`ai-hist/cloud`) runs `ai-hist push --json` in-process for hosts, and `resolveAiHistBinary` is exported.
+
+## [0.3.7] - 2026-06-27
+
+### Added
+
+- Cloud client module with `loginCloud` and `loadStoredRelayhistoryAuth`.
+
+## [0.3.5] - 2026-06-24
+
+### Added
+
+- Grok history source.
+
+## [0.3.4] - 2026-06-20
+
+### Changed
+
+- The public `ai-hist` command defaults to the Rust CLI, including sync, show/context/session, stats, pack, resume, export/import, and tagging.
+- A one-command installer installs the `ai-hist`, `ai-hist-rust`, and `ai-hist-python` launchers without manual Cargo steps.
+- The legacy Python CLI remains available via `AI_HIST_CLI=python` or `ai-hist-python`.
+
+### Fixed
+
+- The Rust default database path honours `XDG_DATA_HOME`.
+- Rust database initialization creates the legacy session metadata schema and enables WAL mode.
+- The legacy Python fallback imports on Python 3.9.
+
+## [0.3.2] - 2026-06-12
+
+### Added
+
+- MCP project scope argument.
+
+## [0.3.1] - 2026-06-06
+
+### Added
+
+- The `ai-hist-mcp` package provides a TypeScript MCP server with Smithery config.
+- MCP can read ai-hist trajectories as a source.
+
+## [0.2.3] - 2026-05-22
+
+### Changed
+
+- `listSessions` is about 68x faster.
+
+## [0.2.1] - 2026-05-22
+
+### Added
+
+- The SDK reads provider JSONL natively and works without the Python CLI.
+
+[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.34.1...HEAD
+[0.34.1]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.34.0...sdk-ts-v0.34.1
+[0.34.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.33.0...sdk-ts-v0.34.0
+[0.33.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.32.3...sdk-ts-v0.33.0
+[0.32.3]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.31.0...sdk-ts-v0.32.3
+[0.31.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.30.0...sdk-ts-v0.31.0
+[0.30.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.29.0...sdk-ts-v0.30.0
+[0.29.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.28.0...sdk-ts-v0.29.0
+[0.28.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.27.1...sdk-ts-v0.28.0
+[0.27.1]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.27.0...sdk-ts-v0.27.1
+[0.27.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.24.0...sdk-ts-v0.27.0
+[0.24.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.23.0...sdk-ts-v0.24.0
+[0.23.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.22.1...sdk-ts-v0.23.0
+[0.22.1]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.21.0...sdk-ts-v0.22.1
+[0.21.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.20.0...sdk-ts-v0.21.0
+[0.20.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.19.0...sdk-ts-v0.20.0
+[0.19.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.18.8...sdk-ts-v0.19.0
+[0.18.8]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.18.1...sdk-ts-v0.18.8
+[0.18.1]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.16.0...sdk-ts-v0.18.1
+[0.16.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.15.2...sdk-ts-v0.16.0
+[0.15.2]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.14.3...sdk-ts-v0.15.2
+[0.14.3]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.14.1...sdk-ts-v0.14.3
+[0.14.1]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.14.0...sdk-ts-v0.14.1
+[0.14.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.13.0...sdk-ts-v0.14.0
+[0.13.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.12.0...sdk-ts-v0.13.0
+[0.12.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.11.0...sdk-ts-v0.12.0
+[0.11.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.10.0...sdk-ts-v0.11.0
+[0.10.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.9.2...sdk-ts-v0.10.0
+[0.9.2]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.9.1...sdk-ts-v0.9.2
+[0.9.1]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.8.2...sdk-ts-v0.9.1
+[0.8.2]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.6.0...sdk-ts-v0.8.2
+[0.6.0]: https://github.com/AgentWorkforce/relayhistory/releases/tag/sdk-ts-v0.6.0
+[0.4.1]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.3.7...sdk-ts-v0.4.1
+[0.3.7]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.3.5...sdk-ts-v0.3.7
+[0.3.5]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.3.4...sdk-ts-v0.3.5
+[0.3.4]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.3.2...sdk-ts-v0.3.4
+[0.3.2]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.3.1...sdk-ts-v0.3.2
+[0.3.1]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.2.3...sdk-ts-v0.3.1
+[0.2.3]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.2.1...sdk-ts-v0.2.3
+[0.2.1]: https://github.com/AgentWorkforce/relayhistory/releases/tag/sdk-ts-v0.2.1

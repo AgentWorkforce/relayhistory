@@ -156,3 +156,41 @@ exit 0
   git(work, "fetch", "origin", "main");
   assert.equal(git(work, "show", "origin/main:version.txt"), "0.21.2");
 });
+
+test("re-cuts the changelog when entries landed during the release", async () => {
+  const { work, other, startSha } = await stageRepos();
+  const pending = (entries, level = "Patch") =>
+    `# Changelog\n\n## [Unreleased - ${level}]\n\n### Fixed\n\n${entries}\n\n## [0.21.1] - 2026-09-20\n\n### Fixed\n\n- Older\n`;
+  await writeFile(join(work, "CHANGELOG.md"), pending("- Shipped fix"));
+  git(work, "add", "CHANGELOG.md");
+  git(work, "commit", "-m", "fix: shipped");
+  git(work, "push", "origin", "main");
+  git(other, "pull", "origin", "main");
+  const releaseStart = git(work, "rev-parse", "HEAD");
+
+  const cut = spawnSync(
+    process.execPath,
+    [join(scripts, "cut-changelog.mjs"), "--version", "0.21.2", "--date", "2026-09-21"],
+    { cwd: work, encoding: "utf8" },
+  );
+  assert.equal(cut.status, 0, cut.stderr);
+  await writeFile(join(work, "version.txt"), "0.21.2\n");
+  git(work, "add", "version.txt", "CHANGELOG.md");
+  git(work, "commit", "-m", "chore: release 0.21.2");
+
+  await writeFile(join(other, "CHANGELOG.md"), pending("- Shipped fix\n- Landed during publish", "Minor"));
+  git(other, "add", "CHANGELOG.md");
+  git(other, "commit", "-m", "fix: land during publish");
+  git(other, "push", "origin", "main");
+
+  const result = persistRelease(work, "main", releaseStart, { VERSION: "0.21.2" });
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stdout, /re-cutting 0\.21\.2 \(2026-09-21\)/);
+  git(work, "fetch", "origin", "main");
+  assert.equal(git(work, "show", "origin/main:version.txt"), "0.21.2");
+  const changelog = git(work, "show", "origin/main:CHANGELOG.md");
+  assert.match(
+    changelog,
+    /## \[Unreleased\]\n\n## \[0\.21\.2\] - 2026-09-21\n\n### Fixed\n\n- Shipped fix\n- Landed during publish\n\n## \[0\.21\.1\]/,
+  );
+});
