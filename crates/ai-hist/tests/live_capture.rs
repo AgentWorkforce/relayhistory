@@ -512,9 +512,50 @@ fn writes_owed_behind_a_held_lock_are_swept_soon_after_it_is_released() {
         .expect("the owed change was never swept after the lock was released");
     let waited = at.duration_since(released);
     assert!(
-        waited < Duration::from_millis(1_500),
+        waited < Duration::from_millis(2_000),
         "the owed change waited {waited:?} after the lock was free"
     );
+}
+
+/// An owed retry keeps its own backoff even when the filesystem backstop is
+/// configured below that cadence, including zero in pure polling mode.
+#[test]
+fn contended_retries_do_not_spin_with_a_short_or_zero_slow_poll() {
+    for slow_poll_ms in [0, 20] {
+        let (sender, attempts) = mpsc::channel();
+        let tick: TickFn = Arc::new(move |force| {
+            assert!(force, "only the owed change should drive these attempts");
+            let _ = sender.send(std::time::Instant::now());
+            Ok(TickOutcome {
+                contended: true,
+                ..TickOutcome::default()
+            })
+        });
+        let running = RunningLoop::start(
+            |watch| {
+                watch
+                    .with_immediate(false)
+                    .with_fs_events(false)
+                    .with_poll_interval_ms(60_000)
+                    .with_slow_poll_ms(slow_poll_ms)
+            },
+            tick,
+        );
+        running.watch.notify_change();
+        let times: Vec<_> = (0..5)
+            .map(|_| attempts.recv_timeout(ARRIVES_WITHIN).expect("owed retry"))
+            .collect();
+        // The first two waits are 250 ms; later attempts double to the 1 s
+        // cap. Assert lower bounds only: a loaded runner can delay a wake,
+        // but can never validly make this cadence faster.
+        for (pair, minimum_ms) in times.windows(2).zip([250, 250, 500, 1_000]) {
+            let waited = pair[1].duration_since(pair[0]);
+            assert!(
+                waited >= Duration::from_millis(minimum_ms),
+                "slow_poll_ms={slow_poll_ms}: retry waited {waited:?}, expected at least {minimum_ms} ms"
+            );
+        }
+    }
 }
 
 #[test]

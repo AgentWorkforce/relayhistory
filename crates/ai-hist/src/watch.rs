@@ -1109,8 +1109,7 @@ impl WatchLoop {
                 if is_retry {
                     retry_backoff = retry_backoff
                         .saturating_mul(2)
-                        .min(CONTENDED_SWEEP_RETRY_MAX_MS.min(self.slow_poll_ms))
-                        .max(CONTENDED_SWEEP_RETRY_MS.min(self.slow_poll_ms));
+                        .clamp(CONTENDED_SWEEP_RETRY_MS, CONTENDED_SWEEP_RETRY_MAX_MS);
                 }
             } else if trigger.forces_scan() {
                 // A forced sweep got through. Whatever was owed is paid, and
