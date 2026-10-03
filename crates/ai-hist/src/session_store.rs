@@ -999,6 +999,7 @@ impl SessionStore {
             .with_poll_interval_ms(opts.poll_interval_ms)
             .with_slow_poll_ms(opts.slow_poll_ms)
             .with_immediate(opts.immediate)
+            .with_leading_edge(opts.leading_edge)
             .on_report(Arc::new(move |report| {
                 let changed = std::mem::take(&mut *report_pending.lock().expect("watch pending"));
                 let tick = TickReport {
@@ -1818,6 +1819,15 @@ pub struct WatchOptions {
     pub use_fs_events: bool,
     /// Run one sweep before parking. Default `true`.
     pub immediate: bool,
+    /// Sweep a filesystem event that finds the loop quiet right away (after
+    /// a 10 ms settle that gathers one write's backend callbacks) instead of
+    /// after `debounce_ms`. Events inside the window that sweep opens
+    /// coalesce into one trailing tick when it closes, so a burst costs at
+    /// most two sweeps and sustained writes tick once per `debounce_ms`.
+    /// `false` restores the trailing-only window. Default `true`, also when
+    /// deserializing options written before this field existed.
+    #[serde(default = "default_leading_edge")]
+    pub leading_edge: bool,
     /// Cancels the tick in flight at its next provider, file or record
     /// boundary, and ends the loop: a cancelled tick arrives as a
     /// [`TickReport`] with `cancelled` set, then the iterator ends. Stopping
@@ -1837,6 +1847,7 @@ impl Default for WatchOptions {
             slow_poll_ms: crate::watch::DEFAULT_SLOW_POLL_MS,
             use_fs_events: true,
             immediate: true,
+            leading_edge: true,
             stop: None,
         }
     }
@@ -1859,6 +1870,10 @@ fn cancel_diff_fault(db_path: &Path) -> bool {
 
 /// The sending half of a watch's report stream.
 type ReportSender = mpsc::Sender<Result<TickReport, Error>>;
+
+fn default_leading_edge() -> bool {
+    true
+}
 
 /// Milliseconds in `duration`, saturating rather than truncating a value
 /// too large for `u64`.
@@ -3115,6 +3130,18 @@ mod tests {
         assert!(watch.next().is_none(), "a stopped loop ends the iterator");
         assert!(started.elapsed() < Duration::from_secs(10));
         stopping.join().unwrap();
+    }
+
+    /// Options serialized before `leading_edge` existed still load, with the
+    /// leading edge on.
+    #[test]
+    fn watch_options_without_leading_edge_deserialize_with_it_on() {
+        let options: WatchOptions = serde_json::from_str(
+            r#"{"debounce_ms":200,"poll_interval_ms":1000,"slow_poll_ms":30000,
+                "use_fs_events":true,"immediate":true}"#,
+        )
+        .expect("an older WatchOptions loads");
+        assert!(options.leading_edge);
     }
 
     /// A timeout too large to name an instant waits without one; it does not

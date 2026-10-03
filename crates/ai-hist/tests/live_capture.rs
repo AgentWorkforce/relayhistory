@@ -212,6 +212,9 @@ fn a_burst_of_change_signals_collapses_into_the_debounce_window() {
             .with_fs_events(false)
             .with_poll_interval_ms(600_000)
             .with_debounce_ms(300)
+            // The trailing-only window; the leading edge's leading + trailing
+            // shape is `a_quiet_change_is_swept_on_the_leading_edge_…`.
+            .with_leading_edge(false)
     });
 
     for _ in 0..100 {
@@ -300,6 +303,8 @@ fn a_report_times_its_sweep_and_its_first_event() {
         .with_fs_events(false)
         .with_poll_interval_ms(600_000)
         .with_debounce_ms(100)
+        // The trailing window, so the event demonstrably waits it out.
+        .with_leading_edge(false)
         .on_report(Arc::new(move |report| {
             let _ = sender.send(*report);
         })),
@@ -380,6 +385,73 @@ fn a_cancelled_tick_is_reported_and_ends_the_loop() {
         reports.try_recv().is_err(),
         "a cancelled forced tick is not retried"
     );
+}
+
+/// With the leading edge on, a change that finds the loop quiet is swept
+/// at once rather than after the debounce window, and further changes inside
+/// the window that sweep opened coalesce into exactly one trailing tick at the
+/// window's close.
+#[test]
+fn a_quiet_change_is_swept_on_the_leading_edge_and_a_burst_trails_once() {
+    let running = RunningLoop::reporting(|watch| {
+        watch
+            .with_immediate(false)
+            .with_fs_events(false)
+            .with_poll_interval_ms(600_000)
+            // Long, so "at once" and "at the window's close" cannot be
+            // confused on a loaded runner.
+            .with_debounce_ms(1_500)
+            .with_leading_edge(true)
+    });
+
+    let signalled = std::time::Instant::now();
+    running.watch.notify_change();
+    assert_eq!(running.next_tick(), Ok(true), "the leading tick is forced");
+    let leading = signalled.elapsed();
+    assert!(
+        leading < Duration::from_millis(750),
+        "a quiet change must not wait out the 1.5 s window: {leading:?}"
+    );
+
+    // A burst inside the window the leading tick opened.
+    for _ in 0..20 {
+        running.watch.notify_change();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(running.next_tick(), Ok(true), "the trailing tick is forced");
+    let trailing = signalled.elapsed();
+    assert!(
+        trailing >= Duration::from_millis(1_400),
+        "the burst must wait for the window to close: {trailing:?}"
+    );
+    assert_eq!(
+        running.ticks.recv_timeout(Duration::from_millis(2_000)),
+        Err(RecvTimeoutError::Timeout),
+        "a burst costs one leading and one trailing sweep, no more"
+    );
+
+    // Quiet again: the next change leads once more.
+    let again = std::time::Instant::now();
+    running.watch.notify_change();
+    assert_eq!(running.next_tick(), Ok(true));
+    assert!(again.elapsed() < Duration::from_millis(750));
+}
+
+/// The trailing-only window is still there for a caller that asks for it.
+#[test]
+fn without_the_leading_edge_a_change_waits_out_the_window() {
+    let running = RunningLoop::reporting(|watch| {
+        watch
+            .with_immediate(false)
+            .with_fs_events(false)
+            .with_poll_interval_ms(600_000)
+            .with_debounce_ms(400)
+            .with_leading_edge(false)
+    });
+    let signalled = std::time::Instant::now();
+    running.watch.notify_change();
+    assert_eq!(running.next_tick(), Ok(true));
+    assert!(signalled.elapsed() >= Duration::from_millis(400));
 }
 
 #[test]

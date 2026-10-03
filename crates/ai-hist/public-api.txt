@@ -817,6 +817,7 @@ pub fn ai_hist::WatchHandle::drop(&mut self)
 #[non_exhaustive] pub struct ai_hist::WatchOptions
 pub ai_hist::WatchOptions::debounce_ms: u64
 pub ai_hist::WatchOptions::immediate: bool
+pub ai_hist::WatchOptions::leading_edge: bool
 pub ai_hist::WatchOptions::poll_interval_ms: u64
 pub ai_hist::WatchOptions::slow_poll_ms: u64
 pub ai_hist::WatchOptions::stop: core::option::Option<ai_hist::StopToken>
