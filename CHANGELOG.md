@@ -718,6 +718,15 @@ Notable changes to the native `ai-hist` CLI are documented here.
   unchanged (#311).
 
 
+
+- Live capture: writes made while another process holds the sync lock are
+  swept within about a second of its release, not at the backstop (#364).
+  The owed retry backed off once per contended *event* tick, up to
+  `slow_poll_ms`, and each new event pushed its deadline later, so a burst
+  during a long foreign sweep could wait 30-60 s after the lock was free. It
+  now backs off only per attempt of the owed retry (250 ms doubling to a
+  1 s cap), a new event keeps the earlier deadline, and a forced sweep that
+  gets through resets it.
 - Live capture: one write is one forced sweep again. The debounce window
   re-armed on the events inside it, so a write the backend reported in more
   than one callback — FSEvents does for a create or a multi-line append —
