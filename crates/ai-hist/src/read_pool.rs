@@ -96,6 +96,9 @@ pub(crate) struct ReadPool {
     /// SQLite resolves URI syntax (including percent escaping and query
     /// parameters) for us at store open. Empty/in-memory filenames stay absent.
     identity_path: Option<PathBuf>,
+    /// A relative URI is resolved against the process directory at open.
+    /// If that directory changes, its cached filename cannot vouch for it.
+    uri_cwd: Option<PathBuf>,
 }
 
 impl fmt::Debug for ReadPool {
@@ -116,6 +119,7 @@ impl ReadPool {
                 .path()
                 .filter(|path| !path.is_empty())
                 .map(PathBuf::from),
+            uri_cwd: std::env::current_dir().ok(),
         }
     }
 
@@ -130,10 +134,22 @@ impl ReadPool {
         path: &Path,
         after_identity: impl FnOnce(),
     ) -> Result<PooledConnection, Error> {
-        let identity_path = if path.to_str().is_some_and(|path| path.starts_with("file:")) {
+        let uri = path.to_str().is_some_and(|path| path.starts_with("file:"));
+        let identity_path = if uri {
             self.identity_path.as_deref().unwrap_or(path)
         } else {
             path
+        };
+        // Without parsing or rewriting SQLite URI options, conservatively
+        // avoid reuse if the directory against which SQLite resolved them
+        // changed. This preserves fresh-open behavior for relative URIs;
+        // absolute URIs merely miss the cache after a directory change.
+        let identity_now = || {
+            if uri && (self.uri_cwd.is_none() || std::env::current_dir().ok() != self.uri_cwd) {
+                None
+            } else {
+                file_identity(identity_path)
+            }
         };
         // Check within the checkout lock, then again after selecting an idle
         // connection. A replacement while waiting for that lock or between
@@ -142,11 +158,11 @@ impl ReadPool {
             .idle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let identity = file_identity(identity_path);
+        let identity = identity_now();
         after_identity();
         idle.retain(|entry| Some(&entry.identity) == identity.as_ref());
         if let Some(entry) = idle.pop() {
-            if file_identity(identity_path).as_ref() == Some(&entry.identity) {
+            if identity_now().as_ref() == Some(&entry.identity) {
                 return Ok(PooledConnection {
                     conn: Some(entry.conn),
                     identity: Some(entry.identity),
@@ -160,10 +176,10 @@ impl ReadPool {
         // Both snapshots surround open. If they differ, this connection may
         // target the old file and must never be tagged with the new identity.
         for _ in 0..3 {
-            let identity = file_identity(identity_path);
+            let identity = identity_now();
             let conn = open_db_readonly(path)
                 .map_err(|error| Error::DatabaseOpen(format!("{error:#}")))?;
-            if identity != file_identity(identity_path) {
+            if identity != identity_now() {
                 continue;
             }
             let pool = identity.as_ref().map(|_| Arc::clone(self));
@@ -379,6 +395,65 @@ mod tests {
         }
         assert_eq!(pool.idle(), 1);
         assert_eq!(cache_size(&pool.get(&uri).unwrap()), -4321);
+    }
+
+    #[test]
+    fn relative_uri_reads_follow_directory_changes_without_pooling_the_wrong_file() {
+        const CHILD: &str = "AI_HIST_READ_POOL_CWD_CHILD";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let root = PathBuf::from(root);
+            let uri = Path::new("file:history.db?mode=ro");
+            let seed = open_db_readonly(uri).unwrap();
+            let pool = Arc::new(ReadPool::new(&seed));
+            drop(seed);
+            let value = |conn: &Connection| -> i64 {
+                conn.query_row("SELECT value FROM cwd_marker", [], |row| row.get(0))
+                    .unwrap()
+            };
+            let old = pool.get(uri).unwrap();
+            old.pragma_update(None, "cache_size", -2468).unwrap();
+            assert_eq!(value(&old), 1);
+            // Return an A connection while the process is already in B.
+            std::env::set_current_dir(root.join("b")).unwrap();
+            drop(old);
+            let new = pool.get(uri).unwrap();
+            assert_eq!(value(&new), 2);
+            assert_ne!(cache_size(&new), -2468);
+            assert_eq!(pool.idle(), 0);
+            // A connection opened in B must not be returned tagged as A,
+            // even when the directory changes back before checkin.
+            std::env::set_current_dir(root.join("a")).unwrap();
+            drop(new);
+            assert_eq!(pool.idle(), 0);
+            assert_eq!(value(&pool.get(uri).unwrap()), 1);
+            return;
+        }
+        // CWD is process-global; isolate changes from the parallel test suite.
+        let dir = tempfile::tempdir().unwrap();
+        for (name, value) in [("a", 1), ("b", 2)] {
+            let root = dir.path().join(name);
+            std::fs::create_dir(&root).unwrap();
+            let conn = open_db(&root.join("history.db")).unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TABLE cwd_marker(value); INSERT INTO cwd_marker VALUES ({value});"
+            ))
+            .unwrap();
+        }
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "read_pool::tests::relative_uri_reads_follow_directory_changes_without_pooling_the_wrong_file",
+                "--nocapture",
+            ])
+            .env(CHILD, dir.path())
+            .current_dir(dir.path().join("a"))
+            .output().unwrap();
+        assert!(
+            child.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
     }
 
     #[cfg(unix)]
