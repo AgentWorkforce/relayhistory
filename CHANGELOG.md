@@ -585,6 +585,20 @@ Notable changes to the native `ai-hist` CLI are documented here.
   `assistant` search with a term also narrows the index scan to that role's
   events. Results are unchanged.
 
+- A sweep no longer counts every repairable session's evidence three times
+  (#321). When the change-feed head has not moved since the stored
+  destination marker was taken (the proof the unforced fast path already
+  trusts), the start of the sweep reads the marker as the current holdings
+  instead of counting. The end-of-sweep re-check and the new marker reuse the
+  start's holdings and recount only the sessions the change feed shows were
+  written (row revisions and tombstones above the start head). The sweep
+  counts everything again when the feed cannot vouch: no head, a different
+  epoch, a replayable source's prompt changed in place or deleted (a prompt's
+  session is not part of its identity; an appended prompt is carried), or
+  more than 256 sessions / 20,000 rows written.
+  Same marker and same outstanding set; on the 100 MB benchmark store the
+  destination checks go from ~5% of a forced tick to ~0.1%.
+
 - When a Codex rollout grows, sync now reads only the appended turns instead
   of re-parsing the whole file (#315). It resumes through the same
   locator-keyed cursor that hydration keeps for Codex child rollouts. The
