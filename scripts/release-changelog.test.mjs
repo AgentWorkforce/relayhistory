@@ -292,6 +292,10 @@ describe("check-release-changelog.mjs", () => {
     assert.equal(low.status, 1);
     assert.match(low.stderr, /requires a Minor release, but 0\.34\.1 -> 0\.34\.2 is Patch/);
 
+    const invalid = check(dir, "--version", "xyz");
+    assert.equal(invalid.status, 1);
+    assert.equal(invalid.stderr.trim(), "Invalid release version: xyz");
+
     assert.equal(check(dir).status, 2);
   });
 });

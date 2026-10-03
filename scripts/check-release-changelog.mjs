@@ -21,6 +21,6 @@ try {
     `changelog ok: ${result.latestVersion} -> ${version} (${result.actualLevel}; pending ${result.pendingLevel ?? "none"})`,
   );
 } catch (error) {
-  console.error(`CHANGELOG.md: ${error.message}`);
+  console.error(error.message);
   process.exit(1);
 }

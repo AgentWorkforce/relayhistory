@@ -80,7 +80,7 @@ export function assertChangelogSemver(changelog, targetVersion) {
   const pendingBody = pending[2].trim();
   if (pendingBody && !pendingLevel) {
     throw new Error(
-      "Non-empty [Unreleased] must declare Patch, Minor, or Major",
+      "CHANGELOG.md: a non-empty [Unreleased] must declare Patch, Minor, or Major",
     );
   }
 
