@@ -209,6 +209,28 @@ describe("carryReleaseCut", () => {
     assert.equal(carryReleaseCut(carried, { version: "0.34.2", released, start }), carried);
   });
 
+  it("does not keep a shipped feature's level for a carried fix", () => {
+    const minorStart = changelog("Minor", "### Added\n\n- Add search");
+    const minorReleased = cutChangelog(minorStart, { version: "0.35.0", date: "2026-10-04" }).changelog;
+    const upstream = changelog("Minor", "### Added\n\n- Add search\n\n### Fixed\n\n- Fix search");
+    const carried = carryReleaseCut(upstream, { version: "0.35.0", released: minorReleased, start: minorStart });
+    assert.match(carried, /## \[Unreleased - Patch\]\n\n### Fixed\n\n- Fix search\n\n## \[0\.35\.0\]/);
+
+    const ambiguous = changelog("Minor", "### Added\n\n- Add search\n\n### Changed\n\n- Faster search");
+    assert.match(
+      carryReleaseCut(ambiguous, { version: "0.35.0", released: minorReleased, start: minorStart }),
+      /## \[Unreleased - Minor\]\n\n### Changed\n\n- Faster search/,
+    );
+  });
+
+  it("keeps a bullet whose text shipped under another section", () => {
+    const upstream = changelog("Patch", "### Fixed\n\n- Shipped fix\n\n### Rust API\n\n- Shipped fix");
+    assert.match(
+      carryReleaseCut(upstream, { version: "0.34.2", released, start }),
+      /## \[Unreleased - Patch\]\n\n### Rust API\n\n- Shipped fix\n\n## \[0\.34\.2\]/,
+    );
+  });
+
   it("leaves a bare [Unreleased] when the branch gained nothing pending", () => {
     const upstream = changelog("Patch", "### Fixed\n\n- Shipped fix").replace("# Changelog", "# Changelog\n\nEdited intro.");
     const carried = carryReleaseCut(upstream, { version: "0.34.2", released, start });

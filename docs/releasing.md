@@ -65,7 +65,8 @@ and `crates/ai-hist-napi/src/lib.rs`).
    that landed during publish does not drop the tag; if that merge added
    changelog entries and the rebase conflicts only in `CHANGELOG.md`, it inserts
    the released section as tagged into the branch's copy and leaves the
-   entries that landed during the release pending, at the branch's level. Crate and plugins depend
+   entries that landed during the release pending, at the level they need
+   (the branch's heading, lowered to `Patch` when they are only fixes). Crate and plugins depend
    on the verified core, not on that persist. If npm accepts a publish but keeps
    its version in processing beyond the wait, or a later gate fails, rerun with
    `skip_core` and this `custom_version` once npm exposes the packages. The

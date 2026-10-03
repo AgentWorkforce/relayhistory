@@ -207,6 +207,29 @@ export function levelAtLeast(level, minimum) {
   return LEVEL_RANK[level] >= LEVEL_RANK[minimum];
 }
 
+const previousVersionOf = (changelog) => latestReleasedVersion(changelog) ?? "0.0.0";
+
+/**
+ * The level of entries carried past a release. The branch's heading covered
+ * the shipped entries too, so it is only an upper bound — unless the branch
+ * raised it during the release, which only a carried entry can have done.
+ * Below that bound, the carried sections decide where they can: Breaking
+ * Changes and Added are what they always are, Fixed and Security alone are a
+ * patch; anything else keeps the bound, since it can be either.
+ */
+function carriedLevel(carried, branchLevel, startLevel, fromVersion) {
+  if (!branchLevel) return null;
+  if (!startLevel || LEVEL_RANK[branchLevel] > LEVEL_RANK[startLevel]) return branchLevel;
+  const headings = [...carried.keys()];
+  let inferred;
+  if (headings.includes("Breaking Changes")) {
+    inferred = parseVersion(fromVersion).major === 0 ? "Minor" : "Major";
+  } else if (headings.includes("Added")) inferred = "Minor";
+  else if (headings.every((heading) => heading === "Fixed" || heading === "Security")) inferred = "Patch";
+  else return branchLevel;
+  return LEVEL_RANK[inferred] < LEVEL_RANK[branchLevel] ? inferred : branchLevel;
+}
+
 /** Pending bullets as `[section, bullet]` pairs, a bullet keeping its continuation lines. */
 function pendingBullets(body) {
   const bullets = [];
@@ -238,22 +261,26 @@ export function carryReleaseCut(upstream, { version, released, start }) {
   const pending = UNRELEASED.exec(upstream);
   if (!pending) throw new Error("CHANGELOG.md has no [Unreleased] heading");
 
-  const shipped = new Set(pendingBullets(UNRELEASED.exec(start)?.[2] ?? "").map(([, text]) => text));
+  const startPending = UNRELEASED.exec(start);
+  const key = (heading, text) => JSON.stringify([heading, text]);
+  const shipped = new Set(
+    pendingBullets(startPending?.[2] ?? "").map(([heading, text]) => key(heading, text)),
+  );
   const carried = new Map();
   for (const [heading, text] of pendingBullets(pending[2])) {
-    if (shipped.has(text)) continue;
+    if (shipped.has(key(heading, text))) continue;
     if (!carried.has(heading)) carried.set(heading, []);
     carried.get(heading).push(text);
   }
   const body = [...carried]
     .map(([heading, texts]) => `${heading ? `### ${heading}\n\n` : ""}${texts.join("\n")}`)
     .join("\n\n");
-  const level = body && pending[1] ? ` - ${pending[1]}` : "";
+  const level = body ? carriedLevel(carried, pending[1], startPending?.[1], previousVersionOf(upstream)) : null;
 
   const previousVersion = latestReleasedVersion(upstream);
   const updated =
     upstream.slice(0, pending.index) +
-    `## [Unreleased${level}]\n\n${body ? `${body}\n\n` : ""}${section.trim()}\n\n` +
+    `## [Unreleased${level ? ` - ${level}` : ""}]\n\n${body ? `${body}\n\n` : ""}${section.trim()}\n\n` +
     upstream.slice(pending.index + pending[0].length);
   return previousVersion
     ? updateComparisonReferences(updated, { version, previousVersion })
