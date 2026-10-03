@@ -568,6 +568,23 @@ Notable changes to the native `ai-hist` CLI are documented here.
   On the 100 MB benchmark store this takes checkpoints from ~15% of a forced
   tick to ~3%.
 
+- `search` (CLI, SDK, MCP) returns a common term's newest matches without
+  reading every match. A query matching at least 5,000 rows walks the
+  timestamp index over growing windows of the newest rows that pass the time
+  window and cursor (2,000, 6,000, then 20,000), testing each row against the
+  FTS5 index by rowid and stopping at `limit`. A window is every row at or
+  after its N-th row's timestamp, so rows tied on that timestamp extend it.
+  The walk serves the page when a window fills it. It grows to the next window
+  while the matches so far could fill the last one at their rate (with 4x
+  slack), or when only the first window has come up empty. It falls back to
+  sorting every match, as before, after two empty windows, after the last
+  window, or when one timestamp ties a whole window's worth of rows. On a
+  500k-event store a common term drops from ~240 ms to ~3 ms, and a role,
+  source or tag filter on it from 100-320 ms to 1-8 ms. A filter no recent row
+  passes, or a large timestamp tie, costs the same as before. A `user` or
+  `assistant` search with a term also narrows the index scan to that role's
+  events. Results are unchanged.
+
 - When a Codex rollout grows, sync now reads only the appended turns instead
   of re-parsing the whole file (#315). It resumes through the same
   locator-keyed cursor that hydration keeps for Codex child rollouts. The
