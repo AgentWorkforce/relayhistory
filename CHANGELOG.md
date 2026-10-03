@@ -670,6 +670,12 @@ Notable changes to the native `ai-hist` CLI are documented here.
   0.72 s to 0.46 s. Snapshots, cursors, retries and the scan budget are
   unchanged (#308).
 
+- An abandoned export snapshot is released when its TTL elapses, not when
+  some later export call happens to sweep. A process-wide native thread
+  sleeps until the earliest expiry and ends the snapshot's read transaction,
+  so a long-lived SDK host no longer holds WAL checkpoints back indefinitely.
+  The thread holds no event-loop handle, so it never keeps Node alive (#306).
+
 - Change-feed schema reconciliation now fingerprints each evidence kind's
   exact exported column names and declared SQLite types. The one-time upgrade
   from a pre-fingerprint database restamps every existing kind above the

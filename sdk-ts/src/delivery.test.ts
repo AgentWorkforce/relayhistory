@@ -3,7 +3,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { access, cp, link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -363,6 +363,60 @@ test('export refuses the live WAL and SHM sidecars and leaves committed rows rea
       await runHistoryExportCommand({ dbPath: `file:${dbPath}`, outputPath, selectionPath });
       assert.equal((await readFile(outputPath, 'utf8')).split('\n').length, exported.split('\n').length);
     } finally { writer.close(); }
+  });
+});
+
+test('an abandoned export snapshot is released when its TTL elapses, with no further export call', async (t) => {
+  // node:sqlite ships unflagged from Node 22.5; it is the independent writer
+  // and checkpointer here.
+  const sqlite = await import('node:sqlite' as string).catch(() => null) as
+    | { DatabaseSync: new (path: string) => {
+        exec(sql: string): void; prepare(sql: string): { get(): unknown }; close(): void } }
+    | null;
+  if (!sqlite) { t.skip('node:sqlite is unavailable on this runtime'); return; }
+  await fixture(async dbPath => {
+    const writer = new sqlite.DatabaseSync(dbPath);
+    // The snapshot lives in another process: two SQLite copies in one
+    // process do not see each other's POSIX locks, so an in-process holder
+    // could never block this checkpoint in the first place.
+    const holder = spawn(process.execPath, ['--input-type=module', '-e', `
+      import { beginHistoryExport } from ${JSON.stringify(sdkModule)};
+      // Never closed and never paged again: only its TTL can release it.
+      await beginHistoryExport(${JSON.stringify(selection)}, { dbPath: ${JSON.stringify(dbPath)}, ttlMs: 1_500 });
+      process.stdout.write('ready\\n');
+      setTimeout(() => {}, 10_000);`], { stdio: ['ignore', 'pipe', 'pipe'] });
+    // Listeners go on before anything else can run, and the wait is bounded,
+    // so a holder that fails or never reports cannot hang the suite.
+    let stderr = '';
+    holder.stderr.on('data', (chunk: Buffer) => { stderr += String(chunk); });
+    let timer: NodeJS.Timeout | undefined;
+    const ready = new Promise<void>((resolve, reject) => {
+      holder.stdout.on('data', (chunk: Buffer) => { if (String(chunk).includes('ready')) resolve(); });
+      holder.on('error', reject);
+      holder.on('exit', (code, signal) => reject(new Error(`snapshot holder exited early (${code ?? signal}): ${stderr}`)));
+      timer = setTimeout(() => reject(new Error(`snapshot holder never became ready: ${stderr}`)), 20_000);
+    });
+    try {
+      writer.exec('PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS ttl_probe(n INTEGER);');
+      const checkpoint = (n: number) => {
+        writer.exec(`INSERT INTO ttl_probe VALUES (${n})`);
+        return writer.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get() as { busy: number };
+      };
+      try { await ready; } finally { clearTimeout(timer); }
+      assert.equal(checkpoint(1).busy, 1, 'a live snapshot holds the checkpoint back');
+      await pause(3_000);
+      assert.equal(holder.exitCode, null, 'the holder process is still running');
+      assert.equal(checkpoint(2).busy, 0, 'the expired snapshot still holds its read transaction');
+    } finally { holder.kill(); writer.close(); }
+  });
+});
+
+test('an export snapshot left open does not keep the process alive', async () => {
+  await fixture(async dbPath => {
+    const script = `import { beginHistoryExport } from ${JSON.stringify(sdkModule)};
+      await beginHistoryExport(${JSON.stringify(selection)}, { dbPath: ${JSON.stringify(dbPath)}, ttlMs: 3600000 });`;
+    // A process kept alive by the reaper would hit the timeout and reject.
+    await run(process.execPath, ['--input-type=module', '-e', script], { timeout: 30_000 });
   });
 });
 
