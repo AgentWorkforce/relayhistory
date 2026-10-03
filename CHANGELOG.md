@@ -610,8 +610,9 @@ Notable changes to the native `ai-hist` CLI are documented here.
   (`-wal`, `-shm`, `-journal`) as well as the database file itself, by path,
   directory alias and inode, both before exporting and again before the final
   rename. A SQLite `file:` URI `--db` is resolved to the file it opens before
-  the guard is derived. Exporting onto a live WAL previously replaced committed database
-  state with NDJSON and left readers failing with a disk I/O error (#305).
+  the guard is derived, preserving raw filename bytes on Unix. Exporting onto
+  a live WAL previously replaced committed database state with NDJSON and left
+  readers failing with a disk I/O error (#305).
 
 - Change-feed schema reconciliation now fingerprints each evidence kind's
   exact exported column names and declared SQLite types. The one-time upgrade
