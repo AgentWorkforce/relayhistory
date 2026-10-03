@@ -608,6 +608,14 @@ Notable changes to the native `ai-hist` CLI are documented here.
   replaced. On a 140,000-event store a forced tick spends 1.7% of its time
   here, down from 11%, and takes about 40 ms less.
 
+- Cheaper sweep ticks: the free-space check before a sweep is one `statfs`/`statvfs`
+  call on Unix instead of spawning `df`, and the per-transcript existence
+  probes a sweep asks about every unchanged Claude transcript and Codex
+  rollout (cursor lookups, sidecar, continuity, fidelity and raw-fact
+  probes), and the per-session ancestor lookup of the cached project-identity
+  upgrade, reuse prepared statements instead of compiling their SQL each
+  time. On the 100 MB benchmark store this is ~10% of a forced tick's CPU.
+
 - When a Codex rollout grows, sync now reads only the appended turns instead
   of re-parsing the whole file (#315). It resumes through the same
   locator-keyed cursor that hydration keeps for Codex child rollouts. The
