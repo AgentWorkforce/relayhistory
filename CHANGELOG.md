@@ -569,6 +569,16 @@ Notable changes to the native `ai-hist` CLI are documented here.
   Same marker and same outstanding set; on the 100 MB benchmark store the
   destination checks go from ~5% of a forced tick to ~0.1%.
 
+- When a Codex rollout grows, sync now reads only the appended turns instead
+  of re-parsing the whole file (#315). It resumes through the same
+  locator-keyed cursor that hydration keeps for Codex child rollouts. The
+  cursor advances only at a `task_complete` boundary, and it is stored in the
+  same transaction as the rows it describes. A rollout re-reads from byte
+  zero, as before, when its session or subagent classification changed, when
+  its evidence is gone, when the destination marker names it, or while a
+  one-time backfill is pending. On a 2 MB rollout, a forced tick after a
+  1 KiB append spends about 15 ms on it instead of about 75 ms.
+
 - Internal refactor: one-entry harness registry (#177). Each built-in harness
   is declared once, as a `LocalSource` descriptor in
   `crates/ai-hist/src/sources/catalog.rs`, and `SOURCE_CHOICES`,

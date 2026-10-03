@@ -4647,10 +4647,32 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                 }
                 touched.insert(meta.session_id.clone());
             }
+            // Resume from the rollout's cursor only when nothing but new
+            // bytes can be missing: the file moved since a pass that indexed
+            // it as this same session and kind, its evidence is still here,
+            // the destination marker does not name it, and no one-time
+            // backfill is waiting to re-read every rollout. Anything else
+            // re-reads from byte zero, exactly as before.
+            let resume = !repair_user_messages
+                && !stamp_unchanged
+                && !backfill_fidelity
+                && !backfill_raw_facts
+                && !backfill_fork_replay
+                && record
+                    .and_then(|r| r.get("session"))
+                    .and_then(Value::as_str)
+                    == Some(meta.session_id.as_str())
+                && record
+                    .and_then(|r| r.get("subagent"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                    == meta.is_subagent
+                && !repairs.contains("codex", &meta.session_id)
+                && codex_session_evidence_exists(conn, &meta.session_id)?;
             let outcome = if repair_user_messages {
                 repair_codex_rollout_user_messages(conn, &rollout, &meta)
             } else {
-                ingest_codex_rollout(conn, &rollout, &meta)
+                ingest_codex_rollout_at_locator(conn, &rollout, &meta, resume)
             };
             let cleanup = meta
                 .is_subagent
@@ -4716,10 +4738,21 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                     // its own: an earlier build may have stored the parent's
                     // replayed prompt, and the shallow writer only ever
                     // fills a missing value, so this is where it is cleared.
-                    if outcome.first_prompt.is_some() || outcome.saw_fork_replay {
+                    if outcome.from_start
+                        && (outcome.first_prompt.is_some() || outcome.saw_fork_replay)
+                    {
                         conn.execute(
                             "UPDATE sessions SET first_prompt = ? \
                              WHERE source = 'codex' AND session_id = ?",
+                            params![outcome.first_prompt, meta.session_id],
+                        )?;
+                    } else if !outcome.from_start && outcome.first_prompt.is_some() {
+                        // A resumed pass saw only the appended span: its first
+                        // prompt is the session's only if it had none yet.
+                        conn.execute(
+                            "UPDATE sessions SET first_prompt = ? \
+                             WHERE source = 'codex' AND session_id = ? \
+                               AND first_prompt IS NULL",
                             params![outcome.first_prompt, meta.session_id],
                         )?;
                     }
@@ -5303,6 +5336,10 @@ pub(crate) struct CodexIngestOutcome {
     /// the catalog holds may be the parent's prompt an earlier build took
     /// from the replay.
     saw_fork_replay: bool,
+    /// Whether this pass read the rollout from its first byte. A pass resumed
+    /// from a cursor saw only what was appended, so `first_prompt` is then
+    /// the first prompt *of that span*, not of the session.
+    from_start: bool,
 }
 
 /// Cumulative token totals from a Codex `token_count` event
@@ -5595,6 +5632,61 @@ pub(crate) fn ingest_codex_rollout(
     Ok(ingest_codex_rollout_incremental(conn, path, meta, &mut cursor)?.0)
 }
 
+/// The global walk's read of one changed rollout, through the locator-keyed
+/// cursor hydration already keeps for Codex child rollouts (#315).
+///
+/// With `resume`, the pass continues from the last committed `task_complete`
+/// boundary, so an append to a long live rollout costs the appended turn
+/// rather than a re-parse of the whole file. Without it the pass starts from
+/// byte zero, as every walk read used to. Either way the cursor it ends on is
+/// stored, inside the caller's write unit, so it lands with the rows it
+/// describes or not at all.
+///
+/// The reader validates the stored position against the file (identity and a
+/// hashed prefix window) and falls back to byte zero on its own when the file
+/// was replaced or truncated.
+fn ingest_codex_rollout_at_locator(
+    conn: &Connection,
+    path: &Path,
+    meta: &CodexSessionMeta,
+    resume: bool,
+) -> Result<CodexIngestOutcome> {
+    let locator = path.to_string_lossy().to_string();
+    let key = transcript_cursor::CursorKey::Locator {
+        source: "codex",
+        locator: &locator,
+    };
+    let mut cursor = if resume {
+        transcript_cursor::load_cursor(conn, &key)?
+    } else {
+        transcript_cursor::TranscriptCursorState::default()
+    };
+    // The reader's own validation hashes a bounded window at each end of the
+    // committed prefix (see `transcript_cursor`), so an in-place edit strictly
+    // between those windows that keeps the file's length would pass it. A
+    // changed stamp alone does not prove an append, so resume only when the
+    // file also grew past the size it had when the cursor was written: an
+    // append-only writer always grows it, an in-place edit that keeps the
+    // length never does. Anything else re-reads from byte zero.
+    //
+    // What is still assumed: an in-place edit inside that gap *and* an append
+    // in the same interval between two passes. Codex appends to its rollouts
+    // and never rewrites them, which is the same trade the Claude walk's
+    // cursor already makes.
+    if let Some(file) = cursor.file.as_ref() {
+        let grew = path
+            .metadata()
+            .map(|now| now.len() > file.size)
+            .unwrap_or(false);
+        if !grew {
+            cursor = transcript_cursor::TranscriptCursorState::default();
+        }
+    }
+    let (outcome, _) = ingest_codex_rollout_incremental(conn, path, meta, &mut cursor)?;
+    transcript_cursor::store_cursor(conn, &key, &cursor)?;
+    Ok(outcome)
+}
+
 /// Index a Codex rollout from its cursor.
 ///
 /// The committed position advances **only at a `task_complete` record**, which
@@ -5636,6 +5728,7 @@ fn ingest_codex_rollout_incremental(
         cursor.codex.clone().unwrap_or_default()
     };
     let start_offset = reader.start_offset();
+    outcome.from_start = start_offset == 0;
     let mut model: Option<String> = resume.model.clone();
     // The baseline the next delta is measured against, and the span and
     // generation counters, continue across passes. The rest of the usage
@@ -27234,9 +27327,8 @@ mod tests {
     /// baseline generation therefore live on the cursor.
     ///
     /// Driven through `ingest_codex_rollout_incremental` with a cursor that
-    /// persists, because that is the only caller that resumes: the global
-    /// sync walk hands it a throwaway cursor and reads every rollout from
-    /// zero.
+    /// persists; `a_resumed_codex_walk_indexes_what_a_full_read_does` covers
+    /// the global walk, which resumes through a locator-keyed cursor.
     #[test]
     fn a_resumed_codex_pass_continues_the_request_numbering() {
         let dir = tempfile::tempdir().unwrap();
@@ -27300,6 +27392,250 @@ mod tests {
             2,
             "a resumed pass restarted the numbering and merged two requests into one: {spans:?}"
         );
+    }
+
+    /// The global walk resumes a changed rollout from its cursor (#315), and
+    /// what it ends up holding is exactly what one full read of the final
+    /// file holds: events with their token deltas and request spans, the
+    /// prompt history, and the catalog row -- the session's first prompt
+    /// included, which a resumed pass must not replace with the first prompt
+    /// of the span it read.
+    ///
+    /// The second append stops inside a turn, so the third pass also has to
+    /// re-derive an open turn from the last `task_complete`.
+    #[test]
+    fn a_resumed_codex_walk_indexes_what_a_full_read_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("codex");
+        let day = root.join("sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-2026-04-20T05-00-00-sess_walk.jsonl");
+        let line = |at: &str, payload: Value| {
+            format!(
+                "{}\n",
+                json!({"timestamp": at, "type": "event_msg", "payload": payload})
+            )
+        };
+        let user = |n: u32| {
+            line(
+                &format!("2026-04-20T05:0{n}:01.000Z"),
+                json!({"type": "user_message", "message": format!("run {n}")}),
+            )
+        };
+        let close = |n: u32, total: u32| {
+            [
+                line(
+                    &format!("2026-04-20T05:0{n}:02.000Z"),
+                    json!({"type": "agent_message", "message": format!("done {n}")}),
+                ),
+                line(
+                    &format!("2026-04-20T05:0{n}:03.000Z"),
+                    json!({"type": "token_count", "info": {"total_token_usage": {
+                        "input_tokens": total, "cached_input_tokens": 0,
+                        "output_tokens": 10, "reasoning_output_tokens": 0,
+                        "total_tokens": total}}}),
+                ),
+                line(
+                    &format!("2026-04-20T05:0{n}:04.000Z"),
+                    json!({"type": "task_complete", "turn_id": format!("t{n}")}),
+                ),
+            ]
+            .concat()
+        };
+        let opening = format!(
+            "{}\n{}\n",
+            json!({"timestamp": "2026-04-20T05:00:00.000Z", "type": "session_meta",
+                   "payload": {"id": "sess_walk", "cwd": "/tmp/project"}}),
+            json!({"timestamp": "2026-04-20T05:00:00.100Z", "type": "turn_context",
+                   "payload": {"turn_id": "t1", "cwd": "/tmp/project", "model": "gpt-5.4"}}),
+        );
+        let append = |text: &str| {
+            let mut file = fs::OpenOptions::new().append(true).open(&rollout).unwrap();
+            std::io::Write::write_all(&mut file, text.as_bytes()).unwrap();
+        };
+
+        let resumed = Connection::open_in_memory().unwrap();
+        init_db(&resumed).unwrap();
+        // An install past the one-time user-message repair, which re-reads
+        // every rollout whole by design.
+        let mut state = Map::new();
+        state.insert("codex_rollouts_v6".into(), json!({}));
+        fs::write(&rollout, format!("{opening}{}{}", user(1), close(1, 100))).unwrap();
+        sync_codex(&resumed, &mut state, &root).unwrap();
+        let offset = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT committed_offset FROM transcript_cursors WHERE source = 'codex'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let first_offset = offset(&resumed);
+        assert!(first_offset > 0, "the walk stored no cursor");
+        // Remove a row behind the cursor: a pass that resumes never sees it
+        // again, a pass that re-reads the file from zero writes it back.
+        let behind = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM session_events \
+                 WHERE source = 'codex' AND text = 'done 1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        resumed
+            .execute(
+                "DELETE FROM session_events WHERE source = 'codex' AND text = 'done 1'",
+                [],
+            )
+            .unwrap();
+        append(&user(2));
+        sync_codex(&resumed, &mut state, &root).unwrap();
+        assert_eq!(
+            offset(&resumed),
+            first_offset,
+            "a pass inside an open turn must not commit past it"
+        );
+        append(&format!("{}{}{}", close(2, 250), user(3), close(3, 400)));
+        sync_codex(&resumed, &mut state, &root).unwrap();
+        assert!(offset(&resumed) > first_offset);
+        assert_eq!(
+            behind(&resumed),
+            0,
+            "a pass re-read the rollout from zero instead of resuming"
+        );
+
+        let full = Connection::open_in_memory().unwrap();
+        init_db(&full).unwrap();
+        let mut fresh = Map::new();
+        fresh.insert("codex_rollouts_v6".into(), json!({}));
+        sync_codex(&full, &mut fresh, &root).unwrap();
+        assert_eq!(behind(&full), 1);
+
+        let rows = |conn: &Connection, sql: &str| -> Vec<Vec<Option<String>>> {
+            let mut statement = conn.prepare(sql).unwrap();
+            let width = statement.column_count();
+            statement
+                .query_map([], |row| {
+                    (0..width)
+                        .map(|i| {
+                            row.get_ref(i).map(|value| match value {
+                                rusqlite::types::ValueRef::Null => None,
+                                rusqlite::types::ValueRef::Integer(i) => Some(i.to_string()),
+                                rusqlite::types::ValueRef::Real(r) => Some(r.to_string()),
+                                rusqlite::types::ValueRef::Text(t)
+                                | rusqlite::types::ValueRef::Blob(t) => {
+                                    Some(String::from_utf8_lossy(t).into_owned())
+                                }
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        for sql in [
+            // Less the row removed above, which only a full read restores.
+            "SELECT event_uid, role, kind, text, token_json, request_span, turn_id, ts_ms, \
+             message_id, parent_id FROM session_events \
+             WHERE source = 'codex' AND text IS NOT 'done 1' ORDER BY event_uid",
+            "SELECT session_id, prompt, timestamp_ms FROM history WHERE source = 'codex' \
+             ORDER BY timestamp_ms, prompt",
+            "SELECT session_id, first_prompt, last_assistant_text, first_activity_ms, \
+             last_activity_ms, cwd FROM sessions WHERE source = 'codex'",
+            "SELECT marker_uid, kind, subkind, turn_id FROM session_markers \
+             WHERE source = 'codex' ORDER BY marker_uid",
+        ] {
+            let expected = rows(&full, sql);
+            assert!(!expected.is_empty(), "nothing to compare for {sql}");
+            assert_eq!(rows(&resumed, sql), expected, "{sql}");
+        }
+        assert_eq!(
+            rows(
+                &resumed,
+                "SELECT first_prompt FROM sessions WHERE session_id = 'sess_walk'"
+            ),
+            vec![vec![Some("run 1".to_string())]]
+        );
+    }
+
+    /// A rollout edited in place, with its length kept, is re-read from zero
+    /// rather than resumed past the change. The edit sits strictly between
+    /// the two validation windows of a committed prefix larger than both, the
+    /// one place the cursor's own bounded check cannot see.
+    #[test]
+    fn a_same_length_edit_inside_a_large_codex_prefix_is_not_resumed_past() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("codex");
+        let day = root.join("sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-2026-04-20T05-00-00-sess_edit.jsonl");
+        let event = |at: String, payload: Value| {
+            format!(
+                "{}\n",
+                json!({"timestamp": at, "type": "event_msg", "payload": payload})
+            )
+        };
+        let mut text = format!(
+            "{}\n",
+            json!({"timestamp": "2026-04-20T05:00:00.000Z", "type": "session_meta",
+                   "payload": {"id": "sess_edit", "cwd": "/tmp/project"}})
+        );
+        // Well past two 64 KiB windows of committed turns.
+        let filler = "x".repeat(2_000);
+        for n in 0..200u32 {
+            let at = |s: u32| format!("2026-04-20T05:{:02}:{:02}.000Z", n / 60, s + (n % 60) % 50);
+            let marker = if n == 100 { "MIDDLE-ORIGINAL" } else { "plain" };
+            text.push_str(&event(
+                at(1),
+                json!({"type": "user_message", "message": format!("run {n} {marker} {filler}")}),
+            ));
+            text.push_str(&event(
+                at(2),
+                json!({"type": "agent_message", "message": format!("done {n}")}),
+            ));
+            text.push_str(&event(
+                at(3),
+                json!({"type": "task_complete", "turn_id": format!("t{n}")}),
+            ));
+        }
+        fs::write(&rollout, &text).unwrap();
+        assert!(text.len() > 4 * transcript_cursor::PREFIX_WINDOW_BYTES as usize);
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        state.insert("codex_rollouts_v6".into(), json!({}));
+        sync_codex(&conn, &mut state, &root).unwrap();
+        let committed: i64 = conn
+            .query_row(
+                "SELECT committed_offset FROM transcript_cursors WHERE source = 'codex'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            committed as usize,
+            text.len(),
+            "the walk committed the whole file"
+        );
+
+        // Same length, a byte in the middle, and an mtime that moves forward.
+        let edited = text.replace("MIDDLE-ORIGINAL", "MIDDLE-REWRITTN");
+        assert_eq!(edited.len(), text.len());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&rollout, &edited).unwrap();
+        sync_codex(&conn, &mut state, &root).unwrap();
+        let rewritten: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events \
+                 WHERE source = 'codex' AND text LIKE '%MIDDLE-REWRITTN%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rewritten, 1, "the walk resumed past an in-place edit");
     }
 
     /// An install already at the recorded generation must still re-read its
