@@ -157,7 +157,7 @@ exit 0
   assert.equal(git(work, "show", "origin/main:version.txt"), "0.21.2");
 });
 
-test("re-cuts the changelog when entries landed during the release", async () => {
+test("keeps entries that landed during the release pending", async () => {
   const { work, other, startSha } = await stageRepos();
   const pending = (entries, level = "Patch") =>
     `# Changelog\n\n## [Unreleased - ${level}]\n\n### Fixed\n\n${entries}\n\n## [0.21.1] - 2026-09-20\n\n### Fixed\n\n- Older\n`;
@@ -185,12 +185,12 @@ test("re-cuts the changelog when entries landed during the release", async () =>
 
   const result = persistRelease(work, "main", releaseStart, { VERSION: "0.21.2" });
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
-  assert.match(result.stdout, /re-cutting 0\.21\.2 \(2026-09-21\)/);
+  assert.match(result.stdout, /carrying the 0\.21\.2 cut/);
   git(work, "fetch", "origin", "main");
   assert.equal(git(work, "show", "origin/main:version.txt"), "0.21.2");
   const changelog = git(work, "show", "origin/main:CHANGELOG.md");
   assert.match(
     changelog,
-    /## \[Unreleased\]\n\n## \[0\.21\.2\] - 2026-09-21\n\n### Fixed\n\n- Shipped fix\n- Landed during publish\n\n## \[0\.21\.1\]/,
+    /## \[Unreleased - Minor\]\n\n### Fixed\n\n- Landed during publish\n\n## \[0\.21\.2\] - 2026-09-21\n\n### Fixed\n\n- Shipped fix\n\n## \[0\.21\.1\]/,
   );
 });

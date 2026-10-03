@@ -12,8 +12,9 @@
 # script only updates the branch.
 #
 # A conflict confined to CHANGELOG.md means entries landed on BRANCH while the
-# release ran: take BRANCH's copy and cut it again for VERSION, on the release
-# date the version commit recorded. Any other conflict fails closed.
+# release ran: take BRANCH's copy, insert the released section exactly as
+# tagged, and keep the entries BRANCH gained since START_SHA pending (they are
+# not in the release). Any other conflict fails closed.
 set -euo pipefail
 
 SCRIPTS=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -40,15 +41,11 @@ if [[ "$VERSION_SHA" == "$START_SHA" ]]; then
 fi
 
 recut_changelog() {
-  local conflicted release_date
-  conflicted=$(git diff --name-only --diff-filter=U)
-  [[ "$conflicted" == "CHANGELOG.md" && -n "${VERSION:-}" ]] || return 1
-  release_date=$(git show "$VERSION_SHA:CHANGELOG.md" |
-    sed -n "s/^## \\[${VERSION//./\\.}\\] - \\([0-9-]*\\)\$/\\1/p" | head -n 1)
-  [[ -n "$release_date" ]] || return 1
-  echo "CHANGELOG.md conflicts with origin/$BRANCH; re-cutting $VERSION ($release_date) against it"
+  [[ "$(git diff --name-only --diff-filter=U)" == "CHANGELOG.md" && -n "${VERSION:-}" ]] || return 1
+  echo "CHANGELOG.md conflicts with origin/$BRANCH; carrying the $VERSION cut onto it"
   git checkout --ours -- CHANGELOG.md
-  node "$SCRIPTS/cut-changelog.mjs" --version "$VERSION" --date "$release_date" || return 1
+  node "$SCRIPTS/cut-changelog.mjs" --version "$VERSION" \
+    --released-from "$VERSION_SHA" --pending-since "$START_SHA" || return 1
   git add CHANGELOG.md
   GIT_EDITOR=true git rebase --continue
 }

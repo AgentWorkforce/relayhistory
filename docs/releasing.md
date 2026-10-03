@@ -36,7 +36,9 @@ and `crates/ai-hist-napi/src/lib.rs`).
    always carries what the helper matrix built from — checks the release
    against the pending `CHANGELOG.md` level (`scripts/check-release-changelog.mjs`
    fails, say, a patch release under `[Unreleased - Minor]`), cuts the
-   changelog (`scripts/cut-changelog.mjs`), prepares the version commit
+   changelog (`scripts/cut-changelog.mjs`; with nothing curated it uses
+   conventional commit subjects since the last tag, failing if they imply a
+   larger bump, or records "No user-facing changes."), prepares the version commit
    carrying both, then publishes the platform packages,
    `ai-hist-native`, `ai-hist` and `ai-hist-mcp` in that order. The SDK root is
    never published before its platform artifacts, because npm multi-package
@@ -61,8 +63,9 @@ and `crates/ai-hist-napi/src/lib.rs`).
    Release only after those tests pass. A separate `persist-version` job rebases
    the version commit onto the current branch tip and pushes, so a merge
    that landed during publish does not drop the tag; if that merge added
-   changelog entries and the rebase conflicts only in `CHANGELOG.md`, it takes
-   the branch's copy and cuts it again for the release. Crate and plugins depend
+   changelog entries and the rebase conflicts only in `CHANGELOG.md`, it inserts
+   the released section as tagged into the branch's copy and leaves the
+   entries that landed during the release pending, at the branch's level. Crate and plugins depend
    on the verified core, not on that persist. If npm accepts a publish but keeps
    its version in processing beyond the wait, or a later gate fails, rerun with
    `skip_core` and this `custom_version` once npm exposes the packages. The

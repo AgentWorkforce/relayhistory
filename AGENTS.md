@@ -93,6 +93,7 @@ version.
   than the pending level (`scripts/check-release-changelog.mjs`), then
   `scripts/cut-changelog.mjs` moves the pending entries under the released
   version, restores a bare `[Unreleased]`, and updates the comparison links.
+  Entries merged while a release runs stay pending.
 - Keep entries concise and impact-first: one short, unwrapped bullet per
   user-visible change, no nested bullets.
 - Omit PR links, internal review notes, test-only or CI-only work, and

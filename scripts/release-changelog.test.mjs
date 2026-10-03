@@ -8,7 +8,9 @@ import { fileURLToPath } from "node:url";
 import {
   assertChangelogSemver,
   bodyFromCommitSubjects,
+  carryReleaseCut,
   cutChangelog,
+  impliedLevel,
   updateComparisonReferences,
 } from "./release-changelog.mjs";
 
@@ -115,7 +117,53 @@ describe("updateComparisonReferences", () => {
   });
 });
 
+function cutCli(dir, version) {
+  return spawnSync(
+    process.execPath,
+    [join(scripts, "cut-changelog.mjs"), "--version", version, "--date", "2026-10-04"],
+    { cwd: dir, encoding: "utf8" },
+  );
+}
+
+function repoWithCommits(subjects) {
+  const dir = mkdtempSync(join(tmpdir(), "relayhistory-changelog-git-"));
+  const git = (...args) => {
+    const result = spawnSync("git", ["-C", dir, ...args], { encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+  };
+  git("init", "-q");
+  git("config", "user.name", "test");
+  git("config", "user.email", "test@example.com");
+  writeFileSync(join(dir, "CHANGELOG.md"), changelog(null, ""));
+  git("add", "CHANGELOG.md");
+  git("commit", "-q", "-m", "chore: release 0.34.1");
+  git("tag", "sdk-ts-v0.34.1");
+  for (const subject of subjects) git("commit", "-q", "--allow-empty", "-m", subject);
+  return dir;
+}
+
 describe("cut-changelog.mjs", () => {
+  it("refuses a release smaller than the commit subjects imply", () => {
+    const dir = repoWithCommits(["feat!: drop the old search API", "fix: tidy"]);
+    const patch = cutCli(dir, "0.34.2");
+    assert.equal(patch.status, 1);
+    assert.match(patch.stderr, /need a Minor release, but 0\.34\.2 is Patch/);
+    assert.equal(readFileSync(join(dir, "CHANGELOG.md"), "utf8"), changelog(null, ""));
+
+    const minor = cutCli(dir, "0.35.0");
+    assert.equal(minor.status, 0, minor.stderr);
+    assert.match(readFileSync(join(dir, "CHANGELOG.md"), "utf8"), /## \[0\.35\.0\] - 2026-10-04\n\n### Breaking Changes\n\n- Drop the old search API/);
+  });
+
+  it("still records a release with no user-facing changes", () => {
+    const dir = repoWithCommits(["chore: update packaging"]);
+    const result = cutCli(dir, "0.34.2");
+    assert.equal(result.status, 0, result.stderr);
+    const cut = readFileSync(join(dir, "CHANGELOG.md"), "utf8");
+    assert.match(cut, /## \[Unreleased\]\n\n## \[0\.34\.2\] - 2026-10-04\n\nNo user-facing changes\.\n\n## \[0\.34\.1\]/);
+    assert.match(cut, /^\[Unreleased\]: .*sdk-ts-v0\.34\.2\.\.\.HEAD$/m);
+  });
+
   it("cuts CHANGELOG.md in the working directory and is idempotent", () => {
     const dir = mkdtempSync(join(tmpdir(), "relayhistory-changelog-"));
     writeFileSync(join(dir, "CHANGELOG.md"), changelog());
@@ -134,5 +182,36 @@ describe("cut-changelog.mjs", () => {
     const second = run();
     assert.equal(second.status, 0, second.stderr);
     assert.equal(readFileSync(join(dir, "CHANGELOG.md"), "utf8"), cut);
+  });
+});
+
+describe("impliedLevel", () => {
+  it("treats a breaking change as Minor before 1.0 and Major after", () => {
+    assert.equal(impliedLevel("### Breaking Changes\n\n- Drop\n\n### Fixed\n\n- Fix", "0.34.1"), "Minor");
+    assert.equal(impliedLevel("### Breaking Changes\n\n- Drop", "1.2.0"), "Major");
+    assert.equal(impliedLevel("### Added\n\n- New", "0.34.1"), "Minor");
+    assert.equal(impliedLevel("### Fixed\n\n- Fix", "0.34.1"), "Patch");
+  });
+});
+
+describe("carryReleaseCut", () => {
+  const start = changelog("Patch", "### Fixed\n\n- Shipped fix");
+  const released = cutChangelog(start, { version: "0.34.2", date: "2026-10-04" }).changelog;
+
+  it("keeps entries added after the release source pending, at the branch level", () => {
+    const upstream = changelog("Minor", "### Added\n\n- New feature\n\n### Fixed\n\n- Shipped fix\n- Later fix\n  continued");
+    const carried = carryReleaseCut(upstream, { version: "0.34.2", released, start });
+    assert.match(
+      carried,
+      /## \[Unreleased - Minor\]\n\n### Added\n\n- New feature\n\n### Fixed\n\n- Later fix\n  continued\n\n## \[0\.34\.2\] - 2026-10-04\n\n### Fixed\n\n- Shipped fix\n\n## \[0\.34\.1\]/,
+    );
+    assert.match(carried, /^\[Unreleased\]: .*sdk-ts-v0\.34\.2\.\.\.HEAD$/m);
+    assert.equal(carryReleaseCut(carried, { version: "0.34.2", released, start }), carried);
+  });
+
+  it("leaves a bare [Unreleased] when the branch gained nothing pending", () => {
+    const upstream = changelog("Patch", "### Fixed\n\n- Shipped fix").replace("# Changelog", "# Changelog\n\nEdited intro.");
+    const carried = carryReleaseCut(upstream, { version: "0.34.2", released, start });
+    assert.match(carried, /Edited intro\.\n\n## \[Unreleased\]\n\n## \[0\.34\.2\] - 2026-10-04\n\n### Fixed\n\n- Shipped fix\n/);
   });
 });

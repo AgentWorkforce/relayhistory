@@ -194,3 +194,68 @@ export function updateComparisonReferences(
   kept.splice(firstDefinition === -1 ? kept.length : firstDefinition, 0, ...definitions);
   return `${kept.join("\n").replace(/\n*$/, "")}\n`;
 }
+
+/** The SemVer level commit-subject notes imply for a release after `fromVersion`. */
+export function impliedLevel(body, fromVersion) {
+  if (/^### Breaking Changes$/m.test(body)) {
+    return parseVersion(fromVersion).major === 0 ? "Minor" : "Major";
+  }
+  return /^### Added$/m.test(body) ? "Minor" : "Patch";
+}
+
+export function levelAtLeast(level, minimum) {
+  return LEVEL_RANK[level] >= LEVEL_RANK[minimum];
+}
+
+/** Pending bullets as `[section, bullet]` pairs, a bullet keeping its continuation lines. */
+function pendingBullets(body) {
+  const bullets = [];
+  let section = "";
+  for (const line of body.split("\n")) {
+    const heading = /^### (.+)$/.exec(line);
+    if (heading) section = heading[1];
+    else if (line.startsWith("- ")) bullets.push([section, line]);
+    else if (line.trim() && bullets.length) bullets.at(-1)[1] += `\n${line}`;
+  }
+  return bullets;
+}
+
+/**
+ * Persist a release cut onto a branch that moved while the release ran:
+ * insert `released`'s `## [version]` section (exactly what was tagged) into
+ * `upstream`, and keep pending only the entries `upstream` gained since
+ * `start` (the release's source tree), with `upstream`'s level.
+ */
+export function carryReleaseCut(upstream, { version, released, start }) {
+  if (new RegExp(`^## \\[${version.replace(/\./g, "\\.")}\\]`, "m").test(upstream)) {
+    return upstream;
+  }
+  const section = new RegExp(
+    `^## \\[${version.replace(/\./g, "\\.")}\\] - [\\s\\S]*?(?=^## \\[|^\\[[^\\]]+\\]:\\s|(?![\\s\\S]))`,
+    "m",
+  ).exec(released)?.[0];
+  if (!section) throw new Error(`released changelog has no [${version}] section`);
+  const pending = UNRELEASED.exec(upstream);
+  if (!pending) throw new Error("CHANGELOG.md has no [Unreleased] heading");
+
+  const shipped = new Set(pendingBullets(UNRELEASED.exec(start)?.[2] ?? "").map(([, text]) => text));
+  const carried = new Map();
+  for (const [heading, text] of pendingBullets(pending[2])) {
+    if (shipped.has(text)) continue;
+    if (!carried.has(heading)) carried.set(heading, []);
+    carried.get(heading).push(text);
+  }
+  const body = [...carried]
+    .map(([heading, texts]) => `${heading ? `### ${heading}\n\n` : ""}${texts.join("\n")}`)
+    .join("\n\n");
+  const level = body && pending[1] ? ` - ${pending[1]}` : "";
+
+  const previousVersion = latestReleasedVersion(upstream);
+  const updated =
+    upstream.slice(0, pending.index) +
+    `## [Unreleased${level}]\n\n${body ? `${body}\n\n` : ""}${section.trim()}\n\n` +
+    upstream.slice(pending.index + pending[0].length);
+  return previousVersion
+    ? updateComparisonReferences(updated, { version, previousVersion })
+    : updated;
+}
