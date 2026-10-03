@@ -207,8 +207,6 @@ export function levelAtLeast(level, minimum) {
   return LEVEL_RANK[level] >= LEVEL_RANK[minimum];
 }
 
-const previousVersionOf = (changelog) => latestReleasedVersion(changelog) ?? "0.0.0";
-
 /**
  * The level of entries carried past a release. The branch's heading covered
  * the shipped entries too, so it is only an upper bound — unless the branch
@@ -217,13 +215,14 @@ const previousVersionOf = (changelog) => latestReleasedVersion(changelog) ?? "0.
  * Changes and Added are what they always are, Fixed and Security alone are a
  * patch; anything else keeps the bound, since it can be either.
  */
-function carriedLevel(carried, branchLevel, startLevel, fromVersion) {
+function carriedLevel(carried, branchLevel, startLevel, releasedVersion) {
   if (!branchLevel) return null;
   if (!startLevel || LEVEL_RANK[branchLevel] > LEVEL_RANK[startLevel]) return branchLevel;
   const headings = [...carried.keys()];
   let inferred;
   if (headings.includes("Breaking Changes")) {
-    inferred = parseVersion(fromVersion).major === 0 ? "Minor" : "Major";
+    // Carried entries are not in `releasedVersion`; the next release follows it.
+    inferred = parseVersion(releasedVersion).major === 0 ? "Minor" : "Major";
   } else if (headings.includes("Added")) inferred = "Minor";
   else if (headings.every((heading) => heading === "Fixed" || heading === "Security")) inferred = "Patch";
   else return branchLevel;
@@ -275,7 +274,7 @@ export function carryReleaseCut(upstream, { version, released, start }) {
   const body = [...carried]
     .map(([heading, texts]) => `${heading ? `### ${heading}\n\n` : ""}${texts.join("\n")}`)
     .join("\n\n");
-  const level = body ? carriedLevel(carried, pending[1], startPending?.[1], previousVersionOf(upstream)) : null;
+  const level = body ? carriedLevel(carried, pending[1], startPending?.[1], version) : null;
 
   const previousVersion = latestReleasedVersion(upstream);
   const updated =

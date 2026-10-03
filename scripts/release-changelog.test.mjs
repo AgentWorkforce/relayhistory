@@ -223,6 +223,15 @@ describe("carryReleaseCut", () => {
     );
   });
 
+  it("levels a breaking change carried past 1.0.0 as Major", () => {
+    const majorStart = changelog("Major", "### Breaking Changes\n\n- Stable API");
+    const majorReleased = cutChangelog(majorStart, { version: "1.0.0", date: "2026-10-04" }).changelog;
+    const upstream = changelog("Major", "### Breaking Changes\n\n- Stable API\n- Drop old flag");
+    const carried = carryReleaseCut(upstream, { version: "1.0.0", released: majorReleased, start: majorStart });
+    assert.match(carried, /## \[Unreleased - Major\]\n\n### Breaking Changes\n\n- Drop old flag\n\n## \[1\.0\.0\]/);
+    assert.throws(() => assertChangelogSemver(carried, "1.1.0"), /requires a Major release/);
+  });
+
   it("keeps a bullet whose text shipped under another section", () => {
     const upstream = changelog("Patch", "### Fixed\n\n- Shipped fix\n\n### Rust API\n\n- Shipped fix");
     assert.match(
