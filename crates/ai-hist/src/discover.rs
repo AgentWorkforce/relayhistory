@@ -546,6 +546,10 @@ pub struct ProviderRoots<'a> {
     pub devin: &'a Path,
     /// Path to the opencode database.
     pub opencode_db: &'a Path,
+    /// Whether `opencode_db` is the only OpenCode database read, so the
+    /// channel databases beside it are not evidence. See
+    /// [`crate::ProviderRoots::opencode_db_pinned`].
+    pub opencode_db_pinned: bool,
 }
 
 /// One path the live-capture watcher monitors, and how deeply.
@@ -567,6 +571,84 @@ pub struct WatchRoot {
     /// asked — see [`WatchRoot::resolve`]. `None` until then, and for a root
     /// whose registration path does not exist yet.
     pub canonical: Option<PathBuf>,
+    /// Which of a [`WatchDepth::Directory`] root's entries count. Ignored at
+    /// the other depths.
+    pub entries: WatchEntries,
+}
+
+/// Which entries of a [`WatchDepth::Directory`] root are evidence.
+///
+/// A directory root exists for a provider that cannot be watched as one file
+/// — OpenCode's database is rewritten in place with SQLite's `-wal`, `-shm`
+/// and `-journal` siblings beside it, and channel databases appear next to
+/// it — but every write to any *other* entry of that directory would still
+/// force a sweep. When `OPENCODE_DB` names a file in a busy directory (its
+/// own log beside it, `$HOME` itself) that is a sweep per write, forever: one
+/// measured collector made 197 forced, fruitless ticks in 90 s of idle time
+/// (#335). The filter keeps the one registration and admits only the names
+/// the sweep reads.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum WatchEntries {
+    /// Every direct entry.
+    #[default]
+    All,
+    /// OpenCode's SQLite stores: the configured database file `primary`
+    /// and its `-wal`, `-shm` and `-journal` siblings, plus — when
+    /// `channels` is set — every channel database (`opencode.db`,
+    /// `opencode-<channel>.db`) and its siblings. `channels` is off when
+    /// `OPENCODE_DB` pins the one database the sweep reads.
+    OpencodeStores {
+        primary: std::ffi::OsString,
+        channels: bool,
+    },
+}
+
+/// The SQLite sidecars that move with a database file.
+const SQLITE_SIDECARS: [&str; 3] = ["-wal", "-shm", "-journal"];
+
+impl WatchEntries {
+    /// Whether an entry named `name` is one this filter admits.
+    fn admits(&self, name: &std::ffi::OsStr) -> bool {
+        let (primary, channels) = match self {
+            WatchEntries::All => return true,
+            WatchEntries::OpencodeStores { primary, channels } => (primary, *channels),
+        };
+        // The configured name and its sidecars first, compared as `OsStr`
+        // rather than stripped as text: the configured file may itself end in
+        // `-wal` (or not be UTF-8 at all), and suffix-stripping the event
+        // name would then never come back to it.
+        if name == primary.as_os_str()
+            || SQLITE_SIDECARS.iter().any(|suffix| {
+                let mut sidecar = primary.clone();
+                sidecar.push(suffix);
+                name == sidecar.as_os_str()
+            })
+        {
+            return true;
+        }
+        if !channels {
+            return false;
+        }
+        // Channel database names are ASCII by construction.
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        let store = SQLITE_SIDECARS
+            .iter()
+            .find_map(|suffix| name.strip_suffix(suffix))
+            .unwrap_or(name);
+        crate::paths::is_opencode_db_filename(store)
+    }
+
+    /// The filter covering both claims on one path: anything wider than a
+    /// single filter is every entry.
+    fn widen(&self, other: &WatchEntries) -> WatchEntries {
+        if self == other {
+            self.clone()
+        } else {
+            WatchEntries::All
+        }
+    }
 }
 
 /// How much of a [`WatchRoot`]'s path is watched.
@@ -629,6 +711,7 @@ impl WatchRoot {
             path: watch_path(&path.into()),
             depth: WatchDepth::Tree,
             canonical: None,
+            entries: WatchEntries::All,
         }
     }
 
@@ -638,7 +721,30 @@ impl WatchRoot {
             path: watch_path(&path.into()),
             depth: WatchDepth::Directory,
             canonical: None,
+            entries: WatchEntries::All,
         }
+    }
+
+    /// Watch only this directory's own entries that `entries` admits.
+    pub fn directory_of(path: impl Into<PathBuf>, entries: WatchEntries) -> Self {
+        Self {
+            entries,
+            ..Self::directory(path)
+        }
+    }
+
+    /// Fold another claim on the same path into this one: the wider depth,
+    /// and the wider entry filter.
+    pub fn widen(&mut self, other: &WatchRoot) {
+        // A filter belongs to the directory depth; a deeper claim carries
+        // every entry with it.
+        self.entries = match (self.depth, other.depth) {
+            (WatchDepth::Directory, WatchDepth::Directory) => self.entries.widen(&other.entries),
+            (WatchDepth::Directory, WatchDepth::File) => self.entries.clone(),
+            (WatchDepth::File, WatchDepth::Directory) => other.entries.clone(),
+            _ => WatchEntries::All,
+        };
+        self.depth = self.depth.max(other.depth);
     }
 
     /// Watch only this one file, through its parent directory.
@@ -647,6 +753,7 @@ impl WatchRoot {
             path: watch_path(&path.into()),
             depth: WatchDepth::File,
             canonical: None,
+            entries: WatchEntries::All,
         }
     }
 
@@ -743,7 +850,13 @@ impl WatchRoot {
     fn covers_as(&self, root: &Path, path: &Path) -> bool {
         match self.depth {
             WatchDepth::Tree => path.starts_with(root),
-            WatchDepth::Directory => path == root || path.parent() == Some(root),
+            WatchDepth::Directory => {
+                path == root
+                    || (path.parent() == Some(root)
+                        && path
+                            .file_name()
+                            .is_some_and(|name| self.entries.admits(name)))
+            }
             WatchDepth::File => path == root,
         }
     }
@@ -761,28 +874,25 @@ pub fn watch_roots(
     providers: &[Box<dyn ShallowSessionProvider>],
     roots: &ProviderRoots<'_>,
 ) -> Vec<WatchRoot> {
-    let mut widest: BTreeMap<PathBuf, WatchDepth> = BTreeMap::new();
+    let mut widest: BTreeMap<PathBuf, WatchRoot> = BTreeMap::new();
     let mut order = Vec::new();
     for provider in providers {
         for root in provider.watch_roots(roots) {
             match widest.get_mut(&root.path) {
-                Some(depth) => *depth = (*depth).max(root.depth),
+                Some(held) => held.widen(&root),
                 None => {
-                    widest.insert(root.path.clone(), root.depth);
-                    order.push(root.path);
+                    order.push(root.path.clone());
+                    widest.insert(root.path.clone(), root);
                 }
             }
         }
     }
     order
         .into_iter()
-        .map(|path| {
-            let depth = widest[&path];
-            WatchRoot {
-                path,
-                depth,
-                canonical: None,
-            }
+        .filter_map(|path| widest.remove(&path))
+        .map(|root| WatchRoot {
+            canonical: None,
+            ..root
         })
         .collect()
 }
@@ -1957,14 +2067,12 @@ impl ShallowSessionProvider for GrokProvider {
         env: &DiscoveryEnv<'_>,
         _requested_limit: Option<usize>,
     ) -> Result<Vec<Candidate>> {
+        // Inside a sweep, one enumeration and one stamp per session directory
+        // serve the fingerprint, the walk and this pass alike (#317).
         file_candidates(
             "grok",
-            crate::collect_matching_files(
-                &env.grok_home.join("sessions"),
-                "chat_history",
-                "jsonl",
-            )?,
-            crate::grok_session_stamp_and_modified,
+            sweep_inventory::grok_transcripts(&env.grok_home.join("sessions"))?,
+            sweep_inventory::grok_stamp_and_modified,
         )
     }
 
@@ -2514,11 +2622,26 @@ impl ShallowSessionProvider for OpencodeProvider {
         // siblings move with it, so the directory is what actually sees every
         // write. Its own entries are enough — opencode keeps unrelated state
         // in subdirectories, and waking on those would cost a fingerprint walk
-        // each time.
+        // each time — and only the store files among them: `OPENCODE_DB` can
+        // name a file in a busy directory, and every other write there would
+        // otherwise be a forced sweep (#335).
+        let Some(name) = roots.opencode_db.file_name() else {
+            return Vec::new();
+        };
         roots
             .opencode_db
             .parent()
-            .map(|dir| vec![WatchRoot::directory(dir)])
+            .map(|dir| {
+                vec![WatchRoot::directory_of(
+                    dir,
+                    WatchEntries::OpencodeStores {
+                        primary: name.to_os_string(),
+                        // A pinned database is the only store the sweep
+                        // reads, so a channel database beside it is noise.
+                        channels: !roots.opencode_db_pinned,
+                    },
+                )]
+            })
             .unwrap_or_default()
     }
 
@@ -4070,6 +4193,7 @@ pub(crate) fn provider_watch_roots(source: &str, roots: &crate::ProviderRoots) -
             muse: &roots.muse,
             devin: &roots.devin,
             opencode_db: &roots.opencode_db,
+            opencode_db_pinned: roots.opencode_db_pinned,
         },
     )
 }
@@ -4137,29 +4261,63 @@ pub(crate) const OBSERVED_SESSION_BY_LOCATOR_SQL: &str = "SELECT session_id FROM
        AND raw_locator=? AND access_state='available' \
      ORDER BY +session_id LIMIT 1";
 
-fn fetch_observed_candidate(
+/// The stamp a candidate's session was last observed at through this
+/// adapter, with the session's id.
+///
+/// `None` unless that observation is `available` and the session is still
+/// catalogued -- the two conditions under which an unmoved stamp lets the
+/// candidate be served from the catalog instead of read.
+///
+/// One prepared-once statement per question rather than a fetch of the whole
+/// observation and the whole catalog row: this runs for every candidate file
+/// on every discovery pass, a sweep's included, and those per-call prepares
+/// and row decodes were 16% of a forced tick (#316). A caller that streams the
+/// row reads it afterwards, only for candidates that matched.
+fn observed_candidate_stamp(
     conn: &Connection,
     provider: &dyn ShallowSessionProvider,
     candidate: &Candidate,
-) -> Result<Option<ShallowSession>> {
+) -> Result<Option<(String, Option<String>)>> {
     let id = match candidate.session_id.as_ref() {
         Some(id) => Some(id.clone()),
-        None => conn.query_row(OBSERVED_SESSION_BY_LOCATOR_SQL,params![candidate.source,provider.location().as_str(),provider.connector_id(),provider.connector_instance(),candidate.locator],|r|r.get(0)).optional()?,
+        None => conn
+            .prepare_cached(OBSERVED_SESSION_BY_LOCATOR_SQL)?
+            .query_row(
+                params![
+                    candidate.source,
+                    provider.location().as_str(),
+                    provider.connector_id(),
+                    provider.connector_instance(),
+                    candidate.locator
+                ],
+                |r| r.get(0),
+            )
+            .optional()?,
     };
     let Some(id) = id else { return Ok(None) };
-    let Some(observation) =
-        crate::observations::get(conn, &observation_key(provider, candidate.source, &id))?
-    else {
-        return Ok(None);
-    };
-    if observation.access_state != "available" {
-        return Ok(None);
-    }
-    let Some(mut row) = fetch_catalog_row(conn, candidate.source, &id)? else {
-        return Ok(None);
-    };
-    row.source_stamp = observation.source_stamp;
-    Ok(Some(row))
+    let key = observation_key(provider, candidate.source, &id);
+    key.validate()?;
+    let stamp = conn
+        .prepare_cached(
+            "SELECT o.source_stamp FROM session_observations o \
+             WHERE o.source = ?1 AND o.session_id = ?2 AND o.location = ?3 \
+               AND o.connector_id = ?4 AND o.connector_instance = ?5 \
+               AND o.access_state = 'available' \
+               AND EXISTS (SELECT 1 FROM sessions s \
+                     WHERE s.source = ?1 AND s.session_id = ?2)",
+        )?
+        .query_row(
+            params![
+                key.source,
+                key.session_id,
+                key.location.as_str(),
+                key.connector_id,
+                key.connector_instance
+            ],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?;
+    Ok(stamp.map(|stamp| (id, stamp)))
 }
 
 /// Whether this source was already examined at this exact stamp and found not
@@ -4175,7 +4333,22 @@ fn is_known_non_session(
     locator: &str,
     stamp: &str,
 ) -> Result<bool> {
-    let known:Option<String>=conn.query_row("SELECT stamp FROM observation_discovery_skips WHERE source=? AND location=? AND connector_id=? AND connector_instance=? AND locator=?",params![source,provider.location().as_str(),provider.connector_id(),provider.connector_instance(),locator],|r|r.get(0)).optional()?;
+    let known: Option<String> = conn
+        .prepare_cached(
+            "SELECT stamp FROM observation_discovery_skips WHERE source=? AND location=? \
+             AND connector_id=? AND connector_instance=? AND locator=?",
+        )?
+        .query_row(
+            params![
+                source,
+                provider.location().as_str(),
+                provider.connector_id(),
+                provider.connector_instance(),
+                locator
+            ],
+            |r| r.get(0),
+        )
+        .optional()?;
     Ok(known.as_deref() == Some(stamp))
 }
 
@@ -4831,7 +5004,14 @@ pub fn discover_sessions_with_provider_refs(
     on_row: impl FnMut(&ShallowSession),
 ) -> Result<DiscoverySummary> {
     let worker_limit = std::thread::available_parallelism().map_or(1, |n| n.get());
-    discover_sessions_with_worker_limit(env, options, providers, on_row, worker_limit, true)
+    discover_sessions_with_worker_limit(
+        env,
+        options,
+        providers,
+        on_row,
+        worker_limit,
+        IdentityRefresh::Streamed,
+    )
 }
 
 /// [`discover_sessions_with_providers`] for the end of a sync sweep, which
@@ -4850,7 +5030,30 @@ pub(crate) fn discover_sessions_for_sweep(
         .map(|provider| provider.as_ref())
         .collect::<Vec<_>>();
     let worker_limit = std::thread::available_parallelism().map_or(1, |n| n.get());
-    discover_sessions_with_worker_limit(env, options, &providers, |_| {}, worker_limit, false)
+    discover_sessions_with_worker_limit(
+        env,
+        options,
+        &providers,
+        |_| {},
+        worker_limit,
+        IdentityRefresh::Sweep,
+    )
+}
+
+/// Who brings project identity up to date around a discovery pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentityRefresh {
+    /// Rows are streamed to the caller. Each cached row is upgraded before it
+    /// is streamed (see [`upgrade_cached_project_identity`]), and the pass
+    /// ends with the whole-catalog refresh.
+    Streamed,
+    /// The sweep: no row is streamed, and the sweep runs the refresh itself
+    /// right after the pass. That refresh stores exactly the key the per-row
+    /// upgrade would have -- the upgrade exists only so a *streamed* row
+    /// agrees with it -- so upgrading every cached row here as well was the
+    /// same resolution and ancestor walk twice, once per candidate file, on
+    /// every tick (#318).
+    Sweep,
 }
 
 // An explicit limit lets regression tests exercise both read paths regardless
@@ -4861,7 +5064,7 @@ fn discover_sessions_with_worker_limit(
     providers: &[&dyn ShallowSessionProvider],
     mut on_row: impl FnMut(&ShallowSession),
     worker_limit: usize,
-    refresh_identity: bool,
+    identity: IdentityRefresh,
 ) -> Result<DiscoverySummary> {
     // A pass is the unit over which the filesystem is treated as fixed, so it
     // is also the unit the project-identity cache may span. A host that stays
@@ -5020,15 +5223,34 @@ fn discover_sessions_with_worker_limit(
             }
             let provider = providers[*provider_index];
             let expected = stored_stamp(&candidate.stamp);
-            let cached = fetch_observed_candidate(conn, provider, candidate)?;
-            if let Some(mut cached) =
-                cached.filter(|row| row.source_stamp.as_deref() == Some(&expected))
-            {
-                // Before the row is queued for emission, not after the pass:
-                // `on_row` streams these to the caller as they are decided, so
-                // correcting the catalog at the end of the pass would still
-                // have handed every consumer the stale key.
-                upgrade_cached_project_identity(conn, &mut cached)?;
+            let unchanged = match observed_candidate_stamp(conn, provider, candidate)? {
+                Some((id, stamp)) if stamp.as_deref() == Some(expected.as_str()) => {
+                    match identity {
+                        // Nothing is streamed, so the row itself is not needed.
+                        IdentityRefresh::Sweep => Some(WindowEntry::Unchanged),
+                        IdentityRefresh::Streamed => {
+                            match fetch_catalog_row(conn, candidate.source, &id)? {
+                                Some(mut cached) => {
+                                    cached.source_stamp = stamp;
+                                    // Before the row is queued for emission,
+                                    // not after the pass: `on_row` streams
+                                    // these to the caller as they are decided,
+                                    // so correcting the catalog at the end of
+                                    // the pass would still have handed every
+                                    // consumer the stale key.
+                                    upgrade_cached_project_identity(conn, &mut cached)?;
+                                    Some(WindowEntry::Cached(cached))
+                                }
+                                // Dropped from the catalog since the lookup
+                                // above: not cached after all.
+                                None => None,
+                            }
+                        }
+                    }
+                }
+                _ => None,
+            };
+            if let Some(unchanged) = unchanged {
                 env.note_skipped();
                 summary.skipped_unchanged += 1;
                 if let Some(entry) = summary.providers.get_mut(candidate.source) {
@@ -5038,7 +5260,7 @@ fn discover_sessions_with_worker_limit(
                         .skipped_unchanged += 1;
                 }
                 potential += 1;
-                entries.push(WindowEntry::Cached(cached));
+                entries.push(unchanged);
                 continue;
             }
             // A source already examined and found not to be a session (a codex
@@ -5160,6 +5382,7 @@ fn discover_sessions_with_worker_limit(
                 break 'apply;
             }
             let (candidate, provider, expected, result) = match entry {
+                WindowEntry::Unchanged => continue,
                 WindowEntry::Cached(row) => {
                     let key = (row.source.clone(), row.session_id.clone());
                     if !emitted_sessions.contains(&key) {
@@ -5347,7 +5570,7 @@ fn discover_sessions_with_worker_limit(
     // nothing to upgrade stays read-only. Reporting rather than failing, for
     // the same reason the sync path does: the rows this discovery wrote are
     // already committed, and every key here is derived from them.
-    if refresh_identity {
+    if identity == IdentityRefresh::Streamed {
         if let Err(error) = crate::store::refresh_project_identity(env.conn) {
             eprintln!(
                 "ai-hist: could not refresh canonical project identity after discovery: {error:#} \
@@ -5397,6 +5620,9 @@ impl Drop for RelaxedSynchronous<'_> {
 enum WindowEntry<'c> {
     /// Stamp matched the catalog: emit the cached row, read nothing.
     Cached(ShallowSession),
+    /// Stamp matched the catalog during a sweep, which streams nothing: read
+    /// nothing, emit nothing.
+    Unchanged,
     /// Needs a shallow read. `result` is filled by the parallel phase for
     /// filesystem providers; a `None` result is read serially at apply time.
     Read {
@@ -5419,3 +5645,5 @@ pub fn discover_sessions_collect(
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) mod sweep_inventory;

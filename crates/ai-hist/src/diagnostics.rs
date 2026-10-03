@@ -13,19 +13,65 @@ pub(crate) fn wal_path(db_path: &Path) -> PathBuf {
 
 /// Free bytes on the filesystem holding `path`.
 ///
-/// Shells out to `df` rather than taking a libc dependency for one number;
-/// this crate already shells out to `git` for the same reason.
+/// Every sweep asks this before it writes, and the sweep is a watch tick:
+/// on Unix it is one `statfs`/`statvfs` call rather than spawning `df`, which cost a
+/// forced tick several milliseconds of `posix_spawn` and pipe reads. `df -P`
+/// reports `f_bavail` -- the blocks an unprivileged writer may use -- so the
+/// figure is the same one.
 pub(crate) fn free_bytes(path: &Path) -> Option<u64> {
-    // df needs an existing path: fall back to the parent for a database that
-    // has not been created yet.
+    // A database that has not been created yet: ask about its directory.
     let target = if path.exists() {
         path.to_path_buf()
     } else {
         path.parent()?.to_path_buf()
     };
+    free_bytes_at(&target)
+}
+
+/// Apple's `statvfs` reports block counts as 32-bit `fsblkcnt_t`, so a volume
+/// with more than 2^32 free blocks (16 TiB at 4 KiB) wraps to a small number
+/// and would trip the free-space floor. Its `statfs` carries 64-bit counts.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn free_bytes_at(target: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(target.as_os_str().as_bytes()).ok()?;
+    let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `path` is a valid NUL-terminated string and `stats` points to
+    // writable memory of the right size; `statfs` initializes it on success.
+    let rc = unsafe { libc::statfs(path.as_ptr(), stats.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    // SAFETY: `statfs` returned 0, so the struct is initialized.
+    let stats = unsafe { stats.assume_init() };
+    stats.f_bavail.checked_mul(u64::from(stats.f_bsize))
+}
+
+/// `statvfs`, whose block counts are 64-bit on Linux and the other Unixes
+/// this builds for.
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
+fn free_bytes_at(target: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(target.as_os_str().as_bytes()).ok()?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `path` is a valid NUL-terminated string and `stats` points to
+    // writable memory of the right size; `statvfs` initializes it on success.
+    let rc = unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    // SAFETY: `statvfs` returned 0, so the struct is initialized.
+    let stats = unsafe { stats.assume_init() };
+    #[allow(clippy::unnecessary_cast)] // the field widths differ by platform
+    let (available, fragment) = (stats.f_bavail as u64, stats.f_frsize as u64);
+    available.checked_mul(fragment)
+}
+
+#[cfg(not(unix))]
+fn free_bytes_at(target: &Path) -> Option<u64> {
     let out = std::process::Command::new("df")
         .arg("-Pk")
-        .arg(&target)
+        .arg(target)
         .output()
         .ok()?;
     if !out.status.success() {
@@ -576,6 +622,40 @@ mod compact_tests {
             .unwrap();
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
         db_path
+    }
+
+    /// `statfs`/`statvfs` report the figure `df -P` did. Free space moves under a
+    /// running test suite, so the two are compared loosely.
+    #[cfg(unix)]
+    #[test]
+    fn free_bytes_agrees_with_df() {
+        let dir = tempfile::tempdir().unwrap();
+        let measured = free_bytes(&dir.path().join("not-yet.db")).expect("statfs/statvfs answers");
+        let out = std::process::Command::new("df")
+            .arg("-Pk")
+            .arg(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "df -Pk failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let text = String::from_utf8_lossy(&out.stdout);
+        let df: u64 = text
+            .lines()
+            .nth(1)
+            .and_then(|line| line.split_whitespace().nth(3))
+            .and_then(|kb| kb.parse::<u64>().ok())
+            .expect("df -Pk prints available kilobytes")
+            * 1024;
+        let tolerance = (df / 20).max(2 << 30);
+        assert!(
+            measured.abs_diff(df) <= tolerance,
+            "free_bytes {measured} vs df {df}"
+        );
+        assert!(free_bytes(Path::new("/definitely/not/a/dir/db")).is_none());
     }
 
     #[test]

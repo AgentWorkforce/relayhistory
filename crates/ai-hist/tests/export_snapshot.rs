@@ -389,3 +389,150 @@ fn a_new_store_exports_without_any_stored_state() {
         .unwrap();
     assert_eq!(stored, Vec::<String>::new());
 }
+
+/// `rows` session events, every `selected_every`-th one in session `picked`
+/// and the rest in `other`, each carrying `payload` bytes of text.
+fn seed_events(conn: &Connection, rows: usize, selected_every: usize, payload: usize) {
+    let tx = conn.unchecked_transaction().unwrap();
+    let text = "x".repeat(payload);
+    for n in 0..rows {
+        let session = if n % selected_every == 0 {
+            "picked"
+        } else {
+            "other"
+        };
+        tx.execute(
+            "INSERT INTO session_events (source, session_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('claude', ?1, ?2, 'user', 'text', ?3, ?4)",
+            rusqlite::params![session, n as i64, text, format!("e{n}")],
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
+}
+
+/// Every page and the SQLite VM steps the whole export took: a count of rows
+/// read that does not depend on the speed of the machine.
+fn export_counting(
+    db: &Path,
+    selection: &ExportSelection,
+    limits: &ExportLimits,
+) -> (Vec<HistoryExportPage>, u64) {
+    let conn = Connection::open(db).unwrap();
+    let steps = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let tick = std::sync::Arc::clone(&steps);
+    conn.progress_handler(
+        1,
+        Some(move || {
+            tick.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            false
+        }),
+    );
+    let mut snapshot = ExportSnapshot::open(conn, selection, limits, 60_000, now()).unwrap();
+    let pages = pages(&mut snapshot);
+    (pages, steps.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+fn flatten(pages: &[HistoryExportPage]) -> Vec<HistoryExportRecord> {
+    pages.iter().flat_map(|page| page.records.clone()).collect()
+}
+
+/// A page reads only the rows it serves. With one record per page, a scan
+/// budget of 10,000 costs what a budget of one does: rows past the page
+/// boundary are not read, decoded and thrown away to be read again by the
+/// next page. Eagerly fetching the whole budget made 600 rows cost
+/// 600 + 599 + ... + 1 row reads (#308).
+#[test]
+fn a_page_does_not_read_rows_past_its_own_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_store, conn, db) = store(dir.path());
+    seed_events(&conn, 600, 1, 10);
+    let selection = all_sessions(&["session_event"]);
+    let limits = |scan: usize| ExportLimits {
+        max_batch_records: 1,
+        max_scan_records: scan,
+        ..ExportLimits::default()
+    };
+    let (narrow, narrow_steps) = export_counting(&db, &selection, &limits(1));
+    let (wide, wide_steps) = export_counting(&db, &selection, &limits(10_000));
+    assert_eq!(flatten(&narrow).len(), 600);
+    assert_eq!(flatten(&wide), flatten(&narrow));
+    eprintln!("batch 1: scan 1 = {narrow_steps} steps, scan 10000 = {wide_steps} steps");
+    assert!(
+        wide_steps < narrow_steps * 2,
+        "a 10,000-row scan budget cost {wide_steps} steps against {narrow_steps} for one"
+    );
+}
+
+/// Rows that break a page on bytes are not read ahead either, and every
+/// record still arrives exactly once, in order, within the byte limit.
+#[test]
+fn a_byte_bounded_page_of_large_payloads_reads_only_what_it_serves() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_store, conn, db) = store(dir.path());
+    seed_events(&conn, 200, 1, 20_000);
+    let selection = all_sessions(&["session_event"]);
+    let tight = ExportLimits {
+        // Two of these records fit, three do not.
+        max_batch_bytes: 50_000,
+        max_batch_records: 10_000,
+        max_scan_records: 10_000,
+    };
+    let (pages, steps) = export_counting(&db, &selection, &tight);
+    assert!(pages
+        .iter()
+        .all(|page| serde_json::to_vec(page).unwrap().len() <= tight.max_batch_bytes));
+    assert!(pages.iter().all(|page| page.records.len() <= 2));
+    let (reference, reference_steps) = export_counting(
+        &db,
+        &selection,
+        &ExportLimits {
+            max_batch_records: 1,
+            max_scan_records: 1,
+            ..tight.clone()
+        },
+    );
+    assert_eq!(flatten(&pages), flatten(&reference));
+    eprintln!("large payloads: {steps} steps, one row per page {reference_steps}");
+    assert!(steps < reference_steps * 2, "{steps} vs {reference_steps}");
+}
+
+/// A sparse selection still honours the scan budget -- a page examines at
+/// most `max_scan_records` rows, selected or not -- and exports exactly the
+/// selected rows whatever the budget.
+#[test]
+fn a_sparse_selection_keeps_the_scan_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_store, conn, db) = store(dir.path());
+    seed_events(&conn, 1_000, 25, 1_000);
+    let selection = ExportSelection {
+        sessions: vec![SessionIdentity {
+            source: "claude".into(),
+            session_id: "picked".into(),
+        }],
+        kinds: vec!["session_event".into()],
+        ..Default::default()
+    };
+    let mut exported = Vec::new();
+    for scan in [1, 7, 100, 10_000] {
+        let limits = ExportLimits {
+            max_scan_records: scan,
+            ..ExportLimits::default()
+        };
+        let (pages, _) = export_counting(&db, &selection, &limits);
+        let records = flatten(&pages);
+        assert_eq!(records.len(), 40, "scan {scan}");
+        assert!(records
+            .iter()
+            .all(|record| record.session_id.as_deref() == Some("picked")));
+        // Each page examined at most `scan` rows, so walking 1,000 rows took
+        // at least 1,000 / scan pages.
+        assert!(
+            pages.len() >= 1_000 / scan,
+            "scan {scan}: {} pages",
+            pages.len()
+        );
+        exported.push(records);
+    }
+    assert!(exported.windows(2).all(|pair| pair[0] == pair[1]));
+}

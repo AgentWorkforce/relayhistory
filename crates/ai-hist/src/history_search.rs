@@ -12,7 +12,7 @@ use crate::{
     QueryFilter, SessionScope,
 };
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{params, Connection, OptionalExtension};
 /// Which rows a search may match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchRole {
@@ -120,45 +120,64 @@ pub fn search_page(
     Ok(HistoryPage { rows, next_cursor })
 }
 
+/// The newest prompt matching a search that names a session (non-empty
+/// session id), or `None`: what `resume` needs, in one query.
+pub fn latest_prompt_with_session(
+    conn: &Connection,
+    terms: &[String],
+    raw_fts: bool,
+    filter: &QueryFilter,
+) -> Result<Option<SearchRow>> {
+    let filter = QueryFilter {
+        limit: 1,
+        ..filter.clone()
+    };
+    filter.validate()?;
+    Ok(
+        search_history_rows_where(conn, terms, raw_fts, &filter, true)?
+            .into_iter()
+            .next(),
+    )
+}
+
 fn search_history_rows(
     conn: &Connection,
     terms: &[String],
     raw_fts: bool,
     filter: &QueryFilter,
 ) -> Result<Vec<SearchRow>> {
-    let mut params_vec = Vec::new();
-    let mut sql = if terms.is_empty() {
-        "SELECT h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms \
-         FROM history h WHERE 1=1"
-            .to_string()
-    } else {
-        params_vec.push(crate::build_fts_query(terms, raw_fts));
-        "SELECT h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms \
-         FROM history_fts f JOIN history h ON f.rowid = h.id WHERE history_fts MATCH ?"
-            .to_string()
-    };
-    append_history_search_filters(&mut sql, &mut params_vec, filter, "h");
-    sql.push_str(" ORDER BY h.timestamp_ms DESC, h.id DESC LIMIT ?");
-    params_vec.push(filter.limit.max(1).to_string());
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt
-        .query_map(rusqlite::params_from_iter(params_vec), |row| {
-            Ok(SearchRow {
-                id: row.get(0)?,
-                source: row.get(1)?,
-                session_id: row.get(2)?,
-                project: row.get(3)?,
-                text: row.get(4)?,
-                timestamp_ms: row.get(5)?,
-                role: "user".to_string(),
-                kind: "history".to_string(),
-                match_source: MATCH_SOURCE_HISTORY.to_string(),
-            })
-        })
-        .map_err(|error| raw_fts_query_error(raw_fts, error))?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|error| raw_fts_query_error(raw_fts, error))?;
-    Ok(rows)
+    search_history_rows_where(conn, terms, raw_fts, filter, false)
+}
+
+fn search_history_rows_where(
+    conn: &Connection,
+    terms: &[String],
+    raw_fts: bool,
+    filter: &QueryFilter,
+    with_session: bool,
+) -> Result<Vec<SearchRow>> {
+    let fts_match = (!terms.is_empty()).then(|| {
+        let query = crate::build_fts_query(terms, raw_fts);
+        BranchMatch {
+            probe: query.clone(),
+            scan: query,
+        }
+    });
+    let mut filter_sql = String::new();
+    let mut filter_params = Vec::new();
+    append_history_search_filters(&mut filter_sql, &mut filter_params, filter, "h");
+    if with_session {
+        filter_sql.push_str(" AND h.session_id IS NOT NULL AND h.session_id != ''");
+    }
+    search_branch(
+        conn,
+        &HISTORY_BRANCH,
+        fts_match,
+        &filter_sql,
+        filter_params,
+        filter,
+        raw_fts,
+    )
 }
 
 fn search_event_rows(
@@ -168,56 +187,441 @@ fn search_event_rows(
     filter: &QueryFilter,
     role: SearchRole,
 ) -> Result<Vec<SearchRow>> {
-    let mut params_vec = Vec::new();
-    let mut sql = if terms.is_empty() {
-        "SELECT e.id, e.source, e.session_id, e.project, COALESCE(e.text, ''), e.ts_ms, e.role, e.kind \
-         FROM session_events e WHERE 1=1"
-            .to_string()
-    } else {
-        // `session_events_fts` also indexes `role`; an ordinary query must not
-        // match `assistant` or `user` against it, or searching for the word
-        // would return every event of that role. `text` and `project` are the
-        // columns `history_fts` matches a prompt on (`prompt`, `project`), so
-        // both branches read a term the same way. A raw query is the caller's
-        // FTS5 expression, column filters included, and is left as written.
+    // `session_events_fts` also indexes `role`; an ordinary query must not
+    // match `assistant` or `user` against it, or searching for the word would
+    // return every event of that role. `text` and `project` are the columns
+    // `history_fts` matches a prompt on (`prompt`, `project`), so both
+    // branches read a term the same way. A raw query is the caller's FTS5
+    // expression, column filters included, and is left as written.
+    //
+    // Reading through the index, a role search also matches the role column,
+    // so the index hands back only that role's events instead of every event
+    // the term matches; the SQL role predicate still decides. A walk tests
+    // one event at a time, where that extra column costs more than the role
+    // predicate it would duplicate, so it tests the term alone.
+    let fts_match = (!terms.is_empty()).then(|| {
         let query = crate::build_fts_query(terms, raw_fts);
-        params_vec.push(if raw_fts {
-            query
-        } else {
-            format!("{{text project}} : ({query})")
-        });
-        "SELECT e.id, e.source, e.session_id, e.project, COALESCE(e.text, ''), e.ts_ms, e.role, e.kind \
-         FROM session_events_fts f JOIN session_events e ON f.rowid = e.id WHERE session_events_fts MATCH ?"
-            .to_string()
-    };
+        if raw_fts {
+            return BranchMatch {
+                probe: query.clone(),
+                scan: query,
+            };
+        }
+        let probe = format!("{{text project}} : ({query})");
+        let scan = match role {
+            SearchRole::User => format!("{probe} AND role : user"),
+            SearchRole::Assistant => format!("{probe} AND role : assistant"),
+            SearchRole::All | SearchRole::Prompt => probe.clone(),
+        };
+        BranchMatch { probe, scan }
+    });
     // The query the history branch runs, which a prompt must match for its
     // event copy to be dropped as a duplicate of it.
     let prompt_match = (!terms.is_empty()).then(|| crate::build_fts_query(terms, raw_fts));
+    let mut filter_sql = String::new();
+    let mut filter_params = Vec::new();
     append_event_search_filters(
-        &mut sql,
-        &mut params_vec,
+        &mut filter_sql,
+        &mut filter_params,
         filter,
         "e",
         role,
         prompt_match.as_deref(),
     );
-    sql.push_str(" ORDER BY e.ts_ms DESC, e.id DESC LIMIT ?");
-    params_vec.push(filter.limit.max(1).to_string());
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt
-        .query_map(rusqlite::params_from_iter(params_vec), |row| {
-            Ok(SearchRow {
-                id: row.get(0)?,
-                source: row.get(1)?,
-                session_id: row.get(2)?,
-                project: row.get(3)?,
-                text: row.get(4)?,
-                timestamp_ms: row.get(5)?,
-                role: row.get(6)?,
-                kind: row.get(7)?,
-                match_source: MATCH_SOURCE_SESSION_EVENT.to_string(),
-            })
+    search_branch(
+        conn,
+        &EVENT_BRANCH,
+        fts_match,
+        &filter_sql,
+        filter_params,
+        filter,
+        raw_fts,
+    )
+}
+
+/// A branch's FTS5 MATCH expression, in the two forms its plans use.
+struct BranchMatch {
+    /// Tests one row by rowid, in the timestamp walk.
+    probe: String,
+    /// Reads every match through the index: the match count, and the
+    /// index-driven plan.
+    scan: String,
+}
+
+/// One searchable table: its rows, their FTS5 index, and the timestamp index
+/// a newest-first walk reads.
+struct SearchBranch {
+    table: &'static str,
+    alias: &'static str,
+    fts: &'static str,
+    ts_column: &'static str,
+    ts_index: &'static str,
+    columns: &'static str,
+    /// Whether a row sorts after a `history` row with the same
+    /// `(timestamp, id)`; see [`append_window_filters`].
+    after_history_tie: bool,
+    row: fn(&rusqlite::Row<'_>) -> rusqlite::Result<SearchRow>,
+}
+
+const HISTORY_BRANCH: SearchBranch = SearchBranch {
+    table: "history",
+    alias: "h",
+    fts: "history_fts",
+    ts_column: "timestamp_ms",
+    ts_index: "idx_history_timestamp",
+    columns: "h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms",
+    after_history_tie: false,
+    row: |row| {
+        Ok(SearchRow {
+            id: row.get(0)?,
+            source: row.get(1)?,
+            session_id: row.get(2)?,
+            project: row.get(3)?,
+            text: row.get(4)?,
+            timestamp_ms: row.get(5)?,
+            role: "user".to_string(),
+            kind: "history".to_string(),
+            match_source: MATCH_SOURCE_HISTORY.to_string(),
         })
+    },
+};
+
+const EVENT_BRANCH: SearchBranch = SearchBranch {
+    table: "session_events",
+    alias: "e",
+    fts: "session_events_fts",
+    ts_column: "ts_ms",
+    ts_index: "idx_session_events_ts",
+    columns: "e.id, e.source, e.session_id, e.project, COALESCE(e.text, ''), e.ts_ms, e.role, e.kind",
+    after_history_tie: true,
+    row: |row| {
+        Ok(SearchRow {
+            id: row.get(0)?,
+            source: row.get(1)?,
+            session_id: row.get(2)?,
+            project: row.get(3)?,
+            text: row.get(4)?,
+            timestamp_ms: row.get(5)?,
+            role: row.get(6)?,
+            kind: row.get(7)?,
+            match_source: MATCH_SOURCE_SESSION_EVENT.to_string(),
+        })
+    },
+};
+
+/// A query matching fewer rows than this is read through its FTS5 index and
+/// sorted: the work is bounded by the match count. Counting up to it reads
+/// only the head of the term's doclist. Tests shrink this bound and
+/// [`RECENT_WINDOW`] so small fixtures cross both.
+const MATCH_SORT_CAP: i64 = if cfg!(test) { 3 } else { 5_000 };
+
+/// The growing windows a walk reads, in newest rows that pass the time
+/// window and cursor; the last is the most it reads before it falls back to
+/// sorting every match. See [`search_branch`].
+const WALK_WINDOWS: [i64; 3] = if cfg!(test) {
+    [2, 3, 6]
+} else {
+    [2_000, 6_000, 20_000]
+};
+const RECENT_WINDOW: i64 = WALK_WINDOWS[WALK_WINDOWS.len() - 1];
+
+#[cfg(test)]
+thread_local! {
+    /// Set by tests to read every search through the index-driven plan, the
+    /// reference the walk must agree with.
+    static SORT_EVERY_MATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// How many walks returned their rows, and how many fell back.
+    static WALK_OUTCOMES: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+fn record_walk(served: bool) {
+    WALK_OUTCOMES.with(|outcomes| {
+        let (hits, misses) = outcomes.get();
+        outcomes.set(if served {
+            (hits + 1, misses)
+        } else {
+            (hits, misses + 1)
+        });
+    });
+}
+
+#[cfg(not(test))]
+fn record_walk(_served: bool) {}
+
+fn walk_allowed() -> bool {
+    #[cfg(test)]
+    if SORT_EVERY_MATCH.with(|sort| sort.get()) {
+        return false;
+    }
+    true
+}
+
+/// One branch's matches, newest first: `filter_sql` and `filter_params` are
+/// the branch's predicates on its alias, `fts_match` its MATCH expression.
+///
+/// A common term matches most of a table, and joining the FTS5 index to it
+/// then reads and sorts every match to return the top `limit`: hundreds of
+/// milliseconds on a few hundred thousand events. So a search walks the
+/// timestamp index instead, testing each row against the FTS5 index by rowid
+/// and stopping at `limit`.
+///
+/// The walk reads the newest rows that pass the time window and cursor in
+/// growing [`WALK_WINDOWS`], up to [`RECENT_WINDOW`] of them. Those rows are
+/// a prefix of the result order, so when `limit` matches are found among them
+/// they are exactly the first `limit` of the full search; otherwise (a term
+/// only older sessions use, or a filter few rows pass) the search falls back
+/// to the index-driven plan. A query with few matches skips the walk: sorting
+/// them is already cheap.
+fn search_branch(
+    conn: &Connection,
+    branch: &SearchBranch,
+    fts_match: Option<BranchMatch>,
+    filter_sql: &str,
+    filter_params: Vec<String>,
+    filter: &QueryFilter,
+    raw_fts: bool,
+) -> Result<Vec<SearchRow>> {
+    let SearchBranch {
+        table,
+        alias,
+        fts,
+        ts_column,
+        ts_index,
+        columns,
+        ..
+    } = branch;
+    let limit = filter.limit.max(1);
+    // A window smaller than the page could never fill it.
+    let mut walk = walk_allowed() && limit < RECENT_WINDOW;
+    if walk {
+        if let Some(query) = &fts_match {
+            let matches: i64 = conn
+                .prepare_cached(&format!(
+                    "SELECT count(*) FROM (SELECT 1 FROM {fts} WHERE {fts} MATCH ? LIMIT ?)"
+                ))?
+                .query_row(params![query.scan, MATCH_SORT_CAP], |row| row.get(0))
+                .map_err(|error| raw_fts_query_error(raw_fts, error))?;
+            walk = matches >= MATCH_SORT_CAP;
+        }
+    }
+    if walk && index_exists(conn, ts_index)? {
+        for (step, window) in WALK_WINDOWS.iter().copied().enumerate() {
+            let floor = recent_window_floor(conn, branch, filter, window)?;
+            // Rows tied on the floor's timestamp all join the window, and the
+            // walk tests every one to order the tie by id. A tie as large as
+            // the window itself (a bulk import stamped with one time) would
+            // make the walk cost more than sorting every match, so fall back.
+            if let Some(floor) = floor {
+                if tie_reaches(conn, branch, filter, floor, window)? {
+                    break;
+                }
+            }
+            // The tie check bounds this window's rows at or above its floor to
+            // fewer than twice the window, and each window in WALK_WINDOWS is
+            // larger than that, so every step's floor is strictly older than
+            // the last and each window is read once.
+            let rows = walk_window(
+                conn,
+                branch,
+                fts_match.as_ref(),
+                filter_sql,
+                &filter_params,
+                filter,
+                raw_fts,
+                floor,
+            )?;
+            // A window that holds every eligible row is the whole search.
+            if floor.is_none() || rows.len() as i64 >= limit {
+                record_walk(true);
+                return Ok(rows);
+            }
+            let found = rows.len();
+            // Grow the window while it could still fill the page: matches at
+            // a rate that could fill the last window (with 4x slack, as they
+            // cluster by session), or none yet in only the first, which a
+            // fresh session without the term can account for. Two windows with
+            // no match -- a filter nothing recent passes, a term the newest
+            // rows do not use -- fall back after a few thousand rows.
+            let grow = if found == 0 {
+                step == 0
+            } else {
+                found as i64 * (RECENT_WINDOW / window) * 4 >= limit
+            };
+            if !grow {
+                break;
+            }
+        }
+        record_walk(false);
+    }
+
+    let mut params_vec = Vec::new();
+    let mut sql = match &fts_match {
+        None => format!("SELECT {columns} FROM {table} {alias} WHERE 1=1"),
+        Some(query) => {
+            params_vec.push(query.scan.clone());
+            format!(
+                "SELECT {columns} FROM {fts} f JOIN {table} {alias} ON f.rowid = {alias}.id \
+                 WHERE {fts} MATCH ?"
+            )
+        }
+    };
+    sql.push_str(filter_sql);
+    params_vec.extend(filter_params);
+    sql.push_str(&format!(
+        " ORDER BY {alias}.{ts_column} DESC, {alias}.id DESC LIMIT ?"
+    ));
+    params_vec.push(limit.to_string());
+    query_branch_rows(conn, branch, &sql, params_vec, raw_fts)
+}
+
+/// Whether an index exists. `init_db` creates both timestamp indexes, but
+/// neither is a schema-currency requirement, so a read-only handle on an
+/// older database may lack one and `INDEXED BY` would fail to prepare.
+fn index_exists(conn: &Connection, name: &str) -> Result<bool> {
+    Ok(conn
+        .prepare_cached("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?")?
+        .exists([name])?)
+}
+
+/// The branch's matches, at most `limit` of them, among the rows at or after
+/// `floor` that pass the time window and cursor (every such row when `floor`
+/// is `None`). See [`recent_window_floor`].
+///
+/// The window is every row at or after the `window`-th row's timestamp: a
+/// prefix of the `(timestamp DESC, id DESC)` order, so `limit` matches found
+/// in it are the search's first `limit`. Rows tied with that timestamp extend
+/// it past `window`; breaking the tie by id would sort the whole tie.
+fn walk_window(
+    conn: &Connection,
+    branch: &SearchBranch,
+    fts_match: Option<&BranchMatch>,
+    filter_sql: &str,
+    filter_params: &[String],
+    filter: &QueryFilter,
+    raw_fts: bool,
+    floor: Option<i64>,
+) -> Result<Vec<SearchRow>> {
+    let SearchBranch {
+        table,
+        alias,
+        fts,
+        ts_column,
+        ts_index,
+        columns,
+        ..
+    } = branch;
+    // The walk orders ids only: rows tied on the floor's timestamp are sorted
+    // by id, and a sorter of ids is cheap where one of full rows (event text
+    // included) is not. The page's rows are read once it is chosen.
+    let mut sql = format!(
+        "SELECT {columns} FROM {table} {alias} WHERE {alias}.id IN (\
+         SELECT {alias}.id FROM {table} {alias} INDEXED BY {ts_index} WHERE 1=1"
+    );
+    let mut params_vec = Vec::new();
+    if let Some(query) = fts_match {
+        sql.push_str(&format!(
+            " AND EXISTS (SELECT 1 FROM {fts} f WHERE {fts} MATCH ? AND f.rowid = {alias}.id)"
+        ));
+        params_vec.push(query.probe.clone());
+    }
+    if let Some(floor) = floor {
+        sql.push_str(&format!(" AND {alias}.{ts_column} >= ?"));
+        params_vec.push(floor.to_string());
+    }
+    sql.push_str(filter_sql);
+    params_vec.extend(filter_params.iter().cloned());
+    sql.push_str(&format!(
+        " ORDER BY {alias}.{ts_column} DESC, {alias}.id DESC LIMIT ?) \
+         ORDER BY {alias}.{ts_column} DESC, {alias}.id DESC"
+    ));
+    params_vec.push(filter.limit.max(1).to_string());
+    query_branch_rows(conn, branch, &sql, params_vec, raw_fts)
+}
+
+/// Whether at least `window` rows that pass the search's time window and
+/// cursor share timestamp `ts`: an index-only count that stops at `window`.
+/// Rows a cursor already passed are not counted, so a deep page inside a large
+/// tie walks only the tied rows it still has to order.
+fn tie_reaches(
+    conn: &Connection,
+    branch: &SearchBranch,
+    filter: &QueryFilter,
+    ts: i64,
+    window: i64,
+) -> Result<bool> {
+    let column = format!("{}.{}", branch.alias, branch.ts_column);
+    let (mut sql, mut params_vec) = eligible_rows(branch, filter, &column);
+    sql.push_str(&format!(" AND {column} = ?"));
+    params_vec.push(ts.to_string());
+    let tied: i64 = conn
+        .prepare(&format!("SELECT count(*) FROM ({sql} LIMIT ?)"))?
+        .query_row(
+            rusqlite::params_from_iter(params_vec.into_iter().chain([window.to_string()])),
+            |row| row.get(0),
+        )?;
+    Ok(tied >= window)
+}
+
+/// The timestamp of the `window`-th newest row that passes the
+/// search's time window and cursor, or `None` when fewer rows pass.
+fn recent_window_floor(
+    conn: &Connection,
+    branch: &SearchBranch,
+    filter: &QueryFilter,
+    window: i64,
+) -> Result<Option<i64>> {
+    let column = format!("{}.{}", branch.alias, branch.ts_column);
+    let (mut sql, mut params_vec) = eligible_rows(branch, filter, &column);
+    sql.push_str(&format!(" ORDER BY {column} DESC LIMIT 1 OFFSET ?"));
+    params_vec.push((window - 1).to_string());
+    Ok(conn
+        .prepare(&sql)?
+        .query_row(rusqlite::params_from_iter(params_vec), |row| row.get(0))
+        .optional()?)
+}
+
+/// `SELECT <ts>` over the branch's timestamp index, restricted to the rows
+/// that pass the search's time window and cursor.
+fn eligible_rows(
+    branch: &SearchBranch,
+    filter: &QueryFilter,
+    column: &str,
+) -> (String, Vec<String>) {
+    let SearchBranch {
+        table,
+        alias,
+        ts_index,
+        after_history_tie,
+        ..
+    } = branch;
+    let mut sql = format!("SELECT {column} FROM {table} {alias} INDEXED BY {ts_index} WHERE 1=1");
+    let mut params_vec = Vec::new();
+    if let Some(before_ms) = filter.before_ms {
+        sql.push_str(&format!(" AND {column} < ?"));
+        params_vec.push(before_ms.to_string());
+    }
+    append_window_filters(
+        &mut sql,
+        &mut params_vec,
+        filter,
+        column,
+        &format!("{alias}.id"),
+        *after_history_tie,
+    );
+    (sql, params_vec)
+}
+
+fn query_branch_rows(
+    conn: &Connection,
+    branch: &SearchBranch,
+    sql: &str,
+    params_vec: Vec<String>,
+    raw_fts: bool,
+) -> Result<Vec<SearchRow>> {
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params_vec), branch.row)
         .map_err(|error| raw_fts_query_error(raw_fts, error))?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|error| raw_fts_query_error(raw_fts, error))?;
@@ -808,5 +1212,291 @@ mod tests {
         assert_eq!(SearchRole::parse("prompt").unwrap(), SearchRole::Prompt);
         let error = SearchRole::parse("tool").unwrap_err().to_string();
         assert!(error.contains("all, user, assistant, prompt"), "got: {error}");
+    }
+
+    /// Sessions across sources and locations, prompts mirrored as user
+    /// events, and a term the newest rows rarely use: enough rows that the
+    /// test-sized window and match cap are crossed both ways.
+    fn walk_fixture() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let sessions = [
+            ("claude", "s1", "/work/alpha"),
+            ("claude", "s2", "/work/beta"),
+            ("codex", "s3", "/work/alpha"),
+            ("codex", "s4", "/work/gamma"),
+        ];
+        for (index, (source, session, _)) in sessions.iter().enumerate() {
+            let location = if index == 3 {
+                crate::SessionLocation::Remote
+            } else {
+                crate::SessionLocation::Local
+            };
+            crate::mark_session_presence(&conn, source, session, location).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO tags (name, display_name, created_ms, updated_ms) VALUES ('hot', 'hot', 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_tags (source, session_id, tag_id, created_ms) VALUES ('claude', 's2', 1, 0)",
+            [],
+        )
+        .unwrap();
+        let mut seed = 7_u64;
+        let mut next = move |bound: u64| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) % bound
+        };
+        for index in 0..90_i64 {
+            let (source, session, project) = sessions[next(4) as usize];
+            // Timestamps collide often, so ties cross the window boundary.
+            let ts = 1_000 + (next(40) as i64) * 10;
+            // `rare` only in the oldest rows, `needle` everywhere.
+            let mut text = format!("needle row {index}");
+            if ts < 1_100 {
+                text.push_str(" rare");
+            }
+            match next(5) {
+                0 => {
+                    insert_history(
+                        &conn,
+                        &HistoryEntry {
+                            id: 0,
+                            source: source.into(),
+                            session_id: Some(session.into()),
+                            project: Some(project.into()),
+                            prompt: text.clone(),
+                            prompt_hash: None,
+                            timestamp_ms: ts,
+                        },
+                    )
+                    .unwrap();
+                    // Most prompts are mirrored as their own user event.
+                    if next(3) > 0 {
+                        conn.execute(
+                            "INSERT INTO session_events \
+                             (source, session_id, project, message_id, ts_ms, role, kind, text, event_uid) \
+                             VALUES (?, ?, ?, 'm', ?, 'user', 'text', ?, ?)",
+                            params![source, session, project, ts, format!(" {text}\n"), format!("p{index}")],
+                        )
+                        .unwrap();
+                    }
+                }
+                pick => {
+                    let (role, kind) = match pick {
+                        1 => ("user", "text"),
+                        2 => ("tool_result", "tool_result"),
+                        _ => ("assistant", "text"),
+                    };
+                    conn.execute(
+                        "INSERT INTO session_events \
+                         (source, session_id, project, message_id, ts_ms, role, kind, text, event_uid) \
+                         VALUES (?, ?, ?, 'm', ?, ?, ?, ?, ?)",
+                        params![source, session, project, ts, role, kind, text, format!("e{index}")],
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        conn
+    }
+
+    fn sorted_reference<T>(read: impl FnOnce() -> T) -> T {
+        SORT_EVERY_MATCH.with(|sort| sort.set(true));
+        let result = read();
+        SORT_EVERY_MATCH.with(|sort| sort.set(false));
+        result
+    }
+
+    #[test]
+    fn the_recent_window_walk_returns_what_sorting_every_match_returns() {
+        let conn = walk_fixture();
+        let term_sets: [&[&str]; 4] = [&["needle"], &["rare"], &[], &["needle", "-rare"]];
+        let roles = [
+            SearchRole::All,
+            SearchRole::User,
+            SearchRole::Assistant,
+            SearchRole::Prompt,
+        ];
+        let filters = [
+            QueryFilter::default(),
+            QueryFilter {
+                scope: SessionScope::All,
+                ..Default::default()
+            },
+            QueryFilter {
+                scope: SessionScope::Remote,
+                ..Default::default()
+            },
+            QueryFilter {
+                source: Some("codex".into()),
+                ..Default::default()
+            },
+            QueryFilter {
+                project: Some("alpha".into()),
+                ..Default::default()
+            },
+            QueryFilter {
+                tag: Some("hot".into()),
+                ..Default::default()
+            },
+            QueryFilter {
+                since_ms: Some(1_100),
+                until_ms: Some(1_300),
+                ..Default::default()
+            },
+            QueryFilter {
+                before_ms: Some(1_200),
+                ..Default::default()
+            },
+        ];
+        let mut walked = 0;
+        WALK_OUTCOMES.with(|outcomes| outcomes.set((0, 0)));
+        for terms in term_sets {
+            let terms = terms.iter().map(|term| term.to_string()).collect::<Vec<_>>();
+            for role in roles {
+                for base in &filters {
+                    for limit in 1..=5 {
+                        let filter = QueryFilter {
+                            limit,
+                            ..base.clone()
+                        };
+                        let expected = sorted_reference(|| {
+                            search_all(&conn, &terms, false, &filter, role).unwrap()
+                        });
+                        let actual = search_all(&conn, &terms, false, &filter, role).unwrap();
+                        assert_eq!(
+                            keys(&actual),
+                            keys(&expected),
+                            "terms {terms:?} role {role:?} filter {filter:?}"
+                        );
+                        walked += 1;
+                    }
+                    // Keyset pages agree page by page, cursor included.
+                    let mut after = None;
+                    loop {
+                        let filter = QueryFilter {
+                            limit: 2,
+                            after: after.clone(),
+                            ..base.clone()
+                        };
+                        let expected = sorted_reference(|| {
+                            search_page(&conn, &terms, false, &filter, role).unwrap()
+                        });
+                        let actual = search_page(&conn, &terms, false, &filter, role).unwrap();
+                        assert_eq!(keys(&actual.rows), keys(&expected.rows));
+                        assert_eq!(actual.next_cursor, expected.next_cursor);
+                        match actual.next_cursor {
+                            Some(cursor) => after = Some(cursor),
+                            None => break,
+                        }
+                    }
+                }
+            }
+        }
+        assert!(walked > 0);
+        let (served, fell_back) = WALK_OUTCOMES.with(|outcomes| outcomes.get());
+        assert!(served > 0 && fell_back > 0, "served {served}, fell back {fell_back}");
+    }
+
+    #[test]
+    fn a_raw_query_error_is_reported_by_the_walk_too() {
+        let conn = walk_fixture();
+        let error = search_all(
+            &conn,
+            &["\"unterminated".to_string()],
+            true,
+            &filter(2),
+            SearchRole::All,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("Invalid raw FTS5 MATCH expression"), "got: {error}");
+    }
+
+    #[test]
+    fn deep_pages_inside_a_large_tie_match_the_sorted_reference() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // Ten events share the newest timestamp: more than any test window,
+        // so a page that starts at the tie falls back, while a deep page
+        // whose cursor has passed most of it walks the rest.
+        let insert = |index: i64, ts: i64| {
+            conn.execute(
+                "INSERT INTO session_events \
+                 (source, session_id, project, message_id, ts_ms, role, kind, text, event_uid) \
+                 VALUES ('claude', 's1', '/work', 'm', ?, 'assistant', 'text', ?, ?)",
+                params![ts, format!("needle {index}"), format!("e{index}")],
+            )
+            .unwrap();
+        };
+        for index in 0..10 {
+            insert(index, 5_000);
+        }
+        for index in 10..20 {
+            insert(index, 1_000 + index);
+        }
+        WALK_OUTCOMES.with(|outcomes| outcomes.set((0, 0)));
+        let terms = ["needle".to_string()];
+        let mut after = None;
+        let mut pages = 0;
+        loop {
+            let filter = QueryFilter {
+                limit: 1,
+                after: after.clone(),
+                ..Default::default()
+            };
+            let expected = sorted_reference(|| {
+                search_page(&conn, &terms, false, &filter, SearchRole::Assistant).unwrap()
+            });
+            let actual = search_page(&conn, &terms, false, &filter, SearchRole::Assistant).unwrap();
+            assert_eq!(keys(&actual.rows), keys(&expected.rows), "page {pages}");
+            assert_eq!(actual.next_cursor, expected.next_cursor, "page {pages}");
+            pages += 1;
+            match actual.next_cursor {
+                Some(cursor) => after = Some(cursor),
+                None => break,
+            }
+        }
+        assert_eq!(pages, 20);
+        let (served, fell_back) = WALK_OUTCOMES.with(|outcomes| outcomes.get());
+        assert!(served > 0 && fell_back > 0, "served {served}, fell back {fell_back}");
+    }
+
+    #[test]
+    fn the_latest_prompt_with_a_session_skips_newer_session_less_prompts() {
+        let conn = walk_fixture();
+        // Newer prompts than any fixture row, none naming a session.
+        for index in 0..10 {
+            insert_history(
+                &conn,
+                &HistoryEntry {
+                    id: 0,
+                    source: "claude".into(),
+                    session_id: if index % 2 == 0 { None } else { Some(String::new()) },
+                    project: Some("/work/alpha".into()),
+                    prompt: format!("needle orphan {index}"),
+                    prompt_hash: None,
+                    timestamp_ms: 9_000 + index,
+                },
+            )
+            .unwrap();
+        }
+        let terms = ["needle".to_string()];
+        for walk in [true, false] {
+            let read = || {
+                latest_prompt_with_session(&conn, &terms, false, &QueryFilter::default()).unwrap()
+            };
+            let found = if walk { read() } else { sorted_reference(read) };
+            let expected = search_all(&conn, &terms, false, &filter(1_000), SearchRole::Prompt)
+                .unwrap()
+                .into_iter()
+                .find(|row| row.session_id.as_deref().is_some_and(|id| !id.is_empty()))
+                .unwrap();
+            let found = found.expect("a resumable prompt");
+            assert_eq!((found.id, found.timestamp_ms), (expected.id, expected.timestamp_ms));
+        }
     }
 }

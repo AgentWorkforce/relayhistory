@@ -855,11 +855,17 @@ mod tests {
         let compacted = learn_rollup_from_output(&id, &transcript, output).unwrap();
         upsert_learn_rollup(&conn, &transcript, &compacted).unwrap();
 
-        let stored = ai_hist::storage::trajectories_after(&conn, 0, 0, 10).unwrap();
+        let stored: Vec<(String, String)> = conn
+            .prepare("SELECT id, retrospective_json FROM trajectories ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
         assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].id, id);
+        assert_eq!(stored[0].0, id);
         assert!(stored[0]
-            .retrospective_json
+            .1
             .contains("Token rotation must accompany middleware edits"));
         assert!(!serde_json::to_string(&compacted)
             .unwrap()

@@ -1032,11 +1032,11 @@ pub(crate) fn forget_locator(conn: &Connection, source: &str, locator: &str) -> 
 /// has since been deleted". The second is a change, and a deletion is the one
 /// change that cannot be noticed by looking at the file.
 pub(crate) fn locator_cursor_exists(conn: &Connection, source: &str, path: &Path) -> Result<bool> {
-    Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM transcript_cursors WHERE source = ? AND locator = ?)",
-        params![source, path.to_string_lossy()],
-        |row| row.get(0),
-    )?)
+    Ok(conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM transcript_cursors WHERE source = ? AND locator = ?)",
+        )?
+        .query_row(params![source, path.to_string_lossy()], |row| row.get(0))?)
 }
 
 /// Record a whole-file cursor for `path` under `source`, and report the
@@ -1630,20 +1630,18 @@ fn load_cursor_with_document(
             session_id,
             location,
         } => conn
-            .query_row(
+            .prepare_cached(
                 "SELECT parser_state_json FROM session_hydration_checkpoints \
                  WHERE source = ? AND session_id = ? AND location = ?",
-                params![source, session_id, location],
-                |row| row.get(0),
-            )
+            )?
+            .query_row(params![source, session_id, location], |row| row.get(0))
             .optional()?,
         CursorKey::Locator { source, locator } => conn
-            .query_row(
+            .prepare_cached(
                 "SELECT parser_state_json FROM transcript_cursors \
                  WHERE source = ? AND locator = ?",
-                params![source, locator],
-                |row| row.get(0),
-            )
+            )?
+            .query_row(params![source, locator], |row| row.get(0))
             .optional()?,
     };
     let raw = raw.flatten();

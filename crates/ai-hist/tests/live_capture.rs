@@ -59,6 +59,7 @@ impl HomeLayout {
             grok: &self.grok,
             muse: &self.muse,
             opencode_db: &self.opencode_db,
+            opencode_db_pinned: false,
             devin: &self.devin,
         }
     }
@@ -118,6 +119,16 @@ impl RunningLoop {
         running
     }
 
+    /// [`reporting`](Self::reporting), then [`settle`](Self::settle): for a
+    /// test that seeded its tree before attaching and asserts on what the
+    /// *next* write does.
+    #[cfg(feature = "fs-events")]
+    fn reporting_from_quiet(build: impl FnOnce(WatchLoop) -> WatchLoop) -> Self {
+        let running = Self::reporting(build);
+        running.settle("after attaching (FSEvents replays pre-attach changes)");
+        running
+    }
+
     fn next_tick(&self) -> Result<bool, RecvTimeoutError> {
         self.ticks.recv_timeout(ARRIVES_WITHIN)
     }
@@ -126,16 +137,28 @@ impl RunningLoop {
     /// next write and nothing before it.
     ///
     /// One `fs::write` is not one filesystem event: creating a file yields a
-    /// create *and* a modify, and an event landing after the debounce window
-    /// has opened deliberately re-arms it, so a single write legitimately
-    /// drives more than one forced tick. An assertion that nothing happens
-    /// has to start from quiet, or it reads the previous write's second tick
-    /// as the thing it was watching for.
+    /// create *and* a modify. Events inside one debounce window are one tick,
+    /// but a backend can deliver the tail of a write after the window has
+    /// closed — while its sweep runs — and that legitimately re-arms the next
+    /// tick. An assertion that nothing happens has to start from quiet, or it
+    /// reads the previous write's trailing tick as the thing it was watching
+    /// for.
+    ///
+    /// The same applies right after the loop attaches. macOS FSEvents
+    /// replays the changes made just *before* a stream was registered — the
+    /// tempdir's creation, a fixture seeded a moment earlier — a few
+    /// milliseconds after it starts, and does so on most runs, not rarely
+    /// (measured: in 8 of 10 runs of the two tests in #324/#331). That is the
+    /// right behaviour for the loop, which owes a sweep for a write landing
+    /// between a caller's last sync and the attach, but it means a test that
+    /// seeds its tree and then attaches has to settle before it can assert
+    /// on the next write. [`RunningLoop::reporting_from_quiet`] does both.
     ///
     /// Bounded in both directions: each wait is several debounce windows, so
     /// a trailing event has time to arrive and be swept, and the whole settle
     /// has a deadline, so a loop that never goes quiet fails the test rather
     /// than hanging it.
+    #[cfg(feature = "fs-events")]
     fn settle(&self, when: &str) {
         let deadline = std::time::Instant::now() + ARRIVES_WITHIN;
         while self.ticks.recv_timeout(Duration::from_millis(400)).is_ok() {
@@ -189,6 +212,9 @@ fn a_burst_of_change_signals_collapses_into_the_debounce_window() {
             .with_fs_events(false)
             .with_poll_interval_ms(600_000)
             .with_debounce_ms(300)
+            // The trailing-only window; the leading edge's leading + trailing
+            // shape is `a_quiet_change_is_swept_on_the_leading_edge_…`.
+            .with_leading_edge(false)
     });
 
     for _ in 0..100 {
@@ -196,23 +222,339 @@ fn a_burst_of_change_signals_collapses_into_the_debounce_window() {
     }
 
     assert_eq!(running.next_tick(), Ok(true));
-    // At most one more: signals that land while the first tick's debounce
-    // window is open re-arm the single-bit pending flag, which is deliberate —
-    // sustained writes keep ticking at the debounce cadence instead of waiting
-    // for a quiet period that a busy session never reaches. What must not
-    // happen is one tick per signal.
-    let mut extra = 0;
-    while running
-        .ticks
-        .recv_timeout(Duration::from_millis(900))
-        .is_ok()
-    {
-        extra += 1;
-        assert!(
-            extra <= 1,
-            "100 change signals produced {} ticks",
-            extra + 1
+    // Exactly one. The signals after the first land inside the window it
+    // opened, and the sweep that window ends in starts after them, so it has
+    // already read every write they stand for. This used to allow a second
+    // tick — the window re-armed on its own signals — and that second, forced
+    // sweep for one write is what made the FSEvents tests in #324/#331 flaky:
+    // FSEvents delivers one append as more than one callback, and whether the
+    // loop woke between them was a race.
+    assert_eq!(
+        running.ticks.recv_timeout(Duration::from_millis(900)),
+        Err(RecvTimeoutError::Timeout),
+        "100 change signals inside one debounce window must be one tick"
+    );
+}
+
+/// The other half of the window: a signal that lands once the window has
+/// closed — while its sweep runs — is a write that sweep may already have
+/// passed, so it is a tick of its own. This is what keeps sustained writes on
+/// a steady cadence rather than waiting for a quiet period.
+#[test]
+fn a_change_during_the_sweep_drives_another_tick() {
+    let (entered_tx, entered) = mpsc::channel::<()>();
+    let (release, release_rx) = mpsc::channel::<()>();
+    let release_rx = Mutex::new(release_rx);
+    let (sender, ticks) = mpsc::channel();
+    let calls = AtomicUsize::new(0);
+    let tick: TickFn = Arc::new(move |force| {
+        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            let _ = entered_tx.send(());
+            let _ = release_rx.lock().unwrap().recv_timeout(ARRIVES_WITHIN);
+        }
+        let _ = sender.send(force);
+        Ok(TickOutcome::default())
+    });
+    let mut running = RunningLoop::start(
+        |watch| {
+            watch
+                .with_immediate(false)
+                .with_fs_events(false)
+                .with_poll_interval_ms(600_000)
+                .with_debounce_ms(50)
+        },
+        tick,
+    );
+    running.ticks = ticks;
+
+    running.watch.notify_change();
+    entered
+        .recv_timeout(ARRIVES_WITHIN)
+        .expect("the first change drove no sweep");
+    // The window has closed and the sweep is running: this write is news.
+    running.watch.notify_change();
+    release.send(()).unwrap();
+
+    assert_eq!(running.next_tick(), Ok(true), "the first sweep");
+    assert_eq!(
+        running.next_tick(),
+        Ok(true),
+        "a change during the sweep must drive a second forced sweep"
+    );
+    assert_eq!(
+        running.ticks.recv_timeout(Duration::from_millis(600)),
+        Err(RecvTimeoutError::Timeout),
+        "and only one"
+    );
+}
+
+/// A report carries the sweep's wall time and, for a change-driven tick, when
+/// the first change behind it arrived — so a consumer can split capture lag
+/// into the debounce window, the sweep and the hand-off.
+#[test]
+fn a_report_times_its_sweep_and_its_first_event() {
+    let (sender, reports) = mpsc::channel::<ai_hist::watch::TickReport>();
+    let watch = Arc::new(
+        WatchLoop::new(Arc::new(|_| {
+            std::thread::sleep(Duration::from_millis(60));
+            Ok(TickOutcome::default())
+        }))
+        .with_immediate(false)
+        .with_fs_events(false)
+        .with_poll_interval_ms(600_000)
+        .with_debounce_ms(100)
+        // The trailing window, so the event demonstrably waits it out.
+        .with_leading_edge(false)
+        .on_report(Arc::new(move |report| {
+            let _ = sender.send(*report);
+        })),
+    );
+    let runner = watch.clone();
+    let thread = std::thread::spawn(move || runner.run().expect("run"));
+
+    let signalled = std::time::Instant::now();
+    watch.notify_change();
+    let report = reports.recv_timeout(ARRIVES_WITHIN).expect("a tick");
+    assert!(report.forced && !report.cancelled);
+    assert!(
+        report.elapsed >= Duration::from_millis(60),
+        "elapsed is the sweep's wall time: {:?}",
+        report.elapsed
+    );
+    let first = report.first_event_at.expect("a change drove this tick");
+    assert!(
+        first >= signalled,
+        "the window opens at the signal, not before"
+    );
+    assert!(
+        first.elapsed() >= Duration::from_millis(160),
+        "the first event waited out the window and the sweep: {:?}",
+        first.elapsed()
+    );
+
+    // A manual tick has no event behind it. The report above is sent before
+    // the change tick releases its slot, so a first `tick()` may join that
+    // run rather than start one; the second always starts its own. Either
+    // way the next report is a manual one.
+    watch.tick();
+    watch.tick();
+    let manual = reports.recv_timeout(ARRIVES_WITHIN).expect("manual tick");
+    assert_eq!(manual.first_event_at, None);
+
+    watch.stop();
+    thread.join().unwrap();
+}
+
+/// A tick cancelled through the capture stop token is neither swept nor
+/// failed, is not retried, and ends the loop: cancellation only ever means
+/// "stop".
+#[test]
+fn a_cancelled_tick_is_reported_and_ends_the_loop() {
+    let (sender, reports) = mpsc::channel::<ai_hist::watch::TickReport>();
+    let failures = Arc::new(AtomicUsize::new(0));
+    let failed = failures.clone();
+    let watch = Arc::new(
+        WatchLoop::new(Arc::new(|_| {
+            Err(anyhow::Error::new(ai_hist::CaptureCancelled).context("sweeping claude"))
+        }))
+        .with_immediate(false)
+        .with_fs_events(false)
+        .with_poll_interval_ms(600_000)
+        .with_debounce_ms(20)
+        .on_report(Arc::new(move |report| {
+            let _ = sender.send(*report);
+        }))
+        .on_error(Arc::new(move |_| {
+            failed.fetch_add(1, Ordering::SeqCst);
+        })),
+    );
+    let runner = watch.clone();
+    let thread = std::thread::spawn(move || runner.run().expect("run"));
+    watch.notify_change();
+    let report = reports.recv_timeout(ARRIVES_WITHIN).expect("a report");
+    assert!(report.cancelled);
+    assert!(!report.outcome.swept && !report.outcome.contended);
+    // `run` returns on its own: nobody called `stop`.
+    thread.join().unwrap();
+    assert_eq!(
+        failures.load(Ordering::SeqCst),
+        0,
+        "a cancellation is not a failure"
+    );
+    assert!(
+        reports.try_recv().is_err(),
+        "a cancelled forced tick is not retried"
+    );
+}
+
+/// With the leading edge on, a change that finds the loop quiet is swept
+/// at once rather than after the debounce window, and further changes inside
+/// the window that sweep opened coalesce into exactly one trailing tick at the
+/// window's close.
+#[test]
+fn a_quiet_change_is_swept_on_the_leading_edge_and_a_burst_trails_once() {
+    let running = RunningLoop::reporting(|watch| {
+        watch
+            .with_immediate(false)
+            .with_fs_events(false)
+            .with_poll_interval_ms(600_000)
+            // Long, so "at once" and "at the window's close" cannot be
+            // confused on a loaded runner.
+            .with_debounce_ms(1_500)
+            .with_leading_edge(true)
+    });
+
+    let signalled = std::time::Instant::now();
+    running.watch.notify_change();
+    assert_eq!(running.next_tick(), Ok(true), "the leading tick is forced");
+    let leading = signalled.elapsed();
+    assert!(
+        leading < Duration::from_millis(750),
+        "a quiet change must not wait out the 1.5 s window: {leading:?}"
+    );
+
+    // A burst inside the window the leading tick opened.
+    for _ in 0..20 {
+        running.watch.notify_change();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(running.next_tick(), Ok(true), "the trailing tick is forced");
+    let trailing = signalled.elapsed();
+    assert!(
+        trailing >= Duration::from_millis(1_400),
+        "the burst must wait for the window to close: {trailing:?}"
+    );
+    assert_eq!(
+        running.ticks.recv_timeout(Duration::from_millis(2_000)),
+        Err(RecvTimeoutError::Timeout),
+        "a burst costs one leading and one trailing sweep, no more"
+    );
+
+    // Quiet again: the next change leads once more.
+    let again = std::time::Instant::now();
+    running.watch.notify_change();
+    assert_eq!(running.next_tick(), Ok(true));
+    assert!(again.elapsed() < Duration::from_millis(750));
+}
+
+/// The trailing-only window is still there for a caller that asks for it.
+#[test]
+fn without_the_leading_edge_a_change_waits_out_the_window() {
+    let running = RunningLoop::reporting(|watch| {
+        watch
+            .with_immediate(false)
+            .with_fs_events(false)
+            .with_poll_interval_ms(600_000)
+            .with_debounce_ms(400)
+            .with_leading_edge(false)
+    });
+    let signalled = std::time::Instant::now();
+    running.watch.notify_change();
+    assert_eq!(running.next_tick(), Ok(true));
+    assert!(signalled.elapsed() >= Duration::from_millis(400));
+}
+
+/// A burst of writes while another process holds the sync lock is one owed
+/// change, and it is read within about a second of the lock coming free —
+/// not at the backstop (#364). Each contended *event* tick used to double the
+/// owed retry's backoff and push its deadline later, so ten events during a
+/// three-second foreign sweep left the change waiting the whole 60 s
+/// backstop after the lock was released.
+#[test]
+fn writes_owed_behind_a_held_lock_are_swept_soon_after_it_is_released() {
+    use std::sync::atomic::AtomicBool;
+
+    let held = Arc::new(AtomicBool::new(true));
+    let (sender, swept) = mpsc::channel::<std::time::Instant>();
+    let tick: TickFn = {
+        let held = held.clone();
+        Arc::new(move |force| {
+            if held.load(Ordering::SeqCst) {
+                // Another process holds the store's lock: nothing was read.
+                return Ok(TickOutcome {
+                    contended: true,
+                    ..TickOutcome::default()
+                });
+            }
+            if force {
+                let _ = sender.send(std::time::Instant::now());
+            }
+            Ok(TickOutcome {
+                swept: true,
+                ..TickOutcome::default()
+            })
+        })
+    };
+    let running = RunningLoop::start(
+        |watch| {
+            watch
+                .with_immediate(false)
+                .with_fs_events(false)
+                .with_debounce_ms(50)
+                // The probe's backstop: an owed change must never wait for it.
+                .with_poll_interval_ms(60_000)
+                .with_slow_poll_ms(60_000)
+        },
+        tick,
+    );
+
+    // Ten writes over three seconds, every one of them turned away.
+    for _ in 0..10 {
+        running.watch.notify_change();
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    assert!(swept.try_recv().is_err(), "nothing can be swept while held");
+
+    held.store(false, Ordering::SeqCst);
+    let released = std::time::Instant::now();
+    let at = swept
+        .recv_timeout(ARRIVES_WITHIN)
+        .expect("the owed change was never swept after the lock was released");
+    let waited = at.duration_since(released);
+    assert!(
+        waited < Duration::from_millis(2_000),
+        "the owed change waited {waited:?} after the lock was free"
+    );
+}
+
+/// An owed retry keeps its own backoff even when the filesystem backstop is
+/// configured below that cadence, including zero in pure polling mode.
+#[test]
+fn contended_retries_do_not_spin_with_a_short_or_zero_slow_poll() {
+    for slow_poll_ms in [0, 20] {
+        let (sender, attempts) = mpsc::channel();
+        let tick: TickFn = Arc::new(move |force| {
+            assert!(force, "only the owed change should drive these attempts");
+            let _ = sender.send(std::time::Instant::now());
+            Ok(TickOutcome {
+                contended: true,
+                ..TickOutcome::default()
+            })
+        });
+        let running = RunningLoop::start(
+            |watch| {
+                watch
+                    .with_immediate(false)
+                    .with_fs_events(false)
+                    .with_poll_interval_ms(60_000)
+                    .with_slow_poll_ms(slow_poll_ms)
+            },
+            tick,
         );
+        running.watch.notify_change();
+        let times: Vec<_> = (0..5)
+            .map(|_| attempts.recv_timeout(ARRIVES_WITHIN).expect("owed retry"))
+            .collect();
+        // The first two waits are 250 ms; later attempts double to the 1 s
+        // cap. Assert lower bounds only: a loaded runner can delay a wake,
+        // but can never validly make this cadence faster.
+        for (pair, minimum_ms) in times.windows(2).zip([250, 250, 500, 1_000]) {
+            let waited = pair[1].duration_since(pair[0]);
+            assert!(
+                waited >= Duration::from_millis(minimum_ms),
+                "slow_poll_ms={slow_poll_ms}: retry waited {waited:?}, expected at least {minimum_ms} ms"
+            );
+        }
     }
 }
 
@@ -257,7 +599,7 @@ impl Gate {
 
 /// A change that lands while a manual tick holds the slot must not be lost.
 ///
-/// The wake state is cleared when the debounce window opens, so by the time
+/// The wake state is cleared when the debounce window closes, so by the time
 /// the driver tries to claim the slot the event is no longer recorded
 /// anywhere. Dropping the tick there — which is the right answer for a
 /// backstop tick, and was being applied to both — loses a real change until
@@ -479,7 +821,7 @@ fn appending_to_a_watched_transcript_drives_one_forced_tick() {
         "claude's transcript root must be watched: {roots:?}"
     );
 
-    let running = RunningLoop::reporting(|watch| {
+    let running = RunningLoop::reporting_from_quiet(|watch| {
         watch
             .with_immediate(false)
             .with_fs_events(true)
@@ -749,7 +1091,7 @@ fn a_write_below_a_non_recursive_root_does_not_force_a_tick() {
     let buried = dir.path().join("todos");
     std::fs::create_dir_all(&buried).expect("subdirectory");
 
-    let running = RunningLoop::reporting(|watch| {
+    let running = RunningLoop::reporting_from_quiet(|watch| {
         watch
             .with_immediate(false)
             .with_fs_events(true)
@@ -1345,6 +1687,64 @@ fn an_attached_loop_re_derives_its_roots_on_the_backstop_not_the_interval() {
     }
 }
 
+/// `OPENCODE_DB` naming a file in a busy directory: a log written beside the
+/// database must not force a sweep, while a commit to the database's WAL — and
+/// a channel database appearing beside it — still must (#335).
+#[cfg(feature = "fs-events")]
+#[test]
+fn a_write_beside_the_opencode_database_does_not_force_a_sweep() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let db = home.path().join("opencode.db");
+    std::fs::write(&db, b"").expect("seed the database");
+
+    let running = RunningLoop::reporting({
+        let home = home.path().to_path_buf();
+        let db = db.clone();
+        move |watch| {
+            watch
+                .with_immediate(false)
+                .with_fs_events(true)
+                .with_roots(ai_hist::sync_watch_roots(&home, &db))
+                .with_debounce_ms(100)
+                .with_poll_interval_ms(600_000)
+                .with_slow_poll_ms(600_000)
+        }
+    });
+    assert_eq!(running.watch.driver(), Some(WatchDriver::FsEvents));
+    // FSEvents replays the seeding above right after the stream starts.
+    running.settle("after attaching");
+
+    for line in 0..5 {
+        use std::io::Write;
+        let mut log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(home.path().join("collector-stderr.log"))
+            .expect("open the log");
+        writeln!(log, "line {line}").expect("write the log");
+    }
+    assert_eq!(
+        running.ticks.recv_timeout(Duration::from_millis(800)),
+        Err(RecvTimeoutError::Timeout),
+        "a log beside the OpenCode database must not force a sweep"
+    );
+
+    std::fs::write(home.path().join("opencode.db-wal"), b"commit").expect("write the WAL");
+    assert_eq!(
+        running.next_tick(),
+        Ok(true),
+        "a commit to the database's WAL must still force a sweep"
+    );
+    running.settle("after the WAL write");
+
+    std::fs::write(home.path().join("opencode-nightly.db"), b"").expect("a channel store");
+    assert_eq!(
+        running.next_tick(),
+        Ok(true),
+        "a channel database appearing beside it must still force a sweep"
+    );
+}
+
 /// The flat logs are single files, and the directory holding one is full of
 /// things a sweep never reads — `~/.claude/settings.json`, the credentials
 /// file, whatever the next harness release adds. Watching the parent as a
@@ -1358,7 +1758,7 @@ fn a_file_beside_the_flat_log_does_not_force_a_sweep() {
     let log = home.path().join(".claude/history.jsonl");
     std::fs::write(&log, "{}\n").expect("seed the flat log");
 
-    let running = RunningLoop::reporting({
+    let running = RunningLoop::reporting_from_quiet({
         let home = home.path().to_path_buf();
         move |watch| {
             watch
@@ -1951,7 +2351,7 @@ fn a_sweep_turned_away_by_another_sync_is_retried_not_dropped() {
 /// for is recorded nowhere else.
 ///
 /// The sibling of the contended case, one door further along: the wake state
-/// was cleared when the debounce window opened, so an `Err` out of the tick —
+/// was cleared when the debounce window closed, so an `Err` out of the tick —
 /// SQLite returning a transient I/O error, a provider that could not be read,
 /// a sync-state write that failed — takes the only record of the change with
 /// it. The loop logs the error and goes back to waiting, and the next chance
@@ -2232,7 +2632,7 @@ fn a_file_root_wakes_on_its_own_name_only() {
     let buried = dir.path().join("nested");
     std::fs::create_dir_all(&buried).expect("sibling directory");
 
-    let running = RunningLoop::reporting({
+    let running = RunningLoop::reporting_from_quiet({
         let named = named.clone();
         move |watch| {
             watch

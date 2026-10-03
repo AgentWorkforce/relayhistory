@@ -197,7 +197,7 @@ fn serialize<T: Serialize>(value: &T) -> napi::Result<String> {
     serde_json::to_string(value).map_err(|error| native_error("DATABASE_QUERY_FAILED", error))
 }
 
-fn open_store(path: &Path, read_only: bool) -> Result<SessionStore, ai_hist::Error> {
+pub(crate) fn open_store(path: &Path, read_only: bool) -> Result<SessionStore, ai_hist::Error> {
     let mut options = StoreOptions::default();
     options.db_path = Some(path.to_path_buf());
     options.read_only = read_only;

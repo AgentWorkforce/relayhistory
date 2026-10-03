@@ -3,12 +3,12 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { access, cp, link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { gunzipSync } from 'node:zlib';
 import {
@@ -295,6 +295,156 @@ test('export rejects aliases through symlinked parents before creating a new dat
     const {runHistoryExportCommand} = await import('./delivery-cli.js');
     await assert.rejects(runHistoryExportCommand({dbPath:join(real,'new.db'),outputPath:join(alias,'new.db'),selectionPath}), /active history database/);
     await assert.rejects(readFile(join(real,'new.db')), {code:'ENOENT'});
+  });
+});
+
+test('a file: URI --db is percent-decoded as SQLite decodes it before the output guard', async () => {
+  await fixture(async (dbPath, root) => {
+    const selectionPath = join(root, 'selection.json');
+    await writeFile(selectionPath, JSON.stringify(selection));
+    // SQLite opens `%41` as `A` and keeps the malformed `%ZZ` literal.
+    const literal = join(root, 'hist%ZZA.db');
+    await cp(dbPath, literal);
+    const uri = `file:${join(root, 'hist%ZZ%41.db')}`;
+    const {runHistoryExportCommand} = await import('./delivery-cli.js');
+    for (const outputPath of [literal, `${literal}-wal`, `${literal}-shm`]) {
+      await assert.rejects(runHistoryExportCommand({ dbPath: uri, outputPath, selectionPath }), /active history database/, outputPath);
+    }
+    const outputPath = join(root, 'export.ndjson');
+    await runHistoryExportCommand({ dbPath: uri, outputPath, selectionPath });
+    assert.ok((await readFile(outputPath, 'utf8')).length > 0);
+  });
+});
+
+test('export preserves invalid UTF-8 database URI bytes and guards their hardlink aliases', async (t) => {
+  if (process.platform === 'win32') { t.skip('Unix byte filenames'); return; }
+  await fixture(async (dbPath, root) => {
+    const selectionPath = join(root, 'selection.json');
+    await writeFile(selectionPath, JSON.stringify(selection));
+    const bytePath = Buffer.concat([Buffer.from(join(root, 'hist')), Buffer.from([0xff]), Buffer.from('.db')]);
+    try { await writeFile(bytePath, await readFile(dbPath)); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EILSEQ') throw error;
+      t.skip('this filesystem requires valid UTF-8 filenames'); return;
+    }
+    const uri = `${pathToFileURL(root).href}/hist%FF.db`;
+    const {runHistoryExportCommand} = await import('./delivery-cli.js');
+    // U+FFFD is a different filename and is a valid export destination.
+    const outputPath = join(root, 'hist\ufffd.db');
+    await runHistoryExportCommand({ dbPath: uri, outputPath, selectionPath });
+    assert.ok((await readFile(outputPath, 'utf8')).length > 0);
+    // Existing main-file and sidecar aliases must still be protected by inode.
+    for (const suffix of ['', '-wal', '-shm', '-journal']) {
+      const protectedPath = Buffer.concat([bytePath, Buffer.from(suffix)]);
+      if (suffix) await writeFile(protectedPath, 'sidecar');
+      const alias = join(root, `alias${suffix}`);
+      await link(protectedPath, alias);
+      await assert.rejects(runHistoryExportCommand({ dbPath: uri, outputPath: alias, selectionPath }), /active history database/);
+    }
+  });
+});
+
+test('export refuses the live WAL and SHM sidecars and leaves committed rows readable', async (t) => {
+  // node:sqlite ships unflagged from Node 22.5; on older runtimes the
+  // path-only guard is still covered by the alias tests above.
+  const sqlite = await import('node:sqlite' as string).catch(() => null) as
+    | { DatabaseSync: new (path: string, options?: { readOnly?: boolean }) => {
+        exec(sql: string): void; prepare(sql: string): { get(): unknown }; close(): void } }
+    | null;
+  if (!sqlite) { t.skip('node:sqlite is unavailable on this runtime'); return; }
+  await fixture(async (dbPath, root) => {
+    const selectionPath = join(root, 'selection.json');
+    await writeFile(selectionPath, JSON.stringify(selection));
+    const alias = join(root, 'alias'); await symlink(root, alias, 'dir');
+    // A live writer whose committed row exists only in the WAL.
+    const writer = new sqlite.DatabaseSync(dbPath);
+    try {
+      writer.exec('PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;');
+      writer.exec('CREATE TABLE export_guard_probe(value TEXT); INSERT INTO export_guard_probe VALUES (\'committed\');');
+      const walHardLink = join(root, 'wal-hardlink');
+      await link(`${dbPath}-wal`, walHardLink);
+      const {runHistoryExportCommand} = await import('./delivery-cli.js');
+      // The native store opens SQLite URI filenames, so a `file:` --db names
+      // the same database and must protect the same sidecars.
+      // pathToFileURL gives the platform's well-formed URI (`file:///C:/…` on
+      // Windows); the localhost form inserts the authority into it.
+      const url = pathToFileURL(dbPath).href;
+      for (const db of [dbPath, `file:${dbPath}`, `${url}?mode=rwc`, `${url.replace('file://', 'file://localhost')}#x`]) {
+        for (const outputPath of [`${dbPath}-wal`, `${dbPath}-shm`, `${dbPath}-journal`,
+          join(alias, 'history.db-wal'), join(alias, 'history.db-shm'), walHardLink]) {
+          await assert.rejects(runHistoryExportCommand({ dbPath: db, outputPath, selectionPath }), /active history database/, `${db} -> ${outputPath}`);
+        }
+      }
+      await assert.rejects(runHistoryExportCommand({ dbPath: `file://elsewhere${dbPath}`, outputPath: join(root, 'x.ndjson'), selectionPath }),
+        /unsupported SQLite URI authority/);
+      const reader = new sqlite.DatabaseSync(dbPath, { readOnly: true });
+      try {
+        assert.deepEqual({ ...reader.prepare('SELECT value FROM export_guard_probe').get() as object }, { value: 'committed' });
+      } finally { reader.close(); }
+      // An ordinary existing output file is still replaced.
+      const outputPath = join(root, 'export.ndjson');
+      await writeFile(outputPath, 'stale');
+      await runHistoryExportCommand({ dbPath, outputPath, selectionPath });
+      const exported = await readFile(outputPath, 'utf8');
+      assert.notEqual(exported, 'stale');
+      // ...and a URI --db really does export the same database.
+      await runHistoryExportCommand({ dbPath: `file:${dbPath}`, outputPath, selectionPath });
+      assert.equal((await readFile(outputPath, 'utf8')).split('\n').length, exported.split('\n').length);
+    } finally { writer.close(); }
+  });
+});
+
+test('an abandoned export snapshot is released when its TTL elapses, with no further export call', async (t) => {
+  // node:sqlite ships unflagged from Node 22.5; it is the independent writer
+  // and checkpointer here.
+  const sqlite = await import('node:sqlite' as string).catch(() => null) as
+    | { DatabaseSync: new (path: string) => {
+        exec(sql: string): void; prepare(sql: string): { get(): unknown }; close(): void } }
+    | null;
+  if (!sqlite) { t.skip('node:sqlite is unavailable on this runtime'); return; }
+  await fixture(async dbPath => {
+    const writer = new sqlite.DatabaseSync(dbPath);
+    // The snapshot lives in another process: two SQLite copies in one
+    // process do not see each other's POSIX locks, so an in-process holder
+    // could never block this checkpoint in the first place.
+    const holder = spawn(process.execPath, ['--input-type=module', '-e', `
+      import { beginHistoryExport } from ${JSON.stringify(sdkModule)};
+      // Never closed and never paged again: only its TTL can release it.
+      await beginHistoryExport(${JSON.stringify(selection)}, { dbPath: ${JSON.stringify(dbPath)}, ttlMs: 1_500 });
+      process.stdout.write('ready\\n');
+      setTimeout(() => {}, 10_000);`], { stdio: ['ignore', 'pipe', 'pipe'] });
+    // Listeners go on before anything else can run, and the wait is bounded,
+    // so a holder that fails or never reports cannot hang the suite.
+    let stderr = '';
+    holder.stderr.on('data', (chunk: Buffer) => { stderr += String(chunk); });
+    let timer: NodeJS.Timeout | undefined;
+    const ready = new Promise<void>((resolve, reject) => {
+      holder.stdout.on('data', (chunk: Buffer) => { if (String(chunk).includes('ready')) resolve(); });
+      holder.on('error', reject);
+      holder.on('exit', (code, signal) => reject(new Error(`snapshot holder exited early (${code ?? signal}): ${stderr}`)));
+      timer = setTimeout(() => reject(new Error(`snapshot holder never became ready: ${stderr}`)), 20_000);
+    });
+    try {
+      writer.exec('PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS ttl_probe(n INTEGER);');
+      const checkpoint = (n: number) => {
+        writer.exec(`INSERT INTO ttl_probe VALUES (${n})`);
+        return writer.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get() as { busy: number };
+      };
+      try { await ready; } finally { clearTimeout(timer); }
+      assert.equal(checkpoint(1).busy, 1, 'a live snapshot holds the checkpoint back');
+      await pause(3_000);
+      assert.equal(holder.exitCode, null, 'the holder process is still running');
+      assert.equal(checkpoint(2).busy, 0, 'the expired snapshot still holds its read transaction');
+    } finally { holder.kill(); writer.close(); }
+  });
+});
+
+test('an export snapshot left open does not keep the process alive', async () => {
+  await fixture(async dbPath => {
+    const script = `import { beginHistoryExport } from ${JSON.stringify(sdkModule)};
+      await beginHistoryExport(${JSON.stringify(selection)}, { dbPath: ${JSON.stringify(dbPath)}, ttlMs: 3600000 });`;
+    // A process kept alive by the reaper would hit the timeout and reject.
+    await run(process.execPath, ['--input-type=module', '-e', script], { timeout: 30_000 });
   });
 });
 

@@ -46,13 +46,14 @@
 //! blocks exactly once, with the usage they ended with.
 
 use crate::discover::{row_to_session, ShallowSession, SESSION_COLUMNS};
+use crate::read_pool::PooledConnection;
 use crate::relationship_graph::{map_relationship, SessionRelationship, RELATIONSHIP_COLUMNS};
 use crate::session_identities::SessionIdentity;
 use crate::session_store::{Error, SessionStore, Source};
 use crate::store::{
-    ensure_columns, migration_applied, open_db, open_db_readonly, row_to_file_edit,
-    row_to_session_event, row_to_session_marker, row_to_tool_call, HistoryEntry, SessionEvent,
-    SessionFileEdit, SessionMarker, SessionToolCall, FILE_EDIT_COLUMNS, SESSION_EVENT_COLUMNS,
+    ensure_columns, migration_applied, open_db, row_to_file_edit, row_to_session_event,
+    row_to_session_marker, row_to_tool_call, HistoryEntry, SessionEvent, SessionFileEdit,
+    SessionMarker, SessionToolCall, FILE_EDIT_COLUMNS, SESSION_EVENT_COLUMNS,
     SESSION_MARKER_COLUMNS, TOOL_CALL_COLUMNS,
 };
 use crate::EvidenceKind;
@@ -63,7 +64,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// The column every fed table carries. Named once so a stored row can leave
@@ -804,7 +805,6 @@ fn stored_value(value: ValueRef<'_>) -> Value {
 #[cfg(feature = "export")]
 /// One row of a fed table, as a local export snapshot reads it.
 pub(crate) struct LiveRow {
-    pub rowid: i64,
     pub source: String,
     /// The stored session, `None` for a prompt that names none.
     pub session: Option<String>,
@@ -815,14 +815,56 @@ pub(crate) struct LiveRow {
 }
 
 #[cfg(feature = "export")]
-/// At most `limit` rows of `kind`'s table past rowid `after`, in rowid order:
-/// one range of the table's own b-tree.
-pub(crate) fn rows_by_rowid(
+/// One row of a fed table while it is being visited: the cheap identity
+/// fields are decoded, the stored columns only on [`RowidRow::decode`].
+pub(crate) struct RowidRow<'r, 's> {
+    pub rowid: i64,
+    pub source: String,
+    /// The stored session, `None` for a prompt that names none.
+    pub session: Option<String>,
+    row: &'r rusqlite::Row<'s>,
+    names: &'r [Arc<str>],
+    table: &'r FedTable,
+    kind: ChangeKind,
+}
+
+#[cfg(feature = "export")]
+impl RowidRow<'_, '_> {
+    /// The whole row, every stored column converted to an owned value.
+    pub(crate) fn decode(&self) -> Result<LiveRow> {
+        let mut columns = Vec::with_capacity(self.names.len());
+        for (offset, name) in self.names.iter().enumerate() {
+            columns.push((
+                Arc::clone(name),
+                stored_value(self.row.get_ref(4 + offset)?),
+            ));
+        }
+        let columns = StoredRow { columns };
+        let revision: Option<i64> = self.row.get(3)?;
+        Ok(LiveRow {
+            source: self.source.clone(),
+            session: self.session.clone(),
+            key: self.table.key_from_row(self.kind, &columns),
+            revision: revision.unwrap_or(0).max(0) as u64,
+            columns,
+        })
+    }
+}
+
+#[cfg(feature = "export")]
+/// Visit at most `limit` rows of `kind`'s table past rowid `after`, in rowid
+/// order: one range of the table's own b-tree. `visit` returns whether to go
+/// on; the statement stops stepping as soon as it says no, and a row's stored
+/// columns are converted only when it asks for them, so a caller that fills
+/// up early, or passes over rows it does not select, neither reads nor
+/// decodes the rest of the budget (#308). Returns how many rows were visited.
+pub(crate) fn visit_rows_by_rowid(
     conn: &Connection,
     kind: ChangeKind,
     after: i64,
     limit: usize,
-) -> Result<Vec<LiveRow>> {
+    mut visit: impl FnMut(RowidRow<'_, '_>) -> Result<bool>,
+) -> Result<usize> {
     let table = kind.table();
     let stored = stored_columns(conn, table.name)?;
     let names: Vec<Arc<str>> = stored
@@ -842,35 +884,27 @@ pub(crate) fn rows_by_rowid(
             .join(", "),
     );
     let mut statement = conn.prepare_cached(&sql)?;
-    let rows = statement.query_map(
-        rusqlite::params![after, limit.min(i64::MAX as usize) as i64],
-        |row| {
-            let mut columns = Vec::with_capacity(names.len());
-            for (offset, name) in names.iter().enumerate() {
-                columns.push((Arc::clone(name), stored_value(row.get_ref(4 + offset)?)));
-            }
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-                StoredRow { columns },
-            ))
-        },
-    )?;
-    let mut live = Vec::new();
-    for row in rows {
-        let (rowid, source, session, revision, columns) = row?;
-        live.push(LiveRow {
-            rowid,
-            source,
-            session,
-            key: table.key_from_row(kind, &columns),
-            revision: revision.unwrap_or(0).max(0) as u64,
-            columns,
-        });
+    let mut rows = statement.query(rusqlite::params![
+        after,
+        limit.min(i64::MAX as usize) as i64
+    ])?;
+    let mut visited = 0;
+    while let Some(row) = rows.next()? {
+        visited += 1;
+        let go_on = visit(RowidRow {
+            rowid: row.get(0)?,
+            source: row.get(1)?,
+            session: row.get(2)?,
+            row,
+            names: &names,
+            table: &table,
+            kind,
+        })?;
+        if !go_on {
+            break;
+        }
     }
-    Ok(live)
+    Ok(visited)
 }
 
 /// The typed row an upsert carries, per kind, so no second read is needed.
@@ -1020,7 +1054,7 @@ impl ChangeQuery {
 pub struct Changes {
     db_path: PathBuf,
     read_only: bool,
-    conn: Connection,
+    conn: PooledConnection,
     kinds: Vec<ChangeKind>,
     consumer: Option<String>,
     session: Option<SessionIdentity>,
@@ -1213,8 +1247,19 @@ impl SessionStore {
     /// epoch, holds a position this store never issued: the database was
     /// reset or replaced under it, and the only recovery is a full resync
     /// from [`Watermark::START`].
+    ///
+    /// A database from before the feed existed answers `START`: nothing in it
+    /// is stamped, so nothing in it is reported yet -- and its
+    /// `observation_clock`, which predates the feed, is not a feed position.
     pub fn head_revision(&self) -> Result<Watermark, Error> {
-        head_revision_at(self.db_path())
+        let mut conn = self.read_conn()?;
+        if !conn
+            .gate("change-feed", schema_is_current)
+            .map_err(Error::query)?
+        {
+            return Ok(Watermark::START);
+        }
+        read_head(&conn).map_err(Error::query)
     }
 
     /// Every change after `from`, oldest first, up to the head at open.
@@ -1236,9 +1281,11 @@ impl SessionStore {
     /// than at `open`: a read-only store over a database written before the
     /// feed existed is told to migrate rather than served `no such column`.
     pub fn changes_since(&self, from: Watermark, query: ChangeQuery) -> Result<Changes, Error> {
-        let conn = open_db_readonly(self.db_path())
-            .map_err(|error| Error::DatabaseOpen(format!("{error:#}")))?;
-        if !schema_is_current(&conn).map_err(Error::query)? {
+        let mut conn = self.read_conn()?;
+        if !conn
+            .gate("change-feed", schema_is_current)
+            .map_err(Error::query)?
+        {
             return Err(Error::DatabaseOpen(format!(
                 "{} predates the change-feed schema this version reads; \
                  open it writable once (or run a sync) to migrate it",
@@ -1305,19 +1352,6 @@ impl SessionStore {
             exhausted: false,
         })
     }
-}
-
-/// The head revision of the database at `db_path`, through a read-only
-/// handle. A database from before the feed existed answers `START`: nothing
-/// in it is stamped, so nothing in it is reported yet -- and its
-/// `observation_clock`, which predates the feed, is not a feed position.
-pub(crate) fn head_revision_at(db_path: &Path) -> Result<Watermark, Error> {
-    let conn =
-        open_db_readonly(db_path).map_err(|error| Error::DatabaseOpen(format!("{error:#}")))?;
-    if !schema_is_current(&conn).map_err(Error::query)? {
-        return Ok(Watermark::START);
-    }
-    read_head(&conn).map_err(Error::query)
 }
 
 /// Resolve where a drain starts and where it is bounded, from one snapshot.
@@ -2267,6 +2301,8 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
 mod tests {
     use super::*;
     use crate::session_store::StoreOptions;
+    use crate::store::open_db_readonly;
+    use std::path::Path;
 
     fn store(dir: &Path) -> (SessionStore, Connection) {
         let db = dir.join("ai-history.db");
@@ -3999,7 +4035,7 @@ INSERT INTO observation_evidence (source, session_id, location, connector_id,
         let mut changes = Changes {
             db_path: db.clone(),
             read_only: false,
-            conn: reader,
+            conn: crate::read_pool::PooledConnection::detached(reader),
             kinds: ChangeKind::ALL.to_vec(),
             consumer: None,
             session: None,
