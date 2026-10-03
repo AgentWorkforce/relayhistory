@@ -20,7 +20,6 @@ macro_rules! workspace_mod {
 /// prevent.
 pub mod project_identity;
 mod store;
-workspace_mod!(storage);
 workspace_mod!(observations);
 workspace_mod!(privacy);
 workspace_mod!(source_evidence);
