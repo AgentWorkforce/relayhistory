@@ -1,10 +1,10 @@
 use ai_hist::{
-    default_db_path, import_json, insert_history, normalize_tag_name, open_db, open_db_readonly,
-    prompt_hash, recent, resume_command, schema_is_current, search, session, session_events,
-    session_file_edits, session_markers_page, session_tool_calls, session_usage_summary,
-    untag_session, HistoryEntry, ProjectGrouping, QueryFilter, SessionEvidenceCursor,
-    SessionMarkerPage, SessionUsageSummary, SESSION_EVIDENCE_CONTRACT_VERSION,
-    SESSION_USAGE_CONTRACT_VERSION, SOURCE_CHOICES,
+    default_db_path, import_json, insert_history, latest_resumable_match, normalize_tag_name,
+    open_db, open_db_readonly, prompt_hash, recent, resume_command, schema_is_current, search,
+    session, session_events, session_file_edits, session_markers_page, session_tool_calls,
+    session_usage_summary, untag_session, HistoryEntry, ProjectGrouping, QueryFilter,
+    SessionEvidenceCursor, SessionMarkerPage, SessionUsageSummary,
+    SESSION_EVIDENCE_CONTRACT_VERSION, SESSION_USAGE_CONTRACT_VERSION, SOURCE_CHOICES,
 };
 pub use ai_hist::{SessionLocation, SessionScope};
 use anyhow::{Context, Result};
@@ -974,19 +974,17 @@ pub fn run() -> Result<()> {
             json,
         } => {
             let requested_scope = scope.resolve();
-            let rows = search(
+            // The newest match that names a session: a newer prompt recorded
+            // without one must not hide an older resumable match.
+            let entry = latest_resumable_match(
                 &conn,
                 &query,
                 fts,
                 &QueryFilter {
                     scope: requested_scope,
-                    limit: 1,
                     ..Default::default()
                 },
             )?;
-            let entry = rows
-                .into_iter()
-                .find(|e| e.session_id.as_ref().is_some_and(|s| !s.is_empty()));
             if let Some(entry) = entry {
                 let (locations, cmd) = local_resume_details(&conn, &entry)?;
                 let locally_available =

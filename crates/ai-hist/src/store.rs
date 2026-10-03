@@ -2611,7 +2611,7 @@ pub fn mark_session_presence(
 /// An empty result is intentionally distinct from `local`: it means no
 /// provenance row was recorded (for example, by an older writer).
 pub fn session_locations(conn: &Connection, source: &str, session_id: &str) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT location FROM session_presences \
          WHERE source = ? AND session_id = ? \
          ORDER BY CASE location WHEN 'local' THEN 0 ELSE 1 END",
@@ -2757,6 +2757,9 @@ pub fn insert_history_at_location(
     Ok(inserted)
 }
 
+/// Prompts matching a search, newest first: the `prompt` role of
+/// [`crate::history_search::search_all`], the read `resume` and `pack` make.
+/// With no terms it is [`recent`].
 pub fn search(
     conn: &Connection,
     terms: &[String],
@@ -2766,20 +2769,43 @@ pub fn search(
     if terms.is_empty() {
         return recent(conn, filter);
     }
-    filter.validate()?;
-    let query = build_fts_query(terms, raw_fts);
-    let mut sql = "SELECT h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms FROM history_fts f JOIN history h ON f.rowid = h.id WHERE history_fts MATCH ?".to_string();
-    let mut params_vec = vec![query];
-    append_filters(&mut sql, &mut params_vec, filter, "h");
-    append_scope_filter(&mut sql, filter.scope, "h");
-    sql.push_str(" ORDER BY h.timestamp_ms DESC, h.id DESC LIMIT ?");
-    params_vec.push(filter.limit.max(1).to_string());
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt
-        .query_map(rusqlite::params_from_iter(params_vec), row_to_entry)
-        .map_err(|error| raw_fts_query_error(raw_fts, error))?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|error| raw_fts_query_error(raw_fts, error))
+    Ok(crate::history_search::search_all(
+        conn,
+        terms,
+        raw_fts,
+        filter,
+        crate::history_search::SearchRole::Prompt,
+    )?
+    .into_iter()
+    .map(prompt_entry)
+    .collect())
+}
+
+/// The newest prompt matching a search that names a session, so it can be
+/// resumed. The session-id predicate is part of the query, so prompts
+/// recorded without a session id never hide an older resumable match.
+pub fn latest_resumable_match(
+    conn: &Connection,
+    terms: &[String],
+    raw_fts: bool,
+    filter: &QueryFilter,
+) -> Result<Option<HistoryEntry>> {
+    Ok(
+        crate::history_search::latest_prompt_with_session(conn, terms, raw_fts, filter)?
+            .map(prompt_entry),
+    )
+}
+
+fn prompt_entry(row: crate::history_search::SearchRow) -> HistoryEntry {
+    HistoryEntry {
+        id: row.id,
+        source: row.source,
+        session_id: row.session_id,
+        project: row.project,
+        prompt: row.text,
+        prompt_hash: None,
+        timestamp_ms: row.timestamp_ms,
+    }
 }
 
 pub fn recent(conn: &Connection, filter: &QueryFilter) -> Result<Vec<HistoryEntry>> {
