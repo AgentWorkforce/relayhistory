@@ -624,6 +624,13 @@ Notable changes to the native `ai-hist` CLI are documented here.
   discovery reuses the walk's stamps. On a store with 879 Grok sessions a
   forced tick takes about 45 ms (13%) less.
 
+- `resume` and `pack` search prompts through the same `prompt`-role search
+  (`store::search` now delegates to `history_search`), so they get the same
+  speedup: a common term with `--limit 1` drops from ~10 ms to ~0.2 ms on 49k
+  prompts. The SDK's `search`, `searchPage`, `recent`, `recentPage` and
+  `getSession` read each session's locations once per result set, not once
+  per row.
+
 - When a Codex rollout grows, sync now reads only the appended turns instead
   of re-parsing the whole file (#315). It resumes through the same
   locator-keyed cursor that hydration keeps for Codex child rollouts. The
@@ -751,6 +758,12 @@ Notable changes to the native `ai-hist` CLI are documented here.
   appended every 50 ms beside it drove 44 forced sweeps and 708 ms of CPU in
   10 s; it now drives none (37 ms of CPU). `SourceCapabilities::watch_roots`
   still advertises the directory, which covers more than the loop admits.
+
+- `ai-hist resume <query>` resumes the newest match that names a session. It
+  used to read only the single newest match and report "No session found"
+  when that prompt had no session id, even when an older match did; the
+  session-id requirement is now part of the search query.
+
 - Change-feed schema reconciliation now fingerprints each evidence kind's
   exact exported column names and declared SQLite types. The one-time upgrade
   from a pre-fingerprint database restamps every existing kind above the
