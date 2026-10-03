@@ -623,6 +623,14 @@ Notable changes to the native `ai-hist` CLI are documented here.
   the guard is derived. Exporting onto a live WAL previously replaced committed database
   state with NDJSON and left readers failing with a disk I/O error (#305).
 
+- `SessionStore::session` reads a session's requests and usage summary from
+  one evaluation of the grouped `session_requests` view instead of one per
+  1,000-request page plus one more for the summary, and attaches tool use ids
+  by hash rather than a per-request linear search of the page. A 50k-event
+  Claude session read drops from ~1.9 s to ~0.23 s; walking
+  `session_requests_page` to the end drops from ~1.9 s to ~1.1 s. Output is
+  unchanged (#311).
+
 - Change-feed schema reconciliation now fingerprints each evidence kind's
   exact exported column names and declared SQLite types. The one-time upgrade
   from a pre-fingerprint database restamps every existing kind above the
