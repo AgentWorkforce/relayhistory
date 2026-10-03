@@ -629,7 +629,7 @@ impl SessionStore {
     /// its back.
     pub fn open(opts: StoreOptions) -> Result<Self, Error> {
         let db_path = resolve_db_path(&opts);
-        if opts.read_only {
+        let readers = if opts.read_only {
             let conn = open_db_readonly(&db_path)
                 .map_err(|error| Error::DatabaseOpen(format!("{error:#}")))?;
             let current = schema_is_event_read_current(&conn)
@@ -640,9 +640,12 @@ impl SessionStore {
             if !current {
                 return Err(Error::stale_schema(&db_path, "session-evidence"));
             }
+            ReadPool::new(&conn)
         } else {
-            open_db(&db_path).map_err(|error| Error::DatabaseOpen(format!("{error:#}")))?;
-        }
+            let conn =
+                open_db(&db_path).map_err(|error| Error::DatabaseOpen(format!("{error:#}")))?;
+            ReadPool::new(&conn)
+        };
         let roots = opts
             .roots
             .unwrap_or_else(|| ProviderRoots::from_env(opts.home.unwrap_or_else(home_dir)));
@@ -650,7 +653,7 @@ impl SessionStore {
             db_path,
             roots,
             read_only: opts.read_only,
-            readers: Arc::default(),
+            readers: Arc::new(readers),
         })
     }
 
