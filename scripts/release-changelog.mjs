@@ -8,7 +8,7 @@ export const REPOSITORY = "https://github.com/AgentWorkforce/relayhistory";
 export const TAG_PREFIX = "sdk-ts-v";
 
 const LEVEL_RANK = { Patch: 0, Minor: 1, Major: 2 };
-const SEMVER = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/;
+const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z.-]+))?$/;
 export const UNRELEASED =
   /^## \[Unreleased(?: - (Patch|Minor|Major))?\][ \t]*\n([\s\S]*?)(?=^## \[|^\[[^\]]+\]:\s|(?![\s\S]))/m;
 const RELEASED = /^## \[(\d+\.\d+\.\d+)\]/m;

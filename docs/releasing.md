@@ -30,16 +30,17 @@ and `crates/ai-hist-napi/src/lib.rs`).
    each executable and its glibc floor. `helpers` applies
    `scripts/set-release-version.mjs` first, so the executables report the
    release version. Both jobs run in parallel and upload binaries as artifacts.
-3. `publish` applies that version to every manifest and lockfile — the core
-   packages and, whatever the `plugins` input, the plugin manifest
-   and plugin crate via `scripts/set-release-version.mjs`, so the tag
-   always carries what the helper matrix built from — checks the release
-   against the pending `CHANGELOG.md` level (`scripts/check-release-changelog.mjs`
-   fails, say, a patch release under `[Unreleased - Minor]`), cuts the
-   changelog (`scripts/cut-changelog.mjs`; with nothing curated it uses
-   conventional commit subjects since the last tag, failing if they imply a
-   larger bump, or records "No user-facing changes."), prepares the version commit
-   carrying both, then publishes the platform packages,
+3. `publish` first checks the release against the pending `CHANGELOG.md`
+   level (`scripts/check-release-changelog.mjs` fails, say, a patch release
+   under `[Unreleased - Minor]`) and cuts the changelog
+   (`scripts/cut-changelog.mjs`; with nothing curated it uses conventional
+   commit subjects since the last tag, failing if they imply a larger bump,
+   or records "No user-facing changes."). It then applies that version to
+   every manifest and lockfile — the core packages and, whatever the
+   `plugins` input, the plugin manifest and plugin crate via
+   `scripts/set-release-version.mjs`, so the tag always carries what the
+   helper matrix built from — prepares the version commit carrying both, then
+   publishes the platform packages,
    `ai-hist-native`, `ai-hist` and `ai-hist-mcp` in that order. The SDK root is
    never published before its platform artifacts, because npm multi-package
    publication is not atomic.

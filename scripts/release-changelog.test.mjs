@@ -48,6 +48,10 @@ describe("assertChangelogSemver", () => {
     assert.equal(assertChangelogSemver(cut.changelog, "0.35.0").actualLevel, "Released");
   });
 
+  it("rejects a version with leading zeros", () => {
+    assert.throws(() => assertChangelogSemver(changelog(), "0.35.00"), /Invalid release version/);
+  });
+
   it("rejects a target that is not newer", () => {
     assert.throws(() => assertChangelogSemver(changelog(), "0.34.0"), /must be newer/);
   });

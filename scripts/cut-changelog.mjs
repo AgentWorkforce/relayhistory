@@ -41,7 +41,7 @@ const flag = (name) => {
 };
 
 const version = flag("version");
-if (!version || !/^\d+\.\d+\.\d+$/.test(version)) {
+if (!version || !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(version)) {
   console.error("usage: cut-changelog.mjs --version <x.y.z> [--date <yyyy-mm-dd>] [--dry-run]");
   process.exit(1);
 }
