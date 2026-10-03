@@ -6,6 +6,8 @@ import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
+  REPOSITORY as REPO,
+  TAG_PREFIX,
   assertChangelogSemver,
   bodyFromCommitSubjects,
   carryReleaseCut,
@@ -15,11 +17,10 @@ import {
 } from "./release-changelog.mjs";
 
 const scripts = dirname(fileURLToPath(import.meta.url));
-const REPO = "https://github.com/AgentWorkforce/relayhistory";
 
 function changelog(level = "Minor", body = "### Added\n\n- Feature") {
   const suffix = level ? ` - ${level}` : "";
-  return `# Changelog\n\n## [Unreleased${suffix}]\n\n${body}\n\n## [0.34.1] - 2026-10-03\n\n### Fixed\n\n- Previous\n\n[Unreleased]: ${REPO}/compare/sdk-ts-v0.34.1...HEAD\n[0.34.1]: ${REPO}/compare/sdk-ts-v0.34.0...sdk-ts-v0.34.1\n`;
+  return `# Changelog\n\n## [Unreleased${suffix}]\n\n${body}\n\n## [0.34.1] - 2026-10-03\n\n### Fixed\n\n- Previous\n\n[Unreleased]: ${REPO}/compare/${TAG_PREFIX}0.34.1...HEAD\n[0.34.1]: ${REPO}/compare/${TAG_PREFIX}0.34.0...${TAG_PREFIX}0.34.1\n`;
 }
 
 describe("assertChangelogSemver", () => {
@@ -82,7 +83,7 @@ describe("cutChangelog", () => {
   });
 
   it("does not swallow link definitions into an empty pending block", () => {
-    const bare = `# Changelog\n\n## [Unreleased]\n\n[Unreleased]: ${REPO}/compare/sdk-ts-v0.1.0...HEAD\n`;
+    const bare = `# Changelog\n\n## [Unreleased]\n\n[Unreleased]: ${REPO}/compare/${TAG_PREFIX}0.1.0...HEAD\n`;
     assert.equal(cutChangelog(bare, { version: "0.1.1", date: "2026-10-04" }).cut, false);
   });
 });
@@ -112,8 +113,8 @@ describe("updateComparisonReferences", () => {
     assert.match(
       updated,
       new RegExp(
-        `\\[Unreleased\\]: ${REPO}/compare/sdk-ts-v0\\.35\\.0\\.\\.\\.HEAD\\n` +
-          `\\[0\\.35\\.0\\]: ${REPO}/compare/sdk-ts-v0\\.34\\.1\\.\\.\\.sdk-ts-v0\\.35\\.0\\n` +
+        `\\[Unreleased\\]: ${REPO}/compare/${TAG_PREFIX}0\\.35\\.0\\.\\.\\.HEAD\\n` +
+          `\\[0\\.35\\.0\\]: ${REPO}/compare/${TAG_PREFIX}0\\.34\\.1\\.\\.\\.${TAG_PREFIX}0\\.35\\.0\\n` +
           `\\[0\\.34\\.1\\]:`,
       ),
     );
@@ -141,7 +142,7 @@ function repoWithCommits(subjects) {
   writeFileSync(join(dir, "CHANGELOG.md"), changelog(null, ""));
   git("add", "CHANGELOG.md");
   git("commit", "-q", "-m", "chore: release 0.34.1");
-  git("tag", "sdk-ts-v0.34.1");
+  git("tag", `${TAG_PREFIX}0.34.1`);
   for (const subject of subjects) git("commit", "-q", "--allow-empty", "-m", subject);
   return dir;
 }
@@ -195,6 +196,9 @@ describe("impliedLevel", () => {
     assert.equal(impliedLevel("### Breaking Changes\n\n- Drop", "1.2.0"), "Major");
     assert.equal(impliedLevel("### Added\n\n- New", "0.34.1"), "Minor");
     assert.equal(impliedLevel("### Fixed\n\n- Fix", "0.34.1"), "Patch");
+    assert.equal(impliedLevel("### Removed\n\n- Drop flag", "0.34.1"), "Minor");
+    assert.equal(impliedLevel("### Removed\n\n- Drop flag", "1.2.0"), "Major");
+    assert.equal(impliedLevel("### Deprecated\n\n- Old flag", "1.2.0"), "Minor");
   });
 });
 

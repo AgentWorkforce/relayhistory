@@ -197,10 +197,11 @@ export function updateComparisonReferences(
 
 /** The SemVer level commit-subject notes imply for a release after `fromVersion`. */
 export function impliedLevel(body, fromVersion) {
-  if (/^### Breaking Changes$/m.test(body)) {
+  // Removing something is breaking; deprecating it is a minor change.
+  if (/^### (Breaking Changes|Removed)$/m.test(body)) {
     return parseVersion(fromVersion).major === 0 ? "Minor" : "Major";
   }
-  return /^### Added$/m.test(body) ? "Minor" : "Patch";
+  return /^### (Added|Deprecated)$/m.test(body) ? "Minor" : "Patch";
 }
 
 export function levelAtLeast(level, minimum) {

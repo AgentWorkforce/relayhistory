@@ -46,7 +46,11 @@ if (!version || !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(version)) {
   process.exit(1);
 }
 const date = flag("date") ?? new Date().toISOString().slice(0, 10);
-if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+if (
+  !/^\d{4}-\d{2}-\d{2}$/.test(date) ||
+  Number.isNaN(Date.parse(`${date}T00:00:00Z`)) ||
+  new Date(`${date}T00:00:00Z`).toISOString().slice(0, 10) !== date
+) {
   console.error(`invalid --date: ${date}`);
   process.exit(1);
 }
