@@ -1,13 +1,15 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { after } from "node:test";
 import { spawnSync } from "node:child_process";
-import { chmod, mkdtemp, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const scripts = dirname(fileURLToPath(import.meta.url));
 const persist = join(scripts, "persist-release-version.sh");
+const roots = [];
+after(() => Promise.all(roots.map((root) => rm(root, { recursive: true, force: true }))));
 
 function git(cwd, ...args) {
   const result = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8" });
@@ -29,6 +31,7 @@ function persistRelease(cwd, branch, startSha, extraEnv = {}) {
 
 async function stageRepos() {
   const root = await mkdtemp(join(tmpdir(), "persist-release-"));
+  roots.push(root);
   const origin = join(root, "origin.git");
   const work = join(root, "work");
   const other = join(root, "other");

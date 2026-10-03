@@ -52,15 +52,17 @@ resolve_changelog_conflict() {
   GIT_EDITOR=true git rebase --continue
 }
 
+# Called as `reconcile_changelog || conflict`, where set -e does not apply,
+# so every step returns its own failure.
 reconcile_changelog() {
   git diff --quiet "$START_SHA" "$VERSION_SHA" -- CHANGELOG.md && return 0
   git diff --quiet "$START_SHA" "origin/$BRANCH" -- CHANGELOG.md && return 0
   echo "origin/$BRANCH changed CHANGELOG.md during the release; carrying the $VERSION cut onto it"
-  git show "origin/$BRANCH:CHANGELOG.md" > CHANGELOG.md
+  git show "origin/$BRANCH:CHANGELOG.md" > CHANGELOG.md || return 1
   node "$SCRIPTS/cut-changelog.mjs" --version "$VERSION" \
-    --released-from "$VERSION_SHA" --pending-since "$START_SHA"
-  git add CHANGELOG.md
-  git diff --cached --quiet || git commit --quiet --amend --no-edit
+    --released-from "$VERSION_SHA" --pending-since "$START_SHA" || return 1
+  git add CHANGELOG.md || return 1
+  git diff --cached --quiet || git commit --quiet --amend --no-edit || return 1
 }
 
 conflict() {

@@ -209,25 +209,28 @@ export function levelAtLeast(level, minimum) {
 }
 
 /**
- * The level of entries carried past a release. The branch's heading covered
- * the shipped entries too, so it is only an upper bound — unless the branch
+ * The level of entries carried past a release. The branch's heading also
+ * covered the shipped entries, so it can overstate them — unless the branch
  * raised it during the release, which only a carried entry can have done.
- * Below that bound, the carried sections decide where they can: Breaking
- * Changes and Added are what they always are, Fixed and Security alone are a
- * patch; anything else keeps the bound, since it can be either.
+ * Otherwise each carried section decides where it can: Breaking Changes and
+ * Removed are breaking (judged against the version just released, which the
+ * next release follows), Added and Deprecated are Minor, Fixed and Security
+ * are Patch. Any other section can be either, so it keeps the branch's level.
+ * The carried level is the highest of these.
  */
 function carriedLevel(carried, branchLevel, startLevel, releasedVersion) {
   if (!branchLevel) return null;
   if (!startLevel || LEVEL_RANK[branchLevel] > LEVEL_RANK[startLevel]) return branchLevel;
-  const headings = [...carried.keys()];
-  let inferred;
-  if (headings.includes("Breaking Changes")) {
-    // Carried entries are not in `releasedVersion`; the next release follows it.
-    inferred = parseVersion(releasedVersion).major === 0 ? "Minor" : "Major";
-  } else if (headings.includes("Added")) inferred = "Minor";
-  else if (headings.every((heading) => heading === "Fixed" || heading === "Security")) inferred = "Patch";
-  else return branchLevel;
-  return LEVEL_RANK[inferred] < LEVEL_RANK[branchLevel] ? inferred : branchLevel;
+  const breaking = parseVersion(releasedVersion).major === 0 ? "Minor" : "Major";
+  const sectionLevel = (heading) => {
+    if (heading === "Breaking Changes" || heading === "Removed") return breaking;
+    if (heading === "Added" || heading === "Deprecated") return "Minor";
+    if (heading === "Fixed" || heading === "Security") return "Patch";
+    return branchLevel;
+  };
+  return [...carried.keys()]
+    .map(sectionLevel)
+    .reduce((highest, level) => (LEVEL_RANK[level] > LEVEL_RANK[highest] ? level : highest), "Patch");
 }
 
 /** Pending bullets as `[section, bullet]` pairs, a bullet keeping its continuation lines. */

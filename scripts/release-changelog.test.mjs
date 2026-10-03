@@ -258,6 +258,15 @@ describe("carryReleaseCut", () => {
     );
   });
 
+  it("levels a removal carried past a Minor 1.0.0 heading as Major", () => {
+    const minorStart = changelog("Minor", "### Added\n\n- Stable API");
+    const released = cutChangelog(minorStart, { version: "1.0.0", date: "2026-10-04" }).changelog;
+    const upstream = changelog("Minor", "### Added\n\n- Stable API\n\n### Removed\n\n- Drop old flag");
+    const carried = carryReleaseCut(upstream, { version: "1.0.0", released, start: minorStart });
+    assert.match(carried, /## \[Unreleased - Major\]\n\n### Removed\n\n- Drop old flag\n\n## \[1\.0\.0\]/);
+    assert.throws(() => assertChangelogSemver(carried, "1.1.0"), /requires a Major release/);
+  });
+
   it("keeps a bullet whose text shipped under another section", () => {
     const upstream = changelog("Patch", "### Fixed\n\n- Shipped fix\n\n### Rust API\n\n- Shipped fix");
     assert.match(
