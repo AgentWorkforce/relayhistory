@@ -631,6 +631,19 @@ Notable changes to the native `ai-hist` CLI are documented here.
   `session_requests_page` to the end drops from ~1.9 s to ~1.1 s. Output is
   unchanged (#311).
 
+
+- Live capture: one write is one forced sweep again. The debounce window
+  re-armed on the events inside it, so a write the backend reported in more
+  than one callback — FSEvents does for a create or a multi-line append —
+  ran a second, redundant forced sweep after the window (a three-line turn
+  went from 2.0 to 1.0 forced sweeps). The window now clears when it closes;
+  a write during the sweep still drives the next tick. This also removes the
+  macOS flakes in the `live_capture` FSEvents tests (#324, #331), together
+  with letting those tests settle after attaching, because FSEvents replays
+  changes made just before a stream registers.
+- `ai-hist` built with `unstable-internal` but without `fs-events` (the napi
+  addon's `--all-features` build) is clippy-clean again: the event-matching
+  helpers and backend-only stubs in `watch.rs` are gated on `fs-events`.
 - Change-feed schema reconciliation now fingerprints each evidence kind's
   exact exported column names and declared SQLite types. The one-time upgrade
   from a pre-fingerprint database restamps every existing kind above the

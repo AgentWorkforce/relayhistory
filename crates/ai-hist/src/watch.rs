@@ -28,21 +28,39 @@
 //! * The debounce window always ends. Under sustained writes the loop emits a
 //!   steady `~debounce` cadence rather than waiting for a quiet period that
 //!   never arrives — waiting for quiet would demote a busy session to the slow
-//!   backstop, which is exactly the case live capture exists for.
+//!   backstop, which is exactly the case live capture exists for. Events
+//!   inside one window are one tick: the sweep starts after the window
+//!   closes, so it already reads every write those events were for.
+//!
+//! Registration replays recent history on macOS: FSEvents delivers the
+//! changes made a few milliseconds *before* a stream was registered right
+//! after it starts. The loop treats them like any other event, which is what
+//! it should do — they are the only signal for a write that landed between a
+//! caller's last sync and the attach — but a caller (or a test) that seeds a
+//! tree and then attaches will see one forced tick it did not cause.
 //!
 //! The loop is plain threads and condition variables. The crate has no async
 //! runtime and this does not need one: a tick is a blocking sweep, and the
 //! watcher backend already runs on its own thread.
 
+#[cfg(feature = "fs-events")]
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+#[cfg(any(feature = "fs-events", test))]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::discover::{self, WatchDepth, WatchRoot};
+// Without a watcher backend the loop never sees an event path, so the
+// matching and registration helpers below exist only with `fs-events`.
+#[cfg(any(feature = "fs-events", test))]
+use crate::discover;
+use crate::discover::WatchRoot;
+#[cfg(feature = "fs-events")]
+use crate::discover::WatchDepth;
 
 /// How often a registration that was *lost* is retried.
 ///
@@ -53,6 +71,7 @@ use crate::discover::{self, WatchDepth, WatchRoot};
 /// there, cleanup taking it away again — a retry on the 30 s backstop misses
 /// the whole of it. One `stat` per lost root, four times a second, and only
 /// until it is attached again.
+#[cfg(feature = "fs-events")]
 const LOST_REGISTRATION_RECHECK_MS: u64 = 250;
 
 /// How soon a forced sweep that could not take the store's lock is tried
@@ -228,6 +247,7 @@ pub type RootsFn = Arc<dyn Fn() -> Vec<WatchRoot> + Send + Sync>;
 /// those would become a *forced* sweep — the expensive kind that bypasses the
 /// fingerprint. Filtering by the depth the root asked for makes the two
 /// backends agree, and on inotify it is simply a no-op the kernel already did.
+#[cfg(any(feature = "fs-events", test))]
 fn event_matches_roots(path: &Path, roots: &[WatchRoot]) -> bool {
     // The event's own spelling is never compared. Roots are absolute from the
     // moment they are built, and a backend reports whatever it was registered
@@ -245,6 +265,7 @@ fn event_matches_roots(path: &Path, roots: &[WatchRoot]) -> bool {
 /// removal, and what comes back is the root's own key rather than the path
 /// that was reported. That is what keeps the recording side and the lookup
 /// side from drifting apart: there is one key, and it comes from here.
+#[cfg(feature = "fs-events")]
 fn removed_registration_keys(path: &Path, roots: &[WatchRoot]) -> Vec<PathBuf> {
     let path = discover::watch_path(path);
     roots
@@ -379,11 +400,6 @@ impl WatchInner {
                 return Some(TickTrigger::RegistrationLost);
             }
             if wake.pending {
-                // Clear before the window, not after: events that land during
-                // the debounce set it again and the next wait observes them
-                // immediately. That is what gives sustained writes a steady
-                // ~debounce cadence instead of a wait for quiet.
-                wake.pending = false;
                 drop(wake);
                 // Cut short by a lost registration, because on a busy tree
                 // this window is where the loop spends nearly all of its
@@ -393,7 +409,24 @@ impl WatchInner {
                 // short session occupies. The bit itself is left set; the
                 // caller takes it and reconciles before it sweeps.
                 self.sleep_through_debounce(debounce);
-                return (!self.stopped()).then_some(TickTrigger::FsEvent);
+                let mut wake = self.wake.lock().expect("watch wake state");
+                if wake.stopped {
+                    return None;
+                }
+                // Cleared when the window *closes*, not when it opens. Every
+                // event that landed inside the window is for a write that has
+                // already happened, and the sweep this tick runs starts after
+                // it, so that sweep reads it: re-arming on those events ran a
+                // second forced sweep for one write whenever the backend
+                // delivered its events in more than one callback (FSEvents
+                // does, for a create or a multi-line append), and the window
+                // collapsed nothing. The window still always ends — it is
+                // fixed from the first event, never extended — and a write
+                // that lands once the window has closed, including during the
+                // sweep, sets the bit again, so sustained writes keep a steady
+                // window-plus-sweep cadence instead of waiting for quiet.
+                wake.pending = false;
+                return Some(TickTrigger::FsEvent);
             }
             let (next, result) = self
                 .wake_cv
@@ -457,7 +490,7 @@ impl WatchInner {
     ///
     /// A **forced** tick is not dropped, because it is evidence that something
     /// changed: the wake state was already cleared when the debounce window
-    /// opened, so returning here would lose that change until the backstop —
+    /// closed, so returning here would lose that change until the backstop —
     /// up to `--interval` later, which may be an hour. It is remembered
     /// instead, and [`InFlight::drop`] re-posts it the moment the run in
     /// flight finishes. Repeats coalesce into the one bit, so a busy tree
@@ -533,7 +566,7 @@ impl WatchInner {
                 // A sweep that failed covered nothing, exactly as a contended
                 // one covered nothing, and the change it was for is recorded
                 // nowhere else: the wake state was cleared when the debounce
-                // window opened. An error is not an answer about the change,
+                // window closed. An error is not an answer about the change,
                 // so it is owed and retried on the same bounded cadence rather
                 // than logged and forgotten until the backstop.
                 forced
@@ -789,7 +822,7 @@ impl WatchLoop {
             if let Some(at) = retry_force {
                 // A change whose sweep never ran. Nothing else will bring the
                 // loop back for it: the wake state was cleared when its
-                // debounce window opened, so without this the next visit is
+                // debounce window closed, so without this the next visit is
                 // the backstop, up to `--interval` away.
                 idle = idle.min(at.saturating_duration_since(Instant::now()));
             }
@@ -903,9 +936,9 @@ impl WatchLoop {
                 retry_backoff = CONTENDED_SWEEP_RETRY_MS;
             }
         }
-        let driver = self.current_driver();
-        drop(watcher);
-        Ok(driver)
+        // The watcher (and with it every OS registration) is released as
+        // `run` returns.
+        Ok(self.current_driver())
     }
 
     /// How often the registrations are re-checked.
@@ -1475,15 +1508,7 @@ mod fs_events {
             0
         }
 
-        pub(super) fn recovering(&self) -> bool {
-            false
-        }
-
         pub(super) fn adopt(&mut self, _roots: Vec<WatchRoot>) -> usize {
-            0
-        }
-
-        pub(super) fn retry_pending(&mut self) -> usize {
             0
         }
     }
