@@ -7,19 +7,19 @@
 //! idle read-only connections and hands one out per call.
 //!
 //! Reuse is only ever of a connection to the *same file*. Each idle
-//! connection remembers the identity (device and inode) the path had just
-//! before it was opened; a checkout compares it with the path's identity now
+//! connection remembers the file identity around open; a checkout compares
+//! it with the path's identity now
 //! and discards every connection that disagrees, so a database replaced or
 //! recreated under the handle gets a fresh connection. A schema change made
 //! in place by another process needs no such check: SQLite notices the
 //! changed `schema_version` on the next statement and re-parses, and the
-//! schema gates each entry point applies still run on every call.
+//! schema gates are rechecked whenever that version changes.
 //!
 //! Only read paths use this. Writers keep opening their own connection under
 //! the `SyncRunLock` and hydration locks, exactly as before.
 use std::fmt;
 use std::ops::{Deref, DerefMut};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use rusqlite::Connection;
@@ -34,7 +34,8 @@ const MAX_IDLE: usize = 4;
 
 /// What a path named when a connection was opened. `None` where the
 /// platform gives no stable identity; such connections are never reused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct FileIdentity {
     device: u64,
     inode: u64,
@@ -50,7 +51,23 @@ fn file_identity(path: &Path) -> Option<FileIdentity> {
     })
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileIdentity(Arc<same_file::Handle>);
+
+#[cfg(windows)]
+fn file_identity(path: &Path) -> Option<FileIdentity> {
+    // Keep the handle alive: Windows may recycle file indexes after close.
+    same_file::Handle::from_path(path)
+        .ok()
+        .map(|handle| FileIdentity(Arc::new(handle)))
+}
+
+#[cfg(not(any(unix, windows)))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileIdentity;
+
+#[cfg(not(any(unix, windows)))]
 fn file_identity(_path: &Path) -> Option<FileIdentity> {
     None
 }
@@ -76,6 +93,9 @@ struct Gates {
 #[derive(Default)]
 pub(crate) struct ReadPool {
     idle: Mutex<Vec<Idle>>,
+    /// SQLite resolves URI syntax (including percent escaping and query
+    /// parameters) for us at store open. Empty/in-memory filenames stay absent.
+    identity_path: Option<PathBuf>,
 }
 
 impl fmt::Debug for ReadPool {
@@ -89,39 +109,78 @@ impl fmt::Debug for ReadPool {
 }
 
 impl ReadPool {
+    pub(crate) fn new(conn: &Connection) -> Self {
+        Self {
+            idle: Mutex::default(),
+            identity_path: conn
+                .path()
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from),
+        }
+    }
+
     /// A read-only connection to `path`: an idle one to the same file if
     /// there is one, otherwise a new one.
     pub(crate) fn get(self: &Arc<Self>, path: &Path) -> Result<PooledConnection, Error> {
-        // Taken before any open, so a connection is never tagged with an
-        // identity newer than the file it opened: a replacement racing the
-        // open makes the tag stale, and a stale tag only costs a reopen.
-        let identity = file_identity(path);
-        if let Some(identity) = identity {
-            let mut idle = self
-                .idle
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            idle.retain(|entry| entry.identity == identity);
-            if let Some(entry) = idle.pop() {
+        self.get_checked(path, || {})
+    }
+
+    fn get_checked(
+        self: &Arc<Self>,
+        path: &Path,
+        after_identity: impl FnOnce(),
+    ) -> Result<PooledConnection, Error> {
+        let identity_path = if path.to_str().is_some_and(|path| path.starts_with("file:")) {
+            self.identity_path.as_deref().unwrap_or(path)
+        } else {
+            path
+        };
+        // Check within the checkout lock, then again after selecting an idle
+        // connection. A replacement while waiting for that lock or between
+        // the first stat and selection must discard the old connection.
+        let mut idle = self
+            .idle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let identity = file_identity(identity_path);
+        after_identity();
+        idle.retain(|entry| Some(&entry.identity) == identity.as_ref());
+        if let Some(entry) = idle.pop() {
+            if file_identity(identity_path).as_ref() == Some(&entry.identity) {
                 return Ok(PooledConnection {
                     conn: Some(entry.conn),
-                    identity: Some(identity),
+                    identity: Some(entry.identity),
                     gates: entry.gates,
                     pool: Some(Arc::clone(self)),
                 });
             }
+            idle.clear();
         }
-        let conn =
-            open_db_readonly(path).map_err(|error| Error::DatabaseOpen(format!("{error:#}")))?;
-        Ok(PooledConnection {
-            conn: Some(conn),
-            identity,
-            gates: Gates::default(),
-            pool: identity.map(|_| Arc::clone(self)),
-        })
+        drop(idle);
+        // Both snapshots surround open. If they differ, this connection may
+        // target the old file and must never be tagged with the new identity.
+        for _ in 0..3 {
+            let identity = file_identity(identity_path);
+            let conn = open_db_readonly(path)
+                .map_err(|error| Error::DatabaseOpen(format!("{error:#}")))?;
+            if identity != file_identity(identity_path) {
+                continue;
+            }
+            let pool = identity.as_ref().map(|_| Arc::clone(self));
+            return Ok(PooledConnection {
+                conn: Some(conn),
+                identity,
+                gates: Gates::default(),
+                pool,
+            });
+        }
+        Err(Error::DatabaseOpen(format!(
+            "{} was repeatedly replaced while opening a read connection",
+            path.display()
+        )))
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) fn idle(&self) -> usize {
         self.idle.lock().unwrap().len()
     }
@@ -201,7 +260,7 @@ impl DerefMut for PooledConnection {
 impl Drop for PooledConnection {
     fn drop(&mut self) {
         let (Some(conn), Some(identity), Some(pool)) =
-            (self.conn.take(), self.identity, self.pool.take())
+            (self.conn.take(), self.identity.take(), self.pool.take())
         else {
             return;
         };
@@ -222,7 +281,7 @@ impl Drop for PooledConnection {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::open_db;
@@ -267,6 +326,7 @@ mod tests {
 
     /// A database replaced under the handle -- a new file at the same path --
     /// is read through a new connection, never the one to the old file.
+    #[cfg(unix)]
     #[test]
     fn a_replaced_database_is_reopened() {
         let dir = tempfile::tempdir().unwrap();
@@ -298,6 +358,78 @@ mod tests {
             pool.idle(),
             1,
             "the connection to the old file was discarded"
+        );
+    }
+
+    #[test]
+    fn sqlite_uri_reads_reuse_the_resolved_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("history with space.db");
+        drop(open_db(&db).unwrap());
+        let uri = PathBuf::from(format!(
+            "file:{}?mode=ro",
+            db.to_string_lossy().replace('\\', "/").replace(' ', "%20")
+        ));
+        let seed = open_db_readonly(&uri).unwrap();
+        let pool = Arc::new(ReadPool::new(&seed));
+        drop(seed);
+        {
+            let conn = pool.get(&uri).unwrap();
+            conn.pragma_update(None, "cache_size", -4321).unwrap();
+        }
+        assert_eq!(pool.idle(), 1);
+        assert_eq!(cache_size(&pool.get(&uri).unwrap()), -4321);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_between_identity_and_checkout_discards_the_idle_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let pool = Arc::new(ReadPool::default());
+        {
+            let conn = pool.get(&db).unwrap();
+            conn.pragma_update(None, "cache_size", -9876).unwrap();
+        }
+        let replacement = dir.path().join("replacement.db");
+        drop(open_db(&replacement).unwrap());
+        let conn = pool
+            .get_checked(&db, || {
+                std::fs::rename(&replacement, &db).unwrap();
+                for sidecar in ["-wal", "-shm"] {
+                    let _ = std::fs::remove_file(format!("{}{sidecar}", db.display()));
+                }
+            })
+            .unwrap();
+        assert_ne!(
+            cache_size(&conn),
+            -9876,
+            "reused the old database connection"
+        );
+        assert_eq!(count(&conn, "session_events"), 0);
+    }
+
+    #[test]
+    fn passed_gates_are_rechecked_after_a_schema_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let writer = open_db(&db).unwrap();
+        let pool = Arc::new(ReadPool::default());
+        {
+            let mut conn = pool.get(&db).unwrap();
+            assert!(conn.gate("test", |_| Ok(true)).unwrap());
+        }
+        let mut conn = pool.get(&db).unwrap();
+        assert!(conn
+            .gate("test", |_| panic!("cached pass was not reused"))
+            .unwrap());
+        writer
+            .execute_batch("CREATE TABLE gate_changed(x)")
+            .unwrap();
+        assert!(!conn.gate("test", |_| Ok(false)).unwrap());
+        assert!(
+            conn.gate("test", |_| Ok(true)).unwrap(),
+            "failed gates must not be cached"
         );
     }
 
