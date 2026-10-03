@@ -599,6 +599,15 @@ Notable changes to the native `ai-hist` CLI are documented here.
   Same marker and same outstanding set; on the 100 MB benchmark store the
   destination checks go from ~5% of a forced tick to ~0.1%.
 
+- The project-identity refresh at the end of each sync now brings events in
+  line with their session's key only for sessions written since the previous
+  refresh in the same process (#319). It used to walk every event of every
+  keyed session on every tick. Sessions are scoped by the change feed's
+  revisions. The first refresh of a database in a process still covers the
+  whole catalog, as does one after a failure or after the database was
+  replaced. On a 140,000-event store a forced tick spends 1.7% of its time
+  here, down from 11%, and takes about 40 ms less.
+
 - When a Codex rollout grows, sync now reads only the appended turns instead
   of re-parsing the whole file (#315). It resumes through the same
   locator-keyed cursor that hydration keeps for Codex child rollouts. The

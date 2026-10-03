@@ -2580,7 +2580,7 @@ impl Drop for SyncRunLock {
     }
 }
 
-fn canonical_db_identity(db_path: &Path) -> Result<PathBuf> {
+pub(crate) fn canonical_db_identity(db_path: &Path) -> Result<PathBuf> {
     if db_path.exists() {
         return fs::canonicalize(db_path)
             .with_context(|| format!("canonicalizing database path {}", db_path.display()));
@@ -2779,7 +2779,7 @@ fn sync_opencode_exclusive(
 /// keys stuck at NULL with no trace of why, and "nothing to do" and "could not
 /// write" would look identical from the outside.
 fn refresh_project_identity_after_sync(conn: &Connection) {
-    if let Err(error) = crate::store::refresh_project_identity(conn) {
+    if let Err(error) = crate::store::refresh_project_identity_after_sweep(conn) {
         eprintln!(
             "ai-hist: could not refresh canonical project identity: {error:#} \
              (project keys stay as they were; the next sync retries)"
