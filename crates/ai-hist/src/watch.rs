@@ -9,7 +9,8 @@
 //! * **Filesystem events** (preferred): a recursive watcher over the providers'
 //!   [`watch_roots`](crate::discover::watch_roots) wakes the loop on a real
 //!   write. A burst of events collapses into one tick through the
-//!   [`WatchLoop::debounce_ms`] window, and a slow poll at
+//!   [`WatchLoop::debounce_ms`] window — swept on its leading edge when the
+//!   loop was quiet ([`WatchLoop::leading_edge`]) — and a slow poll at
 //!   [`WatchLoop::slow_poll_ms`] backstops the platforms where events are
 //!   silently unreliable (network mounts, some container filesystems).
 //! * **Polling** (fallback): when no roots are watchable, when the crate was
@@ -78,10 +79,20 @@ const LOST_REGISTRATION_RECHECK_MS: u64 = 250;
 /// again, before backing off.
 ///
 /// Short, because the usual holder is a manual `sync` that is about to finish
-/// and the change is still owed; backed off from there so a long-running
-/// holder is not asked four times a second for minutes — the retry is a
-/// `try_lock` and a return, but it is also a log line each time.
+/// and the change is still owed.
 const CONTENDED_SWEEP_RETRY_MS: u64 = 250;
+
+/// The longest an owed sweep waits between attempts at a held lock.
+///
+/// Low, because the wait is paid by the change: a write made while another
+/// process sweeps is read no sooner than the first retry after that sweep
+/// releases the lock. A retry is one `try_lock` and a return, so asking once
+/// a second for as long as a holder keeps the lock costs nothing worth
+/// trading for capture latency. It used to be the slow backstop (30–60 s),
+/// reached after a handful of contended *event* ticks, which left the last
+/// writes of a burst unread for up to a minute after the lock was free
+/// (#364).
+const CONTENDED_SWEEP_RETRY_MAX_MS: u64 = 1_000;
 
 /// The longest any configurable interval may be.
 ///
@@ -113,6 +124,14 @@ fn deadline_after(now: Instant, millis: u64) -> Instant {
 /// interactive pause feels live, long enough to collapse the event burst from
 /// one tool result appending a multi-line transcript update.
 pub const DEFAULT_DEBOUNCE_MS: u64 = 200;
+/// How long a leading-edge tick waits before it sweeps.
+///
+/// Not a debounce: one write reaches the loop as several backend callbacks
+/// (FSEvents delivers a create or an append as two or three, within about a
+/// millisecond), and a tick that swept on the first of them would leave the
+/// rest to drive a trailing sweep for the same write. A few milliseconds
+/// gathers one write's callbacks without being perceptible.
+pub const LEADING_EDGE_SETTLE_MS: u64 = 10;
 /// Default slow polling backstop while the filesystem-event driver is active.
 pub const DEFAULT_SLOW_POLL_MS: u64 = 30_000;
 /// Default cadence for the pure polling driver.
@@ -222,6 +241,24 @@ pub struct TickReport {
     pub trigger: TickTrigger,
     pub forced: bool,
     pub outcome: TickOutcome,
+    /// The sweep was stopped through the capture stop token before it
+    /// finished. Neither swept nor failed, and never owed: a cancellation is
+    /// a request to stop, so it also ends the loop.
+    pub cancelled: bool,
+    /// Wall time of the sweep, including the attempt at the store's lock.
+    pub elapsed: Duration,
+    /// When the first change signal behind this tick arrived — the start of
+    /// its debounce window, or of the earliest window a deferred or retried
+    /// forced tick is standing in for. `None` for a tick no change signal
+    /// drove (startup, backstop, manual).
+    pub first_event_at: Option<Instant>,
+}
+
+/// Whether a failed tick was a cancellation rather than a failure.
+fn is_cancellation(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<crate::ingest::CaptureCancelled>())
 }
 
 /// The sweep a tick runs. The `bool` is `force`.
@@ -275,17 +312,40 @@ fn removed_registration_keys(path: &Path, roots: &[WatchRoot]) -> Vec<PathBuf> {
         .collect()
 }
 
+/// What one wait produced: the trigger, and for a change-driven tick when
+/// its first signal arrived.
+#[derive(Debug, Clone, Copy)]
+struct Wake {
+    trigger: TickTrigger,
+    first_event_at: Option<Instant>,
+}
+
+impl From<TickTrigger> for Wake {
+    fn from(trigger: TickTrigger) -> Self {
+        Self {
+            trigger,
+            first_event_at: None,
+        }
+    }
+}
+
 #[derive(Default)]
 struct WakeState {
-    /// A change signal is pending. Single-bit on purpose: a thousand events
-    /// between two ticks cost one wakeup, not a thousand.
-    pending: bool,
+    /// A change signal is pending, and when the first one arrived. One slot
+    /// on purpose: a thousand events between two ticks cost one wakeup, not
+    /// a thousand, and the tick reports how long the oldest of them waited.
+    pending: Option<Instant>,
     /// A registration was reported gone and has to be re-made. Kept apart
     /// from `pending` because it asks for different work: `pending` says
     /// something was written and wants a sweep, this says a watch was lost
     /// and wants the watch back.
     registration_lost: bool,
     stopped: bool,
+    /// When the coalescing window opened by the last change-driven tick
+    /// closes. A change arriving after it finds the loop quiet and, with the
+    /// leading edge on, is swept at once; one arriving before it waits for
+    /// it and becomes the window's one trailing tick.
+    window_until: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -295,6 +355,8 @@ struct RunState {
     /// hundred events during a long sweep are one sweep afterwards, not a
     /// hundred.
     deferred_force: bool,
+    /// When the oldest change behind `deferred_force` first arrived.
+    deferred_since: Option<Instant>,
     /// Monotonic count of finished ticks, so a joiner can wait for "the run
     /// that was in flight when I arrived" without holding the lock across it.
     completed: u64,
@@ -319,18 +381,22 @@ struct InFlight<'a> {
 
 impl Drop for InFlight<'_> {
     fn drop(&mut self) {
-        let deferred = {
+        let (deferred, since) = {
             let mut run = self.inner.run.lock().expect("watch run state");
             run.in_flight = false;
             run.completed = run.completed.wrapping_add(1);
-            std::mem::take(&mut run.deferred_force)
+            (
+                std::mem::take(&mut run.deferred_force),
+                run.deferred_since.take(),
+            )
         };
         self.inner.run_cv.notify_all();
         if deferred {
             // A change arrived while this run held the slot. Post it now that
             // the slot is free: the loop is waiting on the wake state, so it
             // takes it up immediately rather than at the next backstop.
-            self.inner.signal_change();
+            self.inner
+                .signal_change_since(since.unwrap_or_else(Instant::now));
         }
     }
 }
@@ -344,12 +410,18 @@ impl WatchInner {
     /// public through [`WatchLoop::notify_change`] for hosts that already have
     /// their own change feed.
     fn signal_change(&self) {
+        self.signal_change_since(Instant::now());
+    }
+
+    /// Post a change signal that first arrived at `at`, keeping the oldest
+    /// arrival when one is already pending.
+    fn signal_change_since(&self, at: Instant) {
         {
             let mut wake = self.wake.lock().expect("watch wake state");
             if wake.stopped {
                 return;
             }
-            wake.pending = true;
+            wake.pending = Some(wake.pending.map_or(at, |first| first.min(at)));
         }
         self.wake_cv.notify_all();
     }
@@ -386,7 +458,12 @@ impl WatchInner {
     /// Block until a change signal arrives, `timeout` elapses, or the loop is
     /// stopped. A change signal is followed by the debounce window, so further
     /// events landing inside it roll into the same tick.
-    fn wait_for_wake(&self, timeout: Duration, debounce: Duration) -> Option<TickTrigger> {
+    fn wait_for_wake(
+        &self,
+        timeout: Duration,
+        debounce: Duration,
+        leading_edge: bool,
+    ) -> Option<Wake> {
         let mut wake = self.wake.lock().expect("watch wake state");
         loop {
             if wake.stopped {
@@ -397,9 +474,26 @@ impl WatchInner {
             // it waits is a moment writes to that directory are invisible.
             if wake.registration_lost {
                 wake.registration_lost = false;
-                return Some(TickTrigger::RegistrationLost);
+                return Some(Wake::from(TickTrigger::RegistrationLost));
             }
-            if wake.pending {
+            if wake.pending.is_some() {
+                // With the leading edge on, a change that finds the loop quiet
+                // — no change-driven tick in the last window — is swept after
+                // only the settle, and the window opens with that sweep: what
+                // lands inside it is its one trailing tick, at the window's
+                // close. A burst therefore costs at most a leading and a
+                // trailing sweep, an isolated write is swept within a few
+                // milliseconds, and sustained writes tick once per window.
+                // Without it every change waits out the full window.
+                let now = Instant::now();
+                let window = if leading_edge {
+                    match wake.window_until {
+                        Some(until) if until > now => until - now,
+                        _ => debounce.min(Duration::from_millis(LEADING_EDGE_SETTLE_MS)),
+                    }
+                } else {
+                    debounce
+                };
                 drop(wake);
                 // Cut short by a lost registration, because on a busy tree
                 // this window is where the loop spends nearly all of its
@@ -408,7 +502,7 @@ impl WatchInner {
                 // the watch is put back, which is the whole of the gap a
                 // short session occupies. The bit itself is left set; the
                 // caller takes it and reconciles before it sweeps.
-                self.sleep_through_debounce(debounce);
+                self.sleep_through_debounce(window);
                 let mut wake = self.wake.lock().expect("watch wake state");
                 if wake.stopped {
                     return None;
@@ -425,8 +519,17 @@ impl WatchInner {
                 // that lands once the window has closed, including during the
                 // sweep, sets the bit again, so sustained writes keep a steady
                 // window-plus-sweep cadence instead of waiting for quiet.
-                wake.pending = false;
-                return Some(TickTrigger::FsEvent);
+                let first_event_at = wake.pending.take();
+                if leading_edge {
+                    // Bounded like every other interval here: the public
+                    // field can be set past `MAX_INTERVAL_MS` directly.
+                    wake.window_until = Instant::now()
+                        .checked_add(debounce.min(Duration::from_millis(MAX_INTERVAL_MS)));
+                }
+                return Some(Wake {
+                    trigger: TickTrigger::FsEvent,
+                    first_event_at,
+                });
             }
             let (next, result) = self
                 .wake_cv
@@ -437,7 +540,7 @@ impl WatchInner {
                 if wake.stopped {
                     return None;
                 }
-                return Some(TickTrigger::Poll);
+                return Some(Wake::from(TickTrigger::Poll));
             }
         }
     }
@@ -501,19 +604,23 @@ impl WatchInner {
     /// nowhere else. A tick that could not have the slot returns `false`
     /// — that change is remembered as `deferred_force` and re-posted by
     /// [`InFlight::drop`], which is the same promise by another route.
-    fn run_skip_if_busy(&self, trigger: TickTrigger) -> bool {
-        let Some(guard) = self.claim_or_defer(trigger) else {
+    fn run_skip_if_busy(&self, wake: Wake) -> bool {
+        let Some(guard) = self.claim_or_defer(wake) else {
             return false;
         };
-        self.run_claimed(trigger, guard)
+        self.run_claimed(wake, guard)
     }
 
     /// Claim the in-flight slot, or remember a forced trigger that could not
     /// have it.
-    fn claim_or_defer(&self, trigger: TickTrigger) -> Option<InFlight<'_>> {
+    fn claim_or_defer(&self, wake: Wake) -> Option<InFlight<'_>> {
         let mut run = self.run.lock().expect("watch run state");
         if run.in_flight {
-            run.deferred_force |= trigger.forces_scan();
+            if wake.trigger.forces_scan() {
+                run.deferred_force = true;
+                let since = wake.first_event_at.unwrap_or_else(Instant::now);
+                run.deferred_since = Some(run.deferred_since.map_or(since, |held| held.min(since)));
+            }
             return None;
         }
         run.in_flight = true;
@@ -534,7 +641,7 @@ impl WatchInner {
         };
         match join_target {
             None => {
-                self.run_claimed(trigger, InFlight { inner: self });
+                self.run_claimed(Wake::from(trigger), InFlight { inner: self });
             }
             Some(target) => {
                 let mut run = self.run.lock().expect("watch run state");
@@ -545,21 +652,42 @@ impl WatchInner {
         }
     }
 
-    fn run_claimed(&self, trigger: TickTrigger, guard: InFlight<'_>) -> bool {
+    fn run_claimed(&self, wake: Wake, guard: InFlight<'_>) -> bool {
+        let Wake {
+            trigger,
+            first_event_at,
+        } = wake;
         let forced = trigger.forces_scan();
+        let started = Instant::now();
+        let result = (self.tick)(forced);
+        let elapsed = started.elapsed();
+        let report = |outcome: TickOutcome, cancelled: bool| {
+            if let Some(sink) = &self.on_report {
+                sink(&TickReport {
+                    trigger,
+                    forced,
+                    outcome,
+                    cancelled,
+                    elapsed,
+                    first_event_at,
+                });
+            }
+        };
         // Only a forced tick is ever owed anything: a backstop tick that found
         // the store busy, or failed, is covered by the next backstop, while a
         // forced one is standing in for a change nothing else knows about.
-        let owed = match (self.tick)(forced) {
+        let owed = match result {
             Ok(outcome) => {
-                if let Some(sink) = &self.on_report {
-                    sink(&TickReport {
-                        trigger,
-                        forced,
-                        outcome,
-                    });
-                }
+                report(outcome, false);
                 forced && outcome.contended
+            }
+            Err(error) if is_cancellation(&error) => {
+                // Stopped, not failed: the only thing that cancels a sweep
+                // is a request to stop, so the loop ends with it and nothing
+                // is owed. Reported, so a consumer sees the tick end.
+                self.request_stop();
+                report(TickOutcome::default(), true);
+                false
             }
             Err(error) => {
                 self.report_error(&error);
@@ -602,6 +730,11 @@ pub struct WatchLoop {
     pub roots: Vec<WatchRoot>,
     /// Run one sweep before parking.
     pub immediate: bool,
+    /// Sweep a change that finds the loop quiet at once (after
+    /// [`LEADING_EDGE_SETTLE_MS`]) instead of after the debounce window;
+    /// changes inside the window that sweep opens coalesce into one trailing
+    /// tick. Default `true`.
+    pub leading_edge: bool,
     roots_refresh: Option<RootsFn>,
     on_driver: Option<DriverSink>,
     inner: Arc<WatchInner>,
@@ -619,6 +752,7 @@ impl WatchLoop {
             use_fs_events: true,
             roots: Vec::new(),
             immediate: true,
+            leading_edge: true,
             roots_refresh: None,
             on_driver: None,
             inner: Arc::new(WatchInner {
@@ -661,6 +795,11 @@ impl WatchLoop {
 
     pub fn with_immediate(mut self, immediate: bool) -> Self {
         self.immediate = immediate;
+        self
+    }
+
+    pub fn with_leading_edge(mut self, leading_edge: bool) -> Self {
+        self.leading_edge = leading_edge;
         self
     }
 
@@ -765,7 +904,7 @@ impl WatchLoop {
         if self.immediate {
             // A first sweep against a cold catalog has nothing to compare
             // against and runs fully anyway, so it does not need forcing.
-            self.inner.run_skip_if_busy(TickTrigger::Startup);
+            self.inner.run_skip_if_busy(Wake::from(TickTrigger::Startup));
         }
         // When the loop last swept on its own cadence, so that waking early
         // to reconcile does not also sweep early.
@@ -785,7 +924,8 @@ impl WatchLoop {
         let mut next_check = next_refresh;
         // A forced sweep the store's lock turned away, and how long to wait
         // before asking again.
-        let mut retry_force: Option<Instant> = None;
+        // Paired with when the change it stands for first arrived.
+        let mut retry_force: Option<(Instant, Option<Instant>)> = None;
         let mut retry_backoff = CONTENDED_SWEEP_RETRY_MS;
         while !self.inner.stopped() {
             let sweep_every = match self.current_driver() {
@@ -819,16 +959,20 @@ impl WatchLoop {
             let check_every = self.check_cadence(watcher.as_ref(), refresh_every);
             let woke_early = refresh_every.min(check_every) < sweep_every;
             let mut idle = Duration::from_millis(sweep_every.min(refresh_every).min(check_every));
-            if let Some(at) = retry_force {
+            if let Some((at, _)) = retry_force {
                 // A change whose sweep never ran. Nothing else will bring the
                 // loop back for it: the wake state was cleared when its
                 // debounce window closed, so without this the next visit is
                 // the backstop, up to `--interval` away.
                 idle = idle.min(at.saturating_duration_since(Instant::now()));
             }
-            let Some(trigger) = self.inner.wait_for_wake(idle, debounce) else {
+            let Some(wake) = self
+                .inner
+                .wait_for_wake(idle, debounce, self.leading_edge)
+            else {
                 break;
             };
+            let trigger = wake.trigger;
             if self.inner.stopped() {
                 break;
             }
@@ -906,12 +1050,34 @@ impl WatchLoop {
             // have been: the change it is standing in for is still unread, so
             // the fingerprint it would be compared against still cannot be
             // trusted.
-            let trigger = if retry_force.is_some_and(|at| Instant::now() >= at) {
-                retry_force = None;
-                TickTrigger::FsEvent
-            } else {
-                trigger
+            // Whether this tick is the owed retry itself, as opposed to a new
+            // event that happens to arrive while one is owed: only the retry
+            // backs off.
+            let mut is_retry = false;
+            let wake = match retry_force {
+                Some((at, since)) if Instant::now() >= at => {
+                    retry_force = None;
+                    is_retry = true;
+                    Wake {
+                        trigger: TickTrigger::FsEvent,
+                        // The oldest change this sweep now covers.
+                        first_event_at: match (since, wake.first_event_at) {
+                            (Some(a), Some(b)) => Some(a.min(b)),
+                            (a, b) => a.or(b),
+                        },
+                    }
+                }
+                // A forced wake before the retry is due sweeps the change the
+                // retry stands for as well, so it reports from the older of
+                // the two; otherwise a sweep that gets through drops the
+                // retry and its arrival time with it.
+                Some((_, Some(since))) if wake.trigger.forces_scan() => Wake {
+                    first_event_at: Some(wake.first_event_at.map_or(since, |at| at.min(since))),
+                    ..wake
+                },
+                _ => wake,
             };
+            let trigger = wake.trigger;
             if trigger == TickTrigger::Poll {
                 // Reconciled, but not yet due to sweep. Only reached when the
                 // wait was deliberately shortened above, so a loop that was
@@ -921,14 +1087,30 @@ impl WatchLoop {
                 }
                 last_poll_sweep = std::time::Instant::now();
             }
-            if self.inner.run_skip_if_busy(trigger) {
+            if self.inner.run_skip_if_busy(wake) {
                 // Still owed, and the holder may be there for a while. Repeats
                 // coalesce into the one deadline, so a busy tree under a long
                 // sync costs one retry per window rather than one per event.
-                retry_force = Some(deadline_after(Instant::now(), retry_backoff));
-                retry_backoff = retry_backoff
-                    .saturating_mul(2)
-                    .min(self.slow_poll_ms.max(CONTENDED_SWEEP_RETRY_MS));
+                let since = match (retry_force.and_then(|(_, since)| since), wake.first_event_at) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+                // Backed off per attempt of the owed retry, never per event: a
+                // burst of contended events is one owed change, and letting
+                // each of them double the wait (and push the deadline later)
+                // is what stalled capture until the backstop. A new event
+                // keeps the earlier of the two deadlines.
+                let next = deadline_after(Instant::now(), retry_backoff);
+                let at = match retry_force {
+                    Some((held, _)) if !is_retry => held.min(next),
+                    _ => next,
+                };
+                retry_force = Some((at, since));
+                if is_retry {
+                    retry_backoff = retry_backoff
+                        .saturating_mul(2)
+                        .clamp(CONTENDED_SWEEP_RETRY_MS, CONTENDED_SWEEP_RETRY_MAX_MS);
+                }
             } else if trigger.forces_scan() {
                 // A forced sweep got through. Whatever was owed is paid, and
                 // the next contention starts from the short cadence again.

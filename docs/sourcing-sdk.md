@@ -245,7 +245,12 @@ before the hook ran is an answer.
 The `ai-hist watch` loop on its own thread, as an iterator of `TickReport`s.
 Filesystem events over the providers' roots drive it when the crate is built
 with the `fs-events` feature and `WatchOptions::use_fs_events` is on; it polls
-at `poll_interval_ms` otherwise, with a `slow_poll_ms` backstop either way. A
+at `poll_interval_ms` otherwise, with a `slow_poll_ms` backstop either way.
+With `WatchOptions::leading_edge` (the default), a filesystem event that
+finds the loop quiet is swept after a 10 ms settle, not after `debounce_ms`.
+Events inside the window that sweep opens coalesce into one trailing tick
+when the window closes, so a burst costs at most two sweeps, and sustained
+writes tick once per `debounce_ms`. A
 tick is the same locked `sync`; one that finds the lock held reports
 `contended` and is retried by the loop rather than counted as done. A failed
 sweep arrives as an `Err` and the loop keeps running; the rolling catalog
@@ -253,9 +258,22 @@ baseline survives it, so rows a failed sweep had already committed are
 reported by the next tick that succeeds rather than lost. `WatchHandle::stopper()`
 hands another thread a `WatchStop`; iteration ends once the loop has stopped
 and every reported tick has been read, and dropping the handle stops it.
-`next_timeout(timeout)` waits at most `timeout` for a tick, never past a short
-deadline, and a `timeout` too large to name an instant simply waits without
-one.
+Stopping cancels the sweep in flight at its next provider, file or record
+boundary rather than waiting it out; `WatchOptions::stop` takes a caller's
+`StopToken` for the same purpose (and `WatchStop::stop` stops it too). A
+cancelled tick arrives as a `TickReport` with `cancelled` set — neither swept
+nor an error — and the loop ends after it. `next()` blocks on the report
+channel itself, so an idle watch costs its consumer no wakeups;
+`next_timeout(timeout)` waits at most `timeout` for a tick, and a `timeout`
+too large to name an instant simply waits without one. Each report carries
+`elapsed_ms`, the sweep's wall time, and, for a filesystem-event tick,
+`first_event_age_ms`: how long before the report the first event behind it
+arrived, so capture lag splits into the debounce window, the sweep and the
+hand-off. It counts from the oldest change the tick covers, so it also
+includes any time that change spent deferred behind a sweep already in
+flight and waiting out contention retries for the sync lock; it is not just
+the debounce window plus `elapsed_ms`. A cancelled tick's `changed` still
+lists what its sweep committed before the stop.
 
 ### `sessions`
 

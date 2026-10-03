@@ -606,6 +606,16 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Fixed
 
+- Live capture: writes made while another process holds the sync lock are
+  swept within about a second of its release, not at the backstop (#364).
+  The owed retry backed off once per contended *event* tick, up to
+  `slow_poll_ms`, and each new event pushed its deadline later, so a burst
+  during a long foreign sweep could wait 30-60 s after the lock was free. It
+  now backs off only per attempt of the owed retry (250 ms doubling to a
+  1 s cap), a new event keeps the earlier deadline, and a forced sweep that
+  gets through resets it. This cadence is independent of `slow_poll_ms`,
+  including a zero backstop in polling mode, so short backstops cannot turn
+  a held sync lock into a stream of immediate retries.
 - Live capture: one write is one forced sweep again. The debounce window
   re-armed on the events inside it, so a write the backend reported in more
   than one callback — FSEvents does for a create or a multi-line append —
@@ -800,6 +810,36 @@ Notable changes to the native `ai-hist` CLI are documented here.
     recounting every session's evidence.
 
 ### Rust API
+
+- `WatchOptions::leading_edge` (default `true`), plus `WatchLoop::leading_edge`
+  and `with_leading_edge`. A filesystem event that finds the watch loop quiet
+  is swept after a 10 ms settle (`watch::LEADING_EDGE_SETTLE_MS`) instead of
+  after the debounce window. Events inside the window that sweep opens
+  coalesce into one trailing tick at its close. `ai-hist watch` gets the new
+  default. On a 300-session store, write to `TickReport`: p50 259 -> 65 ms,
+  p95 267 -> 100 ms. A three-line turn costs 2 sweeps instead of 1, and
+  sustained writes tick once per window instead of once per window plus
+  sweep (12 -> 16 ticks over 3 s). Set it to `false` for the old
+  trailing-only window; `ai-hist watch --no-leading-edge` does the same.
+  Older serialized `WatchOptions` without the field load with it on.
+
+- `SessionStore::watch` ticks can be cancelled (#333). `WatchOptions::stop:
+  Option<StopToken>` (serde-skipped, like `SyncOptions::stop`) is installed
+  around every tick's sweep, and `WatchStop::stop` / dropping the handle now
+  cancel the sweep in flight at its next provider, file or record boundary
+  instead of waiting it out. A cancelled tick arrives as a `TickReport` with
+  the new `cancelled` field set, neither swept nor an error, and the loop ends
+  after it.
+- `TickReport::elapsed_ms` (the sweep's wall time) and
+  `TickReport::first_event_age_ms` (for a filesystem-event tick, how long
+  before the report the first event behind it arrived, counted from the
+  oldest change a deferred or retried tick stands for) (#334). Measured on a
+  300-session store: sweep 40 ms, first-event age 245 ms, so the 200 ms
+  debounce window is most of the write-to-report latency.
+- `WatchHandle::next` / `next_timeout` block on the report channel instead
+  of waking every 50 ms to check the loop's thread (#332): the loop's thread
+  closes the channel when it ends. An idle watch consumer went from about 19
+  to about 1 process wakeups a second.
 
 - `Source::Muse` and `ProviderRoots::muse` (the Muse Code sessions directory;
   `from_env` honours `XDG_DATA_HOME`). Both types are `#[non_exhaustive]`, so

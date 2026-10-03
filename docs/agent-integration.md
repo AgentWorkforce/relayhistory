@@ -118,8 +118,9 @@ watch mode notices writes, hooks are told about them.
 ### `ai-hist watch`
 
 ```bash
-ai-hist watch                       # fs events, 200ms debounce, 30s backstop
+ai-hist watch                       # fs events, quiet change swept at once, 200ms window, 30s backstop
 ai-hist watch --debounce-ms 500     # collapse bursts over a longer window
+ai-hist watch --no-leading-edge     # wait out the window before every sweep
 ai-hist watch --interval 30         # polling cadence when fs events are off
 ai-hist watch --no-fsevents         # poll only
 ```

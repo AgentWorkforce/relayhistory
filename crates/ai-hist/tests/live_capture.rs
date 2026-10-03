@@ -211,6 +211,9 @@ fn a_burst_of_change_signals_collapses_into_the_debounce_window() {
             .with_fs_events(false)
             .with_poll_interval_ms(600_000)
             .with_debounce_ms(300)
+            // The trailing-only window; the leading edge's leading + trailing
+            // shape is `a_quiet_change_is_swept_on_the_leading_edge_…`.
+            .with_leading_edge(false)
     });
 
     for _ in 0..100 {
@@ -282,6 +285,276 @@ fn a_change_during_the_sweep_drives_another_tick() {
         Err(RecvTimeoutError::Timeout),
         "and only one"
     );
+}
+
+/// A report carries the sweep's wall time and, for a change-driven tick, when
+/// the first change behind it arrived — so a consumer can split capture lag
+/// into the debounce window, the sweep and the hand-off.
+#[test]
+fn a_report_times_its_sweep_and_its_first_event() {
+    let (sender, reports) = mpsc::channel::<ai_hist::watch::TickReport>();
+    let watch = Arc::new(
+        WatchLoop::new(Arc::new(|_| {
+            std::thread::sleep(Duration::from_millis(60));
+            Ok(TickOutcome::default())
+        }))
+        .with_immediate(false)
+        .with_fs_events(false)
+        .with_poll_interval_ms(600_000)
+        .with_debounce_ms(100)
+        // The trailing window, so the event demonstrably waits it out.
+        .with_leading_edge(false)
+        .on_report(Arc::new(move |report| {
+            let _ = sender.send(*report);
+        })),
+    );
+    let runner = watch.clone();
+    let thread = std::thread::spawn(move || runner.run().expect("run"));
+
+    let signalled = std::time::Instant::now();
+    watch.notify_change();
+    let report = reports.recv_timeout(ARRIVES_WITHIN).expect("a tick");
+    assert!(report.forced && !report.cancelled);
+    assert!(
+        report.elapsed >= Duration::from_millis(60),
+        "elapsed is the sweep's wall time: {:?}",
+        report.elapsed
+    );
+    let first = report.first_event_at.expect("a change drove this tick");
+    assert!(
+        first >= signalled,
+        "the window opens at the signal, not before"
+    );
+    assert!(
+        first.elapsed() >= Duration::from_millis(160),
+        "the first event waited out the window and the sweep: {:?}",
+        first.elapsed()
+    );
+
+    // A manual tick has no event behind it. The report above is sent before
+    // the change tick releases its slot, so a first `tick()` may join that
+    // run rather than start one; the second always starts its own. Either
+    // way the next report is a manual one.
+    watch.tick();
+    watch.tick();
+    let manual = reports.recv_timeout(ARRIVES_WITHIN).expect("manual tick");
+    assert_eq!(manual.first_event_at, None);
+
+    watch.stop();
+    thread.join().unwrap();
+}
+
+/// A tick cancelled through the capture stop token is neither swept nor
+/// failed, is not retried, and ends the loop: cancellation only ever means
+/// "stop".
+#[test]
+fn a_cancelled_tick_is_reported_and_ends_the_loop() {
+    let (sender, reports) = mpsc::channel::<ai_hist::watch::TickReport>();
+    let failures = Arc::new(AtomicUsize::new(0));
+    let failed = failures.clone();
+    let watch = Arc::new(
+        WatchLoop::new(Arc::new(|_| {
+            Err(anyhow::Error::new(ai_hist::CaptureCancelled).context("sweeping claude"))
+        }))
+        .with_immediate(false)
+        .with_fs_events(false)
+        .with_poll_interval_ms(600_000)
+        .with_debounce_ms(20)
+        .on_report(Arc::new(move |report| {
+            let _ = sender.send(*report);
+        }))
+        .on_error(Arc::new(move |_| {
+            failed.fetch_add(1, Ordering::SeqCst);
+        })),
+    );
+    let runner = watch.clone();
+    let thread = std::thread::spawn(move || runner.run().expect("run"));
+    watch.notify_change();
+    let report = reports.recv_timeout(ARRIVES_WITHIN).expect("a report");
+    assert!(report.cancelled);
+    assert!(!report.outcome.swept && !report.outcome.contended);
+    // `run` returns on its own: nobody called `stop`.
+    thread.join().unwrap();
+    assert_eq!(
+        failures.load(Ordering::SeqCst),
+        0,
+        "a cancellation is not a failure"
+    );
+    assert!(
+        reports.try_recv().is_err(),
+        "a cancelled forced tick is not retried"
+    );
+}
+
+/// With the leading edge on, a change that finds the loop quiet is swept
+/// at once rather than after the debounce window, and further changes inside
+/// the window that sweep opened coalesce into exactly one trailing tick at the
+/// window's close.
+#[test]
+fn a_quiet_change_is_swept_on_the_leading_edge_and_a_burst_trails_once() {
+    let running = RunningLoop::reporting(|watch| {
+        watch
+            .with_immediate(false)
+            .with_fs_events(false)
+            .with_poll_interval_ms(600_000)
+            // Long, so "at once" and "at the window's close" cannot be
+            // confused on a loaded runner.
+            .with_debounce_ms(1_500)
+            .with_leading_edge(true)
+    });
+
+    let signalled = std::time::Instant::now();
+    running.watch.notify_change();
+    assert_eq!(running.next_tick(), Ok(true), "the leading tick is forced");
+    let leading = signalled.elapsed();
+    assert!(
+        leading < Duration::from_millis(750),
+        "a quiet change must not wait out the 1.5 s window: {leading:?}"
+    );
+
+    // A burst inside the window the leading tick opened.
+    for _ in 0..20 {
+        running.watch.notify_change();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(running.next_tick(), Ok(true), "the trailing tick is forced");
+    let trailing = signalled.elapsed();
+    assert!(
+        trailing >= Duration::from_millis(1_400),
+        "the burst must wait for the window to close: {trailing:?}"
+    );
+    assert_eq!(
+        running.ticks.recv_timeout(Duration::from_millis(2_000)),
+        Err(RecvTimeoutError::Timeout),
+        "a burst costs one leading and one trailing sweep, no more"
+    );
+
+    // Quiet again: the next change leads once more.
+    let again = std::time::Instant::now();
+    running.watch.notify_change();
+    assert_eq!(running.next_tick(), Ok(true));
+    assert!(again.elapsed() < Duration::from_millis(750));
+}
+
+/// The trailing-only window is still there for a caller that asks for it.
+#[test]
+fn without_the_leading_edge_a_change_waits_out_the_window() {
+    let running = RunningLoop::reporting(|watch| {
+        watch
+            .with_immediate(false)
+            .with_fs_events(false)
+            .with_poll_interval_ms(600_000)
+            .with_debounce_ms(400)
+            .with_leading_edge(false)
+    });
+    let signalled = std::time::Instant::now();
+    running.watch.notify_change();
+    assert_eq!(running.next_tick(), Ok(true));
+    assert!(signalled.elapsed() >= Duration::from_millis(400));
+}
+
+/// A burst of writes while another process holds the sync lock is one owed
+/// change, and it is read within about a second of the lock coming free —
+/// not at the backstop (#364). Each contended *event* tick used to double the
+/// owed retry's backoff and push its deadline later, so ten events during a
+/// three-second foreign sweep left the change waiting the whole 60 s
+/// backstop after the lock was released.
+#[test]
+fn writes_owed_behind_a_held_lock_are_swept_soon_after_it_is_released() {
+    use std::sync::atomic::AtomicBool;
+
+    let held = Arc::new(AtomicBool::new(true));
+    let (sender, swept) = mpsc::channel::<std::time::Instant>();
+    let tick: TickFn = {
+        let held = held.clone();
+        Arc::new(move |force| {
+            if held.load(Ordering::SeqCst) {
+                // Another process holds the store's lock: nothing was read.
+                return Ok(TickOutcome {
+                    contended: true,
+                    ..TickOutcome::default()
+                });
+            }
+            if force {
+                let _ = sender.send(std::time::Instant::now());
+            }
+            Ok(TickOutcome {
+                swept: true,
+                ..TickOutcome::default()
+            })
+        })
+    };
+    let running = RunningLoop::start(
+        |watch| {
+            watch
+                .with_immediate(false)
+                .with_fs_events(false)
+                .with_debounce_ms(50)
+                // The probe's backstop: an owed change must never wait for it.
+                .with_poll_interval_ms(60_000)
+                .with_slow_poll_ms(60_000)
+        },
+        tick,
+    );
+
+    // Ten writes over three seconds, every one of them turned away.
+    for _ in 0..10 {
+        running.watch.notify_change();
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    assert!(swept.try_recv().is_err(), "nothing can be swept while held");
+
+    held.store(false, Ordering::SeqCst);
+    let released = std::time::Instant::now();
+    let at = swept
+        .recv_timeout(ARRIVES_WITHIN)
+        .expect("the owed change was never swept after the lock was released");
+    let waited = at.duration_since(released);
+    assert!(
+        waited < Duration::from_millis(2_000),
+        "the owed change waited {waited:?} after the lock was free"
+    );
+}
+
+/// An owed retry keeps its own backoff even when the filesystem backstop is
+/// configured below that cadence, including zero in pure polling mode.
+#[test]
+fn contended_retries_do_not_spin_with_a_short_or_zero_slow_poll() {
+    for slow_poll_ms in [0, 20] {
+        let (sender, attempts) = mpsc::channel();
+        let tick: TickFn = Arc::new(move |force| {
+            assert!(force, "only the owed change should drive these attempts");
+            let _ = sender.send(std::time::Instant::now());
+            Ok(TickOutcome {
+                contended: true,
+                ..TickOutcome::default()
+            })
+        });
+        let running = RunningLoop::start(
+            |watch| {
+                watch
+                    .with_immediate(false)
+                    .with_fs_events(false)
+                    .with_poll_interval_ms(60_000)
+                    .with_slow_poll_ms(slow_poll_ms)
+            },
+            tick,
+        );
+        running.watch.notify_change();
+        let times: Vec<_> = (0..5)
+            .map(|_| attempts.recv_timeout(ARRIVES_WITHIN).expect("owed retry"))
+            .collect();
+        // The first two waits are 250 ms; later attempts double to the 1 s
+        // cap. Assert lower bounds only: a loaded runner can delay a wake,
+        // but can never validly make this cadence faster.
+        for (pair, minimum_ms) in times.windows(2).zip([250, 250, 500, 1_000]) {
+            let waited = pair[1].duration_since(pair[0]);
+            assert!(
+                waited >= Duration::from_millis(minimum_ms),
+                "slow_poll_ms={slow_poll_ms}: retry waited {waited:?}, expected at least {minimum_ms} ms"
+            );
+        }
+    }
 }
 
 #[test]

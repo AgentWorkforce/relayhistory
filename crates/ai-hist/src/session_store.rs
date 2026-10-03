@@ -861,7 +861,8 @@ impl SessionStore {
     /// The loop runs on its own thread and each completed sweep arrives as a
     /// [`TickReport`]; a sweep that failed arrives as an `Err` and the loop
     /// keeps running. Iteration ends after [`WatchStop::stop`] (or dropping
-    /// the handle), which waits for any in-flight sweep. Every sweep is the
+    /// the handle), which cancels the sweep in flight at its next provider,
+    /// file or record boundary and waits for it to return. Every sweep is the
     /// same locked `sync` as [`SessionStore::sync`]; a tick that finds the
     /// lock held reports `contended` and is retried by the loop rather than
     /// counted as done.
@@ -871,7 +872,16 @@ impl SessionStore {
         }
         let roots = sync_watch_roots_with_provider_roots(&self.roots);
         let (reports, receiver) = mpsc::channel::<Result<TickReport, Error>>();
-        let reports = Arc::new(Mutex::new(reports));
+        // The loop's thread takes the sender out when `run` returns, so the
+        // channel closes when the loop ends and `WatchHandle::next` can block
+        // on it instead of polling the thread. The sinks outlive the loop
+        // (they belong to the `WatchLoop` every `WatchStop` shares), so they
+        // cannot be what holds the sender open.
+        let reports = Arc::new(Mutex::new(Some(reports)));
+        let close_reports = reports.clone();
+        let tick_reports = reports.clone();
+        let stop = opts.stop.clone().unwrap_or_default();
+        let tick_stop = stop.clone();
 
         // The sweep and the report sink run on the loop's thread, one tick at
         // a time, so a single slot carries "what this tick changed" from the
@@ -889,24 +899,95 @@ impl SessionStore {
             // change another process made in between is a change since the
             // last report either way — and a fresh read otherwise.
             let mut base = tick_baseline.lock().expect("watch baseline");
-            let (outcome, changed) = rolling_tick(&mut base, |previous| {
-                let outcome = sync_facade_tick(
-                    &db_path,
-                    &tick_roots,
-                    force,
-                    |conn| match previous {
-                        Some(before) => Ok(before),
-                        None => catalog_fingerprint(conn).map_err(anyhow::Error::from),
-                    },
-                    |conn, before, _tick| {
-                        let (after, changed) = changes_under_lock(conn, &before)?;
-                        Ok((after, changed))
-                    },
-                )?;
-                Ok(outcome.map(|(tick, (after, changed))| (tick, after, changed)))
-            })?;
-            *tick_pending.lock().expect("watch pending") = changed;
-            Ok(outcome)
+            // The baseline this sweep compares against, kept outside it so a
+            // cancelled sweep can still say what it committed (below).
+            let mut swept_from: Option<CatalogFingerprint> = None;
+            let result = with_capture_token(tick_stop.clone(), || {
+                rolling_tick(&mut base, |previous| {
+                    let outcome = sync_facade_tick(
+                        &db_path,
+                        &tick_roots,
+                        force,
+                        |conn| {
+                            let before = match previous {
+                                Some(before) => before,
+                                None => catalog_fingerprint(conn).map_err(anyhow::Error::from)?,
+                            };
+                            swept_from = Some(before.clone());
+                            #[cfg(test)]
+                            if cancel_diff_fault(&db_path) {
+                                // Stop once the baseline is taken, so the
+                                // sweep is cancelled with a baseline to diff.
+                                tick_stop.stop();
+                            }
+                            Ok(before)
+                        },
+                        |conn, before, _tick| {
+                            let (after, changed) = changes_under_lock(conn, &before)?;
+                            Ok((after, changed))
+                        },
+                    )?;
+                    Ok(outcome.map(|(tick, (after, changed))| (tick, after, changed)))
+                })
+            });
+            match result {
+                Ok((outcome, changed)) => {
+                    *tick_pending.lock().expect("watch pending") = changed;
+                    Ok(outcome)
+                }
+                Err(error) => {
+                    // A stop can land after the sweep committed chunks, or
+                    // after it finished and rolled the baseline forward — the
+                    // capture scope re-checks the token on the way out. The
+                    // loop ends on a cancellation, so this is the last chance
+                    // to report those rows: diff the catalog against the
+                    // baseline the sweep started from, roll it forward, and
+                    // let the cancelled report carry the result. A read-only
+                    // connection outside the sync lock: the diff writes
+                    // nothing, and a reader is no worse than the "changed
+                    // since the last report" this field already promises.
+                    if error.chain().any(|cause| cause.is::<CaptureCancelled>()) {
+                        if let Some(before) = swept_from {
+                            let diff =
+                                open_db_readonly(&db_path)
+                                    .map_err(Error::sync)
+                                    .and_then(|conn| {
+                                        #[cfg(test)]
+                                        if cancel_diff_fault(&db_path) {
+                                            return Err(Error::sync(anyhow::anyhow!(
+                                                "injected diff failure"
+                                            )));
+                                        }
+                                        changes_under_lock(&conn, &before)
+                                    });
+                            match diff {
+                                Ok((after, changed)) => {
+                                    *base = Some(after);
+                                    *tick_pending.lock().expect("watch pending") = changed;
+                                }
+                                // Surfaced rather than swallowed, and without
+                                // giving up the cancellation: the failure goes
+                                // onto the stream as its own `Err`, ahead of
+                                // the cancelled report, and the cancellation
+                                // is still what this tick returns, so the loop
+                                // ends as it was asked to.
+                                Err(diff_error) => {
+                                    if let Some(sender) =
+                                        &*tick_reports.lock().expect("watch reports")
+                                    {
+                                        let _ = sender.send(Err(Error::sync(anyhow::anyhow!(
+                                            "watch tick cancelled after committing changes \
+                                             that could not be read back for its report: \
+                                             {diff_error}"
+                                        ))));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(error)
+                }
+            }
         });
 
         let report_sink = reports.clone();
@@ -920,25 +1001,28 @@ impl SessionStore {
             .with_poll_interval_ms(opts.poll_interval_ms)
             .with_slow_poll_ms(opts.slow_poll_ms)
             .with_immediate(opts.immediate)
+            .with_leading_edge(opts.leading_edge)
             .on_report(Arc::new(move |report| {
                 let changed = std::mem::take(&mut *report_pending.lock().expect("watch pending"));
-                let _ = report_sink
-                    .lock()
-                    .expect("watch reports")
-                    .send(Ok(TickReport {
-                        trigger: report.trigger,
-                        forced: report.forced,
-                        swept: report.outcome.swept,
-                        skipped_unchanged: report.outcome.skipped_unchanged,
-                        contended: report.outcome.contended,
-                        changed,
-                    }));
+                let tick = TickReport {
+                    trigger: report.trigger,
+                    forced: report.forced,
+                    swept: report.outcome.swept,
+                    skipped_unchanged: report.outcome.skipped_unchanged,
+                    contended: report.outcome.contended,
+                    cancelled: report.cancelled,
+                    elapsed_ms: duration_ms(report.elapsed),
+                    first_event_age_ms: report.first_event_at.map(|at| duration_ms(at.elapsed())),
+                    changed,
+                };
+                if let Some(sender) = &*report_sink.lock().expect("watch reports") {
+                    let _ = sender.send(Ok(tick));
+                }
             }))
             .on_error(Arc::new(move |error| {
-                let _ = error_sink
-                    .lock()
-                    .expect("watch reports")
-                    .send(Err(Error::sync(anyhow::anyhow!("{error:#}"))));
+                if let Some(sender) = &*error_sink.lock().expect("watch reports") {
+                    let _ = sender.send(Err(Error::sync(anyhow::anyhow!("{error:#}"))));
+                }
             }));
         watch = watch.with_roots_refresh(Arc::new(move || {
             sync_watch_roots_with_provider_roots(&refresh_roots)
@@ -952,11 +1036,25 @@ impl SessionStore {
                 // never stops on one; `run` itself fails only when it cannot
                 // start at all, which the thread's end (and the closed
                 // channel) already reports to the iterator.
+                // The end of the loop is the end of the stream — on a panic
+                // too, which a blocked `next` would otherwise wait out
+                // forever.
+                struct CloseOnExit(Arc<Mutex<Option<ReportSender>>>);
+                impl Drop for CloseOnExit {
+                    fn drop(&mut self) {
+                        let mut sender = match self.0.lock() {
+                            Ok(sender) => sender,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        sender.take();
+                    }
+                }
+                let _close = CloseOnExit(close_reports);
                 let _ = runner.run();
             })
             .map_err(|error| Error::SyncFailed(format!("spawning the watch thread: {error}")))?;
         Ok(WatchHandle {
-            stop: WatchStop { inner: watch },
+            stop: WatchStop { inner: watch, stop },
             thread: Some(thread),
             receiver,
         })
@@ -1714,6 +1812,24 @@ pub struct WatchOptions {
     pub use_fs_events: bool,
     /// Run one sweep before parking. Default `true`.
     pub immediate: bool,
+    /// Sweep a filesystem event that finds the loop quiet right away (after
+    /// a 10 ms settle that gathers one write's backend callbacks) instead of
+    /// after `debounce_ms`. Events inside the window that sweep opens
+    /// coalesce into one trailing tick when it closes, so a burst costs at
+    /// most two sweeps and sustained writes tick once per `debounce_ms`.
+    /// `false` restores the trailing-only window. Default `true`, also when
+    /// deserializing options written before this field existed.
+    #[serde(default = "default_leading_edge")]
+    pub leading_edge: bool,
+    /// Cancels the tick in flight at its next provider, file or record
+    /// boundary, and ends the loop: a cancelled tick arrives as a
+    /// [`TickReport`] with `cancelled` set, then the iterator ends. Stopping
+    /// it while the loop is idle ends the loop at its next tick;
+    /// [`WatchStop::stop`] ends it at once, and stops this token too. When
+    /// `None` the loop makes its own, so `WatchStop::stop` always cancels
+    /// the sweep in flight rather than waiting it out. See [`StopToken`].
+    #[serde(skip)]
+    pub stop: Option<StopToken>,
 }
 
 impl Default for WatchOptions {
@@ -1724,8 +1840,38 @@ impl Default for WatchOptions {
             slow_poll_ms: crate::watch::DEFAULT_SLOW_POLL_MS,
             use_fs_events: true,
             immediate: true,
+            leading_edge: true,
+            stop: None,
         }
     }
+}
+
+/// Database paths whose watch ticks stop themselves once their baseline is
+/// taken and then fail the cancellation diff — the one way to reach that path
+/// deterministically from a test.
+#[cfg(test)]
+static CANCEL_DIFF_FAULTS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn cancel_diff_fault(db_path: &Path) -> bool {
+    CANCEL_DIFF_FAULTS
+        .lock()
+        .expect("cancel diff faults")
+        .iter()
+        .any(|path| path == db_path)
+}
+
+/// The sending half of a watch's report stream.
+type ReportSender = mpsc::Sender<Result<TickReport, Error>>;
+
+fn default_leading_edge() -> bool {
+    true
+}
+
+/// Milliseconds in `duration`, saturating rather than truncating a value
+/// too large for `u64`.
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// One completed sweep of a [`WatchHandle`].
@@ -1742,6 +1888,22 @@ pub struct TickReport {
     /// Another process held the sync lock; nothing was read. A forced tick
     /// that comes back this way is retried by the loop.
     pub contended: bool,
+    /// The sweep was cancelled through [`WatchOptions::stop`] or
+    /// [`WatchStop::stop`] before it finished: neither swept nor failed. The
+    /// loop ends after it. `changed` still lists whatever the sweep committed
+    /// before the stop landed.
+    pub cancelled: bool,
+    /// Wall time of this tick's sweep in milliseconds, the attempt at the
+    /// sync lock included (a tick never waits for the lock).
+    pub elapsed_ms: u64,
+    /// For a tick a filesystem event drove: how long before this report the
+    /// first event behind it arrived. It covers the debounce window, the
+    /// sweep and the hand-off, so `first_event_age_ms - elapsed_ms` is the
+    /// time the change spent waiting to be swept. A forced tick deferred
+    /// behind another sweep, or retried after contention, counts from the
+    /// oldest change it stands for. `None` for startup, poll and manual
+    /// ticks.
+    pub first_event_age_ms: Option<u64>,
     /// Sessions whose catalog row changed since the previous tick's report;
     /// see [`SyncReport::changed`]. Compared on every tick that took the
     /// lock, swept or not, so a hydration landing between ticks is reported
@@ -1753,11 +1915,15 @@ pub struct TickReport {
 #[derive(Clone)]
 pub struct WatchStop {
     inner: Arc<WatchLoop>,
+    stop: StopToken,
 }
 
 impl WatchStop {
-    /// Stop the loop and wait for any in-flight sweep. Idempotent.
+    /// Stop the loop: cancel any in-flight sweep at its next provider, file
+    /// or record boundary, and wait for it to return. Stops
+    /// [`WatchOptions::stop`] when one was given. Idempotent.
     pub fn stop(&self) {
+        self.stop.stop();
         self.inner.stop();
     }
 
@@ -1796,8 +1962,8 @@ impl WatchHandle {
         self.stop.clone()
     }
 
-    /// Stop the loop and wait for any in-flight sweep. Ticks already
-    /// reported remain readable through the iterator.
+    /// Stop the loop, cancelling any in-flight sweep, and wait for it to
+    /// return. Ticks already reported remain readable through the iterator.
     pub fn stop(&self) {
         self.stop.stop();
     }
@@ -1815,41 +1981,21 @@ impl WatchHandle {
         self.recv(Instant::now().checked_add(timeout))
     }
 
-    /// Receive until `deadline` (or forever), ending when the loop's thread
-    /// has finished and nothing is left to read. The loop's sinks hold the
-    /// sender for as long as the loop exists, so the channel alone cannot
-    /// say that the loop is over; the thread can.
+    /// Receive until `deadline` (or forever). Blocks on the channel itself:
+    /// the loop's thread drops the sender when `run` returns, so the channel
+    /// disconnects exactly when the loop is over and everything it reported
+    /// has been read. One wakeup per tick, or one at the deadline, and none
+    /// while the loop is idle.
     fn recv(&mut self, deadline: Option<Instant>) -> Option<Result<TickReport, Error>> {
-        loop {
-            // Never sleep past a short deadline: the poll is the ceiling on
-            // one wait, and the remaining budget the floor under it.
-            let wait = deadline.map_or(WATCH_POLL, |deadline| {
-                deadline
-                    .saturating_duration_since(Instant::now())
-                    .min(WATCH_POLL)
-            });
-            match self.receiver.recv_timeout(wait) {
-                Ok(item) => return Some(item),
-                Err(mpsc::RecvTimeoutError::Disconnected) => return None,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if self
-                        .thread
-                        .as_ref()
-                        .is_none_or(|thread| thread.is_finished())
-                    {
-                        return self.receiver.try_recv().ok();
-                    }
-                    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                        return None;
-                    }
-                }
-            }
+        match deadline {
+            None => self.receiver.recv().ok(),
+            Some(deadline) => self
+                .receiver
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .ok(),
         }
     }
 }
-
-/// How often a blocked `next` re-checks whether the loop has ended.
-const WATCH_POLL: Duration = Duration::from_millis(50);
 
 impl Iterator for WatchHandle {
     type Item = Result<TickReport, Error>;
@@ -2786,6 +2932,228 @@ mod tests {
             })
             .expect("an unlocked store syncs");
         assert!(report.swept);
+    }
+
+    /// A watch tick runs under the caller's stop token: a stopped token
+    /// cancels the sweep, which arrives as a cancelled report — neither swept
+    /// nor an error — and ends the loop, which closes the stream.
+    #[test]
+    fn a_stopped_watch_token_cancels_the_tick_and_ends_the_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_at(&dir.path().join("ai-history.db"));
+        let token = StopToken::new();
+        token.stop();
+        let mut watch = store
+            .watch(WatchOptions {
+                use_fs_events: false,
+                poll_interval_ms: 60_000,
+                immediate: true,
+                stop: Some(token),
+                ..WatchOptions::default()
+            })
+            .unwrap();
+        let first = watch
+            .next_timeout(Duration::from_secs(30))
+            .expect("the startup tick is reported")
+            .expect("a cancelled tick is not an error");
+        assert_eq!(first.trigger, TickTrigger::Startup);
+        assert!(first.cancelled);
+        assert!(!first.swept && !first.contended && !first.skipped_unchanged);
+        assert_eq!(first.first_event_age_ms, None, "no event drove startup");
+        // The loop ended with the cancellation, and the stream with the loop:
+        // the iterator ends without anyone calling `stop`, well inside the
+        // 60 s poll interval.
+        let started = Instant::now();
+        assert!(watch.next_timeout(Duration::from_secs(30)).is_none());
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// A stop that lands while the sweep is committing rows must not lose
+    /// them: whatever the catalog holds when the loop ends was reported by
+    /// some tick, the cancelled one included. The stop is timed off the first
+    /// committed row, so on most runs it lands mid-sweep; a run where the
+    /// sweep wins the race still has to satisfy the same invariant.
+    #[test]
+    fn a_cancelled_watch_tick_reports_what_it_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ai-history.db");
+        for index in 0..150 {
+            let project = dir.path().join(format!(".claude/projects/p{}", index % 10));
+            std::fs::create_dir_all(&project).unwrap();
+            let id = format!("00000000-0000-4000-8000-{index:012}");
+            let body: String = (0..30)
+                .map(|n| {
+                    format!(
+                        "{{\"type\":\"user\",\"sessionId\":\"{id}\",\"cwd\":\"/tmp/{id}\",\
+                         \"timestamp\":\"2026-09-19T10:{:02}:00.000Z\",\
+                         \"message\":{{\"role\":\"user\",\"content\":\"prompt {n}\"}}}}\n",
+                        n % 60
+                    )
+                })
+                .collect();
+            std::fs::write(project.join(format!("{id}.jsonl")), body).unwrap();
+        }
+        let store = store_at(&db);
+        let token = StopToken::new();
+        let watch = store
+            .watch(WatchOptions {
+                use_fs_events: false,
+                poll_interval_ms: 600_000,
+                immediate: true,
+                stop: Some(token.clone()),
+                ..WatchOptions::default()
+            })
+            .unwrap();
+        let loop_stop = watch.stopper();
+        let stopper = std::thread::spawn({
+            let token = token.clone();
+            let db = db.clone();
+            move || {
+                let deadline = Instant::now() + Duration::from_secs(60);
+                while Instant::now() < deadline {
+                    let rows = open_db_readonly(&db)
+                        .ok()
+                        .and_then(|conn| {
+                            conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| {
+                                row.get::<_, i64>(0)
+                            })
+                            .ok()
+                        })
+                        .unwrap_or(0);
+                    if rows > 0 {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                // The caller's token is what cancels a sweep in flight. If
+                // the sweep already finished, the loop is idle on a 600 s
+                // poll and only `WatchStop` wakes it, so stop through both.
+                token.stop();
+                loop_stop.stop();
+            }
+        });
+        let mut reported = std::collections::BTreeSet::new();
+        for tick in watch {
+            let tick = tick.expect("a cancellation is not an error");
+            reported.extend(tick.changed);
+        }
+        stopper.join().unwrap();
+        let conn = open_db_readonly(&db).unwrap();
+        let mut statement = conn
+            .prepare("SELECT session_id FROM sessions WHERE source = 'claude'")
+            .unwrap();
+        let committed: std::collections::BTreeSet<SessionRef> = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|id| SessionRef::id(Source::Claude, id.unwrap()))
+            .collect();
+        assert!(!committed.is_empty(), "the sweep committed nothing");
+        assert_eq!(
+            committed.difference(&reported).count(),
+            0,
+            "{} of {} committed sessions were never reported",
+            committed.difference(&reported).count(),
+            committed.len()
+        );
+    }
+
+    /// A cancellation whose diff cannot be read still ends the loop: the
+    /// failure arrives as its own `Err`, the cancelled report follows, and the
+    /// stream ends without anyone calling `stop`.
+    #[test]
+    fn a_cancellation_whose_diff_fails_still_ends_the_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ai-history.db");
+        let project = dir.path().join(".claude/projects/p");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("00000000-0000-4000-8000-000000000001.jsonl"),
+            "{\"type\":\"user\",\"sessionId\":\"00000000-0000-4000-8000-000000000001\",\
+             \"cwd\":\"/tmp/x\",\"timestamp\":\"2026-09-19T10:00:00.000Z\",\
+             \"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+        let store = store_at(&db);
+        CANCEL_DIFF_FAULTS.lock().unwrap().push(db.clone());
+        let watch = store
+            .watch(WatchOptions {
+                use_fs_events: false,
+                poll_interval_ms: 600_000,
+                immediate: true,
+                ..WatchOptions::default()
+            })
+            .unwrap();
+        let (sender, received) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for item in watch {
+                let _ = sender.send(item);
+            }
+        });
+        let mut items = Vec::new();
+        // The reader drops its sender only once the watch iterator has ended,
+        // so `Disconnected` is the loop ending; a timeout is the failure.
+        let ended = loop {
+            match received.recv_timeout(Duration::from_secs(30)) {
+                Ok(item) => items.push(item),
+                Err(mpsc::RecvTimeoutError::Disconnected) => break true,
+                Err(mpsc::RecvTimeoutError::Timeout) => break false,
+            }
+        };
+        CANCEL_DIFF_FAULTS
+            .lock()
+            .unwrap()
+            .retain(|path| path != &db);
+        assert!(ended, "the loop must end on the cancellation: {items:?}");
+        reader.join().unwrap();
+        assert_eq!(items.len(), 2, "{items:?}");
+        match &items[0] {
+            Err(error) => assert!(
+                error.to_string().contains("could not be read back"),
+                "{error}"
+            ),
+            Ok(report) => panic!("expected the diff failure first, got {report:?}"),
+        }
+        let cancelled = items[1].as_ref().expect("then the cancelled report");
+        assert!(cancelled.cancelled);
+    }
+
+    /// `next()` blocks on the channel, not on a poll of the loop's thread,
+    /// and still ends the moment another thread stops the loop.
+    #[test]
+    fn a_blocked_next_ends_when_another_thread_stops_the_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_at(&dir.path().join("ai-history.db"));
+        let mut watch = store
+            .watch(WatchOptions {
+                use_fs_events: false,
+                poll_interval_ms: 600_000,
+                immediate: true,
+                ..WatchOptions::default()
+            })
+            .unwrap();
+        let first = watch.next().expect("startup").expect("sweep");
+        assert_eq!(first.trigger, TickTrigger::Startup);
+        let stopper = watch.stopper();
+        let stopping = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            stopper.stop();
+        });
+        let started = Instant::now();
+        assert!(watch.next().is_none(), "a stopped loop ends the iterator");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        stopping.join().unwrap();
+    }
+
+    /// Options serialized before `leading_edge` existed still load, with the
+    /// leading edge on.
+    #[test]
+    fn watch_options_without_leading_edge_deserialize_with_it_on() {
+        let options: WatchOptions = serde_json::from_str(
+            r#"{"debounce_ms":200,"poll_interval_ms":1000,"slow_poll_ms":30000,
+                "use_fs_events":true,"immediate":true}"#,
+        )
+        .expect("an older WatchOptions loads");
+        assert!(options.leading_edge);
     }
 
     /// A timeout too large to name an instant waits without one; it does not
