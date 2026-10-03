@@ -46,13 +46,14 @@
 //! blocks exactly once, with the usage they ended with.
 
 use crate::discover::{row_to_session, ShallowSession, SESSION_COLUMNS};
+use crate::read_pool::PooledConnection;
 use crate::relationship_graph::{map_relationship, SessionRelationship, RELATIONSHIP_COLUMNS};
 use crate::session_identities::SessionIdentity;
 use crate::session_store::{Error, SessionStore, Source};
 use crate::store::{
-    ensure_columns, migration_applied, open_db, open_db_readonly, row_to_file_edit,
-    row_to_session_event, row_to_session_marker, row_to_tool_call, HistoryEntry, SessionEvent,
-    SessionFileEdit, SessionMarker, SessionToolCall, FILE_EDIT_COLUMNS, SESSION_EVENT_COLUMNS,
+    ensure_columns, migration_applied, open_db, row_to_file_edit, row_to_session_event,
+    row_to_session_marker, row_to_tool_call, HistoryEntry, SessionEvent, SessionFileEdit,
+    SessionMarker, SessionToolCall, FILE_EDIT_COLUMNS, SESSION_EVENT_COLUMNS,
     SESSION_MARKER_COLUMNS, TOOL_CALL_COLUMNS,
 };
 use crate::EvidenceKind;
@@ -63,7 +64,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// The column every fed table carries. Named once so a stored row can leave
@@ -1053,7 +1054,7 @@ impl ChangeQuery {
 pub struct Changes {
     db_path: PathBuf,
     read_only: bool,
-    conn: Connection,
+    conn: PooledConnection,
     kinds: Vec<ChangeKind>,
     consumer: Option<String>,
     session: Option<SessionIdentity>,
@@ -1246,8 +1247,19 @@ impl SessionStore {
     /// epoch, holds a position this store never issued: the database was
     /// reset or replaced under it, and the only recovery is a full resync
     /// from [`Watermark::START`].
+    ///
+    /// A database from before the feed existed answers `START`: nothing in it
+    /// is stamped, so nothing in it is reported yet -- and its
+    /// `observation_clock`, which predates the feed, is not a feed position.
     pub fn head_revision(&self) -> Result<Watermark, Error> {
-        head_revision_at(self.db_path())
+        let mut conn = self.read_conn()?;
+        if !conn
+            .gate("change-feed", schema_is_current)
+            .map_err(Error::query)?
+        {
+            return Ok(Watermark::START);
+        }
+        read_head(&conn).map_err(Error::query)
     }
 
     /// Every change after `from`, oldest first, up to the head at open.
@@ -1269,9 +1281,11 @@ impl SessionStore {
     /// than at `open`: a read-only store over a database written before the
     /// feed existed is told to migrate rather than served `no such column`.
     pub fn changes_since(&self, from: Watermark, query: ChangeQuery) -> Result<Changes, Error> {
-        let conn = open_db_readonly(self.db_path())
-            .map_err(|error| Error::DatabaseOpen(format!("{error:#}")))?;
-        if !schema_is_current(&conn).map_err(Error::query)? {
+        let mut conn = self.read_conn()?;
+        if !conn
+            .gate("change-feed", schema_is_current)
+            .map_err(Error::query)?
+        {
             return Err(Error::DatabaseOpen(format!(
                 "{} predates the change-feed schema this version reads; \
                  open it writable once (or run a sync) to migrate it",
@@ -1338,19 +1352,6 @@ impl SessionStore {
             exhausted: false,
         })
     }
-}
-
-/// The head revision of the database at `db_path`, through a read-only
-/// handle. A database from before the feed existed answers `START`: nothing
-/// in it is stamped, so nothing in it is reported yet -- and its
-/// `observation_clock`, which predates the feed, is not a feed position.
-pub(crate) fn head_revision_at(db_path: &Path) -> Result<Watermark, Error> {
-    let conn =
-        open_db_readonly(db_path).map_err(|error| Error::DatabaseOpen(format!("{error:#}")))?;
-    if !schema_is_current(&conn).map_err(Error::query)? {
-        return Ok(Watermark::START);
-    }
-    read_head(&conn).map_err(Error::query)
 }
 
 /// Resolve where a drain starts and where it is bounded, from one snapshot.
@@ -2300,6 +2301,8 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
 mod tests {
     use super::*;
     use crate::session_store::StoreOptions;
+    use crate::store::open_db_readonly;
+    use std::path::Path;
 
     fn store(dir: &Path) -> (SessionStore, Connection) {
         let db = dir.join("ai-history.db");
@@ -4032,7 +4035,7 @@ INSERT INTO observation_evidence (source, session_id, location, connector_id,
         let mut changes = Changes {
             db_path: db.clone(),
             read_only: false,
-            conn: reader,
+            conn: crate::read_pool::PooledConnection::detached(reader),
             kinds: ChangeKind::ALL.to_vec(),
             consumer: None,
             session: None,
