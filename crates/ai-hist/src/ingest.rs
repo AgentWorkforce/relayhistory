@@ -25633,7 +25633,7 @@ mod tests {
         disk.insert("source_fingerprint".into(), json!("old"));
         disk.insert("claude".into(), typed_cursor(100, 1));
         disk.insert("legacy".into(), json!(40));
-        disk.insert("codex_rollouts_v6".into(), many_stamps(50, "a"));
+        disk.insert("codex_rollouts_v7".into(), many_stamps(50, "a"));
         disk.insert("codex_rollouts_v5".into(), many_stamps(3, "retired"));
         disk.insert(
             CURSOR_SYNC_STATE_KEY.into(),
@@ -25646,8 +25646,8 @@ mod tests {
         ours.insert("source_fingerprint".into(), json!("new"));
         ours.insert("claude".into(), typed_cursor(180, 1));
         ours.insert("legacy".into(), json!(30));
-        ours["codex_rollouts_v6"]["/rollouts/7.jsonl"] = json!("b-7");
-        ours["codex_rollouts_v6"]["/rollouts/new.jsonl"] = json!("b-new");
+        ours["codex_rollouts_v7"]["/rollouts/7.jsonl"] = json!("b-7");
+        ours["codex_rollouts_v7"]["/rollouts/new.jsonl"] = json!("b-new");
         ours[CURSOR_SYNC_STATE_KEY]["/c/2.jsonl"] = typed_cursor(12, 1);
         ours.insert("destination_head".into(), json!("e:9"));
         // A run forgets a path it dropped from its own stamp map.
@@ -25663,7 +25663,7 @@ mod tests {
         let delta = sync_state_delta(&disk, &ours).expect("ours changes the disk");
         // Only the changed stamps travel, not the 50-entry map.
         assert_eq!(
-            delta["codex_rollouts_v6"].as_object().unwrap().len(),
+            delta["codex_rollouts_v7"].as_object().unwrap().len(),
             2,
             "{delta:#?}"
         );
@@ -25698,7 +25698,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".sync-state.json");
         let mut on_disk = Map::new();
-        on_disk.insert("codex_rollouts_v6".into(), many_stamps(40, "a"));
+        on_disk.insert("codex_rollouts_v7".into(), many_stamps(40, "a"));
         on_disk.insert("other-writer".into(), json!("kept"));
         save_sync_state(&path, &on_disk).unwrap();
 
@@ -25706,7 +25706,7 @@ mod tests {
         assert!(stamp.is_some() || cfg!(not(unix)));
         let mut checkpoints = SweepCheckpoints::new(&path, &state, stamp);
         state.remove("other-writer");
-        state["codex_rollouts_v6"]["/rollouts/1.jsonl"] = json!("b-1");
+        state["codex_rollouts_v7"]["/rollouts/1.jsonl"] = json!("b-1");
         state.insert("source_fingerprint".into(), json!("f"));
 
         let mut expected = on_disk.clone();
@@ -25738,12 +25738,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".sync-state.json");
         let mut on_disk = Map::new();
-        on_disk.insert("codex_rollouts_v6".into(), many_stamps(10, "a"));
+        on_disk.insert("codex_rollouts_v7".into(), many_stamps(10, "a"));
         save_sync_state(&path, &on_disk).unwrap();
 
         let (mut state, stamp) = load_sync_state_stamped(&path);
         let mut checkpoints = SweepCheckpoints::new(&path, &state, stamp);
-        state["codex_rollouts_v6"]["/rollouts/2.jsonl"] = json!("ours");
+        state["codex_rollouts_v7"]["/rollouts/2.jsonl"] = json!("ours");
         checkpoints.save(&state);
 
         let mut theirs = Map::new();
@@ -25752,7 +25752,7 @@ mod tests {
             json!({"/c/1.jsonl": typed_cursor(5, 1)}),
         );
         theirs.insert(
-            "codex_rollouts_v6".into(),
+            "codex_rollouts_v7".into(),
             json!({"/rollouts/theirs.jsonl": "theirs"}),
         );
         checkpoint_sync_state(&path, &theirs);
@@ -25763,11 +25763,11 @@ mod tests {
         let saved = load_sync_state(&path).unwrap();
         assert_eq!(saved["source_fingerprint"], json!("f"));
         assert_eq!(
-            saved["codex_rollouts_v6"]["/rollouts/2.jsonl"],
+            saved["codex_rollouts_v7"]["/rollouts/2.jsonl"],
             json!("ours")
         );
         assert_eq!(
-            saved["codex_rollouts_v6"]["/rollouts/theirs.jsonl"],
+            saved["codex_rollouts_v7"]["/rollouts/theirs.jsonl"],
             json!("theirs")
         );
         assert_eq!(
@@ -25785,7 +25785,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".sync-state.json");
         let mut on_disk = Map::new();
-        on_disk.insert("codex_rollouts_v6".into(), many_stamps(5, "a"));
+        on_disk.insert("codex_rollouts_v7".into(), many_stamps(5, "a"));
         save_sync_state(&path, &on_disk).unwrap();
 
         let (mut state, stamp) = load_sync_state_stamped(&path);
@@ -25803,7 +25803,7 @@ mod tests {
         checkpoints.save(&state);
         let saved = load_sync_state(&path).unwrap();
         assert_eq!(saved.get("claude"), Some(&typed_cursor(180, 1)));
-        assert_eq!(saved["codex_rollouts_v6"], on_disk["codex_rollouts_v6"]);
+        assert_eq!(saved["codex_rollouts_v7"], on_disk["codex_rollouts_v7"]);
     }
 
     /// A file replaced behind the sweep's back is merged into by the next
@@ -28032,7 +28032,7 @@ mod tests {
         // An install past the one-time user-message repair, which re-reads
         // every rollout whole by design.
         let mut state = Map::new();
-        state.insert("codex_rollouts_v6".into(), json!({}));
+        state.insert("codex_rollouts_v7".into(), json!({}));
         fs::write(&rollout, format!("{opening}{}{}", user(1), close(1, 100))).unwrap();
         sync_codex(&resumed, &mut state, &root).unwrap();
         let offset = |conn: &Connection| -> i64 {
@@ -28081,7 +28081,7 @@ mod tests {
         let full = Connection::open_in_memory().unwrap();
         init_db(&full).unwrap();
         let mut fresh = Map::new();
-        fresh.insert("codex_rollouts_v6".into(), json!({}));
+        fresh.insert("codex_rollouts_v7".into(), json!({}));
         sync_codex(&full, &mut fresh, &root).unwrap();
         assert_eq!(behind(&full), 1);
 
@@ -28179,7 +28179,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let mut state = Map::new();
-        state.insert("codex_rollouts_v6".into(), json!({}));
+        state.insert("codex_rollouts_v7".into(), json!({}));
         sync_codex(&conn, &mut state, &root).unwrap();
         let committed: i64 = conn
             .query_row(
