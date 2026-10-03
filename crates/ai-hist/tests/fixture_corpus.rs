@@ -1091,8 +1091,8 @@ const SESSION_EVENTS_SQL: &str =
     "SELECT source, session_id, project, cwd, git_branch, message_id, \
      parent_id, ts_ms, role, kind, text, model, token_json, event_uid, control_kind, \
      tool_use_id, payload_bytes, payload_truncated, payload_hash, call_index, event_index, \
-     result_status, event_source, error_signal, subagent_session_id, agent_id \
-     FROM session_events ORDER BY source, session_id, ts_ms, event_uid";
+     result_status, event_source, error_signal, subagent_session_id, agent_id, request_id, \
+     stop_reason FROM session_events ORDER BY source, session_id, ts_ms, event_uid";
 /// `marker_uid` is derived from the provider record, not from insertion
 /// order, so it is a stable key to select and sort by.
 const SESSION_MARKERS_SQL: &str = "SELECT source, session_id, marker_uid, ts_ms, message_id, \
@@ -1106,7 +1106,7 @@ const FILE_EDITS_SQL: &str = "SELECT source, session_id, message_id, tool_use_id
 const SESSION_RELATIONSHIPS_SQL: &str = "SELECT source, parent_session_id, relationship_uid, \
      child_session_id, relationship, identity_status, child_agent_type, child_agent_name, \
      child_model, spawn_depth, evidence_kind, evidence_locator, evidence_ref, child_has_events, \
-     spawned_at_ms FROM session_relationships ORDER BY source, parent_session_id, relationship_uid";
+     spawned_at_ms, origin_session_id FROM session_relationships ORDER BY source, parent_session_id, relationship_uid";
 const HISTORY_SQL: &str = "SELECT source, session_id, project, prompt, timestamp_ms FROM history \
      ORDER BY source, session_id, timestamp_ms, prompt";
 
@@ -2467,7 +2467,6 @@ fn history_and_control_kind_agree_in_every_fixture() {
 /// burn: `simple_turn_parses` — `requestId` and `stop_reason` are raw fields
 /// on every complete Claude assistant record.
 #[test]
-#[ignore = "closed by #164"]
 fn claude_request_id_and_stop_reason_are_captured() {
     let events = rows("claude/simple-turn", "session_events");
     let assistant = events
@@ -2482,7 +2481,6 @@ fn claude_request_id_and_stop_reason_are_captured() {
 /// assistant record with `stop_reason: null` is still being written and must
 /// not be published as a completed message.
 #[test]
-#[ignore = "closed by #164"]
 fn claude_in_progress_assistant_message_is_not_emitted() {
     let events = rows("claude/incomplete-then-complete", "session_events");
     assert!(
@@ -2494,20 +2492,28 @@ fn claude_in_progress_assistant_message_is_not_emitted() {
 }
 
 /// burn: `compact_boundary_emits_compaction_event` — the `system` record with
-/// `subtype: compact_boundary` is a marker, not a droppable row.
+/// `subtype: compact_boundary` is a marker, not a droppable row. The record
+/// names no parent, so its timestamp is what orders it after the turn it
+/// compacted.
 #[test]
-#[ignore = "closed by #165"]
 fn claude_compact_boundary_becomes_a_marker() {
     let markers = rows("claude/compact-boundary", "session_markers");
     assert_eq!(markers.len(), 1, "{markers:?}");
-    assert_eq!(text(&markers[0], "kind"), "compaction");
-    assert_eq!(text(&markers[0], "preceding_message_id"), "msg_c_1");
+    assert_eq!(text(&markers[0], "kind"), "compaction_boundary");
+    assert_eq!(text(&markers[0], "subkind"), "compact_boundary");
+    let boundary = field(&markers[0], "ts_ms").as_i64();
+    let preceding = rows("claude/compact-boundary", "session_events")
+        .iter()
+        .filter(|event| text(event, "role") == "assistant")
+        .filter(|event| field(event, "ts_ms").as_i64() < boundary)
+        .map(|event| text(event, "message_id"))
+        .collect::<Vec<_>>();
+    assert_eq!(preceding, ["u-asst-1"], "{markers:?}");
 }
 
 /// A `type: "summary"` record carries a durable session summary and the
 /// `leafUuid` it summarizes. Today it is dropped by the `_ => {}` arm.
 #[test]
-#[ignore = "closed by #165"]
 fn claude_summary_record_becomes_a_marker() {
     let markers = rows("claude/summary-record", "session_markers");
     assert_eq!(markers.len(), 1, "{markers:?}");
@@ -2517,20 +2523,19 @@ fn claude_summary_record_becomes_a_marker() {
 /// burn: `system_subagent_notification_emits_tool_result_event` — the
 /// notification names a child session id that appears nowhere else.
 #[test]
-#[ignore = "closed by #165"]
 fn claude_system_subagent_notification_is_recorded() {
     let markers = rows("claude/system-subagent-notification", "session_markers");
     assert!(
-        markers
-            .iter()
-            .any(|marker| text(marker, "kind") == "subagent_completed"),
+        markers.iter().any(|marker| {
+            text(marker, "kind") == "subagent_notification"
+                && text(marker, "subkind") == "subagent_completed"
+        }),
         "{markers:?}"
     );
 }
 
 /// burn: `reconcile_emits_fork_rows_when_two_files_share_source_session_id`.
 #[test]
-#[ignore = "closed by #170"]
 fn claude_two_transcripts_sharing_a_session_id_are_a_fork() {
     let relationships = rows("claude/fork-reconciliation", "session_relationships");
     let forks = relationships
@@ -2545,7 +2550,6 @@ fn claude_two_transcripts_sharing_a_session_id_are_a_fork() {
 
 /// burn: `reconcile_emits_continuation_when_parent_uuid_lives_in_other_file`.
 #[test]
-#[ignore = "closed by #170"]
 fn claude_cross_file_parent_uuid_becomes_a_continuation() {
     let relationships = rows(
         "claude/cross-file-parent-reconciliation",
@@ -2562,7 +2566,6 @@ fn claude_cross_file_parent_uuid_becomes_a_continuation() {
 /// burn: `explicit_line_continuedfrom_and_fork_session_id` — the record states
 /// the continuation outright.
 #[test]
-#[ignore = "closed by #170"]
 fn claude_explicit_continued_from_session_id_becomes_a_continuation() {
     let relationships = rows(
         "claude/explicit-continuation-reconciliation",
@@ -2579,7 +2582,6 @@ fn claude_explicit_continued_from_session_id_becomes_a_continuation() {
 /// burn: `resume_marker_root_carries_provenance_when_in_log_id_differs` — the
 /// `/resume <id>` marker names the session being resumed.
 #[test]
-#[ignore = "closed by #170"]
 fn claude_resume_marker_links_to_the_resumed_session() {
     let relationships = rows("claude/resume-marker", "session_relationships");
     assert!(
@@ -2592,18 +2594,30 @@ fn claude_resume_marker_links_to_the_resumed_session() {
 }
 
 /// burn's codex `session-meta-relationships` fixture states all three links on
-/// the rollout's own `session_meta`.
+/// the rollout's own `session_meta`. `forkSessionId` and
+/// `continuedFromSessionId` are parents; `sourceSessionId` names the thread
+/// both descend from and is kept on each edge as `origin_session_id`.
 #[test]
-#[ignore = "closed by #170"]
 fn codex_session_meta_relationship_ids_are_recorded() {
     let relationships = rows("codex/session-meta-relationships", "session_relationships");
-    let parents = relationships
+    let edges = relationships
         .iter()
-        .map(|edge| text(edge, "parent_session_id").to_string())
+        .map(|edge| (text(edge, "relationship"), text(edge, "parent_session_id")))
         .collect::<BTreeSet<_>>();
-    assert!(parents.contains("sess_original"), "{relationships:?}");
-    assert!(parents.contains("sess_previous"), "{relationships:?}");
-    assert!(parents.contains("sess_fork_base"), "{relationships:?}");
+    assert_eq!(
+        edges,
+        BTreeSet::from([
+            ("continuation", "sess_previous"),
+            ("fork", "sess_fork_base")
+        ]),
+        "{relationships:?}"
+    );
+    assert!(
+        relationships
+            .iter()
+            .all(|edge| text(edge, "origin_session_id") == "sess_original"),
+        "{relationships:?}"
+    );
 }
 
 /// The `session_events` rows of a fixture that record a tool result.
@@ -2788,19 +2802,20 @@ fn every_parsed_tool_result_carries_its_fidelity() {
 
 /// burn: `multi_block_turn_emits_one_inference_with_merged_usage` — the four
 /// assistant records are one API request, so the request's usage must be
-/// countable once. Today every block of the message is stamped with the same
-/// `token_json`, which is the row-summing pathology burn's test names: a
-/// consumer that adds `token_json` across `session_events` triples the turn.
+/// countable once. Each block keeps the provider's copy of `token_json`, and
+/// every usage-bearing row names the same `request_id`: the key a consumer
+/// (and `session_requests_page`) groups on before summing.
 #[test]
-#[ignore = "closed by #172"]
 fn claude_multi_block_turn_reports_usage_once_per_request() {
     let events = rows("claude/multi-block-turn", "session_events");
-    let with_usage = events
+    let requests = events
         .iter()
         .filter(|event| !field(event, "token_json").is_null())
-        .count();
+        .map(|event| text(event, "request_id"))
+        .collect::<BTreeSet<_>>();
     assert_eq!(
-        with_usage, 1,
+        requests,
+        BTreeSet::from(["req_1"]),
         "four records sharing requestId req_1 carry one usage payload: {events:?}"
     );
 }
@@ -2809,7 +2824,6 @@ fn claude_multi_block_turn_reports_usage_once_per_request() {
 /// compaction; burn reads the per-turn delta out of that sequence. relayhistory
 /// keeps no per-request usage for codex at all today.
 #[test]
-#[ignore = "closed by #172"]
 fn codex_cumulative_token_counters_are_recorded_per_turn() {
     let events = rows("codex/compaction", "session_events");
     let usages = events
