@@ -1537,8 +1537,8 @@ fn sync_basic(
             );
         }
     }
-    let mut state = load_sync_state(&state_path)?;
-    let mut checkpoints = SweepCheckpoints::new(&state_path, &state);
+    let (mut state, state_stamp) = load_sync_state_stamped(&state_path);
+    let mut checkpoints = SweepCheckpoints::new(&state_path, &state, state_stamp);
     let mut coverage = SweepCoverage::default();
     let providers = shallow_providers();
     // Captured before the sweep, not after. Anything that changes while the
@@ -1609,9 +1609,7 @@ fn sync_basic(
             "claude",
             &roots.claude.join("history.jsonl"),
             parse_claude_line,
-            &mut |in_progress| {
-                checkpoint_sync_state(&state_path, in_progress);
-            },
+            &mut |in_progress| checkpoints.save(in_progress),
         ),
     ) {
         total_inserted += inserted;
@@ -1736,7 +1734,7 @@ fn sync_basic(
         devin::sync_devin_db(conn, &mut state, &roots.devin, &repairs, &mut coverage),
     ) {
         total_inserted += inserted;
-        checkpoint_sync_state(&state_path, &state);
+        checkpoints.save(&state);
         if inserted > 0 {
             sync_note!("  [devin] +{inserted} rows");
         }
@@ -2306,28 +2304,88 @@ pub fn prepare_local_sync_snapshot(db_path: &Path) -> Result<(Connection, bool)>
 /// costs a full re-scan (every insert path upserts) but must never wedge sync.
 /// A disk-full write used to leave this file empty and abort every later run.
 fn load_sync_state(path: &Path) -> Result<Map<String, Value>> {
-    if !path.exists() {
-        return Ok(Map::new());
-    }
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
+    Ok(load_sync_state_stamped(path).0)
+}
+
+/// [`load_sync_state`], plus the [`SyncStateStamp`] of exactly the bytes it
+/// parsed: taken from the open handle before the read, so a replacement that
+/// lands mid-read can only make the stamp disagree with the file later --
+/// which costs a re-read -- never vouch for a document it did not describe.
+fn load_sync_state_stamped(path: &Path) -> (Map<String, Value>, Option<SyncStateStamp>) {
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return (Map::new(), None),
         Err(err) => {
             eprintln!(
                 "ai-hist: could not read {} ({err}); starting from empty sync state",
                 path.display()
             );
-            return Ok(Map::new());
+            return (Map::new(), None);
         }
     };
+    let stamp = file
+        .metadata()
+        .ok()
+        .and_then(|metadata| SyncStateStamp::of(&metadata));
+    let mut text = String::new();
+    if let Err(err) = file.read_to_string(&mut text) {
+        eprintln!(
+            "ai-hist: could not read {} ({err}); starting from empty sync state",
+            path.display()
+        );
+        return (Map::new(), None);
+    }
     match serde_json::from_str::<Value>(&text) {
-        Ok(value) => Ok(value.as_object().cloned().unwrap_or_default()),
+        Ok(Value::Object(map)) => (map, stamp),
+        Ok(_) => (Map::new(), stamp),
         Err(err) => {
             eprintln!(
                 "ai-hist: {} is corrupt ({err}); starting from empty sync state",
                 path.display()
             );
-            Ok(Map::new())
+            (Map::new(), None)
         }
+    }
+}
+
+/// Which file `.sync-state.json` was when it was last read or written: its
+/// device and inode, length and modification time.
+///
+/// Every writer replaces the file by renaming a fresh one over it under
+/// [`SyncStateLock`], so a writer that holds the lock and still finds the
+/// stamp it recorded knows the document is the one it holds in memory and
+/// need not read and parse it again. Unix only: elsewhere there is no inode
+/// to tell a same-length replacement written within one mtime tick apart,
+/// and every checkpoint reads the file as it always did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SyncStateStamp {
+    device: u64,
+    inode: u64,
+    len: u64,
+    mtime_ns: u64,
+}
+
+impl SyncStateStamp {
+    #[cfg(unix)]
+    fn of(metadata: &fs::Metadata) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        Some(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            len: metadata.len(),
+            mtime_ns: metadata_mtime_ns(metadata),
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn of(_metadata: &fs::Metadata) -> Option<Self> {
+        None
+    }
+
+    fn at(path: &Path) -> Option<Self> {
+        fs::metadata(path)
+            .ok()
+            .and_then(|metadata| Self::of(&metadata))
     }
 }
 
@@ -2368,26 +2426,87 @@ fn checkpoint_sync_state(path: &Path, state: &Map<String, Value>) -> bool {
 /// loaded from it) cannot be news to the file, so an unchanged in-memory
 /// state skips the round trip. A checkpoint that failed is not remembered,
 /// so the next one retries it.
+///
+/// A checkpoint that does have something to write (#320) folds only what it
+/// changed. The sweep keeps the document it last read or wrote together with
+/// that file's [`SyncStateStamp`]; under the lock, a stamp that still matches
+/// means no other writer has replaced the file since, so the in-memory copy
+/// *is* the disk and only the changed keys -- and, inside a stamp map, only
+/// the changed entries -- are merged into it before it is written back. A
+/// stamp that moved (another sweep, a hydration checkpoint) falls back to the
+/// full read, merge and write every checkpoint used to do.
+///
+/// Two things send a checkpoint to that full path even when the state has
+/// nothing new for the copy: a previous write that failed (`dirty`: the copy
+/// was folded ahead of a file that never received it, so it no longer
+/// describes the file and the failed checkpoint must be retried), and a file
+/// whose stamp no longer matches (someone replaced it; the state is folded
+/// back in, as any full checkpoint would).
 struct SweepCheckpoints<'a> {
     path: &'a Path,
-    last: Map<String, Value>,
+    /// The document on disk as of `stamp`, unless `dirty`.
+    disk: Map<String, Value>,
+    /// The file `disk` was read from or written to; `None` when unknown.
+    stamp: Option<SyncStateStamp>,
+    /// A write failed after `disk` was folded: the next checkpoint re-reads
+    /// the file and folds the whole state, whatever the delta says.
+    dirty: bool,
 }
 
 impl<'a> SweepCheckpoints<'a> {
-    fn new(path: &'a Path, loaded: &Map<String, Value>) -> Self {
+    fn new(path: &'a Path, loaded: &Map<String, Value>, stamp: Option<SyncStateStamp>) -> Self {
         Self {
             path,
-            last: loaded.clone(),
+            disk: loaded.clone(),
+            stamp,
+            dirty: false,
         }
     }
 
     fn save(&mut self, state: &Map<String, Value>) {
-        if *state == self.last {
-            return;
+        let delta = sync_state_delta(&self.disk, state);
+        if delta.is_none() && !self.dirty {
+            // Nothing new for the copy. Still cheap to ask whether the file
+            // is the one the copy describes: one `stat`. Without a stamp
+            // (non-Unix) this is the old "unchanged state, skip" rule.
+            let replaced = self
+                .stamp
+                .is_some_and(|stamp| SyncStateStamp::at(self.path) != Some(stamp));
+            if !replaced {
+                return;
+            }
         }
-        if checkpoint_sync_state(self.path, state) {
-            self.last = state.clone();
+        let delta = delta.unwrap_or_default();
+        match self.write(state, &delta) {
+            Ok(()) => self.dirty = false,
+            Err(err) => {
+                // Whatever `disk` now holds may not be what the file holds.
+                self.stamp = None;
+                self.dirty = true;
+                eprintln!("ai-hist: could not checkpoint sync state: {err:#}");
+            }
         }
+    }
+
+    fn write(&mut self, state: &Map<String, Value>, delta: &Map<String, Value>) -> Result<()> {
+        let _lock = SyncStateLock::acquire(self.path)?;
+        let current = SyncStateStamp::at(self.path);
+        let changed = if !self.dirty && current.is_some() && current == self.stamp {
+            fold_sync_state(&mut self.disk, delta, state)
+        } else {
+            let (on_disk, stamp) = load_sync_state_stamped(self.path);
+            self.disk = on_disk;
+            self.stamp = stamp;
+            fold_sync_state(&mut self.disk, state, state)
+        };
+        if !changed {
+            return Ok(());
+        }
+        // `disk` is now ahead of the file until the write lands.
+        self.stamp = None;
+        save_sync_state(self.path, &self.disk)?;
+        self.stamp = SyncStateStamp::at(self.path);
+        Ok(())
     }
 }
 
@@ -2805,10 +2924,54 @@ const GROK_SYNC_STATE_KEY: &str = "grok_events_v4";
 
 fn merged_sync_state(path: &Path, ours: &Map<String, Value>) -> Result<Option<Map<String, Value>>> {
     let mut merged = load_sync_state(path)?;
+    Ok(fold_sync_state(&mut merged, ours, ours).then_some(merged))
+}
+
+/// Fold `delta` into `merged` -- the document on disk -- and then apply the
+/// instructions `ours` carries (retired keys, forgotten paths).
+///
+/// `delta` is either all of `ours` or only the part of it that differs from
+/// `merged` (see [`sync_state_delta`]). The two fold to the same document:
+/// every merge rule maps a value merged with itself to that value, so an
+/// entry `ours` shares with the disk changes nothing whether or not it is
+/// folded. (The one exception is cosmetic: a cursor an older build wrote
+/// without a defaulted field is re-encoded with it when folded, and left as
+/// it is when not; both decode to the same cursor.) Returns whether the fold
+/// changed anything.
+fn fold_sync_state(
+    merged: &mut Map<String, Value>,
+    delta: &Map<String, Value>,
+    ours: &Map<String, Value>,
+) -> bool {
     let mut changed = false;
-    for (key, value) in ours {
+    for (key, value) in delta {
         // Applied after the fold, and never persisted.
         if key == FORGOTTEN_PATHS_KEY {
+            continue;
+        }
+        // A stamp map is merged entry by entry in place: the same result as
+        // `merge_object_values`, without copying thousands of untouched
+        // stamps to change one.
+        let per_entry = match (merged.get(key), value) {
+            (Some(existing @ Value::Object(_)), Value::Object(_)) => {
+                key == CURSOR_SYNC_STATE_KEY
+                    || (!is_file_cursor(existing) && !is_file_cursor(value))
+            }
+            _ => false,
+        };
+        if let (true, Some(Value::Object(stamps)), Value::Object(theirs)) =
+            (per_entry, merged.get_mut(key), value)
+        {
+            for (entry, stamp) in theirs {
+                let next = match stamps.get(entry) {
+                    Some(saved) => merge_sync_value(saved, stamp),
+                    None => stamp.clone(),
+                };
+                if stamps.get(entry) != Some(&next) {
+                    stamps.insert(entry.clone(), next);
+                    changed = true;
+                }
+            }
             continue;
         }
         let next = match merged.get(key) {
@@ -2858,7 +3021,85 @@ fn merged_sync_state(path: &Path, ours: &Map<String, Value>) -> Result<Option<Ma
     if merged.remove(FORGOTTEN_PATHS_KEY).is_some() {
         changed = true;
     }
-    Ok(if changed { Some(merged) } else { None })
+    changed
+}
+
+/// What `ours` would change if folded into `disk`, in the shape
+/// [`fold_sync_state`] folds: the top-level keys whose value differs, and for
+/// a stamp map (an object that is not itself a cursor) only the entries that
+/// differ. `None` when nothing would change -- no differing key, no retired
+/// key left to remove and no forgotten path still stamped.
+///
+/// Most of the document is per-file stamps for files a tick did not touch,
+/// so this is a few entries out of thousands, and folding it costs what it
+/// changed rather than a merge of every stamp.
+fn sync_state_delta(
+    disk: &Map<String, Value>,
+    ours: &Map<String, Value>,
+) -> Option<Map<String, Value>> {
+    let mut delta = Map::new();
+    for (key, value) in ours {
+        if key == FORGOTTEN_PATHS_KEY {
+            continue;
+        }
+        let Some(existing) = disk.get(key) else {
+            delta.insert(key.clone(), value.clone());
+            continue;
+        };
+        if existing == value {
+            continue;
+        }
+        let stamp_maps = match (existing, value) {
+            (Value::Object(on_disk), Value::Object(theirs))
+                if !is_file_cursor(existing) && !is_file_cursor(value) =>
+            {
+                Some((on_disk, theirs))
+            }
+            _ => None,
+        };
+        match stamp_maps {
+            Some((on_disk, theirs)) => {
+                let entries: Map<String, Value> = theirs
+                    .iter()
+                    .filter(|(entry, stamp)| on_disk.get(*entry) != Some(*stamp))
+                    .map(|(entry, stamp)| (entry.clone(), stamp.clone()))
+                    .collect();
+                if !entries.is_empty() {
+                    delta.insert(key.clone(), Value::Object(entries));
+                }
+            }
+            None => {
+                delta.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    let retiring = RETIRED_SYNC_STATE_KEYS
+        .iter()
+        .any(|(retired, superseded_by)| {
+            ours.contains_key(*superseded_by) && disk.contains_key(*retired)
+        });
+    let forgetting = ours
+        .get(FORGOTTEN_PATHS_KEY)
+        .and_then(Value::as_object)
+        .is_some_and(|forgotten| {
+            forgotten.iter().any(|(stamp_map_key, paths)| {
+                let Some(stamps) = disk.get(stamp_map_key).and_then(Value::as_object) else {
+                    return false;
+                };
+                paths
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .any(|path| stamps.contains_key(path))
+            })
+        });
+    (!delta.is_empty() || retiring || forgetting || disk.contains_key(FORGOTTEN_PATHS_KEY))
+        .then_some(delta)
+}
+
+fn is_file_cursor(value: &Value) -> bool {
+    FileCursor::decode(value).is_some()
 }
 
 fn merge_sync_value(on_disk: &Value, ours: &Value) -> Value {
@@ -3186,7 +3427,10 @@ impl FileCursor {
         if let Some(offset) = value.as_u64() {
             return Some(DecodedFileCursor::Legacy(offset));
         }
-        serde_json::from_value(value.clone())
+        // Deserialized from the borrowed value: a stamp map is asked this
+        // too, and cloning thousands of entries to learn it is not a cursor
+        // was most of what a sync-state merge cost.
+        FileCursor::deserialize(value)
             .ok()
             .map(DecodedFileCursor::Typed)
     }
@@ -24370,6 +24614,234 @@ mod tests {
                 Some(&json!(writer))
             );
         }
+    }
+
+    fn typed_cursor(offset: u64, observed_at_ns: u64) -> Value {
+        json!({
+            "offset": offset,
+            "generation": {
+                "device": 1, "inode": 7, "started_mtime_ns": 10,
+                "started_size": 0, "observed_at_ns": observed_at_ns,
+                // Spelled out: a cursor that predates the field re-encodes
+                // with it when folded whole, and the delta leaves it alone.
+                "rewrite_epoch": 0,
+            },
+            "observed_mtime_ns": 10 + offset,
+        })
+    }
+
+    fn many_stamps(count: usize, tag: &str) -> Value {
+        Value::Object(
+            (0..count)
+                .map(|i| (format!("/rollouts/{i}.jsonl"), json!(format!("{tag}-{i}"))))
+                .collect(),
+        )
+    }
+
+    /// Folding only what differs from the disk lands on exactly the document
+    /// folding everything would, for every kind of value the state holds:
+    /// scalars, typed and legacy cursors, stamp maps, the per-file cursor map,
+    /// a retired key and a forgotten path.
+    #[test]
+    fn a_sync_state_delta_folds_to_the_same_document_as_the_whole_state() {
+        let mut disk = Map::new();
+        disk.insert("source_fingerprint".into(), json!("old"));
+        disk.insert("claude".into(), typed_cursor(100, 1));
+        disk.insert("legacy".into(), json!(40));
+        disk.insert("codex_rollouts_v6".into(), many_stamps(50, "a"));
+        disk.insert("codex_rollouts_v5".into(), many_stamps(3, "retired"));
+        disk.insert(
+            CURSOR_SYNC_STATE_KEY.into(),
+            json!({"/c/1.jsonl": typed_cursor(5, 1), "/c/2.jsonl": typed_cursor(9, 1)}),
+        );
+        disk.insert("grok_events_v4".into(), many_stamps(20, "g"));
+
+        let mut ours = disk.clone();
+        ours.remove("codex_rollouts_v5");
+        ours.insert("source_fingerprint".into(), json!("new"));
+        ours.insert("claude".into(), typed_cursor(180, 1));
+        ours.insert("legacy".into(), json!(30));
+        ours["codex_rollouts_v6"]["/rollouts/7.jsonl"] = json!("b-7");
+        ours["codex_rollouts_v6"]["/rollouts/new.jsonl"] = json!("b-new");
+        ours[CURSOR_SYNC_STATE_KEY]["/c/2.jsonl"] = typed_cursor(12, 1);
+        ours.insert("destination_head".into(), json!("e:9"));
+        // A run forgets a path it dropped from its own stamp map.
+        ours["grok_events_v4"]
+            .as_object_mut()
+            .unwrap()
+            .remove("/rollouts/3.jsonl");
+        ours.insert(
+            FORGOTTEN_PATHS_KEY.into(),
+            json!({"grok_events_v4": ["/rollouts/3.jsonl"]}),
+        );
+
+        let delta = sync_state_delta(&disk, &ours).expect("ours changes the disk");
+        // Only the changed stamps travel, not the 50-entry map.
+        assert_eq!(
+            delta["codex_rollouts_v6"].as_object().unwrap().len(),
+            2,
+            "{delta:#?}"
+        );
+        assert!(!delta.contains_key("grok_events_v4"));
+
+        let mut whole = disk.clone();
+        let mut partial = disk.clone();
+        assert!(fold_sync_state(&mut whole, &ours, &ours));
+        assert!(fold_sync_state(&mut partial, &delta, &ours));
+        assert_eq!(partial, whole);
+        assert!(!partial.contains_key("codex_rollouts_v5"));
+        assert!(!partial["grok_events_v4"]
+            .as_object()
+            .unwrap()
+            .contains_key("/rollouts/3.jsonl"));
+
+        // Once folded, the same state changes nothing more. (The delta is not
+        // empty: the legacy cursor behind the disk
+        // still differs, and folding it is a no-op.)
+        let again = sync_state_delta(&whole, &ours).unwrap_or_default();
+        assert!(!fold_sync_state(&mut whole, &again, &ours));
+        // A state equal to the disk has no delta at all.
+        assert!(sync_state_delta(&whole, &whole.clone()).is_none());
+    }
+
+    /// A sweep that finds the file it last wrote folds its change into the
+    /// copy it holds instead of reading the file again (#320). Proven by
+    /// leaving same-length garbage behind the unchanged stamp: a re-read
+    /// would parse nothing and drop every key the sweep did not carry.
+    #[test]
+    fn a_sweep_checkpoint_folds_into_the_file_it_last_wrote_without_rereading_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".sync-state.json");
+        let mut on_disk = Map::new();
+        on_disk.insert("codex_rollouts_v6".into(), many_stamps(40, "a"));
+        on_disk.insert("other-writer".into(), json!("kept"));
+        save_sync_state(&path, &on_disk).unwrap();
+
+        let (mut state, stamp) = load_sync_state_stamped(&path);
+        assert!(stamp.is_some() || cfg!(not(unix)));
+        let mut checkpoints = SweepCheckpoints::new(&path, &state, stamp);
+        state.remove("other-writer");
+        state["codex_rollouts_v6"]["/rollouts/1.jsonl"] = json!("b-1");
+        state.insert("source_fingerprint".into(), json!("f"));
+
+        let mut expected = on_disk.clone();
+        assert!(fold_sync_state(&mut expected, &state, &state));
+
+        if cfg!(unix) {
+            let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+            let modified = file.metadata().unwrap().modified().unwrap();
+            let len = file.metadata().unwrap().len();
+            drop(file);
+            fs::write(&path, "x".repeat(len as usize)).unwrap();
+            let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.set_modified(modified).unwrap();
+        }
+
+        checkpoints.save(&state);
+        assert_eq!(load_sync_state(&path).unwrap(), expected);
+
+        // An unchanged state writes nothing at all.
+        let before = fs::metadata(&path).unwrap().modified().unwrap();
+        checkpoints.save(&state);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), before);
+    }
+
+    /// Another writer replacing the file between two checkpoints of a sweep
+    /// sends the next one back to the file, so neither writer's keys are lost.
+    #[test]
+    fn a_sweep_checkpoint_rereads_a_file_another_writer_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".sync-state.json");
+        let mut on_disk = Map::new();
+        on_disk.insert("codex_rollouts_v6".into(), many_stamps(10, "a"));
+        save_sync_state(&path, &on_disk).unwrap();
+
+        let (mut state, stamp) = load_sync_state_stamped(&path);
+        let mut checkpoints = SweepCheckpoints::new(&path, &state, stamp);
+        state["codex_rollouts_v6"]["/rollouts/2.jsonl"] = json!("ours");
+        checkpoints.save(&state);
+
+        let mut theirs = Map::new();
+        theirs.insert(
+            CURSOR_SYNC_STATE_KEY.into(),
+            json!({"/c/1.jsonl": typed_cursor(5, 1)}),
+        );
+        theirs.insert(
+            "codex_rollouts_v6".into(),
+            json!({"/rollouts/theirs.jsonl": "theirs"}),
+        );
+        checkpoint_sync_state(&path, &theirs);
+
+        state.insert("source_fingerprint".into(), json!("f"));
+        checkpoints.save(&state);
+
+        let saved = load_sync_state(&path).unwrap();
+        assert_eq!(saved["source_fingerprint"], json!("f"));
+        assert_eq!(
+            saved["codex_rollouts_v6"]["/rollouts/2.jsonl"],
+            json!("ours")
+        );
+        assert_eq!(
+            saved["codex_rollouts_v6"]["/rollouts/theirs.jsonl"],
+            json!("theirs")
+        );
+        assert_eq!(
+            saved[CURSOR_SYNC_STATE_KEY]["/c/1.jsonl"],
+            typed_cursor(5, 1)
+        );
+    }
+
+    /// A checkpoint whose write failed is retried by the next one even when
+    /// the state has not changed since: the in-memory copy was folded ahead
+    /// of a file that never received it, so the copy cannot vouch for it.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_sweep_checkpoint_is_retried_by_the_next_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".sync-state.json");
+        let mut on_disk = Map::new();
+        on_disk.insert("codex_rollouts_v6".into(), many_stamps(5, "a"));
+        save_sync_state(&path, &on_disk).unwrap();
+
+        let (mut state, stamp) = load_sync_state_stamped(&path);
+        let mut checkpoints = SweepCheckpoints::new(&path, &state, stamp);
+        state.insert("claude".into(), typed_cursor(180, 1));
+
+        // The rename onto a directory fails; the rows behind the cursor are
+        // committed, so the cursor must land on a later checkpoint.
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        checkpoints.save(&state);
+        fs::remove_dir(&path).unwrap();
+        save_sync_state(&path, &on_disk).unwrap();
+
+        checkpoints.save(&state);
+        let saved = load_sync_state(&path).unwrap();
+        assert_eq!(saved.get("claude"), Some(&typed_cursor(180, 1)));
+        assert_eq!(saved["codex_rollouts_v6"], on_disk["codex_rollouts_v6"]);
+    }
+
+    /// A file replaced behind the sweep's back is merged into by the next
+    /// checkpoint even when the sweep has nothing new to say, so a writer
+    /// that dropped the sweep's keys does not keep them dropped.
+    #[cfg(unix)]
+    #[test]
+    fn a_replaced_state_file_is_merged_even_without_a_delta() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".sync-state.json");
+        let (mut state, stamp) = load_sync_state_stamped(&path);
+        let mut checkpoints = SweepCheckpoints::new(&path, &state, stamp);
+        state.insert("source_fingerprint".into(), json!("ours"));
+        checkpoints.save(&state);
+
+        let mut theirs = Map::new();
+        theirs.insert("other-writer".into(), json!(1));
+        save_sync_state(&path, &theirs).unwrap();
+
+        checkpoints.save(&state);
+        let saved = load_sync_state(&path).unwrap();
+        assert_eq!(saved["source_fingerprint"], json!("ours"));
+        assert_eq!(saved["other-writer"], json!(1));
     }
 
     #[test]

@@ -555,6 +555,19 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Changed
 
+- A sweep's `.sync-state.json` checkpoints fold only what they changed
+  (#320). The sweep keeps the document it last read or wrote with that file's
+  identity, length and mtime; while the file is still that one, a checkpoint
+  merges only the changed keys (and, inside a stamp map, only the changed
+  entries) into its copy instead of re-reading, re-parsing and re-merging the
+  whole file. Unix only: elsewhere there is no inode to identify the file,
+  and a checkpoint with something to write reads and merges it in full as
+  before. A file another writer replaced, or a checkpoint after a failed
+  write, is read and merged in full. The Devin and `history.jsonl` checkpoints now go through the same
+  path, so an unchanged Devin source no longer re-reads the state every tick.
+  On the 100 MB benchmark store this takes checkpoints from ~15% of a forced
+  tick to ~3%.
+
 - When a Codex rollout grows, sync now reads only the appended turns instead
   of re-parsing the whole file (#315). It resumes through the same
   locator-keyed cursor that hydration keeps for Codex child rollouts. The
