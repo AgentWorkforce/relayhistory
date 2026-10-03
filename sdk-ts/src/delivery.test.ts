@@ -8,7 +8,7 @@ import { access, cp, link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } fr
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { gunzipSync } from 'node:zlib';
 import {
@@ -295,6 +295,74 @@ test('export rejects aliases through symlinked parents before creating a new dat
     const {runHistoryExportCommand} = await import('./delivery-cli.js');
     await assert.rejects(runHistoryExportCommand({dbPath:join(real,'new.db'),outputPath:join(alias,'new.db'),selectionPath}), /active history database/);
     await assert.rejects(readFile(join(real,'new.db')), {code:'ENOENT'});
+  });
+});
+
+test('a file: URI --db is percent-decoded as SQLite decodes it before the output guard', async () => {
+  await fixture(async (dbPath, root) => {
+    const selectionPath = join(root, 'selection.json');
+    await writeFile(selectionPath, JSON.stringify(selection));
+    // SQLite opens `%41` as `A` and keeps the malformed `%ZZ` literal.
+    const literal = join(root, 'hist%ZZA.db');
+    await cp(dbPath, literal);
+    const uri = `file:${join(root, 'hist%ZZ%41.db')}`;
+    const {runHistoryExportCommand} = await import('./delivery-cli.js');
+    for (const outputPath of [literal, `${literal}-wal`, `${literal}-shm`]) {
+      await assert.rejects(runHistoryExportCommand({ dbPath: uri, outputPath, selectionPath }), /active history database/, outputPath);
+    }
+    const outputPath = join(root, 'export.ndjson');
+    await runHistoryExportCommand({ dbPath: uri, outputPath, selectionPath });
+    assert.ok((await readFile(outputPath, 'utf8')).length > 0);
+  });
+});
+
+test('export refuses the live WAL and SHM sidecars and leaves committed rows readable', async (t) => {
+  // node:sqlite ships unflagged from Node 22.5; on older runtimes the
+  // path-only guard is still covered by the alias tests above.
+  const sqlite = await import('node:sqlite' as string).catch(() => null) as
+    | { DatabaseSync: new (path: string, options?: { readOnly?: boolean }) => {
+        exec(sql: string): void; prepare(sql: string): { get(): unknown }; close(): void } }
+    | null;
+  if (!sqlite) { t.skip('node:sqlite is unavailable on this runtime'); return; }
+  await fixture(async (dbPath, root) => {
+    const selectionPath = join(root, 'selection.json');
+    await writeFile(selectionPath, JSON.stringify(selection));
+    const alias = join(root, 'alias'); await symlink(root, alias, 'dir');
+    // A live writer whose committed row exists only in the WAL.
+    const writer = new sqlite.DatabaseSync(dbPath);
+    try {
+      writer.exec('PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;');
+      writer.exec('CREATE TABLE export_guard_probe(value TEXT); INSERT INTO export_guard_probe VALUES (\'committed\');');
+      const walHardLink = join(root, 'wal-hardlink');
+      await link(`${dbPath}-wal`, walHardLink);
+      const {runHistoryExportCommand} = await import('./delivery-cli.js');
+      // The native store opens SQLite URI filenames, so a `file:` --db names
+      // the same database and must protect the same sidecars.
+      // pathToFileURL gives the platform's well-formed URI (`file:///C:/…` on
+      // Windows); the localhost form inserts the authority into it.
+      const url = pathToFileURL(dbPath).href;
+      for (const db of [dbPath, `file:${dbPath}`, `${url}?mode=rwc`, `${url.replace('file://', 'file://localhost')}#x`]) {
+        for (const outputPath of [`${dbPath}-wal`, `${dbPath}-shm`, `${dbPath}-journal`,
+          join(alias, 'history.db-wal'), join(alias, 'history.db-shm'), walHardLink]) {
+          await assert.rejects(runHistoryExportCommand({ dbPath: db, outputPath, selectionPath }), /active history database/, `${db} -> ${outputPath}`);
+        }
+      }
+      await assert.rejects(runHistoryExportCommand({ dbPath: `file://elsewhere${dbPath}`, outputPath: join(root, 'x.ndjson'), selectionPath }),
+        /unsupported SQLite URI authority/);
+      const reader = new sqlite.DatabaseSync(dbPath, { readOnly: true });
+      try {
+        assert.deepEqual({ ...reader.prepare('SELECT value FROM export_guard_probe').get() as object }, { value: 'committed' });
+      } finally { reader.close(); }
+      // An ordinary existing output file is still replaced.
+      const outputPath = join(root, 'export.ndjson');
+      await writeFile(outputPath, 'stale');
+      await runHistoryExportCommand({ dbPath, outputPath, selectionPath });
+      const exported = await readFile(outputPath, 'utf8');
+      assert.notEqual(exported, 'stale');
+      // ...and a URI --db really does export the same database.
+      await runHistoryExportCommand({ dbPath: `file:${dbPath}`, outputPath, selectionPath });
+      assert.equal((await readFile(outputPath, 'utf8')).split('\n').length, exported.split('\n').length);
+    } finally { writer.close(); }
   });
 });
 

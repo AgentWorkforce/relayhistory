@@ -20,6 +20,61 @@ export async function loadHistoryApplicationConfig(path: string) {
   return { config, registry: await loadHistoryPlugins(config.plugins, { baseDirectory: dirname(absolute) }) };
 }
 
+/**
+ * Percent-decode a URI path the way SQLite's `sqlite3ParseUri` does: a `%`
+ * followed by two hex digits is that byte, anything else (`%ZZ`, a trailing
+ * `%`) stays literal, and a decoded `%00` ends the path. The bytes are then
+ * read as UTF-8, as SQLite passes them to the filesystem.
+ */
+function sqliteUriDecode(path: string): string {
+  const input = Buffer.from(path, 'utf8');
+  const out: number[] = [];
+  const hex = (byte: number) => Number.parseInt(String.fromCharCode(byte), 16);
+  for (let i = 0; i < input.length; i += 1) {
+    if (input[i] === 0x25 && i + 2 < input.length
+      && !Number.isNaN(hex(input[i + 1])) && !Number.isNaN(hex(input[i + 2]))) {
+      const octet = hex(input[i + 1]) * 16 + hex(input[i + 2]);
+      if (octet === 0) break;
+      out.push(octet);
+      i += 2;
+    } else {
+      out.push(input[i]);
+    }
+  }
+  return Buffer.from(out).toString('utf8');
+}
+
+/**
+ * The file on disk SQLite opens for `dbPath`. The native store opens with URI
+ * filenames enabled, so `file:/tmp/history.db` names `/tmp/history.db`, not a
+ * relative path beginning `file:`. Mirrors SQLite's own URI rules: the scheme
+ * is the literal lowercase `file:`, an authority may only be empty or
+ * `localhost`, the query and fragment are not part of the path, and the path
+ * is percent-decoded. Anything else is an ordinary filesystem path.
+ */
+function sqliteDatabaseFile(dbPath: string): string {
+  if (!dbPath.startsWith('file:')) return resolve(dbPath);
+  let path = dbPath.slice('file:'.length);
+  const end = path.search(/[?#]/);
+  if (end >= 0) path = path.slice(0, end);
+  if (path.startsWith('//')) {
+    const slash = path.indexOf('/', 2);
+    const authority = slash < 0 ? path.slice(2) : path.slice(2, slash);
+    if (authority !== '' && authority.toLowerCase() !== 'localhost') {
+      throw new InvalidArgumentError(`unsupported SQLite URI authority: ${authority}`, 'INVALID_ARGUMENT');
+    }
+    path = slash < 0 ? '' : path.slice(slash);
+  }
+  path = sqliteUriDecode(path);
+  // `file:///C:/x/history.db` carries the path `/C:/x/history.db`; SQLite's
+  // Windows VFS drops the slash before a drive letter, and so must we, or
+  // resolve() reads it as a path on the current drive. (A UNC host is an
+  // authority, which SQLite refuses and so is refused above.)
+  if (process.platform === 'win32' && /^\/[A-Za-z]:/.test(path)) path = path.slice(1);
+  if (path === '') throw new InvalidArgumentError('SQLite URI names no database file', 'INVALID_ARGUMENT');
+  return resolve(path);
+}
+
 async function write(stream: Writable, chunk: string): Promise<void> {
   await new Promise<void>((resolve, reject) => stream.write(chunk, (error) => error ? reject(error) : resolve()));
 }
@@ -37,19 +92,34 @@ export async function runHistoryExportCommand(
       return resolve(await canonicalTarget(parent), basename(path));
     }
   };
+  // SQLite keeps committed state in `<db>-wal` (its index in `<db>-shm`, and
+  // `<db>-journal` in rollback mode), so replacing a sidecar corrupts the
+  // database just as replacing the main file would. Each is compared by
+  // canonical path — for both the path as given and its resolved form, since a
+  // symlinked database's sidecars may sit beside either — and by inode. The
+  // check runs again just before the final rename, so a sidecar that appears
+  // while exporting is still caught.
   const assertSafeOutput = async () => {
     if (!options.outputPath) return;
     const target = resolve(options.outputPath);
-    const database = resolve(options.dbPath ?? defaultDbPath());
+    const database = sqliteDatabaseFile(options.dbPath ?? defaultDbPath());
     const metadata = async (path: string) => stat(path).catch((error: NodeJS.ErrnoException) => {
       if (error.code === 'ENOENT') return null;
       throw error;
     });
-    const [targetPath, databasePath, targetStat, databaseStat] = await Promise.all([
-      canonicalTarget(target), canonicalTarget(database), metadata(target), metadata(database),
+    const [targetPath, databasePath, targetStat] = await Promise.all([
+      canonicalTarget(target), canonicalTarget(database), metadata(target),
     ]);
-    if (targetPath === databasePath || (targetStat && databaseStat && targetStat.dev === databaseStat.dev && targetStat.ino === databaseStat.ino)) {
-      throw new InvalidArgumentError('export output must not replace the active history database', 'INVALID_ARGUMENT');
+    const protectedPaths = [...new Set(['', '-wal', '-shm', '-journal']
+      .flatMap((suffix) => [database + suffix, databasePath + suffix]))];
+    const protectedTargets = await Promise.all(protectedPaths.map(async (path) => ({
+      canonical: await canonicalTarget(path), stat: await metadata(path),
+    })));
+    for (const candidate of protectedTargets) {
+      if (targetPath === candidate.canonical
+        || (targetStat && candidate.stat && targetStat.dev === candidate.stat.dev && targetStat.ino === candidate.stat.ino)) {
+        throw new InvalidArgumentError('export output must not replace the active history database', 'INVALID_ARGUMENT');
+      }
     }
   };
   await assertSafeOutput();
