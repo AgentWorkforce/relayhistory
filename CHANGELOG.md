@@ -613,7 +613,9 @@ Notable changes to the native `ai-hist` CLI are documented here.
   during a long foreign sweep could wait 30-60 s after the lock was free. It
   now backs off only per attempt of the owed retry (250 ms doubling to a
   1 s cap), a new event keeps the earlier deadline, and a forced sweep that
-  gets through resets it.
+  gets through resets it. This cadence is independent of `slow_poll_ms`,
+  including a zero backstop in polling mode, so short backstops cannot turn
+  a held sync lock into a stream of immediate retries.
 - Live capture: one write is one forced sweep again. The debounce window
   re-armed on the events inside it, so a write the backend reported in more
   than one callback — FSEvents does for a create or a multi-line append —
