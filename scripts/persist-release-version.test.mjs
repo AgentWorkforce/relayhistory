@@ -1,13 +1,15 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { after } from "node:test";
 import { spawnSync } from "node:child_process";
-import { chmod, mkdtemp, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const scripts = dirname(fileURLToPath(import.meta.url));
 const persist = join(scripts, "persist-release-version.sh");
+const roots = [];
+after(() => Promise.all(roots.map((root) => rm(root, { recursive: true, force: true }))));
 
 function git(cwd, ...args) {
   const result = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8" });
@@ -29,6 +31,7 @@ function persistRelease(cwd, branch, startSha, extraEnv = {}) {
 
 async function stageRepos() {
   const root = await mkdtemp(join(tmpdir(), "persist-release-"));
+  roots.push(root);
   const origin = join(root, "origin.git");
   const work = join(root, "work");
   const other = join(root, "other");
@@ -155,4 +158,173 @@ exit 0
   assert.match(result.stdout, /rejected \(attempt 1\/5\)/);
   git(work, "fetch", "origin", "main");
   assert.equal(git(work, "show", "origin/main:version.txt"), "0.21.2");
+});
+
+test("keeps entries that landed during the release pending", async () => {
+  const { work, other, startSha } = await stageRepos();
+  const pending = (entries, level = "Patch") =>
+    `# Changelog\n\n## [Unreleased - ${level}]\n\n### Fixed\n\n${entries}\n\n## [0.21.1] - 2026-09-20\n\n### Fixed\n\n- Older\n`;
+  await writeFile(join(work, "CHANGELOG.md"), pending("- Shipped fix"));
+  git(work, "add", "CHANGELOG.md");
+  git(work, "commit", "-m", "fix: shipped");
+  git(work, "push", "origin", "main");
+  git(other, "pull", "origin", "main");
+  const releaseStart = git(work, "rev-parse", "HEAD");
+
+  const cut = spawnSync(
+    process.execPath,
+    [join(scripts, "cut-changelog.mjs"), "--version", "0.21.2", "--date", "2026-09-21"],
+    { cwd: work, encoding: "utf8" },
+  );
+  assert.equal(cut.status, 0, cut.stderr);
+  await writeFile(join(work, "version.txt"), "0.21.2\n");
+  git(work, "add", "version.txt", "CHANGELOG.md");
+  git(work, "commit", "-m", "chore: release 0.21.2");
+
+  await writeFile(join(other, "CHANGELOG.md"), pending("- Shipped fix\n- Landed during publish", "Minor"));
+  git(other, "add", "CHANGELOG.md");
+  git(other, "commit", "-m", "fix: land during publish");
+  git(other, "push", "origin", "main");
+
+  const result = persistRelease(work, "main", releaseStart, { VERSION: "0.21.2" });
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stdout, /CHANGELOG.md conflicts with origin\/main/);
+  assert.match(result.stdout, /carrying the 0\.21\.2 cut/);
+  git(work, "fetch", "origin", "main");
+  assert.equal(git(work, "show", "origin/main:version.txt"), "0.21.2");
+  const changelog = git(work, "show", "origin/main:CHANGELOG.md");
+  assert.match(
+    changelog,
+    /## \[Unreleased - Minor\]\n\n### Fixed\n\n- Landed during publish\n\n## \[0\.21\.2\] - 2026-09-21\n\n### Fixed\n\n- Shipped fix\n\n## \[0\.21\.1\]/,
+  );
+});
+
+test("keeps an entry git merged cleanly into the released section pending", async () => {
+  const { work, other, startSha } = await stageRepos();
+  const changelog = (pending) =>
+    `# Changelog\n\n## [Unreleased - Patch]\n\n### Fixed\n\n${pending}\n\n## [0.21.1] - 2026-09-20\n\n### Fixed\n\n- Older\n`;
+  await writeFile(join(work, "CHANGELOG.md"), changelog("- Shipped fix"));
+  git(work, "add", "CHANGELOG.md");
+  git(work, "commit", "-m", "fix: shipped");
+  git(work, "push", "origin", "main");
+  git(other, "pull", "origin", "main");
+  const releaseStart = git(work, "rev-parse", "HEAD");
+
+  const cut = spawnSync(
+    process.execPath,
+    [join(scripts, "cut-changelog.mjs"), "--version", "0.21.2", "--date", "2026-09-21"],
+    { cwd: work, encoding: "utf8" },
+  );
+  assert.equal(cut.status, 0, cut.stderr);
+  git(work, "add", "CHANGELOG.md");
+  git(work, "commit", "-m", "chore: release 0.21.2");
+
+  // Same level, one more bullet: git merges this without a conflict.
+  await writeFile(join(other, "CHANGELOG.md"), changelog("- Shipped fix\n- Landed during publish"));
+  git(other, "add", "CHANGELOG.md");
+  git(other, "commit", "-m", "fix: land during publish");
+  git(other, "push", "origin", "main");
+
+  const result = persistRelease(work, "main", releaseStart, { VERSION: "0.21.2" });
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.doesNotMatch(result.stdout, /conflicts/);
+  assert.match(result.stdout, /carrying the 0\.21\.2 cut/);
+  git(work, "fetch", "origin", "main");
+  assert.match(
+    git(work, "show", "origin/main:CHANGELOG.md"),
+    /## \[Unreleased - Patch\]\n\n### Fixed\n\n- Landed during publish\n\n## \[0\.21\.2\] - 2026-09-21\n\n### Fixed\n\n- Shipped fix\n\n## \[0\.21\.1\]/,
+  );
+  assert.equal(git(work, "log", "-1", "--format=%s", "origin/main"), "chore: release 0.21.2");
+});
+
+// The release commit cuts CHANGELOG.md only (manifests already at the
+// version); the branch raised the pending level meanwhile, so it conflicts.
+async function stageChangelogOnlyConflict() {
+  const { work, other, startSha } = await stageRepos();
+  const pending = (entries, level = "Patch") =>
+    `# Changelog\n\n## [Unreleased - ${level}]\n\n### Fixed\n\n${entries}\n\n## [0.21.1] - 2026-09-20\n\n### Fixed\n\n- Older\n`;
+  await writeFile(join(work, "CHANGELOG.md"), pending("- Shipped fix"));
+  git(work, "add", "CHANGELOG.md");
+  git(work, "commit", "-m", "fix: shipped");
+  git(work, "push", "origin", "main");
+  git(other, "pull", "origin", "main");
+  const releaseStart = git(work, "rev-parse", "HEAD");
+
+  const cut = spawnSync(
+    process.execPath,
+    [join(scripts, "cut-changelog.mjs"), "--version", "0.21.2", "--date", "2026-09-21"],
+    { cwd: work, encoding: "utf8" },
+  );
+  assert.equal(cut.status, 0, cut.stderr);
+  git(work, "add", "CHANGELOG.md");
+  git(work, "commit", "-m", "chore: release 0.21.2");
+  const versionSha = git(work, "rev-parse", "HEAD");
+
+  await writeFile(join(other, "CHANGELOG.md"), pending("- Shipped fix\n- Landed during publish", "Minor"));
+  git(other, "add", "CHANGELOG.md");
+  git(other, "commit", "-m", "feat: land during publish");
+  git(other, "push", "origin", "main");
+  return { work, releaseStart, versionSha, remoteSha: git(other, "rev-parse", "HEAD") };
+}
+
+test("persists a changelog-only release commit through a changelog conflict", async () => {
+  const { work, releaseStart } = await stageChangelogOnlyConflict();
+  const result = persistRelease(work, "main", releaseStart, { VERSION: "0.21.2" });
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  git(work, "fetch", "origin", "main");
+  assert.equal(git(work, "log", "-1", "--format=%s", "origin/main"), "chore: release 0.21.2");
+  assert.match(
+    git(work, "show", "origin/main:CHANGELOG.md"),
+    /## \[Unreleased - Minor\]\n\n### Fixed\n\n- Landed during publish\n\n## \[0\.21\.2\] - 2026-09-21\n\n### Fixed\n\n- Shipped fix\n\n## \[0\.21\.1\]/,
+  );
+});
+
+test("fails closed on a changelog conflict without VERSION", async () => {
+  const { work, releaseStart, versionSha, remoteSha } = await stageChangelogOnlyConflict();
+  const env = { ...process.env };
+  delete env.VERSION;
+  const result = spawnSync("bash", [persist, "main", releaseStart], { cwd: work, encoding: "utf8", env });
+  assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stderr, /VERSION is unset; cannot carry the cut/);
+  git(work, "fetch", "origin", "main");
+  assert.equal(git(work, "rev-parse", "origin/main"), remoteSha);
+  assert.equal(git(work, "rev-parse", "HEAD"), versionSha);
+});
+
+test("fails closed on a clean changelog merge without VERSION", async () => {
+  const { work, other, startSha } = await stageRepos();
+  const changelog = (pending) =>
+    `# Changelog\n\n## [Unreleased - Patch]\n\n### Fixed\n\n${pending}\n\n## [0.21.1] - 2026-09-20\n\n### Fixed\n\n- Older\n`;
+  await writeFile(join(work, "CHANGELOG.md"), changelog("- Shipped fix"));
+  git(work, "add", "CHANGELOG.md");
+  git(work, "commit", "-m", "fix: shipped");
+  git(work, "push", "origin", "main");
+  git(other, "pull", "origin", "main");
+  const releaseStart = git(work, "rev-parse", "HEAD");
+
+  const cut = spawnSync(
+    process.execPath,
+    [join(scripts, "cut-changelog.mjs"), "--version", "0.21.2", "--date", "2026-09-21"],
+    { cwd: work, encoding: "utf8" },
+  );
+  assert.equal(cut.status, 0, cut.stderr);
+  await writeFile(join(work, "version.txt"), "0.21.2\n");
+  git(work, "add", "version.txt", "CHANGELOG.md");
+  git(work, "commit", "-m", "chore: release 0.21.2");
+  const versionSha = git(work, "rev-parse", "HEAD");
+
+  await writeFile(join(other, "CHANGELOG.md"), changelog("- Shipped fix\n- Landed during publish"));
+  git(other, "add", "CHANGELOG.md");
+  git(other, "commit", "-m", "fix: land during publish");
+  git(other, "push", "origin", "main");
+  const remoteSha = git(other, "rev-parse", "HEAD");
+
+  const env = { ...process.env };
+  delete env.VERSION;
+  const result = spawnSync("bash", [persist, "main", releaseStart], { cwd: work, encoding: "utf8", env });
+  assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stderr, /VERSION is unset; cannot carry the cut/);
+  git(work, "fetch", "origin", "main");
+  assert.equal(git(work, "rev-parse", "origin/main"), remoteSha);
+  assert.equal(git(work, "rev-parse", "HEAD"), versionSha);
 });

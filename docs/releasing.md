@@ -30,11 +30,16 @@ and `crates/ai-hist-napi/src/lib.rs`).
    each executable and its glibc floor. `helpers` applies
    `scripts/set-release-version.mjs` first, so the executables report the
    release version. Both jobs run in parallel and upload binaries as artifacts.
-3. `publish` applies that version to every manifest and lockfile — the core
-   packages and, whatever the `plugins` input, the plugin manifest
-   and plugin crate via `scripts/set-release-version.mjs`, so the tag
-   always carries what the helper matrix built from — prepares the
-   version-only commit, then
+3. `publish` first checks the release against the pending `CHANGELOG.md`
+   level (`scripts/check-release-changelog.mjs` fails, say, a patch release
+   under `[Unreleased - Minor]`) and cuts the changelog
+   (`scripts/cut-changelog.mjs`; with nothing curated it uses conventional
+   commit subjects since the last tag, failing if they imply a larger bump,
+   or records "No user-facing changes."). It then applies that version to
+   every manifest and lockfile — the core packages and, whatever the
+   `plugins` input, the plugin manifest and plugin crate via
+   `scripts/set-release-version.mjs`, so the tag always carries what the
+   helper matrix built from — prepares the version commit carrying both, then
    publishes the platform packages,
    `ai-hist-native`, `ai-hist` and `ai-hist-mcp` in that order. The SDK root is
    never published before its platform artifacts, because npm multi-package
@@ -57,8 +62,13 @@ and `crates/ai-hist-napi/src/lib.rs`).
    waits up to 70 minutes for npm's processing queue, then runs the clean registry
    install and older-glibc CLI smoke tests. `finalize-core` creates the GitHub
    Release only after those tests pass. A separate `persist-version` job rebases
-   the version-only commit onto the current branch tip and pushes, so a merge
-   that landed during publish does not drop the tag. Crate and plugins depend
+   the version commit onto the current branch tip and pushes, so a merge
+   that landed during publish does not drop the tag; if that merge added
+   changelog entries (merged cleanly or conflicting only in `CHANGELOG.md`),
+   it rebuilds the changelog from the branch's copy: the released section as
+   tagged, and the entries that landed during the release left pending at
+   the level they need (the branch's heading, lowered to `Patch` when they
+   are only fixes). Crate and plugins depend
    on the verified core, not on that persist. If npm accepts a publish but keeps
    its version in processing beyond the wait, or a later gate fails, rerun with
    `skip_core` and this `custom_version` once npm exposes the packages. The

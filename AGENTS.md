@@ -60,7 +60,7 @@ classification, or similarity-based session linking.
 | [`docs/sourcing-sdk.md`](docs/sourcing-sdk.md)           | Embedder guide: the `SessionStore` facade, its structs and errors, lifecycle and locks, evidence model, semver |
 | [`docs/decisions/`](docs/decisions/)                     | Architecture decision records                                        |
 | [`docs/getting-started.md`](docs/getting-started.md)     | Install and first run                                                |
-| [`docs/releasing.md`](docs/releasing.md)                 | npm and crates.io release pipelines, semver policy                   |
+| [`docs/releasing.md`](docs/releasing.md)                 | npm and crates.io release pipelines, semver policy, changelog cut    |
 | [`docs/agent-integration.md`](docs/agent-integration.md) | Wiring RelayHistory into an agent                                    |
 | [`crates/ai-hist/README.md`](crates/ai-hist/README.md)   | Embedding from Rust                                                  |
 | [`examples/rust-consumer`](examples/rust-consumer)       | Out-of-tree consumer of the published crate; CI smoke test          |
@@ -71,6 +71,33 @@ Durable architecture choices go in `docs/decisions/` as
 `YYYY-MM-DD-short-slug.md`, with a status, date, context, decision, the
 alternatives that were rejected and why, and the consequences. Record the
 choice, not the reasoning transcript.
+
+## Changelog
+
+`CHANGELOG.md` is the one changelog for every package; they all release at one
+version.
+
+- Curate the pending section of `CHANGELOG.md` in the same PR as any
+  user-visible change.
+- An empty post-release changelog starts at `[Unreleased]`. The first pending
+  user-visible change sets the heading to `[Unreleased - Patch]`,
+  `[Unreleased - Minor]`, or `[Unreleased - Major]` according to its SemVer
+  impact. Before 1.0, a breaking change (including a native contract bump or a
+  `### Rust API` break) is `Minor`.
+- The pending level is monotonic: `Patch < Minor < Major`. Raise the heading
+  when a higher-impact change arrives; never lower it, and leave it unchanged
+  for another change at the same level.
+- Sections, in this order: `### Breaking Changes`, `### Added`, `### Changed`,
+  `### Deprecated`, `### Removed`, `### Fixed`, `### Security`, `### Rust API`.
+- Do not hand-cut a release. The publish workflow refuses a release smaller
+  than the pending level (`scripts/check-release-changelog.mjs`), then
+  `scripts/cut-changelog.mjs` moves the pending entries under the released
+  version, restores a bare `[Unreleased]`, and updates the comparison links.
+  Entries merged while a release runs stay pending.
+- Keep entries concise and impact-first: one short, unwrapped bullet per
+  user-visible change, no nested bullets.
+- Omit PR links, internal review notes, test-only or CI-only work, and
+  implementation backstory unless they explain shipped impact.
 
 ## Before opening a PR
 

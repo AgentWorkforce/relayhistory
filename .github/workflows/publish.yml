@@ -482,12 +482,26 @@ jobs:
           # A real release tags the published tree once npm accepts every
           # package; persist-version rebases that commit after verification.
           persist-credentials: true
+          # The changelog cut falls back to commit subjects since the previous
+          # release tag when nothing was curated, so it needs history and tags.
+          fetch-depth: 0
       - uses: actions/setup-node@v6
         with:
           node-version: '22.14.0'
           registry-url: 'https://registry.npmjs.org'
       - name: Install deps
         run: npm ci
+      # The release must be at least the SemVer level the pending changelog
+      # declares; then its entries move under this version and the version
+      # commit (and so the tag) carries the cut changelog. A dry run cuts too,
+      # to show the result, but never commits it.
+      - name: Check and cut the changelog
+        working-directory: .
+        run: |
+          set -euo pipefail
+          node scripts/check-release-changelog.mjs --version "$VERSION"
+          node scripts/cut-changelog.mjs --version "$VERSION" --date "$(date -u +%F)"
+          git diff --stat -- CHANGELOG.md
       - name: Apply the release version to the core manifests
         run: |
           set -euo pipefail
@@ -619,7 +633,8 @@ jobs:
             crates/ai-hist-napi/package-lock.json \
             sdk-ts/package.json \
             sdk-ts/package-lock.json \
-            mcp-package/package.json
+            mcp-package/package.json \
+            CHANGELOG.md
           if git diff --cached --quiet; then
             echo "Version metadata is already committed at $VERSION"
           else
