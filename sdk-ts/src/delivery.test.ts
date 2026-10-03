@@ -316,6 +316,34 @@ test('a file: URI --db is percent-decoded as SQLite decodes it before the output
   });
 });
 
+test('export preserves invalid UTF-8 database URI bytes and guards their hardlink aliases', async (t) => {
+  if (process.platform === 'win32') { t.skip('Unix byte filenames'); return; }
+  await fixture(async (dbPath, root) => {
+    const selectionPath = join(root, 'selection.json');
+    await writeFile(selectionPath, JSON.stringify(selection));
+    const bytePath = Buffer.concat([Buffer.from(join(root, 'hist')), Buffer.from([0xff]), Buffer.from('.db')]);
+    try { await writeFile(bytePath, await readFile(dbPath)); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EILSEQ') throw error;
+      t.skip('this filesystem requires valid UTF-8 filenames'); return;
+    }
+    const uri = `${pathToFileURL(root).href}/hist%FF.db`;
+    const {runHistoryExportCommand} = await import('./delivery-cli.js');
+    // U+FFFD is a different filename and is a valid export destination.
+    const outputPath = join(root, 'hist\ufffd.db');
+    await runHistoryExportCommand({ dbPath: uri, outputPath, selectionPath });
+    assert.ok((await readFile(outputPath, 'utf8')).length > 0);
+    // Existing main-file and sidecar aliases must still be protected by inode.
+    for (const suffix of ['', '-wal', '-shm', '-journal']) {
+      const protectedPath = Buffer.concat([bytePath, Buffer.from(suffix)]);
+      if (suffix) await writeFile(protectedPath, 'sidecar');
+      const alias = join(root, `alias${suffix}`);
+      await link(protectedPath, alias);
+      await assert.rejects(runHistoryExportCommand({ dbPath: uri, outputPath: alias, selectionPath }), /active history database/);
+    }
+  });
+});
+
 test('export refuses the live WAL and SHM sidecars and leaves committed rows readable', async (t) => {
   // node:sqlite ships unflagged from Node 22.5; on older runtimes the
   // path-only guard is still covered by the alias tests above.

@@ -1,6 +1,6 @@
 import { createWriteStream } from 'node:fs';
 import { readFile, realpath, rename, rm, stat } from 'node:fs/promises';
-import { basename, dirname, resolve } from 'node:path';
+import { basename, dirname, posix, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { finished } from 'node:stream/promises';
 import type { Writable } from 'node:stream';
@@ -23,10 +23,10 @@ export async function loadHistoryApplicationConfig(path: string) {
 /**
  * Percent-decode a URI path the way SQLite's `sqlite3ParseUri` does: a `%`
  * followed by two hex digits is that byte, anything else (`%ZZ`, a trailing
- * `%`) stays literal, and a decoded `%00` ends the path. The bytes are then
- * read as UTF-8, as SQLite passes them to the filesystem.
+ * `%`) stays literal, and a decoded `%00` ends the path. Preserve the bytes:
+ * Unix filenames need not be valid UTF-8.
  */
-function sqliteUriDecode(path: string): string {
+function sqliteUriDecode(path: string): Buffer {
   const input = Buffer.from(path, 'utf8');
   const out: number[] = [];
   const hex = (byte: number) => Number.parseInt(String.fromCharCode(byte), 16);
@@ -41,7 +41,7 @@ function sqliteUriDecode(path: string): string {
       out.push(input[i]);
     }
   }
-  return Buffer.from(out).toString('utf8');
+  return Buffer.from(out);
 }
 
 /**
@@ -52,7 +52,7 @@ function sqliteUriDecode(path: string): string {
  * `localhost`, the query and fragment are not part of the path, and the path
  * is percent-decoded. Anything else is an ordinary filesystem path.
  */
-function sqliteDatabaseFile(dbPath: string): string {
+function sqliteDatabaseFile(dbPath: string): string | Buffer {
   if (!dbPath.startsWith('file:')) return resolve(dbPath);
   let path = dbPath.slice('file:'.length);
   const end = path.search(/[?#]/);
@@ -65,7 +65,14 @@ function sqliteDatabaseFile(dbPath: string): string {
     }
     path = slash < 0 ? '' : path.slice(slash);
   }
-  path = sqliteUriDecode(path);
+  const decoded = sqliteUriDecode(path);
+  if (decoded.length === 0) throw new InvalidArgumentError('SQLite URI names no database file', 'INVALID_ARGUMENT');
+  if (process.platform !== 'win32') {
+    // Latin-1 is used only to apply lexical path operations without changing
+    // any byte; the filesystem APIs receive the resulting Buffer.
+    return Buffer.from(posix.resolve(Buffer.from(process.cwd()).toString('latin1'), decoded.toString('latin1')), 'latin1');
+  }
+  path = decoded.toString('utf8');
   // `file:///C:/x/history.db` carries the path `/C:/x/history.db`; SQLite's
   // Windows VFS drops the slash before a drive letter, and so must we, or
   // resolve() reads it as a path on the current drive. (A UNC host is an
@@ -83,13 +90,18 @@ export async function runHistoryExportCommand(
   /** Destination when no `--out` is given. Required unless `outputPath` is set. */
   stdoutStream?: Writable,
 ): Promise<void> {
-  const canonicalTarget = async (path: string): Promise<string> => {
-    try { return await realpath(path); }
+  const canonicalTarget = async (path: string | Buffer): Promise<Buffer> => {
+    if (process.platform === 'win32' && Buffer.isBuffer(path)) path = path.toString('utf8');
+    try { return await realpath(path, { encoding: 'buffer' }); }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-      const parent = dirname(path);
+      const parent = typeof path === 'string' ? dirname(path) : path.subarray(0, Math.max(1, path.lastIndexOf(0x2f)));
+      if (Buffer.isBuffer(path) && Buffer.isBuffer(parent) && path.equals(parent)) throw error;
       if (parent === path) throw error;
-      return resolve(await canonicalTarget(parent), basename(path));
+      const name = typeof path === 'string' ? Buffer.from(basename(path)) : path.subarray(path.lastIndexOf(0x2f) + 1);
+      const canonicalParent = await canonicalTarget(parent);
+      const separator = process.platform === 'win32' ? 0x5c : 0x2f;
+      return Buffer.concat([canonicalParent, canonicalParent.at(-1) === separator ? Buffer.alloc(0) : Buffer.from([separator]), name]);
     }
   };
   // SQLite keeps committed state in `<db>-wal` (its index in `<db>-shm`, and
@@ -103,20 +115,20 @@ export async function runHistoryExportCommand(
     if (!options.outputPath) return;
     const target = resolve(options.outputPath);
     const database = sqliteDatabaseFile(options.dbPath ?? defaultDbPath());
-    const metadata = async (path: string) => stat(path).catch((error: NodeJS.ErrnoException) => {
+    const metadata = async (path: string | Buffer) => stat(path).catch((error: NodeJS.ErrnoException) => {
       if (error.code === 'ENOENT') return null;
       throw error;
     });
     const [targetPath, databasePath, targetStat] = await Promise.all([
       canonicalTarget(target), canonicalTarget(database), metadata(target),
     ]);
-    const protectedPaths = [...new Set(['', '-wal', '-shm', '-journal']
-      .flatMap((suffix) => [database + suffix, databasePath + suffix]))];
+    const protectedPaths = ['', '-wal', '-shm', '-journal']
+      .flatMap((suffix) => [Buffer.concat([Buffer.from(database), Buffer.from(suffix)]), Buffer.concat([databasePath, Buffer.from(suffix)])]);
     const protectedTargets = await Promise.all(protectedPaths.map(async (path) => ({
       canonical: await canonicalTarget(path), stat: await metadata(path),
     })));
     for (const candidate of protectedTargets) {
-      if (targetPath === candidate.canonical
+      if (targetPath.equals(candidate.canonical)
         || (targetStat && candidate.stat && targetStat.dev === candidate.stat.dev && targetStat.ino === candidate.stat.ino)) {
         throw new InvalidArgumentError('export output must not replace the active history database', 'INVALID_ARGUMENT');
       }
