@@ -617,7 +617,7 @@ the provider's several rows.
 
 | Field | Meaning |
 | --- | --- |
-| `id`, `request_key`, `request_key_source` | The group's row id, its grouping key, and where the key came from — `RequestKeySource::RequestId` (Claude's `requestId`), `ProviderMessageId` (Claude's `message.id`, no request id), `RequestSpan` (Codex: the rows between two cumulative `token_count` snapshots, which is one API call, not one turn), `RecordId` (the stored message id, a *record* identity that may be finer than a request). `is_request_identity()` says whether the key is a real upstream identity or a fallback |
+| `id`, `request_key`, `request_key_source` | The group's row id, its grouping key, and where the key came from — `RequestKeySource::RequestId` (Claude's `requestId`), `ProviderMessageId` (Claude's `message.id`, no request id), `RequestSpan` (Codex: the rows between two cumulative `token_count` snapshots, which is one API call, not one turn; takes precedence over output-item `provider_message_id` values), `RecordId` (the stored message id, a *record* identity that may be finer than a request). `is_request_identity()` says whether the key is a real upstream identity or a fallback |
 | `message_ids` | Every message id folded into this request |
 | `model`, `provider` | As the harness recorded them; `None` when it did not |
 | `first_ts_ms`, `last_ts_ms` | Span of the request's rows |

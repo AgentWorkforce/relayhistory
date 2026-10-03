@@ -655,7 +655,8 @@ pub type PromptKey = (i64, String);
 
 /// The request an event belongs to, under the same rule the `session_requests`
 /// view groups by: the provider's own `request_id` first, then its
-/// `provider_message_id`, and the stored record id only as a last resort.
+/// `provider_message_id`, then its span, and the stored record id as a last
+/// resort. Codex spans outrank output-item IDs, which do not identify calls.
 ///
 /// Namespace-qualified, because those three namespaces are separate and can
 /// carry the same text — a bare value is not unique, and a key that is not
@@ -673,6 +674,10 @@ pub(crate) fn request_key(event: &SessionEvent) -> String {
     }
     if let Some(id) = present(event.request_id.as_ref()) {
         format!("request-id:{id}")
+    } else if let Some(span) =
+        present(event.request_span.as_ref()).filter(|_| event.source == "codex")
+    {
+        format!("request-span:{span}")
     } else if let Some(id) = present(event.provider_message_id.as_ref()) {
         format!("provider-message-id:{id}")
     } else if let Some(span) = present(event.request_span.as_ref()) {

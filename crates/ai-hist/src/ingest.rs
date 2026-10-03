@@ -32010,6 +32010,21 @@ mod tests {
             super::ingest_codex_rollout(&conn, &path, &meta).unwrap();
             let rows: Vec<String> = conn.prepare("SELECT text FROM session_events WHERE role='assistant' AND kind='text' ORDER BY ts_ms, event_uid")
                 .unwrap().query_map([], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+            let requests = crate::session_usage::session_requests_page(
+                &conn,
+                "codex",
+                &meta.session_id,
+                50,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                requests.requests.len(),
+                1,
+                "payload IDs must not split the request span"
+            );
+            assert_eq!(requests.requests[0].request_key, "request-span:0");
+            assert_eq!(requests.requests[0].event_count, 6);
             let identities: Vec<(String, String, Option<String>)> = conn
                 .prepare("SELECT event_uid, message_id, provider_message_id FROM session_events WHERE role='assistant' AND kind='text' ORDER BY ts_ms, event_uid")
                 .unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))

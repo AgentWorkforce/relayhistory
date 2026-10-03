@@ -10,7 +10,8 @@ Notable changes to the native `ai-hist` CLI are documented here.
   session history. Mirrored CLI/desktop encodings are stored once, and unchanged
   captures are re-read on upgrade to recover previously missing replies, including
   when the source fingerprint is unchanged. Assistant message IDs stay line-derived;
-  payload IDs are preserved separately as provider message IDs.
+  payload IDs are preserved separately as provider message IDs without splitting
+  the request span shared by reasoning, tool calls, and the reply.
 
 ### Breaking
 
