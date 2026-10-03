@@ -616,6 +616,14 @@ Notable changes to the native `ai-hist` CLI are documented here.
   upgrade, reuse prepared statements instead of compiling their SQL each
   time. On the 100 MB benchmark store this is ~10% of a forced tick's CPU.
 
+- A forced sync now walks the Grok session tree once instead of three times,
+  and stamps each session directory twice instead of three times (#317). The
+  source fingerprint, the Grok walk and the discovery pass at the end of the
+  sweep share one enumeration. The walk still reads its own fresh stamp, so a
+  directory that becomes unreadable mid-sweep is reported in that sweep, and
+  discovery reuses the walk's stamps. On a store with 879 Grok sessions a
+  forced tick takes about 45 ms (13%) less.
+
 - When a Codex rollout grows, sync now reads only the appended turns instead
   of re-parsing the whole file (#315). It resumes through the same
   locator-keyed cursor that hydration keeps for Codex child rollouts. The
