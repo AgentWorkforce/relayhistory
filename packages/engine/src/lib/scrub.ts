@@ -649,9 +649,11 @@ const SUBSTITUTION_WINDOW = 4096;
 
 /**
  * Where scans of substitutions that ran past their fallback end (a line break, or a
- * quoted key's value close) without closing stopped. A later substitution whose
- * fallback lies before it does not run on past it, so extended scans never overlap
- * and the pass stays linear.
+ * quoted key's value close) without closing stopped. A later substitution starting
+ * before it scans only to it: one that closes there costs its own redacted span, one
+ * that does not consumes the rest of the region, and neither moves it. Full-window
+ * scans therefore start after the previous region and never overlap, so the pass
+ * stays linear.
  */
 interface SubstitutionScan {
   extendedTo: number;
@@ -685,9 +687,13 @@ function shellSubstitutionEnd(
   // Where the substitution ends if it never closes: its first line break or, in a
   // quoted key's value, that value's first close.
   let stop = -1;
+  // A substitution starting inside an earlier failed scan's region scans afresh but
+  // only to that region's end: it ends at its own close or, failing closed, there.
+  const region = at < scan.extendedTo ? scan.extendedTo : -1;
   let index = backtick ? at + 1 : at;
   while (index < text.length) {
-    if (stop >= 0 && index - at > SUBSTITUTION_WINDOW) break;
+    if (region >= 0 && index >= region) return region;
+    if (region < 0 && stop >= 0 && index - at > SUBSTITUTION_WINDOW) break;
     const run = backslashes(text, index);
     const char = text[index + run];
     if (
@@ -697,19 +703,12 @@ function shellSubstitutionEnd(
         (char === "n" || char === "r") &&
         escapedBreak(text, index, run, quote))
     ) {
-      if (stop < 0) {
-        stop = index;
-        // Only a substitution not yet overlapping a failed extended scan looks on.
-        if (index < scan.extendedTo) return stop;
-      } else if (keyed) break;
+      if (stop < 0) stop = index;
       index += run + 1;
       continue;
     }
     const role = quoteRole(char, run, quote);
-    if (keyed && role === "close" && stop < 0) {
-      stop = index;
-      if (index < scan.extendedTo) return stop;
-    }
+    if (keyed && role === "close" && stop < 0) stop = index;
     if (
       !keyed &&
       quote.lineBase > 0 &&
@@ -739,6 +738,7 @@ function shellSubstitutionEnd(
     }
     index += run + 1;
   }
+  if (region >= 0) return region;
   if (stop < 0) return Math.min(index, text.length);
   scan.extendedTo = Math.max(scan.extendedTo, index);
   return stop;
