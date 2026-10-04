@@ -332,34 +332,11 @@ jobs:
         run: node scripts/smoke-history-packages.mjs
 
   # The History service engine is independent of the Rust workspace and the SDK. It
-  # runs its whole suite on in-process PGlite (pgvector + pg_trgm) and again against
+  # runs its whole suite on in-process PGlite (pgvector + pg_trgm), and again against
   # real PostgreSQL with pgvector over node-postgres, the self-hosted driver, on the
   # oldest and newest supported server versions.
   engine:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - database: pglite
-          - database: postgres
-            image: pgvector/pgvector:pg16
-          - database: postgres
-            image: pgvector/pgvector:pg17
-    services:
-      postgres:
-        image: ${{ matrix.image || 'pgvector/pgvector:pg17' }}
-        env:
-          POSTGRES_USER: engine
-          POSTGRES_PASSWORD: engine
-          POSTGRES_DB: engine
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U engine"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
     defaults:
       run:
         working-directory: packages/engine
@@ -374,21 +351,47 @@ jobs:
       - run: npm run lint
       - run: npm run typecheck
       - name: Test on PGlite
-        if: ${{ matrix.database == 'pglite' }}
         run: npm test
-      - name: Test on PostgreSQL
-        if: ${{ matrix.database == 'postgres' }}
-        env:
-          DATABASE_URL: postgres://engine:engine@localhost:5432/engine
-        run: npm run test:postgres
-      - name: Packed tarball in a clean consumer
-        if: ${{ matrix.database == 'postgres' }}
-        env:
-          DATABASE_URL: postgres://engine:engine@localhost:5432/engine
-        run: node scripts/pack-smoke.mjs
       - name: Build and pack
-        if: ${{ matrix.database == 'pglite' }}
         run: |
           set -euo pipefail
           npm run build
           npm pack --dry-run
+
+  engine-postgres:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [pgvector/pgvector:pg16, pgvector/pgvector:pg17]
+    services:
+      postgres:
+        image: ${{ matrix.image }}
+        env:
+          POSTGRES_USER: engine
+          POSTGRES_PASSWORD: engine
+          POSTGRES_DB: engine
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U engine"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    defaults:
+      run:
+        working-directory: packages/engine
+    env:
+      DATABASE_URL: postgres://engine:engine@localhost:5432/engine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: packages/engine/package-lock.json
+      - run: npm ci
+      - name: Test on PostgreSQL
+        run: npm run test:postgres
+      - name: Packed tarball in a clean consumer
+        run: node scripts/pack-smoke.mjs
