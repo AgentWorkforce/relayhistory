@@ -68,6 +68,7 @@ describe("OpenAiEmbeddingProvider", () => {
     expect(JSON.parse(String(init.body))).toEqual({
       model: DEFAULT_EMBEDDING_MODEL,
       input: ["Task: Build embeddings"],
+      dimensions: 1536,
     });
   });
 
@@ -96,9 +97,112 @@ describe("OpenAiEmbeddingProvider", () => {
     expect(JSON.parse(String(init.body))).toEqual({
       model: DEFAULT_EMBEDDING_MODEL,
       input: ["first", "second"],
+      dimensions: 1536,
     });
     expect(vectors[0]?.[0]).toBeCloseTo(0.1);
     expect(vectors[1]?.[0]).toBeCloseTo(0.2);
+  });
+});
+
+describe("requested dimensions", () => {
+  function stubVectors(length: number) {
+    const fetchMock = vi.fn(async (_url: string, init: any) => {
+      const { input } = JSON.parse(String(init.body)) as { input: string[] };
+      return new Response(
+        JSON.stringify({
+          data: input.map((_, index) => ({
+            index,
+            embedding: Array.from({ length }, () => 0.1),
+          })),
+        }),
+        { headers: { "Content-Type": "application/json" } },
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  }
+  const body = (fetchMock: ReturnType<typeof stubVectors>) =>
+    JSON.parse(String((fetchMock.mock.calls[0] as any[])[1].body));
+
+  it("asks a v3 model for the column's 1536 dimensions and stores the result", async () => {
+    const fetchMock = stubVectors(1536);
+    const provider = embeddingProviderFromEnv({
+      EMBEDDING_API_KEY: "k",
+      EMBEDDING_MODEL: "text-embedding-3-large",
+    })!;
+    const [result] = await resolveEventEmbeddings(
+      [{ content: "hello" }],
+      provider,
+    );
+    expect(body(fetchMock)).toEqual({
+      model: "text-embedding-3-large",
+      input: ["hello"],
+      dimensions: 1536,
+    });
+    expect(result).toMatchObject({
+      embeddingModel: "text-embedding-3-large",
+      embeddingDim: 1536,
+      embeddingSkipReason: null,
+    });
+  });
+
+  it("sends no dimensions to a model that does not take them", async () => {
+    const fetchMock = stubVectors(1536);
+    await new OpenAiEmbeddingProvider({
+      apiKey: "k",
+      model: "text-embedding-ada-002",
+    }).embed("hello");
+    expect(body(fetchMock)).toEqual({
+      model: "text-embedding-ada-002",
+      input: ["hello"],
+    });
+  });
+});
+
+describe("injected providers", () => {
+  it("one failed embed skips only that input", async () => {
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    const provider = {
+      model: "custom",
+      dim: 3,
+      embed: async (text: string) => {
+        if (text === "bad") throw new Error("provider down");
+        return [1, 2, 3];
+      },
+    };
+    const results = await resolveEventEmbeddings(
+      [{ content: "good" }, { content: "bad" }, { content: "also good" }],
+      provider,
+    );
+    expect(results.map((result) => result.embeddingSkipReason)).toEqual([
+      null,
+      "provider_error",
+      null,
+    ]);
+    expect(results[0]!.embedding).toEqual([1, 2, 3]);
+  });
+
+  it("receives every input bounded to the provider limit", async () => {
+    const seen: string[][] = [];
+    const provider = {
+      model: "custom",
+      dim: 3,
+      embed: async () => [1, 2, 3],
+      embedMany: async (texts: string[]) => {
+        seen.push(texts);
+        return texts.map(() => [1, 2, 3]);
+      },
+    };
+    const long = "x".repeat(MAX_EMBEDDING_INPUT_CHARS + 500);
+    const [result] = await resolveEventEmbeddings(
+      [{ content: long }],
+      provider,
+    );
+    expect(seen).toEqual([[long.slice(0, MAX_EMBEDDING_INPUT_CHARS)]]);
+    // The hash still identifies the whole stored content.
+    expect(result!.contentHash).toBe(
+      (await resolveEventEmbeddings([{ content: long }], null))[0]!.contentHash,
+    );
   });
 });
 
