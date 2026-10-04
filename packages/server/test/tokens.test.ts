@@ -18,6 +18,7 @@ import {
   listTokens,
   revokeToken,
   createTokenFile,
+  shellArgument,
   UndeliveredTokenError,
 } from "../src/tokens.js";
 
@@ -115,6 +116,8 @@ describe.skipIf(!adminUrl)("token bootstrap", () => {
 
   it("revokes an undelivered token even when removing the partial file fails", async () => {
     let minted: string | undefined;
+    const removed: string[] = [];
+    const path = join(dir, "never.json");
     const failing = {
       open: async () => ({
         writeFile: async (text: string | Uint8Array) => {
@@ -125,7 +128,8 @@ describe.skipIf(!adminUrl)("token bootstrap", () => {
           throw Object.assign(new Error("close EIO"), { code: "EIO" });
         },
       }),
-      remove: async () => {
+      remove: async (target: string) => {
+        removed.push(target);
         throw Object.assign(new Error("rm EACCES"), { code: "EACCES" });
       },
     };
@@ -133,12 +137,26 @@ describe.skipIf(!adminUrl)("token bootstrap", () => {
       createTokenFile(
         database.db,
         { orgId: "cleanup", workspaceId: "main", label: "rm-fails" },
-        { path: join(dir, "never.json") },
+        { path },
         failing,
       ),
     ).rejects.toMatchObject({ code: "ENOSPC" });
     expect(minted).toMatch(/^rth_st_/);
     expect(await resolveAccessToken(database.db, minted!)).toBeNull();
+    // The partial file's removal was attempted, after the revoke, and its failure ignored.
+    expect(removed).toEqual([path]);
+  });
+
+  it("an empty path is refused before anything is minted", async () => {
+    const before = (await listTokens(database.db, "emptypath")).length;
+    await expect(
+      createTokenFile(
+        database.db,
+        { orgId: "emptypath", workspaceId: "main", label: "empty" },
+        { path: "" },
+      ),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await listTokens(database.db, "emptypath")).length).toBe(before);
   });
 
   it("names a token it could neither deliver nor revoke", async () => {
@@ -169,6 +187,10 @@ describe.skipIf(!adminUrl)("token bootstrap", () => {
     expect(error).toBeInstanceOf(UndeliveredTokenError);
     expect(error.message).toContain(error.tokenId);
     expect(error.message).not.toContain(minted!);
+    expect(error.revokeCommand).toBe(
+      `relayhistory-server token revoke --org cleanup --id ${error.tokenId}`,
+    );
+    expect(error.message).toContain(error.revokeCommand);
     // It really is still live: the operator must revoke it by id.
     expect(await resolveAccessToken(database.db, minted!)).not.toBeNull();
     expect(await revokeToken(database.db, "cleanup", error.tokenId)).toBe(true);
@@ -183,5 +205,15 @@ describe.skipIf(!adminUrl)("token bootstrap", () => {
         scopes: ["rth:admin"],
       }),
     ).rejects.toThrow(/unknown scopes/);
+  });
+});
+
+describe("shellArgument", () => {
+  it("leaves safe identifiers alone and single-quotes anything else", () => {
+    expect(shellArgument("acme")).toBe("acme");
+    expect(shellArgument("org:acme@eu-1")).toBe("org:acme@eu-1");
+    expect(shellArgument("acme corp")).toBe("'acme corp'");
+    expect(shellArgument("it's; rm -rf ~")).toBe(`'it'\\''s; rm -rf ~'`);
+    expect(shellArgument("$(whoami)")).toBe("'$(whoami)'");
   });
 });

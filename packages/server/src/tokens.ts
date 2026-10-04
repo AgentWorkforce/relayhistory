@@ -122,13 +122,27 @@ const files: TokenFileSystem = {
   remove: (path) => rm(path, { force: true }),
 };
 
+/** Quote one argument for a POSIX shell: plain when it is safe, single-quoted otherwise. */
+export function shellArgument(value: string): string {
+  return /^[A-Za-z0-9._:@/=+-]+$/.test(value)
+    ? value
+    : `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
 /** The token was minted, its delivery failed, and revoking it failed too. */
 export class UndeliveredTokenError extends Error {
   override name = "UndeliveredTokenError";
-  constructor(readonly tokenId: string) {
+  /** The command that revokes it, ready to paste. */
+  readonly revokeCommand: string;
+  constructor(
+    readonly orgId: string,
+    readonly tokenId: string,
+  ) {
+    const command = `relayhistory-server token revoke --org ${shellArgument(orgId)} --id ${shellArgument(tokenId)}`;
     super(
-      `token ${tokenId} could not be delivered or revoked; revoke it with \`token revoke --id ${tokenId}\``,
+      `token ${tokenId} could not be delivered or revoked; run: ${command}`,
     );
+    this.revokeCommand = command;
   }
 }
 
@@ -144,8 +158,10 @@ export async function createTokenFile(
   destination: TokenDestination,
   fs: TokenFileSystem = files,
 ): Promise<TokenFile> {
+  // A path destination is reserved before minting, whatever the path; an invalid one
+  // (even empty) fails here without touching the database.
   const path = "path" in destination ? destination.path : undefined;
-  const handle = path ? await fs.open(path) : undefined;
+  const handle = path !== undefined ? await fs.open(path) : undefined;
   let file: TokenFile | undefined;
   try {
     file = await createToken(db, options);
@@ -168,8 +184,8 @@ export async function createTokenFile(
         () => false,
       );
     await handle?.close().catch(() => {});
-    if (path) await fs.remove(path).catch(() => {});
-    if (!revoked) throw new UndeliveredTokenError(file!.id);
+    if (path !== undefined) await fs.remove(path).catch(() => {});
+    if (!revoked) throw new UndeliveredTokenError(file!.orgId, file!.id);
     throw error;
   }
 }
