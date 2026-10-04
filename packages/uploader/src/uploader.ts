@@ -210,6 +210,40 @@ function defaultSleep(ms: number, signal?: AbortSignal) {
   });
 }
 
+/**
+ * A conflict recovery must account for every submitted record exactly once: either
+ * quarantined (proven conflicting) or carried in the retry under a new batch identity.
+ * Anything else would let the page commit with records that were never accepted. The
+ * SDK guarantees this today; the uploader checks it rather than relying on that.
+ */
+export function checkRecovery(
+  sending: HistoryExportBatch,
+  recovery: {
+    quarantinedRevisionIds: string[];
+    retryBatch: HistoryExportBatch | null;
+  },
+): void {
+  const sent = sending.records.map((record) => record.revision_id);
+  const accounted = [
+    ...recovery.quarantinedRevisionIds,
+    ...(recovery.retryBatch?.records.map((record) => record.revision_id) ?? []),
+  ];
+  const progress =
+    recovery.quarantinedRevisionIds.length > 0 ||
+    (recovery.retryBatch !== null &&
+      recovery.retryBatch.batch_id !== sending.batch_id);
+  if (
+    !progress ||
+    accounted.length !== sent.length ||
+    new Set(accounted).size !== sent.length ||
+    !accounted.every((id) => sent.includes(id))
+  )
+    throw new UploadError(
+      "delivery_conflict",
+      "conflict recovery does not account for every submitted record",
+    );
+}
+
 export async function upload(options: UploadOptions): Promise<UploadSummary> {
   const { config, log } = options;
   const feed = options.feed ?? { getChangesPage, commitChanges };
@@ -300,14 +334,7 @@ export async function upload(options: UploadOptions): Promise<UploadSummary> {
           "server conflict does not match the submitted batch",
         );
       }
-      if (
-        recovery.quarantinedRevisionIds.length === 0 &&
-        recovery.retryBatch?.batch_id === sending.batch_id
-      )
-        throw new UploadError(
-          "delivery_conflict",
-          "conflict recovery made no progress",
-        );
+      checkRecovery(sending, recovery);
       if (
         outcome.response.error.conflict.type === "batch_id" &&
         ++batchIdRecoveries > 1

@@ -32,6 +32,7 @@ export {
   DESTINATION_ID,
   MAPPING_VERSION,
   SCAN_LIMIT,
+  checkRecovery,
   consumerName,
   cutBatches,
   upload,

@@ -3,7 +3,12 @@ import { describe, expect, it } from "vitest";
 import { parseEndpoint } from "../src/config.js";
 import { createLogger, silentLogger } from "../src/log.js";
 import { deliveryRecord, selected } from "../src/records.js";
-import { consumerName, cutBatches, upload } from "../src/uploader.js";
+import {
+  checkRecovery,
+  consumerName,
+  cutBatches,
+  upload,
+} from "../src/uploader.js";
 import {
   ACCOUNT,
   LIMITS,
@@ -228,6 +233,70 @@ describe("cutBatches", () => {
         maxBytes: 600,
       }),
     ).toThrow(/exceeds/);
+  });
+});
+
+describe("checkRecovery", () => {
+  const records = [1, 2, 3].map((r) =>
+    deliveryRecord(change(r), "00000000000000aa"),
+  );
+  const sending = cutBatches(config(), "c", "00000000000000aa", records, {
+    maxRecords: 10,
+    maxBytes: 1_048_576,
+  })[0];
+  const retry = (kept: typeof records, id = "conflict-x") => ({
+    ...sending,
+    batch_id: id,
+    records: kept,
+  });
+  const ids = (list: typeof records) => list.map((r) => r.revision_id);
+
+  it("refuses a recovery that quarantines nothing and retries nothing", () => {
+    expect(() =>
+      checkRecovery(sending, { quarantinedRevisionIds: [], retryBatch: null }),
+    ).toThrow(/account for every/);
+  });
+
+  it("refuses a recovery that drops or invents records", () => {
+    expect(() =>
+      checkRecovery(sending, {
+        quarantinedRevisionIds: ids(records.slice(0, 1)),
+        retryBatch: retry(records.slice(1, 2)),
+      }),
+    ).toThrow();
+    expect(() =>
+      checkRecovery(sending, {
+        quarantinedRevisionIds: ["not-sent"],
+        retryBatch: retry(records.slice(1)),
+      }),
+    ).toThrow();
+    expect(() =>
+      checkRecovery(sending, {
+        quarantinedRevisionIds: [],
+        retryBatch: retry(records, sending.batch_id),
+      }),
+    ).toThrow();
+  });
+
+  it("accepts the recoveries the SDK produces", () => {
+    expect(() =>
+      checkRecovery(sending, {
+        quarantinedRevisionIds: ids(records.slice(0, 1)),
+        retryBatch: retry(records.slice(1)),
+      }),
+    ).not.toThrow();
+    expect(() =>
+      checkRecovery(sending, {
+        quarantinedRevisionIds: ids(records),
+        retryBatch: null,
+      }),
+    ).not.toThrow();
+    expect(() =>
+      checkRecovery(sending, {
+        quarantinedRevisionIds: [],
+        retryBatch: retry(records),
+      }),
+    ).not.toThrow();
   });
 });
 
@@ -640,6 +709,46 @@ describe("upload", () => {
     const posts = fake.requests.filter((r) => r.method === "POST");
     expect(posts).toHaveLength(2);
     expect(posts[1].body.batch.batch_id).not.toBe(posts[0].body.batch.batch_id);
+    expect(feed.commits).toHaveLength(0);
+  });
+
+  it("an empty record-conflict list from the server stops the run and commits nothing", async () => {
+    const feed = new MemoryFeed([change(1)]);
+    const fake = server((body) => {
+      const record = body.batch.records[0];
+      const conflict = {
+        type: "record_revision",
+        originId: record.origin_id,
+        recordId: record.record_id,
+        submittedRevisionId: record.revision_id,
+        submittedRevision: record.revision,
+        submittedDigest: deliveryRecordDigest(record),
+        currentRevisionId: record.revision_id,
+        currentRevision: record.revision,
+        currentDigest: "f".repeat(64),
+      };
+      return json(
+        {
+          error: {
+            code: "delivery_conflict",
+            message: "x",
+            conflict,
+            conflicts: [],
+            conflictCount: 1,
+          },
+        },
+        409,
+      );
+    });
+    await expect(
+      upload({
+        config: config(),
+        log: silentLogger,
+        feed,
+        fetch: fake.fetch,
+        sleep: noSleep,
+      }),
+    ).rejects.toMatchObject({ failure: "delivery_conflict" });
     expect(feed.commits).toHaveLength(0);
   });
 
