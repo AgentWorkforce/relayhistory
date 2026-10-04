@@ -219,9 +219,11 @@ interface HeaderQuote {
   /** `2^level` for the content's escaping level: 1 unquoted, 2 inside `"…"`. */
   unit: number;
   /**
-   * The backslashes that encode a line break in this header's text: the run of the
-   * escaped break the header started after, else one more than a `"` quote's run (a
-   * JSON string's `\n`). 0 when the header's text is raw, where `\n` is literal.
+   * The backslashes that encode a line break in this header's text: one more than the
+   * run of the escaped break the header started after, which proves the text is a
+   * serialized message. 0 otherwise, including `"`-quoted headers: a JSON string's `\n`
+   * and a literal backslash-n in a shell double-quoted string are the same characters,
+   * so a quoted header cannot prove its escapes encode line breaks.
    */
   lineBase: number;
 }
@@ -275,9 +277,8 @@ function redactAuthorization(text: string): string {
       start += escapes + 1;
     } else if (header[1] === '"' || header[1] === "'") {
       quote = headerQuote(header[1], before);
-    } else if (header[1]!.startsWith("\\")) {
-      quote = { ...quote, lineBase: before + 1 };
     }
+    if (header[1]!.startsWith("\\")) quote = { ...quote, lineBase: before + 1 };
     AUTHORIZATION_SCHEME.lastIndex = start;
     const scheme = AUTHORIZATION_SCHEME.exec(text);
     const credential = scheme ? start + scheme[0].length : start;
@@ -303,7 +304,7 @@ function headerQuote(char: string, depth: number): HeaderQuote {
     char,
     depth,
     unit: 2 ** (Math.floor(Math.log2(depth + 1)) + 1),
-    lineBase: depth + 1,
+    lineBase: 0,
   };
 }
 
@@ -336,9 +337,10 @@ const HEADER_NAME = /[!#$%&'*+\-.^_`|~A-Za-z0-9]{1,64}:/y;
  * must be written the way this header's text encodes one (an odd multiple of its
  * `lineBase`; an even multiple is an escaped backslash) and be followed by what can
  * follow a header line: the end, the header's close, another line break, or the next
- * header's name. Anything else is literal: in a `"`-quoted header an encoded line
- * break and a literal shell `\n` are the same characters, so the ambiguous case stays
- * inside the credential.
+ * header's name. Anything else is literal. Only a header that began after an escaped
+ * line break has a `lineBase`: elsewhere an encoded line break and a literal shell `\n`
+ * (`DOMAIN\ryan:password`) are the same characters, so the credential runs on and
+ * redaction may take the text after it.
  */
 function escapedBreak(
   text: string,
