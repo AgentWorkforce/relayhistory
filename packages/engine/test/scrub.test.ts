@@ -375,6 +375,10 @@ describe("hosted ingest scrubbing", () => {
           ),
       ],
       [
+        "a Digest list separated by semicolons",
+        (n) => `Authorization: Digest ${'a="x"; '.repeat(n)}`.slice(0, n),
+      ],
+      [
         "stray parameter items",
         (n) =>
           `Authorization: AWS4 C=a/b, ${"x y=z/w, ".repeat(n)}`.slice(0, n),
@@ -1153,6 +1157,47 @@ describe("hosted ingest scrubbing", () => {
         ),
       ).toBe(
         String.raw`{"msg":"Don't forget\nAuthorization: Basic [REDACTED]","level":"info","more":"x"}`,
+      );
+      expect(scrubText('{"Authorization":"Digest a=","response":"S"}')).toBe(
+        '{"Authorization":"Digest [REDACTED]","response":"S"}',
+      );
+    });
+
+    it("continues a Digest list past `;` or spaces only when another parameter follows", () => {
+      const S = "R9secretZ";
+      const cases: Array<[string, string]> = [
+        [
+          `Authorization: Digest username="u"; realm="r"; response="${S}"\nHost: x`,
+          "Host: x",
+        ],
+        [
+          `Authorization: Digest username="u" realm="r" response="${S}"\nHost: x`,
+          "Host: x",
+        ],
+        [
+          `curl -H 'Authorization: Digest username="u"; response="${S}"' url`,
+          "' url",
+        ],
+        [
+          JSON.stringify({
+            Authorization: `Digest username="u"; response="${S}"`,
+            k: 1,
+          }),
+          '"k":1',
+        ],
+        // Comma lists already continued; unchanged.
+        [
+          `Authorization: Digest username="u", realm="r", response="${S}"\nHost: x`,
+          "Host: x",
+        ],
+      ];
+      for (const [input, kept] of cases) {
+        const out = scrubText(input);
+        expect(out, input).not.toContain(S);
+        expect(out, input).toContain(kept);
+      }
+      expect(scrubText('Authorization: Digest a="b" and then more')).toBe(
+        "Authorization: Digest [REDACTED] and then more",
       );
       expect(scrubText('{"Authorization":"Digest a=","response":"S"}')).toBe(
         '{"Authorization":"Digest [REDACTED]","response":"S"}',
