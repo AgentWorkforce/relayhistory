@@ -57,6 +57,9 @@ database operation run by an operator holding the database credentials. There is
 unauthenticated HTTP bootstrap endpoint: `POST /v1/auth/service-tokens` requires an
 existing credential and only narrows it, so nothing reachable from the network creates
 a token without already holding one, and the hosted `/v1/admin/mint` stays disabled.
+Service tokens are independent credentials, as in the hosted service: a token minted by
+another service token cannot outlive its parent's expiry, but revocation is per token
+and does not cascade.
 
 The main entry is runtime-neutral (Web APIs only) so it bundles for Workers; the Node
 migration runner is the separate `@relayhistory/engine/migrations` entry.
