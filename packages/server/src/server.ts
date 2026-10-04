@@ -52,10 +52,11 @@ export async function startServer(
     log,
   });
   const embeddings = embeddingProviderFromEnv(config.embeddings);
+  const readiness = databaseReadiness(config.databaseUrl);
   let accepting = false;
   const app = createServerApp({
     db: database.db,
-    databaseReady: databaseReadiness(config.databaseUrl),
+    databaseReady: readiness,
     embeddings,
     log,
     accepting: () => accepting,
@@ -117,7 +118,7 @@ export async function startServer(
       const cleanupMs = cleanupBudgetMs(deadline, Date.now());
       let expire: NodeJS.Timeout | undefined;
       const drained = await Promise.race([
-        Promise.all(jobs.map((job) => job.stop()))
+        Promise.all([...jobs.map((job) => job.stop()), readiness.close()])
           .then(() => database.close())
           .then(() => true),
         new Promise<boolean>((resolve) => {
