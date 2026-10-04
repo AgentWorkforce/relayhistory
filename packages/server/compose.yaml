@@ -43,7 +43,8 @@ services:
         - CMD
         - node
         - -e
-        - "fetch('http://127.0.0.1:8080/ready').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"
+        # The same probe as the image's: whatever port the server was told to use.
+        - "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/ready').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"
       interval: 10s
       timeout: 3s
       retries: 3
