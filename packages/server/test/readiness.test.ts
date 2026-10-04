@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { databaseReadiness } from "../src/readiness.js";
 
 /** Just enough of the PostgreSQL wire protocol to misbehave in chosen ways. */
-type Mode = "blackhole" | "silent-after-connect" | "healthy";
+type Mode = "blackhole" | "silent-after-connect" | "healthy" | "recovering";
 const AUTH_OK = Buffer.from([0x52, 0, 0, 0, 8, 0, 0, 0, 0]);
 const READY = Buffer.from([0x5a, 0, 0, 0, 5, 0x49]);
 const SELECT_DONE = (() => {
@@ -21,6 +21,9 @@ async function fakePostgres(mode: Mode) {
   let closed = 0;
   const server = net.createServer((socket) => {
     accepted += 1;
+    // "recovering": the first connection goes silent after connecting, later ones answer.
+    const answers =
+      mode === "healthy" || (mode === "recovering" && accepted > 1);
     sockets.add(socket);
     socket.on("error", () => {});
     socket.on("close", () => {
@@ -35,7 +38,7 @@ async function fakePostgres(mode: Mode) {
         socket.write(Buffer.concat([AUTH_OK, READY]));
         return;
       }
-      if (mode === "healthy" && chunk[0] === 0x51) socket.write(SELECT_DONE);
+      if (answers && chunk[0] === 0x51) socket.write(SELECT_DONE);
     });
   });
   server.listen(0, "127.0.0.1");
@@ -86,6 +89,17 @@ describe("databaseReadiness", () => {
     await settle();
     expect(pgFake.closed()).toBe(1);
     expect(await ready()).toBe(false);
+    expect(pgFake.accepted()).toBe(2);
+  });
+
+  it("a probe right after a timeout recovers on a fresh connection", async () => {
+    const pgFake = await fakePostgres("recovering");
+    stop = pgFake.stop;
+    const ready = databaseReadiness(pgFake.url, 300);
+    expect(await ready()).toBe(false);
+    // Immediately, while the timed-out attempt is still settling.
+    expect(await ready()).toBe(true);
+    expect(await ready()).toBe(true);
     expect(pgFake.accepted()).toBe(2);
   });
 

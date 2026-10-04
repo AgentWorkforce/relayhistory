@@ -24,45 +24,53 @@ export function databaseReadiness(
   url: string,
   timeoutMs = READINESS_TIMEOUT_MS,
 ): DatabaseReadiness {
-  let client: pg.Client | undefined;
-  let socket: Socket | undefined;
+  /** The readiness connection: its client, the socket it owns, and its connect. */
+  interface Connection {
+    client: pg.Client;
+    socket: Socket;
+    connected: Promise<unknown>;
+  }
+  let current: Connection | undefined;
   let inFlight: Promise<boolean> | undefined;
 
-  const drop = () => {
-    socket?.destroy();
-    socket = undefined;
-    client = undefined;
+  // Tear down a connection only if it is still the current one: a timed-out check's
+  // late failure must never destroy the connection a newer probe has opened since.
+  const drop = (connection: Connection) => {
+    connection.socket.destroy();
+    if (current === connection) current = undefined;
   };
 
-  const query = async () => {
-    if (!client) {
-      const own = new Socket();
-      const fresh = new pg.Client({
-        connectionString: url,
-        application_name: "relayhistory-ready",
-        statement_timeout: timeoutMs,
-        stream: () => own,
-      });
-      // Errors after a check settles (a dropped or destroyed socket) are expected.
-      fresh.on("error", () => {});
-      socket = own;
-      client = fresh;
-      await fresh.connect();
-    }
-    await client.query("SELECT 1");
-    return true;
+  const open = (): Connection => {
+    const socket = new Socket();
+    const client = new pg.Client({
+      connectionString: url,
+      application_name: "relayhistory-ready",
+      statement_timeout: timeoutMs,
+      stream: () => socket,
+    });
+    // Errors after a check settles (a dropped or destroyed socket) are expected.
+    client.on("error", () => {});
+    const connected = client.connect();
+    connected.catch(() => {});
+    return { client, socket, connected };
   };
 
   const check = async () => {
+    const connection = (current ??= open());
     let timer: NodeJS.Timeout | undefined;
+    // One deadline covers connecting and the query.
     const deadline = new Promise<boolean>((resolve) => {
       timer = setTimeout(() => {
-        drop();
+        drop(connection);
         resolve(false);
       }, timeoutMs);
     });
-    const attempt = query().catch(() => {
-      drop();
+    const attempt = (async () => {
+      await connection.connected;
+      await connection.client.query("SELECT 1");
+      return true;
+    })().catch(() => {
+      drop(connection);
       return false;
     });
     try {
@@ -78,17 +86,17 @@ export function databaseReadiness(
     }))) as DatabaseReadiness;
 
   ready.close = async () => {
-    const closing = client;
+    const closing = current;
     if (!closing) return;
     let timer: NodeJS.Timeout | undefined;
     await Promise.race([
-      closing.end().catch(() => {}),
+      closing.client.end().catch(() => {}),
       new Promise<void>((resolve) => {
         timer = setTimeout(resolve, timeoutMs);
       }),
     ]);
     clearTimeout(timer);
-    drop();
+    drop(closing);
   };
 
   return ready;

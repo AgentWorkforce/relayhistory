@@ -75,6 +75,12 @@ the image names it; on bare Node run `node dist/cli.js` from `packages/server`.
 | `EMBEDDING_API_KEY` or `OPENAI_API_KEY` | unset                                                | Optional embeddings for `POST /v1/ingest`; upload and recall never need them                                                                |
 | `EMBEDDING_API_URL`, `EMBEDDING_MODEL`  | OpenAI defaults                                      | OpenAI-compatible embedding endpoint                                                                                                        |
 
+Each server uses up to `RELAYHISTORY_DB_POOL_MAX` request connections, one long-lived
+connection for `/ready` (opened on the first probe and reused, so readiness needs no free
+slot later), and one short-lived connection while it applies migrations at start (as do
+`migrate` and `token` commands). Size PostgreSQL's `max_connections` for
+`replicas × (RELAYHISTORY_DB_POOL_MAX + 2)` plus your other clients.
+
 Logs are JSON lines on stderr. They never contain tokens, the database URL, request
 bodies or driver error text.
 
