@@ -21,9 +21,9 @@ const migrations: Migration[] = readMigrations();
 let database: FreshDatabase;
 let client: FreshDatabase;
 async function run(input = migrations, runtimeRole?: string) {
-  await database.transaction(async (tx) => {
+  await database.transaction(async (query) => {
     for (const statement of migrationStatements(input, runtimeRole))
-      await tx.query(statement);
+      await query(statement);
   });
   // A deploy runs the 0029 rollout after its migrations; the projections go live there.
   if (input.some((m) => m.name.startsWith("0029_"))) {
