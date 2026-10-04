@@ -15,6 +15,14 @@ import { openDatabase, prepareDatabase } from "./database.js";
 import { startJob, type RunningJob } from "./jobs.js";
 import type { Logger } from "./log.js";
 
+/** Minimum time to stop jobs and close the pool once requests are done. */
+export const CLEANUP_GRACE_MS = 5_000;
+
+/** Time left to stop jobs and close the pool: the rest of the deadline, at least the grace. */
+export function cleanupBudgetMs(deadline: number, now: number): number {
+  return Math.max(CLEANUP_GRACE_MS, deadline - now);
+}
+
 export interface RunningServer {
   /** The bound port (useful when `PORT=0`). */
   port: number;
@@ -100,23 +108,25 @@ export async function startServer(
       );
       await closed;
       clearTimeout(cutoff);
-      // A job or pool connection stuck on the database must not hold the process past
-      // the deadline; its work is bounded and resumes from PostgreSQL on the next start.
+      // Requests get the shutdown timeout; stopping jobs and closing the pool then get
+      // whatever is left of it, but never less than a short grace of their own, so
+      // connections forced closed at the deadline do not turn a prompt cleanup into a
+      // reported stall. A job or connection stuck on the database still cannot hold the
+      // process: its work is bounded and resumes from PostgreSQL on the next start.
+      const cleanupMs = cleanupBudgetMs(deadline, Date.now());
       let expire: NodeJS.Timeout | undefined;
       const drained = await Promise.race([
         Promise.all(jobs.map((job) => job.stop()))
           .then(() => database.close())
           .then(() => true),
         new Promise<boolean>((resolve) => {
-          expire = setTimeout(
-            () => resolve(false),
-            Math.max(0, deadline - Date.now()),
-          );
+          expire = setTimeout(() => resolve(false), cleanupMs);
         }),
       ]);
       clearTimeout(expire);
       if (drained) log.info("stopped");
-      else log.warn("shutdown deadline passed with database work in progress");
+      else
+        log.warn("shutdown cleanup timed out with database work in progress");
       return drained;
     })());
 
