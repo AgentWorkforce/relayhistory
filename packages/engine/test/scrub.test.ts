@@ -625,18 +625,24 @@ describe("hosted ingest scrubbing", () => {
       expect(medianCost(gen(MAX_SCRUB_CHARS), 3)).toBeLessThan(1_000);
     });
 
-    // Each failed read here gets one re-read of up to SUBSTITUTION_WINDOW (W), so the
-    // cost is linear with a fixed multiplier of about W / u fresh characters per input
-    // character, u being the unit that makes one failed read. Measured: about 53 for
-    // the keyed serialized unit (u ≈ 74, about 195ms standalone at the 256 KiB cap)
-    // and about 28 for the short-region unit (u ≈ 147, about 109ms). Both run at 64
-    // and 128 KiB, where a superlinear cost would show as 4x, not 2x.
+    // Each failed read here gets a re-read of up to SUBSTITUTION_WINDOW, so these cost
+    // a fixed multiple of their size. Measured fresh characters scanned per input
+    // character, and standalone time at 128 KiB: keyed serialized lines about 53 and
+    // 65ms, short serialized failed reads about 72 and 99ms, short regions about 28
+    // and 37ms. The test keeps both sizes under the budget.
     it.each<[string, (n: number) => string]>([
       [
         "keyed headers on serialized lines cut at their string's close",
         (n) =>
           'Authorization: Basic $(oops\n\')"Authorization": "Basic $(q","k":1}\n{"m":"\\n'
             .repeat(n / 74)
+            .slice(0, n),
+      ],
+      [
+        "short serialized failed reads, each with a re-read",
+        (n) =>
+          `Authorization:$(\n${'\\nAuthorization:$(\\nAuthorization:$(,Authorization:$("}\n'.repeat(73)}`
+            .repeat(Math.ceil(n / 4105))
             .slice(0, n),
       ],
       [
@@ -2603,6 +2609,48 @@ describe("hosted ingest scrubbing", () => {
       expect(
         scrubText(`${unit}$(printf 'admin:x' | base64)\nBenign: keep\nHost: x`),
       ).toBe("Authorization: Basic [REDACTED]\nBenign: keep\nHost: x");
+    });
+
+    it("reads a header a re-read reached past its cut as the main pass would", () => {
+      // D F1 (round 20): the re-read at the string's close does not close and reaches
+      // the line's break; the header after the close on that line is read against the
+      // main pass's regions too, not only the sweep's stale nested one.
+      const prefix = (pad: number) =>
+        `Authorization: Basic $(a\n,Authorization: b) ,Authorization: Basic $(n\n${"x".repeat(pad)}\n` +
+        '{"m":"x\\nAuthorization: Basic $(q\\nAuthorization: Basic $(r\\nAuthorization: Basic $(s ,Authorization: Basic $(h","k":1} ';
+      const f1 = (pad: number) =>
+        `${prefix(pad)},Authorization: Basic $(printf 'admin:yyyyyyyyyy\nS3cret' | base64)\nHost: x`;
+      const exact = scrubText(f1(3940));
+      expect(exact).not.toContain("S3cret");
+      expect(exact).toContain("\nHost: x");
+      let neverCloses = 0;
+      let neverClosesFar = 0;
+      for (let pad = 3800; pad <= 4100; pad += 1) {
+        const out = scrubText(f1(pad));
+        expect(out, `pad ${pad}`).not.toContain("S3cret");
+        expect(out, `pad ${pad}`).toContain("\nHost: x");
+        // The re-read's own text past the cut stays redacted.
+        expect(
+          scrubText(`${prefix(pad)}-u admin:S3cret\nHost: x`),
+          `pad ${pad}`,
+        ).not.toContain("S3cret");
+        // A header there that never closes keeps 2c9531a4's fail-closed reach.
+        const tail = `,Authorization: Basic $(printf 'admin:yyyyyyyyyy\n`;
+        if (
+          scrubText(`${prefix(pad)}${tail}S3cret\nmore\nHost: x`).includes(
+            "S3cret",
+          )
+        )
+          neverCloses += 1;
+        if (
+          scrubText(
+            `${prefix(pad)}${tail}${"z".repeat(40)}\nS3cret\nHost: x`,
+          ).includes("S3cret")
+        )
+          neverClosesFar += 1;
+      }
+      expect(neverCloses).toBe(177);
+      expect(neverClosesFar).toBe(218);
     });
 
     it("re-reads a straddler cut at a string's close or at the end of a region", () => {
