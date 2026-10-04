@@ -11,6 +11,32 @@ import { tokenCommand } from "../src/token-command.js";
 
 const adminUrl = process.env.TEST_ADMIN_DATABASE_URL;
 
+const EVERY_PRIVILEGE = {
+  schema_usage: true,
+  select: true,
+  insert: true,
+  update: true,
+  delete: true,
+};
+
+/**
+ * The role's schema usage, and each table privilege held on every `sessions` table
+ * (the migration ledger aside), each checked on its own.
+ */
+async function privileges(client: pg.Client, role: string) {
+  const { rows } = await client.query(
+    `SELECT has_schema_privilege($1, 'sessions', 'USAGE') AS schema_usage,
+            bool_and(has_table_privilege($1, t.oid, 'SELECT')) AS select,
+            bool_and(has_table_privilege($1, t.oid, 'INSERT')) AS insert,
+            bool_and(has_table_privilege($1, t.oid, 'UPDATE')) AS update,
+            bool_and(has_table_privilege($1, t.oid, 'DELETE')) AS delete
+       FROM pg_class t JOIN pg_namespace n ON n.oid = t.relnamespace
+      WHERE n.nspname = 'sessions' AND t.relkind IN ('r', 'p') AND t.relname <> '__migrations'`,
+    [role],
+  );
+  return rows[0];
+}
+
 describe.skipIf(!adminUrl)("token command on a fresh database", () => {
   const suffix = randomBytes(4).toString("hex");
   const name = `rh_token_cmd_${suffix}`;
@@ -56,12 +82,14 @@ describe.skipIf(!adminUrl)("token command on a fresh database", () => {
     const check = new pg.Client({ connectionString: url });
     await check.connect();
     try {
-      const { rows } = await check.query(
-        `SELECT has_schema_privilege($1, 'sessions', 'USAGE') AS schema_usage,
-                has_table_privilege($1, 'sessions.auth_sessions', 'SELECT,INSERT,UPDATE,DELETE') AS tables`,
-        [role],
-      );
-      expect(rows[0]).toEqual({ schema_usage: true, tables: true });
+      expect(await privileges(check, role)).toEqual(EVERY_PRIVILEGE);
+      // has_table_privilege with a comma list is true if ANY is held, so each privilege
+      // is checked alone; prove that by revoking one and seeing exactly it go missing.
+      await check.query(`REVOKE DELETE ON sessions.auth_sessions FROM ${role}`);
+      expect(await privileges(check, role)).toEqual({
+        ...EVERY_PRIVILEGE,
+        delete: false,
+      });
     } finally {
       await check.end();
     }
