@@ -15,7 +15,7 @@ export function createLogger(
     (level: string) =>
     (message: string, fields: Record<string, unknown> = {}) =>
       write(
-        `${JSON.stringify({ time: new Date().toISOString(), level, message, ...fields })}\n`,
+        `${JSON.stringify({ ...fields, time: new Date().toISOString(), level, message })}\n`,
       );
   return { info: emit("info"), warn: emit("warn"), error: emit("error") };
 }

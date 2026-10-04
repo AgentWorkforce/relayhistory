@@ -93,6 +93,17 @@ describe("config", () => {
   it("requires https except on loopback or by explicit opt-in", () => {
     expect(() => parseEndpoint("http://history.example.com")).toThrow(/https/);
     expect(parseEndpoint("http://127.0.0.1:8080").port).toBe("8080");
+    for (const host of [
+      "http://localhost",
+      "http://127.0.0.2",
+      "http://[::1]:8080",
+      "http://[::ffff:127.0.0.1]:8080",
+    ])
+      expect(parseEndpoint(host).protocol, host).toBe("http:");
+    expect(() => parseEndpoint("http://[::ffff:10.0.0.1]")).toThrow(/https/);
+    expect(() => parseEndpoint("http://127.0.0.1.example.com")).toThrow(
+      /https/,
+    );
     expect(parseEndpoint("http://history.lan", true).protocol).toBe("http:");
     expect(() => parseEndpoint("https://user:pw@h.example.com")).toThrow(
       /credentials/,

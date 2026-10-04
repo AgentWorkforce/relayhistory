@@ -60,6 +60,8 @@ const SELECTION_FIELDS = [
 const LABEL = /^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$/;
 const DEFAULT_MAX_RECORDS = 100;
 const DEFAULT_MAX_BYTES = 1_048_576;
+/** Below this no batch envelope plus one ordinary record fits. */
+const MIN_MAX_BYTES = 4_096;
 
 function object(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -133,8 +135,12 @@ export function parseSelection(value: unknown): HistoryExportSelection {
   };
 }
 
+/** `localhost`, 127.0.0.0/8, `[::1]`, or an IPv4-mapped loopback (`[::ffff:7f00:1]`). */
 function loopback(url: URL) {
-  return ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+  const host = url.hostname;
+  if (host === "localhost" || host === "[::1]") return true;
+  if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
+  return /^\[::ffff:7f[0-9a-f]{2}:[0-9a-f]{1,4}\]$/.test(host);
 }
 
 function bound(
@@ -142,15 +148,16 @@ function bound(
   fallback: number,
   max: number,
   field: string,
+  min = 1,
 ): number {
   if (value === undefined) return fallback;
   if (
     !Number.isSafeInteger(value) ||
-    (value as number) < 1 ||
+    (value as number) < min ||
     (value as number) > max
   )
     throw new ConfigError(
-      `limits.${field} must be an integer from 1 to ${max}`,
+      `limits.${field} must be an integer from ${min} to ${max}`,
     );
   return value as number;
 }
@@ -292,6 +299,7 @@ export async function loadConfig(path: string): Promise<UploaderConfig> {
         DEFAULT_MAX_BYTES,
         16_777_216,
         "maxBytes",
+        MIN_MAX_BYTES,
       ),
     },
   };

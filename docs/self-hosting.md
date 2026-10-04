@@ -136,7 +136,9 @@ cat > upload.json <<'JSON'
   "instanceId": "laptop",
   "selection": {
     "all_sources": false, "sources": ["claude"], "sessions": [],
-    "kinds": ["session", "session_event", "tool_call", "file_edit", "history"],
+    "kinds": ["session", "session_event", "tool_call", "file_edit", "session_marker",
+              "relationship", "history", "presence", "commit_link", "trajectory",
+              "source_observation", "observation_evidence"],
     "excluded_sessions": [{ "source": "claude", "session_id": "private-session-id" }]
   }
 }

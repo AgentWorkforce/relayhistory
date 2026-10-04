@@ -62,7 +62,8 @@ describe("feed records match export records", () => {
     try {
       await sync({ dbPath });
     } finally {
-      process.env.HOME = saved;
+      if (saved === undefined) delete process.env.HOME;
+      else process.env.HOME = saved;
     }
   });
   afterAll(() => rm(root, { recursive: true, force: true }));

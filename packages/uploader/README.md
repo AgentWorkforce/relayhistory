@@ -31,7 +31,10 @@ It reads the store only through the public `ai-hist` SDK change feed
       "relationship",
       "history",
       "presence",
-      "commit_link"
+      "commit_link",
+      "trajectory",
+      "source_observation",
+      "observation_evidence"
     ],
     "excluded_sessions": []
   }
@@ -70,10 +73,11 @@ retryable (server unreachable, rate limited, or a signal during an upload); `2` 
 ## Guarantees
 
 - **Receipt before cursor.** The cursor is a named consumer inside the local store. A
-  page moves it only after every selected record on the page has a durable receipt for
-  exactly the batch sent — matching batch id, every revision accepted, nothing
-  unsupported. A crash or a lost response leaves the cursor where it was; the next run
-  resends the same batch identities and the server replays its receipts.
+  page moves it only after each selected record on the page either has a durable receipt
+  for exactly the batch sent (matching batch id, every revision accepted, nothing
+  unsupported) or was quarantined because the server proved it already holds different
+  content at that revision. A crash or a lost response leaves the cursor where it was;
+  the next run resends the same batch identities and the server replays its receipts.
 - **Isolation.** The cursor is per endpoint, account and selection. Another endpoint or
   account never moves it. Changing the selection starts a new cursor from the beginning
   of the local feed, so newly selected history is backfilled and already-sent records
@@ -86,10 +90,10 @@ retryable (server unreachable, rate limited, or a signal during an upload); `2` 
   proves it holds with different content at that revision, using the SDK's recovery
   helper, and delivers the rest.
 - **Deletions.** A local deletion is forwarded as a tombstone only for a session the
-  selection names (or a whole selected source). A relationship's deletion, which does
-  not carry its child, is held back while its source has excluded sessions. Removing a
-  session from the selection, or excluding it, stops future uploads; it never deletes
-  what the server already holds.
+  selection names (or a whole selected source). A tombstone carries only the record's
+  identity; a relationship's identity is its source, parent session and relationship id,
+  so its deletion never names the child. Removing a session from the selection, or
+  excluding it, stops future uploads; it never deletes what the server already holds.
 - **Retries.** Transient failures and `429` back off exponentially with jitter, honoring
   `Retry-After`.
 - **Secrets.** The token is sent only in the `Authorization` header and never logged.
@@ -104,6 +108,11 @@ selections to the real self-hosted server and checks recall, incremental upload,
 lost-response replay, account mismatch, per-account cursors, restart persistence,
 selection backfill and that no token appears in any output.
 
+It needs the engine and server built and a PostgreSQL role that may `CREATE DATABASE`:
+
 ```bash
+npm ci --prefix ../engine && npm run --prefix ../engine build
+(cd ../server && npm ci && npm run build)
+npm ci && npm run build
 node scripts/e2e.mjs --admin-url postgres://postgres@127.0.0.1:5432/postgres
 ```

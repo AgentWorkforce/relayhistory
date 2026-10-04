@@ -90,17 +90,23 @@ const sha256 = (value: string) =>
 const encoder = new TextEncoder();
 
 /**
- * The store cursor's name. It digests the endpoint, the account and the selection:
- * another endpoint or account never moves this cursor, and a changed selection starts
+ * The store cursor's name: a digest of the endpoint, the account and the selection.
+ * Another endpoint or account never moves this cursor, and a changed selection starts
  * a new one from the beginning of the feed, so newly selected history is backfilled.
- * Neither the token nor the account appears in it.
+ * The account and endpoint are hashed in, never spelled out; the token is not part of
+ * it at all, so rotating a token keeps the cursor.
  */
 export function consumerName(
   config: Pick<UploaderConfig, "endpoint" | "accountId" | "selection">,
 ): string {
   const selection = config.selection;
+  // Compare fields, not joined strings: identities may contain commas.
   const sortedIds = (ids: HistoryExportSelection["sessions"]) =>
-    [...ids].map((id) => [id.source, id.session_id]).sort();
+    [...ids]
+      .map((id) => [id.source, id.session_id])
+      .sort(([a, b], [c, d]) =>
+        a < c ? -1 : a > c ? 1 : b < d ? -1 : b > d ? 1 : 0,
+      );
   const identity = canonicalDeliveryJson([
     "relayhistory-upload-v1",
     endpointBase(config.endpoint),
@@ -161,7 +167,7 @@ export function cutBatches(
   let current: HistoryExportRecord[] = [];
   let bytes = envelope;
   for (const record of records) {
-    const size = encoder.encode(JSON.stringify(record)).length + 1;
+    const size = encoder.encode(JSON.stringify(record)).length;
     if (envelope + size > limits.maxBytes)
       throw new UploadError(
         "invalid_payload",
@@ -169,14 +175,16 @@ export function cutBatches(
       );
     if (
       current.length &&
-      (current.length >= limits.maxRecords || bytes + size > limits.maxBytes)
+      (current.length >= limits.maxRecords ||
+        bytes + size + 1 > limits.maxBytes)
     ) {
       batches.push(batchFor(config, consumer, originId, current));
       current = [];
       bytes = envelope;
     }
+    // A comma separates each record after the first.
+    bytes += current.length ? size + 1 : size;
     current.push(record);
-    bytes += size;
   }
   if (current.length)
     batches.push(batchFor(config, consumer, originId, current));
@@ -325,7 +333,10 @@ export async function upload(options: UploadOptions): Promise<UploadSummary> {
       // A dry run never commits, so it walks forward from the cursor by position.
       ...(options.dryRun && position ? { from: position } : { consumer }),
     });
-    if (page.changes.length === 0) break;
+    if (page.changes.length === 0) {
+      summary.cursor ??= page.position;
+      break;
+    }
     const originId = page.head.epoch;
     if (page.position.epoch !== originId)
       throw new UploadError(

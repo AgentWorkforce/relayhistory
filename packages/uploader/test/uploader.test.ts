@@ -68,36 +68,51 @@ describe("selection", () => {
     expect(selected(relationship, excluding)).toBe(false);
   });
 
-  it("holds back a relationship deletion whose child could be excluded", () => {
+  it("a relationship deletion follows its parent and names no child", () => {
+    const withRelationships = {
+      ...selection,
+      kinds: [...selection.kinds, "relationship" as const],
+      excluded_sessions: [{ source: "claude", session_id: "private" }],
+    };
     const deletion = change(1, {
       kind: "relationship",
       op: "delete",
       sessionId: "picked",
     });
-    expect(selected(deletion, selection)).toBe(true);
-    const excluding = {
-      ...selection,
-      excluded_sessions: [{ source: "claude", session_id: "private" }],
-    };
-    expect(selected(deletion, excluding)).toBe(false);
-    const otherSource = {
-      ...selection,
-      excluded_sessions: [{ source: "codex", session_id: "private" }],
-    };
-    expect(selected(deletion, otherSource)).toBe(true);
+    expect(selected(deletion, withRelationships)).toBe(true);
+    const record = deliveryRecord(deletion, "00000000000000aa");
+    expect(record.payload).toBeNull();
+    expect(JSON.stringify(record)).not.toContain("private");
+    expect(
+      selected({ ...deletion, sessionId: "other" }, withRelationships),
+    ).toBe(false);
   });
 
   it("forwards a deletion only when the selection can attribute it", () => {
+    const withHistory = {
+      ...selection,
+      kinds: [...selection.kinds, "history" as const],
+    };
     const unattributed = change(1, {
       kind: "history",
       sessionId: "",
       op: "delete",
     });
-    expect(selected(unattributed, selection)).toBe(false);
-    expect(selected(unattributed, { ...selection, sources: ["claude"] })).toBe(
-      true,
-    );
+    expect(selected(unattributed, withHistory)).toBe(false);
+    expect(
+      selected(unattributed, { ...withHistory, sources: ["claude"] }),
+    ).toBe(true);
     expect(selected(change(2, { op: "delete" }), selection)).toBe(true);
+  });
+
+  it("admits only the selected kinds", () => {
+    expect(selected(change(1, { kind: "tool_call" }), selection)).toBe(false);
+    expect(
+      selected(change(2, { kind: "tool_call" }), {
+        ...selection,
+        kinds: ["tool_call"],
+      }),
+    ).toBe(true);
   });
 });
 
@@ -357,6 +372,43 @@ describe("upload", () => {
       expect(feed.commits).toHaveLength(1);
     },
   );
+
+  it("retries a 408 like any other transient failure", async () => {
+    const feed = new MemoryFeed([change(1)]);
+    const fake = server((body, attempt) =>
+      attempt === 1
+        ? json({ error: { code: "timeout" } }, 408)
+        : json(receiptFor(body)),
+    );
+    await upload({
+      config: config(),
+      log: silentLogger,
+      feed,
+      fetch: fake.fetch,
+      sleep: noSleep,
+    });
+    expect(feed.commits).toHaveLength(1);
+  });
+
+  it("reports the existing cursor on a run with nothing new", async () => {
+    const feed = new MemoryFeed([change(1)]);
+    const fake = server();
+    await upload({
+      config: config(),
+      log: silentLogger,
+      feed,
+      fetch: fake.fetch,
+      sleep: noSleep,
+    });
+    const idle = await upload({
+      config: config(),
+      log: silentLogger,
+      feed,
+      fetch: fake.fetch,
+      sleep: noSleep,
+    });
+    expect(idle.cursor).toEqual({ epoch: feed.epoch, revision: 1 });
+  });
 
   it("keeps the cursor when retries run out, and the next run resends the same batch", async () => {
     const feed = new MemoryFeed([change(1), change(2)]);

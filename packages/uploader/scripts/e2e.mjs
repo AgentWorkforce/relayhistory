@@ -56,208 +56,220 @@ async function freePort() {
 }
 
 // --- local stores --------------------------------------------------------------
-const root = await mkdtemp(join(tmpdir(), "rh-upload-e2e-"));
-const tag = randomBytes(3).toString("hex");
-
-function transcriptLines(sessionId, texts, startMs) {
-  let parent = null;
-  return texts.map((text, index) => {
-    const uuid = `${sessionId}-${index}`;
-    const role = index % 2 === 0 ? "user" : "assistant";
-    const line = {
-      type: role,
-      uuid,
-      ...(parent ? { parentUuid: parent } : {}),
-      sessionId,
-      cwd: "/work/selfhost",
-      timestamp: new Date(startMs + index * 1_000).toISOString(),
-      message:
-        role === "user"
-          ? { role, content: text }
-          : { role, model: "claude-test", content: [{ type: "text", text }] },
-    };
-    parent = uuid;
-    return JSON.stringify(line);
-  });
-}
-
-async function machine(name, sessions) {
-  const home = join(root, name, "home");
-  const project = join(home, ".claude", "projects", "work-selfhost");
-  await mkdir(project, { recursive: true });
-  const files = {};
-  for (const [sessionId, texts, startMs] of sessions) {
-    files[sessionId] = join(project, `${sessionId}.jsonl`);
-    await writeFile(
-      files[sessionId],
-      `${transcriptLines(sessionId, texts, startMs).join("\n")}\n`,
-    );
-  }
-  const dbPath = join(root, name, "ai-history.db");
-  const capture = async () => {
-    const saved = process.env.HOME;
-    process.env.HOME = home;
-    try {
-      await sync({ dbPath });
-    } finally {
-      process.env.HOME = saved;
-    }
-  };
-  await capture();
-  return { name, home, dbPath, files, capture };
-}
-
-const word = `quokka${tag}`;
-const A = {
-  shared: `a-shared-${tag}`,
-  private: `a-private-${tag}`,
-};
-const B = {
-  feature: `b-feature-${tag}`,
-  secret: `b-secret-${tag}`,
-};
-const laptop = await machine("laptop", [
-  [
-    A.shared,
-    ["Outline the self-host guide", "Outlined the guide", "Add backups"],
-    Date.UTC(2026, 9, 1, 9),
-  ],
-  [
-    A.private,
-    ["Personal notes that stay local", "Understood"],
-    Date.UTC(2026, 9, 1, 10),
-  ],
-]);
-const desktop = await machine("desktop", [
-  [
-    B.feature,
-    [
-      `Why does the ${word} job stall`,
-      `The ${word} job waits on a lock`,
-      "Release it",
-    ],
-    Date.UTC(2026, 9, 2, 9),
-  ],
-  [B.secret, ["Credentials rotation notes", "Noted"], Date.UTC(2026, 9, 2, 10)],
-]);
-step(
-  "two machines captured sessions into their own local stores through the SDK",
-);
-
-// --- server ----------------------------------------------------------------------
-const dbName = `rh_upload_e2e_${tag}`;
-const admin = new pg.Client({ connectionString: adminUrl });
-await admin.connect();
-await admin.query(`CREATE DATABASE ${dbName}`);
-const databaseUrl = new URL(adminUrl);
-databaseUrl.pathname = `/${dbName}`;
-const serverEnv = {
-  ...process.env,
-  DATABASE_URL: databaseUrl.toString(),
-  HOST: "127.0.0.1",
-};
-const port = await freePort();
-const endpoint = `http://127.0.0.1:${port}`;
+// Everything the run creates is released in the final block, setup failures included.
+let root;
+let admin;
+let dbName;
+let dbCreated = false;
 let server;
 let serverLog = "";
-
-async function startServer() {
-  server = spawn(process.execPath, [serverCli, "serve"], {
-    env: { ...serverEnv, PORT: String(port) },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  server.stdout.on("data", (chunk) => (serverLog += chunk));
-  server.stderr.on("data", (chunk) => (serverLog += chunk));
-  for (let i = 0; i < 240; i += 1) {
-    try {
-      if ((await fetch(`${endpoint}/ready`)).ok) return;
-    } catch {}
-    await new Promise((done) => setTimeout(done, 250));
-  }
-  throw new Error("server did not become ready");
-}
-async function stopServer() {
-  const exited = once(server, "exit");
-  server.kill("SIGTERM");
-  const [code] = await exited;
-  assert.equal(code, 0);
-}
-
-async function mint(org, label, scopes) {
-  const out = join(root, `${label}-token.json`);
-  await run(
-    process.execPath,
-    [
-      serverCli,
-      "token",
-      "create",
-      "--org",
-      org,
-      "--workspace",
-      "main",
-      "--label",
-      label,
-      "--scopes",
-      scopes,
-      "--out",
-      out,
-    ],
-    { env: serverEnv },
-  );
-  const file = JSON.parse(await readFile(out, "utf8"));
-  secrets.push(file.token);
-  return { path: out, ...file };
-}
-
-async function api(path, token) {
-  const response = await fetch(`${endpoint}${path}`, {
-    headers: { authorization: `Bearer ${token}` },
-  });
-  assert.equal(response.status, 200, `${path} -> ${response.status}`);
-  return response.json();
-}
-
-// --- uploader ----------------------------------------------------------------------
-const ALL_KINDS = [
-  "session",
-  "session_event",
-  "tool_call",
-  "file_edit",
-  "session_marker",
-  "relationship",
-  "history",
-  "presence",
-  "commit_link",
-  "trajectory",
-  "source_observation",
-  "observation_evidence",
-];
-
-async function writeConfig(name, body) {
-  const path = join(root, `${name}.json`);
-  await writeFile(path, JSON.stringify(body, null, 2));
-  return path;
-}
-
-async function upload(configPath, ...flags) {
-  const child = spawn(
-    process.execPath,
-    [uploaderCli, "run", "--config", configPath, ...flags],
-    { stdio: ["ignore", "pipe", "pipe"] },
-  );
-  let stdout = "";
-  let stderr = "";
-  child.stdout.on("data", (chunk) => (stdout += chunk));
-  child.stderr.on("data", (chunk) => (stderr += chunk));
-  const [code] = await once(child, "exit");
-  transcripts.push(stdout, stderr);
-  const summary = stdout.trim()
-    ? JSON.parse(stdout.trim().split("\n").at(-1))
-    : null;
-  return { code, summary, stderr };
-}
-
 try {
+  root = await mkdtemp(join(tmpdir(), "rh-upload-e2e-"));
+  const tag = randomBytes(3).toString("hex");
+
+  function transcriptLines(sessionId, texts, startMs) {
+    let parent = null;
+    return texts.map((text, index) => {
+      const uuid = `${sessionId}-${index}`;
+      const role = index % 2 === 0 ? "user" : "assistant";
+      const line = {
+        type: role,
+        uuid,
+        ...(parent ? { parentUuid: parent } : {}),
+        sessionId,
+        cwd: "/work/selfhost",
+        timestamp: new Date(startMs + index * 1_000).toISOString(),
+        message:
+          role === "user"
+            ? { role, content: text }
+            : { role, model: "claude-test", content: [{ type: "text", text }] },
+      };
+      parent = uuid;
+      return JSON.stringify(line);
+    });
+  }
+
+  async function machine(name, sessions) {
+    const home = join(root, name, "home");
+    const project = join(home, ".claude", "projects", "work-selfhost");
+    await mkdir(project, { recursive: true });
+    const files = {};
+    for (const [sessionId, texts, startMs] of sessions) {
+      files[sessionId] = join(project, `${sessionId}.jsonl`);
+      await writeFile(
+        files[sessionId],
+        `${transcriptLines(sessionId, texts, startMs).join("\n")}\n`,
+      );
+    }
+    const dbPath = join(root, name, "ai-history.db");
+    const capture = async () => {
+      const saved = process.env.HOME;
+      process.env.HOME = home;
+      try {
+        await sync({ dbPath });
+      } finally {
+        process.env.HOME = saved;
+      }
+    };
+    await capture();
+    return { name, home, dbPath, files, capture };
+  }
+
+  const word = `quokka${tag}`;
+  const A = {
+    shared: `a-shared-${tag}`,
+    private: `a-private-${tag}`,
+  };
+  const B = {
+    feature: `b-feature-${tag}`,
+    secret: `b-secret-${tag}`,
+  };
+  const laptop = await machine("laptop", [
+    [
+      A.shared,
+      ["Outline the self-host guide", "Outlined the guide", "Add backups"],
+      Date.UTC(2026, 9, 1, 9),
+    ],
+    [
+      A.private,
+      ["Personal notes that stay local", "Understood"],
+      Date.UTC(2026, 9, 1, 10),
+    ],
+  ]);
+  const desktop = await machine("desktop", [
+    [
+      B.feature,
+      [
+        `Why does the ${word} job stall`,
+        `The ${word} job waits on a lock`,
+        "Release it",
+      ],
+      Date.UTC(2026, 9, 2, 9),
+    ],
+    [
+      B.secret,
+      ["Credentials rotation notes", "Noted"],
+      Date.UTC(2026, 9, 2, 10),
+    ],
+  ]);
+  step(
+    "two machines captured sessions into their own local stores through the SDK",
+  );
+
+  // --- server ----------------------------------------------------------------------
+  dbName = `rh_upload_e2e_${tag}`;
+  admin = new pg.Client({ connectionString: adminUrl });
+  await admin.connect();
+  await admin.query(`CREATE DATABASE ${dbName}`);
+  dbCreated = true;
+  const databaseUrl = new URL(adminUrl);
+  databaseUrl.pathname = `/${dbName}`;
+  const serverEnv = {
+    ...process.env,
+    DATABASE_URL: databaseUrl.toString(),
+    HOST: "127.0.0.1",
+  };
+  // One port for the whole run: the uploader's cursor is keyed by its endpoint, so the
+  // server must come back on the same URL after the restart.
+  const port = await freePort();
+  const endpoint = `http://127.0.0.1:${port}`;
+  async function startServer() {
+    server = spawn(process.execPath, [serverCli, "serve"], {
+      env: { ...serverEnv, PORT: String(port) },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    server.stdout.on("data", (chunk) => (serverLog += chunk));
+    server.stderr.on("data", (chunk) => (serverLog += chunk));
+    for (let i = 0; i < 240; i += 1) {
+      try {
+        if ((await fetch(`${endpoint}/ready`)).ok) return;
+      } catch {}
+      await new Promise((done) => setTimeout(done, 250));
+    }
+    throw new Error("server did not become ready");
+  }
+  async function stopServer() {
+    const exited = once(server, "exit");
+    server.kill("SIGTERM");
+    const [code] = await exited;
+    assert.equal(code, 0);
+  }
+
+  async function mint(org, label, scopes) {
+    const out = join(root, `${label}-token.json`);
+    await run(
+      process.execPath,
+      [
+        serverCli,
+        "token",
+        "create",
+        "--org",
+        org,
+        "--workspace",
+        "main",
+        "--label",
+        label,
+        "--scopes",
+        scopes,
+        "--out",
+        out,
+      ],
+      { env: serverEnv },
+    );
+    const file = JSON.parse(await readFile(out, "utf8"));
+    secrets.push(file.token);
+    return { path: out, ...file };
+  }
+
+  async function api(path, token) {
+    const response = await fetch(`${endpoint}${path}`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    assert.equal(response.status, 200, `${path} -> ${response.status}`);
+    return response.json();
+  }
+
+  // --- uploader ----------------------------------------------------------------------
+  const ALL_KINDS = [
+    "session",
+    "session_event",
+    "tool_call",
+    "file_edit",
+    "session_marker",
+    "relationship",
+    "history",
+    "presence",
+    "commit_link",
+    "trajectory",
+    "source_observation",
+    "observation_evidence",
+  ];
+
+  async function writeConfig(name, body) {
+    const path = join(root, `${name}.json`);
+    await writeFile(path, JSON.stringify(body, null, 2));
+    return path;
+  }
+
+  async function upload(configPath, ...flags) {
+    const child = spawn(
+      process.execPath,
+      [uploaderCli, "run", "--config", configPath, ...flags],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => (stdout += chunk));
+    child.stderr.on("data", (chunk) => (stderr += chunk));
+    // `close` fires after the output streams are drained; `exit` may precede them.
+    const [code] = await once(child, "close");
+    transcripts.push(stdout, stderr);
+    const summary = stdout.trim()
+      ? JSON.parse(stdout.trim().split("\n").at(-1))
+      : null;
+    return { code, summary, stderr };
+  }
+
   await startServer();
   const laptopToken = await mint("acme", `laptop-${tag}`, "rth:sync");
   const desktopToken = await mint("acme", `desktop-${tag}`, "rth:sync");
@@ -413,7 +425,6 @@ try {
   // batch and receives the identical receipt.
   let dropped = null;
   const replays = [];
-  const proxyPort = await freePort();
   const proxy = http.createServer((req, res) => {
     const chunks = [];
     req.on("data", (c) => chunks.push(c));
@@ -442,8 +453,9 @@ try {
         .end(text);
     });
   });
-  proxy.listen(proxyPort, "127.0.0.1");
+  proxy.listen(0, "127.0.0.1");
   await once(proxy, "listening");
+  const proxyPort = proxy.address().port;
   await appendFile(
     laptop.files[A.shared],
     `${transcriptLines(
@@ -579,8 +591,9 @@ try {
     await exited;
   }
   if (!values.keep) {
-    await admin.query(`DROP DATABASE IF EXISTS ${dbName} WITH (FORCE)`);
-    await rm(root, { recursive: true, force: true });
+    if (dbCreated)
+      await admin.query(`DROP DATABASE IF EXISTS ${dbName} WITH (FORCE)`);
+    if (root) await rm(root, { recursive: true, force: true });
   }
-  await admin.end();
+  await admin?.end().catch(() => {});
 }

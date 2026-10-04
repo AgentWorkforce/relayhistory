@@ -87,6 +87,12 @@ function classify(
         ? "token file accountId does not match the token's tenant"
         : `token lacks permission (${label})`,
     );
+  if (status === 408)
+    return new UploadError(
+      "transient",
+      `server timed out (${label})`,
+      deliveryRetryAfter(retryAfter),
+    );
   if (status === 429)
     return new UploadError(
       "rate_limited",

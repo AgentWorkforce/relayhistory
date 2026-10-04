@@ -41,7 +41,12 @@ export function change(
     sourceName: "claude",
     sessionId,
     recordKey: `m-${revision}`,
-    key: ["session_event", "claude", sessionId, `m-${revision}`],
+    key: [
+      overrides.kind ?? "session_event",
+      "claude",
+      sessionId,
+      `m-${revision}`,
+    ],
     revision,
     op,
     columns:
@@ -68,9 +73,11 @@ export class MemoryFeed implements Feed {
     const from =
       options.from && typeof options.from === "object"
         ? options.from.revision
-        : options.consumer
-          ? (this.cursors.get(options.consumer) ?? 0)
-          : 0;
+        : options.from === "start"
+          ? 0
+          : options.consumer
+            ? (this.cursors.get(options.consumer) ?? 0)
+            : 0;
     const kinds = options.kinds;
     const remaining = this.changes
       .filter((c) => c.revision > from && (!kinds || kinds.includes(c.kind)))

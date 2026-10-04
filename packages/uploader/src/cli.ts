@@ -36,11 +36,11 @@ function exitCode(error: unknown): number {
   return 1;
 }
 
-async function check(config: UploaderConfig, log: Logger) {
+async function check(config: UploaderConfig, log: Logger, signal: AbortSignal) {
   const limits = await new HistoryClient({
     endpoint: config.endpoint,
     token: config.token,
-  }).limits();
+  }).limits(signal);
   process.stdout.write(
     `${JSON.stringify(
       {
@@ -62,7 +62,8 @@ async function runOnce(
   flags: { dryRun: boolean; sync: boolean },
   signal: AbortSignal,
 ) {
-  if (flags.sync) await sync(config.dbPath ? { dbPath: config.dbPath } : {});
+  if (flags.sync)
+    await sync({ ...(config.dbPath ? { dbPath: config.dbPath } : {}), signal });
   const summary = await upload({ config, log, signal, dryRun: flags.dryRun });
   process.stdout.write(
     `${JSON.stringify({ dryRun: flags.dryRun, ...summary })}\n`,
@@ -112,7 +113,7 @@ async function main(argv: string[]) {
     });
     if (!values.config) throw new UsageError("--config is required");
     const config = await loadConfig(values.config);
-    if (command === "check") return await check(config, log);
+    if (command === "check") return await check(config, log, controller.signal);
     if (command !== "run") throw new UsageError(`unknown command ${command}`);
     const interval =
       values.interval === undefined
@@ -120,8 +121,11 @@ async function main(argv: string[]) {
         : /^\d+$/.test(values.interval)
           ? Number(values.interval)
           : NaN;
-    if (!Number.isSafeInteger(interval) || interval < 1)
-      throw new UsageError("--interval must be a whole number of seconds");
+    // setTimeout cannot wait longer than 2^31-1 ms.
+    if (!Number.isSafeInteger(interval) || interval < 1 || interval > 2_147_483)
+      throw new UsageError(
+        "--interval must be a whole number of seconds from 1 to 2147483",
+      );
     const flags = { dryRun: values["dry-run"], sync: values.sync };
     if (!values.watch)
       return await runOnce(config, log, flags, controller.signal);
@@ -129,7 +133,8 @@ async function main(argv: string[]) {
       try {
         await runOnce(config, log, flags, controller.signal);
       } catch (error) {
-        if (controller.signal.aborted) break;
+        // Interrupted mid-upload: report it as such (exit 1) below.
+        if (controller.signal.aborted) throw error;
         // Retryable failures wait for the next round; anything else needs the operator.
         if (exitCode(error) !== 1) throw error;
         log.warn(
@@ -145,6 +150,8 @@ async function main(argv: string[]) {
         };
         const timer = setTimeout(wake, interval * 1_000);
         controller.signal.addEventListener("abort", wake);
+        // A signal that arrived before the listener existed still ends the wait.
+        if (controller.signal.aborted) wake();
       });
     }
     log.info("stopped");
