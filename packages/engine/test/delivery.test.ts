@@ -1494,7 +1494,10 @@ describe("durable receipt protocol against migrated PostgreSQL", () => {
       batch: batch([{ ...record(), payload: { ...record().payload, prompt } }]),
     });
     expect(response.status).toBe(200);
-    expect(String((await stored())[0].payload)).not.toMatch(
+    const storedPrompt = ((await stored())[0].payload as { prompt: string })
+      .prompt;
+    expect(storedPrompt).toContain("[relayhistory:");
+    expect(storedPrompt).not.toMatch(
       /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/,
     );
   });

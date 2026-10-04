@@ -33,6 +33,7 @@ export * from "./lib/delivery-contracts.js";
 export * from "./lib/delivery.js";
 export { deliveryBatchShape } from "./routes/delivery.js";
 export * from "./lib/scrub.js";
+export * from "./lib/bounded-json.js";
 export * from "./lib/recall.js";
 export * from "./lib/session-catalog.js";
 export * from "./lib/session-links.js";

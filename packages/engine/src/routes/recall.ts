@@ -172,13 +172,16 @@ function readFilters(c: any): EventFilters | Error {
   };
 }
 
-function readMaxContent(c: any): number | undefined {
+/** Absent (or empty, like every other filter here) leaves content whole. */
+function readMaxContent(c: any): number | undefined | Error {
   const raw = c.req.query("maxContent");
   if (!raw) {
     return undefined;
   }
-  const parsed = Number(raw);
-  return Number.isFinite(parsed) && parsed > 0 ? Math.trunc(parsed) : undefined;
+  const parsed = /^\d+$/.test(raw) ? Number(raw) : NaN;
+  return Number.isSafeInteger(parsed) && parsed > 0
+    ? parsed
+    : new Error("maxContent must be a positive integer");
 }
 
 export function createRecallRoutes<E extends HistoryEnv>(
@@ -209,6 +212,10 @@ export function createRecallRoutes<E extends HistoryEnv>(
         return badRequest(c, "sessionId is required");
       }
       const order = c.req.query("order") === "desc" ? "desc" : "asc";
+      const maxContent = readMaxContent(c);
+      if (maxContent instanceof Error) {
+        return badRequest(c, maxContent.message);
+      }
       const page = await getSessionEvents(
         db,
         getAuth(c),
@@ -222,7 +229,7 @@ export function createRecallRoutes<E extends HistoryEnv>(
           cursor: c.req.query("cursor") ?? null,
           order,
           source: c.req.query("source") || undefined,
-          maxContent: readMaxContent(c),
+          maxContent,
         },
         { workspaceId: scope.workspaceId },
       );
@@ -313,6 +320,10 @@ export function createRecallRoutes<E extends HistoryEnv>(
     if (filters instanceof Error) {
       return badRequest(c, filters.message);
     }
+    const maxContent = readMaxContent(c);
+    if (maxContent instanceof Error) {
+      return badRequest(c, maxContent.message);
+    }
     const sessionId = c.req.query("session");
     const page = await queryEvents(
       db,
@@ -326,7 +337,7 @@ export function createRecallRoutes<E extends HistoryEnv>(
         ),
         cursor: c.req.query("cursor") ?? null,
         order: c.req.query("order") === "asc" ? "asc" : "desc",
-        maxContent: readMaxContent(c),
+        maxContent,
       },
       { workspaceId: scope.workspaceId },
     );
