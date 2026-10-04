@@ -23,7 +23,12 @@ function forbidden(c: Context<any>, message: string) {
   );
 }
 
-const UNSUPPORTED_SELECTORS = ["workspace_id", "workspaceId"] as const;
+const UNSUPPORTED_WORKSPACE_SELECTORS = [
+  "workspace_id",
+  "workspaceId",
+] as const;
+// Tenancy comes only from the token: an organization selector is never honoured.
+const UNSUPPORTED_ORG_SELECTORS = ["org", "org_id", "orgId"] as const;
 
 type WorkspaceRecallScope =
   | { workspaceId: undefined; error?: undefined }
@@ -41,12 +46,17 @@ type WorkspaceRecallScope =
 export function readWorkspaceRecallScope(
   c: Context<any>,
 ): WorkspaceRecallScope {
-  // Other spellings would otherwise be ignored, silently widening the read to the org.
-  for (const selector of UNSUPPORTED_SELECTORS) {
+  // Other spellings would otherwise be ignored, silently answering org-wide.
+  for (const selector of UNSUPPORTED_WORKSPACE_SELECTORS) {
     if (c.req.queries(selector)) {
       return {
         error: badRequest(c, `unsupported selector ${selector}; use workspace`),
       };
+    }
+  }
+  for (const selector of UNSUPPORTED_ORG_SELECTORS) {
+    if (c.req.queries(selector)) {
+      return { error: badRequest(c, `unsupported selector ${selector}`) };
     }
   }
   const requested = c.req.queries("workspace") ?? [];
@@ -67,14 +77,24 @@ export function readWorkspaceRecallScope(
       error: forbidden(c, "workspace does not match the authenticated session"),
     };
   }
-  // The scope is attested in a response header. A value a header cannot carry exactly
-  // would attest a different key than the one the read used, so it is refused.
-  if (!attestable(authenticated)) {
-    return {
-      error: forbidden(c, "authenticated workspace cannot be attested"),
-    };
-  }
+  const unattestable = workspaceAttestationError(c, authenticated);
+  if (unattestable) return { error: unattestable };
   return { workspaceId: authenticated };
+}
+
+/**
+ * The 403 for a workspace-narrowed read whose workspace cannot be attested, or
+ * undefined. The scope is attested in a response header, and a value a header cannot
+ * carry exactly would attest a different key than the one the read used. Check before
+ * querying; `attestWorkspace` refuses the same values.
+ */
+export function workspaceAttestationError(
+  c: Context<any>,
+  workspaceId: string,
+): Response | undefined {
+  return attestable(workspaceId)
+    ? undefined
+    : forbidden(c, "authenticated workspace cannot be attested");
 }
 
 /**
@@ -91,9 +111,12 @@ function attestable(value: string): boolean {
   return true;
 }
 
+/** Attests the workspace a read was narrowed to. Throws for one a header cannot carry. */
 export function attestWorkspace(
   c: Context<any>,
   workspaceId: string | undefined,
 ): void {
-  if (workspaceId) c.header(WORKSPACE_RECALL_HEADER, workspaceId);
+  if (!workspaceId) return;
+  if (!attestable(workspaceId)) throw new Error("workspace cannot be attested");
+  c.header(WORKSPACE_RECALL_HEADER, workspaceId);
 }
