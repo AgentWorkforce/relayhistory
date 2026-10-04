@@ -204,13 +204,22 @@ const AUTHORIZATION_SCHEME =
   /([A-Za-z][A-Za-z0-9!#$%&*+.^_`|~-]*)[ \t]+(?=[^\s=])/y;
 
 /**
- * The quote a header is wrapped in, if any, and how many backslashes escape it: a
- * header inside a JSON string is opened by `\"`, one serialized twice by `\\\"`.
+ * The quote a header is wrapped in, if any, and the escaping inside it. A header in a
+ * JSON string is opened by `\"`, one serialized twice by `\\\"`: each level doubles
+ * the backslashes before a character and adds one. A `"`-quoted header's content is
+ * one level deeper than its opening quote, so a `"` in it is written with `unit - 1`
+ * backslashes, then `unit` more per backslash that escapes it at that level.
  */
 interface HeaderQuote {
   char: string;
+  /** Backslashes before the header's opening quote. */
   depth: number;
+  /** `2^level` for the content's escaping level: 1 unquoted, 2 inside `"…"`. */
+  unit: number;
 }
+
+/** What a quote at some position is to the credential being read. */
+type QuoteRole = "close" | "delimiter" | "content";
 
 /**
  * Redacts each header's credential and keeps its scheme, as the Bearer rule does. The
@@ -220,13 +229,14 @@ interface HeaderQuote {
  * whitespace, a comma or a quote, since real values are not RFC tokens (AWS SigV4's
  * `Credential=AKID/date/region/s3/aws4_request`).
  *
- * Quotes are read by escaping depth, the length of the backslash run before them. A
- * header's quote closes it only at the header's own depth or shallower; a deeper
- * quote is nested in it, so a Digest parameter quoted one level further in, as in a
- * shell command serialized into JSON, stays inside the credential.
+ * Quotes are decoded by escaping level from the backslash run before them (see
+ * `HeaderQuote`): one shallower than the content closes the header; one at the
+ * content level opens or closes a quoted value unless an odd number of decoded
+ * backslashes escapes it, as in a quoted string's `\"`. So `"foo\\"` ends at its last
+ * quote however many times the header around it was serialized.
  *
- * One forward scan: a character is read by the header search and at most twice more
- * by a credential, and a backslash run is read once with the quote it escapes.
+ * One forward scan: a character is read by the header search and at most three more
+ * times by a credential, and a backslash run is read once with the quote it escapes.
  */
 function redactAuthorization(text: string): string {
   let output = "";
@@ -240,14 +250,14 @@ function redactAuthorization(text: string): string {
     let start = header.index + header[0].length;
     const escapes = backslashes(text, start);
     const opening = text[start + escapes];
-    let quote: HeaderQuote = { char: "", depth: 0 };
+    let quote: HeaderQuote = { char: "", depth: 0, unit: 1 };
     if (opening === '"' || opening === "'") {
-      quote = { char: opening, depth: escapes };
+      quote = headerQuote(opening, escapes);
       start += escapes + 1;
     } else if (header[1] === '"' || header[1] === "'") {
       let depth = 0;
       while (text[header.index - depth - 1] === "\\") depth += 1;
-      quote = { char: header[1], depth };
+      quote = headerQuote(header[1], depth);
     }
     AUTHORIZATION_SCHEME.lastIndex = start;
     const scheme = AUTHORIZATION_SCHEME.exec(text);
@@ -262,6 +272,13 @@ function redactAuthorization(text: string): string {
   return output + text.slice(last);
 }
 
+function headerQuote(char: string, depth: number): HeaderQuote {
+  // A `'` adds no backslash escaping (shell, Python repr), so `"` inside it is read
+  // as in an unquoted header.
+  if (char !== '"') return { char, depth, unit: 1 };
+  return { char, depth, unit: 2 ** (Math.floor(Math.log2(depth + 1)) + 1) };
+}
+
 /** The length of the backslash run starting at `at`. */
 function backslashes(text: string, at: number): number {
   let run = 0;
@@ -270,25 +287,37 @@ function backslashes(text: string, at: number): number {
 }
 
 /**
- * Reads one character at `at`, a backslash run and the character it escapes counting
- * as one. Returns the index after it, or -1 when it is a quote that ends the current
- * value: the header's quote at or above its depth, or with `endsAtDoubleQuote` any
- * `"` at or above that depth (the header's depth when it is `"`-quoted, else 0).
+ * The role of a quote escaped by `run` backslashes: whether it closes the header,
+ * delimits a quoted value, or is part of one. `null` when `char` is not a quote.
  */
-function readQuoted(
+function quoteRole(
+  char: string | undefined,
+  run: number,
+  quote: HeaderQuote,
+): QuoteRole | null {
+  if (char === "'" && quote.char === "'")
+    return run <= quote.depth ? "close" : "content";
+  if (char !== '"') return null;
+  const base = quote.unit - 1;
+  if (quote.char === '"' && run < base) return "close";
+  if ((run - base) % quote.unit !== 0) return "content";
+  return ((run - base) / quote.unit) % 2 === 1 ? "content" : "delimiter";
+}
+
+/**
+ * Reads one character at `at`, a backslash run and the character it escapes counting
+ * as one. Returns the quote role there (null for any other character) and the index
+ * after it.
+ */
+function read(
   text: string,
   at: number,
   quote: HeaderQuote,
-  endsAtDoubleQuote: boolean,
-): number {
+): { role: QuoteRole | null; next: number } {
   const run = backslashes(text, at);
-  const after = text[at + run];
-  if (quote.char && after === quote.char && run <= quote.depth) return -1;
-  if (endsAtDoubleQuote && after === '"') {
-    if (run <= (quote.char === '"' ? quote.depth : 0)) return -1;
-  }
-  if (run === 0) return at + 1;
-  return after === '"' || after === "'" ? at + run + 1 : at + run;
+  const role = quoteRole(text[at + run], run, quote);
+  if (role !== null) return { role, next: at + run + 1 };
+  return { role, next: at + Math.max(run, 1) };
 }
 
 /** The end of an auth-param list starting at `at`, or null when none starts there. */
@@ -314,8 +343,9 @@ function authParams(
 
 /**
  * A list item that is not a parameter but holds one (`, stray d=secret`): it runs to
- * the next comma, the end of the line or the closing header quote, and is taken whole
- * when it contains `=`, so no `name=value` after a separator is left behind.
+ * the next comma, the end of the line or the header's close, past any quoted value,
+ * and is taken whole when it contains `=`, so no `name=value` after a separator is
+ * left behind.
  */
 function strayItem(
   text: string,
@@ -330,10 +360,10 @@ function strayItem(
     text[index] !== "\n" &&
     text[index] !== "\r"
   ) {
-    const next = readQuoted(text, index, quote, false);
-    if (next === -1) break;
     if (text[index] === "=") assigns = true;
-    index = next;
+    const { role, next } = read(text, index, quote);
+    if (role === "close") break;
+    index = role === "delimiter" ? quotedValue(text, next, quote) : next;
   }
   return assigns ? Math.min(index, text.length) : null;
 }
@@ -351,13 +381,15 @@ function authParam(
   if (text[index] !== "=") return null;
   index += 1;
   while (text[index] === " " || text[index] === "\t") index += 1;
-  const escapes = backslashes(text, index);
-  if (text[index + escapes] === '"')
-    return quotedString(text, index + escapes + 1, escapes);
+  const opening = read(text, index, quote);
+  if (opening.role === "delimiter")
+    return quotedValue(text, opening.next, quote);
+  if (opening.role === "close")
+    return looseQuotedValue(text, index, opening.next, quote);
   const value = index;
   while (index < text.length && !/[\s,]/.test(text[index]!)) {
-    const next = readQuoted(text, index, quote, true);
-    if (next === -1) break;
+    const { role, next } = read(text, index, quote);
+    if (role === "close" || role === "delimiter") break;
     index = next;
   }
   index = Math.min(index, text.length);
@@ -365,30 +397,67 @@ function authParam(
 }
 
 /**
- * The end of a quoted string whose content starts at `at` and whose opening `"` was
- * escaped by `depth` backslashes: after the first `"` escaped by at most as many, or
- * at the end of the line when it never closes. A more deeply escaped `"` is content.
+ * The end of a quoted value whose content starts at `at`: after the next delimiter at
+ * the content level, or, unterminated, at the header's close or the end of the line.
  */
-function quotedString(text: string, at: number, depth: number): number {
+function quotedValue(text: string, at: number, quote: HeaderQuote): number {
   let index = at;
   while (index < text.length && text[index] !== "\n" && text[index] !== "\r") {
-    const run = backslashes(text, index);
-    if (text[index + run] === '"') {
-      if (run <= depth) return index + run + 1;
-      index += run + 1;
-      continue;
-    }
-    index += run === 0 ? 1 : run;
+    const { role, next } = read(text, index, quote);
+    if (role === "close") return index;
+    if (role === "delimiter") return next;
+    index = next;
   }
   return Math.min(index, text.length);
 }
 
-/** The end of a single credential: up to whitespace or the closing header quote. */
+/**
+ * A value opened by a quote at the header's own level, as in
+ * `-H "Authorization: Digest username="alice", …"` where the inner quotes were never
+ * escaped. It is a value only when the next quote written the same way closes it and
+ * is followed by a separator, the end of the line or the header's close; otherwise
+ * the quote closes the header (`{"Authorization":"Digest a=","next":…}`). Returns the
+ * value's end, or null when the quote is the header's close.
+ */
+function looseQuotedValue(
+  text: string,
+  at: number,
+  content: number,
+  quote: HeaderQuote,
+): number | null {
+  const run = content - at - 1;
+  let index = content;
+  while (index < text.length && text[index] !== "\n" && text[index] !== "\r") {
+    const length = backslashes(text, index);
+    if (text[index + length] === quote.char) {
+      // A shallower quote has already left the header.
+      if (length < run) return null;
+      if (length !== run) {
+        index += length + 1;
+        continue;
+      }
+      const after = index + length + 1;
+      const follower = text[after];
+      if (
+        follower === undefined ||
+        follower === "," ||
+        /\s/.test(follower) ||
+        read(text, after, quote).role === "close"
+      )
+        return after;
+      return null;
+    }
+    index += Math.max(length, 1);
+  }
+  return null;
+}
+
+/** The end of a single credential: up to whitespace or a quote that is not content. */
 function token68(text: string, at: number, quote: HeaderQuote): number {
   let index = at;
   while (index < text.length && !/\s/.test(text[index]!)) {
-    const next = readQuoted(text, index, quote, false);
-    if (next === -1) break;
+    const { role, next } = read(text, index, quote);
+    if (role === "close" || role === "delimiter") break;
     index = next;
   }
   return Math.min(index, text.length);

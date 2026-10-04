@@ -305,6 +305,17 @@ describe("hosted ingest scrubbing", () => {
         (n) => `\\"Authorization: Digest a=${"\\".repeat(n)}`.slice(0, n),
       ],
       [
+        "unmatched loose quote",
+        (n) => `"Authorization: Digest a="${"x".repeat(n)}`.slice(0, n),
+      ],
+      [
+        "compact JSON headers",
+        (n) =>
+          '{"Authorization":"Digest a=","r":"s"}'
+            .repeat(Math.ceil(n / 38))
+            .slice(0, n),
+      ],
+      [
         "stray parameter items",
         (n) =>
           `Authorization: AWS4 C=a/b, ${"x y=z/w, ".repeat(n)}`.slice(0, n),
@@ -596,6 +607,59 @@ describe("hosted ingest scrubbing", () => {
           `{'Authorization': 'Digest username="u", response="${R}"', 'x': 1}`,
         ),
       ).toBe("{'Authorization': 'Digest [REDACTED]', 'x': 1}");
+    });
+
+    it("decodes escaped backslashes before a Digest value's closing quote", () => {
+      const S = "SECRETxyz";
+      // An escaped backslash ends the value; the next parameters stay in the list.
+      expect(
+        scrubText(
+          `Authorization: Digest username="foo\\\\", realm="x", response=${S} next`,
+        ),
+      ).toBe("Authorization: Digest [REDACTED] next");
+      expect(scrubText('Authorization: Digest a="foo\\\\", b=bar next')).toBe(
+        "Authorization: Digest [REDACTED] next",
+      );
+      const shell = `curl -H "Authorization: Digest username=\\"foo\\\\\\\\\\", realm=\\"x\\", response=${S}" http://x`;
+      const redacted = 'curl -H "Authorization: Digest [REDACTED]" http://x';
+      expect(scrubText(shell)).toBe(redacted);
+      expect(scrubText(JSON.stringify({ command: shell }))).toBe(
+        JSON.stringify({ command: redacted }),
+      );
+      expect(
+        scrubText(
+          JSON.stringify({
+            Authorization: `Digest username="foo\\\\", realm="x", response=${S}`,
+          }),
+        ),
+      ).toBe(JSON.stringify({ Authorization: "Digest [REDACTED]" }));
+      expect(
+        scrubText(
+          JSON.stringify({
+            text: `Authorization: Digest a="foo\\\\", b=${S} next`,
+          }),
+        ),
+      ).toBe(JSON.stringify({ text: "Authorization: Digest [REDACTED] next" }));
+    });
+
+    it("never takes a JSON header value's closing quote for a parameter value", () => {
+      expect(scrubText('{"Authorization":"Digest a=","response":"kept"}')).toBe(
+        '{"Authorization":"Digest [REDACTED]","response":"kept"}',
+      );
+      expect(scrubText('{"Authorization":"Digest a=b","next":"keep"}')).toBe(
+        '{"Authorization":"Digest [REDACTED]","next":"keep"}',
+      );
+      expect(
+        scrubText(
+          '{"Authorization":"Digest username=\\"u\\", response=\\"S\\"","x":"keep"}',
+        ),
+      ).toBe('{"Authorization":"Digest [REDACTED]","x":"keep"}');
+      // An escaped quote ending a bare token belongs to the enclosing header.
+      expect(
+        scrubText(
+          '-H "Authorization: Bearer abcdefghijklmnopqrstuv\\" -X POST',
+        ),
+      ).toBe('-H "Authorization: Bearer [REDACTED]\\" -X POST');
     });
 
     it("ends a header's credential where the credential ends", () => {
