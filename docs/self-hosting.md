@@ -180,8 +180,17 @@ protocol is idempotent, so a replayed batch returns the receipt it was first giv
 Pull the new revision and rebuild. Migrations run in one transaction under an advisory
 lock with a checksum ledger, so concurrent starts are safe and an edited applied
 migration stops the server instead of diverging. The first start after an upgrade
-also finishes any projection backfill before it listens; the image's health check allows
-up to an hour for that, so `up --wait` waits rather than failing. Back up before upgrading.
+also finishes any projection backfill before it listens; the health check allows an hour
+for that (`RELAYHISTORY_START_PERIOD`, e.g. `3h`), so `up --wait` waits rather than failing.
+For a very large database, run the schema work as its own step first, with no health
+check involved, then start the server:
+
+```bash
+docker compose -f packages/server/compose.yaml run --rm server migrate
+docker compose -f packages/server/compose.yaml up -d --wait
+```
+
+Back up before upgrading.
 
 ```bash
 git pull

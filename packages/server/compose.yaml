@@ -38,6 +38,18 @@ services:
     ports:
       # Loopback by default: put a TLS reverse proxy in front before exposing it.
       - "${RELAYHISTORY_BIND:-127.0.0.1}:${RELAYHISTORY_PORT:-8080}:8080"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8080/ready').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      # Start-up finishes migrations and projection backfills before listening. Raise
+      # this for a very large upgrade, or run `migrate` first (docs/self-hosting.md).
+      start_period: ${RELAYHISTORY_START_PERIOD:-1h}
     depends_on:
       postgres:
         condition: service_healthy
