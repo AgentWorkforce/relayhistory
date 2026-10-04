@@ -60,8 +60,13 @@ export async function prepareDatabase(
     connectionString: url,
     application_name: "relayhistory-migrate",
   });
-  await client.connect();
+  // A connection lost mid-run is also emitted as an 'error' event; unheard, Node turns
+  // it into an uncaught exception that crashes the process with the driver's raw text.
+  // The statement in flight rejects with the same failure, which propagates from here
+  // to the caller's sanitized logging, so the event itself needs only to be heard.
+  client.on("error", () => {});
   try {
+    await client.connect();
     // The engine reports fixed progress lines (counters, never SQL or rows). A long
     // upgrade backfill gets a heartbeat at most every few seconds; a quick start, none.
     let lastReport = Date.now();
@@ -78,6 +83,7 @@ export async function prepareDatabase(
       rolledUpSessions: result.rolledUpSessions,
     };
   } finally {
-    await client.end();
+    // Closing a lost connection must not replace the failure that lost it.
+    await client.end().catch(() => {});
   }
 }
