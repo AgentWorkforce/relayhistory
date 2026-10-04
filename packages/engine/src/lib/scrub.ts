@@ -293,7 +293,7 @@ function headerState(): HeaderState {
   return {
     enclosing: "",
     searched: 0,
-    substitutions: { extendedTo: 0, nestedTo: 0 },
+    substitutions: { extendedTo: 0, nestedTo: 0, freshTo: 0 },
     matches: matchCache(),
   };
 }
@@ -311,7 +311,8 @@ interface Credential {
 
 /**
  * How a header is read: from the main pass (`top`), by a sweep (`nested`), or by a
- * sweep re-reading a header outside any region (`fresh`, see `sweptEnd`).
+ * sweep re-reading a header outside the regions the others keep (`fresh`, see
+ * `sweptEnd`).
  */
 type ReadMode = "top" | "nested" | "fresh";
 
@@ -323,8 +324,8 @@ type ReadMode = "top" | "nested" | "fresh";
  * failed closed inside a region is also extended by `sweptEnd`, and the end is the
  * larger of the two, so the close is never looked for from inside a later secret.
  * A read by a sweep (`mode` other than `top`) does neither: it reads its own
- * credential only, and records failed scans as `SubstitutionScan.nestedTo`. Null when
- * no credential follows the header.
+ * credential only, and records failed scans in its own region (`SubstitutionScan`).
+ * Null when no credential follows the header.
  */
 function readCredential(
   text: string,
@@ -739,10 +740,13 @@ const SUBSTITUTION_WINDOW = 4096;
  * A nested scan reads both, since a top-level region is no fresher to it. Whatever a
  * nested scan reads below the sweep's end is redacted, and the next top-level header
  * starts past that end, so top-level scans have nothing to take from `nestedTo`.
+ * A sweep's `fresh` re-reads keep a third, `freshTo`, read by no other scan, so a
+ * re-read's failed window moves no later nested header into a region.
  */
 interface SubstitutionScan {
   extendedTo: number;
   nestedTo: number;
+  freshTo: number;
 }
 
 /**
@@ -785,12 +789,16 @@ function shellSubstitutionEnd(
   let lastBreak = -1;
   // A substitution starting inside an earlier failed scan's region scans afresh, with
   // no window: it ends at its own close or, failing closed, at the first line break
-  // at or after the region's end, so nothing straddling that end is cut. A `fresh`
-  // read scans as if outside any region.
+  // at or after the region's end, so nothing straddling that end is cut.
   const frontier =
-    mode === "top" ? scan.extendedTo : Math.max(scan.extendedTo, scan.nestedTo);
-  const region = mode !== "fresh" && at < frontier ? frontier : -1;
-  const recorded = mode === "top" ? "extendedTo" : "nestedTo";
+    mode === "top"
+      ? scan.extendedTo
+      : mode === "nested"
+        ? Math.max(scan.extendedTo, scan.nestedTo)
+        : scan.freshTo;
+  const region = at < frontier ? frontier : -1;
+  const recorded =
+    mode === "top" ? "extendedTo" : mode === "nested" ? "nestedTo" : "freshTo";
   let index = backtick ? at + 1 : at;
   while (index < text.length) {
     if (region < 0 && stop >= 0 && index - at > SUBSTITUTION_WINDOW) break;
@@ -958,11 +966,13 @@ function closedAt(lastBreak: number, close: number): SubstitutionEnd {
  * so are those after it, so at most one read crosses it, and the line ends and nested
  * credentials read cost O(swept span). All of it lies in the redacted span.
  *
- * A read that failed closed in a region gets one `fresh` re-read of the header its
- * chain then skips on the line it was cut at (see below). That re-read rescans part
- * of that one line, which the failed read consumed, and at most `SUBSTITUTION_WINDOW`
- * past it, which a failure records in `nestedTo` like any nested window; a failed
- * read needs a region, so these cost O(n + window) per pass.
+ * A read that failed closed in a region gets `fresh` re-reads of the headers its
+ * chain then skips on the line it was cut at (see below). Those re-reads are disjoint
+ * and inside that one line, which the failed read consumed, and only the last reads
+ * past the cut or uses its window, at most `SUBSTITUTION_WINDOW`, which a failure
+ * records in `freshTo`; a failed read needs a region, so these cost O(n + window) per
+ * pass. A re-read's end moves the sweep's end only, never its chain's: a header after
+ * the cut is read by the chain whatever a re-read covered.
  */
 function sweptEnd(
   text: string,
@@ -977,9 +987,10 @@ function sweptEnd(
   let headerCursor = headersFrom;
   let lineEnd = -1;
   // The reads of headers before `from`, and of those from it on: how far each chain
-  // reached, and where its last read failed closed in a region (else -1).
-  const before = { readTo: -1, failedAt: -1 };
-  const after = { readTo: -1, failedAt: -1 };
+  // reached, where its last read failed closed in a region (else -1), and how far its
+  // re-reads on that cut line reached.
+  const before = { readTo: -1, failedAt: -1, rereadTo: -1 };
+  const after = { readTo: -1, failedAt: -1, rereadTo: -1 };
   const nested: HeaderState = { ...state };
   for (let changed = true; changed;) {
     changed = false;
@@ -1018,21 +1029,28 @@ function sweptEnd(
         const parsed = readCredential(text, header, nested, "nested");
         chain.readTo = parsed ? parsed.end : credential;
         chain.failedAt = parsed ? parsed.failedAt : -1;
+        chain.rereadTo = -1;
         reach = Math.max(reach, chain.readTo);
-      } else if (chain.failedAt === lineEnd) {
+      } else if (chain.failedAt === lineEnd && header.index >= chain.rereadTo) {
         // The chain's last read failed closed at this header's line end, which may cut
-        // this header's own substitution straddling the region's end
+        // a substitution straddling the region's end
         // (`$(printf 'admin:…\nS3cret' | base64)`); read in the region it would fail
-        // closed at the same break, so the first header the chain skips on that line
-        // is read once outside it. A substitution opening on an earlier line than the
-        // cut (`$(printf 'admin:\n…\nS3cret' | base64)`) is not re-read and keeps its
-        // later lines, as on a0903995.
-        chain.failedAt = -1;
+        // closed at the same break, so the headers the chain skips on that line are
+        // read outside it, in turn, until one reads past the cut or uses its window: a
+        // short header earlier on the line (`Bearer x ,Authorization: Basic $(…`) does
+        // not stand in for the straddler. A substitution opening on an earlier line
+        // than the cut (`$(printf 'admin:\n…\nS3cret' | base64)`) is not re-read and
+        // keeps its later lines, as on a0903995.
+        const window = nested.substitutions.freshTo;
         const parsed = readCredential(text, header, nested, "fresh");
-        if (parsed) {
-          chain.readTo = Math.max(chain.readTo, parsed.end);
-          reach = Math.max(reach, parsed.end);
-        }
+        const freshEnd = parsed ? parsed.end : credential;
+        reach = Math.max(reach, freshEnd);
+        if (
+          freshEnd < chain.failedAt &&
+          nested.substitutions.freshTo === window
+        )
+          chain.rereadTo = freshEnd;
+        else chain.failedAt = -1;
       }
       if (reach > end) {
         end = reach;
