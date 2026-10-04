@@ -313,14 +313,18 @@ function redactAuthorization(text: string): string {
 
 /**
  * Where a serialized header line ends, at or after its credential's end `at`: the
- * next real or proven escaped line break, the end of the text, or a string's end — a
- * quote of either kind with fewer backslashes than a line break that `endsString`
- * accepts by what follows it. A message
- * serialized through several layers of different quoting (a Python repr inside JSON),
- * or with a stray quote before the header that misleads `enclosingQuote`, can stop
- * the credential early; this takes the rest of the header line with it, and only a
- * structural string end, never a quote inside a Digest value, stops it short of the
- * line's end.
+ * next real or proven escaped line break, the end of the text, or a string's end. A
+ * message serialized through several layers of different quoting (a Python repr
+ * inside JSON), or with a stray quote before the header that misleads
+ * `enclosingQuote`, can stop the credential early; this takes the rest of the header
+ * line with it.
+ *
+ * Shallow quotes (fewer backslashes than a line break, of either kind) are read by
+ * position in one forward pass. One right after `=` opens a value, which runs to the
+ * next shallow quote of the same kind, whatever it holds (`realm=" a; b"`). Any other
+ * shallow quote may end the string, which `endsString` decides by what follows it;
+ * otherwise it is content. A line break or the end of the text stops the pass in
+ * either state, so an unclosed value is redacted to the line's end.
  */
 function serializedLineEnd(
   text: string,
@@ -328,6 +332,7 @@ function serializedLineEnd(
   quote: HeaderQuote,
 ): number {
   let index = at;
+  let value = "";
   while (index < text.length) {
     const run = backslashes(text, index);
     const char = text[index + run];
@@ -338,15 +343,26 @@ function serializedLineEnd(
       escapedBreak(text, index, run, quote)
     )
       return index;
-    if (
-      (char === '"' || char === "'") &&
-      run < quote.lineBase &&
-      endsString(text, index + run + 1)
-    )
-      return index;
+    if ((char === '"' || char === "'") && run < quote.lineBase) {
+      if (value) {
+        if (char === value) value = "";
+      } else if (afterEquals(text, index)) {
+        value = char;
+      } else if (endsString(text, index + run + 1)) {
+        return index;
+      }
+    }
     index += run + 1;
   }
   return text.length;
+}
+
+/** Whether the text before `at`, past up to 16 spaces or tabs, ends with `=`. */
+function afterEquals(text: string, at: number): boolean {
+  let index = at - 1;
+  while (at - index <= 16 && (text[index] === " " || text[index] === "\t"))
+    index -= 1;
+  return text[index] === "=";
 }
 
 // A further auth-param: the list goes on, so the quote before it is a value's, not

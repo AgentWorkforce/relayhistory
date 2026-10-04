@@ -367,6 +367,14 @@ describe("hosted ingest scrubbing", () => {
           ),
       ],
       [
+        "many quoted values on one serialized line",
+        (n) =>
+          `'GET /\\r\\nAuthorization: Digest ${'a=" x"; '.repeat(n)}`.slice(
+            0,
+            n,
+          ),
+      ],
+      [
         "stray parameter items",
         (n) =>
           `Authorization: AWS4 C=a/b, ${"x y=z/w, ".repeat(n)}`.slice(0, n),
@@ -1069,6 +1077,82 @@ describe("hosted ingest scrubbing", () => {
         ),
       ).toBe(
         String.raw`log: 'GET /\r\nAuthorization: Basic [REDACTED]' and then more`,
+      );
+      expect(scrubText('{"Authorization":"Digest a=","response":"S"}')).toBe(
+        '{"Authorization":"Digest [REDACTED]","response":"S"}',
+      );
+    });
+
+    it("redacts every Digest value of a serialized header however its values are spelled", () => {
+      const S = "R9secretZ";
+      const repr = (text: string) =>
+        "'" +
+        text
+          .replace(/\\/g, "\\\\")
+          .replace(/'/g, "\\'")
+          .replace(/\r/g, "\\r")
+          .replace(/\n/g, "\\n") +
+        "'";
+      const layers = [
+        repr,
+        (text: string) => JSON.stringify({ r: text }),
+        (text: string) => JSON.stringify({ l: repr(text) }),
+      ];
+      for (const layer of layers)
+        for (const separator of [", ", "; ", " ", ",", " , "])
+          for (const prefix of ["", " ", ",", ";", "!x "])
+            for (const position of [1, 2]) {
+              const values = ["u", "r", "n1"].map(
+                (value, index) => `${prefix}${index === position ? S : value}`,
+              );
+              const header = [
+                `username="${values[0]}"`,
+                `realm="${values[1]}"`,
+                `response="${values[2]}"`,
+              ].join(separator);
+              const serialized = layer(
+                `GET / HTTP/1.1\r\nAuthorization: Digest ${header}\r\nHost: x`,
+              );
+              const out = scrubText(serialized);
+              expect(out, serialized).not.toContain(S);
+              expect(out, serialized).toContain("Host: x");
+            }
+      // Controls: what follows a serialized header's string is kept.
+      expect(
+        scrubText(
+          String.raw`curl -H 'GET /\r\nAuthorization: Basic ${S}' https://example.com`,
+        ),
+      ).toBe(
+        String.raw`curl -H 'GET /\r\nAuthorization: Basic [REDACTED]' https://example.com`,
+      );
+      expect(
+        scrubText(
+          JSON.stringify(
+            { req: `GET /\r\nAuthorization: Basic ${S}` },
+            null,
+            2,
+          ),
+        ),
+      ).toBe(
+        JSON.stringify(
+          { req: "GET /\r\nAuthorization: Basic [REDACTED]" },
+          null,
+          2,
+        ),
+      );
+      expect(
+        scrubText(
+          String.raw`log: 'GET /\r\nAuthorization: Basic ${S}' and then more`,
+        ),
+      ).toBe(
+        String.raw`log: 'GET /\r\nAuthorization: Basic [REDACTED]' and then more`,
+      );
+      expect(
+        scrubText(
+          String.raw`{"msg":"Don't forget\nAuthorization: Basic abc","level":"info","more":"x"}`,
+        ),
+      ).toBe(
+        String.raw`{"msg":"Don't forget\nAuthorization: Basic [REDACTED]","level":"info","more":"x"}`,
       );
       expect(scrubText('{"Authorization":"Digest a=","response":"S"}')).toBe(
         '{"Authorization":"Digest [REDACTED]","response":"S"}',
