@@ -359,6 +359,14 @@ describe("hosted ingest scrubbing", () => {
           ),
       ],
       [
+        "quote-space runs after a serialized header",
+        (n) =>
+          `'\\nAuthorization: Digest a=b ${`"${" ".repeat(15)}${"k".repeat(60)} `.repeat(n)}`.slice(
+            0,
+            n,
+          ),
+      ],
+      [
         "stray parameter items",
         (n) =>
           `Authorization: AWS4 C=a/b, ${"x y=z/w, ".repeat(n)}`.slice(0, n),
@@ -1010,6 +1018,60 @@ describe("hosted ingest scrubbing", () => {
         JSON.stringify({
           r: "GET /\r\nAuthorization: Digest [REDACTED]\r\nHost: x",
         }),
+      );
+    });
+
+    it("reads a string end after a serialized header from what follows the quote", () => {
+      const S = "R9secret";
+      // `;` and spaces separate parameters too, so the list continues past them.
+      for (const repr of [
+        String.raw`'GET /\r\nAuthorization: Digest username="u"; realm="r"; response="${S}"\r\nHost: x'`,
+        String.raw`'GET /\r\nAuthorization: Digest username="u" realm="r" response="${S}"\r\nHost: x'`,
+        String.raw`'GET /\r\nAuthorization: Digest username="u" , response="${S}"\r\nHost: x'`,
+      ]) {
+        const out = scrubText(repr);
+        expect(out, repr).not.toContain(S);
+        expect(out, repr).toContain("Host: x");
+      }
+      expect(
+        scrubText(
+          JSON.stringify({
+            r: `GET /\r\nAuthorization: Digest username="u"; realm="r"; response="${S}"\r\nHost: x`,
+          }),
+        ),
+      ).not.toContain(S);
+      // A quote followed by a shell argument, a line end or prose ends the string.
+      expect(
+        scrubText(
+          String.raw`curl -H 'GET /\r\nAuthorization: Basic ${S}' https://example.com`,
+        ),
+      ).toBe(
+        String.raw`curl -H 'GET /\r\nAuthorization: Basic [REDACTED]' https://example.com`,
+      );
+      expect(
+        scrubText(
+          JSON.stringify(
+            { req: `GET /\r\nAuthorization: Basic ${S}` },
+            null,
+            2,
+          ),
+        ),
+      ).toBe(
+        JSON.stringify(
+          { req: "GET /\r\nAuthorization: Basic [REDACTED]" },
+          null,
+          2,
+        ),
+      );
+      expect(
+        scrubText(
+          String.raw`log: 'GET /\r\nAuthorization: Basic ${S}' and then more`,
+        ),
+      ).toBe(
+        String.raw`log: 'GET /\r\nAuthorization: Basic [REDACTED]' and then more`,
+      );
+      expect(scrubText('{"Authorization":"Digest a=","response":"S"}')).toBe(
+        '{"Authorization":"Digest [REDACTED]","response":"S"}',
       );
     });
 
