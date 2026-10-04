@@ -412,6 +412,9 @@ export async function listServiceTokens(db: Db, orgId: string) {
  * Both predicates are in the WHERE clause rather than checked after the read: a revoke
  * that matched a forbidden row and then declined to act would still have confirmed that
  * the id exists.
+ *
+ * Only this token is revoked. Tokens it minted are independent credentials (their expiry
+ * is capped at this token's), so each must be revoked on its own.
  */
 export async function revokeServiceToken(
   db: Db,

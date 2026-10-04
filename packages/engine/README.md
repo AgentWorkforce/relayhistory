@@ -20,6 +20,7 @@ A Node host also needs a server adapter and a PostgreSQL driver:
 
 ```sh
 npm install @relayhistory/engine hono drizzle-orm @hono/node-server pg
+npm install --save-dev @types/pg @types/node   # TypeScript hosts
 ```
 
 ```ts
@@ -84,6 +85,10 @@ const issued = await bootstrapServiceToken(db, {
 The token's tenant is the stored row's `orgId`/`workspaceId`; no request can select
 another. A holder can mint narrower tokens with `POST /v1/auth/service-tokens`; only
 the first credential needs database access.
+
+Every service token is an independent credential. A token minted by another service
+token never outlives its parent's expiry, but revoking the parent does not revoke it:
+revoke each token you want to end (`GET /v1/auth/service-tokens` lists them all).
 
 ## API
 

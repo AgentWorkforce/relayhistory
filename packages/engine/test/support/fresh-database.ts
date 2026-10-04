@@ -117,11 +117,14 @@ async function postgresDatabase(): Promise<FreshDatabase> {
       return role;
     },
     close: async () => {
-      await client.end();
-      await dropDatabase(admin, name);
-      for (const role of roles)
-        await admin.query(`DROP ROLE IF EXISTS ${role}`);
-      await admin.end();
+      try {
+        await client.end();
+        await dropDatabase(admin, name);
+        for (const role of roles)
+          await admin.query(`DROP ROLE IF EXISTS ${role}`);
+      } finally {
+        await admin.end();
+      }
     },
   };
 }
