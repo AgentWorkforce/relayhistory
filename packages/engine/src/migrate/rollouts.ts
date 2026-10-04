@@ -89,9 +89,15 @@ async function withRolloutLock<T>(
   deadline: number,
   run: () => Promise<T>,
 ): Promise<T | undefined> {
+  let holder: unknown;
   for (;;) {
-    const [row] = await query(`SELECT pg_try_advisory_lock(${key}) AS locked`);
-    if (row?.locked === true) break;
+    const [row] = await query(
+      `SELECT pg_try_advisory_lock(${key}) AS locked, pg_backend_pid() AS pid`,
+    );
+    if (row?.locked === true) {
+      holder = row.pid;
+      break;
+    }
     if (Date.now() >= deadline) return undefined;
     await sleep(LOCK_POLL_MS);
   }
@@ -103,7 +109,17 @@ async function withRolloutLock<T>(
     await query(`SELECT pg_advisory_unlock(${key})`).catch(() => {});
     throw error;
   }
-  await query(`SELECT pg_advisory_unlock(${key})`);
+  // A session lock is only released by the backend that took it. Behind a
+  // transaction-mode pooler the unlock can land on another backend and leave the
+  // lock held by an idle server connection, stalling every later rollout, so a
+  // release that did not happen on the holder fails loudly.
+  const [released] = await query(
+    `SELECT pg_advisory_unlock(${key}) AS released, pg_backend_pid() AS pid`,
+  );
+  if (released?.released !== true || String(released.pid) !== String(holder))
+    throw new Error(
+      "rollout lock was not released by the connection that took it; run rollouts on one dedicated session, not through a transaction-mode pooler",
+    );
   return result;
 }
 

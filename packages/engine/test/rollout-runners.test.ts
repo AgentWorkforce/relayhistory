@@ -181,8 +181,8 @@ describe("rollout options", () => {
       sessions: 0,
     });
     expect(calls).toEqual([
-      "SELECT pg_try_advisory_lock(1919249529, 3) AS locked",
-      "SELECT pg_try_advisory_lock(1919249529, 4) AS locked",
+      "SELECT pg_try_advisory_lock(1919249529, 3) AS locked, pg_backend_pid() AS pid",
+      "SELECT pg_try_advisory_lock(1919249529, 4) AS locked, pg_backend_pid() AS pid",
     ]);
   });
 
@@ -208,4 +208,41 @@ describe("rollout options", () => {
     });
     expect(await advisoryLocks()).toBe(0);
   });
+});
+
+describe("rollout lock release", () => {
+  it("fails when the unlock did not release the lock", async () => {
+    const query: RolloutQuery = async (sql) => {
+      if (sql.includes("pg_try_advisory_lock("))
+        return [{ locked: true, pid: 7 }];
+      if (sql.includes("pg_advisory_unlock("))
+        return [{ released: false, pid: 7 }];
+      if (sql.includes("activate_")) return [{ activated: false }];
+      return [];
+    };
+    await expect(rolloutDeliveryProjection(query)).rejects.toThrow(
+      "rollout lock was not released by the connection that took it",
+    );
+    await expect(rolloutSessionRollups(query)).rejects.toThrow(
+      "rollout lock was not released by the connection that took it",
+    );
+  });
+
+  it.runIf(testDatabaseKind === "postgres")(
+    "fails behind a transaction pooler that hands statements to other backends",
+    async () => {
+      const backends = [await secondConnection(), await secondConnection()];
+      let next = 0;
+      // Each statement goes to the other backend, as a transaction-mode pooler may.
+      const pooled: RolloutQuery = async (sql) =>
+        (await backends[next++ % 2]!.query(sql)).rows;
+      await expect(rolloutSessionRollups(pooled)).rejects.toThrow(
+        "rollout lock was not released by the connection that took it",
+      );
+      // The backend that took the lock still holds it: the leak the error reports.
+      expect(await advisoryLocks()).toBe(1);
+      for (const backend of others.splice(0)) await backend.end();
+      expect(await advisoryLocks()).toBe(0);
+    },
+  );
 });

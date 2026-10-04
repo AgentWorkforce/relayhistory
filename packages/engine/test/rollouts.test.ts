@@ -527,7 +527,10 @@ describe("rollout script", () => {
     let busy = 2;
     const query = async (sql: string) => {
       calls.push(sql);
-      if (sql.includes("pg_try_advisory_lock(")) return [{ locked: true }];
+      if (sql.includes("pg_try_advisory_lock("))
+        return [{ locked: true, pid: 1 }];
+      if (sql.includes("pg_advisory_unlock("))
+        return [{ released: true, pid: 1 }];
       if (sql.includes("delivery_rollout_indexes()")) return [];
       if (sql.includes("activate_")) return [{ activated: false }];
       if (sql.includes("_step(")) {
@@ -548,7 +551,8 @@ describe("rollout script", () => {
     await expect(
       rolloutDeliveryProjection(
         async (sql: string) => {
-          if (sql.includes("pg_try_advisory_lock(")) return [{ locked: true }];
+          if (sql.includes("pg_try_advisory_lock("))
+            return [{ locked: true, pid: 1 }];
           if (sql.includes("_step("))
             throw Object.assign(new Error("x"), { code: "57014" });
           return sql.includes("activate_") ? [{ activated: false }] : [];
