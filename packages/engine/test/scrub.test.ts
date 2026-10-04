@@ -1824,6 +1824,17 @@ describe("hosted ingest scrubbing", () => {
       expect(scrubText('{"Authorization":"Basic $(echo","next":"keep"}')).toBe(
         '{"Authorization":"Basic [REDACTED]","next":"keep"}',
       );
+      // Pinned (GH4178298170): a later `)` closes the substitution, so the sibling
+      // goes with it. Stopping at a keyed close followed by JSON structure instead
+      // would leak the password in the confidentiality control below.
+      expect(scrubText('{"Authorization":"Basic $(echo","next":"keep)"}')).toBe(
+        '{"Authorization":"Basic [REDACTED]"}',
+      );
+      expect(
+        scrubText(
+          `{"Authorization": "Bearer $(curl -s https://auth/login -d "{"user":"admin","pass":"${S}"}" | jq -r .token)", "next": "keep"}`,
+        ),
+      ).toBe('{"Authorization": "Bearer [REDACTED]", "next": "keep"}');
       // Pinned (GH4178215596): an unclosed substitution's continuation lines are
       // taken with it; a header-looking line inside one cannot end it, or this
       // heredoc's password would leak.
