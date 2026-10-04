@@ -290,6 +290,22 @@ describe("hosted ingest scrubbing", () => {
       ],
       ["spaced authorization", (n) => `,${" ".repeat(n)}`.slice(0, n)],
       [
+        "long digest parameter list",
+        (n) => `Authorization: Digest ${"a=b, ".repeat(n)}`.slice(0, n),
+      ],
+      [
+        "stray parameter items",
+        (n) =>
+          `Authorization: AWS4 C=a/b, ${"x y=z/w, ".repeat(n)}`.slice(0, n),
+      ],
+      [
+        "repeated open quoted parameters",
+        (n) =>
+          '\nAuthorization: Digest a="x, b=\\"'
+            .repeat(Math.ceil(n / 34))
+            .slice(0, n),
+      ],
+      [
         "repeated bearer",
         (n) => "Bearer a=".repeat(Math.ceil(n / 9)).slice(0, n),
       ],
@@ -501,6 +517,61 @@ describe("hosted ingest scrubbing", () => {
       // Prose that mentions the header is not a header line.
       const prose = "Send the Authorization: header with each call";
       expect(scrubText(prose)).toBe(prose);
+    });
+
+    it("redacts every Digest parameter, however the header is quoted", () => {
+      const unescaped = scrubText(
+        '-H "Authorization: Digest username="alice", realm="svc", response=deadbeef1234" -X POST http://x',
+      );
+      expect(unescaped).not.toContain("deadbeef1234");
+      expect(unescaped).toBe(
+        '-H "Authorization: Digest [REDACTED]" -X POST http://x',
+      );
+      expect(
+        scrubText(
+          '{"Authorization": "Digest username=\\"u\\", response=\\"abc\\"", "a": 1}',
+        ),
+      ).toBe('{"Authorization": "Digest [REDACTED]", "a": 1}');
+      expect(
+        scrubText(
+          "curl -H 'Authorization: Digest username=\"u\", response=abc' url",
+        ),
+      ).toBe("curl -H 'Authorization: Digest [REDACTED]' url");
+      // AWS Signature V4: parameter values are not RFC tokens.
+      const sigv4 = scrubText(
+        "Authorization: AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20261004/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=5d672d79c15b13162d9279b0855cfba6789a8edb4c82c400e06b5924a6f2b5d7",
+      );
+      expect(sigv4).toBe("Authorization: AWS4-HMAC-SHA256 [REDACTED]");
+      expect(sigv4).not.toContain("AKIDEXAMPLE");
+      expect(sigv4).not.toContain("5d672d79");
+      expect(
+        scrubText(
+          '{"Authorization": "AWS4-HMAC-SHA256 Credential=AKID/x, Signature=abc", "a": 1}',
+        ),
+      ).toBe('{"Authorization": "AWS4-HMAC-SHA256 [REDACTED]", "a": 1}');
+      // An item after a comma that is not a parameter still ends no earlier than a
+      // parameter inside it.
+      const tail = scrubText("Authorization: Digest a=b, stray d=secret\nnext");
+      expect(tail).not.toContain("secret");
+      expect(tail).toBe("Authorization: Digest [REDACTED]\nnext");
+      // Parameters with no scheme, spaced around `=`.
+      expect(scrubText('Authorization: realm = "svc", nonce=abc next')).toBe(
+        "Authorization: [REDACTED] next",
+      );
+    });
+
+    it("ends a header's credential where the credential ends", () => {
+      expect(scrubText("(authorization: required per policy) and more")).toBe(
+        "(authorization: required [REDACTED] policy) and more",
+      );
+      expect(
+        scrubText(
+          'curl -H \\"Authorization: Bearer abcdefghijklmnopqrstuvwx\\" -X POST',
+        ),
+      ).toBe('curl -H \\"Authorization: Bearer [REDACTED]\\" -X POST');
+      expect(
+        scrubText("Authorization: Basic dXNlcjpwYXNz then the next words"),
+      ).toBe("Authorization: Basic [REDACTED] then the next words");
     });
 
     it("normalizes a home path that ends at the username", () => {
