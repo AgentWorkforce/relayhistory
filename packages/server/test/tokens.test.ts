@@ -18,6 +18,7 @@ import {
   listTokens,
   revokeToken,
   createTokenFile,
+  UndeliveredTokenError,
 } from "../src/tokens.js";
 
 const adminUrl = process.env.TEST_ADMIN_DATABASE_URL;
@@ -110,6 +111,67 @@ describe.skipIf(!adminUrl)("token bootstrap", () => {
     expect(await resolveAccessToken(database.db, minted!)).toBeNull();
     const [row] = await listTokens(database.db, "pipe");
     expect(row.revokedAt).not.toBeNull();
+  });
+
+  it("revokes an undelivered token even when removing the partial file fails", async () => {
+    let minted: string | undefined;
+    const failing = {
+      open: async () => ({
+        writeFile: async (text: string | Uint8Array) => {
+          minted = JSON.parse(String(text)).token;
+          throw Object.assign(new Error("write ENOSPC"), { code: "ENOSPC" });
+        },
+        close: async () => {
+          throw Object.assign(new Error("close EIO"), { code: "EIO" });
+        },
+      }),
+      remove: async () => {
+        throw Object.assign(new Error("rm EACCES"), { code: "EACCES" });
+      },
+    };
+    await expect(
+      createTokenFile(
+        database.db,
+        { orgId: "cleanup", workspaceId: "main", label: "rm-fails" },
+        { path: join(dir, "never.json") },
+        failing,
+      ),
+    ).rejects.toMatchObject({ code: "ENOSPC" });
+    expect(minted).toMatch(/^rth_st_/);
+    expect(await resolveAccessToken(database.db, minted!)).toBeNull();
+  });
+
+  it("names a token it could neither deliver nor revoke", async () => {
+    let minted: string | undefined;
+    // The database accepts the mint but refuses the revoking update.
+    const noRevoke = new Proxy(database.db, {
+      get(target, prop, receiver) {
+        if (prop === "update")
+          return () => {
+            throw new Error("connection lost");
+          };
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    const failure = createTokenFile(
+      noRevoke,
+      { orgId: "cleanup", workspaceId: "main", label: "revoke-fails" },
+      {
+        async write(text) {
+          minted = JSON.parse(text).token;
+          throw Object.assign(new Error("write EPIPE"), { code: "EPIPE" });
+        },
+      },
+    );
+    const error = (await failure.catch(
+      (e: unknown) => e,
+    )) as UndeliveredTokenError;
+    expect(error).toBeInstanceOf(UndeliveredTokenError);
+    expect(error.message).toContain(error.tokenId);
+    expect(error.message).not.toContain(minted!);
+    // It really is still live: the operator must revoke it by id.
+    expect(await resolveAccessToken(database.db, minted!)).not.toBeNull();
+    expect(await revokeToken(database.db, "cleanup", error.tokenId)).toBe(true);
   });
 
   it("refuses scopes beyond sync and read", async () => {

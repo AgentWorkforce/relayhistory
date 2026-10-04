@@ -17,6 +17,7 @@ import {
   createTokenFile,
   listTokens,
   revokeToken,
+  UndeliveredTokenError,
   validateTokenOptions,
 } from "./tokens.js";
 
@@ -202,7 +203,8 @@ async function main(argv: string[]) {
       process.exitCode = 2;
     } else if (
       error instanceof ConfigError ||
-      error instanceof ServiceTokenError
+      error instanceof ServiceTokenError ||
+      error instanceof UndeliveredTokenError
     ) {
       log.error((error as Error).message);
       process.exitCode = 2;

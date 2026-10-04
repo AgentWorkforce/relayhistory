@@ -2,7 +2,7 @@
  * Operator credential bootstrap. These are database operations run by whoever holds
  * the deployment's `DATABASE_URL`; no HTTP route mints a token without one.
  */
-import { open, rm } from "node:fs/promises";
+import { open, rm, type FileHandle } from "node:fs/promises";
 import {
   DEFAULT_SCOPES,
   SERVICE_TTL_MAX_DAYS,
@@ -111,21 +111,41 @@ export async function createToken(
 export type TokenDestination =
   { path: string } | { write(text: string): Promise<void> };
 
+/** The file operations `createTokenFile` uses; tests substitute failing ones. */
+export interface TokenFileSystem {
+  open(path: string): Promise<Pick<FileHandle, "writeFile" | "close">>;
+  remove(path: string): Promise<void>;
+}
+
+const files: TokenFileSystem = {
+  open: (path) => open(path, "wx", 0o600),
+  remove: (path) => rm(path, { force: true }),
+};
+
+/** The token was minted, its delivery failed, and revoking it failed too. */
+export class UndeliveredTokenError extends Error {
+  override name = "UndeliveredTokenError";
+  constructor(readonly tokenId: string) {
+    super(
+      `token ${tokenId} could not be delivered or revoked; revoke it with \`token revoke --id ${tokenId}\``,
+    );
+  }
+}
+
 /**
  * Mint a token and deliver its file, or leave no usable credential behind. A path is
  * opened owner-only and exclusively before anything is minted, so an existing file is
- * refused without touching the database; a delivery that fails after minting revokes
- * the token it could not hand over.
+ * refused without touching the database. When delivery fails after minting, the token
+ * is revoked first; removing the partial file comes after and cannot prevent it.
  */
 export async function createTokenFile(
   db: HistoryDb,
   options: CreateTokenOptions,
   destination: TokenDestination,
+  fs: TokenFileSystem = files,
 ): Promise<TokenFile> {
-  const handle =
-    "path" in destination
-      ? await open(destination.path, "wx", 0o600)
-      : undefined;
+  const path = "path" in destination ? destination.path : undefined;
+  const handle = path ? await fs.open(path) : undefined;
   let file: TokenFile | undefined;
   try {
     file = await createToken(db, options);
@@ -136,16 +156,20 @@ export async function createTokenFile(
     await handle?.close();
     return file;
   } catch (error) {
-    await handle?.close().catch(() => {});
-    if (handle)
-      await rm((destination as { path: string }).path, { force: true });
+    let revoked = !file;
     if (file)
-      await revokeServiceToken(
+      revoked = await revokeServiceToken(
         db,
         file.orgId,
         file.id,
         "token file could not be delivered",
+      ).then(
+        () => true,
+        () => false,
       );
+    await handle?.close().catch(() => {});
+    if (path) await fs.remove(path).catch(() => {});
+    if (!revoked) throw new UndeliveredTokenError(file!.id);
     throw error;
   }
 }
