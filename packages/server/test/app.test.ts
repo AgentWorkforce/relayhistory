@@ -63,7 +63,9 @@ describe("createServerApp", () => {
       {
         get() {
           throw Object.assign(
-            new Error('relation "x" violates ... password=hunter2'),
+            new Error(
+              'duplicate key in "secret_table_q7": Key (session_id)=(private-s9) password=hunter2',
+            ),
             { code: "XX000" },
           );
         },
@@ -87,9 +89,33 @@ describe("createServerApp", () => {
       error: { code: "internal_error", message: "Internal server error" },
       correlationId: "corr-1",
     });
+    // Exactly the safe fields: no message, detail, query or stack from the driver error.
+    const records = lines.map((line) => JSON.parse(line));
+    expect(records).toHaveLength(1);
+    expect(Object.keys(records[0]).sort()).toEqual(
+      [
+        "code",
+        "correlationId",
+        "error",
+        "level",
+        "message",
+        "method",
+        "time",
+      ].sort(),
+    );
+    expect(records[0]).toMatchObject({
+      message: "request failed",
+      error: "Error",
+      code: "XX000",
+      correlationId: "corr-1",
+    });
     const logged = lines.join("");
-    expect(logged).toContain('"code":"XX000"');
-    expect(logged).toContain('"correlationId":"corr-1"');
-    expect(logged).not.toContain("hunter2");
+    for (const detail of [
+      "secret_table_q7",
+      "private-s9",
+      "hunter2",
+      "duplicate key",
+    ])
+      expect(logged).not.toContain(detail);
   });
 });

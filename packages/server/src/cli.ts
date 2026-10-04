@@ -52,8 +52,12 @@ async function serve(log: Logger) {
     process.on("SIGTERM", stop);
     process.on("SIGINT", stop);
   });
-  // Exit even if a stuck database connection still holds the event loop.
-  process.exit(drained ? 0 : 1);
+  // A clean drain leaves nothing holding the event loop, so the process exits on its own
+  // once stderr has flushed. Only a stuck database connection past the deadline forces it.
+  if (!drained) {
+    process.exitCode = 1;
+    process.stderr.write("", () => process.exit(1));
+  }
 }
 
 async function migrate(log: Logger) {
