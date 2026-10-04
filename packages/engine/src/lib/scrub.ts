@@ -197,13 +197,22 @@ export function scrubText(value: string): string {
  */
 const AUTHORIZATION_HEADER =
   /(^|[\r\n{,(]|["'])[ \t]*(?:proxy-)?authorization["']?[ \t]*[:=][ \t]*/gi;
-const AUTHORIZATION_SCHEME = /^([A-Za-z][\w!#$%&*+.^`|~-]*)[ \t]+\S/;
+// RFC 7230 token characters, less the quotes that can delimit a quoted header.
+const TOKEN = /[A-Za-z0-9!#$%&*+.^_`|~-]/;
+// A scheme is followed by its credential, never by the `=` of a parameter.
+const AUTHORIZATION_SCHEME =
+  /([A-Za-z][A-Za-z0-9!#$%&*+.^_`|~-]*)[ \t]+(?=[^\s=])/y;
 
 /**
- * Redacts each header's credential and keeps its scheme, as the Bearer rule does. A
- * credential runs to the end of its line, or, when it or its header is quoted, to the
- * closing quote, so quoted Digest parameters stay inside it. One forward scan: every
- * character is read once by the header search or by a credential.
+ * Redacts each header's credential and keeps its scheme, as the Bearer rule does. The
+ * credential has RFC 7235's shape: an auth-param list (`name=value`, comma-separated),
+ * or else one token68-like run that ends at whitespace or at the quote closing a
+ * quoted header. Text after it is kept. A value is a quoted string, which opens at
+ * any unescaped `"` or at `\"`, so Digest parameters are covered however the header
+ * is quoted; or any run up to whitespace, a comma or a quote, since real values are
+ * not RFC tokens (AWS SigV4's `Credential=AKID/date/region/s3/aws4_request`). One
+ * forward scan: a character is read by the header search and at most twice more by a
+ * credential.
  */
 function redactAuthorization(text: string): string {
   let output = "";
@@ -214,32 +223,123 @@ function redactAuthorization(text: string): string {
     header;
     header = AUTHORIZATION_HEADER.exec(text)
   ) {
-    let end = header.index + header[0].length;
-    const opening = text[end];
+    let start = header.index + header[0].length;
+    const opening = text[start];
     const quote =
       opening === '"' || opening === "'"
         ? opening
         : header[1] === '"' || header[1] === "'"
           ? header[1]
           : "";
-    if (quote && opening === quote) end += 1;
-    const start = end;
-    while (
-      end < text.length &&
-      text[end] !== "\n" &&
-      text[end] !== "\r" &&
-      text[end] !== quote
-    )
-      end += quote && text[end] === "\\" ? 2 : 1;
-    end = Math.min(end, text.length);
-    const credential = text.slice(start, end);
-    if (!credential.trim()) continue;
-    const scheme = AUTHORIZATION_SCHEME.exec(credential);
+    if (quote && opening === quote) start += 1;
+    AUTHORIZATION_SCHEME.lastIndex = start;
+    const scheme = AUTHORIZATION_SCHEME.exec(text);
+    const credential = scheme ? start + scheme[0].length : start;
+    const end =
+      authParams(text, credential, quote) ?? token68(text, credential, quote);
+    if (end === credential) continue;
     output += `${text.slice(last, start)}${scheme ? `${scheme[1]} ` : ""}${REDACTED}`;
     last = end;
     AUTHORIZATION_HEADER.lastIndex = end;
   }
   return output + text.slice(last);
+}
+
+/** The end of an auth-param list starting at `at`, or null when none starts there. */
+function authParams(text: string, at: number, quote: string): number | null {
+  let end = authParam(text, at, quote);
+  if (end === null) return null;
+  for (;;) {
+    let next: number = end;
+    while (text[next] === " " || text[next] === "\t") next += 1;
+    if (text[next] !== ",") return end;
+    next += 1;
+    while (text[next] === " " || text[next] === "\t") next += 1;
+    const following: number | null =
+      authParam(text, next, quote) ?? strayItem(text, next, quote);
+    if (following === null) return end;
+    end = following;
+  }
+}
+
+/**
+ * A list item that is not a parameter but holds one (`, stray d=secret`): it runs to
+ * the next comma, the end of the line or the closing header quote, and is taken whole
+ * when it contains `=`, so no `name=value` after a separator is left behind.
+ */
+function strayItem(text: string, at: number, quote: string): number | null {
+  let index = at;
+  let assigns = false;
+  while (
+    index < text.length &&
+    text[index] !== "," &&
+    text[index] !== "\n" &&
+    text[index] !== "\r" &&
+    !closesHeader(text, index, quote)
+  ) {
+    if (text[index] === "=") assigns = true;
+    index += 1;
+  }
+  return assigns ? index : null;
+}
+
+/** Whether `index` holds the quote closing a quoted header, bare or backslashed. */
+function closesHeader(text: string, index: number, quote: string): boolean {
+  return (
+    quote !== "" &&
+    (text[index] === quote ||
+      (text[index] === "\\" && text[index + 1] === quote))
+  );
+}
+
+/** The end of one `name=value` auth-param at `at`, or null. */
+function authParam(text: string, at: number, quote: string): number | null {
+  let index = at;
+  while (index < text.length && TOKEN.test(text[index]!)) index += 1;
+  if (index === at) return null;
+  while (text[index] === " " || text[index] === "\t") index += 1;
+  if (text[index] !== "=") return null;
+  index += 1;
+  while (text[index] === " " || text[index] === "\t") index += 1;
+  if (text[index] === '"') return quotedString(text, index + 1, false);
+  if (text[index] === "\\" && text[index + 1] === '"')
+    return quotedString(text, index + 2, true);
+  const value = index;
+  while (
+    index < text.length &&
+    !/[\s,"]/.test(text[index]!) &&
+    !closesHeader(text, index, quote)
+  )
+    index += 1;
+  return index === value ? null : index;
+}
+
+/**
+ * The end of a quoted string whose content starts at `at`: after its closing `"` (or
+ * `\"` when it opened escaped), or at the end of the line when it never closes.
+ */
+function quotedString(text: string, at: number, escaped: boolean): number {
+  let index = at;
+  while (index < text.length && text[index] !== "\n" && text[index] !== "\r") {
+    if (text[index] === "\\") {
+      if (escaped && text[index + 1] === '"') return index + 2;
+      index += 2;
+      continue;
+    }
+    if (text[index] === '"' && !escaped) return index + 1;
+    index += 1;
+  }
+  return Math.min(index, text.length);
+}
+
+/** The end of a single credential: up to whitespace or the closing header quote. */
+function token68(text: string, at: number, quote: string): number {
+  let index = at;
+  while (index < text.length && !/\s/.test(text[index]!)) {
+    if (closesHeader(text, index, quote)) break;
+    index += 1;
+  }
+  return index;
 }
 
 /** A field name the assignment rule would redact the value of in text, or a header. */
