@@ -297,15 +297,21 @@ function redactAuthorization(text: string): string {
     const credential = scheme ? start + scheme[0].length : start;
     const params = authParams(text, credential, quote);
     let end = params ?? token68(text, credential, quote);
-    if (end === credential) continue;
-    // A parameter list ends where its grammar does; a single credential that stops
-    // short of the header's close was cut at a space the shell would expand.
-    // A serialized line's own end is found by `serializedLineEnd`, which keeps the
-    // string's close and what follows it.
-    if (quote.lineBase > 0)
+    if (end === credential) {
+      // A scheme followed by something neither grammar reads (`Digest "quoted", …`)
+      // still introduces a credential, so the rest of the header is redacted.
+      if (!scheme) continue;
+      end = unreadCredentialEnd(text, credential, quote);
+      if (end === credential) continue;
+    } else if (quote.lineBase > 0) {
+      // A serialized line's own end is found by `serializedLineEnd`, which keeps the
+      // string's close and what follows it.
       end = serializedLineEnd(text, end, quote, params === null ? end : -1);
-    else if (params === null && quote.char)
+    } else if (params === null && quote.char) {
+      // A parameter list ends where its grammar does; a single credential that stops
+      // short of the header's close was cut at a space the shell would expand.
       end = closingQuote(text, end, quote) ?? end;
+    }
     output += `${text.slice(last, start)}${scheme ? `${scheme[1]} ` : ""}${REDACTED}`;
     last = end;
     searched = Math.max(searched, end);
@@ -508,6 +514,26 @@ function headerQuote(char: string, depth: number): HeaderQuote {
     unit: 2 ** (Math.floor(Math.log2(depth + 1)) + 1),
     lineBase: 0,
   };
+}
+
+/**
+ * The end of a credential neither the parameter nor the token68 grammar could read:
+ * the end of a serialized line, the header's closing quote, or the end of the line.
+ */
+function unreadCredentialEnd(
+  text: string,
+  at: number,
+  quote: HeaderQuote,
+): number {
+  if (quote.lineBase > 0) return serializedLineEnd(text, at, quote, -1);
+  if (quote.char) {
+    const close = closingQuote(text, at, quote);
+    if (close !== null) return close;
+  }
+  let index = at;
+  while (index < text.length && text[index] !== "\n" && text[index] !== "\r")
+    index += 1;
+  return index;
 }
 
 /**
