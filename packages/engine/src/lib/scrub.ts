@@ -314,8 +314,8 @@ function redactAuthorization(text: string): string {
 /**
  * Where a serialized header line ends, at or after its credential's end `at`: the
  * next real or proven escaped line break, the end of the text, or a string's end — a
- * quote of either kind with fewer backslashes than a line break, followed by `}`, `]`,
- * `)`, `,`, `;` or the end, unless that `,` continues the parameter list. A message
+ * quote of either kind with fewer backslashes than a line break that `endsString`
+ * accepts by what follows it. A message
  * serialized through several layers of different quoting (a Python repr inside JSON),
  * or with a stray quote before the header that misleads `enclosingQuote`, can stop
  * the credential early; this takes the rest of the header line with it, and only a
@@ -349,20 +349,41 @@ function serializedLineEnd(
   return text.length;
 }
 
-const STRING_END = /[}\]),;]/;
-// A further auth-param after a `,`: the list goes on, so the quote before it is a
-// value's, not the string's.
+// A further auth-param: the list goes on, so the quote before it is a value's, not
+// the string's.
 const NEXT_PARAMETER =
   /[ \t]{0,16}[!#$%&'*+.^_`|~0-9A-Za-z-]{1,64}[ \t]{0,16}=/y;
 
-/** Whether the text from `at` closes a string: a structural character or the end. */
+function nextParameter(text: string, at: number): boolean {
+  NEXT_PARAMETER.lastIndex = at;
+  return NEXT_PARAMETER.test(text);
+}
+
+/**
+ * Whether a quote whose next character is at `at` closes its string, judged by what
+ * follows it. A separator (`,` `;`) or spaces before another `name=` continue the
+ * parameter list (`username="u"; realm=…`, `username="u" response=…`); otherwise a
+ * separator, a closing bracket, `:`, a line end, the end of the text, or spaces before
+ * anything else (a shell argument, prose) end the string. A quote run straight into
+ * other text (`o'brien`, `"6629…`) is a value's.
+ */
 function endsString(text: string, at: number): boolean {
-  const follower = text[at];
-  if (follower === undefined) return true;
-  if (!STRING_END.test(follower)) return false;
-  if (follower !== ",") return true;
-  NEXT_PARAMETER.lastIndex = at + 1;
-  return !NEXT_PARAMETER.test(text);
+  let index = at;
+  while (index - at < 16 && (text[index] === " " || text[index] === "\t"))
+    index += 1;
+  const follower = text[index];
+  if (follower === undefined || follower === "\n" || follower === "\r")
+    return true;
+  if (follower === "," || follower === ";")
+    return !nextParameter(text, index + 1);
+  if (
+    follower === "}" ||
+    follower === "]" ||
+    follower === ")" ||
+    follower === ":"
+  )
+    return true;
+  return index > at && !nextParameter(text, index);
 }
 
 /**
