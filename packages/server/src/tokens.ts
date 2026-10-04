@@ -2,7 +2,7 @@
  * Operator credential bootstrap. These are database operations run by whoever holds
  * the deployment's `DATABASE_URL`; no HTTP route mints a token without one.
  */
-import { open } from "node:fs/promises";
+import { open, rm } from "node:fs/promises";
 import {
   bootstrapServiceToken,
   deliveryAccount,
@@ -67,16 +67,46 @@ export async function createToken(
   };
 }
 
+/** Where `createTokenFile` delivers the secret. */
+export type TokenDestination =
+  { path: string } | { write(text: string): Promise<void> };
+
 /**
- * Write a token file readable only by its owner. An existing file is never replaced:
- * a second token for the same path is an operator mistake, not a rotation.
+ * Mint a token and deliver its file, or leave no usable credential behind. A path is
+ * opened owner-only and exclusively before anything is minted, so an existing file is
+ * refused without touching the database; a delivery that fails after minting revokes
+ * the token it could not hand over.
  */
-export async function writeTokenFile(path: string, file: TokenFile) {
-  const handle = await open(path, "wx", 0o600);
+export async function createTokenFile(
+  db: HistoryDb,
+  options: CreateTokenOptions,
+  destination: TokenDestination,
+): Promise<TokenFile> {
+  const handle =
+    "path" in destination
+      ? await open(destination.path, "wx", 0o600)
+      : undefined;
+  let file: TokenFile | undefined;
   try {
-    await handle.writeFile(`${JSON.stringify(file, null, 2)}\n`);
-  } finally {
-    await handle.close();
+    file = await createToken(db, options);
+    const text = `${JSON.stringify(file, null, 2)}\n`;
+    if (handle) await handle.writeFile(text);
+    else
+      await (destination as { write(text: string): Promise<void> }).write(text);
+    await handle?.close();
+    return file;
+  } catch (error) {
+    await handle?.close().catch(() => {});
+    if (handle)
+      await rm((destination as { path: string }).path, { force: true });
+    if (file)
+      await revokeServiceToken(
+        db,
+        file.orgId,
+        file.id,
+        "token file could not be delivered",
+      );
+    throw error;
   }
 }
 

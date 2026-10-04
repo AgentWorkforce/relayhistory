@@ -53,21 +53,24 @@ export DATABASE_URL=postgres://history:SECRET@db.internal:5432/history
 node dist/cli.js serve
 ```
 
+It listens on `127.0.0.1:8080`; set `HOST=0.0.0.0` only when the TLS proxy runs on
+another host.
+
 `relayhistory-server migrate` applies migrations without serving, for a deploy step
 that runs them separately.
 
 ## Configuration
 
-| Variable                                | Default            | Meaning                                                                      |
-| --------------------------------------- | ------------------ | ---------------------------------------------------------------------------- |
-| `DATABASE_URL`                          | required           | `postgres://` URL; standard TCP connection                                   |
-| `HOST` / `PORT`                         | `0.0.0.0` / `8080` | Listen address                                                               |
-| `RELAYHISTORY_DB_POOL_MAX`              | `10`               | Pool connections                                                             |
-| `RELAYHISTORY_SHUTDOWN_TIMEOUT_MS`      | `15000`            | Drain time for in-flight requests on SIGTERM                                 |
-| `RELAYHISTORY_RETENTION_INTERVAL_MS`    | `60000`            | Interval of the job that clears expired retention-bounded evidence           |
-| `RELAYHISTORY_RUNTIME_ROLE`             | unset              | Role granted access to the `sessions` schema after migrations                |
-| `EMBEDDING_API_KEY` or `OPENAI_API_KEY` | unset              | Optional embeddings for `POST /v1/ingest`; upload and recall never need them |
-| `EMBEDDING_API_URL`, `EMBEDDING_MODEL`  | OpenAI defaults    | OpenAI-compatible embedding endpoint                                         |
+| Variable                                | Default                                              | Meaning                                                                      |
+| --------------------------------------- | ---------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `DATABASE_URL`                          | required                                             | `postgres://` URL; standard TCP connection                                   |
+| `HOST` / `PORT`                         | `127.0.0.1` / `8080` (the image sets `HOST=0.0.0.0`) | Listen address                                                               |
+| `RELAYHISTORY_DB_POOL_MAX`              | `10`                                                 | Pool connections                                                             |
+| `RELAYHISTORY_SHUTDOWN_TIMEOUT_MS`      | `15000`                                              | Drain time for in-flight requests on SIGTERM                                 |
+| `RELAYHISTORY_RETENTION_INTERVAL_MS`    | `60000`                                              | Interval of the job that clears expired retention-bounded evidence           |
+| `RELAYHISTORY_RUNTIME_ROLE`             | unset                                                | Role granted access to the `sessions` schema after migrations                |
+| `EMBEDDING_API_KEY` or `OPENAI_API_KEY` | unset                                                | Optional embeddings for `POST /v1/ingest`; upload and recall never need them |
+| `EMBEDDING_API_URL`, `EMBEDDING_MODEL`  | OpenAI defaults                                      | OpenAI-compatible embedding endpoint                                         |
 
 Logs are JSON lines on stderr. They never contain tokens, the database URL, request
 bodies or driver error text.

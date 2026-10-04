@@ -67,7 +67,7 @@ export function loadConfig(env: Env = process.env): ServerConfig {
   }
   return {
     databaseUrl: databaseUrl(env),
-    host: env.HOST?.trim() || "0.0.0.0",
+    host: env.HOST?.trim() || "127.0.0.1",
     port: integer(env, "PORT", 8080, 0, 65_535),
     poolMax: integer(env, "RELAYHISTORY_DB_POOL_MAX", 10, 1, 200),
     shutdownTimeoutMs: integer(

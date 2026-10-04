@@ -2,8 +2,12 @@ import type { HistoryDb } from "@relayhistory/engine";
 import type pg from "pg";
 import { describe, expect, it } from "vitest";
 import { createServerApp } from "../src/app.js";
+import { createLogger, silentLogger, type Logger } from "../src/log.js";
 
-function app(options: { accepting: boolean; database: boolean }) {
+function app(
+  options: { accepting: boolean; database: boolean },
+  log: Logger = silentLogger,
+) {
   const pool = {
     query: async () => {
       if (!options.database) throw new Error("connection refused");
@@ -14,6 +18,7 @@ function app(options: { accepting: boolean; database: boolean }) {
     db: {} as HistoryDb,
     pool,
     embeddings: null,
+    log,
     accepting: () => options.accepting,
   });
 }
@@ -49,5 +54,42 @@ describe("createServerApp", () => {
     expect(await response.json()).toMatchObject({
       error: { code: "missing_authorization" },
     });
+  });
+
+  it("answers an unhandled failure with the engine's body and logs no driver text", async () => {
+    const lines: string[] = [];
+    const db = new Proxy(
+      {},
+      {
+        get() {
+          throw Object.assign(
+            new Error('relation "x" violates ... password=hunter2'),
+            { code: "XX000" },
+          );
+        },
+      },
+    ) as HistoryDb;
+    const failing = createServerApp({
+      db,
+      pool: {} as pg.Pool,
+      embeddings: null,
+      log: createLogger((line) => lines.push(line)),
+      accepting: () => true,
+    });
+    const response = await failing.request("/v1/sessions", {
+      headers: {
+        authorization: "Bearer rth_st_example",
+        "x-correlation-id": "corr-1",
+      },
+    });
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({
+      error: { code: "internal_error", message: "Internal server error" },
+      correlationId: "corr-1",
+    });
+    const logged = lines.join("");
+    expect(logged).toContain('"code":"XX000"');
+    expect(logged).toContain('"correlationId":"corr-1"');
+    expect(logged).not.toContain("hunter2");
   });
 });

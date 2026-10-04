@@ -18,8 +18,11 @@ import type { Logger } from "./log.js";
 export interface RunningServer {
   /** The bound port (useful when `PORT=0`). */
   port: number;
-  /** Stop accepting, finish in-flight requests, stop jobs and close the pool. Idempotent. */
-  close(): Promise<void>;
+  /**
+   * Stop accepting, finish in-flight requests, stop jobs and close the pool, within the
+   * shutdown timeout. Resolves false when the deadline passed first. Idempotent.
+   */
+  close(): Promise<boolean>;
 }
 
 export async function startServer(
@@ -45,6 +48,7 @@ export async function startServer(
     db: database.db,
     pool: database.pool,
     embeddings,
+    log,
     accepting: () => accepting,
   });
 
@@ -80,24 +84,40 @@ export async function startServer(
     embeddings: embeddings ? embeddings.model : "off",
   });
 
-  let closing: Promise<void> | undefined;
+  let closing: Promise<boolean> | undefined;
   const close = () =>
     (closing ??= (async () => {
       accepting = false;
       log.info("draining", { timeoutMs: config.shutdownTimeoutMs });
+      const deadline = Date.now() + config.shutdownTimeoutMs;
       const closed = new Promise<void>((resolve) =>
         server.close(() => resolve()),
       );
       server.closeIdleConnections();
-      const deadline = setTimeout(
+      const cutoff = setTimeout(
         () => server.closeAllConnections(),
         config.shutdownTimeoutMs,
       );
       await closed;
-      clearTimeout(deadline);
-      await Promise.all(jobs.map((job) => job.stop()));
-      await database.close();
-      log.info("stopped");
+      clearTimeout(cutoff);
+      // A job or pool connection stuck on the database must not hold the process past
+      // the deadline; its work is bounded and resumes from PostgreSQL on the next start.
+      let expire: NodeJS.Timeout | undefined;
+      const drained = await Promise.race([
+        Promise.all(jobs.map((job) => job.stop()))
+          .then(() => database.close())
+          .then(() => true),
+        new Promise<boolean>((resolve) => {
+          expire = setTimeout(
+            () => resolve(false),
+            Math.max(0, deadline - Date.now()),
+          );
+        }),
+      ]);
+      clearTimeout(expire);
+      if (drained) log.info("stopped");
+      else log.warn("shutdown deadline passed with database work in progress");
+      return drained;
     })());
 
   return { port, close };

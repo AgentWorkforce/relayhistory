@@ -16,7 +16,7 @@ COPY packages/server packages/server
 RUN cd packages/server && npm run build && npm prune --omit=dev --no-audit --no-fund
 
 FROM node:22-bookworm-slim
-ENV NODE_ENV=production
+ENV NODE_ENV=production HOST=0.0.0.0
 WORKDIR /app
 COPY --from=build /src/packages/server/package.json ./
 COPY --from=build /src/packages/server/node_modules ./node_modules
