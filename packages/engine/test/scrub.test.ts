@@ -386,6 +386,13 @@ describe("hosted ingest scrubbing", () => {
           }).slice(0, n),
       ],
       [
+        "credentials that start with a quote",
+        (n) =>
+          'Authorization: Digest "q", a=b\n'
+            .repeat(Math.ceil(n / 30))
+            .slice(0, n),
+      ],
+      [
         "stray parameter items",
         (n) =>
           `Authorization: AWS4 C=a/b, ${"x y=z/w, ".repeat(n)}`.slice(0, n),
@@ -1341,6 +1348,49 @@ describe("hosted ingest scrubbing", () => {
           const out = scrubText(input);
           expect(out, input).not.toContain(R);
         }
+    });
+
+    it("fails closed when a scheme's credential starts with a quote", () => {
+      const R = "R9secretZ";
+      const repr = (text: string) =>
+        "'" +
+        text
+          .replace(/\\/g, "\\\\")
+          .replace(/'/g, "\\'")
+          .replace(/\r/g, "\\r")
+          .replace(/\n/g, "\\n") +
+        "'";
+      const cases: Array<[string, string]> = [
+        [
+          `Authorization: Digest "quoted", response="${R}"\nHost: x`,
+          "\nHost: x",
+        ],
+        [
+          `curl -H 'Authorization: Digest "quoted", response="${R}"' url`,
+          "' url",
+        ],
+        [`Authorization: Basic "${R}"`, "Authorization: Basic [REDACTED]"],
+        [
+          repr(
+            `it"s: GET /\r\nAuthorization: Digest "quoted", realm="r", response="${R}"\r\nHost: x`,
+          ),
+          "Host: x",
+        ],
+        [
+          JSON.stringify({
+            t: `Here's: GET /\r\nAuthorization: Digest "quoted", realm="r", response="${R}"\r\nHost: x`,
+          }),
+          "Host: x",
+        ],
+      ];
+      for (const [input, kept] of cases) {
+        const out = scrubText(input);
+        expect(out, input).not.toContain(R);
+        expect(out, input).toContain(kept);
+      }
+      expect(scrubText(`Authorization: "${R}"`)).toBe(
+        'Authorization: "[REDACTED]"',
+      );
     });
 
     it("redacts to the line end when a loose quoted value meets a quote of another depth", () => {
