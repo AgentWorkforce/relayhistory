@@ -269,7 +269,7 @@ function redactAuthorization(text: string): string {
     header;
     header = AUTHORIZATION_HEADER.exec(text)
   ) {
-    const credential = readCredential(text, header, state, true);
+    const credential = readCredential(text, header, state, false);
     if (!credential) continue;
     output += `${text.slice(last, credential.start)}${credential.scheme ? `${credential.scheme} ` : ""}${REDACTED}`;
     last = credential.end;
@@ -293,7 +293,7 @@ function headerState(): HeaderState {
   return {
     enclosing: "",
     searched: 0,
-    substitutions: { extendedTo: 0 },
+    substitutions: { extendedTo: 0, nestedTo: 0 },
     matches: matchCache(),
   };
 }
@@ -309,16 +309,18 @@ interface Credential {
  * Reads the credential of the Authorization header matched by `header`: its quoting,
  * scheme, and the parameter list, token68 run or shell substitution it holds, then
  * the header's own close (`closingQuote`, or `serializedLineEnd` on a serialized
- * line) from that credential's end. With `sweep`, a substitution that crossed a line
- * break or failed closed inside a region is also extended by `sweptEnd`, and the end
- * is the larger of the two, so the close is never looked for from inside a later
- * secret. Null when no credential follows the header.
+ * line) from that credential's end. A substitution that crossed a line break or
+ * failed closed inside a region is also extended by `sweptEnd`, and the end is the
+ * larger of the two, so the close is never looked for from inside a later secret.
+ * A `nested` read, of a header that sweep found, does neither: it reads its own
+ * credential only, and records failed scans as `SubstitutionScan.nestedTo`. Null when
+ * no credential follows the header.
  */
 function readCredential(
   text: string,
   header: RegExpExecArray,
   state: HeaderState,
-  sweep: boolean,
+  nested: boolean,
 ): Credential | null {
   let start = header.index + header[0].length;
   const escapes = backslashes(text, start);
@@ -357,6 +359,7 @@ function readCredential(
     quote,
     keyed,
     state.substitutions,
+    nested,
   );
   const params =
     substitution === null ? authParams(text, credential, quote, padded) : null;
@@ -386,7 +389,7 @@ function readCredential(
     // malformed; the rest of the header goes with it.
     end = headerEnd(text, raw, quote);
   }
-  if (sweep && substitution?.sweep)
+  if (!nested && substitution?.sweep)
     end = Math.max(
       end,
       sweptEnd(
@@ -704,19 +707,33 @@ const SUBSTITUTION_WINDOW = 4096;
  * Where scans of substitutions that ran past their fallback end (a line break, or a
  * quoted key's value close) without closing stopped, whether at the window or at a
  * serialized string's close. A later substitution starting before it scans afresh,
- * with no window: one that closes is redacted to its close, one that does not fails
- * closed at the first real line break at or after the region's end (on a serialized
- * line also its first escaped break, and on an unkeyed serialized line the string's
- * structural close) or the end of the text, which `sweptEnd` extends so it splits
- * no multi-line secret (`DB_PASSWORD=\n…`, a PEM block), and neither moves
- * it. Every in-region scan is thus consumed by its redaction, and every scan that
- * returns its fallback
- * has read at most `SUBSTITUTION_WINDOW` past it and starts after the last such
- * region, so substitutions cost O(n + window) per pass, with n bounded by
+ * with no window up to the first real line break at or after the region's end (on a
+ * serialized line also its first escaped break) and with one from there: one that
+ * closes is redacted to its close, so a substitution straddling the region's end
+ * keeps its later lines (`$(printf 'admin:\nS3cret' | base64)`); one that does not
+ * fails closed at that break, at an unkeyed serialized line's structural close, or
+ * at the end of the text, which `sweptEnd` extends so it splits no multi-line secret
+ * (`DB_PASSWORD=\n…`, a PEM block).
+ *
+ * Every in-region scan is consumed by its redaction. One that reaches the region's
+ * end reads on at most `SUBSTITUTION_WINDOW` past it and ends there or later, so the
+ * next header of its kind starts past the region: per region, one top-level scan and,
+ * in a sweep, one on each side of the sweep's `from` read on. Every scan that returns
+ * its fallback has read at most `SUBSTITUTION_WINDOW` past it and starts after the
+ * last region, so substitutions cost O(n + window) per pass, with n bounded by
  * `MAX_SCRUB_CHARS`.
+ *
+ * Top-level headers and the headers a sweep reads (`readCredential`'s `nested`) keep
+ * separate regions, `extendedTo` and `nestedTo`, each amortised as above: a sweep may
+ * read a header no top-level scan would (one inside an outer substitution's quoted
+ * text), and its failed scan must not move a later independent header into a region.
+ * A nested scan reads both, since a top-level region is no fresher to it. Whatever a
+ * nested scan reads below the sweep's end is redacted, and the next top-level header
+ * starts past that end, so top-level scans have nothing to take from `nestedTo`.
  */
 interface SubstitutionScan {
   extendedTo: number;
+  nestedTo: number;
 }
 
 /**
@@ -736,9 +753,9 @@ interface SubstitutionScan {
  * of the text when it has neither. It looks for its close up to `SUBSTITUTION_WINDOW`
  * past its start before falling back, and records how far it read in `scan`. On an
  * unkeyed serialized line the string's structural close (`structuralClose`) ends that
- * search. A substitution starting inside an earlier failed scan's region has no
- * fallback and no window: it ends at its own close or fails closed as
- * `SubstitutionScan` describes. Null when the credential is not a substitution.
+ * search. A substitution starting inside an earlier failed scan's region ends at its
+ * own close or fails closed as `SubstitutionScan` describes. Null when the credential
+ * is not a substitution.
  */
 function shellSubstitutionEnd(
   text: string,
@@ -746,6 +763,7 @@ function shellSubstitutionEnd(
   quote: HeaderQuote,
   keyed: boolean,
   scan: SubstitutionScan,
+  nested: boolean,
 ): SubstitutionEnd | null {
   const backtick = text[at] === "`";
   if (!backtick && !(text[at] === "$" && text[at + 1] === "(")) return null;
@@ -757,12 +775,19 @@ function shellSubstitutionEnd(
   // The last real line break crossed, so a close on a later line can be checked.
   let lastBreak = -1;
   // A substitution starting inside an earlier failed scan's region scans afresh, with
-  // no window: it ends at its own close or, failing closed, at the first line break
-  // at or after the region's end, so nothing straddling that end is cut.
-  const region = at < scan.extendedTo ? scan.extendedTo : -1;
+  // no window up to the first line break at or after the region's end, and from there
+  // on with one: it ends at its own close or, failing closed, at that break, so
+  // nothing straddling the region's end is cut.
+  let failAt = -1;
+  const frontier = nested
+    ? Math.max(scan.extendedTo, scan.nestedTo)
+    : scan.extendedTo;
+  const region = at < frontier ? frontier : -1;
+  const recorded = nested ? "nestedTo" : "extendedTo";
   let index = backtick ? at + 1 : at;
   while (index < text.length) {
     if (region < 0 && stop >= 0 && index - at > SUBSTITUTION_WINDOW) break;
+    if (failAt >= 0 && index - failAt > SUBSTITUTION_WINDOW) break;
     const run = backslashes(text, index);
     const char = text[index + run];
     const real = char === "\n" || char === "\r";
@@ -774,8 +799,13 @@ function shellSubstitutionEnd(
     ) {
       // Past the region a serialized line has no real breaks, so its proven
       // escaped ones end it there.
-      if (region >= 0 && index >= region && (real || quote.lineBase > 0))
-        return failedClosed(at, real ? index + run : index);
+      if (
+        failAt < 0 &&
+        region >= 0 &&
+        index >= region &&
+        (real || quote.lineBase > 0)
+      )
+        failAt = real ? index + run : index;
       if (stop < 0) stop = index;
       if (real) lastBreak = index + run;
       index += run + 1;
@@ -793,9 +823,9 @@ function shellSubstitutionEnd(
       // The serialized string ends here. A scan that ran past its stop to get here
       // marks the span a failed region, so later headers in it do not rescan it; one
       // already inside a region fails closed here.
-      if (region >= 0) return failedClosed(at, index);
+      if (region >= 0) return failedInRegion(at, index, failAt);
       if (stop < 0) return { end: index, sweep: null };
-      scan.extendedTo = Math.max(scan.extendedTo, index);
+      scan[recorded] = Math.max(scan[recorded], index);
       return { end: stop, sweep: null };
     }
     if (char === '"' || char === "'") {
@@ -820,9 +850,10 @@ function shellSubstitutionEnd(
     }
     index += run + 1;
   }
-  if (region >= 0) return failedClosed(at, Math.min(index, text.length));
+  if (region >= 0)
+    return failedInRegion(at, Math.min(index, text.length), failAt);
   if (stop < 0) return { end: Math.min(index, text.length), sweep: null };
-  scan.extendedTo = Math.max(scan.extendedTo, index);
+  scan[recorded] = Math.max(scan[recorded], index);
   return { end: stop, sweep: null };
 }
 
@@ -835,12 +866,20 @@ interface SubstitutionEnd {
   sweep: { from: number; headersFrom: number } | null;
 }
 
-/** An in-region scan that failed closed at `end`, which may split a secret. */
-function failedClosed(at: number, end: number): SubstitutionEnd {
+/**
+ * An in-region scan stopped at `index` without closing: it fails closed at the first
+ * line break at or after the region's end (`failAt`), or at `index` when it never
+ * reached one. Either end may split a secret, so it asks for a sweep.
+ */
+function failedInRegion(
+  at: number,
+  index: number,
+  failAt: number,
+): SubstitutionEnd {
+  const end = failAt >= 0 ? failAt : index;
   return { end, sweep: { from: end, headersFrom: at + 1 } };
 }
 
-/** A pattern-identical copy for checking one line without disturbing the scan. */
 /**
  * Private global copies of the secret patterns and the header pattern for
  * `sweptEnd`, so it moves no shared state.
@@ -912,15 +951,19 @@ function closedAt(lastBreak: number, close: number): SubstitutionEnd {
  * it overlaps. Every secret pattern match starting in [`at`, end) that runs past the
  * end moves the end to the match's end; every Authorization header starting in
  * [`headersFrom`, end) moves it to that header's line end (`headerLineEnd`) and to
- * its own credential's end (`readCredential` without a sweep of its own: this sweep
- * goes on over whatever that adds). The end only grows, and everything up to it is
- * redacted.
+ * its own credential's end (a `nested` `readCredential`, with no sweep of its own:
+ * this sweep goes on over whatever that adds). The end only grows, and everything up
+ * to it is redacted. Nested reads keep their own enclosing-quote search, so a header
+ * inside a redacted span leaves later top-level headers' quoting as it was.
  *
  * Cost: the matches come from `MatchCache`, so each pattern's search runs forward
  * through the pass once; a pattern is not looked for again inside its own match. A
- * header's line end is reused while later headers fall on the same line, and a header
- * inside a credential already read is not read again, so the line ends and nested
- * credentials read are disjoint. All of it lies in the redacted span.
+ * header's line end is reused while later headers fall on the same line. A header
+ * inside a credential already read is not read again, separately on each side of
+ * `from`: a credential read from before the close (`b),Authorization: …`) can swallow
+ * a header after it, which is still read. The reads before `from` are disjoint and
+ * so are those after it, so at most one read crosses it, and the line ends and nested
+ * credentials read cost O(swept span). All of it lies in the redacted span.
  */
 function sweptEnd(
   text: string,
@@ -934,7 +977,10 @@ function sweptEnd(
   const cursors = SWEEP_SECRET_PATTERNS.map(() => at);
   let headerCursor = headersFrom;
   let lineEnd = -1;
-  let readTo = -1;
+  // How far the reads of headers before `from`, and of those from it on, reached.
+  let readBefore = -1;
+  let readAfter = -1;
+  const nested: HeaderState = { ...state };
   for (let changed = true; changed;) {
     changed = false;
     for (const [index, pattern] of SWEEP_SECRET_PATTERNS.entries()) {
@@ -967,9 +1013,12 @@ function sweptEnd(
       if (credential > lineEnd)
         lineEnd = headerLineEnd(text, credential, quote);
       let reach = lineEnd;
-      if (header.index >= readTo) {
-        const parsed = readCredential(text, header, state, false);
-        readTo = parsed ? parsed.end : credential;
+      const before = header.index < from;
+      if (header.index >= (before ? readBefore : readAfter)) {
+        const parsed = readCredential(text, header, nested, true);
+        const readTo = parsed ? parsed.end : credential;
+        if (before) readBefore = readTo;
+        else readAfter = readTo;
         reach = Math.max(reach, readTo);
       }
       if (reach > end) {
