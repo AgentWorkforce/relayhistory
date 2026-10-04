@@ -28,7 +28,8 @@ run       Upload selected changes until the local feed is drained, then print a 
 
 class UsageError extends Error {}
 
-/** Exit codes: 0 ok, 1 retryable failure, 2 needs the operator (config, auth, refused data). */
+/** Exit codes: 0 ok (including --watch stopped between rounds), 1 retryable failure or
+ * a signal during an upload, 2 needs the operator (config, auth, refused data). */
 function exitCode(error: unknown): number {
   if (error instanceof UploadError) return error.retryable ? 1 : 2;
   if (error instanceof ConfigError || error instanceof UsageError) return 2;
@@ -137,15 +138,13 @@ async function main(argv: string[]) {
         );
       }
       await new Promise<void>((resolve) => {
-        const timer = setTimeout(resolve, interval * 1_000);
-        controller.signal.addEventListener(
-          "abort",
-          () => {
-            clearTimeout(timer);
-            resolve();
-          },
-          { once: true },
-        );
+        const wake = () => {
+          clearTimeout(timer);
+          controller.signal.removeEventListener("abort", wake);
+          resolve();
+        };
+        const timer = setTimeout(wake, interval * 1_000);
+        controller.signal.addEventListener("abort", wake);
       });
     }
     log.info("stopped");

@@ -68,6 +68,25 @@ describe("selection", () => {
     expect(selected(relationship, excluding)).toBe(false);
   });
 
+  it("holds back a relationship deletion whose child could be excluded", () => {
+    const deletion = change(1, {
+      kind: "relationship",
+      op: "delete",
+      sessionId: "picked",
+    });
+    expect(selected(deletion, selection)).toBe(true);
+    const excluding = {
+      ...selection,
+      excluded_sessions: [{ source: "claude", session_id: "private" }],
+    };
+    expect(selected(deletion, excluding)).toBe(false);
+    const otherSource = {
+      ...selection,
+      excluded_sessions: [{ source: "codex", session_id: "private" }],
+    };
+    expect(selected(deletion, otherSource)).toBe(true);
+  });
+
   it("forwards a deletion only when the selection can attribute it", () => {
     const unattributed = change(1, {
       kind: "history",
@@ -297,6 +316,47 @@ describe("upload", () => {
     expect(new Set(posts.map((p) => p.body.batch.batch_id)).size).toBe(1);
     expect(feed.commits).toHaveLength(1);
   });
+
+  it.each([
+    [
+      "an interrupted body",
+      () =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(
+                new TextEncoder().encode('{"protocolVersion":1,'),
+              );
+              controller.error(new Error("socket hang up"));
+            },
+          }),
+          { status: 200 },
+        ),
+    ],
+    [
+      "a truncated body",
+      () => new Response('{"protocolVersion":1,"receiptId"', { status: 200 }),
+    ],
+  ])(
+    "treats %s on a success as lost and resends the same batch",
+    async (_, broken) => {
+      const feed = new MemoryFeed([change(1)]);
+      const fake = server((body, attempt) =>
+        attempt === 1 ? broken() : json(receiptFor(body)),
+      );
+      await upload({
+        config: config(),
+        log: silentLogger,
+        feed,
+        fetch: fake.fetch,
+        sleep: noSleep,
+      });
+      const posts = fake.requests.filter((r) => r.method === "POST");
+      expect(posts).toHaveLength(2);
+      expect(posts[1].body.batch.batch_id).toBe(posts[0].body.batch.batch_id);
+      expect(feed.commits).toHaveLength(1);
+    },
+  );
 
   it("keeps the cursor when retries run out, and the next run resends the same batch", async () => {
     const feed = new MemoryFeed([change(1), change(2)]);

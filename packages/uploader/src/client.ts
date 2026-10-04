@@ -181,11 +181,21 @@ export class HistoryClient {
       // Network errors can echo the URL; the class is enough.
       throw new UploadError("transient", "server unreachable");
     }
-    const text = await response.text().catch(() => "");
+    let text: string;
+    try {
+      text = await response.text();
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      // The server may already have committed this batch; a resend gets its receipt.
+      throw new UploadError("transient", "server response was interrupted");
+    }
     let parsed: unknown;
     try {
       parsed = text ? JSON.parse(text) : null;
     } catch {
+      // A truncated success is indistinguishable from a lost one: resend.
+      if (response.status === 200)
+        throw new UploadError("transient", "server response was incomplete");
       parsed = undefined;
     }
     return {

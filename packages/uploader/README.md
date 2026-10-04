@@ -63,9 +63,9 @@ relayhistory-upload run --config upload.json --sync --watch --interval 300
 `--sync` captures local sessions (`ai-hist sync`) before each upload. `--watch` keeps
 running; a retryable failure waits for the next round, anything else exits.
 
-Exit codes: `0` done, `1` retryable (server unreachable, rate limited, interrupted),
-`2` needs you (configuration, token, permission, account mismatch, or data the server
-refuses).
+Exit codes: `0` done, including `--watch` stopped by a signal between rounds; `1`
+retryable (server unreachable, rate limited, or a signal during an upload); `2` needs you
+(configuration, token, permission, account mismatch, or data the server refuses).
 
 ## Guarantees
 
@@ -86,8 +86,10 @@ refuses).
   proves it holds with different content at that revision, using the SDK's recovery
   helper, and delivers the rest.
 - **Deletions.** A local deletion is forwarded as a tombstone only for a session the
-  selection names (or a whole selected source). Removing a session from the selection,
-  or excluding it, stops future uploads; it never deletes what the server already holds.
+  selection names (or a whole selected source). A relationship's deletion, which does
+  not carry its child, is held back while its source has excluded sessions. Removing a
+  session from the selection, or excluding it, stops future uploads; it never deletes
+  what the server already holds.
 - **Retries.** Transient failures and `429` back off exponentially with jitter, honoring
   `Retry-After`.
 - **Secrets.** The token is sent only in the `Authorization` header and never logged.

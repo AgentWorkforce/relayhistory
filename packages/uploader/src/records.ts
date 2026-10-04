@@ -43,9 +43,10 @@ function names(
 
 /**
  * The export selection rule, applied to one change. An excluded session is never
- * sent, nor is a relationship naming it at either end. A change that names no
- * session (a prompt's delete) is admitted only when its whole source is selected,
- * so a deletion is never forwarded for a record the selection cannot attribute.
+ * sent, nor is a relationship naming it at either end. A deletion is forwarded only
+ * when the selection can attribute it: a change that names no session (a prompt's
+ * delete) only under a whole selected source, and a relationship's deletion only when
+ * its source has no excluded sessions its unknown child could be.
  */
 export function selected(
   change: FeedChange,
@@ -54,6 +55,14 @@ export function selected(
   const source = change.sourceName;
   const session = change.sessionId;
   if (session && names(selection.excluded_sessions, source, session))
+    return false;
+  // A relationship's child is only in its columns, which a deletion does not carry.
+  // With exclusions in play the child cannot be checked, so the tombstone is held back.
+  if (
+    change.kind === "relationship" &&
+    change.op === "delete" &&
+    selection.excluded_sessions.some((id) => id.source === source)
+  )
     return false;
   const child = change.columns?.child_session_id;
   if (
