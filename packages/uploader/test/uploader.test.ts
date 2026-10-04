@@ -276,6 +276,13 @@ describe("checkRecovery", () => {
         retryBatch: retry(records, sending.batch_id),
       }),
     ).toThrow();
+    // A partial quarantine does not excuse reusing the submitted identity.
+    expect(() =>
+      checkRecovery(sending, {
+        quarantinedRevisionIds: ids(records.slice(0, 1)),
+        retryBatch: retry(records.slice(1), sending.batch_id),
+      }),
+    ).toThrow(/account for every/);
   });
 
   it("accepts the recoveries the SDK produces", () => {

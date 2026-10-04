@@ -228,11 +228,15 @@ export function checkRecovery(
     ...recovery.quarantinedRevisionIds,
     ...(recovery.retryBatch?.records.map((record) => record.revision_id) ?? []),
   ];
+  // A retry always gets a new identity: reusing the submitted batch id would be
+  // answered with that batch's conflict again (or its receipt, for different content).
+  const renamed =
+    recovery.retryBatch === null ||
+    recovery.retryBatch.batch_id !== sending.batch_id;
   const progress =
-    recovery.quarantinedRevisionIds.length > 0 ||
-    (recovery.retryBatch !== null &&
-      recovery.retryBatch.batch_id !== sending.batch_id);
+    recovery.quarantinedRevisionIds.length > 0 || recovery.retryBatch !== null;
   if (
+    !renamed ||
     !progress ||
     accounted.length !== sent.length ||
     new Set(accounted).size !== sent.length ||
