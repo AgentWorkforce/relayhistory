@@ -266,6 +266,7 @@ function redactAuthorization(text: string): string {
   // backward search for it stopped, so the next search covers only the new text.
   let enclosing = "";
   let searched = 0;
+  const substitutions: SubstitutionScan = { extendedTo: 0 };
   AUTHORIZATION_HEADER.lastIndex = 0;
   for (
     let header = AUTHORIZATION_HEADER.exec(text);
@@ -303,7 +304,13 @@ function redactAuthorization(text: string): string {
     // A quoted key (`"Authorization":"…"`, `'Authorization': '…'`) holds a value that
     // must escape its own quote, so that value's close is a safe boundary.
     const keyed = header[2] !== undefined && quote.char !== "";
-    const substitution = shellSubstitutionEnd(text, credential, quote, keyed);
+    const substitution = shellSubstitutionEnd(
+      text,
+      credential,
+      quote,
+      keyed,
+      substitutions,
+    );
     const params =
       substitution === null
         ? authParams(text, credential, quote, padded)
@@ -353,7 +360,8 @@ function redactAuthorization(text: string): string {
  * position in one forward pass. One right after `=` opens a value, which runs to the
  * next shallow quote of the same kind, whatever it holds (`realm=" a; b"`), except
  * the quote right after a token68 credential, whose `=` is base64 padding
- * (`Basic dXNlcg==",…`). Any other shallow quote may end the string, which
+ * (`Basic dXNlcg==",…`), and one the string's structure closes (`structuralClose`:
+ * `Token dXNlcg==","level":…`, whatever the scheme). Any other shallow quote may end the string, which
  * `endsString` decides by what follows it, unless a further parameter comes before
  * the next quote of its kind (`realm="Admins' area", response=…`, where the `'` only
  * looked like a close); otherwise it is content. A line break or the end of the text
@@ -380,7 +388,11 @@ function serializedLineEnd(
     if ((char === '"' || char === "'") && run < quote.lineBase) {
       if (value) {
         if (char === value) value = "";
-      } else if (index !== token68End && afterEquals(text, index)) {
+      } else if (
+        index !== token68End &&
+        afterEquals(text, index) &&
+        !structuralClose(text, index + run + 1, char, run)
+      ) {
         value = char;
       } else if (
         endsString(text, index + run + 1) &&
@@ -426,6 +438,49 @@ function parameterBefore(
     index += run + 1;
   }
   return false;
+}
+
+/**
+ * Whether the text from `at`, right after a quote of kind `char` written with `run`
+ * backslashes, is the structure that follows a closed string: `}`, `]` or the end
+ * (past up to 16 spaces), or `,` and the next key (`,"level":`) written with the same
+ * quote. A parameter value starting that way would be read as the close; real ones
+ * do not.
+ */
+function structuralClose(
+  text: string,
+  at: number,
+  char: string,
+  run: number,
+): boolean {
+  let index = skipSpaces(text, at);
+  const next = text[index];
+  if (next === undefined || next === "}" || next === "]") return true;
+  if (next !== ",") return false;
+  index = skipSpaces(text, index + 1);
+  if (backslashes(text, index) !== run || text[index + run] !== char)
+    return false;
+  index += run + 1;
+  const key = index;
+  while (
+    index - key < 64 &&
+    index < text.length &&
+    text[index] !== char &&
+    text[index] !== "\\" &&
+    text[index] !== "\n" &&
+    text[index] !== "\r"
+  )
+    index += 1;
+  if (backslashes(text, index) !== run || text[index + run] !== char)
+    return false;
+  return text[skipSpaces(text, index + run + 1)] === ":";
+}
+
+function skipSpaces(text: string, at: number): number {
+  let index = at;
+  while (index - at < 16 && (text[index] === " " || text[index] === "\t"))
+    index += 1;
+  return index;
 }
 
 /** Whether the text before `at`, past up to 16 spaces or tabs, ends with `=`. */
@@ -566,45 +621,105 @@ function headerEnd(text: string, at: number, quote: HeaderQuote): number {
   return text.length;
 }
 
+/** How far a substitution may run past its first line break to find its close. */
+const SUBSTITUTION_WINDOW = 4096;
+
+/**
+ * Where scans of substitutions that ran past a line break without closing stopped. A
+ * later substitution whose first break lies before it does not run on past its
+ * break, so extended scans never overlap and the pass stays linear.
+ */
+interface SubstitutionScan {
+  extendedTo: number;
+}
+
 /**
  * Where a shell substitution starting the credential at `at` ends: after the `)` that
- * closes `$(` (counting nested parentheses) or the backtick that closes one, whatever
- * quotes it holds (`$(printf '%s' user:pass | base64)`). An unmatched one runs to the
- * end of its line, since in a shell argument a quote of the header's kind may sit
- * inside it; in a quoted key's value (`keyed`) it ends at that value's close, which
- * also bounds the scan. Null when the credential is not a substitution.
+ * closes `$(` (counting nested parentheses) or the backtick that closes one. Shell
+ * quoting inside it is read: a quote that decodes to a literal quote at the header's
+ * content level opens a span (`'…'` without escapes, `"…"` with them) in which
+ * parentheses do not count (`$(printf '%s' ')' user:pass)`). A substitution may span
+ * lines (`$(printf 'user:\npass')`, a `\`-newline continuation) when its close lies
+ * within `SUBSTITUTION_WINDOW` of its start; otherwise it ends at its first line
+ * break. An unmatched one runs to the end of its line, since in a shell argument a
+ * quote of the header's kind may sit inside it; in a quoted key's value (`keyed`) it
+ * ends at that value's close, and on a serialized line at the string's structural
+ * close (`structuralClose`), either of which also bounds the scan. Null when the
+ * credential is not a substitution.
  */
 function shellSubstitutionEnd(
   text: string,
   at: number,
   quote: HeaderQuote,
   keyed: boolean,
+  scan: SubstitutionScan,
 ): number | null {
   const backtick = text[at] === "`";
   if (!backtick && !(text[at] === "$" && text[at + 1] === "(")) return null;
   let depth = 0;
+  let span = "";
+  let firstBreak = -1;
   let index = backtick ? at + 1 : at;
   while (index < text.length) {
+    if (firstBreak >= 0 && index - at > SUBSTITUTION_WINDOW) break;
     const run = backslashes(text, index);
     const char = text[index + run];
-    if (char === "\n" || char === "\r") break;
     if (
-      run > 0 &&
-      (char === "n" || char === "r") &&
-      escapedBreak(text, index, run, quote)
-    )
-      break;
+      char === "\n" ||
+      char === "\r" ||
+      (run > 0 &&
+        (char === "n" || char === "r") &&
+        escapedBreak(text, index, run, quote))
+    ) {
+      if (firstBreak < 0) {
+        firstBreak = index;
+        // Only an open substitution, not yet overlapping a failed extended scan,
+        // looks past its break.
+        if (index < scan.extendedTo) break;
+      }
+      index += run + 1;
+      continue;
+    }
     // A quoted key's value cannot hold its own quote unescaped, so its close ends
     // the substitution too.
     if (keyed && quoteRole(char, run, quote) === "close") return index;
-    if (run === 0) {
+    if (
+      !keyed &&
+      quote.lineBase > 0 &&
+      char === quote.char &&
+      run < quote.lineBase &&
+      structuralClose(text, index + run + 1, char, run)
+    )
+      return firstBreak >= 0 ? firstBreak : index;
+    if (char === '"' || char === "'") {
+      if (literalQuote(char, run, quote)) {
+        if (!span) span = char;
+        else if (span === char) span = "";
+      }
+      index += run + 1;
+      continue;
+    }
+    if (run === 0 && !span) {
       if (backtick && char === "`") return index + 1;
       if (!backtick && char === "(") depth += 1;
       if (!backtick && char === ")" && --depth === 0) return index + 1;
     }
     index += run + 1;
   }
-  return Math.min(index, text.length);
+  if (firstBreak < 0) return Math.min(index, text.length);
+  scan.extendedTo = Math.max(scan.extendedTo, index);
+  return firstBreak;
+}
+
+/**
+ * Whether a quote written with `run` backslashes decodes to a literal quote at the
+ * header's content level, the level of a quoted value's delimiters: a `"` with that
+ * role, or a `'` written as content writes it (bare outside a `'` string, escaped once
+ * inside one).
+ */
+function literalQuote(char: string, run: number, quote: HeaderQuote): boolean {
+  if (char === '"') return quoteRole(char, run, quote) === "delimiter";
+  return quote.char === "'" ? run === quote.depth + 1 : run === 0;
 }
 
 /**
