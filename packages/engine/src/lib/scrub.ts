@@ -260,6 +260,10 @@ type QuoteRole = "close" | "delimiter" | "content" | "line";
 function redactAuthorization(text: string): string {
   let output = "";
   let last = 0;
+  // The quote of the string enclosing the last serialized header line, and where the
+  // backward search for it stopped, so the next search covers only the new text.
+  let enclosing = "";
+  let searched = 0;
   AUTHORIZATION_HEADER.lastIndex = 0;
   for (
     let header = AUTHORIZATION_HEADER.exec(text);
@@ -278,7 +282,16 @@ function redactAuthorization(text: string): string {
     } else if (header[1] === '"' || header[1] === "'") {
       quote = headerQuote(header[1], before);
     }
-    if (header[1]!.startsWith("\\")) quote = serializedLine(quote, before + 1);
+    if (header[1]!.startsWith("\\")) {
+      const lineBase = before + 1;
+      if (!quote.char) {
+        enclosing =
+          enclosingQuote(text, header.index - before, searched, lineBase) ??
+          enclosing;
+        searched = header.index;
+      }
+      quote = serializedLine(quote, lineBase, enclosing);
+    }
     AUTHORIZATION_SCHEME.lastIndex = start;
     const scheme = AUTHORIZATION_SCHEME.exec(text);
     const credential = scheme ? start + scheme[0].length : start;
@@ -289,21 +302,84 @@ function redactAuthorization(text: string): string {
     // short of the header's close was cut at a space the shell would expand.
     if (params === null && quote.char)
       end = closingQuote(text, end, quote) ?? end;
+    if (quote.lineBase > 0) end = serializedLineEnd(text, end, quote);
     output += `${text.slice(last, start)}${scheme ? `${scheme[1]} ` : ""}${REDACTED}`;
     last = end;
+    searched = Math.max(searched, end);
     AUTHORIZATION_HEADER.lastIndex = end;
   }
   return output + text.slice(last);
 }
 
 /**
+ * Where a serialized header line ends, at or after its credential's end `at`: the
+ * next real or proven escaped line break, or the enclosing string's own quote (its
+ * character with fewer backslashes than a line break), or the end of the text. A
+ * message serialized through several layers of different quoting (a Python repr
+ * inside JSON) escapes `"` per layer, which one decoding cannot follow, so the
+ * credential may stop early; this takes the rest of the header line with it.
+ */
+function serializedLineEnd(
+  text: string,
+  at: number,
+  quote: HeaderQuote,
+): number {
+  let index = at;
+  while (index < text.length) {
+    const run = backslashes(text, index);
+    const char = text[index + run];
+    if (char === "\n" || char === "\r") return index + run;
+    if (
+      run > 0 &&
+      (char === "n" || char === "r") &&
+      escapedBreak(text, index, run, quote)
+    )
+      return index;
+    if (char === quote.char && run < quote.lineBase) return index;
+    index += run + 1;
+  }
+  return text.length;
+}
+
+/**
+ * The quote opening the string a serialized header line sits in: the nearest `"` or
+ * `'` before `at`, back to `floor`, not escaped at this level (fewer backslashes than
+ * the `lineBase` that writes a line break). Null when there is none in that span.
+ */
+function enclosingQuote(
+  text: string,
+  at: number,
+  floor: number,
+  lineBase: number,
+): string | null {
+  for (let index = at - 1; index >= floor; index -= 1) {
+    const char = text[index];
+    if (char !== '"' && char !== "'") continue;
+    let run = 0;
+    while (index - run - 1 >= floor && text[index - run - 1] === "\\") run += 1;
+    if (run < lineBase) return char;
+    index -= run;
+  }
+  return null;
+}
+
+/**
  * A header line of a serialized message, after an escaped break written with
  * `lineBase` backslashes. Unless the header carries its own quote, its text is the
- * content of a `"`-quoted string at that level (level L writes a break with 2^(L-1)
- * backslashes), so Digest's `\"` delimits a value and a shallower `"` ends the string.
+ * content of the string `enclosing` quotes, at that level (level L writes a break
+ * with 2^(L-1) backslashes). In a `"` string (JSON) Digest's `\"` delimits a value and
+ * a shallower `"` ends the string. In a `'` string (Python repr, shell `$'…'`) `"` is
+ * not escaped, so a bare `"` delimits a value and a shallower `'` ends the string.
+ * Backslashes double per level either way.
  */
-function serializedLine(quote: HeaderQuote, lineBase: number): HeaderQuote {
+function serializedLine(
+  quote: HeaderQuote,
+  lineBase: number,
+  enclosing: string,
+): HeaderQuote {
   if (quote.char) return { ...quote, lineBase };
+  if (enclosing === "'")
+    return { char: "'", depth: lineBase - 1, unit: 2 * lineBase, lineBase };
   return { char: '"', depth: lineBase - 1, unit: 2 * lineBase, lineBase };
 }
 
@@ -391,7 +467,9 @@ function quoteRole(
   if (char === "'" && quote.char === "'")
     return run <= quote.depth ? "close" : "content";
   if (char !== '"') return null;
-  const base = quote.unit - 1;
+  // Inside `"` a content-level `"` carries `unit - 1` backslashes; a `'` string
+  // leaves it bare.
+  const base = quote.char === '"' ? quote.unit - 1 : 0;
   if (quote.char === '"' && run < base) return "close";
   if ((run - base) % quote.unit !== 0) return "content";
   return ((run - base) / quote.unit) % 2 === 1 ? "content" : "delimiter";
