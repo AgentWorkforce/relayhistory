@@ -583,6 +583,13 @@ describe("hosted ingest scrubbing", () => {
             .slice(0, n),
       ],
       [
+        "swept reads failing closed inside a later header's credential",
+        (n) =>
+          "Authorization: Basic $(a\n,Authorization: b) ,Authorization: Basic $(zz\nAuthorization: Basic $(printf 'admin:\nS3cret | base64\n"
+            .repeat(n / 125)
+            .slice(0, n),
+      ],
+      [
         "short serialized regions closed by their string",
         (n) =>
           '{"m":"x\\nAuthorization: Basic $(a\\nX: y,Authorization: Basic $(b","k":1}\n'
@@ -2340,6 +2347,44 @@ describe("hosted ingest scrubbing", () => {
         expect(out, input).not.toContain("hunter2");
         expect(out, input).toContain("\nHost: x");
       }
+    });
+
+    it("re-reads the header a swept read cut at a region's end on that line", () => {
+      const filler = (length: number) => {
+        let text = "";
+        while (text.length < length) {
+          const line = Math.min(63, length - text.length - 1);
+          text += `${line > 0 ? "x".repeat(line) : ""}\n`;
+        }
+        return text.slice(0, length);
+      };
+      // A failed scan's region, then a sweep whose header after the close fails
+      // closed at the first break past that region, inside a later header's credential.
+      const swept =
+        "Authorization: Basic $(oops\nAuthorization: Basic $(a\n,Authorization: b) ,Authorization: Basic $(zz\n";
+      const exact = scrubText(
+        `${swept}${`${"y".repeat(63)}\n`.repeat(62)}Authorization: Basic $(printf 'admin:${"x".repeat(300)}\nS3cret' | base64)\nHost: x`,
+      );
+      expect(exact).not.toContain("S3cret");
+      expect(exact).toContain("\nHost: x");
+      for (let pad = 3950; pad <= 4250; pad += 1) {
+        const out = scrubText(
+          `${swept}${filler(pad)}Authorization: Basic $(printf 'admin:${"x".repeat(300)}\nS3cret' | base64)\nHost: x`,
+        );
+        expect(out, `pad ${pad}`).not.toContain("S3cret");
+        expect(out, `pad ${pad}`).toContain("\nHost: x");
+      }
+      // Documented limit, as on a0903995: a header whose substitution opened on an
+      // earlier line than the cut is not re-read, so its later lines stay.
+      let limit = 0;
+      for (let pad = 3950; pad <= 4250; pad += 1) {
+        const out = scrubText(
+          `${swept}${filler(pad)}Authorization: Basic $(printf 'admin:\n${"x".repeat(300)}\nS3cret' | base64)\nHost: x`,
+        );
+        expect(out, `pad ${pad}`).toContain("\nHost: x");
+        if (out.includes("S3cret")) limit += 1;
+      }
+      expect(limit).toBe(32);
     });
 
     it("fails closed at a region's end when a later header's credential holds a close", () => {
