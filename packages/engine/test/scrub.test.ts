@@ -336,6 +336,21 @@ describe("hosted ingest scrubbing", () => {
             .slice(0, n),
       ],
       [
+        "single-quoted serialized headers",
+        (n) =>
+          `'${'GET /\\r\\nAuthorization: Digest a="x", b="y"\\r\\nHost: z'.repeat(n)}'`.slice(
+            0,
+            n,
+          ),
+      ],
+      [
+        "a Python repr of many messages inside JSON",
+        (n) =>
+          JSON.stringify({
+            log: `'${'GET /\\r\\nAuthorization: Digest username="o\\\'b", realm="a, b"\\r\\nHost: x'.repeat(n)}'`,
+          }).slice(0, n),
+      ],
+      [
         "stray parameter items",
         (n) =>
           `Authorization: AWS4 C=a/b, ${"x y=z/w, ".repeat(n)}`.slice(0, n),
@@ -863,6 +878,54 @@ describe("hosted ingest scrubbing", () => {
           expect(out, serialized).not.toContain(R);
           expect(out, serialized).toContain("Host: x");
         }
+      }
+    });
+
+    it("decodes a header line of a single-quoted serialized message", () => {
+      const R = "6629fae49393a05397450978507c4ef1";
+      // Python's repr and shell's $'…' escape backslashes, ' and line breaks, not ".
+      const repr = (text: string) =>
+        "'" +
+        text
+          .replace(/\\/g, "\\\\")
+          .replace(/'/g, "\\'")
+          .replace(/\r/g, "\\r")
+          .replace(/\n/g, "\\n") +
+        "'";
+      for (const realm of ["r", "Restricted Area", "a, b"]) {
+        const message = `GET / HTTP/1.1\r\nAuthorization: Digest username="u", realm="${realm}", response="${R}"\r\nHost: x`;
+        for (const serialized of [
+          repr(message),
+          `{'req': ${repr(message)}, 'k': 1}`,
+          `printf $${repr(message)}`,
+          JSON.stringify({ req: message }),
+        ]) {
+          const out = scrubText(serialized);
+          expect(out, serialized).not.toContain(R);
+          expect(out, serialized).toContain("Host: x");
+        }
+      }
+    });
+
+    it("redacts a serialized header line through every nested layer", () => {
+      const R = "6629fae49393a05397450978507c4ef1";
+      const message = `GET / HTTP/1.1\r\nAuthorization: Digest username="o'brien", realm="a, b", response="${R}"\r\nHost: x`;
+      const repr = (text: string) =>
+        "'" +
+        text
+          .replace(/\\/g, "\\\\")
+          .replace(/'/g, "\\'")
+          .replace(/\r/g, "\\r")
+          .replace(/\n/g, "\\n") +
+        "'";
+      for (const serialized of [
+        JSON.stringify({ log: repr(message) }),
+        `[${repr(JSON.stringify({ req: message }))}]`,
+        JSON.stringify(JSON.stringify({ log: repr(message) })),
+      ]) {
+        const out = scrubText(serialized);
+        expect(out, serialized).not.toContain(R);
+        expect(out, serialized).toContain("Host: x");
       }
     });
 
