@@ -12,6 +12,7 @@ sessions you select; you search and read them back over the same HTTP API.
 | `GET /v1/sessions` | `rth:read` | List sessions, newest first |
 | `GET /v1/events?q=TEXT` | `rth:read` | Search across sessions |
 | `GET /v1/sessions/:id/events` | `rth:read` | One session's transcript, in order |
+| `GET /v1/sessions/:id/catalog?source=` | `rth:read` | One session's delivered catalog: branch, repository, models, relationships, markers |
 | `GET /health`, `GET /ready` | none | Liveness; readiness (database reachable, not draining) |
 
 Every `/v1` route authenticates a bearer token and takes the tenant (organization and
@@ -28,8 +29,9 @@ curl -s http://127.0.0.1:8080/ready
 # {"ok":true,"service":"relayhistory"}
 ```
 
-The server applies database migrations at every start, so the first start on an
-empty volume creates the schema. PostgreSQL data lives in the `postgres-data` volume;
+The server applies database migrations and the projection rollouts at every start, so
+the first start on an empty volume creates the schema; after an upgrade the first start
+also finishes any projection backfill before serving. PostgreSQL data lives in the `postgres-data` volume;
 `docker compose down` keeps it, `down -v` deletes it.
 
 The port binds to loopback. To serve other machines, put a TLS-terminating reverse
@@ -141,7 +143,7 @@ docker compose -f packages/server/compose.yaml up -d --build --wait
 
 `packages/server/scripts/smoke.mjs` exercises a clean start end to end: tokens for two
 tenants, uploads from two machine origins, replay, conflicts, scope and account
-enforcement, tenant isolation, a tombstone, list/search/transcript reads, and the same
+enforcement, tenant isolation, a tombstone, list/search/transcript/catalog reads, and the same
 reads after a graceful restart.
 
 ```bash

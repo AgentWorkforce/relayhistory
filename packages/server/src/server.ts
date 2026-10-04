@@ -30,7 +30,10 @@ export async function startServer(
     ...(config.runtimeRole ? { runtimeRole: config.runtimeRole } : {}),
     log,
   });
-  log.info("database ready", { migrations: prepared.migrations });
+  log.info("database ready", {
+    migrations: prepared.migrations,
+    rolledUpSessions: prepared.rolledUpSessions,
+  });
 
   const database = openDatabase(config.databaseUrl, {
     max: config.poolMax,

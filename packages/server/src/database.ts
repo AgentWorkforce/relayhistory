@@ -40,13 +40,15 @@ export function openDatabase(
 
 export interface PreparedDatabase {
   migrations: number;
+  /** Sessions the rollup backfill rebuilt this run (nonzero only after an upgrade). */
+  rolledUpSessions: number;
 }
 
 /**
  * Bring the `sessions` schema to the packaged version: every pending migration under
  * the engine's advisory lock and checksum ledger (the migrations install `vector`, and
- * `pg_trgm` when available), then the concurrent indexes. Safe to run from several
- * processes at once.
+ * `pg_trgm` when available), then the concurrent indexes and the projection rollouts.
+ * Safe to run from several processes at once; an interrupted rollout resumes.
  */
 export async function prepareDatabase(
   url: string,
@@ -61,7 +63,10 @@ export async function prepareDatabase(
     const result = await applyMigrations(client, {
       ...(options.runtimeRole ? { runtimeRole: options.runtimeRole } : {}),
     });
-    return { migrations: result.applied.length };
+    return {
+      migrations: result.applied.length,
+      rolledUpSessions: result.rolledUpSessions,
+    };
   } finally {
     await client.end();
   }

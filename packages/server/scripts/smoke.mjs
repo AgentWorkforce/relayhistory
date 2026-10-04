@@ -362,6 +362,19 @@ try {
       `${label}: ordered transcript without the tombstoned message`,
     );
 
+    const catalog = await http(
+      "GET",
+      `/v1/sessions/${desktopSession}/catalog?source=claude`,
+      reader.token,
+    );
+    assert.equal(catalog.status, 200, `${label}: delivered catalog`);
+    const hidden = await http(
+      "GET",
+      `/v1/sessions/${desktopSession}/catalog?source=claude`,
+      other.token,
+    );
+    assert.equal(hidden.status, 404, `${label}: other tenant has no catalog`);
+
     const isolated = await http("GET", "/v1/sessions?limit=50", other.token);
     assert.equal(isolated.status, 200);
     assert.ok(
@@ -409,7 +422,7 @@ try {
 
   await verifyReads("before restart");
   step(
-    "list, search and transcript read back both machines; the other tenant sees nothing",
+    "list, search, transcript and catalog read back both machines; the other tenant sees nothing",
   );
 
   await rt.stop();

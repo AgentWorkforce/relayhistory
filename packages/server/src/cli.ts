@@ -66,7 +66,10 @@ async function migrate(log: Logger) {
     ...(config.runtimeRole ? { runtimeRole: config.runtimeRole } : {}),
     log,
   });
-  log.info("database ready", { migrations: prepared.migrations });
+  log.info("database ready", {
+    migrations: prepared.migrations,
+    rolledUpSessions: prepared.rolledUpSessions,
+  });
 }
 
 function required(values: Record<string, unknown>, name: string): string {
