@@ -313,11 +313,14 @@ function redactAuthorization(text: string): string {
 
 /**
  * Where a serialized header line ends, at or after its credential's end `at`: the
- * next real or proven escaped line break, or the enclosing string's own quote (its
- * character with fewer backslashes than a line break), or the end of the text. A
- * message serialized through several layers of different quoting (a Python repr
- * inside JSON) escapes `"` per layer, which one decoding cannot follow, so the
- * credential may stop early; this takes the rest of the header line with it.
+ * next real or proven escaped line break, the end of the text, or a string's end — a
+ * quote of either kind with fewer backslashes than a line break, followed by `}`, `]`,
+ * `)`, `,`, `;` or the end, unless that `,` continues the parameter list. A message
+ * serialized through several layers of different quoting (a Python repr inside JSON),
+ * or with a stray quote before the header that misleads `enclosingQuote`, can stop
+ * the credential early; this takes the rest of the header line with it, and only a
+ * structural string end, never a quote inside a Digest value, stops it short of the
+ * line's end.
  */
 function serializedLineEnd(
   text: string,
@@ -335,10 +338,31 @@ function serializedLineEnd(
       escapedBreak(text, index, run, quote)
     )
       return index;
-    if (char === quote.char && run < quote.lineBase) return index;
+    if (
+      (char === '"' || char === "'") &&
+      run < quote.lineBase &&
+      endsString(text, index + run + 1)
+    )
+      return index;
     index += run + 1;
   }
   return text.length;
+}
+
+const STRING_END = /[}\]),;]/;
+// A further auth-param after a `,`: the list goes on, so the quote before it is a
+// value's, not the string's.
+const NEXT_PARAMETER =
+  /[ \t]{0,16}[!#$%&'*+.^_`|~0-9A-Za-z-]{1,64}[ \t]{0,16}=/y;
+
+/** Whether the text from `at` closes a string: a structural character or the end. */
+function endsString(text: string, at: number): boolean {
+  const follower = text[at];
+  if (follower === undefined) return true;
+  if (!STRING_END.test(follower)) return false;
+  if (follower !== ",") return true;
+  NEXT_PARAMETER.lastIndex = at + 1;
+  return !NEXT_PARAMETER.test(text);
 }
 
 /**
