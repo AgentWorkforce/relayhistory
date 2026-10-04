@@ -107,20 +107,27 @@ export function consumerName(
 ): string {
   const selection = config.selection;
   // Compare fields, not joined strings: identities may contain commas.
+  // Each list is a set, as the export selection reads it: order and repeats name the
+  // same selection, so neither may change the cursor.
   const sortedIds = (ids: HistoryExportSelection["sessions"]) =>
-    [...ids]
+    [
+      ...new Map(
+        ids.map((id) => [JSON.stringify([id.source, id.session_id]), id]),
+      ).values(),
+    ]
       .map((id) => [id.source, id.session_id])
       .sort(([a, b], [c, d]) =>
         a < c ? -1 : a > c ? 1 : b < d ? -1 : b > d ? 1 : 0,
       );
+  const sortedSet = (values: readonly string[]) => [...new Set(values)].sort();
   const identity = canonicalDeliveryJson([
     "relayhistory-upload-v1",
     endpointBase(config.endpoint),
     config.accountId,
     selection.all_sources,
-    [...selection.sources].sort(),
+    sortedSet(selection.sources),
     sortedIds(selection.sessions),
-    [...selection.kinds].sort(),
+    sortedSet(selection.kinds),
     sortedIds(selection.excluded_sessions),
   ]);
   return `relayhistory-upload:${sha256(identity).slice(0, 32)}`;

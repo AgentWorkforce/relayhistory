@@ -88,6 +88,24 @@ describe("config", () => {
     expect(() => parseSelection({ ...selection, kinds: ["usage"] })).toThrow(
       /kinds/,
     );
+    expect(() =>
+      parseSelection({ ...selection, sources: ["claude", "claude"] }),
+    ).toThrow(/sources lists a source more than once/);
+    expect(() =>
+      parseSelection({
+        ...selection,
+        sessions: [...selection.sessions, ...selection.sessions],
+      }),
+    ).toThrow(/sessions lists a session more than once/);
+    expect(() =>
+      parseSelection({
+        ...selection,
+        excluded_sessions: [
+          { source: "claude", session_id: "x" },
+          { source: "claude", session_id: "x" },
+        ],
+      }),
+    ).toThrow(/excluded_sessions lists a session more than once/);
   });
 
   it("requires https except on loopback or by explicit opt-in", () => {

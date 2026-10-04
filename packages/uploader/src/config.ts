@@ -93,10 +93,16 @@ function sessionList(value: unknown, field: string) {
     throw new ConfigError(
       `selection.${field} must be a list of { source, session_id }`,
     );
-  return value.map((item) => ({
+  const ids = value.map((item) => ({
     source: item.source as string,
     session_id: item.session_id as string,
   }));
+  if (
+    new Set(ids.map((id) => JSON.stringify([id.source, id.session_id])))
+      .size !== ids.length
+  )
+    throw new ConfigError(`selection.${field} lists a session more than once`);
+  return ids;
 }
 
 export function parseSelection(value: unknown): HistoryExportSelection {
@@ -109,6 +115,8 @@ export function parseSelection(value: unknown): HistoryExportSelection {
     !value.sources.every((s) => typeof s === "string" && s.length > 0)
   )
     throw new ConfigError("selection.sources must be a list of source names");
+  if (new Set(value.sources).size !== value.sources.length)
+    throw new ConfigError("selection.sources lists a source more than once");
   const sessions = sessionList(value.sessions, "sessions");
   const excluded = sessionList(value.excluded_sessions, "excluded_sessions");
   if (

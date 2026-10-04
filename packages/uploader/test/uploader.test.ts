@@ -1,4 +1,8 @@
-import { deliveryBatchDigest, deliveryRecordDigest } from "ai-hist";
+import {
+  deliveryBatchDigest,
+  deliveryRecordDigest,
+  type ChangeKind,
+} from "ai-hist";
 import { describe, expect, it } from "vitest";
 import { parseEndpoint } from "../src/config.js";
 import { createLogger, silentLogger } from "../src/log.js";
@@ -186,6 +190,72 @@ describe("consumerName", () => {
         endpoint: parseEndpoint("https://history.example.com/"),
       }),
     ).toBe(name);
+  });
+});
+
+describe("consumerName identity", () => {
+  const base = {
+    endpoint: parseEndpoint("https://history.example.com"),
+    accountId: `relayhistory:${"a".repeat(64)}`,
+    selection: {
+      all_sources: false,
+      sources: ["claude", "codex"],
+      sessions: [
+        { source: "claude", session_id: "s1" },
+        { source: "codex", session_id: "s2" },
+      ],
+      kinds: ["session", "session_event"] as ChangeKind[],
+      excluded_sessions: [{ source: "claude", session_id: "x" }],
+    },
+  };
+  // The name this configuration has always had: existing cursors keep resuming.
+  const PINNED = "relayhistory-upload:e5d6774b2a55bf632823a74ccde666a7";
+
+  it("is stable for an ordinary selection", () => {
+    expect(consumerName(base)).toBe(PINNED);
+  });
+
+  it("treats each list as a set: repeats and order name the same cursor", () => {
+    const repeated = {
+      ...base,
+      selection: {
+        ...base.selection,
+        sources: ["codex", "claude", "claude"],
+        sessions: [...base.selection.sessions]
+          .reverse()
+          .concat(base.selection.sessions[0]),
+        kinds: ["session_event", "session", "session"] as ChangeKind[],
+        excluded_sessions: [
+          ...base.selection.excluded_sessions,
+          ...base.selection.excluded_sessions,
+        ],
+      },
+    };
+    expect(consumerName(repeated)).toBe(PINNED);
+  });
+
+  it("still isolates endpoints, accounts and genuinely different selections", () => {
+    expect(
+      consumerName({
+        ...base,
+        endpoint: parseEndpoint("https://other.example.com"),
+      }),
+    ).not.toBe(PINNED);
+    expect(
+      consumerName({ ...base, accountId: `relayhistory:${"b".repeat(64)}` }),
+    ).not.toBe(PINNED);
+    expect(
+      consumerName({
+        ...base,
+        selection: { ...base.selection, sources: ["claude"] },
+      }),
+    ).not.toBe(PINNED);
+    expect(
+      consumerName({
+        ...base,
+        selection: { ...base.selection, excluded_sessions: [] },
+      }),
+    ).not.toBe(PINNED);
   });
 });
 
