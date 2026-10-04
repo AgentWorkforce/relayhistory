@@ -672,8 +672,8 @@ interface SubstitutionScan {
  * parentheses do not count (`$(printf '%s' ')' user:pass)`); a quote of the header's
  * own kind at its own level does too, since bash allows it inside `$(…)`. A
  * substitution may span lines (`$(printf 'user:\npass')`, a `\`-newline continuation);
- * when its close follows a line break inside a later Authorization header's
- * credential, it ends at that line's end instead (`closedAt`).
+ * when it closes after a line break it never ends inside a secret match or before an
+ * Authorization header it overlaps (`closedAt`).
  *
  * One that does not close ends at its fallback: its first line break or, in a quoted
  * key's value (`keyed`), that value's first close, whichever comes first, or the end
@@ -757,10 +757,11 @@ function shellSubstitutionEnd(
       continue;
     }
     if (run === 0 && !span) {
-      if (backtick && char === "`") return closedAt(text, lastBreak, index + 1);
+      if (backtick && char === "`")
+        return closedAt(text, at, lastBreak, index + 1);
       if (!backtick && char === "(") depth += 1;
       if (!backtick && char === ")" && --depth === 0)
-        return closedAt(text, lastBreak, index + 1);
+        return closedAt(text, at, lastBreak, index + 1);
     }
     index += run + 1;
   }
@@ -776,51 +777,72 @@ const AUTHORIZATION_HEADER_ON_LINE = new RegExp(
   "i",
 );
 
-/** Private copies of the secret patterns, so checking a line moves no shared state. */
-const CLOSING_LINE_PATTERNS = SECRET_PATTERNS.map(
-  ([pattern]) => new RegExp(pattern.source, pattern.flags),
+/**
+ * Sticky private copies of the secret patterns and the header pattern: tried at one
+ * position against the whole text (so `\b`, lookbehinds, multi-line blocks and a
+ * separator across a line break read as they do in the real pass), moving no shared
+ * state.
+ */
+const STICKY_SECRET_PATTERNS = SECRET_PATTERNS.map(
+  ([pattern]) =>
+    new RegExp(pattern.source, pattern.flags.replace("g", "") + "y"),
+);
+const STICKY_AUTHORIZATION_HEADER = new RegExp(
+  AUTHORIZATION_HEADER.source,
+  AUTHORIZATION_HEADER.flags.replace("g", "") + "y",
 );
 
 /**
- * The end of a substitution closed at `close`. When it crossed a real line break, its
- * closing line is checked, since the `)` that closed it may sit inside text the
- * scrubber would otherwise redact whole:
- * - another Authorization header starting before the close (a `)` in that header's
- *   credential matched the earlier `$(`) moves the end to the line's end;
- * - a secret pattern match spanning the close (`DB_PASSWORD=pa)ss`) moves the end to
- *   the furthest such match's end, so neither part is left for the patterns to miss.
- * A close on the substitution's own first line is not checked. Each line is checked at
- * most once per pass: the next substitution starts after this close, and its own
- * closing line, if it crosses a break, is a later one.
+ * The end of a substitution starting at `at` and closed at `close`. A close on the
+ * substitution's own first line is kept. One that crossed a real line break may sit
+ * inside text the scrubber would otherwise redact whole (`DB_PASSWORD=pa)ss`, a `)`
+ * inside a later header's credential), so the end never lands inside a secret match
+ * or before an Authorization header it overlaps:
+ * - another header starting on the closing line before the close moves it to that
+ *   line's end;
+ * - from `at` to the (growing) end, each position is tried against every secret
+ *   pattern, and a match running past the end moves the end to the match's end;
+ * - each position at or after the close is tried against the header pattern, and a
+ *   header there moves the end to its line's end.
+ * Every position swept is redacted. A pattern is not retried inside its own earlier
+ * match, which keeps a run like `sk-sk-sk-…` from being rescanned per position; each
+ * failing attempt is bounded by a literal or a bounded prefix.
  */
-function closedAt(text: string, lastBreak: number, close: number): number {
+function closedAt(
+  text: string,
+  at: number,
+  lastBreak: number,
+  close: number,
+): number {
   if (lastBreak < 0) return close;
-  let lineEnd = close;
-  while (
-    lineEnd < text.length &&
-    text[lineEnd] !== "\n" &&
-    text[lineEnd] !== "\r"
-  )
-    lineEnd += 1;
-  if (AUTHORIZATION_HEADER_ON_LINE.test(text.slice(lastBreak + 1, close)))
-    return lineEnd;
-  const line = text.slice(lastBreak + 1, lineEnd);
-  const at = close - (lastBreak + 1);
   let end = close;
-  for (const pattern of CLOSING_LINE_PATTERNS) {
-    pattern.lastIndex = 0;
-    for (
-      let match = pattern.exec(line);
-      match;
-      match = pattern.global ? pattern.exec(line) : null
-    ) {
-      const matchEnd = match.index + match[0].length;
-      if (match.index < at && matchEnd > at)
-        end = Math.max(end, lastBreak + 1 + matchEnd);
-      if (match[0].length === 0) pattern.lastIndex += 1;
+  if (AUTHORIZATION_HEADER_ON_LINE.test(text.slice(lastBreak + 1, close)))
+    end = lineEndAt(text, close);
+  const reach = STICKY_SECRET_PATTERNS.map(() => at);
+  for (let position = at; position < end; position += 1) {
+    for (const [index, pattern] of STICKY_SECRET_PATTERNS.entries()) {
+      if (position < reach[index]!) continue;
+      pattern.lastIndex = position;
+      const match = pattern.exec(text);
+      if (!match || match[0].length === 0) continue;
+      reach[index] = position + match[0].length;
+      end = Math.max(end, reach[index]!);
+    }
+    if (position >= close) {
+      STICKY_AUTHORIZATION_HEADER.lastIndex = position;
+      const header = STICKY_AUTHORIZATION_HEADER.exec(text);
+      if (header)
+        end = Math.max(end, lineEndAt(text, position + header[0].length));
     }
   }
   return end;
+}
+
+function lineEndAt(text: string, at: number): number {
+  let index = at;
+  while (index < text.length && text[index] !== "\n" && text[index] !== "\r")
+    index += 1;
+  return index;
 }
 
 /**
