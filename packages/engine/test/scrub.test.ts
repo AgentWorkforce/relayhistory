@@ -707,6 +707,29 @@ describe("hosted ingest scrubbing", () => {
       expect(twice).toContain("Host: x");
     });
 
+    it("ends a serialized header line before a next header with any field-name characters", () => {
+      for (const name of [
+        "X_Trace_Id",
+        "x.request.id",
+        "X-Custom!#$%&'*+^`|~",
+      ]) {
+        for (const lineBreak of ["\n", "\r\n"]) {
+          const encoded = JSON.stringify({
+            req: `Authorization: Basic c2VjcmV0dG9rZW4=${lineBreak}${name}: 123`,
+          });
+          const scrubbed = scrubText(encoded);
+          expect(scrubbed).not.toContain("c2VjcmV0dG9rZW4");
+          expect(scrubbed).toContain(`${name}: 123`);
+        }
+        // The same characters written literally (a backslash, then n) stay credential.
+        const literal = scrubText(
+          `curl -H 'Authorization: Basic c2VjcmV0\\n${name}: 123' url`,
+        );
+        expect(literal).not.toContain("c2VjcmV0");
+        expect(literal).toContain("' url");
+      }
+    });
+
     it("tells a literal backslash-n or -r in a credential from an encoded line break", () => {
       const S = "s3cr3tRESP";
       const literal = `Digest username="DOMAIN\\ryan", realm="r", response=${S}`;
