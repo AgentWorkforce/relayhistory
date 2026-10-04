@@ -441,6 +441,7 @@ try {
   );
   const synced = await upload(laptopConfig, "--sync", "--home", laptop.home);
   assert.equal(synced.code, 0, synced.stderr);
+  assert.equal(synced.summary.syncCompleted, true, "the real capture completed");
   assert.ok(
     synced.summary.accepted > 0,
     "--sync captured the new message before uploading",

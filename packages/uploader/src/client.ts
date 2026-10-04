@@ -203,7 +203,8 @@ export class HistoryClient {
     }
     // An empty or truncated success is indistinguishable from a lost one: resend, and
     // the server replays the receipt if it committed the batch.
-    if (response.status === 200 && (parsed === undefined || parsed === null))
+    // A well-formed body, even JSON `null`, is judged by receipt validation instead.
+    if (response.status === 200 && (text === "" || parsed === undefined))
       throw new UploadError("transient", "server response was incomplete");
     return {
       status: response.status,

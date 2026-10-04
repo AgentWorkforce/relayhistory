@@ -21,7 +21,12 @@ export {
 } from "./config.js";
 export { createLogger, silentLogger, type Logger } from "./log.js";
 export { deliveryRecord, selected } from "./records.js";
-export { SYNC_KILL_GRACE_MS, SyncError, runSync } from "./sync.js";
+export {
+  SYNC_INCOMPLETE_EXIT,
+  SYNC_KILL_GRACE_MS,
+  SyncError,
+  runSync,
+} from "./sync.js";
 export {
   DEFAULT_RETRY,
   DESTINATION_ID,

@@ -1,6 +1,11 @@
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { SYNC_KILL_GRACE_MS, SyncError, runSync } from "../src/sync.js";
+import {
+  SYNC_INCOMPLETE_EXIT,
+  SYNC_KILL_GRACE_MS,
+  SyncError,
+  runSync,
+} from "../src/sync.js";
 
 const fixture = (name: string) =>
   fileURLToPath(new URL(`./fixtures/${name}`, import.meta.url));
@@ -38,4 +43,20 @@ describe("runSync", () => {
       }),
     ).rejects.toThrow("stopped");
   });
+
+  it("reports a capture that ran but did not complete, without failing", async () => {
+    expect(SYNC_INCOMPLETE_EXIT).toBe(75);
+    await expect(
+      runSync({ childPath: fixture("incomplete-sync.mjs") }),
+    ).resolves.toEqual({ completed: false });
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "names the signal that ended a capture",
+    async () => {
+      await expect(
+        runSync({ childPath: fixture("killed-sync.mjs") }),
+      ).rejects.toThrow("local sync was ended by SIGKILL");
+    },
+  );
 });

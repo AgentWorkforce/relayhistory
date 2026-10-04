@@ -374,6 +374,22 @@ describe("upload", () => {
     },
   );
 
+  it("refuses a well-formed but empty JSON success instead of resending it", async () => {
+    const feed = new MemoryFeed([change(1)]);
+    const fake = server(() => json(null));
+    await expect(
+      upload({
+        config: config(),
+        log: silentLogger,
+        feed,
+        fetch: fake.fetch,
+        sleep: noSleep,
+      }),
+    ).rejects.toMatchObject({ failure: "invalid_response" });
+    expect(fake.requests.filter((r) => r.method === "POST")).toHaveLength(1);
+    expect(feed.commits).toHaveLength(0);
+  });
+
   it("retries a 408 like any other transient failure", async () => {
     const feed = new MemoryFeed([change(1)]);
     const fake = server((body, attempt) =>

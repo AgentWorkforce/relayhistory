@@ -62,14 +62,27 @@ async function runOnce(
   flags: { dryRun: boolean; sync: boolean },
   signal: AbortSignal,
 ) {
-  if (flags.sync)
-    await runSync({
+  let capture: { completed: boolean } | undefined;
+  if (flags.sync) {
+    capture = await runSync({
       ...(config.dbPath ? { dbPath: config.dbPath } : {}),
       signal,
     });
+    // Another capture holding the lock (`ai-hist watch`) is still capturing; upload
+    // what is in the store now. The cursor never passes evidence it has not seen, so
+    // the rest goes next round.
+    if (!capture.completed)
+      log.warn(
+        "local sync did not complete; uploading what is already captured",
+      );
+  }
   const summary = await upload({ config, log, signal, dryRun: flags.dryRun });
   process.stdout.write(
-    `${JSON.stringify({ dryRun: flags.dryRun, ...summary })}\n`,
+    `${JSON.stringify({
+      dryRun: flags.dryRun,
+      ...(capture ? { syncCompleted: capture.completed } : {}),
+      ...summary,
+    })}\n`,
   );
 }
 

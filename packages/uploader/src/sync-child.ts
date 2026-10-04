@@ -6,10 +6,12 @@
  * transaction.
  */
 import { sync } from "ai-hist";
+import { SYNC_INCOMPLETE_EXIT } from "./sync.js";
 
 const dbPath = process.argv[2];
 try {
-  await sync(dbPath ? { dbPath } : {});
+  const result = await sync(dbPath ? { dbPath } : {});
+  if (!result.completed) process.exitCode = SYNC_INCOMPLETE_EXIT;
 } catch (error) {
   // Capture errors can carry paths; report the class and code only.
   process.stderr.write(
