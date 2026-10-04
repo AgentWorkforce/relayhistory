@@ -35,6 +35,8 @@ export const MAPPING_VERSION = "relayhistory-delivery-v1";
 export const DESTINATION_ID = "relayhistory";
 /** Feed rows read per page. Batches are cut from a page; a page commits as a whole. */
 export const SCAN_LIMIT = 1_000;
+/** The shape of the SDK's conflict-retry batch id, the longest a batch is sent under. */
+const RECOVERY_ID = `conflict-${"0".repeat(64)}`;
 
 export interface Feed {
   getChangesPage: typeof getChangesPage;
@@ -161,10 +163,15 @@ export function cutBatches(
   records: HistoryExportRecord[],
   limits: { maxRecords: number; maxBytes: number },
 ): HistoryExportBatch[] {
+  // Sized for the longest identity the batch can be sent under: a conflict retry
+  // renames it `conflict-<sha256>`, longer than `upload-<sha256>`, and must still fit.
   const envelope = encoder.encode(
     JSON.stringify({
       protocolVersion: 1,
-      batch: batchFor(config, consumer, originId, []),
+      batch: {
+        ...batchFor(config, consumer, originId, []),
+        batch_id: RECOVERY_ID,
+      },
     }),
   ).length;
   const batches: HistoryExportBatch[] = [];

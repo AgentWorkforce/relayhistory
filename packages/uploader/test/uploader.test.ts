@@ -234,6 +234,45 @@ describe("cutBatches", () => {
       }),
     ).toThrow(/exceeds/);
   });
+
+  it("packs to the byte limit exactly, reserving room for a conflict retry's longer id", () => {
+    const single = (maxBytes: number) =>
+      cutBatches(config(), "c", "00000000000000aa", records.slice(0, 1), {
+        maxRecords: 10,
+        maxBytes,
+      });
+    const sent = JSON.stringify({
+      protocolVersion: 1,
+      batch: single(1_048_576)[0],
+    }).length;
+    // `conflict-` is two bytes longer than `upload-`: that is the reserve.
+    const exact = sent + 2;
+    expect(single(exact)).toHaveLength(1);
+    expect(() => single(exact - 1)).toThrow(/exceeds/);
+
+    // Two records fill a limit exactly; one byte less splits them.
+    const pair =
+      JSON.stringify({
+        protocolVersion: 1,
+        batch: cutBatches(
+          config(),
+          "c",
+          "00000000000000aa",
+          records.slice(0, 2),
+          {
+            maxRecords: 10,
+            maxBytes: 1_048_576,
+          },
+        )[0],
+      }).length + 2;
+    const cut = (maxBytes: number) =>
+      cutBatches(config(), "c", "00000000000000aa", records.slice(0, 2), {
+        maxRecords: 10,
+        maxBytes,
+      });
+    expect(cut(pair).map((b) => b.records.length)).toEqual([2]);
+    expect(cut(pair - 1).map((b) => b.records.length)).toEqual([1, 1]);
+  });
 });
 
 describe("checkRecovery", () => {
