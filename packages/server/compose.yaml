@@ -35,6 +35,8 @@ services:
       EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
       EMBEDDING_API_URL: ${EMBEDDING_API_URL:-}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-}
+      # Request drain on SIGTERM; closing the database then takes at most 5 s more.
+      RELAYHISTORY_SHUTDOWN_TIMEOUT_MS: ${RELAYHISTORY_SHUTDOWN_TIMEOUT_MS:-15000}
     ports:
       # Loopback by default: put a TLS reverse proxy in front before exposing it.
       - "${RELAYHISTORY_BIND:-127.0.0.1}:${RELAYHISTORY_PORT:-8080}:8080"
@@ -54,7 +56,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    stop_grace_period: 30s
+    # Must exceed the drain above plus 5 s of cleanup, or Docker kills the server mid-drain.
+    stop_grace_period: ${RELAYHISTORY_STOP_GRACE_PERIOD:-30s}
     restart: unless-stopped
 
 volumes:

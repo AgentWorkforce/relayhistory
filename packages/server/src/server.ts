@@ -13,6 +13,7 @@ import { createServerApp } from "./app.js";
 import type { ServerConfig } from "./config.js";
 import { openDatabase, prepareDatabase } from "./database.js";
 import { startJob, type RunningJob } from "./jobs.js";
+import { databaseReadiness } from "./readiness.js";
 import type { Logger } from "./log.js";
 
 /** Minimum time to stop jobs and close the pool once requests are done. */
@@ -54,7 +55,7 @@ export async function startServer(
   let accepting = false;
   const app = createServerApp({
     db: database.db,
-    pool: database.pool,
+    databaseReady: databaseReadiness(config.databaseUrl),
     embeddings,
     log,
     accepting: () => accepting,
