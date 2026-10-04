@@ -300,9 +300,12 @@ function redactAuthorization(text: string): string {
     if (end === credential) continue;
     // A parameter list ends where its grammar does; a single credential that stops
     // short of the header's close was cut at a space the shell would expand.
-    if (params === null && quote.char)
+    // A serialized line's own end is found by `serializedLineEnd`, which keeps the
+    // string's close and what follows it.
+    if (quote.lineBase > 0)
+      end = serializedLineEnd(text, end, quote, params === null ? end : -1);
+    else if (params === null && quote.char)
       end = closingQuote(text, end, quote) ?? end;
-    if (quote.lineBase > 0) end = serializedLineEnd(text, end, quote);
     output += `${text.slice(last, start)}${scheme ? `${scheme[1]} ` : ""}${REDACTED}`;
     last = end;
     searched = Math.max(searched, end);
@@ -321,15 +324,19 @@ function redactAuthorization(text: string): string {
  *
  * Shallow quotes (fewer backslashes than a line break, of either kind) are read by
  * position in one forward pass. One right after `=` opens a value, which runs to the
- * next shallow quote of the same kind, whatever it holds (`realm=" a; b"`). Any other
- * shallow quote may end the string, which `endsString` decides by what follows it;
- * otherwise it is content. A line break or the end of the text stops the pass in
- * either state, so an unclosed value is redacted to the line's end.
+ * next shallow quote of the same kind, whatever it holds (`realm=" a; b"`), except
+ * the quote right after a token68 credential, whose `=` is base64 padding
+ * (`Basic dXNlcg==",…`). Any other shallow quote may end the string, which
+ * `endsString` decides by what follows it, unless a further parameter comes before
+ * the next quote of its kind (`realm="Admins' area", response=…`, where the `'` only
+ * looked like a close); otherwise it is content. A line break or the end of the text
+ * stops the pass in either state, so an unclosed value is redacted to the line's end.
  */
 function serializedLineEnd(
   text: string,
   at: number,
   quote: HeaderQuote,
+  token68End: number,
 ): number {
   let index = at;
   let value = "";
@@ -346,15 +353,52 @@ function serializedLineEnd(
     if ((char === '"' || char === "'") && run < quote.lineBase) {
       if (value) {
         if (char === value) value = "";
-      } else if (afterEquals(text, index)) {
+      } else if (index !== token68End && afterEquals(text, index)) {
         value = char;
-      } else if (endsString(text, index + run + 1)) {
+      } else if (
+        endsString(text, index + run + 1) &&
+        !parameterBefore(text, index + run + 1, char, quote)
+      ) {
         return index;
       }
     }
     index += run + 1;
   }
   return text.length;
+}
+
+/**
+ * Whether a separator and a further `name=` come after `at` before the next shallow
+ * quote of kind `char`, a line break or the end. Successive quotes of one kind bound
+ * disjoint spans, so the lookahead stays linear.
+ */
+function parameterBefore(
+  text: string,
+  at: number,
+  char: string,
+  quote: HeaderQuote,
+): boolean {
+  let index = at;
+  while (index < text.length) {
+    const run = backslashes(text, index);
+    const next = text[index + run];
+    if (next === "\n" || next === "\r") return false;
+    if (next === char && run < quote.lineBase) return false;
+    if (
+      run > 0 &&
+      (next === "n" || next === "r") &&
+      escapedBreak(text, index, run, quote)
+    )
+      return false;
+    if (
+      run === 0 &&
+      (next === "," || next === ";" || next === " " || next === "\t") &&
+      nextParameter(text, index + 1)
+    )
+      return true;
+    index += run + 1;
+  }
+  return false;
 }
 
 /** Whether the text before `at`, past up to 16 spaces or tabs, ends with `=`. */
@@ -369,6 +413,16 @@ function afterEquals(text: string, at: number): boolean {
 // the string's.
 const NEXT_PARAMETER =
   /[ \t]{0,16}[!#$%&'*+.^_`|~0-9A-Za-z-]{1,64}[ \t]{0,16}=/y;
+
+/** Whether a separator (`,`, `;` or bare spaces) and a further `name=` follow `at`. */
+function listContinues(text: string, at: number): boolean {
+  let index = at;
+  while (index - at < 16 && (text[index] === " " || text[index] === "\t"))
+    index += 1;
+  if (text[index] === "," || text[index] === ";")
+    return nextParameter(text, index + 1);
+  return index > at && nextParameter(text, index);
+}
 
 function nextParameter(text: string, at: number): boolean {
   NEXT_PARAMETER.lastIndex = at;
@@ -635,13 +689,20 @@ function authParam(
     return looseQuotedValue(text, index, opening.next, quote);
   if (opening.role === "line") return null;
   const value = index;
+  let padding = true;
   while (index < text.length && !/[\s,]/.test(text[index]!)) {
     const { role, next } = read(text, index, quote);
     if (role === "close" || role === "delimiter" || role === "line") break;
+    if (text[index] !== "=") padding = false;
     index = next;
   }
   index = Math.min(index, text.length);
-  return index === value ? null : index;
+  // An empty or `=`-only value is an empty parameter when the list goes on after it
+  // (`realm=, response=…`); otherwise it is no parameter, and `=` is a token68
+  // credential's base64 padding (`dXNlcg==`).
+  if (index === value || padding)
+    return listContinues(text, index) ? index : null;
+  return index;
 }
 
 /**
@@ -666,7 +727,8 @@ function quotedValue(text: string, at: number, quote: HeaderQuote): number {
  * A value opened by a quote at the header's own level, as in
  * `-H "Authorization: Digest username="alice", …"` where the inner quotes were never
  * escaped. It is a value only when the next quote on the line is written the same way
- * and is followed by a separator, the end of the line or the header's close; when it
+ * and is followed by a separator (`,`, whitespace, or `;` before another `name=`),
+ * the end of the line or the header's close; when it
  * is written the same way but followed by anything else, the quote closes the header
  * (`{"Authorization":"Digest a=","next":…}`). A next quote written at another depth
  * (`username="al\"ice", response="…"`) leaves the value's extent unknown, so the value
@@ -697,6 +759,7 @@ function looseQuotedValue(
       if (
         follower === undefined ||
         follower === "," ||
+        (follower === ";" && nextParameter(text, after + 1)) ||
         /\s/.test(follower) ||
         read(text, after, quote).role === "close"
       )
