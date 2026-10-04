@@ -393,6 +393,21 @@ describe("hosted ingest scrubbing", () => {
             .slice(0, n),
       ],
       [
+        "nested shell substitutions",
+        (n) =>
+          `Authorization: Basic $(${"$(a ".repeat(n / 8)}${")".repeat(n / 8)})`.slice(
+            0,
+            n,
+          ),
+      ],
+      [
+        "many quote-first JSON headers",
+        (n) =>
+          '{"Authorization":"Basic \\"x\\"","level":"info"}'
+            .repeat(Math.ceil(n / 46))
+            .slice(0, n),
+      ],
+      [
         "stray parameter items",
         (n) =>
           `Authorization: AWS4 C=a/b, ${"x y=z/w, ".repeat(n)}`.slice(0, n),
@@ -1390,6 +1405,130 @@ describe("hosted ingest scrubbing", () => {
       }
       expect(scrubText(`Authorization: "${R}"`)).toBe(
         'Authorization: "[REDACTED]"',
+      );
+    });
+
+    it("redacts single parameters, shell substitutions and quote-first credentials whole", () => {
+      const S = "R9secretZ";
+      const repr = (text: string) =>
+        "'" +
+        text
+          .replace(/\\/g, "\\\\")
+          .replace(/'/g, "\\'")
+          .replace(/\r/g, "\\r")
+          .replace(/\n/g, "\\n") +
+        "'";
+      // Widened matrix: stray quotes before the header, one to three parameters, any
+      // position, Digest and OAuth.
+      const layers = [
+        repr,
+        (text: string) => JSON.stringify({ r: text }),
+        (text: string) => JSON.stringify({ l: repr(text) }),
+      ];
+      const names = ["response", "oauth_signature", "nonce"];
+      let cases = 0;
+      for (const layer of layers)
+        for (const before of [
+          "",
+          'If-None-Match: "v1"\r\n',
+          "X-Note: it's\r\n",
+        ])
+          for (const separator of [", ", " "])
+            for (const prefix of ["", " ", ","])
+              for (const count of [1, 2])
+                for (let position = 0; position < count; position += 1)
+                  for (const scheme of ["Digest", "OAuth"]) {
+                    const header = Array.from(
+                      { length: count },
+                      (_, index) =>
+                        `${names[index]}="${prefix}${index === position ? S : `v${index}`}"`,
+                    ).join(separator);
+                    const serialized = layer(
+                      `GET / HTTP/1.1\r\n${before}Authorization: ${scheme} ${header}\r\nHost: x`,
+                    );
+                    const out = scrubText(serialized);
+                    expect(out, serialized).not.toContain(S);
+                    expect(out, serialized).toContain("Host: x");
+                    cases += 1;
+                  }
+      expect(cases).toBe(324);
+
+      // Shell substitutions are redacted to their end, whatever they quote inside.
+      const substitutions: Array<[string, string]> = [
+        [
+          JSON.stringify({
+            cmd: "GET /\r\nAuthorization: Basic $(printf '%s' admin:hunter2 | base64)",
+          }),
+          '"}',
+        ],
+        [
+          repr(
+            'GET /\r\nAuthorization: Basic $(printf "%s:%s" admin hunter2 | base64)\r\nHost: x',
+          ),
+          "Host: x",
+        ],
+        [
+          repr(
+            "GET /\r\nAuthorization: Basic $(echo -n admin:hunter2 | base64)\r\nHost: x",
+          ),
+          "Host: x",
+        ],
+        [
+          repr(
+            "GET /\r\nAuthorization: Basic $(echo $(cat p) admin:hunter2 | base64)\r\nHost: x",
+          ),
+          "Host: x",
+        ],
+        [
+          repr(
+            'GET /\r\nAuthorization: Basic `printf "%s" admin:hunter2 | base64`\r\nHost: x',
+          ),
+          "Host: x",
+        ],
+        [
+          `curl -H "Authorization: Basic $(printf '%s' admin:hunter2 | base64)" url`,
+          '" url',
+        ],
+        [
+          repr(
+            "GET /\r\nAuthorization: Basic $(printf '%s' admin:hunter2\r\nHost: x",
+          ),
+          "Host: x",
+        ],
+      ];
+      for (const [input, kept] of substitutions) {
+        const out = scrubText(input);
+        expect(out, input).not.toContain("hunter2");
+        expect(out, input).toContain(kept);
+      }
+
+      // A quote-first credential in a quoted header ends at the header's close.
+      expect(
+        scrubText(`{"Authorization":"Basic \\"${S}\\"","level":"info"}`),
+      ).toBe('{"Authorization":"Basic [REDACTED]","level":"info"}');
+      expect(
+        scrubText(
+          JSON.stringify({ Authorization: 'Digest "quoted"', next: "kept" }),
+        ),
+      ).toBe(
+        JSON.stringify({ Authorization: "Digest [REDACTED]", next: "kept" }),
+      );
+      expect(
+        scrubText(`curl -H 'Authorization: Basic "${S}"' -X GET url`),
+      ).toBe("curl -H 'Authorization: Basic [REDACTED]' -X GET url");
+      // A list cut short by a quoted segment in a quoted header takes the header.
+      expect(
+        scrubText(
+          `curl -H 'Authorization: Digest a=="x", response="${S}"' url`,
+        ),
+      ).toBe("curl -H 'Authorization: Digest [REDACTED]' url");
+      // Controls.
+      expect(
+        scrubText(
+          String.raw`{"msg":"GET /\r\nAuthorization: Basic dXNlcjpwYQ==","level":"info"}`,
+        ),
+      ).toBe(
+        String.raw`{"msg":"GET /\r\nAuthorization: Basic [REDACTED]","level":"info"}`,
       );
     });
 
