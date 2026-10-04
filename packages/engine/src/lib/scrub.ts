@@ -300,8 +300,9 @@ function headerState(): HeaderState {
 
 /**
  * One header's credential: where its redaction starts and ends, its scheme, where its
- * substitution failed closed in a region (else -1), and whether that substitution
- * read a window past its fallback without closing.
+ * substitution failed closed in a region (else -1), whether that substitution read a
+ * window past its fallback without closing, and, when its end still asks for a sweep
+ * that a read by a sweep does not run, where that sweep's headers start (else -1).
  */
 interface Credential {
   start: number;
@@ -309,6 +310,7 @@ interface Credential {
   end: number;
   failedAt: number;
   windowed: boolean;
+  headersFrom: number;
 }
 
 /**
@@ -421,6 +423,7 @@ function readCredential(
     end,
     failedAt: substitution?.failed ? substitution.end : -1,
     windowed: substitution?.windowed === true,
+    headersFrom: substitution?.sweep?.headersFrom ?? -1,
   };
 }
 
@@ -990,16 +993,22 @@ function closedAt(lastBreak: number, close: number): SubstitutionEnd {
  * disjoint and inside that one line, which the failed read consumed, and only the
  * last reads past the cut or uses its window, at most `SUBSTITUTION_WINDOW`. A
  * re-read's end moves the sweep's end only, never its chain's: a header after the cut
- * is read by the chain whatever a re-read covered. A header the sweep reaches only
- * because a re-read went past its cut is also read as the main pass would (`outer`),
- * which it would have been without that re-read, and keeps the larger end.
+ * is read by the chain whatever a re-read covered. A header the chain reads inside the
+ * span re-reads reached past their cuts (from the earliest such cut to the furthest
+ * such end) is also read against `extendedTo` only (`outer`), as the main pass would
+ * have read it without those re-reads, though with no sweep of its own and with the
+ * sweep's quote state as the nested read left it. Like a re-read's, its end moves the
+ * sweep's end only, never the chain's; the headers the sweep it asks for would read
+ * (those on its closing line, or all of a failed scan's) are read by the chain.
  *
- * Cost: linear. Each failed read gets at most one window-reading re-read, and at most
- * one window-reading `outer` read past its cut, and each such window needs its own
- * failing reads and a skipped header. The multiplier depends on how short those can
- * be. Measured fresh characters scanned per input character: about 72 on a 56-character
- * serialized unit, 53 on a 74-character keyed serialized unit, 48 on a 42-character
- * one and 28 on a 147-character one; `outer` reads add at most about 2.
+ * Cost: linear. Each failed read gets at most one window-reading re-read, and each
+ * such window needs its own failing reads and a skipped header. `outer` reads are of
+ * headers the chain reads, so they are disjoint in where they start; that this adds at
+ * most one window-reading `outer` read per failed read is argued from that, not
+ * proven. The multiplier depends on how short those units can be. Measured fresh
+ * characters scanned per input character: about 72 on a 56-character serialized unit,
+ * 53 on a 74-character keyed serialized unit, 48 on a 42-character one and 28 on a
+ * 147-character one; `outer` reads added at most about 2 on the shapes measured.
  */
 function sweptEnd(
   text: string,
@@ -1056,23 +1065,29 @@ function sweptEnd(
       let reach = lineEnd;
       const chain = header.index < from ? before : after;
       if (header.index >= chain.readTo) {
-        let parsed = readCredential(text, header, nested, "nested");
+        const parsed = readCredential(text, header, nested, "nested");
+        chain.readTo = parsed ? parsed.end : credential;
+        chain.failedAt = parsed ? parsed.failedAt : -1;
+        chain.rereadTo = -1;
+        reach = Math.max(reach, chain.readTo);
         if (
           parsed &&
           header.index >= rereadFrom &&
           header.index < rereadUntil
         ) {
           // Only a re-read's reach past its cut brought this header into the sweep;
-          // without it the main pass would read it against its own regions, where a
-          // later nested region (`nestedTo`) does not cut it. It keeps the larger end.
+          // without it the main pass would have read it against its own regions, where
+          // a later nested region (`nestedTo`) does not cut it. That read's end moves
+          // the sweep's end only, never the chain's, like a re-read's.
           const outer = readCredential(text, header, { ...nested }, "outer");
-          if (outer && outer.end > parsed.end)
-            parsed = { ...parsed, end: outer.end };
+          if (outer) {
+            reach = Math.max(reach, outer.end);
+            // The main pass would also have swept the headers that read asks for
+            // (those on its closing line), so the chain reads them.
+            if (outer.headersFrom >= 0)
+              chain.readTo = Math.min(chain.readTo, outer.headersFrom);
+          }
         }
-        chain.readTo = parsed ? parsed.end : credential;
-        chain.failedAt = parsed ? parsed.failedAt : -1;
-        chain.rereadTo = -1;
-        reach = Math.max(reach, chain.readTo);
       } else if (chain.failedAt === lineEnd && header.index >= chain.rereadTo) {
         // The chain's last read failed closed at this header's line end, which may cut
         // a substitution straddling the region's end
