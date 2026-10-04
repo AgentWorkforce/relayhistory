@@ -12,7 +12,7 @@ import { ConfigError, loadConfig } from "./config.js";
 import { prepareDatabase } from "./database.js";
 import { createLogger, type Logger } from "./log.js";
 import { startServer } from "./server.js";
-import { UndeliveredTokenError } from "./tokens.js";
+import { LeftoverTokenFileError, UndeliveredTokenError } from "./tokens.js";
 import { tokenCommand, UsageError } from "./token-command.js";
 
 const USAGE = `Usage:
@@ -98,7 +98,8 @@ async function main(argv: string[]) {
     } else if (
       error instanceof ConfigError ||
       error instanceof ServiceTokenError ||
-      error instanceof UndeliveredTokenError
+      error instanceof UndeliveredTokenError ||
+      error instanceof LeftoverTokenFileError
     ) {
       log.error((error as Error).message);
       process.exitCode = 2;

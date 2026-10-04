@@ -1,6 +1,6 @@
 // Token bootstrap against real PostgreSQL. Set TEST_ADMIN_DATABASE_URL to a server
 // where the role may create databases (CI provides one); skipped otherwise.
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { chmod, mkdtemp, open, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
@@ -18,6 +18,7 @@ import {
   listTokens,
   revokeToken,
   createTokenFile,
+  LeftoverTokenFileError,
   shellArgument,
   UndeliveredTokenError,
 } from "../src/tokens.js";
@@ -140,11 +141,90 @@ describe.skipIf(!adminUrl)("token bootstrap", () => {
         { path },
         failing,
       ),
-    ).rejects.toMatchObject({ code: "ENOSPC" });
+    ).rejects.toSatisfy(
+      (error: unknown) =>
+        error instanceof LeftoverTokenFileError &&
+        error.path === path &&
+        (error.cause as { code?: string }).code === "ENOSPC",
+    );
     expect(minted).toMatch(/^rth_st_/);
     expect(await resolveAccessToken(database.db, minted!)).toBeNull();
     // The partial file's removal was attempted, after the revoke, and its failure ignored.
     expect(removed).toEqual([path]);
+  });
+
+  describe("a write that succeeds but whose close fails", () => {
+    // close() can report a deferred write error (EIO, ENOSPC on NFS): the secret may
+    // not be on disk, so delivery has failed and the token must not stay live.
+    const closeFails = (blockRemove: boolean) => ({
+      open: async (target: string) => {
+        const handle = await open(target, "wx", 0o600);
+        return {
+          writeFile: handle.writeFile.bind(handle),
+          close: async () => {
+            await handle.close();
+            throw Object.assign(new Error("close EIO"), { code: "EIO" });
+          },
+        };
+      },
+      remove: async (target: string) => {
+        if (!blockRemove) return rm(target, { force: true });
+        // A directory the process may no longer write: the real remove fails.
+        await chmod(dir, 0o500);
+        try {
+          await rm(target, { force: true });
+        } finally {
+          await chmod(dir, 0o700);
+        }
+      },
+    });
+
+    it("revokes the token and removes the file", async () => {
+      const path = join(dir, "close-eio.json");
+      const error = await createTokenFile(
+        database.db,
+        { orgId: "closefail", workspaceId: "main", label: "close-eio" },
+        { path },
+        closeFails(false),
+      ).catch((e: unknown) => e);
+      expect(error).toMatchObject({ code: "EIO" });
+      await expect(stat(path)).rejects.toMatchObject({ code: "ENOENT" });
+      const [row] = await listTokens(database.db, "closefail");
+      expect(row.revokedAt).not.toBeNull();
+    });
+
+    it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+      "names a file it could not remove, whose token is already revoked",
+      async () => {
+        const path = join(dir, "close-eio-left.json");
+        const error = (await createTokenFile(
+          database.db,
+          { orgId: "closeleft", workspaceId: "main", label: "close-left" },
+          { path },
+          closeFails(true),
+        ).catch((e: unknown) => e)) as LeftoverTokenFileError;
+        expect(error).toBeInstanceOf(LeftoverTokenFileError);
+        expect(error.message).toContain(path);
+        expect(error.message).toContain("revoked");
+        expect((error.cause as { code?: string }).code).toBe("EIO");
+        // The file really is left, complete, and its token is dead.
+        const left = JSON.parse(await readFile(path, "utf8"));
+        expect(left.id).toBe(error.tokenId);
+        expect(await resolveAccessToken(database.db, left.token)).toBeNull();
+        // Reusing the path is refused before anything is minted.
+        const before = (await listTokens(database.db, "closeleft")).length;
+        await expect(
+          createTokenFile(
+            database.db,
+            { orgId: "closeleft", workspaceId: "main", label: "again" },
+            { path },
+          ),
+        ).rejects.toMatchObject({ code: "EEXIST" });
+        expect((await listTokens(database.db, "closeleft")).length).toBe(
+          before,
+        );
+      },
+    );
   });
 
   it("an empty path is refused before anything is minted", async () => {

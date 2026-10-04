@@ -129,6 +129,27 @@ export function shellArgument(value: string): string {
     : `'${value.replaceAll("'", `'\\''`)}'`;
 }
 
+/**
+ * Delivery failed and the reserved file could not be removed. Its token, if one was
+ * minted, has been revoked: whatever the file holds is dead, and the path stays taken
+ * until the operator deletes it.
+ */
+export class LeftoverTokenFileError extends Error {
+  override name = "LeftoverTokenFileError";
+  constructor(
+    readonly path: string,
+    readonly tokenId: string | undefined,
+    cause: unknown,
+  ) {
+    super(
+      tokenId
+        ? `token ${tokenId} was revoked because its file could not be completed; delete ${path} before reusing that path`
+        : `the token file could not be created; delete ${path} before reusing that path`,
+      { cause },
+    );
+  }
+}
+
 /** The token was minted, its delivery failed, and revoking it failed too. */
 export class UndeliveredTokenError extends Error {
   override name = "UndeliveredTokenError";
@@ -184,8 +205,16 @@ export async function createTokenFile(
         () => false,
       );
     await handle?.close().catch(() => {});
-    if (path !== undefined) await fs.remove(path).catch(() => {});
+    const removed =
+      path === undefined ||
+      (await fs.remove(path).then(
+        () => true,
+        () => false,
+      ));
+    // A live token outranks everything: the operator must revoke it.
     if (!revoked) throw new UndeliveredTokenError(file!.orgId, file!.id);
+    // The file stays behind and blocks the path; say what it holds.
+    if (!removed) throw new LeftoverTokenFileError(path!, file?.id, error);
     throw error;
   }
 }

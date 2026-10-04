@@ -29,6 +29,7 @@ export {
   type CreateTokenOptions,
   validateTokenOptions,
   UndeliveredTokenError,
+  LeftoverTokenFileError,
   type TokenDestination,
   type TokenFileSystem,
   type TokenFile,
