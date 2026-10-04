@@ -39,7 +39,7 @@ function event(sessionId, index, role, text, tsMs, project) {
     message_id: `${sessionId}-message-${index}`,
     model: role === "assistant" ? "claude-fixture" : null,
     parent_id: index === 0 ? null : `${sessionId}-message-${index - 1}`,
-    payload_bytes: text.length,
+    payload_bytes: Buffer.byteLength(text, "utf8"),
     payload_hash: sha256(text).slice(0, 16),
     payload_truncated: 0,
     project,

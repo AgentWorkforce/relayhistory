@@ -28,6 +28,7 @@ jobs:
   server:
     name: Server on PostgreSQL + pgvector
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     services:
       postgres:
         image: pgvector/pgvector:pg17
@@ -124,6 +125,7 @@ jobs:
   compose:
     name: Docker Compose clean start
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       POSTGRES_PASSWORD: ${{ github.run_id }}-compose-smoke
     steps:

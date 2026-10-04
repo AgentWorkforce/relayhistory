@@ -13,7 +13,6 @@
 import { spawn, execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { once } from "node:events";
-import { createServer } from "node:net";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -39,22 +38,18 @@ function step(message) {
   process.stdout.write(`ok - ${message}\n`);
 }
 
-async function freePort() {
-  const server = createServer().listen(0, "127.0.0.1");
-  await once(server, "listening");
-  const { port } = server.address();
-  await new Promise((done) => server.close(done));
-  return port;
-}
-
 async function waitReady(baseUrl, timeoutMs = 60_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
-      const response = await fetch(`${baseUrl}/ready`);
+      const response = await fetch(`${baseUrl}/ready`, {
+        signal: AbortSignal.timeout(
+          Math.max(1, Math.min(5_000, deadline - Date.now())),
+        ),
+      });
       if (response.ok) return;
     } catch {
-      // Not listening yet.
+      // Not listening yet, or this probe timed out.
     }
     await new Promise((done) => setTimeout(done, 250));
   }
@@ -70,17 +65,38 @@ async function localRuntime(adminUrl) {
   const url = new URL(adminUrl);
   url.pathname = `/${name}`;
   const env = { ...process.env, DATABASE_URL: url.toString() };
-  const port = await freePort();
-  const baseUrl = `http://127.0.0.1:${port}`;
+  // The server binds an OS-assigned port; its `listening` log line names it.
   let child;
-  return {
-    baseUrl,
+  const rt = {
+    baseUrl: "",
     async start() {
       child = spawn(process.execPath, [cli, "serve"], {
-        env: { ...env, HOST: "127.0.0.1", PORT: String(port) },
-        stdio: ["ignore", "inherit", "inherit"],
+        env: { ...env, HOST: "127.0.0.1", PORT: "0" },
+        stdio: ["ignore", "inherit", "pipe"],
       });
-      await waitReady(baseUrl);
+      const port = await new Promise((resolve, reject) => {
+        let buffered = "";
+        child.stderr.on("data", (chunk) => {
+          process.stderr.write(chunk);
+          buffered += chunk;
+          const line = buffered
+            .split("\n")
+            .map((text) => {
+              try {
+                return JSON.parse(text);
+              } catch {
+                return null;
+              }
+            })
+            .find((entry) => entry?.message === "listening");
+          if (line) resolve(line.port);
+        });
+        child.once("exit", (code) =>
+          reject(new Error(`server exited ${code} before listening`)),
+        );
+      });
+      rt.baseUrl = `http://127.0.0.1:${port}`;
+      await waitReady(rt.baseUrl);
     },
     async stop() {
       const exited = once(child, "exit");
@@ -107,6 +123,7 @@ async function localRuntime(adminUrl) {
       await admin.end();
     },
   };
+  return rt;
 }
 
 /** Drives an already running Compose deployment; restart is `docker compose restart`. */

@@ -38,6 +38,8 @@ export function openDatabase(
   };
 }
 
+const PROGRESS_INTERVAL_MS = 5_000;
+
 export interface PreparedDatabase {
   migrations: number;
   /** Sessions the rollup backfill rebuilt this run (nonzero only after an upgrade). */
@@ -60,8 +62,16 @@ export async function prepareDatabase(
   });
   await client.connect();
   try {
+    // The engine reports fixed progress lines (counters, never SQL or rows). A long
+    // upgrade backfill gets a heartbeat at most every few seconds; a quick start, none.
+    let lastReport = Date.now();
     const result = await applyMigrations(client, {
       ...(options.runtimeRole ? { runtimeRole: options.runtimeRole } : {}),
+      report: (line) => {
+        if (Date.now() - lastReport < PROGRESS_INTERVAL_MS) return;
+        lastReport = Date.now();
+        options.log.info("preparing database", { progress: line });
+      },
     });
     return {
       migrations: result.applied.length,

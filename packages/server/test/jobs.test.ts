@@ -32,23 +32,38 @@ describe("startJob", () => {
   it("logs a failure by code only and keeps scheduling", async () => {
     const lines: string[] = [];
     let runs = 0;
+    let secondRun!: () => void;
+    const rescheduled = new Promise<void>((resolve) => (secondRun = resolve));
     const job = startJob(
       {
         name: "flaky",
-        intervalMs: 1_000,
+        intervalMs: 5,
         async run() {
           runs += 1;
-          throw Object.assign(new Error("password=hunter2 in SQL"), {
-            code: "57P01",
-          });
+          if (runs >= 2) secondRun();
+          throw Object.assign(
+            new Error('SELECT * FROM sessions WHERE password = "hunter2"'),
+            { code: "57P01" },
+          );
         },
       },
       createLogger((line) => lines.push(line)),
     );
-    await new Promise((done) => setTimeout(done, 10));
+    await rescheduled;
     await job.stop();
-    expect(runs).toBe(1);
-    expect(lines.join("")).toContain('"code":"57P01"');
-    expect(lines.join("")).not.toContain("hunter2");
+    expect(runs).toBeGreaterThanOrEqual(2);
+    const records = lines.map((line) => JSON.parse(line));
+    expect(records.length).toBeGreaterThanOrEqual(1);
+    for (const record of records) {
+      expect(Object.keys(record).sort()).toEqual(
+        ["code", "job", "level", "message", "time"].sort(),
+      );
+      expect(record).toMatchObject({
+        level: "error",
+        message: "job failed",
+        job: "flaky",
+        code: "57P01",
+      });
+    }
   });
 });

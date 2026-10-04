@@ -75,6 +75,12 @@ function required(values: Record<string, unknown>, name: string): string {
   return value.trim();
 }
 
+function wholeDays(value: string): number {
+  if (!/^\d+$/.test(value))
+    throw new UsageError("--expires-days must be a whole number of days");
+  return Number(value);
+}
+
 async function token(args: string[], log: Logger) {
   const [action, ...rest] = args;
   const { values } = parseArgs({
@@ -90,29 +96,40 @@ async function token(args: string[], log: Logger) {
     },
     strict: true,
   });
-  if (!["create", "list", "revoke"].includes(action ?? ""))
+  if (action !== "create" && action !== "list" && action !== "revoke")
     throw new UsageError("token needs create, list or revoke");
+  // Every argument is checked before the database is touched.
+  const org = required(values, "org");
+  const create =
+    action === "create"
+      ? {
+          out: required(values, "out"),
+          options: {
+            orgId: org,
+            workspaceId: required(values, "workspace"),
+            label: required(values, "label"),
+            ...(values.scopes
+              ? {
+                  scopes: values.scopes.split(",").map((scope) => scope.trim()),
+                }
+              : {}),
+            ...(values["expires-days"] !== undefined
+              ? { expiresInDays: wholeDays(values["expires-days"]) }
+              : {}),
+          },
+        }
+      : undefined;
+  const id = action === "revoke" ? required(values, "id") : undefined;
   // Token commands may run before the first `serve`; the schema they write must exist.
   const url = databaseUrl();
   await prepareDatabase(url, { log });
   const database = openDatabase(url, { max: 1, log });
   try {
-    if (action === "create") {
-      const out = required(values, "out");
-      const days = values["expires-days"];
-      if (days !== undefined && !/^\d+$/.test(days))
-        throw new UsageError("--expires-days must be a whole number of days");
+    if (create) {
+      const { out } = create;
       const file = await createTokenFile(
         database.db,
-        {
-          orgId: required(values, "org"),
-          workspaceId: required(values, "workspace"),
-          label: required(values, "label"),
-          ...(values.scopes
-            ? { scopes: values.scopes.split(",").map((scope) => scope.trim()) }
-            : {}),
-          ...(days !== undefined ? { expiresInDays: Number(days) } : {}),
-        },
+        create.options,
         // `--out -` hands the token file to a pipe; otherwise the secret only goes to disk.
         out === "-"
           ? {
@@ -136,19 +153,12 @@ async function token(args: string[], log: Logger) {
         ...(out === "-" ? {} : { out }),
       });
     } else if (action === "list") {
-      const tokens = await listTokens(database.db, required(values, "org"));
+      const tokens = await listTokens(database.db, org);
       process.stdout.write(`${JSON.stringify(tokens, null, 2)}\n`);
-    } else if (action === "revoke") {
-      const revoked = await revokeToken(
-        database.db,
-        required(values, "org"),
-        required(values, "id"),
-      );
-      if (!revoked)
-        throw new UsageError("no active service token with that id");
-      log.info("token revoked", { id: values.id });
     } else {
-      throw new UsageError("token needs create, list or revoke");
+      if (!(await revokeToken(database.db, org, id!)))
+        throw new UsageError("no active service token with that id");
+      log.info("token revoked", { id });
     }
   } finally {
     await database.close();
@@ -171,7 +181,7 @@ async function main(argv: string[]) {
   } catch (error) {
     if (
       error instanceof UsageError ||
-      (error as { code?: string })?.code === "ERR_PARSE_ARGS_UNKNOWN_OPTION"
+      String((error as { code?: unknown })?.code).startsWith("ERR_PARSE_ARGS_")
     ) {
       process.stderr.write(`${(error as Error).message}\n\n${USAGE}`);
       process.exitCode = 2;
