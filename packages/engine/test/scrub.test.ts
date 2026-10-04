@@ -415,6 +415,13 @@ describe("hosted ingest scrubbing", () => {
             .slice(0, n),
       ],
       [
+        "unmatched multi-line substitutions",
+        (n) =>
+          "Authorization: Basic $(printf 'a\n"
+            .repeat(Math.ceil(n / 33))
+            .slice(0, n),
+      ],
+      [
         "stray parameter items",
         (n) =>
           `Authorization: AWS4 C=a/b, ${"x y=z/w, ".repeat(n)}`.slice(0, n),
@@ -1442,9 +1449,9 @@ describe("hosted ingest scrubbing", () => {
         ])
           for (const separator of [", ", " "])
             for (const prefix of ["", " ", ","])
-              for (const count of [1, 2])
+              for (const count of [1, 2, 3])
                 for (let position = 0; position < count; position += 1)
-                  for (const scheme of ["Digest", "OAuth"]) {
+                  for (const scheme of ["Digest", "OAuth", "Token"]) {
                     const header = Array.from(
                       { length: count },
                       (_, index) =>
@@ -1458,7 +1465,7 @@ describe("hosted ingest scrubbing", () => {
                     expect(out, serialized).toContain("Host: x");
                     cases += 1;
                   }
-      expect(cases).toBe(324);
+      expect(cases).toBe(972);
 
       // Shell substitutions are redacted to their end, whatever they quote inside.
       const substitutions: Array<[string, string]> = [
@@ -1582,6 +1589,181 @@ describe("hosted ingest scrubbing", () => {
         expect(out, input).not.toContain("hunter2");
         expect(out, input).toContain(kept);
       }
+    });
+
+    it("reads shell quoting and line breaks inside a substitution", () => {
+      const S = "R9secretZ";
+      const repr = (text: string) =>
+        "'" +
+        text
+          .replace(/\\/g, "\\\\")
+          .replace(/'/g, "\\'")
+          .replace(/\r/g, "\\r")
+          .replace(/\n/g, "\\n") +
+        "'";
+      const rows: Array<[string, string]> = [
+        // A `)` inside a shell-quoted argument does not close `$(`.
+        [
+          JSON.stringify({
+            cmd: `GET /\r\nAuthorization: Basic $(printf '%s' ')' admin:${S} | base64)`,
+          }),
+          '"}',
+        ],
+        [
+          repr(
+            `GET /\r\nAuthorization: Basic $(printf "%s" ")" admin:${S} | base64)\r\nHost: x`,
+          ),
+          "Host: x",
+        ],
+        [
+          `curl -H "Authorization: Basic $(printf '%s' ')' admin:${S} | base64)" url`,
+          '" url',
+        ],
+        [
+          `curl -H 'Authorization: Basic $(printf "%s" ")" admin:${S} | base64)' url`,
+          "' url",
+        ],
+        [
+          JSON.stringify({
+            Authorization: `Basic $(printf '%s' ')' admin:${S} | base64)`,
+            next: "keep",
+          }),
+          '"next":"keep"}',
+        ],
+        // A substitution spanning lines, closed within the window.
+        [
+          `curl -H "Authorization: Basic $(printf 'admin:\n${S}' | base64)" url`,
+          '" url',
+        ],
+        [
+          `curl -H "Authorization: Basic $(printf '%s:%s' \\\n  admin ${S} | base64)" https://x\nnext line`,
+          "next line",
+        ],
+        [
+          JSON.stringify({
+            cmd: `curl -H "Authorization: Basic $(printf 'admin:\n${S}' | base64)" url`,
+          }),
+          '\\" url',
+        ],
+        // Controls.
+        [
+          `curl -H "Authorization: Basic $(echo -n admin:${S} | base64)" url`,
+          '" url',
+        ],
+        ['{"Authorization":"Basic $(echo","next":"keep"}', '"next":"keep"}'],
+        [`curl -H 'Authorization: Basic $(echo admin:${S}' url`, "curl -H"],
+      ];
+      for (const [input, kept] of rows) {
+        const out = scrubText(input);
+        expect(out, input).not.toContain(S);
+        expect(out, input).toContain(kept);
+      }
+      // Past the window, an unclosed multi-line substitution ends at its first line
+      // break, as before.
+      const far = `curl -H "Authorization: Basic $(printf 'admin:${S}\n${"x".repeat(5000)}' | base64)" url`;
+      expect(scrubText(far)).toBe(
+        `curl -H "Authorization: Basic [REDACTED]\n${"x".repeat(5000)}' | base64)" url`,
+      );
+    });
+
+    it("ends a padded credential's serialized line at the structure that closes its string", () => {
+      const S = "R9secretZ";
+      const repr = (text: string) =>
+        "'" +
+        text
+          .replace(/\\/g, "\\\\")
+          .replace(/'/g, "\\'")
+          .replace(/\r/g, "\\r")
+          .replace(/\n/g, "\\n") +
+        "'";
+      const json = (value: unknown) => JSON.stringify(value);
+      const rows: Array<[string, string]> = [
+        [
+          json({
+            msg: `GET /\r\nAuthorization: ApiKey dXNl${S}Q==`,
+            level: "info",
+          }),
+          '"level":"info"}',
+        ],
+        [
+          json({
+            msg: `GET /\r\nAuthorization: Token dXNl${S}Q==`,
+            level: "info",
+          }),
+          '"level":"info"}',
+        ],
+        [
+          json({
+            msg: `GET /\r\nAuthorization: Token dXNl${S}Q=`,
+            level: "info",
+          }),
+          '"level":"info"}',
+        ],
+        [
+          json({ msg: `GET /\r\nAuthorization: dXNl${S}Q==`, level: "info" }),
+          '"level":"info"}',
+        ],
+        [
+          `{'msg': 'GET /\\r\\nAuthorization: Token dXNl${S}Q==', 'level': 'info'}`,
+          "'level': 'info'}",
+        ],
+        [
+          json(
+            json({
+              msg: `GET /\r\nAuthorization: Token dXNl${S}Q==`,
+              level: "info",
+            }),
+          ),
+          '\\"level\\":\\"info\\"}',
+        ],
+        [
+          json({
+            msg: `GET /\r\nAuthorization: Basic $(echo -n admin:${S} | base64`,
+            level: "info",
+          }),
+          '"level":"info"}',
+        ],
+        // Controls.
+        [
+          json({
+            msg: `GET /\r\nAuthorization: Basic dXNl${S}Q==`,
+            level: "info",
+          }),
+          '"level":"info"}',
+        ],
+        [
+          json({ Authorization: `Token dXNl${S}Q==`, level: "info" }),
+          '"level":"info"}',
+        ],
+        [
+          repr(
+            `GET /\r\nIf-None-Match: "v1"\r\nAuthorization: Digest response=" ${S}"\r\nHost: x`,
+          ),
+          "Host: x",
+        ],
+        [
+          repr(
+            `GET /\r\nIf-None-Match: "v1"\r\nAuthorization: OAuth oauth_signature=" ${S}"\r\nHost: x`,
+          ),
+          "Host: x",
+        ],
+        [
+          repr(
+            `GET /\r\nIf-None-Match: "v1"\r\nAuthorization: Token response=" ${S}"\r\nHost: x`,
+          ),
+          "Host: x",
+        ],
+      ];
+      for (const [input, kept] of rows) {
+        const out = scrubText(input);
+        expect(out, input).not.toContain(S);
+        expect(out, input).toContain(kept);
+      }
+      expect(
+        scrubText(json({ msg: "x\nAuthorization: Digest a=", k: "v", z: 1 })),
+      ).toBe(
+        json({ msg: "x\nAuthorization: Digest [REDACTED]", k: "v", z: 1 }),
+      );
     });
 
     it("redacts to the line end when a loose quoted value meets a quote of another depth", () => {
