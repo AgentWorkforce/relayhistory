@@ -1,0 +1,64 @@
+{
+  "name": "@relayhistory/engine",
+  "version": "0.34.1",
+  "description": "The RelayHistory service engine: durable delivery, recall, scoped tokens and the sessions schema, shared by the hosted service and self-hosted deployments.",
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AgentWorkforce/relayhistory.git",
+    "directory": "packages/engine"
+  },
+  "homepage": "https://github.com/AgentWorkforce/relayhistory/tree/main/packages/engine",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./schema": {
+      "types": "./dist/db/schema.d.ts",
+      "default": "./dist/db/schema.js"
+    },
+    "./migrations": {
+      "types": "./dist/migrate/index.d.ts",
+      "default": "./dist/migrate/index.js"
+    },
+    "./migrations/*.sql": "./migrations/*.sql",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "!dist/**/*.test.*",
+    "migrations",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "test:postgres": "RELAYHISTORY_ENGINE_TEST_DATABASE=postgres vitest run",
+    "prepack": "npm run build"
+  },
+  "peerDependencies": {
+    "drizzle-orm": "^0.38.3",
+    "hono": "^4.7.0"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.8",
+    "@electric-sql/pglite-pgvector": "^0.0.9",
+    "@types/node": "^22.10.0",
+    "@types/pg": "^8.11.10",
+    "drizzle-orm": "^0.38.4",
+    "hono": "^4.12.26",
+    "pg": "^8.13.1",
+    "prettier": "^3.9.9",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.9"
+  },
+  "engines": {
+    "node": ">=22.16.0"
+  }
+}
