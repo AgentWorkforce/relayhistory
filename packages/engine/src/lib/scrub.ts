@@ -559,7 +559,12 @@ function read(
   return { role, next: at + Math.max(run, 1) };
 }
 
-/** The end of an auth-param list starting at `at`, or null when none starts there. */
+/**
+ * The end of an auth-param list starting at `at`, or null when none starts there. The
+ * list continues past a `,`, and past a `;` or bare spaces when another `name=` follows
+ * them (`username="u"; realm="r"`, `username="u" realm="r"`), so prose after a
+ * parameter (`a="b" and then more`) is not taken into it.
+ */
 function authParams(
   text: string,
   at: number,
@@ -570,11 +575,19 @@ function authParams(
   for (;;) {
     let next: number = end;
     while (text[next] === " " || text[next] === "\t") next += 1;
-    if (text[next] !== ",") return end;
-    next += 1;
-    while (text[next] === " " || text[next] === "\t") next += 1;
-    const following: number | null =
-      authParam(text, next, quote) ?? strayItem(text, next, quote);
+    let following: number | null;
+    if (text[next] === ",") {
+      next += 1;
+      while (text[next] === " " || text[next] === "\t") next += 1;
+      following = authParam(text, next, quote) ?? strayItem(text, next, quote);
+    } else if (text[next] === ";" || next > end) {
+      if (text[next] === ";") next += 1;
+      if (!nextParameter(text, next)) return end;
+      while (text[next] === " " || text[next] === "\t") next += 1;
+      following = authParam(text, next, quote);
+    } else {
+      return end;
+    }
     if (following === null) return end;
     end = following;
   }
