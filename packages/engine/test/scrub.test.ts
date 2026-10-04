@@ -422,6 +422,21 @@ describe("hosted ingest scrubbing", () => {
             .slice(0, n),
       ],
       [
+        "closer runs inside serialized values",
+        (n) =>
+          `'\\nIf-None-Match: "v1"\\nAuthorization: Digest r="${"} ".repeat(n)}`.slice(
+            0,
+            n,
+          ),
+      ],
+      [
+        "nested same-kind quotes in shell substitutions",
+        (n) =>
+          `-H "Authorization: Basic $(printf "%s" ")" a)" `
+            .repeat(Math.ceil(n / 46))
+            .slice(0, n),
+      ],
+      [
         "stray parameter items",
         (n) =>
           `Authorization: AWS4 C=a/b, ${"x y=z/w, ".repeat(n)}`.slice(0, n),
@@ -1764,6 +1779,124 @@ describe("hosted ingest scrubbing", () => {
       ).toBe(
         json({ msg: "x\nAuthorization: Digest [REDACTED]", k: "v", z: 1 }),
       );
+    });
+
+    it("reads same-kind quotes inside a substitution as shell quoting", () => {
+      const S = "R9secretZ";
+      const rows: Array<[string, string]> = [
+        [`{"Authorization": "Basic $(printf "%s" admin:${S} | base64)"}`, '"}'],
+        [
+          `curl -H "Authorization: Basic $(printf "%s" ")" admin:${S} | base64)" url`,
+          '" url',
+        ],
+        [
+          JSON.stringify({
+            cmd: `curl -H "Authorization: Basic $(printf "%s" ")" admin:${S} | base64)" url`,
+          }),
+          '\\" url',
+        ],
+        // Controls.
+        [
+          JSON.stringify({
+            Authorization: `Basic $(printf "%s" admin:${S} | base64)`,
+            next: "keep",
+          }),
+          '"next":"keep"}',
+        ],
+        [
+          `{"Authorization": "Basic $(echo admin:${S}","next":"keep"}`,
+          '"next":"keep"}',
+        ],
+        [
+          `curl -H "Authorization: Basic $(printf '%s' ')' admin:${S} | base64)" url`,
+          '" url',
+        ],
+        [
+          `curl -H "Authorization: Basic $(printf "%s" admin:${S}" url`,
+          "curl -H",
+        ],
+      ];
+      for (const [input, kept] of rows) {
+        const out = scrubText(input);
+        expect(out, input).not.toContain(S);
+        expect(out, input).toContain(kept);
+      }
+      expect(scrubText('{"Authorization":"Basic $(echo","next":"keep"}')).toBe(
+        '{"Authorization":"Basic [REDACTED]","next":"keep"}',
+      );
+      // Pinned (GH4178215596): an unclosed substitution's continuation lines are
+      // taken with it; a header-looking line inside one cannot end it, or this
+      // heredoc's password would leak.
+      expect(
+        scrubText("Authorization: Basic $(unfinished\nX-Note: done)\nHost: x"),
+      ).toBe("Authorization: Basic [REDACTED]\nHost: x");
+      const heredoc = scrubText(
+        `Authorization: Basic $(cat <<X | base64\nuser: admin\npass: ${S}\nX\n)\nHost: x`,
+      );
+      expect(heredoc).not.toContain(S);
+      expect(heredoc).toContain("Host: x");
+    });
+
+    it("reads a string's structural close only where a value cannot hold it", () => {
+      const S = "R9secretZ";
+      const repr = (text: string) =>
+        "'" +
+        text
+          .replace(/\\/g, "\\\\")
+          .replace(/'/g, "\\'")
+          .replace(/\r/g, "\\r")
+          .replace(/\n/g, "\\n") +
+        "'";
+      let cases = 0;
+      for (const layer of [
+        repr,
+        (text: string) => JSON.stringify({ l: repr(text) }),
+      ])
+        for (const scheme of ["Digest", "OAuth", "Token"])
+          for (const lead of ["}", "]", " ]", "}}", "}, ", "],x", "}\t"]) {
+            const serialized = layer(
+              `GET /\r\nIf-None-Match: "v1"\r\nAuthorization: ${scheme} response="${lead}${S}"\r\nHost: x`,
+            );
+            const out = scrubText(serialized);
+            expect(out, serialized).not.toContain(S);
+            expect(out, serialized).toContain("Host: x");
+            cases += 1;
+          }
+      expect(cases).toBe(42);
+      const json = (value: unknown, indent?: number) =>
+        JSON.stringify(value, null, indent);
+      const credential = `GET /\r\nAuthorization: Token dXNl${S}Q==`;
+      const kept: Array<[string, string]> = [
+        [json({ msg: credential, level: "info" }), '","level":"info"}'],
+        [json({ level: "info", msg: credential }), '[REDACTED]"}'],
+        [json({ a: { msg: credential }, b: 1 }), '[REDACTED]"},"b":1}'],
+        [
+          `{'msg': '${credential.replace(/\r/g, "\\r").replace(/\n/g, "\\n")}', 'level': 'info'}`,
+          "', 'level': 'info'}",
+        ],
+        [
+          json(json({ msg: credential, level: "info" })),
+          '\\",\\"level\\":\\"info\\"}',
+        ],
+        [json(json({ level: "info", msg: credential })), '[REDACTED]\\"}"'],
+        [
+          json({ msg: credential, level: "info" }, 2),
+          '[REDACTED]",\n  "level": "info"\n}',
+        ],
+        [json({ level: "info", msg: credential }, 2), '[REDACTED]"\n}'],
+        [
+          json(
+            { msg: `GET /\r\nAuthorization: dXNl${S}Q==`, level: "info" },
+            2,
+          ),
+          '[REDACTED]",\n  "level": "info"\n}',
+        ],
+      ];
+      for (const [input, tail] of kept) {
+        const out = scrubText(input);
+        expect(out, input).not.toContain(S);
+        expect(out, input).toContain(tail);
+      }
     });
 
     it("redacts to the line end when a loose quoted value meets a quote of another depth", () => {

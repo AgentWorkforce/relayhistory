@@ -442,10 +442,13 @@ function parameterBefore(
 
 /**
  * Whether the text from `at`, right after a quote of kind `char` written with `run`
- * backslashes, is the structure that follows a closed string: `}`, `]` or the end
- * (past up to 16 spaces), or `,` and the next key (`,"level":`) written with the same
- * quote. A parameter value starting that way would be read as the close; real ones
- * do not.
+ * backslashes, is the structure that follows a closed string (whitespace, line breaks
+ * and indentation allowed between): the end of the text; `,` and the next key
+ * (`,"level":`) written with the same quote; or a run of `}`/`]` followed by the end,
+ * a line break, the next key, or the close of a string enclosing this one (a quote
+ * with fewer backslashes). A well-formed quoted value cannot hold a bare quote of its
+ * own level or a raw line break, so none of these occurs inside one; a bare closer
+ * followed by anything else (`response="]…"`) is a value's content.
  */
 function structuralClose(
   text: string,
@@ -453,11 +456,31 @@ function structuralClose(
   char: string,
   run: number,
 ): boolean {
-  let index = skipSpaces(text, at);
+  let index = skipWhitespace(text, at);
+  if (index >= text.length) return true;
+  if (text[index] === ",") return nextKey(text, index + 1, char, run);
+  if (text[index] !== "}" && text[index] !== "]") return false;
+  const closers = index;
+  while (
+    index - closers < 64 &&
+    (text[index] === "}" ||
+      text[index] === "]" ||
+      text[index] === " " ||
+      text[index] === "\t")
+  )
+    index += 1;
   const next = text[index];
-  if (next === undefined || next === "}" || next === "]") return true;
-  if (next !== ",") return false;
-  index = skipSpaces(text, index + 1);
+  if (next === undefined || next === "\n" || next === "\r") return true;
+  if (next === ",") return nextKey(text, index + 1, char, run);
+  const outer = backslashes(text, index);
+  return (
+    outer < run && (text[index + outer] === '"' || text[index + outer] === "'")
+  );
+}
+
+/** Whether a key (`"level":`) written with quote `char` and `run` follows `at`. */
+function nextKey(text: string, at: number, char: string, run: number): boolean {
+  let index = skipWhitespace(text, at);
   if (backslashes(text, index) !== run || text[index + run] !== char)
     return false;
   index += run + 1;
@@ -473,13 +496,13 @@ function structuralClose(
     index += 1;
   if (backslashes(text, index) !== run || text[index + run] !== char)
     return false;
-  return text[skipSpaces(text, index + run + 1)] === ":";
+  return text[skipWhitespace(text, index + run + 1)] === ":";
 }
 
-function skipSpaces(text: string, at: number): number {
+/** Past up to 64 spaces, tabs and line breaks (pretty-printed indentation). */
+function skipWhitespace(text: string, at: number): number {
   let index = at;
-  while (index - at < 16 && (text[index] === " " || text[index] === "\t"))
-    index += 1;
+  while (index - at < 64 && /[ \t\r\n]/.test(text[index] ?? "")) index += 1;
   return index;
 }
 
@@ -625,9 +648,10 @@ function headerEnd(text: string, at: number, quote: HeaderQuote): number {
 const SUBSTITUTION_WINDOW = 4096;
 
 /**
- * Where scans of substitutions that ran past a line break without closing stopped. A
- * later substitution whose first break lies before it does not run on past its
- * break, so extended scans never overlap and the pass stays linear.
+ * Where scans of substitutions that ran past their fallback end (a line break, or a
+ * quoted key's value close) without closing stopped. A later substitution whose
+ * fallback lies before it does not run on past it, so extended scans never overlap
+ * and the pass stays linear.
  */
 interface SubstitutionScan {
   extendedTo: number;
@@ -658,10 +682,12 @@ function shellSubstitutionEnd(
   if (!backtick && !(text[at] === "$" && text[at + 1] === "(")) return null;
   let depth = 0;
   let span = "";
-  let firstBreak = -1;
+  // Where the substitution ends if it never closes: its first line break or, in a
+  // quoted key's value, that value's first close.
+  let stop = -1;
   let index = backtick ? at + 1 : at;
   while (index < text.length) {
-    if (firstBreak >= 0 && index - at > SUBSTITUTION_WINDOW) break;
+    if (stop >= 0 && index - at > SUBSTITUTION_WINDOW) break;
     const run = backslashes(text, index);
     const char = text[index + run];
     if (
@@ -671,18 +697,19 @@ function shellSubstitutionEnd(
         (char === "n" || char === "r") &&
         escapedBreak(text, index, run, quote))
     ) {
-      if (firstBreak < 0) {
-        firstBreak = index;
-        // Only an open substitution, not yet overlapping a failed extended scan,
-        // looks past its break.
-        if (index < scan.extendedTo) break;
-      }
+      if (stop < 0) {
+        stop = index;
+        // Only a substitution not yet overlapping a failed extended scan looks on.
+        if (index < scan.extendedTo) return stop;
+      } else if (keyed) break;
       index += run + 1;
       continue;
     }
-    // A quoted key's value cannot hold its own quote unescaped, so its close ends
-    // the substitution too.
-    if (keyed && quoteRole(char, run, quote) === "close") return index;
+    const role = quoteRole(char, run, quote);
+    if (keyed && role === "close" && stop < 0) {
+      stop = index;
+      if (index < scan.extendedTo) return stop;
+    }
     if (
       !keyed &&
       quote.lineBase > 0 &&
@@ -690,9 +717,15 @@ function shellSubstitutionEnd(
       run < quote.lineBase &&
       structuralClose(text, index + run + 1, char, run)
     )
-      return firstBreak >= 0 ? firstBreak : index;
+      return stop >= 0 ? stop : index;
     if (char === '"' || char === "'") {
-      if (literalQuote(char, run, quote)) {
+      // Shell quoting: a literal quote, or one of the header's own kind at its own
+      // level (bash allows those inside `$(…)`), opens or closes a span. A quote
+      // shallower than a serialized line's base is that string's close, never one.
+      const shell =
+        literalQuote(char, run, quote) ||
+        (role === "close" && !(quote.lineBase > 0 && run < quote.lineBase));
+      if (shell) {
         if (!span) span = char;
         else if (span === char) span = "";
       }
@@ -706,9 +739,9 @@ function shellSubstitutionEnd(
     }
     index += run + 1;
   }
-  if (firstBreak < 0) return Math.min(index, text.length);
+  if (stop < 0) return Math.min(index, text.length);
   scan.extendedTo = Math.max(scan.extendedTo, index);
-  return firstBreak;
+  return stop;
 }
 
 /**
