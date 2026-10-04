@@ -232,15 +232,60 @@ describe("rollout lock release", () => {
     "fails behind a transaction pooler that hands statements to other backends",
     async () => {
       const backends = [await secondConnection(), await secondConnection()];
-      let next = 0;
-      // Each statement goes to the other backend, as a transaction-mode pooler may.
-      const pooled: RolloutQuery = async (sql) =>
-        (await backends[next++ % 2]!.query(sql)).rows;
+      const pids = await Promise.all(
+        backends.map(
+          async (backend) =>
+            (await backend.query("SELECT pg_backend_pid() AS pid")).rows[0]
+              .pid as number,
+        ),
+      );
+      // A transaction-mode pooler: an explicit transaction stays on the backend that
+      // ran its BEGIN until COMMIT or ROLLBACK; each statement outside one goes to the
+      // next backend.
+      let current = 0;
+      let pinned: number | null = null;
+      const routed: Array<{ sql: string; backend: number }> = [];
+      const pooled: RolloutQuery = async (sql) => {
+        let backend: number;
+        if (pinned !== null) {
+          backend = pinned;
+          if (sql === "COMMIT" || sql === "ROLLBACK") pinned = null;
+        } else if (sql === "BEGIN") {
+          backend = pinned = current;
+        } else {
+          backend = current;
+          current = (current + 1) % backends.length;
+        }
+        routed.push({ sql, backend });
+        return (await backends[backend]!.query(sql)).rows;
+      };
       await expect(rolloutSessionRollups(pooled)).rejects.toThrow(
         "rollout lock was not released by the connection that took it",
       );
+      // Every backfill transaction ran on one backend, and the unlock reached the
+      // other backend from the one that took the lock.
+      const begin = routed.findIndex((step) => step.sql === "BEGIN");
+      const commit = routed.findIndex((step) => step.sql === "COMMIT");
+      expect(begin).toBeGreaterThan(0);
+      expect(
+        new Set(routed.slice(begin, commit + 1).map((step) => step.backend))
+          .size,
+      ).toBe(1);
+      const lock = routed.find((step) =>
+        step.sql.includes("pg_try_advisory_lock("),
+      )!;
+      const unlock = routed.find((step) =>
+        step.sql.includes("pg_advisory_unlock("),
+      )!;
+      expect(unlock.backend).not.toBe(lock.backend);
       // The backend that took the lock still holds it: the leak the error reports.
-      expect(await advisoryLocks()).toBe(1);
+      expect(
+        (
+          await database.query(
+            "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+          )
+        ).rows,
+      ).toEqual([{ pid: pids[lock.backend] }]);
       for (const backend of others.splice(0)) await backend.end();
       expect(await advisoryLocks()).toBe(0);
     },
