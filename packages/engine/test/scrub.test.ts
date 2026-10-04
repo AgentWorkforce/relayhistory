@@ -285,6 +285,11 @@ describe("hosted ingest scrubbing", () => {
       ],
       ["unbroken home dir", (n) => `/home/${"a".repeat(n)}`.slice(0, n)],
       [
+        "repeated authorization",
+        (n) => "\nAuthorization:  ".repeat(Math.ceil(n / 17)).slice(0, n),
+      ],
+      ["spaced authorization", (n) => `,${" ".repeat(n)}`.slice(0, n)],
+      [
         "repeated bearer",
         (n) => "Bearer a=".repeat(Math.ceil(n / 9)).slice(0, n),
       ],
@@ -474,6 +479,30 @@ describe("hosted ingest scrubbing", () => {
       );
     });
 
+    it("redacts an Authorization header's credential and keeps its scheme", () => {
+      expect(scrubText("Authorization: Basic dXNlcjpwYXNz")).toBe(
+        "Authorization: Basic [REDACTED]",
+      );
+      expect(
+        scrubText(
+          'GET / HTTP/1.1\nProxy-Authorization: Digest username="u", response="abc"\nHost: x',
+        ),
+      ).toBe("GET / HTTP/1.1\nProxy-Authorization: Digest [REDACTED]\nHost: x");
+      expect(scrubText(`curl -H 'authorization: token ghx123' url`)).toBe(
+        "curl -H 'authorization: token [REDACTED]' url",
+      );
+      expect(scrubText('{"Authorization": "Basic dXNlcg==", "a": 1}')).toBe(
+        '{"Authorization": "Basic [REDACTED]", "a": 1}',
+      );
+      // A credential with no scheme is redacted whole.
+      expect(scrubText("Authorization: dXNlcjpwYXNz")).toBe(
+        "Authorization: [REDACTED]",
+      );
+      // Prose that mentions the header is not a header line.
+      const prose = "Send the Authorization: header with each call";
+      expect(scrubText(prose)).toBe(prose);
+    });
+
     it("normalizes a home path that ends at the username", () => {
       expect(scrubText("/Users/alice")).toBe("~");
       expect(scrubText("cd /home/bob && ls")).toBe("cd ~ && ls");
@@ -488,14 +517,22 @@ describe("hosted ingest scrubbing", () => {
       expect(
         scrubJson({
           api_key: "custom-secret",
-          headers: { "x-api-key": "v", Authorization: "Basic dXNlcg==" },
+          headers: {
+            "x-api-key": "v",
+            Authorization: "Basic dXNlcg==",
+            "Proxy-Authorization": ["Digest a=1"],
+          },
           auth: { password: "two words", token: 123, secret: ["a", "b"] },
           empty: { password: "", key: null, secret: true },
           kept: { model: "claude", passwords_rotated: "yes" },
         }),
       ).toEqual({
         api_key: "[REDACTED]",
-        headers: { "x-api-key": "[REDACTED]", Authorization: "Basic dXNlcg==" },
+        headers: {
+          "x-api-key": "[REDACTED]",
+          Authorization: "[REDACTED]",
+          "Proxy-Authorization": ["[REDACTED]"],
+        },
         auth: {
           password: "[REDACTED]",
           token: "[REDACTED]",
