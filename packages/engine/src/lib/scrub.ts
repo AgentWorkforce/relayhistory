@@ -327,7 +327,8 @@ function closingQuote(
   return null;
 }
 
-const HEADER_NAME = /[A-Za-z0-9-]{1,64}:/y;
+/** An HTTP field name (RFC 9110 `token`, bounded) followed by its colon. */
+const HEADER_NAME = /[!#$%&'*+\-.^_`|~A-Za-z0-9]{1,64}:/y;
 
 /**
  * Whether `run` backslashes at `at` and the `n`/`r` after them encode a line break
