@@ -218,11 +218,18 @@ interface HeaderQuote {
   depth: number;
   /** `2^level` for the content's escaping level: 1 unquoted, 2 inside `"…"`. */
   unit: number;
+  /**
+   * The backslashes that encode a line break in this header's text: the run of the
+   * escaped break the header started after, else one more than a `"` quote's run (a
+   * JSON string's `\n`). 0 when the header's text is raw, where `\n` is literal.
+   */
+  lineBase: number;
 }
 
 /**
  * What a quote at some position is to the credential being read, or `line` for a line
- * break, real or escaped into a serialized string, which ends the credential.
+ * break that ends it: a real one, or one escaped into a serialized string (see
+ * `escapedBreak`).
  */
 type QuoteRole = "close" | "delimiter" | "content" | "line";
 
@@ -260,14 +267,16 @@ function redactAuthorization(text: string): string {
     let start = header.index + header[0].length;
     const escapes = backslashes(text, start);
     const opening = text[start + escapes];
-    let quote: HeaderQuote = { char: "", depth: 0, unit: 1 };
+    let quote: HeaderQuote = { char: "", depth: 0, unit: 1, lineBase: 0 };
+    let before = 0;
+    while (text[header.index - before - 1] === "\\") before += 1;
     if (opening === '"' || opening === "'") {
       quote = headerQuote(opening, escapes);
       start += escapes + 1;
     } else if (header[1] === '"' || header[1] === "'") {
-      let depth = 0;
-      while (text[header.index - depth - 1] === "\\") depth += 1;
-      quote = headerQuote(header[1], depth);
+      quote = headerQuote(header[1], before);
+    } else if (header[1]!.startsWith("\\")) {
+      quote = { ...quote, lineBase: before + 1 };
     }
     AUTHORIZATION_SCHEME.lastIndex = start;
     const scheme = AUTHORIZATION_SCHEME.exec(text);
@@ -289,8 +298,13 @@ function redactAuthorization(text: string): string {
 function headerQuote(char: string, depth: number): HeaderQuote {
   // A `'` adds no backslash escaping (shell, Python repr), so `"` inside it is read
   // as in an unquoted header.
-  if (char !== '"') return { char, depth, unit: 1 };
-  return { char, depth, unit: 2 ** (Math.floor(Math.log2(depth + 1)) + 1) };
+  if (char !== '"') return { char, depth, unit: 1, lineBase: 0 };
+  return {
+    char,
+    depth,
+    unit: 2 ** (Math.floor(Math.log2(depth + 1)) + 1),
+    lineBase: depth + 1,
+  };
 }
 
 /**
@@ -311,6 +325,37 @@ function closingQuote(
     index = next;
   }
   return null;
+}
+
+const HEADER_NAME = /[A-Za-z0-9-]{1,64}:/y;
+
+/**
+ * Whether `run` backslashes at `at` and the `n`/`r` after them encode a line break
+ * that ends the header rather than literal text (`DOMAIN\ryan`, `C:\repo\new`). It
+ * must be written the way this header's text encodes one (an odd multiple of its
+ * `lineBase`; an even multiple is an escaped backslash) and be followed by what can
+ * follow a header line: the end, the header's close, another line break, or the next
+ * header's name. Anything else is literal: in a `"`-quoted header an encoded line
+ * break and a literal shell `\n` are the same characters, so the ambiguous case stays
+ * inside the credential.
+ */
+function escapedBreak(
+  text: string,
+  at: number,
+  run: number,
+  quote: HeaderQuote,
+): boolean {
+  const base = quote.lineBase;
+  if (base === 0 || run % base !== 0 || (run / base) % 2 !== 1) return false;
+  const after = at + run + 1;
+  if (after >= text.length) return true;
+  const following = backslashes(text, after);
+  const char = text[after + following];
+  if (char === "\n" || char === "\r") return true;
+  if (following > 0 && (char === "n" || char === "r")) return true;
+  if (quoteRole(char, following, quote) === "close") return true;
+  HEADER_NAME.lastIndex = after;
+  return HEADER_NAME.test(text);
 }
 
 /** The length of the backslash run starting at `at`. */
@@ -350,12 +395,12 @@ function read(
 ): { role: QuoteRole | null; next: number } {
   const run = backslashes(text, at);
   const char = text[at + run];
-  if (
-    char === "\n" ||
-    char === "\r" ||
-    (run > 0 && (char === "n" || char === "r"))
-  )
+  if (char === "\n" || char === "\r")
     return { role: "line", next: at + run + 1 };
+  if (run > 0 && (char === "n" || char === "r"))
+    return escapedBreak(text, at, run, quote)
+      ? { role: "line", next: at + run + 1 }
+      : { role: null, next: at + run };
   const role = quoteRole(char, run, quote);
   if (role !== null) return { role, next: at + run + 1 };
   return { role, next: at + Math.max(run, 1) };
@@ -441,7 +486,10 @@ function quotedValue(text: string, at: number, quote: HeaderQuote): number {
   let index = at;
   while (index < text.length) {
     const { role, next } = read(text, index, quote);
-    if (role === "close" || role === "line") return index;
+    if (role === "close") return index;
+    // Only a real line break ends a quoted value; an escaped one is its content.
+    if (role === "line" && (text[index] === "\n" || text[index] === "\r"))
+      return index;
     if (role === "delimiter") return next;
     index = next;
   }
@@ -467,12 +515,12 @@ function looseQuotedValue(
   while (index < text.length) {
     const length = backslashes(text, index);
     const char = text[index + length];
-    if (
-      char === "\n" ||
-      char === "\r" ||
-      (length > 0 && (char === "n" || char === "r"))
-    )
-      return null;
+    if (char === "\n" || char === "\r") return null;
+    if (length > 0 && (char === "n" || char === "r")) {
+      if (escapedBreak(text, index, length, quote)) return null;
+      index += length;
+      continue;
+    }
     if (char === quote.char) {
       if (length !== run) return null;
       const after = index + length + 1;
