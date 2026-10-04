@@ -24,6 +24,7 @@ export {
   createTokenFile,
   listTokens,
   revokeToken,
+  shellArgument,
   type CreateTokenOptions,
   validateTokenOptions,
   UndeliveredTokenError,
