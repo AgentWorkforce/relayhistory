@@ -379,6 +379,13 @@ describe("hosted ingest scrubbing", () => {
         (n) => `Authorization: Digest ${'a="x"; '.repeat(n)}`.slice(0, n),
       ],
       [
+        "alternating quote kinds after a serialized header",
+        (n) =>
+          JSON.stringify({
+            r: `Here's\r\nAuthorization: Basic x${"' a, k=v\" b".repeat(n)}`,
+          }).slice(0, n),
+      ],
+      [
         "stray parameter items",
         (n) =>
           `Authorization: AWS4 C=a/b, ${"x y=z/w, ".repeat(n)}`.slice(0, n),
@@ -1202,6 +1209,138 @@ describe("hosted ingest scrubbing", () => {
       expect(scrubText('{"Authorization":"Digest a=","response":"S"}')).toBe(
         '{"Authorization":"Digest [REDACTED]","response":"S"}',
       );
+    });
+
+    it("keeps serialized evidence around padded, apostrophe-bearing and loose credentials", () => {
+      const R = "R9secretZ";
+      const rows: Array<[string, string]> = [
+        [
+          String.raw`{"msg":"Don't forget\nAuthorization: Basic abc${R}","level":"info","more":"it's x"}`,
+          `"level":"info","more":"it's x"}`,
+        ],
+        [
+          JSON.stringify({
+            t: `Here's the dump: GET /\r\nAuthorization: Digest username="u", realm="Admins' area", response="${R}"\r\nHost: x`,
+          }),
+          "Host: x",
+        ],
+        [
+          JSON.stringify({
+            req: `Here's the dump: GET /\r\nAuthorization: Digest username="u", realm="Members' Area", response="${R}"\r\nHost: x`,
+          }),
+          "Host: x",
+        ],
+        [
+          JSON.stringify({
+            req: `Here's: GET /\r\nAuthorization: Digest username="u", realm="Admins' (internal)", response="${R}"\r\nHost: x`,
+          }),
+          "Host: x",
+        ],
+        [
+          String.raw`{"msg":"GET /\r\nAuthorization: Basic dXNlcjpwYQ${R}==","level":"info"}`,
+          `"level":"info"}`,
+        ],
+        [
+          String.raw`{"msg":"GET /\r\nAuthorization: Basic dXNlcjpw${R}=","level":"info"}`,
+          `"level":"info"}`,
+        ],
+        [
+          String.raw`{"msg":"GET /\r\nAuthorization: Negotiate YII${R}=="}`,
+          `"}`,
+        ],
+        [String.raw`'GET /\r\nAuthorization: NTLM TlRM${R}==' next`, "' next"],
+        [
+          `curl -H "Authorization: Digest username="u"; realm="r"; response="${R}"" url`,
+          "curl -H",
+        ],
+        [
+          `curl -H "Authorization: Digest username="u" realm="r" response="${R}"" url`,
+          "curl -H",
+        ],
+        [
+          String.raw`'GET /\r\nAuthorization: Basic $(echo -n admin:${R} | base64)' x`,
+          "' x",
+        ],
+      ];
+      for (const [input, kept] of rows) {
+        const out = scrubText(input);
+        expect(out, input).not.toContain(R);
+        expect(out, input).toContain(kept);
+      }
+      for (const sibling of ['"more":"x"', '"note":"retry x=1"'])
+        expect(
+          scrubText(
+            String.raw`{"msg":"Don't forget\nAuthorization: Basic abc","level":"info",${sibling}}`,
+          ),
+        ).toBe(
+          String.raw`{"msg":"Don't forget\nAuthorization: Basic [REDACTED]","level":"info",${sibling}}`,
+        );
+      // A stray apostrophe before the header, and one inside a value before the secret.
+      for (const inner of ["' ", "'(", "':"])
+        for (const layer of [
+          (text: string) => JSON.stringify({ req: text }),
+          (text: string) => JSON.stringify(JSON.stringify({ req: text })),
+        ]) {
+          const serialized = layer(
+            `Here's it: GET /\r\nAuthorization: Digest username="u", realm="Admins${inner}x", response="${R}"\r\nHost: x`,
+          );
+          const out = scrubText(serialized);
+          expect(out, serialized).not.toContain(R);
+          expect(out, serialized).toContain("Host: x");
+        }
+      // Padded base64 credentials, with and without what follows their string.
+      for (const scheme of ["Basic", "NTLM", "Negotiate"])
+        for (const padding of ["=", "=="]) {
+          const credential = `${scheme} dXNl${R}${padding}`;
+          for (const [input, kept] of [
+            [
+              String.raw`{"msg":"GET /\r\nAuthorization: ${credential}","level":"info"}`,
+              `"level":"info"}`,
+            ],
+            [String.raw`{"msg":"GET /\r\nAuthorization: ${credential}"}`, `"}`],
+            [
+              String.raw`'GET /\r\nAuthorization: ${credential}' next`,
+              "' next",
+            ],
+            [
+              String.raw`'GET /\r\nAuthorization: ${credential}'`,
+              "[REDACTED]'",
+            ],
+          ] as const) {
+            const out = scrubText(input);
+            expect(out, input).not.toContain(R);
+            expect(out, input).toContain(kept);
+          }
+        }
+    });
+
+    it("continues a Digest list past an empty or `=`-only value", () => {
+      const R = "R9secretZ";
+      const repr = (text: string) =>
+        "'" +
+        text
+          .replace(/\\/g, "\\\\")
+          .replace(/'/g, "\\'")
+          .replace(/\r/g, "\\r")
+          .replace(/\n/g, "\\n") +
+        "'";
+      for (const header of [
+        `Digest a==, response="${R}"`,
+        `Digest username==; response="${R}"`,
+        `Digest realm=, response="${R}"`,
+        `Digest nonce="", response="${R}"`,
+        `Digest username= , response="${R}"`,
+        `Basic ${R}==, x`,
+      ])
+        for (const input of [
+          `Authorization: ${header}\nHost: x`,
+          JSON.stringify({ r: `GET /\r\nAuthorization: ${header}\r\nHost: x` }),
+          repr(`GET /\r\nAuthorization: ${header}\r\nHost: x`),
+          `curl -H 'Authorization: ${header}' url`,
+        ]) {
+          const out = scrubText(input);
+          expect(out, input).not.toContain(R);
+        }
     });
 
     it("redacts to the line end when a loose quoted value meets a quote of another depth", () => {
