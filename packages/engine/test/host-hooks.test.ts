@@ -12,19 +12,23 @@ describe("containRejection", () => {
   it("reads then once and calls it with the result as receiver", () => {
     const onRejected = vi.fn();
     let reads = 0;
+    let receiver: unknown;
     const thenable = {
       get then() {
         reads += 1;
         // A second read would hand back something that is not callable.
         if (reads > 1) return undefined;
         return function (this: unknown, _: unknown, reject: () => void) {
-          expect(this).toBe(thenable);
+          // Recorded, not asserted here: containRejection would catch a failed
+          // expectation and report it as the rejection this test also expects.
+          receiver = this;
           reject();
         };
       },
     };
     containRejection(thenable, onRejected);
     expect(reads).toBe(1);
+    expect(receiver).toBe(thenable);
     expect(onRejected).toHaveBeenCalledTimes(1);
   });
 
