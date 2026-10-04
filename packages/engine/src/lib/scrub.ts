@@ -707,20 +707,14 @@ const SUBSTITUTION_WINDOW = 4096;
  * Where scans of substitutions that ran past their fallback end (a line break, or a
  * quoted key's value close) without closing stopped, whether at the window or at a
  * serialized string's close. A later substitution starting before it scans afresh,
- * with no window up to the first real line break at or after the region's end (on a
- * serialized line also its first escaped break) and with one from there: one that
- * closes is redacted to its close, so a substitution straddling the region's end
- * keeps its later lines (`$(printf 'admin:\nS3cret' | base64)`); one that does not
- * fails closed at that break, at an unkeyed serialized line's structural close, or
- * at the end of the text, which `sweptEnd` extends so it splits no multi-line secret
- * (`DB_PASSWORD=\n…`, a PEM block).
- *
- * Every in-region scan is consumed by its redaction. One that reaches the region's
- * end reads on at most `SUBSTITUTION_WINDOW` past it and ends there or later, so the
- * next header of its kind starts past the region: per region, one top-level scan and,
- * in a sweep, one on each side of the sweep's `from` read on. Every scan that returns
- * its fallback has read at most `SUBSTITUTION_WINDOW` past it and starts after the
- * last region, so substitutions cost O(n + window) per pass, with n bounded by
+ * with no window: one that closes is redacted to its close, one that does not fails
+ * closed at the first real line break at or after the region's end (on a serialized
+ * line also its first escaped break, and on an unkeyed serialized line the string's
+ * structural close) or the end of the text, which `sweptEnd` extends so it splits no
+ * multi-line secret (`DB_PASSWORD=\n…`, a PEM block), and neither moves it. Every
+ * in-region scan is thus consumed by its redaction, and every scan that returns its
+ * fallback has read at most `SUBSTITUTION_WINDOW` past it and starts after the last
+ * such region, so substitutions cost O(n + window) per pass, with n bounded by
  * `MAX_SCRUB_CHARS`.
  *
  * Top-level headers and the headers a sweep reads (`readCredential`'s `nested`) keep
@@ -753,9 +747,9 @@ interface SubstitutionScan {
  * of the text when it has neither. It looks for its close up to `SUBSTITUTION_WINDOW`
  * past its start before falling back, and records how far it read in `scan`. On an
  * unkeyed serialized line the string's structural close (`structuralClose`) ends that
- * search. A substitution starting inside an earlier failed scan's region ends at its
- * own close or fails closed as `SubstitutionScan` describes. Null when the credential
- * is not a substitution.
+ * search. A substitution starting inside an earlier failed scan's region has no
+ * fallback and no window: it ends at its own close or fails closed as
+ * `SubstitutionScan` describes. Null when the credential is not a substitution.
  */
 function shellSubstitutionEnd(
   text: string,
@@ -775,10 +769,8 @@ function shellSubstitutionEnd(
   // The last real line break crossed, so a close on a later line can be checked.
   let lastBreak = -1;
   // A substitution starting inside an earlier failed scan's region scans afresh, with
-  // no window up to the first line break at or after the region's end, and from there
-  // on with one: it ends at its own close or, failing closed, at that break, so
-  // nothing straddling the region's end is cut.
-  let failAt = -1;
+  // no window: it ends at its own close or, failing closed, at the first line break
+  // at or after the region's end, so nothing straddling that end is cut.
   const frontier = nested
     ? Math.max(scan.extendedTo, scan.nestedTo)
     : scan.extendedTo;
@@ -787,7 +779,6 @@ function shellSubstitutionEnd(
   let index = backtick ? at + 1 : at;
   while (index < text.length) {
     if (region < 0 && stop >= 0 && index - at > SUBSTITUTION_WINDOW) break;
-    if (failAt >= 0 && index - failAt > SUBSTITUTION_WINDOW) break;
     const run = backslashes(text, index);
     const char = text[index + run];
     const real = char === "\n" || char === "\r";
@@ -799,13 +790,8 @@ function shellSubstitutionEnd(
     ) {
       // Past the region a serialized line has no real breaks, so its proven
       // escaped ones end it there.
-      if (
-        failAt < 0 &&
-        region >= 0 &&
-        index >= region &&
-        (real || quote.lineBase > 0)
-      )
-        failAt = real ? index + run : index;
+      if (region >= 0 && index >= region && (real || quote.lineBase > 0))
+        return failedClosed(at, real ? index + run : index);
       if (stop < 0) stop = index;
       if (real) lastBreak = index + run;
       index += run + 1;
@@ -823,7 +809,7 @@ function shellSubstitutionEnd(
       // The serialized string ends here. A scan that ran past its stop to get here
       // marks the span a failed region, so later headers in it do not rescan it; one
       // already inside a region fails closed here.
-      if (region >= 0) return failedInRegion(at, index, failAt);
+      if (region >= 0) return failedClosed(at, index);
       if (stop < 0) return { end: index, sweep: null };
       scan[recorded] = Math.max(scan[recorded], index);
       return { end: stop, sweep: null };
@@ -850,8 +836,7 @@ function shellSubstitutionEnd(
     }
     index += run + 1;
   }
-  if (region >= 0)
-    return failedInRegion(at, Math.min(index, text.length), failAt);
+  if (region >= 0) return failedClosed(at, Math.min(index, text.length));
   if (stop < 0) return { end: Math.min(index, text.length), sweep: null };
   scan[recorded] = Math.max(scan[recorded], index);
   return { end: stop, sweep: null };
@@ -866,17 +851,8 @@ interface SubstitutionEnd {
   sweep: { from: number; headersFrom: number } | null;
 }
 
-/**
- * An in-region scan stopped at `index` without closing: it fails closed at the first
- * line break at or after the region's end (`failAt`), or at `index` when it never
- * reached one. Either end may split a secret, so it asks for a sweep.
- */
-function failedInRegion(
-  at: number,
-  index: number,
-  failAt: number,
-): SubstitutionEnd {
-  const end = failAt >= 0 ? failAt : index;
+/** An in-region scan that failed closed at `end`, which may split a secret. */
+function failedClosed(at: number, end: number): SubstitutionEnd {
   return { end, sweep: { from: end, headersFrom: at + 1 } };
 }
 

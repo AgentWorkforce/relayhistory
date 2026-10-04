@@ -583,6 +583,13 @@ describe("hosted ingest scrubbing", () => {
             .slice(0, n),
       ],
       [
+        "short serialized regions closed by their string",
+        (n) =>
+          '{"m":"x\\nAuthorization: Basic $(a\\nX: y,Authorization: Basic $(b","k":1}\n'
+            .repeat(n / 73)
+            .slice(0, n),
+      ],
+      [
         "headers before a cross-line close",
         (n) =>
           `Authorization: Basic $(oops\n${",Authorization: b".repeat(200)})\n`
@@ -2335,39 +2342,18 @@ describe("hosted ingest scrubbing", () => {
       }
     });
 
-    it("reads a substitution straddling a failed region's end to its close", () => {
-      const filler = (length: number) => {
-        let text = "";
-        while (text.length < length) {
-          const line = Math.min(63, length - text.length - 1);
-          text += `${line > 0 ? "x".repeat(line) : ""}\n`;
-        }
-        return text.slice(0, length);
-      };
-      const failed = "Authorization: Basic $(oops\n";
-      const forms: Array<[string, (pad: number) => string]> = [
-        [
-          "raw",
-          (pad) =>
-            `${failed}${filler(pad)}Authorization: Basic $(printf 'admin:\nS3cret' | base64)\nHost: x`,
-        ],
-        [
-          "curl",
-          (pad) =>
-            `${failed}${filler(pad)}curl -H "Authorization: Basic $(printf '%s' 'admin:\nS3cret' | base64)" url\nHost: x`,
-        ],
-        [
-          "continued lines",
-          (pad) =>
-            `${failed}${filler(pad)}Authorization: Basic $(printf '%s' \\\n${"y".repeat(200)} \\\nS3cret | base64)\nHost: x`,
-        ],
-      ];
-      for (const [name, form] of forms)
-        for (let pad = 3950; pad <= 4250; pad += 1) {
-          const out = scrubText(form(pad));
-          expect(out, `${name} pad ${pad}`).not.toContain("S3cret");
-          expect(out, `${name} pad ${pad}`).toContain("\nHost: x");
-        }
+    it("fails closed at a region's end when a later header's credential holds a close", () => {
+      // An in-region scan's `)` past the region's end may sit inside a later header's
+      // credential; failing closed at the region's end leaves that header to be read.
+      const lines = (count: number) => `${"y".repeat(63)}\n`.repeat(count);
+      for (const input of [
+        `Authorization: Basic $(oops\nAuthorization: Basic $(echo don't\n${lines(70)}Authorization: Basic $(printf 'admin:\n)\nS3cret' | base64)\nHost: x`,
+        `Authorization: Basic $(oops\n${lines(63)}Authorization: Basic $(oops it's${"x".repeat(200)}\nAuthorization: Basic $(printf 'admin:\nx)S3cret' | base64)\nHost: x`,
+      ]) {
+        const out = scrubText(input);
+        expect(out, input).not.toContain("S3cret");
+        expect(out, input).toContain("\nHost: x");
+      }
     });
 
     it("keeps a swept header's failed scan from moving later headers into a region", () => {
