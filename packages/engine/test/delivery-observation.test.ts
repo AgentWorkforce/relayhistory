@@ -280,6 +280,45 @@ describe("a failing observer", () => {
     throw new Error("observer callback failed");
   };
 
+  const rejectingFactory = (async () => {
+    throw new Error("observer factory rejected");
+  }) as unknown as () => (observation: DeliveryBatchObservation) => void;
+  const rejectingCallback = () => async () => {
+    throw new Error("observer callback rejected");
+  };
+
+  it.each([
+    ["factory", rejectingFactory],
+    ["callback", rejectingCallback],
+  ])(
+    "contains an async %s rejection without changing the response",
+    async (_name, observer) => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const unhandled: unknown[] = [];
+      const onUnhandled = (reason: unknown) => unhandled.push(reason);
+      process.on("unhandledRejection", onUnhandled);
+      try {
+        const accepted = await failing(observer)(
+          JSON.stringify({ protocolVersion: 1, batch: await batch() }),
+        );
+        expect(accepted.status).toBe(200);
+        expect(await accepted.json()).toMatchObject({
+          acceptanceLevel: "durable",
+        });
+        await new Promise((done) => setTimeout(done, 20));
+        expect(unhandled).toEqual([]);
+        expect(warn.mock.calls.map((call) => String(call[0]))).toContainEqual(
+          expect.stringMatching(
+            /^\[delivery\] batch observer (failed|unavailable)$/,
+          ),
+        );
+      } finally {
+        process.off("unhandledRejection", onUnhandled);
+        warn.mockRestore();
+      }
+    },
+  );
+
   it.each([
     ["factory", throwingFactory],
     ["callback", throwingCallback],

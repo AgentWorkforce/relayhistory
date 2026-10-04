@@ -1,5 +1,6 @@
 import type { Context, MiddlewareHandler } from "hono";
 import { createMiddleware } from "hono/factory";
+import { containRejection } from "../lib/host-hooks.js";
 import {
   hostContext,
   type AuthContext,
@@ -37,23 +38,28 @@ export function errorSummary(error: unknown): { name: string; code: unknown } {
 }
 
 /**
- * Hands `error` to the host's `reportError`, or logs its summary. Never throws: a failing
- * host hook falls back to the summary log, so reporting cannot fail the request.
+ * Hands `error` to the host's `reportError`, or logs its summary. Never throws and never
+ * leaves a rejection unhandled: a failing (or rejecting) host hook falls back to the
+ * summary log, so reporting cannot fail the request.
  */
 export function reportError<E extends HistoryEnv>(
   deps: Pick<HistoryEngineDeps<E>, "reportError">,
   error: unknown,
   c: Context<any>,
 ): void {
+  const fallback = () =>
+    console.error("[relayhistory] request failed", errorSummary(error));
   if (deps.reportError) {
     try {
-      deps.reportError(error, hostContext<E>(c));
+      // An async hook's rejection is contained too. The hook's own error may quote
+      // what it was given, so either failure logs only the original's summary.
+      containRejection(deps.reportError(error, hostContext<E>(c)), fallback);
       return;
     } catch {
-      // The hook's own error may quote what it was given; log only the original's summary.
+      // Fall through to the summary log.
     }
   }
-  console.error("[relayhistory] request failed", errorSummary(error));
+  fallback();
 }
 
 export function getAuth(c: Context<any>): AuthContext {
