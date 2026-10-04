@@ -274,6 +274,10 @@ export async function upload(options: UploadOptions): Promise<UploadSummary> {
   /** Send one batch until it is durably accepted, recovering proven conflicts. */
   async function deliver(batch: HistoryExportBatch) {
     let pending: HistoryExportBatch | null = batch;
+    // A record conflict always quarantines at least one record, so those rounds end
+    // with the batch. A batch-id conflict renames the batch without shrinking it; a
+    // second one means the server holds different content under the recovery id too.
+    let batchIdRecoveries = 0;
     while (pending) {
       const sending: HistoryExportBatch = pending;
       const outcome = await withRetry(() =>
@@ -303,6 +307,14 @@ export async function upload(options: UploadOptions): Promise<UploadSummary> {
         throw new UploadError(
           "delivery_conflict",
           "conflict recovery made no progress",
+        );
+      if (
+        outcome.response.error.conflict.type === "batch_id" &&
+        ++batchIdRecoveries > 1
+      )
+        throw new UploadError(
+          "delivery_conflict",
+          "server refused the recovery batch identity as well",
         );
       summary.quarantined += recovery.quarantinedRevisionIds.length;
       log.warn("conflict", {
@@ -337,6 +349,19 @@ export async function upload(options: UploadOptions): Promise<UploadSummary> {
       // A dry run never commits, so it walks forward from the cursor by position.
       ...(options.dryRun && position ? { from: position } : { consumer }),
     });
+    const originId = page.head.epoch;
+    if (page.position.epoch !== originId)
+      throw new UploadError(
+        "invalid_payload",
+        "local store returned a position from another database",
+      );
+    // Pin the origin for the run, empty pages included: a store replaced mid-run is a
+    // new origin whose cursor starts over, never a continuation of this one.
+    if (summary.originId && summary.originId !== originId)
+      throw new UploadError(
+        "invalid_payload",
+        "local store was replaced during the upload; run again",
+      );
     if (page.changes.length === 0) {
       // An exhausted drain positions itself at the head even when no change of the
       // selected kinds lies below it, so `position` is how far the feed was read, not
@@ -353,19 +378,6 @@ export async function upload(options: UploadOptions): Promise<UploadSummary> {
         ).cursor;
       break;
     }
-    const originId = page.head.epoch;
-    if (page.position.epoch !== originId)
-      throw new UploadError(
-        "invalid_payload",
-        "local store returned a position from another database",
-      );
-    // Pin the origin for the run: a store replaced mid-run is a new origin whose
-    // cursor starts over, never a continuation of this one.
-    if (summary.originId && summary.originId !== originId)
-      throw new UploadError(
-        "invalid_payload",
-        "local store was replaced during the upload; run again",
-      );
     summary.originId = originId;
     summary.scanned += page.changes.length;
 

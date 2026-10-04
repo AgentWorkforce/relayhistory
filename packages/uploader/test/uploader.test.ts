@@ -1,4 +1,4 @@
-import { deliveryRecordDigest } from "ai-hist";
+import { deliveryBatchDigest, deliveryRecordDigest } from "ai-hist";
 import { describe, expect, it } from "vitest";
 import { parseEndpoint } from "../src/config.js";
 import { createLogger, silentLogger } from "../src/log.js";
@@ -608,6 +608,41 @@ describe("upload", () => {
     expect(feed.commits).toHaveLength(1);
   });
 
+  it("stops when the server refuses the recovery batch identity too", async () => {
+    const feed = new MemoryFeed([change(1)]);
+    const fake = server((body) =>
+      json(
+        {
+          error: {
+            code: "delivery_conflict",
+            message: "x",
+            conflict: {
+              type: "batch_id",
+              originId: body.batch.origin_id,
+              batchId: body.batch.batch_id,
+              submittedDigest: deliveryBatchDigest(body.batch),
+              currentDigest: "e".repeat(64),
+            },
+          },
+        },
+        409,
+      ),
+    );
+    await expect(
+      upload({
+        config: config(),
+        log: silentLogger,
+        feed,
+        fetch: fake.fetch,
+        sleep: noSleep,
+      }),
+    ).rejects.toMatchObject({ failure: "delivery_conflict" });
+    const posts = fake.requests.filter((r) => r.method === "POST");
+    expect(posts).toHaveLength(2);
+    expect(posts[1].body.batch.batch_id).not.toBe(posts[0].body.batch.batch_id);
+    expect(feed.commits).toHaveLength(0);
+  });
+
   it("refuses a conflict that does not name what was sent", async () => {
     const feed = new MemoryFeed([change(1)]);
     const fake = server((body) => {
@@ -692,6 +727,34 @@ describe("upload", () => {
       selected: 2,
       sessions: { "claude/picked": 2 },
     });
+  });
+
+  it("stops when the store is replaced and the next page is empty", async () => {
+    const feed = new MemoryFeed([change(1), change(2)]);
+    const original = feed.getChangesPage;
+    let pages = 0;
+    feed.getChangesPage = async (options) => {
+      pages += 1;
+      if (pages === 1) return original({ ...options, limit: 1 });
+      // The replacement store has nothing of the selected kinds: an empty page at its head.
+      return {
+        changes: [],
+        position: { epoch: "00000000000000bb", revision: 7 },
+        head: { epoch: "00000000000000bb", revision: 7 },
+        done: true,
+        consumer: options?.consumer ?? null,
+      };
+    };
+    await expect(
+      upload({
+        config: config(),
+        log: silentLogger,
+        feed,
+        fetch: server().fetch,
+        sleep: noSleep,
+      }),
+    ).rejects.toThrow(/replaced/);
+    expect(feed.commits.map((c) => c.position.epoch)).toEqual([feed.epoch]);
   });
 
   it("stops when the local store is replaced mid-run", async () => {
