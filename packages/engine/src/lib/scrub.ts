@@ -652,11 +652,12 @@ const SUBSTITUTION_WINDOW = 4096;
  * quoted key's value close) without closing stopped, whether at the window or at a
  * serialized string's close. A later substitution starting before it scans afresh,
  * with no window: one that closes is redacted to its close, one that does not fails
- * closed at the first line break at or after the region's end (on a serialized line
- * its first escaped break, or the string's close), and neither moves it. Every
- * in-region scan is thus consumed by its redaction, and every scan that returns its
- * fallback has read at most `SUBSTITUTION_WINDOW` past it and starts after the last
- * such region, so substitutions cost O(n + window) per pass, with n bounded by
+ * closed at the first real line break at or after the region's end (on a serialized
+ * line also its first escaped break, and on an unkeyed serialized line the string's
+ * structural close) or the end of the text, and neither moves it. Every in-region
+ * scan is thus consumed by its redaction, and every scan that returns its fallback
+ * has read at most `SUBSTITUTION_WINDOW` past it and starts after the last such
+ * region, so substitutions cost O(n + window) per pass, with n bounded by
  * `MAX_SCRUB_CHARS`.
  */
 interface SubstitutionScan {
@@ -668,14 +669,20 @@ interface SubstitutionScan {
  * closes `$(` (counting nested parentheses) or the backtick that closes one. Shell
  * quoting inside it is read: a quote that decodes to a literal quote at the header's
  * content level opens a span (`'…'` without escapes, `"…"` with them) in which
- * parentheses do not count (`$(printf '%s' ')' user:pass)`). A substitution may span
- * lines (`$(printf 'user:\npass')`, a `\`-newline continuation) when its close lies
- * within `SUBSTITUTION_WINDOW` of its start; otherwise it ends at its first line
- * break. An unmatched one runs to the end of its line, since in a shell argument a
- * quote of the header's kind may sit inside it; in a quoted key's value (`keyed`) it
- * ends at that value's close, and on a serialized line at the string's structural
- * close (`structuralClose`), either of which also bounds the scan. Null when the
- * credential is not a substitution.
+ * parentheses do not count (`$(printf '%s' ')' user:pass)`); a quote of the header's
+ * own kind at its own level does too, since bash allows it inside `$(…)`. A
+ * substitution may span lines (`$(printf 'user:\npass')`, a `\`-newline continuation);
+ * when its close follows a line break inside a later Authorization header's
+ * credential, it ends at that line's end instead (`closedAt`).
+ *
+ * One that does not close ends at its fallback: its first line break or, in a quoted
+ * key's value (`keyed`), that value's first close, whichever comes first, or the end
+ * of the text when it has neither. It looks for its close up to `SUBSTITUTION_WINDOW`
+ * past its start before falling back, and records how far it read in `scan`. On an
+ * unkeyed serialized line the string's structural close (`structuralClose`) ends that
+ * search. A substitution starting inside an earlier failed scan's region has no
+ * fallback and no window: it ends at its own close or fails closed as
+ * `SubstitutionScan` describes. Null when the credential is not a substitution.
  */
 function shellSubstitutionEnd(
   text: string,
