@@ -714,8 +714,9 @@ describe("hosted ingest scrubbing", () => {
         "X-Custom!#$%&'*+^`|~",
       ]) {
         for (const lineBreak of ["\n", "\r\n"]) {
+          // The header follows an escaped line break, so the text is a serialized message.
           const encoded = JSON.stringify({
-            req: `Authorization: Basic c2VjcmV0dG9rZW4=${lineBreak}${name}: 123`,
+            req: `GET / HTTP/1.1${lineBreak}Authorization: Basic c2VjcmV0dG9rZW4=${lineBreak}${name}: 123`,
           });
           const scrubbed = scrubText(encoded);
           expect(scrubbed).not.toContain("c2VjcmV0dG9rZW4");
@@ -728,6 +729,36 @@ describe("hosted ingest scrubbing", () => {
         expect(literal).not.toContain("c2VjcmV0");
         expect(literal).toContain("' url");
       }
+    });
+
+    it("keeps a backslashed Windows account inside the credential wherever serialization is unproven", () => {
+      const password = "hunter2PASS";
+      const shell = (credential: string) =>
+        `curl -H "Authorization: ${credential}" url`;
+      for (const credential of [
+        `Basic DOMAIN\\ryan:${password}`,
+        `NTLM CORP\\nancy:${password}`,
+        `DOMAIN\\ryan:${password}`,
+      ]) {
+        for (const text of [
+          shell(credential),
+          JSON.stringify({ c: shell(credential) }),
+          JSON.stringify(JSON.stringify({ c: shell(credential) })),
+        ]) {
+          const scrubbed = scrubText(text);
+          expect(scrubbed).not.toContain(password);
+          expect(scrubbed).toContain(" url");
+        }
+      }
+      // Fail-closed trade-off: a header at the start of a quoted string cannot prove its
+      // escapes encode line breaks, so the following header is redacted with it.
+      expect(
+        scrubText(
+          JSON.stringify({
+            req: "Authorization: Basic abc\r\nX_Trace_Id: 123",
+          }),
+        ),
+      ).toBe('{"req":"Authorization: Basic [REDACTED]"}');
     });
 
     it("tells a literal backslash-n or -r in a credential from an encoded line break", () => {
