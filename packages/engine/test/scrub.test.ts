@@ -325,6 +325,10 @@ describe("hosted ingest scrubbing", () => {
         },
       ],
       [
+        "literal backslash-r runs in a value",
+        (n) => `"Authorization: Digest a=${"x\\r".repeat(n)}=`.slice(0, n),
+      ],
+      [
         "stray parameter items",
         (n) =>
           `Authorization: AWS4 C=a/b, ${"x y=z/w, ".repeat(n)}`.slice(0, n),
@@ -701,6 +705,87 @@ describe("hosted ingest scrubbing", () => {
       const twice = scrubText(JSON.stringify(JSON.stringify({ req: request })));
       expect(twice).not.toContain(S);
       expect(twice).toContain("Host: x");
+    });
+
+    it("tells a literal backslash-n or -r in a credential from an encoded line break", () => {
+      const S = "s3cr3tRESP";
+      const literal = `Digest username="DOMAIN\\ryan", realm="r", response=${S}`;
+      const pairs: Array<[string, string, string]> = [
+        // [literal shape, encoded-line-break counterpart, text that must survive]
+        [
+          `Authorization: ${literal} tail`,
+          `Authorization: Basic ${S}\nHost: x`,
+          " tail|Host: x",
+        ],
+        [
+          `Authorization: Digest username=DOMAIN\\ryan, response=${S} tail`,
+          `Authorization: Basic ${S}\r\nHost: x`,
+          " tail|Host: x",
+        ],
+        [
+          `Authorization: Digest uri="C:\\repo\\new", response=${S} tail`,
+          JSON.stringify({
+            req: `GET /\r\nAuthorization: Basic ${S}\r\nHost: x`,
+          }),
+          " tail|Host: x",
+        ],
+        [
+          `Authorization: Token abc\\ndef${S} tail`,
+          JSON.stringify({
+            req: `GET / HTTP/1.1\r\nAuthorization: Basic ${S}\r\nHost: x\r\n`,
+          }),
+          " tail|Host: x",
+        ],
+        [
+          `curl -H "Authorization: ${literal.replace(/"/g, '\\"')}" url`,
+          JSON.stringify({
+            req: `GET /\r\nAuthorization: ${literal}\r\nHost: x`,
+          }),
+          " url|Host: x",
+        ],
+        [
+          `curl -H "Authorization: Digest username=DOMAIN\\ryan, response=${S}" url`,
+          JSON.stringify(
+            JSON.stringify({
+              req: `GET /\r\nAuthorization: Basic ${S}\r\nHost: x`,
+            }),
+          ),
+          " url|Host: x",
+        ],
+        // A JSON-encoded newline inside a `"`-quoted header followed by free text is
+        // indistinguishable from a literal one, so it is redacted up to the header's
+        // close; the JSON after it stays intact.
+        [
+          JSON.stringify({ authorization: literal, k: "kept" }),
+          JSON.stringify({ t: `Authorization: ${literal}\nnext`, k: "kept" }),
+          'kept|[REDACTED]","k":"kept"}',
+        ],
+        [
+          JSON.stringify(JSON.stringify({ authorization: literal, k: "kept" })),
+          JSON.stringify(
+            JSON.stringify({ t: `Authorization: ${literal}\nnext`, k: "kept" }),
+          ),
+          'kept|[REDACTED]\\",\\"k\\":\\"kept\\"}"',
+        ],
+      ];
+      // A literal `\n` in a shell-quoted header's last parameter is not a line end.
+      for (const header of [
+        `Digest username=u, response=abc\\n${S}`,
+        `AWS4-HMAC-SHA256 Credential=K/x, Signature=ab\\n${S}`,
+      ]) {
+        const shell = scrubText(`curl -H "Authorization: ${header}" url`);
+        expect(shell).not.toContain(S);
+        expect(shell).toContain('[REDACTED]" url');
+      }
+      for (const [literalShape, encoded, kept] of pairs) {
+        const [literalKept, encodedKept] = kept.split("|") as [string, string];
+        const fromLiteral = scrubText(literalShape);
+        expect(fromLiteral, literalShape).not.toContain(S);
+        expect(fromLiteral, literalShape).toContain(literalKept);
+        const fromEncoded = scrubText(encoded);
+        expect(fromEncoded, encoded).not.toContain(S);
+        expect(fromEncoded, encoded).toContain(encodedKept);
+      }
     });
 
     it("scrubs a scrub-limit line of headers at rising escape depths in linear time", () => {
