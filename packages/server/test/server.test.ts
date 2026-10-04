@@ -57,24 +57,51 @@ describe.skipIf(!adminUrl)("server shutdown", () => {
       label: "shutdown",
     });
     await database.close();
-    // An upload whose body never finishes keeps one request in flight.
-    const request = http.request({
-      host: "127.0.0.1",
-      port: server.port,
-      method: "POST",
-      path: "/v1/delivery/batches",
-      headers: {
-        "content-type": "application/json",
-        "transfer-encoding": "chunked",
-      },
-    });
-    request.on("error", () => {});
-    request.write("{");
+    // An upload whose body never finishes, so its request stays in flight.
+    const stalledUpload = (authorization?: string) => {
+      const responses: number[] = [];
+      const request = http.request(
+        {
+          host: "127.0.0.1",
+          port: server.port,
+          method: "POST",
+          path: "/v1/delivery/batches",
+          headers: {
+            ...(authorization ? { authorization } : {}),
+            "content-type": "application/json",
+            "transfer-encoding": "chunked",
+          },
+        },
+        (response) => {
+          responses.push(response.statusCode ?? 0);
+          response.resume();
+        },
+      );
+      request.on("error", () => {});
+      request.write("{");
+      return { request, responses };
+    };
+
+    // Without the token, authentication answers at once: the handler never runs.
+    const anonymous = stalledUpload();
     await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(anonymous.responses).toEqual([401]);
+    anonymous.request.destroy();
+
+    // With it, the request passes authentication and the delivery handler waits on the
+    // body, so it is still unanswered when shutdown starts.
+    const upload = stalledUpload(`Bearer ${token}`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(upload.responses).toEqual([]);
+
     const started = Date.now();
     const drained = await server.close();
+    const elapsed = Date.now() - started;
     expect(drained).toBe(true);
-    expect(Date.now() - started).toBeLessThan(200 + CLEANUP_GRACE_MS);
-    request.destroy();
+    // Held until the 200 ms cutoff forced it closed, then cleanup within its grace.
+    expect(elapsed).toBeGreaterThanOrEqual(180);
+    expect(elapsed).toBeLessThan(200 + CLEANUP_GRACE_MS);
+    expect(upload.responses).toEqual([]);
+    upload.request.destroy();
   });
 });

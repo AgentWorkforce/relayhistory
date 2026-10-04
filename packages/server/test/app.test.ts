@@ -1,5 +1,4 @@
 import type { HistoryDb } from "@relayhistory/engine";
-import type pg from "pg";
 import { describe, expect, it } from "vitest";
 import { createServerApp } from "../src/app.js";
 import { createLogger, silentLogger, type Logger } from "../src/log.js";
@@ -8,15 +7,9 @@ function app(
   options: { accepting: boolean; database: boolean },
   log: Logger = silentLogger,
 ) {
-  const pool = {
-    query: async () => {
-      if (!options.database) throw new Error("connection refused");
-      return { rows: [] };
-    },
-  } as unknown as pg.Pool;
   return createServerApp({
     db: {} as HistoryDb,
-    pool,
+    databaseReady: async () => options.database,
     embeddings: null,
     log,
     accepting: () => options.accepting,
@@ -73,7 +66,7 @@ describe("createServerApp", () => {
     ) as HistoryDb;
     const failing = createServerApp({
       db,
-      pool: {} as pg.Pool,
+      databaseReady: async () => true,
       embeddings: null,
       log: createLogger((line) => lines.push(line)),
       accepting: () => true,
