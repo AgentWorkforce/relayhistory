@@ -13,12 +13,7 @@ import { ConfigError, databaseUrl, loadConfig } from "./config.js";
 import { openDatabase, prepareDatabase } from "./database.js";
 import { createLogger, type Logger } from "./log.js";
 import { startServer } from "./server.js";
-import {
-  createToken,
-  listTokens,
-  revokeToken,
-  writeTokenFile,
-} from "./tokens.js";
+import { createTokenFile, listTokens, revokeToken } from "./tokens.js";
 
 const USAGE = `Usage:
   relayhistory-server serve
@@ -38,7 +33,7 @@ class UsageError extends Error {}
 
 async function serve(log: Logger) {
   const server = await startServer(loadConfig(), log);
-  await new Promise<void>((resolve) => {
+  const drained = await new Promise<boolean>((resolve) => {
     let signals = 0;
     const stop = (signal: NodeJS.Signals) => {
       signals += 1;
@@ -51,13 +46,14 @@ async function serve(log: Logger) {
         log.error("shutdown failed", {
           code: (error as { code?: unknown })?.code ?? "unknown",
         });
-        process.exitCode = 1;
-        resolve();
+        resolve(false);
       });
     };
     process.on("SIGTERM", stop);
     process.on("SIGINT", stop);
   });
+  // Exit even if a stuck database connection still holds the event loop.
+  process.exit(drained ? 0 : 1);
 }
 
 async function migrate(log: Logger) {
@@ -101,19 +97,29 @@ async function token(args: string[], log: Logger) {
       const days = values["expires-days"];
       if (days !== undefined && !/^\d+$/.test(days))
         throw new UsageError("--expires-days must be a whole number of days");
-      const file = await createToken(database.db, {
-        orgId: required(values, "org"),
-        workspaceId: required(values, "workspace"),
-        label: required(values, "label"),
-        ...(values.scopes
-          ? { scopes: values.scopes.split(",").map((scope) => scope.trim()) }
-          : {}),
-        ...(days !== undefined ? { expiresInDays: Number(days) } : {}),
-      });
-      // `--out -` hands the token file to a pipe; otherwise the secret only goes to disk.
-      if (out === "-")
-        process.stdout.write(`${JSON.stringify(file, null, 2)}\n`);
-      else await writeTokenFile(out, file);
+      const file = await createTokenFile(
+        database.db,
+        {
+          orgId: required(values, "org"),
+          workspaceId: required(values, "workspace"),
+          label: required(values, "label"),
+          ...(values.scopes
+            ? { scopes: values.scopes.split(",").map((scope) => scope.trim()) }
+            : {}),
+          ...(days !== undefined ? { expiresInDays: Number(days) } : {}),
+        },
+        // `--out -` hands the token file to a pipe; otherwise the secret only goes to disk.
+        out === "-"
+          ? {
+              write: (text) =>
+                new Promise<void>((resolve, reject) =>
+                  process.stdout.write(text, (error) =>
+                    error ? reject(error) : resolve(),
+                  ),
+                ),
+            }
+          : { path: out },
+      );
       log.info("token created", {
         id: file.id,
         label: file.label,

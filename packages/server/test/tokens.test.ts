@@ -17,7 +17,7 @@ import {
   createToken,
   listTokens,
   revokeToken,
-  writeTokenFile,
+  createTokenFile,
 } from "../src/tokens.js";
 
 const adminUrl = process.env.TEST_ADMIN_DATABASE_URL;
@@ -77,18 +77,39 @@ describe.skipIf(!adminUrl)("token bootstrap", () => {
   });
 
   it("writes an owner-only token file and never replaces one", async () => {
-    const file = await createToken(database.db, {
-      orgId: "acme",
-      workspaceId: "main",
-      label: "desktop",
-    });
     const path = join(dir, "desktop.json");
-    await writeTokenFile(path, file);
+    const options = { orgId: "files", workspaceId: "main", label: "desktop" };
+    const file = await createTokenFile(database.db, options, { path });
     expect((await stat(path)).mode & 0o777).toBe(0o600);
     expect(JSON.parse(await readFile(path, "utf8"))).toEqual(file);
-    await expect(writeTokenFile(path, file)).rejects.toMatchObject({
-      code: "EEXIST",
-    });
+    expect(await resolveAccessToken(database.db, file.token)).not.toBeNull();
+
+    // The existing file is refused before anything is minted.
+    await expect(
+      createTokenFile(database.db, options, { path }),
+    ).rejects.toMatchObject({ code: "EEXIST" });
+    expect((await listTokens(database.db, "files")).length).toBe(1);
+    expect(JSON.parse(await readFile(path, "utf8"))).toEqual(file);
+  });
+
+  it("revokes a token whose file could not be delivered", async () => {
+    let minted: string | undefined;
+    await expect(
+      createTokenFile(
+        database.db,
+        { orgId: "pipe", workspaceId: "main", label: "broken-pipe" },
+        {
+          async write(text) {
+            minted = JSON.parse(text).token;
+            throw Object.assign(new Error("write EPIPE"), { code: "EPIPE" });
+          },
+        },
+      ),
+    ).rejects.toMatchObject({ code: "EPIPE" });
+    expect(minted).toMatch(/^rth_st_/);
+    expect(await resolveAccessToken(database.db, minted!)).toBeNull();
+    const [row] = await listTokens(database.db, "pipe");
+    expect(row.revokedAt).not.toBeNull();
   });
 
   it("refuses scopes beyond sync and read", async () => {

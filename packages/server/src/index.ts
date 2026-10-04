@@ -11,9 +11,10 @@ export { createLogger, silentLogger, type Logger } from "./log.js";
 export { startServer, type RunningServer } from "./server.js";
 export {
   createToken,
+  createTokenFile,
   listTokens,
   revokeToken,
-  writeTokenFile,
   type CreateTokenOptions,
+  type TokenDestination,
   type TokenFile,
 } from "./tokens.js";

@@ -7,7 +7,7 @@ describe("loadConfig", () => {
   it("applies defaults", () => {
     const config = loadConfig(base);
     expect(config).toMatchObject({
-      host: "0.0.0.0",
+      host: "127.0.0.1",
       port: 8080,
       poolMax: 10,
       shutdownTimeoutMs: 15_000,
