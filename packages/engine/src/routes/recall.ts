@@ -36,6 +36,7 @@ const MAX_Q_LENGTH = 500;
 export { WORKSPACE_RECALL_HEADER } from "../middleware/workspace-recall.js";
 import {
   readWorkspaceRecallScope,
+  workspaceAttestationError,
   attestWorkspace,
 } from "../middleware/workspace-recall.js";
 
@@ -410,6 +411,10 @@ export function createRecallRoutes<E extends HistoryEnv>(
       if (!source) return badRequest(c, "source is required");
       const sessionId = c.req.param("sessionId");
       const auth = getAuth(c);
+      if (auth.workspaceId) {
+        const unattestable = workspaceAttestationError(c, auth.workspaceId);
+        if (unattestable) return unattestable;
+      }
       const detail = await getSessionCatalog(db, auth, source, sessionId);
       if (auth.workspaceId) attestWorkspace(c, auth.workspaceId);
       if (!detail) {

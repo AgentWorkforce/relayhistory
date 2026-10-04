@@ -185,12 +185,68 @@ export function exceedsScrubBound(value: string): boolean {
 export function scrubText(value: string): string {
   return SECRET_PATTERNS.reduce(
     (text, [pattern, replacement]) => text.replace(pattern, replacement as any),
-    boundForScrub(value),
+    redactAuthorization(boundForScrub(value)),
   );
 }
 
-/** A field name the assignment rule would redact the value of in text. */
-const SENSITIVE_KEY = new RegExp(`(?:^|\\b)${SENSITIVE_NAME}$`, "i");
+/**
+ * An `Authorization` or `Proxy-Authorization` header where a header starts: at the
+ * start of a line, after `{`, `,` or `(`, or after the quote opening a quoted header
+ * (`-H 'Authorization: …'`, `{"Authorization": …}`). Prose that mentions the header
+ * mid-sentence is not one.
+ */
+const AUTHORIZATION_HEADER =
+  /(^|[\r\n{,(]|["'])[ \t]*(?:proxy-)?authorization["']?[ \t]*[:=][ \t]*/gi;
+const AUTHORIZATION_SCHEME = /^([A-Za-z][\w!#$%&*+.^`|~-]*)[ \t]+\S/;
+
+/**
+ * Redacts each header's credential and keeps its scheme, as the Bearer rule does. A
+ * credential runs to the end of its line, or, when it or its header is quoted, to the
+ * closing quote, so quoted Digest parameters stay inside it. One forward scan: every
+ * character is read once by the header search or by a credential.
+ */
+function redactAuthorization(text: string): string {
+  let output = "";
+  let last = 0;
+  AUTHORIZATION_HEADER.lastIndex = 0;
+  for (
+    let header = AUTHORIZATION_HEADER.exec(text);
+    header;
+    header = AUTHORIZATION_HEADER.exec(text)
+  ) {
+    let end = header.index + header[0].length;
+    const opening = text[end];
+    const quote =
+      opening === '"' || opening === "'"
+        ? opening
+        : header[1] === '"' || header[1] === "'"
+          ? header[1]
+          : "";
+    if (quote && opening === quote) end += 1;
+    const start = end;
+    while (
+      end < text.length &&
+      text[end] !== "\n" &&
+      text[end] !== "\r" &&
+      text[end] !== quote
+    )
+      end += quote && text[end] === "\\" ? 2 : 1;
+    end = Math.min(end, text.length);
+    const credential = text.slice(start, end);
+    if (!credential.trim()) continue;
+    const scheme = AUTHORIZATION_SCHEME.exec(credential);
+    output += `${text.slice(last, start)}${scheme ? `${scheme[1]} ` : ""}${REDACTED}`;
+    last = end;
+    AUTHORIZATION_HEADER.lastIndex = end;
+  }
+  return output + text.slice(last);
+}
+
+/** A field name the assignment rule would redact the value of in text, or a header. */
+const SENSITIVE_KEY = new RegExp(
+  `(?:^|\\b)${SENSITIVE_NAME}$|^(?:proxy-)?authorization$`,
+  "i",
+);
 
 export function scrubJson<T>(value: T): T {
   if (typeof value === "string") {

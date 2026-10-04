@@ -18,6 +18,7 @@ import {
 } from "vitest";
 import {
   ServiceTokenError,
+  attestWorkspace,
   bootstrapServiceToken,
   createHistoryEngine,
   createServiceToken,
@@ -591,4 +592,94 @@ describe("workspace recall scope", () => {
       }
     },
   );
+
+  it.each(["org", "org_id", "orgId"])(
+    "rejects the %s selector instead of ignoring it",
+    async (selector) => {
+      for (const path of [
+        "/v1/sessions",
+        "/v1/events",
+        "/v1/sessions/s/events",
+      ]) {
+        const res = await hostEngine("ws_a").request(
+          `${path}?${selector}=org_other`,
+          { headers: bearer("idp") },
+        );
+        expect(res.status).toBe(400);
+        expect(await res.json()).toMatchObject({
+          error: {
+            code: "bad_request",
+            message: `unsupported selector ${selector}`,
+          },
+        });
+      }
+    },
+  );
+});
+
+describe("session catalog attestation", () => {
+  function hostEngine(workspaceId: string | undefined) {
+    return engine({
+      verifyBearer: async () => ({
+        userId: "u",
+        orgId: "org_catalog",
+        workspaceId,
+        tokenSubject: "u",
+        scopes: ["rth:read"],
+        claims: {},
+      }),
+    });
+  }
+  const catalog = (workspaceId: string | undefined) =>
+    hostEngine(workspaceId).request(
+      "/v1/sessions/session-x/catalog?source=claude",
+      { headers: bearer("idp") },
+    );
+
+  it.each([
+    ["surrounding whitespace", " ws_a "],
+    ["a trailing tab", "ws_a\t"],
+    ["an embedded newline", "ws\na"],
+    ["a character outside Latin-1", "ws_\u2603"],
+  ])("refuses a workspace it cannot attest: %s", async (_, workspaceId) => {
+    const res = await catalog(workspaceId);
+
+    expect(res.status).toBe(403);
+    expect(await res.json()).toMatchObject({
+      error: {
+        code: "forbidden",
+        message: "authenticated workspace cannot be attested",
+      },
+    });
+    expect(res.headers.get("X-Relayhistory-Workspace-Id")).toBeNull();
+  });
+
+  it("attests an ordinary workspace exactly", async () => {
+    const res = await catalog("team a");
+    expect(res.status).toBe(404);
+    expect(res.headers.get("X-Relayhistory-Workspace-Id")).toBe("team a");
+  });
+
+  it("attests nothing for an identity without a workspace", async () => {
+    const res = await catalog(undefined);
+    expect(res.status).toBe(404);
+    expect(res.headers.get("X-Relayhistory-Workspace-Id")).toBeNull();
+  });
+});
+
+describe("attestWorkspace", () => {
+  it("refuses a workspace a header cannot carry exactly", async () => {
+    const app = new Hono();
+    app.get("/", (c) => {
+      attestWorkspace(c, " ws_a ");
+      return c.text("attested");
+    });
+    app.onError((error, c) => c.text(error.message, 500));
+
+    const res = await app.request("/");
+
+    expect(res.status).toBe(500);
+    expect(await res.text()).toBe("workspace cannot be attested");
+    expect(res.headers.get("X-Relayhistory-Workspace-Id")).toBeNull();
+  });
 });

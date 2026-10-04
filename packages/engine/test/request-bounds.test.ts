@@ -68,77 +68,84 @@ const legacyRoutes = [
     name: "/v1/ingest",
     path: "/ingest",
     routes: () => createIngestRoutes({ database: () => untouchedDb }),
+    // Only reachable once the body parsed into an object.
+    validation: "machine.id is required",
   },
   {
     name: "/v1/sessions/:sessionId/turns",
     path: "/sessions/session-a/turns",
     routes: () => createTurnRoutes({ database: () => untouchedDb }),
+    validation: "Body must be a turn array or include a turns array",
   },
 ];
 
-describe.each(legacyRoutes)("$name request body bound", ({ path, routes }) => {
-  it("answers 413 without reading past the limit", async () => {
-    const { stream, pulled } = countedBody(MAX_JSON_BODY_BYTES + 8 * MiB);
-    const response = await app(routes()).request(
-      new Request(`http://localhost${path}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: stream,
-        duplex: "half",
-      } as RequestInit),
-    );
-    expect(response.status).toBe(413);
-    expect(await response.json()).toEqual({
-      error: {
-        code: "payload_too_large",
-        message: `Request body exceeds ${MAX_JSON_BODY_BYTES} bytes`,
-      },
-      correlationId: "corr-test",
-    });
-    expect(pulled.bytes).toBeLessThanOrEqual(MAX_JSON_BODY_BYTES + 2 * MiB);
-  });
-
-  it("still parses a body at the limit", async () => {
-    const json = JSON.stringify({ pad: "" });
-    const body =
-      json.slice(0, -2) +
-      " ".repeat(MAX_JSON_BODY_BYTES - json.length) +
-      json.slice(-2);
-    expect(new TextEncoder().encode(body).length).toBe(MAX_JSON_BODY_BYTES);
-    const response = await app(routes()).request(path, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body,
-    });
-    // Parsed, then rejected by the envelope validation, before the database.
-    expect(response.status).toBe(400);
-    expect(await response.json()).toMatchObject({
-      error: { code: "bad_request" },
-    });
-  });
-
-  it.each([
-    ["malformed JSON", "{"],
-    ["invalid UTF-8", new Uint8Array([0x7b, 0xff, 0x7d])],
-    ["an empty body", ""],
-  ])("keeps the invalid JSON answer for %s", async (_name, body) => {
-    const response = await app(routes()).request(path, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body,
-    });
-    expect(response.status).toBe(400);
-    expect(await response.text()).toBe(
-      JSON.stringify({
+describe.each(legacyRoutes)(
+  "$name request body bound",
+  ({ path, routes, validation }) => {
+    it("answers 413 without reading past the limit", async () => {
+      const { stream, pulled } = countedBody(MAX_JSON_BODY_BYTES + 8 * MiB);
+      const response = await app(routes()).request(
+        new Request(`http://localhost${path}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: stream,
+          duplex: "half",
+        } as RequestInit),
+      );
+      expect(response.status).toBe(413);
+      expect(await response.json()).toEqual({
         error: {
-          code: "bad_request",
-          message: "Request body must be valid JSON",
+          code: "payload_too_large",
+          message: `Request body exceeds ${MAX_JSON_BODY_BYTES} bytes`,
         },
         correlationId: "corr-test",
-      }),
-    );
-  });
-});
+      });
+      expect(pulled.bytes).toBeLessThanOrEqual(MAX_JSON_BODY_BYTES + 2 * MiB);
+    });
+
+    it("still parses a body at the limit", async () => {
+      const json = JSON.stringify({ pad: "" });
+      const body =
+        json.slice(0, -2) +
+        " ".repeat(MAX_JSON_BODY_BYTES - json.length) +
+        json.slice(-2);
+      expect(new TextEncoder().encode(body).length).toBe(MAX_JSON_BODY_BYTES);
+      const response = await app(routes()).request(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+      });
+      // Parsed, then rejected by the envelope validation, before the database.
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({
+        error: { code: "bad_request", message: validation },
+        correlationId: "corr-test",
+      });
+    });
+
+    it.each([
+      ["malformed JSON", "{"],
+      ["invalid UTF-8", new Uint8Array([0x7b, 0xff, 0x7d])],
+      ["an empty body", ""],
+    ])("keeps the invalid JSON answer for %s", async (_name, body) => {
+      const response = await app(routes()).request(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+      });
+      expect(response.status).toBe(400);
+      expect(await response.text()).toBe(
+        JSON.stringify({
+          error: {
+            code: "bad_request",
+            message: "Request body must be valid JSON",
+          },
+          correlationId: "corr-test",
+        }),
+      );
+    });
+  },
+);
 
 describe("recall maxContent", () => {
   const recall = () => app(createRecallRoutes({ database: () => untouchedDb }));

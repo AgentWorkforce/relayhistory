@@ -98,9 +98,12 @@ async function postgresDatabase(): Promise<TestDatabase> {
       await pool.query(text);
     },
     close: async () => {
-      await pool.end();
-      await dropDatabase(admin, name);
-      await admin.end();
+      try {
+        await pool.end();
+        await dropDatabase(admin, name);
+      } finally {
+        await admin.end();
+      }
       if (poolErrors.length) throw poolErrors[0];
     },
   };
