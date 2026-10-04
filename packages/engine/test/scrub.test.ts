@@ -2653,6 +2653,35 @@ describe("hosted ingest scrubbing", () => {
       expect(neverClosesFar).toBe(218);
     });
 
+    it("reads every header after one a re-read reached, whatever that header's main-pass read covered", () => {
+      // Round 21 C and D: the main-pass read of the header after the string's close
+      // ends inside a later header's quoted text; that later header is still read.
+      const prefix = (pad: number) =>
+        `Authorization: Basic $(a\n,Authorization: b) ,Authorization: Basic $(n\n${"x".repeat(pad)}\n` +
+        '{"m":"x\\nAuthorization: Basic $(q\\nAuthorization: Basic $(r\\nAuthorization: Basic $(s ,Authorization: Basic $(h","k":1} ';
+      const c = (pad: number) =>
+        `${prefix(pad)},Authorization: Basic $(printf 'admin:yyyyyyyyyy\nS3cret' "x ,Authorization: Basic $(echo ')" )\nZq9leak' )\nHost: x`;
+      const d = (pad: number) =>
+        `${prefix(pad)},Authorization: Basic $(printf 'admin:yyyyyyyyyy\nAuthorization: Basic $(echo ' | base64)\nS3cret')\nHost: x`;
+      for (const out of [scrubText(c(3940)), scrubText(d(3940))]) {
+        expect(out).not.toContain("S3cret");
+        expect(out).not.toContain("Zq9leak");
+        expect(out).toContain("\nHost: x");
+      }
+      // Pads still leaking are the inherited unbalanced-quote ones 161b3d5c leaks too.
+      for (let pad = 3800; pad <= 4100; pad += 1) {
+        const cOut = scrubText(c(pad));
+        const dOut = scrubText(d(pad));
+        expect(cOut, `C pad ${pad}`).not.toContain("S3cret");
+        if (pad < 3878 || pad > 3889)
+          expect(cOut, `C pad ${pad}`).not.toContain("Zq9leak");
+        if (pad < 3884 || pad > 3901)
+          expect(dOut, `D pad ${pad}`).not.toContain("S3cret");
+        expect(cOut, `C pad ${pad}`).toContain("\nHost: x");
+        expect(dOut, `D pad ${pad}`).toContain("\nHost: x");
+      }
+    });
+
     it("re-reads a straddler cut at a string's close or at the end of a region", () => {
       // C N2: the failed read is cut at the JSON string's close, which ends neither
       // the raw shell text nor the straddler's credential after it.
