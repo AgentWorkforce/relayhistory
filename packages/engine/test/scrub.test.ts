@@ -628,8 +628,8 @@ describe("hosted ingest scrubbing", () => {
     // Each failed read here gets a re-read of up to SUBSTITUTION_WINDOW, so these cost
     // a fixed multiple of their size. Measured fresh characters scanned per input
     // character, and standalone time at 128 KiB: keyed serialized lines about 53 and
-    // 65ms, short serialized failed reads about 72 and 99ms, short regions about 28
-    // and 37ms. The test keeps both sizes under the budget.
+    // 65ms, short serialized failed reads about 72 and 99ms, short regions about 55
+    // and 59ms. The test keeps both sizes under the budget.
     it.each<[string, (n: number) => string]>([
       [
         "keyed headers on serialized lines cut at their string's close",
@@ -2599,12 +2599,17 @@ describe("hosted ingest scrubbing", () => {
       const exact = scrubText(input(10));
       expect(exact).not.toContain("S3cret");
       expect(exact).toContain("\nHost: x");
-      // Only a straddler whose close lies past the window still leaks.
+      // Only a straddler whose close lies past the window still leaks. The failing
+      // raw `$(b` re-read of its own header uses its window without closing, and must
+      // not stop the straddler after it from being re-read.
+      let leaking = 0;
       for (let length = 0; length <= 4400; length += 4) {
         const out = scrubText(input(length));
         expect(out, `L ${length}`).toContain("\nHost: x");
         if (length < 4064) expect(out, `L ${length}`).not.toContain("S3cret");
+        if (out.includes("S3cret")) leaking += 1;
       }
+      expect(leaking).toBe(85);
       // Its benign sibling, closing on its own line, keeps the lines after it.
       expect(
         scrubText(`${unit}$(printf 'admin:x' | base64)\nBenign: keep\nHost: x`),
@@ -2668,18 +2673,44 @@ describe("hosted ingest scrubbing", () => {
         expect(out).not.toContain("Zq9leak");
         expect(out).toContain("\nHost: x");
       }
-      // Pads still leaking are the inherited unbalanced-quote ones 161b3d5c leaks too.
+      // GH #4179717151: the echo header is itself cut at the first break past a region's
+      // end on the line it opened, and is re-read to its close.
       for (let pad = 3800; pad <= 4100; pad += 1) {
         const cOut = scrubText(c(pad));
         const dOut = scrubText(d(pad));
         expect(cOut, `C pad ${pad}`).not.toContain("S3cret");
-        if (pad < 3878 || pad > 3889)
-          expect(cOut, `C pad ${pad}`).not.toContain("Zq9leak");
-        if (pad < 3884 || pad > 3901)
-          expect(dOut, `D pad ${pad}`).not.toContain("S3cret");
+        expect(cOut, `C pad ${pad}`).not.toContain("Zq9leak");
+        expect(dOut, `D pad ${pad}`).not.toContain("S3cret");
         expect(cOut, `C pad ${pad}`).toContain("\nHost: x");
         expect(dOut, `D pad ${pad}`).toContain("\nHost: x");
       }
+    });
+
+    it("reads the headers after an outer read's close apart from those before it", () => {
+      // Round 22 C N1 / D N1: the header before the outer read's close reads past it;
+      // the header after that close is still read, as the main pass's own sweep would.
+      const prefix = (pad: number) =>
+        `Authorization: Basic $(a\n,Authorization: b) ,Authorization: Basic $(n\n${"x".repeat(pad)}\n` +
+        '{"m":"x\\nAuthorization: Basic $(q\\nAuthorization: Basic $(r\\nAuthorization: Basic $(s ,Authorization: Basic $(h","k":1} ' +
+        `,Authorization: Basic $(printf 'admin:yyyyyyyyyy\nS3cret' "x ,Authorization: Basic $(echo ')" ) ,Authorization: Basic `;
+      const forms: Array<[(pad: number) => string, string[]]> = [
+        [
+          (pad) => `${prefix(pad)}$(printf "u\nZq9leak' ) Lk6leak" )\nHost: x`,
+          ["S3cret", "Zq9leak", "Lk6leak"],
+        ],
+        [
+          (pad) =>
+            `${prefix(pad)}$(printf "u:\nZq9leak' ) M4leak" | base64)\nHost: x`,
+          ["S3cret", "Zq9leak", "M4leak"],
+        ],
+      ];
+      for (const [form, sentinels] of forms)
+        for (let pad = 3800; pad <= 4100; pad += 1) {
+          const out = scrubText(form(pad));
+          for (const sentinel of sentinels)
+            expect(out, `${sentinel} pad ${pad}`).not.toContain(sentinel);
+          expect(out, `pad ${pad}`).toContain("\nHost: x");
+        }
     });
 
     it("re-reads a straddler cut at a string's close or at the end of a region", () => {

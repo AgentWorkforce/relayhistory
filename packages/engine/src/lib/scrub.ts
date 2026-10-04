@@ -301,8 +301,9 @@ function headerState(): HeaderState {
 /**
  * One header's credential: where its redaction starts and ends, its scheme, where its
  * substitution failed closed in a region (else -1), whether that substitution read a
- * window past its fallback without closing, and, when its end still asks for a sweep
- * that a read by a sweep does not run, where that sweep's headers start (else -1).
+ * window past its fallback without closing, and, when its end asks for a sweep, where
+ * that sweep's headers start (else -1); set in every mode, and used by a sweep for the
+ * `outer` reads, whose sweep it does not run.
  */
 interface Credential {
   start: number;
@@ -980,35 +981,43 @@ function closedAt(lastBreak: number, close: number): SubstitutionEnd {
  * Cost: the matches come from `MatchCache`, so each pattern's search runs forward
  * through the pass once; a pattern is not looked for again inside its own match. A
  * header's line end is reused while later headers fall on the same line. A header
- * inside a credential already read is not read again, separately on each side of
- * `from`: a credential read from before the close (`b),Authorization: …`) can swallow
- * a header after it, which is still read. The reads before `from` are disjoint and
- * so are those after it, so at most one read crosses it, and the line ends and nested
- * credentials read cost O(swept span). All of it lies in the redacted span.
+ * inside a credential already read is not read again within its chain; the chains are
+ * split at `from` and at the end of each `outer` read that asks for a sweep, since a
+ * credential read from before such a close (`b),Authorization: …`) can swallow a
+ * header after it, which is still read. Within a chain the reads are disjoint except
+ * that an `outer` read's sweep moves its chain back to that read's closing line (or a
+ * failed scan's start), so later reads there re-read part of that one read's text,
+ * and at most one read crosses each split. All of it lies in the redacted span.
  *
- * A read that failed closed in a region gets `fresh` re-reads of the headers its chain
- * then skips on the line it was cut at (see below). The cut is one of three: the first
- * line break past the region's end, a serialized string's close (a raw header after
- * it follows shell grammar past that close), or the text's end. Those re-reads are
- * disjoint and inside that one line, which the failed read consumed, and only the
- * last reads past the cut or uses its window, at most `SUBSTITUTION_WINDOW`. A
+ * A read that failed closed in a region gets `fresh` re-reads of its own header, when
+ * its substitution opened on the line it was cut at, and of the headers its chain then
+ * skips on that line (see below). The cut is one of three: the first line break past
+ * the region's end, a serialized string's close (a raw header after it follows shell
+ * grammar past that close), or the text's end. The own header's re-read reads that
+ * one line, which the failed read consumed, and ends the others only by reading past
+ * the cut. The skipped headers' re-reads are disjoint and inside that line, and only
+ * the last reads past the cut or uses its window, at most `SUBSTITUTION_WINDOW`. A
  * re-read's end moves the sweep's end only, never its chain's: a header after the cut
  * is read by the chain whatever a re-read covered. A header the chain reads inside the
  * span re-reads reached past their cuts (from the earliest such cut to the furthest
  * such end) is also read against `extendedTo` only (`outer`), as the main pass would
  * have read it without those re-reads, though with no sweep of its own and with the
  * sweep's quote state as the nested read left it. Like a re-read's, its end moves the
- * sweep's end only, never the chain's; the headers the sweep it asks for would read
- * (those on its closing line, or all of a failed scan's) are read by the chain.
+ * sweep's end only, never the chain's. The headers the sweep it asks for would read are
+ * read in two chains split at its close, as that sweep reads them: those before it (on
+ * its closing line, or all of a failed scan's) by the current chain, and those from
+ * its end on by a chain of their own.
  *
- * Cost: linear. Each failed read gets at most one window-reading re-read, and each
- * such window needs its own failing reads and a skipped header. `outer` reads are of
- * headers the chain reads, so they are disjoint in where they start; that this adds at
- * most one window-reading `outer` read per failed read is argued from that, not
- * proven. The multiplier depends on how short those units can be. Measured fresh
- * characters scanned per input character: about 72 on a 56-character serialized unit,
- * 53 on a 74-character keyed serialized unit, 48 on a 42-character one and 28 on a
- * 147-character one; `outer` reads added at most about 2 on the shapes measured.
+ * Cost: linear. Each failed read gets at most two window-reading re-reads (its own
+ * header's and one skipped header's), and each such window needs its own failing reads
+ * and a skipped header or the failed read's own header; this, and that `outer` reads
+ * add at most one window-reading read per failed read since they start at headers the
+ * chain reads, and that the re-reading after an `outer` read's sweep adds a bounded
+ * multiple of that read's own text, is argued, not proven. The multiplier depends on
+ * how short those units can be. Measured fresh characters scanned per input character:
+ * about 72.6 on a 56-character serialized unit, 55.3 on a 147-character one, 52.9 on a
+ * 74-character keyed serialized unit and 48.2 on a 42-character one; `outer` reads
+ * added at most about 2 on the shapes measured.
  */
 function sweptEnd(
   text: string,
@@ -1022,11 +1031,13 @@ function sweptEnd(
   const cursors = SWEEP_SECRET_PATTERNS.map(() => at);
   let headerCursor = headersFrom;
   let lineEnd = -1;
-  // The reads of headers before `from`, and of those from it on: how far each chain
-  // reached, where its last read failed closed in a region (else -1), and how far its
-  // re-reads on that cut line reached.
-  const before = { readTo: -1, failedAt: -1, rereadTo: -1 };
-  const after = { readTo: -1, failedAt: -1, rereadTo: -1 };
+  // Headers are read in chains, each from where it starts to where the next starts:
+  // one before `from`, one from it on, and one from the end of each `outer` read that
+  // asks for a sweep. Each chain records how far its reads reached, where its last read
+  // failed closed in a region (else -1), and how far its re-reads on that cut line
+  // reached. Chains not yet reached wait in `pending`, ordered by start.
+  let chain = sweepChain(-1);
+  const pending: SweepChain[] = [sweepChain(from)];
   // The span a re-read reached past its cut, from that cut on.
   let rereadFrom = Infinity;
   let rereadUntil = -1;
@@ -1063,13 +1074,24 @@ function sweptEnd(
       if (credential > lineEnd)
         lineEnd = headerLineEnd(text, credential, quote);
       let reach = lineEnd;
-      const chain = header.index < from ? before : after;
+      while (pending.length > 0 && pending[0]!.start <= header.index)
+        chain = popChain(pending);
       if (header.index >= chain.readTo) {
         const parsed = readCredential(text, header, nested, "nested");
         chain.readTo = parsed ? parsed.end : credential;
         chain.failedAt = parsed ? parsed.failedAt : -1;
         chain.rereadTo = -1;
         reach = Math.max(reach, chain.readTo);
+        if (chain.failedAt >= 0 && chain.failedAt === lineEnd) {
+          // The failed read's own substitution opened on the line it was cut at, so it
+          // may itself straddle the cut: it is the first of that line's re-reads. It
+          // ends them only by reading past the cut, not by using its window, since a
+          // header that never closes would otherwise stand in for a straddler after it.
+          const self = readCredential(text, header, nested, "fresh");
+          const selfEnd = self ? self.end : credential;
+          reach = Math.max(reach, selfEnd);
+          if (selfEnd > chain.failedAt) chain.failedAt = -1;
+        }
         if (
           parsed &&
           header.index >= rereadFrom &&
@@ -1082,10 +1104,15 @@ function sweptEnd(
           const outer = readCredential(text, header, { ...nested }, "outer");
           if (outer) {
             reach = Math.max(reach, outer.end);
-            // The main pass would also have swept the headers that read asks for
-            // (those on its closing line), so the chain reads them.
-            if (outer.headersFrom >= 0)
+            // The main pass would also have swept the headers that read asks for,
+            // in two chains split at its close: those before it (on its closing
+            // line, or all of a failed scan's) are read by this chain, and those
+            // from its end on by a chain of their own, so a read from before the
+            // close does not swallow a header after it.
+            if (outer.headersFrom >= 0) {
               chain.readTo = Math.min(chain.readTo, outer.headersFrom);
+              pushChain(pending, sweepChain(outer.end));
+            }
           }
         }
       } else if (chain.failedAt === lineEnd && header.index >= chain.rereadTo) {
@@ -1116,6 +1143,48 @@ function sweptEnd(
     }
   }
   return end;
+}
+
+/** A chain of a sweep's header reads (`sweptEnd`). */
+interface SweepChain {
+  start: number;
+  readTo: number;
+  failedAt: number;
+  rereadTo: number;
+}
+
+function sweepChain(start: number): SweepChain {
+  return { start, readTo: -1, failedAt: -1, rereadTo: -1 };
+}
+
+/** Adds `chain` to a binary min-heap of chains ordered by start. */
+function pushChain(heap: SweepChain[], chain: SweepChain): void {
+  heap.push(chain);
+  for (let index = heap.length - 1; index > 0;) {
+    const parent = (index - 1) >> 1;
+    if (heap[parent]!.start <= heap[index]!.start) break;
+    [heap[parent], heap[index]] = [heap[index]!, heap[parent]!];
+    index = parent;
+  }
+}
+
+/** Removes and returns the chain that starts first. */
+function popChain(heap: SweepChain[]): SweepChain {
+  const first = heap[0]!;
+  const last = heap.pop()!;
+  if (heap.length > 0) {
+    heap[0] = last;
+    for (let index = 0; ;) {
+      let least = index;
+      for (const child of [2 * index + 1, 2 * index + 2])
+        if (child < heap.length && heap[child]!.start < heap[least]!.start)
+          least = child;
+      if (least === index) break;
+      [heap[least], heap[index]] = [heap[index]!, heap[least]!];
+      index = least;
+    }
+  }
+  return first;
 }
 
 /**
