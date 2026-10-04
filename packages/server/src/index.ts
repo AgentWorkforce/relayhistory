@@ -16,6 +16,7 @@ export { createLogger, silentLogger, type Logger } from "./log.js";
 export {
   CLEANUP_GRACE_MS,
   cleanupBudgetMs,
+  listen,
   startServer,
   type RunningServer,
 } from "./server.js";

@@ -24,6 +24,33 @@ export function cleanupBudgetMs(deadline: number, now: number): number {
   return Math.max(CLEANUP_GRACE_MS, deadline - now);
 }
 
+/**
+ * Bind and serve. A failure to bind (the port in use, say) rejects. Once listening, the
+ * startup listener is replaced by one that stays: a later server error, such as an
+ * accept failure when file descriptors run out, is logged by code and the server keeps
+ * listening, rather than being dropped or crashing the process as an unheard event.
+ */
+export function listen(
+  fetch: (request: Request) => Response | Promise<Response>,
+  host: string,
+  port: number,
+  log: Logger,
+): Promise<Server> {
+  return new Promise<Server>((resolve, reject) => {
+    const server = serve({ fetch, hostname: host, port }, () => {
+      server.removeListener("error", reject);
+      server.on("error", (error: Error & { code?: string; syscall?: string }) =>
+        log.error("server error", {
+          code: error.code ?? "unknown",
+          ...(error.syscall ? { syscall: error.syscall } : {}),
+        }),
+      );
+      resolve(server);
+    }) as Server;
+    server.once("error", reject);
+  });
+}
+
 export interface RunningServer {
   /** The bound port (useful when `PORT=0`). */
   port: number;
@@ -64,13 +91,7 @@ export async function startServer(
 
   let server: Server;
   try {
-    server = await new Promise<Server>((resolve, reject) => {
-      const listening = serve(
-        { fetch: app.fetch, hostname: config.host, port: config.port },
-        () => resolve(listening as Server),
-      ) as Server;
-      listening.once("error", reject);
-    });
+    server = await listen(app.fetch, config.host, config.port, log);
   } catch (error) {
     await database.close();
     throw error;
