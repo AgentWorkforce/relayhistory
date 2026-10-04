@@ -590,6 +590,17 @@ describe("hosted ingest scrubbing", () => {
             .slice(0, n),
       ],
       [
+        "short headers re-read on lines a swept read was cut at",
+        (n) => {
+          const unit =
+            "Authorization: Basic $(oops\nAuthorization: Basic $(a\n,Authorization: b) ,Authorization: Basic $(zz\n" +
+            `${"x".repeat(63)}\n`.repeat(62) +
+            "Authorization: x ,".repeat(400) +
+            "Authorization: Basic $(printf 'admin:\nS3cret' | base64)\nHost: x\n";
+          return unit.repeat(Math.ceil(n / unit.length)).slice(0, n);
+        },
+      ],
+      [
         "short serialized regions closed by their string",
         (n) =>
           '{"m":"x\\nAuthorization: Basic $(a\\nX: y,Authorization: Basic $(b","k":1}\n'
@@ -2385,6 +2396,90 @@ describe("hosted ingest scrubbing", () => {
         if (out.includes("S3cret")) limit += 1;
       }
       expect(limit).toBe(32);
+    });
+
+    it("re-reads past short headers on the cut line and never skips a header after it", () => {
+      const filler = (length: number) => {
+        let text = "";
+        while (text.length < length) {
+          const line = Math.min(63, length - text.length - 1);
+          text += `${line > 0 ? "x".repeat(line) : ""}\n`;
+        }
+        return text.slice(0, length);
+      };
+      const swept =
+        "Authorization: Basic $(oops\nAuthorization: Basic $(a\n,Authorization: b) ,Authorization: Basic $(zz\n";
+      const straddler = `$(printf 'admin:${"x".repeat(300)}\nS3cret' | base64)`;
+      const forms: Array<[string, string, number]> = [
+        // A short header earlier on the cut line does not take the re-read.
+        [
+          "Bearer x",
+          `Authorization: Bearer x ,Authorization: Basic ${straddler}\nHost: x`,
+          0,
+        ],
+        [
+          "Basic abc",
+          `Authorization: Basic abc ,Authorization: Basic ${straddler}\nHost: x`,
+          0,
+        ],
+        [
+          "two -H",
+          `curl -H "Authorization: Bearer x" -H "Authorization: Basic ${straddler}" url\nHost: x`,
+          0,
+        ],
+        // A re-read closing inside the next header's quoted credential (a stray `'`)
+        // leaves that header to be read by the chain. The 231 pads still leaking
+        // (4020..4250) are the same as on 2b89066d: the inherited unbalanced-quote class.
+        [
+          "don't",
+          `Authorization: Basic $(echo don't ${"x".repeat(300)}\nAuthorization: Basic $(printf 'admin:\n)\nS3cret' | base64)\nHost: x`,
+          231,
+        ],
+        [
+          "it's",
+          `Authorization: Basic $(oops it's${"x".repeat(200)}\nAuthorization: Basic $(printf 'admin:\nx)S3cret' | base64)\nHost: x`,
+          231,
+        ],
+      ];
+      for (const [name, tail, leaking] of forms) {
+        const exact = scrubText(
+          `${swept}${`${"y".repeat(63)}\n`.repeat(62)}${tail}`,
+        );
+        expect(exact, name).not.toContain("S3cret");
+        expect(exact, name).toContain("Host: x");
+        let leaks = 0;
+        for (let pad = 3950; pad <= 4250; pad += 1) {
+          const out = scrubText(`${swept}${filler(pad)}${tail}`);
+          expect(out, `${name} pad ${pad}`).toContain("Host: x");
+          if (out.includes("S3cret")) leaks += 1;
+        }
+        expect(leaks, name).toBe(leaking);
+      }
+    });
+
+    it("keeps a re-read's failed window from moving later swept headers into a region", () => {
+      const filler = (length: number) => {
+        let text = "";
+        while (text.length < length) {
+          const line = Math.min(63, length - text.length - 1);
+          text += `${line > 0 ? "x".repeat(line) : ""}\n`;
+        }
+        return text.slice(0, length);
+      };
+      // The cut line holds a substitution that never closes, so its re-read uses its
+      // window; a later swept header's three-line substitution starting inside that
+      // window is still read to its own close.
+      const input = (gap: number, body: number) =>
+        "Authorization: Basic $(oops\nAuthorization: Basic $(a\n,Authorization: b) ,Authorization: Basic $(zz\n" +
+        `${filler(4010)}Authorization: Basic $(never ${"q".repeat(200)}\n${filler(gap)}` +
+        `Authorization: Basic $(a\napi_key=x)y(Authorization: Basic $(printf 'admin:\n${"m".repeat(body)}\nS3cret' | base64)\nHost: x`;
+      expect(scrubText(input(3614, 200))).not.toContain("S3cret");
+      for (let gap = 3600; gap <= 4200; gap += 7)
+        for (const body of [10, 60, 200]) {
+          const out = scrubText(input(gap, body));
+          expect(out, `gap ${gap} body ${body}`).not.toContain("S3cret");
+          expect(out, `gap ${gap} body ${body}`).toContain("\nHost: x");
+        }
     });
 
     it("fails closed at a region's end when a later header's credential holds a close", () => {
