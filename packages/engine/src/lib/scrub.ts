@@ -191,12 +191,14 @@ export function scrubText(value: string): string {
 
 /**
  * An `Authorization` or `Proxy-Authorization` header where a header starts: at the
- * start of a line, after `{`, `,` or `(`, or after the quote opening a quoted header
- * (`-H 'Authorization: …'`, `{"Authorization": …}`). Prose that mentions the header
+ * start of a line (a real one, or `\n` / `\r` escaped into a serialized string), after
+ * `{`, `,` or `(`, or after the quote opening a quoted header (`-H 'Authorization: …'`,
+ * `{"Authorization": …}`). A key's closing quote may be escaped, as in a header
+ * serialized more than once (`{\"authorization\":\"…`). Prose that mentions the header
  * mid-sentence is not one.
  */
 const AUTHORIZATION_HEADER =
-  /(^|[\r\n{,(]|["'])[ \t]*(?:proxy-)?authorization["']?[ \t]*[:=][ \t]*/gi;
+  /(^|[\r\n{,(]|["']|\\[nr])[ \t]*(?:proxy-)?authorization(?:\\*["'])?[ \t]*[:=][ \t]*/gi;
 // RFC 7230 token characters, less the quotes that can delimit a quoted header.
 const TOKEN = /[A-Za-z0-9!#$%&*+.^_`|~-]/;
 // A scheme is followed by its credential, never by the `=` of a parameter.
@@ -218,8 +220,11 @@ interface HeaderQuote {
   unit: number;
 }
 
-/** What a quote at some position is to the credential being read. */
-type QuoteRole = "close" | "delimiter" | "content";
+/**
+ * What a quote at some position is to the credential being read, or `line` for a line
+ * break, real or escaped into a serialized string, which ends the credential.
+ */
+type QuoteRole = "close" | "delimiter" | "content" | "line";
 
 /**
  * Redacts each header's credential and keeps its scheme, as the Bearer rule does. The
@@ -235,8 +240,13 @@ type QuoteRole = "close" | "delimiter" | "content";
  * backslashes escapes it, as in a quoted string's `\"`. So `"foo\\"` ends at its last
  * quote however many times the header around it was serialized.
  *
- * One forward scan: a character is read by the header search and at most three more
+ * A quoted header's single credential (not a parameter list) runs on to the header's
+ * closing quote when that is the next quote on the line, so a credential the shell
+ * computes (`"Authorization: Basic $(echo -n user:pass | base64)"`) is redacted whole.
+ *
+ * One forward scan: a character is read by the header search and at most four more
  * times by a credential, and a backslash run is read once with the quote it escapes.
+ * Every lookahead stops at the first quote or line break it meets.
  */
 function redactAuthorization(text: string): string {
   let output = "";
@@ -262,9 +272,13 @@ function redactAuthorization(text: string): string {
     AUTHORIZATION_SCHEME.lastIndex = start;
     const scheme = AUTHORIZATION_SCHEME.exec(text);
     const credential = scheme ? start + scheme[0].length : start;
-    const end =
-      authParams(text, credential, quote) ?? token68(text, credential, quote);
+    const params = authParams(text, credential, quote);
+    let end = params ?? token68(text, credential, quote);
     if (end === credential) continue;
+    // A parameter list ends where its grammar does; a single credential that stops
+    // short of the header's close was cut at a space the shell would expand.
+    if (params === null && quote.char)
+      end = closingQuote(text, end, quote) ?? end;
     output += `${text.slice(last, start)}${scheme ? `${scheme[1]} ` : ""}${REDACTED}`;
     last = end;
     AUTHORIZATION_HEADER.lastIndex = end;
@@ -277,6 +291,26 @@ function headerQuote(char: string, depth: number): HeaderQuote {
   // as in an unquoted header.
   if (char !== '"') return { char, depth, unit: 1 };
   return { char, depth, unit: 2 ** (Math.floor(Math.log2(depth + 1)) + 1) };
+}
+
+/**
+ * Where the header's closing quote starts when it is the next quote on the line after
+ * `at`, or null.
+ */
+function closingQuote(
+  text: string,
+  at: number,
+  quote: HeaderQuote,
+): number | null {
+  let index = at;
+  while (index < text.length) {
+    const { role, next } = read(text, index, quote);
+    if (role === "line") return null;
+    if (text[next - 1] === quote.char && role !== null)
+      return role === "close" ? index : null;
+    index = next;
+  }
+  return null;
 }
 
 /** The length of the backslash run starting at `at`. */
@@ -315,7 +349,14 @@ function read(
   quote: HeaderQuote,
 ): { role: QuoteRole | null; next: number } {
   const run = backslashes(text, at);
-  const role = quoteRole(text[at + run], run, quote);
+  const char = text[at + run];
+  if (
+    char === "\n" ||
+    char === "\r" ||
+    (run > 0 && (char === "n" || char === "r"))
+  )
+    return { role: "line", next: at + run + 1 };
+  const role = quoteRole(char, run, quote);
   if (role !== null) return { role, next: at + run + 1 };
   return { role, next: at + Math.max(run, 1) };
 }
@@ -354,15 +395,10 @@ function strayItem(
 ): number | null {
   let index = at;
   let assigns = false;
-  while (
-    index < text.length &&
-    text[index] !== "," &&
-    text[index] !== "\n" &&
-    text[index] !== "\r"
-  ) {
+  while (index < text.length && text[index] !== ",") {
     if (text[index] === "=") assigns = true;
     const { role, next } = read(text, index, quote);
-    if (role === "close") break;
+    if (role === "close" || role === "line") break;
     index = role === "delimiter" ? quotedValue(text, next, quote) : next;
   }
   return assigns ? Math.min(index, text.length) : null;
@@ -386,10 +422,11 @@ function authParam(
     return quotedValue(text, opening.next, quote);
   if (opening.role === "close")
     return looseQuotedValue(text, index, opening.next, quote);
+  if (opening.role === "line") return null;
   const value = index;
   while (index < text.length && !/[\s,]/.test(text[index]!)) {
     const { role, next } = read(text, index, quote);
-    if (role === "close" || role === "delimiter") break;
+    if (role === "close" || role === "delimiter" || role === "line") break;
     index = next;
   }
   index = Math.min(index, text.length);
@@ -402,9 +439,9 @@ function authParam(
  */
 function quotedValue(text: string, at: number, quote: HeaderQuote): number {
   let index = at;
-  while (index < text.length && text[index] !== "\n" && text[index] !== "\r") {
+  while (index < text.length) {
     const { role, next } = read(text, index, quote);
-    if (role === "close") return index;
+    if (role === "close" || role === "line") return index;
     if (role === "delimiter") return next;
     index = next;
   }
@@ -414,8 +451,8 @@ function quotedValue(text: string, at: number, quote: HeaderQuote): number {
 /**
  * A value opened by a quote at the header's own level, as in
  * `-H "Authorization: Digest username="alice", …"` where the inner quotes were never
- * escaped. It is a value only when the next quote written the same way closes it and
- * is followed by a separator, the end of the line or the header's close; otherwise
+ * escaped. It is a value only when the next quote on the line is written the same way
+ * and is followed by a separator, the end of the line or the header's close; otherwise
  * the quote closes the header (`{"Authorization":"Digest a=","next":…}`). Returns the
  * value's end, or null when the quote is the header's close.
  */
@@ -427,15 +464,17 @@ function looseQuotedValue(
 ): number | null {
   const run = content - at - 1;
   let index = content;
-  while (index < text.length && text[index] !== "\n" && text[index] !== "\r") {
+  while (index < text.length) {
     const length = backslashes(text, index);
-    if (text[index + length] === quote.char) {
-      // A shallower quote has already left the header.
-      if (length < run) return null;
-      if (length !== run) {
-        index += length + 1;
-        continue;
-      }
+    const char = text[index + length];
+    if (
+      char === "\n" ||
+      char === "\r" ||
+      (length > 0 && (char === "n" || char === "r"))
+    )
+      return null;
+    if (char === quote.char) {
+      if (length !== run) return null;
       const after = index + length + 1;
       const follower = text[after];
       if (
@@ -457,7 +496,7 @@ function token68(text: string, at: number, quote: HeaderQuote): number {
   let index = at;
   while (index < text.length && !/\s/.test(text[index]!)) {
     const { role, next } = read(text, index, quote);
-    if (role === "close" || role === "delimiter") break;
+    if (role === "close" || role === "delimiter" || role === "line") break;
     index = next;
   }
   return Math.min(index, text.length);

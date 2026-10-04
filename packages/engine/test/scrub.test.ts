@@ -316,6 +316,15 @@ describe("hosted ingest scrubbing", () => {
             .slice(0, n),
       ],
       [
+        "headers at rising escape depths",
+        (n) => {
+          let text = "";
+          for (let depth = 0; text.length < n; depth += 1)
+            text += `${"\\".repeat(depth)}"Authorization: Digest a=${"\\".repeat(depth)}"`;
+          return text.slice(0, n);
+        },
+      ],
+      [
         "stray parameter items",
         (n) =>
           `Authorization: AWS4 C=a/b, ${"x y=z/w, ".repeat(n)}`.slice(0, n),
@@ -660,6 +669,68 @@ describe("hosted ingest scrubbing", () => {
           '-H "Authorization: Bearer abcdefghijklmnopqrstuv\\" -X POST',
         ),
       ).toBe('-H "Authorization: Bearer [REDACTED]\\" -X POST');
+    });
+
+    it("finds a header serialized into JSON more than once", () => {
+      const S = "s3cr3tTOKENvalue";
+      for (const value of [
+        `Basic ${S}`,
+        `Token ${S}`,
+        `Digest username="u", response="${S}"`,
+        `AWS4-HMAC-SHA256 Credential=AKID/${S}/s3/aws4_request, Signature=${S}`,
+        S,
+      ]) {
+        let serialized = JSON.stringify({ authorization: value, next: "kept" });
+        for (let level = 1; level <= 3; level += 1) {
+          const out = scrubText(serialized);
+          expect(out, `${value} at level ${level}`).not.toContain(S);
+          expect(out).toContain("kept");
+          serialized = JSON.stringify(serialized);
+        }
+      }
+    });
+
+    it("treats an escaped line break as the end of a header line", () => {
+      const S = "s3cr3tTOKENvalue";
+      const request = `GET / HTTP/1.1\r\nAuthorization: Basic ${S}\r\nHost: x\r\n`;
+      expect(scrubText(JSON.stringify({ req: request }))).toBe(
+        JSON.stringify({
+          req: "GET / HTTP/1.1\r\nAuthorization: Basic [REDACTED]\r\nHost: x\r\n",
+        }),
+      );
+      const twice = scrubText(JSON.stringify(JSON.stringify({ req: request })));
+      expect(twice).not.toContain(S);
+      expect(twice).toContain("Host: x");
+    });
+
+    it("scrubs a scrub-limit line of headers at rising escape depths in linear time", () => {
+      let input = "";
+      for (let depth = 0; input.length < MAX_SCRUB_CHARS; depth += 1)
+        input += `${"\\".repeat(depth)}"Authorization: Digest a=${"\\".repeat(depth)}"`;
+      input = input.slice(0, MAX_SCRUB_CHARS);
+      const samples: number[] = [];
+      for (let run = 0; run < 3; run += 1) {
+        const started = performance.now();
+        scrubText(input);
+        samples.push(performance.now() - started);
+      }
+      // Measured ~7 ms; ~420 ms when an unmatched quote's lookahead ran past deeper
+      // quotes to the end of the line.
+      expect(samples.sort((a, b) => a - b)[1]).toBeLessThan(100);
+    });
+
+    it("redacts a quoted header's credential up to the header's closing quote", () => {
+      const S = "s3cr3tTOKENvalue";
+      expect(
+        scrubText(
+          `curl -H "Authorization: Basic $(echo -n admin:${S} | base64)" url`,
+        ),
+      ).toBe('curl -H "Authorization: Basic [REDACTED]" url');
+      expect(
+        scrubText(
+          `curl -H 'Authorization: Basic $(echo -n admin:${S} | base64)' url`,
+        ),
+      ).toBe("curl -H 'Authorization: Basic [REDACTED]' url");
     });
 
     it("ends a header's credential where the credential ends", () => {
