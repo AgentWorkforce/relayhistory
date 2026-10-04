@@ -608,20 +608,6 @@ describe("hosted ingest scrubbing", () => {
             .slice(0, n),
       ],
       [
-        "re-reads after short regions, one sweep after another",
-        (n) =>
-          'Authorization: Basic $(a\n,Authorization: b) {"m":"x\\nAuthorization: Basic $(q\\nX: y,Authorization: Basic $(b ,Authorization: Basic $(never","k":1}\n'
-            .repeat(n / 147)
-            .slice(0, n),
-      ],
-      [
-        "keyed headers on serialized lines cut at their string's close",
-        (n) =>
-          'Authorization: Basic $(oops\n\')"Authorization": "Basic $(q","k":1}\n{"m":"\\n'
-            .repeat(n / 74)
-            .slice(0, n),
-      ],
-      [
         "short serialized regions closed by their string",
         (n) =>
           '{"m":"x\\nAuthorization: Basic $(a\\nX: y,Authorization: Basic $(b","k":1}\n'
@@ -637,6 +623,32 @@ describe("hosted ingest scrubbing", () => {
       ],
     ])("scrubs 256 KiB of %s far inside the budget", (_l, gen) => {
       expect(medianCost(gen(MAX_SCRUB_CHARS), 3)).toBeLessThan(1_000);
+    });
+
+    // Each failed read here gets one re-read of up to SUBSTITUTION_WINDOW (W), so the
+    // cost is linear with a fixed multiplier of about W / u fresh characters per input
+    // character, u being the unit that makes one failed read. Measured: about 53 for
+    // the keyed serialized unit (u ≈ 74, about 195ms standalone at the 256 KiB cap)
+    // and about 28 for the short-region unit (u ≈ 147, about 109ms). Both run at 64
+    // and 128 KiB, where a superlinear cost would show as 4x, not 2x.
+    it.each<[string, (n: number) => string]>([
+      [
+        "keyed headers on serialized lines cut at their string's close",
+        (n) =>
+          'Authorization: Basic $(oops\n\')"Authorization": "Basic $(q","k":1}\n{"m":"\\n'
+            .repeat(n / 74)
+            .slice(0, n),
+      ],
+      [
+        "re-reads after short regions, one sweep after another",
+        (n) =>
+          'Authorization: Basic $(a\n,Authorization: b) {"m":"x\\nAuthorization: Basic $(q\\nX: y,Authorization: Basic $(b ,Authorization: Basic $(never","k":1}\n'
+            .repeat(n / 147)
+            .slice(0, n),
+      ],
+    ])("scrubs 64 and 128 KiB of %s inside the budget", (_l, gen) => {
+      expect(medianCost(gen(65_536), 3)).toBeLessThan(1_000);
+      expect(medianCost(gen(131_072), 3)).toBeLessThan(1_000);
     });
   });
 
@@ -2569,6 +2581,60 @@ describe("hosted ingest scrubbing", () => {
               `g1 ${g1} L ${length} g2 ${g2}`,
             ).toBe(true);
           }
+    });
+
+    it("re-reads a straddler after a serialized string's close to its own close", () => {
+      // GH #4179383971: a short region made inside a JSON string; the raw header after
+      // the string's close follows shell grammar past it and is re-read in full.
+      const unit =
+        'Authorization: Basic $(a\n,Authorization: b) {"m":"x\\nAuthorization: Basic $(q\\nX: y,Authorization: Basic $(b ","k":1} ,Authorization: Basic ';
+      const input = (length: number) =>
+        `${unit}$(printf 'admin:${"x".repeat(length)}\nS3cret' | base64)\nHost: x`;
+      const exact = scrubText(input(10));
+      expect(exact).not.toContain("S3cret");
+      expect(exact).toContain("\nHost: x");
+      // Only a straddler whose close lies past the window still leaks.
+      for (let length = 0; length <= 4400; length += 4) {
+        const out = scrubText(input(length));
+        expect(out, `L ${length}`).toContain("\nHost: x");
+        if (length < 4064) expect(out, `L ${length}`).not.toContain("S3cret");
+      }
+      // Its benign sibling, closing on its own line, keeps the lines after it.
+      expect(
+        scrubText(`${unit}$(printf 'admin:x' | base64)\nBenign: keep\nHost: x`),
+      ).toBe("Authorization: Basic [REDACTED]\nBenign: keep\nHost: x");
+    });
+
+    it("re-reads a straddler cut at a string's close or at the end of a region", () => {
+      // C N2: the failed read is cut at the JSON string's close, which ends neither
+      // the raw shell text nor the straddler's credential after it.
+      const n2 =
+        '{"m":"x\\nAuthorization: Basic $(a\\nX: y\\nAuthorization: Basic $(b\\nAuthorization: Basic $(c ,Authorization: Basic ';
+      const n2Out = scrubText(
+        `${n2}$(printf 'admin:","k":1}\nS3cret' | base64)\nHost: x`,
+      );
+      expect(n2Out).not.toContain("S3cret");
+      expect(n2Out).toContain("\nHost: x");
+      expect(
+        scrubText(`${n2}$(printf admin:x)","k":1}\nBenign: keep\nHost: x`),
+      ).toContain('","k":1}\nBenign: keep\nHost: x');
+      // D R19-D1: a multi-line curl body after a failed read cut at the region's end.
+      const r19 =
+        'Authorization: Basic $(never ((\n{"m":"x\\nAuthorization: Basic $(a \\nAuthorization: Basic $(b\n';
+      const r19Out = scrubText(
+        `${r19}Authorization: Bearer $(curl -s -d '{"u":"admin",\n"p":"S3cret"}\n' https://auth/token | jq -r .token)\nHost: x`,
+      );
+      expect(r19Out).not.toContain("S3cret");
+      expect(r19Out).toContain("\nHost: x");
+      // Its benign sibling fails closed through the region, as on every head since
+      // 2b89066d.
+      expect(
+        scrubText(
+          `${r19}Authorization: Bearer $(curl -s https://auth/token)\nBenign: keep\nHost: x`,
+        ),
+      ).toBe(
+        'Authorization: Basic [REDACTED]\n{"m":"x\\nAuthorization: Basic [REDACTED]',
+      );
     });
 
     it("fails closed at a region's end when a later header's credential holds a close", () => {
