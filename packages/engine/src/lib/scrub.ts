@@ -262,90 +262,143 @@ type QuoteRole = "close" | "delimiter" | "content" | "line";
 function redactAuthorization(text: string): string {
   let output = "";
   let last = 0;
-  // The quote of the string enclosing the last serialized header line, and where the
-  // backward search for it stopped, so the next search covers only the new text.
-  let enclosing = "";
-  let searched = 0;
-  const substitutions: SubstitutionScan = { extendedTo: 0 };
+  const state = headerState();
   AUTHORIZATION_HEADER.lastIndex = 0;
   for (
     let header = AUTHORIZATION_HEADER.exec(text);
     header;
     header = AUTHORIZATION_HEADER.exec(text)
   ) {
-    let start = header.index + header[0].length;
-    const escapes = backslashes(text, start);
-    const opening = text[start + escapes];
-    let quote: HeaderQuote = { char: "", depth: 0, unit: 1, lineBase: 0 };
-    let before = 0;
-    while (text[header.index - before - 1] === "\\") before += 1;
-    if (opening === '"' || opening === "'") {
-      quote = headerQuote(opening, escapes);
-      start += escapes + 1;
-    } else if (header[1] === '"' || header[1] === "'") {
-      quote = headerQuote(header[1], before);
-    }
-    if (header[1]!.startsWith("\\")) {
-      const lineBase = before + 1;
-      if (!quote.char) {
-        enclosing =
-          enclosingQuote(text, header.index - before, searched, lineBase) ??
-          enclosing;
-        searched = header.index;
-      }
-      quote = serializedLine(quote, lineBase, enclosing);
-    }
-    AUTHORIZATION_SCHEME.lastIndex = start;
-    const scheme = AUTHORIZATION_SCHEME.exec(text);
-    const credential = scheme ? start + scheme[0].length : start;
-    // Only these schemes carry a token68 credential whose `=` is base64 padding; any
-    // other scheme's `name=` is a parameter (`Digest response=" …"`).
-    const padded = scheme !== null && TOKEN68_SCHEME.test(scheme[1]!);
-    // A quoted key (`"Authorization":"…"`, `'Authorization': '…'`) holds a value that
-    // must escape its own quote, so that value's close is a safe boundary.
-    const keyed = header[2] !== undefined && quote.char !== "";
-    const substitution = shellSubstitutionEnd(
-      text,
-      credential,
-      quote,
-      keyed,
-      substitutions,
-    );
-    const params =
-      substitution === null
-        ? authParams(text, credential, quote, padded)
-        : null;
-    let end = substitution ?? params ?? token68(text, credential, quote);
-    if (end === credential) {
-      // A scheme followed by something neither grammar reads (`Digest "quoted", …`)
-      // still introduces a credential, so the rest of the header is redacted.
-      if (!scheme) continue;
-      end = unreadCredentialEnd(text, credential, quote);
-      if (end === credential) continue;
-    } else if (quote.lineBase > 0) {
-      // A serialized line's own end is found by `serializedLineEnd`, which keeps the
-      // string's close and what follows it.
-      end = serializedLineEnd(
-        text,
-        end,
-        quote,
-        params === null && padded && substitution === null ? end : -1,
-      );
-    } else if (params === null && quote.char) {
-      // A parameter list ends where its grammar does; a single credential that stops
-      // short of the header's close was cut at a space the shell would expand.
-      end = closingQuote(text, end, quote) ?? end;
-    } else if (quote.char && read(text, end, quote).role === "delimiter") {
-      // A list cut short by a quoted segment no parameter holds (`a=="x", …`) is
-      // malformed; the rest of the header goes with it.
-      end = headerEnd(text, end, quote);
-    }
-    output += `${text.slice(last, start)}${scheme ? `${scheme[1]} ` : ""}${REDACTED}`;
-    last = end;
-    searched = Math.max(searched, end);
-    AUTHORIZATION_HEADER.lastIndex = end;
+    const credential = readCredential(text, header, state, true);
+    if (!credential) continue;
+    output += `${text.slice(last, credential.start)}${credential.scheme ? `${credential.scheme} ` : ""}${REDACTED}`;
+    last = credential.end;
+    state.searched = Math.max(state.searched, credential.end);
+    AUTHORIZATION_HEADER.lastIndex = credential.end;
   }
   return output + text.slice(last);
+}
+
+/** What one pass over a text carries from header to header. */
+interface HeaderState {
+  // The quote of the string enclosing the last serialized header line, and where the
+  // backward search for it stopped, so the next search covers only the new text.
+  enclosing: string;
+  searched: number;
+  substitutions: SubstitutionScan;
+  matches: MatchCache;
+}
+
+function headerState(): HeaderState {
+  return {
+    enclosing: "",
+    searched: 0,
+    substitutions: { extendedTo: 0 },
+    matches: matchCache(),
+  };
+}
+
+/** One header's credential: where its redaction starts and ends, and its scheme. */
+interface Credential {
+  start: number;
+  scheme: string | null;
+  end: number;
+}
+
+/**
+ * Reads the credential of the Authorization header matched by `header`: its quoting,
+ * scheme, and the parameter list, token68 run or shell substitution it holds, then
+ * the header's own close (`closingQuote`, or `serializedLineEnd` on a serialized
+ * line) from that credential's end. With `sweep`, a substitution that crossed a line
+ * break or failed closed inside a region is also extended by `sweptEnd`, and the end
+ * is the larger of the two, so the close is never looked for from inside a later
+ * secret. Null when no credential follows the header.
+ */
+function readCredential(
+  text: string,
+  header: RegExpExecArray,
+  state: HeaderState,
+  sweep: boolean,
+): Credential | null {
+  let start = header.index + header[0].length;
+  const escapes = backslashes(text, start);
+  const opening = text[start + escapes];
+  let quote: HeaderQuote = { char: "", depth: 0, unit: 1, lineBase: 0 };
+  let before = 0;
+  while (text[header.index - before - 1] === "\\") before += 1;
+  if (opening === '"' || opening === "'") {
+    quote = headerQuote(opening, escapes);
+    start += escapes + 1;
+  } else if (header[1] === '"' || header[1] === "'") {
+    quote = headerQuote(header[1], before);
+  }
+  if (header[1]!.startsWith("\\")) {
+    const lineBase = before + 1;
+    if (!quote.char) {
+      state.enclosing =
+        enclosingQuote(text, header.index - before, state.searched, lineBase) ??
+        state.enclosing;
+      state.searched = Math.max(state.searched, header.index);
+    }
+    quote = serializedLine(quote, lineBase, state.enclosing);
+  }
+  AUTHORIZATION_SCHEME.lastIndex = start;
+  const scheme = AUTHORIZATION_SCHEME.exec(text);
+  const credential = scheme ? start + scheme[0].length : start;
+  // Only these schemes carry a token68 credential whose `=` is base64 padding; any
+  // other scheme's `name=` is a parameter (`Digest response=" …"`).
+  const padded = scheme !== null && TOKEN68_SCHEME.test(scheme[1]!);
+  // A quoted key (`"Authorization":"…"`, `'Authorization': '…'`) holds a value that
+  // must escape its own quote, so that value's close is a safe boundary.
+  const keyed = header[2] !== undefined && quote.char !== "";
+  const substitution = shellSubstitutionEnd(
+    text,
+    credential,
+    quote,
+    keyed,
+    state.substitutions,
+  );
+  const params =
+    substitution === null ? authParams(text, credential, quote, padded) : null;
+  const raw = substitution?.end ?? params ?? token68(text, credential, quote);
+  let end = raw;
+  if (raw === credential) {
+    // A scheme followed by something neither grammar reads (`Digest "quoted", …`)
+    // still introduces a credential, so the rest of the header is redacted.
+    if (!scheme) return null;
+    end = unreadCredentialEnd(text, credential, quote);
+    if (end === credential) return null;
+  } else if (quote.lineBase > 0) {
+    // A serialized line's own end is found by `serializedLineEnd`, which keeps the
+    // string's close and what follows it.
+    end = serializedLineEnd(
+      text,
+      raw,
+      quote,
+      params === null && padded && substitution === null ? raw : -1,
+    );
+  } else if (params === null && quote.char) {
+    // A parameter list ends where its grammar does; a single credential that stops
+    // short of the header's close was cut at a space the shell would expand.
+    end = closingQuote(text, raw, quote) ?? raw;
+  } else if (quote.char && read(text, raw, quote).role === "delimiter") {
+    // A list cut short by a quoted segment no parameter holds (`a=="x", …`) is
+    // malformed; the rest of the header goes with it.
+    end = headerEnd(text, raw, quote);
+  }
+  if (sweep && substitution?.sweep)
+    end = Math.max(
+      end,
+      sweptEnd(
+        text,
+        credential,
+        substitution.sweep.from,
+        substitution.sweep.headersFrom,
+        quote,
+        state,
+      ),
+    );
+  return { start, scheme: scheme ? scheme[1]! : null, end };
 }
 
 /**
@@ -654,8 +707,10 @@ const SUBSTITUTION_WINDOW = 4096;
  * with no window: one that closes is redacted to its close, one that does not fails
  * closed at the first real line break at or after the region's end (on a serialized
  * line also its first escaped break, and on an unkeyed serialized line the string's
- * structural close) or the end of the text, and neither moves it. Every in-region
- * scan is thus consumed by its redaction, and every scan that returns its fallback
+ * structural close) or the end of the text, which `sweptEnd` extends so it splits
+ * no multi-line secret (`DB_PASSWORD=\n…`, a PEM block), and neither moves
+ * it. Every in-region scan is thus consumed by its redaction, and every scan that
+ * returns its fallback
  * has read at most `SUBSTITUTION_WINDOW` past it and starts after the last such
  * region, so substitutions cost O(n + window) per pass, with n bounded by
  * `MAX_SCRUB_CHARS`.
@@ -672,8 +727,9 @@ interface SubstitutionScan {
  * parentheses do not count (`$(printf '%s' ')' user:pass)`); a quote of the header's
  * own kind at its own level does too, since bash allows it inside `$(…)`. A
  * substitution may span lines (`$(printf 'user:\npass')`, a `\`-newline continuation);
- * when it closes after a line break it never ends inside a secret match or before an
- * Authorization header it overlaps (`closedAt`).
+ * when it closes after a line break, the end it returns asks for a sweep (`closedAt`,
+ * `sweptEnd`), so the redaction never ends inside a secret match or before an
+ * Authorization header it overlaps.
  *
  * One that does not close ends at its fallback: its first line break or, in a quoted
  * key's value (`keyed`), that value's first close, whichever comes first, or the end
@@ -690,7 +746,7 @@ function shellSubstitutionEnd(
   quote: HeaderQuote,
   keyed: boolean,
   scan: SubstitutionScan,
-): number | null {
+): SubstitutionEnd | null {
   const backtick = text[at] === "`";
   if (!backtick && !(text[at] === "$" && text[at + 1] === "(")) return null;
   let depth = 0;
@@ -719,7 +775,7 @@ function shellSubstitutionEnd(
       // Past the region a serialized line has no real breaks, so its proven
       // escaped ones end it there.
       if (region >= 0 && index >= region && (real || quote.lineBase > 0))
-        return real ? index + run : index;
+        return failedClosed(at, real ? index + run : index);
       if (stop < 0) stop = index;
       if (real) lastBreak = index + run;
       index += run + 1;
@@ -737,10 +793,10 @@ function shellSubstitutionEnd(
       // The serialized string ends here. A scan that ran past its stop to get here
       // marks the span a failed region, so later headers in it do not rescan it; one
       // already inside a region fails closed here.
-      if (region >= 0) return index;
-      if (stop < 0) return index;
+      if (region >= 0) return failedClosed(at, index);
+      if (stop < 0) return { end: index, sweep: null };
       scan.extendedTo = Math.max(scan.extendedTo, index);
-      return stop;
+      return { end: stop, sweep: null };
     }
     if (char === '"' || char === "'") {
       // Shell quoting: a literal quote, or one of the header's own kind at its own
@@ -757,85 +813,200 @@ function shellSubstitutionEnd(
       continue;
     }
     if (run === 0 && !span) {
-      if (backtick && char === "`")
-        return closedAt(text, at, lastBreak, index + 1);
+      if (backtick && char === "`") return closedAt(lastBreak, index + 1);
       if (!backtick && char === "(") depth += 1;
       if (!backtick && char === ")" && --depth === 0)
-        return closedAt(text, at, lastBreak, index + 1);
+        return closedAt(lastBreak, index + 1);
     }
     index += run + 1;
   }
-  if (region >= 0) return Math.min(index, text.length);
-  if (stop < 0) return Math.min(index, text.length);
+  if (region >= 0) return failedClosed(at, Math.min(index, text.length));
+  if (stop < 0) return { end: Math.min(index, text.length), sweep: null };
   scan.extendedTo = Math.max(scan.extendedTo, index);
-  return stop;
+  return { end: stop, sweep: null };
+}
+
+/**
+ * Where a substitution's scan ended, and the sweep its end still needs (`sweptEnd`):
+ * from where, and from which position later Authorization headers count.
+ */
+interface SubstitutionEnd {
+  end: number;
+  sweep: { from: number; headersFrom: number } | null;
+}
+
+/** An in-region scan that failed closed at `end`, which may split a secret. */
+function failedClosed(at: number, end: number): SubstitutionEnd {
+  return { end, sweep: { from: end, headersFrom: at + 1 } };
 }
 
 /** A pattern-identical copy for checking one line without disturbing the scan. */
-const AUTHORIZATION_HEADER_ON_LINE = new RegExp(
-  AUTHORIZATION_HEADER.source,
-  "i",
-);
-
 /**
- * Sticky private copies of the secret patterns and the header pattern: tried at one
- * position against the whole text (so `\b`, lookbehinds, multi-line blocks and a
- * separator across a line break read as they do in the real pass), moving no shared
- * state.
+ * Private global copies of the secret patterns and the header pattern for
+ * `sweptEnd`, so it moves no shared state.
  */
-const STICKY_SECRET_PATTERNS = SECRET_PATTERNS.map(
+const SWEEP_SECRET_PATTERNS = SECRET_PATTERNS.map(
   ([pattern]) =>
-    new RegExp(pattern.source, pattern.flags.replace("g", "") + "y"),
+    new RegExp(
+      pattern.source,
+      pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`,
+    ),
 );
-const STICKY_AUTHORIZATION_HEADER = new RegExp(
+const SWEEP_AUTHORIZATION_HEADER = new RegExp(
   AUTHORIZATION_HEADER.source,
-  AUTHORIZATION_HEADER.flags.replace("g", "") + "y",
+  AUTHORIZATION_HEADER.flags,
 );
 
 /**
- * The end of a substitution starting at `at` and closed at `close`. A close on the
- * substitution's own first line is kept. One that crossed a real line break may sit
- * inside text the scrubber would otherwise redact whole (`DB_PASSWORD=pa)ss`, a `)`
- * inside a later header's credential), so the end never lands inside a secret match
- * or before an Authorization header it overlaps:
- * - another header starting on the closing line before the close moves it to that
- *   line's end;
- * - from `at` to the (growing) end, each position is tried against every secret
- *   pattern, and a match running past the end moves the end to the match's end;
- * - each position at or after the close is tried against the header pattern, and a
- *   header there moves the end to its line's end.
- * Every position swept is redacted. A pattern is not retried inside its own earlier
- * match, which keeps a run like `sk-sk-sk-…` from being rescanned per position; each
- * failing attempt is bounded by a literal or a bounded prefix.
+ * The next match of each sweep pattern at or after where it was last searched from.
+ * Sweeps run left to right through a pass and each searches from where the last
+ * stopped, so a cached match is reused until the sweep passes it and every pattern
+ * reads the text about once per pass, whatever the number of sweeps.
  */
-function closedAt(
+interface MatchCache {
+  secrets: { from: number; match: RegExpExecArray | null }[];
+  header: { from: number; match: RegExpExecArray | null };
+}
+
+function matchCache(): MatchCache {
+  return {
+    secrets: SWEEP_SECRET_PATTERNS.map(() => ({ from: -1, match: null })),
+    header: { from: -1, match: null },
+  };
+}
+
+function nextMatch(
+  text: string,
+  pattern: RegExp,
+  cached: { from: number; match: RegExpExecArray | null },
+  from: number,
+): RegExpExecArray | null {
+  const reusable =
+    cached.from >= 0 &&
+    cached.from <= from &&
+    (cached.match === null || cached.match.index >= from);
+  if (!reusable) {
+    pattern.lastIndex = from;
+    cached.from = from;
+    cached.match = pattern.exec(text);
+  }
+  return cached.match;
+}
+
+/**
+ * The end of a substitution closed at `close`: the close itself, which a sweep still
+ * extends (`sweptEnd`) when the substitution crossed a real line break, since its `)`
+ * may then sit inside text the scrubber would otherwise redact whole
+ * (`DB_PASSWORD=pa)ss`, a later header's credential). A close on the substitution's
+ * own first line is kept as is. Headers count from the closing line's start.
+ */
+function closedAt(lastBreak: number, close: number): SubstitutionEnd {
+  return {
+    end: close,
+    sweep: lastBreak < 0 ? null : { from: close, headersFrom: lastBreak },
+  };
+}
+
+/**
+ * Moves `from` so it lands inside no secret match and before no Authorization header
+ * it overlaps. Every secret pattern match starting in [`at`, end) that runs past the
+ * end moves the end to the match's end; every Authorization header starting in
+ * [`headersFrom`, end) moves it to that header's line end (`headerLineEnd`) and to
+ * its own credential's end (`readCredential` without a sweep of its own: this sweep
+ * goes on over whatever that adds). The end only grows, and everything up to it is
+ * redacted.
+ *
+ * Cost: the matches come from `MatchCache`, so each pattern's search runs forward
+ * through the pass once; a pattern is not looked for again inside its own match. A
+ * header's line end is reused while later headers fall on the same line, and a header
+ * inside a credential already read is not read again, so the line ends and nested
+ * credentials read are disjoint. All of it lies in the redacted span.
+ */
+function sweptEnd(
   text: string,
   at: number,
-  lastBreak: number,
-  close: number,
+  from: number,
+  headersFrom: number,
+  quote: HeaderQuote,
+  state: HeaderState,
 ): number {
-  if (lastBreak < 0) return close;
-  let end = close;
-  if (AUTHORIZATION_HEADER_ON_LINE.test(text.slice(lastBreak + 1, close)))
-    end = lineEndAt(text, close);
-  const reach = STICKY_SECRET_PATTERNS.map(() => at);
-  for (let position = at; position < end; position += 1) {
-    for (const [index, pattern] of STICKY_SECRET_PATTERNS.entries()) {
-      if (position < reach[index]!) continue;
-      pattern.lastIndex = position;
-      const match = pattern.exec(text);
-      if (!match || match[0].length === 0) continue;
-      reach[index] = position + match[0].length;
-      end = Math.max(end, reach[index]!);
+  let end = from;
+  const cursors = SWEEP_SECRET_PATTERNS.map(() => at);
+  let headerCursor = headersFrom;
+  let lineEnd = -1;
+  let readTo = -1;
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const [index, pattern] of SWEEP_SECRET_PATTERNS.entries()) {
+      for (;;) {
+        const match = nextMatch(
+          text,
+          pattern,
+          state.matches.secrets[index]!,
+          cursors[index]!,
+        );
+        if (!match || match.index >= end) break;
+        const matchEnd = match.index + match[0].length;
+        cursors[index] = Math.max(matchEnd, match.index + 1);
+        if (matchEnd > end) {
+          end = matchEnd;
+          changed = true;
+        }
+      }
     }
-    if (position >= close) {
-      STICKY_AUTHORIZATION_HEADER.lastIndex = position;
-      const header = STICKY_AUTHORIZATION_HEADER.exec(text);
-      if (header)
-        end = Math.max(end, lineEndAt(text, position + header[0].length));
+    for (;;) {
+      const header = nextMatch(
+        text,
+        SWEEP_AUTHORIZATION_HEADER,
+        state.matches.header,
+        headerCursor,
+      );
+      if (!header || header.index >= end) break;
+      headerCursor = header.index + 1;
+      const credential = header.index + header[0].length;
+      if (credential > lineEnd)
+        lineEnd = headerLineEnd(text, credential, quote);
+      let reach = lineEnd;
+      if (header.index >= readTo) {
+        const parsed = readCredential(text, header, state, false);
+        readTo = parsed ? parsed.end : credential;
+        reach = Math.max(reach, readTo);
+      }
+      if (reach > end) {
+        end = reach;
+        changed = true;
+      }
     }
   }
   return end;
+}
+
+/**
+ * The end of a header's line from `at`: a real line break, or on a serialized line
+ * its next proven escaped break or the string's structural close, or the end.
+ */
+function headerLineEnd(text: string, at: number, quote: HeaderQuote): number {
+  if (quote.lineBase === 0) return lineEndAt(text, at);
+  let index = at;
+  while (index < text.length) {
+    const run = backslashes(text, index);
+    const char = text[index + run];
+    if (char === "\n" || char === "\r") return index + run;
+    if (
+      run > 0 &&
+      (char === "n" || char === "r") &&
+      escapedBreak(text, index, run, quote)
+    )
+      return index;
+    if (
+      char === quote.char &&
+      run < quote.lineBase &&
+      structuralClose(text, index + run + 1, char, run)
+    )
+      return index;
+    index += run + 1;
+  }
+  return text.length;
 }
 
 function lineEndAt(text: string, at: number): number {
