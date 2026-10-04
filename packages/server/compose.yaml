@@ -11,7 +11,7 @@ services:
     image: pgvector/pgvector:pg17
     environment:
       POSTGRES_USER: relayhistory
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD to a URL-safe secret}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
       POSTGRES_DB: relayhistory
     volumes:
       - postgres-data:/var/lib/postgresql/data
@@ -28,7 +28,9 @@ services:
       dockerfile: packages/server/Dockerfile
     image: relayhistory-server:local
     environment:
-      DATABASE_URL: postgres://relayhistory:${POSTGRES_PASSWORD}@postgres:5432/relayhistory
+      # The password travels separately, so any character in it is safe.
+      DATABASE_URL: postgres://relayhistory@postgres:5432/relayhistory
+      PGPASSWORD: ${POSTGRES_PASSWORD}
       # Optional: embeddings for POST /v1/ingest. Upload and recall work without them.
       EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
       EMBEDDING_API_URL: ${EMBEDDING_API_URL:-}

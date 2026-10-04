@@ -60,7 +60,7 @@ export function databaseUrl(env: Env = process.env): string {
 
 export function loadConfig(env: Env = process.env): ServerConfig {
   const runtimeRole = env.RELAYHISTORY_RUNTIME_ROLE?.trim();
-  if (runtimeRole && !/^[a-z_][a-z0-9_]{0,62}$/.test(runtimeRole)) {
+  if (runtimeRole && !/^[a-z_][a-z0-9_$]{0,62}$/.test(runtimeRole)) {
     throw new ConfigError(
       "RELAYHISTORY_RUNTIME_ROLE must be a lowercase PostgreSQL role name",
     );

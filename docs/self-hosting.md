@@ -5,15 +5,15 @@ implementation the hosted service runs — on Node and ordinary PostgreSQL with
 pgvector. It needs no Agent Relay, Neon or Cloudflare account. Machines upload the
 sessions you select; you search and read them back over the same HTTP API.
 
-| Route | Scope | Purpose |
-| --- | --- | --- |
-| `POST /v1/delivery/batches` | `rth:sync` | Durable upload (protocol 1): receipts, replay, conflicts, tombstones |
-| `GET /v1/delivery/limits` | `rth:sync` | Server batch limits |
-| `GET /v1/sessions` | `rth:read` | List sessions, newest first |
-| `GET /v1/events?q=TEXT` | `rth:read` | Search across sessions |
-| `GET /v1/sessions/:id/events` | `rth:read` | One session's transcript, in order |
+| Route                                  | Scope      | Purpose                                                                             |
+| -------------------------------------- | ---------- | ----------------------------------------------------------------------------------- |
+| `POST /v1/delivery/batches`            | `rth:sync` | Durable upload (protocol 1): receipts, replay, conflicts, tombstones                |
+| `GET /v1/delivery/limits`              | `rth:sync` | Server batch limits                                                                 |
+| `GET /v1/sessions`                     | `rth:read` | List sessions, newest first                                                         |
+| `GET /v1/events?q=TEXT`                | `rth:read` | Search across sessions                                                              |
+| `GET /v1/sessions/:id/events`          | `rth:read` | One session's transcript, in order                                                  |
 | `GET /v1/sessions/:id/catalog?source=` | `rth:read` | One session's delivered catalog: branch, repository, models, relationships, markers |
-| `GET /health`, `GET /ready` | none | Liveness; readiness (database reachable, not draining) |
+| `GET /health`, `GET /ready`            | none       | Liveness; readiness (database reachable, not draining)                              |
 
 Every `/v1` route authenticates a bearer token and takes the tenant (organization and
 workspace) from the token's stored row, never from the request.
@@ -23,7 +23,7 @@ workspace) from the token's stored row, never from the request.
 Requires Docker with Compose v2. From a clone of this repository:
 
 ```bash
-export POSTGRES_PASSWORD=$(openssl rand -hex 24)   # URL-safe; keep it somewhere safe
+export POSTGRES_PASSWORD=$(openssl rand -hex 24)   # keep it somewhere safe
 docker compose -f packages/server/compose.yaml up -d --build --wait
 curl -s http://127.0.0.1:8080/ready
 # {"ok":true,"service":"relayhistory"}
@@ -56,21 +56,23 @@ node dist/cli.js serve
 It listens on `127.0.0.1:8080`; set `HOST=0.0.0.0` only when the TLS proxy runs on
 another host.
 
-`relayhistory-server migrate` applies migrations without serving, for a deploy step
-that runs them separately.
+`node dist/cli.js migrate` applies migrations without serving, for a deploy step that
+runs them separately. The CLI examples below write `relayhistory-server`, which is how
+the image names it; on bare Node run `node dist/cli.js` from `packages/server`.
 
 ## Configuration
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `DATABASE_URL` | required | `postgres://` URL; standard TCP connection |
-| `HOST` / `PORT` | `127.0.0.1` / `8080` (the image sets `HOST=0.0.0.0`) | Listen address |
-| `RELAYHISTORY_DB_POOL_MAX` | `10` | Pool connections |
-| `RELAYHISTORY_SHUTDOWN_TIMEOUT_MS` | `15000` | Drain time for in-flight requests on SIGTERM |
-| `RELAYHISTORY_RETENTION_INTERVAL_MS` | `60000` | Interval of the job that clears expired retention-bounded evidence |
-| `RELAYHISTORY_RUNTIME_ROLE` | unset | Role granted access to the `sessions` schema after migrations |
-| `EMBEDDING_API_KEY` or `OPENAI_API_KEY` | unset | Optional embeddings for `POST /v1/ingest`; upload and recall never need them |
-| `EMBEDDING_API_URL`, `EMBEDDING_MODEL` | OpenAI defaults | OpenAI-compatible embedding endpoint |
+| Variable                                | Default                                              | Meaning                                                                         |
+| --------------------------------------- | ---------------------------------------------------- | ------------------------------------------------------------------------------- |
+| `DATABASE_URL`                          | required                                             | `postgres://` URL; standard TCP connection                                      |
+| `PGPASSWORD`                            | unset                                                | Database password when the URL carries none (any characters; Compose uses this) |
+| `HOST` / `PORT`                         | `127.0.0.1` / `8080` (the image sets `HOST=0.0.0.0`) | Listen address                                                                  |
+| `RELAYHISTORY_DB_POOL_MAX`              | `10`                                                 | Pool connections                                                                |
+| `RELAYHISTORY_SHUTDOWN_TIMEOUT_MS`      | `15000`                                              | Drain time for in-flight requests on SIGTERM                                    |
+| `RELAYHISTORY_RETENTION_INTERVAL_MS`    | `60000`                                              | Interval of the job that clears expired retention-bounded evidence              |
+| `RELAYHISTORY_RUNTIME_ROLE`             | unset                                                | Role granted access to the `sessions` schema after migrations                   |
+| `EMBEDDING_API_KEY` or `OPENAI_API_KEY` | unset                                                | Optional embeddings for `POST /v1/ingest`; upload and recall never need them    |
+| `EMBEDDING_API_URL`, `EMBEDDING_MODEL`  | OpenAI defaults                                      | OpenAI-compatible embedding endpoint                                            |
 
 Logs are JSON lines on stderr. They never contain tokens, the database URL, request
 bodies or driver error text.
@@ -95,9 +97,17 @@ file; `--out -` writes it to stdout for a pipe. The file holds the secret once �
 its hash is stored — plus the tenant and the `accountId` an uploader must name:
 
 ```json
-{ "version": 1, "token": "rth_st_…", "id": "…", "label": "laptop",
-  "scopes": ["rth:sync", "rth:read"], "expiresAt": "…",
-  "orgId": "acme", "workspaceId": "main", "accountId": "relayhistory:…" }
+{
+  "version": 1,
+  "token": "rth_st_…",
+  "id": "…",
+  "label": "laptop",
+  "scopes": ["rth:sync", "rth:read"],
+  "expiresAt": "…",
+  "orgId": "acme",
+  "workspaceId": "main",
+  "accountId": "relayhistory:…"
+}
 ```
 
 Give each machine its own token: `rth:sync` to upload, `rth:read` to search and read.
@@ -121,7 +131,8 @@ Everything the service keeps is in PostgreSQL's `sessions` schema. Back it up wi
 docker compose -f packages/server/compose.yaml exec -T postgres \
   pg_dump -U relayhistory -d relayhistory -Fc > relayhistory-$(date +%F).dump
 
-# Restore into a fresh stack
+# Restore: stop the server so nothing reads or writes during the restore
+docker compose -f packages/server/compose.yaml stop server
 docker compose -f packages/server/compose.yaml up -d --wait postgres
 docker compose -f packages/server/compose.yaml exec -T postgres \
   pg_restore -U relayhistory -d relayhistory --clean --if-exists < relayhistory-2026-10-04.dump
