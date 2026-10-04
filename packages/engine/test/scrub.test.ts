@@ -451,6 +451,23 @@ describe("hosted ingest scrubbing", () => {
             .slice(0, n),
       ],
       [
+        "unmatched serialized substitutions ending at a string close",
+        (n) => {
+          let group = "";
+          while (group.length < 4000) group += "\\nAuthorization: Basic $(a";
+          return `{"m":"${group}","k":1}`
+            .repeat(Math.ceil(n / 4010))
+            .slice(0, n);
+        },
+      ],
+      [
+        "plain credentials after failed substitutions",
+        (n) =>
+          `Authorization: Basic $(oops\n${"x".repeat(60)}\nAuthorization: Basic abc\n`
+            .repeat(Math.ceil(n / 115))
+            .slice(0, n),
+      ],
+      [
         "stray parameter items",
         (n) =>
           `Authorization: AWS4 C=a/b, ${"x y=z/w, ".repeat(n)}`.slice(0, n),
@@ -1982,6 +1999,116 @@ describe("hosted ingest scrubbing", () => {
       ).toBe(
         '{"Authorization":"Basic [REDACTED]","x":1} {"Authorization": "Basic [REDACTED]',
       );
+    });
+
+    it("keeps a credential straddling a failed region's end redacted", () => {
+      const S = "hunter2SECRETx";
+      const filler = (length: number) => {
+        let text = "";
+        while (text.length < length) {
+          const line = Math.min(63, length - text.length - 1);
+          text += `${line > 0 ? "x".repeat(line) : ""}\n`;
+        }
+        return text.slice(0, length);
+      };
+      const failed = "Authorization: Basic $(oops\n";
+      const forms: Array<[string, (pad: number) => string]> = [
+        [
+          "raw substitution",
+          (pad) =>
+            `${failed}${filler(pad)}Authorization: Basic $(printf admin:${S} | base64)\nHost: x`,
+        ],
+        [
+          "keyed substitution",
+          (pad) =>
+            `{"Authorization":"Basic $(oops","x":1}\n${filler(pad)}{"Authorization": "Basic $(printf "%s" admin:${S} | base64)", "n": 1}\nHost: x`,
+        ],
+        [
+          "shell substitution",
+          (pad) =>
+            `${failed}${filler(pad)}curl -H "Authorization: Basic $(printf "%s" admin:${S} | base64)" url\nHost: x`,
+        ],
+        [
+          "plain after two failed scans",
+          (pad) =>
+            `${failed}Authorization: Basic $(oops2\n${filler(pad)}Authorization: Basic ${S}${S}${S}\nHost: x`,
+        ],
+        [
+          "plain after a failed keyed scan",
+          (pad) =>
+            `${failed}{"Authorization":"Basic $(oops2","x":1}\n${filler(pad)}Authorization: Basic ${S}${S}${S}\nHost: x`,
+        ],
+        [
+          "serialized",
+          (pad) =>
+            JSON.stringify({
+              a: `${failed}${filler(pad)}Authorization: Basic $(printf admin:${S} | base64)\nHost: x`,
+            }),
+        ],
+      ];
+      for (const [name, form] of forms)
+        for (let pad = 3950; pad <= 4140; pad += 1) {
+          const input = form(pad);
+          const out = scrubText(input);
+          expect(out, `${name} pad ${pad}`).not.toContain("SECRET");
+          expect(out, `${name} pad ${pad}`).not.toContain("ECRETx");
+          // `Host: x` survives when the first failed scan's region (its window)
+          // ends before its line break; inside the region it fails closed with it.
+          if (
+            name !== "serialized" &&
+            input.indexOf("\nHost: x") > input.indexOf("$(") + 4096
+          )
+            expect(out, `${name} pad ${pad}`).toContain("\nHost: x");
+        }
+      // A `)` inside a later header's credential does not leave its suffix behind.
+      expect(
+        scrubText(
+          `{"Authorization":"Basic $(echo","x":1}\nsay "hi\nAuthorization: Basic admin:pa)ss1234SECRET`,
+        ),
+      ).toBe('{"Authorization":"Basic [REDACTED]');
+      expect(
+        scrubText(
+          "Authorization: Basic $(oops\nAuthorization: Basic admin:pa)ss1234SECRET",
+        ),
+      ).toBe("Authorization: Basic [REDACTED]");
+      // Controls.
+      const R = "R9secretZ";
+      const exact: Array<[string, string]> = [
+        [
+          `{"Authorization":"Basic $(echo","x":1} {"Authorization": "Basic $(printf "%s" admin:${R} | base64)"}`,
+          '{"Authorization":"Basic [REDACTED]","x":1} {"Authorization": "Basic [REDACTED]"}',
+        ],
+        [
+          '{"Authorization":"Basic $(echo","next":"keep"}',
+          '{"Authorization":"Basic [REDACTED]","next":"keep"}',
+        ],
+        [
+          `{"Authorization": "Basic $(printf "%s" admin:${R} | base64)"}`,
+          '{"Authorization": "Basic [REDACTED]"}',
+        ],
+        [
+          `{"Authorization": "Bearer $(curl -s https://auth/login -d "{"user":"admin","pass":"${R}"}" | jq -r .token)", "next": "keep"}`,
+          '{"Authorization": "Bearer [REDACTED]", "next": "keep"}',
+        ],
+        [
+          `{"Authorization": "Basic $(cat <<X | base64\nuser: admin\npass: ${R}\nX\n)", "next": "keep"}`,
+          '{"Authorization": "Basic [REDACTED]", "next": "keep"}',
+        ],
+        [
+          '{"Authorization":"Basic $(echo","x":1}\n{"y":"a)"}\n{"z":2}',
+          '{"Authorization":"Basic [REDACTED]"}\n{"z":2}',
+        ],
+        [
+          '{"Authorization":"Basic $(echo","next":"keep)"}',
+          '{"Authorization":"Basic [REDACTED]"}',
+        ],
+        [
+          "Authorization: Basic $(unfinished\nX-Note: done)\nHost: x",
+          "Authorization: Basic [REDACTED]\nHost: x",
+        ],
+      ];
+      for (const [input, output] of exact)
+        expect(scrubText(input), input).toBe(output);
     });
 
     it("redacts to the line end when a loose quoted value meets a quote of another depth", () => {
