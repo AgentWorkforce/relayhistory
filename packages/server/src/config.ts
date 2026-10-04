@@ -58,13 +58,22 @@ export function databaseUrl(env: Env = process.env): string {
   return url;
 }
 
-export function loadConfig(env: Env = process.env): ServerConfig {
-  const runtimeRole = env.RELAYHISTORY_RUNTIME_ROLE?.trim();
-  if (runtimeRole && !/^[a-z_][a-z0-9_$]{0,62}$/.test(runtimeRole)) {
+/**
+ * The role granted access to the `sessions` schema after migrations. Every command that
+ * prepares the schema (`serve`, `migrate`, `token`) passes it, so tables a run creates
+ * are granted at once.
+ */
+export function runtimeRole(env: Env = process.env): string | undefined {
+  const role = env.RELAYHISTORY_RUNTIME_ROLE?.trim();
+  if (role && !/^[a-z_][a-z0-9_$]{0,62}$/.test(role))
     throw new ConfigError(
       "RELAYHISTORY_RUNTIME_ROLE must be a lowercase PostgreSQL role name",
     );
-  }
+  return role || undefined;
+}
+
+export function loadConfig(env: Env = process.env): ServerConfig {
+  const role = runtimeRole(env);
   return {
     databaseUrl: databaseUrl(env),
     host: env.HOST?.trim() || "127.0.0.1",
@@ -84,7 +93,7 @@ export function loadConfig(env: Env = process.env): ServerConfig {
       1_000,
       86_400_000,
     ),
-    ...(runtimeRole ? { runtimeRole } : {}),
+    ...(role ? { runtimeRole: role } : {}),
     embeddings: {
       EMBEDDING_API_KEY: env.EMBEDDING_API_KEY,
       OPENAI_API_KEY: env.OPENAI_API_KEY,
