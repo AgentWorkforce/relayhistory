@@ -575,6 +575,26 @@ describe("createHistoryEngine", () => {
       };
     }
 
+    function reply(
+      sessionId: string,
+      id: string,
+      text: string,
+      timestampMs: number,
+    ): HistoryExportRecord {
+      return {
+        ...record(sessionId, id, text, timestampMs),
+        kind: "session_event",
+        payload: {
+          role: "assistant",
+          kind: "text",
+          text,
+          message_id: `${id}-message`,
+          model: "claude-opus",
+          ts_ms: timestampMs,
+        },
+      };
+    }
+
     async function batch(
       auth: Pick<AuthContext, "orgId" | "workspaceId">,
       records: HistoryExportRecord[],
@@ -615,6 +635,22 @@ describe("createHistoryEngine", () => {
     }
 
     it("stores a batch through the engine and recalls it only for its tenant", async () => {
+      // A freshly migrated database: applyMigrations ran both rollouts, so delivered
+      // records project through the v2 activity projection into session rollups.
+      expect(
+        (
+          await database.query(
+            `SELECT stage, completed_at IS NOT NULL AS done FROM sessions.delivery_rollout
+             UNION ALL
+             SELECT 'rollups', completed_at IS NOT NULL FROM sessions.session_rollup_rollout
+             ORDER BY 1`,
+          )
+        ).rows,
+      ).toEqual([
+        { stage: "activity", done: true },
+        { stage: "catalog", done: true },
+        { stage: "rollups", done: true },
+      ]);
       const app = engine();
       const a = await serviceToken("org_e2e_a", "ws_e2e_a");
       const b = await serviceToken("org_e2e_b", "ws_e2e_b");
@@ -626,6 +662,7 @@ describe("createHistoryEngine", () => {
         [
           record("session-a", "a-1", "alpha needle opening", 1_788_000_000_000),
           record("session-a", "a-2", "alpha follow-up", 1_788_000_001_000),
+          reply("session-a", "a-3", "alpha answer", 1_788_000_001_500),
         ],
         "batch-a",
       );
@@ -641,7 +678,7 @@ describe("createHistoryEngine", () => {
       expect(storedA).toMatchObject({
         protocolVersion: 1,
         batchId: "batch-a",
-        acceptedRevisionIds: ["a-1-r1", "a-2-r1"],
+        acceptedRevisionIds: ["a-1-r1", "a-2-r1", "a-3-r1"],
         acceptanceLevel: "durable",
       });
       expect((await upload(app, b.token, batchB)).status).toBe(200);
@@ -663,6 +700,23 @@ describe("createHistoryEngine", () => {
         error: { code: "delivery_account_mismatch" },
       });
 
+      // Every accepted record was projected, by the v2 projection (which links each
+      // event to its delivery record), into the session's rollup.
+      expect(
+        (
+          await database.query(
+            "SELECT delivery_record_id AS id FROM sessions.convergence_events WHERE org_id = 'org_e2e_a' ORDER BY 1",
+          )
+        ).rows,
+      ).toEqual([{ id: "a-1" }, { id: "a-2" }, { id: "a-3" }]);
+      expect(
+        (
+          await database.query(
+            "SELECT event_count::int AS n FROM sessions.session_rollups WHERE org_id = 'org_e2e_a'",
+          )
+        ).rows,
+      ).toEqual([{ n: 3 }]);
+
       const sessionsA = await get(app, a.token, "/v1/sessions");
       expect(sessionsA.status).toBe(200);
       expect(sessionsA.body.sessions.map((s: any) => s.sessionId)).toEqual([
@@ -670,7 +724,8 @@ describe("createHistoryEngine", () => {
       ]);
       expect(sessionsA.body.sessions[0]).toMatchObject({
         source: "claude",
-        eventCount: 2,
+        eventCount: 3,
+        models: ["claude-opus"],
       });
       const sessionsB = await get(app, b.token, "/v1/sessions");
       expect(sessionsB.body.sessions.map((s: any) => s.sessionId)).toEqual([
@@ -682,6 +737,7 @@ describe("createHistoryEngine", () => {
       expect(eventsA.body.events.map((e: any) => e.content)).toEqual([
         "alpha needle opening",
         "alpha follow-up",
+        "alpha answer",
       ]);
       const crossEvents = await get(
         app,
@@ -710,6 +766,7 @@ describe("createHistoryEngine", () => {
       expect(recordsA.body.records.map((r: any) => r.record_id)).toEqual([
         "a-1",
         "a-2",
+        "a-3",
       ]);
       const recordsB = await get(app, b.token, "/v1/delivery/records", {
         "X-RelayHistory-Expected-Account": batchB.account_id,

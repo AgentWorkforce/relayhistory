@@ -24,7 +24,7 @@ export interface FreshDatabase {
   exec(text: string): Promise<void>;
   /** Runs `fn` in one transaction, rolled back when it throws. */
   transaction(
-    fn: (tx: Pick<FreshDatabase, "query">) => Promise<void>,
+    fn: (query: FreshDatabase["query"]) => Promise<void>,
   ): Promise<void>;
   /** The connection as `applyMigrations` takes it. */
   client: MigrationClient;
@@ -59,9 +59,7 @@ async function pgliteDatabase(): Promise<FreshDatabase> {
     },
     transaction: async (fn) => {
       await client.transaction(async (tx) => {
-        await fn({
-          query: async (text, params) => tx.query(text, params) as never,
-        });
+        await fn(async (text, params) => tx.query(text, params) as never);
       });
     },
     client: { query: (text) => query(text) },
@@ -103,7 +101,7 @@ async function postgresDatabase(): Promise<FreshDatabase> {
     transaction: async (fn) => {
       await client.query("BEGIN");
       try {
-        await fn({ query });
+        await fn(query);
         await client.query("COMMIT");
       } catch (error) {
         await client.query("ROLLBACK");

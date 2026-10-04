@@ -4,7 +4,9 @@ import { join } from "node:path";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 import {
   CONCURRENT_INDEXES,
+  DELIVERY_PROJECTION_ROLLOUT_MIGRATION,
   MIGRATIONS_DIR,
+  SESSION_ROLLUPS_MIGRATION,
   SUPERSEDED_CHECKSUMS,
   applyMigrations,
   migrationStatements,
@@ -54,8 +56,13 @@ function fakeClient(
     notices?: string[];
     /** `current_setting('transaction_timeout', true)`; null on PostgreSQL < 17. */
     transactionTimeout?: string | null;
+    /** Migration names the ledger reports after the run. */
+    ledger?: string[];
+    /** Sessions the first session rollup backfill step reports. */
+    rolledUp?: number;
   } = {},
 ) {
+  let rolledUp = options.rolledUp ?? 0;
   const queries: string[] = [];
   const listeners = { added: 0, removed: 0 };
   let onNotice: ((notice: { message?: string }) => void) | undefined;
@@ -80,7 +87,17 @@ function fakeClient(
           ],
         };
       if (statement === LEDGER)
-        return { rows: [{ name: "0001.sql", checksum: "checksum" }] };
+        return {
+          rows: (options.ledger ?? ["0001.sql"]).map((name) => ({
+            name,
+            checksum: "checksum",
+          })),
+        };
+      if (statement.includes("session_rollup_backfill_step(")) {
+        const processed = rolledUp;
+        rolledUp = 0;
+        return { rows: [{ processed }] };
+      }
       return { rows: [] };
     },
     on(event: "notice", listener: (notice: { message?: string }) => void) {
@@ -189,24 +206,23 @@ describe("migration runner", () => {
       report: (message) => progress.push(message),
     });
 
-    // The migration transaction, then the concurrent indexes; the rollouts follow.
-    expect(
-      fake.queries.slice(
-        0,
-        PREAMBLE.length + FIXTURE_STATEMENTS.length + 1 + INDEX_PROBES.length,
-      ),
-    ).toEqual([...PREAMBLE, ...FIXTURE_STATEMENTS, "COMMIT", ...INDEX_PROBES]);
-    expect(fake.queries.filter((q) => q === "BEGIN")).toHaveLength(
-      fake.queries.filter((q) => q === "COMMIT").length,
-    );
+    // The migration transaction, then the concurrent indexes. The ledger holds
+    // neither rollout's migration, so no rollout runs.
+    expect(fake.queries).toEqual([
+      ...PREAMBLE,
+      ...FIXTURE_STATEMENTS,
+      "COMMIT",
+      ...INDEX_PROBES,
+    ]);
     expect(FIXTURE_STATEMENTS[0]).toBe(
       "SELECT pg_advisory_xact_lock(1919249529, 1)",
     );
-    expect(result).toMatchObject({
+    expect(result).toEqual({
       applied: [{ name: "0001.sql", checksum: "checksum" }],
       indexes: Object.fromEntries(
         CONCURRENT_INDEXES.map(({ name }) => [name, "skipped"]),
       ),
+      rolledUpSessions: 0,
     });
     expect(progress).toContain(
       `Sessions migration statement ${FIXTURE_STATEMENTS.length}/${FIXTURE_STATEMENTS.length}: done`,
@@ -299,12 +315,145 @@ describe("Concurrent index runner", () => {
     expect(Object.values(indexes).every((a) => a === "skipped")).toBe(true);
     expect(builds.some((q) => /\bBEGIN\b/.test(q))).toBe(false);
     expect(builds.every((q) => q.includes("pg_extension"))).toBe(true);
-    // Nothing else touches the indexes: what follows is the rollouts.
+    expect(fake.queries.slice(commit + 1)).toEqual(builds);
+  });
+});
+
+describe("rollouts after the migration transaction", () => {
+  const ROLLOUTS = migrationsDirectory({
+    [DELIVERY_PROJECTION_ROLLOUT_MIGRATION]: "SELECT 1;\n",
+    [SESSION_ROLLUPS_MIGRATION]: "SELECT 1;\n",
+  });
+  const rolloutQuery = (q: string) =>
+    /delivery_rollout|activate_delivery|_backfill_step|_reproject_step|session_rollup/.test(
+      q,
+    );
+
+  it("runs no rollout when the ledger holds neither migration", async () => {
+    const fake = fakeClient();
+    await applyMigrations(fake.client, { directory: FIXTURE });
+    expect(fake.queries.filter(rolloutQuery)).toEqual([]);
+  });
+
+  it("runs the delivery projection rollout, then the session rollup backfill, after the indexes", async () => {
+    const fake = fakeClient({
+      ledger: [
+        DELIVERY_PROJECTION_ROLLOUT_MIGRATION,
+        SESSION_ROLLUPS_MIGRATION,
+      ],
+      rolledUp: 3,
+    });
+    const progress: string[] = [];
+    const result = await applyMigrations(fake.client, {
+      directory: ROLLOUTS,
+      report: (line) => progress.push(line),
+    });
+
+    expect(result.rolledUpSessions).toBe(3);
+    const commit = fake.queries.indexOf("COMMIT");
+    const after = fake.queries.slice(commit + 1 + CONCURRENT_INDEXES.length);
+    const position = (fragment: string) =>
+      after.findIndex((q) => q.includes(fragment));
+    expect(position("activate_delivery_catalog()")).toBeGreaterThanOrEqual(0);
+    expect(position("activate_delivery_catalog()")).toBeLessThan(
+      position("activate_delivery_projection_v2()"),
+    );
+    expect(position("activate_delivery_projection_v2()")).toBeLessThan(
+      position("session_rollup_backfill_step("),
+    );
+    // The backfill filled the table, so it is analyzed for the planner.
+    expect(after.at(-1)).toBe("ANALYZE sessions.session_rollups");
+    expect(progress).toContain(
+      "Session rollups: complete (3 sessions this run)",
+    );
+  });
+
+  it("runs only the delivery projection rollout before 0030 is applied", async () => {
+    const fake = fakeClient({
+      ledger: [DELIVERY_PROJECTION_ROLLOUT_MIGRATION],
+    });
+    const result = await applyMigrations(fake.client, { directory: ROLLOUTS });
     expect(
-      fake.queries
-        .slice(commit + 1 + CONCURRENT_INDEXES.length)
-        .some((q) => q.includes("pg_extension")),
+      fake.queries.some((q) => q.includes("activate_delivery_projection_v2()")),
+    ).toBe(true);
+    expect(
+      fake.queries.some((q) => q.includes("session_rollup_backfill_step(")),
     ).toBe(false);
+    expect(result.rolledUpSessions).toBe(0);
+  });
+
+  it("leaves a database migrated short of 0029 without either rollout", async () => {
+    const database = await createFreshDatabase();
+    try {
+      const directory = migrationsDirectory({}, { packaged: true });
+      for (const name of readMigrations())
+        if (name.name >= DELIVERY_PROJECTION_ROLLOUT_MIGRATION)
+          rmSync(join(directory, name.name));
+
+      const result = await applyMigrations(database.client, { directory });
+
+      expect(result.applied.map((m) => m.name)).not.toContain(
+        DELIVERY_PROJECTION_ROLLOUT_MIGRATION,
+      );
+      expect(result.rolledUpSessions).toBe(0);
+      expect(
+        (
+          await database.query(
+            "SELECT to_regclass('sessions.delivery_rollout') AS relation",
+          )
+        ).rows,
+      ).toEqual([{ relation: null }]);
+    } finally {
+      await database.close();
+    }
+  });
+
+  it("completes both rollouts on a real server and reports the sessions rolled up", async () => {
+    const database = await createFreshDatabase();
+    try {
+      const directory = migrationsDirectory({}, { packaged: true });
+      for (const name of readMigrations())
+        if (name.name >= SESSION_ROLLUPS_MIGRATION)
+          rmSync(join(directory, name.name));
+      await applyMigrations(database.client, { directory });
+      // Events stored before 0030, as on a database upgraded across it.
+      for (const session of ["s1", "s2", "s3"])
+        await database.query(
+          `INSERT INTO sessions.convergence_events
+             (org_id, workspace_id, machine_id, user_id, source, session_id, event_id, kind, type, ts, record)
+           VALUES ('org', 'ws', 'machine', 'user', 'claude', $1, $1 || '-e', 'assistant', 'message', now(), '{}')`,
+          [session],
+        );
+
+      const result = await applyMigrations(database.client);
+
+      expect(result.rolledUpSessions).toBe(3);
+      expect(
+        (
+          await database.query(
+            `SELECT stage, completed_at IS NOT NULL AS done FROM sessions.delivery_rollout
+             UNION ALL
+             SELECT 'rollups', completed_at IS NOT NULL FROM sessions.session_rollup_rollout
+             ORDER BY 1`,
+          )
+        ).rows,
+      ).toEqual([
+        { stage: "activity", done: true },
+        { stage: "catalog", done: true },
+        { stage: "rollups", done: true },
+      ]);
+      expect(
+        (
+          await database.query(
+            "SELECT count(*)::int AS n FROM sessions.session_rollups",
+          )
+        ).rows,
+      ).toEqual([{ n: 3 }]);
+      // A rerun has nothing left to roll up.
+      expect((await applyMigrations(database.client)).rolledUpSessions).toBe(0);
+    } finally {
+      await database.close();
+    }
   });
 });
 

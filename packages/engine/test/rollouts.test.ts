@@ -40,6 +40,15 @@ const beforeRollups = migrations.filter(
   (m) => m.name < SESSION_ROLLUPS_MIGRATION,
 );
 
+const auth = {
+  orgId: "org-a",
+  workspaceId: "ws-1",
+  userId: "user-1",
+  tokenSubject: "user-1",
+  scopes: ["rth:read", "rth:sync"],
+  claims: {},
+} as AuthContext;
+
 let client: FreshDatabase;
 let db: HistoryDb;
 
@@ -54,17 +63,15 @@ async function rollout(database: FreshDatabase, batch?: number) {
 
 async function migrate(filter = (_name: string) => true) {
   const input = migrations.filter((m) => filter(m.name));
-  await client.transaction(async (tx) => {
-    for (const statement of migrationStatements(input))
-      await tx.query(statement);
+  await client.transaction(async (query) => {
+    for (const statement of migrationStatements(input)) await query(statement);
   });
 }
 
 /** Migrations, then the 0029 rollout when the set includes it. */
 async function migrateSet(input: Migration[]) {
-  await client.transaction(async (tx) => {
-    for (const statement of migrationStatements(input))
-      await tx.query(statement);
+  await client.transaction(async (query) => {
+    for (const statement of migrationStatements(input)) await query(statement);
   });
   if (input.some((m) => m.name.startsWith("0029_"))) await rollout(client);
 }
@@ -256,37 +263,6 @@ async function rollupOf(session: string, extra = "true") {
        FROM sessions.session_rollups WHERE session_id = $1 AND ${extra}`,
     [session],
   );
-}
-
-/** Walks every page of both read paths and requires identical pages and cursors. */
-async function expectSamePages(
-  filters: EventFilters,
-  limit: number,
-  scope: RecallScope = {},
-) {
-  let cursor: string | null = null;
-  let seen = 0;
-  for (let pageNumber = 0; pageNumber < 200; pageNumber++) {
-    const fromRollups = await listSessions(
-      db,
-      auth,
-      filters,
-      { limit, cursor },
-      scope,
-    );
-    const fromEvents = await listSessionsFromEvents(
-      db,
-      auth,
-      filters,
-      { limit, cursor },
-      scope,
-    );
-    expect(fromRollups).toEqual(fromEvents);
-    seen += fromRollups.sessions.length;
-    cursor = fromRollups.nextCursor;
-    if (!cursor) return seen;
-  }
-  throw new Error("pagination did not terminate");
 }
 
 beforeEach(async () => {
@@ -842,7 +818,8 @@ describe("session rollup maintenance", () => {
       { session: "s1", id: "e2", ts: "2026-09-01T10:01:00Z", cost: 4 },
     ]);
     const settle = async (sql: string) =>
-      client.transaction(async (tx) => {
+      client.transaction(async (query) => {
+        const tx = { query };
         await tx.query(sql);
         const [marked] = (
           await tx.query<{ n: number }>(
@@ -881,7 +858,8 @@ describe("session rollup maintenance", () => {
     await insert([
       { session: "s1", id: "e0", ts: "2026-09-01T10:00:00Z", title: "Start" },
     ]);
-    await client.transaction(async (tx) => {
+    await client.transaction(async (query) => {
+      const tx = { query };
       for (let step = 1; step <= 5; step++) {
         await tx.query(
           `INSERT INTO sessions.convergence_events (${COLUMNS})
