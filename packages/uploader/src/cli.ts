@@ -4,6 +4,7 @@
  * relayhistory-upload run --config FILE [--dry-run] [--sync] [--watch] [--interval SECONDS]
  */
 import { parseArgs } from "node:util";
+import { describe, exitCode, UsageError } from "./failures.js";
 import { runSync } from "./sync.js";
 import { HistoryClient, UploadError } from "./client.js";
 import {
@@ -25,16 +26,6 @@ run       Upload selected changes until the local feed is drained, then print a 
           --sync      capture local sessions (ai-hist sync) before each upload
           --watch     keep running; upload again every --interval seconds (default 60)
 `;
-
-class UsageError extends Error {}
-
-/** Exit codes: 0 ok (including --watch stopped between rounds), 1 retryable failure or
- * a signal during an upload, 2 needs the operator (config, auth, refused data). */
-function exitCode(error: unknown): number {
-  if (error instanceof UploadError) return error.retryable ? 1 : 2;
-  if (error instanceof ConfigError || error instanceof UsageError) return 2;
-  return 1;
-}
 
 async function check(config: UploaderConfig, log: Logger, signal: AbortSignal) {
   const limits = await new HistoryClient({
@@ -84,19 +75,6 @@ async function runOnce(
       ...summary,
     })}\n`,
   );
-}
-
-function describe(error: unknown) {
-  if (error instanceof UploadError)
-    return { failure: error.failure, detail: error.message };
-  if (error instanceof ConfigError)
-    return { failure: "config", detail: error.message };
-  // SDK and driver errors may carry paths but never the token; report class and code.
-  return {
-    failure: "error",
-    error: (error as Error)?.name ?? "Error",
-    code: (error as { code?: unknown })?.code ?? "unknown",
-  };
 }
 
 async function main(argv: string[]) {
