@@ -352,6 +352,7 @@ describe("upload", () => {
       "a truncated body",
       () => new Response('{"protocolVersion":1,"receiptId"', { status: 200 }),
     ],
+    ["an empty body", () => new Response("", { status: 200 })],
   ])(
     "treats %s on a success as lost and resends the same batch",
     async (_, broken) => {

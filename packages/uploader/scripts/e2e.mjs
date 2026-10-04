@@ -252,10 +252,18 @@ try {
   }
 
   async function upload(configPath, ...flags) {
+    // `--home DIR` runs the uploader as if on that machine (for `--sync`).
+    const homeAt = flags.indexOf("--home");
+    const home = homeAt >= 0 ? flags.splice(homeAt, 2)[1] : undefined;
     const child = spawn(
       process.execPath,
       [uploaderCli, "run", "--config", configPath, ...flags],
-      { stdio: ["ignore", "pipe", "pipe"] },
+      {
+        stdio: ["ignore", "pipe", "pipe"],
+        ...(home
+          ? { env: { ...process.env, HOME: home, USERPROFILE: home } }
+          : {}),
+      },
     );
     let stdout = "";
     let stderr = "";
@@ -421,6 +429,27 @@ try {
   );
   step("new local evidence uploads incrementally");
 
+  await appendFile(
+    laptop.files[A.shared],
+    `${transcriptLines(
+      A.shared,
+      ["", "", "", "", "", "Captured by --sync"],
+      Date.UTC(2026, 9, 1, 9),
+    )
+      .slice(5)
+      .join("\n")}\n`,
+  );
+  const synced = await upload(laptopConfig, "--sync", "--home", laptop.home);
+  assert.equal(synced.code, 0, synced.stderr);
+  assert.ok(
+    synced.summary.accepted > 0,
+    "--sync captured the new message before uploading",
+  );
+  assert.ok(
+    (await verifyRecall("after --sync")).includes("Captured by --sync"),
+  );
+  step("--sync captures in a child process, then uploads what it captured");
+
   // A response lost after the server committed: the uploader resends the identical
   // batch and receives the identical receipt.
   let dropped = null;
@@ -585,15 +614,29 @@ try {
   step("no token appeared in uploader or server output");
   process.stdout.write("uploader e2e passed\n");
 } finally {
-  if (server && server.exitCode === null) {
-    const exited = once(server, "exit");
-    server.kill("SIGTERM");
-    await exited;
-  }
+  // Each step is attempted and none replaces the error that ended the run.
+  const attempt = async (step, work) => {
+    try {
+      await work();
+    } catch {
+      process.stderr.write(`cleanup: ${step} failed\n`);
+    }
+  };
+  if (server && server.exitCode === null)
+    await attempt("stop server", async () => {
+      const exited = once(server, "exit");
+      server.kill("SIGTERM");
+      await exited;
+    });
   if (!values.keep) {
     if (dbCreated)
-      await admin.query(`DROP DATABASE IF EXISTS ${dbName} WITH (FORCE)`);
-    if (root) await rm(root, { recursive: true, force: true });
+      await attempt("drop database", () =>
+        admin.query(`DROP DATABASE IF EXISTS ${dbName} WITH (FORCE)`),
+      );
+    if (root)
+      await attempt("remove files", () =>
+        rm(root, { recursive: true, force: true }),
+      );
   }
-  await admin?.end().catch(() => {});
+  if (admin) await attempt("close admin connection", () => admin.end());
 }

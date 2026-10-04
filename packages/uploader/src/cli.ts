@@ -4,7 +4,7 @@
  * relayhistory-upload run --config FILE [--dry-run] [--sync] [--watch] [--interval SECONDS]
  */
 import { parseArgs } from "node:util";
-import { sync } from "ai-hist";
+import { runSync } from "./sync.js";
 import { HistoryClient, UploadError } from "./client.js";
 import {
   ConfigError,
@@ -63,7 +63,10 @@ async function runOnce(
   signal: AbortSignal,
 ) {
   if (flags.sync)
-    await sync({ ...(config.dbPath ? { dbPath: config.dbPath } : {}), signal });
+    await runSync({
+      ...(config.dbPath ? { dbPath: config.dbPath } : {}),
+      signal,
+    });
   const summary = await upload({ config, log, signal, dryRun: flags.dryRun });
   process.stdout.write(
     `${JSON.stringify({ dryRun: flags.dryRun, ...summary })}\n`,

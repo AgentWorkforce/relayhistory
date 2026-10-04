@@ -199,11 +199,12 @@ export class HistoryClient {
     try {
       parsed = text ? JSON.parse(text) : null;
     } catch {
-      // A truncated success is indistinguishable from a lost one: resend.
-      if (response.status === 200)
-        throw new UploadError("transient", "server response was incomplete");
       parsed = undefined;
     }
+    // An empty or truncated success is indistinguishable from a lost one: resend, and
+    // the server replays the receipt if it committed the batch.
+    if (response.status === 200 && (parsed === undefined || parsed === null))
+      throw new UploadError("transient", "server response was incomplete");
     return {
       status: response.status,
       body: parsed,
