@@ -294,6 +294,17 @@ describe("hosted ingest scrubbing", () => {
         (n) => `Authorization: Digest ${"a=b, ".repeat(n)}`.slice(0, n),
       ],
       [
+        "escaped header quotes",
+        (n) =>
+          '\\\\\\"Authorization: Digest a=\\\\\\\\\\\\\\"x'
+            .repeat(Math.ceil(n / 40))
+            .slice(0, n),
+      ],
+      [
+        "long backslash run",
+        (n) => `\\"Authorization: Digest a=${"\\".repeat(n)}`.slice(0, n),
+      ],
+      [
         "stray parameter items",
         (n) =>
           `Authorization: AWS4 C=a/b, ${"x y=z/w, ".repeat(n)}`.slice(0, n),
@@ -558,6 +569,33 @@ describe("hosted ingest scrubbing", () => {
       expect(scrubText('Authorization: realm = "svc", nonce=abc next')).toBe(
         "Authorization: [REDACTED] next",
       );
+    });
+
+    it("redacts a Digest header serialized inside JSON, once or twice", () => {
+      const R = "deadbeef1234";
+      const command = `curl -H "Authorization: Digest username=\\"alice\\", response=${R}" http://x`;
+      const once = scrubText(JSON.stringify({ command }));
+      expect(once).not.toContain(R);
+      expect(once).toBe(
+        JSON.stringify({
+          command: 'curl -H "Authorization: Digest [REDACTED]" http://x',
+        }),
+      );
+      const twice = scrubText(JSON.stringify(JSON.stringify({ command })));
+      expect(twice).not.toContain(R);
+      expect(twice).toBe(
+        JSON.stringify(
+          JSON.stringify({
+            command: 'curl -H "Authorization: Digest [REDACTED]" http://x',
+          }),
+        ),
+      );
+      // A Python repr quotes the header with `'` and leaves the inner `"` bare.
+      expect(
+        scrubText(
+          `{'Authorization': 'Digest username="u", response="${R}"', 'x': 1}`,
+        ),
+      ).toBe("{'Authorization': 'Digest [REDACTED]', 'x': 1}");
     });
 
     it("ends a header's credential where the credential ends", () => {
