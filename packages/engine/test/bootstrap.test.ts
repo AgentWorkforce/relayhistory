@@ -174,12 +174,11 @@ describe("bootstrapServiceToken", () => {
       },
     );
 
-    it("treats an empty scope list as the default", async () => {
-      const issued = await bootstrapServiceToken(database.db, {
-        ...valid,
-        scopes: [],
-      });
-      expect(issued.scopes).toEqual(["rth:sync", "rth:read"]);
+    it("refuses an explicit empty scope list", async () => {
+      await expect(
+        bootstrapServiceToken(database.db, { ...valid, scopes: [] }),
+      ).rejects.toThrow("scopes must not be empty");
+      expect((await tokenRows()).rows).toEqual([]);
     });
   });
 
