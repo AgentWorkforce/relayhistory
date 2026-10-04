@@ -601,6 +601,20 @@ describe("hosted ingest scrubbing", () => {
         },
       ],
       [
+        "re-reads that never close, one sweep after another",
+        (n) =>
+          "Authorization: Basic $(a\n,Authorization: b) ,Authorization: Basic $(zz\nAuthorization: Basic $(never qqq\nAuthorization: Basic $(a\n,Authorization: b) ,Authorization: Basic $(zz\nAuthorization: Basic $(printf 'admin:\nS3cret' | base64)\n"
+            .repeat(n / 231)
+            .slice(0, n),
+      ],
+      [
+        "keyed headers on serialized lines cut at their string's close",
+        (n) =>
+          'Authorization: Basic $(oops\n\')"Authorization": "Basic $(q","k":1}\n{"m":"\\n'
+            .repeat(n / 74)
+            .slice(0, n),
+      ],
+      [
         "short serialized regions closed by their string",
         (n) =>
           '{"m":"x\\nAuthorization: Basic $(a\\nX: y,Authorization: Basic $(b","k":1}\n'
@@ -2480,6 +2494,41 @@ describe("hosted ingest scrubbing", () => {
           expect(out, `gap ${gap} body ${body}`).not.toContain("S3cret");
           expect(out, `gap ${gap} body ${body}`).toContain("\nHost: x");
         }
+    });
+
+    it("re-reads a cut-line straddler inside an earlier re-read's window to its close", () => {
+      const filler = (length: number) => {
+        let text = "";
+        while (text.length < length) {
+          const line = Math.min(63, length - text.length - 1);
+          text += `${line > 0 ? "x".repeat(line) : ""}\n`;
+        }
+        return text.slice(0, length);
+      };
+      const swept =
+        "Authorization: Basic $(a\n,Authorization: b) ,Authorization: Basic $(zz\n";
+      // The first sweep's cut line holds a substitution that never closes, so its
+      // re-read reads a whole window; the second sweep, inside that window, re-reads
+      // its own cut line's straddler.
+      const input = (p1: number, gap: number, tail: string) =>
+        `Authorization: Basic $(oops\n${swept}${filler(p1)}Authorization: Basic $(never qqq\n` +
+        `Authorization: Basic $(oops2\n${swept}${filler(gap)}${tail}`;
+      const straddler = `$(printf 'admin:${"x".repeat(300)}\nS3cret' | base64)`;
+      const tails = [
+        `Authorization: Basic ${straddler}\nHost: x`,
+        `curl -H "Authorization: Basic ${straddler}" url\nHost: x`,
+        `Authorization: Bearer x ,Authorization: Basic ${straddler}\nHost: x`,
+      ];
+      const exact = scrubText(input(4000, 3800, tails[0]!));
+      expect(exact).not.toContain("S3cret");
+      expect(exact).toContain("\nHost: x");
+      for (const tail of tails)
+        for (const p1 of [4000, 4080])
+          for (let gap = 3800; gap <= 4300; gap += 4) {
+            const out = scrubText(input(p1, gap, tail));
+            expect(out, `p1 ${p1} gap ${gap}`).not.toContain("S3cret");
+            expect(out, `p1 ${p1} gap ${gap}`).toContain("Host: x");
+          }
     });
 
     it("fails closed at a region's end when a later header's credential holds a close", () => {
