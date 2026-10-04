@@ -1,4 +1,4 @@
-import { and, eq, isNull, lte, or } from "drizzle-orm";
+import { and, eq, isNull, lte, or, sql } from "drizzle-orm";
 import type { HistoryDb as Db } from "../db/database.js";
 import { authSessions, type AuthSession } from "../db/schema.js";
 
@@ -93,6 +93,10 @@ export async function createSession(
 export async function resolveAccessToken(
   db: Db,
   accessToken: string,
+  options: {
+    /** A failed usage-timestamp write. The token still resolves. */
+    onUsageError?(error: unknown): void;
+  } = {},
 ): Promise<AuthSession | null> {
   if (
     !accessToken.startsWith(ACCESS_PREFIX) &&
@@ -116,22 +120,27 @@ export async function resolveAccessToken(
   if (record.accessTokenExpiresAt.getTime() <= Date.now()) return null;
 
   // Authorization is checked on every request. Usage timestamps are approximate
-  // telemetry: avoid a write for every heartbeat, status poll, or uploaded batch.
+  // telemetry: avoid a write for every heartbeat, status poll, or uploaded batch, and
+  // never fail an authorized request because the write did.
   const now = new Date();
   const cutoff = new Date(now.getTime() - TOKEN_USAGE_INTERVAL_MS);
   if (!record.lastUsedAt || record.lastUsedAt <= cutoff) {
-    await db
-      .update(authSessions)
-      .set({ lastUsedAt: now, updatedAt: now })
-      .where(
-        and(
-          eq(authSessions.id, record.id),
-          or(
-            isNull(authSessions.lastUsedAt),
-            lte(authSessions.lastUsedAt, cutoff),
+    try {
+      await db
+        .update(authSessions)
+        .set({ lastUsedAt: now, updatedAt: now })
+        .where(
+          and(
+            eq(authSessions.id, record.id),
+            or(
+              isNull(authSessions.lastUsedAt),
+              lte(authSessions.lastUsedAt, cutoff),
+            ),
           ),
-        ),
-      );
+        );
+    } catch (error) {
+      options.onUsageError?.(error);
+    }
   }
 
   return record;
@@ -175,7 +184,10 @@ export async function refreshSession(
   const refreshExp = expiresAt(REFRESH_TTL_SECONDS);
   const now = new Date();
 
-  await db
+  // Conditional on the presented refresh hash: of two concurrent refreshes of one
+  // token, only the first rotation returns a pair, so no caller holds a pair the
+  // other's rotation already replaced.
+  const rotated = await db
     .update(authSessions)
     .set({
       accessTokenHash: await hashToken(nextAccess),
@@ -185,7 +197,15 @@ export async function refreshSession(
       lastRefreshedAt: now,
       updatedAt: now,
     })
-    .where(eq(authSessions.id, record.id));
+    .where(
+      and(
+        eq(authSessions.id, record.id),
+        eq(authSessions.refreshTokenHash, tokenHash),
+        isNull(authSessions.revokedAt),
+      ),
+    )
+    .returning({ id: authSessions.id });
+  if (rotated.length === 0) return null;
 
   return {
     sessionId: record.id,
@@ -289,7 +309,14 @@ export async function createServiceToken(
     workspaceId: string;
     scopes: string[];
   },
-  opts: { label: string; scopes?: string[]; expiresInDays?: number },
+  opts: {
+    label: string;
+    /** Omitted: the minter's scopes. An empty list is refused. */
+    scopes?: string[];
+    expiresInDays?: number;
+    /** Latest expiry, e.g. the minting service token's own. */
+    notAfter?: Date;
+  },
 ): Promise<{
   id: string;
   token: string;
@@ -297,7 +324,7 @@ export async function createServiceToken(
   scopes: string[];
   expiresAt: string;
 }> {
-  const requested = opts.scopes?.length ? opts.scopes : [...minter.scopes];
+  const requested = opts.scopes ?? [...minter.scopes];
   // Intersect, never union: a service token is a narrowing of the minter's authority.
   const scopes = requested.filter((scope) => minter.scopes.includes(scope));
   if (scopes.length === 0) {
@@ -312,7 +339,11 @@ export async function createServiceToken(
   );
   const token = generateOpaqueToken(SERVICE_PREFIX);
   const id = crypto.randomUUID();
-  const exp = expiresAt(days * 24 * 60 * 60);
+  const requestedExp = expiresAt(days * 24 * 60 * 60);
+  const exp =
+    opts.notAfter && opts.notAfter < requestedExp
+      ? opts.notAfter
+      : requestedExp;
 
   await db.insert(authSessions).values({
     id,
@@ -336,6 +367,19 @@ export async function createServiceToken(
 }
 
 export class ServiceTokenError extends Error {}
+
+/** When a session's access token expires, or null when no such session exists. */
+export async function accessTokenExpiry(
+  db: Db,
+  sessionId: string,
+): Promise<Date | null> {
+  const rows = await db
+    .select({ expiresAt: authSessions.accessTokenExpiresAt })
+    .from(authSessions)
+    .where(eq(authSessions.id, sessionId))
+    .limit(1);
+  return rows[0]?.expiresAt ?? null;
+}
 
 /** List an org's service tokens. Never returns a secret — there is no way to. */
 export async function listServiceTokens(db: Db, orgId: string) {
@@ -361,10 +405,12 @@ export async function listServiceTokens(db: Db, orgId: string) {
 }
 
 /**
- * Revoke one service token, scoped to the caller's org.
+ * Revoke one service token, scoped to the caller's org and, with `withinScopes`, to
+ * tokens whose scopes are a subset of the caller's: the same narrowing as minting, so a
+ * read-only credential cannot revoke an upload credential.
  *
- * The org predicate is in the WHERE clause rather than checked after the read: a revoke
- * that matched another org's row and then declined to act would still have confirmed that
+ * Both predicates are in the WHERE clause rather than checked after the read: a revoke
+ * that matched a forbidden row and then declined to act would still have confirmed that
  * the id exists.
  */
 export async function revokeServiceToken(
@@ -372,6 +418,7 @@ export async function revokeServiceToken(
   orgId: string,
   id: string,
   reason = "revoked by operator",
+  options: { withinScopes?: string[] } = {},
 ): Promise<boolean> {
   const rows = await db
     .update(authSessions)
@@ -386,6 +433,9 @@ export async function revokeServiceToken(
         eq(authSessions.orgId, orgId),
         eq(authSessions.subjectType, "service"),
         isNull(authSessions.revokedAt),
+        options.withinScopes
+          ? sql`${authSessions.scopes} <@ ${JSON.stringify(options.withinScopes)}::jsonb`
+          : undefined,
       ),
     )
     .returning({ id: authSessions.id });

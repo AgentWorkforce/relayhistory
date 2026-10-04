@@ -8,6 +8,11 @@ import {
 import { getAuth, requireScope } from "../middleware/auth.js";
 import { embeddingProviderFromEnv } from "../lib/embed.js";
 import { applyIngest } from "../lib/ingest.js";
+import {
+  BoundedJsonError,
+  MAX_JSON_BODY_BYTES,
+  readBoundedJson,
+} from "../lib/bounded-json.js";
 import type { IngestRequest, IngestResponse } from "../lib/types.js";
 
 const MAX_BATCH_SIZE = 1000;
@@ -80,6 +85,19 @@ function badRequest(c: any, message: string): Response {
   );
 }
 
+function payloadTooLarge(c: any): Response {
+  return c.json(
+    {
+      error: {
+        code: "payload_too_large",
+        message: `Request body exceeds ${MAX_JSON_BODY_BYTES} bytes`,
+      },
+      correlationId: c.get("correlationId") ?? "",
+    },
+    413,
+  );
+}
+
 export function createIngestRoutes<E extends HistoryEnv>(
   deps: HistoryEngineDeps<E>,
 ): Hono<HistoryEnv> {
@@ -103,9 +121,13 @@ export function createIngestRoutes<E extends HistoryEnv>(
 
     let body: IngestRequest;
     try {
-      body = await c.req.json<IngestRequest>();
-    } catch {
-      return badRequest(c, "Request body must be valid JSON");
+      body = (await readBoundedJson(c.req.raw, {
+        maxBytes: MAX_JSON_BODY_BYTES,
+      })) as IngestRequest;
+    } catch (error) {
+      return error instanceof BoundedJsonError && error.failure === "too_large"
+        ? payloadTooLarge(c)
+        : badRequest(c, "Request body must be valid JSON");
     }
 
     const error = validateIngestRequest(body);

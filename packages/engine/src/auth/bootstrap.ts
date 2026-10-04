@@ -13,7 +13,7 @@ export interface BootstrapServiceTokenOptions {
   /** Recorded as the token's subject. Defaults to `operator`. */
   userId?: string;
   label: string;
-  /** A subset of `rth:sync` and `rth:read`. Defaults to both. */
+  /** A non-empty subset of `rth:sync` and `rth:read`. Omitted: both. */
   scopes?: string[];
   /** 1..`SERVICE_TTL_MAX_DAYS`. Defaults to `SERVICE_TTL_DEFAULT_DAYS`. */
   expiresInDays?: number;
@@ -62,7 +62,11 @@ export async function bootstrapServiceToken(
   if (!label || label.length > 120) {
     throw new ServiceTokenError("label must be 1..120 characters");
   }
-  const scopes = options.scopes?.length ? options.scopes : [...DEFAULT_SCOPES];
+  // An explicit empty list is a request for no authority, never for the default.
+  if (options.scopes && options.scopes.length === 0) {
+    throw new ServiceTokenError("scopes must not be empty");
+  }
+  const scopes = options.scopes ?? [...DEFAULT_SCOPES];
   const unknown = scopes.filter(
     (scope) => !(DEFAULT_SCOPES as readonly string[]).includes(scope),
   );

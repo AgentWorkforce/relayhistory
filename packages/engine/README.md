@@ -16,6 +16,12 @@ Node-only.
 
 ## Run it
 
+A Node host also needs a server adapter and a PostgreSQL driver:
+
+```sh
+npm install @relayhistory/engine hono drizzle-orm @hono/node-server pg
+```
+
 ```ts
 import { serve } from "@hono/node-server";
 import { drizzle } from "drizzle-orm/node-postgres";
@@ -44,8 +50,11 @@ const app = createHistoryEngine({
 });
 serve({ fetch: app.fetch, port: 8787 });
 
-// Retained control-plane evidence expires on a schedule.
-setInterval(() => void expireBabysitterEvidence(db), 60_000);
+// Retained control-plane evidence expires on a schedule. A failed tick is retried by
+// the next one.
+setInterval(() => {
+  expireBabysitterEvidence(db).catch(() => console.error("evidence expiry failed"));
+}, 60_000);
 ```
 
 Use `drizzle-orm/node-postgres`: the engine reads raw query results as `{ rows }`.
@@ -73,11 +82,13 @@ const issued = await bootstrapServiceToken(db, {
 ```
 
 The token's tenant is the stored row's `orgId`/`workspaceId`; no request can select
-another. A holder can mint narrower tokens with `POST /v1/auth/service-tokens`.
+another. A holder can mint narrower tokens with `POST /v1/auth/service-tokens`; only
+the first credential needs database access.
 
 ## API
 
-All `/v1` routes need `Authorization: Bearer <token>`.
+All built-in `/v1` routes need `Authorization: Bearer <token>`; a host's
+`publicRoutes` do not.
 
 | Route | Scope | |
 | --- | --- | --- |
@@ -92,10 +103,10 @@ All `/v1` routes need `Authorization: Bearer <token>`.
 | `GET /v1/sessions/:id/catalog` | `rth:read` | delivered session catalog (`?source=`) |
 | `GET /v1/sessions/:id/thread` | `rth:read` | lifecycle links and outcomes (`?source=`) |
 | `POST`/`GET /v1/sessions/:id/turns`, `GET /v1/sessions/:id/metadata` | `rth:sync`/`rth:read` | conversation turns |
-| `POST`/`GET`/`DELETE /v1/auth/service-tokens` | any | mint (narrowing only), list and revoke service tokens |
+| `POST`/`GET /v1/auth/service-tokens`, `DELETE /v1/auth/service-tokens/:id` | any | mint (narrowing only), list and revoke service tokens |
 
 A delivery batch's `account_id` must equal `deliveryAccount(auth)` —
-`"relayhistory:" + sha256(JSON.stringify([orgId, workspaceId]))` — so a client
+`"relayhistory:" + sha256(JSON.stringify([orgId, workspaceId ?? ""]))` — so a client
 configured for one tenant can never write into another with a swapped token.
 
 ## Dependencies
@@ -109,6 +120,7 @@ configured for one tenant can never write into another with a swapped token.
 | `embeddings?(c)` | embedding provider for `/v1/ingest`; absent stores events without vectors |
 | `enrichSessions?(c, db, auth, sessions)` | in-place enrichment of an organization-scoped `GET /v1/sessions` page |
 | `observeDeliveryBatch?(c)` | telemetry: returns a callback that receives each delivery batch's outcome |
+| `reportError?(error, c)` | receives unexpected request failures; the default logs only the error's name and code, never SQL, rows or bearers |
 | `middleware`, `rootRoutes`, `publicRoutes`, `routes` | host middleware and extra routes (`routes` sit behind auth) |
 
 Hosts that assemble their own app can use `createHistoryRoutes(deps)` and

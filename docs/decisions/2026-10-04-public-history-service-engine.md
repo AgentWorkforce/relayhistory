@@ -44,15 +44,19 @@ In the engine, and therefore identical in both deployments:
   deployments share one ledger history and an applied migration is never edited.
 
 Not in the engine: pricing and cost derivation, activity classification,
-similarity-based linking, session analysis and briefs, rollups, digests, memory,
-reflex, identity exchange (`/v1/cli/login`, `/v1/admin/mint`) and telemetry export.
+similarity-based linking, session analysis and briefs, project and epic rollups,
+digests, memory, reflex, identity exchange (`/v1/cli/login`, `/v1/admin/mint`) and
+telemetry export. Per-session rollups (`session_rollups`, which `GET /v1/sessions`
+reads) and explicit lifecycle links (`GET /v1/sessions/:id/thread`) are recall, and
+are in the engine.
 They stay hosted features plugged in through `deps`, consistent with the 2026-09-19
 ownership boundary. Costs the client reports are stored and read back, never computed.
 
 A self-hosted deployment gets its first credential from `bootstrapServiceToken`, a
 database operation run by an operator holding the database credentials. There is no
-HTTP minting endpoint, so nothing reachable from the network creates a token without
-already holding one, and the hosted `/v1/admin/mint` stays disabled.
+unauthenticated HTTP bootstrap endpoint: `POST /v1/auth/service-tokens` requires an
+existing credential and only narrows it, so nothing reachable from the network creates
+a token without already holding one, and the hosted `/v1/admin/mint` stays disabled.
 
 The main entry is runtime-neutral (Web APIs only) so it bundles for Workers; the Node
 migration runner is the separate `@relayhistory/engine/migrations` entry.

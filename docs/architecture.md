@@ -131,7 +131,8 @@ Hono application; the hosted Worker (Neon) and a self-hosted Node server (Postgr
 pgvector) run it with different `deps` for the database connection, an optional second
 identity provider, optional embeddings and telemetry. It is independent of the Rust
 workspace and the SDK: nothing local depends on it, and it never reads
-`ai-history.db`. Pricing, classification, linking and analysis stay out of it. See the
+`ai-history.db`. Pricing, classification, similarity-based session linking and analysis
+stay out of it; explicit lifecycle links are part of recall. See the
 [engine ADR](decisions/2026-10-04-public-history-service-engine.md) and
 [`packages/engine/README.md`](../packages/engine/README.md).
 

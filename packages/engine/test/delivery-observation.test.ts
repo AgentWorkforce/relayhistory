@@ -1,5 +1,13 @@
 import { Hono } from "hono";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import {
+  afterAll,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 import type {
   AuthContext,
   DeliveryBatchObservation,
@@ -239,4 +247,75 @@ describe("delivery batch observation", () => {
       batch: undefined,
     });
   });
+});
+
+describe("a failing observer", () => {
+  function failing(
+    observeDeliveryBatch: () => (observation: DeliveryBatchObservation) => void,
+  ) {
+    const result = new Hono<HistoryEnv>();
+    result.use("*", async (c, next) => {
+      c.set("correlationId", "corr-test");
+      c.set("auth", auth);
+      await next();
+    });
+    result.route(
+      "/",
+      createDeliveryRoutes({
+        database: () => database.db,
+        observeDeliveryBatch,
+      }),
+    );
+    return (body: string) =>
+      result.request("/delivery/batches", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+      });
+  }
+  const throwingFactory = () => {
+    throw new Error("observer factory failed");
+  };
+  const throwingCallback = () => () => {
+    throw new Error("observer callback failed");
+  };
+
+  it.each([
+    ["factory", throwingFactory],
+    ["callback", throwingCallback],
+  ])(
+    "does not change the delivery response when its %s throws",
+    async (_name, observer) => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const post = failing(observer);
+        const value = await batch();
+        const accepted = await post(
+          JSON.stringify({ protocolVersion: 1, batch: value }),
+        );
+        expect(accepted.status).toBe(200);
+        expect(await accepted.json()).toMatchObject({
+          batchId: "batch-1",
+          acceptanceLevel: "durable",
+          acceptedRevisionIds: ["record-1-r1", "record-2-r1", "record-3-r1"],
+        });
+        const rejected = await post(
+          JSON.stringify({
+            protocolVersion: 1,
+            batch: { ...value, schema_version: 2 },
+          }),
+        );
+        expect(rejected.status).toBe(422);
+        expect(await rejected.json()).toMatchObject({
+          error: { code: "unsupported_schema" },
+          correlationId: "corr-test",
+        });
+        expect(
+          warn.mock.calls.map((call) => String(call[0])).join("\n"),
+        ).not.toContain("hello");
+      } finally {
+        warn.mockRestore();
+      }
+    },
+  );
 });

@@ -14,9 +14,11 @@ import {
 } from "../env.js";
 import { getAuth } from "../middleware/auth.js";
 import {
+  DEFAULT_SCOPES,
   SERVICE_TTL_DEFAULT_DAYS,
   SERVICE_TTL_MAX_DAYS,
   ServiceTokenError,
+  accessTokenExpiry,
   createServiceToken,
   listServiceTokens,
   revokeServiceToken,
@@ -71,6 +73,17 @@ export function createServiceTokenRoutes<E extends HistoryEnv>(
       ) {
         return badRequest(c, "scopes must be an array of strings");
       }
+      if (body.scopes.length === 0) {
+        // Not "omitted": an empty request must never inherit the minter's authority.
+        return badRequest(c, "scopes must not be empty");
+      }
+      // A typo'd or unknown scope would otherwise vanish in the narrowing below.
+      const unknown = (body.scopes as string[]).filter(
+        (scope) => !(DEFAULT_SCOPES as readonly string[]).includes(scope),
+      );
+      if (unknown.length) {
+        return badRequest(c, `unknown scopes: ${unknown.join(", ")}`);
+      }
     }
     if (body.expiresInDays != null) {
       if (
@@ -90,6 +103,19 @@ export function createServiceTokenRoutes<E extends HistoryEnv>(
 
     const auth = getAuth(c);
     try {
+      // A service token cannot mint a credential that outlives it, or its expiry and
+      // revocation would not end a stolen token's access.
+      let notAfter: Date | undefined;
+      if (auth.claims.subjectType === "service") {
+        const parentExpiry = auth.sessionId
+          ? await accessTokenExpiry(db, auth.sessionId)
+          : null;
+        if (!parentExpiry)
+          throw new ServiceTokenError(
+            "the minting service token is not active",
+          );
+        notAfter = parentExpiry;
+      }
       const issued = await createServiceToken(
         db,
         {
@@ -104,6 +130,7 @@ export function createServiceTokenRoutes<E extends HistoryEnv>(
           expiresInDays:
             (body.expiresInDays as number | undefined) ??
             SERVICE_TTL_DEFAULT_DAYS,
+          notAfter,
         },
       );
       return c.json(
@@ -139,20 +166,26 @@ export function createServiceTokenRoutes<E extends HistoryEnv>(
     return c.json({ tokens, correlationId: c.get("correlationId") ?? "" });
   });
 
-  /** `DELETE /v1/auth/service-tokens/:id` — revoke, scoped to the caller's org. */
+  /**
+   * `DELETE /v1/auth/service-tokens/:id` — revoke, scoped to the caller's org and to
+   * tokens whose scopes the caller holds.
+   */
   serviceTokenRoutes.delete("/auth/service-tokens/:id", async (c) => {
     const db = database(c);
     if (!db) {
       return c.json({ error: "DATABASE_URL is required" }, 503);
     }
+    const auth = getAuth(c);
     const revoked = await revokeServiceToken(
       db,
-      getAuth(c).orgId,
+      auth.orgId,
       c.req.param("id"),
+      undefined,
+      { withinScopes: auth.scopes ?? [] },
     );
     if (!revoked) {
-      // Same response whether the id belongs to another org or does not exist: a
-      // distinguishable 404 would confirm which ids are real.
+      // Same response whether the id belongs to another org, holds a scope the caller
+      // lacks, or does not exist: a distinguishable answer would confirm which ids are real.
       return c.json(
         {
           error: { code: "not_found", message: "no such service token" },

@@ -155,6 +155,12 @@ export class OpenAiEmbeddingProvider implements EmbeddingProvider {
         // Bound every input: one over-length text 400s the whole request, taking the
         // other 63 embeddings in this batch down with it.
         input: texts.map(boundEmbeddingInput),
+        // The v3 models shorten their output on request; without it
+        // text-embedding-3-large answers 3072 dimensions, which the vector(1536) column
+        // cannot hold, and every event is skipped as a dimension mismatch.
+        ...(this.model.startsWith("text-embedding-3-")
+          ? { dimensions: this.dim }
+          : {}),
       }),
     });
     if (!response.ok) {
@@ -280,9 +286,11 @@ export async function resolveEventEmbeddings(
     EMBEDDING_BATCH_CONCURRENCY,
     async (batch) => {
       try {
+        // Bounded here as well as in the OpenAI provider, so an injected provider
+        // gets the inputs the batch was sized for.
         const vectors = await embedTexts(
           provider,
-          batch.map((entry) => entry.content),
+          batch.map((entry) => boundEmbeddingInput(entry.content)),
         );
         if (vectors.length !== batch.length) {
           throw new Error("embedding provider returned wrong batch size");
@@ -333,8 +341,10 @@ async function embedTexts(
   if (typeof provider.embedMany === "function") {
     return provider.embedMany(texts);
   }
+  // One failed input skips only itself: the empty vector is recorded as its
+  // provider_error while its neighbours keep their vectors.
   return runWithConcurrency(texts, EMBEDDING_BATCH_CONCURRENCY, (text) =>
-    provider.embed(text),
+    provider.embed(text).catch((): number[] => []),
   );
 }
 

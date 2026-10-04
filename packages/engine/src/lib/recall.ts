@@ -1047,9 +1047,11 @@ async function sessionRowsFromEvents(
       models: sql<
         string[]
       >`array_remove(array_agg(distinct ${convergenceEvents.model}), null)`,
+      // Same (ts, title) precedence as the session_rollups aggregate, so a summary does
+      // not change when the rollups take over.
       taskTitle: sql<
         string | null
-      >`(array_remove(array_agg(${convergenceEvents.taskTitle} order by ${convergenceEvents.ts} desc), null))[1]`,
+      >`(array_remove(array_agg(${convergenceEvents.taskTitle} order by ${convergenceEvents.ts} desc, ${convergenceEvents.taskTitle} desc), null))[1]`,
       taskRefs: sql<
         unknown[]
       >`coalesce(jsonb_agg(distinct ${convergenceEvents.taskRef}) filter (where ${convergenceEvents.taskRef} <> '{}'::jsonb), '[]'::jsonb)`,

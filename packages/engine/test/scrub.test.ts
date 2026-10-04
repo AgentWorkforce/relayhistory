@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { MAX_SCRUB_CHARS, scrubRecord, scrubText } from "../src/lib/scrub.js";
+import {
+  MAX_SCRUB_CHARS,
+  scrubJson,
+  scrubRecord,
+  scrubText,
+} from "../src/lib/scrub.js";
 
 describe("hosted ingest scrubbing", () => {
   it("redacts content in place so readable value remains useful", () => {
@@ -272,6 +277,17 @@ describe("hosted ingest scrubbing", () => {
       ["long domain", (n) => ("a@" + "b.".repeat(n)).slice(0, n)],
       ["git long domain", (n) => ("git@" + "b.".repeat(n)).slice(0, n)],
       ["repeated git@", (n) => "git@".repeat(Math.ceil(n / 4)).slice(0, n)],
+      // Shapes aimed at the quoted-assignment, home-path and bearer endings.
+      ["open quoted assignment", (n) => `token="${"a ".repeat(n)}`.slice(0, n)],
+      [
+        "repeated home dirs",
+        (n) => " /Users/a'".repeat(Math.ceil(n / 10)).slice(0, n),
+      ],
+      ["unbroken home dir", (n) => `/home/${"a".repeat(n)}`.slice(0, n)],
+      [
+        "repeated bearer",
+        (n) => "Bearer a=".repeat(Math.ceil(n / 9)).slice(0, n),
+      ],
     ];
 
     // Median of several runs: a single wall-clock sample is noisy enough on a loaded
@@ -378,6 +394,122 @@ describe("hosted ingest scrubbing", () => {
       const out = scrubText(input);
       // Either wholly redacted or wholly dropped — never a raw prefix of the token.
       expect(out).not.toMatch(/ghp_abcdefghij/);
+    });
+  });
+
+  describe("private key blocks", () => {
+    const BODY = "MIIEowIBAAKCAQEAyZ1examplekeymaterial";
+
+    it("redacts a complete block", () => {
+      expect(
+        scrubText(
+          `before -----BEGIN PRIVATE KEY-----\n${BODY}\n-----END PRIVATE KEY----- after`,
+        ),
+      ).toBe("before [REDACTED] after");
+    });
+
+    it("redacts a block with no END to the end of the text", () => {
+      expect(
+        scrubText(`pasted -----BEGIN RSA PRIVATE KEY-----\n${BODY}\nmore`),
+      ).toBe("pasted [REDACTED]");
+    });
+
+    it("stops an unterminated block at the next BEGIN", () => {
+      const out = scrubText(
+        `-----BEGIN PRIVATE KEY-----\n${BODY}\n-----BEGIN CERTIFICATE-----\npublic`,
+      );
+      expect(out).toBe("[REDACTED]-----BEGIN CERTIFICATE-----\npublic");
+    });
+
+    it("redacts a block the truncation cut and keeps the truncation note", () => {
+      const filler = "word ".repeat(Math.ceil(MAX_SCRUB_CHARS / 5));
+      const key = `-----BEGIN PRIVATE KEY-----\n${`${BODY}\n`.repeat(400)}-----END PRIVATE KEY-----`;
+      const out = scrubText(
+        `${filler.slice(0, MAX_SCRUB_CHARS - 1_000)}${key}`,
+      );
+      expect(out).not.toContain(BODY);
+      expect(out).toMatch(
+        /\[REDACTED\]\n\[relayhistory: truncated \d+ characters/,
+      );
+    });
+
+    it("scrubs a scrub-limit run of unterminated headers in linear time", () => {
+      const header = "-----BEGIN PRIVATE KEY----- ";
+      const input = header
+        .repeat(Math.ceil(MAX_SCRUB_CHARS / header.length))
+        .slice(0, MAX_SCRUB_CHARS);
+      const samples: number[] = [];
+      for (let run = 0; run < 3; run += 1) {
+        const started = performance.now();
+        scrubText(input);
+        samples.push(performance.now() - started);
+      }
+      // Measured 4-25 ms per pass linear; 230-1,700 ms per pass (warm and cold) before
+      // the BEGIN bound.
+      expect(samples.sort((a, b) => a - b)[1]).toBeLessThan(100);
+    });
+  });
+
+  describe("assignment, bearer and home-path edges", () => {
+    it("redacts the whole quoted value of an assignment, spaces included", () => {
+      expect(scrubText('PASSWORD="correct horse battery staple" next')).toBe(
+        "PASSWORD=[REDACTED] next",
+      );
+      expect(scrubText("api_key: 'two words', other")).toBe(
+        "api_key:[REDACTED], other",
+      );
+      // An unterminated quote runs to the end of its line.
+      expect(scrubText('token="open quote\nnext line')).toBe(
+        "token=[REDACTED]\nnext line",
+      );
+      expect(scrubText('PASSWORD=""')).toBe('PASSWORD=""');
+    });
+
+    it("redacts a bearer value ending in base64 padding", () => {
+      expect(scrubText("Authorization: Bearer abcdefghijklmno=")).toBe(
+        "Authorization: Bearer [REDACTED]",
+      );
+      expect(scrubText("Bearer abcdefghijklmnopqrst== next")).toBe(
+        "Bearer [REDACTED] next",
+      );
+    });
+
+    it("normalizes a home path that ends at the username", () => {
+      expect(scrubText("/Users/alice")).toBe("~");
+      expect(scrubText("cd /home/bob && ls")).toBe("cd ~ && ls");
+      expect(scrubText('{"cwd":"/Users/alice"}')).toBe('{"cwd":"~"}');
+      expect(scrubText("C:\\Users\\carol")).toBe("~");
+      expect(scrubText("/Users/alice/Projects/x")).toBe("~/Projects/x");
+    });
+  });
+
+  describe("structured values under sensitive names", () => {
+    it("redacts the value of a sensitive field, whole", () => {
+      expect(
+        scrubJson({
+          api_key: "custom-secret",
+          headers: { "x-api-key": "v", Authorization: "Basic dXNlcg==" },
+          auth: { password: "two words", token: 123, secret: ["a", "b"] },
+          empty: { password: "", key: null, secret: true },
+          kept: { model: "claude", passwords_rotated: "yes" },
+        }),
+      ).toEqual({
+        api_key: "[REDACTED]",
+        headers: { "x-api-key": "[REDACTED]", Authorization: "Basic dXNlcg==" },
+        auth: {
+          password: "[REDACTED]",
+          token: "[REDACTED]",
+          secret: ["[REDACTED]", "[REDACTED]"],
+        },
+        empty: { password: "", key: null, secret: true },
+        kept: { model: "claude", passwords_rotated: "yes" },
+      });
+    });
+
+    it("redacts them inside an allowlisted record field", () => {
+      expect(
+        scrubRecord({ toolCalls: [{ input: { STRIPE_KEY: "custom" } }] }),
+      ).toEqual({ toolCalls: [{ input: { STRIPE_KEY: "[REDACTED]" } }] });
     });
   });
 });

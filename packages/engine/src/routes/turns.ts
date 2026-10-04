@@ -14,8 +14,14 @@ import {
   type ConversationTurnInput,
 } from "../lib/turns.js";
 import { getAuth, requireScope } from "../middleware/auth.js";
+import {
+  BoundedJsonError,
+  MAX_JSON_BODY_BYTES,
+  readBoundedJson,
+} from "../lib/bounded-json.js";
 
 const MAX_TURNS_PER_REQUEST = 1000;
+const MAX_TURN_INDEX = 2_147_483_647;
 const ROLES = new Set<ConversationRole>(["user", "assistant", "system"]);
 const ACTOR_ROLES = new Set<ConversationActorRole>(["owner", "steerer"]);
 const NATIVE_CLIS = new Set(["claude", "codex"]);
@@ -49,6 +55,10 @@ export function parseTurnRequest(
     }
     if (!Number.isInteger(turn.turnIndex) || Number(turn.turnIndex) < 0) {
       return `turns[${index}].turnIndex must be a non-negative integer`;
+    }
+    // conversation_turns.turn_index is a PostgreSQL integer.
+    if (Number(turn.turnIndex) > MAX_TURN_INDEX) {
+      return `turns[${index}].turnIndex must be at most ${MAX_TURN_INDEX}`;
     }
     if (
       typeof turn.role !== "string" ||
@@ -136,6 +146,19 @@ function badRequest(c: any, message: string): Response {
   );
 }
 
+function payloadTooLarge(c: any): Response {
+  return c.json(
+    {
+      error: {
+        code: "payload_too_large",
+        message: `Request body exceeds ${MAX_JSON_BODY_BYTES} bytes`,
+      },
+      correlationId: c.get("correlationId") ?? "",
+    },
+    413,
+  );
+}
+
 export function createTurnRoutes<E extends HistoryEnv>(
   deps: HistoryEngineDeps<E>,
 ): Hono<HistoryEnv> {
@@ -153,9 +176,14 @@ export function createTurnRoutes<E extends HistoryEnv>(
 
       let body: unknown;
       try {
-        body = await c.req.json();
-      } catch {
-        return badRequest(c, "Request body must be valid JSON");
+        body = await readBoundedJson(c.req.raw, {
+          maxBytes: MAX_JSON_BODY_BYTES,
+        });
+      } catch (error) {
+        return error instanceof BoundedJsonError &&
+          error.failure === "too_large"
+          ? payloadTooLarge(c)
+          : badRequest(c, "Request body must be valid JSON");
       }
 
       const parsed = parseTurnRequest(body);

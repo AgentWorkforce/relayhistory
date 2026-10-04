@@ -65,6 +65,13 @@ export interface HistoryEngineDeps<E extends HistoryEnv = HistoryEnv> {
     auth: AuthContext,
     sessions: SessionSummary[],
   ): Promise<void>;
+  /**
+   * A failure the engine answered without exposing it: an unhandled route error (the
+   * error itself, answered 500), a host bearer verifier that threw, or a failed token
+   * usage write (each as `{ name, code }` only, since those may carry the bearer).
+   * Absent: logs `{ name, code }`, never a message, SQL or row contents.
+   */
+  reportError?(error: unknown, c: Context<E>): void;
   /** Called as a delivery batch request starts; the result receives its outcome. */
   observeDeliveryBatch?(
     c: Context<E>,
