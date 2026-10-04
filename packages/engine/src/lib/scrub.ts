@@ -649,11 +649,15 @@ const SUBSTITUTION_WINDOW = 4096;
 
 /**
  * Where scans of substitutions that ran past their fallback end (a line break, or a
- * quoted key's value close) without closing stopped. A later substitution starting
- * before it scans only to it: one that closes there costs its own redacted span, one
- * that does not consumes the rest of the region, and neither moves it. Full-window
- * scans therefore start after the previous region and never overlap, so the pass
- * stays linear.
+ * quoted key's value close) without closing stopped, whether at the window or at a
+ * serialized string's close. A later substitution starting before it scans afresh,
+ * with no window: one that closes is redacted to its close, one that does not fails
+ * closed at the first line break at or after the region's end (on a serialized line
+ * its first escaped break, or the string's close), and neither moves it. Every
+ * in-region scan is thus consumed by its redaction, and every scan that returns its
+ * fallback has read at most `SUBSTITUTION_WINDOW` past it and starts after the last
+ * such region, so substitutions cost O(n + window) per pass, with n bounded by
+ * `MAX_SCRUB_CHARS`.
  */
 interface SubstitutionScan {
   extendedTo: number;
@@ -687,23 +691,30 @@ function shellSubstitutionEnd(
   // Where the substitution ends if it never closes: its first line break or, in a
   // quoted key's value, that value's first close.
   let stop = -1;
-  // A substitution starting inside an earlier failed scan's region scans afresh but
-  // only to that region's end: it ends at its own close or, failing closed, there.
+  // The last real line break crossed, so a close on a later line can be checked.
+  let lastBreak = -1;
+  // A substitution starting inside an earlier failed scan's region scans afresh, with
+  // no window: it ends at its own close or, failing closed, at the first line break
+  // at or after the region's end, so nothing straddling that end is cut.
   const region = at < scan.extendedTo ? scan.extendedTo : -1;
   let index = backtick ? at + 1 : at;
   while (index < text.length) {
-    if (region >= 0 && index >= region) return region;
     if (region < 0 && stop >= 0 && index - at > SUBSTITUTION_WINDOW) break;
     const run = backslashes(text, index);
     const char = text[index + run];
+    const real = char === "\n" || char === "\r";
     if (
-      char === "\n" ||
-      char === "\r" ||
+      real ||
       (run > 0 &&
         (char === "n" || char === "r") &&
         escapedBreak(text, index, run, quote))
     ) {
+      // Past the region a serialized line has no real breaks, so its proven
+      // escaped ones end it there.
+      if (region >= 0 && index >= region && (real || quote.lineBase > 0))
+        return real ? index + run : index;
       if (stop < 0) stop = index;
+      if (real) lastBreak = index + run;
       index += run + 1;
       continue;
     }
@@ -715,8 +726,15 @@ function shellSubstitutionEnd(
       char === quote.char &&
       run < quote.lineBase &&
       structuralClose(text, index + run + 1, char, run)
-    )
-      return stop >= 0 ? stop : index;
+    ) {
+      // The serialized string ends here. A scan that ran past its stop to get here
+      // marks the span a failed region, so later headers in it do not rescan it; one
+      // already inside a region fails closed here.
+      if (region >= 0) return index;
+      if (stop < 0) return index;
+      scan.extendedTo = Math.max(scan.extendedTo, index);
+      return stop;
+    }
     if (char === '"' || char === "'") {
       // Shell quoting: a literal quote, or one of the header's own kind at its own
       // level (bash allows those inside `$(…)`), opens or closes a span. A quote
@@ -732,16 +750,39 @@ function shellSubstitutionEnd(
       continue;
     }
     if (run === 0 && !span) {
-      if (backtick && char === "`") return index + 1;
+      if (backtick && char === "`") return closedAt(text, lastBreak, index + 1);
       if (!backtick && char === "(") depth += 1;
-      if (!backtick && char === ")" && --depth === 0) return index + 1;
+      if (!backtick && char === ")" && --depth === 0)
+        return closedAt(text, lastBreak, index + 1);
     }
     index += run + 1;
   }
-  if (region >= 0) return region;
+  if (region >= 0) return Math.min(index, text.length);
   if (stop < 0) return Math.min(index, text.length);
   scan.extendedTo = Math.max(scan.extendedTo, index);
   return stop;
+}
+
+/** A pattern-identical copy for checking one line without disturbing the scan. */
+const AUTHORIZATION_HEADER_ON_LINE = new RegExp(
+  AUTHORIZATION_HEADER.source,
+  "i",
+);
+
+/**
+ * The end of a substitution closed at `close`. When it crossed a real line break and
+ * another Authorization header starts on its closing line before the close (a `)`
+ * inside that header's credential matched the earlier `$(`), the end moves to that
+ * line's end, so the header's credential is not left half redacted.
+ */
+function closedAt(text: string, lastBreak: number, close: number): number {
+  if (lastBreak < 0) return close;
+  if (!AUTHORIZATION_HEADER_ON_LINE.test(text.slice(lastBreak + 1, close)))
+    return close;
+  let index = close;
+  while (index < text.length && text[index] !== "\n" && text[index] !== "\r")
+    index += 1;
+  return index;
 }
 
 /**
