@@ -4,12 +4,14 @@
  */
 
 /**
- * The body bound for `POST /v1/ingest` and `POST /v1/sessions/:sessionId/turns`. Their
- * batches are bounded by count (1,000 records or turns), not bytes; 16 MiB is the
- * largest single transcript record the local reader produces (`MAX_RECORD_BYTES`), so a
- * batch carrying one is still accepted while memory per request stays bounded.
+ * The body bound for `POST /v1/ingest` and `POST /v1/sessions/:sessionId/turns`: 100 MiB,
+ * the request limit the hosted Worker's platform (Cloudflare) enforces. Their batches are
+ * bounded by count (1,000 records or turns), not bytes, and a single local transcript
+ * record may be 16 MiB before JSON escaping, so no smaller bound is safe to impose
+ * without rejecting uploads the hosted service accepts. A self-hosted server still holds
+ * at most this much of one request in memory.
  */
-export const MAX_JSON_BODY_BYTES = 16 * 1024 * 1024;
+export const MAX_JSON_BODY_BYTES = 100 * 1024 * 1024;
 
 /** Why a body could not be read: absent, not UTF-8 JSON, or over the limit. */
 export type BoundedJsonFailure = "missing" | "malformed" | "too_large";

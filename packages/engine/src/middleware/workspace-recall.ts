@@ -67,7 +67,28 @@ export function readWorkspaceRecallScope(
       error: forbidden(c, "workspace does not match the authenticated session"),
     };
   }
+  // The scope is attested in a response header. A value a header cannot carry exactly
+  // would attest a different key than the one the read used, so it is refused.
+  if (!attestable(authenticated)) {
+    return {
+      error: forbidden(c, "authenticated workspace cannot be attested"),
+    };
+  }
   return { workspaceId: authenticated };
+}
+
+/**
+ * Whether `value` survives as a header value unchanged: no surrounding HTTP whitespace
+ * (which is trimmed), no control characters and nothing outside Latin-1 (which a header
+ * cannot hold).
+ */
+function attestable(value: string): boolean {
+  if (/^[\t\n\r ]|[\t\n\r ]$/.test(value)) return false;
+  for (const character of value) {
+    const code = character.codePointAt(0)!;
+    if (code < 0x20 || code === 0x7f || code > 0xff) return false;
+  }
+  return true;
 }
 
 export function attestWorkspace(
