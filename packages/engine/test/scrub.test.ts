@@ -351,6 +351,14 @@ describe("hosted ingest scrubbing", () => {
           }).slice(0, n),
       ],
       [
+        "quote-comma runs after a serialized header",
+        (n) =>
+          `\\nAuthorization: Digest a=b ${`", ${"k".repeat(60)} `.repeat(n)}`.slice(
+            0,
+            n,
+          ),
+      ],
+      [
         "stray parameter items",
         (n) =>
           `Authorization: AWS4 C=a/b, ${"x y=z/w, ".repeat(n)}`.slice(0, n),
@@ -927,6 +935,82 @@ describe("hosted ingest scrubbing", () => {
         expect(out, serialized).not.toContain(R);
         expect(out, serialized).toContain("Host: x");
       }
+    });
+
+    it("ends a serialized header line only at a string's structural end, whatever quotes precede it", () => {
+      const R = "6629fae49393a05397450978507c4ef1";
+      const repr = (text: string) =>
+        "'" +
+        text
+          .replace(/\\/g, "\\\\")
+          .replace(/'/g, "\\'")
+          .replace(/\r/g, "\\r")
+          .replace(/\n/g, "\\n") +
+        "'";
+      for (const message of [
+        `GET /o'reilly HTTP/1.1\r\nAuthorization: Digest username="o'brien", realm="a, b", response="${R}"\r\nHost: x`,
+        `GET / HTTP/1.1\r\nX-Note: it's fine\r\nAuthorization: Digest username="o'brien", response="${R}"\r\nHost: x`,
+        `GET / HTTP/1.1\r\nX-Q: say "hi"\r\nAuthorization: Digest username="u", realm="a, b", response="${R}"\r\nHost: x`,
+      ]) {
+        for (const serialized of [
+          JSON.stringify({ req: message }),
+          JSON.stringify(JSON.stringify({ req: message })),
+          repr(message),
+          JSON.stringify({ log: repr(message) }),
+        ]) {
+          const out = scrubText(serialized);
+          expect(out, serialized).not.toContain(R);
+          expect(out, serialized).toContain("Host: x");
+        }
+      }
+      // With no line after it, the header ends at its string's close.
+      const last = scrubText(
+        JSON.stringify({
+          req: `GET /\r\nAuthorization: Digest username="u", response="${R}"`,
+        }),
+      );
+      expect(last).not.toContain(R);
+      expect(last.endsWith('"}')).toBe(true);
+    });
+
+    it("keeps quoted fields before a serialized header and the JSON siblings after it", () => {
+      const R = "6629fae49393a05397450978507c4ef1";
+      for (const field of [
+        'If-None-Match: "abc"',
+        'Cookie: a="b c"; d="e"',
+        'Content-Disposition: attachment; filename="x.txt"',
+      ]) {
+        const repr = String.raw`'GET / HTTP/1.1\r\n${field}\r\nAuthorization: Digest username="u", realm="r", response="${R}"\r\nHost: x'`;
+        expect(scrubText(repr)).toBe(
+          String.raw`'GET / HTTP/1.1\r\n${field}\r\nAuthorization: Digest [REDACTED]\r\nHost: x'`,
+        );
+      }
+      const dump = scrubText(
+        JSON.stringify(
+          `Here's the dump: GET /\r\nAuthorization: Digest username="o'brien", realm="A B", response="${R}"\r\nHost: x`,
+        ),
+      );
+      expect(dump).not.toContain(R);
+      expect(dump).toContain("Host: x");
+      expect(
+        scrubText(
+          String.raw`{"msg":"Don't forget\nAuthorization: Basic abc","level":"info","more":"x"}`,
+        ),
+      ).toBe(
+        String.raw`{"msg":"Don't forget\nAuthorization: Basic [REDACTED]","level":"info","more":"x"}`,
+      );
+      // A value quote followed by `, response=` continues the list.
+      expect(
+        scrubText(
+          JSON.stringify({
+            r: `GET /\r\nAuthorization: Digest username="u", response="${R}"\r\nHost: x`,
+          }),
+        ),
+      ).toBe(
+        JSON.stringify({
+          r: "GET /\r\nAuthorization: Digest [REDACTED]\r\nHost: x",
+        }),
+      );
     });
 
     it("redacts to the line end when a loose quoted value meets a quote of another depth", () => {
