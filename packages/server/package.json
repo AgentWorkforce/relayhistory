@@ -1,0 +1,41 @@
+{
+  "name": "@relayhistory/server",
+  "version": "0.34.1",
+  "private": true,
+  "description": "Self-hosted RelayHistory service: the History engine on Node and PostgreSQL.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "relayhistory-server": "dist/cli.js"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.14.0",
+    "@relayhistory/engine": "file:../engine",
+    "drizzle-orm": "^0.38.4",
+    "hono": "^4.12.26",
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/pg": "^8.11.10",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.9"
+  },
+  "engines": {
+    "node": ">=22.16.0"
+  }
+}

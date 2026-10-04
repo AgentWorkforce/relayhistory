@@ -4,7 +4,11 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Minor]
+
+### Added
+
+- `packages/server` self-hosts the History service on Node and PostgreSQL with pgvector: startup migrations, operator token bootstrap (`relayhistory-server token create`), readiness, graceful shutdown, a Docker Compose stack, and a backup/restore guide (`docs/self-hosting.md`).
 
 ## [0.34.1] - 2026-10-03
 

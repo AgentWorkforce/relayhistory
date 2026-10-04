@@ -1,0 +1,6 @@
+*
+!packages/engine
+!packages/server
+**/node_modules
+**/dist
+**/*.tgz

@@ -1,0 +1,46 @@
+# Self-hosted RelayHistory: the server plus PostgreSQL with pgvector.
+#
+#   export POSTGRES_PASSWORD=$(openssl rand -hex 24)
+#   docker compose -f packages/server/compose.yaml up -d --build
+#
+# See docs/self-hosting.md.
+name: relayhistory
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: relayhistory
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD to a URL-safe secret}
+      POSTGRES_DB: relayhistory
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U relayhistory -d relayhistory"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  server:
+    build:
+      context: ../..
+      dockerfile: packages/server/Dockerfile
+    image: relayhistory-server:local
+    environment:
+      DATABASE_URL: postgres://relayhistory:${POSTGRES_PASSWORD}@postgres:5432/relayhistory
+      # Optional: embeddings for POST /v1/ingest. Upload and recall work without them.
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      EMBEDDING_API_URL: ${EMBEDDING_API_URL:-}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-}
+    ports:
+      # Loopback by default: put a TLS reverse proxy in front before exposing it.
+      - "${RELAYHISTORY_BIND:-127.0.0.1}:${RELAYHISTORY_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+volumes:
+  postgres-data:

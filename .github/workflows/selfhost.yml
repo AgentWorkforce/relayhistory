@@ -1,0 +1,106 @@
+name: Self-host
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "packages/engine/**"
+      - "packages/server/**"
+      - ".github/workflows/selfhost.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "packages/engine/**"
+      - "packages/server/**"
+      - ".github/workflows/selfhost.yml"
+
+concurrency:
+  group: selfhost-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  server:
+    name: Server on PostgreSQL + pgvector
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      TEST_ADMIN_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            packages/engine/package-lock.json
+            packages/server/package-lock.json
+      - name: Build engine
+        run: |
+          npm ci --prefix packages/engine
+          npm run --prefix packages/engine build
+      - name: Install server
+        working-directory: packages/server
+        run: npm ci
+      - name: Typecheck
+        working-directory: packages/server
+        run: npm run typecheck
+      - name: Test
+        working-directory: packages/server
+        run: npm test
+      - name: Build
+        working-directory: packages/server
+        run: npm run build
+      - name: Clean-start smoke
+        working-directory: packages/server
+        run: node scripts/smoke.mjs --admin-url "$TEST_ADMIN_DATABASE_URL"
+
+  compose:
+    name: Docker Compose clean start
+    runs-on: ubuntu-latest
+    env:
+      POSTGRES_PASSWORD: ${{ github.run_id }}-compose-smoke
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Start the stack
+        run: docker compose -f packages/server/compose.yaml up -d --build --wait --wait-timeout 300
+      - name: Install smoke dependencies
+        working-directory: packages/server
+        run: |
+          npm ci --prefix ../engine
+          npm run --prefix ../engine build
+          npm ci
+      - name: Smoke against the stack
+        working-directory: packages/server
+        run: node scripts/smoke.mjs --compose compose.yaml --base-url http://127.0.0.1:8080
+      - name: Data survives recreating the containers
+        working-directory: packages/server
+        run: |
+          docker compose -f compose.yaml down
+          docker compose -f compose.yaml up -d --wait --wait-timeout 300
+          docker compose -f compose.yaml exec -T postgres \
+            psql -U relayhistory -d relayhistory -Atc "SELECT count(*) > 0 FROM sessions.delivery_records" | grep -qx t
+      - name: Server logs
+        if: always()
+        run: docker compose -f packages/server/compose.yaml logs server
+      - name: Tear down
+        if: always()
+        run: docker compose -f packages/server/compose.yaml down -v
