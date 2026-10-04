@@ -776,20 +776,51 @@ const AUTHORIZATION_HEADER_ON_LINE = new RegExp(
   "i",
 );
 
+/** Private copies of the secret patterns, so checking a line moves no shared state. */
+const CLOSING_LINE_PATTERNS = SECRET_PATTERNS.map(
+  ([pattern]) => new RegExp(pattern.source, pattern.flags),
+);
+
 /**
- * The end of a substitution closed at `close`. When it crossed a real line break and
- * another Authorization header starts on its closing line before the close (a `)`
- * inside that header's credential matched the earlier `$(`), the end moves to that
- * line's end, so the header's credential is not left half redacted.
+ * The end of a substitution closed at `close`. When it crossed a real line break, its
+ * closing line is checked, since the `)` that closed it may sit inside text the
+ * scrubber would otherwise redact whole:
+ * - another Authorization header starting before the close (a `)` in that header's
+ *   credential matched the earlier `$(`) moves the end to the line's end;
+ * - a secret pattern match spanning the close (`DB_PASSWORD=pa)ss`) moves the end to
+ *   the furthest such match's end, so neither part is left for the patterns to miss.
+ * A close on the substitution's own first line is not checked. Each line is checked at
+ * most once per pass: the next substitution starts after this close, and its own
+ * closing line, if it crosses a break, is a later one.
  */
 function closedAt(text: string, lastBreak: number, close: number): number {
   if (lastBreak < 0) return close;
-  if (!AUTHORIZATION_HEADER_ON_LINE.test(text.slice(lastBreak + 1, close)))
-    return close;
-  let index = close;
-  while (index < text.length && text[index] !== "\n" && text[index] !== "\r")
-    index += 1;
-  return index;
+  let lineEnd = close;
+  while (
+    lineEnd < text.length &&
+    text[lineEnd] !== "\n" &&
+    text[lineEnd] !== "\r"
+  )
+    lineEnd += 1;
+  if (AUTHORIZATION_HEADER_ON_LINE.test(text.slice(lastBreak + 1, close)))
+    return lineEnd;
+  const line = text.slice(lastBreak + 1, lineEnd);
+  const at = close - (lastBreak + 1);
+  let end = close;
+  for (const pattern of CLOSING_LINE_PATTERNS) {
+    pattern.lastIndex = 0;
+    for (
+      let match = pattern.exec(line);
+      match;
+      match = pattern.global ? pattern.exec(line) : null
+    ) {
+      const matchEnd = match.index + match[0].length;
+      if (match.index < at && matchEnd > at)
+        end = Math.max(end, lastBreak + 1 + matchEnd);
+      if (match[0].length === 0) pattern.lastIndex += 1;
+    }
+  }
+  return end;
 }
 
 /**
