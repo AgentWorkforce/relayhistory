@@ -59,11 +59,39 @@ function object(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/**
+ * Error codes the History service emits. A response's `error.code` is shown only when
+ * it is one of these: the server, or a proxy in front of it, controls every other byte,
+ * and an echoed header must never reach an error message or a log line.
+ */
+const KNOWN_ERROR_CODES = new Set([
+  "bad_request",
+  "delivery_account_mismatch",
+  "delivery_conflict",
+  "delivery_too_large",
+  "delivery_unavailable",
+  "forbidden",
+  "forbidden_scope",
+  "internal_error",
+  "invalid_authorization",
+  "invalid_claims",
+  "invalid_delivery",
+  "invalid_token",
+  "missing_authorization",
+  "not_configured",
+  "not_found",
+  "payload_too_large",
+  "rate_limited",
+  "unsupported_evidence",
+  "unsupported_mapping",
+  "unsupported_protocol",
+  "unsupported_schema",
+]);
+
 function errorCode(body: unknown): string | undefined {
-  return object(body) &&
-    object(body.error) &&
-    typeof body.error.code === "string"
-    ? body.error.code
+  const code = object(body) && object(body.error) ? body.error.code : undefined;
+  return typeof code === "string" && KNOWN_ERROR_CODES.has(code)
+    ? code
     : undefined;
 }
 

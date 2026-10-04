@@ -334,7 +334,10 @@ export async function upload(options: UploadOptions): Promise<UploadSummary> {
   function logReceipt(receipt: DeliveryReceipt, batch: HistoryExportBatch) {
     log.info("batch accepted", {
       batchId: batch.batch_id,
-      receiptId: receipt.receiptId,
+      // Server-chosen text: logged only in the engine's own content-addressed form.
+      ...(/^rhr_[0-9a-f]{64}$/.test(receipt.receiptId)
+        ? { receiptId: receipt.receiptId }
+        : {}),
       records: receipt.acceptedRevisionIds.length,
     });
   }
