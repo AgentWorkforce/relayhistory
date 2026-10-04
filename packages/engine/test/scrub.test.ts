@@ -329,6 +329,13 @@ describe("hosted ingest scrubbing", () => {
         (n) => `"Authorization: Digest a=${"x\\r".repeat(n)}=`.slice(0, n),
       ],
       [
+        "loose quotes meeting another depth",
+        (n) =>
+          '"Authorization: Digest a="x\\"y\n'
+            .repeat(Math.ceil(n / 31))
+            .slice(0, n),
+      ],
+      [
         "stray parameter items",
         (n) =>
           `Authorization: AWS4 C=a/b, ${"x y=z/w, ".repeat(n)}`.slice(0, n),
@@ -840,6 +847,34 @@ describe("hosted ingest scrubbing", () => {
         expect(fromEncoded, encoded).not.toContain(S);
         expect(fromEncoded, encoded).toContain(encodedKept);
       }
+    });
+
+    it("decodes quoted Digest values in a header line of a serialized message", () => {
+      const R = "6629fae49393a05397450978507c4ef1";
+      for (const realm of ["Restricted Area", "a, b", "r"]) {
+        const message = {
+          req: `GET / HTTP/1.1\r\nAuthorization: Digest username="u", realm="${realm}", nonce="n1", response="${R}"\r\nHost: x`,
+        };
+        for (const serialized of [
+          JSON.stringify(message),
+          JSON.stringify(JSON.stringify(message)),
+        ]) {
+          const out = scrubText(serialized);
+          expect(out, serialized).not.toContain(R);
+          expect(out, serialized).toContain("Host: x");
+        }
+      }
+    });
+
+    it("redacts to the line end when a loose quoted value meets a quote of another depth", () => {
+      const out = scrubText(
+        'curl -H "Authorization: Digest username="al\\"ice", response="S3CRET"" url',
+      );
+      expect(out).not.toContain("S3CRET");
+      // The same depth still reads the quote as the header's close.
+      expect(scrubText('{"Authorization":"Digest a=","response":"S"}')).toBe(
+        '{"Authorization":"Digest [REDACTED]","response":"S"}',
+      );
     });
 
     it("scrubs a scrub-limit line of headers at rising escape depths in linear time", () => {

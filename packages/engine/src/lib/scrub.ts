@@ -278,7 +278,7 @@ function redactAuthorization(text: string): string {
     } else if (header[1] === '"' || header[1] === "'") {
       quote = headerQuote(header[1], before);
     }
-    if (header[1]!.startsWith("\\")) quote = { ...quote, lineBase: before + 1 };
+    if (header[1]!.startsWith("\\")) quote = serializedLine(quote, before + 1);
     AUTHORIZATION_SCHEME.lastIndex = start;
     const scheme = AUTHORIZATION_SCHEME.exec(text);
     const credential = scheme ? start + scheme[0].length : start;
@@ -294,6 +294,17 @@ function redactAuthorization(text: string): string {
     AUTHORIZATION_HEADER.lastIndex = end;
   }
   return output + text.slice(last);
+}
+
+/**
+ * A header line of a serialized message, after an escaped break written with
+ * `lineBase` backslashes. Unless the header carries its own quote, its text is the
+ * content of a `"`-quoted string at that level (level L writes a break with 2^(L-1)
+ * backslashes), so Digest's `\"` delimits a value and a shallower `"` ends the string.
+ */
+function serializedLine(quote: HeaderQuote, lineBase: number): HeaderQuote {
+  if (quote.char) return { ...quote, lineBase };
+  return { char: '"', depth: lineBase - 1, unit: 2 * lineBase, lineBase };
 }
 
 function headerQuote(char: string, depth: number): HeaderQuote {
@@ -503,9 +514,12 @@ function quotedValue(text: string, at: number, quote: HeaderQuote): number {
  * A value opened by a quote at the header's own level, as in
  * `-H "Authorization: Digest username="alice", …"` where the inner quotes were never
  * escaped. It is a value only when the next quote on the line is written the same way
- * and is followed by a separator, the end of the line or the header's close; otherwise
- * the quote closes the header (`{"Authorization":"Digest a=","next":…}`). Returns the
- * value's end, or null when the quote is the header's close.
+ * and is followed by a separator, the end of the line or the header's close; when it
+ * is written the same way but followed by anything else, the quote closes the header
+ * (`{"Authorization":"Digest a=","next":…}`). A next quote written at another depth
+ * (`username="al\"ice", response="…"`) leaves the value's extent unknown, so the value
+ * runs to the end of the line. Returns the value's end, or null when the quote is the
+ * header's close.
  */
 function looseQuotedValue(
   text: string,
@@ -525,7 +539,7 @@ function looseQuotedValue(
       continue;
     }
     if (char === quote.char) {
-      if (length !== run) return null;
+      if (length !== run) return lineEnd(text, index, quote);
       const after = index + length + 1;
       const follower = text[after];
       if (
@@ -540,6 +554,24 @@ function looseQuotedValue(
     index += Math.max(length, 1);
   }
   return null;
+}
+
+/** Where the line holding `at` ends: its next real or proven escaped line break. */
+function lineEnd(text: string, at: number, quote: HeaderQuote): number {
+  let index = at;
+  while (index < text.length) {
+    const length = backslashes(text, index);
+    const char = text[index + length];
+    if (char === "\n" || char === "\r") return index + length;
+    if (
+      length > 0 &&
+      (char === "n" || char === "r") &&
+      escapedBreak(text, index, length, quote)
+    )
+      return index;
+    index += Math.max(length, 1);
+  }
+  return text.length;
 }
 
 /** The end of a single credential: up to whitespace or a quote that is not content. */
