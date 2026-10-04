@@ -1,6 +1,7 @@
-// Installs the packed tarball into an empty project from the public registry and runs
-// it end to end against DATABASE_URL: migrate, bootstrap a token, upload one delivery
-// batch, read it back. Proves the published artifact works without this checkout.
+// Packs this checkout, installs the tarball into an empty project whose other
+// dependencies come from the public registry, and runs it end to end against
+// DATABASE_URL: migrate, bootstrap a token, upload one delivery batch, read it back.
+// Proves the packed artifact works without this checkout.
 //
 //   DATABASE_URL=postgres://... node scripts/pack-smoke.mjs
 import { execFileSync } from "node:child_process";
@@ -62,11 +63,20 @@ await admin.query("CREATE DATABASE ${database}");
 const target = new URL(process.env.DATABASE_URL);
 target.pathname = "/${database}";
 const pool = new pg.Pool({ connectionString: target.toString() });
+// A server-side error on an idle pooled client (e.g. the server restarting) is a smoke
+// failure: record it instead of letting the unhandled "error" event crash the process.
+const poolErrors = [];
+pool.on("error", (error) => poolErrors.push(error));
+let failure;
 try {
   const client = await pool.connect();
-  await client.query("CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public");
-  const migrated = await applyMigrations(client);
-  client.release();
+  let migrated;
+  try {
+    await client.query("CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public");
+    migrated = await applyMigrations(client);
+  } finally {
+    client.release();
+  }
   const db = drizzle(pool, { schema });
   const app = createHistoryEngine({ database: () => db });
   const issued = await bootstrapServiceToken(db, {
@@ -94,14 +104,38 @@ try {
   const sessions = await (await app.request("/v1/sessions", { headers })).json();
   if (!sessions.sessions?.some((s) => s.sessionId === "s1"))
     throw new Error("uploaded session not listed: " + JSON.stringify(sessions));
+  if (poolErrors.length) throw poolErrors[0];
   console.log(JSON.stringify({
     migrations: migrated.applied.length, receipt: receipt.receiptId,
     sessions: sessions.sessions.length,
   }));
+} catch (error) {
+  failure = error;
 } finally {
-  await pool.end();
-  await admin.query("DROP DATABASE IF EXISTS ${database} WITH (FORCE)");
-  await admin.end();
+  // pool.end() resolves once the pool has asked its clients to close, before their
+  // backends have gone. Dropping the database then would terminate live backends
+  // (57P01). Wait until the server shows none, then drop without forcing.
+  const cleanup = [];
+  await pool.end().catch((error) => cleanup.push(error));
+  try {
+    for (let attempt = 0; ; attempt++) {
+      const { rows } = await admin.query(
+        "SELECT count(*)::int AS n FROM pg_stat_activity WHERE datname = $1",
+        ["${database}"],
+      );
+      if (rows[0].n === 0) break;
+      if (attempt >= 100) throw new Error("smoke database still has connections");
+      await new Promise((done) => setTimeout(done, 100));
+    }
+    await admin.query("DROP DATABASE IF EXISTS ${database}");
+  } catch (error) {
+    cleanup.push(error);
+  }
+  await admin.end().catch((error) => cleanup.push(error));
+  // The run's own failure is the result; cleanup failures are reported beside it.
+  for (const error of cleanup) console.error("cleanup failed:", error.message);
+  if (failure) throw failure;
+  if (cleanup.length) throw cleanup[0];
 }
 `,
   );

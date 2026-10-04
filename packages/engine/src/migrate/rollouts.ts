@@ -8,6 +8,11 @@
  * Each batch is its own short transaction, so uploads continue throughout, and the
  * cursors are durable: a rerun resumes where the last run stopped. `query(sql)` runs
  * one statement on a dedicated connection and resolves to its rows.
+ *
+ * Each rollout holds a session-level advisory lock on that connection for its whole
+ * run, so replicas that migrate together take turns: the migration's own lock ends at
+ * its commit, and two runners building the same index concurrently deadlock. The one
+ * that waits then finds every stage complete.
  */
 export type RolloutQuery = (sql: string) => Promise<Record<string, unknown>[]>;
 
@@ -57,6 +62,51 @@ const RETRY_DELAY_MS = 1000;
 
 const IDENTIFIER = /^[a-z_][a-z0-9_]*$/;
 
+// Session-level advisory lock keys, beside the migration's (1919249529, 1).
+const DELIVERY_PROJECTION_LOCK = "1919249529, 3";
+const SESSION_ROLLUPS_LOCK = "1919249529, 4";
+const LOCK_POLL_MS = 1000;
+
+const sleep = (ms: number) => new Promise<void>((done) => setTimeout(done, ms));
+
+function requirePositiveBatch(batch: number): void {
+  // The step functions return 0 for LIMIT 0 without completing, so the loop would
+  // never end.
+  if (!Number.isInteger(batch) || batch < 1)
+    throw new RangeError("rollout batch must be a positive integer");
+}
+
+/**
+ * Runs `run` holding the advisory lock `key` on the rollout's connection, or returns
+ * `undefined` when `deadline` passes before the lock is free. Waiting polls
+ * `pg_try_advisory_lock` instead of blocking in `pg_advisory_lock`: a blocked
+ * statement keeps its snapshot, and CREATE INDEX CONCURRENTLY in the holder waits for
+ * every older snapshot, so a blocked waiter would deadlock the build it waits on.
+ */
+async function withRolloutLock<T>(
+  query: RolloutQuery,
+  key: string,
+  deadline: number,
+  run: () => Promise<T>,
+): Promise<T | undefined> {
+  for (;;) {
+    const [row] = await query(`SELECT pg_try_advisory_lock(${key}) AS locked`);
+    if (row?.locked === true) break;
+    if (Date.now() >= deadline) return undefined;
+    await sleep(LOCK_POLL_MS);
+  }
+  let result: T;
+  try {
+    result = await run();
+  } catch (error) {
+    // Preserve the rollout failure; a broken connection releases the lock anyway.
+    await query(`SELECT pg_advisory_unlock(${key})`).catch(() => {});
+    throw error;
+  }
+  await query(`SELECT pg_advisory_unlock(${key})`);
+  return result;
+}
+
 /**
  * Runs every pending stage through `query(sql) -> rows`. In production each call
  * is one autocommit statement on a dedicated connection; tests pass PGlite.
@@ -72,6 +122,30 @@ export async function rolloutDeliveryProjection(
     report = () => {},
   }: DeliveryProjectionRolloutOptions = {},
 ): Promise<{ complete: true } | { complete: false; stage: string }> {
+  requirePositiveBatch(batch);
+  const outcome = await withRolloutLock(
+    query,
+    DELIVERY_PROJECTION_LOCK,
+    deadline,
+    () => runDeliveryProjection(query, concurrently, batch, deadline, report),
+  );
+  if (outcome) return outcome;
+  const stage = STAGES[0]!.stage;
+  report(`Rollout ${stage}: another runner holds the rollout; rerun to resume`);
+  return { complete: false, stage };
+}
+
+async function runDeliveryProjection(
+  query: RolloutQuery,
+  concurrently: boolean,
+  batch: number,
+  deadline: number,
+  report: (line: string) => void,
+): Promise<{ complete: true } | { complete: false; stage: string }> {
+  const paused = (stage: string, done: string) => {
+    report(`Rollout ${stage}: paused after ${done}; rerun to resume`);
+    return { complete: false as const, stage };
+  };
   for (const { stage, activate, step, unit } of STAGES) {
     const [stageState] = await query(
       `SELECT sessions.delivery_rollout_stage_requires_indexes('${stage}') AS requires_indexes`,
@@ -99,6 +173,7 @@ export async function rolloutDeliveryProjection(
           WHERE n.nspname = 'sessions' AND c.relname = '${name}'`,
       );
       if (state?.valid) continue;
+      if (Date.now() >= deadline) return paused(stage, `0 ${unit}`);
       // An interrupted concurrent build leaves an invalid index: rebuild it.
       if (state)
         await query(
@@ -110,18 +185,14 @@ export async function rolloutDeliveryProjection(
       );
       report(`Rollout ${stage}: index ${name} ready`);
     }
+    if (Date.now() >= deadline) return paused(stage, `0 ${unit}`);
     const [activated] = await query(
       `SELECT sessions.${activate}() AS activated`,
     );
     if (activated?.activated) report(`Rollout ${stage}: projection live`);
     let total = 0;
     for (;;) {
-      if (Date.now() >= deadline) {
-        report(
-          `Rollout ${stage}: paused after ${total} ${unit}; rerun to resume`,
-        );
-        return { complete: false, stage };
-      }
+      if (Date.now() >= deadline) return paused(stage, `${total} ${unit}`);
       let processed: number;
       for (let attempt = 1; ; attempt += 1) {
         await query("BEGIN");
@@ -158,8 +229,6 @@ export async function rolloutDeliveryProjection(
   return { complete: true };
 }
 
-// A batch that meets an upload's session lock yields rather than waits.
-
 /**
  * Drives session_rollup_backfill_step() to completion through `query(sql) -> rows`.
  * In production each call is one statement on a dedicated connection; tests pass
@@ -172,6 +241,24 @@ export async function rolloutSessionRollups(
     deadline = Number.POSITIVE_INFINITY,
     report = () => {},
   }: SessionRollupsRolloutOptions = {},
+): Promise<{ complete: boolean; sessions: number }> {
+  requirePositiveBatch(batch);
+  const outcome = await withRolloutLock(
+    query,
+    SESSION_ROLLUPS_LOCK,
+    deadline,
+    () => runSessionRollups(query, batch, deadline, report),
+  );
+  if (outcome) return outcome;
+  report("Session rollups: another runner holds the backfill; rerun to resume");
+  return { complete: false, sessions: 0 };
+}
+
+async function runSessionRollups(
+  query: RolloutQuery,
+  batch: number,
+  deadline: number,
+  report: (line: string) => void,
 ): Promise<{ complete: boolean; sessions: number }> {
   let total = 0;
   for (;;) {

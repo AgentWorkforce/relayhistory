@@ -86,11 +86,10 @@ async function postgresDatabase(): Promise<TestDatabase> {
     max: 4,
     options: "-c search_path=sessions,public",
   });
-  // `pool.end()` resolves before its sockets close, so the forced DROP DATABASE in
-  // `close` can terminate a backend still shutting down (57P01). That is the intended
-  // end of the connection, not a test failure.
-  pool.on("error", () => {});
-  pool.on("connect", (client) => client.on("error", () => {}));
+  // An error on an idle pooled client is a test failure; it surfaces from `close`
+  // instead of crashing the worker as an unhandled "error" event.
+  const poolErrors: Error[] = [];
+  pool.on("error", (error) => poolErrors.push(error));
   return {
     kind: "postgres",
     db: drizzlePg(pool, { schema }),
@@ -100,8 +99,28 @@ async function postgresDatabase(): Promise<TestDatabase> {
     },
     close: async () => {
       await pool.end();
-      await admin.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
+      await dropDatabase(admin, name);
       await admin.end();
+      if (poolErrors.length) throw poolErrors[0];
     },
   };
+}
+
+/**
+ * Drop a test database once its backends have exited. `pool.end()` and `client.end()`
+ * resolve when the client side closes, slightly before the server-side backend is gone;
+ * a forced drop at that moment terminates backends a pool may still report (57P01).
+ */
+export async function dropDatabase(admin: pg.Client, name: string) {
+  for (let attempt = 0; ; attempt++) {
+    const { rows } = await admin.query<{ n: number }>(
+      "SELECT count(*)::int AS n FROM pg_stat_activity WHERE datname = $1",
+      [name],
+    );
+    if (rows[0]!.n === 0) break;
+    if (attempt >= 100)
+      throw new Error(`test database ${name} still has connections`);
+    await new Promise((done) => setTimeout(done, 100));
+  }
+  await admin.query(`DROP DATABASE IF EXISTS ${name}`);
 }

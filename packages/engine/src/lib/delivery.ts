@@ -830,7 +830,10 @@ export async function listDelivery(
       ].includes(key)
     )
       invalid("Unknown delivery filter");
-  if (query.kind && !DELIVERY_KINDS.includes(query.kind as DeliveryKind))
+  if (
+    query.kind !== undefined &&
+    !DELIVERY_KINDS.includes(query.kind as DeliveryKind)
+  )
     invalid("Unknown evidence kind");
   for (const key of ["source", "session_id"])
     if (query[key] !== undefined && !identifier(query[key]))

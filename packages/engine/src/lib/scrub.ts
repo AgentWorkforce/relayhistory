@@ -2,15 +2,34 @@ const REDACTED = "[REDACTED]";
 
 type Replacement = string | ((substring: string) => string);
 
+/** The sensitive names `<name>=<value>` assignments and structured fields are keyed by. */
+const SENSITIVE_NAME =
+  "(?:[A-Za-z0-9]+_){0,8}(?:api[_-]?key|apikey|key|secret|token|password|passwd|pwd)";
+
 const SECRET_PATTERNS: Array<[RegExp, Replacement]> = [
+  // A private key block, or what is left of one: a block that never reaches its END
+  // (cut by truncation, or pasted partially) is redacted up to the next BEGIN, the
+  // truncation note, or the end. A block never extends past another BEGIN, so each
+  // character is scanned by one block at most and the pass stays linear on input made
+  // of repeated, unterminated headers.
   [
-    /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
+    /-----BEGIN [A-Z ]*PRIVATE KEY-----(?:(?!-----BEGIN )[\s\S])*?(?:-----END [A-Z ]*PRIVATE KEY-----|(?=-----BEGIN |\n\[relayhistory: truncated )|$)/g,
     REDACTED,
   ],
-  [/(^|[\s"'(=:/])\/Users\/[^/\s]+(?=\/)/g, "$1~"],
-  [/(^|[\s"'(=:/])\/home\/[^/\s]+(?=\/)/g, "$1~"],
-  [/(^|[\s"'(=])([A-Z]:\\Users\\[^\\\s]+)(?=\\)/gi, "$1~"],
-  [/\bBearer\s+[A-Za-z0-9._~+/=-]{16,}\b/gi, `Bearer ${REDACTED}`],
+  // A home directory ends at the next separator, or, when the path is the directory
+  // itself, at whitespace, a quote or the end of the text.
+  [/(^|[\s"'(=:/])\/Users\/(?:[^/\s]+(?=\/)|[^/\s"'`]+(?=[\s"'`]|$))/g, "$1~"],
+  [/(^|[\s"'(=:/])\/home\/(?:[^/\s]+(?=\/)|[^/\s"'`]+(?=[\s"'`]|$))/g, "$1~"],
+  [
+    /(^|[\s"'(=])(?:[A-Z]:\\Users\\(?:[^\\\s]+(?=\\)|[^\\\s"'`]+(?=[\s"'`]|$)))/gi,
+    "$1~",
+  ],
+  // The token alphabet ends a value, not `\b`: a value ending in `=` padding has no
+  // word boundary after it.
+  [
+    /\bBearer\s+[A-Za-z0-9._~+/=-]{16,}(?![A-Za-z0-9._~+/=-])/gi,
+    `Bearer ${REDACTED}`,
+  ],
   // Provider key prefixes. The hyphen form covers OpenAI-style `sk-…`; the underscore form
   // covers Stripe-style `sk_live_…`/`sk_test_…` (and rk_/pk_) which the hyphen pattern misses.
   [/\b(?:sk|rk|pk|ak)-[A-Za-z0-9_-]{20,}\b/g, REDACTED],
@@ -39,7 +58,12 @@ const SECRET_PATTERNS: Array<[RegExp, Replacement]> = [
     // literal is the same quadratic shape fixed in the URL and email patterns. Eight
     // underscore-separated segments is far past any real identifier
     // (`AWS_SECRET_ACCESS_KEY` is three).
-    /\b(?:[A-Za-z0-9]+_){0,8}(?:api[_-]?key|apikey|key|secret|token|password|passwd|pwd)\s*[:=]\s*["'`]?[^"'`\s,;]+/gi,
+    // A quoted value runs to its closing quote (or the end of the line), spaces and
+    // all; an unquoted one to the first space or delimiter.
+    new RegExp(
+      `\\b${SENSITIVE_NAME}\\s*[:=]\\s*(?:"[^"\\n]+"?|'[^'\\n]+'?|\`[^\`\\n]+\`?|[^"'\`\\s,;]+)`,
+      "gi",
+    ),
     (match) => {
       // Pick the separator POSITIONALLY (first `:` or `=`) — that is the real name/value
       // delimiter, since the identifier name contains neither. Choosing by `includes("=")`
@@ -165,6 +189,9 @@ export function scrubText(value: string): string {
   );
 }
 
+/** A field name the assignment rule would redact the value of in text. */
+const SENSITIVE_KEY = new RegExp(`(?:^|\\b)${SENSITIVE_NAME}$`, "i");
+
 export function scrubJson<T>(value: T): T {
   if (typeof value === "string") {
     return scrubText(value) as T;
@@ -175,9 +202,29 @@ export function scrubJson<T>(value: T): T {
   if (value && typeof value === "object") {
     const output: Record<string, unknown> = {};
     for (const [key, item] of Object.entries(value)) {
-      output[key] = scrubJson(item);
+      output[key] = SENSITIVE_KEY.test(key)
+        ? redactValues(item)
+        : scrubJson(item);
     }
     return output as T;
+  }
+  return value;
+}
+
+/**
+ * A structured field never carries its name beside its value the way text does, so a
+ * value under a sensitive name is redacted whole: every non-empty string and every
+ * number in it. Its shape is kept.
+ */
+function redactValues(value: unknown): unknown {
+  if ((typeof value === "string" && value !== "") || typeof value === "number")
+    return REDACTED;
+  if (Array.isArray(value)) return value.map(redactValues);
+  if (value && typeof value === "object") {
+    const output: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value))
+      output[key] = redactValues(item);
+    return output;
   }
   return value;
 }

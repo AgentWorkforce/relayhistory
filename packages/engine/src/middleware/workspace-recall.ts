@@ -23,6 +23,8 @@ function forbidden(c: Context<any>, message: string) {
   );
 }
 
+const UNSUPPORTED_SELECTORS = ["workspace_id", "workspaceId"] as const;
+
 type WorkspaceRecallScope =
   | { workspaceId: undefined; error?: undefined }
   | { workspaceId: string; error?: undefined }
@@ -39,6 +41,14 @@ type WorkspaceRecallScope =
 export function readWorkspaceRecallScope(
   c: Context<any>,
 ): WorkspaceRecallScope {
+  // Other spellings would otherwise be ignored, silently widening the read to the org.
+  for (const selector of UNSUPPORTED_SELECTORS) {
+    if (c.req.queries(selector)) {
+      return {
+        error: badRequest(c, `unsupported selector ${selector}; use workspace`),
+      };
+    }
+  }
   const requested = c.req.queries("workspace") ?? [];
   if (requested.length === 0) return { workspaceId: undefined };
   if (requested.length !== 1 || !requested[0]?.trim()) {
@@ -49,8 +59,10 @@ export function readWorkspaceRecallScope(
       ),
     };
   }
-  const authenticated = getAuth(c).workspaceId?.trim();
-  if (!authenticated || requested[0] !== authenticated) {
+  // Exact comparison with the token's own value: trimming would let a padded
+  // workspace id answer for a different one.
+  const authenticated = getAuth(c).workspaceId;
+  if (!authenticated?.trim() || requested[0] !== authenticated) {
     return {
       error: forbidden(c, "workspace does not match the authenticated session"),
     };

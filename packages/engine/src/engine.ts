@@ -1,8 +1,9 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import { HTTPException } from "hono/http-exception";
 import { secureHeaders } from "hono/secure-headers";
 import type { HistoryEngineDeps, HistoryEnv } from "./env.js";
-import { createRequireAuth } from "./middleware/auth.js";
+import { createRequireAuth, reportError } from "./middleware/auth.js";
 import { createDeliveryRoutes } from "./routes/delivery.js";
 import { createHealthRoutes } from "./routes/health.js";
 import { createIngestRoutes } from "./routes/ingest.js";
@@ -83,6 +84,7 @@ export function createHistoryEngine<E extends HistoryEnv = HistoryEnv>(
     ),
   );
   app.onError((err, c) => {
+    if (err instanceof HTTPException) return err.getResponse();
     if (err.name === "BadRequestError") {
       return jsonError(
         c.get("correlationId"),
@@ -92,7 +94,7 @@ export function createHistoryEngine<E extends HistoryEnv = HistoryEnv>(
         err.message,
       );
     }
-    console.error(err);
+    reportError(deps, err, c);
     return jsonError(
       c.get("correlationId"),
       c,

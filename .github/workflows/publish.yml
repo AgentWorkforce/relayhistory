@@ -995,7 +995,7 @@ jobs:
       - uses: actions/setup-node@v6
         if: ${{ steps.engine.outputs.present == 'true' }}
         with:
-          node-version: '22.14.0'
+          node-version: '22.16.0'
           registry-url: 'https://registry.npmjs.org'
       - name: Match release npm version
         if: ${{ steps.engine.outputs.present == 'true' }}

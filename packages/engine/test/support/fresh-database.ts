@@ -12,7 +12,7 @@ import pg from "pg";
 import type { HistoryDb } from "../../src/db/database.js";
 import * as schema from "../../src/db/schema.js";
 import type { MigrationClient } from "../../src/migrate/index.js";
-import { testDatabaseKind } from "./database.js";
+import { dropDatabase, testDatabaseKind } from "./database.js";
 
 export interface FreshDatabase {
   kind: "pglite" | "postgres";
@@ -118,7 +118,7 @@ async function postgresDatabase(): Promise<FreshDatabase> {
     },
     close: async () => {
       await client.end();
-      await admin.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
+      await dropDatabase(admin, name);
       for (const role of roles)
         await admin.query(`DROP ROLE IF EXISTS ${role}`);
       await admin.end();

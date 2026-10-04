@@ -27,6 +27,25 @@ export class AuthError extends Error {
   }
 }
 
+/** The parts of an error safe to log: its name and driver code, never its message. */
+export function errorSummary(error: unknown): { name: string; code: unknown } {
+  const failure = error as { name?: unknown; code?: unknown } | null;
+  return {
+    name: typeof failure?.name === "string" ? failure.name : typeof error,
+    code: failure?.code,
+  };
+}
+
+/** Hands `error` to the host's `reportError`, or logs its summary. */
+export function reportError<E extends HistoryEnv>(
+  deps: Pick<HistoryEngineDeps<E>, "reportError">,
+  error: unknown,
+  c: Context<any>,
+): void {
+  if (deps.reportError) deps.reportError(error, hostContext<E>(c));
+  else console.error("[relayhistory] request failed", errorSummary(error));
+}
+
 export function getAuth(c: Context<any>): AuthContext {
   const auth = c.get("auth");
   if (!auth) {
@@ -63,7 +82,7 @@ export function requireScope(scope: string): MiddlewareHandler<any> {
  * `verifyBearer` when there is one.
  */
 export function createRequireAuth<E extends HistoryEnv>(
-  deps: Pick<HistoryEngineDeps<E>, "database" | "verifyBearer">,
+  deps: Pick<HistoryEngineDeps<E>, "database" | "verifyBearer" | "reportError">,
 ): MiddlewareHandler<HistoryEnv> {
   return createMiddleware<HistoryEnv>(async (c, next) => {
     const token = bearerToken(c.req.header("Authorization"));
@@ -91,7 +110,9 @@ export function createRequireAuth<E extends HistoryEnv>(
         );
       }
 
-      const session = await resolveAccessToken(db, token);
+      const session = await resolveAccessToken(db, token, {
+        onUsageError: (error) => reportError(deps, errorSummary(error), c),
+      });
       if (session) {
         c.set("auth", {
           userId: session.userId,
@@ -115,7 +136,8 @@ export function createRequireAuth<E extends HistoryEnv>(
         if (error instanceof AuthError) {
           return authError(c, 401, error.code, error.message);
         }
-        console.error(error);
+        // The verifier's error may quote the bearer: report its name and code only.
+        reportError(deps, errorSummary(error), c);
         return authError(c, 401, "invalid_token", "invalid bearer token");
       }
       if (auth) {

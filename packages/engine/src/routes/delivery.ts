@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import {
   hostContext,
+  type DeliveryBatchObservation,
   type HistoryContext,
   type HistoryEngineDeps,
   type HistoryEnv,
@@ -13,55 +14,35 @@ import {
   requireDeliveryAccount,
 } from "../lib/delivery.js";
 import {
+  readBoundedJson,
+  type BoundedJsonFailure,
+} from "../lib/bounded-json.js";
+import {
   DELIVERY_LIMITS,
   DeliveryError,
   MAX_DELIVERY_BYTES,
   type HistoryExportBatch,
 } from "../lib/delivery-contracts.js";
-/** `read.bytes` counts what was received so far, including when parsing fails. */
-async function boundedJson(
-  request: Request,
-  read: { bytes: number },
-): Promise<unknown> {
-  const reader = request.body?.getReader();
-  if (!reader)
-    throw new DeliveryError(
+const DELIVERY_BODY_ERRORS: Record<BoundedJsonFailure, () => DeliveryError> = {
+  missing: () =>
+    new DeliveryError(
       "invalid_delivery",
       400,
       "Delivery request body is required",
-    );
-  const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });
-  let size = 0;
-  let text = "";
-  try {
-    while (true) {
-      const chunk = await reader.read();
-      if (chunk.done) break;
-      size += chunk.value.byteLength;
-      read.bytes = size;
-      if (size > MAX_DELIVERY_BYTES) {
-        await reader.cancel();
-        throw new DeliveryError(
-          "delivery_too_large",
-          413,
-          `Delivery request exceeds ${MAX_DELIVERY_BYTES} bytes`,
-        );
-      }
-      text += decoder.decode(chunk.value, { stream: true });
-    }
-    text += decoder.decode();
-    return JSON.parse(text);
-  } catch (error) {
-    if (error instanceof DeliveryError) throw error;
-    throw new DeliveryError(
+    ),
+  malformed: () =>
+    new DeliveryError(
       "invalid_delivery",
       400,
       "Delivery request must be valid UTF-8 JSON",
-    );
-  } finally {
-    reader.releaseLock();
-  }
-}
+    ),
+  too_large: () =>
+    new DeliveryError(
+      "delivery_too_large",
+      413,
+      `Delivery request exceeds ${MAX_DELIVERY_BYTES} bytes`,
+    ),
+};
 function failure(c: HistoryContext, error: unknown) {
   const safe =
     error instanceof DeliveryError
@@ -150,13 +131,29 @@ export function createDeliveryRoutes<E extends HistoryEnv>(
 ): Hono<HistoryEnv> {
   const database = (c: HistoryContext) => deps.database(hostContext<E>(c));
   const deliveryRoutes = new Hono<HistoryEnv>();
+  // Host telemetry never changes a delivery result: a failing observer is dropped.
+  const observer = (c: HistoryContext) => {
+    let observe: ((observation: DeliveryBatchObservation) => void) | undefined;
+    try {
+      observe = deps.observeDeliveryBatch?.(hostContext<E>(c));
+    } catch {
+      console.warn("[delivery] batch observer unavailable");
+    }
+    return (observation: DeliveryBatchObservation) => {
+      try {
+        observe?.(observation);
+      } catch {
+        console.warn("[delivery] batch observer failed");
+      }
+    };
+  };
 
   deliveryRoutes.post(
     "/delivery/batches",
     requireScope("rth:sync"),
     async (c) => {
       const started = Date.now();
-      const observe = deps.observeDeliveryBatch?.(hostContext<E>(c));
+      const observe = observer(c);
       let batch: HistoryExportBatch | undefined;
       const read = { bytes: 0 };
       let outcome = "accepted";
@@ -169,7 +166,13 @@ export function createDeliveryRoutes<E extends HistoryEnv>(
             503,
             "DATABASE_URL is required",
           );
-        batch = parseDeliveryRequest(await boundedJson(c.req.raw, read));
+        batch = parseDeliveryRequest(
+          await readBoundedJson(c.req.raw, {
+            maxBytes: MAX_DELIVERY_BYTES,
+            error: (failure) => DELIVERY_BODY_ERRORS[failure](),
+            read,
+          }),
+        );
         return c.json(await acceptDelivery(db, getAuth(c), batch));
       } catch (error) {
         outcome =
@@ -178,7 +181,7 @@ export function createDeliveryRoutes<E extends HistoryEnv>(
         logConflict(c, batch, error);
         return failure(c, error);
       } finally {
-        observe?.({
+        observe({
           auth: getAuth(c),
           batch,
           bytes: read.bytes,
@@ -208,11 +211,8 @@ export function createDeliveryRoutes<E extends HistoryEnv>(
             503,
             "DATABASE_URL is required",
           );
-        if (
-          [...new URL(c.req.url).searchParams.keys()].some(
-            (key) => new URL(c.req.url).searchParams.getAll(key).length > 1,
-          )
-        )
+        const keys = [...new URL(c.req.url).searchParams.keys()];
+        if (new Set(keys).size !== keys.length)
           throw new DeliveryError(
             "invalid_delivery",
             400,
