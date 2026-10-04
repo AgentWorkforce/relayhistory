@@ -94,7 +94,9 @@ function fakeClient(
           })),
         };
       if (statement.includes("pg_try_advisory_lock("))
-        return { rows: [{ locked: true }] };
+        return { rows: [{ locked: true, pid: 1 }] };
+      if (statement.includes("pg_advisory_unlock("))
+        return { rows: [{ released: true, pid: 1 }] };
       if (statement.includes("session_rollup_backfill_step(")) {
         const processed = rolledUp;
         rolledUp = 0;
@@ -366,7 +368,7 @@ describe("rollouts after the migration transaction", () => {
     // The backfill filled the table, so it is analyzed for the planner, and each
     // rollout releases its lock as it ends.
     expect(after.at(-2)).toBe("ANALYZE sessions.session_rollups");
-    expect(after.at(-1)).toBe("SELECT pg_advisory_unlock(1919249529, 4)");
+    expect(after.at(-1)).toContain("pg_advisory_unlock(1919249529, 4)");
     expect(progress).toContain(
       "Session rollups: complete (3 sessions this run)",
     );

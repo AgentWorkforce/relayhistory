@@ -3,6 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { HistoryDb } from "../src/db/database.js";
 import type { AuthContext, HistoryEnv } from "../src/env.js";
 import { MAX_JSON_BODY_BYTES } from "../src/lib/bounded-json.js";
+import { MAX_SCRUB_CHARS } from "../src/lib/scrub.js";
 import { deliveryAccount, listDelivery } from "../src/lib/delivery.js";
 import { createDeliveryRoutes } from "../src/routes/delivery.js";
 import { createIngestRoutes } from "../src/routes/ingest.js";
@@ -274,5 +275,59 @@ describe("turn index range", () => {
       };
       expect(events[0]?.content).toContain("[truncated by maxContent]");
     });
+  });
+});
+
+describe("/v1/ingest at the largest local transcript record", () => {
+  let database: TestDatabase;
+  beforeAll(async () => {
+    database = await createTestDatabase();
+  });
+  afterAll(async () => {
+    await database?.close();
+  });
+
+  it("accepts a 16 MiB escape-heavy record and scrubs it as before", async () => {
+    // The local reader's MAX_RECORD_BYTES. Quotes, backslashes and newlines each
+    // serialize to two bytes, so the request is far larger than the record.
+    const content = 'a"\\\n'.repeat((16 * MiB) / 4);
+    expect(new TextEncoder().encode(content).length).toBe(16 * MiB);
+    const body = JSON.stringify({
+      machine: { id: "machine-a" },
+      batchId: "batch-max-record",
+      records: [
+        {
+          v: 1,
+          kind: "decision",
+          source: "trajectories",
+          lens: "trajectories",
+          sessionId: "traj_max",
+          eventId: "decision:traj_max:0",
+          ts: "2026-10-04T00:00:00.000Z",
+          type: "decision",
+          content,
+        },
+      ],
+    });
+    expect(new TextEncoder().encode(body).length).toBeGreaterThan(
+      16 * MiB + 8 * MiB,
+    );
+    const response = await app(
+      createIngestRoutes({ database: () => database.db }),
+    ).request("/ingest", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ received: 1, accepted: 1 });
+    const [stored] = (
+      await database.query<{ length: number; tail: string }>(
+        `SELECT length(content) AS length, right(content, 200) AS tail
+           FROM sessions.convergence_events WHERE session_id = 'traj_max'`,
+      )
+    ).rows;
+    expect(stored.length).toBeLessThan(MAX_SCRUB_CHARS + 200);
+    expect(stored.tail).toContain("[relayhistory: truncated");
   });
 });
