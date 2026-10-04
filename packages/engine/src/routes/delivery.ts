@@ -6,6 +6,7 @@ import {
   type HistoryEngineDeps,
   type HistoryEnv,
 } from "../env.js";
+import { containRejection } from "../lib/host-hooks.js";
 import { getAuth, requireScope } from "../middleware/auth.js";
 import {
   acceptDelivery,
@@ -133,17 +134,24 @@ export function createDeliveryRoutes<E extends HistoryEnv>(
   const deliveryRoutes = new Hono<HistoryEnv>();
   // Host telemetry never changes a delivery result: a failing observer is dropped.
   const observer = (c: HistoryContext) => {
+    const unavailable = () =>
+      console.warn("[delivery] batch observer unavailable");
+    const failed = () => console.warn("[delivery] batch observer failed");
     let observe: ((observation: DeliveryBatchObservation) => void) | undefined;
     try {
-      observe = deps.observeDeliveryBatch?.(hostContext<E>(c));
+      const made: unknown = deps.observeDeliveryBatch?.(hostContext<E>(c));
+      if (typeof made === "function")
+        observe = made as (observation: DeliveryBatchObservation) => void;
+      // An async factory is not a supported shape; contain its rejection and skip it.
+      else containRejection(made, unavailable);
     } catch {
-      console.warn("[delivery] batch observer unavailable");
+      unavailable();
     }
     return (observation: DeliveryBatchObservation) => {
       try {
-        observe?.(observation);
+        containRejection(observe?.(observation), failed);
       } catch {
-        console.warn("[delivery] batch observer failed");
+        failed();
       }
     };
   };

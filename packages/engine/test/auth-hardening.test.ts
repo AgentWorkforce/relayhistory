@@ -356,6 +356,37 @@ describe("error reporting", () => {
     ]);
   });
 
+  it("answers the JSON 500 and leaves no unhandled rejection when an async reporter rejects", async () => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const failing = new Hono<HistoryEnv>();
+      failing.get("/explode", () => {
+        throw Object.assign(new Error(`row ${SECRET}`), { code: "XX000" });
+      });
+
+      const res = await engine({
+        reportError: async () => {
+          throw new Error(`sink rejected ${SECRET}`);
+        },
+        publicRoutes: [failing],
+      }).request("/v1/explode");
+
+      expect(res.status).toBe(500);
+      await new Promise((done) => setTimeout(done, 20));
+      expect(unhandled).toEqual([]);
+      expect(JSON.stringify(log.mock.calls)).not.toContain(SECRET);
+      expect(log.mock.calls).toContainEqual([
+        "[relayhistory] request failed",
+        { name: "Error", code: "XX000" },
+      ]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+
   it("answers a thrown HTTPException with its own response", async () => {
     const reportError = vi.fn();
     const failing = new Hono<HistoryEnv>();
@@ -420,6 +451,32 @@ describe("token usage telemetry", () => {
       "[relayhistory] request failed",
       { name: "Error", code: "25006" },
     ]);
+  });
+
+  it("authenticates the request when an async host reporter rejects", async () => {
+    const issued = await serviceToken(["rth:read"]);
+    failUsageWrites();
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const res = await engine({
+        reportError: async () => {
+          throw new Error("telemetry sink down");
+        },
+      }).request("/v1/sessions", { headers: bearer(issued.token) });
+
+      expect(res.status).toBe(200);
+      await new Promise((done) => setTimeout(done, 20));
+      expect(unhandled).toEqual([]);
+      expect(log.mock.calls).toContainEqual([
+        "[relayhistory] request failed",
+        { name: "Error", code: "25006" },
+      ]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
   });
 
   it("authenticates the request and reports the write failure sanitized", async () => {
