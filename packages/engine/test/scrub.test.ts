@@ -437,6 +437,20 @@ describe("hosted ingest scrubbing", () => {
             .slice(0, n),
       ],
       [
+        "unmatched keyed multi-line substitutions",
+        (n) =>
+          '{"Authorization":"Basic $(echo a\n'
+            .repeat(Math.ceil(n / 33))
+            .slice(0, n),
+      ],
+      [
+        "alternating malformed and well-formed substitutions",
+        (n) =>
+          `{"Authorization":"Basic $(echo","x":1} {"Authorization": "Basic $(printf "%s" a:b | base64)"} `
+            .repeat(Math.ceil(n / 100))
+            .slice(0, n),
+      ],
+      [
         "stray parameter items",
         (n) =>
           `Authorization: AWS4 C=a/b, ${"x y=z/w, ".repeat(n)}`.slice(0, n),
@@ -1824,6 +1838,17 @@ describe("hosted ingest scrubbing", () => {
       expect(scrubText('{"Authorization":"Basic $(echo","next":"keep"}')).toBe(
         '{"Authorization":"Basic [REDACTED]","next":"keep"}',
       );
+      // Pinned (GH4178298170): a later `)` closes the substitution, so the sibling
+      // goes with it. Stopping at a keyed close followed by JSON structure instead
+      // would leak the password in the confidentiality control below.
+      expect(scrubText('{"Authorization":"Basic $(echo","next":"keep)"}')).toBe(
+        '{"Authorization":"Basic [REDACTED]"}',
+      );
+      expect(
+        scrubText(
+          `{"Authorization": "Bearer $(curl -s https://auth/login -d "{"user":"admin","pass":"${S}"}" | jq -r .token)", "next": "keep"}`,
+        ),
+      ).toBe('{"Authorization": "Bearer [REDACTED]", "next": "keep"}');
       // Pinned (GH4178215596): an unclosed substitution's continuation lines are
       // taken with it; a header-looking line inside one cannot end it, or this
       // heredoc's password would leak.
@@ -1897,6 +1922,66 @@ describe("hosted ingest scrubbing", () => {
         expect(out, input).not.toContain(S);
         expect(out, input).toContain(tail);
       }
+    });
+
+    it("scans a keyed substitution across lines and re-scans inside a failed region", () => {
+      const S = "R9secretZ";
+      // A: a keyed substitution spans lines like an unkeyed one.
+      for (const input of [
+        `{"Authorization": "Basic $(cat <<X | base64\nuser: admin\npass: ${S}\nX\n)", "next": "keep"}`,
+        `{"Authorization": "Basic $(printf '%s:%s' \\\n  admin \\\n  ${S} | base64)", "next": "keep"}`,
+        `{"Authorization": "Basic $(printf "%s" \\\n  admin:${S} | base64)", "next": "keep"}`,
+      ])
+        expect(scrubText(input), input).toBe(
+          '{"Authorization": "Basic [REDACTED]", "next": "keep"}',
+        );
+      // Controls.
+      expect(scrubText('{"Authorization":"Basic $(echo","next":"keep"}')).toBe(
+        '{"Authorization":"Basic [REDACTED]","next":"keep"}',
+      );
+      expect(
+        scrubText(
+          `{"Authorization": "Basic $(printf "%s" admin:${S} | base64)"}`,
+        ),
+      ).toBe('{"Authorization": "Basic [REDACTED]"}');
+      expect(
+        scrubText(
+          `{"Authorization": "Bearer $(curl -s https://auth/login -d "{"user":"admin","pass":"${S}"}" | jq -r .token)", "next": "keep"}`,
+        ),
+      ).toBe('{"Authorization": "Bearer [REDACTED]", "next": "keep"}');
+      expect(
+        scrubText(
+          JSON.stringify({
+            Authorization: `Basic $(cat <<X | base64\nuser: admin\npass: ${S}\nX\n)`,
+            next: "keep",
+          }),
+        ),
+      ).toBe('{"Authorization":"Basic [REDACTED]","next":"keep"}');
+
+      // B: a substitution starting inside an earlier failed scan's region scans it
+      // afresh and ends at its own close.
+      expect(
+        scrubText(
+          `{"Authorization":"Basic $(echo","x":1} {"Authorization": "Basic $(printf "%s" admin:${S} | base64)"}`,
+        ),
+      ).toBe(
+        '{"Authorization":"Basic [REDACTED]","x":1} {"Authorization": "Basic [REDACTED]"}',
+      );
+      expect(
+        scrubText(
+          `Authorization: Basic $(oops\nAuthorization: Basic $(printf 'admin:\n${S}' | base64)\nHost: x`,
+        ),
+      ).toBe(
+        "Authorization: Basic [REDACTED]\nAuthorization: Basic [REDACTED]\nHost: x",
+      );
+      // One that never closes there fails closed through the region.
+      expect(
+        scrubText(
+          `{"Authorization":"Basic $(echo","x":1} {"Authorization": "Basic $(printf ${S}"} tail`,
+        ),
+      ).toBe(
+        '{"Authorization":"Basic [REDACTED]","x":1} {"Authorization": "Basic [REDACTED]',
+      );
     });
 
     it("redacts to the line end when a loose quoted value meets a quote of another depth", () => {
