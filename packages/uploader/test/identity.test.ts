@@ -15,6 +15,7 @@ import { parseEndpoint } from "../src/config.js";
 import { silentLogger } from "../src/log.js";
 import { deliveryRecord } from "../src/records.js";
 import { consumerName, upload } from "../src/uploader.js";
+import { LIMITS, fakeServer, json, receiptFor } from "./support.js";
 
 describe("feed records match export records", () => {
   let root: string;
@@ -144,5 +145,46 @@ describe("feed records match export records", () => {
     );
     expect(summary.cursor).toEqual(stored.cursor);
     expect(summary.cursor!.revision).toBeGreaterThan(0);
+  });
+
+  it("reordered kinds resume the same cursor in the real store", async () => {
+    const accepting = fakeServer(({ url, body }) =>
+      url.endsWith("/v1/delivery/limits")
+        ? json(LIMITS)
+        : json(receiptFor(body)),
+    );
+    const config = (kinds: ("session" | "session_event")[]) => ({
+      endpoint: parseEndpoint("https://history.example.com"),
+      token: "rth_st_unused",
+      accountId: `relayhistory:${"d".repeat(64)}`,
+      dbPath,
+      selection: {
+        all_sources: true,
+        sources: [],
+        sessions: [],
+        kinds,
+        excluded_sessions: [],
+      },
+      instanceId: "identity",
+      limits: { maxRecords: 100, maxBytes: 1_048_576 },
+    });
+    const first = await upload({
+      config: config(["session", "session_event"]),
+      log: silentLogger,
+      fetch: accepting.fetch,
+    });
+    expect(first.selected).toBeGreaterThan(0);
+    // The store normalizes a consumer's kind set (sorted, deduplicated), so the same
+    // kinds in another order are the same consumer and resume where it stopped.
+    const reordered = config(["session_event", "session"]);
+    expect(consumerName(reordered)).toBe(first.consumer);
+    const second = await upload({
+      config: reordered,
+      log: silentLogger,
+      fetch: accepting.fetch,
+    });
+    expect(second.consumer).toBe(first.consumer);
+    expect(second.scanned).toBe(0);
+    expect(second.cursor).toEqual(first.cursor);
   });
 });
