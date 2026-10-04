@@ -468,6 +468,13 @@ describe("hosted ingest scrubbing", () => {
             .slice(0, n),
       ],
       [
+        "multi-line substitutions with long closing lines",
+        (n) =>
+          `Authorization: Basic $(printf a\n${"x".repeat(200)})${"y ".repeat(500)}\n`
+            .repeat(Math.ceil(n / 1236))
+            .slice(0, n),
+      ],
+      [
         "stray parameter items",
         (n) =>
           `Authorization: AWS4 C=a/b, ${"x y=z/w, ".repeat(n)}`.slice(0, n),
@@ -2109,6 +2116,42 @@ describe("hosted ingest scrubbing", () => {
       ];
       for (const [input, output] of exact)
         expect(scrubText(input), input).toBe(output);
+    });
+
+    it("does not split a secret on a substitution's closing line", () => {
+      const filler = (length: number) => {
+        let text = "";
+        while (text.length < length) {
+          const line = Math.min(63, length - text.length - 1);
+          text += `${line > 0 ? "x".repeat(line) : ""}\n`;
+        }
+        return text.slice(0, length);
+      };
+      const lines = [
+        "X-Token: abcdefghPREFIX)SUFFIXsecret",
+        "DB_PASSWORD=paPREFIX)SUFFIXsecret",
+      ];
+      const failed =
+        "Authorization: Basic $(oops\nAuthorization: Basic $(oops2\n";
+      for (const line of lines) {
+        for (let pad = 3950; pad <= 4250; pad += 1) {
+          const out = scrubText(`${failed}${filler(pad)}${line}\nHost: x`);
+          expect(out, `${line} pad ${pad}`).not.toContain("PREFIX");
+          expect(out, `${line} pad ${pad}`).not.toContain("SUFFIX");
+        }
+        const outside = scrubText(
+          `Authorization: Basic $(oops\n${line}\nHost: x`,
+        );
+        expect(outside, line).not.toContain("PREFIX");
+        expect(outside, line).not.toContain("SUFFIX");
+        expect(outside, line).toContain("\nHost: x");
+      }
+      // A well-formed multi-line substitution keeps what follows its header.
+      expect(
+        scrubText(
+          `curl -H "Authorization: Basic $(printf 'admin:\npass' | base64)" url`,
+        ),
+      ).toBe('curl -H "Authorization: Basic [REDACTED]" url');
     });
 
     it("redacts to the line end when a loose quoted value meets a quote of another depth", () => {
