@@ -533,6 +533,30 @@ describe("hosted ingest scrubbing", () => {
     it("scrubs 200 KB far inside the budget a quadratic pass could never meet", () => {
       expect(medianCost("A".repeat(200_000), 3)).toBeLessThan(2_000);
     });
+
+    // Headers on one line after a substitution that closed on a later line: each is
+    // swept, and its line end and credential are read once, not once per header.
+    // Measured at ~20ms for 256 KiB; a per-header read of the line took 3,000-4,500ms.
+    it.each<[string, (n: number) => string]>([
+      [
+        "headers after a cross-line close on one line",
+        (n) =>
+          `Authorization: Basic $(a\n,Authorization: b)${",Authorization: c".repeat(n / 17)}`.slice(
+            0,
+            n,
+          ),
+      ],
+      [
+        "headers after a failed scan's cross-line close on one line",
+        (n) =>
+          `Authorization: Basic $(oops\nAuthorization: Basic a)${",Authorization: x".repeat(n / 17)}`.slice(
+            0,
+            n,
+          ),
+      ],
+    ])("scrubs 256 KiB of %s far inside the budget", (_l, gen) => {
+      expect(medianCost(gen(MAX_SCRUB_CHARS), 3)).toBeLessThan(1_000);
+    });
   });
 
   // ---------------------------------------------------------------------------
@@ -2227,6 +2251,80 @@ describe("hosted ingest scrubbing", () => {
           `curl -H "Authorization: Basic $(printf 'admin:\npass' | base64)" url`,
         ),
       ).toBe('curl -H "Authorization: Basic [REDACTED]" url');
+    });
+
+    it("never fails closed inside a multi-line secret match", () => {
+      const filler = (length: number) => {
+        let text = "";
+        while (text.length < length) {
+          const line = Math.min(63, length - text.length - 1);
+          text += `${line > 0 ? "x".repeat(line) : ""}\n`;
+        }
+        return text.slice(0, length);
+      };
+      const pem =
+        "-----BEGIN RSA PRIVATE KEY-----\nMIIEpPEMBODYline1QQQQ\nMIIEpPEMBODYline2QQQQ\nMIIEpPEMBODYline3QQQQ\n-----END RSA PRIVATE KEY-----";
+      const forms: Array<[string, string[]]> = [
+        ["DB_PASSWORD=\npaPREFIX)SUFFIXsecret", ["PREFIX", "SUFFIX"]],
+        ["password:\n  paPREFIX)SUFFIXsecret", ["PREFIX", "SUFFIX"]],
+        ["DB_PASSWORD=\npaPREFIXSUFFIXsecret", ["PREFIX", "SUFFIX"]],
+        [pem, ["PEMBODY"]],
+      ];
+      const failed =
+        "Authorization: Basic $(oops\nAuthorization: Basic $(oops2\n";
+      for (const [form, secrets] of forms)
+        for (let pad = 3950; pad <= 4250; pad += 1) {
+          const input = `${failed}${filler(pad)}${form}\nHost: x`;
+          const out = scrubText(input);
+          for (const secret of secrets)
+            expect(out, `${secret} pad ${pad}`).not.toContain(secret);
+          // `Host: x` survives when its line starts past the first scan's region.
+          if (input.indexOf("\nHost: x") > input.indexOf("$(") + 4096)
+            expect(out, `pad ${pad}`).toContain("\nHost: x");
+        }
+    });
+
+    it("reads a swept header's own credential and the header's close from its raw end", () => {
+      const rows: Array<[string, string, string]> = [
+        [
+          "Authorization: Basic $(printf a\napi_key=x)(Authorization: Basic $(printf 'admin:\nhunter2' | base64)\nHost: x",
+          "hunter2",
+          "\nHost: x",
+        ],
+        [
+          "Authorization: Basic $(printf a\napi_key=x)y,Authorization: Basic $(printf 'admin:\nhunter2' | base64)\nHost: x",
+          "hunter2",
+          "\nHost: x",
+        ],
+        [
+          "Authorization: Basic $(oops\n,Authorization: b) (Authorization: Basic $(printf 'admin:\nhunter2' | base64)\nHost: x",
+          "hunter2",
+          "\nHost: x",
+        ],
+        [
+          "Authorization: Basic $(oops\nDB_PASSWORD=pa)ss(Authorization: Basic $(printf 'admin:\nS3cret' | base64)\nHost: x",
+          "S3cret",
+          "\nHost: x",
+        ],
+      ];
+      for (const [input, secret, kept] of rows) {
+        const out = scrubText(input);
+        expect(out, input).not.toContain(secret);
+        expect(out, input).toContain(kept);
+      }
+      // The header's close is looked for from its substitution's end, not from a
+      // secret swept past it, so the next argument is scrubbed on its own.
+      const curl = `curl -H "Authorization: Bearer $(curl -s \\\n  'https://idp.example/token?state=x')" -d client_secret="S3cretValue" https://api`;
+      const out = scrubText(curl);
+      expect(out).not.toContain("S3cretValue");
+      expect(out).toContain("client_secret=[REDACTED]");
+      expect(out).toContain(" https://api");
+      // Serialized, the header still ends at its own (escaped) close.
+      const serialized = scrubText(JSON.stringify({ cmd: curl }));
+      expect(serialized).toContain(
+        'Authorization: Bearer [REDACTED]\\" -d client_secret=',
+      );
+      expect(serialized).toContain(" https://api");
     });
 
     it("redacts to the line end when a loose quoted value meets a quote of another depth", () => {
