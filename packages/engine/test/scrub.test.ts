@@ -554,6 +554,41 @@ describe("hosted ingest scrubbing", () => {
             n,
           ),
       ],
+      [
+        "swept headers whose substitutions never close",
+        (n) =>
+          "Authorization: Basic $(a\n,Authorization: Basic $(zz' )\n"
+            .repeat(n / 54)
+            .slice(0, n),
+      ],
+      [
+        "swept headers whose substitutions never close, between multi-line headers",
+        (n) =>
+          "Authorization: Basic $(a\n,Authorization: Basic $(zz' )\nAuthorization: Basic $(printf 'admin:\nS3cret' | base64)\nHost: x\n"
+            .repeat(n / 120)
+            .slice(0, n),
+      ],
+      [
+        "swept headers past a key whose substitutions never close",
+        (n) =>
+          "Authorization: Basic $(a\napi_key=x)y(Authorization: Basic $(zz\n"
+            .repeat(n / 60)
+            .slice(0, n),
+      ],
+      [
+        "swept headers past a header before the close whose substitutions never close",
+        (n) =>
+          "Authorization: Basic $(a\n,Authorization: b),Authorization: Basic $(zz\n"
+            .repeat(n / 70)
+            .slice(0, n),
+      ],
+      [
+        "headers before a cross-line close",
+        (n) =>
+          `Authorization: Basic $(oops\n${",Authorization: b".repeat(200)})\n`
+            .repeat(n / 3430)
+            .slice(0, n),
+      ],
     ])("scrubs 256 KiB of %s far inside the budget", (_l, gen) => {
       expect(medianCost(gen(MAX_SCRUB_CHARS), 3)).toBeLessThan(1_000);
     });
@@ -2282,6 +2317,77 @@ describe("hosted ingest scrubbing", () => {
           if (input.indexOf("\nHost: x") > input.indexOf("$(") + 4096)
             expect(out, `pad ${pad}`).toContain("\nHost: x");
         }
+    });
+
+    it("reads every header from a substitution's close on, whatever a header before it read", () => {
+      // The header before the close reads `b),Authorization:` as one token68 run; the
+      // header after the close is still read to its own substitution's close.
+      for (const next of [
+        ",Authorization: Basic $(",
+        "(Authorization: Basic $(",
+        ",Authorization:$(",
+        " (Authorization: Basic $(",
+      ]) {
+        const input = `Authorization: Basic $(oops\n,Authorization: b)${next}printf 'admin:\nhunter2' | base64)\nHost: x`;
+        const out = scrubText(input);
+        expect(out, input).not.toContain("hunter2");
+        expect(out, input).toContain("\nHost: x");
+      }
+    });
+
+    it("reads a substitution straddling a failed region's end to its close", () => {
+      const filler = (length: number) => {
+        let text = "";
+        while (text.length < length) {
+          const line = Math.min(63, length - text.length - 1);
+          text += `${line > 0 ? "x".repeat(line) : ""}\n`;
+        }
+        return text.slice(0, length);
+      };
+      const failed = "Authorization: Basic $(oops\n";
+      const forms: Array<[string, (pad: number) => string]> = [
+        [
+          "raw",
+          (pad) =>
+            `${failed}${filler(pad)}Authorization: Basic $(printf 'admin:\nS3cret' | base64)\nHost: x`,
+        ],
+        [
+          "curl",
+          (pad) =>
+            `${failed}${filler(pad)}curl -H "Authorization: Basic $(printf '%s' 'admin:\nS3cret' | base64)" url\nHost: x`,
+        ],
+        [
+          "continued lines",
+          (pad) =>
+            `${failed}${filler(pad)}Authorization: Basic $(printf '%s' \\\n${"y".repeat(200)} \\\nS3cret | base64)\nHost: x`,
+        ],
+      ];
+      for (const [name, form] of forms)
+        for (let pad = 3950; pad <= 4250; pad += 1) {
+          const out = scrubText(form(pad));
+          expect(out, `${name} pad ${pad}`).not.toContain("S3cret");
+          expect(out, `${name} pad ${pad}`).toContain("\nHost: x");
+        }
+    });
+
+    it("keeps a swept header's failed scan from moving later headers into a region", () => {
+      // The swept `$(zz' …` never closes; the independent header 60 lines on is read
+      // to its own close.
+      const input =
+        "Authorization: Basic $(printf '\n,Authorization: Basic $(zz' )\n" +
+        `${"y".repeat(63)}\n`.repeat(60) +
+        `Authorization: Basic $(printf 'admin:${"x".repeat(300)}\nS3cret' | base64)\nHost: x`;
+      const out = scrubText(input);
+      expect(out).not.toContain("S3cret");
+      expect(out).toContain("\nHost: x");
+      // Nor does it make the next top-level failed scan fail closed at the text's end.
+      expect(
+        scrubText(
+          "Authorization: Basic $(a\napi_key=x)y(Authorization: Basic $(oops\nAuthorization: Basic $(oops2\nHost: keep",
+        ),
+      ).toBe(
+        "Authorization: Basic [REDACTED]\nAuthorization: Basic [REDACTED]\nHost: keep",
+      );
     });
 
     it("reads a swept header's own credential and the header's close from its raw end", () => {
