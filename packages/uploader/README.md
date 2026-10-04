@@ -66,7 +66,8 @@ relayhistory-upload run --config upload.json --sync --watch --interval 300
 `--sync` captures local sessions (`ai-hist sync`) before each upload, in a child process a
 signal can stop. When capture did not complete (another process such as `ai-hist watch`
 holds the sync lock, or a source reported diagnostics) the run logs a warning, uploads
-what is already captured and reports `"syncCompleted": false`; the rest goes next round. `--watch` keeps
+what is already captured and reports `"syncCompleted": false`; the rest is uploaded by the next
+`--watch` round or the next run. `--watch` keeps
 running; a retryable failure waits for the next round, anything else exits.
 
 Exit codes: `0` done, including `--watch` stopped by a signal between rounds; `1`
