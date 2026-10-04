@@ -82,26 +82,35 @@ describe.skipIf(!adminUrl)("server shutdown", () => {
       return { request, responses };
     };
 
-    // Without the token, authentication answers at once: the handler never runs.
-    const anonymous = stalledUpload();
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    expect(anonymous.responses).toEqual([401]);
-    anonymous.request.destroy();
+    let anonymous: ReturnType<typeof stalledUpload> | undefined;
+    let upload: ReturnType<typeof stalledUpload> | undefined;
+    let closed = false;
+    try {
+      // Without the token, authentication answers at once: the handler never runs.
+      anonymous = stalledUpload();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(anonymous.responses).toEqual([401]);
 
-    // With it, the request passes authentication and the delivery handler waits on the
-    // body, so it is still unanswered when shutdown starts.
-    const upload = stalledUpload(`Bearer ${token}`);
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    expect(upload.responses).toEqual([]);
+      // With it, the request passes authentication and the delivery handler waits on the
+      // body, so it is still unanswered when shutdown starts.
+      upload = stalledUpload(`Bearer ${token}`);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(upload.responses).toEqual([]);
 
-    const started = Date.now();
-    const drained = await server.close();
-    const elapsed = Date.now() - started;
-    expect(drained).toBe(true);
-    // Held until the 200 ms cutoff forced it closed, then cleanup within its grace.
-    expect(elapsed).toBeGreaterThanOrEqual(180);
-    expect(elapsed).toBeLessThan(200 + CLEANUP_GRACE_MS);
-    expect(upload.responses).toEqual([]);
-    upload.request.destroy();
+      const started = Date.now();
+      closed = true;
+      const drained = await server.close();
+      const elapsed = Date.now() - started;
+      expect(drained).toBe(true);
+      // Held until the 200 ms cutoff forced it closed, then cleanup within its grace.
+      expect(elapsed).toBeGreaterThanOrEqual(180);
+      expect(elapsed).toBeLessThan(200 + CLEANUP_GRACE_MS);
+      expect(upload.responses).toEqual([]);
+    } finally {
+      // A failed assertion must not leave the server listening or a socket open.
+      anonymous?.request.destroy();
+      upload?.request.destroy();
+      if (!closed) await server.close();
+    }
   });
 });
