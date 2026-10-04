@@ -329,6 +329,32 @@ describe("error reporting", () => {
     ]);
   });
 
+  it("answers the JSON 500 when the host reporter itself throws", async () => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const failing = new Hono<HistoryEnv>();
+    failing.get("/explode", () => {
+      throw Object.assign(new Error(`row ${SECRET}`), { code: "XX000" });
+    });
+
+    const res = await engine({
+      reportError: () => {
+        throw new Error(`sink rejected ${SECRET}`);
+      },
+      publicRoutes: [failing],
+    }).request("/v1/explode", { headers: { "X-Correlation-Id": "trace-r" } });
+
+    expect(res.status).toBe(500);
+    expect(await res.json()).toEqual({
+      error: { code: "internal_error", message: "Internal server error" },
+      correlationId: "trace-r",
+    });
+    expect(JSON.stringify(log.mock.calls)).not.toContain(SECRET);
+    expect(log.mock.calls).toContainEqual([
+      "[relayhistory] request failed",
+      { name: "Error", code: "XX000" },
+    ]);
+  });
+
   it("answers a thrown HTTPException with its own response", async () => {
     const reportError = vi.fn();
     const failing = new Hono<HistoryEnv>();
@@ -374,6 +400,25 @@ describe("token usage telemetry", () => {
 
     expect(resolved?.id).toBe(issued.id);
     expect(failures).toHaveLength(1);
+  });
+
+  it("authenticates the request when the host reporter itself throws", async () => {
+    const issued = await serviceToken(["rth:read"]);
+    failUsageWrites();
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const res = await engine({
+      reportError: () => {
+        throw new Error("telemetry sink down");
+      },
+    }).request("/v1/sessions", { headers: bearer(issued.token) });
+
+    expect(res.status).toBe(200);
+    // The usage failure still reaches the default log, sanitized.
+    expect(log.mock.calls).toContainEqual([
+      "[relayhistory] request failed",
+      { name: "Error", code: "25006" },
+    ]);
   });
 
   it("authenticates the request and reports the write failure sanitized", async () => {
@@ -472,13 +517,48 @@ describe("workspace recall scope", () => {
       headers: bearer("idp"),
     });
     expect(trimmed.status).toBe(403);
-
-    const exact = await app.request("/v1/sessions?workspace=%20ws_a%20", {
-      headers: bearer("idp"),
+    expect(await trimmed.json()).toMatchObject({
+      error: { message: "workspace does not match the authenticated session" },
     });
-    expect(exact.status).toBe(200);
-    // Headers drop surrounding whitespace, so the attestation reads trimmed.
-    expect(exact.headers.get("X-Relayhistory-Workspace-Id")).toBe("ws_a");
+  });
+
+  it.each([
+    ["surrounding whitespace", " ws_a ", "%20ws_a%20"],
+    ["a trailing tab", "ws_a\t", "ws_a%09"],
+    ["an embedded newline", "ws\na", "ws%0Aa"],
+    ["a character outside Latin-1", "ws_\u2603", "ws_%E2%98%83"],
+  ])(
+    "refuses a workspace scope it cannot attest: %s",
+    async (_, workspaceId, query) => {
+      const app = hostEngine(workspaceId);
+
+      const res = await app.request(`/v1/sessions?workspace=${query}`, {
+        headers: bearer("idp"),
+      });
+
+      expect(res.status).toBe(403);
+      expect(await res.json()).toMatchObject({
+        error: {
+          code: "forbidden",
+          message: "authenticated workspace cannot be attested",
+        },
+      });
+      expect(res.headers.get("X-Relayhistory-Workspace-Id")).toBeNull();
+      // Organization-wide recall needs no attestation and is unchanged.
+      const orgWide = await app.request("/v1/sessions", {
+        headers: bearer("idp"),
+      });
+      expect(orgWide.status).toBe(200);
+    },
+  );
+
+  it("attests an ordinary workspace with interior spaces exactly", async () => {
+    const res = await hostEngine("team a").request(
+      "/v1/sessions?workspace=team%20a",
+      { headers: bearer("idp") },
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get("X-Relayhistory-Workspace-Id")).toBe("team a");
   });
 
   it("refuses a blank authenticated workspace", async () => {

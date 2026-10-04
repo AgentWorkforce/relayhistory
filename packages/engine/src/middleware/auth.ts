@@ -36,14 +36,24 @@ export function errorSummary(error: unknown): { name: string; code: unknown } {
   };
 }
 
-/** Hands `error` to the host's `reportError`, or logs its summary. */
+/**
+ * Hands `error` to the host's `reportError`, or logs its summary. Never throws: a failing
+ * host hook falls back to the summary log, so reporting cannot fail the request.
+ */
 export function reportError<E extends HistoryEnv>(
   deps: Pick<HistoryEngineDeps<E>, "reportError">,
   error: unknown,
   c: Context<any>,
 ): void {
-  if (deps.reportError) deps.reportError(error, hostContext<E>(c));
-  else console.error("[relayhistory] request failed", errorSummary(error));
+  if (deps.reportError) {
+    try {
+      deps.reportError(error, hostContext<E>(c));
+      return;
+    } catch {
+      // The hook's own error may quote what it was given; log only the original's summary.
+    }
+  }
+  console.error("[relayhistory] request failed", errorSummary(error));
 }
 
 export function getAuth(c: Context<any>): AuthContext {
