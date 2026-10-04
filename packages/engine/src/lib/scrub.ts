@@ -201,6 +201,8 @@ const AUTHORIZATION_HEADER =
   /(^|[\r\n{,(]|["']|\\[nr])[ \t]*(?:proxy-)?authorization(?:\\*["'])?[ \t]*[:=][ \t]*/gi;
 // RFC 7230 token characters, less the quotes that can delimit a quoted header.
 const TOKEN = /[A-Za-z0-9!#$%&*+.^_`|~-]/;
+// Schemes whose credential is token68 (RFC 7235), possibly base64 with `=` padding.
+const TOKEN68_SCHEME = /^(?:basic|bearer|negotiate|ntlm)$/i;
 // A scheme is followed by its credential, never by the `=` of a parameter.
 const AUTHORIZATION_SCHEME =
   /([A-Za-z][A-Za-z0-9!#$%&*+.^_`|~-]*)[ \t]+(?=[^\s=])/y;
@@ -295,8 +297,15 @@ function redactAuthorization(text: string): string {
     AUTHORIZATION_SCHEME.lastIndex = start;
     const scheme = AUTHORIZATION_SCHEME.exec(text);
     const credential = scheme ? start + scheme[0].length : start;
-    const params = authParams(text, credential, quote);
-    let end = params ?? token68(text, credential, quote);
+    // Only these schemes carry a token68 credential whose `=` is base64 padding; any
+    // other scheme's `name=` is a parameter (`Digest response=" …"`).
+    const padded = scheme !== null && TOKEN68_SCHEME.test(scheme[1]!);
+    const substitution = shellSubstitutionEnd(text, credential, quote);
+    const params =
+      substitution === null
+        ? authParams(text, credential, quote, padded)
+        : null;
+    let end = substitution ?? params ?? token68(text, credential, quote);
     if (end === credential) {
       // A scheme followed by something neither grammar reads (`Digest "quoted", …`)
       // still introduces a credential, so the rest of the header is redacted.
@@ -306,11 +315,20 @@ function redactAuthorization(text: string): string {
     } else if (quote.lineBase > 0) {
       // A serialized line's own end is found by `serializedLineEnd`, which keeps the
       // string's close and what follows it.
-      end = serializedLineEnd(text, end, quote, params === null ? end : -1);
+      end = serializedLineEnd(
+        text,
+        end,
+        quote,
+        params === null && padded && substitution === null ? end : -1,
+      );
     } else if (params === null && quote.char) {
       // A parameter list ends where its grammar does; a single credential that stops
       // short of the header's close was cut at a space the shell would expand.
       end = closingQuote(text, end, quote) ?? end;
+    } else if (quote.char && read(text, end, quote).role === "delimiter") {
+      // A list cut short by a quoted segment no parameter holds (`a=="x", …`) is
+      // malformed; the rest of the header goes with it.
+      end = headerEnd(text, end, quote);
     }
     output += `${text.slice(last, start)}${scheme ? `${scheme[1]} ` : ""}${REDACTED}`;
     last = end;
@@ -526,14 +544,58 @@ function unreadCredentialEnd(
   quote: HeaderQuote,
 ): number {
   if (quote.lineBase > 0) return serializedLineEnd(text, at, quote, -1);
-  if (quote.char) {
-    const close = closingQuote(text, at, quote);
-    if (close !== null) return close;
-  }
+  return headerEnd(text, at, quote);
+}
+
+/**
+ * The header's close at or after `at`, skipping quotes inside it (content, or a quoted
+ * value's span), or else the end of its line.
+ */
+function headerEnd(text: string, at: number, quote: HeaderQuote): number {
   let index = at;
-  while (index < text.length && text[index] !== "\n" && text[index] !== "\r")
-    index += 1;
-  return index;
+  while (index < text.length) {
+    const { role, next } = read(text, index, quote);
+    // A quoted header ends at its close; quotes inside it are content or a quoted
+    // value's, whose span is skipped.
+    if (role === "close" || role === "line") return index;
+    index = role === "delimiter" ? quotedValue(text, next, quote) : next;
+  }
+  return text.length;
+}
+
+/**
+ * Where a shell substitution starting the credential at `at` ends: after the `)` that
+ * closes `$(` (counting nested parentheses) or the backtick that closes one, whatever
+ * quotes it holds (`$(printf '%s' user:pass | base64)`). An unmatched one runs to the
+ * end of its line. Null when the credential is not a substitution.
+ */
+function shellSubstitutionEnd(
+  text: string,
+  at: number,
+  quote: HeaderQuote,
+): number | null {
+  const backtick = text[at] === "`";
+  if (!backtick && !(text[at] === "$" && text[at + 1] === "(")) return null;
+  let depth = 0;
+  let index = backtick ? at + 1 : at;
+  while (index < text.length) {
+    const run = backslashes(text, index);
+    const char = text[index + run];
+    if (char === "\n" || char === "\r") return index;
+    if (
+      run > 0 &&
+      (char === "n" || char === "r") &&
+      escapedBreak(text, index, run, quote)
+    )
+      return index;
+    if (run === 0) {
+      if (backtick && char === "`") return index + 1;
+      if (!backtick && char === "(") depth += 1;
+      if (!backtick && char === ")" && --depth === 0) return index + 1;
+    }
+    index += run + 1;
+  }
+  return text.length;
 }
 
 /**
@@ -649,8 +711,9 @@ function authParams(
   text: string,
   at: number,
   quote: HeaderQuote,
+  padded: boolean,
 ): number | null {
-  let end = authParam(text, at, quote);
+  let end = authParam(text, at, quote, padded);
   if (end === null) return null;
   for (;;) {
     let next: number = end;
@@ -659,12 +722,13 @@ function authParams(
     if (text[next] === ",") {
       next += 1;
       while (text[next] === " " || text[next] === "\t") next += 1;
-      following = authParam(text, next, quote) ?? strayItem(text, next, quote);
+      following =
+        authParam(text, next, quote, padded) ?? strayItem(text, next, quote);
     } else if (text[next] === ";" || next > end) {
       if (text[next] === ";") next += 1;
       if (!nextParameter(text, next)) return end;
       while (text[next] === " " || text[next] === "\t") next += 1;
-      following = authParam(text, next, quote);
+      following = authParam(text, next, quote, padded);
     } else {
       return end;
     }
@@ -695,11 +759,15 @@ function strayItem(
   return assigns ? Math.min(index, text.length) : null;
 }
 
-/** The end of one `name=value` auth-param at `at`, or null. */
+/**
+ * The end of one `name=value` auth-param at `at`, or null. `padded`: the scheme's
+ * credential is token68, so an `=`-only value may be its base64 padding.
+ */
 function authParam(
   text: string,
   at: number,
   quote: HeaderQuote,
+  padded: boolean,
 ): number | null {
   let index = at;
   while (index < text.length && TOKEN.test(text[index]!)) index += 1;
@@ -723,10 +791,10 @@ function authParam(
     index = next;
   }
   index = Math.min(index, text.length);
-  // An empty or `=`-only value is an empty parameter when the list goes on after it
-  // (`realm=, response=…`); otherwise it is no parameter, and `=` is a token68
-  // credential's base64 padding (`dXNlcg==`).
-  if (index === value || padding)
+  // An empty value, or under a token68 scheme an `=`-only one, is an empty parameter
+  // when the list goes on after it (`realm=, response=…`); otherwise it is no
+  // parameter, and `=` is the credential's base64 padding (`dXNlcg==`).
+  if (index === value || (padded && padding))
     return listContinues(text, index) ? index : null;
   return index;
 }
