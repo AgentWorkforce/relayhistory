@@ -475,6 +475,13 @@ describe("hosted ingest scrubbing", () => {
             .slice(0, n),
       ],
       [
+        "cross-line substitutions full of near-miss secrets",
+        (n) =>
+          `Authorization: Basic $(printf a\n${"password -----BEGI http:/ a.b@c. sk- ".repeat(110)})\n`
+            .repeat(Math.ceil(n / 4000))
+            .slice(0, n),
+      ],
+      [
         "stray parameter items",
         (n) =>
           `Authorization: AWS4 C=a/b, ${"x y=z/w, ".repeat(n)}`.slice(0, n),
@@ -2130,6 +2137,7 @@ describe("hosted ingest scrubbing", () => {
       const lines = [
         "X-Token: abcdefghPREFIX)SUFFIXsecret",
         "DB_PASSWORD=paPREFIX)SUFFIXsecret",
+        "api_key: abcdPREFIX)SUFFIXsecret",
       ];
       const failed =
         "Authorization: Basic $(oops\nAuthorization: Basic $(oops2\n";
@@ -2147,6 +2155,73 @@ describe("hosted ingest scrubbing", () => {
         expect(outside, line).toContain("\nHost: x");
       }
       // A well-formed multi-line substitution keeps what follows its header.
+      expect(
+        scrubText(
+          `curl -H "Authorization: Basic $(printf 'admin:\npass' | base64)" url`,
+        ),
+      ).toBe('curl -H "Authorization: Basic [REDACTED]" url');
+    });
+
+    it("never ends a cross-line substitution inside a secret match or a later header", () => {
+      const filler = (length: number) => {
+        let text = "";
+        while (text.length < length) {
+          const line = Math.min(63, length - text.length - 1);
+          text += `${line > 0 ? "x".repeat(line) : ""}\n`;
+        }
+        return text.slice(0, length);
+      };
+      const pem =
+        "-----BEGIN RSA PRIVATE KEY-----\nMIIEpPEMBODYsecretQQQQ\n-----END RSA PRIVATE KEY-----";
+      const twoFailed =
+        "Authorization: Basic $(oops\nAuthorization: Basic $(oops2\n";
+      const rows: Array<[string, string[]]> = [
+        [
+          "Authorization: Basic $(oops\nGET /cb?state=ab)cd,Authorization: Basic c2VjcmV0OnBhc3M=\nHost: x",
+          ["c2VjcmV0OnBhc3M"],
+        ],
+        [
+          "Authorization: Basic $(oops\nDB_PASSWORD=pa)ss(Authorization: Basic S3cretValueQ\nHost: x",
+          ["S3cretValueQ"],
+        ],
+        [
+          "Authorization: Basic $(printf a\napi_key=x)Bearer abcdefghijklmnopqrstuvwxyz0123\nHost: x",
+          ["abcdefghijklmnopqrstuvwxyz0123"],
+        ],
+        [
+          `Authorization: Basic $(printf a\nsecret=x)${pem}\nHost: x`,
+          ["PEMBODYsecret"],
+        ],
+        [
+          "Authorization: Basic $(printf a\napi_key=a)(Authorization: Basic S3cretValueQ\nHost: x",
+          ["S3cretValueQ"],
+        ],
+        [
+          "Authorization: Basic $(printf a\napi_key=a)\nAuthorization: Basic S3cretValueQ\nHost: x",
+          ["S3cretValueQ"],
+        ],
+        [
+          `${twoFailed}${filler(4000)}password:\n  paPREFIX)SUFFIXsecret\nHost: x`,
+          ["PREFIX", "SUFFIX"],
+        ],
+        [
+          `${twoFailed}${filler(4000)}DB_PASSWORD=\npaPREFIX)SUFFIXsecret\nHost: x`,
+          ["PREFIX", "SUFFIX"],
+        ],
+        [
+          "Authorization: Basic $(oops\npassword:\n  paPREFIX)SUFFIXsecret\nHost: x",
+          ["PREFIX", "SUFFIX"],
+        ],
+        [
+          "Authorization: Basic $(oops\napi_key: abcdPREFIX)SUFFIXsecret\nHost: x",
+          ["PREFIX", "SUFFIX"],
+        ],
+      ];
+      for (const [input, secrets] of rows) {
+        const out = scrubText(input);
+        for (const secret of secrets) expect(out, input).not.toContain(secret);
+        expect(out, input).toContain("\nHost: x");
+      }
       expect(
         scrubText(
           `curl -H "Authorization: Basic $(printf 'admin:\npass' | base64)" url`,
