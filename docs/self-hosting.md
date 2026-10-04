@@ -5,15 +5,15 @@ implementation the hosted service runs — on Node and ordinary PostgreSQL with
 pgvector. It needs no Agent Relay, Neon or Cloudflare account. Machines upload the
 sessions you select; you search and read them back over the same HTTP API.
 
-| Route | Scope | Purpose |
-| --- | --- | --- |
-| `POST /v1/delivery/batches` | `rth:sync` | Durable upload (protocol 1): receipts, replay, conflicts, tombstones |
-| `GET /v1/delivery/limits` | `rth:sync` | Server batch limits |
-| `GET /v1/sessions` | `rth:read` | List sessions, newest first |
-| `GET /v1/events?q=TEXT` | `rth:read` | Search across sessions |
-| `GET /v1/sessions/:id/events` | `rth:read` | One session's transcript, in order |
+| Route                                  | Scope      | Purpose                                                                             |
+| -------------------------------------- | ---------- | ----------------------------------------------------------------------------------- |
+| `POST /v1/delivery/batches`            | `rth:sync` | Durable upload (protocol 1): receipts, replay, conflicts, tombstones                |
+| `GET /v1/delivery/limits`              | `rth:sync` | Server batch limits                                                                 |
+| `GET /v1/sessions`                     | `rth:read` | List sessions, newest first                                                         |
+| `GET /v1/events?q=TEXT`                | `rth:read` | Search across sessions                                                              |
+| `GET /v1/sessions/:id/events`          | `rth:read` | One session's transcript, in order                                                  |
 | `GET /v1/sessions/:id/catalog?source=` | `rth:read` | One session's delivered catalog: branch, repository, models, relationships, markers |
-| `GET /health`, `GET /ready` | none | Liveness; readiness (database reachable, not draining) |
+| `GET /health`, `GET /ready`            | none       | Liveness; readiness (database reachable, not draining)                              |
 
 Every `/v1` route authenticates a bearer token and takes the tenant (organization and
 workspace) from the token's stored row, never from the request.
@@ -58,16 +58,16 @@ that runs them separately.
 
 ## Configuration
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `DATABASE_URL` | required | `postgres://` URL; standard TCP connection |
-| `HOST` / `PORT` | `0.0.0.0` / `8080` | Listen address |
-| `RELAYHISTORY_DB_POOL_MAX` | `10` | Pool connections |
-| `RELAYHISTORY_SHUTDOWN_TIMEOUT_MS` | `15000` | Drain time for in-flight requests on SIGTERM |
-| `RELAYHISTORY_RETENTION_INTERVAL_MS` | `60000` | Interval of the job that clears expired retention-bounded evidence |
-| `RELAYHISTORY_RUNTIME_ROLE` | unset | Role granted access to the `sessions` schema after migrations |
-| `EMBEDDING_API_KEY` or `OPENAI_API_KEY` | unset | Optional embeddings for `POST /v1/ingest`; upload and recall never need them |
-| `EMBEDDING_API_URL`, `EMBEDDING_MODEL` | OpenAI defaults | OpenAI-compatible embedding endpoint |
+| Variable                                | Default            | Meaning                                                                      |
+| --------------------------------------- | ------------------ | ---------------------------------------------------------------------------- |
+| `DATABASE_URL`                          | required           | `postgres://` URL; standard TCP connection                                   |
+| `HOST` / `PORT`                         | `0.0.0.0` / `8080` | Listen address                                                               |
+| `RELAYHISTORY_DB_POOL_MAX`              | `10`               | Pool connections                                                             |
+| `RELAYHISTORY_SHUTDOWN_TIMEOUT_MS`      | `15000`            | Drain time for in-flight requests on SIGTERM                                 |
+| `RELAYHISTORY_RETENTION_INTERVAL_MS`    | `60000`            | Interval of the job that clears expired retention-bounded evidence           |
+| `RELAYHISTORY_RUNTIME_ROLE`             | unset              | Role granted access to the `sessions` schema after migrations                |
+| `EMBEDDING_API_KEY` or `OPENAI_API_KEY` | unset              | Optional embeddings for `POST /v1/ingest`; upload and recall never need them |
+| `EMBEDDING_API_URL`, `EMBEDDING_MODEL`  | OpenAI defaults    | OpenAI-compatible embedding endpoint                                         |
 
 Logs are JSON lines on stderr. They never contain tokens, the database URL, request
 bodies or driver error text.
@@ -92,9 +92,17 @@ file; `--out -` writes it to stdout for a pipe. The file holds the secret once �
 its hash is stored — plus the tenant and the `accountId` an uploader must name:
 
 ```json
-{ "version": 1, "token": "rth_st_…", "id": "…", "label": "laptop",
-  "scopes": ["rth:sync", "rth:read"], "expiresAt": "…",
-  "orgId": "acme", "workspaceId": "main", "accountId": "relayhistory:…" }
+{
+  "version": 1,
+  "token": "rth_st_…",
+  "id": "…",
+  "label": "laptop",
+  "scopes": ["rth:sync", "rth:read"],
+  "expiresAt": "…",
+  "orgId": "acme",
+  "workspaceId": "main",
+  "accountId": "relayhistory:…"
+}
 ```
 
 Give each machine its own token: `rth:sync` to upload, `rth:read` to search and read.
@@ -107,6 +115,37 @@ relayhistory-server token revoke --org acme --id <id>
 
 An existing token can mint narrower tokens for its own tenant through
 `POST /v1/auth/service-tokens`.
+
+## Upload from your machines
+
+Each machine runs `relayhistory-upload` ([`packages/uploader`](../packages/uploader/README.md))
+with its own `rth:sync` token file and an explicit selection. It reads the local store
+through the `ai-hist` change feed and moves its cursor only after the server's durable
+receipt, so it is safe to interrupt and rerun.
+
+```bash
+cat > upload.json <<'JSON'
+{
+  "endpoint": "https://history.example.com",
+  "tokenFile": "laptop-token.json",
+  "instanceId": "laptop",
+  "selection": {
+    "all_sources": false, "sources": ["claude"], "sessions": [],
+    "kinds": ["session", "session_event", "tool_call", "file_edit", "history"],
+    "excluded_sessions": [{ "source": "claude", "session_id": "private-session-id" }]
+  }
+}
+JSON
+relayhistory-upload check --config upload.json
+relayhistory-upload run --config upload.json --dry-run
+relayhistory-upload run --config upload.json --sync --watch --interval 300
+```
+
+Read it back with an `rth:read` token:
+
+```bash
+curl -s -H "Authorization: Bearer $READ_TOKEN" "https://history.example.com/v1/events?q=lock+timeout"
+```
 
 ## Backup and restore
 

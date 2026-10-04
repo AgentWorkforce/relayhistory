@@ -10,6 +10,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - `@relayhistory/engine` publishes the History service itself (durable delivery, recall, conversation turns, scoped service tokens and the PostgreSQL `sessions` schema with migrations) as one `createHistoryEngine(deps)` app that the hosted service and self-hosted Node + PostgreSQL deployments both run; `bootstrapServiceToken` mints a deployment's first scoped token without any HTTP minting endpoint.
 - `packages/server` self-hosts the History service on Node and PostgreSQL with pgvector: startup migrations, operator token bootstrap (`relayhistory-server token create`), readiness, graceful shutdown, a Docker Compose stack, and a backup/restore guide (`docs/self-hosting.md`).
+- `relayhistory-upload` (`@relayhistory/uploader`) uploads explicitly selected local sessions to a History service from the `ai-hist` change feed, advancing a per-endpoint, per-account cursor only after a durable receipt, with retries, conflict recovery and no remote deletion on exclusion.
 
 ## [0.34.1] - 2026-10-03
 

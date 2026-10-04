@@ -1,0 +1,48 @@
+{
+  "name": "@relayhistory/uploader",
+  "version": "0.34.1",
+  "private": true,
+  "description": "Uploads explicitly selected local RelayHistory sessions to a History service.",
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AgentWorkforce/relayhistory.git",
+    "directory": "packages/uploader"
+  },
+  "bin": {
+    "relayhistory-upload": "dist/cli.js"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "!dist/**/*.test.*",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "e2e": "node scripts/e2e.mjs"
+  },
+  "dependencies": {
+    "ai-hist": "^0.34.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "pg": "^8.13.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.9"
+  },
+  "engines": {
+    "node": ">=22.16.0"
+  }
+}

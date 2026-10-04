@@ -6,6 +6,7 @@ on:
     paths:
       - "packages/engine/**"
       - "packages/server/**"
+      - "packages/uploader/**"
       - ".github/workflows/selfhost.yml"
   push:
     branches:
@@ -13,6 +14,7 @@ on:
     paths:
       - "packages/engine/**"
       - "packages/server/**"
+      - "packages/uploader/**"
       - ".github/workflows/selfhost.yml"
 
 concurrency:
@@ -69,6 +71,55 @@ jobs:
       - name: Clean-start smoke
         working-directory: packages/server
         run: node scripts/smoke.mjs --admin-url "$TEST_ADMIN_DATABASE_URL"
+
+  uploader:
+    name: Uploader end to end
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      E2E_ADMIN_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            packages/engine/package-lock.json
+            packages/server/package-lock.json
+            packages/uploader/package-lock.json
+      - name: Build engine and server
+        run: |
+          npm ci --prefix packages/engine
+          npm run --prefix packages/engine build
+          cd packages/server && npm ci && npm run build
+      - name: Install uploader
+        working-directory: packages/uploader
+        run: npm ci
+      - name: Typecheck
+        working-directory: packages/uploader
+        run: npm run typecheck
+      - name: Test
+        working-directory: packages/uploader
+        run: npm test
+      - name: Build
+        working-directory: packages/uploader
+        run: npm run build
+      - name: Two machines through the real server
+        working-directory: packages/uploader
+        run: node scripts/e2e.mjs --admin-url "$E2E_ADMIN_URL"
 
   compose:
     name: Docker Compose clean start
