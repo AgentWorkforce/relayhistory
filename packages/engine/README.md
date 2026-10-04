@@ -124,8 +124,8 @@ configured for one tenant can never write into another with a swapped token.
 | `verifyBearer?(token, c)` | a second identity provider for non-service-local bearers; throw `AuthError` for a specific 401 |
 | `embeddings?(c)` | embedding provider for `/v1/ingest`; absent stores events without vectors |
 | `enrichSessions?(c, db, auth, sessions)` | in-place enrichment of an organization-scoped `GET /v1/sessions` page |
-| `observeDeliveryBatch?(c)` | telemetry: returns a callback that receives each delivery batch's outcome |
-| `reportError?(error, c)` | receives unexpected request failures; the default logs only the error's name and code, never SQL, rows or bearers |
+| `observeDeliveryBatch?(c)` | telemetry: returns a callback that receives each delivery batch's outcome. A throwing or rejecting observer is dropped without changing the response |
+| `reportError?(error, c)` | receives unexpected request failures; the default logs only the error's name and code, never SQL, rows or bearers. May be async: a throw or rejection falls back to the default log and never changes the response |
 | `middleware`, `rootRoutes`, `publicRoutes`, `routes` | host middleware and extra routes (`routes` sit behind auth) |
 
 Hosts that assemble their own app can use `createHistoryRoutes(deps)` and
