@@ -81,7 +81,11 @@ export interface UploadSummary {
   batches: number;
   /** Per-session counts of admitted rows, keyed `source/session_id`. */
   sessions: Record<string, number>;
-  /** The committed cursor after the run; the position reached, for a dry run. */
+  /**
+   * The consumer cursor as stored after the run's last commit; null when nothing was
+   * ever committed (no local feed). For a dry run, which never commits, the feed
+   * position the run read up to.
+   */
   cursor: Watermark | null;
 }
 
@@ -334,7 +338,19 @@ export async function upload(options: UploadOptions): Promise<UploadSummary> {
       ...(options.dryRun && position ? { from: position } : { consumer }),
     });
     if (page.changes.length === 0) {
-      summary.cursor ??= page.position;
+      // An exhausted drain positions itself at the head even when no change of the
+      // selected kinds lies below it, so `position` is how far the feed was read, not
+      // the stored cursor. Nothing up to it needs delivering, which is the same reason
+      // a page of only unselected rows is committed; committing it makes the reported
+      // cursor the stored one. A store with no feed yet (revision 0) has nothing to commit.
+      if (options.dryRun) summary.cursor = position ?? page.position;
+      else if (page.position.revision > 0)
+        summary.cursor = (
+          await feed.commitChanges(consumer, page.position, {
+            ...storage,
+            kinds,
+          })
+        ).cursor;
       break;
     }
     const originId = page.head.epoch;

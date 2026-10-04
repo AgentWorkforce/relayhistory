@@ -390,7 +390,7 @@ describe("upload", () => {
     expect(feed.commits).toHaveLength(1);
   });
 
-  it("reports the existing cursor on a run with nothing new", async () => {
+  it("an idle run reports the stored cursor, never an uncommitted read position", async () => {
     const feed = new MemoryFeed([change(1)]);
     const fake = server();
     await upload({
@@ -400,6 +400,9 @@ describe("upload", () => {
       fetch: fake.fetch,
       sleep: noSleep,
     });
+    // Unrelated evidence of an unselected kind moves the head; the kind-filtered page is
+    // empty but positioned at the head.
+    feed.changes.push(change(2, { kind: "tool_call" }));
     const idle = await upload({
       config: config(),
       log: silentLogger,
@@ -407,7 +410,40 @@ describe("upload", () => {
       fetch: fake.fetch,
       sleep: noSleep,
     });
-    expect(idle.cursor).toEqual({ epoch: feed.epoch, revision: 1 });
+    const consumer = consumerName(config());
+    expect(idle.scanned).toBe(0);
+    expect(idle.cursor).toEqual({
+      epoch: feed.epoch,
+      revision: feed.cursors.get(consumer),
+    });
+    expect(feed.cursors.get(consumer)).toBe(2);
+    expect(fake.requests.filter((r) => r.method === "POST")).toHaveLength(1);
+  });
+
+  it("reports no cursor when there is no local feed to commit", async () => {
+    const feed = new MemoryFeed([]);
+    const idle = await upload({
+      config: config(),
+      log: silentLogger,
+      feed,
+      fetch: server().fetch,
+      sleep: noSleep,
+    });
+    expect(idle.cursor).toBeNull();
+    expect(feed.commits).toHaveLength(0);
+  });
+
+  it("a dry run reports how far it read and commits nothing", async () => {
+    const feed = new MemoryFeed([change(1), change(2, { kind: "tool_call" })]);
+    const dry = await upload({
+      config: config(),
+      log: silentLogger,
+      feed,
+      fetch: server().fetch,
+      dryRun: true,
+    });
+    expect(dry.cursor).toEqual({ epoch: feed.epoch, revision: 2 });
+    expect(feed.commits).toHaveLength(0);
   });
 
   it("keeps the cursor when retries run out, and the next run resends the same batch", async () => {

@@ -83,12 +83,17 @@ export class MemoryFeed implements Feed {
       .filter((c) => c.revision > from && (!kinds || kinds.includes(c.kind)))
       .sort((a, b) => a.revision - b.revision);
     const page = remaining.slice(0, options.limit ?? 1000);
-    const last = page.at(-1)?.revision ?? from;
+    const done = page.length === remaining.length;
+    // As the native drain: an exhausted read is positioned at the head, a partial one
+    // at its last change.
     return {
       changes: page,
-      position: { epoch: this.epoch, revision: page.length ? last : head },
+      position: {
+        epoch: this.epoch,
+        revision: done ? head : page.at(-1)!.revision,
+      },
       head: { epoch: this.epoch, revision: head },
-      done: page.length === remaining.length,
+      done,
       consumer: options.consumer ?? null,
     };
   };

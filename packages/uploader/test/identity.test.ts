@@ -8,9 +8,13 @@ import {
   exportHistory,
   getChangesPage,
   sync,
+  commitChanges,
 } from "ai-hist";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { parseEndpoint } from "../src/config.js";
+import { silentLogger } from "../src/log.js";
 import { deliveryRecord } from "../src/records.js";
+import { consumerName, upload } from "../src/uploader.js";
 
 describe("feed records match export records", () => {
   let root: string;
@@ -103,5 +107,42 @@ describe("feed records match export records", () => {
       });
     }
     expect(exported).toBe(page.changes.length);
+  });
+
+  it("an idle upload reports the cursor the store holds", async () => {
+    // file_edit: a kind this store has none of, so every page is empty and positioned
+    // at the head, as an idle run after unrelated evidence would be.
+    const config = {
+      endpoint: parseEndpoint("https://history.example.com"),
+      token: "rth_st_unused",
+      accountId: `relayhistory:${"c".repeat(64)}`,
+      dbPath,
+      selection: {
+        all_sources: true,
+        sources: [],
+        sessions: [],
+        kinds: ["file_edit" as const],
+        excluded_sessions: [],
+      },
+      instanceId: "identity",
+      limits: { maxRecords: 100, maxBytes: 1_048_576 },
+    };
+    const unreachable = (async () => {
+      throw new Error("nothing should be sent");
+    }) as typeof fetch;
+    const summary = await upload({
+      config,
+      log: silentLogger,
+      fetch: unreachable,
+    });
+    expect(summary.selected).toBe(0);
+    // A commit behind the stored cursor moves nothing and returns the cursor as stored.
+    const stored = await commitChanges(
+      consumerName(config),
+      { epoch: summary.cursor!.epoch, revision: 0 },
+      { dbPath, kinds: ["file_edit"] },
+    );
+    expect(summary.cursor).toEqual(stored.cursor);
+    expect(summary.cursor!.revision).toBeGreaterThan(0);
   });
 });
