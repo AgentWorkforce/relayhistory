@@ -90,7 +90,12 @@ async function token(args: string[], log: Logger) {
     },
     strict: true,
   });
-  const database = openDatabase(databaseUrl(), { max: 1, log });
+  if (!["create", "list", "revoke"].includes(action ?? ""))
+    throw new UsageError("token needs create, list or revoke");
+  // Token commands may run before the first `serve`; the schema they write must exist.
+  const url = databaseUrl();
+  await prepareDatabase(url, { log });
+  const database = openDatabase(url, { max: 1, log });
   try {
     if (action === "create") {
       const out = required(values, "out");
