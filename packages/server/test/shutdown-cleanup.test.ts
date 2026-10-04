@@ -79,6 +79,11 @@ describe.skipIf(!adminUrl)("shutdown when closing the pool fails", () => {
       const lines: string[] = [];
       const server = await started(lines);
       const realEnd = pg.Pool.prototype.end;
+      // Settled at the moment the injected rejection is thrown, so the test waits for
+      // the rejection itself rather than for a guessed delay.
+      let markRejected!: () => void;
+      let threw = false;
+      const rejected = new Promise<void>((resolve) => (markRejected = resolve));
       // Cleanup loses the race: pool.end() settles only after the cleanup grace, then fails.
       vi.spyOn(pg.Pool.prototype, "end").mockImplementation(async function (
         this: pg.Pool,
@@ -87,11 +92,23 @@ describe.skipIf(!adminUrl)("shutdown when closing the pool fails", () => {
         await new Promise((resolve) =>
           setTimeout(resolve, CLEANUP_GRACE_MS + 300),
         );
-        throw Object.assign(new Error(SENTINEL), { code: "57P01" });
+        try {
+          throw Object.assign(new Error(SENTINEL), { code: "57P01" });
+        } finally {
+          threw = true;
+          markRejected();
+        }
       });
-      expect(await server.close()).toBe(false);
-      // Wait past the late rejection.
-      await new Promise((resolve) => setTimeout(resolve, 800));
+      const closed = server.close();
+      expect(await closed).toBe(false);
+      // close() returned at its deadline, before the injected failure: prove the failure
+      // then actually happened, and give Node the turn in which it reports a rejection
+      // nobody handled.
+      expect(threw).toBe(false);
+      await rejected;
+      expect(threw).toBe(true);
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setTimeout(resolve, 20));
       expect(unhandled).toEqual([]);
       expect(lines.join("\n")).toContain("shutdown cleanup timed out");
       expect(lines.join("\n")).not.toContain("SENTINEL");
