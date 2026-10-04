@@ -35,7 +35,8 @@ export function getAuth(c: Context<any>): AuthContext {
   return auth;
 }
 
-export function requireScope(scope: string) {
+/** Usable on any host route whose env carries the engine's `auth` variable. */
+export function requireScope(scope: string): MiddlewareHandler<any> {
   return createMiddleware<HistoryEnv>(async (c, next) => {
     const auth = getAuth(c);
     if (!auth.scopes.includes(scope)) {

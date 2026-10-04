@@ -1,5 +1,5 @@
 import { selectedSessionTurns } from "./session-work-state.js";
-import { and, asc, desc, eq } from "drizzle-orm";
+import { and, asc, desc, eq, sql } from "drizzle-orm";
 import type { HistoryDb as Db } from "../db/database.js";
 import { conversationTurns } from "../db/schema.js";
 import type { AuthContext } from "../env.js";
@@ -142,10 +142,11 @@ export async function listConversationTurns(
       )
       // Several workspaces or sources can hold the same turn index for one session id;
       // the rest of the key, then the row id, makes the order total and repeatable.
+      // Text keys sort bytewise so the order does not depend on the database collation.
       .orderBy(
         asc(conversationTurns.turnIndex),
-        asc(conversationTurns.workspaceId),
-        asc(conversationTurns.source),
+        sql`${conversationTurns.workspaceId} collate "C"`,
+        sql`${conversationTurns.source} collate "C"`,
         asc(conversationTurns.id),
       )
   );

@@ -113,6 +113,8 @@ remote provider acquisition. Its connectors reuse sign-ins you already have: `cl
 
 Team uploads come from the [Agent Relay desktop app](https://agentrelay.com), not from this repository.
 
+The History service those uploads land in is public too: [`@relayhistory/engine`](packages/engine/README.md) is the service implementation the hosted service runs, usable on your own PostgreSQL.
+
 ## Why `ai-hist`
 
 - **Every harness, one search.** Claude Code, Codex, Cursor, Grok, Muse Code, OpenCode, Devin CLI, Agent Relay — indexed side-by-side. No per-harness silo.
