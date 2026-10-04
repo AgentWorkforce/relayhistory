@@ -517,6 +517,10 @@ jobs:
             npm version "$VERSION" --no-git-tag-version --allow-same-version
             npm pkg set dependencies.ai-hist="$VERSION"
           )
+          (
+            cd ../../packages/engine
+            npm version "$VERSION" --no-git-tag-version --allow-same-version
+          )
           node - "$VERSION" <<'NODE'
           const fs = require("node:fs");
           const version = process.argv[2];
@@ -557,6 +561,7 @@ jobs:
               "crates/ai-hist-napi/package.json",
               "sdk-ts/package.json",
               "mcp-package/package.json",
+              "packages/engine/package.json",
             ].map((path) => [path, JSON.parse(fs.readFileSync(path, "utf8"))]);
             for (const [path, manifest] of manifests) {
               if (manifest.version !== process.env.VERSION) {
@@ -572,6 +577,7 @@ jobs:
             const lockVersions = [
               ["crates/ai-hist-napi/package-lock.json", ["", null]],
               ["sdk-ts/package-lock.json", ["", "../crates/ai-hist-napi"]],
+              ["packages/engine/package-lock.json", [""]],
             ];
             for (const [path, packageKeys] of lockVersions) {
               const lock = JSON.parse(fs.readFileSync(path, "utf8"));
@@ -634,6 +640,8 @@ jobs:
             sdk-ts/package.json \
             sdk-ts/package-lock.json \
             mcp-package/package.json \
+            packages/engine/package.json \
+            packages/engine/package-lock.json \
             CHANGELOG.md
           if git diff --cached --quiet; then
             echo "Version metadata is already committed at $VERSION"
@@ -951,6 +959,86 @@ jobs:
           # Dry-run already compiled the package. The token is the short-lived
           # crates.io credential minted from GitHub OIDC above, not a repo secret.
           cargo publish -p ai-hist --allow-dirty --locked --no-verify
+
+  publish-engine:
+    name: Publish @relayhistory/engine
+    needs: [version, publish, verify-core, finalize-core]
+    # Independent of the core packages: nothing local depends on the service engine,
+    # so a failure here never blocks or partially undoes the core release, and a
+    # skip_core run retries only the packages still missing at this version.
+    if: ${{ !cancelled() && needs.version.result == 'success' && ((inputs.dry_run && (inputs.skip_core || needs.publish.result == 'success')) || (!inputs.dry_run && needs.verify-core.result == 'success' && needs.finalize-core.result == 'success')) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: packages/engine
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.skip_core && format('refs/tags/sdk-ts-v{0}', needs.version.outputs.version) || needs.publish.outputs.release_sha || github.sha }}
+          persist-credentials: false
+      - name: Find the engine in the release tree
+        id: engine
+        working-directory: .
+        run: |
+          # Release tags cut before the engine existed have nothing to publish.
+          if [ -f packages/engine/package.json ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::No packages/engine in this release tree; nothing to publish"
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-node@v6
+        if: ${{ steps.engine.outputs.present == 'true' }}
+        with:
+          node-version: '22.14.0'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Match release npm version
+        if: ${{ steps.engine.outputs.present == 'true' }}
+        run: npm install -g npm@11.19.1
+      - name: Stamp the engine at the release version
+        if: ${{ steps.engine.outputs.present == 'true' }}
+        run: |
+          set -euo pipefail
+          test -n "$VERSION"
+          # A dry run has no version commit; a real run's release commit already
+          # carries this version, so the stamp is a no-op there.
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+      - name: Install, test and build
+        if: ${{ steps.engine.outputs.present == 'true' }}
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run typecheck
+          npm test
+          npm pack --dry-run
+      - name: Check whether this version is already on npm
+        id: engine-gate
+        if: ${{ !inputs.dry_run && steps.engine.outputs.present == 'true' }}
+        run: |
+          set -euo pipefail
+          # Only a definite "no such version" (E404) publishes; any other failure
+          # stops here rather than looking like an absent version.
+          if out="$(npm view "@relayhistory/engine@$VERSION" version 2>&1)"; then
+            if [ "$out" = "$VERSION" ]; then
+              echo "exists=true" >> "$GITHUB_OUTPUT"
+              echo "@relayhistory/engine@$VERSION already exists on npm; skip"
+              exit 0
+            fi
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          elif printf '%s' "$out" | grep -q "E404"; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::npm lookup failed; not publishing"
+            exit 1
+          fi
+      - name: Publish
+        if: ${{ !inputs.dry_run && steps.engine.outputs.present == 'true' && steps.engine-gate.outputs.exists == 'false' }}
+        run: npm publish --access public --provenance
 
   package-plugins:
     name: Package optional history plugins

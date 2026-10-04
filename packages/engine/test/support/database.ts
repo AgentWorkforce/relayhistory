@@ -86,6 +86,11 @@ async function postgresDatabase(): Promise<TestDatabase> {
     max: 4,
     options: "-c search_path=sessions,public",
   });
+  // `pool.end()` resolves before its sockets close, so the forced DROP DATABASE in
+  // `close` can terminate a backend still shutting down (57P01). That is the intended
+  // end of the connection, not a test failure.
+  pool.on("error", () => {});
+  pool.on("connect", (client) => client.on("error", () => {}));
   return {
     kind: "postgres",
     db: drizzlePg(pool, { schema }),

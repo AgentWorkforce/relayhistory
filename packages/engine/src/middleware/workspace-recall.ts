@@ -1,10 +1,9 @@
 import type { Context } from "hono";
-import type { HistoryEnv } from "../env.js";
 import { getAuth } from "./auth.js";
 
 export const WORKSPACE_RECALL_HEADER = "X-Relayhistory-Workspace-Id";
 
-function badRequest(c: Context<HistoryEnv>, message: string) {
+function badRequest(c: Context<any>, message: string) {
   return c.json(
     {
       error: { code: "bad_request", message },
@@ -14,7 +13,7 @@ function badRequest(c: Context<HistoryEnv>, message: string) {
   );
 }
 
-function forbidden(c: Context<HistoryEnv>, message: string) {
+function forbidden(c: Context<any>, message: string) {
   return c.json(
     {
       error: { code: "forbidden", message },
@@ -38,7 +37,7 @@ type WorkspaceRecallScope =
  * token value rather than the query value.
  */
 export function readWorkspaceRecallScope(
-  c: Context<HistoryEnv>,
+  c: Context<any>,
 ): WorkspaceRecallScope {
   const requested = c.req.queries("workspace") ?? [];
   if (requested.length === 0) return { workspaceId: undefined };
@@ -60,7 +59,7 @@ export function readWorkspaceRecallScope(
 }
 
 export function attestWorkspace(
-  c: Context<HistoryEnv>,
+  c: Context<any>,
   workspaceId: string | undefined,
 ): void {
   if (workspaceId) c.header(WORKSPACE_RECALL_HEADER, workspaceId);

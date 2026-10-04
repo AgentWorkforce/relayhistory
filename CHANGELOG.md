@@ -1,6 +1,6 @@
 # Changelog
 
-User-facing release notes for RelayHistory. Every public package — the `ai-hist` npm package and CLI, `ai-hist-native` and its platform packages, `ai-hist-mcp`, the optional history plugins, and the `ai-hist` crate on crates.io — is released in lockstep at one version, tagged `sdk-ts-v<version>`.
+User-facing release notes for RelayHistory. Every public package — the `ai-hist` npm package and CLI, `ai-hist-native` and its platform packages, `ai-hist-mcp`, `@relayhistory/engine`, the optional history plugins, and the `ai-hist` crate on crates.io — is released in lockstep at one version, tagged `sdk-ts-v<version>`.
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
@@ -8,6 +8,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `@relayhistory/engine` publishes the History service itself (durable delivery, recall, conversation turns, scoped service tokens and the PostgreSQL `sessions` schema with migrations) as one `createHistoryEngine(deps)` app that the hosted service and self-hosted Node + PostgreSQL deployments both run; `bootstrapServiceToken` mints a deployment's first scoped token without any HTTP minting endpoint.
 - `packages/server` self-hosts the History service on Node and PostgreSQL with pgvector: startup migrations, operator token bootstrap (`relayhistory-server token create`), readiness, graceful shutdown, a Docker Compose stack, and a backup/restore guide (`docs/self-hosting.md`).
 
 ## [0.34.1] - 2026-10-03

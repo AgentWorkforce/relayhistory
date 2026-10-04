@@ -12,9 +12,14 @@ import { createHash } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  rolloutDeliveryProjection,
+  rolloutSessionRollups,
+} from "./rollouts.js";
 import { splitSqlStatements } from "./split-sql-statements.js";
 
 export { splitSqlStatements };
+export * from "./rollouts.js";
 
 /** The packaged migrations, `packages/engine/migrations`. */
 export const MIGRATIONS_DIR = resolve(
@@ -315,20 +320,28 @@ export interface ApplyMigrationsOptions {
   indexes?: ConcurrentIndexOptions;
 }
 
+/** The migrations whose schema is completed by `rolloutDeliveryProjection` and `rolloutSessionRollups`. */
+export const DELIVERY_PROJECTION_ROLLOUT_MIGRATION =
+  "0029_delivery_projection_rollout.sql";
+export const SESSION_ROLLUPS_MIGRATION = "0030_session_rollups.sql";
+
 export interface AppliedMigrations {
   /** Every migration in the ledger after the run. */
   applied: { name: string; checksum: string }[];
   indexes: Record<string, ConcurrentIndexAction>;
+  /** Sessions the 0030 rollup backfill rebuilt in this run. */
+  rolledUpSessions: number;
 }
 
 const PROGRESS =
   /^Sessions migration detail [1-9]\d*\/[1-9]\d* statement [1-9]\d*\/[1-9]\d*: (start|done)$/;
 
 /**
- * Apply every pending migration in one transaction on `client`, then ensure the
- * concurrent indexes on the same connection outside any transaction. Safe to run from
- * several processes at once: the advisory lock serializes them and an applied
- * migration is skipped.
+ * Bring a database to the current schema on `client`: every pending migration in one
+ * transaction, then the concurrent indexes and the 0029/0030 rollouts on the same
+ * connection outside it. Safe to run from several processes at once: the advisory
+ * lock serializes migrations, an applied migration is skipped, and each rollout stage
+ * is idempotent and resumable.
  */
 export async function applyMigrations(
   client: MigrationClient,
@@ -389,16 +402,23 @@ export async function applyMigrations(
   } finally {
     client.removeListener?.("notice", onNotice);
   }
+  const query = async (text: string) => (await client.query(text)).rows;
   const indexes = await ensureConcurrentIndexes(
-    async (text) => (await client.query(text)).rows,
+    query,
     CONCURRENT_INDEXES,
     options.indexes,
   );
-  return {
-    applied: ledger.map((row) => ({
-      name: String(row.name),
-      checksum: String(row.checksum),
-    })),
-    indexes,
-  };
+  const applied = ledger.map((row) => ({
+    name: String(row.name),
+    checksum: String(row.checksum),
+  }));
+  // Each rollout completes the migration that introduced it, so it runs once that
+  // migration is in the ledger (a directory holding an earlier subset has neither).
+  const inLedger = (name: string) => applied.some((row) => row.name === name);
+  if (inLedger(DELIVERY_PROJECTION_ROLLOUT_MIGRATION))
+    await rolloutDeliveryProjection(query, { report });
+  const rollups = inLedger(SESSION_ROLLUPS_MIGRATION)
+    ? await rolloutSessionRollups(query, { report })
+    : { sessions: 0 };
+  return { applied, indexes, rolledUpSessions: rollups.sessions };
 }

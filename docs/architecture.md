@@ -118,8 +118,22 @@ second addon or implicit plugin discovery is involved. Explicit registration is
 inert until an operation selects the plugin; normal local operations do not
 read its auth.
 
-Uploads are not part of this repository. Team uploads come from the Agent Relay
+Uploads are not part of the local packages. Team uploads come from the Agent Relay
 desktop app, which consumes the published `ai-hist` crate.
+
+## History service engine
+
+`packages/engine` (`@relayhistory/engine`) is the History service that receives
+uploads: delivery protocol 1 (scrubbing, digests, conflicts, tombstones, durable
+receipts), recall, conversation turns, service-local tokens and the PostgreSQL
+`sessions` schema with its migrations. `createHistoryEngine(deps)` returns the whole
+Hono application; the hosted Worker (Neon) and a self-hosted Node server (PostgreSQL +
+pgvector) run it with different `deps` for the database connection, an optional second
+identity provider, optional embeddings and telemetry. It is independent of the Rust
+workspace and the SDK: nothing local depends on it, and it never reads
+`ai-history.db`. Pricing, classification, linking and analysis stay out of it. See the
+[engine ADR](decisions/2026-10-04-public-history-service-engine.md) and
+[`packages/engine/README.md`](../packages/engine/README.md).
 
 ## Session ledger and location scope
 
