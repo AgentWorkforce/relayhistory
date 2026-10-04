@@ -13,7 +13,12 @@ import { ConfigError, databaseUrl, loadConfig } from "./config.js";
 import { openDatabase, prepareDatabase } from "./database.js";
 import { createLogger, type Logger } from "./log.js";
 import { startServer } from "./server.js";
-import { createTokenFile, listTokens, revokeToken } from "./tokens.js";
+import {
+  createTokenFile,
+  listTokens,
+  revokeToken,
+  validateTokenOptions,
+} from "./tokens.js";
 
 const USAGE = `Usage:
   relayhistory-server serve
@@ -54,11 +59,16 @@ async function serve(log: Logger) {
   });
   // A clean drain leaves nothing holding the event loop, so the process exits on its own
   // once stderr has flushed. Only a stuck database connection past the deadline forces it.
+  // The flush gets a bounded moment: a stderr pipe nobody reads must not outlive the
+  // deadline either.
   if (!drained) {
     process.exitCode = 1;
+    setTimeout(() => process.exit(1), FORCED_EXIT_FLUSH_MS).unref();
     process.stderr.write("", () => process.exit(1));
   }
 }
+
+const FORCED_EXIT_FLUSH_MS = 1_000;
 
 async function migrate(log: Logger) {
   const config = loadConfig();
@@ -123,6 +133,7 @@ async function token(args: string[], log: Logger) {
           },
         }
       : undefined;
+  if (create) validateTokenOptions(create.options);
   const id = action === "revoke" ? required(values, "id") : undefined;
   // Token commands may run before the first `serve`; the schema they write must exist.
   const url = databaseUrl();

@@ -4,6 +4,9 @@
  */
 import { open, rm } from "node:fs/promises";
 import {
+  DEFAULT_SCOPES,
+  SERVICE_TTL_MAX_DAYS,
+  ServiceTokenError,
   bootstrapServiceToken,
   deliveryAccount,
   listServiceTokens,
@@ -32,6 +35,43 @@ export interface CreateTokenOptions {
   label: string;
   scopes?: string[];
   expiresInDays?: number;
+}
+
+/** The tenant identifier rule `bootstrapServiceToken` enforces. */
+const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$/;
+
+/**
+ * Reject options `bootstrapServiceToken` would refuse, before any database work, so a
+ * mistyped command neither needs nor modifies the database. The engine stays the
+ * authority: it checks again when minting.
+ */
+export function validateTokenOptions(options: CreateTokenOptions): void {
+  for (const [flag, value] of [
+    ["--org", options.orgId],
+    ["--workspace", options.workspaceId],
+  ] as const)
+    if (!IDENTIFIER.test(value))
+      throw new ServiceTokenError(
+        `${flag} must be 1..128 characters of letters, digits and . _ : @ -`,
+      );
+  const label = options.label.trim();
+  if (!label || label.length > 120)
+    throw new ServiceTokenError("--label must be 1..120 characters");
+  const unknown = (options.scopes ?? []).filter(
+    (scope) => !(DEFAULT_SCOPES as readonly string[]).includes(scope),
+  );
+  if (unknown.length || options.scopes?.length === 0)
+    throw new ServiceTokenError(
+      `--scopes must name ${DEFAULT_SCOPES.join(" and/or ")}`,
+    );
+  const days = options.expiresInDays;
+  if (
+    days !== undefined &&
+    (!Number.isInteger(days) || days < 1 || days > SERVICE_TTL_MAX_DAYS)
+  )
+    throw new ServiceTokenError(
+      `--expires-days must be from 1 to ${SERVICE_TTL_MAX_DAYS}`,
+    );
 }
 
 export async function createToken(

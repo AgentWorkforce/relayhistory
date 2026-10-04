@@ -146,7 +146,9 @@ protocol is idempotent, so a replayed batch returns the receipt it was first giv
 
 Pull the new revision and rebuild. Migrations run in one transaction under an advisory
 lock with a checksum ledger, so concurrent starts are safe and an edited applied
-migration stops the server instead of diverging. Back up before upgrading.
+migration stops the server instead of diverging. The first start after an upgrade
+also finishes any projection backfill before it listens; the image's health check allows
+up to an hour for that, so `up --wait` waits rather than failing. Back up before upgrading.
 
 ```bash
 git pull

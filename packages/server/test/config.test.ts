@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { ConfigError, loadConfig } from "../src/config.js";
+import { validateTokenOptions } from "../src/tokens.js";
 
 const base = { DATABASE_URL: "postgres://history:secret@db:5432/history" };
 
@@ -55,5 +56,31 @@ describe("loadConfig", () => {
       EMBEDDING_API_URL: undefined,
       EMBEDDING_MODEL: "m",
     });
+  });
+});
+
+describe("validateTokenOptions", () => {
+  const base = { orgId: "acme", workspaceId: "main", label: "laptop" };
+  it("accepts what bootstrapServiceToken accepts", () => {
+    expect(() =>
+      validateTokenOptions({
+        ...base,
+        scopes: ["rth:sync"],
+        expiresInDays: 365,
+      }),
+    ).not.toThrow();
+  });
+  it.each([
+    [{ expiresInDays: 0 }, /expires-days/],
+    [{ expiresInDays: 366 }, /expires-days/],
+    [{ scopes: ["rth:admin"] }, /scopes/],
+    [{ scopes: [] }, /scopes/],
+    [{ label: "  " }, /label/],
+    [{ orgId: "acme corp" }, /--org/],
+    [{ workspaceId: "-main" }, /--workspace/],
+  ])("refuses %o before any database work", (override, message) => {
+    expect(() => validateTokenOptions({ ...base, ...override })).toThrow(
+      message,
+    );
   });
 });

@@ -15,6 +15,7 @@ export {
   listTokens,
   revokeToken,
   type CreateTokenOptions,
+  validateTokenOptions,
   type TokenDestination,
   type TokenFile,
 } from "./tokens.js";
