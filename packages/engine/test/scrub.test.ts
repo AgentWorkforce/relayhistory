@@ -608,6 +608,13 @@ describe("hosted ingest scrubbing", () => {
             .slice(0, n),
       ],
       [
+        "re-reads after short regions, one sweep after another",
+        (n) =>
+          'Authorization: Basic $(a\n,Authorization: b) {"m":"x\\nAuthorization: Basic $(q\\nX: y,Authorization: Basic $(b ,Authorization: Basic $(never","k":1}\n'
+            .repeat(n / 147)
+            .slice(0, n),
+      ],
+      [
         "keyed headers on serialized lines cut at their string's close",
         (n) =>
           'Authorization: Basic $(oops\n\')"Authorization": "Basic $(q","k":1}\n{"m":"\\n'
@@ -2528,6 +2535,39 @@ describe("hosted ingest scrubbing", () => {
             const out = scrubText(input(p1, gap, tail));
             expect(out, `p1 ${p1} gap ${gap}`).not.toContain("S3cret");
             expect(out, `p1 ${p1} gap ${gap}`).toContain("Host: x");
+          }
+    });
+
+    it("re-reads a later sweep's straddler past an earlier sweep's failed re-read", () => {
+      // GH #4179256903: the first sweep's cut line holds a substitution that never
+      // closes; the straddler a later sweep re-reads is read to its own close.
+      const filler = (length: number) => {
+        let text = "";
+        while (text.length < length) {
+          const line = Math.min(63, length - text.length - 1);
+          text += `${line > 0 ? "x".repeat(line) : ""}\n`;
+        }
+        return text.slice(0, length);
+      };
+      const swept = (name: string) =>
+        `Authorization: Basic $(${name}\nAuthorization: Basic $(a\n,Authorization: b) ,Authorization: Basic $(zz\n`;
+      const input = (g1: number, g2: number, length: number) =>
+        `${swept("oops")}${filler(4010)}Authorization: Basic $(never ${"q".repeat(200)}\n${filler(g1)}` +
+        `${swept("oops2")}${filler(g2)}Authorization: Basic $(printf 'admin:${"x".repeat(length)}\nS3cret' | base64)\nHost: x`;
+      const exact = scrubText(input(0, 3700, 300));
+      expect(exact).not.toContain("S3cret");
+      expect(exact.endsWith("Host: x")).toBe(true);
+      for (const g1 of [0, 64, 200])
+        for (const length of [300, 600])
+          for (let g2 = 3700; g2 <= 4300; g2 += 3) {
+            const out = scrubText(input(g1, g2, length));
+            expect(out, `g1 ${g1} L ${length} g2 ${g2}`).not.toContain(
+              "S3cret",
+            );
+            expect(
+              out.endsWith("Host: x"),
+              `g1 ${g1} L ${length} g2 ${g2}`,
+            ).toBe(true);
           }
     });
 
