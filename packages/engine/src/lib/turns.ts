@@ -175,8 +175,8 @@ export async function getSessionMetadata(
     )
     .orderBy(
       desc(conversationTurns.turnIndex),
-      asc(conversationTurns.workspaceId),
-      asc(conversationTurns.source),
+      sql`${conversationTurns.workspaceId} collate "C"`,
+      sql`${conversationTurns.source} collate "C"`,
       asc(conversationTurns.id),
     );
 
