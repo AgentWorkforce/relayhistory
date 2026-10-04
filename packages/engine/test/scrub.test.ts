@@ -408,6 +408,13 @@ describe("hosted ingest scrubbing", () => {
             .slice(0, n),
       ],
       [
+        "unclosed substitutions in quoted keys",
+        (n) =>
+          '{"Authorization":"Basic $(echo a","n":"k"}'
+            .repeat(Math.ceil(n / 42))
+            .slice(0, n),
+      ],
+      [
         "stray parameter items",
         (n) =>
           `Authorization: AWS4 C=a/b, ${"x y=z/w, ".repeat(n)}`.slice(0, n),
@@ -1530,6 +1537,51 @@ describe("hosted ingest scrubbing", () => {
       ).toBe(
         String.raw`{"msg":"GET /\r\nAuthorization: Basic [REDACTED]","level":"info"}`,
       );
+    });
+
+    it("ends an unclosed substitution in a quoted key's value at the value's close", () => {
+      expect(scrubText('{"Authorization":"Basic $(echo","next":"keep"}')).toBe(
+        '{"Authorization":"Basic [REDACTED]","next":"keep"}',
+      );
+      const rows: Array<[string, string]> = [
+        [
+          '{"Authorization":"Basic $(echo admin:hunter2","next":"keep"}',
+          '"next":"keep"}',
+        ],
+        [
+          "{'Authorization': 'Basic $(echo admin:hunter2', 'next': 'keep'}",
+          "'next': 'keep'}",
+        ],
+        [
+          `{"Authorization":"Basic $(printf '%s' admin:hunter2 | base64)","next":"keep"}`,
+          '"next":"keep"}',
+        ],
+        [
+          JSON.stringify({
+            Authorization: 'Basic $(printf "%s" admin:hunter2 | base64)',
+            next: "keep",
+          }),
+          '"next":"keep"}',
+        ],
+        [
+          JSON.stringify({
+            r: "GET /\r\nAuthorization: Basic $(echo admin:hunter2\r\nHost: x",
+          }),
+          "Host: x",
+        ],
+        // In a shell argument a same-kind quote may sit inside `$(…)`, so no quote is
+        // a safe stop: still redacted to the line end.
+        ["curl -H 'Authorization: Basic $(echo admin:hunter2' url", "curl -H"],
+        [
+          'curl -H "Authorization: Basic $(printf "%s" admin:hunter2" url',
+          "curl -H",
+        ],
+      ];
+      for (const [input, kept] of rows) {
+        const out = scrubText(input);
+        expect(out, input).not.toContain("hunter2");
+        expect(out, input).toContain(kept);
+      }
     });
 
     it("redacts to the line end when a loose quoted value meets a quote of another depth", () => {

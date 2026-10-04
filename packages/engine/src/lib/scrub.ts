@@ -198,7 +198,7 @@ export function scrubText(value: string): string {
  * mid-sentence is not one.
  */
 const AUTHORIZATION_HEADER =
-  /(^|[\r\n{,(]|["']|\\[nr])[ \t]*(?:proxy-)?authorization(?:\\*["'])?[ \t]*[:=][ \t]*/gi;
+  /(^|[\r\n{,(]|["']|\\[nr])[ \t]*(?:proxy-)?authorization(\\*["'])?[ \t]*[:=][ \t]*/gi;
 // RFC 7230 token characters, less the quotes that can delimit a quoted header.
 const TOKEN = /[A-Za-z0-9!#$%&*+.^_`|~-]/;
 // Schemes whose credential is token68 (RFC 7235), possibly base64 with `=` padding.
@@ -300,7 +300,10 @@ function redactAuthorization(text: string): string {
     // Only these schemes carry a token68 credential whose `=` is base64 padding; any
     // other scheme's `name=` is a parameter (`Digest response=" …"`).
     const padded = scheme !== null && TOKEN68_SCHEME.test(scheme[1]!);
-    const substitution = shellSubstitutionEnd(text, credential, quote);
+    // A quoted key (`"Authorization":"…"`, `'Authorization': '…'`) holds a value that
+    // must escape its own quote, so that value's close is a safe boundary.
+    const keyed = header[2] !== undefined && quote.char !== "";
+    const substitution = shellSubstitutionEnd(text, credential, quote, keyed);
     const params =
       substitution === null
         ? authParams(text, credential, quote, padded)
@@ -567,12 +570,15 @@ function headerEnd(text: string, at: number, quote: HeaderQuote): number {
  * Where a shell substitution starting the credential at `at` ends: after the `)` that
  * closes `$(` (counting nested parentheses) or the backtick that closes one, whatever
  * quotes it holds (`$(printf '%s' user:pass | base64)`). An unmatched one runs to the
- * end of its line. Null when the credential is not a substitution.
+ * end of its line, since in a shell argument a quote of the header's kind may sit
+ * inside it; in a quoted key's value (`keyed`) it ends at that value's close, which
+ * also bounds the scan. Null when the credential is not a substitution.
  */
 function shellSubstitutionEnd(
   text: string,
   at: number,
   quote: HeaderQuote,
+  keyed: boolean,
 ): number | null {
   const backtick = text[at] === "`";
   if (!backtick && !(text[at] === "$" && text[at + 1] === "(")) return null;
@@ -581,13 +587,16 @@ function shellSubstitutionEnd(
   while (index < text.length) {
     const run = backslashes(text, index);
     const char = text[index + run];
-    if (char === "\n" || char === "\r") return index;
+    if (char === "\n" || char === "\r") break;
     if (
       run > 0 &&
       (char === "n" || char === "r") &&
       escapedBreak(text, index, run, quote)
     )
-      return index;
+      break;
+    // A quoted key's value cannot hold its own quote unescaped, so its close ends
+    // the substitution too.
+    if (keyed && quoteRole(char, run, quote) === "close") return index;
     if (run === 0) {
       if (backtick && char === "`") return index + 1;
       if (!backtick && char === "(") depth += 1;
@@ -595,7 +604,7 @@ function shellSubstitutionEnd(
     }
     index += run + 1;
   }
-  return text.length;
+  return Math.min(index, text.length);
 }
 
 /**
