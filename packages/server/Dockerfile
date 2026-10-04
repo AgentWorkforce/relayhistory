@@ -24,7 +24,9 @@ COPY --from=build /src/packages/server/dist ./dist
 RUN chmod +x dist/cli.js && ln -s /app/dist/cli.js /usr/local/bin/relayhistory-server
 USER node
 EXPOSE 8080
-HEALTHCHECK --interval=10s --timeout=3s --start-period=60s --retries=3 \
+# Start-up applies migrations and resumable projection backfills before listening; after a
+# large upgrade that can take a while, and each step is bounded by statement timeouts.
+HEALTHCHECK --interval=10s --timeout=3s --start-period=1h --retries=3 \
   CMD ["node", "-e", "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/ready').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
 ENTRYPOINT ["relayhistory-server"]
 CMD ["serve"]
