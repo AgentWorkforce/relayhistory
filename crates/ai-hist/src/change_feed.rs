@@ -621,6 +621,28 @@ fn feed_identity_exists(conn: &Connection) -> Result<bool> {
     .map_err(Into::into)
 }
 
+/// The temporary table a restamp stages each row's ordinal in, keyed by the
+/// fed table's rowid.
+const RESTAMP_ORDINALS: &str = "temp.change_feed_restamp_ordinals";
+
+/// The statement that stamps every row of `table` with `?1` plus its ordinal
+/// from [`RESTAMP_ORDINALS`].
+///
+/// The ordinals come from a staged table with an INTEGER PRIMARY KEY rather
+/// than a `ROW_NUMBER()` CTE in the statement itself: every fed table carries
+/// change-feed triggers, and SQLite does not build an automatic index on a
+/// CTE for an UPDATE of a triggered table, so the inline form rescanned the
+/// whole table per row. Through the staged table each row is one primary-key
+/// lookup, whatever the planner's heuristics.
+fn restamp_update_sql(table: &str) -> String {
+    format!(
+        "UPDATE {table}
+         SET {REVISION_COLUMN} = ?1 + (
+             SELECT ordinal FROM {RESTAMP_ORDINALS} o WHERE o.rowid = {table}.rowid
+         )"
+    )
+}
+
 fn restamp_exported_rows(conn: &Connection, kind: ChangeKind) -> Result<()> {
     let table = kind.table().name;
     let count: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
@@ -637,18 +659,18 @@ fn restamp_exported_rows(conn: &Connection, kind: ChangeKind) -> Result<()> {
     let head = base
         .checked_add(count)
         .context("change-feed revision overflow while restamping an exported schema")?;
-    conn.execute(
-        &format!(
-            "WITH ranked(rowid, ordinal) AS (
-                 SELECT rowid, ROW_NUMBER() OVER (ORDER BY rowid) FROM {table}
-             )
-             UPDATE {table}
-             SET {REVISION_COLUMN} = ?1 + (
-                 SELECT ordinal FROM ranked WHERE ranked.rowid = {table}.rowid
-             )"
-        ),
-        [base],
-    )?;
+    conn.execute_batch(&format!(
+        "DROP TABLE IF EXISTS {RESTAMP_ORDINALS};
+         CREATE TABLE {RESTAMP_ORDINALS} (
+             rowid INTEGER PRIMARY KEY,
+             ordinal INTEGER NOT NULL
+         );
+         INSERT INTO {RESTAMP_ORDINALS} (rowid, ordinal)
+         SELECT rowid, ROW_NUMBER() OVER (ORDER BY rowid) FROM {table};"
+    ))?;
+    let stamped = conn.execute(&restamp_update_sql(table), [base]);
+    conn.execute_batch(&format!("DROP TABLE IF EXISTS {RESTAMP_ORDINALS};"))?;
+    stamped?;
     conn.execute(
         "UPDATE observation_clock SET version=?1 WHERE singleton=1",
         [head],
@@ -3261,6 +3283,81 @@ INSERT INTO observation_evidence (source, session_id, location, connector_id,
 
         let (reopened, _) = store(dir.path());
         assert_eq!(reopened.head_revision().unwrap(), new_head);
+    }
+
+    /// Every fed table carries change-feed triggers, which stop SQLite from
+    /// indexing a CTE for an UPDATE of that table. A restamp must therefore
+    /// reach each row's ordinal through a keyed lookup, or a large install
+    /// rescans the table per row and its first open after an upgrade runs for
+    /// hours.
+    #[test]
+    fn a_restamp_looks_each_ordinal_up_by_key_on_a_triggered_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, conn) = store(dir.path());
+        for i in 0..2_000 {
+            insert_event(&conn, "s1", &format!("e{i}"), "event");
+        }
+        let triggers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type='trigger' AND tbl_name='session_events'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            triggers > 0,
+            "the fed table carries its change-feed triggers"
+        );
+        let base = i64::try_from(store.head_revision().unwrap().revision).unwrap();
+
+        restamp_exported_rows(&conn, ChangeKind::SessionEvent).unwrap();
+
+        let revisions: Vec<i64> = conn
+            .prepare("SELECT revision FROM session_events ORDER BY rowid")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            revisions,
+            (base + 1..=base + 2_000).collect::<Vec<_>>(),
+            "rows are stamped densely above the old head in rowid order"
+        );
+        assert_eq!(
+            i64::try_from(store.head_revision().unwrap().revision).unwrap(),
+            base + 2_000
+        );
+        assert!(
+            conn.prepare(&format!("SELECT 1 FROM {RESTAMP_ORDINALS}"))
+                .is_err(),
+            "the staged ordinals do not outlive the restamp"
+        );
+
+        conn.execute_batch(&format!(
+            "CREATE TABLE {RESTAMP_ORDINALS} (rowid INTEGER PRIMARY KEY, ordinal INTEGER NOT NULL)"
+        ))
+        .unwrap();
+        let plan: Vec<String> = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                restamp_update_sql("session_events")
+            ))
+            .unwrap()
+            .query_map([0i64], |row| row.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("SEARCH o USING INTEGER PRIMARY KEY")),
+            "each ordinal is a primary-key lookup: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|step| step.starts_with("SCAN o")),
+            "no per-row scan of the staged ordinals: {plan:?}"
+        );
     }
 
     #[test]
