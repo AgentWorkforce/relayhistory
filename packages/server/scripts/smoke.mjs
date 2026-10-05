@@ -19,6 +19,7 @@ import { promisify } from "node:util";
 import { parseArgs } from "node:util";
 import assert from "node:assert/strict";
 import pg from "pg";
+import { running, stopChild } from "./child-process.mjs";
 import { batch, eventTombstone, sessionRecords } from "./fixtures.mjs";
 
 const run = promisify(execFile);
@@ -99,6 +100,11 @@ async function localRuntime(adminUrl) {
       await waitReady(rt.baseUrl);
     },
     async stop() {
+      // A server that already died has emitted `exit`; waiting for it would never end.
+      assert.ok(
+        running(child),
+        `server had already exited ${child.exitCode ?? child.signalCode}`,
+      );
       const exited = once(child, "exit");
       child.kill("SIGTERM");
       const [code, signal] = await exited;
@@ -113,11 +119,7 @@ async function localRuntime(adminUrl) {
       return JSON.parse(stdout);
     },
     async cleanup() {
-      if (child && child.exitCode === null) {
-        const exited = once(child, "exit");
-        child.kill("SIGTERM");
-        await exited;
-      }
+      if (child) await stopChild(child);
       if (!values.keep)
         await admin.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
       await admin.end();
