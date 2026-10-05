@@ -668,9 +668,10 @@ fn restamp_exported_rows(conn: &Connection, kind: ChangeKind) -> Result<()> {
          INSERT INTO {RESTAMP_ORDINALS} (rowid, ordinal)
          SELECT rowid, ROW_NUMBER() OVER (ORDER BY rowid) FROM {table};"
     ))?;
-    let stamped = conn.execute(&restamp_update_sql(table), [base]);
+    conn.execute(&restamp_update_sql(table), [base])?;
+    // A failed restamp rolls the staged table back with the migration's
+    // transaction, and the next attempt drops any leftover before staging.
     conn.execute_batch(&format!("DROP TABLE IF EXISTS {RESTAMP_ORDINALS};"))?;
-    stamped?;
     conn.execute(
         "UPDATE observation_clock SET version=?1 WHERE singleton=1",
         [head],
