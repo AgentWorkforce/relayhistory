@@ -2713,6 +2713,41 @@ describe("hosted ingest scrubbing", () => {
         }
     });
 
+    it("keeps re-reading the cut line's skipped headers after the own header's re-read", () => {
+      // Round 23 C F1 / D N1: the failed header's own re-read closes past the cut; a
+      // header the chain skipped on that line, whose own credential runs further, is
+      // still re-read.
+      const c = (pad: number) =>
+        `Authorization: Basic $(a\n${"x".repeat(pad)},Authorization: Basic $(b ,Authorization: Basic $(echo 'x ,Authorization: Basic $(printf "u\nS3cret' ) Lk6leak" )\nHost: x`;
+      const d = (pad: number) =>
+        `Authorization: Basic $(a\n,Authorization: b) ,Authorization: Basic $(n\n${"x".repeat(pad)}\n` +
+        '{"m":"x\\nAuthorization: Basic $(q\\nAuthorization: Basic $(r\\nAuthorization: Basic $(s ,Authorization: Basic $(h","k":1} ' +
+        `,Authorization: Basic $(printf 'admin:yy ,Authorization: Basic $(printf "a\nS3cret' | base64) Kp8leak" )\nHost: x`;
+      for (const out of [scrubText(c(4020)), scrubText(d(3940))]) {
+        expect(out).not.toContain("S3cret");
+        expect(out).not.toContain("Lk6leak");
+        expect(out).not.toContain("Kp8leak");
+        expect(out).toContain("\nHost: x");
+      }
+      // Pads still leaking are those 621dfd1c leaks too: C's last 16, where the skipped
+      // header's close lies past its window, and D's outside 3898..3949, where by shell
+      // grammar Kp8leak is literal text after the first header's close. C pad 3980 fails
+      // closed through Host, as every head since 2b89066d does.
+      for (let pad = 3980; pad <= 4060; pad += 1) {
+        const out = scrubText(c(pad));
+        expect(out, `C pad ${pad}`).not.toContain("S3cret");
+        if (pad < 4045) expect(out, `C pad ${pad}`).not.toContain("Lk6leak");
+        if (pad > 3980) expect(out, `C pad ${pad}`).toContain("\nHost: x");
+      }
+      for (let pad = 3800; pad <= 4100; pad += 1) {
+        const out = scrubText(d(pad));
+        expect(out, `D pad ${pad}`).not.toContain("S3cret");
+        if (pad >= 3898 && pad <= 3949)
+          expect(out, `D pad ${pad}`).not.toContain("Kp8leak");
+        expect(out, `D pad ${pad}`).toContain("\nHost: x");
+      }
+    });
+
     it("re-reads a straddler cut at a string's close or at the end of a region", () => {
       // C N2: the failed read is cut at the JSON string's close, which ends neither
       // the raw shell text nor the straddler's credential after it.
