@@ -4,7 +4,11 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Patch]
+
+### Fixed
+
+- The first open after upgrading a large store no longer hangs on "Upgrading the ai-hist database": the export-schema restamp is linear in table size (770k `session_events` rows in ~14 s instead of ~27 h).
 
 ## [0.34.1] - 2026-10-03
 
