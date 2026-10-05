@@ -993,10 +993,11 @@ function closedAt(lastBreak: number, close: number): SubstitutionEnd {
  * its substitution opened on the line it was cut at, and of the headers its chain then
  * skips on that line (see below). The cut is one of three: the first line break past
  * the region's end, a serialized string's close (a raw header after it follows shell
- * grammar past that close), or the text's end. The own header's re-read reads that
- * one line, which the failed read consumed, and ends the others only by reading past
- * the cut. The skipped headers' re-reads are disjoint and inside that line, and only
- * the last reads past the cut or uses its window, at most `SUBSTITUTION_WINDOW`. A
+ * grammar past that close), or the text's end. The own header's re-read starts on that
+ * line, which the failed read consumed, reads up to `SUBSTITUTION_WINDOW` past it and
+ * ends none of the others. The skipped headers' re-reads are disjoint and start inside
+ * that line, and only the last reads past the cut or uses its window, at most
+ * `SUBSTITUTION_WINDOW`. A
  * re-read's end moves the sweep's end only, never its chain's: a header after the cut
  * is read by the chain whatever a re-read covered. A header the chain reads inside the
  * span re-reads reached past their cuts (from the earliest such cut to the furthest
@@ -1008,12 +1009,14 @@ function closedAt(lastBreak: number, close: number): SubstitutionEnd {
  * its closing line, or all of a failed scan's) by the current chain, and those from
  * its end on by a chain of their own.
  *
- * Cost: linear. Each failed read gets at most two window-reading re-reads (its own
- * header's and one skipped header's), and each such window needs its own failing reads
- * and a skipped header or the failed read's own header; this, and that `outer` reads
- * add at most one window-reading read per failed read since they start at headers the
- * chain reads, and that the re-reading after an `outer` read's sweep adds a bounded
- * multiple of that read's own text, is argued, not proven. The multiplier depends on
+ * Cost: linear. Each failed read, in each chain, gets at most two window-reading
+ * re-reads (its own header's and one skipped header's), and each such window needs its
+ * own failing read and a header it re-reads. A chain split at an `outer` read's end can
+ * bring another failed read onto the same cut line, so the same window may be read
+ * once per chain. This, that `outer` reads add at most one window-reading read per
+ * failed read since they start at headers the chain reads, and that the re-reading
+ * after an `outer` read's sweep adds a bounded multiple of that read's own text, is
+ * argued, not proven. The multiplier depends on
  * how short those units can be. Measured fresh characters scanned per input character:
  * about 72.6 on a 56-character serialized unit, 55.3 on a 147-character one, 52.9 on a
  * 74-character keyed serialized unit and 48.2 on a 42-character one; `outer` reads
@@ -1084,13 +1087,11 @@ function sweptEnd(
         reach = Math.max(reach, chain.readTo);
         if (chain.failedAt >= 0 && chain.failedAt === lineEnd) {
           // The failed read's own substitution opened on the line it was cut at, so it
-          // may itself straddle the cut: it is the first of that line's re-reads. It
-          // ends them only by reading past the cut, not by using its window, since a
-          // header that never closes would otherwise stand in for a straddler after it.
+          // may itself straddle the cut, and is re-read too. It ends none of the
+          // skipped headers' re-reads, whether it uses its window or closes past the
+          // cut: a header skipped on that line may close later still.
           const self = readCredential(text, header, nested, "fresh");
-          const selfEnd = self ? self.end : credential;
-          reach = Math.max(reach, selfEnd);
-          if (selfEnd > chain.failedAt) chain.failedAt = -1;
+          reach = Math.max(reach, self ? self.end : credential);
         }
         if (
           parsed &&
