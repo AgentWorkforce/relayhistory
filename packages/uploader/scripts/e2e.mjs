@@ -28,6 +28,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs, promisify } from "node:util";
 import pg from "pg";
+import { stopChild } from "./child-process.mjs";
 import { sync } from "ai-hist";
 
 const run = promisify(execFile);
@@ -441,7 +442,11 @@ try {
   );
   const synced = await upload(laptopConfig, "--sync", "--home", laptop.home);
   assert.equal(synced.code, 0, synced.stderr);
-  assert.equal(synced.summary.syncCompleted, true, "the real capture completed");
+  assert.equal(
+    synced.summary.syncCompleted,
+    true,
+    "the real capture completed",
+  );
   assert.ok(
     synced.summary.accepted > 0,
     "--sync captured the new message before uploading",
@@ -623,12 +628,7 @@ try {
       process.stderr.write(`cleanup: ${step} failed\n`);
     }
   };
-  if (server && server.exitCode === null)
-    await attempt("stop server", async () => {
-      const exited = once(server, "exit");
-      server.kill("SIGTERM");
-      await exited;
-    });
+  if (server) await attempt("stop server", () => stopChild(server));
   if (!values.keep) {
     if (dbCreated)
       await attempt("drop database", () =>
