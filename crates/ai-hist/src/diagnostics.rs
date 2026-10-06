@@ -19,19 +19,27 @@ pub(crate) fn wal_path(db_path: &Path) -> PathBuf {
 /// milliseconds of `posix_spawn` and pipe reads. The figure is the space this
 /// user may write -- `f_bavail` on Unix, as `df -P` reports it.
 pub(crate) fn free_bytes(path: &Path) -> Option<u64> {
-    free_bytes_at(&containing_dir(path)?)
+    free_bytes_at(&measured_dir(path)?)
 }
 
 /// The directory whose filesystem holds `path`: the database may not exist
-/// yet, and `GetDiskFreeSpaceExW` takes only a directory. A bare filename's
-/// parent is the empty path, which names no directory, so it is `.`.
-fn containing_dir(path: &Path) -> Option<&Path> {
+/// yet, and `GetDiskFreeSpaceExW` takes only a directory. A symlinked
+/// database lives on its target's filesystem, so the link is resolved first.
+/// A bare filename's parent is the empty path, which names no directory, so
+/// it is `.`.
+fn measured_dir(path: &Path) -> Option<PathBuf> {
+    let is_link = fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink());
+    let path = if is_link {
+        fs::canonicalize(path).ok()?
+    } else {
+        path.to_path_buf()
+    };
     if path.is_dir() {
         return Some(path);
     }
     match path.parent()? {
-        parent if parent.as_os_str().is_empty() => Some(Path::new(".")),
-        parent => Some(parent),
+        parent if parent.as_os_str().is_empty() => Some(PathBuf::from(".")),
+        parent => Some(parent.to_path_buf()),
     }
 }
 
@@ -80,7 +88,13 @@ fn free_bytes_at(target: &Path) -> Option<u64> {
 #[cfg(windows)]
 fn free_bytes_at(dir: &Path) -> Option<u64> {
     use std::os::windows::ffi::OsStrExt;
-    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
+    // A UNC directory -- including the `\\?\UNC\` form `canonicalize`
+    // returns -- must end in a backslash; a local one may.
+    let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
+    if !matches!(wide.last(), Some(&c) if c == u16::from(b'\\') || c == u16::from(b'/')) {
+        wide.push(u16::from(b'\\'));
+    }
+    wide.push(0);
     let mut available = 0u64;
     // SAFETY: `wide` is a NUL-terminated UTF-16 path; the out-pointer is a
     // valid `u64` and the unused outputs may be null.
@@ -669,10 +683,27 @@ mod compact_tests {
     #[test]
     fn free_bytes_measures_a_bare_filename_in_the_current_directory() {
         assert_eq!(
-            containing_dir(Path::new("ai-history.db")),
-            Some(Path::new("."))
+            measured_dir(Path::new("ai-history.db")),
+            Some(PathBuf::from("."))
         );
         assert!(free_bytes(Path::new("ai-history.db")).is_some());
+    }
+
+    /// A database symlinked onto another volume is measured where its bytes
+    /// are written, not where the link sits.
+    #[cfg(unix)]
+    #[test]
+    fn free_bytes_measures_a_symlinked_database_at_its_target() {
+        let link_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let db = data_dir.path().join("history.db");
+        fs::write(&db, b"").unwrap();
+        let link = link_dir.path().join("history.db");
+        std::os::unix::fs::symlink(&db, &link).unwrap();
+        assert_eq!(
+            measured_dir(&link),
+            Some(fs::canonicalize(data_dir.path()).unwrap())
+        );
     }
 
     #[test]
