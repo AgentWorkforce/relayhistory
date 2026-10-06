@@ -2026,8 +2026,14 @@ fn sync_basic(
     // stopping up front with an actionable message is strictly better than
     // discovering it through torn state. The database and the sync state are
     // separate writes that sit on different volumes when the database is a
-    // symlink, so each volume is checked.
-    for written in [db_path, state_path.as_path()] {
+    // symlink, so each volume is checked. Checkpoints write a temp file into
+    // the state's directory and rename it over the state, so that directory --
+    // not a symlinked state's target -- is the one measured.
+    let state_dir = match state_path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    for written in [db_path, state_dir] {
         if let Some(free) = free_bytes(written) {
             if free < FREE_SPACE_FLOOR_BYTES {
                 anyhow::bail!(
