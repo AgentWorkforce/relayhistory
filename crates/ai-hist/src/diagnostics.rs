@@ -19,13 +19,20 @@ pub(crate) fn wal_path(db_path: &Path) -> PathBuf {
 /// milliseconds of `posix_spawn` and pipe reads. The figure is the space this
 /// user may write -- `f_bavail` on Unix, as `df -P` reports it.
 pub(crate) fn free_bytes(path: &Path) -> Option<u64> {
-    // A database that has not been created yet: ask about its directory.
-    let target = if path.exists() {
-        path.to_path_buf()
-    } else {
-        path.parent()?.to_path_buf()
-    };
-    free_bytes_at(&target)
+    free_bytes_at(&containing_dir(path)?)
+}
+
+/// The directory whose filesystem holds `path`: the database may not exist
+/// yet, and `GetDiskFreeSpaceExW` takes only a directory. A bare filename's
+/// parent is the empty path, which names no directory, so it is `.`.
+fn containing_dir(path: &Path) -> Option<&Path> {
+    if path.is_dir() {
+        return Some(path);
+    }
+    match path.parent()? {
+        parent if parent.as_os_str().is_empty() => Some(Path::new(".")),
+        parent => Some(parent),
+    }
 }
 
 /// Apple's `statvfs` reports block counts as 32-bit `fsblkcnt_t`, so a volume
@@ -69,15 +76,10 @@ fn free_bytes_at(target: &Path) -> Option<u64> {
 
 /// `GetDiskFreeSpaceExW`: a 64-bit byte count (the cluster counts of
 /// `GetDiskFreeSpaceW` are 32-bit) that honors per-user quotas, like
-/// `f_bavail`. It takes a directory, so a database file asks about its parent.
+/// `f_bavail`.
 #[cfg(windows)]
-fn free_bytes_at(target: &Path) -> Option<u64> {
+fn free_bytes_at(dir: &Path) -> Option<u64> {
     use std::os::windows::ffi::OsStrExt;
-    let dir = if target.is_dir() {
-        target
-    } else {
-        target.parent()?
-    };
     let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
     let mut available = 0u64;
     // SAFETY: `wide` is a NUL-terminated UTF-16 path; the out-pointer is a
@@ -660,6 +662,17 @@ mod compact_tests {
             "free_bytes {measured} vs df {df}"
         );
         assert!(free_bytes(Path::new("/definitely/not/a/dir/db")).is_none());
+    }
+
+    /// A bare filename such as `AI_HIST_DB=ai-history.db` lives in the current
+    /// directory; its empty parent must not turn into an unknown measurement.
+    #[test]
+    fn free_bytes_measures_a_bare_filename_in_the_current_directory() {
+        assert_eq!(
+            containing_dir(Path::new("ai-history.db")),
+            Some(Path::new("."))
+        );
+        assert!(free_bytes(Path::new("ai-history.db")).is_some());
     }
 
     #[test]
