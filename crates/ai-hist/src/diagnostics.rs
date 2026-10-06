@@ -14,11 +14,10 @@ pub(crate) fn wal_path(db_path: &Path) -> PathBuf {
 /// Free bytes on the filesystem holding `path`.
 ///
 /// Every sweep asks this before it writes, and the sweep is a watch tick:
-/// it is one filesystem call (`statfs`/`statvfs` on Unix, `GetDiskFreeSpaceW`
+/// it is one filesystem call (`statfs`/`statvfs` on Unix, `GetDiskFreeSpaceExW`
 /// on Windows), never a spawned `df`, which cost a forced tick several
-/// milliseconds of `posix_spawn` and pipe reads. On Unix the figure is
-/// `f_bavail` -- the blocks an unprivileged writer may use -- as `df -P`
-/// reports it.
+/// milliseconds of `posix_spawn` and pipe reads. The figure is the space this
+/// user may write -- `f_bavail` on Unix, as `df -P` reports it.
 pub(crate) fn free_bytes(path: &Path) -> Option<u64> {
     // A database that has not been created yet: ask about its directory.
     let target = if path.exists() {
@@ -68,11 +67,30 @@ fn free_bytes_at(target: &Path) -> Option<u64> {
     available.checked_mul(fragment)
 }
 
-/// `fs2::available_space`: one `GetDiskFreeSpaceW` call on the volume
-/// holding `target`.
+/// `GetDiskFreeSpaceExW`: a 64-bit byte count (the cluster counts of
+/// `GetDiskFreeSpaceW` are 32-bit) that honors per-user quotas, like
+/// `f_bavail`. It takes a directory, so a database file asks about its parent.
 #[cfg(windows)]
 fn free_bytes_at(target: &Path) -> Option<u64> {
-    fs2::available_space(target).ok()
+    use std::os::windows::ffi::OsStrExt;
+    let dir = if target.is_dir() {
+        target
+    } else {
+        target.parent()?
+    };
+    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut available = 0u64;
+    // SAFETY: `wide` is a NUL-terminated UTF-16 path; the out-pointer is a
+    // valid `u64` and the unused outputs may be null.
+    let ok = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut available,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    (ok != 0).then_some(available)
 }
 
 /// A process holding the database file open, and whether it can still release it.
