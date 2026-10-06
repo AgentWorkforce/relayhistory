@@ -43,6 +43,7 @@ url = { version = "2", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 fs2 = "0.4"
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tempfile = "3"

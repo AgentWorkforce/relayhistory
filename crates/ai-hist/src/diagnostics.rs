@@ -14,18 +14,40 @@ pub(crate) fn wal_path(db_path: &Path) -> PathBuf {
 /// Free bytes on the filesystem holding `path`.
 ///
 /// Every sweep asks this before it writes, and the sweep is a watch tick:
-/// on Unix it is one `statfs`/`statvfs` call rather than spawning `df`, which cost a
-/// forced tick several milliseconds of `posix_spawn` and pipe reads. `df -P`
-/// reports `f_bavail` -- the blocks an unprivileged writer may use -- so the
-/// figure is the same one.
+/// it is one filesystem call (`statfs`/`statvfs` on Unix, `GetDiskFreeSpaceExW`
+/// on Windows), never a spawned `df`, which cost a forced tick several
+/// milliseconds of `posix_spawn` and pipe reads. The figure is the space this
+/// user may write -- `f_bavail` on Unix, as `df -P` reports it.
 pub(crate) fn free_bytes(path: &Path) -> Option<u64> {
-    // A database that has not been created yet: ask about its directory.
-    let target = if path.exists() {
-        path.to_path_buf()
-    } else {
-        path.parent()?.to_path_buf()
-    };
-    free_bytes_at(&target)
+    free_bytes_at(&measured_dir(path)?)
+}
+
+/// The directory whose filesystem holds `path`: the database may not exist
+/// yet, and `GetDiskFreeSpaceExW` takes only a directory. A symlinked
+/// database lives on its target's filesystem, so links are followed first --
+/// with `read_link`, which also answers for a target not created yet. A bare
+/// filename's parent is the empty path, which names no directory, so it is `.`.
+fn measured_dir(path: &Path) -> Option<PathBuf> {
+    let mut path = path.to_path_buf();
+    // A cycle stops at the kernel's own link limit and measures where it is.
+    for _ in 0..40 {
+        let Ok(target) = fs::read_link(&path) else {
+            break;
+        };
+        // A relative target is relative to the link's directory; joining an
+        // absolute one replaces the base.
+        path = match path.parent() {
+            Some(dir) => dir.join(target),
+            None => target,
+        };
+    }
+    if path.is_dir() {
+        return Some(path);
+    }
+    match path.parent()? {
+        parent if parent.as_os_str().is_empty() => Some(PathBuf::from(".")),
+        parent => Some(parent.to_path_buf()),
+    }
 }
 
 /// Apple's `statvfs` reports block counts as 32-bit `fsblkcnt_t`, so a volume
@@ -67,26 +89,31 @@ fn free_bytes_at(target: &Path) -> Option<u64> {
     available.checked_mul(fragment)
 }
 
-#[cfg(not(unix))]
-fn free_bytes_at(target: &Path) -> Option<u64> {
-    let out = std::process::Command::new("df")
-        .arg("-Pk")
-        .arg(target)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+/// `GetDiskFreeSpaceExW`: a 64-bit byte count (the cluster counts of
+/// `GetDiskFreeSpaceW` are 32-bit) that honors per-user quotas, like
+/// `f_bavail`.
+#[cfg(windows)]
+fn free_bytes_at(dir: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    // A UNC directory -- including the `\\?\UNC\` form `canonicalize`
+    // returns -- must end in a backslash; a local one may.
+    let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
+    if !matches!(wide.last(), Some(&c) if c == u16::from(b'\\') || c == u16::from(b'/')) {
+        wide.push(u16::from(b'\\'));
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    // Filesystem  1024-blocks  Used  Available  Capacity  Mounted-on
-    let available_kb: u64 = text
-        .lines()
-        .nth(1)?
-        .split_whitespace()
-        .nth(3)?
-        .parse()
-        .ok()?;
-    Some(available_kb * 1024)
+    wide.push(0);
+    let mut available = 0u64;
+    // SAFETY: `wide` is a NUL-terminated UTF-16 path; the out-pointer is a
+    // valid `u64` and the unused outputs may be null.
+    let ok = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut available,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    (ok != 0).then_some(available)
 }
 
 /// A process holding the database file open, and whether it can still release it.
@@ -656,6 +683,37 @@ mod compact_tests {
             "free_bytes {measured} vs df {df}"
         );
         assert!(free_bytes(Path::new("/definitely/not/a/dir/db")).is_none());
+    }
+
+    /// A bare filename such as `AI_HIST_DB=ai-history.db` lives in the current
+    /// directory; its empty parent must not turn into an unknown measurement.
+    #[test]
+    fn free_bytes_measures_a_bare_filename_in_the_current_directory() {
+        assert_eq!(
+            measured_dir(Path::new("ai-history.db")),
+            Some(PathBuf::from("."))
+        );
+        assert!(free_bytes(Path::new("ai-history.db")).is_some());
+    }
+
+    /// A database symlinked onto another volume is measured where its bytes
+    /// are written, not where the link sits -- including on a first run, when
+    /// the link's target does not exist yet.
+    #[cfg(unix)]
+    #[test]
+    fn free_bytes_measures_a_symlinked_database_at_its_target() {
+        let link_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let db = data_dir.path().join("history.db");
+        let link = link_dir.path().join("history.db");
+        std::os::unix::fs::symlink(&db, &link).unwrap();
+        assert_eq!(measured_dir(&link), Some(data_dir.path().to_path_buf()));
+        fs::write(&db, b"").unwrap();
+        assert_eq!(measured_dir(&link), Some(data_dir.path().to_path_buf()));
+
+        let relative = link_dir.path().join("relative.db");
+        std::os::unix::fs::symlink("nested/history.db", &relative).unwrap();
+        assert_eq!(measured_dir(&relative), Some(link_dir.path().join("nested")));
     }
 
     #[test]
