@@ -6,6 +6,21 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.34.3] - 2026-10-06
+
+### Changed
+
+- GetDiskFreeSpaceExW for 64-bit, quota-aware Windows free space
+- Read Windows free space with GetDiskFreeSpaceW instead of spawning df
+
+### Fixed
+
+- Follow a database symlink whose target does not exist yet
+- Measure the sync-state directory that receives checkpoint writes
+- Check free space on both the database and sync-state volumes
+- Measure a symlinked database on its target's filesystem
+- Measure free space for a bare database filename; lock windows-sys in provider-sources
+
 ## [0.34.2] - 2026-10-05
 
 ### Fixed
@@ -568,7 +583,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - The SDK reads provider JSONL natively and works without the Python CLI.
 
-[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.34.2...HEAD
+[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.34.3...HEAD
+[0.34.3]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.34.2...sdk-ts-v0.34.3
 [0.34.2]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.34.1...sdk-ts-v0.34.2
 [0.34.1]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.34.0...sdk-ts-v0.34.1
 [0.34.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.33.0...sdk-ts-v0.34.0
