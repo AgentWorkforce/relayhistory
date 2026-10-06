@@ -4,7 +4,11 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Patch]
+
+### Changed
+
+- `discover` and sync sweeps refresh project identity only for sessions written since the previous refresh and their delegation descendants, instead of re-walking every delegated session: a scoped discover on a 48k-session store takes ~30 ms instead of ~2.9 s after the first pass in a process.
 
 ## [0.34.3] - 2026-10-06
 

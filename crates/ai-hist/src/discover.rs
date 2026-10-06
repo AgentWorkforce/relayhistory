@@ -5045,7 +5045,7 @@ pub(crate) fn discover_sessions_for_sweep(
 enum IdentityRefresh {
     /// Rows are streamed to the caller. Each cached row is upgraded before it
     /// is streamed (see [`upgrade_cached_project_identity`]), and the pass
-    /// ends with the whole-catalog refresh.
+    /// ends with the incremental catalog refresh.
     Streamed,
     /// The sweep: no row is streamed, and the sweep runs the refresh itself
     /// right after the pass. That refresh stores exactly the key the per-row
@@ -5567,11 +5567,14 @@ fn discover_sessions_with_worker_limit(
     //
     // The refresh is what revisits it. Pass 1 reconsiders exactly the rows a
     // path key is not final for, and probes before writing, so a pass with
-    // nothing to upgrade stays read-only. Reporting rather than failing, for
-    // the same reason the sync path does: the rows this discovery wrote are
-    // already committed, and every key here is derived from them.
+    // nothing to upgrade stays read-only. The inheriting passes are scoped to
+    // the rows written since the last refresh and their delegation
+    // descendants, so a pass over an unchanged catalog does not re-walk every
+    // delegated child. Reporting rather than failing, for the same reason the
+    // sync path does: the rows this discovery wrote are already committed, and
+    // every key here is derived from them.
     if identity == IdentityRefresh::Streamed {
-        if let Err(error) = crate::store::refresh_project_identity(env.conn) {
+        if let Err(error) = crate::store::refresh_project_identity_incrementally(env.conn) {
             eprintln!(
                 "ai-hist: could not refresh canonical project identity after discovery: {error:#} \
                  (project keys stay as they were; the next pass retries)"

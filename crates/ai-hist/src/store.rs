@@ -4238,9 +4238,9 @@ const PROJECT_KEY_INHERITANCE_PASSES: usize = crate::relationships::MAX_TREE_MAX
 /// second call on an unchanged database returns 0.
 pub fn refresh_project_identity(conn: &Connection) -> Result<usize> {
     let mut written = resolve_missing_project_keys(conn)?;
-    written += inherit_project_keys(conn)?;
+    written += inherit_project_keys(conn, IdentityScope::All)?;
     written += denormalize_event_project_keys(conn)?;
-    written += inherit_event_project_keys(conn)?;
+    written += inherit_event_project_keys(conn, IdentityScope::All)?;
     Ok(written)
 }
 
@@ -4249,13 +4249,14 @@ pub fn refresh_project_identity(conn: &Connection) -> Result<usize> {
 type RefreshedStore = (PathBuf, i64);
 
 /// The change-feed revision each database's last successful
-/// [`refresh_project_identity_after_sweep`] in this process started at.
+/// [`refresh_project_identity_incrementally`] in this process started at.
 ///
 /// Every row a refresh can find out of line was written, by some process,
 /// after the last refresh that left everything in line: the feed's triggers
 /// stamp every insert and every update that changes a column, `project_key`
 /// and `project_key_method` included, with a revision above that point. So the
-/// denormalizing pass needs to look only at sessions holding such a row.
+/// inheriting and denormalizing passes need to look only at sessions holding
+/// such a row, and at their delegation descendants.
 static REFRESHED_THROUGH: std::sync::LazyLock<std::sync::Mutex<BTreeMap<RefreshedStore, i64>>> =
     std::sync::LazyLock::new(Default::default);
 
@@ -4272,24 +4273,35 @@ fn feed_position(conn: &Connection) -> Option<(RefreshedStore, i64)> {
     Some(((path, head.epoch as i64), head.revision as i64))
 }
 
-/// [`refresh_project_identity`] for the end of a sweep, scoped to what was
-/// written since the previous one.
+/// [`refresh_project_identity`] scoped to what was written since the previous
+/// refresh of the same database in this process. Sync sweeps and discovery
+/// passes both end with it.
 ///
-/// Passes 1, 2 and 4 run in full: they read the catalog and the relationship
-/// ledger rather than the events, and pass 1 is how a checkout that gained an
-/// `origin` reaches sessions whose transcripts never change. Pass 3 is the
-/// one whose cost grew with the event table -- its probe walks every event of
-/// every keyed session through `idx_session_events_project`, about 50 ms on a
-/// 140,000-event store, on every tick (#319) -- and it is scoped here to the
-/// sessions whose catalog row or events carry a revision above the point the
-/// previous refresh of this database started at. Rows passes 1 and 2 rewrite
-/// just now carry such a revision too, so they are in that set.
+/// Pass 1 runs in full: it is how a checkout that gained an `origin` reaches
+/// sessions whose transcripts never change, and it reads only the catalog.
+/// Passes 2, 3 and 4 are scoped. Their full forms walk every delegated child
+/// and every keyed session's events, which is seconds on a catalog of tens of
+/// thousands of subagent sessions, on every pass, to conclude that nothing
+/// moved.
 ///
-/// The first refresh of a database in a process runs pass 3 in full, as does
-/// one whose feed epoch changed or whose head went backwards (a database
-/// replaced under the process). A failed refresh forgets the point, so the
-/// next one is full again.
-pub(crate) fn refresh_project_identity_after_sweep(conn: &Connection) -> Result<usize> {
+/// The scope is sound because a refresh that succeeded left every row at the
+/// passes' fixed point as of the head it started at, and every input those
+/// passes read stamps a revision when it changes: the feed's triggers stamp a
+/// session row, a relationship and an event on insert and on any change to a
+/// column, `project_key` and `project_key_method` included, and a deleted
+/// session leaves a tombstone at its revision. A row's inherited key depends
+/// only on its own row, the delegation edges above it and its ancestors'
+/// rows, so the rows that can have moved are the ones stamped above that
+/// head, plus every delegation descendant of one (see [`IdentityScope`]).
+/// Rows pass 1 rewrites just now carry such a revision too, so the scope is
+/// collected after it runs.
+///
+/// The first refresh of a database in a process runs in full, as does one
+/// whose feed epoch changed or whose head went backwards (a database replaced
+/// under the process), and one after a relationship was deleted, since its
+/// tombstone does not name the child that lost a parent. A failed refresh
+/// forgets the point, so the next one is full again.
+pub(crate) fn refresh_project_identity_incrementally(conn: &Connection) -> Result<usize> {
     let position = feed_position(conn);
     let since = position.as_ref().and_then(|(store, head)| {
         let remembered = REFRESHED_THROUGH.lock().ok()?.get(store).copied()?;
@@ -4297,12 +4309,24 @@ pub(crate) fn refresh_project_identity_after_sweep(conn: &Connection) -> Result<
     });
     let refreshed = (|| {
         let mut written = resolve_missing_project_keys(conn)?;
-        written += inherit_project_keys(conn)?;
-        written += match since {
-            Some(since) => denormalize_event_project_keys_since(conn, since)?,
-            None => denormalize_event_project_keys(conn)?,
+        let scope = match since {
+            Some(since) if IdentityScope::collect_changed(conn, since)? => {
+                Some((since, IdentityScope::Changed))
+            }
+            _ => None,
         };
-        written += inherit_event_project_keys(conn)?;
+        match scope {
+            Some((since, scope)) => {
+                written += inherit_project_keys(conn, scope)?;
+                written += denormalize_event_project_keys_since(conn, since)?;
+                written += inherit_event_project_keys(conn, scope)?;
+            }
+            None => {
+                written += inherit_project_keys(conn, IdentityScope::All)?;
+                written += denormalize_event_project_keys(conn)?;
+                written += inherit_event_project_keys(conn, IdentityScope::All)?;
+            }
+        }
         Ok(written)
     })();
     if let Some((store, head)) = position {
@@ -4317,6 +4341,82 @@ pub(crate) fn refresh_project_identity_after_sweep(conn: &Connection) -> Result<
         }
     }
     refreshed
+}
+
+/// Which delegated rows passes 2 and 4 reconsider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentityScope {
+    /// Every row.
+    All,
+    /// The rows [`IdentityScope::collect_changed`] last wrote into
+    /// `temp.identity_refresh_scope` on this connection.
+    Changed,
+}
+
+impl IdentityScope {
+    /// A SQL predicate admitting the session named by two column expressions.
+    ///
+    /// Asked as a row-value `IN` so the planner drives the query from the
+    /// scope through the table's `(source, session_id)` index; a correlated
+    /// `EXISTS` is evaluated per row of a full scan instead.
+    fn admits(self, source: &str, session_id: &str) -> String {
+        match self {
+            IdentityScope::All => "1".into(),
+            IdentityScope::Changed => format!(
+                "({source}, {session_id}) IN \
+                 (SELECT source, session_id FROM temp.identity_refresh_scope)"
+            ),
+        }
+    }
+
+    /// Fill `temp.identity_refresh_scope` with every session whose inherited
+    /// key can have moved since revision `since`: each session row,
+    /// delegation child and deleted session stamped above it, with all their
+    /// delegation descendants (cataloged or not, to the depth the passes
+    /// walk), plus each session with an event stamped above it, which pass 4
+    /// may have to key. `false` when the scope cannot be named, after a
+    /// relationship was deleted, and the caller runs the full passes.
+    fn collect_changed(conn: &Connection, since: i64) -> Result<bool> {
+        if conn
+            .prepare_cached(
+                "SELECT 1 FROM evidence_tombstones \
+                 WHERE kind = 'relationship' AND revision > ?1 LIMIT 1",
+            )?
+            .exists([since])?
+        {
+            return Ok(false);
+        }
+        conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS identity_refresh_scope ( \
+                 source TEXT NOT NULL, session_id TEXT NOT NULL, \
+                 PRIMARY KEY (source, session_id)) WITHOUT ROWID; \
+             DELETE FROM temp.identity_refresh_scope;",
+        )?;
+        // `UNION` rather than `UNION ALL` with the depth carried, so a
+        // delegation cycle ends at the bound and a diamond is not walked once
+        // per route at each depth.
+        conn.prepare_cached(
+            "WITH RECURSIVE moved(source, session_id) AS ( \
+                 SELECT source, session_id FROM sessions WHERE revision > ?1 \
+                 UNION SELECT source, child_session_id FROM session_relationships \
+                     WHERE revision > ?1 AND child_session_id IS NOT NULL \
+                 UNION SELECT source, session_id FROM evidence_tombstones \
+                     WHERE kind = 'session' AND revision > ?1 \
+             ), \
+             descendant(source, session_id, depth) AS ( \
+                 SELECT source, session_id, 0 FROM moved \
+                 UNION SELECT r.source, r.child_session_id, d.depth + 1 \
+                     FROM descendant d JOIN session_relationships r \
+                       ON r.source = d.source AND r.parent_session_id = d.session_id \
+                     WHERE r.child_session_id IS NOT NULL AND d.depth < ?2 \
+             ) \
+             INSERT OR IGNORE INTO temp.identity_refresh_scope (source, session_id) \
+                 SELECT source, session_id FROM descendant \
+                 UNION SELECT source, session_id FROM session_events WHERE revision > ?1",
+        )?
+        .execute(params![since, PROJECT_KEY_INHERITANCE_PASSES as i64])?;
+        Ok(true)
+    }
 }
 
 /// Reconcile one hydrated session and its delegation descendants with indexed
@@ -4488,9 +4588,13 @@ fn resolve_missing_project_keys(conn: &Connection) -> Result<usize> {
 /// resolved its *own* remote keeps it — that is a stronger statement than the
 /// parent's, and a subagent genuinely running in another checkout should not
 /// be filed under the delegator's repository.
-fn inherit_project_keys(conn: &Connection) -> Result<usize> {
+fn inherit_project_keys(conn: &Connection, scope: IdentityScope) -> Result<usize> {
     let parent = inheritable_parent_key_sql("sessions.source", "sessions.session_id");
-    let inheritable = inheritable_session_sql();
+    let inheritable = format!(
+        "{} AND {}",
+        inheritable_session_sql(),
+        scope.admits("sessions.source", "sessions.session_id")
+    );
     let sql = format!(
         "UPDATE sessions SET project_key = ({parent}), project_key_method = 'inherited' \
          WHERE {inheritable}"
@@ -4527,7 +4631,7 @@ fn inherit_project_keys(conn: &Connection) -> Result<usize> {
         // covers exactly that gap, and has to run whether or not the statement
         // found anything: its probe asks a strictly narrower question than
         // this one does, so breaking on it would skip the walk entirely.
-        changed += inherit_across_uncataloged_generations(conn)?;
+        changed += inherit_across_uncataloged_generations(conn, scope)?;
         written += changed;
         if changed == 0 {
             break;
@@ -4546,7 +4650,10 @@ fn inherit_project_keys(conn: &Connection) -> Result<usize> {
 /// session row itself is not, so this fills the row and lets the ordinary
 /// denormalizing pass carry it down — and keeps it in step afterwards, when
 /// the ancestor it borrowed from moves.
-fn inherit_across_uncataloged_generations(conn: &Connection) -> Result<usize> {
+fn inherit_across_uncataloged_generations(
+    conn: &Connection,
+    scope: IdentityScope,
+) -> Result<usize> {
     // Two kinds of row reach the walk, and everything else is the statement's:
     //
     //   - one already wearing a borrowed key, because re-lending has to be
@@ -4557,6 +4664,7 @@ fn inherit_across_uncataloged_generations(conn: &Connection) -> Result<usize> {
     //
     // A row the statement can settle is left to it rather than walked twice.
     let lendable_parent = inheritable_parent_key_sql("sessions.source", "sessions.session_id");
+    let in_scope = scope.admits("sessions.source", "sessions.session_id");
     let pending: Vec<(String, String)> = conn
         .prepare(&format!(
             "SELECT source, session_id FROM sessions \
@@ -4565,7 +4673,8 @@ fn inherit_across_uncataloged_generations(conn: &Connection) -> Result<usize> {
                         AND NOT EXISTS ({lendable_parent}))) \
                AND EXISTS (SELECT 1 FROM session_relationships r \
                      WHERE r.source = sessions.source \
-                       AND r.child_session_id = sessions.session_id)"
+                       AND r.child_session_id = sessions.session_id) \
+               AND {in_scope}"
         ))?
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
@@ -4815,15 +4924,17 @@ fn stale_event_project_keys_sql() -> String {
 
 /// Pass 4's candidates: the events of delegated threads the catalog does not
 /// hold, whose key an ancestor could still improve.
-fn uncataloged_delegated_events_sql() -> String {
+fn uncataloged_delegated_events_sql(scope: IdentityScope) -> String {
     let joined_rank = event_key_rank_sql("e.project_key", "e.project_key_method");
+    let in_scope = scope.admits("r.source", "r.child_session_id");
     format!(
         "SELECT DISTINCT e.source, e.session_id \
          FROM session_relationships r CROSS JOIN session_events e \
            ON e.source = r.source AND e.session_id = r.child_session_id \
          WHERE NOT EXISTS (SELECT 1 FROM sessions s \
                  WHERE s.source = e.source AND s.session_id = e.session_id) \
-           AND ({joined_rank}) <= {EVENT_INHERITED_RANK}"
+           AND ({joined_rank}) <= {EVENT_INHERITED_RANK} \
+           AND {in_scope}"
     )
 }
 
@@ -4855,7 +4966,7 @@ const EVENT_INHERITED_RANK: i64 = 2;
 /// or a merely path-derived one, and replaces a borrowed key that has gone
 /// stale, but never displaces a `remote` the thread resolved for itself. A
 /// subagent that genuinely ran in another checkout stays filed where it ran.
-fn inherit_event_project_keys(conn: &Connection) -> Result<usize> {
+fn inherit_event_project_keys(conn: &Connection, scope: IdentityScope) -> Result<usize> {
     let stored_rank = event_key_rank_sql("project_key", "project_key_method");
     // "No catalog row" is asked as exactly that, and not as "its key reads
     // NULL". The two are different sessions with different answers: a session
@@ -4877,7 +4988,7 @@ fn inherit_event_project_keys(conn: &Connection) -> Result<usize> {
     // delegated child can match it, and the ledger names every one. Scanning
     // the events for them instead read the whole table on every refresh.
     let pending: Vec<(String, String)> = conn
-        .prepare(&uncataloged_delegated_events_sql())?
+        .prepare(&uncataloged_delegated_events_sql(scope))?
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
     if pending.is_empty() {
@@ -8832,7 +8943,10 @@ mod tests {
                     "pass 3 probe",
                     format!("SELECT 1 {} LIMIT 1", stale_event_project_keys_sql()),
                 ),
-                ("pass 4 candidates", uncataloged_delegated_events_sql()),
+                (
+                    "pass 4 candidates",
+                    uncataloged_delegated_events_sql(IdentityScope::All),
+                ),
             ] {
                 let steps = query_plan(&conn, &sql);
                 let joined = steps.join(" | ");
@@ -8917,10 +9031,10 @@ mod tests {
         insert_event("b", "b1", None);
 
         // The first refresh in the process has nothing to scope by: full.
-        assert_eq!(refresh_project_identity_after_sweep(&conn).unwrap(), 2);
+        assert_eq!(refresh_project_identity_incrementally(&conn).unwrap(), 2);
         assert_eq!(event_key("a1").as_deref(), Some("/work/a"));
         assert_eq!(event_key("b1").as_deref(), Some("/work/b"));
-        assert_eq!(refresh_project_identity_after_sweep(&conn).unwrap(), 0);
+        assert_eq!(refresh_project_identity_incrementally(&conn).unwrap(), 0);
 
         // A key that moves, an event written bare, a session catalogued after
         // its events: all stamped above the previous refresh, all found.
@@ -8938,11 +9052,11 @@ mod tests {
             [],
         )
         .unwrap();
-        assert_eq!(refresh_project_identity_after_sweep(&conn).unwrap(), 3);
+        assert_eq!(refresh_project_identity_incrementally(&conn).unwrap(), 3);
         assert_eq!(event_key("a1").as_deref(), Some("github.com/acme/a"));
         assert_eq!(event_key("b2").as_deref(), Some("/work/b"));
         assert_eq!(event_key("c1").as_deref(), Some("/work/c"));
-        assert_eq!(refresh_project_identity_after_sweep(&conn).unwrap(), 0);
+        assert_eq!(refresh_project_identity_incrementally(&conn).unwrap(), 0);
 
         // And the scope really is the changed rows. An event put out of line
         // under an old revision (the update trigger leaves a write that sets
@@ -8955,10 +9069,118 @@ mod tests {
             [],
         )
         .unwrap();
-        assert_eq!(refresh_project_identity_after_sweep(&conn).unwrap(), 0);
+        assert_eq!(refresh_project_identity_incrementally(&conn).unwrap(), 0);
         assert_eq!(event_key("b1"), None);
         assert_eq!(refresh_project_identity(&conn).unwrap(), 1);
         assert_eq!(event_key("b1").as_deref(), Some("/work/b"));
+    }
+
+    /// The incremental refresh reaches every row an ancestor's move can
+    /// reach, through generations the catalog does not hold, and nothing
+    /// else; a deleted relationship, whose tombstone does not name the child,
+    /// makes it run in full.
+    #[test]
+    fn the_incremental_refresh_follows_a_moved_ancestor_and_nothing_else() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = open_db(&temp.path().join("scoped.db")).unwrap();
+        let session = |id: &str, key: &str, method: &str| {
+            conn.execute(
+                "INSERT INTO sessions (source, session_id, project_key, project_key_method, \
+                 last_activity_ms, discovery_state) VALUES ('codex', ?1, ?2, ?3, 1, 'full')",
+                params![id, key, method],
+            )
+            .unwrap();
+        };
+        let edge = |parent: &str, child: &str| {
+            conn.execute(
+                "INSERT INTO session_relationships \
+                 (source, parent_session_id, relationship_uid, child_session_id, \
+                  relationship, identity_status, evidence_kind, evidence_locator, \
+                  created_ms, updated_ms) \
+                 VALUES ('codex', ?1, ?2, ?2, 'subagent', 'observed', 'rollout', NULL, 0, 0)",
+                params![parent, child],
+            )
+            .unwrap();
+        };
+        let key = |id: &str| -> (Option<String>, Option<String>) {
+            conn.query_row(
+                "SELECT project_key, project_key_method FROM sessions WHERE session_id = ?",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        let event_key = |uid: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT project_key FROM session_events WHERE event_uid = ?",
+                [uid],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let inherited = |key: &str| (Some(key.to_string()), Some("inherited".to_string()));
+
+        // root -> mid (not cataloged) -> grand -> leaf (events only), and an
+        // unrelated tree beside it.
+        session("root", "github.com/acme/one", "remote");
+        edge("root", "mid");
+        edge("mid", "grand");
+        session("grand", "/work/grand", "path");
+        edge("grand", "leaf");
+        edge("root", "spare");
+        conn.execute(
+            "INSERT INTO session_events (source, session_id, event_uid, ts_ms, role, kind, text) \
+             VALUES ('codex', 'leaf', 'l1', 1, 'user', 'text', 'hi')",
+            [],
+        )
+        .unwrap();
+        session("other", "github.com/acme/other", "remote");
+        edge("other", "sib");
+        session("sib", "/work/sib", "path");
+
+        // The first refresh in the process is full.
+        assert!(refresh_project_identity_incrementally(&conn).unwrap() > 0);
+        assert_eq!(key("grand"), inherited("github.com/acme/one"));
+        assert_eq!(event_key("l1").as_deref(), Some("github.com/acme/one"));
+        assert_eq!(key("sib"), inherited("github.com/acme/other"));
+        assert_eq!(refresh_project_identity_incrementally(&conn).unwrap(), 0);
+
+        // The root moves. A row out of line under an old revision (a write
+        // that sets `revision` itself bypasses the trigger) is outside the
+        // scope and stays as planted, which is what proves there is a scope.
+        conn.execute(
+            "UPDATE sessions SET project_key = 'github.com/acme/two' WHERE session_id = 'root'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sessions SET project_key = '/work/sib', project_key_method = 'path', \
+             revision = 1 WHERE session_id = 'sib'",
+            [],
+        )
+        .unwrap();
+        assert!(refresh_project_identity_incrementally(&conn).unwrap() > 0);
+        assert_eq!(key("grand"), inherited("github.com/acme/two"));
+        assert_eq!(event_key("l1").as_deref(), Some("github.com/acme/two"));
+        assert_eq!(key("sib").1.as_deref(), Some("path"));
+
+        // A new delegation edge brings its child into scope.
+        session("late", "/work/late", "path");
+        edge("grand", "late");
+        assert!(refresh_project_identity_incrementally(&conn).unwrap() > 0);
+        assert_eq!(key("late"), inherited("github.com/acme/two"));
+        assert_eq!(key("sib").1.as_deref(), Some("path"));
+
+        // A deleted relationship cannot be scoped, so the refresh is full and
+        // reaches the planted row too.
+        conn.execute(
+            "DELETE FROM session_relationships WHERE child_session_id = 'spare'",
+            [],
+        )
+        .unwrap();
+        assert!(refresh_project_identity_incrementally(&conn).unwrap() > 0);
+        assert_eq!(key("sib"), inherited("github.com/acme/other"));
+        assert_eq!(refresh_project_identity_incrementally(&conn).unwrap(), 0);
     }
 }
 
