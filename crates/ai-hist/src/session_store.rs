@@ -519,9 +519,8 @@ pub struct WatchedPath {
     pub path: PathBuf,
     pub scope: WatchScope,
     /// Which of a `Directory` path's entries are evidence; see
-    /// [`WatchedPath::admits`]. Serialized with the path, so a round trip
-    /// keeps the filter.
-    #[serde(default)]
+    /// [`WatchedPath::admits`]. Serialized with the path and required on
+    /// the way back, so a value never widens to every entry by losing it.
     entries: discover::WatchEntries,
 }
 
@@ -3801,6 +3800,12 @@ mod tests {
                 let back: WatchedPath =
                     serde_json::from_str(&serde_json::to_string(watched).unwrap()).unwrap();
                 assert_eq!(&back, watched);
+                let mut bare = serde_json::to_value(watched).unwrap();
+                bare.as_object_mut().unwrap().remove("entries");
+                assert!(
+                    serde_json::from_value::<WatchedPath>(bare).is_err(),
+                    "a path without its filter is refused, not widened"
+                );
             }
         }
     }

@@ -526,7 +526,8 @@ registers: the file's own name for `File`; for a `Directory`, OpenCode's SQLite
 stores and their sidecars in its database directory and every entry of any
 other; everything for `Tree`. An event naming a `Directory` path itself always
 counts. An embedder running its own watcher filters with it instead of
-restating the rules; the filter is serialized with the path.
+restating the rules. The filter is serialized with the path as `entries`, and
+a payload without it does not deserialize.
 
 ## Errors
 
