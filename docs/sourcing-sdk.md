@@ -522,9 +522,11 @@ has none; relay and trajectory, which shallow discovery exempts, still declare
 `history.jsonl` prompt log as a `File` scope (register its parent, filter to
 the one name — never watch the parent as a tree). `WatchedPath::admits(name)`
 is the filter the watcher applies to an entry directly inside the directory it
-registers: the file's own name for `File`, OpenCode's SQLite stores and their
-sidecars for its database directory, everything for `Tree`. An embedder
-running its own watcher filters with it instead of restating the rules.
+registers: the file's own name for `File`; for a `Directory`, OpenCode's SQLite
+stores and their sidecars in its database directory and every entry of any
+other; everything for `Tree`. An event naming a `Directory` path itself always
+counts. An embedder running its own watcher filters with it instead of
+restating the rules; the filter is serialized with the path.
 
 ## Errors
 

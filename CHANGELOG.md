@@ -8,7 +8,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- `WatchedPath::admits(name)` publishes the entry filter the store's own watcher applies to each advertised watch path (OpenCode's database directory admits only its SQLite stores and sidecars), so an embedder's watcher cannot drift from it.
+- `WatchedPath::admits(name)` publishes the entry filter the store's own watcher applies to each advertised watch path (OpenCode's database directory admits only its SQLite stores and sidecars), so an embedder's watcher cannot drift from it; `WatchedPath` serializes the filter as `entries`.
 
 ### Changed
 
