@@ -2277,7 +2277,7 @@ fn sync_basic(
     // failed outright; the CLI prints the same chain it always did, behind
     // the code.
     // Without discovery's own identity refresh: the sweep runs it itself just
-    // below, and running both was the same whole-catalog pass twice.
+    // below, and one refresh per sweep is all the catalog needs.
     let discovered = discover::discover_sessions_for_sweep(
         &discovery_env,
         &DiscoverOptions::default(),

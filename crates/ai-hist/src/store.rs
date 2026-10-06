@@ -4310,23 +4310,18 @@ pub(crate) fn refresh_project_identity_incrementally(conn: &Connection) -> Resul
     });
     let refreshed = (|| {
         let mut written = resolve_missing_project_keys(conn)?;
-        let scope = match since {
-            Some(since) if IdentityScope::collect_changed(conn, since)? => {
-                Some((since, IdentityScope::Changed))
-            }
-            _ => None,
+        let scoped = match since {
+            Some(since) => IdentityScope::collect_changed(conn, since)?,
+            None => false,
         };
-        match scope {
-            Some((since, scope)) => {
-                written += inherit_project_keys(conn, scope)?;
-                written += denormalize_event_project_keys_since(conn, since)?;
-                written += inherit_event_project_keys(conn, scope)?;
-            }
-            None => {
-                written += inherit_project_keys(conn, IdentityScope::All)?;
-                written += denormalize_event_project_keys(conn)?;
-                written += inherit_event_project_keys(conn, IdentityScope::All)?;
-            }
+        if scoped {
+            written += inherit_project_keys(conn, IdentityScope::Changed)?;
+            written += denormalize_scoped_event_project_keys(conn)?;
+            written += inherit_event_project_keys(conn, IdentityScope::Changed)?;
+        } else {
+            written += inherit_project_keys(conn, IdentityScope::All)?;
+            written += denormalize_event_project_keys(conn)?;
+            written += inherit_event_project_keys(conn, IdentityScope::All)?;
         }
         Ok(written)
     })();
@@ -4383,8 +4378,11 @@ impl IdentityScope {
     /// ancestor walk climbs past such a row exactly as past one the catalog
     /// does not hold, whatever it holds: pass 1 has already promoted any of
     /// them whose checkout now resolves to a remote, and no pass lowers a
-    /// lendable key. So the activity stamp a sweep puts on the root of a
-    /// large path-keyed delegation tree does not re-walk the tree.
+    /// lendable key. A session deleted and catalogued again between two
+    /// refreshes can come back with a lower one; pass 2 then re-lends it, and
+    /// that write brings its tree into the next refresh's scope. So the
+    /// activity stamp a sweep puts on the root of a large path-keyed
+    /// delegation tree does not re-walk the tree.
     fn collect_changed(conn: &Connection, since: i64) -> Result<bool> {
         if conn
             .prepare_cached(
@@ -4884,22 +4882,21 @@ fn denormalize_event_project_keys(conn: &Connection) -> Result<usize> {
     )?)
 }
 
-/// Pass 3 over the sessions whose catalog row or events were written above
-/// revision `since`.
+/// Pass 3 over the sessions in `temp.identity_refresh_scope`.
 ///
-/// Every event that can be out of line with its session is in that set when
-/// the previous refresh left everything in line at `since`: staleness is born
-/// only of a session's key moving or of an event being written, and both
-/// stamp a revision. Each session costs a primary-key seek and a range of
-/// `idx_session_events_project`, so a tick that touched one session reads one
-/// session's events rather than every event in the store.
-fn denormalize_event_project_keys_since(conn: &Connection, since: i64) -> Result<usize> {
+/// Every event that can be out of line with its session belongs to a session
+/// in the scope when the previous refresh left everything in line: staleness
+/// is born only of a session's key moving or of an event being written, both
+/// stamp a revision, and the scope holds every session whose row or events
+/// were stamped above that refresh's head -- including the rows pass 2 has
+/// just rewritten, which it rewrites only within the scope. Each session costs
+/// a primary-key seek and a range of `idx_session_events_project`, so a tick
+/// that touched one session reads one session's events rather than every
+/// event in the store.
+fn denormalize_scoped_event_project_keys(conn: &Connection) -> Result<usize> {
     let touched: Vec<(String, String)> = conn
-        .prepare(
-            "SELECT source, session_id FROM sessions WHERE revision > ?1 \
-             UNION SELECT source, session_id FROM session_events WHERE revision > ?1",
-        )?
-        .query_map([since], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .prepare("SELECT source, session_id FROM temp.identity_refresh_scope")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
     if touched.is_empty() {
         return Ok(0);
@@ -9211,13 +9208,19 @@ mod tests {
 
         // A stamp on a row with nothing to lend -- a sweep recording activity
         // on a path-keyed root -- does not bring its delegation tree in.
+        // `kid` is planted on its own path under an old revision while a
+        // lendable parent `lender` would give it a key: only a scope holding
+        // `kid` changes it.
+        session("lender", "github.com/acme/lender", "remote");
         session("plain", "/work/plain", "path");
         edge("plain", "kid");
+        edge("lender", "kid");
         session("kid", "/work/kid", "path");
-        assert_eq!(refresh_project_identity_incrementally(&conn).unwrap(), 0);
+        assert!(refresh_project_identity_incrementally(&conn).unwrap() > 0);
+        assert_eq!(key("kid"), inherited("github.com/acme/lender"));
         conn.execute(
-            "UPDATE sessions SET project_key = NULL, project_key_method = NULL, revision = 1 \
-             WHERE session_id = 'kid'",
+            "UPDATE sessions SET project_key = '/work/kid', project_key_method = 'path', \
+             revision = 1 WHERE session_id = 'kid'",
             [],
         )
         .unwrap();
@@ -9227,7 +9230,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(refresh_project_identity_incrementally(&conn).unwrap(), 0);
-        assert_eq!(key("kid"), (None, None));
+        assert_eq!(key("kid").1.as_deref(), Some("path"));
 
         // A new delegation edge brings its child into scope.
         session("late", "/work/late", "path");
