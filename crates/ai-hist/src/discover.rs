@@ -587,7 +587,7 @@ pub struct WatchRoot {
 /// measured collector made 197 forced, fruitless ticks in 90 s of idle time
 /// (#335). The filter keeps the one registration and admits only the names
 /// the sweep reads.
-#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum WatchEntries {
     /// Every direct entry.
     #[default]
@@ -608,7 +608,7 @@ const SQLITE_SIDECARS: [&str; 3] = ["-wal", "-shm", "-journal"];
 
 impl WatchEntries {
     /// Whether an entry named `name` is one this filter admits.
-    fn admits(&self, name: &std::ffi::OsStr) -> bool {
+    pub(crate) fn admits(&self, name: &std::ffi::OsStr) -> bool {
         let (primary, channels) = match self {
             WatchEntries::All => return true,
             WatchEntries::OpencodeStores { primary, channels } => (primary, *channels),

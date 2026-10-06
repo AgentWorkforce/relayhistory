@@ -518,6 +518,10 @@ pub struct WatchedPath {
     /// otherwise.
     pub path: PathBuf,
     pub scope: WatchScope,
+    /// Which of a `Directory` path's entries are evidence; see
+    /// [`WatchedPath::admits`].
+    #[serde(skip)]
+    entries: discover::WatchEntries,
 }
 
 impl WatchedPath {
@@ -529,6 +533,30 @@ impl WatchedPath {
                 discover::WatchDepth::Tree => WatchScope::Tree,
             },
             path: root.path,
+            entries: root.entries,
+        }
+    }
+
+    /// Whether a change to `name`, an entry directly inside the directory
+    /// the watcher registers for this path, is evidence the watcher acts on.
+    ///
+    /// - `File`: the registered directory is the file's parent, and only the
+    ///   file's own name is admitted.
+    /// - `Directory`: the entries the source reads. OpenCode's database
+    ///   directory admits only its SQLite stores and their `-wal`, `-shm`
+    ///   and `-journal` sidecars: the configured database and, unless
+    ///   `OPENCODE_DB` pins it, every channel database (`opencode.db`,
+    ///   `opencode-<channel>.db`). Every other directory admits every entry.
+    /// - `Tree`: every entry; the whole subtree counts.
+    ///
+    /// An embedder running its own watcher filters with this rather than
+    /// restating the rules, so its notion of a relevant write cannot drift
+    /// from the store's.
+    pub fn admits(&self, name: &std::ffi::OsStr) -> bool {
+        match self.scope {
+            WatchScope::File => self.path.file_name() == Some(name),
+            WatchScope::Directory => self.entries.admits(name),
+            WatchScope::Tree => true,
         }
     }
 }
@@ -3728,6 +3756,7 @@ mod tests {
                 mine.contains(&WatchedPath {
                     path: flat_log.clone(),
                     scope: WatchScope::File,
+                    entries: discover::WatchEntries::All,
                 }),
                 "{source} advertises its flat log as a file root: {mine:?}"
             );
