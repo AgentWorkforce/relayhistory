@@ -24,16 +24,23 @@ pub(crate) fn free_bytes(path: &Path) -> Option<u64> {
 
 /// The directory whose filesystem holds `path`: the database may not exist
 /// yet, and `GetDiskFreeSpaceExW` takes only a directory. A symlinked
-/// database lives on its target's filesystem, so the link is resolved first.
-/// A bare filename's parent is the empty path, which names no directory, so
-/// it is `.`.
+/// database lives on its target's filesystem, so links are followed first --
+/// with `read_link`, which also answers for a target not created yet. A bare
+/// filename's parent is the empty path, which names no directory, so it is `.`.
 fn measured_dir(path: &Path) -> Option<PathBuf> {
-    let is_link = fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink());
-    let path = if is_link {
-        fs::canonicalize(path).ok()?
-    } else {
-        path.to_path_buf()
-    };
+    let mut path = path.to_path_buf();
+    // A cycle stops at the kernel's own link limit and measures where it is.
+    for _ in 0..40 {
+        let Ok(target) = fs::read_link(&path) else {
+            break;
+        };
+        // A relative target is relative to the link's directory; joining an
+        // absolute one replaces the base.
+        path = match path.parent() {
+            Some(dir) => dir.join(target),
+            None => target,
+        };
+    }
     if path.is_dir() {
         return Some(path);
     }
@@ -690,20 +697,23 @@ mod compact_tests {
     }
 
     /// A database symlinked onto another volume is measured where its bytes
-    /// are written, not where the link sits.
+    /// are written, not where the link sits -- including on a first run, when
+    /// the link's target does not exist yet.
     #[cfg(unix)]
     #[test]
     fn free_bytes_measures_a_symlinked_database_at_its_target() {
         let link_dir = tempfile::tempdir().unwrap();
         let data_dir = tempfile::tempdir().unwrap();
         let db = data_dir.path().join("history.db");
-        fs::write(&db, b"").unwrap();
         let link = link_dir.path().join("history.db");
         std::os::unix::fs::symlink(&db, &link).unwrap();
-        assert_eq!(
-            measured_dir(&link),
-            Some(fs::canonicalize(data_dir.path()).unwrap())
-        );
+        assert_eq!(measured_dir(&link), Some(data_dir.path().to_path_buf()));
+        fs::write(&db, b"").unwrap();
+        assert_eq!(measured_dir(&link), Some(data_dir.path().to_path_buf()));
+
+        let relative = link_dir.path().join("relative.db");
+        std::os::unix::fs::symlink("nested/history.db", &relative).unwrap();
+        assert_eq!(measured_dir(&relative), Some(link_dir.path().join("nested")));
     }
 
     #[test]
