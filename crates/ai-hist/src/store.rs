@@ -4292,7 +4292,8 @@ fn feed_position(conn: &Connection) -> Option<(RefreshedStore, i64)> {
 /// session leaves a tombstone at its revision. A row's inherited key depends
 /// only on its own row, the delegation edges above it and its ancestors'
 /// rows, so the rows that can have moved are the ones stamped above that
-/// head, plus every delegation descendant of one (see [`IdentityScope`]).
+/// head, plus the delegation descendants of one that can lend a key (see
+/// [`IdentityScope::collect_changed`]).
 /// Rows pass 1 rewrites just now carry such a revision too, so the scope is
 /// collected after it runs.
 ///
@@ -4370,12 +4371,20 @@ impl IdentityScope {
     }
 
     /// Fill `temp.identity_refresh_scope` with every session whose inherited
-    /// key can have moved since revision `since`: each session row,
-    /// delegation child and deleted session stamped above it, with all their
-    /// delegation descendants (cataloged or not, to the depth the passes
-    /// walk), plus each session with an event stamped above it, which pass 4
-    /// may have to key. `false` when the scope cannot be named, after a
-    /// relationship was deleted, and the caller runs the full passes.
+    /// key can have moved since revision `since`: each session row stamped
+    /// above it; the delegation descendants (cataloged or not, to the depth
+    /// the passes walk) of each such row holding a key it can lend, of each
+    /// delegation child stamped above it and of each deleted session; and
+    /// each session with an event stamped above it, which pass 4 may have to
+    /// key. `false` when the scope cannot be named, after a relationship was
+    /// deleted, and the caller runs the full passes.
+    ///
+    /// A stamped row with no key, or only its path, adds no descendants. The
+    /// ancestor walk climbs past such a row exactly as past one the catalog
+    /// does not hold, whatever it holds: pass 1 has already promoted any of
+    /// them whose checkout now resolves to a remote, and no pass lowers a
+    /// lendable key. So the activity stamp a sweep puts on the root of a
+    /// large path-keyed delegation tree does not re-walk the tree.
     fn collect_changed(conn: &Connection, since: i64) -> Result<bool> {
         if conn
             .prepare_cached(
@@ -4392,32 +4401,42 @@ impl IdentityScope {
                  PRIMARY KEY (source, session_id)) WITHOUT ROWID; \
              DELETE FROM temp.identity_refresh_scope;",
         )?;
-        // `UNION` rather than `UNION ALL` with the depth carried, so a
-        // delegation cycle ends at the bound and a diamond is not walked once
-        // per route at each depth.
-        conn.prepare_cached(
-            "WITH RECURSIVE moved(source, session_id) AS ( \
-                 SELECT source, session_id FROM sessions WHERE revision > ?1 \
-                 UNION SELECT source, child_session_id FROM session_relationships \
-                     WHERE revision > ?1 AND child_session_id IS NOT NULL \
-                 UNION SELECT source, session_id FROM evidence_tombstones \
-                     WHERE kind = 'session' AND revision > ?1 \
-             ), \
-             descendant(source, session_id, depth) AS ( \
-                 SELECT source, session_id, 0 FROM moved \
-                 UNION SELECT r.source, r.child_session_id, d.depth + 1 \
-                     FROM descendant d JOIN session_relationships r \
-                       ON r.source = d.source AND r.parent_session_id = d.session_id \
-                     WHERE r.child_session_id IS NOT NULL AND d.depth < ?2 \
-             ) \
-             INSERT OR IGNORE INTO temp.identity_refresh_scope (source, session_id) \
-                 SELECT source, session_id FROM descendant \
-                 UNION SELECT source, session_id FROM session_events WHERE revision > ?1",
-        )?
-        .execute(params![since, PROJECT_KEY_INHERITANCE_PASSES as i64])?;
+        conn.prepare_cached(IDENTITY_SCOPE_SQL)?
+            .execute(params![since, PROJECT_KEY_INHERITANCE_PASSES as i64])?;
         Ok(true)
     }
 }
+
+/// [`IdentityScope::collect_changed`]'s fill of `temp.identity_refresh_scope`:
+/// `?1` is the revision the previous refresh started at, `?2` the walk depth.
+///
+/// `UNION` rather than `UNION ALL` with the depth carried, so a delegation
+/// cycle ends at the bound and a diamond is not walked once per route at each
+/// depth. The recursive step's `+` keeps `child_session_id IS NOT NULL` off
+/// the index: as an index term it is a range on `idx_session_relationships_child`
+/// that the planner prefers to the parent lookup, and every step then reads
+/// every edge of the source -- minutes for one stamped root of an 18k-session
+/// OpenCode delegation tree instead of milliseconds.
+const IDENTITY_SCOPE_SQL: &str = "WITH RECURSIVE moved(source, session_id) AS ( \
+         SELECT source, session_id FROM sessions WHERE revision > ?1 \
+             AND project_key IS NOT NULL \
+             AND project_key_method IN ('remote', 'inherited') \
+         UNION SELECT source, child_session_id FROM session_relationships \
+             WHERE revision > ?1 AND child_session_id IS NOT NULL \
+         UNION SELECT source, session_id FROM evidence_tombstones \
+             WHERE kind = 'session' AND revision > ?1 \
+     ), \
+     descendant(source, session_id, depth) AS ( \
+         SELECT source, session_id, 0 FROM moved \
+         UNION SELECT r.source, r.child_session_id, d.depth + 1 \
+             FROM descendant d JOIN session_relationships r \
+               ON r.source = d.source AND r.parent_session_id = d.session_id \
+             WHERE +r.child_session_id IS NOT NULL AND d.depth < ?2 \
+     ) \
+     INSERT OR IGNORE INTO temp.identity_refresh_scope (source, session_id) \
+         SELECT source, session_id FROM descendant \
+         UNION SELECT source, session_id FROM sessions WHERE revision > ?1 \
+         UNION SELECT source, session_id FROM session_events WHERE revision > ?1";
 
 /// Reconcile one hydrated session and its delegation descendants with indexed
 /// identity lookups. Ancestor resolution uses the same cycle-safe ranking walk
@@ -8967,6 +8986,32 @@ mod tests {
         }
     }
 
+    /// The incremental scope's descendant walk seeks each node's children by
+    /// parent. Any other plan reads every edge of the source per node.
+    #[test]
+    fn the_identity_scope_walks_children_by_parent() {
+        for analyze in [false, true] {
+            let conn = planned_store(analyze);
+            conn.execute_batch(
+                "CREATE TEMP TABLE identity_refresh_scope ( \
+                     source TEXT NOT NULL, session_id TEXT NOT NULL, \
+                     PRIMARY KEY (source, session_id)) WITHOUT ROWID;",
+            )
+            .unwrap();
+            let steps = bound_query_plan(&conn, IDENTITY_SCOPE_SQL, &[&0i64, &64i64]);
+            let recursive = steps
+                .split("RECURSIVE STEP")
+                .nth(1)
+                .expect("the scope is a recursive walk");
+            assert!(
+                recursive.contains(
+                    "idx_session_relationships_parent (source=? AND parent_session_id=?)"
+                ),
+                "the descendant walk does not seek by parent (analyze={analyze}): {steps}"
+            );
+        }
+    }
+
     /// The identity index covers `(source, session_id)` as a prefix, and that
     /// is exactly why it must not replace the bare index: with no statistics
     /// the planner ranks a two-of-four match below a one-of-one match on
@@ -9163,6 +9208,26 @@ mod tests {
         assert_eq!(key("grand"), inherited("github.com/acme/two"));
         assert_eq!(event_key("l1").as_deref(), Some("github.com/acme/two"));
         assert_eq!(key("sib").1.as_deref(), Some("path"));
+
+        // A stamp on a row with nothing to lend -- a sweep recording activity
+        // on a path-keyed root -- does not bring its delegation tree in.
+        session("plain", "/work/plain", "path");
+        edge("plain", "kid");
+        session("kid", "/work/kid", "path");
+        assert_eq!(refresh_project_identity_incrementally(&conn).unwrap(), 0);
+        conn.execute(
+            "UPDATE sessions SET project_key = NULL, project_key_method = NULL, revision = 1 \
+             WHERE session_id = 'kid'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sessions SET last_activity_ms = 2 WHERE session_id = 'plain'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(refresh_project_identity_incrementally(&conn).unwrap(), 0);
+        assert_eq!(key("kid"), (None, None));
 
         // A new delegation edge brings its child into scope.
         session("late", "/work/late", "path");
