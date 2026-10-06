@@ -14,10 +14,11 @@ pub(crate) fn wal_path(db_path: &Path) -> PathBuf {
 /// Free bytes on the filesystem holding `path`.
 ///
 /// Every sweep asks this before it writes, and the sweep is a watch tick:
-/// on Unix it is one `statfs`/`statvfs` call rather than spawning `df`, which cost a
-/// forced tick several milliseconds of `posix_spawn` and pipe reads. `df -P`
-/// reports `f_bavail` -- the blocks an unprivileged writer may use -- so the
-/// figure is the same one.
+/// it is one filesystem call (`statfs`/`statvfs` on Unix, `GetDiskFreeSpaceW`
+/// on Windows), never a spawned `df`, which cost a forced tick several
+/// milliseconds of `posix_spawn` and pipe reads. On Unix the figure is
+/// `f_bavail` -- the blocks an unprivileged writer may use -- as `df -P`
+/// reports it.
 pub(crate) fn free_bytes(path: &Path) -> Option<u64> {
     // A database that has not been created yet: ask about its directory.
     let target = if path.exists() {
@@ -67,26 +68,11 @@ fn free_bytes_at(target: &Path) -> Option<u64> {
     available.checked_mul(fragment)
 }
 
-#[cfg(not(unix))]
+/// `fs2::available_space`: one `GetDiskFreeSpaceW` call on the volume
+/// holding `target`.
+#[cfg(windows)]
 fn free_bytes_at(target: &Path) -> Option<u64> {
-    let out = std::process::Command::new("df")
-        .arg("-Pk")
-        .arg(target)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    // Filesystem  1024-blocks  Used  Available  Capacity  Mounted-on
-    let available_kb: u64 = text
-        .lines()
-        .nth(1)?
-        .split_whitespace()
-        .nth(3)?
-        .parse()
-        .ok()?;
-    Some(available_kb * 1024)
+    fs2::available_space(target).ok()
 }
 
 /// A process holding the database file open, and whether it can still release it.
