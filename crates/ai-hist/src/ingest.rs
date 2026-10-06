@@ -2024,16 +2024,20 @@ fn sync_basic(
     // Refuse to start rather than fail partway. A write that runs out of space
     // mid-flight is what truncated .sync-state.json and wedged sync for days;
     // stopping up front with an actionable message is strictly better than
-    // discovering it through torn state.
-    if let Some(free) = free_bytes(db_path) {
-        if free < FREE_SPACE_FLOOR_BYTES {
-            anyhow::bail!(
-                "only {} free on the volume holding {} (need {}). \
-                 Free space before syncing: a write that fails partway can leave torn state.",
-                human_bytes(free),
-                db_path.display(),
-                human_bytes(FREE_SPACE_FLOOR_BYTES)
-            );
+    // discovering it through torn state. The database and the sync state are
+    // separate writes that sit on different volumes when the database is a
+    // symlink, so each volume is checked.
+    for written in [db_path, state_path.as_path()] {
+        if let Some(free) = free_bytes(written) {
+            if free < FREE_SPACE_FLOOR_BYTES {
+                anyhow::bail!(
+                    "only {} free on the volume holding {} (need {}). \
+                     Free space before syncing: a write that fails partway can leave torn state.",
+                    human_bytes(free),
+                    written.display(),
+                    human_bytes(FREE_SPACE_FLOOR_BYTES)
+                );
+            }
         }
     }
     let (mut state, state_stamp) = load_sync_state_stamped(&state_path);
