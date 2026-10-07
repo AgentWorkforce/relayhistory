@@ -518,6 +518,10 @@ pub struct WatchedPath {
     /// otherwise.
     pub path: PathBuf,
     pub scope: WatchScope,
+    /// Which of a `Directory` path's entries are evidence; see
+    /// [`WatchedPath::admits`]. Serialized with the path and required on
+    /// the way back, so a value never widens to every entry by losing it.
+    entries: discover::WatchEntries,
 }
 
 impl WatchedPath {
@@ -529,6 +533,32 @@ impl WatchedPath {
                 discover::WatchDepth::Tree => WatchScope::Tree,
             },
             path: root.path,
+            entries: root.entries,
+        }
+    }
+
+    /// Whether a change to `name`, an entry directly inside the directory
+    /// the watcher registers for this path, is evidence the watcher acts on.
+    ///
+    /// - `File`: the registered directory is the file's parent, and only the
+    ///   file's own name is admitted.
+    /// - `Directory`: the entries the source reads. OpenCode's database
+    ///   directory admits only its SQLite stores and their `-wal`, `-shm`
+    ///   and `-journal` sidecars: the configured database and, unless
+    ///   `OPENCODE_DB` pins it, every channel database (`opencode.db`,
+    ///   `opencode-<channel>.db`). Every other directory admits every entry.
+    ///   An event naming the directory itself is evidence whatever the
+    ///   filter, as it is to the watcher.
+    /// - `Tree`: every entry; the whole subtree counts.
+    ///
+    /// An embedder running its own watcher filters with this rather than
+    /// restating the rules, so its notion of a relevant write cannot drift
+    /// from the store's.
+    pub fn admits(&self, name: &std::ffi::OsStr) -> bool {
+        match self.scope {
+            WatchScope::File => self.path.file_name() == Some(name),
+            WatchScope::Directory => self.entries.admits(name),
+            WatchScope::Tree => true,
         }
     }
 }
@@ -3700,6 +3730,86 @@ mod tests {
     /// The roots the facade advertises per source are the roots the watch
     /// loop registers, path for path and scope for scope — including the
     /// flat prompt logs, which are watched as single files.
+    /// `admits` answers exactly what the loop's own matcher does for every
+    /// entry of every registered directory, including where `OPENCODE_DB`
+    /// shares a directory with another source's root; a round trip through
+    /// serde keeps the filter.
+    #[test]
+    fn a_watched_path_admits_what_the_loop_matches() {
+        use std::ffi::OsStr;
+        const NAMES: &[&str] = &[
+            "opencode.db",
+            "opencode.db-wal",
+            "opencode.db-shm",
+            "opencode.db-journal",
+            "opencode-beta.db",
+            "opencode-.db",
+            "x.db",
+            "x.db-wal",
+            "notes.txt",
+            "history.jsonl",
+            "settings.json",
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let mut default =
+            ProviderRoots::from_home(dir.path().to_path_buf(), dir.path().join("oc/opencode.db"));
+        default.opencode_db_pinned = false;
+        let pinned = |file: PathBuf| ProviderRoots {
+            opencode_db: file,
+            opencode_db_pinned: true,
+            ..default.clone()
+        };
+        for roots in [
+            default.clone(),
+            pinned(default.devin.join("x.db")),
+            pinned(default.claude.join("x.db")),
+            pinned(default.codex.join("sessions/x.db")),
+        ] {
+            let registered = sync_watch_roots_with_provider_roots(&roots);
+            let advertised: Vec<WatchedPath> = Source::ALL
+                .iter()
+                .flat_map(|source| source.capabilities().watch_roots(&roots))
+                .collect();
+            for root in &registered {
+                let directory = root.registered_path();
+                for name in NAMES {
+                    let event = discover::watch_path(&directory.join(name));
+                    let looped = registered.iter().any(|root| root.covers(&event));
+                    let embedded = advertised.iter().any(|watched| {
+                        let watched_directory = match watched.scope {
+                            WatchScope::File => watched.path.parent().unwrap(),
+                            _ => watched.path.as_path(),
+                        };
+                        watched_directory == directory && watched.admits(OsStr::new(name))
+                    });
+                    assert_eq!(
+                        looped,
+                        embedded,
+                        "{} entry {name:?} (OPENCODE_DB {})",
+                        directory.display(),
+                        roots.opencode_db.display()
+                    );
+                }
+            }
+            for watched in &advertised {
+                // The directory itself, whatever its filter.
+                if watched.scope == WatchScope::Directory {
+                    let itself = discover::watch_path(&watched.path);
+                    assert!(registered.iter().any(|root| root.covers(&itself)));
+                }
+                let back: WatchedPath =
+                    serde_json::from_str(&serde_json::to_string(watched).unwrap()).unwrap();
+                assert_eq!(&back, watched);
+                let mut bare = serde_json::to_value(watched).unwrap();
+                bare.as_object_mut().unwrap().remove("entries");
+                assert!(
+                    serde_json::from_value::<WatchedPath>(bare).is_err(),
+                    "a path without its filter is refused, not widened"
+                );
+            }
+        }
+    }
+
     #[test]
     fn advertised_watch_roots_are_the_roots_the_loop_registers() {
         let dir = tempfile::tempdir().unwrap();
@@ -3728,6 +3838,7 @@ mod tests {
                 mine.contains(&WatchedPath {
                     path: flat_log.clone(),
                     scope: WatchScope::File,
+                    entries: discover::WatchEntries::All,
                 }),
                 "{source} advertises its flat log as a file root: {mine:?}"
             );

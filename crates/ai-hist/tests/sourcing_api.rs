@@ -17,7 +17,7 @@ use ai_hist::{
     CaptureProgress, CatalogQuery, DiscoveryOptions, DiscoveryState, Error, EvidenceKind,
     HydrateOptions, HydrateStatus, ProgressObserver, ProviderRoots, RelationshipSide, Role,
     SessionEvidence, SessionQuery, SessionRef, SessionStore, Source, StopToken, StoreOptions,
-    SyncOptions, TickTrigger, WatchOptions,
+    SyncOptions, TickTrigger, WatchOptions, WatchScope,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -1295,6 +1295,65 @@ fn sync_hydrate_and_watch_roots_share_one_root_resolution() {
     assert!(!watched
         .iter()
         .any(|root| root.path.starts_with(dir.path().join(".codex"))));
+}
+
+/// Each advertised watch path carries the entry filter the store's own
+/// watcher applies, so an embedder's watcher admits exactly what it does.
+#[test]
+fn a_watched_path_admits_the_entries_the_watcher_acts_on() {
+    use std::ffi::OsStr;
+    let home = tempfile::tempdir().unwrap();
+    let mut roots = roots_under(home.path());
+    let directory = |roots: &ProviderRoots| {
+        Source::OpenCode
+            .capabilities()
+            .watch_roots(roots)
+            .into_iter()
+            .find(|watched| watched.scope == WatchScope::Directory)
+            .expect("OpenCode's database directory is watched as a directory")
+    };
+
+    // The default store: every channel database and its sidecars.
+    roots.opencode_db = home.path().join("opencode/opencode.db");
+    roots.opencode_db_pinned = false;
+    let watched = directory(&roots);
+    assert_eq!(watched.path, home.path().join("opencode"));
+    for name in [
+        "opencode.db",
+        "opencode.db-wal",
+        "opencode.db-shm",
+        "opencode.db-journal",
+        "opencode-stable.db",
+        "opencode-nightly.db-wal",
+    ] {
+        assert!(watched.admits(OsStr::new(name)), "{name} is evidence");
+    }
+    for name in ["opencode.log", "auth.json", "opencode-.db", "other.db"] {
+        assert!(!watched.admits(OsStr::new(name)), "{name} is not evidence");
+    }
+
+    // A pinned database in a busy directory: that file and its sidecars only.
+    roots.opencode_db = home.path().join("busy/custom.sqlite");
+    roots.opencode_db_pinned = true;
+    let watched = directory(&roots);
+    assert!(watched.admits(OsStr::new("custom.sqlite")));
+    assert!(watched.admits(OsStr::new("custom.sqlite-wal")));
+    assert!(!watched.admits(OsStr::new("opencode.db")));
+    assert!(!watched.admits(OsStr::new("notes.txt")));
+
+    // A file scope admits only its own name; a tree admits every entry.
+    let claude = Source::Claude.capabilities().watch_roots(&roots);
+    let log = claude
+        .iter()
+        .find(|watched| watched.scope == WatchScope::File)
+        .expect("Claude's prompt log is watched as a file");
+    assert!(log.admits(log.path.file_name().unwrap()));
+    assert!(!log.admits(OsStr::new("todos")));
+    let tree = claude
+        .iter()
+        .find(|watched| watched.scope == WatchScope::Tree)
+        .expect("Claude's transcripts are watched as a tree");
+    assert!(tree.admits(OsStr::new("anything.jsonl")));
 }
 
 /// Serialises the tests that set `TRAJECTORY_ROOT`; every other test here
