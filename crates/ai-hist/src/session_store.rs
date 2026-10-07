@@ -1143,6 +1143,7 @@ impl SessionStore {
             before_ms: q.before_ms,
             after: None,
             project_key: q.project_key,
+            exclude_delegated: q.exclude_delegated,
         };
         CatalogIter {
             conn: self.read_conn(),
@@ -2095,6 +2096,10 @@ pub struct CatalogQuery {
     pub before_ms: Option<i64>,
     /// Rows fetched per internal page. Default 200; clamped to 1..=1000.
     pub page_size: i64,
+    /// Leave out delegated children — subagents and child threads another
+    /// session delegated work to — so the listing names only conversations
+    /// of their own. See [`SessionStore::delegated_descendants`].
+    pub exclude_delegated: bool,
 }
 
 impl Default for CatalogQuery {
@@ -2105,6 +2110,7 @@ impl Default for CatalogQuery {
             project_key: None,
             before_ms: None,
             page_size: 200,
+            exclude_delegated: false,
         }
     }
 }

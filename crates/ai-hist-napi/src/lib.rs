@@ -1721,6 +1721,7 @@ pub async fn list_session_catalog_page(
             session_id: cursor.session_id,
         }),
         project_key: options.project_key,
+        ..ai_hist::CatalogListOptions::default()
     };
     read_database_with_schema(
         path,

@@ -28,6 +28,19 @@ pub const IDENTITY_UNLINKED: &str = "unlinked";
 
 /// One session delegated work to another thread.
 pub const RELATIONSHIP_DELEGATED: &str = "delegated";
+/// SQL that is true when the session named by two column expressions is a
+/// delegated child: some other session delegated work to it. Such a session is
+/// part of its parent's work rather than a conversation of its own. Served by
+/// `idx_session_relationships_child`.
+pub(crate) fn delegated_child_sql(source: &str, session_id: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM session_relationships delegation \
+         WHERE delegation.source = {source} AND delegation.child_session_id = {session_id} \
+           AND delegation.relationship = '{RELATIONSHIP_DELEGATED}' \
+           AND delegation.parent_session_id <> delegation.child_session_id)"
+    )
+}
+
 /// A remote session materialized locally under a second identity.
 pub const RELATIONSHIP_MATERIALIZED_LOCAL: &str = "materialized_local";
 /// A later session carries on the same conversation as a prior one.

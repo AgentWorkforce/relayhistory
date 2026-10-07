@@ -3970,6 +3970,10 @@ pub struct CatalogListOptions {
     /// prefix: `github.com/org/repo` and `github.com/org/repo-fork` are
     /// different projects.
     pub project_key: Option<String>,
+    /// Leave out delegated children: sessions another session delegated
+    /// work to, which are part of that session rather than conversations of
+    /// their own.
+    pub exclude_delegated: bool,
 }
 
 /// One page of the catalog plus the cursor that continues it.
@@ -4018,6 +4022,12 @@ fn catalog_list_query(options: &CatalogListOptions) -> (String, Vec<Box<dyn rusq
     if let Some(project_key) = options.project_key.as_ref() {
         sql.push_str(" AND project_key = ?");
         args.push(Box::new(project_key.clone()));
+    }
+    if options.exclude_delegated {
+        sql.push_str(&format!(
+            " AND NOT {}",
+            crate::relationships::delegated_child_sql("sessions.source", "sessions.session_id")
+        ));
     }
     match options.after.as_ref() {
         // Everything strictly after the cursor in the catalog's total order.

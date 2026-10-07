@@ -278,6 +278,7 @@ impl core::ops::drop::Drop for ai_hist::CatalogIter
 pub fn ai_hist::CatalogIter::drop(&mut self)
 #[non_exhaustive] pub struct ai_hist::CatalogQuery
 pub ai_hist::CatalogQuery::before_ms: core::option::Option<i64>
+pub ai_hist::CatalogQuery::exclude_delegated: bool
 pub ai_hist::CatalogQuery::page_size: i64
 pub ai_hist::CatalogQuery::project_key: core::option::Option<alloc::string::String>
 pub ai_hist::CatalogQuery::scope: ai_hist::SessionScope
@@ -419,9 +420,11 @@ pub ai_hist::HydrateReport::session: ai_hist::SessionRef
 pub ai_hist::HydrateReport::status: ai_hist::HydrateStatus
 #[non_exhaustive] pub struct ai_hist::IdentityQuery
 pub ai_hist::IdentityQuery::after: core::option::Option<ai_hist::SessionIdentity>
+pub ai_hist::IdentityQuery::exclude_delegated: bool
 pub ai_hist::IdentityQuery::limit: usize
 impl ai_hist::IdentityQuery
 pub fn ai_hist::IdentityQuery::after(self, ai_hist::SessionIdentity) -> Self
+pub fn ai_hist::IdentityQuery::exclude_delegated(self) -> Self
 pub fn ai_hist::IdentityQuery::limit(self, usize) -> Self
 #[non_exhaustive] pub struct ai_hist::Marker
 pub ai_hist::Marker::kind: alloc::string::String
@@ -687,6 +690,7 @@ pub fn ai_hist::SessionStore::sessions(&self, ai_hist::CatalogQuery) -> ai_hist:
 pub fn ai_hist::SessionStore::sync(&self, ai_hist::SyncOptions) -> core::result::Result<ai_hist::SyncReport, ai_hist::Error>
 pub fn ai_hist::SessionStore::watch(&self, ai_hist::WatchOptions) -> core::result::Result<ai_hist::WatchHandle, ai_hist::Error>
 impl ai_hist::SessionStore
+pub fn ai_hist::SessionStore::delegated_by(&self, &ai_hist::SessionIdentity) -> core::result::Result<alloc::vec::Vec<ai_hist::SessionIdentity>, ai_hist::Error>
 pub fn ai_hist::SessionStore::delegated_descendants(&self, &[ai_hist::SessionIdentity]) -> core::result::Result<alloc::vec::Vec<ai_hist::SessionIdentity>, ai_hist::Error>
 pub fn ai_hist::SessionStore::has_session(&self, &ai_hist::SessionIdentity) -> core::result::Result<bool, ai_hist::Error>
 pub fn ai_hist::SessionStore::session_identities(&self, ai_hist::IdentityQuery) -> core::result::Result<alloc::vec::Vec<ai_hist::SessionIdentity>, ai_hist::Error>

@@ -1203,6 +1203,7 @@ pub fn run() -> Result<()> {
                         before_ms,
                         after,
                         project_key: project,
+                        ..CatalogListOptions::default()
                     },
                 )?;
                 print_session_catalog(&page, json)
