@@ -167,12 +167,21 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
             claude.tool_results = rewound;
         }
     }
-    // The session this file belongs to. The metadata fold has already read it
-    // from the head, so a resumed pass does not go looking for it again.
-    let file_session_id = claude
+    // The session this file belongs to. The sweep's metadata fold has already
+    // read it from the head, so a resumed pass does not go looking for it
+    // again. A pass with no fold -- a hydration reading the transcript from
+    // zero -- learns it from the first record that names one, as the fold
+    // does. The sessionless records ahead of that line (Claude's
+    // `file-history-snapshot`s, summaries) are kept under the same session a
+    // sweep keeps them under: only where they begin is remembered, and the
+    // span is read again, a capped record at a time, once the id is known,
+    // so a long prefix costs nothing to hold.
+    let mut file_session_id = claude
         .scan
         .as_ref()
         .and_then(|scan| scan.fold.session_id.clone());
+    let mut sessionless_from: Option<u64> = None;
+    let mut reread_bytes = 0u64;
     // Nothing has been appended since the last pass, so whatever was still
     // being written then is not going to be finished. Holding it back again
     // would hold it back forever.
@@ -246,6 +255,45 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
             continue;
         };
         pass.records += 1;
+        if file_session_id.is_none() && attributed_session_id.is_none() {
+            match obj
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+            {
+                Some(id) => {
+                    file_session_id = Some(id.to_string());
+                    if let Some(from) = sessionless_from.take() {
+                        reread_bytes += reread_records(path, from, line_start, |held| {
+                            let Ok(value) = serde_json::from_str::<Value>(held) else {
+                                return Ok(());
+                            };
+                            let Some(held_obj) = value.as_object() else {
+                                return Ok(());
+                            };
+                            ingest_claude_record(
+                                conn,
+                                path,
+                                None,
+                                file_session_id.as_deref(),
+                                held,
+                                held_obj,
+                                &mut claude.tool_results,
+                                &mut claude.cache_reads,
+                                &mut claude.slash_commands,
+                            )
+                        })?;
+                    }
+                }
+                // Complete records only: an unterminated one is re-read next
+                // pass anyway.
+                None if kind != ReadRecord::Unterminated => {
+                    sessionless_from.get_or_insert(line_start);
+                    continue;
+                }
+                None => {}
+            }
+        }
         // An unterminated record goes through the same deferral decision as
         // any other. Indexing it on the spot because it parsed wrote a live
         // assistant line with `stop_reason: null` straight out, left
@@ -397,6 +445,7 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
         .position()
         .saturating_sub(start_offset)
         .saturating_add(reader.tail_bytes())
+        .saturating_add(reread_bytes)
         .saturating_add(pass.validation_bytes);
     Ok(pass)
 }

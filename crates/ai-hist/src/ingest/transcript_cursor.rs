@@ -624,6 +624,60 @@ impl TranscriptCursorState {
 
 /// Hash the bounded validation window for `[0, offset)`. See the module docs.
 /// A record's text, or `None` when its bytes are not valid UTF-8.
+/// Read the records in `[from, to)` of `path` again, handing each decodable,
+/// newline-terminated one to `each` without its line ending. Memory is
+/// bounded the way [`TranscriptReader::next_line`] bounds it: a record past
+/// [`MAX_RECORD_BYTES`] is walked over in fixed-size chunks and skipped. The
+/// bytes read are returned, because a re-read is a provider read.
+pub(crate) fn reread_records(
+    path: &Path,
+    from: u64,
+    to: u64,
+    mut each: impl FnMut(&str) -> Result<()>,
+) -> Result<u64> {
+    use std::io::Read;
+    let mut reader = BufReader::new(fs::File::open(path)?);
+    reader.seek(std::io::SeekFrom::Start(from))?;
+    let mut position = from;
+    let mut read_total = 0u64;
+    let mut raw = Vec::new();
+    while position < to {
+        super::check_capture_cancelled()?;
+        raw.clear();
+        let budget = MAX_RECORD_BYTES.min(to - position);
+        let read = (&mut reader).take(budget).read_until(b'\n', &mut raw)? as u64;
+        if read == 0 {
+            break;
+        }
+        read_total += read;
+        position += read;
+        if raw.last() == Some(&b'\n') {
+            if let Some(text) = decode_record(&raw) {
+                each(text.trim_end_matches(['\n', '\r']))?;
+            }
+            continue;
+        }
+        // Over the ceiling: walk to its newline in chunks without holding it.
+        let mut chunk = vec![0u8; 64 * 1024];
+        loop {
+            super::check_capture_cancelled()?;
+            let read = reader.read(&mut chunk)?;
+            if read == 0 {
+                return Ok(read_total);
+            }
+            if let Some(index) = chunk[..read].iter().position(|byte| *byte == b'\n') {
+                read_total += index as u64 + 1;
+                position += index as u64 + 1;
+                reader.seek(std::io::SeekFrom::Start(position))?;
+                break;
+            }
+            read_total += read as u64;
+            position += read as u64;
+        }
+    }
+    Ok(read_total)
+}
+
 fn decode_record(raw: &[u8]) -> Option<&str> {
     std::str::from_utf8(raw).ok()
 }

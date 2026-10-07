@@ -5,7 +5,7 @@ coding-agent session evidence without parsing harness logs itself. This guide
 is for that program's author: the surface the crate exposes on its **default
 features**, and the rules that surface is governed by.
 
-Everything a consumer needs is one type, `ai_hist::SessionStore`, ten
+Everything a consumer needs is one type, `ai_hist::SessionStore`, fourteen
 operations, and the typed structs they return. Nothing on this surface names a
 `rusqlite` type, and no JSON column reaches a consumer as a string. This is the
 surface [`docs/sourcing-contract.md`](sourcing-contract.md) is delivered
@@ -85,7 +85,7 @@ What the facade owes you, and what it asks in return:
   `Error::UnsupportedOperation`, and a watermark the store cannot serve is
   `Error::WatermarkAheadOfStore`.
 
-## The twelve operations
+## The fourteen operations
 
 | Method                                           | Provider I/O                                | Database work                                                             | Lock                                             |
 | ------------------------------------------------ | ------------------------------------------- | ------------------------------------------------------------------------- | ------------------------------------------------ |
@@ -100,6 +100,8 @@ What the facade owes you, and what it asks in return:
 | `has_session(&SessionIdentity)`                  | none                                        | one indexed existence probe per table                                     | none (one read snapshot)                         |
 | `changes_since(Watermark, ChangeQuery)`          | none                                        | one indexed revision-range read per kind per page, plus tombstones; a session drain seeks that session's index instead | none (one read snapshot per page) |
 | `head_revision() -> Watermark`                   | none                                        | one read of the feed head                                                 | none                                             |
+| `forget_evidence(ForgetScope, ForgetOptions)`    | none                                        | batched deletes of the named sessions' evidence; catalog rows to shallow  | `SyncRunLock`, whole run                         |
+| `compact(CompactOptions)`                        | none                                        | FTS segment merge, `VACUUM`, WAL truncate                                 | `SyncRunLock`, whole run                         |
 | `Source::capabilities() -> SourceCapabilities`   | none                                        | none — static                                                             | none                                             |
 
 ### `open`
@@ -123,7 +125,7 @@ and assign the fields you set, not with a struct literal.
 | `db_path: None`, `home: None` | The CLI's database: `$AI_HIST_DB` if set, else `$XDG_DATA_HOME/ai-hist/ai-history.db` if `XDG_DATA_HOME` is set, else `~/.local/share/ai-hist/ai-history.db` (`HOME`, or `USERPROFILE` on Windows). |
 | `home` | Also the directory the providers are rooted at when `roots` is `None`: `<home>/.claude`, `<home>/.codex`, `<home>/.grok`, `<home>/.local/share/opencode/`. `None` means the process `HOME`. Ignored when `roots` is set. |
 | `roots: Some(ProviderRoots)` | Exactly where each provider keeps its sessions, resolved by the caller. |
-| `read_only` | Open without creating or migrating. `discover`, `sync`, `hydrate` and `watch` are `Error::UnsupportedOperation`. |
+| `read_only` | Open without creating or migrating. `discover`, `sync`, `hydrate`, `watch`, `forget_evidence` and `compact` are `Error::UnsupportedOperation`. |
 
 **Provider roots.** `ProviderRoots::from_env(home)` is the CLI's resolution —
 `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME`, `OPENCODE_DB`,
@@ -507,6 +509,105 @@ A read-only handle drains the feed but cannot commit a cursor, and a commit
 writes only into the database the drain read: one whose path now holds another
 database is `Error::WatermarkAheadOfStore`.
 
+### `forget_evidence` and `compact`
+
+`forget_evidence(scope, ForgetOptions { lock_timeout_ms, stop,
+include_unrecoverable })` drops the evidence of the sessions `scope` names and
+keeps their catalog rows. It is an eviction, not a deletion: by default it
+touches only sessions whose evidence a local `hydrate` can read back.
+
+```rust
+use ai_hist::{CompactOptions, ForgetOptions, ForgetScope};
+
+// Keep evidence for the selected sessions only.
+let report = store.forget_evidence(ForgetScope::AllExcept(selected), ForgetOptions::default())?;
+if report.sessions > 0 {
+    store.compact(CompactOptions::default())?;
+}
+```
+
+- `ForgetScope::Sessions(refs)` forgets those sessions and the catalog-less
+  delegated descendants reached from them without passing through a
+  catalogued session (Claude subagents, Codex child threads): those have no
+  catalog row to be named by and are re-read through the hydration of the
+  session that delegated to them. A catalogued child is a session of its own,
+  forgotten only when named; its own catalog-less descendants go with it.
+  `ForgetScope::AllExcept(refs)` forgets every session holding evidence except
+  those and all their delegated descendants, including evidence whose session
+  has no catalog row. References are by id; `SessionRef::Path` is
+  `Error::InvalidArgument`.
+- Which sessions come back is decided by the snapshot `hydrate` itself takes,
+  not by a separate heuristic. A catalogued session is forgotten only when
+  hydration would accept it (its transcript is there, an OpenCode or Devin
+  store still holds it and does not hide it, its layout is the configured
+  one, its source has a local parser), none of its evidence came from a
+  connector other than the builtin local one (remote sync, plugin intake),
+  and every transcript a sweep indexed under its id is one hydration reads (a
+  Claude conversation forked into branch files keeps its id in each; a sweep
+  indexes all of them, hydration only the catalogued one). A catalog-less
+  child is forgotten only when one catalogued ancestor that passes the same
+  test -- its nearest, through any catalog-less intermediaries -- reads every
+  transcript its relationships name for it, the child's own, not an
+  intermediary's. Everything else is
+  **unrecoverable**: left exactly as it was, never treated as a kept parent,
+  and counted in `ForgetReport::skipped_unrecoverable` when it holds evidence.
+  `include_unrecoverable: true` forgets it anyway, and that evidence is then
+  lost.
+- Removed: `session_events` and their full-text rows, `tool_calls`,
+  `file_edits`, `session_markers`, `observation_evidence`, both hydration
+  checkpoint tables, the transcript cursors of the session's transcript, its
+  sidecar directory and its child transcripts, and the Grok turn census.
+  `session_relationships.child_has_events` drops to 0 for a forgotten child.
+  Every surviving catalogued ancestor whose hydration re-reads a forgotten
+  child, through any catalog-less intermediaries, loses its hydration
+  checkpoints, gets new observation revisions and is marked `shallow` too,
+  so its next hydration re-reads the child. Kept: the catalog (`sessions`, `session_presences`,
+  `session_observations`, set to `discovery_state = 'shallow'`),
+  relationships, continuity and identity evidence, tags, session tags, commit
+  links, and the provider-wide logs (`history`, `grok_unified_usage`,
+  `trajectories`), which a session's hydration does not re-read.
+- A forgotten session's catalog row stays listed by `sessions()`, now as
+  `Shallow`, and `session()` returns it with no evidence; a catalog-less child
+  had no catalog row and gains none. `hydrate()` reports `Hydrated` and
+  restores the session; its catalog-less children come back only with
+  `HydrateOptions::include_related` on (the default). An embedder that
+  hydrates with `include_related: false` restores a forgotten family by
+  hydrating each `Shallow` parent once with `include_related: true`.
+- The change feed carries no tombstones for removed records: a durable
+  receiver keeps what it was sent, and a later hydration reports the same
+  keys as upserts. What it does report is each row this writes and changes:
+  the `sessions`, `session_presences` and `session_observations` rows of a
+  forgotten session or kept parent that were not already `shallow`, and a
+  forgotten child's `session_relationships` row when its `child_has_events`
+  was 1. A catalog-less child has no catalog row, so a child already at
+  `child_has_events = 0` changes nothing the feed reports.
+- It holds the `SyncRunLock` for the run (waiting up to `lock_timeout_ms`, then
+  `Error::SyncLocked`) and commits in batches of about 4,000 rows or 200 ms,
+  never splitting a session, so a hydration or discovery running beside it
+  waits for one batch. A hydration that commits after a session's batch
+  restores that session, as any hydration would. `stop` cancels between
+  batches; committed batches stay forgotten, and the next call works out the
+  remaining sessions again.
+- A later `sync` or `watch` captures every session again, forgotten ones
+  included: forgetting suits an embedder that discovers the catalog and
+  hydrates only the sessions it keeps.
+- `ForgetReport` counts the sessions and rows removed and the sessions
+  skipped, and reports `reclaimable_bytes` (the freelist) and `db_bytes`.
+
+Freed pages stay in the file for later writes to reuse, and the full-text
+index keeps its delete markers until its segments merge. `compact(CompactOptions
+{ lock_timeout_ms })` returns both to the volume: it merges the full-text
+indexes, rewrites the file with `VACUUM` and truncates the WAL. It deletes
+nothing and migrates nothing: the space check is the first thing it does
+after taking the lock, so a refusal comes before any write. It holds the
+`SyncRunLock` for the rewrite, so a `sync` in that time
+returns `Error::SyncLocked` once its own `lock_timeout_ms` runs out and a
+`watch` tick reports `contended` and retries; `hydrate` and `discover` wait in
+SQLite's busy handler. Run it when a pause in writes is acceptable. It needs
+about twice the live data plus 512 MiB free on the database's volume, and
+returns `Error::InsufficientSpace` before writing anything when that is not
+there.
+
 ### `Source::capabilities()`
 
 Static, per source: `evidence_kinds` (the parser's ceiling — a kind absent here
@@ -540,7 +641,7 @@ codes where both sides have the failure; `Display` renders `CODE: message`.
 | `DatabaseOpen`             | `DATABASE_OPEN_FAILED`       | cannot open, create or migrate                                         |
 | `StaleSchema`              | `DATABASE_STALE_SCHEMA`      | read-only open of a database older than the shape this version reads   |
 | `InvalidArgument`          | `INVALID_ARGUMENT`           | a caller value was rejected before anything was read                   |
-| `UnsupportedOperation`     | `UNSUPPORTED_OPERATION`      | `discover` / `sync` / `hydrate` / `watch` on a read-only handle        |
+| `UnsupportedOperation`     | `UNSUPPORTED_OPERATION`      | `discover` / `sync` / `hydrate` / `watch` / `forget_evidence` / `compact` on a read-only handle |
 | `SessionNotFound`          | `SESSION_NOT_FOUND`          | `hydrate` of a session the catalog does not hold                       |
 | `SessionSourceUnavailable` | `SESSION_SOURCE_UNAVAILABLE` | catalogued, but the provider source is gone                            |
 | `SourceMismatch`           | `SESSION_SOURCE_MISMATCH`    | the provider data and the claimed session disagree                     |
@@ -556,7 +657,8 @@ codes where both sides have the failure; `Display` renders `CODE: message`.
 | `SyncLocked`               | `SYNC_LOCKED`                | another process holds the `SyncRunLock` past the caller's timeout      |
 | `WatermarkAheadOfStore`    | `WATERMARK_AHEAD_OF_STORE`   | a `changes_since` watermark this store did not issue (epoch or revision) |
 | `ConsumerKindsMismatch`    | `CONSUMER_KINDS_MISMATCH`    | a named cursor was drained under a different kind set than it holds     |
-| `Cancelled`                | `CANCELLED`                  | the caller's `StopToken` stopped `discover`, `sync` or `hydrate`       |
+| `InsufficientSpace`        | `INSUFFICIENT_SPACE`         | `compact` refused: the volume cannot hold the rewrite, or its free space is unknown |
+| `Cancelled`                | `CANCELLED`                  | the caller's `StopToken` stopped `discover`, `sync`, `hydrate` or `forget_evidence` |
 
 The four Node-only classes (`UNSUPPORTED_PLATFORM`, `NATIVE_PACKAGE_MISSING`,
 `NATIVE_LOAD_FAILED`, `NATIVE_CONTRACT_MISMATCH`) have no Rust counterpart.
@@ -752,7 +854,7 @@ embedder reads before bumping.
 
 | Feature | Default | What it adds | For |
 | --- | --- | --- | --- |
-| *(none)* | ✓ | `SessionStore` and its twelve operations, the change feed (`Change`, `ChangeQuery`, `Watermark`, `EvidenceRow`, `StoredRow`), `SessionIdentity` and `IdentityQuery`, `Source` and `SourceCapabilities`, `Error`, the evidence structs above, `NormalizedUsage` and the usage normalizers, `project_identity`, `declared_evidence_kinds` | Embedders |
+| *(none)* | ✓ | `SessionStore` and its fourteen operations, the change feed (`Change`, `ChangeQuery`, `Watermark`, `EvidenceRow`, `StoredRow`), `SessionIdentity` and `IdentityQuery`, `Source` and `SourceCapabilities`, `Error`, the evidence structs above, `NormalizedUsage` and the usage normalizers, `project_identity`, `declared_evidence_kinds` | Embedders |
 | `fs-events` | — | The `notify` backend behind `watch`; without it `watch` polls at `poll_interval_ms`. `WatchOptions::use_fs_events` selects it when it is compiled in | The CLI, and an embedder that wants event-driven ticks |
 | `export` | — | `ai_hist::export`: bounded, resumable NDJSON snapshots of the store's evidence, keyed like the change feed | napi (the SDK's `exportHistory`) |
 | `opencode-backup` | — | Snapshot a live OpenCode SQLite store through `rusqlite`'s backup API before reading it | The CLI, napi |

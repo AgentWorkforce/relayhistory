@@ -82,6 +82,7 @@ pub ai_hist::Error::Discovery(alloc::string::String)
 pub ai_hist::Error::EvidencePartial(alloc::string::String)
 pub ai_hist::Error::HydrationFailed(alloc::string::String)
 pub ai_hist::Error::HydrationUnsupported(alloc::string::String)
+pub ai_hist::Error::InsufficientSpace(alloc::string::String)
 pub ai_hist::Error::InvalidArgument(alloc::string::String)
 pub ai_hist::Error::Query(alloc::string::String)
 pub ai_hist::Error::SessionNotFound(alloc::string::String)
@@ -120,6 +121,9 @@ pub ai_hist::EvidenceRow::SessionEvent(ai_hist::SessionEvent)
 pub ai_hist::EvidenceRow::SessionMarker(ai_hist::SessionMarker)
 pub ai_hist::EvidenceRow::ToolCall(ai_hist::SessionToolCall)
 pub ai_hist::EvidenceRow::Untyped
+#[non_exhaustive] pub enum ai_hist::ForgetScope
+pub ai_hist::ForgetScope::AllExcept(alloc::vec::Vec<ai_hist::SessionRef>)
+pub ai_hist::ForgetScope::Sessions(alloc::vec::Vec<ai_hist::SessionRef>)
 #[non_exhaustive] pub enum ai_hist::HydrateStatus
 pub ai_hist::HydrateStatus::CapabilityLimited
 pub ai_hist::HydrateStatus::Hydrated
@@ -334,6 +338,16 @@ pub fn ai_hist::Changes::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt:
 impl core::iter::traits::iterator::Iterator for ai_hist::Changes
 pub type ai_hist::Changes::Item = core::result::Result<ai_hist::Change, ai_hist::Error>
 pub fn ai_hist::Changes::next(&mut self) -> core::option::Option<Self::Item>
+#[non_exhaustive] pub struct ai_hist::CompactOptions
+pub ai_hist::CompactOptions::lock_timeout_ms: u64
+#[non_exhaustive] pub struct ai_hist::CompactReport
+pub ai_hist::CompactReport::db_bytes_after: u64
+pub ai_hist::CompactReport::db_bytes_before: u64
+pub ai_hist::CompactReport::elapsed_ms: u64
+pub ai_hist::CompactReport::reclaimable_before: u64
+pub ai_hist::CompactReport::wal_bytes_after: u64
+pub ai_hist::CompactReport::wal_bytes_before: u64
+pub ai_hist::CompactReport::wal_truncated: bool
 #[non_exhaustive] pub struct ai_hist::Diagnostic
 pub ai_hist::Diagnostic::code: alloc::string::String
 pub ai_hist::Diagnostic::message: alloc::string::String
@@ -367,6 +381,21 @@ pub ai_hist::FileEdit::ts_ms: core::option::Option<i64>
 pub ai_hist::FileEdit::user_modified: core::option::Option<bool>
 impl ai_hist::FileEdit
 pub fn ai_hist::FileEdit::raw_structured_patch(&self) -> core::option::Option<&str>
+#[non_exhaustive] pub struct ai_hist::ForgetOptions
+pub ai_hist::ForgetOptions::include_unrecoverable: bool
+pub ai_hist::ForgetOptions::lock_timeout_ms: u64
+pub ai_hist::ForgetOptions::stop: core::option::Option<ai_hist::StopToken>
+#[non_exhaustive] pub struct ai_hist::ForgetReport
+pub ai_hist::ForgetReport::db_bytes: u64
+pub ai_hist::ForgetReport::elapsed_ms: u64
+pub ai_hist::ForgetReport::events: u64
+pub ai_hist::ForgetReport::file_edits: u64
+pub ai_hist::ForgetReport::markers: u64
+pub ai_hist::ForgetReport::observation_evidence: u64
+pub ai_hist::ForgetReport::reclaimable_bytes: u64
+pub ai_hist::ForgetReport::sessions: u64
+pub ai_hist::ForgetReport::skipped_unrecoverable: u64
+pub ai_hist::ForgetReport::tool_calls: u64
 pub struct ai_hist::HistoryEntry
 pub ai_hist::HistoryEntry::id: i64
 pub ai_hist::HistoryEntry::project: core::option::Option<alloc::string::String>
@@ -643,6 +672,9 @@ pub struct ai_hist::SessionStore
 impl ai_hist::SessionStore
 pub fn ai_hist::SessionStore::changes_since(&self, ai_hist::Watermark, ai_hist::ChangeQuery) -> anyhow::Result<ai_hist::Changes, ai_hist::Error>
 pub fn ai_hist::SessionStore::head_revision(&self) -> anyhow::Result<ai_hist::Watermark, ai_hist::Error>
+impl ai_hist::SessionStore
+pub fn ai_hist::SessionStore::compact(&self, ai_hist::CompactOptions) -> core::result::Result<ai_hist::CompactReport, ai_hist::Error>
+pub fn ai_hist::SessionStore::forget_evidence(&self, ai_hist::ForgetScope, ai_hist::ForgetOptions) -> core::result::Result<ai_hist::ForgetReport, ai_hist::Error>
 impl ai_hist::SessionStore
 pub fn ai_hist::SessionStore::db_path(&self) -> &std::path::Path
 pub fn ai_hist::SessionStore::discover(&self, ai_hist::DiscoveryOptions) -> core::result::Result<ai_hist::DiscoveryReport, ai_hist::Error>

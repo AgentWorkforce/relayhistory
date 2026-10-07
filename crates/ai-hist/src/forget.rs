@@ -1,0 +1,893 @@
+//! Dropping sessions' evidence while keeping their catalog rows, and handing
+//! the freed space back to the volume.
+//!
+//! [`SessionStore::forget_evidence`] is an eviction, not a retraction: it
+//! removes only evidence a local hydration reads back, keeps everything that
+//! names or links a session, and never touches what a person created.
+//! Whether hydration reads a session back is answered by the snapshot
+//! hydration itself takes (`HydrationProbe` in `ingest::hydrate`), not
+//! by a second heuristic; a session it would refuse, one with evidence from
+//! another connector, or one a sweep indexed from transcripts hydration does
+//! not read is skipped unless the caller opts in.
+//!
+//! A session is forgotten with the catalog-less delegated descendants reached
+//! from it without passing through a catalogued session (Claude subagents,
+//! Codex child threads): they have no catalog row to name them by, and their
+//! evidence comes back through the hydration of the session that delegated
+//! to them, so each is forgotten only when that hydration enumerates its
+//! transcript. Keeping a session keeps all its delegated descendants.
+//!
+//! | Table | Kept? | Why |
+//! |---|---|---|
+//! | `session_events` (+ `session_events_fts` via its trigger), `tool_calls`, `file_edits`, `session_markers` | removed | parsed evidence; hydration rewrites it |
+//! | `observation_evidence` | removed | the builtin local connector's snapshot rows; hydration rewrites them |
+//! | `session_hydration_checkpoints`, `observation_hydration_checkpoints` | removed | they claim the evidence is current; without them hydration re-reads from byte zero |
+//! | `transcript_cursors` for the session's transcript, its sidecar directory and its child transcripts | removed | a byte position into evidence that is gone would resume past it |
+//! | `grok_session_turns` | removed | turn census of the last replacing read |
+//! | `sessions`, `session_presences`, `session_observations` | kept, `discovery_state = 'shallow'` | the catalog; now says no evidence is held |
+//! | `session_relationships` | kept, `child_has_events = 0` for a forgotten child | lineage; the flag says whether the child's events are held |
+//! | `session_continuity_evidence`, `session_identity_correlations`, `observation_versions` | kept | identity and lineage, not evidence |
+//! | `tags`, `session_tags`, `session_commit_links` | kept | user-created |
+//! | `history`, `grok_unified_usage`, `trajectories` | kept | read from provider-wide logs, which a session's hydration does not re-read |
+//! | `canonical_evidence_protection` | kept | ownership claims that outlive any one observation |
+//! | `discovery_skips`, `observation_discovery_skips`, change-feed and cursor tables | kept | store bookkeeping |
+//!
+//! Each removed row would leave a change-feed tombstone through its table's
+//! delete trigger. Those tombstones are dropped in the same transaction: a
+//! durable receiver must not retract evidence the provider still holds. What
+//! the feed reports instead is each session's catalog row moving to
+//! `shallow`, and a later hydration reports the evidence again as upserts of
+//! the same keys.
+
+use crate::diagnostics::{self, CompactRefused};
+use crate::ingest::{check_capture_cancelled, try_acquire_sync_lock, SyncRunLock};
+use crate::observations::{self, ObservationKey};
+use crate::session_store::{Error, SessionRef, SessionStore, StopToken};
+use crate::store::{open_db, SessionLocation};
+use crate::ProviderRoots;
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+/// Which sessions [`SessionStore::forget_evidence`] drops evidence for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+#[serde(tag = "scope", content = "sessions", rename_all = "snake_case")]
+pub enum ForgetScope {
+    /// Exactly these sessions.
+    Sessions(Vec<SessionRef>),
+    /// Every session holding evidence except these — the store keeps evidence
+    /// for this set only. An empty set forgets every session's evidence.
+    AllExcept(Vec<SessionRef>),
+}
+
+/// How to run [`SessionStore::forget_evidence`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ForgetOptions {
+    /// How long to wait for another process's `SyncRunLock` before returning
+    /// [`Error::SyncLocked`]. `0` (the default) tries once.
+    pub lock_timeout_ms: u64,
+    /// Stops between batches. Batches already committed stay forgotten; a
+    /// later call works out the remaining sessions again.
+    #[serde(skip)]
+    pub stop: Option<StopToken>,
+    /// Also forget sessions whose evidence a local hydration cannot read back
+    /// (see [`ForgetReport::skipped_unrecoverable`]). That evidence is lost.
+    pub include_unrecoverable: bool,
+}
+
+/// Result of [`SessionStore::forget_evidence`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ForgetReport {
+    /// Sessions that held evidence or a hydrated state and now hold neither.
+    pub sessions: u64,
+    /// Sessions in scope holding evidence that were left as they were
+    /// because a local hydration could not read it back: the transcript is gone (Claude Code
+    /// deletes old ones), the source has no local parser, or evidence came
+    /// from a remote connector or plugin intake.
+    pub skipped_unrecoverable: u64,
+    pub events: u64,
+    pub tool_calls: u64,
+    pub file_edits: u64,
+    pub markers: u64,
+    pub observation_evidence: u64,
+    /// Bytes of the database file now on SQLite's freelist. Later writes
+    /// reuse them; [`SessionStore::compact`] returns them to the volume.
+    pub reclaimable_bytes: u64,
+    /// Size of the database file.
+    pub db_bytes: u64,
+    pub elapsed_ms: u64,
+}
+
+/// How to run [`SessionStore::compact`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct CompactOptions {
+    /// How long to wait for another process's `SyncRunLock` before returning
+    /// [`Error::SyncLocked`]. `0` (the default) tries once.
+    pub lock_timeout_ms: u64,
+}
+
+/// Result of [`SessionStore::compact`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct CompactReport {
+    pub db_bytes_before: u64,
+    pub wal_bytes_before: u64,
+    pub db_bytes_after: u64,
+    pub wal_bytes_after: u64,
+    /// Freelist bytes before the rewrite.
+    pub reclaimable_before: u64,
+    /// `false` when a reader holding an older snapshot kept the WAL from
+    /// being reset; it shrinks at a later checkpoint.
+    pub wal_truncated: bool,
+    pub elapsed_ms: u64,
+}
+
+/// A write transaction commits once it has removed this many evidence rows
+/// or run this long, whichever comes first, so a concurrent hydration or
+/// discovery waits for one batch rather than the whole run. Time matters as
+/// much as rows: a row's cost is mostly its full-text and index entries, and
+/// one large tool output costs as much as hundreds of short rows. One session
+/// is never split across transactions.
+const BATCH_ROWS: u64 = 4_000;
+const BATCH_TIME: Duration = Duration::from_millis(200);
+
+/// Retry cadence while another process holds the `SyncRunLock`.
+const LOCK_RETRY: Duration = Duration::from_millis(100);
+
+/// Longest lock wait honoured, as for `sync`.
+const MAX_LOCK_WAIT_MS: u64 = crate::watch::MAX_INTERVAL_MS;
+
+/// Change-feed kinds whose delete triggers tombstone the rows removed here.
+const TOMBSTONED_KINDS: &str =
+    "'session_event','tool_call','file_edit','session_marker','observation_evidence'";
+
+type Key = (String, String);
+
+impl SessionStore {
+    /// Drop the evidence of the sessions `scope` names, and of their
+    /// catalog-less delegated children, keeping their catalog rows:
+    /// [`SessionStore::sessions`] still lists each one, now as
+    /// [`crate::DiscoveryState::Shallow`], and [`SessionStore::hydrate`] reads
+    /// it again in full. Tags and commit links stay. A session whose evidence
+    /// a local hydration could not read back is skipped and counted in
+    /// [`ForgetReport::skipped_unrecoverable`], unless
+    /// [`ForgetOptions::include_unrecoverable`] is set.
+    ///
+    /// Holds the `SyncRunLock` for the run, so no sweep or watch tick
+    /// interleaves; deletes commit in batches, each session in one
+    /// transaction, so hydration and discovery proceed between batches. The
+    /// change feed reports each session's catalog row, not a tombstone per
+    /// removed record. Freed pages stay in the file for reuse until
+    /// [`SessionStore::compact`].
+    ///
+    /// A later `sync` or `watch` captures every session again, forgotten ones
+    /// included; this suits an embedder that hydrates the sessions it keeps.
+    pub fn forget_evidence(
+        &self,
+        scope: ForgetScope,
+        opts: ForgetOptions,
+    ) -> Result<ForgetReport, Error> {
+        if self.read_only() {
+            return Err(Error::read_only("forget_evidence"));
+        }
+        let (named, keep_only) = match scope {
+            ForgetScope::Sessions(refs) => (id_keys(refs, "forget_evidence")?, false),
+            ForgetScope::AllExcept(refs) => (id_keys(refs, "forget_evidence")?, true),
+        };
+        let started = Instant::now();
+        crate::session_store::controlled(opts.stop.as_ref(), None, || {
+            let _lock = wait_for_sync_lock(self.db_path(), opts.lock_timeout_ms)?;
+            let mut conn = open_db(self.db_path())
+                .map_err(|error| Error::DatabaseOpen(format!("{error:#}")))?;
+            let (targets, skipped) = plan(
+                &conn,
+                self.roots(),
+                named,
+                keep_only,
+                opts.include_unrecoverable,
+            )
+            .map_err(Error::query)?;
+            let mut report = ForgetReport {
+                skipped_unrecoverable: skipped,
+                ..ForgetReport::default()
+            };
+            let mut pending = targets.iter().peekable();
+            while pending.peek().is_some() {
+                check_capture_cancelled().map_err(Error::sync)?;
+                forget_batch(&mut conn, &mut pending, &mut report).map_err(Error::query)?;
+            }
+            let usage = diagnostics::read_page_usage(&conn).map_err(Error::sql)?;
+            report.reclaimable_bytes = usage.free_bytes();
+            report.db_bytes = usage.page_count.saturating_mul(usage.page_size);
+            report.elapsed_ms = started.elapsed().as_millis() as u64;
+            Ok(report)
+        })
+    }
+
+    /// Return the database's unused space to the volume: merge the full-text
+    /// indexes' segments, rewrite the file with `VACUUM` and truncate the WAL.
+    /// Deletes nothing.
+    ///
+    /// Holds the `SyncRunLock`; other writers wait behind the rewrite through
+    /// their busy handler, so run it when a pause in writes is acceptable.
+    /// Needs about twice the live data free on the database's volume, and
+    /// returns [`Error::InsufficientSpace`] before writing anything when
+    /// that is not there.
+    pub fn compact(&self, opts: CompactOptions) -> Result<CompactReport, Error> {
+        if self.read_only() {
+            return Err(Error::read_only("compact"));
+        }
+        let started = Instant::now();
+        let deadline = lock_deadline(started, opts.lock_timeout_ms);
+        loop {
+            match diagnostics::compact_database(self.db_path()) {
+                Ok(done) => {
+                    return Ok(CompactReport {
+                        db_bytes_before: done.db_bytes_before,
+                        wal_bytes_before: done.wal_bytes_before,
+                        db_bytes_after: done.db_bytes_after,
+                        wal_bytes_after: done.wal_bytes_after,
+                        reclaimable_before: done.reclaimable_before,
+                        wal_truncated: done.wal_truncated,
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                    })
+                }
+                Err(error) => match error.downcast_ref::<CompactRefused>() {
+                    Some(CompactRefused::SyncRunning) => {
+                        if !wait_or_give_up(deadline) {
+                            return Err(Error::SyncLocked {
+                                path: self.db_path().to_path_buf(),
+                                waited_ms: started.elapsed().as_millis() as u64,
+                            });
+                        }
+                    }
+                    Some(refused) => return Err(Error::InsufficientSpace(refused.to_string())),
+                    None => return Err(Error::query(error)),
+                },
+            }
+        }
+    }
+}
+
+/// The `(source, session_id)` keys of `refs`, which must all be by id: a path
+/// names a transcript, and forgetting is about sessions the catalog holds.
+fn id_keys(refs: Vec<SessionRef>, operation: &str) -> Result<BTreeSet<Key>, Error> {
+    refs.into_iter()
+        .map(|r| match r {
+            SessionRef::Id { source, session_id } => Ok((source.as_str().to_string(), session_id)),
+            SessionRef::Path { .. } => Err(Error::InvalidArgument(format!(
+                "{operation} takes sessions by id, not by transcript path"
+            ))),
+        })
+        .collect()
+}
+
+fn lock_deadline(started: Instant, timeout_ms: u64) -> Instant {
+    started + Duration::from_millis(timeout_ms.min(MAX_LOCK_WAIT_MS))
+}
+
+/// Sleep one retry step if the budget allows; `false` when it is spent.
+fn wait_or_give_up(deadline: Instant) -> bool {
+    let now = Instant::now();
+    if now >= deadline {
+        return false;
+    }
+    std::thread::sleep((deadline - now).min(LOCK_RETRY));
+    true
+}
+
+fn wait_for_sync_lock(db_path: &Path, timeout_ms: u64) -> Result<SyncRunLock, Error> {
+    let started = Instant::now();
+    let deadline = lock_deadline(started, timeout_ms);
+    loop {
+        if let Some(lock) = try_acquire_sync_lock(db_path).map_err(Error::sync)? {
+            return Ok(lock);
+        }
+        check_capture_cancelled().map_err(Error::sync)?;
+        if !wait_or_give_up(deadline) {
+            return Err(Error::SyncLocked {
+                path: db_path.to_path_buf(),
+                waited_ms: started.elapsed().as_millis() as u64,
+            });
+        }
+    }
+}
+
+/// Every session that holds evidence or claims to: a catalog row not marked
+/// `shallow`, a hydrated observation, a checkpoint, or any evidence row —
+/// including rows whose session has no catalog row at all.
+fn evidence_holders(conn: &Connection) -> anyhow::Result<BTreeSet<Key>> {
+    let mut statement = conn.prepare(
+        "SELECT source, session_id FROM sessions WHERE discovery_state IS NOT 'shallow' \
+         UNION SELECT source, session_id FROM session_presences \
+               WHERE discovery_state IS NOT 'shallow' \
+         UNION SELECT source, session_id FROM session_observations \
+               WHERE discovery_state = 'full' \
+         UNION SELECT DISTINCT source, session_id FROM session_events \
+         UNION SELECT DISTINCT source, session_id FROM tool_calls \
+         UNION SELECT DISTINCT source, session_id FROM file_edits \
+         UNION SELECT DISTINCT source, session_id FROM session_markers \
+         UNION SELECT DISTINCT source, session_id FROM observation_evidence \
+         UNION SELECT source, session_id FROM session_hydration_checkpoints \
+         UNION SELECT source, session_id FROM observation_hydration_checkpoints \
+         UNION SELECT 'grok', session_id FROM grok_session_turns",
+    )?;
+    let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// One session to forget, with what forgetting it touches beyond its own rows.
+struct Target {
+    key: Key,
+    /// Transcripts its parents' relationships name for it.
+    child_locators: Vec<String>,
+    /// Delegating parents that stay, whose checkpoints vouch for this child.
+    kept_parents: Vec<Key>,
+}
+
+/// Delegation edges: parent to child and back, with the child's transcript.
+#[derive(Default)]
+struct Family {
+    children: HashMap<Key, Vec<Key>>,
+    parents: HashMap<Key, Vec<Key>>,
+    locators: HashMap<Key, Vec<String>>,
+}
+
+impl Family {
+    fn load(conn: &Connection) -> anyhow::Result<Self> {
+        let mut family = Family::default();
+        let mut statement = conn.prepare(
+            "SELECT source, parent_session_id, child_session_id, evidence_locator \
+             FROM session_relationships \
+             WHERE relationship = ? AND child_session_id IS NOT NULL",
+        )?;
+        let mut rows = statement.query([crate::relationships::RELATIONSHIP_DELEGATED])?;
+        while let Some(row) = rows.next()? {
+            let source: String = row.get(0)?;
+            let parent = (source.clone(), row.get::<_, String>(1)?);
+            let child = (source, row.get::<_, String>(2)?);
+            if parent == child {
+                continue;
+            }
+            if let Some(locator) = row.get::<_, Option<String>>(3)? {
+                family
+                    .locators
+                    .entry(child.clone())
+                    .or_default()
+                    .push(locator);
+            }
+            family
+                .children
+                .entry(parent.clone())
+                .or_default()
+                .push(child.clone());
+            family.parents.entry(child).or_default().push(parent);
+        }
+        Ok(family)
+    }
+
+    /// The nearest catalogued ancestors of `key`: up through its parents,
+    /// stopping on each path at the first catalogued session.
+    fn catalogued_ancestors(&self, key: &Key, catalog: &HashSet<Key>) -> Vec<Key> {
+        let mut found = Vec::new();
+        let mut visited = HashSet::from([key.clone()]);
+        let mut frontier = vec![key.clone()];
+        while let Some(node) = frontier.pop() {
+            for parent in self.parents.get(&node).into_iter().flatten() {
+                if !visited.insert(parent.clone()) {
+                    continue;
+                }
+                if catalog.contains(parent) {
+                    found.push(parent.clone());
+                } else {
+                    frontier.push(parent.clone());
+                }
+            }
+        }
+        found
+    }
+
+    /// `start` and every descendant reached through children `descend`
+    /// admits.
+    fn closure(&self, start: BTreeSet<Key>, descend: impl Fn(&Key) -> bool) -> BTreeSet<Key> {
+        let mut reached = start;
+        let mut frontier: Vec<Key> = reached.iter().cloned().collect();
+        while let Some(node) = frontier.pop() {
+            for child in self.children.get(&node).into_iter().flatten() {
+                if !reached.contains(child) && descend(child) {
+                    reached.insert(child.clone());
+                    frontier.push(child.clone());
+                }
+            }
+        }
+        reached
+    }
+}
+
+/// The sessions to forget, in key order, and how many in scope holding
+/// evidence were skipped as unrecoverable.
+fn plan(
+    conn: &Connection,
+    roots: &ProviderRoots,
+    named: BTreeSet<Key>,
+    keep_only: bool,
+    include_unrecoverable: bool,
+) -> anyhow::Result<(Vec<Target>, u64)> {
+    let family = Family::load(conn)?;
+    let catalog: HashSet<Key> = conn
+        .prepare("SELECT source, session_id FROM sessions")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let scope: BTreeSet<Key> = if keep_only {
+        let keep = family.closure(named, |_| true);
+        evidence_holders(conn)?
+            .into_iter()
+            .filter(|key| !keep.contains(key))
+            .collect()
+    } else {
+        family.closure(named, |child| !catalog.contains(child))
+    };
+    let mut recovery = Recovery {
+        conn,
+        roots,
+        family: &family,
+        catalog: &catalog,
+        transcripts: claude_transcripts(conn)?,
+        probe: crate::ingest::hydrate::HydrationProbe::default(),
+        reads: HashMap::new(),
+    };
+    let mut forget = BTreeSet::new();
+    let mut skipped = 0;
+    for key in &scope {
+        check_capture_cancelled()?;
+        if include_unrecoverable || recovery.recoverable(key)? {
+            forget.insert(key.clone());
+        } else if holds_evidence(conn, key)? {
+            skipped += 1;
+        }
+    }
+    let mut targets = Vec::with_capacity(forget.len());
+    for key in &forget {
+        // Every surviving catalogued ancestor whose hydration re-reads this
+        // child, through any catalog-less intermediaries: its checkpoint
+        // vouches for evidence that is about to go.
+        let locators = family.locators.get(key).cloned().unwrap_or_default();
+        let mut kept_parents = Vec::new();
+        for ancestor in family.catalogued_ancestors(key, &catalog) {
+            if !forget.contains(&ancestor)
+                && !scope.contains(&ancestor)
+                && recovery.catalogued_recoverable(&ancestor)?
+                && recovery
+                    .reads(&ancestor)?
+                    .is_some_and(|reads| locators.iter().any(|locator| reads.contains(locator)))
+            {
+                kept_parents.push(ancestor);
+            }
+        }
+        targets.push(Target {
+            key: key.clone(),
+            child_locators: family.locators.get(key).cloned().unwrap_or_default(),
+            kept_parents,
+        });
+    }
+    Ok((targets, skipped))
+}
+
+/// Claude transcripts the sweep's cursors know, by the session id their
+/// records carry.
+fn claude_transcripts(conn: &Connection) -> anyhow::Result<HashMap<String, Vec<String>>> {
+    let mut statement = conn.prepare(
+        "SELECT json_extract(parser_state_json, '$.claude.scan.fold.session_id'), locator \
+         FROM transcript_cursors WHERE source = 'claude' AND json_valid(parser_state_json)",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut transcripts: HashMap<String, Vec<String>> = HashMap::new();
+    while let Some(row) = rows.next()? {
+        if let Some(session_id) = row.get::<_, Option<String>>(0)? {
+            transcripts.entry(session_id).or_default().push(row.get(1)?);
+        }
+    }
+    Ok(transcripts)
+}
+
+/// Whether the session has evidence rows, as against only a catalog row that
+/// claims a hydrated state.
+fn holds_evidence(conn: &Connection, (source, session_id): &Key) -> anyhow::Result<bool> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM session_events WHERE source = ?1 AND session_id = ?2) \
+             OR EXISTS(SELECT 1 FROM tool_calls WHERE source = ?1 AND session_id = ?2) \
+             OR EXISTS(SELECT 1 FROM file_edits WHERE source = ?1 AND session_id = ?2) \
+             OR EXISTS(SELECT 1 FROM session_markers WHERE source = ?1 AND session_id = ?2) \
+             OR EXISTS(SELECT 1 FROM observation_evidence WHERE source = ?1 AND session_id = ?2)",
+        )?
+        .query_row(params![source, session_id], |row| row.get(0))?)
+}
+
+/// Whether a local hydration reads a session's evidence back, answered by
+/// the snapshot hydration itself takes.
+struct Recovery<'a> {
+    conn: &'a Connection,
+    roots: &'a ProviderRoots,
+    family: &'a Family,
+    catalog: &'a HashSet<Key>,
+    /// Every Claude transcript a sweep has read, by the session id its
+    /// records carry.
+    transcripts: HashMap<String, Vec<String>>,
+    probe: crate::ingest::hydrate::HydrationProbe,
+    /// Each catalogued session's hydration reads, once probed; `None` when
+    /// hydration would refuse it.
+    reads: HashMap<Key, Option<HashSet<String>>>,
+}
+
+impl Recovery<'_> {
+    fn recoverable(&mut self, key: &Key) -> anyhow::Result<bool> {
+        if self.catalog.contains(key) {
+            return self.catalogued_recoverable(key);
+        }
+        if self.foreign(key)? {
+            return Ok(false);
+        }
+        self.enumerated_by_ancestor(key)
+    }
+
+    /// A catalogued session hydration reads back in full: hydration accepts
+    /// it, nothing of it came from another connector, and every transcript a
+    /// sweep indexed it from is one hydration reads. A Claude conversation
+    /// forked into branch files keeps its id in each of them; a sweep indexes
+    /// all of them under that id, hydration only the catalogued one.
+    fn catalogued_recoverable(&mut self, key: &Key) -> anyhow::Result<bool> {
+        if self.foreign(key)? {
+            return Ok(false);
+        }
+        let swept = match key.0.as_str() {
+            "claude" => self.transcripts.get(&key.1).cloned().unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        Ok(self
+            .reads(key)?
+            .is_some_and(|reads| swept.iter().all(|locator| reads.contains(locator))))
+    }
+
+    /// A catalog-less child comes back only through the hydration of a
+    /// catalogued ancestor that itself passes, and that hydration has to
+    /// read every transcript the child's evidence came from: the child's own
+    /// locators, checked against each ancestor, never an intermediary's.
+    fn enumerated_by_ancestor(&mut self, key: &Key) -> anyhow::Result<bool> {
+        let locators = self.family.locators.get(key).cloned().unwrap_or_default();
+        if locators.is_empty() {
+            return Ok(false);
+        }
+        for ancestor in self.family.catalogued_ancestors(key, self.catalog) {
+            if self.rereads(&ancestor, &locators)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether `ancestor` hydrates back and its hydration reads every one of
+    /// `locators`.
+    fn rereads(&mut self, ancestor: &Key, locators: &[String]) -> anyhow::Result<bool> {
+        if !self.catalogued_recoverable(ancestor)? {
+            return Ok(false);
+        }
+        Ok(self
+            .reads(ancestor)?
+            .is_some_and(|reads| locators.iter().all(|locator| reads.contains(locator))))
+    }
+
+    fn reads(&mut self, key: &Key) -> anyhow::Result<Option<&HashSet<String>>> {
+        if !self.reads.contains_key(key) {
+            let reads = self
+                .probe
+                .reads(self.conn, &key.0, &key.1, self.roots)?
+                .map(|paths| {
+                    paths
+                        .into_iter()
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .collect()
+                });
+            self.reads.insert(key.clone(), reads);
+        }
+        Ok(self.reads.get(key).and_then(Option::as_ref))
+    }
+
+    /// Evidence a remote connector or plugin intake supplied: local
+    /// hydration reads only the builtin local adapter's source.
+    fn foreign(&self, (source, session_id): &Key) -> anyhow::Result<bool> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM session_presences \
+                   WHERE source = ?1 AND session_id = ?2 AND location <> 'local') \
+                 OR EXISTS(SELECT 1 FROM session_observations \
+                   WHERE source = ?1 AND session_id = ?2 AND (location <> 'local' \
+                   OR (connector_id NOT IN (?1, 'legacy-unknown') \
+                   OR connector_instance <> 'default')))",
+            )?
+            .query_row(params![source, session_id], |row| row.get(0))?)
+    }
+}
+
+/// Forget sessions from `pending` in one write transaction until it has
+/// removed [`BATCH_ROWS`] evidence rows or run out of sessions.
+fn forget_batch<'a>(
+    conn: &mut Connection,
+    pending: &mut std::iter::Peekable<impl Iterator<Item = &'a Target>>,
+    report: &mut ForgetReport,
+) -> anyhow::Result<()> {
+    let started = Instant::now();
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let clock: i64 = tx
+        .query_row(
+            "SELECT version FROM observation_clock WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    let cursor_sources: Vec<String> = tx
+        .prepare("SELECT DISTINCT source FROM transcript_cursors")?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut rows = 0;
+    while rows < BATCH_ROWS && started.elapsed() < BATCH_TIME {
+        let Some(target) = pending.next() else {
+            break;
+        };
+        let removed = forget_session(&tx, target, &cursor_sources)?;
+        rows += removed.rows();
+        if removed.changed {
+            report.sessions += 1;
+        }
+        report.events += removed.events;
+        report.tool_calls += removed.tool_calls;
+        report.file_edits += removed.file_edits;
+        report.markers += removed.markers;
+        report.observation_evidence += removed.observation_evidence;
+    }
+    // This transaction is the only writer since `clock` was read, so every
+    // tombstone stamped after it is one of the deletes above.
+    tx.execute(
+        &format!(
+            "DELETE FROM evidence_tombstones WHERE kind IN ({TOMBSTONED_KINDS}) AND revision > ?"
+        ),
+        [clock],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+#[derive(Default)]
+struct Removed {
+    events: u64,
+    tool_calls: u64,
+    file_edits: u64,
+    markers: u64,
+    observation_evidence: u64,
+    changed: bool,
+}
+
+impl Removed {
+    fn rows(&self) -> u64 {
+        self.events + self.tool_calls + self.file_edits + self.markers + self.observation_evidence
+    }
+}
+
+fn forget_session(
+    tx: &Connection,
+    target: &Target,
+    cursor_sources: &[String],
+) -> anyhow::Result<Removed> {
+    let (source, session_id) = (target.key.0.as_str(), target.key.1.as_str());
+    let delete = |table: &str| -> rusqlite::Result<u64> {
+        tx.prepare_cached(&format!(
+            "DELETE FROM {table} WHERE source = ? AND session_id = ?"
+        ))?
+        .execute(params![source, session_id])
+        .map(|n| n as u64)
+    };
+    let mut removed = Removed {
+        events: delete("session_events")?,
+        tool_calls: delete("tool_calls")?,
+        file_edits: delete("file_edits")?,
+        markers: delete("session_markers")?,
+        observation_evidence: delete("observation_evidence")?,
+        changed: false,
+    };
+    let mut state = delete("session_hydration_checkpoints")?;
+    state += delete("observation_hydration_checkpoints")?;
+    if source == "grok" {
+        state += tx
+            .prepare_cached("DELETE FROM grok_session_turns WHERE session_id = ?")?
+            .execute([session_id])? as u64;
+    }
+    state += forget_cursors(tx, target, cursor_sources)?;
+    state += tx
+        .prepare_cached(
+            "UPDATE session_relationships SET child_has_events = 0 \
+             WHERE source = ? AND child_session_id = ? AND child_has_events <> 0",
+        )?
+        .execute(params![source, session_id])? as u64;
+    // A kept parent's checkpoint vouches for this child's evidence too. Without
+    // it, and marked shallow like any session missing evidence, the parent's
+    // next hydration re-reads its related transcripts.
+    for (parent_source, parent_id) in &target.kept_parents {
+        for table in [
+            "session_hydration_checkpoints",
+            "observation_hydration_checkpoints",
+        ] {
+            tx.prepare_cached(&format!(
+                "DELETE FROM {table} WHERE source = ? AND session_id = ?"
+            ))?
+            .execute(params![parent_source, parent_id])?;
+        }
+        mark_shallow(tx, parent_source, parent_id)?;
+        // A hydration of the parent taken before this batch is fenced too:
+        // the related evidence it was acquired against has changed.
+        bump_observations(tx, parent_source, parent_id)?;
+    }
+    state += mark_shallow(tx, source, session_id)?;
+    removed.changed = removed.rows() + state > 0;
+    if removed.changed {
+        bump_observations(tx, source, session_id)?;
+    }
+    Ok(removed)
+}
+
+/// Set the session's catalog rows to `shallow`; the number of rows changed.
+fn mark_shallow(tx: &Connection, source: &str, session_id: &str) -> anyhow::Result<u64> {
+    let mut changed = tx
+        .prepare_cached(
+            "UPDATE sessions SET discovery_state = 'shallow' \
+             WHERE source = ? AND session_id = ? AND discovery_state IS NOT 'shallow'",
+        )?
+        .execute(params![source, session_id])? as u64;
+    changed += tx
+        .prepare_cached(
+            "UPDATE session_presences SET discovery_state = 'shallow' \
+             WHERE source = ? AND session_id = ? AND discovery_state IS NOT 'shallow'",
+        )?
+        .execute(params![source, session_id])? as u64;
+    changed += tx
+        .prepare_cached(
+            "UPDATE session_observations SET discovery_state = 'shallow', updated_ms = ? \
+             WHERE source = ? AND session_id = ? AND discovery_state = 'full'",
+        )?
+        .execute(params![crate::now_ms(), source, session_id])? as u64;
+    Ok(changed)
+}
+
+/// New observation revisions fence an acquisition that started before this:
+/// the evidence it was taken against has changed.
+fn bump_observations(tx: &Connection, source: &str, session_id: &str) -> anyhow::Result<()> {
+    for key in observation_keys(tx, source, session_id)? {
+        observations::bump_revision(tx, &key)?;
+    }
+    Ok(())
+}
+
+/// Drop the byte cursors into the session's own transcript and the sidecar
+/// directory beside it (`<transcript stem>/`, where Claude keeps subagent
+/// transcripts). A transcript other sessions also live in — an OpenCode or
+/// Devin database — keeps its cursor: it positions their evidence too.
+fn forget_cursors(
+    tx: &Connection,
+    target: &Target,
+    cursor_sources: &[String],
+) -> rusqlite::Result<u64> {
+    if cursor_sources.is_empty() {
+        return Ok(0);
+    }
+    let (source, session_id) = (target.key.0.as_str(), target.key.1.as_str());
+    let mut locators = local_locators(tx, source, session_id)?;
+    locators.extend(target.child_locators.iter().cloned());
+    let mut removed = 0;
+    for locator in locators {
+        let shared: bool = tx
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE source = ?2 AND raw_path = ?1 \
+                   AND session_id <> ?3)",
+            )?
+            .query_row(params![locator, source, session_id], |row| row.get(0))?;
+        if shared {
+            continue;
+        }
+        let sidecars = sidecar_prefix(&locator);
+        let sidecars_end = prefix_end(&sidecars);
+        // A Claude subagent transcript's metadata document keeps a cursor of
+        // its own beside it.
+        let metadata = Path::new(&locator)
+            .with_extension("meta.json")
+            .to_string_lossy()
+            .into_owned();
+        for cursor_source in cursor_sources {
+            removed += tx
+                .prepare_cached(
+                    "DELETE FROM transcript_cursors WHERE source = ?1 \
+                     AND (locator = ?2 OR locator = ?5 OR (locator >= ?3 AND locator < ?4))",
+                )?
+                .execute(params![
+                    cursor_source,
+                    locator,
+                    sidecars,
+                    sidecars_end,
+                    metadata
+                ])? as u64;
+        }
+    }
+    Ok(removed)
+}
+
+/// The session's own local transcript locators, as the catalog records them.
+fn local_locators(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+) -> rusqlite::Result<Vec<String>> {
+    conn.prepare_cached(
+        "SELECT raw_path FROM sessions WHERE source = ?1 AND session_id = ?2 \
+           AND raw_path IS NOT NULL \
+         UNION SELECT raw_locator FROM session_presences \
+           WHERE source = ?1 AND session_id = ?2 AND location = ?3 \
+           AND raw_locator IS NOT NULL \
+         UNION SELECT raw_locator FROM session_observations \
+           WHERE source = ?1 AND session_id = ?2 AND location = ?3 \
+           AND raw_locator IS NOT NULL",
+    )?
+    .query_map(
+        params![source, session_id, SessionLocation::Local.as_str()],
+        |row| row.get(0),
+    )?
+    .collect()
+}
+
+/// `<dir>/<stem>/` for `<dir>/<stem>.<ext>`.
+fn sidecar_prefix(locator: &str) -> String {
+    let path = Path::new(locator);
+    let stem = path.with_extension("");
+    format!("{}{}", stem.to_string_lossy(), std::path::MAIN_SEPARATOR)
+}
+
+/// The smallest string greater than every string starting with `prefix`,
+/// which ends in an ASCII separator.
+fn prefix_end(prefix: &str) -> String {
+    let mut end = prefix.to_string();
+    if let Some(last) = end.pop() {
+        end.push((last as u8 + 1) as char);
+    }
+    end
+}
+
+fn observation_keys(
+    tx: &Connection,
+    source: &str,
+    session_id: &str,
+) -> rusqlite::Result<Vec<ObservationKey>> {
+    tx.prepare_cached(
+        "SELECT location, connector_id, connector_instance FROM session_observations \
+         WHERE source = ? AND session_id = ?",
+    )?
+    .query_map(params![source, session_id], |row| {
+        let location: String = row.get(0)?;
+        Ok(ObservationKey {
+            source: source.to_string(),
+            session_id: session_id.to_string(),
+            location: if location == "remote" {
+                SessionLocation::Remote
+            } else {
+                SessionLocation::Local
+            },
+            connector_id: row.get(1)?,
+            connector_instance: row.get(2)?,
+        })
+    })?
+    .collect()
+}

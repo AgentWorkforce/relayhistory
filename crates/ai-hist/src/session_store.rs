@@ -5,7 +5,7 @@
 //! — stays behind the `unstable-internal` feature. Cargo semver is the
 //! contract; there is no separate Rust contract-version constant.
 //!
-//! Ten operations, one entry type:
+//! Twelve operations, one entry type:
 //!
 //! | Method | What it does |
 //! |---|---|
@@ -18,10 +18,13 @@
 //! | [`SessionStore::session`] | everything the store holds about one session, typed |
 //! | [`SessionStore::changes_since`] | the revision-stamped change feed, with named consumer cursors |
 //! | [`SessionStore::head_revision`] | the feed head, for a consumer checking its stored watermark |
+//! | [`SessionStore::forget_evidence`] | drop sessions' evidence, keeping their catalog rows |
+//! | [`SessionStore::compact`] | return the database's unused space to the volume |
 //! | [`Source::capabilities`] | what a source can and cannot report, statically |
 //!
-//! The two change-feed methods live in [`crate::change_feed`]; they are
-//! inherent methods on this type, so the facade stays the one entry point.
+//! The two change-feed methods live in [`crate::change_feed`] and the two
+//! space methods in `crate::forget`; they are inherent methods on this type,
+//! so the facade stays the one entry point.
 //!
 //! Every value type here is `#[non_exhaustive]`, `Clone`, `Serialize`,
 //! `Deserialize` and `PartialEq`; only [`CatalogIter`] (a read snapshot) and
@@ -77,9 +80,9 @@ use std::time::{Duration, Instant};
 ///
 /// The variants mirror the TypeScript SDK's native error classes
 /// (`docs/architecture.md`, "Native errors") minus the four that only a Node
-/// addon can raise, plus the four the Rust facade adds: [`Error::SyncLocked`],
-/// [`Error::SourceMismatch`], [`Error::WatermarkAheadOfStore`] and
-/// [`Error::Cancelled`].
+/// addon can raise, plus the ones the Rust facade adds: [`Error::SyncLocked`],
+/// [`Error::SourceMismatch`], [`Error::WatermarkAheadOfStore`],
+/// [`Error::InsufficientSpace`] and [`Error::Cancelled`].
 /// [`Error::code`] is the stable `SCREAMING_SNAKE_CASE` code a host can match
 /// on or forward; `Display` renders `CODE: message`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,7 +105,8 @@ pub enum Error {
     /// A caller-supplied value was rejected before anything was read.
     InvalidArgument(String),
     /// The operation is not available on this handle: `discover`, `sync`,
-    /// `hydrate` and `watch` on a store opened with `read_only: true`.
+    /// `hydrate`, `watch`, `forget_evidence` and `compact` on a store opened
+    /// with `read_only: true`.
     UnsupportedOperation(String),
     /// `hydrate` was asked for a session the catalog does not hold.
     SessionNotFound(String),
@@ -158,9 +162,15 @@ pub enum Error {
     /// position in one kind set's stream; use another consumer name for
     /// another filter. See [`SessionStore::changes_since`].
     ConsumerKindsMismatch(String),
-    /// The caller's [`StopToken`] stopped `discover`, `sync` or `hydrate`.
-    /// Work committed before the stop stays; the unfinished transaction rolls
-    /// back and the next call resumes from its checkpoint.
+    /// [`SessionStore::compact`] refused before writing anything: the
+    /// database's volume cannot hold the rewrite, or its free space could
+    /// not be measured.
+    InsufficientSpace(String),
+    /// The caller's [`StopToken`] stopped `discover`, `sync`, `hydrate` or
+    /// `forget_evidence`. Work committed before the stop stays; the
+    /// unfinished transaction rolls back. The next `discover`, `sync` or
+    /// `hydrate` resumes from its checkpoint, and the next `forget_evidence`
+    /// works out the remaining sessions again.
     Cancelled(String),
 }
 
@@ -187,6 +197,7 @@ impl Error {
             Self::SyncLocked { .. } => "SYNC_LOCKED",
             Self::WatermarkAheadOfStore(_) => "WATERMARK_AHEAD_OF_STORE",
             Self::ConsumerKindsMismatch(_) => "CONSUMER_KINDS_MISMATCH",
+            Self::InsufficientSpace(_) => "INSUFFICIENT_SPACE",
             Self::Cancelled(_) => "CANCELLED",
         }
     }
@@ -212,6 +223,7 @@ impl Error {
             | Self::SyncFailed(m)
             | Self::WatermarkAheadOfStore(m)
             | Self::ConsumerKindsMismatch(m)
+            | Self::InsufficientSpace(m)
             | Self::Cancelled(m) => m.clone(),
             Self::SyncLocked { path, waited_ms } => format!(
                 "another sync holds the lock on {} (waited {waited_ms} ms); \
@@ -261,7 +273,7 @@ impl Error {
         Self::classify(error, Self::HydrationFailed)
     }
 
-    fn sync(error: anyhow::Error) -> Self {
+    pub(crate) fn sync(error: anyhow::Error) -> Self {
         Self::classify(error, Self::SyncFailed)
     }
 
@@ -585,8 +597,8 @@ pub struct StoreOptions {
     /// does. One resolution drives `sync`, `hydrate`, `watch` and
     /// [`SourceCapabilities::watch_roots`] alike.
     pub roots: Option<ProviderRoots>,
-    /// Never write. `discover`, `sync`, `hydrate` and `watch` return
-    /// [`Error::UnsupportedOperation`]; a database older than the shape this
+    /// Never write. `discover`, `sync`, `hydrate`, `watch`, `forget_evidence`
+    /// and `compact` return [`Error::UnsupportedOperation`]; a database older than the shape this
     /// version reads is refused at `open` rather than failing inside a query.
     pub read_only: bool,
 }
@@ -1420,7 +1432,7 @@ impl fmt::Debug for ProgressObserver {
 }
 
 /// Run `work` with the caller's stop and progress installed for this thread.
-fn controlled<T>(
+pub(crate) fn controlled<T>(
     stop: Option<&StopToken>,
     progress: Option<&ProgressObserver>,
     work: impl FnOnce() -> Result<T, Error>,
@@ -4051,6 +4063,7 @@ mod tests {
             },
             Error::WatermarkAheadOfStore(String::new()),
             Error::ConsumerKindsMismatch(String::new()),
+            Error::InsufficientSpace(String::new()),
         ] {
             let json = serde_json::to_value(&error).unwrap();
             assert_eq!(json["code"].as_str(), Some(error.code()), "{error:?}");

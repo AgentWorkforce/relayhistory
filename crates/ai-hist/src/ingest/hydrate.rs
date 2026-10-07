@@ -1463,6 +1463,109 @@ fn catalog_target(conn: &Connection, options: &HydrateSessionOptions) -> Result<
     })
 }
 
+/// Which OpenCode source a catalog locator names now.
+#[derive(Clone)]
+enum OpencodeSource {
+    /// A session file in the legacy JSON tree.
+    TreeSession,
+    /// The configured SQLite store, and the channel stores ahead of it that
+    /// would claim the session first.
+    Store { earlier: Vec<PathBuf> },
+}
+
+/// Classify an OpenCode catalog locator against the configured layout, by
+/// the same precedence global sync uses. Fails when hydration must refuse it.
+fn opencode_source(path: &Path, roots: &crate::ProviderRoots) -> Result<OpencodeSource> {
+    let configured_path = &roots.opencode_db;
+    let configured_storage = &roots.opencode_storage_dir;
+    // Which layout is current *now*, by the same precedence global sync
+    // uses -- not which one this catalog row was written from. A row
+    // written while only the tree existed still names a session file
+    // after `opencode.db` appears, and classifying that locator on its
+    // own would leave targeted hydration reading the superseded tree
+    // while `sync --local` reads SQLite: two paths disagreeing about one
+    // session.
+    //
+    // When the layouts disagree the row is stale as a whole, not just in
+    // its locator -- its prompt, models, timestamps and stamp all came
+    // from the other store -- so hydrating from the current one behind
+    // its back would stamp the checkpoint against a store the row does
+    // not describe. Refuse, and name the way out.
+    let current_layout = crate::ingest::opencode::OpencodeLayout::detect(
+        configured_path,
+        roots.opencode_db_pinned,
+        configured_storage,
+    );
+    // Classify the locator by what it *is*, not by which directory it sits
+    // under. `OPENCODE_DB` and `OPENCODE_STORAGE_DIR` are independent
+    // paths, so the database can perfectly well live inside the storage
+    // directory -- and a prefix test then reads a live SQLite locator as a
+    // legacy session file, refuses it as superseded, and leaves the
+    // session permanently unhydratable, because rediscovery writes back
+    // the same database path.
+    //
+    // So: the configured store is matched on resolved identity first, and
+    // only then is the locator considered as a session file, which means
+    // sitting under the tree's own `session/` subtree rather than merely
+    // somewhere beneath the storage root.
+    //
+    // "The configured store" is any of them: the default `opencode.db`
+    // and, unless it is pinned, every channel database beside it.
+    let resolved = fs::canonicalize(path).ok();
+    let stores = crate::paths::opencode_db_files(configured_path, roots.opencode_db_pinned);
+    let store_index = resolved.as_ref().and_then(|resolved| {
+        stores
+            .iter()
+            .position(|store| fs::canonicalize(store).ok().as_ref() == Some(resolved))
+    });
+    let is_configured_store = store_index.is_some();
+    let is_tree_session_file = !is_configured_store
+        && opencode_locator_is_in_storage_tree(path, &configured_storage.join("session"));
+
+    if is_tree_session_file {
+        if let Some(crate::ingest::opencode::OpencodeLayout::Sqlite(stores)) = &current_layout {
+            return Err(opencode_superseded(path, &stores[0]));
+        }
+        return Ok(OpencodeSource::TreeSession);
+    }
+    if is_configured_store {
+        if let Some(crate::ingest::opencode::OpencodeLayout::JsonTree(tree)) = &current_layout {
+            return Err(opencode_superseded(path, tree));
+        }
+    }
+    if !is_configured_store {
+        return Err(hydration_error(
+            "SESSION_SOURCE_MISMATCH",
+            format!(
+                "OpenCode catalog store {} does not match configured store {}",
+                path.display(),
+                configured_path.display()
+            ),
+        ));
+    }
+    if !path.is_file() {
+        return Err(hydration_error(
+            "SESSION_SOURCE_UNAVAILABLE",
+            format!("OpenCode source {} is unavailable", path.display()),
+        ));
+    }
+    Ok(OpencodeSource::Store {
+        earlier: stores[..store_index.unwrap_or(0)].to_vec(),
+    })
+}
+
+fn opencode_superseded(stale: &Path, current: &Path) -> anyhow::Error {
+    hydration_error(
+        "SESSION_SOURCE_MISMATCH",
+        format!(
+            "OpenCode catalog row points at {}, but {} is now the current store; \
+             run discoverSessions() again to re-establish this session's provenance",
+            stale.display(),
+            current.display()
+        ),
+    )
+}
+
 fn source_snapshot(
     conn: &Connection,
     options: &HydrateSessionOptions,
@@ -1474,8 +1577,6 @@ fn source_snapshot(
         return Err(hydration_error("HYDRATION_UNSUPPORTED", refusal));
     }
     if options.source == "opencode" {
-        let configured_path = &roots.opencode_db;
-        let configured_storage = &roots.opencode_storage_dir;
         let locator = target.locator.as_deref().ok_or_else(|| {
             hydration_error(
                 "SESSION_SOURCE_UNAVAILABLE",
@@ -1483,99 +1584,21 @@ fn source_snapshot(
             )
         })?;
         let path = PathBuf::from(locator);
-        // Which layout is current *now*, by the same precedence global sync
-        // uses -- not which one this catalog row was written from. A row
-        // written while only the tree existed still names a session file
-        // after `opencode.db` appears, and classifying that locator on its
-        // own would leave targeted hydration reading the superseded tree
-        // while `sync --local` reads SQLite: two paths disagreeing about one
-        // session.
-        //
-        // When the layouts disagree the row is stale as a whole, not just in
-        // its locator -- its prompt, models, timestamps and stamp all came
-        // from the other store -- so hydrating from the current one behind
-        // its back would stamp the checkpoint against a store the row does
-        // not describe. Refuse, and name the way out.
-        let current_layout = crate::ingest::opencode::OpencodeLayout::detect(
-            configured_path,
-            roots.opencode_db_pinned,
-            configured_storage,
-        );
-        let superseded = |stale: &Path, current: &Path| {
-            hydration_error(
-                "SESSION_SOURCE_MISMATCH",
-                format!(
-                    "OpenCode catalog row points at {}, but {} is now the current store; \
-                     run discoverSessions() again to re-establish this session's provenance",
-                    stale.display(),
-                    current.display()
-                ),
-            )
+        let earlier = match opencode_source(&path, roots)? {
+            OpencodeSource::TreeSession => return opencode_json_tree_snapshot(options, &path),
+            OpencodeSource::Store { earlier } => earlier,
         };
-        // Classify the locator by what it *is*, not by which directory it sits
-        // under. `OPENCODE_DB` and `OPENCODE_STORAGE_DIR` are independent
-        // paths, so the database can perfectly well live inside the storage
-        // directory -- and a prefix test then reads a live SQLite locator as a
-        // legacy session file, refuses it as superseded, and leaves the
-        // session permanently unhydratable, because rediscovery writes back
-        // the same database path.
-        //
-        // So: the configured store is matched on resolved identity first, and
-        // only then is the locator considered as a session file, which means
-        // sitting under the tree's own `session/` subtree rather than merely
-        // somewhere beneath the storage root.
-        //
-        // "The configured store" is any of them: the default `opencode.db`
-        // and, unless it is pinned, every channel database beside it.
-        let resolved = fs::canonicalize(&path).ok();
-        let stores = crate::paths::opencode_db_files(configured_path, roots.opencode_db_pinned);
-        let store_index = resolved.as_ref().and_then(|resolved| {
-            stores
-                .iter()
-                .position(|store| fs::canonicalize(store).ok().as_ref() == Some(resolved))
-        });
-        let is_configured_store = store_index.is_some();
-        let is_tree_session_file = !is_configured_store
-            && opencode_locator_is_in_storage_tree(&path, &configured_storage.join("session"));
-
-        if is_tree_session_file {
-            if let Some(crate::ingest::opencode::OpencodeLayout::Sqlite(stores)) = &current_layout {
-                return Err(superseded(&path, &stores[0]));
-            }
-            return opencode_json_tree_snapshot(options, &path);
-        }
-        if is_configured_store {
-            if let Some(crate::ingest::opencode::OpencodeLayout::JsonTree(tree)) = &current_layout {
-                return Err(superseded(&path, tree));
-            }
-        }
-        if !is_configured_store {
-            return Err(hydration_error(
-                "SESSION_SOURCE_MISMATCH",
-                format!(
-                    "OpenCode catalog store {} does not match configured store {}",
-                    path.display(),
-                    configured_path.display()
-                ),
-            ));
-        }
-        if !path.is_file() {
-            return Err(hydration_error(
-                "SESSION_SOURCE_UNAVAILABLE",
-                format!("OpenCode source {} is unavailable", path.display()),
-            ));
-        }
         // A session held by more than one channel store belongs to the first
         // (discovery and sync both claim it there). If an earlier store has
         // gained this session since the row was cataloged, the row names a
         // superseded copy: sync now reads the earlier one, so hydrating this
         // one would import evidence sync disagrees with. An earlier store that
         // cannot be read claims nothing, exactly as in sync.
-        for earlier in &stores[..store_index.unwrap_or(0)] {
+        for earlier in &earlier {
             if crate::ingest::opencode::sqlite_store_holds_session(earlier, &options.session_id)
                 .unwrap_or(false)
             {
-                return Err(superseded(&path, earlier));
+                return Err(opencode_superseded(&path, earlier));
             }
         }
         let src = Connection::open_with_flags(
@@ -1833,7 +1856,8 @@ fn source_snapshot(
         // Finding the children means reading one head record from every
         // sibling rollout in the directory, whether or not it turns out to be
         // one. That is provider I/O this hydration did.
-        let (children, enumeration_bytes) = codex_children_counted(&path, &options.session_id)?;
+        let (children, enumeration_bytes) =
+            codex_children_counted(conn, &path, &options.session_id)?;
         scanned_bytes += enumeration_bytes as i64;
         for child in children {
             super::check_capture_cancelled()?;
@@ -2977,14 +3001,34 @@ fn claude_subagents(
     let Some(directory) = transcript.parent() else {
         return Ok((Vec::new(), 0, false));
     };
+    let (sidecars, mut bytes_read, superseded) = claude_sidecars(conn, directory)?;
     let mut evidence = Vec::new();
+    for (candidate, meta) in sidecars {
+        // A subagent transcript's records carry the PARENT's sessionId, which
+        // is what ties this file to the session being hydrated.
+        if candidate == transcript || meta.session_id != session_id {
+            continue;
+        }
+        let (found, evidence_bytes) = claude_subagent_evidence(candidate, &meta);
+        bytes_read += evidence_bytes;
+        evidence.push(found);
+    }
+    Ok((evidence, bytes_read, superseded))
+}
+
+/// Sidecars with the identity their records carry, the bytes the walk read,
+/// and whether a sidecar was rewritten under it.
+type ClaudeSidecarWalk = (Vec<(PathBuf, ClaudeSessionMeta)>, u64, bool);
+
+/// Every `agent-*.jsonl` sidecar under a Claude project directory, with the
+/// identity its records carry, from the resumed metadata walk; the bytes
+/// that walk read, and whether a sidecar was rewritten under it.
+fn claude_sidecars(conn: &Connection, directory: &Path) -> Result<ClaudeSidecarWalk> {
+    let mut sidecars = Vec::new();
     let mut bytes_read = 0u64;
     let mut superseded = false;
     for candidate in collect_matching_files(directory, "agent-", "jsonl")? {
         super::check_capture_cancelled()?;
-        if candidate == transcript {
-            continue;
-        }
         let locator = candidate.to_string_lossy().to_string();
         let key = CursorKey::Locator {
             source: "claude",
@@ -2998,19 +3042,11 @@ fn claude_subagents(
         bytes_read += read;
         cursor.claude.get_or_insert_with(Default::default).scan = scan;
         store_cursor(conn, &key, &cursor)?;
-        // A subagent transcript's records carry the PARENT's sessionId, which
-        // is what ties this file to the session being hydrated.
-        let Some(meta) = meta else {
-            continue;
-        };
-        if meta.session_id != session_id {
-            continue;
+        if let Some(meta) = meta {
+            sidecars.push((candidate, meta));
         }
-        let (found, evidence_bytes) = claude_subagent_evidence(candidate, &meta);
-        bytes_read += evidence_bytes;
-        evidence.push(found);
     }
-    Ok((evidence, bytes_read, superseded))
+    Ok((sidecars, bytes_read, superseded))
 }
 
 /// The first parseable record of a transcript, from a bounded read of its
@@ -3189,7 +3225,8 @@ fn ingest_codex_children(
     // once here — and each pass reads every candidate's head. Counting both
     // is what makes `bytesRead` the bytes this hydration read rather than the
     // bytes it would have read if it were written differently.
-    let (children, enumeration_bytes) = codex_children_counted(root_path, &options.session_id)?;
+    let (children, enumeration_bytes) =
+        codex_children_counted(conn, root_path, &options.session_id)?;
     let mut indexed = IngestOutcome {
         bytes_read: enumeration_bytes as i64,
         ..Default::default()
@@ -3226,16 +3263,38 @@ fn ingest_codex_children(
 /// record to find them. Enumeration reads one record per sibling rollout, and
 /// a parent with ten candidates pays for ten of them whether or not any turn
 /// out to be children.
+///
+/// Candidates are the rollouts beside the parent's date (see
+/// [`codex_child_candidates`]) and every rollout a recorded delegation from
+/// this family already names: an archived parent sits in a flat directory
+/// while its children stay under their dated one, and only the recorded
+/// locator connects them.
 fn codex_children_counted(
+    conn: &Connection,
     root_path: &Path,
     parent_session_id: &str,
 ) -> Result<(Vec<PathBuf>, u64)> {
     let Some(directory) = root_path.parent() else {
         return Ok((Vec::new(), 0));
     };
+    let mut candidates = codex_child_candidates(directory)?;
+    candidates.extend(recorded_codex_child_rollouts(conn, parent_session_id)?);
+    codex_descendants(candidates, root_path, parent_session_id)
+}
+
+/// The rollouts among `candidates` that descend from `parent_session_id`, by
+/// the parent each one's head record names, and the bytes reading those
+/// heads cost.
+fn codex_descendants(
+    mut candidates: Vec<PathBuf>,
+    root_path: &Path,
+    parent_session_id: &str,
+) -> Result<(Vec<PathBuf>, u64)> {
+    candidates.sort();
+    candidates.dedup();
     let mut bytes_read = 0u64;
     let mut children_by_parent: HashMap<String, Vec<(String, PathBuf)>> = HashMap::new();
-    for candidate in codex_child_candidates(directory)? {
+    for candidate in candidates {
         if candidate == root_path {
             continue;
         }
@@ -3279,6 +3338,236 @@ fn codex_children_counted(
     }
     descendants.sort();
     Ok((descendants, bytes_read))
+}
+
+/// Child rollouts the delegations recorded under `parent_session_id`, and
+/// under its recorded descendants, name and that are still on disk.
+fn recorded_codex_child_rollouts(
+    conn: &Connection,
+    parent_session_id: &str,
+) -> Result<Vec<PathBuf>> {
+    let mut statement = conn.prepare_cached(
+        "WITH RECURSIVE family(id) AS ( \
+             SELECT ?1 \
+             UNION SELECT r.child_session_id FROM session_relationships r \
+               JOIN family f ON r.parent_session_id = f.id \
+             WHERE r.source = 'codex' AND r.relationship = ?2 \
+               AND r.child_session_id IS NOT NULL) \
+         SELECT DISTINCT r.evidence_locator FROM session_relationships r \
+           JOIN family f ON r.parent_session_id = f.id \
+         WHERE r.source = 'codex' AND r.relationship = ?2 \
+           AND r.evidence_locator IS NOT NULL",
+    )?;
+    let locators = statement
+        .query_map(
+            params![
+                parent_session_id,
+                crate::relationships::RELATIONSHIP_DELEGATED
+            ],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(locators
+        .into_iter()
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .collect())
+}
+
+/// Answers, per catalogued session, what a local hydration would read --
+/// decided by the snapshot hydration itself takes: the session's own source
+/// and, with related evidence, every child transcript it enumerates (Claude
+/// sidecars and their metadata, Codex child rollouts, Muse subagent logs).
+/// `None` when hydration would refuse the session: its source gone, the
+/// session no longer in it or hidden, superseded, or a source with no local
+/// parser.
+///
+/// Read-only: the snapshot's own cursor bookkeeping is rolled back. An
+/// OpenCode store is classified once per locator and kept open, so asking
+/// about every session of a large store is one indexed lookup each.
+#[derive(Default)]
+pub(crate) struct HydrationProbe {
+    /// Each OpenCode locator's classification; `Err` when hydration refuses
+    /// it outright.
+    opencode_sources: HashMap<String, std::result::Result<OpencodeSource, ()>>,
+    opencode_stores: HashMap<PathBuf, Option<Connection>>,
+    /// Each Claude project directory's sidecars by the session id their
+    /// records carry, walked once per probe instead of once per session.
+    claude_sidecars: HashMap<PathBuf, HashMap<String, Vec<PathBuf>>>,
+}
+
+impl HydrationProbe {
+    pub(crate) fn reads(
+        &mut self,
+        conn: &Connection,
+        source: &str,
+        session_id: &str,
+        roots: &crate::ProviderRoots,
+    ) -> Result<Option<Vec<PathBuf>>> {
+        let options = HydrateSessionOptions {
+            source: source.to_string(),
+            session_id: session_id.to_string(),
+            scope: SessionScope::Local,
+            include_related: true,
+        };
+        let Ok(mut target) = catalog_target(conn, &options) else {
+            return Ok(None);
+        };
+        let local_key = ObservationKey {
+            source: source.to_string(),
+            session_id: session_id.to_string(),
+            location: SessionLocation::Local,
+            connector_id: source.to_string(),
+            connector_instance: "default".into(),
+        };
+        if let Some(observation) = observations::get(conn, &local_key)? {
+            if !matches!(source, "opencode" | "devin") {
+                target.locator = observation.raw_locator.clone();
+            }
+        }
+        if source == "opencode" {
+            if let Some(locator) = target.locator.as_deref() {
+                if let Some(reads) = self.opencode_store_reads(locator, session_id, roots) {
+                    return Ok(reads);
+                }
+            }
+        }
+        // A Codex child that comes back is one a delegation recorded: hydration
+        // reads the recorded rollouts beside its sibling scan, and the scan
+        // reads every rollout of two whole date directories, which is not a
+        // cost to pay per session here. So the snapshot runs without it and
+        // the recorded descendants are resolved the way the scan resolves
+        // them.
+        let codex = source == "codex";
+        let claude = source == "claude";
+        let options = HydrateSessionOptions {
+            include_related: !(codex || claude),
+            ..options
+        };
+        let probe = conn.unchecked_transaction()?;
+        let snapshot = source_snapshot(&probe, &options, &target, roots, None);
+        probe.rollback()?;
+        match snapshot {
+            Ok(snapshot) => {
+                let mut reads: Vec<PathBuf> = snapshot
+                    .stamped_cursors
+                    .into_iter()
+                    .map(|(_, path)| path)
+                    .collect();
+                if let Some(path) = snapshot.path {
+                    // A Muse session's subagent logs are read with it but
+                    // carry no cursor of their own.
+                    if source == "muse" {
+                        reads.extend(muse_session_files(&path)?);
+                    }
+                    if codex {
+                        let recorded = recorded_codex_child_rollouts(conn, session_id)?;
+                        reads.extend(codex_descendants(recorded, &path, session_id)?.0);
+                    }
+                    if claude {
+                        for sidecar in self.claude_sidecars_of(conn, &path, session_id)? {
+                            let metadata = claude_subagent_meta_path(&sidecar);
+                            if metadata.is_file() {
+                                reads.push(metadata);
+                            }
+                            reads.push(sidecar);
+                        }
+                    }
+                    reads.push(path);
+                }
+                Ok(Some(reads))
+            }
+            Err(error)
+                if error
+                    .chain()
+                    .any(|cause| cause.is::<super::CaptureCancelled>()) =>
+            {
+                Err(error)
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// The sidecars a related Claude hydration of `session_id` reads: the
+    /// same walk and the same identity test as [`claude_subagents`], over a
+    /// directory index built once.
+    fn claude_sidecars_of(
+        &mut self,
+        conn: &Connection,
+        transcript: &Path,
+        session_id: &str,
+    ) -> Result<Vec<PathBuf>> {
+        let Some(directory) = transcript.parent() else {
+            return Ok(Vec::new());
+        };
+        if !self.claude_sidecars.contains_key(directory) {
+            let probe = conn.unchecked_transaction()?;
+            let walked = claude_sidecars(&probe, directory);
+            probe.rollback()?;
+            let mut index: HashMap<String, Vec<PathBuf>> = HashMap::new();
+            for (path, meta) in walked?.0 {
+                index.entry(meta.session_id).or_default().push(path);
+            }
+            self.claude_sidecars.insert(directory.to_path_buf(), index);
+        }
+        Ok(self.claude_sidecars[directory]
+            .get(session_id)
+            .into_iter()
+            .flatten()
+            .filter(|path| path.as_path() != transcript)
+            .cloned()
+            .collect())
+    }
+
+    /// The OpenCode SQLite branch of [`source_snapshot`], with the store's
+    /// classification and connections cached: `Some(None)` when hydration
+    /// would refuse the session, `None` when the locator is not a SQLite
+    /// store and the full snapshot must answer.
+    fn opencode_store_reads(
+        &mut self,
+        locator: &str,
+        session_id: &str,
+        roots: &crate::ProviderRoots,
+    ) -> Option<Option<Vec<PathBuf>>> {
+        let path = PathBuf::from(locator);
+        let source = self
+            .opencode_sources
+            .entry(locator.to_string())
+            .or_insert_with(|| opencode_source(&path, roots).map_err(|_| ()));
+        let earlier = match source {
+            Err(()) => return Some(None),
+            Ok(OpencodeSource::TreeSession) => return None,
+            Ok(OpencodeSource::Store { earlier }) => earlier.clone(),
+        };
+        for store in &earlier {
+            // An earlier store that cannot be read claims nothing.
+            if self.store_holds(store, session_id) == Some(true) {
+                return Some(None);
+            }
+        }
+        match self.store_holds(&path, session_id) {
+            Some(true) => Some(Some(vec![path])),
+            _ => Some(None),
+        }
+    }
+
+    fn store_holds(&mut self, store: &Path, session_id: &str) -> Option<bool> {
+        let conn = self
+            .opencode_stores
+            .entry(store.to_path_buf())
+            .or_insert_with(|| {
+                Connection::open_with_flags(
+                    store,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                        | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+                )
+                .ok()
+            })
+            .as_ref()?;
+        conn.prepare_cached("SELECT 1 FROM session WHERE id = ?")
+            .and_then(|mut statement| statement.exists([session_id]))
+            .ok()
+    }
 }
 
 fn ingest_cursor(

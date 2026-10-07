@@ -13,14 +13,22 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - `WatchedPath::admits(name)` publishes the entry filter the store's own watcher applies to each advertised watch path (OpenCode's database directory admits only its SQLite stores and sidecars), so an embedder's watcher cannot drift from it; `WatchedPath` serializes the filter as `entries`.
+- An embedder can drop the evidence of sessions it no longer keeps while they stay in the catalog and re-hydratable, and compact the database afterwards; a 4.1 GB store keeping 10 of 46,502 sessions shrinks to about 0.7 GB. Sessions whose evidence hydration could not read back (deleted or forked transcripts, sessions gone from their store, remote or plugin evidence) are kept unless the caller opts in.
 
 ### Changed
 
 - `discover` and sync sweeps re-run project-key inheritance only for sessions written since the previous refresh and the delegation trees below the ones that can lend a key, instead of walking every delegated session (unresolved keys are still re-resolved in full): a scoped discover on a 48k-session store takes ~30 ms instead of ~2.9 s after the first pass in a process.
 
+### Fixed
+
+- Hydrating an archived Codex session also reads the child threads it delegated to that are still under their dated `sessions/` directory.
+- Hydrating a Claude transcript from its start keeps the sessionless records ahead of its first session-naming line (`file-history-snapshot`, summaries) as markers, as a sweep does.
+
 ### Rust API
 
 - Added `WatchedPath::admits(&OsStr) -> bool`.
+- `SessionStore::forget_evidence(ForgetScope, ForgetOptions) -> ForgetReport` removes the named sessions' evidence (`ForgetScope::Sessions`) or every other session's (`ForgetScope::AllExcept`), together with their catalog-less delegated children, leaving them catalogued as `Shallow`; `ForgetOptions::include_unrecoverable` and `ForgetReport::skipped_unrecoverable` govern sessions a local hydration cannot restore; the change feed reports catalog rows, not tombstones.
+- `SessionStore::compact(CompactOptions) -> CompactReport` merges the full-text indexes and rewrites the database with `VACUUM` under the `SyncRunLock`; `Error::InsufficientSpace` (`INSUFFICIENT_SPACE`) is its refusal when the volume cannot hold the rewrite.
 
 ## [0.34.3] - 2026-10-06
 
