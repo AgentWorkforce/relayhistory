@@ -264,7 +264,7 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
                 Some(id) => {
                     file_session_id = Some(id.to_string());
                     if let Some(from) = sessionless_from.take() {
-                        reread_bytes += reread_records(path, from, line_start, |held| {
+                        reread_bytes += reader.replay(from, line_start, |held| {
                             let Ok(value) = serde_json::from_str::<Value>(held) else {
                                 return Ok(());
                             };
