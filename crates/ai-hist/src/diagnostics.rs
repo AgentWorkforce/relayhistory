@@ -421,7 +421,7 @@ impl PageUsage {
     }
 }
 
-fn read_page_usage(conn: &Connection) -> rusqlite::Result<PageUsage> {
+pub(crate) fn read_page_usage(conn: &Connection) -> rusqlite::Result<PageUsage> {
     let pragma = |name: &str| -> rusqlite::Result<u64> {
         conn.query_row(&format!("PRAGMA {name}"), [], |row| row.get::<_, i64>(0))
             .map(|value| value.max(0) as u64)
@@ -568,27 +568,47 @@ fn compact_database_measured(
     let db_bytes_before = file_len(db_path);
     let wal_bytes_before = file_len(&wal_path(db_path));
     // Measured through a read-only handle before anything opens the database
-    // writable: `open_db` can run schema migrations, and a refusal has to come
-    // before any write.
+    // writable, so a refusal comes before any write.
     let before = page_usage(db_path)?;
     ensure_room_to_compact(db_path, before, &measure_free)?;
-    let conn = crate::open_db(db_path)?;
-    // Again after the open, in case a migration grew the live pages.
-    ensure_room_to_compact(db_path, read_page_usage(&conn)?, &measure_free)?;
-    let mut fts_optimized = Vec::new();
-    for table in COMPACTED_FTS_TABLES {
-        let exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?)",
-            [table],
-            |row| row.get(0),
-        )?;
-        if exists {
-            conn.execute_batch(&format!(
-                "INSERT INTO {table}({table}) VALUES('optimize');"
-            ))?;
-            fts_optimized.push(*table);
+    // Not `open_db`: compacting rewrites the pages as they are, and a schema
+    // migration on open would be a write -- one that can grow the live pages
+    // -- after the space was vouched for.
+    let conn = Connection::open(db_path)?;
+    crate::store::configure_busy_retry(&conn)?;
+    // The sync lock keeps sweeps out, but a hydration or discovery takes no
+    // such lock and can commit between the measurement above and the first
+    // write here. So the space is vouched for again on this handle, holding
+    // SQLite's write lock, and the index merges run under that same lock.
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let merged = (|| -> anyhow::Result<Vec<&'static str>> {
+        ensure_room_to_compact(db_path, read_page_usage(&conn)?, &measure_free)?;
+        let mut merged = Vec::new();
+        for table in COMPACTED_FTS_TABLES {
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?)",
+                [table],
+                |row| row.get(0),
+            )?;
+            if exists {
+                conn.execute_batch(&format!(
+                    "INSERT INTO {table}({table}) VALUES('optimize');"
+                ))?;
+                merged.push(*table);
+            }
         }
-    }
+        Ok(merged)
+    })();
+    let fts_optimized = match merged {
+        Ok(merged) => {
+            conn.execute_batch("COMMIT;")?;
+            merged
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            return Err(error);
+        }
+    };
     // Best effort: a busy result here only means VACUUM writes through a
     // larger WAL, and the final checkpoint below is the one reported.
     truncate_wal(&conn)?;
@@ -780,6 +800,32 @@ mod compact_tests {
             "{error:#}"
         );
         assert_eq!(file_len(&db_path), before, "a refusal writes nothing");
+    }
+
+    #[test]
+    fn compact_measures_again_under_the_write_lock_before_writing() {
+        // A hydration that commits between the first measurement and the
+        // writable open can spend the room that measurement saw. The second
+        // answer, taken holding SQLite's write lock, is the one that counts.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = seeded(dir.path());
+        let before = file_len(&db_path);
+        let calls = std::cell::Cell::new(0);
+        let error = compact_database_measured(&db_path, |_| {
+            calls.set(calls.get() + 1);
+            Some(if calls.get() == 1 { u64::MAX } else { 0 })
+        })
+        .unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<CompactRefused>(),
+                Some(CompactRefused::InsufficientSpace { free: 0, .. })
+            ),
+            "{error:#}"
+        );
+        assert_eq!(calls.get(), 2);
+        assert_eq!(file_len(&db_path), before, "a refusal writes nothing");
+        assert!(page_usage(&db_path).unwrap().freelist_count > 0);
     }
 
     #[test]

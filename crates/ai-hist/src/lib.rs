@@ -37,6 +37,7 @@ workspace_mod!(sources);
 workspace_mod!(watch);
 mod change_feed;
 mod file_lock;
+mod forget;
 mod jsonl_temp;
 mod read_pool;
 mod session_identities;
@@ -76,6 +77,7 @@ pub use change_feed::{
     DEFAULT_CHANGE_BATCH, MAX_CHANGE_BATCH,
 };
 pub use discover::{declared_evidence_kinds, missing_evidence_kinds, ShallowSession};
+pub use forget::{CompactOptions, CompactReport, ForgetOptions, ForgetReport, ForgetScope};
 pub use ingest::CaptureProgress;
 pub use relationship_graph::{RelationshipCapabilities, SessionRelationship};
 pub use session_identities::{IdentityQuery, SessionIdentity};

@@ -534,7 +534,7 @@ fn busy_retry_handler(prior_attempts: i32) -> bool {
     true
 }
 
-fn configure_busy_retry(conn: &Connection) -> Result<()> {
+pub(crate) fn configure_busy_retry(conn: &Connection) -> Result<()> {
     conn.busy_handler(Some(busy_retry_handler))?;
     Ok(())
 }

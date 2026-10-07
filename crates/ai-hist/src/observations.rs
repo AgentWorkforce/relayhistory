@@ -624,7 +624,7 @@ pub fn revision(conn: &Connection, key: &ObservationKey) -> Result<Option<String
     let version:Option<i64>=conn.query_row("SELECT version FROM observation_versions WHERE source=? AND session_id=? AND location=? AND connector_id=? AND connector_instance=?",params![key.source,key.session_id,key.location.as_str(),key.connector_id,key.connector_instance],|row|row.get(0)).optional()?;
     Ok(version.map(|version| format!("v1:{version}")))
 }
-fn bump_revision(conn: &Connection, key: &ObservationKey) -> Result<()> {
+pub(crate) fn bump_revision(conn: &Connection, key: &ObservationKey) -> Result<()> {
     let version: i64 = conn.query_row(
         "UPDATE observation_clock SET version=version+1 WHERE singleton=1 RETURNING version",
         [],

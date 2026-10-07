@@ -628,6 +628,56 @@ fn decode_record(raw: &[u8]) -> Option<&str> {
     std::str::from_utf8(raw).ok()
 }
 
+/// What one capped record read found.
+enum CappedRead {
+    /// The reader was already at the end.
+    End,
+    /// A record of this many bytes, in `raw`: newline-terminated, or the
+    /// file's unterminated tail.
+    Record(usize),
+    /// A record past [`MAX_RECORD_BYTES`]. Its first `MAX_RECORD_BYTES` bytes
+    /// are consumed and dropped; the rest is still ahead of the reader.
+    Oversized,
+}
+
+/// Read one record into `raw`, never holding more than [`MAX_RECORD_BYTES`]
+/// plus its newline. The one boundary rule every record walk shares.
+fn read_capped_record(reader: &mut impl BufRead, raw: &mut Vec<u8>) -> Result<CappedRead> {
+    // The cap is on the reader, not on a check around it: `read_until`
+    // extends `raw` until it finds a newline or reaches EOF, so a budget
+    // consulted afterwards can only observe an allocation that already
+    // happened.
+    let mut read = reader
+        .by_ref()
+        .take(MAX_RECORD_BYTES)
+        .read_until(b'\n', raw)?;
+    if read == 0 {
+        return Ok(CappedRead::End);
+    }
+    // Stopping at the ceiling is not the same claim as passing it: the
+    // limited read stops there whether the record ends at the ceiling or
+    // runs past it. One byte tells them apart, and a record that ends
+    // exactly on the ceiling is an ordinary record — refusing it would drop
+    // a complete line on every pass and report it as corruption.
+    if raw.last() != Some(&b'\n') && read as u64 == MAX_RECORD_BYTES {
+        match reader.fill_buf()?.first().copied() {
+            // The file ends here: an unterminated tail at the ceiling.
+            None => {}
+            // Terminated, exactly on the ceiling.
+            Some(b'\n') => {
+                reader.consume(1);
+                raw.push(b'\n');
+                read += 1;
+            }
+            Some(_) => {
+                *raw = Vec::new();
+                return Ok(CappedRead::Oversized);
+            }
+        }
+    }
+    Ok(CappedRead::Record(read))
+}
+
 fn prefix_window_digest(file: &mut fs::File, offset: u64) -> Result<String> {
     Ok(prefix_window_digest_counted(file, offset)?.0)
 }
@@ -1373,41 +1423,16 @@ impl TranscriptReader {
         super::check_capture_cancelled()?;
         line.clear();
         let mut raw = Vec::new();
-        // The cap is on the reader, not on a check around it: `read_until`
-        // extends `raw` until it finds a newline or reaches EOF, so a budget
-        // consulted afterwards can only observe an allocation that already
-        // happened.
-        let mut read = (&mut self.reader)
-            .take(MAX_RECORD_BYTES)
-            .read_until(b'\n', &mut raw)?;
-        if read == 0 {
-            return Ok(None);
-        }
-        // Stopping at the ceiling is not the same claim as passing it: the
-        // limited read stops there whether the record ends at the ceiling or
-        // runs past it. One byte tells them apart, and a record that ends
-        // exactly on the ceiling is an ordinary record — refusing it would
-        // drop a complete line on every pass and report it as corruption.
-        if raw.last() != Some(&b'\n') && read as u64 == MAX_RECORD_BYTES {
-            match self.reader.fill_buf()?.first().copied() {
-                // The file ends here. Falls through to the tail handling
-                // below, which is what an unterminated final record gets.
-                None => {}
-                // Terminated, exactly on the ceiling.
-                Some(b'\n') => {
-                    self.reader.consume(1);
-                    raw.push(b'\n');
-                    read += 1;
-                }
-                // Genuinely over. Get past it without ever holding it: drop
-                // what was read and walk to the newline in fixed-size chunks.
-                Some(_) => {
-                    drop(raw);
-                    let terminated = self.drain_oversized_record()?;
-                    return Ok(Some(ReadRecord::Oversized { terminated }));
-                }
+        let read = match read_capped_record(&mut self.reader, &mut raw)? {
+            CappedRead::End => return Ok(None),
+            CappedRead::Record(read) => read,
+            // Genuinely over. Get past it without ever holding it: walk to
+            // the newline in fixed-size chunks.
+            CappedRead::Oversized => {
+                let terminated = self.drain_oversized_record()?;
+                return Ok(Some(ReadRecord::Oversized { terminated }));
             }
-        }
+        };
         if raw.last() != Some(&b'\n') {
             // A genuine tail: the file ends here, at or under the ceiling.
             let Some(text) = decode_record(&raw) else {
@@ -1470,6 +1495,73 @@ impl TranscriptReader {
             }
             drained += read as u64;
         }
+    }
+
+    /// Hand each decodable, newline-terminated record in `[from, to)` — a
+    /// span this pass has already walked — to `each` again, without its line
+    /// ending, and return the bytes read.
+    ///
+    /// Read through this reader's own open file, never by reopening the
+    /// path: a transcript atomically replaced since the pass opened it would
+    /// otherwise replay the new generation's records into rows the old
+    /// generation's cursor then authenticates. Records are bounded by the
+    /// same rule as [`Self::next_line`], and the shared file position is put
+    /// back afterwards, so the walk continues where it was.
+    pub(crate) fn replay(
+        &mut self,
+        from: u64,
+        to: u64,
+        mut each: impl FnMut(&str) -> Result<()>,
+    ) -> Result<u64> {
+        let resume = self.reader.get_mut().stream_position()?;
+        let replayed = (|| -> Result<u64> {
+            let mut file = &self.file;
+            file.seek(std::io::SeekFrom::Start(from))?;
+            let mut span = BufReader::new(file.take(to.saturating_sub(from)));
+            let mut read_total = 0u64;
+            let mut raw = Vec::new();
+            loop {
+                super::check_capture_cancelled()?;
+                raw.clear();
+                match read_capped_record(&mut span, &mut raw)? {
+                    CappedRead::End => return Ok(read_total),
+                    CappedRead::Record(read) => {
+                        read_total += read as u64;
+                        if raw.last() == Some(&b'\n') {
+                            if let Some(text) = decode_record(&raw) {
+                                each(text.trim_end_matches(['\n', '\r']))?;
+                            }
+                        }
+                    }
+                    CappedRead::Oversized => {
+                        read_total += MAX_RECORD_BYTES;
+                        loop {
+                            super::check_capture_cancelled()?;
+                            let buffered = span.fill_buf()?;
+                            if buffered.is_empty() {
+                                return Ok(read_total);
+                            }
+                            match buffered.iter().position(|byte| *byte == b'\n') {
+                                Some(index) => {
+                                    span.consume(index + 1);
+                                    read_total += index as u64 + 1;
+                                    break;
+                                }
+                                None => {
+                                    let len = buffered.len();
+                                    span.consume(len);
+                                    read_total += len as u64;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        })();
+        self.reader
+            .get_mut()
+            .seek(std::io::SeekFrom::Start(resume))?;
+        replayed
     }
 
     /// The cursor to store for a pass that committed through `offset`.
@@ -1748,6 +1840,84 @@ pub(crate) struct IncrementalPass {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A replay reads the generation the pass opened. A transcript replaced
+    /// on disk since then is a different file, and its records must not be
+    /// handed out under the open one's cursor.
+    #[test]
+    fn a_replay_reads_the_open_generation_not_its_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let first = "{\"type\":\"snapshot\",\"generation\":\"a\"}\n";
+        fs::write(&path, format!("{first}{{\"sessionId\":\"s\"}}\n")).unwrap();
+        let mut reader = TranscriptReader::open(&path, None, None).unwrap();
+        let mut line = String::new();
+        reader.next_line(&mut line).unwrap();
+        reader.next_line(&mut line).unwrap();
+        let walked = reader.position();
+
+        let replacement = dir.path().join("replacement.jsonl");
+        fs::write(
+            &replacement,
+            "{\"type\":\"snapshot\",\"generation\":\"b\"}\n{\"sessionId\":\"s\"}\n",
+        )
+        .unwrap();
+        fs::rename(&replacement, &path).unwrap();
+
+        let mut replayed = Vec::new();
+        let read = reader
+            .replay(0, first.len() as u64, |record| {
+                replayed.push(record.to_string());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(replayed, vec![first.trim_end().to_string()]);
+        assert_eq!(read, first.len() as u64);
+        // The walk resumes where it stood.
+        assert_eq!(reader.position(), walked);
+        assert!(reader.next_line(&mut line).unwrap().is_none());
+    }
+
+    /// A replay applies the walk's own ceiling: a record ending exactly on
+    /// it is delivered, one past it is skipped without being held, and every
+    /// byte of the span is counted.
+    #[test]
+    fn a_replay_bounds_records_exactly_as_the_walk_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ceiling.jsonl");
+        let ceiling = MAX_RECORD_BYTES as usize;
+        let mut bytes = vec![b'a'; ceiling];
+        bytes.push(b'\n');
+        bytes.extend(vec![b'b'; ceiling + 10]);
+        bytes.push(b'\n');
+        bytes.extend_from_slice(b"{\"type\":\"summary\"}\n");
+        fs::write(&path, &bytes).unwrap();
+
+        let mut reader = TranscriptReader::open(&path, None, None).unwrap();
+        let mut line = String::new();
+        let mut walked = Vec::new();
+        while let Some(kind) = reader.next_line(&mut line).unwrap() {
+            walked.push((kind, line.trim_end().len()));
+        }
+        assert_eq!(
+            walked,
+            vec![
+                (ReadRecord::Terminated, ceiling),
+                (ReadRecord::Oversized { terminated: true }, 0),
+                (ReadRecord::Terminated, "{\"type\":\"summary\"}".len()),
+            ]
+        );
+
+        let mut replayed = Vec::new();
+        let read = reader
+            .replay(0, bytes.len() as u64, |record| {
+                replayed.push(record.len());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(replayed, vec![ceiling, "{\"type\":\"summary\"}".len()]);
+        assert_eq!(read, bytes.len() as u64);
+    }
 
     #[test]
     fn cancellation_interrupts_an_oversized_record_between_chunks() {
