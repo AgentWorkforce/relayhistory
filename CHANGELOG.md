@@ -4,7 +4,15 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Minor]
+
+### Added
+
+- `SessionStore::delegated_descendants` lists the subagents and child threads a set of sessions delegated work to, through every generation and whether or not the catalog holds them, so an embedder sharing a session can share its delegated work with it.
+
+### Rust API
+
+- Added `SessionStore::delegated_descendants(&[SessionIdentity]) -> Result<Vec<SessionIdentity>, Error>`.
 
 ## [0.35.0] - 2026-10-07
 

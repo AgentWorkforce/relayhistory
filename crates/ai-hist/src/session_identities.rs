@@ -140,6 +140,63 @@ impl SessionStore {
         let conn = self.read_conn()?;
         identity_exists(&conn, &identity.source_name, &identity.session_id).map_err(Error::query)
     }
+
+    /// Every session reached from `roots` through delegation: the subagents
+    /// and child threads they delegated work to, the work those delegated in
+    /// turn, and so on, whether or not the catalog holds them. These are the
+    /// sessions that are part of a root's work rather than conversations of
+    /// their own; continuity (a fork, resume or continuation) is not followed.
+    ///
+    /// The roots themselves are never listed. Read on one snapshot; each step
+    /// is an indexed lookup by parent, and a cycle in the ledger ends where it
+    /// closes. Listed in identity order.
+    pub fn delegated_descendants(
+        &self,
+        roots: &[SessionIdentity],
+    ) -> std::result::Result<Vec<SessionIdentity>, Error> {
+        let conn = self.read_conn()?;
+        let tx = conn.unchecked_transaction().map_err(Error::sql)?;
+        delegated_descendants(&tx, roots).map_err(Error::query)
+    }
+}
+
+/// [`SessionStore::delegated_descendants`] on one connection.
+fn delegated_descendants(
+    conn: &Connection,
+    roots: &[SessionIdentity],
+) -> Result<Vec<SessionIdentity>> {
+    let mut children = conn.prepare_cached(
+        "SELECT DISTINCT child_session_id FROM session_relationships \
+         WHERE source = ?1 AND parent_session_id = ?2 AND relationship = ?3 \
+           AND child_session_id IS NOT NULL AND child_session_id <> ''",
+    )?;
+    let key =
+        |identity: &SessionIdentity| (identity.source_name.clone(), identity.session_id.clone());
+    let mut reached: std::collections::BTreeSet<(String, String)> = roots.iter().map(key).collect();
+    let mut frontier: Vec<(String, String)> = reached.iter().cloned().collect();
+    let mut found = std::collections::BTreeSet::new();
+    while let Some((source, parent)) = frontier.pop() {
+        let ids = children
+            .query_map(
+                rusqlite::params![source, parent, crate::relationships::RELATIONSHIP_DELEGATED],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for child in ids {
+            let child = (source.clone(), child);
+            if reached.insert(child.clone()) {
+                found.insert(child.clone());
+                frontier.push(child);
+            }
+        }
+    }
+    Ok(found
+        .into_iter()
+        .map(|(source_name, session_id)| SessionIdentity {
+            source_name,
+            session_id,
+        })
+        .collect())
 }
 
 /// Every table a session identity can be stored in: its name and the column
@@ -329,6 +386,54 @@ mod tests {
         })
         .unwrap();
         db
+    }
+
+    /// Delegation is followed through every generation, cataloged or not;
+    /// continuity is not, the roots are not listed, and a cycle ends.
+    #[test]
+    fn delegated_descendants_follow_delegation_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(dir.path());
+        let conn = open_db(&db).unwrap();
+        let edge = |parent: &str, child: &str, relationship: &str| {
+            conn.execute(
+                "INSERT INTO session_relationships (source, parent_session_id, relationship_uid, \
+                 child_session_id, relationship, identity_status, evidence_kind, created_ms, \
+                 updated_ms) VALUES ('codex', ?1, ?2, ?2, ?3, 'observed', 'rollout', 0, 0)",
+                rusqlite::params![parent, child, relationship],
+            )
+            .unwrap();
+        };
+        edge("root", "child", "delegated");
+        edge("child", "grandchild", "delegated");
+        edge("grandchild", "child", "delegated");
+        edge("root", "fork", "fork");
+        edge("fork", "forks-child", "delegated");
+        edge("other", "elsewhere", "delegated");
+        let store = SessionStore::open(StoreOptions {
+            db_path: Some(db),
+            read_only: true,
+            ..StoreOptions::default()
+        })
+        .unwrap();
+        let identity = |session: &str| SessionIdentity {
+            source_name: "codex".into(),
+            session_id: session.into(),
+        };
+        assert_eq!(
+            store.delegated_descendants(&[identity("root")]).unwrap(),
+            vec![identity("child"), identity("grandchild")]
+        );
+        assert_eq!(
+            store
+                .delegated_descendants(&[identity("root"), identity("child")])
+                .unwrap(),
+            vec![identity("grandchild")]
+        );
+        assert!(store
+            .delegated_descendants(&[identity("nobody")])
+            .unwrap()
+            .is_empty());
     }
 
     /// A page is one snapshot even on an autocommit connection. An identity
