@@ -59,6 +59,8 @@ pub struct IdentityQuery {
     pub after: Option<SessionIdentity>,
     /// Identities per page, clamped to `1..=10_000`; zero means 1,000.
     pub limit: usize,
+    /// Leave out delegated children; see [`IdentityQuery::exclude_delegated`].
+    pub exclude_delegated: bool,
 }
 
 impl IdentityQuery {
@@ -71,6 +73,15 @@ impl IdentityQuery {
     /// Identities per page; see [`IdentityQuery::limit`].
     pub fn limit(mut self, limit: usize) -> Self {
         self.limit = limit;
+        self
+    }
+
+    /// Leave out delegated children — subagents and child threads another
+    /// session delegated work to — which are part of that session rather
+    /// than sessions of their own. A page still holds up to `limit`
+    /// identities.
+    pub fn exclude_delegated(mut self) -> Self {
+        self.exclude_delegated = true;
         self
     }
 }
@@ -119,6 +130,7 @@ impl SessionStore {
                 .as_ref()
                 .map(|after| (after.source_name.as_str(), after.session_id.as_str())),
             limit,
+            query.exclude_delegated,
         )
         .map_err(Error::query)?;
         Ok(page
@@ -140,6 +152,116 @@ impl SessionStore {
         let conn = self.read_conn()?;
         identity_exists(&conn, &identity.source_name, &identity.session_id).map_err(Error::query)
     }
+
+    /// Every session reached from `roots` through delegation: the subagents
+    /// and child threads they delegated work to, the work those delegated in
+    /// turn, and so on, whether or not the catalog holds them — the same
+    /// related work hydration reads with a root, including the local
+    /// transcript a remote Claude session was materialized as. These are the
+    /// sessions that are part of a root's work rather than conversations of
+    /// their own; continuity (a fork, resume or continuation) is not followed.
+    ///
+    /// The whole reachable work is returned, never a truncated part of it: a
+    /// caller sharing a root shares all of it. The roots themselves are never
+    /// listed. Read on one snapshot; each step is an indexed lookup by parent,
+    /// and a cycle in the ledger ends where it closes. Listed in identity
+    /// order.
+    pub fn delegated_descendants(
+        &self,
+        roots: &[SessionIdentity],
+    ) -> std::result::Result<Vec<SessionIdentity>, Error> {
+        let conn = self.read_conn()?;
+        let tx = conn.unchecked_transaction().map_err(Error::sql)?;
+        delegated_descendants(&tx, roots).map_err(Error::query)
+    }
+
+    /// The sessions that delegated work to `identity`, in identity order:
+    /// empty for a session of its own, and its parents when it is a subagent
+    /// or child thread, which is then part of their work rather than a
+    /// session to select apart from them.
+    pub fn delegated_by(
+        &self,
+        identity: &SessionIdentity,
+    ) -> std::result::Result<Vec<SessionIdentity>, Error> {
+        let conn = self.read_conn()?;
+        let mut parents = conn.prepare_cached(DELEGATED_BY_SQL).map_err(Error::sql)?;
+        let ids = parents
+            .query_map(
+                rusqlite::params![
+                    identity.source_name,
+                    identity.session_id,
+                    crate::relationships::RELATIONSHIP_DELEGATED
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(Error::sql)?
+            .collect::<rusqlite::Result<std::collections::BTreeSet<_>>>()
+            .map_err(Error::sql)?;
+        Ok(ids
+            .into_iter()
+            .map(|parent| SessionIdentity {
+                source_name: identity.source_name.clone(),
+                session_id: parent,
+            })
+            .collect())
+    }
+}
+
+/// One step of [`delegated_descendants`]: the delegated and materialized
+/// children of `(?1, ?2)`, with `?3` and `?4` the two kinds. Not `DISTINCT`:
+/// the walk's reached set already drops a repeat, and `DISTINCT` is what
+/// draws the planner to the child index, whose order would serve it.
+const DESCENDANT_STEP_SQL: &str = "SELECT child_session_id FROM session_relationships \
+     WHERE source = ?1 AND parent_session_id = ?2 AND relationship IN (?3, ?4) \
+       AND +child_session_id IS NOT NULL AND +child_session_id <> ''";
+
+/// The delegating parents of `(?1, ?2)` under kind `?3`. Ordered and
+/// deduplicated by the caller: asking SQLite for either makes the parent
+/// index's order look worth more than the child lookup.
+const DELEGATED_BY_SQL: &str = "SELECT parent_session_id FROM session_relationships \
+     WHERE source = ?1 AND child_session_id = ?2 AND relationship = ?3 \
+       AND +parent_session_id <> +child_session_id";
+
+/// [`SessionStore::delegated_descendants`] on one connection.
+fn delegated_descendants(
+    conn: &Connection,
+    roots: &[SessionIdentity],
+) -> Result<Vec<SessionIdentity>> {
+    // Each step must seek by parent; on the child index it would read every
+    // edge of the source. See `the_descendant_walk_seeks_by_parent`.
+    let mut children = conn.prepare_cached(DESCENDANT_STEP_SQL)?;
+    let key =
+        |identity: &SessionIdentity| (identity.source_name.clone(), identity.session_id.clone());
+    let mut reached: std::collections::BTreeSet<(String, String)> = roots.iter().map(key).collect();
+    let mut frontier: Vec<(String, String)> = reached.iter().cloned().collect();
+    let mut found = std::collections::BTreeSet::new();
+    while let Some((source, parent)) = frontier.pop() {
+        let ids = children
+            .query_map(
+                rusqlite::params![
+                    source,
+                    parent,
+                    crate::relationships::RELATIONSHIP_DELEGATED,
+                    crate::relationships::RELATIONSHIP_MATERIALIZED_LOCAL
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for child in ids {
+            let child = (source.clone(), child);
+            if reached.insert(child.clone()) {
+                found.insert(child.clone());
+                frontier.push(child);
+            }
+        }
+    }
+    Ok(found
+        .into_iter()
+        .map(|(source_name, session_id)| SessionIdentity {
+            source_name,
+            session_id,
+        })
+        .collect())
 }
 
 /// Every table a session identity can be stored in: its name and the column
@@ -273,21 +395,27 @@ pub(crate) fn identities_after(
     conn: &Connection,
     after: Option<(&str, &str)>,
     limit: usize,
+    exclude_delegated: bool,
 ) -> Result<Vec<Identity>> {
     if conn.is_autocommit() {
         let snapshot = conn.unchecked_transaction()?;
-        let page = merge_page(&snapshot, after, limit)?;
+        let page = merge_page(&snapshot, after, limit, exclude_delegated)?;
         snapshot.commit()?;
         return Ok(page);
     }
-    merge_page(conn, after, limit)
+    merge_page(conn, after, limit, exclude_delegated)
 }
 
 fn merge_page(
     conn: &Connection,
     after: Option<(&str, &str)>,
     limit: usize,
+    exclude_delegated: bool,
 ) -> Result<Vec<Identity>> {
+    let mut delegated = conn.prepare_cached(&format!(
+        "SELECT {}",
+        crate::relationships::delegated_child_sql("?1", "?2")
+    ))?;
     let arms: Vec<Option<(&str, &str)>> = IDENTITY_TABLES
         .iter()
         .map(|(table, session)| Some((*table, *session)))
@@ -306,6 +434,13 @@ fn merge_page(
             if offer.as_ref() == Some(&next) {
                 *offer = next_in(conn, *arm, Some((next.0.as_str(), next.1.as_str())))?;
             }
+        }
+        if exclude_delegated
+            && delegated.query_row(rusqlite::params![next.0, next.1], |row| {
+                row.get::<_, bool>(0)
+            })?
+        {
+            continue;
         }
         page.push(next);
     }
@@ -331,6 +466,166 @@ mod tests {
         db
     }
 
+    /// Delegation is followed through every generation, cataloged or not;
+    /// continuity is not, the roots are not listed, and a cycle ends.
+    #[test]
+    fn delegated_descendants_follow_delegation_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(dir.path());
+        let conn = open_db(&db).unwrap();
+        let edge = |parent: &str, child: &str, relationship: &str| {
+            conn.execute(
+                "INSERT INTO session_relationships (source, parent_session_id, relationship_uid, \
+                 child_session_id, relationship, identity_status, evidence_kind, created_ms, \
+                 updated_ms) VALUES ('codex', ?1, ?2, ?2, ?3, 'observed', 'rollout', 0, 0)",
+                rusqlite::params![parent, child, relationship],
+            )
+            .unwrap();
+        };
+        edge("root", "child", "delegated");
+        edge("child", "grandchild", "delegated");
+        edge("grandchild", "child", "delegated");
+        edge("root", "fork", "fork");
+        edge("fork", "forks-child", "delegated");
+        edge("other", "elsewhere", "delegated");
+        edge("remote", "local", "materialized_local");
+        edge("local", "local-subagent", "delegated");
+        let store = SessionStore::open(StoreOptions {
+            db_path: Some(db),
+            read_only: true,
+            ..StoreOptions::default()
+        })
+        .unwrap();
+        let identity = |session: &str| SessionIdentity {
+            source_name: "codex".into(),
+            session_id: session.into(),
+        };
+        assert_eq!(
+            store.delegated_descendants(&[identity("root")]).unwrap(),
+            vec![identity("child"), identity("grandchild")]
+        );
+        assert_eq!(
+            store
+                .delegated_descendants(&[identity("root"), identity("child")])
+                .unwrap(),
+            vec![identity("grandchild")]
+        );
+        assert!(store
+            .delegated_descendants(&[identity("nobody")])
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store.delegated_by(&identity("grandchild")).unwrap(),
+            vec![identity("child")]
+        );
+        assert!(store.delegated_by(&identity("fork")).unwrap().is_empty());
+        assert!(store.delegated_by(&identity("root")).unwrap().is_empty());
+        // A remote session's work includes the local transcript it was
+        // materialized as, and that transcript's own delegations; the local
+        // transcript stays a session of its own.
+        assert_eq!(
+            store.delegated_descendants(&[identity("remote")]).unwrap(),
+            vec![identity("local"), identity("local-subagent")]
+        );
+        assert!(store.delegated_by(&identity("local")).unwrap().is_empty());
+    }
+
+    /// Each step of the descendant walk seeks by parent, and the parent lookup
+    /// by child, with or without statistics; any other plan reads every edge
+    /// of the source.
+    #[test]
+    fn the_descendant_walk_seeks_by_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(dir.path());
+        let conn = open_db(&db).unwrap();
+        for analyze in [false, true] {
+            if analyze {
+                conn.execute_batch("ANALYZE").unwrap();
+            }
+            let plan: Vec<String> = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {DESCENDANT_STEP_SQL}"))
+                .unwrap()
+                .query_map(
+                    rusqlite::params!["codex", "root", "delegated", "materialized_local"],
+                    |row| row.get::<_, String>(3),
+                )
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            let plan = plan.join(" | ");
+            assert!(
+                plan.contains(
+                    "idx_session_relationships_parent (source=? AND parent_session_id=?)"
+                ),
+                "the step does not seek by parent (analyze={analyze}): {plan}"
+            );
+            let plan: Vec<String> = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {DELEGATED_BY_SQL}"))
+                .unwrap()
+                .query_map(rusqlite::params!["codex", "child", "delegated"], |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            let plan = plan.join(" | ");
+            assert!(
+                plan.contains("idx_session_relationships_child (source=? AND child_session_id=?)"),
+                "the parent lookup does not seek by child (analyze={analyze}): {plan}"
+            );
+        }
+    }
+
+    /// Listings that leave delegated children out still name every session
+    /// of its own, including a fork, and fill their pages.
+    #[test]
+    fn listings_can_leave_delegated_children_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(dir.path());
+        let conn = open_db(&db).unwrap();
+        for session in ["root", "child", "fork", "solo"] {
+            conn.execute(
+                "INSERT INTO sessions (source, session_id, last_activity_ms, discovery_state) \
+                 VALUES ('opencode', ?1, 1, 'shallow')",
+                [session],
+            )
+            .unwrap();
+        }
+        for (parent, child, relationship) in
+            [("root", "child", "delegated"), ("root", "fork", "fork")]
+        {
+            conn.execute(
+                "INSERT INTO session_relationships (source, parent_session_id, relationship_uid, \
+                 child_session_id, relationship, identity_status, evidence_kind, created_ms, \
+                 updated_ms) VALUES ('opencode', ?1, ?2, ?2, ?3, 'observed', 'db', 0, 0)",
+                rusqlite::params![parent, child, relationship],
+            )
+            .unwrap();
+        }
+        let store = SessionStore::open(StoreOptions {
+            db_path: Some(db),
+            read_only: true,
+            ..StoreOptions::default()
+        })
+        .unwrap();
+        let mut listed: Vec<String> = store
+            .sessions(crate::CatalogQuery {
+                exclude_delegated: true,
+                ..crate::CatalogQuery::default()
+            })
+            .map(|row| row.unwrap().session_id)
+            .collect();
+        listed.sort();
+        assert_eq!(listed, ["fork", "root", "solo"]);
+        assert_eq!(store.sessions(crate::CatalogQuery::default()).count(), 4);
+
+        let page = store
+            .session_identities(IdentityQuery::default().limit(3).exclude_delegated())
+            .unwrap();
+        let names: Vec<_> = page.iter().map(|id| id.session_id.as_str()).collect();
+        assert_eq!(names, ["fork", "root", "solo"]);
+    }
+
     /// A page is one snapshot even on an autocommit connection. An identity
     /// whose only row moves from a table the page has not sought yet to one
     /// it already has -- committed by another connection between the two
@@ -353,7 +648,7 @@ mod tests {
         assert!(reader.is_autocommit());
         // A page with no hook first, so every statement is prepared and the
         // schema parsed: what remains to count is each seek's own work.
-        assert_eq!(identities_after(&reader, None, 10).unwrap().len(), 1);
+        assert_eq!(identities_after(&reader, None, 10, false).unwrap().len(), 1);
         // How many progress callbacks the catalog's arm -- the first seek a
         // page runs -- takes on its own. The move fires just past them: after
         // that seek has read the catalog, before the events arm reads.
@@ -395,7 +690,7 @@ mod tests {
                 false
             }),
         );
-        let page = identities_after(&reader, None, 10).unwrap();
+        let page = identities_after(&reader, None, 10, false).unwrap();
         reader.progress_handler(0, None::<fn() -> bool>);
         assert!(
             fired.load(Ordering::SeqCst),
@@ -429,7 +724,7 @@ mod tests {
                  updated_ms, timestamp_ms) VALUES ('traj-1', '[]', '{}', 'x', 1, 1);",
         )
         .unwrap();
-        let listed = identities_after(&conn, None, 100).unwrap();
+        let listed = identities_after(&conn, None, 100, false).unwrap();
         assert_eq!(
             listed,
             [

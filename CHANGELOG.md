@@ -4,7 +4,21 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Minor]
+
+### Breaking Changes
+
+- A serialized `CatalogQuery` now carries `exclude_delegated`; a value saved without it no longer deserializes.
+
+### Added
+
+- `SessionStore::delegated_descendants` lists the subagents and child threads a set of sessions delegated work to, through every generation and whether or not the catalog holds them, so an embedder sharing a session can share its delegated work with it.
+- `CatalogQuery::exclude_delegated` and `IdentityQuery::exclude_delegated()` list only sessions of their own, leaving out subagents and child threads that are part of another session's work; `SessionStore::delegated_by` names a delegated session's parents.
+
+### Rust API
+
+- Added `SessionStore::delegated_descendants(&[SessionIdentity]) -> Result<Vec<SessionIdentity>, Error>`.
+- Added `SessionStore::delegated_by(&SessionIdentity) -> Result<Vec<SessionIdentity>, Error>`, `CatalogQuery::exclude_delegated` and `IdentityQuery::exclude_delegated` (field and builder).
 
 ## [0.35.0] - 2026-10-07
 

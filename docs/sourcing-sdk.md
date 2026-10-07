@@ -5,7 +5,7 @@ coding-agent session evidence without parsing harness logs itself. This guide
 is for that program's author: the surface the crate exposes on its **default
 features**, and the rules that surface is governed by.
 
-Everything a consumer needs is one type, `ai_hist::SessionStore`, fourteen
+Everything a consumer needs is one type, `ai_hist::SessionStore`, sixteen
 operations, and the typed structs they return. Nothing on this surface names a
 `rusqlite` type, and no JSON column reaches a consumer as a string. This is the
 surface [`docs/sourcing-contract.md`](sourcing-contract.md) is delivered
@@ -85,7 +85,7 @@ What the facade owes you, and what it asks in return:
   `Error::UnsupportedOperation`, and a watermark the store cannot serve is
   `Error::WatermarkAheadOfStore`.
 
-## The fourteen operations
+## The sixteen operations
 
 | Method                                           | Provider I/O                                | Database work                                                             | Lock                                             |
 | ------------------------------------------------ | ------------------------------------------- | ------------------------------------------------------------------------- | ------------------------------------------------ |
@@ -98,6 +98,8 @@ What the facade owes you, and what it asks in return:
 | `session(&SessionRef, SessionQuery)`             | none                                        | every table for one session, on one snapshot                              | none (one deferred read transaction)             |
 | `session_identities(IdentityQuery)`              | none                                        | one covering index seek per identity per table that holds it              | none (one read snapshot per page)                |
 | `has_session(&SessionIdentity)`                  | none                                        | one indexed existence probe per table                                     | none (one read snapshot)                         |
+| `delegated_descendants(&[SessionIdentity])`      | none                                        | one indexed lookup by parent per session reached                          | none (one read snapshot)                         |
+| `delegated_by(&SessionIdentity)`                 | none                                        | one indexed lookup by child                                               | none (one read snapshot)                         |
 | `changes_since(Watermark, ChangeQuery)`          | none                                        | one indexed revision-range read per kind per page, plus tombstones; a session drain seeks that session's index instead | none (one read snapshot per page) |
 | `head_revision() -> Watermark`                   | none                                        | one read of the feed head                                                 | none                                             |
 | `forget_evidence(ForgetScope, ForgetOptions)`    | none                                        | batched deletes of the named sessions' evidence; catalog rows to shallow  | `SyncRunLock`, whole run                         |
@@ -335,6 +337,24 @@ same tables and rule: true exactly when the listing would name it, so every
 session an embedder counts is one it can select, and false for an empty source
 or session id. It is one indexed existence probe per table, all on one
 snapshot.
+
+`delegated_descendants(&[SessionIdentity])` lists every session reached from
+the given ones through delegation — the subagents and child threads they
+delegated work to, and those children's own delegations, plus the local
+transcript a remote Claude session was materialized as — whether or not the
+catalog holds them, in identity order and never including the given sessions.
+It returns the whole reachable work, never a truncated part of it.
+Continuity (a fork, resume or continuation) is not followed: those are
+conversations of their own. An embedder sharing a session's work shares these
+with it. `delegated_by(&SessionIdentity)` is the other direction: the sessions
+that delegated work to one, empty for a session of its own.
+
+A delegated child is part of its parent's work, not a session to offer apart
+from it. Setting `CatalogQuery { exclude_delegated: true, .. }` or calling
+`IdentityQuery::exclude_delegated()` leaves delegated children out of
+`sessions` and `session_identities`, so a listing names only conversations of
+their own; forks, resumes, continuations and materialized local transcripts
+stay listed.
 
 Every seek of a page reads one snapshot, so a page is the store at one
 moment; an identity written between pages is seen only if it sorts after the
@@ -854,7 +874,7 @@ embedder reads before bumping.
 
 | Feature | Default | What it adds | For |
 | --- | --- | --- | --- |
-| *(none)* | ✓ | `SessionStore` and its fourteen operations, the change feed (`Change`, `ChangeQuery`, `Watermark`, `EvidenceRow`, `StoredRow`), `SessionIdentity` and `IdentityQuery`, `Source` and `SourceCapabilities`, `Error`, the evidence structs above, `NormalizedUsage` and the usage normalizers, `project_identity`, `declared_evidence_kinds` | Embedders |
+| *(none)* | ✓ | `SessionStore` and its sixteen operations, the change feed (`Change`, `ChangeQuery`, `Watermark`, `EvidenceRow`, `StoredRow`), `SessionIdentity` and `IdentityQuery`, `Source` and `SourceCapabilities`, `Error`, the evidence structs above, `NormalizedUsage` and the usage normalizers, `project_identity`, `declared_evidence_kinds` | Embedders |
 | `fs-events` | — | The `notify` backend behind `watch`; without it `watch` polls at `poll_interval_ms`. `WatchOptions::use_fs_events` selects it when it is compiled in | The CLI, and an embedder that wants event-driven ticks |
 | `export` | — | `ai_hist::export`: bounded, resumable NDJSON snapshots of the store's evidence, keyed like the change feed | napi (the SDK's `exportHistory`) |
 | `opencode-backup` | — | Snapshot a live OpenCode SQLite store through `rusqlite`'s backup API before reading it | The CLI, napi |
