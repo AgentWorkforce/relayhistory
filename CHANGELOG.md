@@ -6,6 +6,10 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased - Minor]
 
+### Breaking Changes
+
+- A serialized `WatchedPath` now carries its entry filter as `entries`, and a value saved without it no longer deserializes; regenerate saved watch roots from `SourceCapabilities::watch_roots`.
+
 ### Added
 
 - `WatchedPath::admits(name)` publishes the entry filter the store's own watcher applies to each advertised watch path (OpenCode's database directory admits only its SQLite stores and sidecars), so an embedder's watcher cannot drift from it; `WatchedPath` serializes the filter as `entries`.
