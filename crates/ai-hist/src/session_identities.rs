@@ -155,13 +155,17 @@ impl SessionStore {
 
     /// Every session reached from `roots` through delegation: the subagents
     /// and child threads they delegated work to, the work those delegated in
-    /// turn, and so on, whether or not the catalog holds them. These are the
+    /// turn, and so on, whether or not the catalog holds them — the same
+    /// related work hydration reads with a root, including the local
+    /// transcript a remote Claude session was materialized as. These are the
     /// sessions that are part of a root's work rather than conversations of
     /// their own; continuity (a fork, resume or continuation) is not followed.
     ///
-    /// The roots themselves are never listed. Read on one snapshot; each step
-    /// is an indexed lookup by parent, and a cycle in the ledger ends where it
-    /// closes. Listed in identity order.
+    /// The whole reachable work is returned, never a truncated part of it: a
+    /// caller sharing a root shares all of it. The roots themselves are never
+    /// listed. Read on one snapshot; each step is an indexed lookup by parent,
+    /// and a cycle in the ledger ends where it closes. Listed in identity
+    /// order.
     pub fn delegated_descendants(
         &self,
         roots: &[SessionIdentity],
@@ -180,14 +184,8 @@ impl SessionStore {
         identity: &SessionIdentity,
     ) -> std::result::Result<Vec<SessionIdentity>, Error> {
         let conn = self.read_conn()?;
-        let mut parents = conn
-            .prepare_cached(
-                "SELECT DISTINCT parent_session_id FROM session_relationships \
-                 WHERE source = ?1 AND child_session_id = ?2 AND relationship = ?3 \
-                   AND parent_session_id <> child_session_id ORDER BY parent_session_id",
-            )
-            .map_err(Error::sql)?;
-        let rows = parents
+        let mut parents = conn.prepare_cached(DELEGATED_BY_SQL).map_err(Error::sql)?;
+        let ids = parents
             .query_map(
                 rusqlite::params![
                     identity.source_name,
@@ -196,27 +194,42 @@ impl SessionStore {
                 ],
                 |row| row.get::<_, String>(0),
             )
+            .map_err(Error::sql)?
+            .collect::<rusqlite::Result<std::collections::BTreeSet<_>>>()
             .map_err(Error::sql)?;
-        rows.map(|parent| {
-            Ok(SessionIdentity {
+        Ok(ids
+            .into_iter()
+            .map(|parent| SessionIdentity {
                 source_name: identity.source_name.clone(),
-                session_id: parent.map_err(Error::sql)?,
+                session_id: parent,
             })
-        })
-        .collect()
+            .collect())
     }
 }
+
+/// One step of [`delegated_descendants`]: the delegated and materialized
+/// children of `(?1, ?2)`, with `?3` and `?4` the two kinds. Not `DISTINCT`:
+/// the walk's reached set already drops a repeat, and `DISTINCT` is what
+/// draws the planner to the child index, whose order would serve it.
+const DESCENDANT_STEP_SQL: &str = "SELECT child_session_id FROM session_relationships \
+     WHERE source = ?1 AND parent_session_id = ?2 AND relationship IN (?3, ?4) \
+       AND +child_session_id IS NOT NULL AND +child_session_id <> ''";
+
+/// The delegating parents of `(?1, ?2)` under kind `?3`. Ordered and
+/// deduplicated by the caller: asking SQLite for either makes the parent
+/// index's order look worth more than the child lookup.
+const DELEGATED_BY_SQL: &str = "SELECT parent_session_id FROM session_relationships \
+     WHERE source = ?1 AND child_session_id = ?2 AND relationship = ?3 \
+       AND +parent_session_id <> +child_session_id";
 
 /// [`SessionStore::delegated_descendants`] on one connection.
 fn delegated_descendants(
     conn: &Connection,
     roots: &[SessionIdentity],
 ) -> Result<Vec<SessionIdentity>> {
-    let mut children = conn.prepare_cached(
-        "SELECT DISTINCT child_session_id FROM session_relationships \
-         WHERE source = ?1 AND parent_session_id = ?2 AND relationship = ?3 \
-           AND child_session_id IS NOT NULL AND child_session_id <> ''",
-    )?;
+    // Each step must seek by parent; on the child index it would read every
+    // edge of the source. See `the_descendant_walk_seeks_by_parent`.
+    let mut children = conn.prepare_cached(DESCENDANT_STEP_SQL)?;
     let key =
         |identity: &SessionIdentity| (identity.source_name.clone(), identity.session_id.clone());
     let mut reached: std::collections::BTreeSet<(String, String)> = roots.iter().map(key).collect();
@@ -225,7 +238,12 @@ fn delegated_descendants(
     while let Some((source, parent)) = frontier.pop() {
         let ids = children
             .query_map(
-                rusqlite::params![source, parent, crate::relationships::RELATIONSHIP_DELEGATED],
+                rusqlite::params![
+                    source,
+                    parent,
+                    crate::relationships::RELATIONSHIP_DELEGATED,
+                    crate::relationships::RELATIONSHIP_MATERIALIZED_LOCAL
+                ],
                 |row| row.get::<_, String>(0),
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -470,6 +488,8 @@ mod tests {
         edge("root", "fork", "fork");
         edge("fork", "forks-child", "delegated");
         edge("other", "elsewhere", "delegated");
+        edge("remote", "local", "materialized_local");
+        edge("local", "local-subagent", "delegated");
         let store = SessionStore::open(StoreOptions {
             db_path: Some(db),
             read_only: true,
@@ -500,6 +520,60 @@ mod tests {
         );
         assert!(store.delegated_by(&identity("fork")).unwrap().is_empty());
         assert!(store.delegated_by(&identity("root")).unwrap().is_empty());
+        // A remote session's work includes the local transcript it was
+        // materialized as, and that transcript's own delegations; the local
+        // transcript stays a session of its own.
+        assert_eq!(
+            store.delegated_descendants(&[identity("remote")]).unwrap(),
+            vec![identity("local"), identity("local-subagent")]
+        );
+        assert!(store.delegated_by(&identity("local")).unwrap().is_empty());
+    }
+
+    /// Each step of the descendant walk seeks by parent, and the parent lookup
+    /// by child, with or without statistics; any other plan reads every edge
+    /// of the source.
+    #[test]
+    fn the_descendant_walk_seeks_by_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(dir.path());
+        let conn = open_db(&db).unwrap();
+        for analyze in [false, true] {
+            if analyze {
+                conn.execute_batch("ANALYZE").unwrap();
+            }
+            let plan: Vec<String> = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {DESCENDANT_STEP_SQL}"))
+                .unwrap()
+                .query_map(
+                    rusqlite::params!["codex", "root", "delegated", "materialized_local"],
+                    |row| row.get::<_, String>(3),
+                )
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            let plan = plan.join(" | ");
+            assert!(
+                plan.contains(
+                    "idx_session_relationships_parent (source=? AND parent_session_id=?)"
+                ),
+                "the step does not seek by parent (analyze={analyze}): {plan}"
+            );
+            let plan: Vec<String> = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {DELEGATED_BY_SQL}"))
+                .unwrap()
+                .query_map(rusqlite::params!["codex", "child", "delegated"], |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            let plan = plan.join(" | ");
+            assert!(
+                plan.contains("idx_session_relationships_child (source=? AND child_session_id=?)"),
+                "the parent lookup does not seek by child (analyze={analyze}): {plan}"
+            );
+        }
     }
 
     /// Listings that leave delegated children out still name every session

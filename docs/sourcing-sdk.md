@@ -340,18 +340,21 @@ snapshot.
 
 `delegated_descendants(&[SessionIdentity])` lists every session reached from
 the given ones through delegation — the subagents and child threads they
-delegated work to, and those children's own delegations — whether or not the
+delegated work to, and those children's own delegations, plus the local
+transcript a remote Claude session was materialized as — whether or not the
 catalog holds them, in identity order and never including the given sessions.
+It returns the whole reachable work, never a truncated part of it.
 Continuity (a fork, resume or continuation) is not followed: those are
 conversations of their own. An embedder sharing a session's work shares these
 with it. `delegated_by(&SessionIdentity)` is the other direction: the sessions
 that delegated work to one, empty for a session of its own.
 
 A delegated child is part of its parent's work, not a session to offer apart
-from it. `CatalogQuery::exclude_delegated` and `IdentityQuery::exclude_delegated()`
-leave delegated children out of `sessions` and `session_identities`, so a
-listing names only conversations of their own; forks, resumes and
-continuations stay listed.
+from it. Setting `CatalogQuery { exclude_delegated: true, .. }` or calling
+`IdentityQuery::exclude_delegated()` leaves delegated children out of
+`sessions` and `session_identities`, so a listing names only conversations of
+their own; forks, resumes, continuations and materialized local transcripts
+stay listed.
 
 Every seek of a page reads one snapshot, so a page is the store at one
 moment; an identity written between pages is seen only if it sorts after the

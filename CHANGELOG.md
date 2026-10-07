@@ -6,6 +6,10 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased - Minor]
 
+### Breaking Changes
+
+- A serialized `CatalogQuery` now carries `exclude_delegated`; a value saved without it no longer deserializes.
+
 ### Added
 
 - `SessionStore::delegated_descendants` lists the subagents and child threads a set of sessions delegated work to, through every generation and whether or not the catalog holds them, so an embedder sharing a session can share its delegated work with it.
