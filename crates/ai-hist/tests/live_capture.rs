@@ -1322,6 +1322,17 @@ fn a_busy_root_does_not_starve_another_root_of_its_reconciliation() {
         }
     }
 
+    // The other provider arrives while the busy root is demonstrably busy, so
+    // a reconciliation that lands quickly is still one that happened under
+    // load rather than before it started.
+    let deadline = std::time::Instant::now() + ARRIVES_WITHIN;
+    while written.load(Ordering::SeqCst) <= 4 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the busy root was never written to"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     std::fs::create_dir_all(&late).expect("install the second provider");
 
     let deadline = std::time::Instant::now() + ARRIVES_WITHIN;

@@ -2277,7 +2277,7 @@ fn sync_basic(
     // failed outright; the CLI prints the same chain it always did, behind
     // the code.
     // Without discovery's own identity refresh: the sweep runs it itself just
-    // below, and running both was the same whole-catalog pass twice.
+    // below, and one refresh per sweep is all the catalog needs.
     let discovered = discover::discover_sessions_for_sweep(
         &discovery_env,
         &DiscoverOptions::default(),
@@ -2792,7 +2792,7 @@ fn sync_opencode_exclusive(
 /// keys stuck at NULL with no trace of why, and "nothing to do" and "could not
 /// write" would look identical from the outside.
 fn refresh_project_identity_after_sync(conn: &Connection) {
-    if let Err(error) = crate::store::refresh_project_identity_after_sweep(conn) {
+    if let Err(error) = crate::store::refresh_project_identity_incrementally(conn) {
         eprintln!(
             "ai-hist: could not refresh canonical project identity: {error:#} \
              (project keys stay as they were; the next sync retries)"
