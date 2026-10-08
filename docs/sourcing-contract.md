@@ -62,7 +62,10 @@ Claude is duplicated across every content block of a message.
 ## 2. Content blocks — `ContentRecord`
 
 `role` × `kind` (`text`, `thinking`, `tool_use`, `tool_result`) plus the block
-payload. `session_events` already stores exactly this shape. Two obligations:
+payload. `session_events` already stores exactly this shape. A Claude
+`thinking` block carrying a `signature` is a `thinking` event even when its
+text is empty, so the record that opens a streamed response belongs to its
+request. Two obligations:
 
 - `SessionQuery.include_text` must be honoured, mapping onto burn's
   `ContentStoreMode::{full, hash-only, off}`. A hash-only consumer must not pay

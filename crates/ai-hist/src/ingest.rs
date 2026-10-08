@@ -9748,7 +9748,13 @@ fn ingest_claude_record(
                     .get("thinking")
                     .or_else(|| block.get("text"))
                     .and_then(Value::as_str);
-                if text.is_some_and(|s| !s.trim().is_empty()) {
+                // A signed block with no display text is still the model's
+                // reasoning: Claude streams it as the first record of a
+                // response, and that record's timestamp is when the request
+                // started. Without an event it joins no request, so the
+                // request would begin at its second record.
+                let signed = block.get("signature").and_then(Value::as_str).is_some();
+                if signed || text.is_some_and(|s| !s.trim().is_empty()) {
                     insert_session_event(
                         conn,
                         "claude",

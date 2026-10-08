@@ -4,7 +4,12 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Patch]
+
+### Fixed
+
+- Claude: a signed `thinking` block with empty text is stored as a `thinking` event, so the record that opens a streamed response joins its request and the request's `first_ts_ms`, `message_ids` and `has_thinking` include it.
+- Claude: `continuation` and `fork` edges from `continuedFromSessionId` / `forkSessionId` carry the timestamp of the record that named them in `spawned_at_ms`, not the transcript's first record.
 
 ## [0.36.0] - 2026-10-07
 
