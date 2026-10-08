@@ -10570,7 +10570,7 @@ mod tests {
             hydrate_session_at_with_home(&db, &options("claude", "session-1"), dir.path()).unwrap();
         assert_eq!(first.status, "hydrated");
         assert_eq!(first.evidence.prompts, 1);
-        assert_eq!(first.evidence.events, 3);
+        assert_eq!(first.evidence.events, 4);
         let presence_stamp: String = open_db(&db)
             .unwrap()
             .query_row(
@@ -10586,7 +10586,7 @@ mod tests {
         let second =
             hydrate_session_at_with_home(&db, &options("claude", "session-1"), dir.path()).unwrap();
         assert_eq!(second.status, "unchanged");
-        assert_eq!(second.evidence.events, 3);
+        assert_eq!(second.evidence.events, 4);
 
         open_db(&db)
             .unwrap()
@@ -10608,7 +10608,7 @@ mod tests {
         let partial =
             hydrate_session_at_with_home(&db, &options("claude", "session-1"), dir.path()).unwrap();
         assert_eq!(partial.status, "updated");
-        assert_eq!(partial.evidence.events, 3);
+        assert_eq!(partial.evidence.events, 4);
 
         let mut file = fs::OpenOptions::new()
             .append(true)
@@ -10620,7 +10620,7 @@ mod tests {
             hydrate_session_at_with_home(&db, &options("claude", "session-1"), dir.path()).unwrap();
         assert_eq!(appended.status, "updated");
         assert_eq!(appended.evidence.prompts, 2);
-        assert_eq!(appended.evidence.events, 4);
+        assert_eq!(appended.evidence.events, 5);
     }
 
     /// Write a cursor transcript at the layout its adapter enumerates and
@@ -11789,7 +11789,8 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
-        assert_eq!(counts, (1, 0, 0, 0));
+        // The delegated prompt and the child's output.
+        assert_eq!(counts, (2, 0, 0, 0));
     }
 
     #[test]
@@ -12002,7 +12003,8 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(placement, (1, 0));
+        // The delegated prompt and the child's output.
+        assert_eq!(placement, (2, 0));
     }
 
     #[test]
@@ -12127,7 +12129,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 placement,
-                (1, 0, 0, transcript.to_string_lossy().to_string())
+                (2, 0, 0, transcript.to_string_lossy().to_string())
             );
         }
     }
@@ -12289,7 +12291,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(now, (1, 1));
+        assert_eq!(now, (1, 2));
     }
 
     #[test]

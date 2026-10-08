@@ -1820,7 +1820,7 @@ fn claude_sidecar_subagent_usage_lands_under_the_child_thread() {
     let events = rows("claude/sidecar-subagent", "session_events");
     let child = events
         .iter()
-        .filter(|event| text(event, "session_id") == "plan01")
+        .filter(|event| text(event, "session_id") == "plan01" && text(event, "role") == "assistant")
         .collect::<Vec<_>>();
     assert_eq!(child.len(), 1, "{events:?}");
     let usage: Value =
@@ -1834,6 +1834,56 @@ fn claude_sidecar_subagent_usage_lands_under_the_child_thread() {
             .all(|event| text(event, "message_id") != "u-agent-asst-1"),
         "the child's output is not re-attributed to the parent: {events:?}"
     );
+}
+
+/// burn: `nested-subagent`. Sidechain rows are delegated traffic, and every
+/// one is captured: the delegating agent's prompts and the subagent's tool
+/// results sit beside the subagent's output, so each sidechain row's parent
+/// chain resolves to a captured row back to the Agent call that spawned it.
+/// None of them is a human prompt.
+#[test]
+fn claude_sidechain_user_rows_keep_the_delegated_parent_chain_whole() {
+    let events = rows("claude/nested-subagent", "session_events");
+    let ids: BTreeSet<&str> = events
+        .iter()
+        .map(|event| text(event, "message_id"))
+        .collect();
+    for id in ["u-sub1-user", "u-sub2-user", "u-sub1-toolresult"] {
+        assert!(ids.contains(id), "{id} is captured: {ids:?}");
+    }
+    for event in events {
+        if let Some(parent) = field(event, "parent_id").as_str() {
+            assert!(
+                ids.contains(parent),
+                "{} names parent {parent}, which is not captured",
+                text(event, "message_id")
+            );
+        }
+    }
+    let results: BTreeSet<&str> = events
+        .iter()
+        .filter(|event| text(event, "kind") == "tool_result")
+        .map(|event| text(event, "tool_use_id"))
+        .collect();
+    assert_eq!(results, BTreeSet::from(["toolu_inner", "toolu_outer"]));
+    let prompts: Vec<&str> = rows("claude/nested-subagent", "history")
+        .iter()
+        .map(|row| text(row, "prompt"))
+        .collect();
+    assert_eq!(prompts, vec!["explore"]);
+
+    let leading = rows("claude/sidechain-leading-then-main", "session_events");
+    assert!(
+        leading
+            .iter()
+            .any(|event| text(event, "message_id") == "u-side-1"),
+        "{leading:?}"
+    );
+    let prompts: Vec<&str> = rows("claude/sidechain-leading-then-main", "history")
+        .iter()
+        .map(|row| text(row, "prompt"))
+        .collect();
+    assert_eq!(prompts, vec!["continue from elsewhere"]);
 }
 
 /// burn: `parent_chain_groups_out_of_order_rows_for_classification`. The raw

@@ -4,7 +4,11 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Patch]
+
+### Fixed
+
+- Claude sidechain user rows — a subagent's delegated prompts and the tool results it received — are captured as `is_sidechain` evidence in messages, tool results and user turns, so a delegated thread's parent chain is whole; they still never become prompts or `history`.
 
 ## [0.36.0] - 2026-10-07
 
