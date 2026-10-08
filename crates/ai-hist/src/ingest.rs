@@ -3178,21 +3178,23 @@ const CODEX_RAW_MESSAGE_FACTS_KEY: &str = "codex_raw_message_facts";
 const CODEX_FORK_REPLAY_GENERATION: i64 = 1;
 const CODEX_FORK_REPLAY_KEY: &str = "codex_fork_replay_gate";
 
-/// One-time re-read of every Codex rollout indexed before `token_count`
-/// snapshots were stored as `usage_snapshot` markers. A finished rollout's
-/// stamp never changes, so without this its counters would stay unread for
-/// the life of the install. Recorded only after a walk that reached every
+/// One-time re-read of every Codex rollout indexed before its state records
+/// were stored: `token_count` as `usage_snapshot` markers and `turn_context`
+/// as `turn_context` markers. A finished rollout's stamp never changes, so
+/// without this its counters and turn settings would stay unread for the life
+/// of the install. Recorded only after a walk that reached every
 /// known root, like the other backfills.
-const CODEX_USAGE_SNAPSHOT_GENERATION: i64 = 1;
-const CODEX_USAGE_SNAPSHOT_KEY: &str = "codex_usage_snapshots";
+const CODEX_STATE_MARKER_GENERATION: i64 = 1;
+const CODEX_STATE_MARKER_KEY: &str = "codex_state_markers";
 
-/// Whether a Codex session already carries the `usage_snapshot` markers this
-/// parser writes.
-fn codex_usage_snapshots_exist(conn: &Connection, session_id: &str) -> Result<bool> {
+/// Whether a Codex session already carries the state markers this parser
+/// writes. Either kind is enough: a rollout read by this parser has a
+/// `turn_context` marker for every turn and a snapshot for every counter.
+fn codex_state_markers_exist(conn: &Connection, session_id: &str) -> Result<bool> {
     Ok(conn
         .prepare_cached(
             "SELECT EXISTS(SELECT 1 FROM session_markers \
-             WHERE source = 'codex' AND session_id = ? AND kind = 'usage_snapshot')",
+             WHERE source = 'codex' AND session_id = ? AND kind IN ('usage_snapshot', 'turn_context'))",
         )?
         .query_row([session_id], |row| row.get::<_, bool>(0))?)
 }
@@ -4779,11 +4781,11 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
         .and_then(Value::as_i64)
         .unwrap_or(0)
         < CODEX_FORK_REPLAY_GENERATION;
-    let backfill_usage_snapshots = state
-        .get(CODEX_USAGE_SNAPSHOT_KEY)
+    let backfill_state_markers = state
+        .get(CODEX_STATE_MARKER_KEY)
         .and_then(Value::as_i64)
         .unwrap_or(0)
-        < CODEX_USAGE_SNAPSHOT_GENERATION;
+        < CODEX_STATE_MARKER_GENERATION;
     // A root the stamp map has entries for but whose rollouts this run cannot
     // see is an archive we could not read, not an archive that is gone.
     // Walking it vacuously and then recording the generation would retire the
@@ -4913,10 +4915,10 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                     Some(_)
                         if backfill_fork_replay
                             && crate::continuity::codex_evidence_names_fork(conn, &key)? => {}
-                    // Indexed before `token_count` snapshots were stored:
-                    // re-read once so its counters are captured.
-                    Some(id)
-                        if backfill_usage_snapshots && !codex_usage_snapshots_exist(conn, id)? => {}
+                    // Indexed before its state records were stored: re-read
+                    // once so its counters and turn settings are captured.
+                    Some(id) if backfill_state_markers && !codex_state_markers_exist(conn, id)? => {
+                    }
                     Some(id)
                         if codex_session_evidence_exists(conn, id)?
                             && !(backfill_fidelity
@@ -5130,8 +5132,8 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
             json!(CODEX_FORK_REPLAY_GENERATION),
         );
         state.insert(
-            CODEX_USAGE_SNAPSHOT_KEY.to_string(),
-            json!(CODEX_USAGE_SNAPSHOT_GENERATION),
+            CODEX_STATE_MARKER_KEY.to_string(),
+            json!(CODEX_STATE_MARKER_GENERATION),
         );
     }
     if repairs.repairs_all() && !walked_every_known_root {
@@ -6477,6 +6479,27 @@ fn ingest_codex_rollout_incremental(
         previous_assistant = None;
         match line_type {
             "turn_context" => {
+                // The turn's settings as the provider wrote them: the model
+                // is otherwise only stamped onto the turn's messages, and a
+                // turn that wrote none would have no model at all.
+                insert_session_marker(
+                    conn,
+                    "codex",
+                    session_id,
+                    &NewSessionMarker {
+                        marker_uid: &format!("{index}:marker"),
+                        ts_ms: (ts_ms != 0).then_some(ts_ms),
+                        message_id: None,
+                        parent_id: None,
+                        turn_id: payload_str("turn_id"),
+                        kind: "turn_context",
+                        subkind: Some("turn_context"),
+                        text: None,
+                        payload_json: Some(&serde_json::to_string(&bound_marker_value(
+                            Value::Object(payload.clone()),
+                        ))?),
+                    },
+                )?;
                 if let Some(m) = payload_str("model") {
                     model = Some(m.to_string());
                 }
@@ -7339,7 +7362,7 @@ fn flush_unwritten_codex_line(
 /// Codex lines that legitimately write no row of their own.
 ///
 /// These are state updates, not records, and their information is stored
-/// elsewhere: `session_meta` and `turn_context` populate the session catalog,
+/// elsewhere: `session_meta` populates the session catalog,
 /// `thread_settings_applied` only carries the model forward, a `*_delta` is a
 /// fragment of an event recorded whole, while assistant messages are stored above (including desktop-only replies).
 ///
@@ -7359,7 +7382,7 @@ fn codex_line_is_state_only(
     _payload: &Map<String, Value>,
 ) -> bool {
     match line_type {
-        "session_meta" | "turn_context" => true,
+        "session_meta" => true,
         "event_msg" => {
             payload_type == "thread_settings_applied" || payload_type.ends_with("_delta")
         }
@@ -30214,13 +30237,20 @@ mod tests {
                 .iter()
                 .map(|(kind, subkind, _)| (kind.as_str(), subkind.as_str()))
                 .collect::<Vec<_>>(),
-            vec![("unknown", "message"), ("unknown", "user_message")],
+            vec![
+                ("turn_context", "turn_context"),
+                ("unknown", "message"),
+                ("unknown", "user_message")
+            ],
             "every user line nothing stored must leave a row: {markers:?}"
         );
         // No marker payload carries the image or the wrapper text, only the
         // fact that the line was there.
         assert!(
-            markers.iter().all(|(_, _, payload)| payload.is_empty()),
+            markers
+                .iter()
+                .filter(|(kind, _, _)| kind != "turn_context")
+                .all(|(_, _, payload)| payload.is_empty()),
             "the marker records that the line existed, not its contents"
         );
     }
@@ -30269,9 +30299,11 @@ mod tests {
             vec!["fix the importer".to_string(), "done".to_string()],
             "one row per turn, not one per representation"
         );
+        // The turn's own `turn_context` is its marker; the mirrored twin adds
+        // none.
         let markers = markers_of(&conn, "codex", "sess-mirror");
         assert!(
-            markers.is_empty(),
+            markers.iter().all(|(kind, _, _)| kind == "turn_context"),
             "a mirrored twin wrote through its partner, so it earns its silence: {markers:?}"
         );
     }
@@ -30348,11 +30380,10 @@ mod tests {
         }
         // Session metadata is a state update, not a record: it populates the
         // catalog rather than the ledger, and must stay silent or every
-        // rollout gains two markers it does not need.
+        // rollout gains markers it does not need. A `turn_context` is the
+        // turn's settings and is stored as its own `turn_context` marker.
         assert!(
-            !subkinds
-                .iter()
-                .any(|s| s == "session_meta" || s == "turn_context"),
+            !subkinds.iter().any(|s| s == "session_meta"),
             "state-only lines must not produce markers: {subkinds:?}"
         );
     }
@@ -31088,6 +31119,7 @@ mod tests {
             "subagent_notification",
             "compaction_boundary",
             "task_complete",
+            "turn_context",
         ] {
             assert!(
                 kinds.iter().any(|kind| kind == expected),
@@ -31096,9 +31128,9 @@ mod tests {
         }
         assert_eq!(
             kinds.len(),
-            10,
+            11,
             "a streaming delta is a fragment of an event that is already \
-             recorded whole, and turn_context is modeled: {markers:?}"
+             recorded whole: {markers:?}"
         );
 
         let unknown = markers
@@ -31139,7 +31171,7 @@ mod tests {
 
         // Idempotent under a re-parse: uids are derived from file position.
         super::ingest_codex_rollout(&conn, &path, &codex_meta(&path)).unwrap();
-        assert_eq!(marker_kinds(&conn, "codex", "sess-markers").len(), 10);
+        assert_eq!(marker_kinds(&conn, "codex", "sess-markers").len(), 11);
     }
 
     /// The tool-result row answering one call, whatever its position. A
@@ -32686,8 +32718,8 @@ mod tests {
         // An install that has already run the usage-snapshot backfill, so the
         // stamp-unchanged fast path is what this exercises.
         state.insert(
-            super::CODEX_USAGE_SNAPSHOT_KEY.into(),
-            json!(super::CODEX_USAGE_SNAPSHOT_GENERATION),
+            super::CODEX_STATE_MARKER_KEY.into(),
+            json!(super::CODEX_STATE_MARKER_GENERATION),
         );
 
         let (cwds, branches, inserted) = super::sync_codex_rollouts_with_repairs(
@@ -32737,8 +32769,8 @@ mod tests {
             }),
         );
         state.insert(
-            CODEX_USAGE_SNAPSHOT_KEY.into(),
-            json!(CODEX_USAGE_SNAPSHOT_GENERATION),
+            CODEX_STATE_MARKER_KEY.into(),
+            json!(CODEX_STATE_MARKER_GENERATION),
         );
         state
     }
@@ -36731,7 +36763,7 @@ mod codex_fork_replay_tests {
     /// unchanged stamp, so only the one-time backfill re-reads it for its
     /// counters. Once recorded, the backfill is spent.
     #[test]
-    fn an_unchanged_rollout_is_re_read_once_for_its_usage_snapshots() {
+    fn an_unchanged_rollout_is_re_read_once_for_its_state_markers() {
         let dir = tempfile::tempdir().unwrap();
         let day = dir.path().join(".codex/sessions/2026/04/20");
         fs::create_dir_all(&day).unwrap();
@@ -36761,14 +36793,14 @@ mod codex_fork_replay_tests {
         let conn = open_db(&dir.path().join("history.db")).unwrap();
         let mut state = Map::new();
         sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
-        assert!(codex_usage_snapshots_exist(&conn, PARENT).unwrap());
+        assert!(codex_state_markers_exist(&conn, PARENT).unwrap());
         assert_eq!(
-            state.get(CODEX_USAGE_SNAPSHOT_KEY),
-            Some(&json!(CODEX_USAGE_SNAPSHOT_GENERATION))
+            state.get(CODEX_STATE_MARKER_KEY),
+            Some(&json!(CODEX_STATE_MARKER_GENERATION))
         );
         let forget = || {
             conn.execute(
-                "DELETE FROM session_markers WHERE kind = 'usage_snapshot'",
+                "DELETE FROM session_markers WHERE kind IN ('usage_snapshot', 'turn_context')",
                 [],
             )
             .unwrap();
@@ -36777,15 +36809,15 @@ mod codex_fork_replay_tests {
         // With the backfill spent, an unchanged rollout is not re-read.
         forget();
         sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
-        assert!(!codex_usage_snapshots_exist(&conn, PARENT).unwrap());
+        assert!(!codex_state_markers_exist(&conn, PARENT).unwrap());
 
         // An install that predates the snapshots owes the backfill.
-        state.remove(CODEX_USAGE_SNAPSHOT_KEY);
+        state.remove(CODEX_STATE_MARKER_KEY);
         sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
-        assert!(codex_usage_snapshots_exist(&conn, PARENT).unwrap());
+        assert!(codex_state_markers_exist(&conn, PARENT).unwrap());
         assert_eq!(
-            state.get(CODEX_USAGE_SNAPSHOT_KEY),
-            Some(&json!(CODEX_USAGE_SNAPSHOT_GENERATION))
+            state.get(CODEX_STATE_MARKER_KEY),
+            Some(&json!(CODEX_STATE_MARKER_GENERATION))
         );
     }
 

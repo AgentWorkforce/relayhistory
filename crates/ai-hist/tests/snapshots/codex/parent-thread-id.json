@@ -152,6 +152,32 @@
   ],
   "session_markers": [
     {
+      "kind": "turn_context",
+      "marker_uid": "1:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"cwd\":\"/tmp/project\",\"model\":\"gpt-5.4\",\"turn_id\":\"turn_child_1\"}",
+      "session_id": "sess_parent_thread_child",
+      "source": "codex",
+      "subkind": "turn_context",
+      "text": null,
+      "ts_ms": 1776643210100,
+      "turn_id": "turn_child_1"
+    },
+    {
+      "kind": "turn_context",
+      "marker_uid": "1:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"cwd\":\"/tmp/project\",\"model\":\"gpt-5.4\",\"turn_id\":\"turn_root_1\"}",
+      "session_id": "sess_parent_thread_root",
+      "source": "codex",
+      "subkind": "turn_context",
+      "text": null,
+      "ts_ms": 1776643200100,
+      "turn_id": "turn_root_1"
+    },
+    {
       "kind": "usage_snapshot",
       "marker_uid": "4:marker",
       "message_id": null,

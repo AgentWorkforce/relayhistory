@@ -166,6 +166,19 @@
       "turn_id": "019da89d-b4e8-7000-8000-0000000000d1"
     },
     {
+      "kind": "turn_context",
+      "marker_uid": "2:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"cwd\":\"/tmp/project\",\"model\":\"gpt-5.4\",\"turn_id\":\"019da89d-b4e8-7000-8000-0000000000d1\"}",
+      "session_id": "019da89d-b100-7000-8000-0000000000d0",
+      "source": "codex",
+      "subkind": "turn_context",
+      "text": null,
+      "ts_ms": 1776650401001,
+      "turn_id": "019da89d-b4e8-7000-8000-0000000000d1"
+    },
+    {
       "kind": "task_complete",
       "marker_uid": "5:marker",
       "message_id": null,
@@ -202,6 +215,19 @@
       "subkind": "task_started",
       "text": null,
       "ts_ms": 1776650440010,
+      "turn_id": "019da89e-4d72-7000-8000-0000000000e1"
+    },
+    {
+      "kind": "turn_context",
+      "marker_uid": "4:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"cwd\":\"/tmp/project\",\"model\":\"gpt-5.4\",\"turn_id\":\"019da89e-4d72-7000-8000-0000000000e1\"}",
+      "session_id": "019da89e-4d40-7000-8000-0000000000e0",
+      "source": "codex",
+      "subkind": "turn_context",
+      "text": null,
+      "ts_ms": 1776650440012,
       "turn_id": "019da89e-4d72-7000-8000-0000000000e1"
     },
     {

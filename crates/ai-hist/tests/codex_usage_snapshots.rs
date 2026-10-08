@@ -1,4 +1,5 @@
-//! Every Codex `token_count` counter reaches the public read surface verbatim.
+//! Every Codex `token_count` counter and `turn_context` record reaches the
+//! public read surface verbatim.
 //!
 //! A turn whose rollout reports usage through `event_msg/token_count` without
 //! an assistant message still billed those tokens. Each populated snapshot is
@@ -176,4 +177,31 @@ fn snapshots_do_not_change_per_request_usage() {
         summary.usage.expect("totals").provider_total_tokens,
         Some(6950)
     );
+}
+
+/// burn's `simple-turn` again: its only assistant-free turn still names its
+/// model, through the `turn_context` the provider wrote, kept whole.
+#[test]
+fn a_turn_with_no_assistant_message_keeps_its_turn_context() {
+    let rollout = fixture("simple-turn.jsonl");
+    let (_dir, evidence) = synced(&rollout, "sess_simple_1");
+    let contexts: Vec<(Option<&str>, Value)> = evidence
+        .markers
+        .iter()
+        .filter(|marker| marker.kind == "turn_context")
+        .map(|marker| {
+            assert_eq!(marker.subkind.as_deref(), Some("turn_context"));
+            (
+                marker.turn_id.as_deref(),
+                serde_json::from_str(marker.raw_payload().expect("raw payload")).unwrap(),
+            )
+        })
+        .collect();
+    eprintln!("simple-turn: turn_context markers={contexts:?}");
+    let written: Value = serde_json::from_str(rollout.lines().nth(1).unwrap()).unwrap();
+    assert_eq!(
+        contexts,
+        vec![(Some("turn_simple_1"), written["payload"].clone())]
+    );
+    assert_eq!(contexts[0].1["model"], "gpt-5.4");
 }

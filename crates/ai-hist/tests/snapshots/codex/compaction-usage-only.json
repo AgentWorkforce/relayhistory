@@ -21,6 +21,19 @@
   "session_events": [],
   "session_markers": [
     {
+      "kind": "turn_context",
+      "marker_uid": "1:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"cwd\":\"/tmp/project\",\"model\":\"gpt-5.4\",\"turn_id\":\"turn_compact_1\"}",
+      "session_id": "sess_codex_compact",
+      "source": "codex",
+      "subkind": "turn_context",
+      "text": null,
+      "ts_ms": 1776654000100,
+      "turn_id": "turn_compact_1"
+    },
+    {
       "kind": "task_started",
       "marker_uid": "2:marker",
       "message_id": null,
@@ -84,6 +97,19 @@
       "text": null,
       "ts_ms": 1776654003100,
       "turn_id": null
+    },
+    {
+      "kind": "turn_context",
+      "marker_uid": "7:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"cwd\":\"/tmp/project\",\"model\":\"gpt-5.4\",\"turn_id\":\"turn_compact_2\"}",
+      "session_id": "sess_codex_compact",
+      "source": "codex",
+      "subkind": "turn_context",
+      "text": null,
+      "ts_ms": 1776654004000,
+      "turn_id": "turn_compact_2"
     },
     {
       "kind": "task_started",

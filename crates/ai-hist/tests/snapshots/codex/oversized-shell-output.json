@@ -82,6 +82,19 @@
   ],
   "session_markers": [
     {
+      "kind": "turn_context",
+      "marker_uid": "1:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"cwd\":\"/tmp/project\",\"model\":\"gpt-5.4\",\"turn_id\":\"turn_bloat_codex\"}",
+      "session_id": "sess_bloat_codex",
+      "source": "codex",
+      "subkind": "turn_context",
+      "text": null,
+      "ts_ms": 1776646800100,
+      "turn_id": "turn_bloat_codex"
+    },
+    {
       "kind": "task_started",
       "marker_uid": "2:marker",
       "message_id": null,
