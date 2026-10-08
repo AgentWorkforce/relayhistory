@@ -150,7 +150,7 @@
       "marker_uid": "3:marker",
       "message_id": null,
       "parent_id": null,
-      "payload_json": "null",
+      "payload_json": null,
       "session_id": "sess_context_wrapper_1",
       "source": "codex",
       "subkind": "token_count",

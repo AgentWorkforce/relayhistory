@@ -5912,8 +5912,8 @@ fn bounded_marker_json(document: &Value) -> Result<String> {
 /// Store one Codex `token_count` as a `usage_snapshot` marker.
 ///
 /// The payload is the provider's `info` as written — `total_token_usage`,
-/// `last_token_usage`, `model_context_window`, or `null` for the snapshot
-/// Codex emits before a turn has spent anything — bounded whole like any
+/// `last_token_usage`, `model_context_window` — or no payload for the `info:
+/// null` snapshot Codex emits before a turn has spent anything — bounded whole like any
 /// provider document in `payload_json`; the bound never alters a number, so
 /// counters are never truncated.
 /// It is a cumulative snapshot, not a per-request delta: per-request usage
@@ -5930,7 +5930,12 @@ fn record_codex_usage_snapshot(
     turn_id: Option<&str>,
     info: &Value,
 ) -> Result<()> {
-    let payload_json = bounded_marker_json(info)?;
+    // `info: null` carries no counters and stores no payload, like every
+    // other marker with nothing to say: a stored `"null"` would read back as
+    // `Some(Null)` here and `None` after a serde round trip.
+    let payload_json = (!info.is_null())
+        .then(|| bounded_marker_json(info))
+        .transpose()?;
     insert_session_marker(
         conn,
         "codex",
@@ -5944,7 +5949,7 @@ fn record_codex_usage_snapshot(
             kind: "usage_snapshot",
             subkind: Some("token_count"),
             text: None,
-            payload_json: Some(&payload_json),
+            payload_json: payload_json.as_deref(),
         },
     )?;
     Ok(())

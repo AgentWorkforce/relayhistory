@@ -1,4 +1,4 @@
-{"timestamp":"2026-04-20T03:00:00.000Z","type":"session_meta","payload":{"id":"sess_codex_compact","cwd":"/tmp/project","timestamp":"2026-04-20T03:00:00.000Z"}}
+{"timestamp":"2026-04-20T03:00:00.000Z","type":"session_meta","payload":{"id":"sess_codex_compact_usage_only","cwd":"/tmp/project","timestamp":"2026-04-20T03:00:00.000Z"}}
 {"timestamp":"2026-04-20T03:00:00.100Z","type":"turn_context","payload":{"turn_id":"turn_compact_1","cwd":"/tmp/project","model":"gpt-5.4"}}
 {"timestamp":"2026-04-20T03:00:00.200Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn_compact_1"}}
 {"timestamp":"2026-04-20T03:00:01.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":3000,"cached_input_tokens":1000,"output_tokens":200,"reasoning_output_tokens":50,"total_tokens":3200}}}}

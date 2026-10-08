@@ -440,7 +440,7 @@ const CORPUS: &[Fixture] = &[
         layout: Layout::CodexRollout,
         origin: Origin::Burn,
         files: &["codex/compaction-usage-only.jsonl"],
-        quirk: "burn's `compaction.jsonl`, byte for byte (this corpus's `compaction.jsonl` adds message records): two turns either side of a `compacted` record whose only usage evidence is their cumulative `token_count`s, with no assistant message",
+        quirk: "burn's `compaction.jsonl` with its session id renamed so it does not collide with this corpus's `compaction.jsonl`, which adds message records: two turns either side of a `compacted` record whose only usage evidence is their cumulative `token_count`s, with no assistant message",
     },
     Fixture {
         source: "codex",

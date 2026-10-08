@@ -69,8 +69,11 @@ fn snapshots(evidence: &SessionEvidence) -> Vec<(Option<&str>, Value)> {
         .into_iter()
         .map(|marker| {
             assert_eq!(marker.subkind.as_deref(), Some("token_count"));
-            let raw: Value = serde_json::from_str(marker.raw_payload().expect("raw payload"))
-                .expect("raw payload is JSON");
+            // `info: null` stores no payload.
+            let raw: Value = marker
+                .raw_payload()
+                .map(|raw| serde_json::from_str(raw).expect("raw payload is JSON"))
+                .unwrap_or(Value::Null);
             (marker.turn_id.as_deref(), raw)
         })
         .collect()
@@ -107,13 +110,13 @@ fn a_turn_with_no_assistant_message_keeps_its_token_count() {
     );
 }
 
-/// burn's verbatim `compaction`: two turns either side of a `compacted`
+/// burn's `compaction` (session id renamed): two turns either side of a `compacted`
 /// record, neither with an assistant message. Both cumulative snapshots stay
 /// readable, so the consumer can difference them itself.
 #[test]
 fn every_cumulative_snapshot_of_an_assistantless_rollout_is_kept() {
     let rollout = fixture("compaction-usage-only.jsonl");
-    let (_dir, evidence) = synced(&rollout, "sess_codex_compact");
+    let (_dir, evidence) = synced(&rollout, "sess_codex_compact_usage_only");
     eprintln!(
         "compaction-usage-only: requests={} usage={:?} snapshots={:?}",
         evidence.requests.len(),
@@ -245,4 +248,19 @@ fn counters_are_never_altered_by_the_marker_bound() {
     .collect::<String>();
     let (_dir, evidence) = synced(&rollout, "sess_counters");
     assert_eq!(snapshots(&evidence), vec![(Some("turn_c"), info)]);
+}
+
+/// State markers survive a serde round trip unchanged, `info: null` included:
+/// that snapshot stores no payload, so it cannot read back as `Some(Null)`
+/// before serialization and `None` after it.
+#[test]
+fn state_markers_round_trip_through_serde() {
+    let rollout = fixture("simple-turn.jsonl");
+    let (_dir, evidence) = synced(&rollout, "sess_simple_1");
+    let null_snapshot = usage_snapshots(&evidence)[0];
+    assert_eq!(null_snapshot.raw_payload(), None);
+    assert_eq!(null_snapshot.payload, None);
+    let encoded = serde_json::to_string(&evidence.markers).unwrap();
+    let decoded: Vec<Marker> = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(decoded, evidence.markers);
 }
