@@ -5911,11 +5911,12 @@ fn bounded_marker_json(document: &Value) -> Result<String> {
 
 /// Store one Codex `token_count` as a `usage_snapshot` marker.
 ///
-/// The payload is the provider's `info` as written — `total_token_usage`,
-/// `last_token_usage`, `model_context_window` — or no payload for the `info:
-/// null` snapshot Codex emits before a turn has spent anything — bounded whole like any
+/// The payload is the provider's `info` as written (`total_token_usage`,
+/// `last_token_usage`, `model_context_window`), bounded whole like any
 /// provider document in `payload_json`; the bound never alters a number, so
-/// counters are never truncated.
+/// counters are never truncated. The `info: null` snapshot Codex emits before
+/// a turn has spent anything stores no payload.
+///
 /// It is a cumulative snapshot, not a per-request delta: per-request usage
 /// stays on the assistant events' `token_json`, and nothing reads these
 /// markers into `session_requests`, so a turn's spend is never counted twice.
