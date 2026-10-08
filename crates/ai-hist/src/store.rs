@@ -825,6 +825,9 @@ const REQUIRED_INDEXES: &[&str] = &[
     "idx_session_events_page",
     "idx_tool_calls_page_v2",
     "idx_file_edits_page_v2",
+    // Retiring one record's rows on a re-read keys on its message id.
+    "idx_tool_calls_message",
+    "idx_file_edits_message",
     "idx_session_markers_page",
     "idx_session_presences_location",
     "idx_session_presences_locator",
@@ -1923,6 +1926,18 @@ VALUES ('session_presences_local_backfill_v1');
     )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_session_markers_page ON session_markers(source, session_id, (ts_ms IS NULL), ts_ms, id)",
+        [],
+    )?;
+    // A re-read retires one record's rows by `(source, session_id,
+    // message_id)` -- the Claude parser does it for every sidechain record it
+    // moves onto its child -- and without these each retirement scanned every
+    // tool call and edit of the parent session.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tool_calls_message ON tool_calls(source, session_id, message_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_file_edits_message ON file_edits(source, session_id, message_id)",
         [],
     )?;
     conn.execute(
