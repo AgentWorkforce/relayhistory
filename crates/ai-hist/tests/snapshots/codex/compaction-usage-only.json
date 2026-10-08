@@ -17,7 +17,7 @@
   "layout": "CodexRollout",
   "notes": [],
   "origin": "burn",
-  "quirk": "burn's `compaction.jsonl` verbatim: two turns either side of a `compacted` record whose only usage evidence is their cumulative `token_count`s, with no assistant message",
+  "quirk": "burn's `compaction.jsonl`, byte for byte (this corpus's `compaction.jsonl` adds message records): two turns either side of a `compacted` record whose only usage evidence is their cumulative `token_count`s, with no assistant message",
   "session_events": [],
   "session_markers": [
     {

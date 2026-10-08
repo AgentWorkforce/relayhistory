@@ -139,7 +139,7 @@ source without deciding which one fails the test.
 | `codex/with-tool-call` | burn | `codex/with-tool-call.jsonl` | function calls and their outputs as `response_item` records |
 | `codex/with-spawn-agent` | burn | `codex/with-spawn-agent.jsonl` | a `spawn_agent` function call: delegation stated in the tool call, not in session metadata |
 | `codex/compaction` | burn | `codex/compaction.jsonl` | a `compacted` record with `replacement_history`, followed by `context_compacted` and a fresh turn |
-| `codex/compaction-usage-only` | burn | `codex/compaction-usage-only.jsonl` | burn's `compaction.jsonl` verbatim: two turns either side of a `compacted` record whose only usage evidence is their cumulative `token_count`s, with no assistant message |
+| `codex/compaction-usage-only` | burn | `codex/compaction-usage-only.jsonl` | burn's `compaction.jsonl`, byte for byte (this corpus's `compaction.jsonl` adds message records): two turns either side of a `compacted` record whose only usage evidence is their cumulative `token_count`s, with no assistant message |
 | `codex/session-meta-relationships` | burn | `codex/session-meta-relationships.jsonl` | `sourceSessionId` / `forkSessionId` / `continuedFromSessionId` on a repeated `session_meta` |
 | `codex/user-turn-blocks` | burn | `codex/user-turn-blocks.jsonl` | user input arriving as `response_item` message blocks rather than `event_msg` |
 | `codex/oversized-shell-output` | burn | `codex/oversized-shell-output.jsonl` | an 80 KB shell function-call output |

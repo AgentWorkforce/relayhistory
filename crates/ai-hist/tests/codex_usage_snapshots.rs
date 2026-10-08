@@ -169,6 +169,15 @@ fn snapshots_do_not_change_per_request_usage() {
         snapshots(&evidence)
     );
     assert_eq!(snapshots(&evidence).len(), 2);
+    // Each request keeps its own delta: 3200 from zero, then 6950 - 3200.
+    assert_eq!(
+        evidence
+            .requests
+            .iter()
+            .map(|request| request.usage.as_ref().and_then(|u| u.provider_total_tokens))
+            .collect::<Vec<_>>(),
+        vec![Some(3200), Some(3750)]
+    );
     let summary = evidence.usage.expect("usage summary");
     assert_eq!(summary.total_request_count, 2);
     // The second snapshot's cumulative total: the deltas still sum to it, so
@@ -204,4 +213,36 @@ fn a_turn_with_no_assistant_message_keeps_its_turn_context() {
         vec![(Some("turn_simple_1"), written["payload"].clone())]
     );
     assert_eq!(contexts[0].1["model"], "gpt-5.4");
+}
+
+/// Token counters reach the consumer exactly as the provider wrote them. The
+/// marker payload bound cuts long strings and containers past 32 entries;
+/// it never touches a number, so a counter at `u64::MAX`, one above
+/// `i64::MAX`, a zero, and even a malformed fractional or negative one are
+/// all stored unchanged. Key order is not preserved and is not part of the
+/// contract.
+#[test]
+fn counters_are_never_altered_by_the_marker_bound() {
+    let info = json!({
+        "total_token_usage": {
+            "input_tokens": u64::MAX,
+            "cached_input_tokens": 9_223_372_036_854_775_808u64,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 1.5,
+            "reasoning_output_tokens": -3,
+            "total_tokens": 18_446_744_073_709_551_000u64
+        },
+        "last_token_usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+        "model_context_window": 400_000
+    });
+    let rollout = [
+        json!({"timestamp":"2026-04-20T00:00:00.000Z","type":"session_meta","payload":{"id":"sess_counters","cwd":"/tmp/project"}}),
+        json!({"timestamp":"2026-04-20T00:00:00.100Z","type":"turn_context","payload":{"turn_id":"turn_c","cwd":"/tmp/project","model":"gpt-5.4"}}),
+        json!({"timestamp":"2026-04-20T00:00:01.000Z","type":"event_msg","payload":{"type":"token_count","info":info}}),
+    ]
+    .iter()
+    .map(|line| format!("{line}\n"))
+    .collect::<String>();
+    let (_dir, evidence) = synced(&rollout, "sess_counters");
+    assert_eq!(snapshots(&evidence), vec![(Some("turn_c"), info)]);
 }

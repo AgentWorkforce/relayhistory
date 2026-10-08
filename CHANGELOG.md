@@ -8,8 +8,12 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- Codex sessions keep every `token_count` snapshot verbatim as a `usage_snapshot` marker on `SessionEvidence::markers`, with its `turn_id` and in read order, including turns that wrote no assistant message; a fork's `fork_replay_boundary` marker carries the inherited snapshot as `inherited_snapshot`. Existing stores re-read their Codex rollouts once on the next sync or hydration to capture them.
-- Codex sessions keep every `turn_context` record whole as a `turn_context` marker with its `turn_id`, so a turn's model, cwd and approval/sandbox policy are readable even when it wrote no assistant message.
+- Codex sessions keep every `token_count` snapshot outside a fork's replayed parent history as a `usage_snapshot` marker, as written, bounded per the marker contract (counters are never truncated), on `SessionEvidence::markers`, with its `turn_id` and in read order, including turns that wrote no assistant message; a fork's `fork_replay_boundary` marker carries the inherited snapshot as `inherited_snapshot`. Existing stores re-read their Codex rollouts once on the next sync or hydration to capture them.
+- Codex sessions keep every `turn_context` record as a `turn_context` marker, as written, bounded per the marker contract, with its `turn_id`, so a turn's model, cwd and approval/sandbox policy are readable even when it wrote no assistant message.
+
+### Fixed
+
+- Hydrating a Codex session with related sessions after a parser upgrade re-reads its child rollouts from the start instead of resuming from cursors the older parser committed.
 
 ## [0.36.0] - 2026-10-07
 
