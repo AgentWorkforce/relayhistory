@@ -117,10 +117,9 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 3;
 /// Version 15 recovers Codex desktop assistant response items from unchanged
 /// captures that previous parsers skipped.
 ///
-/// Version 16 stores each Claude record's own usage in `record_token_json`. A
-/// Claude checkpoint at 15 holds only the settled request blob, so it
-/// re-parses once and an embedder that only hydrates gets the column `sync`
-/// fills through raw-facts generation 4.
+/// Version 16 is the same one-time re-read for embedders that only hydrate:
+/// a checkpoint at 15 re-parses once and gets what raw-facts generation 4
+/// gives `sync`.
 const HYDRATION_PARSER_VERSION: i64 = 16;
 
 #[derive(Debug, Clone)]

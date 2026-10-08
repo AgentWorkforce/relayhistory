@@ -11149,9 +11149,9 @@ fn heal_claude_synthetic_session_summaries(conn: &Connection) -> Result<()> {
 /// indexed before it existed is indistinguishable from a prompt -- which is
 /// exactly the reading the column exists to prevent -- so the backfill this
 /// version drives is the one that repairs it.
-/// Generation 4 adds `record_token_json`: a Claude row indexed before it holds
-/// only the settled request blob, and the record's own usage is in the
-/// transcript alone.
+/// Generation 4 is the one capture re-read of the release after 0.36.0: a row
+/// stamped below it predates evidence that release's parsers store, and a
+/// finished transcript never changes on disk, so only this re-read stores it.
 const RAW_MESSAGE_FACTS_VERSION: i64 = 4;
 
 #[derive(Debug, Default, Clone, Copy)]
