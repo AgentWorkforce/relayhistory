@@ -7786,8 +7786,12 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
             }
             // A primary transcript is no delegation's evidence. An earlier
             // build read one made only of sidechain rows as a sidecar of its
-            // own session; that delegation is retracted here.
-            if misread_as_sidecar {
+            // own session; that delegation is retracted here. Asked of every
+            // transcript this walk re-reads, not only those the one-time pass
+            // found, so a file that was away while the pass ran is healed when
+            // it returns; the walk is reading the whole file already, and the
+            // probe is one indexed lookup.
+            if misread_as_sidecar || claude_delegation_cites(conn, &path)? {
                 retract_claude_delegation_evidence(conn, &path)?;
             }
             upsert_session(
@@ -27551,6 +27555,41 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A transcript that was away while the one-time pass ran -- its cursor
+    /// forgotten, so it never held the pass open -- still carries the earlier
+    /// build's delegation and child evidence when it returns. The walk reads
+    /// it as a new file and heals it then, after the pass is recorded.
+    #[test]
+    fn claude_sync_heals_a_misread_transcript_that_returns_after_the_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_claude_sidechain_only_transcript(dir.path(), Some("child-1"));
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let meta = scan_claude_session_file_resumed(&path, &mut None)
+            .unwrap()
+            .meta
+            .unwrap();
+        let (evidence, _) = hydrate::claude_subagent_evidence(path.clone(), &meta);
+        hydrate::ingest_claude_subagent(&conn, &meta.session_id, &evidence).unwrap();
+        transcript_cursor::forget_locator(&conn, "claude", &path.to_string_lossy()).unwrap();
+        assert_eq!(sidechain_only_placement(&conn, &path), (0, 1, 0, 1));
+        let mut state = Map::new();
+        state.insert(
+            CLAUDE_SIDECAR_LAYOUT_KEY.to_string(),
+            json!(CLAUDE_SIDECAR_LAYOUT_GENERATION),
+        );
+
+        sync_claude_session_metadata_with_repairs(
+            &conn,
+            &mut state,
+            dir.path(),
+            &Default::default(),
+        )
+        .unwrap();
+
+        assert_eq!(sidechain_only_placement(&conn, &path), (1, 0, 1, 0));
     }
 
     #[test]
