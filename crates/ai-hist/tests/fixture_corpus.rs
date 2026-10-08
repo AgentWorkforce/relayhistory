@@ -228,7 +228,7 @@ const CORPUS: &[Fixture] = &[
         layout: Layout::ClaudeTranscript,
         origin: Origin::Burn,
         files: &["claude/sidechain-turn.jsonl"],
-        quirk: "every record is `isSidechain: true` — a subagent sidecar, not a session of its own",
+        quirk: "every record is `isSidechain: true` in a primary `<session>.jsonl` — inline Task traffic, still its session's transcript",
     },
     Fixture {
         source: "claude",
@@ -1760,25 +1760,29 @@ fn claude_oversized_bash_output_records_the_call() {
     assert_eq!(text(&calls[0], "tool_use_id"), "tu_bash_big");
 }
 
-/// A sidecar transcript whose every record is `isSidechain: true` is evidence
-/// about somebody else's session, never a session of its own. It still records
-/// an *unlinked* delegation edge: the work happened, but the file names no
-/// child identity.
+/// A primary transcript whose every record is `isSidechain: true` — inline
+/// Task traffic from Claude Code versions that wrote it there — is its
+/// session's transcript: catalogued under the records' `sessionId`, its
+/// sidechain assistant turn and usage kept with `is_sidechain` set, and no
+/// delegation edge, because the file is not laid out as a sidecar.
 #[test]
-fn claude_sidechain_only_transcript_is_evidence_not_a_session() {
-    assert!(
-        rows("claude/sidechain-turn", "sessions").is_empty(),
-        "a sidechain-only file must not enter the catalog"
-    );
-    let relationships = rows("claude/sidechain-turn", "session_relationships");
-    assert_eq!(relationships.len(), 1, "{relationships:?}");
-    let edge = &relationships[0];
+fn claude_sidechain_only_primary_transcript_is_a_session() {
+    let sessions = rows("claude/sidechain-turn", "sessions");
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
     assert_eq!(
-        text(edge, "parent_session_id"),
+        text(&sessions[0], "session_id"),
         "44444444-4444-4444-4444-444444444444"
     );
-    assert_eq!(text(edge, "identity_status"), "unlinked");
-    assert_eq!(text(edge, "evidence_kind"), "claude_sidechain_records");
+    let events = rows("claude/sidechain-turn", "session_events");
+    assert_eq!(events.len(), 1, "{events:?}");
+    let usage: Value =
+        serde_json::from_str(text(&events[0], "token_json")).expect("token payload is JSON");
+    assert_eq!(usage.get("input_tokens").and_then(Value::as_i64), Some(50));
+    assert_eq!(usage.get("output_tokens").and_then(Value::as_i64), Some(10));
+    assert!(
+        rows("claude/sidechain-turn", "session_relationships").is_empty(),
+        "a primary transcript is no delegation's evidence"
+    );
 }
 
 /// The same file becomes a session as soon as one main-chain record appears.

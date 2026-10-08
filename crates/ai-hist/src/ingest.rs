@@ -7613,7 +7613,12 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
     for path in capture_files("claude", transcripts) {
         check_capture_cancelled()?;
         let transcript_events = claude_transcript_events_exist(conn, &path)?;
-        let indexed = transcript_events || claude_sidecar_evidence_exists(conn, &path)?;
+        // Delegation evidence vouches only for a file laid out as a sidecar.
+        // A primary transcript an earlier build read as one -- every record a
+        // sidechain row -- left that evidence and no catalog row, so it is not
+        // indexed until it is read as the session it is.
+        let indexed = transcript_events
+            || (is_claude_sidecar_file(&path) && claude_sidecar_evidence_exists(conn, &path)?);
         // During the one-time backfill passes, an unchanged transcript whose
         // rows predate either additive evidence shape is re-read to populate
         // it. Outside those passes the cursor alone decides, so a row this
@@ -7756,6 +7761,10 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
                 write.commit()?;
                 continue;
             }
+            // A primary transcript is no delegation's evidence. An earlier
+            // build read one made only of sidechain rows as a sidecar of its
+            // own session; that delegation row is retracted here.
+            retract_claude_delegation_evidence(conn, &path)?;
             upsert_session(
                 conn,
                 &meta.session_id,
@@ -7904,6 +7913,21 @@ where
 /// paired with the events it produced — under the child it named, or under
 /// the parent when it named none — so a wiped or rebuilt database still
 /// re-reads the file.
+/// Remove the `delegated` rows whose evidence is the transcript at `path`.
+///
+/// Called for a transcript read as a primary session: the only `delegated`
+/// rows that name one as their evidence are those an earlier build recorded
+/// when it read a primary transcript of nothing but sidechain rows as a
+/// sidecar.
+fn retract_claude_delegation_evidence(conn: &Connection, path: &Path) -> Result<()> {
+    conn.prepare_cached(
+        "DELETE FROM session_relationships \
+         WHERE source = 'claude' AND relationship = 'delegated' AND evidence_locator = ?",
+    )?
+    .execute([path.to_string_lossy().as_ref()])?;
+    Ok(())
+}
+
 fn claude_sidecar_evidence_exists(conn: &Connection, path: &Path) -> Result<bool> {
     let locator = path.to_string_lossy();
     // Markers count, for the same reason they count in the two session
@@ -8219,9 +8243,10 @@ pub(crate) struct ClaudeSessionMeta {
     /// `None` is the whole file's answer, not a gap: a transcript of nothing
     /// but control rows has no first prompt, and the catalog says so.
     first_prompt: Option<String>,
-    /// Every identified record is a sidechain row, so this file is a delegated
-    /// sidecar rather than a session of its own — the same rule discovery uses
-    /// to keep sidecars out of the catalog.
+    /// This file is a delegated sidecar rather than a session of its own: it
+    /// is named as one ([`is_claude_sidecar_file`]) and every identified
+    /// record is a sidechain row — the same rule discovery uses to keep
+    /// sidecars out of the catalog.
     subagent: bool,
     /// The child identity the provider recorded, read from the records and
     /// never from the file name. Absent on versions that do not emit it.
@@ -8389,9 +8414,9 @@ impl ClaudeMetaFold {
         }
     }
 
-    /// The session this transcript describes, or `None` when no record named
-    /// one.
-    pub(crate) fn finish(&self) -> Option<ClaudeSessionMeta> {
+    /// The session the transcript at `path` describes, or `None` when no
+    /// record named one.
+    pub(crate) fn finish(&self, path: &Path) -> Option<ClaudeSessionMeta> {
         let session_id = self.session_id.clone()?;
         let first = self.first_ts.unwrap_or(0);
         Some(ClaudeSessionMeta {
@@ -8403,11 +8428,42 @@ impl ClaudeMetaFold {
             last_ts: self.last_ts.unwrap_or(first),
             last_assistant_text: self.last_assistant_text.clone(),
             first_prompt: self.first_prompt.clone(),
-            subagent: self.identified_records > 0
-                && self.sidechain_records == self.identified_records,
+            subagent: is_claude_sidecar_file(path)
+                && claude_records_are_all_sidechain(
+                    self.identified_records,
+                    self.sidechain_records,
+                ),
             agent_id: self.agent_id.clone(),
         })
     }
+}
+
+/// The file-name prefix Claude Code gives a subagent sidecar transcript, in
+/// both layouts it has written: flat `agent-<id>.jsonl` beside the parent and
+/// `<parentSessionId>/subagents/agent-<id>.jsonl`. A primary transcript is
+/// `<sessionId>.jsonl`.
+pub(crate) const CLAUDE_SIDECAR_PREFIX: &str = "agent-";
+
+/// Whether `path` is laid out as a subagent sidecar transcript.
+///
+/// The layout decides which *role* a file plays, never whose identity it
+/// carries: a sidecar's child id still comes from its records' `agentId`.
+/// Content alone cannot decide the role. Claude Code versions that wrote Task
+/// traffic inline put it in the primary transcript as `isSidechain` rows, so
+/// a primary transcript can consist of nothing else — and its billable turns
+/// are that session's evidence, not a delegation of some other session.
+pub(crate) fn is_claude_sidecar_file(path: &Path) -> bool {
+    path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(CLAUDE_SIDECAR_PREFIX))
+}
+
+/// Every record that names a session is a sidechain row — what a sidecar's
+/// records look like, and the half of the sidecar rule content can answer.
+pub(crate) fn claude_records_are_all_sidechain(identified: usize, sidechain: usize) -> bool {
+    identified > 0 && sidechain == identified
 }
 
 /// Walk only the records that have arrived since `state` was written.
@@ -8543,7 +8599,7 @@ fn scan_claude_session_text(path: &Path, text: &str) -> Result<Option<ClaudeSess
         "conflicting sessionId values in Claude transcript {}",
         path.display()
     );
-    Ok(fold.finish())
+    Ok(fold.finish(path))
 }
 
 /// Index the records in bytes the hook captured.
@@ -8665,7 +8721,7 @@ pub(crate) fn scan_claude_session_file_resumed(
     let continuity =
         crate::continuity::finish_claude_fold(fold.continuity.clone(), fold.continuity_any, path);
     Ok(ClaudeScanPass {
-        meta: fold.finish(),
+        meta: fold.finish(path),
         bytes_read,
         validation_bytes,
         superseded,
@@ -27260,6 +27316,99 @@ mod tests {
             )
             .unwrap();
         assert_eq!(placement, (0, 1));
+    }
+
+    /// Inline Task traffic from older Claude Code versions: a primary
+    /// `<sessionId>.jsonl` whose every record is an `isSidechain` row.
+    fn write_claude_sidechain_only_transcript(root: &Path) -> PathBuf {
+        let project = root.join("-tmp-project");
+        fs::create_dir_all(&project).unwrap();
+        let path = project.join("44444444-4444-4444-4444-444444444444.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"parentUuid":null,"isSidechain":true,"type":"user","message":{"role":"user","content":"subagent prompt"},"uuid":"u-sidechain-user","timestamp":"2026-04-20T00:00:00.000Z","cwd":"/tmp/project","sessionId":"44444444-4444-4444-4444-444444444444"}"#, "\n",
+                r#"{"parentUuid":"u-sidechain-user","isSidechain":true,"message":{"model":"claude-haiku-4-5","id":"msg_side_1","type":"message","role":"assistant","content":[{"type":"text","text":"working on it"}],"stop_reason":"end_turn","usage":{"input_tokens":50,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"requestId":"req_side","type":"assistant","uuid":"u-asst-side","timestamp":"2026-04-20T00:00:01.000Z","cwd":"/tmp/project","sessionId":"44444444-4444-4444-4444-444444444444"}"#, "\n",
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    /// `(catalog rows naming the transcript, delegated rows citing it,
+    /// sidechain assistant rows with usage under the session)`.
+    fn sidechain_only_placement(conn: &Connection, path: &Path) -> (i64, i64, i64) {
+        conn.query_row(
+            "SELECT \
+               (SELECT COUNT(*) FROM sessions WHERE source = 'claude' \
+                  AND session_id = '44444444-4444-4444-4444-444444444444' AND raw_path = ?1), \
+               (SELECT COUNT(*) FROM session_relationships WHERE evidence_locator = ?1), \
+               (SELECT COUNT(*) FROM session_events WHERE source = 'claude' \
+                  AND session_id = '44444444-4444-4444-4444-444444444444' \
+                  AND role = 'assistant' AND is_sidechain = 1 AND token_json IS NOT NULL)",
+            [path.to_string_lossy().as_ref()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn plain_claude_sync_catalogs_a_primary_transcript_of_only_sidechain_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_claude_sidechain_only_transcript(dir.path());
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+
+        sync_claude_session_metadata_with_repairs(
+            &conn,
+            &mut state,
+            dir.path(),
+            &Default::default(),
+        )
+        .unwrap();
+
+        assert_eq!(sidechain_only_placement(&conn, &path), (1, 0, 1));
+    }
+
+    /// A store an earlier build synced read this transcript as a sidecar of
+    /// its own session: the events and an unlinked delegation row citing the
+    /// file, no catalog row, and a cursor that says the file is unchanged.
+    /// The next sync catalogs it and retracts the delegation.
+    #[test]
+    fn claude_sync_heals_a_sidechain_only_transcript_read_as_a_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_claude_sidechain_only_transcript(dir.path());
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut scan = None;
+        let meta = scan_claude_session_file_resumed(&path, &mut scan)
+            .unwrap()
+            .meta
+            .unwrap();
+        let (evidence, _) = hydrate::claude_subagent_evidence(path.clone(), &meta);
+        hydrate::ingest_claude_subagent(&conn, &meta.session_id, &evidence).unwrap();
+        let locator = path.to_string_lossy().to_string();
+        let key = transcript_cursor::CursorKey::Locator {
+            source: "claude",
+            locator: &locator,
+        };
+        let mut cursor = transcript_cursor::load_cursor(&conn, &key).unwrap();
+        cursor.claude.get_or_insert_with(Default::default).scan = scan;
+        transcript_cursor::store_cursor(&conn, &key, &cursor).unwrap();
+        assert_eq!(sidechain_only_placement(&conn, &path), (0, 1, 1));
+        assert!(claude_transcript_unchanged(&conn, &path).unwrap());
+
+        let mut state = Map::new();
+        sync_claude_session_metadata_with_repairs(
+            &conn,
+            &mut state,
+            dir.path(),
+            &Default::default(),
+        )
+        .unwrap();
+
+        assert_eq!(sidechain_only_placement(&conn, &path), (1, 0, 1));
     }
 
     #[test]

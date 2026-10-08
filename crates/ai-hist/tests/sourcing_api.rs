@@ -725,6 +725,104 @@ fn usage_request_id_and_stop_reason_arrive_typed_on_the_message() {
     assert_eq!(assistant.usage.as_ref().unwrap().cache_read_tokens, 500);
 }
 
+/// Stage `body` as the primary transcript `<home>/.claude/projects/-tmp-project/<name>.jsonl`
+/// and sync a store over that home.
+fn synced_claude_transcript(name: &str, body: &str) -> (tempfile::TempDir, SessionStore) {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join(".claude/projects/-tmp-project");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(project.join(format!("{name}.jsonl")), body).unwrap();
+    let store = open(dir.path());
+    store.sync(SyncOptions::default()).expect("sync");
+    (dir, store)
+}
+
+/// Claude Code versions that wrote Task traffic inline put it in the primary
+/// transcript as `isSidechain` rows, so a transcript can consist of nothing
+/// else. Its billable turn is that session's evidence: the session is listed,
+/// the message keeps `is_sidechain` and its provider usage verbatim, and the
+/// request carries the usage.
+#[test]
+fn a_primary_transcript_of_only_sidechain_rows_is_a_session_with_its_usage() {
+    let body = fs::read_to_string(fixtures_root().join("claude/sidechain-turn.jsonl")).unwrap();
+    let (_dir, store) = synced_claude_transcript("sidechain-turn", &body);
+    let evidence = only_session(&store, Source::Claude);
+    assert_eq!(
+        evidence.session.session_id,
+        "44444444-4444-4444-4444-444444444444"
+    );
+    assert_eq!(evidence.session.first_prompt, None);
+    assert!(evidence.relationships.is_empty());
+    let [message] = evidence.messages.as_slice() else {
+        panic!("one assistant message: {:?}", evidence.messages);
+    };
+    assert_eq!(message.role, Role::Assistant);
+    assert_eq!(message.is_sidechain, Some(true));
+    assert_eq!(message.model.as_deref(), Some("claude-haiku-4-5"));
+    let raw: Value = serde_json::from_str(message.raw_usage().expect("usage kept")).unwrap();
+    assert_eq!(raw["input_tokens"], 50);
+    assert_eq!(raw["output_tokens"], 10);
+    let [request] = evidence.requests.as_slice() else {
+        panic!("one request: {:?}", evidence.requests);
+    };
+    assert_eq!(request.request_key, "request-id:req_side");
+    let usage = request.usage.as_ref().expect("request usage");
+    assert_eq!((usage.input_tokens, usage.output_tokens), (50, 10));
+}
+
+/// Sidechain rows ahead of the main chain in one transcript: the sidechain
+/// assistant turn's usage is captured on the same session, flagged, and
+/// counted as its own request beside the main chain's.
+#[test]
+fn sidechain_usage_ahead_of_the_main_chain_stays_on_the_session() {
+    let body = concat!(
+        r#"{"parentUuid":"u-spawn","isSidechain":true,"type":"user","message":{"role":"user","content":"sidechain prompt"},"uuid":"u-side-1","timestamp":"2026-04-22T00:00:00.000Z","cwd":"/tmp/project","sessionId":"cccccccc-cccc-cccc-cccc-cccccccccccc","version":"2.1.97"}"#,
+        "\n",
+        r#"{"parentUuid":"u-side-1","isSidechain":true,"message":{"model":"claude-haiku-4-5","id":"msg_side","type":"message","role":"assistant","content":[{"type":"text","text":"side"}],"stop_reason":"end_turn","usage":{"input_tokens":50,"output_tokens":10}},"requestId":"req_side","type":"assistant","uuid":"u-asst-side","timestamp":"2026-04-22T00:00:00.500Z","cwd":"/tmp/project","sessionId":"cccccccc-cccc-cccc-cccc-cccccccccccc","version":"2.1.97"}"#,
+        "\n",
+        r#"{"parentUuid":"u-original-asst","isSidechain":false,"type":"user","message":{"role":"user","content":"continue from elsewhere"},"uuid":"u-main-1","timestamp":"2026-04-22T00:00:01.000Z","cwd":"/tmp/project","sessionId":"cccccccc-cccc-cccc-cccc-cccccccccccc","version":"2.1.97"}"#,
+        "\n",
+        r#"{"parentUuid":"u-main-1","isSidechain":false,"message":{"model":"claude-sonnet-4-6","id":"msg_x","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":1}},"requestId":"req_x","type":"assistant","uuid":"u-asst-x","timestamp":"2026-04-22T00:00:02.000Z","cwd":"/tmp/project","sessionId":"cccccccc-cccc-cccc-cccc-cccccccccccc","version":"2.1.97"}"#,
+        "\n",
+    );
+    let (_dir, store) = synced_claude_transcript("cccccccc-cccc-cccc-cccc-cccccccccccc", body);
+    let evidence = only_session(&store, Source::Claude);
+    assert_eq!(
+        evidence.session.first_prompt.as_deref(),
+        Some("continue from elsewhere")
+    );
+    let assistant: Vec<_> = evidence
+        .messages
+        .iter()
+        .filter(|message| message.role == Role::Assistant)
+        .map(|message| (message.message_id.as_deref(), message.is_sidechain))
+        .collect();
+    assert_eq!(
+        assistant,
+        vec![
+            (Some("u-asst-side"), Some(true)),
+            (Some("u-asst-x"), Some(false))
+        ]
+    );
+    let mut requests: Vec<_> = evidence
+        .requests
+        .iter()
+        .map(|request| {
+            let usage = request.usage.as_ref().expect("request usage");
+            (
+                request.request_key.as_str(),
+                usage.input_tokens,
+                usage.output_tokens,
+            )
+        })
+        .collect();
+    requests.sort();
+    assert_eq!(
+        requests,
+        vec![("request-id:req_side", 50, 10), ("request-id:req_x", 3, 1)]
+    );
+}
+
 #[test]
 fn markers_carry_the_compaction_boundary() {
     let (_dir, store, _) = synced(&CORPUS[3]); // claude/compact-boundary

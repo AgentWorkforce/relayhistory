@@ -4,7 +4,11 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Patch]
+
+### Fixed
+
+- A Claude transcript made only of `isSidechain` rows (inline Task traffic from older Claude Code) is now catalogued as its own session, with its sidechain turns' usage in `SessionEvidence::requests`; only an `agent-*.jsonl` file is read as a subagent sidecar, and the first `sync` after upgrading catalogs transcripts an earlier build dropped.
 
 ## [0.36.0] - 2026-10-07
 

@@ -3027,7 +3027,7 @@ fn claude_sidecars(conn: &Connection, directory: &Path) -> Result<ClaudeSidecarW
     let mut sidecars = Vec::new();
     let mut bytes_read = 0u64;
     let mut superseded = false;
-    for candidate in collect_matching_files(directory, "agent-", "jsonl")? {
+    for candidate in collect_matching_files(directory, super::CLAUDE_SIDECAR_PREFIX, "jsonl")? {
         super::check_capture_cancelled()?;
         let locator = candidate.to_string_lossy().to_string();
         let key = CursorKey::Locator {
