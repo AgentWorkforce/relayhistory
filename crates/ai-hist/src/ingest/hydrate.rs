@@ -117,10 +117,9 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 3;
 /// Version 15 recovers Codex desktop assistant response items from unchanged
 /// captures that previous parsers skipped.
 ///
-/// Version 16 captures Claude sidechain user rows -- delegated prompts and the
-/// tool results a subagent received -- which earlier parsers dropped. A Claude
-/// checkpoint at 15 re-parses once, so an embedder that only hydrates gets the
-/// rows `sync` gets from raw-facts generation 4.
+/// Version 16 is the same one-time re-read for embedders that only hydrate:
+/// a checkpoint at 15 re-parses once and gets what raw-facts generation 4
+/// gives `sync`.
 const HYDRATION_PARSER_VERSION: i64 = 16;
 
 #[derive(Debug, Clone)]

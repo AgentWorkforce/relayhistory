@@ -11100,9 +11100,9 @@ fn heal_claude_synthetic_session_summaries(conn: &Connection) -> Result<()> {
 /// indexed before it existed is indistinguishable from a prompt -- which is
 /// exactly the reading the column exists to prevent -- so the backfill this
 /// version drives is the one that repairs it.
-/// Generation 4 captures Claude sidechain user rows -- delegated prompts and
-/// the tool results a subagent received -- which earlier parsers dropped; a
-/// finished transcript never changes on disk, so only this re-read stores them.
+/// Generation 4 is the one capture re-read of the release after 0.36.0: a row
+/// stamped below it predates evidence that release's parsers store, and a
+/// finished transcript never changes on disk, so only this re-read stores it.
 const RAW_MESSAGE_FACTS_VERSION: i64 = 4;
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -27320,126 +27320,6 @@ mod tests {
         );
     }
 
-    /// An install synced before sidechain user rows were captured holds the
-    /// subagent's output and not the delegated prompt or tool result its
-    /// parent chain names. The transcript is unchanged on disk, so the
-    /// raw-facts generation is what re-reads it and stores them.
-    #[test]
-    fn plain_claude_sync_backfills_sidechain_user_rows_an_earlier_parser_dropped() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(
-            dir.path().join("sess-inline.jsonl"),
-            concat!(
-                r#"{"type":"user","uuid":"u1","sessionId":"sess-inline","cwd":"/tmp/project","isSidechain":false,"timestamp":"2026-04-20T00:00:00.000Z","message":{"role":"user","content":"explore"}}"#, "\n",
-                r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"sess-inline","cwd":"/tmp/project","isSidechain":false,"timestamp":"2026-04-20T00:00:01.000Z","message":{"id":"m1","role":"assistant","model":"claude-opus-5","content":[{"type":"tool_use","id":"toolu_task","name":"Task","input":{"prompt":"Research"}}]}}"#, "\n",
-                r#"{"type":"user","uuid":"s1","parentUuid":"a1","sessionId":"sess-inline","cwd":"/tmp/project","isSidechain":true,"timestamp":"2026-04-20T00:00:02.000Z","message":{"role":"user","content":"Research"}}"#, "\n",
-                r#"{"type":"assistant","uuid":"s2","parentUuid":"s1","sessionId":"sess-inline","cwd":"/tmp/project","isSidechain":true,"timestamp":"2026-04-20T00:00:03.000Z","message":{"id":"m2","role":"assistant","model":"claude-haiku-4-5","content":[{"type":"tool_use","id":"toolu_read","name":"Read","input":{"file_path":"/tmp/project/a.rs"}}],"usage":{"input_tokens":5,"output_tokens":2}}}"#, "\n",
-                r#"{"type":"user","uuid":"s3","parentUuid":"s2","sessionId":"sess-inline","cwd":"/tmp/project","isSidechain":true,"timestamp":"2026-04-20T00:00:04.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_read","content":"fn main() {}"}]}}"#, "\n",
-            ),
-        )
-        .unwrap();
-        let sidechain_rows = |conn: &Connection| -> Vec<(String, String, String)> {
-            conn.prepare(
-                "SELECT message_id, kind, COALESCE(parent_id, '') FROM session_events \
-                 WHERE source = 'claude' AND is_sidechain = 1 ORDER BY ts_ms, id",
-            )
-            .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap()
-        };
-        let expected = vec![
-            ("s1".to_string(), "text".to_string(), "a1".to_string()),
-            ("s2".to_string(), "tool_use".to_string(), "s1".to_string()),
-            (
-                "s3".to_string(),
-                "tool_result".to_string(),
-                "s2".to_string(),
-            ),
-        ];
-
-        let conn = Connection::open_in_memory().unwrap();
-        init_db(&conn).unwrap();
-        let mut state = Map::new();
-        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
-        assert_eq!(sidechain_rows(&conn), expected);
-        let history: Vec<String> = conn
-            .prepare("SELECT prompt FROM history WHERE source = 'claude'")
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        assert_eq!(history, vec!["explore".to_string()]);
-
-        // What an earlier parser left: no sidechain user rows, and rows
-        // stamped with the generation before this one.
-        conn.execute(
-            "DELETE FROM session_events WHERE source = 'claude' AND message_id IN ('s1', 's3')",
-            [],
-        )
-        .unwrap();
-        blank_raw_message_facts(&conn, "claude");
-        blank_raw_message_facts_state(&mut state);
-        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
-        assert_eq!(sidechain_rows(&conn), expected);
-    }
-
-    /// A named sidecar whose only record is the delegated prompt -- a child
-    /// interrupted before it replied -- left an earlier parser a delegation
-    /// row and no child events. That is not delegation evidence the fast path
-    /// accepts (`claude_sidecar_evidence_exists` asks for the child's rows),
-    /// so the next sync re-reads the sidecar and stores the prompt.
-    #[test]
-    fn plain_claude_sync_rereads_a_sidecar_an_earlier_parser_left_without_rows() {
-        let dir = tempfile::tempdir().unwrap();
-        let project = dir.path().join("app");
-        let subagents = project.join("root-1/subagents");
-        fs::create_dir_all(&subagents).unwrap();
-        fs::write(
-            project.join("root-1.jsonl"),
-            concat!(
-                r#"{"type":"user","uuid":"u1","sessionId":"root-1","cwd":"/work/app","timestamp":"2026-08-31T11:00:00Z","message":{"role":"user","content":"start"}}"#, "\n",
-            ),
-        )
-        .unwrap();
-        let sidecar = subagents.join("agent-child.jsonl");
-        fs::write(
-            &sidecar,
-            concat!(
-                r#"{"type":"user","uuid":"c1","sessionId":"root-1","agentId":"child","isSidechain":true,"cwd":"/work/app","timestamp":"2026-08-31T11:00:01Z","message":{"role":"user","content":"delegated instruction"}}"#, "\n",
-            ),
-        )
-        .unwrap();
-        let child_rows = |conn: &Connection| -> (i64, i64) {
-            conn.query_row(
-                "SELECT \
-                   (SELECT COUNT(*) FROM session_events WHERE source = 'claude' \
-                      AND session_id = 'child' AND is_sidechain = 1), \
-                   (SELECT COUNT(*) FROM session_relationships WHERE source = 'claude' \
-                      AND child_session_id = 'child')",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap()
-        };
-        let conn = Connection::open_in_memory().unwrap();
-        init_db(&conn).unwrap();
-        let mut state = Map::new();
-        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
-        assert_eq!(child_rows(&conn), (1, 1));
-
-        conn.execute(
-            "DELETE FROM session_events WHERE source = 'claude' AND session_id = 'child'",
-            [],
-        )
-        .unwrap();
-        assert!(!claude_sidecar_evidence_exists(&conn, &sidecar).unwrap());
-        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
-        assert_eq!(child_rows(&conn), (1, 1));
-    }
-
     #[test]
     fn plain_claude_sync_backfills_raw_facts_for_transcripts_indexed_before_them() {
         let dir = tempfile::tempdir().unwrap();
@@ -33389,6 +33269,126 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM session_events", [], |r| r.get(0))
             .unwrap();
         assert_eq!(before, after);
+    }
+
+    /// An install synced before sidechain user rows were captured holds the
+    /// subagent's output and not the delegated prompt or tool result its
+    /// parent chain names. The transcript is unchanged on disk, so the
+    /// raw-facts generation is what re-reads it and stores them.
+    #[test]
+    fn plain_claude_sync_backfills_sidechain_user_rows_an_earlier_parser_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("sess-inline.jsonl"),
+            concat!(
+                r#"{"type":"user","uuid":"u1","sessionId":"sess-inline","cwd":"/tmp/project","isSidechain":false,"timestamp":"2026-04-20T00:00:00.000Z","message":{"role":"user","content":"explore"}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"sess-inline","cwd":"/tmp/project","isSidechain":false,"timestamp":"2026-04-20T00:00:01.000Z","message":{"id":"m1","role":"assistant","model":"claude-opus-5","content":[{"type":"tool_use","id":"toolu_task","name":"Task","input":{"prompt":"Research"}}]}}"#, "\n",
+                r#"{"type":"user","uuid":"s1","parentUuid":"a1","sessionId":"sess-inline","cwd":"/tmp/project","isSidechain":true,"timestamp":"2026-04-20T00:00:02.000Z","message":{"role":"user","content":"Research"}}"#, "\n",
+                r#"{"type":"assistant","uuid":"s2","parentUuid":"s1","sessionId":"sess-inline","cwd":"/tmp/project","isSidechain":true,"timestamp":"2026-04-20T00:00:03.000Z","message":{"id":"m2","role":"assistant","model":"claude-haiku-4-5","content":[{"type":"tool_use","id":"toolu_read","name":"Read","input":{"file_path":"/tmp/project/a.rs"}}],"usage":{"input_tokens":5,"output_tokens":2}}}"#, "\n",
+                r#"{"type":"user","uuid":"s3","parentUuid":"s2","sessionId":"sess-inline","cwd":"/tmp/project","isSidechain":true,"timestamp":"2026-04-20T00:00:04.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_read","content":"fn main() {}"}]}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let sidechain_rows = |conn: &Connection| -> Vec<(String, String, String)> {
+            conn.prepare(
+                "SELECT message_id, kind, COALESCE(parent_id, '') FROM session_events \
+                 WHERE source = 'claude' AND is_sidechain = 1 ORDER BY ts_ms, id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        };
+        let expected = vec![
+            ("s1".to_string(), "text".to_string(), "a1".to_string()),
+            ("s2".to_string(), "tool_use".to_string(), "s1".to_string()),
+            (
+                "s3".to_string(),
+                "tool_result".to_string(),
+                "s2".to_string(),
+            ),
+        ];
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(sidechain_rows(&conn), expected);
+        let history: Vec<String> = conn
+            .prepare("SELECT prompt FROM history WHERE source = 'claude'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(history, vec!["explore".to_string()]);
+
+        // What an earlier parser left: no sidechain user rows, and rows
+        // stamped with the generation before this one.
+        conn.execute(
+            "DELETE FROM session_events WHERE source = 'claude' AND message_id IN ('s1', 's3')",
+            [],
+        )
+        .unwrap();
+        blank_raw_message_facts(&conn, "claude");
+        blank_raw_message_facts_state(&mut state);
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(sidechain_rows(&conn), expected);
+    }
+
+    /// A named sidecar whose only record is the delegated prompt -- a child
+    /// interrupted before it replied -- left an earlier parser a delegation
+    /// row and no child events. That is not delegation evidence the fast path
+    /// accepts (`claude_sidecar_evidence_exists` asks for the child's rows),
+    /// so the next sync re-reads the sidecar and stores the prompt.
+    #[test]
+    fn plain_claude_sync_rereads_a_sidecar_an_earlier_parser_left_without_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("app");
+        let subagents = project.join("root-1/subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        fs::write(
+            project.join("root-1.jsonl"),
+            concat!(
+                r#"{"type":"user","uuid":"u1","sessionId":"root-1","cwd":"/work/app","timestamp":"2026-08-31T11:00:00Z","message":{"role":"user","content":"start"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let sidecar = subagents.join("agent-child.jsonl");
+        fs::write(
+            &sidecar,
+            concat!(
+                r#"{"type":"user","uuid":"c1","sessionId":"root-1","agentId":"child","isSidechain":true,"cwd":"/work/app","timestamp":"2026-08-31T11:00:01Z","message":{"role":"user","content":"delegated instruction"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let child_rows = |conn: &Connection| -> (i64, i64) {
+            conn.query_row(
+                "SELECT \
+                   (SELECT COUNT(*) FROM session_events WHERE source = 'claude' \
+                      AND session_id = 'child' AND is_sidechain = 1), \
+                   (SELECT COUNT(*) FROM session_relationships WHERE source = 'claude' \
+                      AND child_session_id = 'child')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(child_rows(&conn), (1, 1));
+
+        conn.execute(
+            "DELETE FROM session_events WHERE source = 'claude' AND session_id = 'child'",
+            [],
+        )
+        .unwrap();
+        assert!(!claude_sidecar_evidence_exists(&conn, &sidecar).unwrap());
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(child_rows(&conn), (1, 1));
     }
 
     #[test]
