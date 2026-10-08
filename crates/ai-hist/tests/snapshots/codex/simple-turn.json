@@ -34,6 +34,32 @@
       "turn_id": "turn_simple_1"
     },
     {
+      "kind": "usage_snapshot",
+      "marker_uid": "3:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "null",
+      "session_id": "sess_simple_1",
+      "source": "codex",
+      "subkind": "token_count",
+      "text": null,
+      "ts_ms": 1776643200300,
+      "turn_id": "turn_simple_1"
+    },
+    {
+      "kind": "usage_snapshot",
+      "marker_uid": "4:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"last_token_usage\":{\"cached_input_tokens\":400,\"input_tokens\":1000,\"output_tokens\":120,\"reasoning_output_tokens\":30,\"total_tokens\":1120},\"total_token_usage\":{\"cached_input_tokens\":400,\"input_tokens\":1000,\"output_tokens\":120,\"reasoning_output_tokens\":30,\"total_tokens\":1120}}",
+      "session_id": "sess_simple_1",
+      "source": "codex",
+      "subkind": "token_count",
+      "text": null,
+      "ts_ms": 1776643205000,
+      "turn_id": "turn_simple_1"
+    },
+    {
       "kind": "task_complete",
       "marker_uid": "5:marker",
       "message_id": null,

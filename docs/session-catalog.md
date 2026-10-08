@@ -510,8 +510,9 @@ it holds for every kind.
 | `stream_error` | – | ✓ | – | – | – | `stream_error` |
 | `tool_begin` | – | ✓ any `*_begin` | – | – | – | `exec_command_begin`, `patch_apply_begin`, `mcp_tool_call_begin` |
 | `review_mode` | – | ✓ | – | – | – | `entered_review_mode`, `exited_review_mode` |
-| `fork_replay_boundary` | – | ✓ one per replayed span in a forked rollout: `parent_id` is the fork parent, `turn_id` the child turn that closed it, `payload_json` carries `first_line`, `last_line`, `replayed_lines`, `closed_by` (`turn_id`, `task_started.started_at`, `undecided`, or null while the span is still open), `inherited_total_tokens`, and `inherited_baseline` (`pending`, `applied`, `dropped`) with `inherited_baseline_basis` (`last_token_usage`, `regression`, `no_evidence`) | – | – | – | `session_meta` |
+| `fork_replay_boundary` | – | ✓ one per replayed span in a forked rollout: `parent_id` is the fork parent, `turn_id` the child turn that closed it, `payload_json` carries `first_line`, `last_line`, `replayed_lines`, `closed_by` (`turn_id`, `task_started.started_at`, `undecided`, or null while the span is still open), `inherited_total_tokens` with `inherited_snapshot` (the replayed `token_count` `info` it was read from, verbatim), and `inherited_baseline` (`pending`, `applied`, `dropped`) with `inherited_baseline_basis` (`last_token_usage`, `regression`, `no_evidence`) | – | – | – | `session_meta` |
 | `unsupported_block` | ✓ any content block with no event `kind`, plus thinking signatures | – | – | – | ✓ a human `user` node whose `content` holds no readable text; its JSON type in `payload_json`, never the payload | `image`, `document`, `redacted_thinking`, `server_tool_use`, `thinking_signature`, `user_content` |
+| `usage_snapshot` | – | ✓ every `event_msg/token_count`, in read order: `payload_json` is the provider's `info` verbatim (`total_token_usage`, `last_token_usage`, `model_context_window`, or `null`), `turn_id` the turn it fell inside. A cumulative snapshot, never added into `session_requests` | – | – | – | `token_count` |
 | `encrypted_reasoning` | – | ✓ `response_item/reasoning` | ✓ an opaque reasoning trace with no summary | ✓ `reasoning_committed` with only `encrypted_content` | – | `reasoning` |
 | `tool_replacement` | ✓ `_meta.replaces` / `_meta.collapsedCalls` | – | – | – | – | `tool_result` |
 | `system` | – | – | ✓ a system preamble, in `text` | – | ✓ a `role:"system"` node, in `text` | – |
@@ -567,8 +568,7 @@ rule.
 
 Codex keeps one explicit exception list, for lines that are state updates
 rather than records and whose information is stored elsewhere: `session_meta`
-and `turn_context` populate the catalog, `token_count` is folded into the
-adjacent assistant event's `token_json`, `thread_settings_applied` carries the
+and `turn_context` populate the catalog, `thread_settings_applied` carries the
 model forward, a `*_delta` is a fragment of an event recorded whole, and an
 assistant `message` is the mirrored twin of the `agent_message` that stores the
 text.

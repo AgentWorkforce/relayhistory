@@ -720,14 +720,15 @@ Bring a tokenizer and apply it to `byte_len`.
 carry, kept rather than dropped — compaction and summary boundaries, provider
 `system` rows, non-text content blocks (`image`, `document`,
 `redacted_thinking`, thinking signatures), tool-replacement metadata, Codex
-lifecycle events, and the folded slash-command triad.
+lifecycle events, Codex `token_count` usage snapshots, and the folded
+slash-command triad.
 
 | Field | Meaning |
 | --- | --- |
 | `id`, `marker_uid` | Row id and the stable per-session marker identity |
 | `ts_ms` | `Option` — some markers are undated |
 | `message_id`, `parent_id`, `turn_id` | Where in the conversation it sits, as far as the provider said |
-| `kind` | The parser's classified vocabulary — `compaction_boundary`, `system`, `synthetic_turn`, `encrypted_reasoning`, `slash_command`, `unknown`, … — stable per source once written |
+| `kind` | The parser's classified vocabulary — `compaction_boundary`, `system`, `synthetic_turn`, `encrypted_reasoning`, `usage_snapshot`, `slash_command`, `unknown`, … — stable per source once written |
 | `subkind` | The provider-native type, verbatim — so a record no classifier knows still lands with its real name |
 | `text` | The provider's own readable text, when it wrote one. `None` under `include_text: false` |
 | `payload` | `Option<serde_json::Value>`: an allowlisted, bounded projection, parsed — strings cut at 128 characters, containers at 32 entries, recursively. Never the bytes of an image. `raw_payload()` is the stored string |

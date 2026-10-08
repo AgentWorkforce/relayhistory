@@ -157,6 +157,19 @@
   ],
   "session_markers": [
     {
+      "kind": "usage_snapshot",
+      "marker_uid": "2:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"total_token_usage\":{\"cached_input_tokens\":0,\"input_tokens\":-1,\"output_tokens\":9000,\"reasoning_output_tokens\":0,\"total_tokens\":8999}}",
+      "session_id": "sess_codex_reinstall",
+      "source": "codex",
+      "subkind": "token_count",
+      "text": null,
+      "ts_ms": 1776682800150,
+      "turn_id": "t1"
+    },
+    {
       "kind": "task_started",
       "marker_uid": "3:marker",
       "message_id": null,
@@ -167,6 +180,45 @@
       "subkind": "task_started",
       "text": null,
       "ts_ms": 1776682800200,
+      "turn_id": "t1"
+    },
+    {
+      "kind": "usage_snapshot",
+      "marker_uid": "6:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"total_token_usage\":{\"cached_input_tokens\":0,\"input_tokens\":900,\"output_tokens\":55.5,\"reasoning_output_tokens\":0,\"total_tokens\":955}}",
+      "session_id": "sess_codex_reinstall",
+      "source": "codex",
+      "subkind": "token_count",
+      "text": null,
+      "ts_ms": 1776682801000,
+      "turn_id": "t1"
+    },
+    {
+      "kind": "usage_snapshot",
+      "marker_uid": "7:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"total_token_usage\":{\"cached_input_tokens\":0,\"input_tokens\":1000,\"output_tokens\":300,\"reasoning_output_tokens\":0,\"total_tokens\":1300}}",
+      "session_id": "sess_codex_reinstall",
+      "source": "codex",
+      "subkind": "token_count",
+      "text": null,
+      "ts_ms": 1776682801500,
+      "turn_id": "t1"
+    },
+    {
+      "kind": "usage_snapshot",
+      "marker_uid": "10:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"total_token_usage\":{\"cached_input_tokens\":0,\"input_tokens\":1400,\"output_tokens\":440,\"reasoning_output_tokens\":0,\"total_tokens\":1840}}",
+      "session_id": "sess_codex_reinstall",
+      "source": "codex",
+      "subkind": "token_count",
+      "text": null,
+      "ts_ms": 1776682803000,
       "turn_id": "t1"
     },
     {

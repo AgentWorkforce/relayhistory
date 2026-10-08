@@ -4,7 +4,11 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Minor]
+
+### Added
+
+- Codex sessions keep every `token_count` snapshot verbatim as a `usage_snapshot` marker on `SessionEvidence::markers`, with its `turn_id` and in read order, including turns that wrote no assistant message; a fork's `fork_replay_boundary` marker carries the inherited snapshot as `inherited_snapshot`. Existing stores re-read their Codex rollouts once on the next sync or hydration to capture them.
 
 ## [0.36.0] - 2026-10-07
 

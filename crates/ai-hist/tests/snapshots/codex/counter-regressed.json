@@ -133,6 +133,32 @@
       "turn_id": "turn_regressed_1"
     },
     {
+      "kind": "usage_snapshot",
+      "marker_uid": "5:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"total_token_usage\":{\"cached_input_tokens\":1000,\"input_tokens\":3000,\"output_tokens\":200,\"reasoning_output_tokens\":50,\"total_tokens\":3200}}",
+      "session_id": "sess_codex_regressed",
+      "source": "codex",
+      "subkind": "token_count",
+      "text": null,
+      "ts_ms": 1776657601000,
+      "turn_id": "turn_regressed_1"
+    },
+    {
+      "kind": "usage_snapshot",
+      "marker_uid": "7:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"total_token_usage\":{\"cached_input_tokens\":1500,\"input_tokens\":3100,\"output_tokens\":250,\"reasoning_output_tokens\":60,\"total_tokens\":3410}}",
+      "session_id": "sess_codex_regressed",
+      "source": "codex",
+      "subkind": "token_count",
+      "text": null,
+      "ts_ms": 1776657602000,
+      "turn_id": "turn_regressed_1"
+    },
+    {
       "kind": "task_complete",
       "marker_uid": "8:marker",
       "message_id": null,

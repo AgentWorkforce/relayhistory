@@ -116,7 +116,11 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 3;
 ///
 /// Version 15 recovers Codex desktop assistant response items from unchanged
 /// captures that previous parsers skipped.
-const HYDRATION_PARSER_VERSION: i64 = 15;
+///
+/// Version 16 stores every Codex `token_count` as a `usage_snapshot` marker. A
+/// checkpoint at 15 re-parses once, so an embedder that only hydrates gets the
+/// counters sync's `codex_usage_snapshots` backfill captures.
+const HYDRATION_PARSER_VERSION: i64 = 16;
 
 #[derive(Debug, Clone)]
 pub struct HydrateSessionOptions {

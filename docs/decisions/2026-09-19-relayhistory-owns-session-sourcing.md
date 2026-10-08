@@ -248,6 +248,14 @@ carry its usage, streamed copies whose output side grows are settled onto one
 blob at parse time, and `<synthetic>` notices are stored as `local_notice`
 markers rather than as requests. See `docs/usage-accounting.md`._
 
+_Codex's raw counters are captured whole: every `token_count` is stored
+verbatim, in read order, as a `usage_snapshot` marker carrying the provider's
+`info` and the turn it fell inside — a turn with no assistant message
+included — and a fork's replayed snapshot is kept on its
+`fork_replay_boundary` marker. Codex stays `◐` because the per-request deltas
+are still attached to assistant events, so a turn with none reports no
+request. See `docs/usage-accounting.md`._
+
 Devin is `◐` on the same row: `message_nodes.chat_message.metadata.num_tokens`
 is written to `token_json` verbatim, but it is a single figure with no
 input/output split, and the session-level counters in `sessions.metadata` ride

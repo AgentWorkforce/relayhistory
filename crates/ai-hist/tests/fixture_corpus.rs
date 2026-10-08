@@ -436,6 +436,14 @@ const CORPUS: &[Fixture] = &[
     },
     Fixture {
         source: "codex",
+        name: "compaction-usage-only",
+        layout: Layout::CodexRollout,
+        origin: Origin::Burn,
+        files: &["codex/compaction-usage-only.jsonl"],
+        quirk: "burn's `compaction.jsonl` verbatim: two turns either side of a `compacted` record whose only usage evidence is their cumulative `token_count`s, with no assistant message",
+    },
+    Fixture {
+        source: "codex",
         name: "session-meta-relationships",
         layout: Layout::CodexRollout,
         origin: Origin::Burn,

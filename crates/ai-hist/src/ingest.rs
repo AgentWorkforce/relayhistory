@@ -3178,6 +3178,25 @@ const CODEX_RAW_MESSAGE_FACTS_KEY: &str = "codex_raw_message_facts";
 const CODEX_FORK_REPLAY_GENERATION: i64 = 1;
 const CODEX_FORK_REPLAY_KEY: &str = "codex_fork_replay_gate";
 
+/// One-time re-read of every Codex rollout indexed before `token_count`
+/// snapshots were stored as `usage_snapshot` markers. A finished rollout's
+/// stamp never changes, so without this its counters would stay unread for
+/// the life of the install. Recorded only after a walk that reached every
+/// known root, like the other backfills.
+const CODEX_USAGE_SNAPSHOT_GENERATION: i64 = 1;
+const CODEX_USAGE_SNAPSHOT_KEY: &str = "codex_usage_snapshots";
+
+/// Whether a Codex session already carries the `usage_snapshot` markers this
+/// parser writes.
+fn codex_usage_snapshots_exist(conn: &Connection, session_id: &str) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM session_markers \
+             WHERE source = 'codex' AND session_id = ? AND kind = 'usage_snapshot')",
+        )?
+        .query_row([session_id], |row| row.get::<_, bool>(0))?)
+}
+
 /// Whether this provider still owes a one-time raw-facts backfill pass.
 fn raw_facts_backfill_pending(state: &Map<String, Value>, key: &str) -> bool {
     state.get(key).and_then(Value::as_i64).unwrap_or(0) < RAW_MESSAGE_FACTS_GENERATION
@@ -4760,6 +4779,11 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
         .and_then(Value::as_i64)
         .unwrap_or(0)
         < CODEX_FORK_REPLAY_GENERATION;
+    let backfill_usage_snapshots = state
+        .get(CODEX_USAGE_SNAPSHOT_KEY)
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        < CODEX_USAGE_SNAPSHOT_GENERATION;
     // A root the stamp map has entries for but whose rollouts this run cannot
     // see is an archive we could not read, not an archive that is gone.
     // Walking it vacuously and then recording the generation would retire the
@@ -4889,6 +4913,10 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                     Some(_)
                         if backfill_fork_replay
                             && crate::continuity::codex_evidence_names_fork(conn, &key)? => {}
+                    // Indexed before `token_count` snapshots were stored:
+                    // re-read once so its counters are captured.
+                    Some(id)
+                        if backfill_usage_snapshots && !codex_usage_snapshots_exist(conn, id)? => {}
                     Some(id)
                         if codex_session_evidence_exists(conn, id)?
                             && !(backfill_fidelity
@@ -5100,6 +5128,10 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
         state.insert(
             CODEX_FORK_REPLAY_KEY.to_string(),
             json!(CODEX_FORK_REPLAY_GENERATION),
+        );
+        state.insert(
+            CODEX_USAGE_SNAPSHOT_KEY.to_string(),
+            json!(CODEX_USAGE_SNAPSHOT_GENERATION),
         );
     }
     if repairs.repairs_all() && !walked_every_known_root {
@@ -5847,6 +5879,46 @@ fn surviving_refusals(
     refused
 }
 
+/// Store one Codex `token_count` as a `usage_snapshot` marker.
+///
+/// The payload is the provider's `info` as written — `total_token_usage`,
+/// `last_token_usage`, `model_context_window`, or `null` for the snapshot
+/// Codex emits before a turn has spent anything — bounded whole like any
+/// provider document in `payload_json` (a bound no counter object reaches).
+/// It is a cumulative snapshot, not a per-request delta: per-request usage
+/// stays on the assistant events' `token_json`, and nothing reads these
+/// markers into `session_requests`, so a turn's spend is never counted twice.
+/// What it adds is the counter itself, for every snapshot the provider wrote,
+/// including those of a turn that produced no assistant event to carry a
+/// delta.
+fn record_codex_usage_snapshot(
+    conn: &Connection,
+    session_id: &str,
+    index: usize,
+    ts_ms: i64,
+    turn_id: Option<&str>,
+    info: &Value,
+) -> Result<()> {
+    let payload_json = serde_json::to_string(&bound_marker_value(info.clone()))?;
+    insert_session_marker(
+        conn,
+        "codex",
+        session_id,
+        &NewSessionMarker {
+            marker_uid: &format!("{index}:marker"),
+            ts_ms: (ts_ms != 0).then_some(ts_ms),
+            message_id: None,
+            parent_id: None,
+            turn_id,
+            kind: "usage_snapshot",
+            subkind: Some("token_count"),
+            text: None,
+            payload_json: Some(&payload_json),
+        },
+    )?;
+    Ok(())
+}
+
 /// Attach measured usage to the assistant event that earned it, or hold it
 /// until one appears.
 fn attach_codex_usage(
@@ -6443,10 +6515,20 @@ fn ingest_codex_rollout_incremental(
                     }
                 }
                 "token_count" => {
-                    let Some(usage) = payload
-                        .get("info")
-                        .and_then(|info| info.get("total_token_usage"))
-                    else {
+                    // The provider's counters, kept as written whatever the
+                    // differencing below makes of them: a turn with no
+                    // assistant event has nowhere to attach a delta, and its
+                    // snapshot is still the only record of what it billed.
+                    let info = payload.get("info").unwrap_or(&Value::Null);
+                    record_codex_usage_snapshot(
+                        conn,
+                        session_id,
+                        index,
+                        ts_ms,
+                        turn_id.as_deref(),
+                        info,
+                    )?;
+                    let Some(usage) = info.get("total_token_usage") else {
                         continue;
                     };
                     // The provider reported a call here, so the rows written
@@ -7015,6 +7097,9 @@ struct ForkReplaySpan {
     prompts: Vec<(i64, String)>,
     /// The last readable cumulative snapshot inside the replay.
     inherited: Option<CodexTokenTotals>,
+    /// The provider's `info` object that `inherited` was read from, as
+    /// written.
+    inherited_snapshot: Option<Value>,
 }
 
 impl ForkReplaySpan {
@@ -7026,6 +7111,7 @@ impl ForkReplaySpan {
             call_ids: Vec::new(),
             prompts: Vec::new(),
             inherited: None,
+            inherited_snapshot: None,
         }
     }
 
@@ -7055,12 +7141,13 @@ impl ForkReplaySpan {
             self.prompts.push((ts_ms, message.text));
         }
         if payload.get("type").and_then(Value::as_str) == Some("token_count") {
-            if let Some(totals) = payload
-                .get("info")
+            let info = payload.get("info");
+            if let Some(totals) = info
                 .and_then(|info| info.get("total_token_usage"))
                 .and_then(CodexTokenTotals::from_usage)
             {
                 self.inherited = Some(totals);
+                self.inherited_snapshot = info.cloned().map(bound_marker_value);
             }
         }
     }
@@ -7129,6 +7216,8 @@ fn record_codex_fork_replay(
         "closed_by_turn_id": closed_by.and_then(|(turn, _)| turn),
         "closed_by": closed_by.map(|(_, basis)| basis),
         "inherited_total_tokens": span.inherited.map(|totals| totals.total),
+        // The replayed `token_count` `info` that total came from, verbatim.
+        "inherited_snapshot": span.inherited_snapshot,
         // `pending` until the child's first readable snapshot, then
         // `applied` or `dropped` with `inherited_baseline_basis` (see
         // `inherited_baseline_verdict`); null when nothing was inherited or
@@ -7251,7 +7340,6 @@ fn flush_unwritten_codex_line(
 ///
 /// These are state updates, not records, and their information is stored
 /// elsewhere: `session_meta` and `turn_context` populate the session catalog,
-/// `token_count` is folded into the adjacent assistant event's `token_json`,
 /// `thread_settings_applied` only carries the model forward, a `*_delta` is a
 /// fragment of an event recorded whole, while assistant messages are stored above (including desktop-only replies).
 ///
@@ -7273,8 +7361,7 @@ fn codex_line_is_state_only(
     match line_type {
         "session_meta" | "turn_context" => true,
         "event_msg" => {
-            matches!(payload_type, "token_count" | "thread_settings_applied")
-                || payload_type.ends_with("_delta")
+            payload_type == "thread_settings_applied" || payload_type.ends_with("_delta")
         }
         "response_item" => payload_type.ends_with("_delta"),
         _ => false,
@@ -32596,6 +32683,12 @@ mod tests {
             "codex_session_branches".into(),
             json!({"sess-unchanged-sub": "main"}),
         );
+        // An install that has already run the usage-snapshot backfill, so the
+        // stamp-unchanged fast path is what this exercises.
+        state.insert(
+            super::CODEX_USAGE_SNAPSHOT_KEY.into(),
+            json!(super::CODEX_USAGE_SNAPSHOT_GENERATION),
+        );
 
         let (cwds, branches, inserted) = super::sync_codex_rollouts_with_repairs(
             &conn,
@@ -32642,6 +32735,10 @@ mod tests {
                     "subagent": true
                 }
             }),
+        );
+        state.insert(
+            CODEX_USAGE_SNAPSHOT_KEY.into(),
+            json!(CODEX_USAGE_SNAPSHOT_GENERATION),
         );
         state
     }
@@ -36469,6 +36566,8 @@ mod codex_fork_replay_tests {
         let closed = replay_marker(&conn, CHILD).expect("closed replay marker");
         assert_eq!(closed["closed_by_turn_id"], CHILD_TURN);
         assert_eq!(closed["inherited_total_tokens"], 1000);
+        // The replayed snapshot itself, as the parent's rollout wrote it.
+        assert_eq!(closed["inherited_snapshot"], usage(1000)["info"]);
         // 1600 cumulative, 1000 of it inherited from the parent.
         assert_eq!(token_totals(&conn, CHILD), vec![600]);
     }
@@ -36625,6 +36724,68 @@ mod codex_fork_replay_tests {
         assert_eq!(
             state.get(CODEX_FORK_REPLAY_KEY),
             Some(&json!(CODEX_FORK_REPLAY_GENERATION))
+        );
+    }
+
+    /// A rollout indexed before `token_count` snapshots were stored has an
+    /// unchanged stamp, so only the one-time backfill re-reads it for its
+    /// counters. Once recorded, the backfill is spent.
+    #[test]
+    fn an_unchanged_rollout_is_re_read_once_for_its_usage_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(
+            day.join("rollout-plain.jsonl"),
+            [
+                line(
+                    "2026-04-20T00:00:00.000Z",
+                    "session_meta",
+                    json!({"id": PARENT, "cwd": "/tmp/project"}),
+                ),
+                line(
+                    "2026-04-20T00:00:00.100Z",
+                    "turn_context",
+                    json!({"turn_id": PARENT_TURN, "cwd": "/tmp/project", "model": "gpt-5.4"}),
+                ),
+                line(
+                    "2026-04-20T00:00:01.000Z",
+                    "event_msg",
+                    json!({"type": "user_message", "message": "prompt"}),
+                ),
+                line("2026-04-20T00:00:02.000Z", "event_msg", usage(1000)),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+        assert!(codex_usage_snapshots_exist(&conn, PARENT).unwrap());
+        assert_eq!(
+            state.get(CODEX_USAGE_SNAPSHOT_KEY),
+            Some(&json!(CODEX_USAGE_SNAPSHOT_GENERATION))
+        );
+        let forget = || {
+            conn.execute(
+                "DELETE FROM session_markers WHERE kind = 'usage_snapshot'",
+                [],
+            )
+            .unwrap();
+        };
+
+        // With the backfill spent, an unchanged rollout is not re-read.
+        forget();
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+        assert!(!codex_usage_snapshots_exist(&conn, PARENT).unwrap());
+
+        // An install that predates the snapshots owes the backfill.
+        state.remove(CODEX_USAGE_SNAPSHOT_KEY);
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+        assert!(codex_usage_snapshots_exist(&conn, PARENT).unwrap());
+        assert_eq!(
+            state.get(CODEX_USAGE_SNAPSHOT_KEY),
+            Some(&json!(CODEX_USAGE_SNAPSHOT_GENERATION))
         );
     }
 
