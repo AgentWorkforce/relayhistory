@@ -107,7 +107,11 @@ parent. A Claude sidecar's records name the session at the root of its
 delegation tree, so the edge's parent is the session whose tool call has the
 `toolUseId` the `agent-<agentId>.meta.json` names: a subagent spawned from
 inside another subagent hangs under that subagent (`spawnDepth` 2 under
-depth 1), and the root only when the call is in the root's own transcript.
+depth 1). The root is the parent when the call is in the root's own
+transcript, and also when the meta names no `toolUseId` or no stored call
+matches it yet; a sidecar whose meta disappeared keeps the parent its edge
+already names, and an edge recorded before its spawning subagent's calls were
+stored moves under that subagent when they are.
 Claude Code's meta files name no model, so `child_model` is the model the
 sidecar's first assistant record names when the meta has none. A catalog-less
 child's evidence is read by its own id through `SessionStore::session`, which
@@ -629,7 +633,7 @@ status, because a fabricated measurement reads exactly like a real one:
 
 | Source | `payload_bytes` / `payload_hash` | `payload_truncated` | `call_index` / `event_index` | `result_status` | `event_source` | `error_signal` | `subagent_session_id` / `agent_id` |
 |---|---|---|---|---|---|---|---|
-| **claude** | ✓ (raw `content`) | ✓ (harness markers) | ✓ | ✓ | `tool_result`, `subagent_notification` | `tool_result.is_error`, `subagent_status` | ✓ (system subagent notifications; `agent_id` from a spawn result's `toolUseResult.agentId`) |
+| **claude** | ✓ (raw `content`) | ✓ (harness markers) | ✓ | ✓ | `tool_result`, `subagent_notification` | `tool_result.is_error`, `subagent_status` | ✓ (system subagent notifications; `agent_id` from a parent transcript's spawn result `toolUseResult.agentId`; sidechain user rows are not ingested) |
 | **codex** | ✓ (raw `output`) | ✓ (harness markers) | ✓ | ✓ (settled at `task_complete`) | `function_call_output` | `exit_code`, `patch_apply`, `mcp_err` | – (no notification rail) |
 | **cursor** | ✓ (raw block `content`) | ✓ (harness markers) | ✓ | ✓ | `tool_result` | `tool_result.is_error` | – (no notification rail) |
 | **grok** | ✓ (raw line `content`) | ✓ (harness markers) | ✓ | ✓ (`unknown` with neither signal) | `function_call_output` | `tool_result.is_error`, `tool_status` | – (no notification rail) |

@@ -425,7 +425,9 @@ Every child of a session, for a consumer accounting for its delegated spend:
 let root = SessionIdentity::new("claude", session_id);
 for child in store.delegated_descendants(&[root])? {
     let Some(source) = child.source() else { continue };
-    let evidence = store.session(&SessionRef::id(source, &child.session_id), SessionQuery::default())?;
+    let Some(evidence) = store.session(&SessionRef::id(source, &child.session_id), SessionQuery::default())? else {
+        continue; // named by an edge, nothing stored under it
+    };
     // evidence.messages[..].raw_usage(), evidence.requests, evidence.tool_calls …
 }
 ```

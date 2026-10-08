@@ -378,3 +378,20 @@ fn a_codex_child_thread_is_readable_by_its_id() {
     let spawned = delegation(&child, RelationshipSide::Child, "child");
     assert_eq!(spawned.parent_session_id, "root");
 }
+
+#[test]
+fn a_nested_sidecar_whose_meta_is_gone_keeps_its_spawner() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = staged(temp.path());
+    fs::remove_file(subagents(temp.path()).join("agent-a2.meta.json")).unwrap();
+    store.sync(SyncOptions::default()).unwrap();
+    hydrate(&store);
+
+    let a2 = read(&store, "a2").unwrap();
+    let spawned = delegation(&a2, RelationshipSide::Child, "a2");
+    // The meta was the only record of the tool use; its absence says nothing
+    // about who spawned the child, so the recorded spawner stands.
+    assert_eq!(spawned.parent_session_id, "a1");
+    assert_eq!(spawned.evidence_ref, None);
+    assert_eq!(spawned.child_agent_type, None);
+}

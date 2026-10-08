@@ -770,6 +770,7 @@ fn destination_head(conn: &Connection) -> Result<String> {
 /// generations belong in the stamp.
 const SWEEP_PARSER_GENERATIONS: &[&str] = &[
     "claude_sessions_v3",
+    CLAUDE_DELEGATION_CAPTURE_KEY,
     "codex_rollouts_v7",
     GROK_SYNC_STATE_KEY,
 ];
@@ -3177,6 +3178,22 @@ const CODEX_RAW_MESSAGE_FACTS_KEY: &str = "codex_raw_message_facts";
 /// backfills.
 const CODEX_FORK_REPLAY_GENERATION: i64 = 1;
 const CODEX_FORK_REPLAY_KEY: &str = "codex_fork_replay_gate";
+
+/// One-time re-read of the Claude transcripts whose delegation evidence an
+/// earlier parser recorded thinner than the provider wrote it: a spawn result
+/// without the record's `toolUseResult.agentId`, and a sidecar edge without
+/// its child's model or hung on the root instead of the subagent that spawned
+/// it. Finished transcripts never change again, so without the pass an
+/// upgraded install that only syncs keeps the old edges for good. The name is
+/// in [`SWEEP_PARSER_GENERATIONS`], so the sweep fingerprint an earlier build
+/// stored cannot skip the pass; it is recorded only after a walk that reached
+/// every known root, like the other backfills.
+const CLAUDE_DELEGATION_CAPTURE_KEY: &str = "claude_delegation_capture_v1";
+
+/// Whether the Claude delegation backfill pass is still owed.
+fn delegation_backfill_pending(state: &Map<String, Value>) -> bool {
+    !state.contains_key(CLAUDE_DELEGATION_CAPTURE_KEY)
+}
 
 /// Whether this provider still owes a one-time raw-facts backfill pass.
 fn raw_facts_backfill_pending(state: &Map<String, Value>, key: &str) -> bool {
@@ -7569,6 +7586,7 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
     }
     let backfill_fidelity = fidelity_backfill_pending(state, CLAUDE_FIDELITY_GENERATION_KEY);
     let backfill_raw_facts = raw_facts_backfill_pending(state, CLAUDE_RAW_MESSAGE_FACTS_KEY);
+    let backfill_delegation = delegation_backfill_pending(state);
     // The first read failure, returned once everything else has been indexed.
     // Continuing past it indexes the rest of the tree, but the run did omit a
     // transcript it discovered, and a caller told the sync completed would
@@ -7620,7 +7638,8 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
         // transcript does not own cannot pin the file off the fast path.
         let backfill = (backfill_fidelity
             && claude_transcript_lacks_tool_result_fidelity(conn, &path)?)
-            || (backfill_raw_facts && claude_transcript_lacks_raw_facts(conn, &path)?);
+            || (backfill_raw_facts && claude_transcript_lacks_raw_facts(conn, &path)?)
+            || (backfill_delegation && claude_transcript_lacks_delegation_capture(conn, &path)?);
         // Present but short: the destination marker says this transcript's
         // session lost rows. A cursor cannot answer that — it describes bytes,
         // not evidence — and the transcript's bytes will never move again to
@@ -7811,6 +7830,7 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
 
     if walked_every_known_root {
         record_fidelity_backfill(state, CLAUDE_FIDELITY_GENERATION_KEY);
+        state.insert(CLAUDE_DELEGATION_CAPTURE_KEY.to_string(), json!(1));
     }
     crate::continuity::reconcile(conn, "claude")?;
     record_raw_facts_backfill(state, CLAUDE_RAW_MESSAGE_FACTS_KEY, walked_every_known_root);
@@ -8158,6 +8178,44 @@ fn claude_transcript_lacks_raw_facts(conn: &Connection, path: &Path) -> Result<b
         conn,
         CLAUDE_LACKS_RAW_FACTS_SQL,
         params![raw_path.as_ref(), RAW_MESSAGE_FACTS_VERSION],
+        |row| row.get(0),
+    )?;
+    Ok(lacking != 0)
+}
+
+/// [`claude_transcript_lacks_delegation_capture`]'s probe: a session
+/// transcript holding an Agent/Task result with no `agent_id`, or a sidecar
+/// whose edge has no child model or may be nested (`spawn_depth` above 1).
+/// `CROSS JOIN` pins the join order for the reason
+/// [`CLAUDE_TRANSCRIPT_EVENTS_SQL`] gives.
+const CLAUDE_LACKS_DELEGATION_CAPTURE_SQL: &str = "SELECT
+            EXISTS(
+                SELECT 1
+                FROM sessions s
+                CROSS JOIN session_events e ON e.source = s.source AND e.session_id = s.session_id
+                CROSS JOIN tool_calls t ON t.source = e.source AND t.session_id = e.session_id
+                  AND t.tool_use_id = e.tool_use_id
+                WHERE s.source = 'claude' AND s.raw_path = ?1
+                  AND e.kind = 'tool_result' AND e.agent_id IS NULL
+                  AND t.name IN ('Agent', 'Task')
+                LIMIT 1
+            )
+            OR EXISTS(
+                SELECT 1
+                FROM session_relationships r
+                WHERE r.source = 'claude' AND r.evidence_locator = ?1
+                  AND r.relationship = 'delegated' AND r.child_session_id IS NOT NULL
+                  AND (r.child_model IS NULL OR COALESCE(r.spawn_depth, 0) > 1)
+                LIMIT 1
+            )";
+
+/// Whether the delegation backfill pass has to re-read this transcript.
+fn claude_transcript_lacks_delegation_capture(conn: &Connection, path: &Path) -> Result<bool> {
+    let raw_path = path.to_string_lossy();
+    let lacking: i64 = cached_query_row(
+        conn,
+        CLAUDE_LACKS_DELEGATION_CAPTURE_SQL,
+        [raw_path.as_ref()],
         |row| row.get(0),
     )?;
     Ok(lacking != 0)

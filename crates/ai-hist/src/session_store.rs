@@ -1167,7 +1167,8 @@ impl SessionStore {
     /// and its `relationships` carry the [`RelationshipSide::Child`] edge
     /// naming the session that spawned it. Read every child of a session by
     /// passing it to [`SessionStore::delegated_descendants`] and each id
-    /// returned here.
+    /// returned here; an id only a delegation edge names, with nothing stored
+    /// under it, is `None`.
     ///
     /// Every table is read on one SQLite snapshot, so a sync landing halfway
     /// through cannot hand back tool calls from a newer version of the
@@ -1498,9 +1499,15 @@ const DELEGATED_CHILD_PROJECT_SQL: &str = "SELECT project_key, project_key_metho
        AND project_key IS NOT NULL AND project_key <> '' ORDER BY ts_ms, id LIMIT 1";
 
 /// The models a delegated child's events name, in order of first use.
-const DELEGATED_CHILD_MODELS_SQL: &str = "SELECT model FROM session_events \
-     WHERE source = ?1 AND session_id = ?2 AND model IS NOT NULL AND model <> '' \
-     GROUP BY model ORDER BY MIN(ts_ms), MIN(id)";
+/// `<synthetic>` is the placeholder Claude Code writes on its own notices,
+/// not a model, and the catalog leaves it out the same way.
+const DELEGATED_CHILD_MODELS_SQL: &str = "SELECT model FROM ( \
+       SELECT model, ts_ms, id, \
+         ROW_NUMBER() OVER (PARTITION BY model ORDER BY ts_ms, id) AS nth \
+       FROM session_events \
+       WHERE source = ?1 AND session_id = ?2 AND model IS NOT NULL AND model <> '' \
+         AND lower(trim(model)) <> '<synthetic>' \
+     ) WHERE nth = 1 ORDER BY ts_ms, id";
 
 /// The transcript a delegation edge names for its child.
 const DELEGATED_CHILD_LOCATOR_SQL: &str = "SELECT evidence_locator FROM session_relationships \

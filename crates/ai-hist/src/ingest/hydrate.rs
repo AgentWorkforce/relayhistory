@@ -2853,6 +2853,7 @@ pub(crate) fn ingest_claude_subagent_batched(
                 parent_session_id,
                 agent_id,
                 evidence.tool_use_id.as_deref(),
+                &locator,
             )?;
             // A sidecar names the session at the root of its delegation tree;
             // the tool use that started it says which session in that tree
@@ -2922,16 +2923,28 @@ pub(crate) fn ingest_claude_subagent_batched(
 
 /// The session whose transcript holds `tool_use_id`, the tool use that
 /// started `agent_id`: `root` or a subagent already recorded in its
-/// delegation tree. `root` when the call is not (yet) stored, or the sidecar
-/// names no tool use.
+/// delegation tree, and `root` when the call is not (yet) stored. A sidecar
+/// that names no tool use — its meta file is gone, or never existed — is no
+/// evidence about who spawned it, so the parent the edge from this same
+/// sidecar already names stands.
 fn claude_subagent_spawner(
     conn: &Connection,
     root: &str,
     agent_id: &str,
     tool_use_id: Option<&str>,
+    locator: &str,
 ) -> Result<String> {
     let Some(tool_use_id) = tool_use_id else {
-        return Ok(root.to_string());
+        let recorded: Option<String> = conn
+            .prepare_cached(
+                "SELECT parent_session_id FROM session_relationships \
+                 WHERE source = 'claude' AND relationship = 'delegated' \
+                   AND child_session_id = ?1 AND evidence_locator = ?2 \
+                 ORDER BY parent_session_id = ?3, parent_session_id LIMIT 1",
+            )?
+            .query_row(params![agent_id, locator, root], |row| row.get(0))
+            .optional()?;
+        return Ok(recorded.unwrap_or_else(|| root.to_string()));
     };
     let spawner: Option<String> = conn
         .prepare_cached(

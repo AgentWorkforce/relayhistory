@@ -8,13 +8,14 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- `SessionStore::session` reads a delegated child the catalog leaves out — a Claude subagent sidecar, a Codex child thread — by its own id: its messages with raw usage, requests, tool calls and results, with the edge naming the session that spawned it, so every child of a session is readable through `delegated_descendants` and `session`; `sessions()` still lists only the root.
+- `SessionStore::session` reads a delegated child the catalog leaves out (a Claude subagent, a Codex child thread) by its own id, so each `delegated_descendants` entry's messages, usage and tool calls are readable.
 
 ### Fixed
 
 - A Claude subagent spawned from inside another subagent is recorded as delegated by that subagent rather than by the root session.
 - A Claude delegation's `child_model` names the model the subagent's own records used when its `agent-*.meta.json` names none, as Claude Code's never do.
 - A Claude spawn tool result carries the child's `agent_id` from the record's `toolUseResult.agentId`.
+- An existing store heals those three on its next `sync` or hydration: Claude transcripts holding them re-parse once, with every file unchanged.
 
 ### Rust API
 
