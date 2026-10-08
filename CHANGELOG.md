@@ -13,7 +13,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- Hydrating a Codex session with related sessions after a parser upgrade re-reads its child rollouts from the start instead of resuming from cursors the older parser committed.
+- Hydrating a session with related sessions after a parser upgrade re-reads its Codex child rollouts and Claude subagent sidecars from the start instead of resuming from cursors the older parser committed.
 
 ## [0.36.0] - 2026-10-07
 
