@@ -7639,7 +7639,9 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
         let backfill = (backfill_fidelity
             && claude_transcript_lacks_tool_result_fidelity(conn, &path)?)
             || (backfill_raw_facts && claude_transcript_lacks_raw_facts(conn, &path)?)
-            || (backfill_delegation && claude_transcript_lacks_delegation_capture(conn, &path)?);
+            || (backfill_delegation
+                && indexed
+                && claude_transcript_lacks_delegation_capture(conn, &path)?);
         // Present but short: the destination marker says this transcript's
         // session lost rows. A cursor cannot answer that — it describes bytes,
         // not evidence — and the transcript's bytes will never move again to
