@@ -768,11 +768,15 @@ fn raw_usage_is_each_claude_records_own_snapshot() {
             ("a3".to_string(), None),
         ]
     );
-    assert!(evidence
+    // Normalized usage is the settled request's on every copy that carried
+    // usage; settlement gives none to a copy that carried none.
+    let settled: Vec<_> = evidence
         .messages
         .iter()
-        .filter(|message| message.role == Role::Assistant && message.usage.is_some())
-        .all(|message| message.usage.as_ref().unwrap().output_tokens == 7));
+        .filter(|message| message.role == Role::Assistant)
+        .map(|message| message.usage.as_ref().map(|usage| usage.output_tokens))
+        .collect();
+    assert_eq!(settled, vec![Some(7), Some(7), None]);
     let [request] = evidence.requests.as_slice() else {
         panic!("one request: {:?}", evidence.requests);
     };
