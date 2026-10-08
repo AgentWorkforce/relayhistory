@@ -776,8 +776,17 @@ const SWEEP_PARSER_GENERATIONS: &[&str] = &[
 
 /// The generation half of a stored fingerprint: what this build of the sweep
 /// would produce from a given tree, independent of the tree itself.
+///
+/// The one-time backfill generations are part of it for the same reason as
+/// the keys above: each is recorded in sync state and re-reads unchanged
+/// sources when it moves, which it can only do if the sweep runs.
 fn sweep_generation() -> String {
-    let parts = SWEEP_PARSER_GENERATIONS.join("|");
+    let parts = format!(
+        "{}|tool_result_fidelity={TOOL_RESULT_FIDELITY_GENERATION}\
+         |raw_message_facts={RAW_MESSAGE_FACTS_GENERATION}\
+         |codex_fork_replay={CODEX_FORK_REPLAY_GENERATION}",
+        SWEEP_PARSER_GENERATIONS.join("|")
+    );
     format!(
         "g{:016x}",
         discover::fingerprint_hash(
