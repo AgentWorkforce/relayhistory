@@ -3165,7 +3165,7 @@ fn record_fidelity_backfill(state: &mut Map<String, Value>, key: &str) {
 /// repairing the rows the bump was for — a change that reads as done and does
 /// nothing, for exactly the installs that needed it.
 /// `the_raw_facts_version_and_generation_are_bumped_together` is the guard.
-const RAW_MESSAGE_FACTS_GENERATION: i64 = 4;
+const RAW_MESSAGE_FACTS_GENERATION: i64 = 5;
 const CLAUDE_RAW_MESSAGE_FACTS_KEY: &str = "claude_raw_message_facts";
 const CODEX_RAW_MESSAGE_FACTS_KEY: &str = "codex_raw_message_facts";
 
@@ -11149,10 +11149,10 @@ fn heal_claude_synthetic_session_summaries(conn: &Connection) -> Result<()> {
 /// indexed before it existed is indistinguishable from a prompt -- which is
 /// exactly the reading the column exists to prevent -- so the backfill this
 /// version drives is the one that repairs it.
-/// Generation 4 adds `record_token_json`: a Claude row indexed before it holds
+/// Generation 5 adds `record_token_json`: a Claude row indexed before it holds
 /// only the settled request blob, and the record's own usage is in the
-/// transcript alone.
-const RAW_MESSAGE_FACTS_VERSION: i64 = 4;
+/// transcript alone. (4 is the sidechain user-row capture.)
+const RAW_MESSAGE_FACTS_VERSION: i64 = 5;
 
 #[derive(Debug, Default, Clone, Copy)]
 struct RawMessageFacts<'a> {

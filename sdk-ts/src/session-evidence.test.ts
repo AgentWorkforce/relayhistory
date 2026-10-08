@@ -12,7 +12,7 @@ import {
   hydrateSession, parseStoredJson, sessionFileEdits, sessionToolCalls, sync,
   type EvidenceCursor, type SessionFileEdit, type SessionToolCall,
 } from './index.js';
-import { combineHydration, normalizeHydration } from './normalization.js';
+import { combineHydration, normalizeHydration, sessionEvent } from './normalization.js';
 
 // Undated tool calls and file edits are legal — both `ts_ms` columns are
 // nullable — but no provider adapter writes one, so the only way to build the
@@ -670,4 +670,15 @@ test('user turn pages group each message with its blocks and page by keyset', as
   } finally {
     await cleanup();
   }
+});
+
+test('recordTokenUsage is the usage of the event\'s own record', () => {
+  const base = { id: 1, source: 'claude', sessionId: 's', tsMs: 0, role: 'assistant', kind: 'text', eventUid: 'e' };
+  const settled = '{"input_tokens":10,"output_tokens":7}';
+  assert.deepEqual(sessionEvent({ ...base, tokenJson: settled }).recordTokenUsage, { input_tokens: 10, output_tokens: 7 });
+  assert.deepEqual(
+    sessionEvent({ ...base, tokenJson: settled, recordTokenJson: '{"input_tokens":10,"output_tokens":1}' }).recordTokenUsage,
+    { input_tokens: 10, output_tokens: 1 },
+  );
+  assert.equal(sessionEvent({ ...base, tokenJson: settled, recordTokenJson: 'null' }).recordTokenUsage, null);
 });

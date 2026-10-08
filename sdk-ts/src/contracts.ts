@@ -320,9 +320,9 @@ export interface SessionEvent {
   model: string | null;
   tokenUsage: Record<string, unknown> | null;
   /**
-   * Claude: the usage this one record carried, where it differs from
-   * `tokenUsage` -- the blob a streamed request's copies settle into. Null
-   * wherever `tokenUsage` already is the record's own.
+   * The usage this one record carried. For Claude, `tokenUsage` is the blob a
+   * streamed request's copies settle into, so the two differ on an earlier
+   * copy, and this is null on a copy that carried none.
    */
   recordTokenUsage: Record<string, unknown> | null;
   /**
