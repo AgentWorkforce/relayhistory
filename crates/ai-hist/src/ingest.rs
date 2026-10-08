@@ -770,10 +770,10 @@ fn destination_head(conn: &Connection) -> Result<String> {
 /// generations belong in the stamp.
 ///
 /// Claude transcripts are skipped on their byte cursors rather than a stamp
-/// map, so their entry names the cursor generation and moves with
-/// `TRANSCRIPT_CURSOR_VERSION`.
+/// map, so their entry names the one-time Claude pass that is pending,
+/// `CLAUDE_RECORD_ATTRIBUTION_KEY` at its generation.
 const SWEEP_PARSER_GENERATIONS: &[&str] = &[
-    "claude_transcript_cursors_v5",
+    "claude_record_attribution_1",
     "codex_rollouts_v7",
     GROK_SYNC_STATE_KEY,
 ];
@@ -3171,6 +3171,16 @@ fn record_fidelity_backfill(state: &mut Map<String, Value>, key: &str) {
 /// `the_raw_facts_version_and_generation_are_bumped_together` is the guard.
 const RAW_MESSAGE_FACTS_GENERATION: i64 = 3;
 const CLAUDE_RAW_MESSAGE_FACTS_KEY: &str = "claude_raw_message_facts";
+
+/// One-time pass over indexed Claude transcripts for what earlier parsers
+/// left out: the event of a signed, empty `thinking` block (its signature
+/// marker is stored, the event is not) and the timestamps of the records
+/// naming explicit continuity targets. Only transcripts the probes select are
+/// re-read or re-captured, and the probes run only while the pass is pending
+/// and only for transcripts already indexed, so a fresh store and every later
+/// sync pay nothing.
+const CLAUDE_RECORD_ATTRIBUTION_GENERATION: i64 = 1;
+const CLAUDE_RECORD_ATTRIBUTION_KEY: &str = "claude_record_attribution";
 const CODEX_RAW_MESSAGE_FACTS_KEY: &str = "codex_raw_message_facts";
 
 /// One-time re-read of every Codex fork rollout, so the fork replay gate
@@ -7573,6 +7583,11 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
     }
     let backfill_fidelity = fidelity_backfill_pending(state, CLAUDE_FIDELITY_GENERATION_KEY);
     let backfill_raw_facts = raw_facts_backfill_pending(state, CLAUDE_RAW_MESSAGE_FACTS_KEY);
+    let backfill_attribution = state
+        .get(CLAUDE_RECORD_ATTRIBUTION_KEY)
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        < CLAUDE_RECORD_ATTRIBUTION_GENERATION;
     // The first read failure, returned once everything else has been indexed.
     // Continuing past it indexes the rest of the tree, but the run did omit a
     // transcript it discovered, and a caller told the sync completed would
@@ -7624,7 +7639,10 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
         // transcript does not own cannot pin the file off the fast path.
         let backfill = (backfill_fidelity
             && claude_transcript_lacks_tool_result_fidelity(conn, &path)?)
-            || (backfill_raw_facts && claude_transcript_lacks_raw_facts(conn, &path)?);
+            || (backfill_raw_facts && claude_transcript_lacks_raw_facts(conn, &path)?)
+            || (backfill_attribution
+                && indexed
+                && claude_transcript_lacks_signed_thinking(conn, &path)?);
         // Present but short: the destination marker says this transcript's
         // session lost rows. A cursor cannot answer that — it describes bytes,
         // not evidence — and the transcript's bytes will never move again to
@@ -7642,7 +7660,11 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
             // Gated on `transcript_events` because a subagent sidecar reaches
             // this skip through its delegation evidence instead, and a sidecar
             // is not a session: it has no row to owe and must not be re-read.
-            if transcript_events && claude_transcript_lacks_continuity_evidence(conn, &path)? {
+            if transcript_events
+                && (claude_transcript_lacks_continuity_evidence(conn, &path)?
+                    || (backfill_attribution
+                        && crate::continuity::claude_evidence_lacks_naming_times(conn, &path)?))
+            {
                 crate::continuity::capture_claude_transcript(conn, &path)?;
             }
             continue;
@@ -7818,6 +7840,12 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
     }
     crate::continuity::reconcile(conn, "claude")?;
     record_raw_facts_backfill(state, CLAUDE_RAW_MESSAGE_FACTS_KEY, walked_every_known_root);
+    if walked_every_known_root {
+        state.insert(
+            CLAUDE_RECORD_ATTRIBUTION_KEY.to_string(),
+            json!(CLAUDE_RECORD_ATTRIBUTION_GENERATION),
+        );
+    }
     if repairs.repairs_all() && !walked_every_known_root {
         coverage.note_unread();
     }
@@ -8145,6 +8173,48 @@ const CLAUDE_LACKS_RAW_FACTS_SQL: &str = "SELECT
                   AND COALESCE(e.raw_facts_version, 0) < ?2
                 LIMIT 1
         )";
+
+/// A thinking-signature marker whose record has no `thinking` event: what a
+/// parser that dropped signed, empty `thinking` blocks left behind. Reached by
+/// the same two routes as [`CLAUDE_LACKS_RAW_FACTS_SQL`].
+const CLAUDE_LACKS_SIGNED_THINKING_SQL: &str = "SELECT
+            EXISTS(
+                SELECT 1
+                FROM sessions s
+                CROSS JOIN session_markers m ON m.source = s.source AND m.session_id = s.session_id
+                WHERE s.source = 'claude' AND s.raw_path = ?1
+                  AND m.subkind = 'thinking_signature'
+                  AND NOT EXISTS(
+                    SELECT 1 FROM session_events e
+                    WHERE e.source = 'claude' AND e.message_id = m.message_id
+                      AND e.kind = 'thinking')
+                LIMIT 1
+            )
+            OR EXISTS(
+                SELECT 1
+                FROM session_relationships r
+                CROSS JOIN session_markers m
+                  ON m.source = 'claude'
+                 AND m.session_id = COALESCE(r.child_session_id, r.parent_session_id)
+                WHERE r.source = 'claude' AND r.evidence_locator = ?1
+                  AND m.subkind = 'thinking_signature'
+                  AND NOT EXISTS(
+                    SELECT 1 FROM session_events e
+                    WHERE e.source = 'claude' AND e.message_id = m.message_id
+                      AND e.kind = 'thinking')
+                LIMIT 1
+        )";
+
+fn claude_transcript_lacks_signed_thinking(conn: &Connection, path: &Path) -> Result<bool> {
+    let raw_path = path.to_string_lossy();
+    let lacking: i64 = cached_query_row(
+        conn,
+        CLAUDE_LACKS_SIGNED_THINKING_SQL,
+        [raw_path.as_ref()],
+        |row| row.get(0),
+    )?;
+    Ok(lacking != 0)
+}
 
 /// The raw-facts question for a Claude transcript.
 ///
@@ -31913,8 +31983,9 @@ mod tests {
     /// A store the previous parser indexed has no event for the signed, empty
     /// `thinking` record that opens a streamed response, continuity evidence
     /// without naming timestamps, a fork edge dated by the transcript's first
-    /// record, cursors at end of file and a fingerprint that vouches for all of
-    /// it. One plain sync repairs every part, then the fast path resumes.
+    /// record, cursors at end of file, no attribution pass recorded and a
+    /// fingerprint that vouches for all of it. One plain sync repairs every
+    /// part, then the fast path resumes.
     #[test]
     fn unchanged_claude_transcripts_gain_opening_records_and_naming_times_after_upgrade() {
         let dir = tempfile::tempdir().unwrap();
@@ -31945,11 +32016,10 @@ mod tests {
                 SET explicit_targets_json = json_remove(explicit_targets_json,
                       '$.continuation_ts_ms', '$.fork_ts_ms');
              UPDATE session_relationships SET spawned_at_ms = 1776996000000
-              WHERE relationship = 'fork';
-             UPDATE transcript_cursors
-                SET parser_state_json = json_set(parser_state_json, '$.v', 4);",
+              WHERE relationship = 'fork';",
         )
         .unwrap();
+        state.remove(super::CLAUDE_RECORD_ATTRIBUTION_KEY);
         // The previous build's fingerprint and a destination proof taken over
         // what it stored, so nothing but the generation can force the sweep.
         let source_part = state[super::SOURCE_FINGERPRINT_KEY]

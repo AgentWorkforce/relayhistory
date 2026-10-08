@@ -488,6 +488,23 @@ pub(crate) fn codex_evidence_is_current(conn: &Connection, locator: &str) -> Res
         .unwrap_or(false))
 }
 
+/// Whether a Claude transcript's banked evidence names an explicit target but
+/// was banked before the naming records' timestamps were recorded.
+pub(crate) fn claude_evidence_lacks_naming_times(conn: &Connection, path: &Path) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT json_type(explicit_targets_json, '$.continuation_ts_ms') IS NULL \
+                AND (json_array_length(explicit_targets_json, '$.continuation') > 0 \
+                     OR json_array_length(explicit_targets_json, '$.fork') > 0) \
+             FROM session_continuity_evidence \
+             WHERE source = 'claude' AND locator = ? AND json_valid(explicit_targets_json) \
+             LIMIT 1",
+        )?
+        .query_row([path.to_string_lossy().as_ref()], |row| row.get::<_, bool>(0))
+        .optional()?
+        .unwrap_or(false))
+}
+
 /// Whether a Codex rollout's banked evidence names a parent in one of Codex's
 /// own fork fields (`forked_from_id`, `thread_spawn.parent_thread_id`).
 ///
