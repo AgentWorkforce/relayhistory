@@ -8788,43 +8788,51 @@ pub(crate) fn ingest_claude_transcript(conn: &Connection, path: &Path) -> Result
 /// exposing a delegated thread's actions as its own long after the events
 /// moved to the child. The event prefix is compared with `substr` rather than
 /// `LIKE` because a provider id may contain `_` or `%`.
+/// The rows one Claude record produced, per table, as `(table, condition)`
+/// over `(session_id, message_uuid)`. Event and marker uids are the record's
+/// uuid plus `:`-suffixes, so the prefix is a range on the uid -- `:` and `;`
+/// are adjacent bytes -- which the `(source, session_id, uid)` unique index
+/// answers; `substr()` there scanned every row of the session. The parser
+/// retires a record's rows under the parent for every sidechain record it
+/// moves onto its child, so a scan made each re-read of a sidecar quadratic
+/// in the size of the parent session.
+const CLAUDE_RECORD_ROWS: [(&str, &str); 4] = [
+    (
+        "session_events",
+        "source = 'claude' AND session_id = ?1 \
+         AND event_uid >= ?2 || ':' AND event_uid < ?2 || ';'",
+    ),
+    (
+        "tool_calls",
+        "source = 'claude' AND session_id = ?1 AND message_id = ?2",
+    ),
+    (
+        "file_edits",
+        "source = 'claude' AND session_id = ?1 AND message_id = ?2",
+    ),
+    // Markers are derived from the same record and keyed on the same prefix,
+    // so they move with it rather than outliving it under the old identity.
+    (
+        "session_markers",
+        "source = 'claude' AND session_id = ?1 \
+         AND marker_uid >= ?2 || ':' AND marker_uid < ?2 || ';'",
+    ),
+];
+
 fn delete_claude_record_rows(
     conn: &Connection,
     session_id: &str,
     message_uuid: &str,
 ) -> Result<()> {
-    crate::store::retire_evidence_share(
-        conn,
-        "session_events",
-        "source = 'claude' AND session_id = ? \
-         AND substr(event_uid, 1, length(?) + 1) = ? || ':'",
-        params![session_id, message_uuid, message_uuid],
-        SessionLocation::Local,
-    )?;
-    crate::store::retire_evidence_share(
-        conn,
-        "tool_calls",
-        "source = 'claude' AND session_id = ? AND message_id = ?",
-        params![session_id, message_uuid],
-        SessionLocation::Local,
-    )?;
-    crate::store::retire_evidence_share(
-        conn,
-        "file_edits",
-        "source = 'claude' AND session_id = ? AND message_id = ?",
-        params![session_id, message_uuid],
-        SessionLocation::Local,
-    )?;
-    // Markers are derived from the same record and keyed on the same prefix,
-    // so they move with it rather than outliving it under the old identity.
-    crate::store::retire_evidence_share(
-        conn,
-        "session_markers",
-        "source = 'claude' AND session_id = ? \
-         AND substr(marker_uid, 1, length(?) + 1) = ? || ':'",
-        params![session_id, message_uuid, message_uuid],
-        SessionLocation::Local,
-    )?;
+    for (table, condition) in CLAUDE_RECORD_ROWS {
+        crate::store::retire_evidence_share(
+            conn,
+            table,
+            condition,
+            params![session_id, message_uuid],
+            SessionLocation::Local,
+        )?;
+    }
     Ok(())
 }
 
@@ -17522,6 +17530,51 @@ mod tests {
     use rusqlite::Connection;
     use serde_json::{json, Map, Value};
     use std::{fs, io::Write as _, time::Duration};
+
+    /// Retiring one record's rows is a keyed search in every table, and the
+    /// uid range takes exactly the record's own `uuid:`-prefixed rows. The
+    /// parser runs it for every sidechain record it moves onto its child, so
+    /// a scan here makes a sidecar re-read quadratic in the parent's size.
+    #[test]
+    fn retiring_a_claude_record_reads_only_its_own_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for (table, condition) in CLAUDE_RECORD_ROWS {
+            let plan: Vec<String> = conn
+                .prepare(&format!(
+                    "EXPLAIN QUERY PLAN DELETE FROM {table} WHERE ({condition}) AND location = 'local'"
+                ))
+                .unwrap()
+                .query_map(params!["parent", "m"], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            let keyed = plan
+                .iter()
+                .any(|step| step.contains("_uid>?") || step.contains("message_id=?"));
+            assert!(
+                keyed,
+                "{table} retirement is not keyed on the record: {plan:?}"
+            );
+        }
+        for uid in ["m:0", "m:1:marker", "m", "mx:0", "l:0", "m;0"] {
+            conn.execute(
+                "INSERT INTO session_events (source, session_id, ts_ms, role, kind, text, event_uid) \
+                 VALUES ('claude', 'parent', 1, 'assistant', 'text', 't', ?1)",
+                [uid],
+            )
+            .unwrap();
+        }
+        delete_claude_record_rows(&conn, "parent", "m").unwrap();
+        let left: Vec<String> = conn
+            .prepare("SELECT event_uid FROM session_events ORDER BY event_uid")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(left, ["l:0", "m", "m;0", "mx:0"]);
+    }
 
     /// The walk's per-transcript probes are asked of every Claude file on
     /// every sweep, so each must be a keyed search whatever the planner knows.
