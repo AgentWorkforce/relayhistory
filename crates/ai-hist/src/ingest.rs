@@ -5897,6 +5897,18 @@ fn surviving_refusals(
     refused
 }
 
+/// Serialize a provider document for `payload_json`, bounded per the marker
+/// contract. These run on every `token_count` and `turn_context` line, and a
+/// document is almost always within the bound already, so it is checked in
+/// place and copied only when something actually has to be cut.
+fn bounded_marker_json(document: &Value) -> Result<String> {
+    Ok(if marker_payload_is_bounded(document) {
+        serde_json::to_string(document)?
+    } else {
+        serde_json::to_string(&bound_marker_value(document.clone()))?
+    })
+}
+
 /// Store one Codex `token_count` as a `usage_snapshot` marker.
 ///
 /// The payload is the provider's `info` as written — `total_token_usage`,
@@ -5918,7 +5930,7 @@ fn record_codex_usage_snapshot(
     turn_id: Option<&str>,
     info: &Value,
 ) -> Result<()> {
-    let payload_json = serde_json::to_string(&bound_marker_value(info.clone()))?;
+    let payload_json = bounded_marker_json(info)?;
     insert_session_marker(
         conn,
         "codex",
@@ -6521,9 +6533,7 @@ fn ingest_codex_rollout_incremental(
                         kind: "turn_context",
                         subkind: Some("turn_context"),
                         text: None,
-                        payload_json: Some(&serde_json::to_string(&bound_marker_value(
-                            Value::Object(payload.clone()),
-                        ))?),
+                        payload_json: Some(&bounded_marker_json(&value["payload"])?),
                     },
                 )?;
                 if let Some(m) = payload_str("model") {
