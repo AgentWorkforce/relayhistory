@@ -2956,7 +2956,8 @@ pub struct SessionEvent {
     /// One of `slash_command_caveat`, `slash_command_invocation`,
     /// `slash_command_output`, `task_notification`, `hook_output`,
     /// `bash_passthrough_input`, `bash_passthrough_output`,
-    /// `system_reminder`, `codex_context_wrapper`, `meta`, `resume_marker`.
+    /// `system_reminder`, `codex_context_wrapper`, `meta`, `resume_marker`,
+    /// `synthetic`.
     /// The row keeps `role = "user"` and `kind = "text"` and its text
     /// verbatim; this column is what a consumer building human turns, prompt
     /// roots or an overhead breakdown filters on, so none of them has to

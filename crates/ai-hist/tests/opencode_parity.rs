@@ -315,6 +315,7 @@ fn opencode_reaches_event_level_parity_across_both_storage_layouts() {
     a_long_assistant_turn_is_excerpted_in_the_catalog_and_whole_in_its_event();
     the_exclusive_sync_reads_whichever_layout_the_host_has();
     a_hydration_does_not_move_catalog_recency_backwards();
+    every_assistant_message_is_evidence_in_both_layouts();
 }
 
 fn shallow_discovery_qualifies_models_identically_across_layouts() {
@@ -586,36 +587,63 @@ fn every_session_in_the_corpus_is_parsed() {
     sync_local_at(&db_path).unwrap();
     let conn = open_db(&db_path).unwrap();
 
-    // (session, user text, assistant text, tool_use, tool_result) counts.
+    // (session, user text, assistant text, envelope, tool_use, tool_result)
+    // counts. An envelope is the text-less block an assistant message made only
+    // of step parts is carried by: every assistant message is a request, so
+    // `ses_child`, `msg_multi_a1` and both `ses_compact` turns are present
+    // even though none of them has a text or tool part.
     let expected = [
-        ("ses_simple", 0, 1, 0, 0),
-        ("ses_multi", 0, 0, 1, 1),
-        ("ses_child", 0, 0, 0, 0),
-        ("ses_tool", 0, 0, 3, 3),
-        ("ses_compact", 2, 1, 0, 0),
-        ("ses_utb", 2, 1, 2, 2),
+        ("ses_simple", 0, 1, 0, 0, 0),
+        ("ses_multi", 0, 0, 1, 1, 1),
+        ("ses_child", 0, 0, 1, 0, 0),
+        ("ses_tool", 0, 0, 0, 3, 3),
+        ("ses_compact", 2, 1, 2, 0, 0),
+        ("ses_utb", 2, 1, 0, 2, 2),
     ];
-    for (session_id, users, assistants, tool_uses, tool_results) in expected {
+    for (session_id, users, assistants, envelopes, tool_uses, tool_results) in expected {
         let events = session_events(&conn, session_id, Some("opencode")).unwrap();
-        let count = |role: &str, kind: &str| {
+        let count = |role: &str, kind: &str, has_text: bool| {
             events
                 .iter()
-                .filter(|event| event.role == role && event.kind == kind)
+                .filter(|event| {
+                    event.role == role && event.kind == kind && event.text.is_some() == has_text
+                })
                 .count()
         };
         assert_eq!(
             (
-                count("user", "text"),
-                count("assistant", "text"),
-                count("assistant", "tool_use"),
-                count("tool_result", "tool_result"),
+                count("user", "text", true),
+                count("assistant", "text", true),
+                count("assistant", "text", false),
+                count("assistant", "tool_use", true),
+                count("tool_result", "tool_result", true),
             ),
-            (users, assistants, tool_uses, tool_results),
+            (users, assistants, envelopes, tool_uses, tool_results),
             "{session_id} parsed to the wrong shape; events were {:?}",
             events
                 .iter()
                 .map(|event| (&event.role, &event.kind, &event.event_uid))
                 .collect::<Vec<_>>()
+        );
+        // Every assistant message is evidence, whatever parts it has.
+        let assistant_messages = conn
+            .prepare(
+                "SELECT COUNT(DISTINCT message_id) FROM session_events \
+                 WHERE source='opencode' AND session_id=? AND role='assistant'",
+            )
+            .unwrap()
+            .query_row([session_id], |row| row.get::<_, i64>(0))
+            .unwrap();
+        let fixture_assistants = fs::read_dir(tree.join("message").join(session_id))
+            .unwrap()
+            .filter(|entry| {
+                let raw = fs::read_to_string(entry.as_ref().unwrap().path()).unwrap();
+                serde_json::from_str::<serde_json::Value>(&raw).unwrap()["role"] == "assistant"
+            })
+            .count() as i64;
+        assert_eq!(
+            assistant_messages, fixture_assistants,
+            "{session_id}: every assistant message must reach the store"
         );
     }
 
@@ -2957,6 +2985,193 @@ fn a_hydration_does_not_move_catalog_recency_backwards() {
         catalog_row(&db_path, "ses_ahead").1,
         Some(1888000000000),
         "the catalog merge keeps the later value, whatever a writer offers"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// A store whose assistant turns carry no `text` or `tool` part: reasoning
+/// only, step parts only, and reasoning the provider returned encrypted.
+const STEP_ONLY_STORE: &str = r#"
+CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT, time_created INTEGER, time_updated INTEGER);
+CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+INSERT INTO session VALUES ('ses_steps', NULL, '/tmp/project', 1777000000000, 1777000004000);
+INSERT INTO message VALUES
+  ('msg_steps_u1', 'ses_steps', 1777000001000,
+   '{"id":"msg_steps_u1","sessionID":"ses_steps","role":"user","time":{"created":1777000001000}}'),
+  ('msg_steps_a1', 'ses_steps', 1777000002000,
+   '{"id":"msg_steps_a1","sessionID":"ses_steps","role":"assistant","parentID":"msg_steps_u1","providerID":"openai","modelID":"gpt-5","finish":"stop","time":{"created":1777000002000,"completed":1777000002500},"path":{"cwd":"/tmp/project","root":"/tmp/project"},"cost":0,"tokens":{"input":40,"output":7,"reasoning":300,"cache":{"read":1000,"write":0}}}'),
+  ('msg_steps_a2', 'ses_steps', 1777000003000,
+   '{"id":"msg_steps_a2","sessionID":"ses_steps","role":"assistant","parentID":"msg_steps_u1","providerID":"openai","modelID":"gpt-5","finish":"length","time":{"created":1777000003000},"path":{"cwd":"/tmp/project","root":"/tmp/project"},"cost":0,"tokens":{"input":41,"output":9,"reasoning":0,"cache":{"read":1300,"write":0}}}'),
+  ('msg_steps_a3', 'ses_steps', 1777000004000,
+   '{"id":"msg_steps_a3","sessionID":"ses_steps","role":"assistant","parentID":"msg_steps_u1","providerID":"openai","modelID":"gpt-5","time":{"created":1777000004000},"path":{"cwd":"/tmp/project","root":"/tmp/project"},"cost":0,"tokens":{"input":42,"output":11,"reasoning":64,"cache":{"read":1400,"write":0}}}');
+INSERT INTO part VALUES
+  ('prt_steps_u1_a', 'msg_steps_u1', 'ses_steps', 1777000001000,
+   '{"id":"prt_steps_u1_a","sessionID":"ses_steps","messageID":"msg_steps_u1","type":"text","text":"summarize README.md"}'),
+  ('prt_steps_u1_b', 'msg_steps_u1', 'ses_steps', 1777000001000,
+   '{"id":"prt_steps_u1_b","sessionID":"ses_steps","messageID":"msg_steps_u1","type":"text","text":"Called the Read tool with README.md","synthetic":true}'),
+  ('prt_steps_a1_1', 'msg_steps_a1', 'ses_steps', 1777000002000,
+   '{"id":"prt_steps_a1_1","sessionID":"ses_steps","messageID":"msg_steps_a1","type":"step-start","snapshot":"abc"}'),
+  ('prt_steps_a1_2', 'msg_steps_a1', 'ses_steps', 1777000002100,
+   '{"id":"prt_steps_a1_2","sessionID":"ses_steps","messageID":"msg_steps_a1","type":"reasoning","text":"The README is short; plan the summary.","time":{"start":1777000002100,"end":1777000002400}}'),
+  ('prt_steps_a1_3', 'msg_steps_a1', 'ses_steps', 1777000002500,
+   '{"id":"prt_steps_a1_3","sessionID":"ses_steps","messageID":"msg_steps_a1","type":"step-finish","reason":"tool-calls","tokens":{"input":40,"output":7,"reasoning":300,"cache":{"read":1000,"write":0}}}'),
+  ('prt_steps_a2_1', 'msg_steps_a2', 'ses_steps', 1777000003000,
+   '{"id":"prt_steps_a2_1","sessionID":"ses_steps","messageID":"msg_steps_a2","type":"step-start","snapshot":"def"}'),
+  ('prt_steps_a2_2', 'msg_steps_a2', 'ses_steps', 1777000003100,
+   '{"id":"prt_steps_a2_2","sessionID":"ses_steps","messageID":"msg_steps_a2","type":"step-finish","tokens":{"input":41,"output":9,"reasoning":0,"cache":{"read":1300,"write":0}}}'),
+  ('prt_steps_a3_1', 'msg_steps_a3', 'ses_steps', 1777000004000,
+   '{"id":"prt_steps_a3_1","sessionID":"ses_steps","messageID":"msg_steps_a3","type":"reasoning","text":"","metadata":{"openai":{"reasoningEncryptedContent":"gAAAA"}}}'),
+  ('prt_steps_a3_2', 'msg_steps_a3', 'ses_steps', 1777000004100,
+   '{"id":"prt_steps_a3_2","sessionID":"ses_steps","messageID":"msg_steps_a3","type":"step-finish","reason":"stop","tokens":{"input":42,"output":11,"reasoning":64,"cache":{"read":1400,"write":0}}}');
+"#;
+
+/// Acceptance: an assistant message is a model request whatever parts it has.
+/// One with only `step-start` / `step-finish` / `reasoning` parts is a
+/// `Message` with its `tokens` verbatim, model, provider and stop reason, and a
+/// request; reasoning text is a thinking block; synthetic user text is a
+/// `synthetic` control row and not a prompt. The same session read from
+/// `opencode.db` and from the legacy tree derived from it must agree.
+fn every_assistant_message_is_evidence_in_both_layouts() {
+    use ai_hist::{
+        BlockKind, ControlKind, ProviderRoots, Role, SessionQuery, SessionRef, SessionStore,
+        Source, StoreOptions, SyncOptions,
+    };
+
+    let root = temp_root("step-only");
+    let sqlite_home = root.join("sqlite-home");
+    let store_path = sqlite_home.join(".local/share/opencode/opencode.db");
+    fs::create_dir_all(store_path.parent().unwrap()).unwrap();
+    Connection::open(&store_path)
+        .unwrap()
+        .execute_batch(STEP_ONLY_STORE)
+        .unwrap();
+    let json_home = root.join("json-home");
+    sqlite_store_as_json_tree(
+        &store_path,
+        &json_home.join(".local/share/opencode/storage"),
+    );
+
+    let read = |home: &Path| {
+        let mut options = StoreOptions::default();
+        options.db_path = Some(home.join("ai-history.db"));
+        options.roots = Some(ProviderRoots::from_home(
+            home.to_path_buf(),
+            home.join(".local/share/opencode/opencode.db"),
+        ));
+        let store = SessionStore::open(options).unwrap();
+        store.sync(SyncOptions::default()).unwrap();
+        store
+            .session(
+                &SessionRef::id(Source::OpenCode, "ses_steps"),
+                SessionQuery::default(),
+            )
+            .unwrap()
+            .expect("ses_steps is catalogued")
+    };
+    let from_sqlite = read(&sqlite_home);
+    let from_json = read(&json_home);
+
+    for (layout, evidence) in [("sqlite", &from_sqlite), ("json", &from_json)] {
+        let ids: Vec<&str> = evidence
+            .messages
+            .iter()
+            .map(|message| message.message_id.as_deref().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "msg_steps_u1",
+                "msg_steps_a1",
+                "msg_steps_a2",
+                "msg_steps_a3"
+            ],
+            "{layout}: every message is evidence"
+        );
+
+        let user = &evidence.messages[0];
+        assert_eq!(user.blocks.len(), 2, "{layout}: {:?}", user.blocks);
+        assert_eq!(user.blocks[0].control, None);
+        assert_eq!(user.blocks[1].control, Some(ControlKind::Synthetic));
+        assert_eq!(
+            user.blocks[1].text.as_deref(),
+            Some("Called the Read tool with README.md")
+        );
+        let prompts: Vec<_> = evidence
+            .prompts
+            .iter()
+            .map(|prompt| prompt.prompt.as_deref())
+            .collect();
+        assert_eq!(prompts, [Some("summarize README.md")], "{layout}");
+
+        let expected = [
+            (
+                "msg_steps_a1",
+                BlockKind::Thinking,
+                Some("The README is short; plan the summary."),
+                "tool-calls",
+                r#"{"input":40,"output":7,"reasoning":300,"cache":{"read":1000,"write":0}}"#,
+            ),
+            // No `step-finish.reason`: the message's own `finish` stands.
+            (
+                "msg_steps_a2",
+                BlockKind::Text,
+                None,
+                "length",
+                r#"{"input":41,"output":9,"reasoning":0,"cache":{"read":1300,"write":0}}"#,
+            ),
+            // Encrypted reasoning carries no text, so no thinking block.
+            (
+                "msg_steps_a3",
+                BlockKind::Text,
+                None,
+                "stop",
+                r#"{"input":42,"output":11,"reasoning":64,"cache":{"read":1400,"write":0}}"#,
+            ),
+        ];
+        for (message, (id, kind, text, stop, tokens)) in evidence.messages[1..].iter().zip(expected)
+        {
+            assert_eq!(message.message_id.as_deref(), Some(id));
+            assert_eq!(message.role, Role::Assistant, "{layout} {id}");
+            assert_eq!(
+                message.model.as_deref(),
+                Some("openai/gpt-5"),
+                "{layout} {id}"
+            );
+            assert_eq!(message.provider.as_deref(), Some("openai"), "{layout} {id}");
+            assert_eq!(message.stop_reason.as_deref(), Some(stop), "{layout} {id}");
+            let raw: serde_json::Value =
+                serde_json::from_str(message.raw_usage().expect("tokens are captured")).unwrap();
+            assert_eq!(
+                raw,
+                serde_json::from_str::<serde_json::Value>(tokens).unwrap(),
+                "{layout} {id}: the provider's tokens, verbatim"
+            );
+            assert_eq!(
+                message.blocks.len(),
+                1,
+                "{layout} {id}: {:?}",
+                message.blocks
+            );
+            assert_eq!(message.blocks[0].kind, kind, "{layout} {id}");
+            assert_eq!(message.blocks[0].text.as_deref(), text, "{layout} {id}");
+        }
+
+        let requested: Vec<Vec<String>> = evidence
+            .requests
+            .iter()
+            .map(|request| request.message_ids.clone())
+            .collect();
+        assert_eq!(
+            requested,
+            [["msg_steps_a1"], ["msg_steps_a2"], ["msg_steps_a3"]],
+            "{layout}: one request per assistant message"
+        );
+    }
+    assert_eq!(
+        from_sqlite.messages, from_json.messages,
+        "the two layouts must produce the same messages"
     );
 
     fs::remove_dir_all(&root).ok();

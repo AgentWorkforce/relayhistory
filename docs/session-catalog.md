@@ -727,7 +727,7 @@ in flight.
 |---|---|---|---|---|---|---|
 | **claude** | ✓ (`requestId`) | ✓ (`message.stop_reason`) | ✓ (`version` / `sourceVersion`) | ✓ (`isSidechain`) | ✓ (`isMeta`) | – |
 | **codex** | – | – | – | – | – | ✓ (`turn_context.turn_id`, carried to the next `turn_context`) |
-| **opencode** | – | ✓ (`step-finish.reason`, pending event-level parity) | – | – | – | – |
+| **opencode** | – | ✓ (last `step-finish.reason`, else message `finish`) | – | – | – | – |
 | **muse** | ✓ (`response_id`) | ✓ (the step's `finish_reason`) | ✓ (`build.semver`) | – | – | ✓ (the run's `run_id`) |
 | **devin** | ✓ (`metadata.request_id`) | ✓ (`metadata.finish_reason`) | ✓ (transcript `agent.version`) | – | – | – |
 | **cursor**, **grok**, **relay** | – | – | – | – | – | – |
@@ -1779,16 +1779,24 @@ How each adapter works:
   every row apart from the provenance path.
 
   A hydrated OpenCode session yields, per assistant message: `session_events`
-  of kind `text` for each non-synthetic `text` part, `tool_use` plus a
-  `tool_calls` row for each `tool` part (`tool_use_id` = `callID`, `is_error`
-  from `state.status == "error"` or `state.metadata.exit != 0`), a
-  `tool_result` event from `state.output`, and a `file_edits` row for
-  `write`/`edit`/`patch`. Each event carries `model` as
+  of kind `thinking` for each `reasoning` part with text (`event_uid`
+  `reasoning:<partId>`; an encrypted-only reasoning part has none), `text` for
+  each non-synthetic `text` part, `tool_use` plus a `tool_calls` row for each
+  `tool` part (`tool_use_id` = `callID`, `is_error` from
+  `state.status == "error"` or `state.metadata.exit != 0`), a `tool_result`
+  event from `state.output`, and a `file_edits` row for `write`/`edit`/`patch`.
+  Every assistant message is a request whatever its parts: one that yields none
+  of these — only `step-start` / `step-finish` parts, or encrypted reasoning —
+  is carried by one `text` event with no text (`event_uid`
+  `message:<messageId>`). Each event carries `model` as
   `"<providerID>/<modelID>"`, `provider` as the bare `providerID`, `token_json`
   as the message's `tokens` object verbatim
   (`{input, output, reasoning, cache:{read, write}}`), and `stop_reason` from
-  the message's last `step-finish.reason`. A `compaction` part records a
-  `session_markers` row of kind `compaction_boundary`.
+  the message's last `step-finish.reason`, else the message's own `finish`.
+  Per user message: a `text` event for each `text` part, those flagged
+  `synthetic: true` with `control_kind = "synthetic"` and kept out of
+  `history`. A `compaction` part records a `session_markers` row of kind
+  `compaction_boundary`.
 
   Global sync reads the live store with session-keyed queries and copies
   nothing. The old whole-database `Connection::backup` is now opt-in at both

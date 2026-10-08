@@ -23,6 +23,7 @@
 //! reference reader (`crates/relayburn-sdk/src/reader/opencode.rs`), which is
 //! the behaviour this store has to match.
 
+use super::control::ControlKind;
 use super::{
     insert_session_event_with_provenance, insert_tool_call, upsert_file_edit_from_call,
     upsert_session, RawMessageFacts, RequestIdentity, OPENCODE_MARKER_COMPACTION_BOUNDARY,
@@ -65,6 +66,9 @@ pub(crate) struct OpencodeMessage {
     /// The provider's `tokens` object verbatim, stored as written:
     /// `{input, output, reasoning, cache:{read, write}}`.
     pub tokens: Option<Value>,
+    /// The assistant message's own `finish`, verbatim. The stop reason when no
+    /// `step-finish` part names one.
+    pub finish: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1085,6 +1089,11 @@ fn parse_message(
             .and_then(Value::as_str)
             .map(str::to_string),
         tokens: object.get("tokens").cloned(),
+        finish: object
+            .get("finish")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
     })
 }
 
@@ -1211,10 +1220,33 @@ fn last_step_finish_reason(parts: &[OpencodePart]) -> Option<String> {
 /// Text a part carries, unless the provider marked it `synthetic` — synthetic
 /// text is the harness talking to itself, not the transcript.
 fn part_text(part: &OpencodePart) -> Option<&str> {
-    if part.kind != "text" {
+    if is_synthetic(part) {
         return None;
     }
-    if part.get("synthetic").and_then(Value::as_bool) == Some(true) {
+    text_of(part, "text")
+}
+
+/// Text the harness wrote into a turn itself: a `text` part flagged
+/// `synthetic: true`. Not the transcript, but the model reads it.
+fn synthetic_text(part: &OpencodePart) -> Option<&str> {
+    if !is_synthetic(part) {
+        return None;
+    }
+    text_of(part, "text")
+}
+
+/// The model's reasoning, from a `reasoning` part. A provider that returns only
+/// an encrypted trace writes the part with empty text, which carries nothing.
+fn reasoning_text(part: &OpencodePart) -> Option<&str> {
+    text_of(part, "reasoning").filter(|text| !text.trim().is_empty())
+}
+
+fn is_synthetic(part: &OpencodePart) -> bool {
+    part.get("synthetic").and_then(Value::as_bool) == Some(true)
+}
+
+fn text_of<'a>(part: &'a OpencodePart, kind: &str) -> Option<&'a str> {
+    if part.kind != kind {
         return None;
     }
     part.get("text")
@@ -1347,7 +1379,7 @@ fn normalize_session(
             .tokens
             .as_ref()
             .and_then(|tokens| serde_json::to_string(tokens).ok());
-        let stop_reason = last_step_finish_reason(parts);
+        let stop_reason = last_step_finish_reason(parts).or_else(|| message.finish.clone());
         let message_project = message.path_cwd.clone().or_else(|| project.clone());
 
         if message.role == "user" {
@@ -1368,6 +1400,41 @@ fn normalize_session(
                         &marker_uid,
                     )?;
                     keys.markers.insert(marker_uid);
+                    continue;
+                }
+                if let Some(text) = synthetic_text(part) {
+                    // Context the harness added to the turn: an event, so the
+                    // turn's size is what the model read, and a control row,
+                    // so it is never mistaken for — or ledgered as — a prompt.
+                    let event_uid = format!("text:{}", part.id);
+                    insert_session_event_with_provenance(
+                        conn,
+                        "opencode",
+                        session_id,
+                        message_project.as_deref(),
+                        message_project.as_deref(),
+                        None,
+                        &message.id,
+                        message.parent_id.as_deref(),
+                        message.time_created,
+                        "user",
+                        "text",
+                        Some(text),
+                        None,
+                        None,
+                        None,
+                        None,
+                        RequestIdentity::none(),
+                        &event_uid,
+                        None,
+                        RawMessageFacts {
+                            control_kind: Some(ControlKind::Synthetic.as_str()),
+                            ..RawMessageFacts::default()
+                        },
+                        None,
+                    )?;
+                    keys.events.insert(event_uid);
+                    counts.events += 1;
                     continue;
                 }
                 let Some(text) = part_text(part) else {
@@ -1434,8 +1501,38 @@ fn normalize_session(
         // call that looks successful and has no result. `finish` has already
         // ordered the parts, so "last" here is the provider's own order.
         let final_part_for_call = last_part_index_per_call(parts);
+        let events_before_message = counts.events;
         for (index, part) in parts.iter().enumerate() {
             super::check_capture_cancelled()?;
+            if let Some(text) = reasoning_text(part) {
+                let event_uid = format!("reasoning:{}", part.id);
+                insert_session_event_with_provenance(
+                    conn,
+                    "opencode",
+                    session_id,
+                    message_project.as_deref(),
+                    message_project.as_deref(),
+                    None,
+                    &message.id,
+                    message.parent_id.as_deref(),
+                    message.time_created,
+                    "assistant",
+                    "thinking",
+                    Some(text),
+                    model.as_deref(),
+                    token_json.as_deref(),
+                    message.provider_id.as_deref(),
+                    stop_reason.as_deref(),
+                    RequestIdentity::none(),
+                    &event_uid,
+                    None,
+                    RawMessageFacts::default(),
+                    None,
+                )?;
+                keys.events.insert(event_uid);
+                counts.events += 1;
+                continue;
+            }
             if let Some(text) = part_text(part) {
                 let event_uid = format!("text:{}", part.id);
                 insert_session_event_with_provenance(
@@ -1590,6 +1687,41 @@ fn normalize_session(
                     counts.events += 1;
                 }
             }
+        }
+
+        // An assistant message is a model request whatever its parts are. One
+        // made only of `step-start` / `step-finish` parts, or of reasoning the
+        // provider returned encrypted, has no block to carry its envelope, so
+        // it gets one: a text block with no text, holding the message's
+        // tokens, model, provider and stop reason as every other block does.
+        // Without it the request — and what it billed — is not in the store.
+        if counts.events == events_before_message {
+            let event_uid = format!("message:{}", message.id);
+            insert_session_event_with_provenance(
+                conn,
+                "opencode",
+                session_id,
+                message_project.as_deref(),
+                message_project.as_deref(),
+                None,
+                &message.id,
+                message.parent_id.as_deref(),
+                message.time_created,
+                "assistant",
+                "text",
+                None,
+                model.as_deref(),
+                token_json.as_deref(),
+                message.provider_id.as_deref(),
+                stop_reason.as_deref(),
+                RequestIdentity::none(),
+                &event_uid,
+                None,
+                RawMessageFacts::default(),
+                None,
+            )?;
+            keys.events.insert(event_uid);
+            counts.events += 1;
         }
     }
 
@@ -1817,6 +1949,34 @@ mod tests {
             part_text(&part(
                 r#"{"id":"p","type":"text","text":"generated","synthetic":true}"#
             )),
+            None
+        );
+        assert_eq!(
+            synthetic_text(&part(
+                r#"{"id":"p","type":"text","text":"generated","synthetic":true}"#
+            )),
+            Some("generated")
+        );
+        assert_eq!(
+            synthetic_text(&part(r#"{"id":"p","type":"text","text":"real"}"#)),
+            None
+        );
+    }
+
+    #[test]
+    fn reasoning_text_is_thinking_unless_the_provider_kept_it_encrypted() {
+        assert_eq!(
+            reasoning_text(&part(r#"{"id":"p","type":"reasoning","text":"plan it"}"#)),
+            Some("plan it")
+        );
+        assert_eq!(
+            reasoning_text(&part(
+                r#"{"id":"p","type":"reasoning","text":"","metadata":{"openai":{"reasoningEncryptedContent":"gAAAA"}}}"#
+            )),
+            None
+        );
+        assert_eq!(
+            reasoning_text(&part(r#"{"id":"p","type":"text","text":"not reasoning"}"#)),
             None
         );
     }

@@ -380,7 +380,8 @@ export type ControlKind =
   | 'system_reminder'
   | 'codex_context_wrapper'
   | 'meta'
-  | 'resume_marker';
+  | 'resume_marker'
+  | 'synthetic';
 
 export type ToolResultStatus = 'running' | 'completed' | 'errored' | 'cancelled' | 'unknown';
 
