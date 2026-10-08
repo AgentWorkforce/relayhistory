@@ -4,7 +4,15 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Minor]
+
+### Changed
+
+- `Message::raw_usage` returns the usage blob of the message's own record, so each streamed copy of one Claude response keeps its own snapshot; `Message::usage` and `SessionEvidence::requests` still read the request's settled usage, and the first `sync` after upgrading re-reads Claude and Codex transcripts once to fill it.
+
+### Rust API
+
+- Added `SessionEvent::record_token_json`; code constructing `SessionEvent` with a struct literal must set it.
 
 ## [0.36.0] - 2026-10-07
 

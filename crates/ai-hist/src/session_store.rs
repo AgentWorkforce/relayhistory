@@ -2484,13 +2484,17 @@ pub struct Message {
     pub usage_error: Option<String>,
     pub blocks: Vec<Block>,
     #[serde(rename = "raw_usage", default, skip_serializing_if = "Option::is_none")]
-    token_json: Option<String>,
+    raw_usage: Option<String>,
 }
 
 impl Message {
-    /// The provider's usage blob as stored, verbatim.
+    /// The provider's usage blob exactly as this message's record carried it.
+    ///
+    /// For Claude that is the record's own `message.usage`, which may be an
+    /// earlier snapshot than `usage` when one response was streamed as several
+    /// records; `usage` is normalized from the request's settled blob.
     pub fn raw_usage(&self) -> Option<&str> {
-        self.token_json.as_deref()
+        self.raw_usage.as_deref()
     }
 }
 
@@ -2524,6 +2528,10 @@ pub struct Block {
 
 fn group_messages(source: Source, events: &[(SessionEvent, Option<i64>)]) -> Vec<Message> {
     let mut messages: Vec<Message> = Vec::new();
+    // The stored blob each message's `usage` is normalized from, parallel to
+    // `messages`: for Claude, the blob a streamed request's copies settle
+    // into, which is not the record's own `raw_usage`.
+    let mut usage_blobs: Vec<Option<String>> = Vec::new();
     let mut index: BTreeMap<String, usize> = BTreeMap::new();
     for (event, text_bytes) in events {
         let block = Block {
@@ -2548,10 +2556,14 @@ fn group_messages(source: Source, events: &[(SessionEvent, Option<i64>)]) -> Vec
                 // Claude copies one message's usage onto every block. The
                 // copies are expected to agree; when they do not, the message
                 // does not get to pick one.
-                match (&message.token_json, &event.token_json) {
+                if message.raw_usage.is_none() {
+                    message.raw_usage = record_usage(event);
+                }
+                let blob = &mut usage_blobs[at];
+                match (&*blob, &event.token_json) {
                     (None, Some(raw)) => {
-                        message.token_json = Some(raw.clone());
-                        set_usage(source, message);
+                        *blob = Some(raw.clone());
+                        set_usage(source, message, raw);
                     }
                     (Some(have), Some(raw)) if have != raw => {
                         message.usage = None;
@@ -2600,20 +2612,29 @@ fn group_messages(source: Source, events: &[(SessionEvent, Option<i64>)]) -> Vec
                     usage: None,
                     usage_error: None,
                     blocks: vec![block],
-                    token_json: event.token_json.clone(),
+                    raw_usage: record_usage(event),
                 };
-                set_usage(source, &mut message);
+                if let Some(raw) = event.token_json.as_deref() {
+                    set_usage(source, &mut message, raw);
+                }
                 messages.push(message);
+                usage_blobs.push(event.token_json.clone());
             }
         }
     }
     messages
 }
 
-fn set_usage(source: Source, message: &mut Message) {
-    let Some(raw) = message.token_json.as_deref() else {
-        return;
-    };
+/// The usage blob the event's own record carried: the separately kept copy
+/// where the source settles `token_json` across records, else `token_json`.
+fn record_usage(event: &SessionEvent) -> Option<String> {
+    event
+        .record_token_json
+        .clone()
+        .or_else(|| event.token_json.clone())
+}
+
+fn set_usage(source: Source, message: &mut Message, raw: &str) {
     match normalize_usage_str(source.as_str(), raw) {
         Ok(usage) => {
             message.usage = usage;

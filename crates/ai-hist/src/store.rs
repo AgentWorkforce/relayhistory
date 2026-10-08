@@ -321,6 +321,11 @@ CREATE TABLE IF NOT EXISTS session_events (
     -- Null for a genuine prompt and for every model-output row. See
     -- `ingest::control`.
     control_kind TEXT,
+    -- The provider's usage blob exactly as this one record carried it. Claude
+    -- settles a streamed request's copies into `token_json`; this column
+    -- keeps each record's own `message.usage`. Null where `token_json` is
+    -- already the record's own blob.
+    record_token_json TEXT,
     -- Which evidence backs this row: 'local' (a local parser read it from
     -- the provider's own files), 'remote' (a remote observation supplied
     -- it) or 'both'. See `EVIDENCE_LOCATION_TABLES`.
@@ -783,6 +788,13 @@ const REQUIRED_SESSION_EVENT_COLUMNS: &[(&str, &str)] = &[
     // so it is re-stamped by the same raw-facts backfill that repairs the
     // columns above: a row without it is a row the classifier never saw.
     ("control_kind", "TEXT"),
+    // The provider's usage blob as this one record carried it, verbatim.
+    // Claude writes one streamed response as several records whose usage
+    // snapshots `token_json` settles into one blob; this keeps each record's
+    // own. Null where `token_json` already is the record's own blob. Written
+    // by the same parser generation as the facts above, so the raw-facts
+    // backfill fills it on rows indexed before it existed.
+    ("record_token_json", "TEXT"),
 ];
 /// Columns the v2 `session_relationships` shape adds. A v1 row set cannot
 /// represent related evidence whose child has no provider-recorded identity,
@@ -2964,6 +2976,12 @@ pub struct SessionEvent {
     /// `None` also on rows written before the column existed, which the next
     /// plain `sync` re-stamps.
     pub control_kind: Option<String>,
+    /// The provider's usage blob exactly as this one record carried it.
+    /// Claude: the record's own `message.usage`, while `token_json` holds the
+    /// blob a streamed request's copies settle into. `None` for sources whose
+    /// `token_json` is already the record's own blob, and on a row indexed
+    /// before the column existed until the next `sync` re-reads it.
+    pub record_token_json: Option<String>,
 }
 
 /// Stable continuation for normalized session events.
@@ -3099,7 +3117,7 @@ pub(crate) const SESSION_EVENT_COLUMNS: &str =
      payload_truncated, payload_hash, call_index, event_index, result_status, event_source, \
      error_signal, subagent_session_id, agent_id, request_id, provider_message_id, \
      stop_reason, agent_version, is_sidechain, is_meta, turn_id, request_span, raw_kind, \
-     control_kind";
+     control_kind, record_token_json";
 
 pub(crate) fn row_to_session_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionEvent> {
     Ok(SessionEvent {
@@ -3141,6 +3159,7 @@ pub(crate) fn row_to_session_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<
         request_span: row.get(35)?,
         raw_kind: row.get(36)?,
         control_kind: row.get(37)?,
+        record_token_json: row.get(38)?,
     })
 }
 

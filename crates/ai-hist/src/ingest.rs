@@ -3165,7 +3165,7 @@ fn record_fidelity_backfill(state: &mut Map<String, Value>, key: &str) {
 /// repairing the rows the bump was for — a change that reads as done and does
 /// nothing, for exactly the installs that needed it.
 /// `the_raw_facts_version_and_generation_are_bumped_together` is the guard.
-const RAW_MESSAGE_FACTS_GENERATION: i64 = 3;
+const RAW_MESSAGE_FACTS_GENERATION: i64 = 4;
 const CLAUDE_RAW_MESSAGE_FACTS_KEY: &str = "claude_raw_message_facts";
 const CODEX_RAW_MESSAGE_FACTS_KEY: &str = "codex_raw_message_facts";
 
@@ -9335,6 +9335,9 @@ fn ingest_claude_record(
     let mut token_json = message
         .and_then(|m| m.get("usage"))
         .and_then(|v| serde_json::to_string(v).ok());
+    // Kept apart from `token_json`, which a streamed request's settlement
+    // below replaces with the blob its copies merge into.
+    let record_token_json = token_json.clone();
     // Read once per record: every row this record produces belongs to the
     // same provider request, whatever `message_uuid` the block gets.
     let identity = RequestIdentity::from_claude_record(obj, message);
@@ -9363,6 +9366,7 @@ fn ingest_claude_record(
         request_span: None,
         // Decided per text row below, once the record is classified.
         control_kind: None,
+        record_token_json: record_token_json.as_deref(),
     };
     // A notice Claude Code wrote itself, not model output; see
     // `is_claude_synthetic_placeholder_model`.
@@ -11135,7 +11139,10 @@ fn heal_claude_synthetic_session_summaries(conn: &Connection) -> Result<()> {
 /// indexed before it existed is indistinguishable from a prompt -- which is
 /// exactly the reading the column exists to prevent -- so the backfill this
 /// version drives is the one that repairs it.
-const RAW_MESSAGE_FACTS_VERSION: i64 = 3;
+/// Generation 4 adds `record_token_json`: a Claude row indexed before it holds
+/// only the settled request blob, and the record's own usage is in the
+/// transcript alone.
+const RAW_MESSAGE_FACTS_VERSION: i64 = 4;
 
 #[derive(Debug, Default, Clone, Copy)]
 struct RawMessageFacts<'a> {
@@ -11154,6 +11161,10 @@ struct RawMessageFacts<'a> {
     /// The one derived fact carried here, because every insert already
     /// threads this struct and the column is stamped per row like the rest.
     control_kind: Option<&'a str>,
+    /// The record's own usage blob, for a provider whose `token_json` is
+    /// settled across records (Claude). `None` where `token_json` already is
+    /// the record's own blob.
+    record_token_json: Option<&'a str>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11340,7 +11351,7 @@ fn insert_session_event_with_provenance(
           tool_use_id, payload_bytes, payload_truncated, payload_hash, call_index, event_index, result_status, event_source, \
           error_signal, subagent_session_id, agent_id, \
           request_id, provider_message_id, stop_reason, agent_version, is_sidechain, is_meta, turn_id, request_span, raw_facts_version, raw_kind, \
-          control_kind) \
+          control_kind, record_token_json) \
          VALUES (?1, ?2, ?3, \
            COALESCE((SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2), ?16), \
            CASE WHEN (SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2) IS NOT NULL \
@@ -11348,7 +11359,7 @@ fn insert_session_event_with_provenance(
                 ELSE ?17 END, \
            ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
            ?14, ?15, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, \
-           ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39) \
+           ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40) \
          ON CONFLICT(source, session_id, event_uid) DO UPDATE SET \
          project=excluded.project, \
          project_key=COALESCE((SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2), session_events.project_key, ?16), \
@@ -11371,7 +11382,7 @@ fn insert_session_event_with_provenance(
          is_sidechain=excluded.is_sidechain, is_meta=excluded.is_meta, turn_id=excluded.turn_id, \
          request_span=excluded.request_span, \
          raw_facts_version=excluded.raw_facts_version, raw_kind=excluded.raw_kind, \
-         control_kind=excluded.control_kind, \
+         control_kind=excluded.control_kind, record_token_json=excluded.record_token_json, \
          location=CASE WHEN session_events.location = excluded.location \
            THEN session_events.location ELSE 'both' END",
     )?.execute(
@@ -11415,6 +11426,7 @@ fn insert_session_event_with_provenance(
             RAW_MESSAGE_FACTS_VERSION,
             raw_kind,
             raw_facts.control_kind,
+            raw_facts.record_token_json,
         ],
     )?;
     Ok(())
@@ -27327,7 +27339,8 @@ mod tests {
         conn.execute(
             "UPDATE session_events SET request_id = NULL, stop_reason = NULL, \
              agent_version = NULL, is_sidechain = NULL, is_meta = NULL, turn_id = NULL, \
-             request_span = NULL, raw_facts_version = NULL WHERE source = ?",
+             request_span = NULL, record_token_json = NULL, raw_facts_version = NULL \
+             WHERE source = ?",
             [source],
         )
         .unwrap();
@@ -27349,6 +27362,60 @@ mod tests {
             super::RAW_MESSAGE_FACTS_GENERATION,
             "bump both, or the backfill it exists to trigger never runs"
         );
+    }
+
+    /// One streamed Claude response as two records whose usage snapshots
+    /// grow. `token_json` settles to the merged blob on both rows;
+    /// `record_token_json` keeps each record's own, including on a store
+    /// indexed before the column existed, which the raw-facts backfill fills.
+    #[test]
+    fn claude_rows_keep_each_records_own_usage_beside_the_settled_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess-stream.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","uuid":"u1","sessionId":"sess-stream","cwd":"/tmp/project","timestamp":"2026-04-20T00:00:00.000Z","message":{"role":"user","content":"run it"}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"sess-stream","cwd":"/tmp/project","requestId":"req_1","timestamp":"2026-04-20T00:00:01.000Z","message":{"id":"msg_1","role":"assistant","model":"claude-opus-5","content":[{"type":"text","text":"Looking."}],"usage":{"input_tokens":10,"output_tokens":1}}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a2","parentUuid":"a1","sessionId":"sess-stream","cwd":"/tmp/project","requestId":"req_1","timestamp":"2026-04-20T00:00:02.000Z","message":{"id":"msg_1","role":"assistant","model":"claude-opus-5","stop_reason":"end_turn","content":[{"type":"text","text":"Done."}],"usage":{"input_tokens":10,"output_tokens":7}}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let usage = |conn: &Connection| -> Vec<(String, String, Option<String>)> {
+            conn.prepare(
+                "SELECT event_uid, token_json, record_token_json FROM session_events \
+                 WHERE source = 'claude' AND role = 'assistant' ORDER BY event_uid",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        };
+        let settled = r#"{"input_tokens":10,"output_tokens":7}"#.to_string();
+        let expected = vec![
+            (
+                "a1:0".to_string(),
+                settled.clone(),
+                Some(r#"{"input_tokens":10,"output_tokens":1}"#.to_string()),
+            ),
+            (
+                "a2:0".to_string(),
+                settled.clone(),
+                Some(r#"{"input_tokens":10,"output_tokens":7}"#.to_string()),
+            ),
+        ];
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(usage(&conn), expected);
+
+        blank_raw_message_facts(&conn, "claude");
+        blank_raw_message_facts_state(&mut state);
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(usage(&conn), expected);
     }
 
     #[test]
