@@ -321,10 +321,10 @@ CREATE TABLE IF NOT EXISTS session_events (
     -- Null for a genuine prompt and for every model-output row. See
     -- `ingest::control`.
     control_kind TEXT,
-    -- Claude: the usage blob exactly as this one record carried it (its own
-    -- `message.usage`, null when it carried none), while `token_json` holds
-    -- the blob a streamed request's copies settle into. Null for every other
-    -- source, whose `token_json` is already the record's own.
+    -- Claude: the usage blob exactly as this one record carried it, kept
+    -- only where `token_json` holds a different blob -- the one a streamed
+    -- request's copies settle into -- and JSON `null` for a copy that carried
+    -- none. Null wherever `token_json` already is the record's own.
     record_token_json TEXT,
     -- Which evidence backs this row: 'local' (a local parser read it from
     -- the provider's own files), 'remote' (a remote observation supplied
@@ -788,10 +788,11 @@ const REQUIRED_SESSION_EVENT_COLUMNS: &[(&str, &str)] = &[
     // so it is re-stamped by the same raw-facts backfill that repairs the
     // columns above: a row without it is a row the classifier never saw.
     ("control_kind", "TEXT"),
-    // Claude: the usage blob as this one record carried it, verbatim, null
-    // when it carried none. Claude writes one streamed response as several
-    // records whose usage snapshots `token_json` settles into one blob; this
-    // keeps each record's own. Null for every other source. Written
+    // Claude: the usage blob as this one record carried it, verbatim. Claude
+    // writes one streamed response as several records whose usage snapshots
+    // `token_json` settles into one blob; this keeps a record's own where it
+    // differs (JSON `null` for a copy that carried none), and is null wherever
+    // `token_json` already is the record's own. Written
     // by the same parser generation as the facts above, so the raw-facts
     // backfill fills it on rows indexed before it existed.
     ("record_token_json", "TEXT"),
@@ -2976,12 +2977,11 @@ pub struct SessionEvent {
     /// `None` also on rows written before the column existed, which the next
     /// plain `sync` re-stamps.
     pub control_kind: Option<String>,
-    /// Claude: the usage blob exactly as this one record carried it -- its own
-    /// `message.usage`, `None` when it carried none -- while `token_json`
-    /// holds the blob a streamed request's copies settle into. `None` for
-    /// every other source, whose `token_json` is already the record's own,
-    /// and on a Claude row indexed before the column existed until the next
-    /// `sync` re-reads it.
+    /// Claude: the usage blob exactly as this one record carried it, where
+    /// `token_json` holds a different one -- the blob a streamed request's
+    /// copies settle into. JSON `null` for a copy that carried none. `None`
+    /// wherever `token_json` already is the record's own: every row of other
+    /// sources, and a Claude row whose usage settlement did not change.
     pub record_token_json: Option<String>,
 }
 

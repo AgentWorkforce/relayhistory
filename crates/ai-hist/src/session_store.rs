@@ -2557,7 +2557,7 @@ fn group_messages(source: Source, events: &[(SessionEvent, Option<i64>)]) -> Vec
                 // copies are expected to agree; when they do not, the message
                 // does not get to pick one.
                 if message.raw_usage.is_none() {
-                    message.raw_usage = record_usage(source, event);
+                    message.raw_usage = record_usage(event);
                 }
                 let blob = &mut usage_blobs[at];
                 match (&*blob, &event.token_json) {
@@ -2612,7 +2612,7 @@ fn group_messages(source: Source, events: &[(SessionEvent, Option<i64>)]) -> Vec
                     usage: None,
                     usage_error: None,
                     blocks: vec![block],
-                    raw_usage: record_usage(source, event),
+                    raw_usage: record_usage(event),
                 };
                 if let Some(raw) = event.token_json.as_deref() {
                     set_usage(source, &mut message, raw);
@@ -2627,14 +2627,14 @@ fn group_messages(source: Source, events: &[(SessionEvent, Option<i64>)]) -> Vec
 
 /// The usage blob the event's own record carried.
 ///
-/// Claude settles `token_json` across a streamed request's records, so a
-/// Claude record's own usage is `record_token_json` alone, and a record that
-/// carried none has none even when its settled `token_json` is set. Every
-/// other source stores usage once per record, in `token_json`.
-fn record_usage(source: Source, event: &SessionEvent) -> Option<String> {
-    match source {
-        Source::Claude => event.record_token_json.clone(),
-        _ => event.token_json.clone(),
+/// `record_token_json` is set only where Claude's settlement replaced the
+/// record's own usage in `token_json`, and is JSON `null` for a copy that
+/// carried none; everywhere else `token_json` is the record's own.
+fn record_usage(event: &SessionEvent) -> Option<String> {
+    match event.record_token_json.as_deref() {
+        Some("null") => None,
+        Some(own) => Some(own.to_string()),
+        None => event.token_json.clone(),
     }
 }
 

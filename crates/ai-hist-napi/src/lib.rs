@@ -581,8 +581,9 @@ pub struct NativeSessionEvent {
     /// Why a user-role row is not a human prompt; null for a genuine prompt
     /// and for every model-output row.
     pub control_kind: Option<String>,
-    /// Claude: the usage blob this one record carried, beside the settled
-    /// request blob in `token_json`. Null for other sources.
+    /// Claude: the usage blob this one record carried, where it differs from
+    /// the settled request blob in `token_json` (JSON `null` for a copy that
+    /// carried none). Null wherever `token_json` is the record's own.
     pub record_token_json: Option<String>,
 }
 

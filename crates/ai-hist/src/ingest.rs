@@ -9335,9 +9335,6 @@ fn ingest_claude_record(
     let mut token_json = message
         .and_then(|m| m.get("usage"))
         .and_then(|v| serde_json::to_string(v).ok());
-    // Kept apart from `token_json`, which a streamed request's settlement
-    // below replaces with the blob its copies merge into.
-    let record_token_json = token_json.clone();
     // Read once per record: every row this record produces belongs to the
     // same provider request, whatever `message_uuid` the block gets.
     let identity = RequestIdentity::from_claude_record(obj, message);
@@ -9366,7 +9363,8 @@ fn ingest_claude_record(
         request_span: None,
         // Decided per text row below, once the record is classified.
         control_kind: None,
-        record_token_json: record_token_json.as_deref(),
+        // Set below, once the request's usage is settled.
+        record_token_json: None,
     };
     // A notice Claude Code wrote itself, not model output; see
     // `is_claude_synthetic_placeholder_model`.
@@ -9449,6 +9447,7 @@ fn ingest_claude_record(
         )?;
         return Ok(());
     }
+    let mut record_token_json: Option<String> = None;
     if message_role == "assistant" {
         if let Some(provider_message_id) = identity.provider_message_id {
             // The request id exactly as the row stores it, so the rows settled
@@ -9458,15 +9457,25 @@ fn ingest_claude_record(
                 .request_id
                 .or(raw_facts.request_id)
                 .filter(|id| !id.is_empty());
-            token_json = settle_claude_request_usage(
+            let settled = settle_claude_request_usage(
                 conn,
                 session_id,
                 request_id,
                 provider_message_id,
                 token_json.as_deref(),
             )?;
+            // The record's own usage is kept only where settlement replaced
+            // it: JSON `null` for a copy that carried none.
+            let own = std::mem::replace(&mut token_json, settled);
+            if own != token_json {
+                record_token_json = Some(own.unwrap_or_else(|| "null".to_string()));
+            }
         }
     }
+    let raw_facts = RawMessageFacts {
+        record_token_json: record_token_json.as_deref(),
+        ..raw_facts
+    };
     // How many rows this record produced, counted rather than predicted.
     //
     // Every record must leave at least one row behind, and the only
@@ -10914,7 +10923,8 @@ fn settle_claude_request_usage(
         return Ok(token_json.map(str::to_string));
     };
     conn.execute(
-        "UPDATE session_events SET token_json = ?4 \
+        "UPDATE session_events SET token_json = ?4, \
+           record_token_json = COALESCE(record_token_json, token_json) \
          WHERE source = 'claude' AND session_id = ?1 AND provider_message_id = ?3 \
            AND (request_id = ?2 OR (?2 IS NULL AND NULLIF(request_id, '') IS NULL)) \
            AND role = 'assistant' AND token_json IS NOT NULL AND token_json <> ?4",
@@ -11161,9 +11171,9 @@ struct RawMessageFacts<'a> {
     /// The one derived fact carried here, because every insert already
     /// threads this struct and the column is stamped per row like the rest.
     control_kind: Option<&'a str>,
-    /// Claude: the record's own usage blob, `None` when it carried none.
-    /// `None` for every other source, whose `token_json` already is the
-    /// record's own.
+    /// Claude: the record's own usage blob where settlement replaced it in
+    /// `token_json` -- JSON `null` for a copy that carried none. `None` where
+    /// `token_json` already is the record's own, and for every other source.
     record_token_json: Option<&'a str>,
 }
 
@@ -27366,7 +27376,7 @@ mod tests {
 
     /// One streamed Claude response as two records whose usage snapshots
     /// grow. `token_json` settles to the merged blob on both rows;
-    /// `record_token_json` keeps each record's own, including on a store
+    /// `record_token_json` keeps a record's own where it differs, including on a store
     /// indexed before the column existed, which the raw-facts backfill fills.
     #[test]
     fn claude_rows_keep_each_records_own_usage_beside_the_settled_blob() {
@@ -27399,11 +27409,9 @@ mod tests {
                 settled.clone(),
                 Some(r#"{"input_tokens":10,"output_tokens":1}"#.to_string()),
             ),
-            (
-                "a2:0".to_string(),
-                settled.clone(),
-                Some(r#"{"input_tokens":10,"output_tokens":7}"#.to_string()),
-            ),
+            // The last copy's own usage is the settled blob, so nothing is
+            // stored beside it.
+            ("a2:0".to_string(), settled.clone(), None),
         ];
 
         let conn = Connection::open_in_memory().unwrap();
