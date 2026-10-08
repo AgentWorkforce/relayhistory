@@ -11,6 +11,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Claude: a signed `thinking` block with empty text is stored as a `thinking` event, so the record that opens a streamed response joins its request and the request's `first_ts_ms`, `message_ids` and `has_thinking` include it.
 - Claude: `continuation` and `fork` edges from `continuedFromSessionId` / `forkSessionId` carry the timestamp of the record that named them in `spawned_at_ms`, not the transcript's first record.
 - Existing stores gain both on the next `sync`, which re-reads only the Claude transcripts holding a signed, empty `thinking` block and re-captures continuity only for transcripts naming an explicit target.
+- Re-reading a Claude subagent transcript is linear in its own records again: retiring a sidechain record's rows under the parent session is an indexed lookup instead of a scan of the parent's events, tool calls, edits and markers. On a store with a 50 MB session and ~1,100 sidecar subagents the one-time re-read above takes about as long as a cold sync instead of ~19x it.
 
 ## [0.36.0] - 2026-10-07
 
