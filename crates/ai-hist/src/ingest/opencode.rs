@@ -1244,15 +1244,25 @@ fn reasoning_text(part: &OpencodePart) -> Option<&str> {
     text_of(part, "reasoning").filter(|text| !text.trim().is_empty())
 }
 
-/// A `reasoning` part with no text but provider metadata: the trace was
-/// returned encrypted (OpenAI's `reasoningEncryptedContent`, for one).
+/// A `reasoning` part with no text whose provider metadata carries the trace
+/// opaquely: a non-empty encrypted or redacted payload under the provider's key
+/// (OpenAI's `reasoningEncryptedContent`, Anthropic's `redactedData`). Other
+/// metadata, such as a token count, is not a trace.
 fn is_encrypted_reasoning(part: &OpencodePart) -> bool {
     part.kind == "reasoning"
         && reasoning_text(part).is_none()
         && part
             .get("metadata")
             .and_then(Value::as_object)
-            .is_some_and(|metadata| !metadata.is_empty())
+            .into_iter()
+            .flat_map(|metadata| metadata.values())
+            .filter_map(Value::as_object)
+            .flatten()
+            .any(|(key, value)| {
+                let key = key.to_ascii_lowercase();
+                (key.contains("encrypted") || key.contains("redacted"))
+                    && value.as_str().is_some_and(|payload| !payload.is_empty())
+            })
 }
 
 fn is_synthetic(part: &OpencodePart) -> bool {
@@ -2033,6 +2043,15 @@ mod tests {
         )));
         assert!(!is_encrypted_reasoning(&part(
             r#"{"id":"p","type":"reasoning","text":""}"#
+        )));
+        assert!(is_encrypted_reasoning(&part(
+            r#"{"id":"p","type":"reasoning","text":"","metadata":{"anthropic":{"redactedData":"EqQB"}}}"#
+        )));
+        assert!(!is_encrypted_reasoning(&part(
+            r#"{"id":"p","type":"reasoning","text":"","metadata":{"openai":{"reasoningTokens":0}}}"#
+        )));
+        assert!(!is_encrypted_reasoning(&part(
+            r#"{"id":"p","type":"reasoning","text":"","metadata":{"openai":{"reasoningEncryptedContent":""}}}"#
         )));
     }
 

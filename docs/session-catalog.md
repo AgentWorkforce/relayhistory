@@ -1780,8 +1780,9 @@ How each adapter works:
 
   A hydrated OpenCode session yields, per assistant message: `session_events`
   of kind `thinking` for each `reasoning` part with text (`event_uid`
-  `reasoning:<partId>`; an encrypted-only one, blank text with provider
-  `metadata`, is an `encrypted_reasoning` marker instead), `text` for
+  `reasoning:<partId>`; an encrypted-only one, blank text with a non-empty
+  encrypted or redacted payload in its provider `metadata`, is an
+  `encrypted_reasoning` marker instead), `text` for
   each non-synthetic `text` part, `tool_use` plus a `tool_calls` row for each
   `tool` part (`tool_use_id` = `callID`, `is_error` from
   `state.status == "error"` or `state.metadata.exit != 0`), a `tool_result`
