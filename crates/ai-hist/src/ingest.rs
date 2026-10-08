@@ -767,12 +767,22 @@ fn destination_head(conn: &Connection) -> Result<String> {
 ///
 /// Add the new key here in the same change that introduces it; the old one
 /// stays in [`RETIRED_SYNC_STATE_KEYS`] for the migration, but only live
-/// generations belong in the stamp.
+/// generations belong in the stamp. OpenCode keeps no per-file sync state --
+/// every sweep re-normalizes every session -- so its entry is a generation name
+/// alone, [`OPENCODE_NORMALIZER_GENERATION`].
 const SWEEP_PARSER_GENERATIONS: &[&str] = &[
     "claude_sessions_v3",
     "codex_rollouts_v7",
     GROK_SYNC_STATE_KEY,
+    OPENCODE_NORMALIZER_GENERATION,
 ];
+
+/// What the OpenCode normalizer produces from an unchanged store. Bumped when
+/// that output changes, so the first sweep after an upgrade re-reads stores
+/// the source fingerprint would otherwise call unchanged. `v2` makes every
+/// assistant message evidence (step-only and reasoning-only messages, thinking
+/// blocks, `synthetic` control rows).
+const OPENCODE_NORMALIZER_GENERATION: &str = "opencode_normalizer_v2";
 
 /// The generation half of a stored fingerprint: what this build of the sweep
 /// would produce from a given tree, independent of the tree itself.
@@ -31971,6 +31981,104 @@ mod tests {
                 .swept
         );
         assert_eq!(conn.query_row("SELECT count(*) FROM session_events WHERE session_id='desktop-upgrade' AND text='Recovered reply'", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert!(
+            !super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept
+        );
+    }
+
+    /// OpenCode keeps no per-file sync state, so the only thing that tells an
+    /// upgraded sweep to re-normalize an unchanged store is the generation in
+    /// the source fingerprint. Without it a step-only assistant message the
+    /// previous build never captured stays missing until OpenCode writes again.
+    #[test]
+    fn unchanged_opencode_store_gains_step_only_messages_after_parser_upgrade() {
+        fn copy_tree(from: &Path, to: &Path) {
+            fs::create_dir_all(to).unwrap();
+            for entry in fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                let target = to.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy_tree(&entry.path(), &target);
+                } else {
+                    fs::copy(entry.path(), target).unwrap();
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let share = dir.path().join(".local/share/opencode");
+        copy_tree(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/opencode/legacy-json-multi-turn/storage"),
+            &share.join("storage"),
+        );
+        let db = dir.path().join("history.db");
+        let roots =
+            crate::ProviderRoots::from_home(dir.path().to_path_buf(), share.join("opencode.db"));
+        super::sync_exclusive_with_roots(&db, &roots, false).unwrap();
+        let conn = open_db(&db).unwrap();
+        let envelope = |conn: &Connection| {
+            conn.query_row(
+                "SELECT count(*) FROM session_events WHERE source='opencode' \
+                 AND session_id='ses_multi' AND event_uid='message:msg_multi_a1'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(envelope(&conn), 1);
+
+        // The previous build's output: no envelope for the step-only message,
+        // under that build's fingerprint and destination proof.
+        conn.execute(
+            "DELETE FROM session_events WHERE event_uid='message:msg_multi_a1'",
+            [],
+        )
+        .unwrap();
+        let state_path = dir.path().join(".sync-state.json");
+        let mut state = load_sync_state(&state_path).unwrap();
+        let source_part = state[super::SOURCE_FINGERPRINT_KEY]
+            .as_str()
+            .unwrap()
+            .split_once('/')
+            .unwrap()
+            .1
+            .to_string();
+        let old_generations = [
+            "claude_sessions_v3",
+            "codex_rollouts_v7",
+            super::GROK_SYNC_STATE_KEY,
+        ]
+        .join("|");
+        let old_generation = format!(
+            "g{:016x}",
+            crate::discover::fingerprint_hash(
+                "sweep-generation",
+                &crate::discover::SHALLOW_SCANNER_VERSION.to_string(),
+                &old_generations,
+            )
+        );
+        let old_fingerprint = format!("{old_generation}/{source_part}");
+        state.insert(super::SOURCE_FINGERPRINT_KEY.into(), json!(old_fingerprint));
+        state.insert(
+            super::DESTINATION_GENERATION_KEY.into(),
+            json!(super::destination_generation(&conn).unwrap()),
+        );
+        state.insert(
+            super::DESTINATION_HEAD_KEY.into(),
+            json!(super::destination_head(&conn).unwrap()),
+        );
+        assert!(super::sources_unchanged(&conn, &state, &old_fingerprint));
+        fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+
+        assert!(
+            super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept,
+            "the generation bump must cross the previous build's fingerprint"
+        );
+        assert_eq!(envelope(&conn), 1);
         assert!(
             !super::sync_exclusive_with_roots(&db, &roots, false)
                 .unwrap()

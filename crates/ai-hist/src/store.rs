@@ -3024,7 +3024,9 @@ pub struct SessionFileEdit {
 ///
 /// 3: `session_events` rows carry `control_kind`, and the user-turn page
 /// leaves control rows out.
-pub const SESSION_EVIDENCE_CONTRACT_VERSION: u32 = 3;
+///
+/// 4: `control_kind` may be `synthetic` (OpenCode harness-written user text).
+pub const SESSION_EVIDENCE_CONTRACT_VERSION: u32 = 4;
 
 /// Stable continuation for tool calls and file edits.
 ///

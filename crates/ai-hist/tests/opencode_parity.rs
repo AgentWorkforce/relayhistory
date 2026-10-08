@@ -3020,7 +3020,9 @@ INSERT INTO part VALUES
   ('prt_steps_a2_1', 'msg_steps_a2', 'ses_steps', 1777000003000,
    '{"id":"prt_steps_a2_1","sessionID":"ses_steps","messageID":"msg_steps_a2","type":"step-start","snapshot":"def"}'),
   ('prt_steps_a2_2', 'msg_steps_a2', 'ses_steps', 1777000003100,
-   '{"id":"prt_steps_a2_2","sessionID":"ses_steps","messageID":"msg_steps_a2","type":"step-finish","tokens":{"input":41,"output":9,"reasoning":0,"cache":{"read":1300,"write":0}}}'),
+   '{"id":"prt_steps_a2_2","sessionID":"ses_steps","messageID":"msg_steps_a2","type":"step-finish","reason":"tool-calls","tokens":{"input":20,"output":4,"reasoning":0,"cache":{"read":650,"write":0}}}'),
+  ('prt_steps_a2_3', 'msg_steps_a2', 'ses_steps', 1777000003200,
+   '{"id":"prt_steps_a2_3","sessionID":"ses_steps","messageID":"msg_steps_a2","type":"step-finish","tokens":{"input":21,"output":5,"reasoning":0,"cache":{"read":650,"write":0}}}'),
   ('prt_steps_a3_1', 'msg_steps_a3', 'ses_steps', 1777000004000,
    '{"id":"prt_steps_a3_1","sessionID":"ses_steps","messageID":"msg_steps_a3","type":"reasoning","text":"","metadata":{"openai":{"reasoningEncryptedContent":"gAAAA"}}}'),
   ('prt_steps_a3_2', 'msg_steps_a3', 'ses_steps', 1777000004100,
@@ -3113,7 +3115,8 @@ fn every_assistant_message_is_evidence_in_both_layouts() {
                 "tool-calls",
                 r#"{"input":40,"output":7,"reasoning":300,"cache":{"read":1000,"write":0}}"#,
             ),
-            // No `step-finish.reason`: the message's own `finish` stands.
+            // The final `step-finish` names no reason, so the message's own
+            // `finish` stands, not the earlier step's `tool-calls`.
             (
                 "msg_steps_a2",
                 BlockKind::Text,
@@ -3158,6 +3161,17 @@ fn every_assistant_message_is_evidence_in_both_layouts() {
             assert_eq!(message.blocks[0].text.as_deref(), text, "{layout} {id}");
         }
 
+        let encrypted: Vec<_> = evidence
+            .markers
+            .iter()
+            .map(|marker| (marker.kind.as_str(), marker.message_id.as_deref()))
+            .collect();
+        assert_eq!(
+            encrypted,
+            [("encrypted_reasoning", Some("msg_steps_a3"))],
+            "{layout}: an encrypted trace is recorded, not dropped"
+        );
+
         let requested: Vec<Vec<String>> = evidence
             .requests
             .iter()
@@ -3172,6 +3186,10 @@ fn every_assistant_message_is_evidence_in_both_layouts() {
     assert_eq!(
         from_sqlite.messages, from_json.messages,
         "the two layouts must produce the same messages"
+    );
+    assert_eq!(
+        from_sqlite.markers, from_json.markers,
+        "the two layouts must produce the same markers"
     );
 
     fs::remove_dir_all(&root).ok();

@@ -1207,14 +1207,16 @@ fn is_failed_tool(state: Option<&Map<String, Value>>) -> bool {
 }
 
 /// The reason on the message's *last* `step-finish` part. A turn can take
-/// several steps; only the last one says why the turn ended.
+/// several steps; only the last one says why the turn ended, so a final step
+/// that names no reason yields none rather than an earlier step's.
 fn last_step_finish_reason(parts: &[OpencodePart]) -> Option<String> {
-    parts.iter().rev().find_map(|part| {
-        (part.kind == "step-finish")
-            .then(|| part.get("reason").and_then(Value::as_str))
-            .flatten()
-            .map(str::to_string)
-    })
+    parts
+        .iter()
+        .rev()
+        .find(|part| part.kind == "step-finish")?
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 /// Text a part carries, unless the provider marked it `synthetic` — synthetic
@@ -1236,9 +1238,21 @@ fn synthetic_text(part: &OpencodePart) -> Option<&str> {
 }
 
 /// The model's reasoning, from a `reasoning` part. A provider that returns only
-/// an encrypted trace writes the part with empty text, which carries nothing.
+/// an encrypted trace writes the part with empty text; see
+/// [`is_encrypted_reasoning`].
 fn reasoning_text(part: &OpencodePart) -> Option<&str> {
     text_of(part, "reasoning").filter(|text| !text.trim().is_empty())
+}
+
+/// A `reasoning` part with no text but provider metadata: the trace was
+/// returned encrypted (OpenAI's `reasoningEncryptedContent`, for one).
+fn is_encrypted_reasoning(part: &OpencodePart) -> bool {
+    part.kind == "reasoning"
+        && reasoning_text(part).is_none()
+        && part
+            .get("metadata")
+            .and_then(Value::as_object)
+            .is_some_and(|metadata| !metadata.is_empty())
 }
 
 fn is_synthetic(part: &OpencodePart) -> bool {
@@ -1403,9 +1417,11 @@ fn normalize_session(
                     continue;
                 }
                 if let Some(text) = synthetic_text(part) {
-                    // Context the harness added to the turn: an event, so the
-                    // turn's size is what the model read, and a control row,
-                    // so it is never mistaken for — or ledgered as — a prompt.
+                    // Context the harness added to the turn, which the model
+                    // read: an event, so the user message carries it, and a
+                    // control row, like every other harness-written user row,
+                    // so it is never a prompt, a `history` entry or a block of
+                    // a human user turn.
                     let event_uid = format!("text:{}", part.id);
                     insert_session_event_with_provenance(
                         conn,
@@ -1504,6 +1520,27 @@ fn normalize_session(
         let events_before_message = counts.events;
         for (index, part) in parts.iter().enumerate() {
             super::check_capture_cancelled()?;
+            if is_encrypted_reasoning(part) {
+                // The trace exists but is opaque: record that the model reasoned
+                // here, as the other providers' encrypted traces are, rather
+                // than inventing thinking text for it.
+                let marker_uid = format!("part:{}", part.id);
+                counts.markers += crate::insert_session_marker(
+                    conn,
+                    "opencode",
+                    session_id,
+                    &crate::NewSessionMarker {
+                        marker_uid: &marker_uid,
+                        ts_ms: Some(message.time_created),
+                        message_id: Some(&message.id),
+                        kind: "encrypted_reasoning",
+                        subkind: Some("reasoning"),
+                        ..Default::default()
+                    },
+                )?;
+                keys.markers.insert(marker_uid);
+                continue;
+            }
             if let Some(text) = reasoning_text(part) {
                 let event_uid = format!("reasoning:{}", part.id);
                 insert_session_event_with_provenance(
@@ -1940,6 +1977,15 @@ mod tests {
     }
 
     #[test]
+    fn a_reasonless_final_step_does_not_borrow_an_earlier_steps_reason() {
+        let parts = vec![
+            part(r#"{"id":"p1","type":"step-finish","reason":"tool-calls"}"#),
+            part(r#"{"id":"p2","type":"step-finish"}"#),
+        ];
+        assert_eq!(last_step_finish_reason(&parts), None);
+    }
+
+    #[test]
     fn synthetic_text_is_not_transcript() {
         assert_eq!(
             part_text(&part(r#"{"id":"p","type":"text","text":"real"}"#)),
@@ -1979,6 +2025,15 @@ mod tests {
             reasoning_text(&part(r#"{"id":"p","type":"text","text":"not reasoning"}"#)),
             None
         );
+        assert!(is_encrypted_reasoning(&part(
+            r#"{"id":"p","type":"reasoning","text":"","metadata":{"openai":{"reasoningEncryptedContent":"gAAAA"}}}"#
+        )));
+        assert!(!is_encrypted_reasoning(&part(
+            r#"{"id":"p","type":"reasoning","text":"plan it","metadata":{"openai":{}}}"#
+        )));
+        assert!(!is_encrypted_reasoning(&part(
+            r#"{"id":"p","type":"reasoning","text":""}"#
+        )));
     }
 
     /// A provider store with the fixture schema, and optionally the indexes

@@ -1780,7 +1780,8 @@ How each adapter works:
 
   A hydrated OpenCode session yields, per assistant message: `session_events`
   of kind `thinking` for each `reasoning` part with text (`event_uid`
-  `reasoning:<partId>`; an encrypted-only reasoning part has none), `text` for
+  `reasoning:<partId>`; an encrypted-only one, blank text with provider
+  `metadata`, is an `encrypted_reasoning` marker instead), `text` for
   each non-synthetic `text` part, `tool_use` plus a `tool_calls` row for each
   `tool` part (`tool_use_id` = `callID`, `is_error` from
   `state.status == "error"` or `state.metadata.exit != 0`), a `tool_result`
@@ -1792,7 +1793,8 @@ How each adapter works:
   `"<providerID>/<modelID>"`, `provider` as the bare `providerID`, `token_json`
   as the message's `tokens` object verbatim
   (`{input, output, reasoning, cache:{read, write}}`), and `stop_reason` from
-  the message's last `step-finish.reason`, else the message's own `finish`.
+  the message's final `step-finish` part's `reason`, else the message's own
+  `finish`.
   Per user message: a `text` event for each `text` part, those flagged
   `synthetic: true` with `control_kind = "synthetic"` and kept out of
   `history`. A `compaction` part records a `session_markers` row of kind

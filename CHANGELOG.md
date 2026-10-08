@@ -8,16 +8,16 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- OpenCode `reasoning` parts are thinking blocks, and synthetic user text (harness-written context such as an `@file` read) is captured as a user text block with `control_kind = "synthetic"`, never as a prompt.
+- Text-bearing OpenCode `reasoning` parts are thinking blocks and an encrypted-only one is an `encrypted_reasoning` marker; synthetic user text (harness-written context such as an `@file` read) is captured as a user text block with `control_kind = "synthetic"`, never as a prompt.
 
 ### Fixed
 
 - Every OpenCode assistant message is a `Message` and a request in `SessionStore::session`, with its `tokens` verbatim as `raw_usage`, model, provider and stop reason, including messages made only of `step-start` / `step-finish` / `reasoning` parts; their usage was previously missing from the store in both the `opencode.db` and legacy `storage/` layouts.
-- An OpenCode message's own `finish` is its stop reason when no `step-finish` part names one.
+- An OpenCode message's stop reason is its final `step-finish` reason, else the message's own `finish`; a reasonless final step no longer reports an earlier step's reason.
 
 ### Rust API
 
-- Added `ControlKind::Synthetic` (`"synthetic"`).
+- Added `ControlKind::Synthetic` (`"synthetic"`); `SESSION_EVIDENCE_CONTRACT_VERSION` is 4 in Rust and TypeScript, so an SDK without the value rejects an addon that can return it.
 
 ## [0.36.0] - 2026-10-07
 

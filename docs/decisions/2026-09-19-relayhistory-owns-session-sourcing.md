@@ -169,16 +169,15 @@ session are synthesized. Relay has no local transcript at all: its rows arrive
 from a remote connector, and `RelayProvider` in `src/discover.rs` derives its
 catalog row from `history` rows a previous sync already stored.
 
-**Event rows, model, tool calls, file edits — grok, opencode, relay.**
-`ingest_grok_session` inserts `history` rows and nothing else.
-`sync_opencode_session_from_connection` selects only
-`role = 'user' AND type = 'text'` parts. Relay never reaches an event-level
-parser: `source_snapshot` in `src/ingest/hydrate.rs` returns
-`HYDRATION_UNSUPPORTED` — "Relay catalog evidence has no configured
-full-evidence connector". These three sources are prompts-only. Model is `◐` for
-grok and opencode because the shallow catalog read records a `models` list
-(from grok's `summary.json`, and from OpenCode's indexed part read when the
-provider index exists) while no per-event model is ever stored.
+**Event rows, model, tool calls, file edits — grok, relay.**
+`ingest_grok_session` inserts `history` rows and nothing else. Relay never
+reaches an event-level parser: `source_snapshot` in `src/ingest/hydrate.rs`
+returns `HYDRATION_UNSUPPORTED` — "Relay catalog evidence has no configured
+full-evidence connector". These two sources are prompts-only. Model is `◐` for
+grok because the shallow catalog read records a `models` list from grok's
+`summary.json` while no per-event model is ever stored. OpenCode's cells are
+`✓`: one normalizer (`src/ingest/opencode.rs`) writes every assistant message
+as evidence from both of its storage layouts.
 
 **Cursor, since [#166](https://github.com/AgentWorkforce/relayhistory/issues/166).**
 `ingest_cursor_transcript` replaced the prompt-only `ingest_cursor_line`, so
@@ -264,8 +263,8 @@ control surface (`app_state`, `shell_last_seen_index`, `prompt_history`,
 **`request_id`, `stop_reason`, `turn_id`, sidechain and meta flags.** Grep the
 crate: `requestId`, `stop_reason`, `stopReason` and `turn_id` appear only in
 test fixtures. Claude transcripts carry `requestId` on assistant rows and
-`stop_reason` on the message; neither is read. OpenCode records a step-finish
-reason on its parts, which is also not read. Codex reports no stop reason at
+`stop_reason` on the message; neither is read. OpenCode's is read from the
+message's last `step-finish` part, else the message's `finish`. Codex reports no stop reason at
 all — burn's own Codex reader hard-codes `stop_reason: None` — so that cell is
 `—` rather than a gap. Codex payloads do carry `turn_id`, and it is not read. `isSidechain` and `isMeta` _are_ read, but only as filters — a
 sidechain row decides attribution and a meta row is excluded from `history`;
