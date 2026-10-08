@@ -9274,9 +9274,9 @@ fn ingest_claude_record(
     };
     let session_id = attributed_session_id.unwrap_or(record_session_id);
     // A sidechain row is delegated traffic: the subagent's output, and the
-    // parent agent's prompts and tool results to it. Every one is stored, with
-    // `is_sidechain` set, so the delegated thread's parent chain and tool
-    // results are whole; its user-role rows are the delegating agent's, not a
+    // parent agent's prompts and tool results to it. Every one is stored --
+    // its event rows with `is_sidechain` set -- so the delegated thread's
+    // parent chain and tool results are whole; its user-role rows are the delegating agent's, not a
     // human's, so they never become `history`, a prompt or a control row.
     let is_sidechain = obj.get("isSidechain").and_then(Value::as_bool);
     let sidechain = is_sidechain.unwrap_or(false);
@@ -27384,6 +27384,60 @@ mod tests {
         blank_raw_message_facts_state(&mut state);
         sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
         assert_eq!(sidechain_rows(&conn), expected);
+    }
+
+    /// A named sidecar whose only record is the delegated prompt -- a child
+    /// interrupted before it replied -- left an earlier parser a delegation
+    /// row and no child events. That is not delegation evidence the fast path
+    /// accepts (`claude_sidecar_evidence_exists` asks for the child's rows),
+    /// so the next sync re-reads the sidecar and stores the prompt.
+    #[test]
+    fn plain_claude_sync_rereads_a_sidecar_an_earlier_parser_left_without_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("app");
+        let subagents = project.join("root-1/subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        fs::write(
+            project.join("root-1.jsonl"),
+            concat!(
+                r#"{"type":"user","uuid":"u1","sessionId":"root-1","cwd":"/work/app","timestamp":"2026-08-31T11:00:00Z","message":{"role":"user","content":"start"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let sidecar = subagents.join("agent-child.jsonl");
+        fs::write(
+            &sidecar,
+            concat!(
+                r#"{"type":"user","uuid":"c1","sessionId":"root-1","agentId":"child","isSidechain":true,"cwd":"/work/app","timestamp":"2026-08-31T11:00:01Z","message":{"role":"user","content":"delegated instruction"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let child_rows = |conn: &Connection| -> (i64, i64) {
+            conn.query_row(
+                "SELECT \
+                   (SELECT COUNT(*) FROM session_events WHERE source = 'claude' \
+                      AND session_id = 'child' AND is_sidechain = 1), \
+                   (SELECT COUNT(*) FROM session_relationships WHERE source = 'claude' \
+                      AND child_session_id = 'child')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(child_rows(&conn), (1, 1));
+
+        conn.execute(
+            "DELETE FROM session_events WHERE source = 'claude' AND session_id = 'child'",
+            [],
+        )
+        .unwrap();
+        assert!(!claude_sidecar_evidence_exists(&conn, &sidecar).unwrap());
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(child_rows(&conn), (1, 1));
     }
 
     #[test]
