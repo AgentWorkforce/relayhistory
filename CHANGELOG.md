@@ -14,6 +14,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Every OpenCode assistant message is a `Message` and a request in `SessionStore::session`, with its `tokens` verbatim as `raw_usage`, model, provider and stop reason, including messages made only of `step-start` / `step-finish` / `reasoning` parts; their usage was previously missing from the store in both the `opencode.db` and legacy `storage/` layouts.
 - An OpenCode message's stop reason is its final `step-finish` reason, else the message's own `finish`; a reasonless final step no longer reports an earlier step's reason.
+- `sync` no longer rewrites the full-text index entry of a row it re-reads unchanged: a sweep that re-reads the OpenCode store, or re-parses a transcript, re-indexes only rows whose text, role or project changed, so walking syncs write less and search stays as fast as on a freshly indexed store.
 
 ### Rust API
 

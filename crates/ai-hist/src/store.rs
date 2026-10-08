@@ -443,10 +443,11 @@ CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
     INSERT INTO history_fts(rowid, prompt, project)
     VALUES (new.id, new.prompt, new.project);
 END;
--- `UPDATE OF`, for the same reason as `session_events_au` below: the
--- change feed re-stamps `revision` after each insert, and that touches
--- nothing the index holds.
-CREATE TRIGGER IF NOT EXISTS history_au AFTER UPDATE OF id, prompt, project ON history BEGIN
+-- `UPDATE OF` and `WHEN`, for the same reasons as `session_events_au`
+-- below.
+CREATE TRIGGER IF NOT EXISTS history_au AFTER UPDATE OF id, prompt, project ON history
+    WHEN old.id IS NOT new.id OR old.prompt IS NOT new.prompt OR old.project IS NOT new.project
+BEGIN
     INSERT INTO history_fts(history_fts, rowid, prompt, project)
     VALUES('delete', old.id, old.prompt, old.project);
     INSERT INTO history_fts(rowid, prompt, project)
@@ -463,8 +464,14 @@ END;
 -- `UPDATE OF`, not every update: the change feed re-stamps a row's
 -- `revision` after each insert, and the project-identity pass rewrites
 -- `project_key` in bulk. Neither touches what the index holds, and an
--- unconditional trigger re-indexed every event twice.
-CREATE TRIGGER IF NOT EXISTS session_events_au AFTER UPDATE OF text, role, project ON session_events BEGIN
+-- unconditional trigger re-indexed every event twice. `WHEN`, because
+-- `UPDATE OF` fires whenever a statement assigns the column, changed or not:
+-- every sweep re-upserts the rows it re-reads with the values they already
+-- hold, and without the guard each one deleted and re-inserted its index
+-- entry, writing index pages and fragmenting the index searches read.
+CREATE TRIGGER IF NOT EXISTS session_events_au AFTER UPDATE OF text, role, project ON session_events
+    WHEN old.text IS NOT new.text OR old.role IS NOT new.role OR old.project IS NOT new.project
+BEGIN
     INSERT INTO session_events_fts(session_events_fts, rowid, text, role, project)
     VALUES('delete', old.id, old.text, old.role, old.project);
     INSERT INTO session_events_fts(rowid, text, role, project)
@@ -1041,6 +1048,9 @@ const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &[
     // so the marker is what makes the rebuild happen exactly once.
     "session_events_fts_update_of_v1",
     "history_fts_update_of_v1",
+    // The FTS update triggers re-index only a row whose indexed values
+    // changed; the marker rebuilds an existing database's body once.
+    "fts_update_changed_only_v1",
     "evidence_location_v1",
     EXPORT_CAPTURE_RETIRED,
 ];
@@ -1463,8 +1473,13 @@ fn init_db_locked(conn: &Connection) -> Result<()> {
     if !migration_applied(conn, "session_events_fts_update_of_v1")? {
         conn.execute_batch("DROP TRIGGER IF EXISTS session_events_au;")?;
     }
-    if !migration_applied(conn, "history_fts_update_of_v1")? {
+    if !migration_applied(conn, "history_fts_update_of_v1")?
+        || !migration_applied(conn, "fts_update_changed_only_v1")?
+    {
         conn.execute_batch("DROP TRIGGER IF EXISTS history_au;")?;
+    }
+    if !migration_applied(conn, "fts_update_changed_only_v1")? {
+        conn.execute_batch("DROP TRIGGER IF EXISTS session_events_au;")?;
     }
     conn.execute_batch(SCHEMA)?;
     // Before the trigger below, whose body deletes from these tables.
@@ -1654,7 +1669,8 @@ END;
         "INSERT OR IGNORE INTO schema_migrations (name) \
          VALUES ('session_delete_continuity_reopen_v1'), \
                 ('session_events_fts_update_of_v1'), \
-                ('history_fts_update_of_v1');",
+                ('history_fts_update_of_v1'), \
+                ('fts_update_changed_only_v1');",
     )?;
     // Before the change feed's revision backfill, whose UPDATE of every
     // trajectory would otherwise fire the Python-era trigger.
@@ -5625,6 +5641,83 @@ pub fn import_json(conn: &Connection, entries: &[HistoryEntry]) -> Result<usize>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sweep re-upserts every row it re-reads with the values it already
+    /// holds. Such an update leaves both full-text indexes untouched -- no
+    /// index page is written -- while a real change to an indexed value is
+    /// still re-indexed. Also covers a database created with the earlier
+    /// unconditional trigger bodies, which `open_db` rebuilds once.
+    #[test]
+    fn fts_update_triggers_reindex_only_changed_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        let index_blocks = |conn: &Connection| -> (i64, i64) {
+            conn.query_row(
+                "SELECT (SELECT count(*) FROM session_events_fts_data), \
+                        (SELECT count(*) FROM history_fts_data)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        let matches = |conn: &Connection, term: &str| -> (i64, i64) {
+            conn.query_row(
+                "SELECT (SELECT count(*) FROM session_events_fts WHERE session_events_fts MATCH ?1), \
+                        (SELECT count(*) FROM history_fts WHERE history_fts MATCH ?1)",
+                [term],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        for legacy in [false, true] {
+            let _ = fs::remove_file(&path);
+            let mut conn = open_db(&path).unwrap();
+            if legacy {
+                conn.execute_batch(
+                    "DROP TRIGGER session_events_au;
+                     CREATE TRIGGER session_events_au AFTER UPDATE OF text, role, project ON session_events BEGIN
+                         INSERT INTO session_events_fts(session_events_fts, rowid, text, role, project)
+                         VALUES('delete', old.id, old.text, old.role, old.project);
+                         INSERT INTO session_events_fts(rowid, text, role, project)
+                         VALUES (new.id, new.text, new.role, new.project);
+                     END;
+                     DROP TRIGGER history_au;
+                     CREATE TRIGGER history_au AFTER UPDATE OF id, prompt, project ON history BEGIN
+                         INSERT INTO history_fts(history_fts, rowid, prompt, project)
+                         VALUES('delete', old.id, old.prompt, old.project);
+                         INSERT INTO history_fts(rowid, prompt, project)
+                         VALUES (new.id, new.prompt, new.project);
+                     END;
+                     DELETE FROM schema_migrations WHERE name = 'fts_update_changed_only_v1';",
+                )
+                .unwrap();
+                drop(conn);
+                conn = open_db(&path).unwrap();
+            }
+            conn.execute_batch(
+                "INSERT INTO session_events (source, session_id, project, ts_ms, role, kind, text, event_uid) \
+                   VALUES ('claude', 's1', '/work/app', 1, 'assistant', 'text', 'alpha', 'e1');
+                 INSERT INTO history (source, session_id, project, prompt, timestamp_ms) \
+                   VALUES ('claude', 's1', '/work/app', 'alpha', 1);",
+            )
+            .unwrap();
+            let before = index_blocks(&conn);
+            conn.execute_batch(
+                "UPDATE session_events SET text = text, role = role, project = project;
+                 UPDATE history SET prompt = prompt, project = project;",
+            )
+            .unwrap();
+            assert_eq!(index_blocks(&conn), before, "legacy={legacy}");
+            assert_eq!(matches(&conn, "alpha"), (1, 1), "legacy={legacy}");
+            conn.execute_batch(
+                "UPDATE session_events SET text = 'beta';
+                 UPDATE history SET prompt = 'beta';",
+            )
+            .unwrap();
+            assert_eq!(matches(&conn, "alpha"), (0, 0), "legacy={legacy}");
+            assert_eq!(matches(&conn, "beta"), (1, 1), "legacy={legacy}");
+        }
+    }
 
     /// The Python CLI's `trajectory_fts` and the triggers that maintained it,
     /// verbatim.
