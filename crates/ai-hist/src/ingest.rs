@@ -3131,6 +3131,14 @@ impl Drop for SyncStateLock {
 /// Recording the generation per provider makes the pass happen exactly once.
 const TOOL_RESULT_FIDELITY_GENERATION: i64 = 1;
 const CLAUDE_FIDELITY_GENERATION_KEY: &str = "claude_tool_result_fidelity";
+
+/// One-time pass that re-reads every primary transcript an earlier build
+/// classified as a subagent sidecar by content alone, before the sidecar rule
+/// required the `agent-*.jsonl` layout. Recorded only after a walk that
+/// reached every known root, like the other backfills; from then on the sync
+/// walk does not probe for it.
+const CLAUDE_SIDECAR_LAYOUT_GENERATION: i64 = 1;
+const CLAUDE_SIDECAR_LAYOUT_KEY: &str = "claude_sidecar_layout";
 const CODEX_FIDELITY_GENERATION_KEY: &str = "codex_tool_result_fidelity";
 
 /// Whether this provider still owes a one-time fidelity backfill pass.
@@ -7569,6 +7577,11 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
     }
     let backfill_fidelity = fidelity_backfill_pending(state, CLAUDE_FIDELITY_GENERATION_KEY);
     let backfill_raw_facts = raw_facts_backfill_pending(state, CLAUDE_RAW_MESSAGE_FACTS_KEY);
+    let reclassify_sidecars = state
+        .get(CLAUDE_SIDECAR_LAYOUT_KEY)
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        < CLAUDE_SIDECAR_LAYOUT_GENERATION;
     // The first read failure, returned once everything else has been indexed.
     // Continuing past it indexes the rest of the tree, but the run did omit a
     // transcript it discovered, and a caller told the sync completed would
@@ -7618,9 +7631,12 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
         // record a sidechain row -- is still cited as delegation evidence,
         // whether or not discovery has since catalogued it. Its cursor says
         // nothing about that, so it is re-read as the session it is, which
-        // retracts the delegation.
-        let misread_as_sidecar =
-            !is_claude_sidecar_file(&path) && claude_delegation_cites(conn, &path)?;
+        // retracts the delegation. Asked only during the one-time pass: the
+        // current classification never cites a primary transcript, so once
+        // every root has been walked there is nothing left to find.
+        let misread_as_sidecar = reclassify_sidecars
+            && !is_claude_sidecar_file(&path)
+            && claude_delegation_cites(conn, &path)?;
         // During the one-time backfill passes, an unchanged transcript whose
         // rows predate either additive evidence shape is re-read to populate
         // it. Outside those passes the cursor alone decides, so a row this
@@ -7770,8 +7786,10 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
             }
             // A primary transcript is no delegation's evidence. An earlier
             // build read one made only of sidechain rows as a sidecar of its
-            // own session; that delegation row is retracted here.
-            retract_claude_delegation_evidence(conn, &path)?;
+            // own session; that delegation is retracted here.
+            if misread_as_sidecar {
+                retract_claude_delegation_evidence(conn, &path)?;
+            }
             upsert_session(
                 conn,
                 &meta.session_id,
@@ -7827,6 +7845,10 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
 
     if walked_every_known_root {
         record_fidelity_backfill(state, CLAUDE_FIDELITY_GENERATION_KEY);
+        state.insert(
+            CLAUDE_SIDECAR_LAYOUT_KEY.to_string(),
+            json!(CLAUDE_SIDECAR_LAYOUT_GENERATION),
+        );
     }
     crate::continuity::reconcile(conn, "claude")?;
     record_raw_facts_backfill(state, CLAUDE_RAW_MESSAGE_FACTS_KEY, walked_every_known_root);
@@ -7912,7 +7934,7 @@ where
 }
 
 /// Whether a `delegated` row cites the transcript at `path` as its evidence.
-fn claude_delegation_cites(conn: &Connection, path: &Path) -> Result<bool> {
+pub(crate) fn claude_delegation_cites(conn: &Connection, path: &Path) -> Result<bool> {
     let cites: i64 = cached_query_row(
         conn,
         "SELECT EXISTS(SELECT 1 FROM session_relationships \

@@ -2669,8 +2669,11 @@ fn ingest_claude(
         ));
     }
     // The selected transcript is the session's own, so it is no delegation's
-    // evidence; see `retract_claude_delegation_evidence`.
-    crate::ingest::retract_claude_delegation_evidence(conn, path)?;
+    // evidence; see `retract_claude_delegation_evidence`. One indexed probe
+    // when nothing cites it, which is every transcript the current build read.
+    if crate::ingest::claude_delegation_cites(conn, path)? {
+        crate::ingest::retract_claude_delegation_evidence(conn, path)?;
+    }
     upsert_session(
         conn,
         &meta.session_id,
