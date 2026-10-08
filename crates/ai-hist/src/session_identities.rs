@@ -184,18 +184,7 @@ impl SessionStore {
         identity: &SessionIdentity,
     ) -> std::result::Result<Vec<SessionIdentity>, Error> {
         let conn = self.read_conn()?;
-        let mut parents = conn.prepare_cached(DELEGATED_BY_SQL).map_err(Error::sql)?;
-        let ids = parents
-            .query_map(
-                rusqlite::params![
-                    identity.source_name,
-                    identity.session_id,
-                    crate::relationships::RELATIONSHIP_DELEGATED
-                ],
-                |row| row.get::<_, String>(0),
-            )
-            .map_err(Error::sql)?
-            .collect::<rusqlite::Result<std::collections::BTreeSet<_>>>()
+        let ids = delegating_parents(&conn, &identity.source_name, &identity.session_id)
             .map_err(Error::sql)?;
         Ok(ids
             .into_iter()
@@ -221,6 +210,25 @@ const DESCENDANT_STEP_SQL: &str = "SELECT child_session_id FROM session_relation
 const DELEGATED_BY_SQL: &str = "SELECT parent_session_id FROM session_relationships \
      WHERE source = ?1 AND child_session_id = ?2 AND relationship = ?3 \
        AND +parent_session_id <> +child_session_id";
+
+/// [`SessionStore::delegated_by`] on one connection: the parents that
+/// delegated work to `(source, session_id)`, distinct and in order.
+pub(crate) fn delegating_parents(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+) -> rusqlite::Result<std::collections::BTreeSet<String>> {
+    let mut parents = conn.prepare_cached(DELEGATED_BY_SQL)?;
+    let ids = parents.query_map(
+        rusqlite::params![
+            source,
+            session_id,
+            crate::relationships::RELATIONSHIP_DELEGATED
+        ],
+        |row| row.get::<_, String>(0),
+    )?;
+    ids.collect()
+}
 
 /// [`SessionStore::delegated_descendants`] on one connection.
 fn delegated_descendants(

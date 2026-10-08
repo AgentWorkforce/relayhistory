@@ -9704,6 +9704,18 @@ fn ingest_claude_record(
             &mut first_text_event_uid,
         )?;
     }
+    // Claude Code writes a tool's structured result beside the message, as
+    // the record's `toolUseResult`, one result per record. It describes the
+    // record's tool_result block only when there is exactly one to describe.
+    let record_tool_use_result = obj.get("toolUseResult").filter(|_| {
+        content
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+            .count()
+            == 1
+    });
     for (block_index, block) in content.as_array().into_iter().flatten().enumerate() {
         let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
         let event_uid = format!("{message_uuid}:{block_index}");
@@ -9845,8 +9857,15 @@ fn ingest_claude_record(
                 // actually returned, which a post-processed string can no
                 // longer answer.
                 let (call_index, event_index) = indexer.next(tool_use_id);
-                let facts = tool_result_facts::claude_tool_result_facts(block)
+                let mut facts = tool_result_facts::claude_tool_result_facts(block)
                     .with_ordering(call_index, event_index);
+                // The delegated child an Agent/Task result reports on.
+                facts.agent_id = find_tool_use_result(block)
+                    .or(record_tool_use_result)
+                    .and_then(|result| result.get("agentId"))
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string);
                 let text = materialize_tool_result_text(content);
                 insert_session_event_with_provenance(
                     conn,

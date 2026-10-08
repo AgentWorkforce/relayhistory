@@ -103,7 +103,16 @@ session id rather than flattened into the parent, and delegated task prompts
 are not stored as human prompt history. Claude evidence from a provider
 version that does not name the child is recorded as an unlinked relationship —
 never as a synthesized identity — and its output stays attributed to the
-parent. The hydration stamp covers every file that evidence came from — the
+parent. A Claude sidecar's records name the session at the root of its
+delegation tree, so the edge's parent is the session whose tool call has the
+`toolUseId` the `agent-<agentId>.meta.json` names: a subagent spawned from
+inside another subagent hangs under that subagent (`spawnDepth` 2 under
+depth 1), and the root only when the call is in the root's own transcript.
+Claude Code's meta files name no model, so `child_model` is the model the
+sidecar's first assistant record names when the meta has none. A catalog-less
+child's evidence is read by its own id through `SessionStore::session`, which
+reports it as `DiscoveryState::Delegated`; it never becomes a catalog row.
+The hydration stamp covers every file that evidence came from — the
 selected transcript, each subagent transcript, and the
 `agent-<agentId>.meta.json` describing it — so a metadata sidecar that arrives
 or changes on its own still re-hydrates the session. Set
@@ -383,7 +392,7 @@ contract:
 | `workspace_roots` | observed | extra workspace roots, when the provider records them |
 | `raw_path` | observed | provider file this row came from; the session/task URL for remote rows; `null` for database-backed sources |
 | `source_stamp` | internal | change marker; see [rescan behaviour](#rescans-and-source-stamps) |
-| `discovery_state` | internal | `"shallow"` or `"full"` |
+| `discovery_state` | internal | `"shallow"` or `"full"`; `"delegated"` only on a delegated child `SessionStore::session` read without a catalog row |
 | `locations` | derived | sorted presences from `session_presences`: `"local"`, `"remote"`, or both |
 | `from_cache` | per-response | `true` when the row was served without re-reading the source |
 
@@ -620,7 +629,7 @@ status, because a fabricated measurement reads exactly like a real one:
 
 | Source | `payload_bytes` / `payload_hash` | `payload_truncated` | `call_index` / `event_index` | `result_status` | `event_source` | `error_signal` | `subagent_session_id` / `agent_id` |
 |---|---|---|---|---|---|---|---|
-| **claude** | ✓ (raw `content`) | ✓ (harness markers) | ✓ | ✓ | `tool_result`, `subagent_notification` | `tool_result.is_error`, `subagent_status` | ✓ (system subagent notifications) |
+| **claude** | ✓ (raw `content`) | ✓ (harness markers) | ✓ | ✓ | `tool_result`, `subagent_notification` | `tool_result.is_error`, `subagent_status` | ✓ (system subagent notifications; `agent_id` from a spawn result's `toolUseResult.agentId`) |
 | **codex** | ✓ (raw `output`) | ✓ (harness markers) | ✓ | ✓ (settled at `task_complete`) | `function_call_output` | `exit_code`, `patch_apply`, `mcp_err` | – (no notification rail) |
 | **cursor** | ✓ (raw block `content`) | ✓ (harness markers) | ✓ | ✓ | `tool_result` | `tool_result.is_error` | – (no notification rail) |
 | **grok** | ✓ (raw line `content`) | ✓ (harness markers) | ✓ | ✓ (`unknown` with neither signal) | `function_call_output` | `tool_result.is_error`, `tool_status` | – (no notification rail) |

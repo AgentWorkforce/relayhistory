@@ -69,6 +69,7 @@ pub ai_hist::ControlKind::TaskNotification
 impl ai_hist::ControlKind
 pub fn ai_hist::ControlKind::as_str(self) -> &'static str
 #[non_exhaustive] pub enum ai_hist::DiscoveryState
+pub ai_hist::DiscoveryState::Delegated
 pub ai_hist::DiscoveryState::Full
 pub ai_hist::DiscoveryState::Shallow
 #[non_exhaustive] pub enum ai_hist::Error

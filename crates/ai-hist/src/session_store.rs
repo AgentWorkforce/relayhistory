@@ -1158,7 +1158,16 @@ impl SessionStore {
     // -- one session --------------------------------------------------------
 
     /// Everything the store holds about one session, typed, or `None` when
-    /// the catalog has no such session.
+    /// the store has no such session.
+    ///
+    /// A [`SessionRef::Id`] names a catalogued session or a delegated child
+    /// the catalog leaves out — a Claude subagent, a Codex child thread —
+    /// whose evidence is stored under its own id. A child's `session` is
+    /// [`DiscoveryState::Delegated`], described from its stored evidence,
+    /// and its `relationships` carry the [`RelationshipSide::Child`] edge
+    /// naming the session that spawned it. Read every child of a session by
+    /// passing it to [`SessionStore::delegated_descendants`] and each id
+    /// returned here.
     ///
     /// Every table is read on one SQLite snapshot, so a sync landing halfway
     /// through cannot hand back tool calls from a newer version of the
@@ -1190,10 +1199,20 @@ impl SessionStore {
             }
         }
         .map_err(Error::query)?;
-        let Some(row) = row else {
-            return Ok(None);
+        let session = match (row, r) {
+            (Some(row), _) => CatalogSession::from_row(row)?,
+            // A delegated child — a Claude subagent sidecar, a Codex child
+            // thread — is kept out of the catalog because it is part of its
+            // parent's work, but its evidence is stored under its own id.
+            (None, SessionRef::Id { session_id, .. }) => {
+                match delegated_child_session(&tx, source, session_id)? {
+                    Some(session) => session,
+                    None => return Ok(None),
+                }
+            }
+            (None, SessionRef::Path { .. }) => return Ok(None),
         };
-        let session_id = row.session_id.clone();
+        let session_id = session.session_id.clone();
         // What this read fetches is the source's declared coverage narrowed
         // by the query, in the coverage's canonical order — never a kind the
         // source cannot produce, so `loaded` is always within `coverage` and
@@ -1208,7 +1227,7 @@ impl SessionStore {
         let mut diagnostics = Vec::new();
 
         let mut evidence = SessionEvidence {
-            session: CatalogSession::from_row(row)?,
+            session,
             prompts: Vec::new(),
             messages: Vec::new(),
             tool_calls: Vec::new(),
@@ -1367,6 +1386,127 @@ fn path_names_one_session(source: Source) -> Result<(), Error> {
         HOOK_HARNESSES.join(", ")
     )))
 }
+
+/// `session_id` as a delegated child: its catalog-shaped description, read
+/// from the evidence stored under it, or `None` unless some session
+/// delegated to it and the store holds something under it.
+///
+/// Every field is one the child's own rows recorded. The catalog's derived
+/// excerpts (`first_prompt`, `last_assistant_text`) and source stamp have no
+/// counterpart and stay empty; `locations` is empty because a child has no
+/// presence apart from its parents; `raw_path` is the transcript the
+/// delegation evidence names.
+fn delegated_child_session(
+    conn: &Connection,
+    source: Source,
+    session_id: &str,
+) -> Result<Option<CatalogSession>, Error> {
+    let name = source.as_str();
+    if crate::session_identities::delegating_parents(conn, name, session_id)
+        .map_err(Error::sql)?
+        .is_empty()
+        || !crate::session_identities::identity_exists(conn, name, session_id)
+            .map_err(Error::query)?
+    {
+        return Ok(None);
+    }
+    let params = rusqlite::params![name, session_id];
+    let (first_activity_ms, last_activity_ms, cwd, git_branch, agent_version) = conn
+        .prepare_cached(DELEGATED_CHILD_SQL)
+        .and_then(|mut statement| {
+            statement.query_row(params, |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+        })
+        .map_err(Error::sql)?;
+    let (project_key, project_key_method) = conn
+        .prepare_cached(DELEGATED_CHILD_PROJECT_SQL)
+        .and_then(|mut statement| {
+            rusqlite::OptionalExtension::optional(
+                statement.query_row(params, |row| Ok((row.get(0)?, row.get(1)?))),
+            )
+        })
+        .map_err(Error::sql)?
+        .unwrap_or((None, None));
+    let models = conn
+        .prepare_cached(DELEGATED_CHILD_MODELS_SQL)
+        .and_then(|mut statement| {
+            statement
+                .query_map(params, |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .map_err(Error::sql)?;
+    let raw_path: Option<String> = conn
+        .prepare_cached(DELEGATED_CHILD_LOCATOR_SQL)
+        .and_then(|mut statement| {
+            rusqlite::OptionalExtension::optional(statement.query_row(
+                rusqlite::params![
+                    name,
+                    session_id,
+                    crate::relationships::RELATIONSHIP_DELEGATED
+                ],
+                |row| row.get(0),
+            ))
+        })
+        .map_err(Error::sql)?;
+    Ok(Some(CatalogSession {
+        source,
+        session_id: session_id.to_string(),
+        cwd,
+        git_branch,
+        first_activity_ms,
+        last_activity_ms,
+        first_prompt: None,
+        last_assistant_text: None,
+        models,
+        originator: None,
+        agent_version,
+        repo_url: None,
+        initial_commit: None,
+        workspace_roots: Vec::new(),
+        project_key,
+        project_key_method,
+        raw_path: raw_path.map(PathBuf::from),
+        source_stamp: None,
+        discovery_state: DiscoveryState::Delegated,
+        locations: Vec::new(),
+    }))
+}
+
+/// A delegated child's activity window, its first recorded working
+/// directory, and its last recorded branch and agent version.
+const DELEGATED_CHILD_SQL: &str = "SELECT \
+     (SELECT MIN(ts_ms) FROM session_events WHERE source = ?1 AND session_id = ?2), \
+     (SELECT MAX(ts_ms) FROM session_events WHERE source = ?1 AND session_id = ?2), \
+     (SELECT cwd FROM session_events WHERE source = ?1 AND session_id = ?2 \
+        AND cwd IS NOT NULL AND cwd <> '' ORDER BY ts_ms, id LIMIT 1), \
+     (SELECT git_branch FROM session_events WHERE source = ?1 AND session_id = ?2 \
+        AND git_branch IS NOT NULL AND git_branch <> '' ORDER BY ts_ms DESC, id DESC LIMIT 1), \
+     (SELECT agent_version FROM session_events WHERE source = ?1 AND session_id = ?2 \
+        AND agent_version IS NOT NULL AND agent_version <> '' ORDER BY ts_ms DESC, id DESC LIMIT 1)";
+
+/// The project identity a delegated child's first keyed event was resolved
+/// to at ingest, with how it was resolved.
+const DELEGATED_CHILD_PROJECT_SQL: &str = "SELECT project_key, project_key_method \
+     FROM session_events WHERE source = ?1 AND session_id = ?2 \
+       AND project_key IS NOT NULL AND project_key <> '' ORDER BY ts_ms, id LIMIT 1";
+
+/// The models a delegated child's events name, in order of first use.
+const DELEGATED_CHILD_MODELS_SQL: &str = "SELECT model FROM session_events \
+     WHERE source = ?1 AND session_id = ?2 AND model IS NOT NULL AND model <> '' \
+     GROUP BY model ORDER BY MIN(ts_ms), MIN(id)";
+
+/// The transcript a delegation edge names for its child.
+const DELEGATED_CHILD_LOCATOR_SQL: &str = "SELECT evidence_locator FROM session_relationships \
+     WHERE source = ?1 AND child_session_id = ?2 AND relationship = ?3 \
+       AND evidence_locator IS NOT NULL AND evidence_locator <> '' \
+     ORDER BY parent_session_id, relationship_uid LIMIT 1";
 
 /// How often a held sync lock is re-tried while a caller's timeout runs.
 const SYNC_LOCK_RETRY: Duration = Duration::from_millis(100);
@@ -2122,6 +2262,11 @@ impl Default for CatalogQuery {
 pub enum DiscoveryState {
     Shallow,
     Full,
+    /// No catalog row of its own: a subagent or child thread whose evidence
+    /// is stored as part of the work of the sessions that delegated to it.
+    /// Only [`SessionStore::session`] returns it, describing the child from
+    /// that evidence.
+    Delegated,
 }
 
 /// One catalog row. The fields are the provider's observed session metadata

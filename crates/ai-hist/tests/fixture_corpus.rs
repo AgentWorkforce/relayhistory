@@ -393,6 +393,14 @@ const CORPUS: &[Fixture] = &[
         files: &["claude/sidecar-subagent"],
         quirk: "a subagent transcript in `<sessionId>/subagents/agent-<id>.jsonl` with its `agent-<id>.meta.json` sidecar, carrying the PARENT's sessionId",
     },
+    Fixture {
+        source: "claude",
+        name: "nested-sidecars",
+        layout: Layout::HomeTree,
+        origin: Origin::Burn,
+        files: &["claude/nested-sidecars"],
+        quirk: "two `subagents/` sidecars whose meta files name no model: `a1` spawned from the main transcript, `a2` spawned by a tool use inside `a1` (`spawnDepth` 2); the spawn results carry `toolUseResult.agentId` on the record",
+    },
     // -- codex, from burn --------------------------------------------------
     Fixture {
         source: "codex",

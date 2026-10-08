@@ -310,7 +310,9 @@ correlation, claude only). Claude's `delegated` is `◐` because a subagent
 sidecar carries the _parent's_ `sessionId` on every record — the child is only
 independently addressable when the provider emits a per-child `agentId`;
 otherwise `relationship_capture` records it as `identity_status = 'unlinked'`
-with a null child id. `relationship_capabilities().stable_child_identity` is
+with a null child id. A linked child's edge names the session whose tool call
+started it (a nested subagent's parent is the subagent that spawned it), and
+its evidence is read by id through `SessionStore::session`. `relationship_capabilities().stable_child_identity` is
 `always` for codex, opencode and muse, `sometimes` for claude and grok, and
 `never` for cursor/devin/relay. Codex fork is `✓`:
 the `fork` edge is recorded from the fields Codex actually writes on
