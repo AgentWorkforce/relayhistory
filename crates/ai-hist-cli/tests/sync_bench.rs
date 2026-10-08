@@ -94,6 +94,28 @@ fn peak_rss_bytes() -> Option<u64> {
     None
 }
 
+/// User plus system CPU time this process has used, in milliseconds. CPU time
+/// barely moves with a neighbour's load the way a wall clock does, which is
+/// what lets `scripts/benchmark-ab.mjs` compare two commits on a busy machine.
+#[cfg(unix)]
+fn cpu_ms() -> Option<f64> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: as in `peak_rss_bytes`.
+    let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    // SAFETY: `getrusage` returned 0, so the struct is initialized.
+    let usage = unsafe { usage.assume_init() };
+    let ms = |time: libc::timeval| time.tv_sec as f64 * 1000.0 + time.tv_usec as f64 / 1000.0;
+    Some(ms(usage.ru_utime) + ms(usage.ru_stime))
+}
+
+#[cfg(not(unix))]
+fn cpu_ms() -> Option<f64> {
+    None
+}
+
 /// `(rchar, syscr)` from `/proc/self/io`: bytes returned by reads, and read
 /// syscalls. Linux only; `None` everywhere else.
 fn proc_io() -> Option<(u64, u64)> {
@@ -229,6 +251,9 @@ fn hydrate_once(db_path: &Path, source: &str, session_id: &str) -> (u64, Option<
 
 struct Measurement {
     elapsed_ms: f64,
+    /// CPU time over the same region as `elapsed_ms`; `None` where the
+    /// platform has no `getrusage` and for the calibration workload.
+    cpu_ms: Option<f64>,
     records: u64,
     source_bytes: u64,
     detail: Value,
@@ -398,6 +423,7 @@ fn calibration() -> Measurement {
     }
     Measurement {
         elapsed_ms: best,
+        cpu_ms: None,
         records: ROWS as u64,
         source_bytes: (document.len() * ROWS) as u64,
         detail: json!({
@@ -421,11 +447,16 @@ fn run_phase(phase: &str, home: &Path, db_path: &Path) -> Measurement {
             );
             let (store_bytes, store_files) = store_size(home);
             let before = row_count(db_path);
+            let cpu_started = cpu_ms();
             let started = Instant::now();
             sync_once(db_path, home);
             let elapsed = started.elapsed();
+            let cpu = cpu_started
+                .zip(cpu_ms())
+                .map(|(before, after)| after - before);
             Measurement {
                 elapsed_ms: elapsed.as_secs_f64() * 1000.0,
+                cpu_ms: cpu,
                 records: row_count(db_path).saturating_sub(before),
                 source_bytes: store_bytes,
                 detail: json!({ "storeFiles": store_files }),
@@ -439,11 +470,16 @@ fn run_phase(phase: &str, home: &Path, db_path: &Path) -> Measurement {
             );
             let appended = append_one_record(&target);
             let before = row_count(db_path);
+            let cpu_started = cpu_ms();
             let started = Instant::now();
             sync_once(db_path, home);
             let elapsed = started.elapsed();
+            let cpu = cpu_started
+                .zip(cpu_ms())
+                .map(|(before, after)| after - before);
             Measurement {
                 elapsed_ms: elapsed.as_secs_f64() * 1000.0,
+                cpu_ms: cpu,
                 records: row_count(db_path).saturating_sub(before),
                 source_bytes: appended,
                 detail: json!({ "appendedBytes": appended, "appendedTo": target.display().to_string() }),
@@ -455,12 +491,17 @@ fn run_phase(phase: &str, home: &Path, db_path: &Path) -> Measurement {
                 "unchanged_sync must run after cold_sync against the same database"
             );
             let before = row_count(db_path);
+            let cpu_started = cpu_ms();
             let started = Instant::now();
             sync_once(db_path, home);
             let elapsed = started.elapsed();
+            let cpu = cpu_started
+                .zip(cpu_ms())
+                .map(|(before, after)| after - before);
             let after = row_count(db_path);
             Measurement {
                 elapsed_ms: elapsed.as_secs_f64() * 1000.0,
+                cpu_ms: cpu,
                 records: after.saturating_sub(before),
                 source_bytes: 0,
                 detail: json!({ "rowsBefore": before, "rowsAfter": after }),
@@ -478,10 +519,14 @@ fn run_phase(phase: &str, home: &Path, db_path: &Path) -> Measurement {
                 hydrate_once(db_path, source, session_id);
             }
             let before = row_count(db_path);
+            let cpu_started = cpu_ms();
             let started = Instant::now();
             let (evidence, source_bytes, records_parsed) =
                 hydrate_once(db_path, source, session_id);
             let elapsed = started.elapsed();
+            let cpu = cpu_started
+                .zip(cpu_ms())
+                .map(|(before, after)| after - before);
             let written = row_count(db_path).saturating_sub(before);
             // A cold hydration is measured by what it parsed; an unchanged one
             // parses nothing, so its record count is the evidence it served.
@@ -491,6 +536,7 @@ fn run_phase(phase: &str, home: &Path, db_path: &Path) -> Measurement {
             };
             Measurement {
                 elapsed_ms: elapsed.as_secs_f64() * 1000.0,
+                cpu_ms: cpu,
                 records,
                 source_bytes: source_bytes
                     .and_then(|b| u64::try_from(b).ok())
@@ -531,6 +577,7 @@ fn benchmark_phase() {
     let report = json!({
         "phase": phase,
         "elapsedMs": measurement.elapsed_ms,
+        "cpuMs": measurement.cpu_ms,
         "records": measurement.records,
         "recordsPerSecond": if seconds > 0.0 { measurement.records as f64 / seconds } else { 0.0 },
         "storeBytes": measurement.source_bytes,

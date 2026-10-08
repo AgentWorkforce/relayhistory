@@ -1087,3 +1087,30 @@ every 20 ms throughout and records its slowest lock wait.
 - `compact` keeps its `TRUNCATE` with the full busy handler: it is an explicit
   maintenance action that already holds the sync lock and rewrites the file
   with `VACUUM`, so a wait there is expected.
+
+## Base versus head
+
+`scripts/benchmark-sync.mjs --gate` compares one run with stored absolute
+baselines, and runner noise forces 2x margins on it: it catches "this is now
+twice as slow", not "this is now 5% slower". The `benchmark-ab` CI job catches
+the second. It measures a pull request's base commit and its head on the same
+runner, against one generated store, and compares them with each other:
+
+```bash
+git worktree add ../base origin/main
+node scripts/benchmark-ab.mjs --base ../base --head . --rounds 2
+```
+
+- Each side builds and runs its own `sync_bench` harness over a fresh copy of
+  the store, in the order `cold_sync`, `incremental_sync`, `unchanged_sync`,
+  `hydrate_cold`, `hydrate_unchanged`. The store holds every provider,
+  OpenCode included.
+- On Linux each phase runs under `valgrind --tool=cachegrind --cache-sim=no`
+  and the metric is instructions executed, which a neighbour's load does not
+  move. Elsewhere (`--metric cpu`) it is the harness's `cpuMs` -- user plus
+  system time over the timed region -- with rounds interleaved base/head, or
+  wall time when the base harness predates `cpuMs`.
+- `incremental_sync`, `unchanged_sync` and `hydrate_unchanged` -- the work
+  every sync tick and repeat read pays -- fail above 2% over base. `cold_sync`
+  and `hydrate_cold` may grow with evidence a change newly captures, so they
+  and the database size are reported in the job summary, not gated.
