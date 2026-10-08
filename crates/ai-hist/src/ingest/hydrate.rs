@@ -2668,6 +2668,9 @@ fn ingest_claude(
             "Claude transcript identity does not match the catalog row",
         ));
     }
+    // The selected transcript is the session's own, so it is no delegation's
+    // evidence; see `retract_claude_delegation_evidence`.
+    crate::ingest::retract_claude_delegation_evidence(conn, path)?;
     upsert_session(
         conn,
         &meta.session_id,
