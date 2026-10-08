@@ -3183,8 +3183,10 @@ const CODEX_FORK_REPLAY_KEY: &str = "codex_fork_replay_gate";
 /// were stored: `token_count` as `usage_snapshot` markers and `turn_context`
 /// as `turn_context` markers. A finished rollout's stamp never changes, so
 /// without this its counters and turn settings would stay unread for the life
-/// of the install. Recorded only after a walk that reached every
-/// known root, like the other backfills.
+/// of the install. Each rollout's stamp record says which generation last read
+/// it, so a rollout is re-read once however long the pass stays open; the pass
+/// itself is recorded only after a walk that reached every known root, like
+/// the other backfills.
 ///
 /// The key is in [`SWEEP_PARSER_GENERATIONS`], so the first sync after the
 /// upgrade cannot honour the source fingerprint the previous build stored and
@@ -3193,23 +3195,20 @@ const CODEX_FORK_REPLAY_KEY: &str = "codex_fork_replay_gate";
 const CODEX_STATE_MARKER_GENERATION: i64 = 1;
 const CODEX_STATE_MARKER_KEY: &str = "codex_state_markers_v1";
 
-/// Whether a Codex session already carries both kinds of state marker this
-/// parser writes from the local rollout. One kind alone does not vouch for
-/// the other — a store written while only one was captured has it without
-/// the other — so a session is re-read unless both are present. A session
-/// that genuinely has no `token_count` is re-read once more than it needs,
-/// during the one pass this probe is consulted in. A marker that arrived only
-/// from a remote observation says nothing about whether the local rollout was
-/// read, so it does not count.
-fn codex_state_markers_exist(conn: &Connection, session_id: &str) -> Result<bool> {
-    Ok(conn
-        .prepare_cached(
-            "SELECT COUNT(DISTINCT kind) = 2 FROM session_markers \
-             WHERE source = 'codex' AND session_id = ? \
-               AND kind IN ('usage_snapshot', 'turn_context') \
-               AND location IN ('local', 'both')",
-        )?
-        .query_row([session_id], |row| row.get::<_, bool>(0))?)
+/// Whether the rollout behind a stamp-map record was last read by a parser
+/// older than the state-marker generation.
+///
+/// Recorded on the rollout's own stamp record, not inferred from the markers
+/// a session holds: a rollout with no `token_count` legitimately has no
+/// `usage_snapshot`, a marker observed only remotely says nothing about the
+/// local file, and either would make a marker probe re-read the rollout on
+/// every sync for as long as the backfill stays open.
+fn rollout_owes_state_markers(record: Option<&Map<String, Value>>) -> bool {
+    record
+        .and_then(|r| r.get("state_markers"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        < CODEX_STATE_MARKER_GENERATION
 }
 
 /// Whether this provider still owes a one-time raw-facts backfill pass.
@@ -4930,8 +4929,7 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                             && crate::continuity::codex_evidence_names_fork(conn, &key)? => {}
                     // Indexed before its state records were stored: re-read
                     // once so its counters and turn settings are captured.
-                    Some(id) if backfill_state_markers && !codex_state_markers_exist(conn, id)? => {
-                    }
+                    Some(_) if backfill_state_markers && rollout_owes_state_markers(record) => {}
                     Some(id)
                         if codex_session_evidence_exists(conn, id)?
                             && !(backfill_fidelity
@@ -4991,7 +4989,6 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                 && !backfill_fidelity
                 && !backfill_raw_facts
                 && !backfill_fork_replay
-                && !backfill_state_markers
                 && record
                     .and_then(|r| r.get("session"))
                     .and_then(Value::as_str)
@@ -5106,7 +5103,12 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
             write.commit()?;
             seen.insert(
                 key,
-                json!({ "stamp": stamp, "session": meta.session_id, "subagent": meta.is_subagent }),
+                json!({
+                    "stamp": stamp,
+                    "session": meta.session_id,
+                    "subagent": meta.is_subagent,
+                    "state_markers": CODEX_STATE_MARKER_GENERATION,
+                }),
             );
         }
     }
@@ -6097,6 +6099,15 @@ fn ingest_codex_rollout_incremental(
     let cwd = Some(meta.cwd.as_str());
     let branch = meta.git_branch.as_deref();
     let mut outcome = CodexIngestOutcome::default();
+    // A position an older parser committed sits past records whose state
+    // markers it never wrote: read the rollout again from byte zero.
+    if cursor
+        .codex
+        .as_ref()
+        .is_some_and(|codex| codex.state_markers < CODEX_STATE_MARKER_GENERATION)
+    {
+        *cursor = transcript_cursor::TranscriptCursorState::default();
+    }
     // Codex keeps its existing rule for a trailing line with no newline: it
     // is the half-written tail of a live rollout and the next pass re-reads
     // it. Unlike Claude, no Codex writer leaves its last line unterminated.
@@ -6763,6 +6774,7 @@ fn ingest_codex_rollout_incremental(
                                 saw_model_output,
                                 previous_human_message: human_messages.remembered(),
                                 inherited_baseline_marker: inherited_baseline_marker.clone(),
+                                state_markers: CODEX_STATE_MARKER_GENERATION,
                             },
                         );
                     }
@@ -36775,106 +36787,112 @@ mod codex_fork_replay_tests {
         );
     }
 
-    /// A rollout indexed before `token_count` snapshots were stored has an
-    /// unchanged stamp, so only the one-time backfill re-reads it for its
-    /// counters. Once recorded, the backfill is spent.
+    /// Local `usage_snapshot` and `turn_context` markers for `PARENT`.
+    fn state_marker_uids(conn: &Connection) -> Vec<String> {
+        conn.prepare(
+            "SELECT marker_uid FROM session_markers WHERE source = 'codex' \
+             AND session_id = ? AND kind IN ('usage_snapshot', 'turn_context') \
+             AND location IN ('local', 'both') ORDER BY marker_uid",
+        )
+        .unwrap()
+        .query_map([PARENT], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    fn forget_state_markers(conn: &Connection) {
+        conn.execute(
+            "DELETE FROM session_markers WHERE kind IN ('usage_snapshot', 'turn_context')",
+            [],
+        )
+        .unwrap();
+    }
+
+    /// The sync state an older build left: no state-marker pass recorded,
+    /// and no rollout stamped with the generation that read it.
+    fn as_older_build(state: &mut Map<String, Value>) {
+        state.remove(CODEX_STATE_MARKER_KEY);
+        if let Some(seen) = state
+            .get_mut("codex_rollouts_v7")
+            .and_then(Value::as_object_mut)
+        {
+            for record in seen.values_mut().filter_map(Value::as_object_mut) {
+                record.remove("state_markers");
+            }
+        }
+    }
+
+    /// A one-turn rollout whose turn closed, so sync commits a cursor at its
+    /// end.
+    fn closed_turn_rollout(path: &std::path::Path, with_usage: bool) {
+        let mut lines = vec![
+            line(
+                "2026-04-20T00:00:00.000Z",
+                "session_meta",
+                json!({"id": PARENT, "cwd": "/tmp/project"}),
+            ),
+            line(
+                "2026-04-20T00:00:00.100Z",
+                "turn_context",
+                json!({"turn_id": PARENT_TURN, "cwd": "/tmp/project", "model": "gpt-5.4"}),
+            ),
+        ];
+        if with_usage {
+            lines.push(line("2026-04-20T00:00:02.000Z", "event_msg", usage(1000)));
+        }
+        lines.push(line(
+            "2026-04-20T00:00:03.000Z",
+            "event_msg",
+            json!({"type": "task_complete", "turn_id": PARENT_TURN}),
+        ));
+        fs::write(path, lines.concat()).unwrap();
+    }
+
+    /// A rollout an older build indexed has an unchanged stamp, so only the
+    /// one-time backfill re-reads it for its state markers. Once recorded,
+    /// the backfill is spent.
     #[test]
     fn an_unchanged_rollout_is_re_read_once_for_its_state_markers() {
         let dir = tempfile::tempdir().unwrap();
         let day = dir.path().join(".codex/sessions/2026/04/20");
         fs::create_dir_all(&day).unwrap();
-        fs::write(
-            day.join("rollout-plain.jsonl"),
-            [
-                line(
-                    "2026-04-20T00:00:00.000Z",
-                    "session_meta",
-                    json!({"id": PARENT, "cwd": "/tmp/project"}),
-                ),
-                line(
-                    "2026-04-20T00:00:00.100Z",
-                    "turn_context",
-                    json!({"turn_id": PARENT_TURN, "cwd": "/tmp/project", "model": "gpt-5.4"}),
-                ),
-                line(
-                    "2026-04-20T00:00:01.000Z",
-                    "event_msg",
-                    json!({"type": "user_message", "message": "prompt"}),
-                ),
-                line("2026-04-20T00:00:02.000Z", "event_msg", usage(1000)),
-            ]
-            .concat(),
-        )
-        .unwrap();
+        closed_turn_rollout(&day.join("rollout-plain.jsonl"), true);
         let conn = open_db(&dir.path().join("history.db")).unwrap();
         let mut state = Map::new();
         sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
-        assert!(codex_state_markers_exist(&conn, PARENT).unwrap());
+        assert_eq!(state_marker_uids(&conn), vec!["1:marker", "2:marker"]);
         assert_eq!(
             state.get(CODEX_STATE_MARKER_KEY),
             Some(&json!(CODEX_STATE_MARKER_GENERATION))
         );
-        let forget = || {
-            conn.execute(
-                "DELETE FROM session_markers WHERE kind IN ('usage_snapshot', 'turn_context')",
-                [],
-            )
-            .unwrap();
-        };
 
         // With the backfill spent, an unchanged rollout is not re-read.
-        forget();
+        forget_state_markers(&conn);
         sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
-        assert!(!codex_state_markers_exist(&conn, PARENT).unwrap());
+        assert!(state_marker_uids(&conn).is_empty());
 
-        // An install that predates the snapshots owes the backfill.
-        state.remove(CODEX_STATE_MARKER_KEY);
+        // An install that predates the markers owes the backfill.
+        as_older_build(&mut state);
         sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
-        assert!(codex_state_markers_exist(&conn, PARENT).unwrap());
+        assert_eq!(state_marker_uids(&conn), vec!["1:marker", "2:marker"]);
         assert_eq!(
             state.get(CODEX_STATE_MARKER_KEY),
             Some(&json!(CODEX_STATE_MARKER_GENERATION))
         );
-    }
-
-    /// A one-turn rollout whose turn closed, so sync commits a cursor at its
-    /// end, plus a helper that appends a second turn.
-    fn closed_turn_rollout(path: &std::path::Path) {
-        fs::write(
-            path,
-            [
-                line(
-                    "2026-04-20T00:00:00.000Z",
-                    "session_meta",
-                    json!({"id": PARENT, "cwd": "/tmp/project"}),
-                ),
-                line(
-                    "2026-04-20T00:00:00.100Z",
-                    "turn_context",
-                    json!({"turn_id": PARENT_TURN, "cwd": "/tmp/project", "model": "gpt-5.4"}),
-                ),
-                line("2026-04-20T00:00:02.000Z", "event_msg", usage(1000)),
-                line(
-                    "2026-04-20T00:00:03.000Z",
-                    "event_msg",
-                    json!({"type": "task_complete", "turn_id": PARENT_TURN}),
-                ),
-            ]
-            .concat(),
-        )
-        .unwrap();
     }
 
     /// A rollout that grew since the last sync would normally resume from its
-    /// cursor. While the state-marker backfill is owed it is read from byte
-    /// zero, or the records before the cursor would never gain their markers.
+    /// cursor. A cursor an older parser committed names no state-marker
+    /// generation, so the rollout is read from byte zero, or the records
+    /// before the cursor would never gain their markers.
     #[test]
     fn the_state_marker_backfill_reads_a_grown_rollout_from_the_start() {
         let dir = tempfile::tempdir().unwrap();
         let day = dir.path().join(".codex/sessions/2026/04/20");
         fs::create_dir_all(&day).unwrap();
         let rollout = day.join("rollout-grown.jsonl");
-        closed_turn_rollout(&rollout);
+        closed_turn_rollout(&rollout, true);
         let append = |at: &str, message: &str| {
             let mut file = fs::OpenOptions::new().append(true).open(&rollout).unwrap();
             std::io::Write::write_all(
@@ -36896,27 +36914,69 @@ mod codex_fork_replay_tests {
         append("2026-04-20T00:00:04.000Z", "again");
         sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
 
-        // An older parser's store: no state markers, backfill not recorded.
+        forget_state_markers(&conn);
+        as_older_build(&mut state);
         conn.execute(
-            "DELETE FROM session_markers WHERE kind IN ('usage_snapshot', 'turn_context')",
+            "UPDATE transcript_cursors \
+             SET parser_state_json = json_remove(parser_state_json, '$.codex.state_markers') \
+             WHERE source = 'codex'",
             [],
         )
         .unwrap();
-        state.remove(CODEX_STATE_MARKER_KEY);
         append("2026-04-20T00:00:05.000Z", "and again");
-
         sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
-        let uids: Vec<String> = conn
-            .prepare(
-                "SELECT marker_uid FROM session_markers WHERE source = 'codex' \
-                 AND kind IN ('usage_snapshot', 'turn_context') ORDER BY marker_uid",
-            )
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        assert_eq!(uids, vec!["1:marker", "2:marker"]);
+        assert_eq!(state_marker_uids(&conn), vec!["1:marker", "2:marker"]);
+    }
+
+    /// Markers observed only remotely say nothing about the local rollout,
+    /// which an older build still owes a read.
+    #[test]
+    fn remote_state_markers_do_not_spend_a_local_rollouts_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        closed_turn_rollout(&day.join("rollout-remote.jsonl"), true);
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+
+        forget_state_markers(&conn);
+        conn.execute(
+            "INSERT INTO session_markers (source, session_id, marker_uid, kind, subkind, location) \
+             VALUES ('codex', ?1, 'remote:1', 'usage_snapshot', 'token_count', 'remote'), \
+                    ('codex', ?1, 'remote:2', 'turn_context', 'turn_context', 'remote')",
+            [PARENT],
+        )
+        .unwrap();
+        as_older_build(&mut state);
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+        assert_eq!(state_marker_uids(&conn), vec!["1:marker", "2:marker"]);
+    }
+
+    /// The backfill is spent per rollout. A rollout with no `token_count`
+    /// holds only a `turn_context` marker after its re-read, and while the
+    /// pass stays open (an unreadable root holds it back) it is not re-read
+    /// again on every sync.
+    #[test]
+    fn a_rollout_is_re_read_once_while_the_backfill_stays_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        closed_turn_rollout(&day.join("rollout-no-usage.jsonl"), false);
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+
+        as_older_build(&mut state);
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+        assert_eq!(state_marker_uids(&conn), vec!["1:marker"]);
+
+        // The pass is still open, but this rollout has been read by this
+        // generation: dropping its markers shows it is not read again.
+        state.remove(CODEX_STATE_MARKER_KEY);
+        forget_state_markers(&conn);
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+        assert!(state_marker_uids(&conn).is_empty());
     }
 
     /// A store synced by the previous build has a source fingerprint that
@@ -36926,62 +36986,6 @@ mod codex_fork_replay_tests {
     fn the_state_marker_backfill_moves_the_sweep_generation() {
         assert!(SWEEP_PARSER_GENERATIONS.contains(&CODEX_STATE_MARKER_KEY));
     }
-
-    /// One kind of state marker does not vouch for the other.
-    #[test]
-    fn a_session_with_only_one_state_marker_kind_is_re_read() {
-        let dir = tempfile::tempdir().unwrap();
-        let day = dir.path().join(".codex/sessions/2026/04/20");
-        fs::create_dir_all(&day).unwrap();
-        closed_turn_rollout(&day.join("rollout-partial.jsonl"));
-        let conn = open_db(&dir.path().join("history.db")).unwrap();
-        let mut state = Map::new();
-        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
-        assert!(codex_state_markers_exist(&conn, PARENT).unwrap());
-
-        conn.execute(
-            "DELETE FROM session_markers WHERE kind = 'turn_context'",
-            [],
-        )
-        .unwrap();
-        assert!(!codex_state_markers_exist(&conn, PARENT).unwrap());
-        state.remove(CODEX_STATE_MARKER_KEY);
-        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
-        assert!(codex_state_markers_exist(&conn, PARENT).unwrap());
-    }
-
-    /// A state marker that arrived only from a remote observation does not
-    /// prove the local rollout was read, so it does not spend the backfill
-    /// for that session.
-    #[test]
-    fn a_remote_only_state_marker_does_not_satisfy_the_backfill_probe() {
-        let dir = tempfile::tempdir().unwrap();
-        let day = dir.path().join(".codex/sessions/2026/04/20");
-        fs::create_dir_all(&day).unwrap();
-        closed_turn_rollout(&day.join("rollout-remote.jsonl"));
-        let conn = open_db(&dir.path().join("history.db")).unwrap();
-        let mut state = Map::new();
-        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
-
-        conn.execute(
-            "DELETE FROM session_markers WHERE kind IN ('usage_snapshot', 'turn_context')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO session_markers (source, session_id, marker_uid, kind, subkind, location) \
-             VALUES ('codex', ?1, 'remote:1', 'usage_snapshot', 'token_count', 'remote'), \
-                    ('codex', ?1, 'remote:2', 'turn_context', 'turn_context', 'remote')",
-            [PARENT],
-        )
-        .unwrap();
-        assert!(!codex_state_markers_exist(&conn, PARENT).unwrap());
-
-        state.remove(CODEX_STATE_MARKER_KEY);
-        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
-        assert!(codex_state_markers_exist(&conn, PARENT).unwrap());
-    }
-
     /// A child turn whose snapshot carries `last_token_usage`, as codex-rs
     /// writes it.
     fn child_turn_with_last(turn: &str, total: u64, last: u64) -> String {

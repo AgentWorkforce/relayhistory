@@ -312,6 +312,13 @@ pub(crate) struct CodexCursorState {
     /// re-reading the whole replay until it does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inherited_baseline_marker: Option<String>,
+    /// The state-marker generation of the parser that indexed the rows behind
+    /// this position. A cursor from an older one sits past records whose
+    /// `usage_snapshot` and `turn_context` markers it never wrote, so it is
+    /// not resumed from — whether sync or a related-session hydration loads
+    /// it.
+    #[serde(default)]
+    pub state_markers: i64,
 }
 
 /// A stat under which a cursor's positions were proven by their digests.

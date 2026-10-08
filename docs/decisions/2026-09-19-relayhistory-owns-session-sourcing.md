@@ -250,12 +250,14 @@ markers rather than as requests. See `docs/usage-accounting.md`._
 
 _Codex's raw counters are captured: every `token_count` outside a fork's
 replayed parent history is stored in read order as a `usage_snapshot` marker
-carrying the provider's `info` as written, bounded per the marker contract (counters are never truncated), and the turn it fell inside — a turn with no assistant message
-included. The replayed lines are the parent's evidence, indexed under the
-parent; the child's `fork_replay_boundary` marker keeps the last replayed
-snapshot, the child's inherited baseline, as `inherited_snapshot`. Codex stays `◐` because the per-request deltas
-are still attached to assistant events, so a turn with none reports no
-request. See `docs/usage-accounting.md`._
+carrying the provider's `info` as written, bounded per the marker contract
+(counters are never truncated), and the turn it fell inside — a turn with no
+assistant message included. The replayed lines are the parent's evidence,
+indexed under the parent; the child's `fork_replay_boundary` marker keeps
+the last replayed snapshot, the child's inherited baseline, as
+`inherited_snapshot`. Codex stays `◐` because the per-request deltas are
+still attached to assistant events, so a turn with none reports no request.
+See `docs/usage-accounting.md`._
 
 Devin is `◐` on the same row: `message_nodes.chat_message.metadata.num_tokens`
 is written to `token_json` verbatim, but it is a single figure with no

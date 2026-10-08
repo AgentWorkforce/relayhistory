@@ -9620,6 +9620,44 @@ mod tests {
             2,
             "the child was re-read from byte zero, not resumed from its cursor"
         );
+
+        // An older build also left the child's own cursor, and the root may
+        // be upgraded by a hydration that never opens its children. The
+        // child's cursor names the generation that wrote it, so a later
+        // related hydration still reads the child from byte zero.
+        conn.execute(
+            "DELETE FROM session_markers WHERE kind IN ('usage_snapshot', 'turn_context')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE transcript_cursors \
+             SET parser_state_json = json_remove(parser_state_json, '$.codex.state_markers') \
+             WHERE source = 'codex'",
+            [],
+        )
+        .unwrap();
+        for table in [
+            "session_hydration_checkpoints",
+            "observation_hydration_checkpoints",
+        ] {
+            conn.execute(
+                &format!("UPDATE {table} SET parser_version = ? WHERE source = 'codex'"),
+                params![HYDRATION_PARSER_VERSION - 1],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        let mut root_only = options("codex", "root");
+        root_only.include_related = false;
+        hydrate_session_at_with_home(&db, &root_only, dir.path()).unwrap();
+        hydrate_session_at_with_home(&db, &options("codex", "root"), dir.path()).unwrap();
+        let conn = open_db(&db).unwrap();
+        assert_eq!(
+            child_markers(&conn),
+            2,
+            "a child cursor from an older generation is not resumed from"
+        );
     }
 
     /// A cursor may only vouch for the bytes its rows came from.
