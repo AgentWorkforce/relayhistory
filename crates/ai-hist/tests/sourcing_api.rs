@@ -740,6 +740,7 @@ fn raw_usage_is_each_claude_records_own_snapshot() {
             r#"{"type":"user","uuid":"u1","sessionId":"sess-stream","cwd":"/tmp/project","timestamp":"2026-04-20T00:00:00.000Z","message":{"role":"user","content":"run it"}}"#, "\n",
             r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"sess-stream","cwd":"/tmp/project","requestId":"req_1","timestamp":"2026-04-20T00:00:01.000Z","message":{"id":"msg_1","role":"assistant","model":"claude-opus-5","content":[{"type":"text","text":"Looking."}],"usage":{"input_tokens":10,"output_tokens":1}}}"#, "\n",
             r#"{"type":"assistant","uuid":"a2","parentUuid":"a1","sessionId":"sess-stream","cwd":"/tmp/project","requestId":"req_1","timestamp":"2026-04-20T00:00:02.000Z","message":{"id":"msg_1","role":"assistant","model":"claude-opus-5","stop_reason":"end_turn","content":[{"type":"text","text":"Done."}],"usage":{"input_tokens":10,"output_tokens":7}}}"#, "\n",
+            r#"{"type":"assistant","uuid":"a3","parentUuid":"a2","sessionId":"sess-stream","cwd":"/tmp/project","requestId":"req_1","timestamp":"2026-04-20T00:00:03.000Z","message":{"id":"msg_1","role":"assistant","model":"claude-opus-5","content":[{"type":"text","text":"(no usage on this copy)"}]}}"#, "\n",
         ),
     )
     .unwrap();
@@ -751,21 +752,27 @@ fn raw_usage_is_each_claude_records_own_snapshot() {
         .iter()
         .filter(|message| message.role == Role::Assistant)
         .map(|message| {
-            let raw: Value = serde_json::from_str(message.raw_usage().unwrap()).unwrap();
-            (
-                message.message_id.clone().unwrap(),
-                raw["output_tokens"].as_u64(),
-                message.usage.as_ref().map(|usage| usage.output_tokens),
-            )
+            let raw = message
+                .raw_usage()
+                .map(|raw| serde_json::from_str::<Value>(raw).unwrap()["output_tokens"].as_u64());
+            (message.message_id.clone().unwrap(), raw)
         })
         .collect();
+    // A copy that carried no usage has none of its own, whatever the
+    // request settled to.
     assert_eq!(
         assistant,
         vec![
-            ("a1".to_string(), Some(1), Some(7)),
-            ("a2".to_string(), Some(7), Some(7)),
+            ("a1".to_string(), Some(Some(1))),
+            ("a2".to_string(), Some(Some(7))),
+            ("a3".to_string(), None),
         ]
     );
+    assert!(evidence
+        .messages
+        .iter()
+        .filter(|message| message.role == Role::Assistant && message.usage.is_some())
+        .all(|message| message.usage.as_ref().unwrap().output_tokens == 7));
     let [request] = evidence.requests.as_slice() else {
         panic!("one request: {:?}", evidence.requests);
     };

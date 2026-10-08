@@ -8,11 +8,12 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- `Message::raw_usage` returns the usage blob of the message's own record, so each streamed copy of one Claude response keeps its own snapshot; `Message::usage` and `SessionEvidence::requests` still read the request's settled usage, and the first `sync` after upgrading re-reads Claude and Codex transcripts once to fill it.
+- `Message::raw_usage` returns the usage blob of the message's own record, so each streamed copy of one Claude response keeps its own snapshot (and a copy that carried none has none); `Message::usage` and `SessionEvidence::requests` still read the request's settled usage. The first `sync` after upgrading fills it through a one-time raw-facts re-read of Claude and Codex transcripts.
+- Session events carry `recordTokenJson` natively and `recordTokenUsage` in the TypeScript SDK; the session evidence contract is version 4.
 
 ### Rust API
 
-- Added `SessionEvent::record_token_json`; code constructing `SessionEvent` with a struct literal must set it.
+- Added `SessionEvent::record_token_json`; code constructing `SessionEvent` with a struct literal must set it. `SESSION_EVIDENCE_CONTRACT_VERSION` is 4.
 
 ## [0.36.0] - 2026-10-07
 

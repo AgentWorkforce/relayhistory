@@ -2557,7 +2557,7 @@ fn group_messages(source: Source, events: &[(SessionEvent, Option<i64>)]) -> Vec
                 // copies are expected to agree; when they do not, the message
                 // does not get to pick one.
                 if message.raw_usage.is_none() {
-                    message.raw_usage = record_usage(event);
+                    message.raw_usage = record_usage(source, event);
                 }
                 let blob = &mut usage_blobs[at];
                 match (&*blob, &event.token_json) {
@@ -2612,7 +2612,7 @@ fn group_messages(source: Source, events: &[(SessionEvent, Option<i64>)]) -> Vec
                     usage: None,
                     usage_error: None,
                     blocks: vec![block],
-                    raw_usage: record_usage(event),
+                    raw_usage: record_usage(source, event),
                 };
                 if let Some(raw) = event.token_json.as_deref() {
                     set_usage(source, &mut message, raw);
@@ -2625,13 +2625,17 @@ fn group_messages(source: Source, events: &[(SessionEvent, Option<i64>)]) -> Vec
     messages
 }
 
-/// The usage blob the event's own record carried: the separately kept copy
-/// where the source settles `token_json` across records, else `token_json`.
-fn record_usage(event: &SessionEvent) -> Option<String> {
-    event
-        .record_token_json
-        .clone()
-        .or_else(|| event.token_json.clone())
+/// The usage blob the event's own record carried.
+///
+/// Claude settles `token_json` across a streamed request's records, so a
+/// Claude record's own usage is `record_token_json` alone, and a record that
+/// carried none has none even when its settled `token_json` is set. Every
+/// other source stores usage once per record, in `token_json`.
+fn record_usage(source: Source, event: &SessionEvent) -> Option<String> {
+    match source {
+        Source::Claude => event.record_token_json.clone(),
+        _ => event.token_json.clone(),
+    }
 }
 
 fn set_usage(source: Source, message: &mut Message, raw: &str) {
@@ -4204,13 +4208,15 @@ mod tests {
              VALUES ('claude', 's1', 'm1', 10, 'user', 'text', 'hello', 'e1');
              INSERT INTO session_events \
              (source, session_id, message_id, ts_ms, role, kind, text, event_uid, model, \
-              token_json, request_id, stop_reason) \
+              token_json, record_token_json, request_id, stop_reason) \
              VALUES ('claude', 's1', 'm2', 20, 'assistant', 'thinking', 'hmm', 'e2', 'm', \
+              '{\"input_tokens\":3,\"output_tokens\":4}', \
               '{\"input_tokens\":3,\"output_tokens\":4}', 'req_1', 'end_turn');
              INSERT INTO session_events \
              (source, session_id, message_id, ts_ms, role, kind, text, event_uid, model, \
-              token_json, tool_use_id, request_id) \
+              token_json, record_token_json, tool_use_id, request_id) \
              VALUES ('claude', 's1', 'm2', 20, 'assistant', 'tool_use', NULL, 'e3', 'm', \
+              '{\"input_tokens\":3,\"output_tokens\":4}', \
               '{\"input_tokens\":3,\"output_tokens\":4}', 'tu_1', 'req_1');
              INSERT INTO session_events \
              (source, session_id, message_id, ts_ms, role, kind, text, event_uid, tool_use_id, \

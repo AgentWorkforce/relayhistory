@@ -320,6 +320,12 @@ export interface SessionEvent {
   model: string | null;
   tokenUsage: Record<string, unknown> | null;
   /**
+   * Claude: the usage this one record carried. `tokenUsage` is the blob a
+   * streamed request's copies settle into, so the two differ on an earlier
+   * copy. Null for other sources, whose `tokenUsage` is already the record's own.
+   */
+  recordTokenUsage: Record<string, unknown> | null;
+  /**
    * The upstream inference provider, when the harness records one of its own
    * (OpenCode's `providerID`). Null for harnesses that do not name one — it is
    * never inferred from `model`.

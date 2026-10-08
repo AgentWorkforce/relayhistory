@@ -11161,9 +11161,9 @@ struct RawMessageFacts<'a> {
     /// The one derived fact carried here, because every insert already
     /// threads this struct and the column is stamped per row like the rest.
     control_kind: Option<&'a str>,
-    /// The record's own usage blob, for a provider whose `token_json` is
-    /// settled across records (Claude). `None` where `token_json` already is
-    /// the record's own blob.
+    /// Claude: the record's own usage blob, `None` when it carried none.
+    /// `None` for every other source, whose `token_json` already is the
+    /// record's own.
     record_token_json: Option<&'a str>,
 }
 

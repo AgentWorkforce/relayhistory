@@ -274,6 +274,7 @@ export function sessionEvent(value: UnknownRecord): SessionEvent {
     text: nullableString(value.text),
     model: nullableString(value.model),
     tokenUsage: tokenUsage(value.tokenJson),
+    recordTokenUsage: tokenUsage(value.recordTokenJson),
     provider: nullableString(value.provider),
     eventUid: String(value.eventUid),
     toolUseId: nullableString(value.toolUseId),

@@ -739,9 +739,10 @@ while `"isSidechain": false` stores `0`.
 Usage is kept the same way. Claude writes one streamed response as several
 records, each carrying the usage snapshot current when it was written;
 `token_json` holds the request's settled blob on every one of its rows, and
-`record_token_json` holds each record's own `message.usage`. `Message::raw_usage`
-returns the record's own blob — `record_token_json`, or `token_json` where the
-source stores no separate copy because `token_json` already is the record's own.
+`record_token_json` holds each record's own `message.usage` (null when the
+record carried none). `Message::raw_usage` returns the record's own blob: for
+Claude `record_token_json`, for every other source `token_json`, which already
+is the record's own.
 
 Because of that, none of the six can answer "was this row indexed before the
 facts existed?" -- a real record legitimately has no `request_id`, no
