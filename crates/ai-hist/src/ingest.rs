@@ -3182,8 +3182,8 @@ const CODEX_FORK_REPLAY_KEY: &str = "codex_fork_replay_gate";
 /// One-time re-read of the Claude transcripts whose delegation evidence an
 /// earlier parser recorded thinner than the provider wrote it: a spawn result
 /// without the record's `toolUseResult.agentId`, and a sidecar edge without
-/// its child's model or hung on the root instead of the subagent that spawned
-/// it. Finished transcripts never change again, so without the pass an
+/// its child's model or hung on a parent that does not hold the tool use that
+/// started it. Finished transcripts never change again, so without the pass an
 /// upgraded install that only syncs keeps the old edges for good. The name is
 /// in [`SWEEP_PARSER_GENERATIONS`], so the sweep fingerprint an earlier build
 /// stored cannot skip the pass; it is recorded only after a walk that reached
@@ -8187,7 +8187,8 @@ fn claude_transcript_lacks_raw_facts(conn: &Connection, path: &Path) -> Result<b
 
 /// [`claude_transcript_lacks_delegation_capture`]'s probe: a session
 /// transcript holding an Agent/Task result with no `agent_id`, or a sidecar
-/// whose edge has no child model or may be nested (`spawn_depth` above 1).
+/// whose edge has no child model or hangs on a parent whose transcript does
+/// not hold the tool use that started it.
 /// `CROSS JOIN` pins the join order for the reason
 /// [`CLAUDE_TRANSCRIPT_EVENTS_SQL`] gives.
 const CLAUDE_LACKS_DELEGATION_CAPTURE_SQL: &str = "SELECT
@@ -8207,7 +8208,11 @@ const CLAUDE_LACKS_DELEGATION_CAPTURE_SQL: &str = "SELECT
                 FROM session_relationships r
                 WHERE r.source = 'claude' AND r.evidence_locator = ?1
                   AND r.relationship = 'delegated' AND r.child_session_id IS NOT NULL
-                  AND (r.child_model IS NULL OR COALESCE(r.spawn_depth, 0) > 1)
+                  AND (r.child_model IS NULL
+                    OR (r.evidence_ref IS NOT NULL AND NOT EXISTS(
+                          SELECT 1 FROM tool_calls t
+                          WHERE t.source = 'claude' AND t.session_id = r.parent_session_id
+                            AND t.tool_use_id = r.evidence_ref)))
                 LIMIT 1
             )";
 

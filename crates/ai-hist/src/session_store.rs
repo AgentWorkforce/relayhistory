@@ -1517,7 +1517,9 @@ const DELEGATED_CHILD_SQL: &str = "SELECT \
          OR EXISTS(SELECT 1 FROM tool_calls WHERE source = ?1 AND session_id = ?2) \
          OR EXISTS(SELECT 1 FROM session_markers WHERE source = ?1 AND session_id = ?2) \
          OR EXISTS(SELECT 1 FROM file_edits WHERE source = ?1 AND session_id = ?2) \
-         OR EXISTS(SELECT 1 FROM history WHERE source = ?1 AND session_id = ?2))";
+         OR EXISTS(SELECT 1 FROM history WHERE source = ?1 AND session_id = ?2) \
+         OR EXISTS(SELECT 1 FROM session_relationships \
+                   WHERE source = ?1 AND parent_session_id = ?2))";
 
 /// How often a held sync lock is re-tried while a caller's timeout runs.
 const SYNC_LOCK_RETRY: Duration = Duration::from_millis(100);

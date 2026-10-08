@@ -176,3 +176,72 @@ fn hydration_heals_delegation_an_earlier_parser_recorded() {
     hydrate(&store);
     assert_eq!(observed(&store), expected());
 }
+
+#[test]
+fn plain_sync_heals_a_nested_edge_that_kept_its_model() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path();
+    copy_tree(Path::new(FIXTURE), home);
+    let store = open(home);
+    store.sync(SyncOptions::default()).unwrap();
+
+    // Only the parent is wrong: the model and the tool use are recorded, the
+    // depth is not.
+    let conn = open_db(&home.join("ai-history.db")).unwrap();
+    conn.execute(
+        "UPDATE session_relationships SET parent_session_id = ?1, spawn_depth = NULL \
+         WHERE source = 'claude' AND child_session_id = 'a2'",
+        [MAIN],
+    )
+    .unwrap();
+    drop(conn);
+    let state_path = home.join(".sync-state.json");
+    let mut state: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&fs::read_to_string(&state_path).unwrap()).unwrap();
+    state.remove("claude_delegation_capture_v1");
+    state.remove("source_fingerprint");
+    fs::write(&state_path, serde_json::to_string(&state).unwrap()).unwrap();
+    assert_ne!(observed(&store), expected());
+
+    store.sync(SyncOptions::default()).unwrap();
+    assert_eq!(observed(&store), expected());
+}
+
+#[test]
+fn a_child_whose_only_rows_are_its_own_delegations_is_readable() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path();
+    copy_tree(Path::new(FIXTURE), home);
+    let store = open(home);
+    store.sync(SyncOptions::default()).unwrap();
+
+    let conn = open_db(&home.join("ai-history.db")).unwrap();
+    for table in [
+        "session_events",
+        "tool_calls",
+        "session_markers",
+        "file_edits",
+        "history",
+    ] {
+        conn.execute(
+            &format!("DELETE FROM {table} WHERE source = 'claude' AND session_id = 'a1'"),
+            [],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    let a1 = store
+        .session(
+            &SessionRef::id(Source::Claude, "a1"),
+            SessionQuery::default(),
+        )
+        .unwrap()
+        .expect("a1 still holds its delegation to a2");
+    assert!(a1.messages.is_empty());
+    assert!(a1
+        .relationships
+        .iter()
+        .any(|edge| edge.side == RelationshipSide::Parent
+            && edge.child_session_id.as_deref() == Some("a2")));
+}
