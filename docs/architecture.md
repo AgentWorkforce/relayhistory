@@ -334,9 +334,10 @@ explicit fields a provider writes (`continuedFromSessionId`, `forkSessionId`,
 `sourceSessionId`), a `/resume <id>` or `/continue <id>` the human typed, a
 transcript's first `parentUuid` resolved against the session that actually
 holds that record, and two or more transcripts carrying one in-log session id.
-`evidence_ref` names which one produced the row. An explicit-field edge's
-`spawned_at_ms` is the timestamp of the record that first named its target;
-the other signals date the edge by the transcript's first record.
+`evidence_ref` names which one produced the row. A `continuedFromSessionId` or
+`forkSessionId` edge's `spawned_at_ms` is the timestamp of the record that
+first named its target; every other edge is dated by the transcript's first
+record.
 
 A `/resume` is read in both forms Claude writes: the bare `/resume <id>` a
 human types, and the control wrapper Claude Code actually stores —

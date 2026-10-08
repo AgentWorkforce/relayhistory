@@ -313,11 +313,15 @@ pub(crate) fn fold_claude_record(
     if let Some(target) =
         string_field(object, &["continuedFromSessionId", "continued_from_session_id"])
     {
-        note_named_at(&mut evidence.explicit_continuation_ts_ms, &target, object);
+        if !evidence.explicit_continuation_targets.contains(&target) {
+            note_named_at(&mut evidence.explicit_continuation_ts_ms, &target, object);
+        }
         push_unique(&mut evidence.explicit_continuation_targets, target);
     }
     if let Some(target) = string_field(object, &["forkSessionId", "fork_session_id"]) {
-        note_named_at(&mut evidence.explicit_fork_ts_ms, &target, object);
+        if !evidence.explicit_fork_targets.contains(&target) {
+            note_named_at(&mut evidence.explicit_fork_ts_ms, &target, object);
+        }
         push_unique(&mut evidence.explicit_fork_targets, target);
     }
     if evidence.explicit_source_session_id.is_none() {
@@ -1520,15 +1524,14 @@ fn ts_map(value: &Value, key: &str) -> BTreeMap<String, i64> {
         .unwrap_or_default()
 }
 
-/// Remember when a record first named `target`, keeping the earliest naming.
+/// Remember when the record that first names `target` was written. Called
+/// only for that first record: one without a timestamp leaves the target
+/// undated rather than dated by a later record.
 fn note_named_at(
     named: &mut BTreeMap<String, i64>,
     target: &str,
     object: &serde_json::Map<String, Value>,
 ) {
-    if named.contains_key(target) {
-        return;
-    }
     if let Some(ts) = record_ts_ms(object) {
         named.insert(target.to_string(), ts);
     }
@@ -1537,9 +1540,8 @@ fn note_named_at(
 /// When the record naming an explicit target was written.
 ///
 /// A Codex rollout names its targets only on the `session_meta` line that
-/// opens it, so its first record is the naming record. Claude evidence banked
-/// before naming timestamps were recorded has none either, and is dated by the
-/// transcript's first record until the file is read again.
+/// opens it, so its first record is the naming record. A Claude naming record
+/// without a timestamp leaves only the transcript's first record to date by.
 fn named_at(
     named: &BTreeMap<String, i64>,
     target: &str,
@@ -1805,6 +1807,27 @@ mod tests {
         };
         assert_eq!(spawned_at("original-session"), Some(1_776_996_000_000));
         assert_eq!(spawned_at("fork-source-session"), Some(1_776_996_001_000));
+    }
+
+    #[test]
+    fn a_target_whose_naming_record_is_undated_falls_back_to_the_first_record() {
+        let mut evidence = ContinuityEvidence {
+            first_ts_ms: Some(1_000),
+            ..ContinuityEvidence::default()
+        };
+        let mut first_user_seen = false;
+        for record in [
+            json!({"sessionId": "s", "forkSessionId": "base"}),
+            json!({"sessionId": "s", "forkSessionId": "base",
+                   "timestamp": "2026-04-24T02:00:01.000Z"}),
+        ] {
+            fold_claude_record(&mut evidence, &mut first_user_seen, record.as_object().unwrap());
+        }
+        assert!(evidence.explicit_fork_ts_ms.is_empty());
+        assert_eq!(
+            named_at(&evidence.explicit_fork_ts_ms, "base", &evidence),
+            Some(1_000)
+        );
     }
 
     #[test]

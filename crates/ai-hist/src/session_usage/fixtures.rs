@@ -99,8 +99,10 @@ fn a_multi_block_turn_is_one_request_per_request_id() {
     assert_eq!(request.request_key, "request-id:req_1");
     assert_eq!(request.request_key_source, RequestKeySource::RequestId);
     assert_eq!(request.model.as_deref(), Some("claude-opus-4-7"));
+    let mut message_ids = request.message_ids.clone();
+    message_ids.sort();
     assert_eq!(
-        request.message_ids,
+        message_ids,
         ["u-asst-1a", "u-asst-1b", "u-asst-1c", "u-asst-1d"],
         "the signature-only record that opens the response is part of it"
     );

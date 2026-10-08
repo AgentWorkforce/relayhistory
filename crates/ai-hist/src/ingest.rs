@@ -768,8 +768,12 @@ fn destination_head(conn: &Connection) -> Result<String> {
 /// Add the new key here in the same change that introduces it; the old one
 /// stays in [`RETIRED_SYNC_STATE_KEYS`] for the migration, but only live
 /// generations belong in the stamp.
+///
+/// Claude transcripts are skipped on their byte cursors rather than a stamp
+/// map, so their entry names the cursor generation and moves with
+/// `TRANSCRIPT_CURSOR_VERSION`.
 const SWEEP_PARSER_GENERATIONS: &[&str] = &[
-    "claude_sessions_v3",
+    "claude_transcript_cursors_v5",
     "codex_rollouts_v7",
     GROK_SYNC_STATE_KEY,
 ];
@@ -31903,6 +31907,111 @@ mod tests {
                     None,
                 ),
             ]
+        );
+    }
+
+    /// A store the previous parser indexed has no event for the signed, empty
+    /// `thinking` record that opens a streamed response, continuity evidence
+    /// without naming timestamps, a fork edge dated by the transcript's first
+    /// record, cursors at end of file and a fingerprint that vouches for all of
+    /// it. One plain sync repairs every part, then the fast path resumes.
+    #[test]
+    fn unchanged_claude_transcripts_gain_opening_records_and_naming_times_after_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join(".claude/projects/-tmp-project");
+        fs::create_dir_all(&project).unwrap();
+        for name in [
+            "multi-block-turn.jsonl",
+            "explicit-line-relationships.jsonl",
+        ] {
+            fs::copy(
+                corpus_fixture(&format!("claude/{name}")),
+                project.join(name),
+            )
+            .unwrap();
+        }
+        let db = dir.path().join("history.db");
+        let roots = crate::ProviderRoots::from_home(
+            dir.path().to_path_buf(),
+            dir.path().join("opencode.db"),
+        );
+        super::sync_exclusive_with_roots(&db, &roots, false).unwrap();
+        let conn = open_db(&db).unwrap();
+        let state_path = dir.path().join(".sync-state.json");
+        let mut state = load_sync_state(&state_path).unwrap();
+        conn.execute_batch(
+            "DELETE FROM session_events WHERE event_uid = 'u-asst-1a:0';
+             UPDATE session_continuity_evidence
+                SET explicit_targets_json = json_remove(explicit_targets_json,
+                      '$.continuation_ts_ms', '$.fork_ts_ms');
+             UPDATE session_relationships SET spawned_at_ms = 1776996000000
+              WHERE relationship = 'fork';
+             UPDATE transcript_cursors
+                SET parser_state_json = json_set(parser_state_json, '$.v', 4);",
+        )
+        .unwrap();
+        // The previous build's fingerprint and a destination proof taken over
+        // what it stored, so nothing but the generation can force the sweep.
+        let source_part = state[super::SOURCE_FINGERPRINT_KEY]
+            .as_str()
+            .unwrap()
+            .split_once('/')
+            .unwrap()
+            .1
+            .to_string();
+        let old_generations = [
+            "claude_sessions_v3",
+            "codex_rollouts_v7",
+            super::GROK_SYNC_STATE_KEY,
+        ]
+        .join("|");
+        let old_generation = format!(
+            "g{:016x}",
+            crate::discover::fingerprint_hash(
+                "sweep-generation",
+                &crate::discover::SHALLOW_SCANNER_VERSION.to_string(),
+                &old_generations,
+            )
+        );
+        let old_fingerprint = format!("{old_generation}/{source_part}");
+        state.insert(super::SOURCE_FINGERPRINT_KEY.into(), json!(old_fingerprint));
+        state.insert(
+            super::DESTINATION_GENERATION_KEY.into(),
+            json!(super::destination_generation(&conn).unwrap()),
+        );
+        state.insert(
+            super::DESTINATION_HEAD_KEY.into(),
+            json!(super::destination_head(&conn).unwrap()),
+        );
+        assert!(super::sources_unchanged(&conn, &state, &old_fingerprint));
+        fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+
+        assert!(
+            super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept
+        );
+        let (first_ts, has_thinking): (i64, bool) = conn
+            .query_row(
+                "SELECT first_ts_ms, has_thinking FROM session_requests \
+                 WHERE source = 'claude' AND request_key = 'request-id:req_1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((first_ts, has_thinking), (1_776_643_201_000, true));
+        let forked_at: i64 = conn
+            .query_row(
+                "SELECT spawned_at_ms FROM session_relationships WHERE relationship = 'fork'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(forked_at, 1_776_996_001_000);
+        assert!(
+            !super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept
         );
     }
 

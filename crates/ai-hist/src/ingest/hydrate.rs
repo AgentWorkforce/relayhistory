@@ -116,7 +116,11 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 3;
 ///
 /// Version 15 recovers Codex desktop assistant response items from unchanged
 /// captures that previous parsers skipped.
-const HYDRATION_PARSER_VERSION: i64 = 15;
+///
+/// Version 16 stores Claude's signed, empty `thinking` blocks as events and
+/// dates explicit continuity edges by the record that names them; both exist
+/// only in the transcript, so a checkpoint at 15 re-parses once.
+const HYDRATION_PARSER_VERSION: i64 = 16;
 
 #[derive(Debug, Clone)]
 pub struct HydrateSessionOptions {
