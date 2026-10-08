@@ -336,8 +336,8 @@ transcript's first `parentUuid` resolved against the session that actually
 holds that record, and two or more transcripts carrying one in-log session id.
 `evidence_ref` names which one produced the row. A `continuedFromSessionId` or
 `forkSessionId` edge's `spawned_at_ms` is the timestamp of the record that
-first named its target; every other edge is dated by the transcript's first
-record.
+first named its target (the transcript's first record when that record has
+no timestamp); every other edge is dated by the transcript's first record.
 
 A `/resume` is read in both forms Claude writes: the bare `/resume <id>` a
 human types, and the control wrapper Claude Code actually stores —
