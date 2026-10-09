@@ -8,6 +8,8 @@ use crate::SessionLocation;
 use anyhow::{ensure, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObservationKey {
@@ -445,11 +447,7 @@ fn write_checkpoint_inner(
 
 /// Replace one successful snapshot as independent records, so a long
 /// transcript is many evidence rows rather than one oversized one.
-pub fn save_evidence(
-    conn: &Connection,
-    key: &ObservationKey,
-    payload: &serde_json::Value,
-) -> Result<()> {
+pub fn save_evidence(conn: &Connection, key: &ObservationKey, payload: &Value) -> Result<()> {
     let transaction = if conn.is_autocommit() {
         Some(conn.unchecked_transaction()?)
     } else {
@@ -462,12 +460,7 @@ pub fn save_evidence(
     Ok(())
 }
 
-fn save_evidence_inner(
-    conn: &Connection,
-    key: &ObservationKey,
-    payload: &serde_json::Value,
-) -> Result<()> {
-    use serde_json::{json, Value};
+fn save_evidence_inner(conn: &Connection, key: &ObservationKey, payload: &Value) -> Result<()> {
     ensure!(
         get(conn, key)?.is_some(),
         "evidence requires an observation"
@@ -476,7 +469,25 @@ fn save_evidence_inner(
         .get("format")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("observation evidence format is required"))?;
-    let mut records = std::collections::BTreeMap::new();
+    let mut records = evidence_records(format, payload)?;
+    if records.is_empty() {
+        records.insert("empty".into(), json!({"format":format,"empty":true}));
+    }
+    let prior=conn.prepare("SELECT evidence_uid FROM observation_evidence WHERE source=? AND session_id=? AND location=? AND connector_id=? AND connector_instance=?")?.query_map(params![key.source,key.session_id,key.location.as_str(),key.connector_id,key.connector_instance],|row|row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    for uid in prior {
+        if !records.contains_key(&uid) {
+            conn.execute("DELETE FROM observation_evidence WHERE source=? AND session_id=? AND location=? AND connector_id=? AND connector_instance=? AND evidence_uid=?",params![key.source,key.session_id,key.location.as_str(),key.connector_id,key.connector_instance,uid])?;
+        }
+    }
+    for (uid, payload) in records {
+        conn.execute("INSERT INTO observation_evidence(source,session_id,location,connector_id,connector_instance,evidence_uid,payload_json) VALUES(?,?,?,?,?,?,?) ON CONFLICT(source,session_id,location,connector_id,connector_instance,evidence_uid) DO UPDATE SET payload_json=excluded.payload_json WHERE observation_evidence.payload_json!=excluded.payload_json",params![key.source,key.session_id,key.location.as_str(),key.connector_id,key.connector_instance,uid,serde_json::to_string(&payload)?])?;
+    }
+    bump_revision(conn, key)
+}
+
+/// A payload's evidence rows, keyed by their stable evidence uid.
+fn evidence_records(format: &str, payload: &Value) -> Result<BTreeMap<String, Value>> {
+    let mut records = BTreeMap::new();
     match format {
         "records" => {
             use sha2::{Digest, Sha256};
@@ -562,24 +573,11 @@ fn save_evidence_inner(
         }
         _ => anyhow::bail!("unsupported observation evidence format"),
     }
-    if records.is_empty() {
-        records.insert("empty".into(), json!({"format":format,"empty":true}));
-    }
-    let prior=conn.prepare("SELECT evidence_uid FROM observation_evidence WHERE source=? AND session_id=? AND location=? AND connector_id=? AND connector_instance=?")?.query_map(params![key.source,key.session_id,key.location.as_str(),key.connector_id,key.connector_instance],|row|row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-    for uid in prior {
-        if !records.contains_key(&uid) {
-            conn.execute("DELETE FROM observation_evidence WHERE source=? AND session_id=? AND location=? AND connector_id=? AND connector_instance=? AND evidence_uid=?",params![key.source,key.session_id,key.location.as_str(),key.connector_id,key.connector_instance,uid])?;
-        }
-    }
-    for (uid, payload) in records {
-        conn.execute("INSERT INTO observation_evidence(source,session_id,location,connector_id,connector_instance,evidence_uid,payload_json) VALUES(?,?,?,?,?,?,?) ON CONFLICT(source,session_id,location,connector_id,connector_instance,evidence_uid) DO UPDATE SET payload_json=excluded.payload_json WHERE observation_evidence.payload_json!=excluded.payload_json",params![key.source,key.session_id,key.location.as_str(),key.connector_id,key.connector_instance,uid,serde_json::to_string(&payload)?])?;
-    }
-    bump_revision(conn, key)
+    Ok(records)
 }
 
 /// Reconstruct one connector's snapshot for canonical evidence reconciliation.
-pub fn evidence(conn: &Connection, key: &ObservationKey) -> Result<Option<serde_json::Value>> {
-    use serde_json::{json, Value};
+pub fn evidence(conn: &Connection, key: &ObservationKey) -> Result<Option<Value>> {
     key.validate()?;
     let payloads=conn.prepare("SELECT payload_json FROM observation_evidence WHERE source=? AND session_id=? AND location=? AND connector_id=? AND connector_instance=? ORDER BY evidence_uid")?.query_map(params![key.source,key.session_id,key.location.as_str(),key.connector_id,key.connector_instance],|row|row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
     let mut rows = payloads
