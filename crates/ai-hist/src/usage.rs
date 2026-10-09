@@ -723,6 +723,12 @@ struct UsageMessage {
     /// prompt, so never an owner; the walk to the owning prompt steps over
     /// it.
     control: bool,
+    /// A Claude sidechain user record: the delegating agent's prompt to a
+    /// subagent, or a tool result the subagent received. Not the human's, so
+    /// never an owner -- and not a step on the way to one either: a
+    /// subagent's usage is the delegated thread's, as a sidecar subagent's is
+    /// its own session's, so the walk ends there with no owner.
+    sidechain: bool,
 }
 
 /// What one record contributes to its request.
@@ -822,6 +828,7 @@ pub fn attribute_usage_to_prompts(
                 .collect::<Vec<_>>()
                 .join("\n");
             let control = first.role == "user" && rows.iter().all(|r| r.control_kind.is_some());
+            let sidechain = first.role == "user" && rows.iter().any(|r| r.is_sidechain == Some(1));
             Some((
                 id.to_string(),
                 UsageMessage {
@@ -833,6 +840,7 @@ pub fn attribute_usage_to_prompts(
                     usage,
                     request,
                     control,
+                    sidechain,
                 },
             ))
         })
@@ -844,14 +852,17 @@ pub fn attribute_usage_to_prompts(
     // turn of its own would hand the answer to the wrapper.
     let mut boundaries: Vec<_> = events
         .iter()
-        .filter(|e| e.role == "user" && e.control_kind.is_none())
+        .filter(|e| e.role == "user" && e.control_kind.is_none() && e.is_sidechain != Some(1))
         .collect();
     boundaries.sort_by_key(|e| e.ts_ms);
     // Parsers use zero when time is missing. Such a turn could fall anywhere,
     // so timestamp-only ownership is unsafe for the session.
     let timestamps_known = boundaries.iter().all(|e| e.ts_ms > 0);
     let mut prompt_counts = HashMap::new();
-    for user in messages.values().filter(|m| m.role == "user" && !m.control) {
+    for user in messages
+        .values()
+        .filter(|m| m.role == "user" && !m.control && !m.sidechain)
+    {
         *prompt_counts
             .entry((user.ts, user.text.clone()))
             .or_insert(0) += 1;
@@ -1029,6 +1040,9 @@ fn parent_prompt<'a>(
         // A slash command's rows sit between the answer and the prompt that
         // caused it. They are chained like any record, and they are not the
         // owner, so the walk continues through them to the prompt.
+        if current.role == "user" && current.sidechain {
+            return None;
+        }
         if current.role == "user" && !current.control {
             return Some(current);
         }

@@ -34491,6 +34491,18 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(history, vec!["explore".to_string()]);
+        // The delegated prompt and the tool result the subagent received are
+        // the delegated thread's evidence: neither is a turn of the session's
+        // human, and the subagent's usage is charged to no prompt.
+        let turns: Vec<Option<String>> =
+            crate::store::session_user_turns_all(&conn, "claude", "sess-inline")
+                .unwrap()
+                .into_iter()
+                .map(|turn| turn.message_id)
+                .collect();
+        assert_eq!(turns, vec![Some("u1".to_string())]);
+        let events = crate::session_events(&conn, "sess-inline", Some("claude")).unwrap();
+        assert!(crate::usage::attribute_usage_to_prompts(&events, "claude").is_empty());
 
         // What an earlier parser left: no sidechain user rows, and rows
         // stamped with the generation before this one.

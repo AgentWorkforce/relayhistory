@@ -3789,9 +3789,13 @@ const USER_TURN_KEY: &str = "COALESCE(NULLIF(message_id, ''), 'event:' || id)";
 /// A user-role row carrying a `control_kind` is the harness's, not the
 /// human's: a Codex context wrapper would otherwise read as a turn of its own,
 /// and a `<system-reminder>` row split off a prompt would be counted among the
-/// prompt's blocks and bytes.
-const USER_TURN_ROW_FILTER: &str = "((role = 'user' AND control_kind IS NULL) \
-     OR (role = 'tool_result' AND event_source = 'tool_result'))";
+/// prompt's blocks and bytes. A Claude sidechain row is delegated traffic --
+/// the delegating agent's prompt to a subagent and the tool results the
+/// subagent received -- so it is evidence of the delegated thread, never a
+/// turn of the session's human.
+const USER_TURN_ROW_FILTER: &str = "(COALESCE(is_sidechain, 0) = 0 \
+     AND ((role = 'user' AND control_kind IS NULL) \
+       OR (role = 'tool_result' AND event_source = 'tool_result')))";
 
 /// The message recorded next to a turn, on either side of it.
 ///
