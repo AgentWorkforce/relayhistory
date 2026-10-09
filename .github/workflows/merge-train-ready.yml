@@ -23,7 +23,9 @@ on:
 
 concurrency:
   # One run per PR: a newer push or label event supersedes the in-flight run.
-  group: merge-train-ready-${{ github.event.pull_request.number }}
+  # An event the job will skip (`mergeable` absent) gets a throwaway group, so
+  # it can never cancel a real run and leave `cancelled` as the head's verdict.
+  group: merge-train-ready-${{ contains(github.event.pull_request.labels.*.name, 'mergeable') && format('pr-{0}', github.event.pull_request.number) || format('ignored-{0}', github.run_id) }}
   cancel-in-progress: true
 
 permissions: {}

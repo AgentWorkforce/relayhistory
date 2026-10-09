@@ -77,6 +77,8 @@ test("feature PRs into trunk get the ready check the sweeper requires", () => {
   const source = read("merge-train-ready.yml");
   assert.match(source, /\n    branches: \[trunk\]\n    types: \[labeled, synchronize, reopened\]\n/);
   assert.match(source, /\n    name: Merge-train ready check\n/);
+  // A skip-bound event (no `mergeable`) must not cancel a real ready-check run.
+  assert.match(source, /contains\(github\.event\.pull_request\.labels\.\*\.name, 'mergeable'\) && format\('pr-\{0\}', github\.event\.pull_request\.number\) \|\| format\('ignored-\{0\}', github\.run_id\)/);
   assert.match(source, /contains\(github\.event\.pull_request\.labels\.\*\.name, 'mergeable'\)/);
   // Fork PRs get the check too (no secrets under `pull_request`); trust is the sweeper's gate.
   assert.doesNotMatch(source, /head\.repo\.full_name/);
