@@ -117,10 +117,10 @@ pub struct StoreOptions {           // #[non_exhaustive]
 }
 ```
 
-`StoreOptions` is `#[non_exhaustive]`, like every options type here: build it
-from `default()` with the chainable setter named after each field, not with a
-struct literal. `DiscoveryOptions`, `SyncOptions`, `HydrateOptions` and
-`ForgetOptions` work the same way.
+`StoreOptions` is `#[non_exhaustive]`: build it from `default()` with the
+chainable setter named after each field, not with a struct literal.
+`DiscoveryOptions`, `SyncOptions`, `HydrateOptions` and `ForgetOptions` have
+the same setters.
 
 ```rust
 let store = SessionStore::open(
