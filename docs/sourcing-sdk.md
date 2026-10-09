@@ -501,7 +501,10 @@ replace, never a duplicate.
 | `ObservationEvidence` | `observation_evidence`  | `source, session_id, location, connector_id, connector_instance, evidence_uid` | —            |
 
 `columns` is the row as stored, on every upsert: a `StoredRow` of every column
-but `revision`, in table order, each value as SQLite holds it — JSON text stays
+but `revision` and the store's own bookkeeping — `session_events.raw_facts_version`
+(the local parser generation) and `sessions.source_stamp` (the discovery
+generation and local file stamp), which a generation bump rewrites on every row
+without changing any evidence — in table order, each value as SQLite holds it — JSON text stays
 text, integers stay integers, NULL stays `null` — read from the live table, so
 a column a migration adds is carried without a code change. It serializes as a
 JSON object in column order. `key` is the record's identity: the kind's wire
@@ -555,7 +558,9 @@ database that issued it; one from another database, or one past the head, is
 `Error::WatermarkAheadOfStore` — the store was reset or replaced, and the only
 recovery is a resync from `Watermark::START`, which names no store. An exported
 column-name or declared-type change restamps only rows of the affected kind
-above the old head, preserving the epoch and named cursors. A newly fed kind is
+above the old head, preserving the epoch and named cursors; an appended column
+restamps only the rows holding a value in it, since a column a row was
+delivered without is NULL. A newly fed kind is
 backfilled above the old head and records its fingerprint without replay; a named
 cursor past the head names no revision of this store, so that resync's commit
 replaces it. Retiring a fed kind rotates the epoch because no live table

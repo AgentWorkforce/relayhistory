@@ -19,7 +19,8 @@ Sources and individual session identities form a union. Select every source
 with `all_sources: true`; evidence kinds must still be explicit. A session in
 `excluded_sessions` is left out, and so is a relationship that names it at
 either end. Each record is one stored row: `payload` holds every column as
-SQLite stores it, `record_id` is the SHA-256 of the change feed's key for the
+SQLite stores it except the store's own bookkeeping
+(`session_events.raw_facts_version`, `sessions.source_stamp`), `record_id` is the SHA-256 of the change feed's key for the
 row, and `revision` is the row's change-feed revision, so an export and the
 feed name a record the same way. `origin_id` is the store's change-feed epoch.
 
