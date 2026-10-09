@@ -246,6 +246,28 @@ impl std::fmt::Debug for ExportSnapshot {
     }
 }
 
+/// Add `record` to `page` when it fits in `max_bytes`, keeping `bytes` the
+/// page's exact serialized size. `false` means the page is full; a record too
+/// large for an empty page is an error, since no page could ever serve it.
+fn admit_record(
+    page: &mut HistoryExportPage,
+    bytes: &mut usize,
+    max_bytes: usize,
+    record: HistoryExportRecord,
+) -> Result<bool> {
+    let size = serde_json::to_vec(&record)?.len() + usize::from(!page.records.is_empty());
+    if *bytes + size > max_bytes {
+        ensure!(
+            !page.records.is_empty(),
+            "export record exceeds configured page byte limit"
+        );
+        return Ok(false);
+    }
+    *bytes += size;
+    page.records.push(record);
+    Ok(true)
+}
+
 impl ExportSnapshot {
     /// Open a snapshot over `conn`, which it owns from here on and holds in
     /// one read transaction until dropped. `conn` must be a store connection
@@ -322,6 +344,30 @@ impl ExportSnapshot {
                 .is_some_and(|(served, _)| served == cursor)
     }
 
+    /// Add `row` to `page` unless the selection leaves it out. `false` means
+    /// the page is full.
+    fn admit_row(
+        &self,
+        kind: ChangeKind,
+        row: &change_feed::RowidRow<'_, '_>,
+        page: &mut HistoryExportPage,
+        bytes: &mut usize,
+    ) -> Result<bool> {
+        // Decided on the row's identity alone, so a row the selection leaves
+        // out is never decoded.
+        if !selected(&self.selection, &row.source, row.session.as_deref())
+            || excluded(&self.selection, &row.source, row.session.as_deref())
+        {
+            return Ok(true);
+        }
+        let live = row.decode()?;
+        if child_excluded(&self.selection, &live) {
+            return Ok(true);
+        }
+        let record = make_record(&self.origin_id, kind, live)?;
+        admit_record(page, bytes, self.limits.max_batch_bytes, record)
+    }
+
     /// The page `cursor` names. An expired snapshot serves nothing.
     pub fn page(&mut self, cursor: &str, now_ms: i64) -> Result<HistoryExportPage> {
         ensure!(!self.expired(now_ms), "export snapshot expired");
@@ -373,31 +419,12 @@ impl ExportSnapshot {
                     after,
                     self.limits.max_scan_records - scanned,
                     |row| {
-                        let rowid = row.rowid;
-                        // Decided on the row's identity alone, so a row the
-                        // selection leaves out is never decoded.
-                        if selected(&self.selection, &row.source, row.session.as_deref())
-                            && !excluded(&self.selection, &row.source, row.session.as_deref())
-                        {
-                            let live = row.decode()?;
-                            if !child_excluded(&self.selection, &live) {
-                                let record = make_record(&self.origin_id, kind, live)?;
-                                let size = serde_json::to_vec(&record)?.len()
-                                    + usize::from(!page.records.is_empty());
-                                if bytes + size > self.limits.max_batch_bytes {
-                                    ensure!(
-                                        !page.records.is_empty(),
-                                        "export record exceeds configured page byte limit"
-                                    );
-                                    full = true;
-                                    return Ok(false);
-                                }
-                                bytes += size;
-                                page.records.push(record);
-                            }
+                        if !self.admit_row(kind, &row, &mut page, &mut bytes)? {
+                            full = true;
+                            return Ok(false);
                         }
                         scanned += 1;
-                        after = rowid;
+                        after = row.rowid;
                         if page.records.len() >= self.limits.max_batch_records {
                             full = true;
                             return Ok(false);

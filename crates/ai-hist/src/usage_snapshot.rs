@@ -267,7 +267,7 @@ impl Serialize for Stored<'_> {
             seq.serialize_element(self.0)?;
             return seq.end();
         };
-        let usage = |key: &str| info.get(key).and_then(Value::as_object);
+        let usage = |key: &str| info.get(key).and_then(Value::as_object).map(StoredUsage);
         let total = usage("total_token_usage");
         let last = usage("last_token_usage");
         let window = info.get("model_context_window").filter(|v| !v.is_null());
@@ -280,29 +280,20 @@ impl Serialize for Stored<'_> {
             })
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
-        let len = if !other.is_empty() {
-            4
-        } else if window.is_some() {
-            3
-        } else if last.is_some() {
-            2
-        } else if total.is_some() {
-            1
-        } else {
-            0
-        };
+        // Trailing absent slots are dropped.
+        let present = [
+            total.is_some(),
+            last.is_some(),
+            window.is_some(),
+            !other.is_empty(),
+        ];
+        let len = present.iter().rposition(|&slot| slot).map_or(0, |i| i + 1);
         let mut seq = serializer.serialize_seq(Some(len))?;
         if len > 0 {
-            match total {
-                Some(usage) => seq.serialize_element(&StoredUsage(usage))?,
-                None => seq.serialize_element(null())?,
-            }
+            seq.serialize_element(&total)?;
         }
         if len > 1 {
-            match last {
-                Some(usage) => seq.serialize_element(&StoredUsage(usage))?,
-                None => seq.serialize_element(null())?,
-            }
+            seq.serialize_element(&last)?;
         }
         if len > 2 {
             seq.serialize_element(window.unwrap_or(null()))?;

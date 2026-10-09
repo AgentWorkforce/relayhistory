@@ -11,6 +11,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod schema_check;
+use schema_check::schema_has_required_indexes;
+
 pub use crate::relationship_graph::{
     relationship_capabilities, session_children, session_children_page, session_continuity_edges,
     session_parents, session_relationships, session_tree, RelationshipCapabilities,
@@ -1163,128 +1166,6 @@ pub fn schema_is_evidence_read_current(conn: &Connection) -> Result<bool> {
 /// event indexes as the event page.
 pub fn schema_is_usage_read_current(conn: &Connection) -> Result<bool> {
     schema_has_required_indexes(conn, REQUIRED_EVENT_READ_INDEXES)
-}
-
-fn schema_has_required_indexes(conn: &Connection, required_indexes: &[&str]) -> Result<bool> {
-    let mut table = conn.prepare("SELECT 1 FROM sqlite_master WHERE name = ? LIMIT 1")?;
-    for name in REQUIRED_TABLES {
-        if !table.exists([*name])? {
-            return Ok(false);
-        }
-    }
-    for name in REQUIRED_TRIGGERS {
-        if !table.exists([name])? {
-            return Ok(false);
-        }
-    }
-    // A view is a query shape, not a row set: it can be present and still be
-    // derived from a column set the table no longer has, which is why this
-    // asks whether it is *current* rather than whether it exists.
-    if !crate::session_usage::session_requests_view_is_current(conn)? {
-        return Ok(false);
-    }
-    let mut migration = conn.prepare("SELECT 1 FROM schema_migrations WHERE name = ? LIMIT 1")?;
-    for name in REQUIRED_SCHEMA_MIGRATIONS {
-        if !migration.exists([*name])? {
-            return Ok(false);
-        }
-    }
-    let columns: HashSet<String> = conn
-        .prepare("SELECT name FROM pragma_table_info('history')")?
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    if !REQUIRED_HISTORY_COLUMNS
-        .iter()
-        .all(|needed| columns.contains(*needed))
-    {
-        return Ok(false);
-    }
-    let session_columns: HashSet<String> = conn
-        .prepare("SELECT name FROM pragma_table_info('sessions')")?
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    if !REQUIRED_SESSIONS_COLUMNS
-        .iter()
-        .all(|needed| session_columns.contains(*needed))
-    {
-        return Ok(false);
-    }
-    let checkpoint_columns: HashSet<String> = conn
-        .prepare("SELECT name FROM pragma_table_info('session_hydration_checkpoints')")?
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    if !REQUIRED_HYDRATION_CHECKPOINT_COLUMNS
-        .iter()
-        .all(|needed| checkpoint_columns.contains(*needed))
-    {
-        return Ok(false);
-    }
-    let presence_columns: HashSet<String> = conn
-        .prepare("SELECT name FROM pragma_table_info('session_presences')")?
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    if !REQUIRED_SESSION_PRESENCE_COLUMNS
-        .iter()
-        .all(|needed| presence_columns.contains(*needed))
-    {
-        return Ok(false);
-    }
-    let cursor_columns: HashSet<String> = conn
-        .prepare("SELECT name FROM pragma_table_info('session_hydration_checkpoints')")?
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    if !REQUIRED_HYDRATION_CURSOR_COLUMNS
-        .iter()
-        .all(|(needed, _)| cursor_columns.contains(*needed))
-    {
-        return Ok(false);
-    }
-    let marker_columns: HashSet<String> = conn
-        .prepare("SELECT name FROM pragma_table_info('session_markers')")?
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    if !REQUIRED_SESSION_MARKER_COLUMNS
-        .iter()
-        .all(|(needed, _)| marker_columns.contains(*needed))
-    {
-        return Ok(false);
-    }
-    let event_columns: HashSet<String> = conn
-        .prepare("SELECT name FROM pragma_table_info('session_events')")?
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    if !REQUIRED_SESSION_EVENT_COLUMNS
-        .iter()
-        .all(|(needed, _)| event_columns.contains(*needed))
-    {
-        return Ok(false);
-    }
-    for table in EVIDENCE_LOCATION_TABLES {
-        let has_location: bool = conn
-            .prepare("SELECT 1 FROM pragma_table_info(?) WHERE name = 'location'")?
-            .exists([table])?;
-        if !has_location {
-            return Ok(false);
-        }
-    }
-    let relationship_columns: HashSet<String> = conn
-        .prepare("SELECT name FROM pragma_table_info('session_relationships')")?
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    if !REQUIRED_SESSION_RELATIONSHIP_COLUMNS
-        .iter()
-        .all(|needed| relationship_columns.contains(*needed))
-    {
-        return Ok(false);
-    }
-    let mut index =
-        conn.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ? LIMIT 1")?;
-    for name in required_indexes {
-        if !index.exists([name])? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
 }
 
 /// Whether any [`RETIRED_INDEXES`] entry still exists.
@@ -4040,11 +3921,12 @@ fn fill_user_turns(
             .flatten())
     };
     // `message_id <> ''` excludes nothing a named row can carry.
-    let mut last_named = named_before("")?;
-    let mut previous_named = match &last_named {
+    let last = named_before("")?;
+    let previous = match &last {
         Some(last) => named_before(last)?,
         None => None,
     };
+    let mut trail = NamedTrail { last, previous };
 
     let mut stream = conn.prepare(&user_turn_stream_sql())?;
     let mut rows = stream.query(params![
@@ -4072,45 +3954,85 @@ fn fill_user_turns(
             if (header.ts_ms, header.id) > at {
                 break;
             }
-            user_turns[next_anchor].preceding_message_id = match &last_named {
-                Some(last) if *last != header.key => Some(last.clone()),
-                _ => previous_named.clone(),
-            };
+            user_turns[next_anchor].preceding_message_id = trail.preceding(&header.key);
             awaiting_following.push(next_anchor);
             next_anchor += 1;
         }
         let message_id: Option<String> = row.get(2)?;
         if let Some(message_id) = &message_id {
             awaiting_following.retain(|&index| {
-                let header = &headers[index];
-                if (header.ts_ms, header.id) < at && header.key != *message_id {
-                    user_turns[index].following_message_id = Some(message_id.clone());
-                    false
-                } else {
-                    true
-                }
+                !release_following(&headers[index], &mut user_turns[index], at, message_id)
             });
-            if last_named.as_deref() != Some(message_id.as_str()) {
-                previous_named = last_named.replace(message_id.clone());
-            }
+            trail.observe(message_id);
         }
         if row.get::<_, i64>(3)? == 1 {
-            let key = match &message_id {
-                Some(message_id) => std::borrow::Cow::Borrowed(message_id.as_str()),
-                None => std::borrow::Cow::Owned(format!("event:{id}")),
-            };
-            if let Some(&index) = by_key.get(key.as_ref()) {
-                user_turns[index].blocks.push(user_turn_block(
-                    &row.get::<_, String>(4)?,
-                    &row.get::<_, String>(5)?,
-                    row.get(6)?,
-                    row.get(8)?,
-                    row.get::<_, Option<String>>(7)?.as_deref(),
-                ));
-            }
+            push_turn_block(row, id, message_id.as_deref(), &by_key, &mut user_turns)?;
         }
     }
     Ok(user_turns)
+}
+
+/// The named messages a forward walk has passed: the nearest one, and the
+/// nearest one that differs from it.
+struct NamedTrail {
+    last: Option<String>,
+    previous: Option<String>,
+}
+
+impl NamedTrail {
+    /// The nearest named message before the turn keyed `key`: the last one
+    /// seen unless it is the turn's own, then the last different one.
+    fn preceding(&self, key: &str) -> Option<String> {
+        match &self.last {
+            Some(last) if last != key => Some(last.clone()),
+            _ => self.previous.clone(),
+        }
+    }
+
+    fn observe(&mut self, message_id: &str) {
+        if self.last.as_deref() != Some(message_id) {
+            self.previous = self.last.replace(message_id.to_owned());
+        }
+    }
+}
+
+/// Settle `turn`'s following message on a named row at `at`, when the row is
+/// past its anchor and is not its own. Returns whether it was settled.
+fn release_following(
+    header: &UserTurnHeader,
+    turn: &mut SessionUserTurn,
+    at: (i64, i64),
+    message_id: &str,
+) -> bool {
+    let released = (header.ts_ms, header.id) < at && header.key != message_id;
+    if released {
+        turn.following_message_id = Some(message_id.to_owned());
+    }
+    released
+}
+
+/// Add a block row to the turn its key belongs to, if that turn is on the page.
+fn push_turn_block(
+    row: &rusqlite::Row<'_>,
+    id: i64,
+    message_id: Option<&str>,
+    by_key: &std::collections::HashMap<&str, usize>,
+    user_turns: &mut [SessionUserTurn],
+) -> Result<()> {
+    let key = match message_id {
+        Some(message_id) => std::borrow::Cow::Borrowed(message_id),
+        None => std::borrow::Cow::Owned(format!("event:{id}")),
+    };
+    if let Some(&index) = by_key.get(key.as_ref()) {
+        user_turns[index].blocks.push(user_turn_block(
+            &row.get::<_, String>(4)?,
+            &row.get::<_, String>(5)?,
+            row.get(6)?,
+            row.get(8)?,
+            row.get::<_, Option<String>>(7)?.as_deref(),
+        ));
+    }
+    Ok(())
 }
 
 fn user_turn_block(
@@ -4500,26 +4422,9 @@ pub(crate) fn refresh_session_project_identity(
             continue;
         }
         let row=conn.query_row("SELECT cwd,repo_url,project_key,project_key_method FROM sessions WHERE source=? AND session_id=?",params![source,id],|r|Ok((r.get::<_,Option<String>>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?))).optional()?;
-        let (key, method) = if let Some((cwd, repo_url, mut key, mut method)) = row {
-            if key.is_none() || matches!(method.as_deref(), Some("path" | "inherited")) {
-                if let Some((own, how)) =
-                    crate::project_identity::identity_for(cwd.as_deref(), repo_url.as_deref())
-                {
-                    if key.is_none()
-                        || how.as_str() == "remote"
-                        || method.as_deref() == Some("path")
-                    {
-                        key = Some(own);
-                        method = Some(how.as_str().to_string());
-                    }
-                }
-                if key.is_none() || matches!(method.as_deref(), Some("path" | "inherited")) {
-                    if let Some(parent) = lendable_ancestor_key_for(conn, source, &id)? {
-                        key = Some(parent);
-                        method = Some("inherited".into());
-                    }
-                }
-            }
+        let (key, method) = if let Some((cwd, repo_url, key, method)) = row {
+            let (key, method) =
+                reconsidered_session_key(conn, source, &id, cwd, repo_url, key, method)?;
             written+=conn.execute("UPDATE sessions SET project_key=?3,project_key_method=?4 WHERE source=?1 AND session_id=?2 AND (project_key IS NOT ?3 OR project_key_method IS NOT ?4)",params![source,id,key,method])?;
             (key, method)
         } else {
@@ -4529,12 +4434,7 @@ pub(crate) fn refresh_session_project_identity(
             )
         };
         if let Some(key) = key {
-            let rank = match method.as_deref() {
-                Some("remote") => 3,
-                Some("inherited") => 2,
-                Some("path") => 1,
-                _ => 0,
-            };
+            let rank = project_key_method_rank(method.as_deref());
             let stored = event_key_rank_sql("project_key", "project_key_method");
             written+=conn.execute(&format!("UPDATE session_events SET project_key=?3,project_key_method=?4 WHERE source=?1 AND session_id=?2 AND (({stored})<?5 OR (({stored})=?5 AND project_key IS NOT ?3))"),params![source,id,key,method,rank])?;
         }
@@ -4544,6 +4444,52 @@ pub(crate) fn refresh_session_project_identity(
         }
     }
     Ok(written)
+}
+
+/// Whether a session's key is still open to reconsideration: none yet, or one
+/// that is provisional (`path`) or borrowed (`inherited`).
+fn project_key_is_unsettled(key: Option<&str>, method: Option<&str>) -> bool {
+    key.is_none() || matches!(method, Some("path" | "inherited"))
+}
+
+/// A session's key after reconsidering an unsettled one: its own identity
+/// where that outranks what it holds, else a lendable ancestor's key.
+fn reconsidered_session_key(
+    conn: &Connection,
+    source: &str,
+    id: &str,
+    cwd: Option<String>,
+    repo_url: Option<String>,
+    mut key: Option<String>,
+    mut method: Option<String>,
+) -> Result<(Option<String>, Option<String>)> {
+    if !project_key_is_unsettled(key.as_deref(), method.as_deref()) {
+        return Ok((key, method));
+    }
+    if let Some((own, how)) =
+        crate::project_identity::identity_for(cwd.as_deref(), repo_url.as_deref())
+    {
+        if key.is_none() || how.as_str() == "remote" || method.as_deref() == Some("path") {
+            key = Some(own);
+            method = Some(how.as_str().to_string());
+        }
+    }
+    if project_key_is_unsettled(key.as_deref(), method.as_deref()) {
+        if let Some(parent) = lendable_ancestor_key_for(conn, source, id)? {
+            key = Some(parent);
+            method = Some("inherited".into());
+        }
+    }
+    Ok((key, method))
+}
+
+fn project_key_method_rank(method: Option<&str>) -> i32 {
+    match method {
+        Some("remote") => 3,
+        Some("inherited") => 2,
+        Some("path") => 1,
+        _ => 0,
+    }
 }
 
 /// Pass 1: stamp sessions with no key, and upgrade ones stuck on a borrowed

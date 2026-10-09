@@ -92,21 +92,16 @@ fn resolve_against_existing(path: &Path) -> Result<std::path::PathBuf> {
     Ok(resolved)
 }
 
-pub fn install(mut options: GitLinkOptions, node: &str, sdk_url: &str) -> Result<String> {
-    let root = git_repo_root(Path::new(&options.repo))?;
-    options.repo = root.display().to_string();
-    options.db_path = fs::canonicalize(&options.db_path)?.display().to_string();
-    options.source = Some(resolve_source(&options)?);
-    if options.pr_url.is_none() {
-        // Resolve an existing PR once at install time. The post-commit path is
-        // deliberately offline. A repository override also works without gh.
-        options.pr_url = git_stdout(&root, &["config", "--get", "ai-hist.pr-url"])
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-        if options.pr_url.is_none() {
-            options.pr_url = std::process::Command::new("gh")
-                .current_dir(&root)
+/// The repository's PR, resolved once at install time. The post-commit path is
+/// deliberately offline. A repository override also works without gh.
+fn discover_pr_url(root: &Path) -> Option<String> {
+    git_stdout(root, &["config", "--get", "ai-hist.pr-url"])
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::process::Command::new("gh")
+                .current_dir(root)
                 .env("GH_PROMPT_DISABLED", "1")
                 .args(["pr", "view", "--json", "url", "--jq", ".url"])
                 .output()
@@ -114,14 +109,13 @@ pub fn install(mut options: GitLinkOptions, node: &str, sdk_url: &str) -> Result
                 .filter(|out| out.status.success())
                 .and_then(|out| String::from_utf8(out.stdout).ok())
                 .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty());
-        }
-    }
-    if let Some(url) = &options.pr_url {
-        pr_ref(url)?;
-    }
-    let hook = git_path(&root, "hooks/post-commit")?;
-    let common = git_stdout(&root, &["rev-parse", "--git-common-dir"])?;
+                .filter(|value| !value.is_empty())
+        })
+}
+
+/// Refuse a hooks directory this worktree does not own alone.
+fn ensure_hook_dir_is_this_worktrees(root: &Path, hook: &Path) -> Result<()> {
+    let common = git_stdout(root, &["rev-parse", "--git-common-dir"])?;
     let common = root.join(common.trim()).canonicalize()?;
     let hook_parent = hook.parent().context("missing hook parent")?;
     // Resolve before comparing: an unresolved `..` can satisfy the lexical
@@ -140,7 +134,7 @@ pub fn install(mut options: GitLinkOptions, node: &str, sdk_url: &str) -> Result
     // than corrupt the linkage we exist to record. A work-tree-local hooks
     // directory is per-worktree and stays allowed.
     if shared_hooks {
-        let git_dir = git_stdout(&root, &["rev-parse", "--git-dir"])?;
+        let git_dir = git_stdout(root, &["rev-parse", "--git-dir"])?;
         let git_dir = root.join(git_dir.trim()).canonicalize()?;
         anyhow::ensure!(
             git_dir == common,
@@ -148,6 +142,32 @@ pub fn install(mut options: GitLinkOptions, node: &str, sdk_url: &str) -> Result
              install from the main worktree, or set a worktree-local core.hooksPath first"
         );
     }
+    Ok(())
+}
+
+/// A compiled or non-UTF-8 hook still deserves preservation: only a missing
+/// file means there is nothing to back up. Decoding failure is not emptiness.
+fn hook_needs_backup(hook: &Path, marker: &str) -> bool {
+    match fs::read_to_string(hook) {
+        Ok(text) => !text.is_empty() && !text.contains(marker),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
+pub fn install(mut options: GitLinkOptions, node: &str, sdk_url: &str) -> Result<String> {
+    let root = git_repo_root(Path::new(&options.repo))?;
+    options.repo = root.display().to_string();
+    options.db_path = fs::canonicalize(&options.db_path)?.display().to_string();
+    options.source = Some(resolve_source(&options)?);
+    if options.pr_url.is_none() {
+        options.pr_url = discover_pr_url(&root);
+    }
+    if let Some(url) = &options.pr_url {
+        pr_ref(url)?;
+    }
+    let hook = git_path(&root, "hooks/post-commit")?;
+    ensure_hook_dir_is_this_worktrees(&root, &hook)?;
     let script = hook.with_file_name("ai-hist-post-commit.mjs");
     fs::create_dir_all(hook.parent().context("missing hook parent")?)?;
     let body = format!(
@@ -158,14 +178,7 @@ pub fn install(mut options: GitLinkOptions, node: &str, sdk_url: &str) -> Result
     fs::write(&script, body)?;
     let marker = "# ai-hist SDK hook";
     let backup = hook.with_file_name("post-commit.before-ai-hist");
-    // A compiled or non-UTF-8 hook still deserves preservation: only a missing
-    // file means there is nothing to back up. Decoding failure is not emptiness.
-    let needs_backup = match fs::read_to_string(&hook) {
-        Ok(text) => !text.is_empty() && !text.contains(marker),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(_) => true,
-    };
-    if needs_backup {
+    if hook_needs_backup(&hook, marker) {
         anyhow::ensure!(
             !backup.exists(),
             "hook backup already exists; refusing to overwrite it"
