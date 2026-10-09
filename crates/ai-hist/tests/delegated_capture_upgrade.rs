@@ -245,3 +245,62 @@ fn a_child_whose_only_rows_are_its_own_delegations_is_readable() {
         .any(|edge| edge.side == RelationshipSide::Parent
             && edge.child_session_id.as_deref() == Some("a2")));
 }
+
+/// A nested sidecar first read before its records named the child left an
+/// unlinked edge under the root. Once a record names it, the child hangs under
+/// the subagent that spawned it, and the root keeps no unlinked edge for it.
+#[test]
+fn a_nested_sidecar_named_on_a_later_read_keeps_no_unlinked_root_edge() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path();
+    copy_tree(Path::new(FIXTURE), home);
+    let sidecar =
+        home.join(".claude/projects/-tmp-project/sidecar-session/subagents/agent-a2.jsonl");
+    let named = fs::read_to_string(&sidecar).unwrap();
+    let unnamed: String = named
+        .lines()
+        .map(|line| {
+            let mut record: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(line).unwrap();
+            record.remove("agentId");
+            format!("{}\n", serde_json::to_string(&record).unwrap())
+        })
+        .collect();
+    fs::write(&sidecar, unnamed).unwrap();
+    let store = open(home);
+    store.sync(SyncOptions::default()).unwrap();
+    let locator = sidecar.to_string_lossy().to_string();
+    let edges = |home: &Path| -> Vec<(String, Option<String>, String)> {
+        let conn = open_db(&home.join("ai-history.db")).unwrap();
+        let mut statement = conn
+            .prepare(
+                "SELECT parent_session_id, child_session_id, identity_status \
+                 FROM session_relationships \
+                 WHERE source = 'claude' AND relationship = 'delegated' AND evidence_locator = ?1 \
+                 ORDER BY parent_session_id",
+            )
+            .unwrap();
+        statement
+            .query_map([&locator], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    assert_eq!(
+        edges(home),
+        vec![(MAIN.to_string(), None, "unlinked".to_string())]
+    );
+
+    fs::write(&sidecar, named).unwrap();
+    store.sync(SyncOptions::default()).unwrap();
+    assert_eq!(
+        edges(home),
+        vec![(
+            "a1".to_string(),
+            Some("a2".to_string()),
+            "observed".to_string()
+        )]
+    );
+}

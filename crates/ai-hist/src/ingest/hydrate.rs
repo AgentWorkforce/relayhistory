@@ -2932,12 +2932,17 @@ pub(crate) fn ingest_claude_subagent_batched(
             };
             // A sidecar names the session at the root of its delegation tree;
             // the tool use that started it says which session in that tree
-            // spawned it. An edge an earlier read hung elsewhere is retired.
+            // spawned it. An edge an earlier read hung elsewhere is retired,
+            // and so is the unlinked edge a read of this file before its
+            // records named the child recorded -- under the root, wherever
+            // the spawner turns out to be. The locator is the child's own
+            // file, so every unlinked edge citing it stood for this child.
             conn.prepare_cached(
                 "DELETE FROM session_relationships \
                  WHERE source = 'claude' AND relationship = 'delegated' \
-                   AND child_session_id = ?1 AND evidence_locator = ?2 \
-                   AND parent_session_id <> ?3",
+                   AND evidence_locator = ?2 \
+                   AND ((child_session_id = ?1 AND parent_session_id <> ?3) \
+                     OR (child_session_id IS NULL AND identity_status = 'unlinked'))",
             )?
             .execute(params![agent_id, locator, spawner])?;
             let child_model = match evidence.model.clone() {
