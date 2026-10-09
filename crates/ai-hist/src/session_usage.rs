@@ -880,19 +880,49 @@ mod tests {
         conn
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn event(
-        conn: &Connection,
-        source: &str,
-        session_id: &str,
-        message_id: &str,
+    /// One `session_events` row to seed. `Default` is a Claude assistant text
+    /// block in session `s1`; tests name only the fields they vary.
+    #[derive(Clone, Copy)]
+    struct SeedEvent<'a> {
+        source: &'a str,
+        session_id: &'a str,
+        message_id: &'a str,
         ts_ms: i64,
-        role: &str,
-        kind: &str,
-        model: Option<&str>,
-        token_json: Option<&str>,
-        uid: &str,
-    ) {
+        role: &'a str,
+        kind: &'a str,
+        model: Option<&'a str>,
+        token_json: Option<&'a str>,
+        uid: &'a str,
+    }
+
+    impl Default for SeedEvent<'_> {
+        fn default() -> Self {
+            Self {
+                source: "claude",
+                session_id: "s1",
+                message_id: "",
+                ts_ms: 0,
+                role: "assistant",
+                kind: "text",
+                model: None,
+                token_json: None,
+                uid: "",
+            }
+        }
+    }
+
+    fn event(conn: &Connection, event: &SeedEvent<'_>) {
+        let SeedEvent {
+            source,
+            session_id,
+            message_id,
+            ts_ms,
+            role,
+            kind,
+            model,
+            token_json,
+            uid,
+        } = *event;
         // `provider_message_id` mirrors what the parser stores: the
         // provider's own message id, shared by every record of one request.
         // Seeding it keeps these tests about grouping and normalization
@@ -918,15 +948,15 @@ mod tests {
         {
             event(
                 conn,
-                "claude",
-                "s1",
-                "msg_multi_1",
-                1_000,
-                "assistant",
-                kind,
-                Some("claude-opus-4-7"),
-                Some(CLAUDE_USAGE),
-                &format!("msg_multi_1:{index}"),
+                &SeedEvent {
+                    message_id: "msg_multi_1",
+                    ts_ms: 1_000,
+                    kind,
+                    model: Some("claude-opus-4-7"),
+                    token_json: Some(CLAUDE_USAGE),
+                    uid: &format!("msg_multi_1:{index}"),
+                    ..SeedEvent::default()
+                },
             );
         }
     }
@@ -961,15 +991,14 @@ mod tests {
         ] {
             event(
                 &conn,
-                "codex",
-                "s1",
-                uid,
-                1000,
-                "assistant",
-                kind,
-                None,
-                None,
-                uid,
+                &SeedEvent {
+                    source: "codex",
+                    message_id: uid,
+                    ts_ms: 1000,
+                    kind,
+                    uid,
+                    ..SeedEvent::default()
+                },
             );
             conn.execute(
                 "UPDATE session_events SET request_span = '0', provider_message_id = ?1 WHERE source = 'codex' AND event_uid = ?2",
@@ -1017,15 +1046,13 @@ mod tests {
         for source in ["claude", "opencode", "grok"] {
             event(
                 &conn,
-                source,
-                "s1",
-                "provider-id",
-                1000,
-                "assistant",
-                "text",
-                None,
-                None,
-                "reply",
+                &SeedEvent {
+                    source,
+                    message_id: "provider-id",
+                    ts_ms: 1000,
+                    uid: "reply",
+                    ..SeedEvent::default()
+                },
             );
             conn.execute(
                 "UPDATE session_events SET request_span = '0' WHERE source = ?1",
@@ -1161,34 +1188,30 @@ mod tests {
         // Both buckets reported.
         event(
             &conn,
-            "claude",
-            "s1",
-            "m_full",
-            1_000,
-            "assistant",
-            "text",
-            None,
-            Some(
-                r#"{"input_tokens":1,"cache_creation_input_tokens":8,
+            &SeedEvent {
+                message_id: "m_full",
+                ts_ms: 1_000,
+                token_json: Some(
+                    r#"{"input_tokens":1,"cache_creation_input_tokens":8,
                     "cache_creation":{"ephemeral_5m_input_tokens":3,"ephemeral_1h_input_tokens":5}}"#,
-            ),
-            "m_full:0",
+                ),
+                uid: "m_full:0",
+                ..SeedEvent::default()
+            },
         );
         // Cache writes reported, but only the 5m bucket broken out.
         event(
             &conn,
-            "claude",
-            "s1",
-            "m_half",
-            2_000,
-            "assistant",
-            "text",
-            None,
-            Some(
-                r#"{"input_tokens":1,"cache_creation_input_tokens":4,
+            &SeedEvent {
+                message_id: "m_half",
+                ts_ms: 2_000,
+                token_json: Some(
+                    r#"{"input_tokens":1,"cache_creation_input_tokens":4,
                     "cache_creation":{"ephemeral_5m_input_tokens":4}}"#,
-            ),
-            "m_half:0",
+                ),
+                uid: "m_half:0",
+                ..SeedEvent::default()
+            },
         );
         let summary = session_usage_summary(&conn, "claude", "s1")
             .unwrap()
@@ -1217,15 +1240,14 @@ mod tests {
         let conn = db();
         event(
             &conn,
-            "claude",
-            "s1",
-            "part,1",
-            1,
-            "assistant",
-            "tool_use",
-            None,
-            Some(r#"{"input_tokens":5,"output_tokens":6}"#),
-            "part,1:0",
+            &SeedEvent {
+                message_id: "part,1",
+                ts_ms: 1,
+                kind: "tool_use",
+                token_json: Some(r#"{"input_tokens":5,"output_tokens":6}"#),
+                uid: "part,1:0",
+                ..SeedEvent::default()
+            },
         );
         conn.execute(
             "INSERT INTO tool_calls (source, session_id, message_id, tool_use_id, name, ts_ms) \
@@ -1253,15 +1275,14 @@ mod tests {
         for (index, id) in ["123", "true", "{}", "[1,2]", "null"].iter().enumerate() {
             event(
                 &conn,
-                "claude",
-                "s1",
-                id,
-                1_000 + index as i64,
-                "assistant",
-                "tool_use",
-                None,
-                Some(r#"{"input_tokens":5,"output_tokens":6}"#),
-                &format!("{id}:0"),
+                &SeedEvent {
+                    message_id: id,
+                    ts_ms: 1_000 + index as i64,
+                    kind: "tool_use",
+                    token_json: Some(r#"{"input_tokens":5,"output_tokens":6}"#),
+                    uid: &format!("{id}:0"),
+                    ..SeedEvent::default()
+                },
             );
             conn.execute(
                 "INSERT INTO tool_calls (source, session_id, message_id, tool_use_id, name, ts_ms) \
@@ -1395,27 +1416,24 @@ mod tests {
         let conn = db();
         event(
             &conn,
-            "claude",
-            "s1",
-            "m1",
-            1,
-            "assistant",
-            "text",
-            None,
-            Some(r#"{"input_tokens":10}"#),
-            "m1:0",
+            &SeedEvent {
+                message_id: "m1",
+                ts_ms: 1,
+                token_json: Some(r#"{"input_tokens":10}"#),
+                uid: "m1:0",
+                ..SeedEvent::default()
+            },
         );
         event(
             &conn,
-            "claude",
-            "s1",
-            "m1",
-            1,
-            "assistant",
-            "thinking",
-            None,
-            Some(r#"{"input_tokens":99}"#),
-            "m1:1",
+            &SeedEvent {
+                message_id: "m1",
+                ts_ms: 1,
+                kind: "thinking",
+                token_json: Some(r#"{"input_tokens":99}"#),
+                uid: "m1:1",
+                ..SeedEvent::default()
+            },
         );
         let page = session_requests_page(&conn, "claude", "s1", 50, None).unwrap();
         assert_eq!(page.requests[0].usage, None);
@@ -1454,15 +1472,13 @@ mod tests {
         let conn = db();
         event(
             &conn,
-            "claude",
-            "s1",
-            "m1",
-            1,
-            "assistant",
-            "text",
-            None,
-            Some(r#"{"input_tokens":-4}"#),
-            "m1:0",
+            &SeedEvent {
+                message_id: "m1",
+                ts_ms: 1,
+                token_json: Some(r#"{"input_tokens":-4}"#),
+                uid: "m1:0",
+                ..SeedEvent::default()
+            },
         );
         let page = session_requests_page(&conn, "claude", "s1", 50, None).unwrap();
         assert_eq!(
@@ -1480,15 +1496,14 @@ mod tests {
         let conn = db();
         event(
             &conn,
-            "claude",
-            "s1",
-            "msg_partial_1",
-            1,
-            "assistant",
-            "text",
-            Some("claude-sonnet-4-6"),
-            Some(r#"{"input_tokens":10}"#),
-            "msg_partial_1:0",
+            &SeedEvent {
+                message_id: "msg_partial_1",
+                ts_ms: 1,
+                model: Some("claude-sonnet-4-6"),
+                token_json: Some(r#"{"input_tokens":10}"#),
+                uid: "msg_partial_1:0",
+                ..SeedEvent::default()
+            },
         );
         let summary = session_usage_summary(&conn, "claude", "s1")
             .unwrap()
@@ -1505,15 +1520,12 @@ mod tests {
         let conn = db();
         event(
             &conn,
-            "claude",
-            "s1",
-            "m1",
-            1,
-            "assistant",
-            "text",
-            None,
-            None,
-            "m1:0",
+            &SeedEvent {
+                message_id: "m1",
+                ts_ms: 1,
+                uid: "m1:0",
+                ..SeedEvent::default()
+            },
         );
         let summary = session_usage_summary(&conn, "claude", "s1")
             .unwrap()
@@ -1530,7 +1542,14 @@ mod tests {
     fn user_turns_are_not_requests() {
         let conn = db();
         event(
-            &conn, "claude", "s1", "u1", 1, "user", "text", None, None, "u1:0",
+            &conn,
+            &SeedEvent {
+                message_id: "u1",
+                ts_ms: 1,
+                role: "user",
+                uid: "u1:0",
+                ..SeedEvent::default()
+            },
         );
         let page = session_requests_page(&conn, "claude", "s1", 50, None).unwrap();
         assert!(page.requests.is_empty());
@@ -1541,39 +1560,35 @@ mod tests {
         let conn = db();
         event(
             &conn,
-            "claude",
-            "s1",
-            "m1",
-            1,
-            "assistant",
-            "text",
-            None,
-            Some(r#"{"input_tokens":1}"#),
-            "m1:0",
+            &SeedEvent {
+                message_id: "m1",
+                ts_ms: 1,
+                token_json: Some(r#"{"input_tokens":1}"#),
+                uid: "m1:0",
+                ..SeedEvent::default()
+            },
         );
         event(
             &conn,
-            "codex",
-            "s1",
-            "m2",
-            2,
-            "assistant",
-            "text",
-            None,
-            Some(r#"{"input_tokens":7}"#),
-            "m2:0",
+            &SeedEvent {
+                source: "codex",
+                message_id: "m2",
+                ts_ms: 2,
+                token_json: Some(r#"{"input_tokens":7}"#),
+                uid: "m2:0",
+                ..SeedEvent::default()
+            },
         );
         event(
             &conn,
-            "claude",
-            "s2",
-            "m3",
-            3,
-            "assistant",
-            "text",
-            None,
-            Some(r#"{"input_tokens":5}"#),
-            "m3:0",
+            &SeedEvent {
+                session_id: "s2",
+                message_id: "m3",
+                ts_ms: 3,
+                token_json: Some(r#"{"input_tokens":5}"#),
+                uid: "m3:0",
+                ..SeedEvent::default()
+            },
         );
         let page = session_requests_page(&conn, "claude", "s1", 50, None).unwrap();
         assert_eq!(page.requests.len(), 1);
@@ -1586,15 +1601,13 @@ mod tests {
         for index in 0..7 {
             event(
                 &conn,
-                "claude",
-                "s1",
-                &format!("m{index}"),
-                1_000,
-                "assistant",
-                "text",
-                None,
-                Some(r#"{"input_tokens":1,"output_tokens":1}"#),
-                &format!("m{index}:0"),
+                &SeedEvent {
+                    message_id: &format!("m{index}"),
+                    ts_ms: 1_000,
+                    token_json: Some(r#"{"input_tokens":1,"output_tokens":1}"#),
+                    uid: &format!("m{index}:0"),
+                    ..SeedEvent::default()
+                },
             );
         }
         let mut seen = Vec::new();
@@ -1628,31 +1641,31 @@ mod tests {
         let conn = db();
         event(
             &conn,
-            "codex",
-            "s1",
-            "1:agent_message",
-            1_000,
-            "assistant",
-            "text",
-            Some("gpt-5.4"),
-            Some(
-                r#"{"input_tokens":3000,"cached_input_tokens":1000,"cache_write_input_tokens":0,"output_tokens":200,"reasoning_output_tokens":50,"total_tokens":3200}"#,
-            ),
-            "1:agent_message",
+            &SeedEvent {
+                source: "codex",
+                message_id: "1:agent_message",
+                ts_ms: 1_000,
+                model: Some("gpt-5.4"),
+                token_json: Some(
+                    r#"{"input_tokens":3000,"cached_input_tokens":1000,"cache_write_input_tokens":0,"output_tokens":200,"reasoning_output_tokens":50,"total_tokens":3200}"#,
+                ),
+                uid: "1:agent_message",
+                ..SeedEvent::default()
+            },
         );
         event(
             &conn,
-            "codex",
-            "s1",
-            "2:agent_message",
-            2_000,
-            "assistant",
-            "text",
-            Some("gpt-5.4"),
-            Some(
-                r#"{"input_tokens":3500,"cached_input_tokens":500,"cache_write_input_tokens":0,"output_tokens":250,"reasoning_output_tokens":40,"total_tokens":3750}"#,
-            ),
-            "2:agent_message",
+            &SeedEvent {
+                source: "codex",
+                message_id: "2:agent_message",
+                ts_ms: 2_000,
+                model: Some("gpt-5.4"),
+                token_json: Some(
+                    r#"{"input_tokens":3500,"cached_input_tokens":500,"cache_write_input_tokens":0,"output_tokens":250,"reasoning_output_tokens":40,"total_tokens":3750}"#,
+                ),
+                uid: "2:agent_message",
+                ..SeedEvent::default()
+            },
         );
         let summary = session_usage_summary(&conn, "codex", "s1")
             .unwrap()
@@ -1702,15 +1715,13 @@ mod tests {
             let conn = open_db(&path).unwrap();
             event(
                 &conn,
-                "claude",
-                "s1",
-                "m1",
-                1,
-                "assistant",
-                "text",
-                None,
-                Some(r#"{"input_tokens":1}"#),
-                "m1:0",
+                &SeedEvent {
+                    message_id: "m1",
+                    ts_ms: 1,
+                    token_json: Some(r#"{"input_tokens":1}"#),
+                    uid: "m1:0",
+                    ..SeedEvent::default()
+                },
             );
         }
         let conn = open_db(&path).unwrap();

@@ -44,14 +44,13 @@ const JOURNAL_ERA_TABLES: &[&str] = &[
 
 const ORIGIN: &str = "5f0c1c4e0a8b4d6f9e2a7b3c1d0e9f8a";
 
-#[allow(clippy::field_reassign_with_default)]
 fn open(home: &Path) -> SessionStore {
-    let mut options = StoreOptions::default();
-    options.db_path = Some(home.join("ai-history.db"));
-    options.roots = Some(ProviderRoots::from_home(
-        home.to_path_buf(),
-        home.join(".local/share/opencode/opencode.db"),
-    ));
+    let options = StoreOptions::default()
+        .db_path(home.join("ai-history.db"))
+        .roots(ProviderRoots::from_home(
+            home.to_path_buf(),
+            home.join(".local/share/opencode/opencode.db"),
+        ));
     SessionStore::open(options).expect("open")
 }
 

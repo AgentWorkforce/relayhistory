@@ -909,12 +909,14 @@ fn resolve_explicit(
         written.push(write_edge(
             conn,
             evidence,
-            RELATIONSHIP_CONTINUATION,
-            target,
-            Some(evidence.session_id.as_str()),
-            REF_CONTINUED_FROM,
-            evidence.explicit_source_session_id.as_deref(),
-            named_at(&evidence.explicit_continuation_ts_ms, target, evidence),
+            &ContinuityEdge {
+                relationship: RELATIONSHIP_CONTINUATION,
+                parent_session_id: target,
+                child_session_id: Some(evidence.session_id.as_str()),
+                evidence_ref: REF_CONTINUED_FROM,
+                origin_session_id: evidence.explicit_source_session_id.as_deref(),
+                spawned_at_ms: named_at(&evidence.explicit_continuation_ts_ms, target, evidence),
+            },
         )?);
     }
     for target in &evidence.explicit_fork_targets {
@@ -932,12 +934,14 @@ fn resolve_explicit(
         written.push(write_edge(
             conn,
             evidence,
-            RELATIONSHIP_FORK,
-            target,
-            Some(evidence.session_id.as_str()),
-            evidence_ref,
-            Some(origin),
-            named_at(&evidence.explicit_fork_ts_ms, target, evidence),
+            &ContinuityEdge {
+                relationship: RELATIONSHIP_FORK,
+                parent_session_id: target,
+                child_session_id: Some(evidence.session_id.as_str()),
+                evidence_ref,
+                origin_session_id: Some(origin),
+                spawned_at_ms: named_at(&evidence.explicit_fork_ts_ms, target, evidence),
+            },
         )?);
     }
     Ok(())
@@ -976,12 +980,14 @@ fn resolve_explicit_source(
     written.push(write_edge(
         conn,
         evidence,
-        RELATIONSHIP_FORK,
-        origin,
-        Some(evidence.session_id.as_str()),
-        REF_SOURCE_SESSION,
-        Some(origin),
-        evidence.first_ts_ms,
+        &ContinuityEdge {
+            relationship: RELATIONSHIP_FORK,
+            parent_session_id: origin,
+            child_session_id: Some(evidence.session_id.as_str()),
+            evidence_ref: REF_SOURCE_SESSION,
+            origin_session_id: Some(origin),
+            spawned_at_ms: evidence.first_ts_ms,
+        },
     )?);
     Ok(())
 }
@@ -1011,18 +1017,20 @@ fn resolve_resume(
     written.push(write_edge(
         conn,
         evidence,
-        RELATIONSHIP_RESUME,
-        target,
-        Some(evidence.session_id.as_str()),
-        REF_RESUME_MARKER,
-        // The explicit origin when the file names one, so skipping the
-        // source-only fork never loses it.
-        evidence
+        &ContinuityEdge {
+            relationship: RELATIONSHIP_RESUME,
+            parent_session_id: target,
+            child_session_id: Some(evidence.session_id.as_str()),
+            evidence_ref: REF_RESUME_MARKER,
+            // The explicit origin when the file names one, so skipping the
+            // source-only fork never loses it.
+            origin_session_id: evidence
             .explicit_source_session_id
             .as_deref()
             .filter(|id| !id.is_empty() && *id != evidence.session_id)
             .or(Some(target)),
-        evidence.first_ts_ms,
+            spawned_at_ms: evidence.first_ts_ms,
+        },
     )?);
     Ok(())
 }
@@ -1069,12 +1077,14 @@ fn resolve_cross_file_parent(
     written.push(write_edge(
         conn,
         evidence,
-        RELATIONSHIP_CONTINUATION,
-        &parent_session_id,
-        Some(evidence.session_id.as_str()),
-        parent_uuid,
-        evidence.explicit_source_session_id.as_deref(),
-        evidence.first_ts_ms,
+        &ContinuityEdge {
+            relationship: RELATIONSHIP_CONTINUATION,
+            parent_session_id: &parent_session_id,
+            child_session_id: Some(evidence.session_id.as_str()),
+            evidence_ref: parent_uuid,
+            origin_session_id: evidence.explicit_source_session_id.as_deref(),
+            spawned_at_ms: evidence.first_ts_ms,
+        },
     )?);
     Ok(())
 }
@@ -1141,12 +1151,14 @@ fn resolve_fork_group(
         let uid = write_edge(
             conn,
             member,
-            RELATIONSHIP_FORK,
-            &origin,
-            child,
-            REF_SHARED_SESSION_ID,
-            Some(origin.as_str()),
-            member.first_ts_ms,
+            &ContinuityEdge {
+                relationship: RELATIONSHIP_FORK,
+                parent_session_id: &origin,
+                child_session_id: child,
+                evidence_ref: REF_SHARED_SESSION_ID,
+                origin_session_id: Some(origin.as_str()),
+                spawned_at_ms: member.first_ts_ms,
+            },
         )?;
         // Only this locator's own row is part of its keep-set; a sibling's row
         // is retracted by the sibling's own pass, never by this one.
@@ -1187,17 +1199,29 @@ fn has_stronger_lineage(conn: &Connection, evidence: &ContinuityEvidence) -> Res
 // Storage helpers
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
+/// One lineage edge a resolution step derived from a transcript's evidence.
+struct ContinuityEdge<'a> {
+    relationship: &'a str,
+    parent_session_id: &'a str,
+    child_session_id: Option<&'a str>,
+    evidence_ref: &'a str,
+    origin_session_id: Option<&'a str>,
+    spawned_at_ms: Option<i64>,
+}
+
 fn write_edge(
     conn: &Connection,
     evidence: &ContinuityEvidence,
-    relationship: &str,
-    parent_session_id: &str,
-    child_session_id: Option<&str>,
-    evidence_ref: &str,
-    origin_session_id: Option<&str>,
-    spawned_at_ms: Option<i64>,
+    edge: &ContinuityEdge<'_>,
 ) -> Result<(String, String)> {
+    let &ContinuityEdge {
+        relationship,
+        parent_session_id,
+        child_session_id,
+        evidence_ref,
+        origin_session_id,
+        spawned_at_ms,
+    } = edge;
     // Unlinked branches of one origin must not collapse into a single row, so
     // their uid carries the transcript that distinguishes them.
     let uid = match child_session_id {

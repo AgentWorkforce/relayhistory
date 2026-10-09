@@ -6,6 +6,10 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Rust API
+
+- Added chainable by-value setters named after each field to the `#[non_exhaustive]` options types, so an embedder builds them from `default()` without field assignment: `StoreOptions::{db_path, home, roots, read_only}`, `DiscoveryOptions::{sources, limit, stop}`, `SyncOptions::{force, lock_timeout_ms, stop, progress}`, `HydrateOptions::{include_related, stop}` and `ForgetOptions::{lock_timeout_ms, stop, include_unrecoverable}` (e.g. `StoreOptions::default().db_path(path).read_only(true)`).
+
 ## [0.37.0] - 2026-10-09
 
 ### Breaking Changes

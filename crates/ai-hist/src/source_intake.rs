@@ -343,16 +343,18 @@ pub(crate) fn apply_normalized(
     crate::hydrate::save_observation_progress(
         &tx,
         &observation,
-        &evidence.source_stamp,
-        evidence.source_bytes,
-        evidence.records.len() as i64,
-        // What this acquisition actually did, so the stored checkpoint cannot
-        // contradict a hydration that did index delegation.
-        include_related,
-        full,
-        // A remote connector delivers records, not a growing local file:
-        // there is no byte position in the source to resume from.
-        None,
+        &crate::hydrate::ObservationProgress {
+            stamp: &evidence.source_stamp,
+            bytes: evidence.source_bytes,
+            records: evidence.records.len() as i64,
+            // What this acquisition actually did, so the stored checkpoint
+            // cannot contradict a hydration that did index delegation.
+            include_related,
+            full,
+            // A remote connector delivers records, not a growing local file:
+            // there is no byte position in the source to resume from.
+            cursor: None,
+        },
     )?;
     // Inside the transaction that wrote the records, for the same reason the
     // local hydration path does it: a snapshot supplies `session_events` rows
@@ -380,26 +382,30 @@ pub(crate) fn apply_normalized(
     crate::hydrate::build_remote_result(
         conn,
         &options,
-        if unchanged {
-            "unchanged"
-        } else if previous.is_some() {
-            "updated"
-        } else {
-            "hydrated"
+        crate::hydrate::HydrationPass {
+            status: if unchanged {
+                "unchanged"
+            } else if previous.is_some() {
+                "updated"
+            } else {
+                "hydrated"
+            },
+            source_stamp: evidence.source_stamp,
+            source_bytes: evidence.source_bytes,
+            records_parsed: evidence.records.len() as i64,
+            started,
         },
-        // Capability follows this acquisition's coverage, not the accumulated
-        // set, or it would contradict the `coverage` beside it -- which the SDK
-        // re-derives and rejects on mismatch. `discovery_state` keeps following
-        // the stored row.
-        crate::hydrate::capability_for(&coverage),
-        if full { "full" } else { "shallow" },
-        coverage,
-        evidence.source_stamp,
-        evidence.source_bytes,
-        evidence.records.len() as i64,
-        "SOURCE_EVIDENCE_INDEXED",
-        "selected source snapshot committed",
-        started,
+        crate::hydrate::RemoteSnapshot {
+            // Capability follows this acquisition's coverage, not the
+            // accumulated set, or it would contradict the `coverage` beside it
+            // -- which the SDK re-derives and rejects on mismatch.
+            // `discovery_state` keeps following the stored row.
+            capability: crate::hydrate::capability_for(&coverage),
+            discovery_state: if full { "full" } else { "shallow" },
+            coverage,
+            diagnostic_code: "SOURCE_EVIDENCE_INDEXED",
+            diagnostic_message: "selected source snapshot committed",
+        },
     )
 }
 

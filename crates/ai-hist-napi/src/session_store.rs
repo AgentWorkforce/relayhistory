@@ -198,10 +198,7 @@ fn serialize<T: Serialize>(value: &T) -> napi::Result<String> {
 }
 
 pub(crate) fn open_store(path: &Path, read_only: bool) -> Result<SessionStore, ai_hist::Error> {
-    let mut options = StoreOptions::default();
-    options.db_path = Some(path.to_path_buf());
-    options.read_only = read_only;
-    SessionStore::open(options)
+    SessionStore::open(StoreOptions::default().db_path(path).read_only(read_only))
 }
 
 /// A read connection on the database the facade has just accepted.

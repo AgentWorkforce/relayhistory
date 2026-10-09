@@ -2671,7 +2671,6 @@ pub fn session_locations(conn: &Connection, source: &str, session_id: &str) -> R
 /// Locator and stamp live on the presence so a dual local/remote session can
 /// retain independent change detection state. Canonical merged metadata stays
 /// on `sessions` for the unified user-facing row.
-#[allow(clippy::too_many_arguments)]
 pub fn upsert_session_presence(
     conn: &Connection,
     source: &str,
@@ -7045,16 +7044,43 @@ mod tests {
         );
     }
 
-    fn add_event(
-        conn: &Connection,
-        source: &str,
-        session_id: &str,
+    /// One `session_events` row to seed. `Default` is a Claude event in
+    /// session `s1` with no token usage; tests name only the fields they vary.
+    #[derive(Clone, Copy)]
+    struct SeedEvent<'a> {
+        source: &'a str,
+        session_id: &'a str,
         ts_ms: i64,
-        role: &str,
-        text: &str,
-        token_json: Option<&str>,
-        event_uid: &str,
-    ) {
+        role: &'a str,
+        text: &'a str,
+        token_json: Option<&'a str>,
+        event_uid: &'a str,
+    }
+
+    impl Default for SeedEvent<'_> {
+        fn default() -> Self {
+            Self {
+                source: "claude",
+                session_id: "s1",
+                ts_ms: 0,
+                role: "",
+                text: "",
+                token_json: None,
+                event_uid: "",
+            }
+        }
+    }
+
+    fn add_event(conn: &Connection, event: &SeedEvent<'_>) {
+        let SeedEvent {
+            source,
+            session_id,
+            ts_ms,
+            role,
+            text,
+            token_json,
+            event_uid,
+        } = *event;
         conn.execute(
             "INSERT INTO session_events (source, session_id, project, cwd, git_branch, message_id, \
              parent_id, ts_ms, role, kind, text, model, token_json, event_uid) \
@@ -7070,21 +7096,59 @@ mod tests {
         init_db(&conn).unwrap();
         // Inserted out of order, and with a tie the ordering must break by
         // insertion order rather than at random.
-        add_event(&conn, "claude", "s1", 300, "assistant", "third", None, "e3");
-        add_event(&conn, "claude", "s1", 100, "user", "first", None, "e1");
         add_event(
             &conn,
-            "claude",
-            "s1",
-            300,
-            "user",
-            "fourth",
-            Some(r#"{"input_tokens":10,"output_tokens":20}"#),
-            "e4",
+            &SeedEvent {
+                ts_ms: 300,
+                role: "assistant",
+                text: "third",
+                event_uid: "e3",
+                ..SeedEvent::default()
+            },
         );
-        add_event(&conn, "claude", "s1", 200, "user", "second", None, "e2");
+        add_event(
+            &conn,
+            &SeedEvent {
+                ts_ms: 100,
+                role: "user",
+                text: "first",
+                event_uid: "e1",
+                ..SeedEvent::default()
+            },
+        );
+        add_event(
+            &conn,
+            &SeedEvent {
+                ts_ms: 300,
+                role: "user",
+                text: "fourth",
+                token_json: Some(r#"{"input_tokens":10,"output_tokens":20}"#),
+                event_uid: "e4",
+                ..SeedEvent::default()
+            },
+        );
+        add_event(
+            &conn,
+            &SeedEvent {
+                ts_ms: 200,
+                role: "user",
+                text: "second",
+                event_uid: "e2",
+                ..SeedEvent::default()
+            },
+        );
         // A different agent reusing the same session id must not bleed in.
-        add_event(&conn, "codex", "s1", 150, "user", "other agent", None, "e5");
+        add_event(
+            &conn,
+            &SeedEvent {
+                source: "codex",
+                ts_ms: 150,
+                role: "user",
+                text: "other agent",
+                event_uid: "e5",
+                ..SeedEvent::default()
+            },
+        );
 
         let all = session_events(&conn, "s1", None).unwrap();
         assert_eq!(

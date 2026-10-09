@@ -357,6 +357,16 @@ fn walk_allowed() -> bool {
     true
 }
 
+/// What one branch is searched for, as [`search_branch`] hands it to each
+/// walk window.
+struct BranchSearch<'a> {
+    fts_match: Option<&'a BranchMatch>,
+    filter_sql: &'a str,
+    filter_params: &'a [String],
+    filter: &'a QueryFilter,
+    raw_fts: bool,
+}
+
 /// One branch's matches, newest first: `filter_sql` and `filter_params` are
 /// the branch's predicates on its alias, `fts_match` its MATCH expression.
 ///
@@ -406,6 +416,13 @@ fn search_branch(
         }
     }
     if walk && index_exists(conn, ts_index)? {
+        let search = BranchSearch {
+            fts_match: fts_match.as_ref(),
+            filter_sql,
+            filter_params: &filter_params,
+            filter,
+            raw_fts,
+        };
         for (step, window) in WALK_WINDOWS.iter().copied().enumerate() {
             let floor = recent_window_floor(conn, branch, filter, window)?;
             // Rows tied on the floor's timestamp all join the window, and the
@@ -421,16 +438,7 @@ fn search_branch(
             // fewer than twice the window, and each window in WALK_WINDOWS is
             // larger than that, so every step's floor is strictly older than
             // the last and each window is read once.
-            let rows = walk_window(
-                conn,
-                branch,
-                fts_match.as_ref(),
-                filter_sql,
-                &filter_params,
-                filter,
-                raw_fts,
-                floor,
-            )?;
+            let rows = walk_window(conn, branch, &search, floor)?;
             // A window that holds every eligible row is the whole search.
             if floor.is_none() || rows.len() as i64 >= limit {
                 record_walk(true);
@@ -495,13 +503,16 @@ fn index_exists(conn: &Connection, name: &str) -> Result<bool> {
 fn walk_window(
     conn: &Connection,
     branch: &SearchBranch,
-    fts_match: Option<&BranchMatch>,
-    filter_sql: &str,
-    filter_params: &[String],
-    filter: &QueryFilter,
-    raw_fts: bool,
+    search: &BranchSearch<'_>,
     floor: Option<i64>,
 ) -> Result<Vec<SearchRow>> {
+    let &BranchSearch {
+        fts_match,
+        filter_sql,
+        filter_params,
+        filter,
+        raw_fts,
+    } = search;
     let SearchBranch {
         table,
         alias,

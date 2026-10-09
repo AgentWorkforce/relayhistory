@@ -79,6 +79,30 @@ pub struct ForgetOptions {
     pub include_unrecoverable: bool,
 }
 
+impl ForgetOptions {
+    /// Wait this long for the lock; see [`ForgetOptions::lock_timeout_ms`].
+    #[must_use]
+    pub fn lock_timeout_ms(mut self, lock_timeout_ms: u64) -> Self {
+        self.lock_timeout_ms = lock_timeout_ms;
+        self
+    }
+
+    /// Stop when this token is stopped; see [`ForgetOptions::stop`].
+    #[must_use]
+    pub fn stop(mut self, stop: StopToken) -> Self {
+        self.stop = Some(stop);
+        self
+    }
+
+    /// Also forget unrecoverable evidence; see
+    /// [`ForgetOptions::include_unrecoverable`].
+    #[must_use]
+    pub fn include_unrecoverable(mut self, include_unrecoverable: bool) -> Self {
+        self.include_unrecoverable = include_unrecoverable;
+        self
+    }
+}
+
 /// Result of [`SessionStore::forget_evidence`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]

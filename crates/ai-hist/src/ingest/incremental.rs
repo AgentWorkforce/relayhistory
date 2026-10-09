@@ -269,6 +269,7 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
                 Some(id) => {
                     file_session_id = Some(id.to_string());
                     if let Some(from) = sessionless_from.take() {
+                        let mut file = claude.file_parse(path, None, file_session_id.as_deref());
                         reread_bytes += reader.replay(from, line_start, |held| {
                             let Ok(value) = serde_json::from_str::<Value>(held) else {
                                 return Ok(());
@@ -276,17 +277,7 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
                             let Some(held_obj) = value.as_object() else {
                                 return Ok(());
                             };
-                            ingest_claude_record(
-                                conn,
-                                path,
-                                None,
-                                file_session_id.as_deref(),
-                                held,
-                                held_obj,
-                                &mut claude.tool_results,
-                                &mut claude.cache_reads,
-                                &mut claude.slash_commands,
-                            )
+                            ingest_claude_record(conn, &mut file, held, held_obj)
                         })?;
                     }
                 }
@@ -317,29 +308,27 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
                     if complete {
                         flush_deferred(
                             conn,
-                            path,
-                            attributed_session_id,
+                            &mut claude.file_parse(
+                                path,
+                                attributed_session_id,
+                                file_session_id.as_deref(),
+                            ),
                             &message_id,
                             &mut deferred,
                             &mut deferred_order,
                             &mut deferred_bytes,
-                            &mut claude.tool_results,
-                            file_session_id.as_deref(),
-                            &mut claude.cache_reads,
-                            &mut claude.slash_commands,
                         )?;
                     }
                 } else if complete || !defer_unfinished {
                     ingest_claude_record(
                         conn,
-                        path,
-                        attributed_session_id,
-                        file_session_id.as_deref(),
+                        &mut claude.file_parse(
+                            path,
+                            attributed_session_id,
+                            file_session_id.as_deref(),
+                        ),
                         record,
                         obj,
-                        &mut claude.tool_results,
-                        &mut claude.cache_reads,
-                        &mut claude.slash_commands,
                     )?;
                 } else {
                     deferred_bytes += line.len();
@@ -360,14 +349,9 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
             }
             None => ingest_claude_record(
                 conn,
-                path,
-                attributed_session_id,
-                file_session_id.as_deref(),
+                &mut claude.file_parse(path, attributed_session_id, file_session_id.as_deref()),
                 record,
                 obj,
-                &mut claude.tool_results,
-                &mut claude.cache_reads,
-                &mut claude.slash_commands,
             )?,
         }
         if kind == ReadRecord::Unterminated {
@@ -382,16 +366,11 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
             pass.deferral_overflowed = true;
             flush_deferred(
                 conn,
-                path,
-                attributed_session_id,
+                &mut claude.file_parse(path, attributed_session_id, file_session_id.as_deref()),
                 &oldest,
                 &mut deferred,
                 &mut deferred_order,
                 &mut deferred_bytes,
-                &mut claude.tool_results,
-                file_session_id.as_deref(),
-                &mut claude.cache_reads,
-                &mut claude.slash_commands,
             )?;
         }
     }
@@ -455,19 +434,34 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
     Ok(pass)
 }
 
+impl ClaudeCursorState {
+    /// The transcript state this cursor carries, lent to the record indexer
+    /// for one file.
+    fn file_parse<'a>(
+        &'a mut self,
+        path: &'a Path,
+        attributed_session_id: Option<&'a str>,
+        file_session_id: Option<&'a str>,
+    ) -> ClaudeFileParse<'a> {
+        ClaudeFileParse {
+            path,
+            attributed_session_id,
+            file_session_id,
+            indexer: &mut self.tool_results,
+            last_assistant_cache_read: &mut self.cache_reads,
+            triads: &mut self.slash_commands,
+        }
+    }
+}
+
 /// Index one deferred message's records in file order and forget it.
 fn flush_deferred(
     conn: &Connection,
-    path: &Path,
-    attributed_session_id: Option<&str>,
+    file: &mut ClaudeFileParse<'_>,
     message_id: &str,
     deferred: &mut HashMap<String, DeferredMessage>,
     deferred_order: &mut Vec<String>,
     deferred_bytes: &mut usize,
-    indexer: &mut crate::ingest::tool_result_facts::ToolResultIndexer,
-    file_session_id: Option<&str>,
-    cache_reads: &mut std::collections::HashMap<String, i64>,
-    triads: &mut super::control::SlashCommandTriads,
 ) -> Result<()> {
     let Some(entry) = deferred.remove(message_id) else {
         return Ok(());
@@ -482,17 +476,7 @@ fn flush_deferred(
         let Some(obj) = value.as_object() else {
             continue;
         };
-        ingest_claude_record(
-            conn,
-            path,
-            attributed_session_id,
-            file_session_id,
-            record,
-            obj,
-            indexer,
-            cache_reads,
-            triads,
-        )?;
+        ingest_claude_record(conn, file, record, obj)?;
     }
     Ok(())
 }

@@ -10,12 +10,9 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-#[allow(clippy::field_reassign_with_default)]
 fn store(dir: &Path) -> (SessionStore, Connection, PathBuf) {
     let db = dir.join("ai-history.db");
-    let mut options = StoreOptions::default();
-    options.db_path = Some(db.clone());
-    let store = SessionStore::open(options).unwrap();
+    let store = SessionStore::open(StoreOptions::default().db_path(&db)).unwrap();
     let conn = Connection::open(&db).unwrap();
     (store, conn, db)
 }

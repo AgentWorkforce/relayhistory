@@ -359,6 +359,10 @@ pub ai_hist::Diagnostic::subject: core::option::Option<alloc::string::String>
 pub ai_hist::DiscoveryOptions::limit: core::option::Option<usize>
 pub ai_hist::DiscoveryOptions::sources: core::option::Option<alloc::vec::Vec<ai_hist::Source>>
 pub ai_hist::DiscoveryOptions::stop: core::option::Option<ai_hist::StopToken>
+impl ai_hist::DiscoveryOptions
+pub fn ai_hist::DiscoveryOptions::limit(self, usize) -> Self
+pub fn ai_hist::DiscoveryOptions::sources(self, impl core::iter::traits::collect::IntoIterator<Item = ai_hist::Source>) -> Self
+pub fn ai_hist::DiscoveryOptions::stop(self, ai_hist::StopToken) -> Self
 #[non_exhaustive] pub struct ai_hist::DiscoveryReport
 pub ai_hist::DiscoveryReport::diagnostics: alloc::vec::Vec<ai_hist::Diagnostic>
 pub ai_hist::DiscoveryReport::discovered: usize
@@ -388,6 +392,10 @@ pub fn ai_hist::FileEdit::raw_structured_patch(&self) -> core::option::Option<&s
 pub ai_hist::ForgetOptions::include_unrecoverable: bool
 pub ai_hist::ForgetOptions::lock_timeout_ms: u64
 pub ai_hist::ForgetOptions::stop: core::option::Option<ai_hist::StopToken>
+impl ai_hist::ForgetOptions
+pub fn ai_hist::ForgetOptions::include_unrecoverable(self, bool) -> Self
+pub fn ai_hist::ForgetOptions::lock_timeout_ms(self, u64) -> Self
+pub fn ai_hist::ForgetOptions::stop(self, ai_hist::StopToken) -> Self
 #[non_exhaustive] pub struct ai_hist::ForgetReport
 pub ai_hist::ForgetReport::db_bytes: u64
 pub ai_hist::ForgetReport::elapsed_ms: u64
@@ -410,6 +418,9 @@ pub ai_hist::HistoryEntry::timestamp_ms: i64
 #[non_exhaustive] pub struct ai_hist::HydrateOptions
 pub ai_hist::HydrateOptions::include_related: bool
 pub ai_hist::HydrateOptions::stop: core::option::Option<ai_hist::StopToken>
+impl ai_hist::HydrateOptions
+pub fn ai_hist::HydrateOptions::include_related(self, bool) -> Self
+pub fn ai_hist::HydrateOptions::stop(self, ai_hist::StopToken) -> Self
 impl core::default::Default for ai_hist::HydrateOptions
 pub fn ai_hist::HydrateOptions::default() -> Self
 #[non_exhaustive] pub struct ai_hist::HydrateReport
@@ -779,6 +790,11 @@ pub ai_hist::StoreOptions::db_path: core::option::Option<std::path::PathBuf>
 pub ai_hist::StoreOptions::home: core::option::Option<std::path::PathBuf>
 pub ai_hist::StoreOptions::read_only: bool
 pub ai_hist::StoreOptions::roots: core::option::Option<ai_hist::ProviderRoots>
+impl ai_hist::StoreOptions
+pub fn ai_hist::StoreOptions::db_path(self, impl core::convert::Into<std::path::PathBuf>) -> Self
+pub fn ai_hist::StoreOptions::home(self, impl core::convert::Into<std::path::PathBuf>) -> Self
+pub fn ai_hist::StoreOptions::read_only(self, bool) -> Self
+pub fn ai_hist::StoreOptions::roots(self, ai_hist::ProviderRoots) -> Self
 pub struct ai_hist::StoredRow
 impl ai_hist::StoredRow
 pub fn ai_hist::StoredRow::get(&self, &str) -> core::option::Option<&serde_json::value::Value>
@@ -794,6 +810,11 @@ pub ai_hist::SyncOptions::force: bool
 pub ai_hist::SyncOptions::lock_timeout_ms: u64
 pub ai_hist::SyncOptions::progress: core::option::Option<ai_hist::ProgressObserver>
 pub ai_hist::SyncOptions::stop: core::option::Option<ai_hist::StopToken>
+impl ai_hist::SyncOptions
+pub fn ai_hist::SyncOptions::force(self, bool) -> Self
+pub fn ai_hist::SyncOptions::lock_timeout_ms(self, u64) -> Self
+pub fn ai_hist::SyncOptions::progress(self, ai_hist::ProgressObserver) -> Self
+pub fn ai_hist::SyncOptions::stop(self, ai_hist::StopToken) -> Self
 #[non_exhaustive] pub struct ai_hist::SyncReport
 pub ai_hist::SyncReport::changed: alloc::vec::Vec<ai_hist::SessionRef>
 pub ai_hist::SyncReport::head_revision: u64

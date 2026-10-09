@@ -509,15 +509,17 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
         // reading every file the short-circuit exists to skip. `bytes` is
         // metadata and stays current.
         let records_parsed = stored_records_parsed(&conn, options)?;
-        return build_result_with(
+        return build_local_result(
             &conn,
             options,
-            "unchanged",
-            snapshot.stamp,
-            snapshot.bytes,
-            records_parsed,
+            HydrationPass {
+                status: "unchanged",
+                source_stamp: snapshot.stamp,
+                source_bytes: snapshot.bytes,
+                records_parsed,
+                started,
+            },
             outcome.bytes_read,
-            started.elapsed().as_millis() as i64,
             cached_diagnostics,
             snapshot.codex_relationship_complete,
         );
@@ -572,19 +574,20 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
         } else {
             load_cursor(&tx, &cursor_key)?
         };
-        let (indexed, source_diagnostics, cursor_consumed_through) = ingest_selected(
-            &tx,
-            options,
-            &target,
-            snapshot.path.as_deref(),
-            &snapshot.claude_subagents,
-            snapshot.claude_transcript.as_ref(),
-            snapshot.devin_session.as_ref(),
-            &mut cursor,
-            parser_upgrade,
-            records_parsed,
-            snapshot.opencode_layout,
-        )?;
+        let (indexed, source_diagnostics, cursor_consumed_through) =
+            ingest_selected(SelectedIngest {
+                conn: &tx,
+                options,
+                target: &target,
+                path: snapshot.path.as_deref(),
+                claude_subagents: &snapshot.claude_subagents,
+                claude_snapshot: snapshot.claude_transcript.as_ref(),
+                devin_session: snapshot.devin_session.as_ref(),
+                cursor: &mut cursor,
+                parser_upgrade,
+                records: records_parsed,
+                opencode_layout: snapshot.opencode_layout,
+            })?;
         let mut indexed = indexed;
         // What the pass actually parsed. For a provider whose reader re-reads the
         // whole file this is the count above; for an incremental one the snapshot
@@ -668,12 +671,14 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
         save_observation_progress(
             &tx,
             &local_observation,
-            &snapshot.stamp,
-            snapshot.bytes,
-            records_parsed,
-            options.include_related,
-            true,
-            Some(&cursor),
+            &ObservationProgress {
+                stamp: &snapshot.stamp,
+                bytes: snapshot.bytes,
+                records: records_parsed,
+                include_related: options.include_related,
+                full: true,
+                cursor: Some(&cursor),
+            },
         )?;
         // Inside the transaction and after every relationship this hydration
         // recorded: a subagent transcript is routinely read before its parent, so
@@ -711,15 +716,17 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
     // About this run, not the stored evidence, so it is reported and not
     // checkpointed.
     source_diagnostics.extend(log_diagnostics);
-    build_result_with(
+    build_local_result(
         &conn,
         options,
-        status,
-        snapshot.stamp,
-        snapshot.bytes,
-        records_parsed,
+        HydrationPass {
+            status,
+            source_stamp: snapshot.stamp,
+            source_bytes: snapshot.bytes,
+            records_parsed,
+            started,
+        },
         indexed.bytes_read,
-        started.elapsed().as_millis() as i64,
         source_diagnostics,
         snapshot.codex_relationship_complete,
     )
@@ -971,16 +978,21 @@ fn hydrate_remote_claude_observed(
         return build_remote_result(
             conn,
             options,
-            "unchanged",
-            "full",
-            "full",
-            crate::source_evidence::FULL_SESSION_KINDS.to_vec(),
-            source_stamp,
-            source_bytes,
-            records.len() as i64,
-            "REMOTE_EVIDENCE_FULL",
-            "all evidence exposed by Claude's teleport interface is indexed",
-            started,
+            HydrationPass {
+                status: "unchanged",
+                source_stamp,
+                source_bytes,
+                records_parsed: records.len() as i64,
+                started,
+            },
+            RemoteSnapshot {
+                capability: "full",
+                discovery_state: "full",
+                coverage: crate::source_evidence::FULL_SESSION_KINDS.to_vec(),
+                diagnostic_code: "REMOTE_EVIDENCE_FULL",
+                diagnostic_message:
+                    "all evidence exposed by Claude's teleport interface is indexed",
+            },
         );
     }
     for record in &mut records {
@@ -1065,14 +1077,16 @@ fn hydrate_remote_claude_observed(
         save_observation_progress(
             &tx,
             observation,
-            &source_stamp,
-            source_bytes,
-            records.len() as i64,
-            options.include_related,
-            true,
-            // Remote evidence arrives as records over a transport; there is no
-            // local file with a byte position to resume from.
-            None,
+            &ObservationProgress {
+                stamp: &source_stamp,
+                bytes: source_bytes,
+                records: records.len() as i64,
+                include_related: options.include_related,
+                full: true,
+                // Remote evidence arrives as records over a transport; there is
+                // no local file with a byte position to resume from.
+                cursor: None,
+            },
         )?;
         observations::save_evidence(
             &tx,
@@ -1084,20 +1098,24 @@ fn hydrate_remote_claude_observed(
     build_remote_result(
         conn,
         options,
-        if previous.is_some() {
-            "updated"
-        } else {
-            "hydrated"
+        HydrationPass {
+            status: if previous.is_some() {
+                "updated"
+            } else {
+                "hydrated"
+            },
+            source_stamp,
+            source_bytes,
+            records_parsed: records.len() as i64,
+            started,
         },
-        "full",
-        "full",
-        crate::source_evidence::FULL_SESSION_KINDS.to_vec(),
-        source_stamp,
-        source_bytes,
-        records.len() as i64,
-        "REMOTE_EVIDENCE_FULL",
-        "all evidence exposed by Claude's teleport interface is indexed",
-        started,
+        RemoteSnapshot {
+            capability: "full",
+            discovery_state: "full",
+            coverage: crate::source_evidence::FULL_SESSION_KINDS.to_vec(),
+            diagnostic_code: "REMOTE_EVIDENCE_FULL",
+            diagnostic_message: "all evidence exposed by Claude's teleport interface is indexed",
+        },
     )
 }
 
@@ -1194,12 +1212,14 @@ fn hydrate_remote_codex_diff_observed(
             save_observation_progress(
                 &tx,
                 observation,
-                &source_stamp,
-                source_bytes,
-                1,
-                options.include_related,
-                false,
-                None,
+                &ObservationProgress {
+                    stamp: &source_stamp,
+                    bytes: source_bytes,
+                    records: 1,
+                    include_related: options.include_related,
+                    full: false,
+                    cursor: None,
+                },
             )?;
             observations::save_evidence(
                 &tx,
@@ -1212,23 +1232,27 @@ fn hydrate_remote_codex_diff_observed(
     build_remote_result(
         conn,
         options,
-        if unchanged {
-            "unchanged"
-        } else if previous.is_some() {
-            "updated"
-        } else {
-            "hydrated"
+        HydrationPass {
+            status: if unchanged {
+                "unchanged"
+            } else if previous.is_some() {
+                "updated"
+            } else {
+                "hydrated"
+            },
+            source_stamp,
+            source_bytes,
+            records_parsed: 1,
+            started,
         },
-        "partial",
-        "shallow",
-        // The cloud task exposes its diff and nothing else.
-        vec![EvidenceKind::FileEdit],
-        source_stamp,
-        source_bytes,
-        1,
-        "EVIDENCE_PARTIAL",
-        "Codex exposes the task diff but no supported transcript, tool-result, token, model, or agent-relationship export",
-        started,
+        RemoteSnapshot {
+            capability: "partial",
+            discovery_state: "shallow",
+            // The cloud task exposes its diff and nothing else.
+            coverage: vec![EvidenceKind::FileEdit],
+            diagnostic_code: "EVIDENCE_PARTIAL",
+            diagnostic_message: "Codex exposes the task diff but no supported transcript, tool-result, token, model, or agent-relationship export",
+        },
     )
 }
 
@@ -1380,21 +1404,34 @@ fn write_hydration_checkpoint(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn build_remote_result(
+/// What one hydration pass established about the evidence it read, whichever
+/// path -- local parser, remote snapshot, connector intake -- acquired it.
+pub(crate) struct HydrationPass<'a> {
+    /// `hydrated`, `updated`, `unchanged`, or `capability_limited`.
+    pub(crate) status: &'a str,
+    pub(crate) source_stamp: String,
+    pub(crate) source_bytes: i64,
+    pub(crate) records_parsed: i64,
+    pub(crate) started: Instant,
+}
+
+/// What a remote or connector snapshot declares about itself: the coverage it
+/// exposes and the one diagnostic that describes it. A local pass derives these
+/// from the request and the stored rows instead.
+pub(crate) struct RemoteSnapshot<'a> {
+    pub(crate) capability: &'a str,
+    pub(crate) discovery_state: &'a str,
+    pub(crate) coverage: Vec<EvidenceKind>,
+    pub(crate) diagnostic_code: &'a str,
+    pub(crate) diagnostic_message: &'a str,
+}
+
+/// The requested session's related ids, and those ids together with the
+/// session's own, which is the set every evidence total counts over.
+fn related_scope(
     conn: &Connection,
     options: &HydrateSessionOptions,
-    status: &str,
-    capability: &str,
-    discovery_state: &str,
-    coverage: Vec<EvidenceKind>,
-    source_stamp: String,
-    source_bytes: i64,
-    records_parsed: i64,
-    diagnostic_code: &str,
-    diagnostic_message: &str,
-    started: Instant,
-) -> Result<HydrateSessionResult> {
+) -> Result<(Vec<String>, Vec<String>)> {
     let related_session_ids = if options.include_related {
         related_ids(conn, &options.source, &options.session_id)?
     } else {
@@ -1402,6 +1439,30 @@ pub(crate) fn build_remote_result(
     };
     let mut ids = vec![options.session_id.clone()];
     ids.extend(related_session_ids.iter().cloned());
+    Ok((related_session_ids, ids))
+}
+
+pub(crate) fn build_remote_result(
+    conn: &Connection,
+    options: &HydrateSessionOptions,
+    pass: HydrationPass<'_>,
+    snapshot: RemoteSnapshot<'_>,
+) -> Result<HydrateSessionResult> {
+    let HydrationPass {
+        status,
+        source_stamp,
+        source_bytes,
+        records_parsed,
+        started,
+    } = pass;
+    let RemoteSnapshot {
+        capability,
+        discovery_state,
+        coverage,
+        diagnostic_code,
+        diagnostic_message,
+    } = snapshot;
+    let (related_session_ids, ids) = related_scope(conn, options)?;
     Ok(HydrateSessionResult {
         contract_version: SESSION_HYDRATION_CONTRACT_VERSION,
         source: options.source.clone(),
@@ -2518,39 +2579,14 @@ impl<'a> SelectedIngest<'a> {
 ///
 /// Dispatches through the source's catalog descriptor; a source without a
 /// parser there has no targeted hydration.
-#[allow(clippy::too_many_arguments)]
-fn ingest_selected(
-    conn: &Connection,
-    options: &HydrateSessionOptions,
-    target: &CatalogTarget,
-    path: Option<&Path>,
-    claude_subagents: &[ClaudeSubagentEvidence],
-    claude_snapshot: Option<&ClaudeTranscriptSnapshot>,
-    devin_session: Option<&crate::ingest::devin::DevinSession>,
-    cursor: &mut TranscriptCursorState,
-    parser_upgrade: bool,
-    records: i64,
-    opencode_layout: Option<OpencodeIngestLayout>,
-) -> Result<SelectedIngestResult> {
-    let Some(parser) = crate::sources::catalog::selected_ingest(&options.source) else {
+fn ingest_selected(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
+    let Some(parser) = crate::sources::catalog::selected_ingest(&ctx.options.source) else {
         return Err(hydration_error(
             "HYDRATION_UNSUPPORTED",
-            format!("{} targeted hydration is unavailable", options.source),
+            format!("{} targeted hydration is unavailable", ctx.options.source),
         ));
     };
-    parser(SelectedIngest {
-        conn,
-        options,
-        target,
-        path,
-        claude_subagents,
-        claude_snapshot,
-        devin_session,
-        cursor,
-        parser_upgrade,
-        records,
-        opencode_layout,
-    })
+    parser(ctx)
 }
 
 pub(crate) fn ingest_selected_claude(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
@@ -2713,14 +2749,16 @@ fn ingest_claude(
     }
     upsert_session(
         conn,
-        &meta.session_id,
-        "claude",
-        meta.cwd.as_deref(),
-        meta.git_branch.as_deref(),
-        meta.first_ts,
-        meta.last_ts,
-        meta.last_assistant_text.as_deref(),
-        Some(&path.to_string_lossy()),
+        &SessionCatalogRow {
+            session_id: &meta.session_id,
+            source: "claude",
+            cwd: meta.cwd.as_deref(),
+            git_branch: meta.git_branch.as_deref(),
+            first_ts: meta.first_ts,
+            last_ts: meta.last_ts,
+            last_assistant_text: meta.last_assistant_text.as_deref(),
+            raw_path: Some(&path.to_string_lossy()),
+        },
     )?;
     // The fold above walked the whole transcript, so its first prompt is the
     // catalog's, null included -- unless the file was rewritten under the
@@ -3338,14 +3376,16 @@ fn ingest_codex(
     if let Some(first) = outcome.first_ts {
         upsert_session(
             conn,
-            &meta.session_id,
-            "codex",
-            Some(&meta.cwd),
-            meta.git_branch.as_deref(),
-            first,
-            outcome.last_ts.unwrap_or(first),
-            outcome.last_assistant_text.as_deref(),
-            Some(&path.to_string_lossy()),
+            &SessionCatalogRow {
+                session_id: &meta.session_id,
+                source: "codex",
+                cwd: Some(&meta.cwd),
+                git_branch: meta.git_branch.as_deref(),
+                first_ts: first,
+                last_ts: outcome.last_ts.unwrap_or(first),
+                last_assistant_text: outcome.last_assistant_text.as_deref(),
+                raw_path: Some(&path.to_string_lossy()),
+            },
         )?;
     }
     if options.include_related {
@@ -3863,14 +3903,16 @@ fn ingest_cursor(
     // wrote, which MAX() can never retract.
     upsert_session_rebuilt(
         conn,
-        &options.session_id,
-        "cursor",
-        project.as_deref(),
-        None,
-        outcome.first_ts_ms.unwrap_or(mtime_ms),
-        outcome.last_ts_ms.unwrap_or(mtime_ms),
-        outcome.last_assistant_text.as_deref(),
-        Some(&path.to_string_lossy()),
+        &SessionCatalogRow {
+            session_id: &options.session_id,
+            source: "cursor",
+            cwd: project.as_deref(),
+            git_branch: None,
+            first_ts: outcome.first_ts_ms.unwrap_or(mtime_ms),
+            last_ts: outcome.last_ts_ms.unwrap_or(mtime_ms),
+            last_assistant_text: outcome.last_assistant_text.as_deref(),
+            raw_path: Some(&path.to_string_lossy()),
+        },
     )?;
     Ok((cursor_diagnostics(&outcome), outcome.consumed_through))
 }
@@ -4234,10 +4276,6 @@ fn grok_diagnostics(outcome: &GrokIngestOutcome) -> Vec<HydrationDiagnostic> {
     diagnostics
 }
 
-/// Assemble the result, including the diagnostics the provider's parser
-/// produced this run — or, on a read that parsed nothing, the ones a previous
-/// parse of the same evidence recorded.
-#[allow(clippy::too_many_arguments)]
 /// What a pass has to say about *how* it read, as diagnostics.
 ///
 /// These describe the read rather than the provider's records, which is why
@@ -4310,25 +4348,26 @@ fn outcome_diagnostics(indexed: &IngestOutcome, source_bytes: i64) -> Vec<Hydrat
     diagnostics
 }
 
-fn build_result_with(
+/// Assemble a local pass's result, including the diagnostics the provider's
+/// parser produced this run -- or, on a read that parsed nothing, the ones a
+/// previous parse of the same evidence recorded.
+fn build_local_result(
     conn: &Connection,
     options: &HydrateSessionOptions,
-    status: &str,
-    source_stamp: String,
-    source_bytes: i64,
-    records_parsed: i64,
+    pass: HydrationPass<'_>,
     bytes_read: i64,
-    duration_ms: i64,
     source_diagnostics: Vec<HydrationDiagnostic>,
     codex_relationship_complete: bool,
 ) -> Result<HydrateSessionResult> {
-    let related_session_ids = if options.include_related {
-        related_ids(conn, &options.source, &options.session_id)?
-    } else {
-        Vec::new()
-    };
-    let mut ids = vec![options.session_id.clone()];
-    ids.extend(related_session_ids.iter().cloned());
+    let HydrationPass {
+        status,
+        source_stamp,
+        source_bytes,
+        records_parsed,
+        started,
+    } = pass;
+    let duration_ms = started.elapsed().as_millis() as i64;
+    let (related_session_ids, ids) = related_scope(conn, options)?;
     let evidence = evidence_counts(
         conn,
         &options.source,
@@ -4743,32 +4782,53 @@ pub(crate) fn hydrate_with_provider(
             build_remote_result(
                 &conn,
                 options,
-                "capability_limited",
-                "shallow_only",
-                &observation.discovery_state,
-                Vec::new(),
-                observation.source_stamp.clone().unwrap_or_default(),
-                0,
-                0,
-                code,
-                &message,
-                started,
+                HydrationPass {
+                    status: "capability_limited",
+                    source_stamp: observation.source_stamp.clone().unwrap_or_default(),
+                    source_bytes: 0,
+                    records_parsed: 0,
+                    started,
+                },
+                RemoteSnapshot {
+                    capability: "shallow_only",
+                    discovery_state: &observation.discovery_state,
+                    coverage: Vec::new(),
+                    diagnostic_code: code,
+                    diagnostic_message: &message,
+                },
             )
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// How far one acquisition read an observation's evidence: the checkpoint it
+/// leaves behind for the next pass.
+pub(crate) struct ObservationProgress<'a> {
+    pub(crate) stamp: &'a str,
+    pub(crate) bytes: i64,
+    pub(crate) records: i64,
+    pub(crate) include_related: bool,
+    /// The acquisition covered the whole session, so the observation is
+    /// promoted to `full` discovery.
+    pub(crate) full: bool,
+    /// The local transcript position to resume from; `None` for evidence that
+    /// arrives as records rather than as a growing file.
+    pub(crate) cursor: Option<&'a TranscriptCursorState>,
+}
+
 pub(crate) fn save_observation_progress(
     conn: &Connection,
     observation: &SessionObservation,
-    stamp: &str,
-    bytes: i64,
-    records: i64,
-    include_related: bool,
-    full: bool,
-    cursor: Option<&TranscriptCursorState>,
+    progress: &ObservationProgress<'_>,
 ) -> Result<()> {
+    let &ObservationProgress {
+        stamp,
+        bytes,
+        records,
+        include_related,
+        full,
+        cursor,
+    } = progress;
     let mut observation = observation.clone();
     observation.updated_ms = now_ms();
     observation.access_state = "available".into();
@@ -5121,19 +5181,19 @@ mod tests {
 
         let mut cursor = TranscriptCursorState::default();
         let records = snapshot.records.count().unwrap();
-        ingest_selected(
-            &conn,
-            &request,
-            &target,
-            snapshot.path.as_deref(),
-            &snapshot.claude_subagents,
-            snapshot.claude_transcript.as_ref(),
-            snapshot.devin_session.as_ref(),
-            &mut cursor,
-            false,
+        ingest_selected(SelectedIngest {
+            conn: &conn,
+            options: &request,
+            target: &target,
+            path: snapshot.path.as_deref(),
+            claude_subagents: &snapshot.claude_subagents,
+            claude_snapshot: snapshot.claude_transcript.as_ref(),
+            devin_session: snapshot.devin_session.as_ref(),
+            cursor: &mut cursor,
+            parser_upgrade: false,
             records,
-            snapshot.opencode_layout,
-        )
+            opencode_layout: snapshot.opencode_layout,
+        })
         .unwrap();
 
         let indexed: String = conn

@@ -5116,14 +5116,16 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                 if let Some(first) = outcome.first_ts {
                     upsert_session(
                         conn,
-                        &meta.session_id,
-                        "codex",
-                        Some(&meta.cwd),
-                        meta.git_branch.as_deref(),
-                        first,
-                        outcome.last_ts.unwrap_or(first),
-                        outcome.last_assistant_text.as_deref(),
-                        Some(&rollout.to_string_lossy()),
+                        &SessionCatalogRow {
+                            session_id: &meta.session_id,
+                            source: "codex",
+                            cwd: Some(&meta.cwd),
+                            git_branch: meta.git_branch.as_deref(),
+                            first_ts: first,
+                            last_ts: outcome.last_ts.unwrap_or(first),
+                            last_assistant_text: outcome.last_assistant_text.as_deref(),
+                            raw_path: Some(&rollout.to_string_lossy()),
+                        },
                     )?;
                     // A fork's walk is authoritative even with no prompt of
                     // its own: an earlier build may have stored the parent's
@@ -6577,32 +6579,30 @@ fn ingest_codex_rollout_incremental(
             let message_id = message.message_id.as_deref().unwrap_or(uid.as_str());
             insert_session_event(
                 conn,
-                "codex",
-                session_id,
-                cwd,
-                cwd,
-                branch,
-                message_id,
-                None,
-                ts_ms,
-                "user",
-                "text",
-                Some(&message.text),
-                None,
-                None,
-                RequestIdentity::none(),
-                &uid,
-                None,
-                RawMessageFacts {
-                    turn_id: turn_id.as_deref(),
-                    // A user turn is not a request, and the view does not
-                    // read it.
-                    request_span: None,
-                    // App-injected context is stored, typed, and is a
-                    // prompt nowhere: not in `history`, not as
-                    // `first_prompt`, not as a prompt root.
-                    control_kind: message.control.map(control::ControlKind::as_str),
-                    ..RawMessageFacts::default()
+                &EventRow {
+                    source: "codex",
+                    session_id,
+                    project: cwd,
+                    cwd,
+                    git_branch: branch,
+                    message_id,
+                    ts_ms,
+                    role: "user",
+                    kind: "text",
+                    text: Some(&message.text),
+                    event_uid: &uid,
+                    raw_facts: RawMessageFacts {
+                        turn_id: turn_id.as_deref(),
+                        // A user turn is not a request, and the view does not
+                        // read it.
+                        request_span: None,
+                        // App-injected context is stored, typed, and is a
+                        // prompt nowhere: not in `history`, not as
+                        // `first_prompt`, not as a prompt root.
+                        control_kind: message.control.map(control::ControlKind::as_str),
+                        ..RawMessageFacts::default()
+                    },
+                    ..EventRow::default()
                 },
             )?;
             outcome.events += 1;
@@ -6680,29 +6680,30 @@ fn ingest_codex_rollout_incremental(
             let token_json = pending_usage.take().map(PendingCodexUsage::into_token_json);
             insert_session_event(
                 conn,
-                "codex",
-                session_id,
-                cwd,
-                cwd,
-                branch,
-                &uid,
-                None,
-                ts_ms,
-                "assistant",
-                "text",
-                Some(&message.text),
-                model.as_deref(),
-                token_json.as_deref(),
-                RequestIdentity {
-                    provider_message_id: message.message_id.as_deref(),
-                    ..RequestIdentity::default()
-                },
-                &uid,
-                None,
-                RawMessageFacts {
-                    turn_id: turn_id.as_deref(),
-                    request_span: Some(request_span.to_string().as_str()),
-                    ..RawMessageFacts::default()
+                &EventRow {
+                    source: "codex",
+                    session_id,
+                    project: cwd,
+                    cwd,
+                    git_branch: branch,
+                    message_id: &uid,
+                    ts_ms,
+                    role: "assistant",
+                    kind: "text",
+                    text: Some(&message.text),
+                    model: model.as_deref(),
+                    token_json: token_json.as_deref(),
+                    identity: RequestIdentity {
+                        provider_message_id: message.message_id.as_deref(),
+                        ..RequestIdentity::default()
+                    },
+                    event_uid: &uid,
+                    raw_facts: RawMessageFacts {
+                        turn_id: turn_id.as_deref(),
+                        request_span: Some(request_span.to_string().as_str()),
+                        ..RawMessageFacts::default()
+                    },
+                    ..EventRow::default()
                 },
             )?;
             outcome.events += 1;
@@ -6763,22 +6764,28 @@ fn ingest_codex_rollout_incremental(
                 "agent_reasoning" => {
                     if let Some(reasoning) = payload_str("text").filter(|t| !t.trim().is_empty()) {
                         let uid = format!("{index}:agent_reasoning");
-                        insert_codex_event(
+                        insert_session_event(
                             conn,
-                            session_id,
-                            cwd,
-                            branch,
-                            ts_ms,
-                            "assistant",
-                            "thinking",
-                            reasoning.trim(),
-                            &uid,
-                            &uid,
-                            model.as_deref(),
-                            None,
-                            None,
-                            turn_id.as_deref(),
-                            Some(request_span.to_string().as_str()),
+                            &EventRow {
+                                source: "codex",
+                                session_id,
+                                project: cwd,
+                                cwd,
+                                git_branch: branch,
+                                message_id: &uid,
+                                ts_ms,
+                                role: "assistant",
+                                kind: "thinking",
+                                text: Some(reasoning.trim()),
+                                model: model.as_deref(),
+                                event_uid: &uid,
+                                raw_facts: RawMessageFacts {
+                                    turn_id: turn_id.as_deref(),
+                                    request_span: Some(request_span.to_string().as_str()),
+                                    ..RawMessageFacts::default()
+                                },
+                                ..EventRow::default()
+                            },
                         )?;
                         outcome.events += 1;
                         untokened_assistant_uid = Some(uid);
@@ -7038,15 +7045,18 @@ fn ingest_codex_rollout_incremental(
                     }
                     insert_tool_call(
                         conn,
-                        "codex",
-                        session_id,
-                        &format!("{index}:mcp_tool_call_end"),
-                        call_id,
+                        &ToolCallRef {
+                            source: "codex",
+                            session_id,
+                            message_id: &format!("{index}:mcp_tool_call_end"),
+                            tool_use_id: call_id,
+                            ts_ms,
+                            ..Default::default()
+                        },
                         &name,
                         None,
                         &args_json,
                         is_error,
-                        ts_ms,
                     )?;
                 }
                 "web_search_end" => {
@@ -7055,15 +7065,18 @@ fn ingest_codex_rollout_incremental(
                     };
                     insert_tool_call(
                         conn,
-                        "codex",
-                        session_id,
-                        &format!("{index}:web_search_end"),
-                        call_id,
+                        &ToolCallRef {
+                            source: "codex",
+                            session_id,
+                            message_id: &format!("{index}:web_search_end"),
+                            tool_use_id: call_id,
+                            ts_ms,
+                            ..Default::default()
+                        },
                         "web_search",
                         payload_str("query"),
                         "null",
                         None,
-                        ts_ms,
                     )?;
                 }
                 "patch_apply_end" => {
@@ -7089,15 +7102,17 @@ fn ingest_codex_rollout_incremental(
                         let edit_id = format!("{call_id}#{file_path}");
                         upsert_file_edit_from_call(
                             conn,
-                            "codex",
-                            session_id,
-                            &format!("{index}:patch_apply_end"),
-                            &edit_id,
+                            &ToolCallRef {
+                                source: "codex",
+                                session_id,
+                                message_id: &format!("{index}:patch_apply_end"),
+                                tool_use_id: &edit_id,
+                                ts_ms,
+                                git_branch: branch,
+                                cwd,
+                            },
                             file_path,
                             "apply_patch",
-                            ts_ms,
-                            branch,
-                            cwd,
                         )?;
                         let diff = change
                             .get("unified_diff")
@@ -7158,22 +7173,29 @@ fn ingest_codex_rollout_incremental(
                     let message_id = payload_str("id").unwrap_or(uid.as_str()).to_string();
                     let event_text = format_tool_event_text(name, target.as_deref(), &args);
                     let token_json = pending_usage.take().map(PendingCodexUsage::into_token_json);
-                    insert_codex_event(
+                    insert_session_event(
                         conn,
-                        session_id,
-                        cwd,
-                        branch,
-                        ts_ms,
-                        "assistant",
-                        "tool_use",
-                        &event_text,
-                        &uid,
-                        &message_id,
-                        model.as_deref(),
-                        token_json.as_deref(),
-                        None,
-                        turn_id.as_deref(),
-                        Some(request_span.to_string().as_str()),
+                        &EventRow {
+                            source: "codex",
+                            session_id,
+                            project: cwd,
+                            cwd,
+                            git_branch: branch,
+                            message_id: &message_id,
+                            ts_ms,
+                            role: "assistant",
+                            kind: "tool_use",
+                            text: Some(&event_text),
+                            model: model.as_deref(),
+                            token_json: token_json.as_deref(),
+                            event_uid: &uid,
+                            raw_facts: RawMessageFacts {
+                                turn_id: turn_id.as_deref(),
+                                request_span: Some(request_span.to_string().as_str()),
+                                ..RawMessageFacts::default()
+                            },
+                            ..EventRow::default()
+                        },
                     )?;
                     outcome.events += 1;
                     untokened_assistant_uid = token_json.is_none().then(|| uid.clone());
@@ -7183,15 +7205,18 @@ fn ingest_codex_rollout_incremental(
                             serde_json::to_string(&args).unwrap_or_else(|_| "null".to_string());
                         insert_tool_call(
                             conn,
-                            "codex",
-                            session_id,
-                            &message_id,
-                            call_id,
+                            &ToolCallRef {
+                                source: "codex",
+                                session_id,
+                                message_id: &message_id,
+                                tool_use_id: call_id,
+                                ts_ms,
+                                ..Default::default()
+                            },
                             name,
                             target.as_deref(),
                             &args_json,
                             None,
-                            ts_ms,
                         )?;
                     }
                 }
@@ -7216,23 +7241,29 @@ fn ingest_codex_rollout_incremental(
                     // joined string this row stores.
                     let facts = tool_result_facts::codex_output_facts(output, call_id)
                         .with_ordering(call_index, event_index);
-                    insert_codex_event(
+                    insert_session_event(
                         conn,
-                        session_id,
-                        cwd,
-                        branch,
-                        ts_ms,
-                        "tool_result",
-                        "tool_result",
-                        &output_text,
-                        &uid,
-                        &message_id,
-                        None,
-                        None,
-                        Some(&facts),
-                        turn_id.as_deref(),
-                        // Likewise: a tool's own output is not an API call.
-                        None,
+                        &EventRow {
+                            source: "codex",
+                            session_id,
+                            project: cwd,
+                            cwd,
+                            git_branch: branch,
+                            message_id: &message_id,
+                            ts_ms,
+                            role: "tool_result",
+                            kind: "tool_result",
+                            text: Some(&output_text),
+                            event_uid: &uid,
+                            tool_result_facts: Some(&facts),
+                            raw_facts: RawMessageFacts {
+                                turn_id: turn_id.as_deref(),
+                                // Likewise: a tool's own output is not an API call.
+                                request_span: None,
+                                ..RawMessageFacts::default()
+                            },
+                            ..EventRow::default()
+                        },
                     )?;
                     outcome.events += 1;
                     if !call_id.is_empty() {
@@ -7681,50 +7712,6 @@ fn resolve_codex_tool_results(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn insert_codex_event(
-    conn: &Connection,
-    session_id: &str,
-    cwd: Option<&str>,
-    branch: Option<&str>,
-    ts_ms: i64,
-    role: &str,
-    kind: &str,
-    text: &str,
-    uid: &str,
-    message_id: &str,
-    model: Option<&str>,
-    token_json: Option<&str>,
-    tool_result_facts: Option<&ToolResultFacts>,
-    turn_id: Option<&str>,
-    request_span: Option<&str>,
-) -> Result<()> {
-    insert_session_event(
-        conn,
-        "codex",
-        session_id,
-        cwd,
-        cwd,
-        branch,
-        message_id,
-        None,
-        ts_ms,
-        role,
-        kind,
-        Some(text),
-        model,
-        token_json,
-        RequestIdentity::none(),
-        uid,
-        tool_result_facts,
-        RawMessageFacts {
-            turn_id,
-            request_span,
-            ..RawMessageFacts::default()
-        },
-    )
-}
-
 fn codex_pick_tool_target(name: &str, args: &Value) -> Option<String> {
     let obj = args.as_object()?;
     let get = |keys: &[&str]| {
@@ -7847,14 +7834,16 @@ fn backfill_codex_metadata(
         if let Some(first) = first {
             upsert_session(
                 conn,
-                session_id,
-                "codex",
-                Some(cwd),
-                branch.map(String::as_str),
-                first,
-                last.unwrap_or(first),
-                None,
-                None,
+                &SessionCatalogRow {
+                    session_id,
+                    source: "codex",
+                    cwd: Some(cwd),
+                    git_branch: branch.map(String::as_str),
+                    first_ts: first,
+                    last_ts: last.unwrap_or(first),
+                    last_assistant_text: None,
+                    raw_path: None,
+                },
             )?;
         }
     }
@@ -8165,14 +8154,16 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
             }
             upsert_session(
                 conn,
-                &meta.session_id,
-                "claude",
-                meta.cwd.as_deref(),
-                meta.git_branch.as_deref(),
-                meta.first_ts,
-                meta.last_ts,
-                meta.last_assistant_text.as_deref(),
-                Some(&path.to_string_lossy()),
+                &SessionCatalogRow {
+                    session_id: &meta.session_id,
+                    source: "claude",
+                    cwd: meta.cwd.as_deref(),
+                    git_branch: meta.git_branch.as_deref(),
+                    first_ts: meta.first_ts,
+                    last_ts: meta.last_ts,
+                    last_assistant_text: meta.last_assistant_text.as_deref(),
+                    raw_path: Some(&path.to_string_lossy()),
+                },
             )?;
             // A superseded fold read bytes that were rewritten under it, so
             // its first prompt describes no generation of the file that
@@ -9162,6 +9153,14 @@ fn ingest_claude_transcript_text_as(
     let mut indexer = tool_result_facts::ToolResultIndexer::default();
     let mut cache_reads: HashMap<String, i64> = HashMap::new();
     let mut triads = control::SlashCommandTriads::default();
+    let mut file = ClaudeFileParse {
+        path,
+        attributed_session_id,
+        file_session_id: file_session_id.as_deref(),
+        indexer: &mut indexer,
+        last_assistant_cache_read: &mut cache_reads,
+        triads: &mut triads,
+    };
     for line in text.lines() {
         check_capture_cancelled()?;
         let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -9170,17 +9169,7 @@ fn ingest_claude_transcript_text_as(
         let Some(obj) = value.as_object() else {
             continue;
         };
-        ingest_claude_record(
-            conn,
-            path,
-            attributed_session_id,
-            file_session_id.as_deref(),
-            line,
-            obj,
-            &mut indexer,
-            &mut cache_reads,
-            &mut triads,
-        )?;
+        ingest_claude_record(conn, &mut file, line, obj)?;
     }
     Ok(())
 }
@@ -9474,12 +9463,22 @@ struct ClaudeFactEvent {
     kind: String,
 }
 
-fn claude_record_facts(
-    message: Option<&Map<String, Value>>,
-    message_role: &str,
-    model: Option<&str>,
-    token_json: Option<&str>,
-) -> ClaudeRecordFacts {
+/// The parts of one transcript record its stored rows are derived from.
+#[derive(Clone, Copy)]
+struct ClaudeRecordParts<'a> {
+    message: Option<&'a Map<String, Value>>,
+    message_role: &'a str,
+    model: Option<&'a str>,
+    token_json: Option<&'a str>,
+}
+
+fn claude_record_facts(record: ClaudeRecordParts<'_>) -> ClaudeRecordFacts {
+    let ClaudeRecordParts {
+        message,
+        message_role,
+        model,
+        token_json,
+    } = record;
     let mut facts = ClaudeRecordFacts {
         events: Vec::new(),
         tool_use_ids: Vec::new(),
@@ -9569,10 +9568,7 @@ fn heal_legacy_positional_record(
     session_id: &str,
     stem: &str,
     ts_ms: i64,
-    message: Option<&Map<String, Value>>,
-    message_role: &str,
-    model: Option<&str>,
-    token_json: Option<&str>,
+    record: ClaudeRecordParts<'_>,
 ) -> Result<()> {
     let legacy = legacy_positional_message_ids(conn, session_id, stem)?;
     if legacy.is_empty() {
@@ -9583,7 +9579,7 @@ fn heal_legacy_positional_record(
         session_id,
         &legacy,
         ts_ms,
-        &claude_record_facts(message, message_role, model, token_json),
+        &claude_record_facts(record),
     )
 }
 
@@ -9746,6 +9742,14 @@ fn ingest_claude_transcript_as(
     let mut indexer = tool_result_facts::ToolResultIndexer::default();
     let mut cache_reads: HashMap<String, i64> = HashMap::new();
     let mut triads = control::SlashCommandTriads::default();
+    let mut file = ClaudeFileParse {
+        path,
+        attributed_session_id,
+        file_session_id: file_session_id.as_deref(),
+        indexer: &mut indexer,
+        last_assistant_cache_read: &mut cache_reads,
+        triads: &mut triads,
+    };
     loop {
         check_capture_cancelled()?;
         raw.clear();
@@ -9770,17 +9774,7 @@ fn ingest_claude_transcript_as(
         let Some(obj) = value.as_object() else {
             continue;
         };
-        ingest_claude_record(
-            conn,
-            path,
-            attributed_session_id,
-            file_session_id.as_deref(),
-            line,
-            obj,
-            &mut indexer,
-            &mut cache_reads,
-            &mut triads,
-        )?;
+        ingest_claude_record(conn, &mut file, line, obj)?;
     }
     Ok(())
 }
@@ -9815,6 +9809,26 @@ fn claude_file_session_id(path: &Path) -> Result<Option<String>> {
     }
 }
 
+/// What one Claude transcript threads through its records, whichever reader
+/// walks it.
+///
+/// `indexer`, `last_assistant_cache_read` and `triads` are borrowed rather
+/// than owned because each runs across the whole transcript: tool-result
+/// ordering, the cache read a compaction boundary reports as the context it
+/// replaced, and slash-command triads spanning records. A resumed pass
+/// restores them from the cursor.
+struct ClaudeFileParse<'a> {
+    path: &'a Path,
+    /// Overrides each record's own `sessionId`; see
+    /// `ingest_claude_transcript_as`.
+    attributed_session_id: Option<&'a str>,
+    /// The first session id the file names, for records that carry none.
+    file_session_id: Option<&'a str>,
+    indexer: &'a mut tool_result_facts::ToolResultIndexer,
+    last_assistant_cache_read: &'a mut HashMap<String, i64>,
+    triads: &'a mut control::SlashCommandTriads,
+}
+
 /// Index one Claude transcript record.
 ///
 /// Split out of the file walk so the whole-file and the incremental readers
@@ -9823,23 +9837,20 @@ fn claude_file_session_id(path: &Path) -> Result<Option<String>> {
 ///
 /// `line` is the record's bytes as written, because a record carrying neither
 /// `uuid` nor `message.id` takes its identity from a hash of them.
-///
-/// `indexer` and `last_assistant_cache_read` are threaded in rather than owned
-/// here because both run across the whole transcript: tool-result ordering,
-/// and the cache read a compaction boundary reports as the context it
-/// replaced. A resumed pass restores both from the cursor.
-#[allow(clippy::too_many_arguments)]
 fn ingest_claude_record(
     conn: &Connection,
-    path: &Path,
-    attributed_session_id: Option<&str>,
-    file_session_id: Option<&str>,
+    file: &mut ClaudeFileParse<'_>,
     line: &str,
     obj: &Map<String, Value>,
-    indexer: &mut tool_result_facts::ToolResultIndexer,
-    last_assistant_cache_read: &mut HashMap<String, i64>,
-    triads: &mut control::SlashCommandTriads,
 ) -> Result<()> {
+    let ClaudeFileParse {
+        path,
+        attributed_session_id,
+        file_session_id,
+        ref mut indexer,
+        ref mut last_assistant_cache_read,
+        ref mut triads,
+    } = *file;
     let stem = path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -10001,10 +10012,12 @@ fn ingest_claude_record(
                 record_session_id,
                 stem,
                 ts_ms,
-                message,
-                message_role,
-                model,
-                token_json.as_deref(),
+                ClaudeRecordParts {
+                    message,
+                    message_role,
+                    model,
+                    token_json: token_json.as_deref(),
+                },
             )?;
         }
     }
@@ -10132,30 +10145,31 @@ fn ingest_claude_record(
             // `tool_result` content block: both normalize to
             // `kind = "tool_result"`, and the normalized vocabulary is
             // deliberately not widened to carry the distinction.
-            insert_session_event_with_provenance(
+            insert_session_event(
                 conn,
-                "claude",
-                session_id,
-                project,
-                cwd,
-                git_branch,
-                message_uuid,
-                parent_id,
-                ts_ms,
-                "tool_result",
-                "tool_result",
-                notification_text,
-                None,
-                None,
-                // Claude records neither an inference provider nor a
-                // stop reason on this record.
-                None,
-                None,
-                identity,
-                &format!("{message_uuid}:subagent_notification"),
-                Some(&tool_facts),
-                raw_facts,
-                Some("system_subagent_notification"),
+                &EventRow {
+                    source: "claude",
+                    session_id,
+                    project,
+                    cwd,
+                    git_branch,
+                    message_id: message_uuid,
+                    parent_id,
+                    ts_ms,
+                    role: "tool_result",
+                    kind: "tool_result",
+                    text: notification_text,
+                    // Claude records neither an inference provider nor a
+                    // stop reason on this record.
+                    provider: None,
+                    stop_reason: None,
+                    identity,
+                    event_uid: &format!("{message_uuid}:subagent_notification"),
+                    tool_result_facts: Some(&tool_facts),
+                    raw_facts,
+                    raw_kind: Some("system_subagent_notification"),
+                    ..EventRow::default()
+                },
             )?;
             return Ok(());
         }
@@ -10352,23 +10366,25 @@ fn ingest_claude_record(
                 if text.is_some_and(|s| !s.trim().is_empty()) {
                     insert_session_event(
                         conn,
-                        "claude",
-                        session_id,
-                        project,
-                        cwd,
-                        git_branch,
-                        message_uuid,
-                        parent_id,
-                        ts_ms,
-                        "assistant",
-                        "thinking",
-                        text,
-                        model,
-                        token_json.as_deref(),
-                        identity,
-                        &event_uid,
-                        None,
-                        raw_facts,
+                        &EventRow {
+                            source: "claude",
+                            session_id,
+                            project,
+                            cwd,
+                            git_branch,
+                            message_id: message_uuid,
+                            parent_id,
+                            ts_ms,
+                            role: "assistant",
+                            kind: "thinking",
+                            text,
+                            model,
+                            token_json: token_json.as_deref(),
+                            identity,
+                            event_uid: &event_uid,
+                            raw_facts,
+                            ..EventRow::default()
+                        },
                     )?;
                     record_rows += 1;
                 }
@@ -10381,54 +10397,43 @@ fn ingest_claude_record(
                 let event_text = format_tool_event_text(name, target.as_deref(), args);
                 insert_session_event(
                     conn,
-                    "claude",
-                    session_id,
-                    project,
-                    cwd,
-                    git_branch,
-                    message_uuid,
-                    parent_id,
-                    ts_ms,
-                    "assistant",
-                    "tool_use",
-                    Some(&event_text),
-                    model,
-                    token_json.as_deref(),
-                    identity,
-                    &event_uid,
-                    None,
-                    raw_facts,
+                    &EventRow {
+                        source: "claude",
+                        session_id,
+                        project,
+                        cwd,
+                        git_branch,
+                        message_id: message_uuid,
+                        parent_id,
+                        ts_ms,
+                        role: "assistant",
+                        kind: "tool_use",
+                        text: Some(&event_text),
+                        model,
+                        token_json: token_json.as_deref(),
+                        identity,
+                        event_uid: &event_uid,
+                        raw_facts,
+                        ..EventRow::default()
+                    },
                 )?;
                 record_rows += 1;
                 if !tool_use_id.is_empty() && !name.is_empty() {
                     let args_json =
                         serde_json::to_string(args).unwrap_or_else(|_| "null".to_string());
-                    insert_tool_call(
-                        conn,
-                        "claude",
+                    let call = ToolCallRef {
+                        source: "claude",
                         session_id,
-                        message_uuid,
+                        message_id: message_uuid,
                         tool_use_id,
-                        name,
-                        target.as_deref(),
-                        &args_json,
-                        None,
                         ts_ms,
-                    )?;
+                        git_branch,
+                        cwd,
+                    };
+                    insert_tool_call(conn, &call, name, target.as_deref(), &args_json, None)?;
                     if is_file_edit_tool(name) {
                         if let Some(file_path) = target.as_deref() {
-                            upsert_file_edit_from_call(
-                                conn,
-                                "claude",
-                                session_id,
-                                message_uuid,
-                                tool_use_id,
-                                file_path,
-                                name,
-                                ts_ms,
-                                git_branch,
-                                cwd,
-                            )?;
+                            upsert_file_edit_from_call(conn, &call, file_path, name)?;
                         }
                     }
                 }
@@ -10456,28 +10461,29 @@ fn ingest_claude_record(
                     .filter(|id| !id.is_empty())
                     .map(str::to_string);
                 let text = materialize_tool_result_text(content);
-                insert_session_event_with_provenance(
+                insert_session_event(
                     conn,
-                    "claude",
-                    session_id,
-                    project,
-                    cwd,
-                    git_branch,
-                    message_uuid,
-                    parent_id,
-                    ts_ms,
-                    "tool_result",
-                    "tool_result",
-                    text.as_deref(),
-                    model,
-                    token_json.as_deref(),
-                    None,
-                    None,
-                    identity,
-                    &event_uid,
-                    Some(&facts),
-                    raw_facts,
-                    Some("tool_result_block"),
+                    &EventRow {
+                        source: "claude",
+                        session_id,
+                        project,
+                        cwd,
+                        git_branch,
+                        message_id: message_uuid,
+                        parent_id,
+                        ts_ms,
+                        role: "tool_result",
+                        kind: "tool_result",
+                        text: text.as_deref(),
+                        model,
+                        token_json: token_json.as_deref(),
+                        identity,
+                        event_uid: &event_uid,
+                        tool_result_facts: Some(&facts),
+                        raw_facts,
+                        raw_kind: Some("tool_result_block"),
+                        ..EventRow::default()
+                    },
                 )?;
                 record_rows += 1;
                 let is_error = block.get("is_error").and_then(Value::as_bool);
@@ -10488,14 +10494,16 @@ fn ingest_claude_record(
                     if let Some(result) = find_tool_use_result(block) {
                         update_file_edit_from_tool_result(
                             conn,
-                            "claude",
-                            session_id,
-                            message_uuid,
-                            tool_use_id,
+                            &ToolCallRef {
+                                source: "claude",
+                                session_id,
+                                message_id: message_uuid,
+                                tool_use_id,
+                                ts_ms,
+                                git_branch,
+                                cwd,
+                            },
                             result,
-                            ts_ms,
-                            git_branch,
-                            cwd,
                         )?;
                     }
                 }
@@ -10612,25 +10620,27 @@ impl ClaudeTextRows<'_> {
             }
             insert_session_event(
                 conn,
-                "claude",
-                self.session_id,
-                self.project,
-                self.cwd,
-                self.git_branch,
-                self.message_uuid,
-                self.parent_id,
-                self.ts_ms,
-                self.role,
-                "text",
-                Some(text),
-                self.model,
-                self.token_json,
-                self.identity,
-                uid,
-                None,
-                RawMessageFacts {
-                    control_kind: kind.map(control::ControlKind::as_str),
-                    ..self.raw_facts
+                &EventRow {
+                    source: "claude",
+                    session_id: self.session_id,
+                    project: self.project,
+                    cwd: self.cwd,
+                    git_branch: self.git_branch,
+                    message_id: self.message_uuid,
+                    parent_id: self.parent_id,
+                    ts_ms: self.ts_ms,
+                    role: self.role,
+                    kind: "text",
+                    text: Some(text),
+                    model: self.model,
+                    token_json: self.token_json,
+                    identity: self.identity,
+                    event_uid: uid,
+                    raw_facts: RawMessageFacts {
+                        control_kind: kind.map(control::ControlKind::as_str),
+                        ..self.raw_facts
+                    },
+                    ..EventRow::default()
                 },
             )?;
             *record_rows += 1;
@@ -11349,23 +11359,6 @@ fn codex_marker_for_payload(
     }
 }
 
-/// The verbatim stop reason an OpenCode `step-finish` part carries, if this is
-/// one.
-///
-/// OpenCode does not put a stop reason on the message: it writes a trailing
-/// `step-finish` part whose `reason` is the wire string (`tool-calls`,
-/// `stop`, `length`, …). Stored as written, exactly like Claude's
-/// `message.stop_reason`; consumers map it to their own enum.
-///
-/// The event-level OpenCode parser uses the equivalent shared normalizer; this
-/// helper keeps the envelope-facts regression test explicit at this layer.
-#[allow(dead_code)]
-fn opencode_step_finish_stop_reason(part: &Value) -> Option<&str> {
-    (part.get("type").and_then(Value::as_str) == Some("step-finish"))
-        .then(|| part.get("reason").and_then(Value::as_str))
-        .flatten()
-}
-
 /// Whether a Claude `message.model` is the placeholder Claude Code writes on a
 /// notice it produced itself.
 ///
@@ -11810,7 +11803,6 @@ struct RawMessageFacts<'a> {
     record_token_json: Option<&'a str>,
 }
 
-#[allow(clippy::too_many_arguments)]
 /// The provider's own identities for the request a record belongs to, read
 /// once per record and stored verbatim.
 ///
@@ -11858,35 +11850,51 @@ impl<'a> RequestIdentity<'a> {
     }
 }
 
-/// For providers that do not record an upstream inference provider.
-/// OpenCode does, so it calls [`insert_session_event_with_provenance`]
-/// directly. Stop reasons for every provider travel in [`RawMessageFacts`].
-#[allow(clippy::too_many_arguments)]
-fn insert_session_event(
-    conn: &Connection,
-    source: &str,
-    session_id: &str,
-    project: Option<&str>,
-    cwd: Option<&str>,
-    git_branch: Option<&str>,
-    message_id: &str,
-    parent_id: Option<&str>,
+/// One normalized `session_events` row, borrowed from the record it is
+/// parsed from. Fields a provider does not record stay at their `Default`.
+#[derive(Clone, Copy, Default)]
+struct EventRow<'a> {
+    source: &'a str,
+    session_id: &'a str,
+    project: Option<&'a str>,
+    cwd: Option<&'a str>,
+    git_branch: Option<&'a str>,
+    message_id: &'a str,
+    parent_id: Option<&'a str>,
     ts_ms: i64,
-    role: &str,
-    kind: &str,
-    text: Option<&str>,
-    model: Option<&str>,
-    token_json: Option<&str>,
-    identity: RequestIdentity<'_>,
-    event_uid: &str,
-    // Carried as one struct rather than ten more positional arguments: the
-    // fidelity columns are only meaningful together, and a tenth `None` in a
-    // call list is how a fact silently ends up in the wrong column.
-    tool_result_facts: Option<&ToolResultFacts>,
-    raw_facts: RawMessageFacts<'_>,
-) -> Result<()> {
-    insert_session_event_with_provenance(
-        conn,
+    role: &'a str,
+    kind: &'a str,
+    text: Option<&'a str>,
+    model: Option<&'a str>,
+    token_json: Option<&'a str>,
+    /// The upstream inference provider, which OpenCode records as
+    /// `providerID`. Null for a provider that does not record one rather than
+    /// inferred from the model string, which is a consumer's job and not a
+    /// parser's.
+    provider: Option<&'a str>,
+    /// OpenCode's last `step-finish.reason`. Stop reasons for every other
+    /// provider travel in [`RawMessageFacts`].
+    stop_reason: Option<&'a str>,
+    identity: RequestIdentity<'a>,
+    event_uid: &'a str,
+    /// The fidelity columns travel as one struct: they are only meaningful
+    /// together, and a positional `None` is how a fact silently ends up in
+    /// the wrong column.
+    tool_result_facts: Option<&'a ToolResultFacts>,
+    raw_facts: RawMessageFacts<'a>,
+    /// The provider-native record or block type the event came from. Two very
+    /// different provider records normalize to `kind = "tool_result"`: a
+    /// `tool_result` content block, and a `type: "system"` subagent
+    /// notification reporting a delegated call finishing. It keeps them apart
+    /// without widening the normalized `kind` vocabulary, which downstream
+    /// readers switch on exhaustively.
+    raw_kind: Option<&'a str>,
+}
+
+/// Write one normalized event, including the columns only some providers can
+/// fill.
+fn insert_session_event(conn: &Connection, row: &EventRow<'_>) -> Result<()> {
+    let &EventRow {
         source,
         session_id,
         project,
@@ -11900,55 +11908,14 @@ fn insert_session_event(
         text,
         model,
         token_json,
-        None,
-        None,
+        provider,
+        stop_reason,
         identity,
         event_uid,
         tool_result_facts,
         raw_facts,
-        None,
-    )
-}
-
-/// One normalized event, including the columns only some providers can
-/// fill.
-///
-/// `provider` is the upstream inference provider, which OpenCode records as
-/// `providerID`, and `stop_reason` is OpenCode's last `step-finish.reason`.
-/// Both stay null for a provider that does not record them rather than being
-/// inferred from the model string, which is a consumer's job and not a
-/// parser's.
-///
-/// `raw_kind` is the provider-native record or block type the event came
-/// from. Two very different provider records normalize to
-/// `kind = "tool_result"`: a `tool_result` content block, and a
-/// `type: "system"` subagent notification reporting a delegated call
-/// finishing. It keeps them apart without widening the normalized `kind`
-/// vocabulary, which downstream readers switch on exhaustively.
-#[allow(clippy::too_many_arguments)]
-fn insert_session_event_with_provenance(
-    conn: &Connection,
-    source: &str,
-    session_id: &str,
-    project: Option<&str>,
-    cwd: Option<&str>,
-    git_branch: Option<&str>,
-    message_id: &str,
-    parent_id: Option<&str>,
-    ts_ms: i64,
-    role: &str,
-    kind: &str,
-    text: Option<&str>,
-    model: Option<&str>,
-    token_json: Option<&str>,
-    provider: Option<&str>,
-    stop_reason: Option<&str>,
-    identity: RequestIdentity<'_>,
-    event_uid: &str,
-    tool_result_facts: Option<&ToolResultFacts>,
-    raw_facts: RawMessageFacts<'_>,
-    raw_kind: Option<&str>,
-) -> Result<()> {
+        raw_kind,
+    } = row;
     crate::mark_session_presence(conn, source, session_id, SessionLocation::Local)?;
     let blank = ToolResultFacts::default();
     let tool_result_facts = tool_result_facts.unwrap_or(&blank);
@@ -12075,19 +12042,41 @@ fn insert_session_event_with_provenance(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+/// One tool call as a provider record names it, with the record context its
+/// rows are written under.
+///
+/// `tool_calls` and `file_edits` both key on `(source, session_id,
+/// tool_use_id)`. An edit scoped to one file of a multi-file call is the same
+/// call under a per-file `tool_use_id`.
+#[derive(Clone, Copy, Default)]
+struct ToolCallRef<'a> {
+    source: &'a str,
+    session_id: &'a str,
+    message_id: &'a str,
+    tool_use_id: &'a str,
+    ts_ms: i64,
+    /// Stored on `file_edits` only; `tool_calls` has no checkout columns.
+    git_branch: Option<&'a str>,
+    /// Stored on `file_edits` only.
+    cwd: Option<&'a str>,
+}
+
 fn insert_tool_call(
     conn: &Connection,
-    source: &str,
-    session_id: &str,
-    message_id: &str,
-    tool_use_id: &str,
+    call: &ToolCallRef<'_>,
     name: &str,
     target: Option<&str>,
     args_json: &str,
     is_error: Option<bool>,
-    ts_ms: i64,
 ) -> Result<()> {
+    let ToolCallRef {
+        source,
+        session_id,
+        message_id,
+        tool_use_id,
+        ts_ms,
+        ..
+    } = *call;
     crate::mark_session_presence(conn, source, session_id, SessionLocation::Local)?;
     conn.prepare_cached(
         "INSERT INTO tool_calls \
@@ -12129,19 +12118,21 @@ fn set_tool_call_error(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn upsert_file_edit_from_call(
     conn: &Connection,
-    source: &str,
-    session_id: &str,
-    message_id: &str,
-    tool_use_id: &str,
+    call: &ToolCallRef<'_>,
     file_path: &str,
     tool_name: &str,
-    ts_ms: i64,
-    git_branch: Option<&str>,
-    cwd: Option<&str>,
 ) -> Result<()> {
+    let ToolCallRef {
+        source,
+        session_id,
+        message_id,
+        tool_use_id,
+        ts_ms,
+        git_branch,
+        cwd,
+    } = *call;
     crate::mark_session_presence(conn, source, session_id, SessionLocation::Local)?;
     conn.prepare_cached(
         "INSERT INTO file_edits \
@@ -12168,18 +12159,20 @@ fn upsert_file_edit_from_call(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn update_file_edit_from_tool_result(
     conn: &Connection,
-    source: &str,
-    session_id: &str,
-    message_id: &str,
-    tool_use_id: &str,
+    call: &ToolCallRef<'_>,
     result: &Value,
-    ts_ms: i64,
-    git_branch: Option<&str>,
-    cwd: Option<&str>,
 ) -> Result<()> {
+    let ToolCallRef {
+        source,
+        session_id,
+        message_id,
+        tool_use_id,
+        ts_ms,
+        git_branch,
+        cwd,
+    } = *call;
     let structured_patch = result
         .get("structuredPatch")
         .or_else(|| result.get("structured_patch"));
@@ -12303,34 +12296,25 @@ fn count_patch_text(text: &str) -> (i64, i64) {
     (added, removed)
 }
 
+/// One `sessions` catalog row as an ingest pass writes it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SessionCatalogRow<'a> {
+    pub(crate) session_id: &'a str,
+    pub(crate) source: &'a str,
+    pub(crate) cwd: Option<&'a str>,
+    pub(crate) git_branch: Option<&'a str>,
+    pub(crate) first_ts: i64,
+    pub(crate) last_ts: i64,
+    pub(crate) last_assistant_text: Option<&'a str>,
+    pub(crate) raw_path: Option<&'a str>,
+}
+
 /// Register a session whose full evidence (`session_events`, `tool_calls`, …)
 /// has just been ingested, so the row is marked `discovery_state = 'full'`.
 /// Shallow discovery writes through [`discover::upsert_shallow_session`]
 /// instead and never downgrades a `'full'` row.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn upsert_session(
-    conn: &Connection,
-    session_id: &str,
-    source: &str,
-    cwd: Option<&str>,
-    git_branch: Option<&str>,
-    first_ts: i64,
-    last_ts: i64,
-    last_assistant_text: Option<&str>,
-    raw_path: Option<&str>,
-) -> Result<()> {
-    upsert_session_inner(
-        conn,
-        session_id,
-        source,
-        cwd,
-        git_branch,
-        first_ts,
-        last_ts,
-        last_assistant_text,
-        raw_path,
-        ActivityWindow::Expand,
-    )
+pub(crate) fn upsert_session(conn: &Connection, row: &SessionCatalogRow<'_>) -> Result<()> {
+    upsert_session_inner(conn, row, ActivityWindow::Expand)
 }
 
 /// How an upsert reconciles the activity window it carries with the one the
@@ -12348,20 +12332,16 @@ pub(crate) enum ActivityWindow {
     Replace,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn upsert_session_rebuilt(
+pub(crate) fn upsert_session_rebuilt(conn: &Connection, row: &SessionCatalogRow<'_>) -> Result<()> {
+    upsert_session_inner(conn, row, ActivityWindow::Replace)
+}
+
+fn upsert_session_inner(
     conn: &Connection,
-    session_id: &str,
-    source: &str,
-    cwd: Option<&str>,
-    git_branch: Option<&str>,
-    first_ts: i64,
-    last_ts: i64,
-    last_assistant_text: Option<&str>,
-    raw_path: Option<&str>,
+    row: &SessionCatalogRow<'_>,
+    window: ActivityWindow,
 ) -> Result<()> {
-    upsert_session_inner(
-        conn,
+    let SessionCatalogRow {
         session_id,
         source,
         cwd,
@@ -12370,23 +12350,7 @@ pub(crate) fn upsert_session_rebuilt(
         last_ts,
         last_assistant_text,
         raw_path,
-        ActivityWindow::Replace,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn upsert_session_inner(
-    conn: &Connection,
-    session_id: &str,
-    source: &str,
-    cwd: Option<&str>,
-    git_branch: Option<&str>,
-    first_ts: i64,
-    last_ts: i64,
-    last_assistant_text: Option<&str>,
-    raw_path: Option<&str>,
-    window: ActivityWindow,
-) -> Result<()> {
+    } = *row;
     // `last_assistant_text` follows the same rule as the window. A pass that
     // saw only part of the session must not erase prose it did not read, but a
     // rebuild has just re-read the whole source: if there is no assistant
@@ -12937,14 +12901,16 @@ fn sync_cursor_with_hooks(
         };
         upsert(
             &tx,
-            &transcript.session_id,
-            "cursor",
-            Some(&transcript.project),
-            None,
-            outcome.first_ts_ms.unwrap_or(transcript.timestamp_ms),
-            outcome.last_ts_ms.unwrap_or(transcript.timestamp_ms),
-            outcome.last_assistant_text.as_deref(),
-            Some(&transcript.path.to_string_lossy()),
+            &SessionCatalogRow {
+                session_id: &transcript.session_id,
+                source: "cursor",
+                cwd: Some(&transcript.project),
+                git_branch: None,
+                first_ts: outcome.first_ts_ms.unwrap_or(transcript.timestamp_ms),
+                last_ts: outcome.last_ts_ms.unwrap_or(transcript.timestamp_ms),
+                last_assistant_text: outcome.last_assistant_text.as_deref(),
+                raw_path: Some(&transcript.path.to_string_lossy()),
+            },
         )?;
     }
     tx.commit().context("commit Cursor sync")?;
@@ -13665,24 +13631,23 @@ pub(crate) fn ingest_cursor_transcript(
                     emitted_evidence = true;
                     insert_session_event(
                         conn,
-                        "cursor",
-                        session_id,
-                        project,
-                        project,
-                        None,
-                        &message_id,
-                        None,
-                        ts_ms,
-                        if is_user { "user" } else { "assistant" },
-                        "text",
-                        Some(&text),
-                        model,
-                        token_json.as_deref(),
-                        // Cursor records no request identity on this path.
-                        RequestIdentity::none(),
-                        &event_uid,
-                        None,
-                        RawMessageFacts::default(),
+                        &EventRow {
+                            source: "cursor",
+                            session_id,
+                            project,
+                            cwd: project,
+                            message_id: &message_id,
+                            ts_ms,
+                            role: if is_user { "user" } else { "assistant" },
+                            kind: "text",
+                            text: Some(&text),
+                            model,
+                            token_json: token_json.as_deref(),
+                            // Cursor records no request identity on this path.
+                            identity: RequestIdentity::none(),
+                            event_uid: &event_uid,
+                            ..EventRow::default()
+                        },
                     )?;
                 }
                 "thinking" | "reasoning" => {
@@ -13696,23 +13661,21 @@ pub(crate) fn ingest_cursor_transcript(
                         emitted_evidence = true;
                         insert_session_event(
                             conn,
-                            "cursor",
-                            session_id,
-                            project,
-                            project,
-                            None,
-                            &message_id,
-                            None,
-                            ts_ms,
-                            "assistant",
-                            "thinking",
-                            Some(thinking),
-                            model,
-                            token_json.as_deref(),
-                            RequestIdentity::none(),
-                            &event_uid,
-                            None,
-                            RawMessageFacts::default(),
+                            &EventRow {
+                                source: "cursor",
+                                session_id,
+                                project,
+                                cwd: project,
+                                message_id: &message_id,
+                                ts_ms,
+                                role: "assistant",
+                                kind: "thinking",
+                                text: Some(thinking),
+                                model,
+                                token_json: token_json.as_deref(),
+                                event_uid: &event_uid,
+                                ..EventRow::default()
+                            },
                         )?;
                     }
                 }
@@ -13747,36 +13710,40 @@ pub(crate) fn ingest_cursor_transcript(
                     emitted_evidence = true;
                     insert_session_event(
                         conn,
-                        "cursor",
-                        session_id,
-                        project,
-                        project,
-                        None,
-                        &message_id,
-                        None,
-                        ts_ms,
-                        "assistant",
-                        "tool_use",
-                        Some(&format_tool_event_text(&name, target.as_deref(), args)),
-                        model,
-                        token_json.as_deref(),
-                        // Cursor records no request identity on this path.
-                        RequestIdentity::none(),
-                        &event_uid,
-                        None,
-                        RawMessageFacts::default(),
+                        &EventRow {
+                            source: "cursor",
+                            session_id,
+                            project,
+                            cwd: project,
+                            message_id: &message_id,
+                            ts_ms,
+                            role: "assistant",
+                            kind: "tool_use",
+                            text: Some(&format_tool_event_text(&name, target.as_deref(), args)),
+                            model,
+                            token_json: token_json.as_deref(),
+                            // Cursor records no request identity on this path.
+                            identity: RequestIdentity::none(),
+                            event_uid: &event_uid,
+                            ..EventRow::default()
+                        },
                     )?;
+                    let call = ToolCallRef {
+                        source: "cursor",
+                        session_id,
+                        message_id: &message_id,
+                        tool_use_id: &tool_use_id,
+                        ts_ms,
+                        git_branch: None,
+                        cwd: project,
+                    };
                     insert_tool_call(
                         conn,
-                        "cursor",
-                        session_id,
-                        &message_id,
-                        &tool_use_id,
+                        &call,
                         &name,
                         target.as_deref(),
                         &serde_json::to_string(args).unwrap_or_else(|_| "null".to_string()),
                         None,
-                        ts_ms,
                     )?;
                     if cursor::is_file_edit_tool(&name) {
                         // One `ApplyPatch` call routinely rewrites several
@@ -13794,47 +13761,23 @@ pub(crate) fn ingest_cursor_transcript(
                             // edit keeps the unscoped call id and no line
                             // counts are invented for it.
                             if let Some(file_path) = target.as_deref() {
-                                upsert_file_edit_from_call(
-                                    conn,
-                                    "cursor",
-                                    session_id,
-                                    &message_id,
-                                    &tool_use_id,
-                                    file_path,
-                                    &name,
-                                    ts_ms,
-                                    None,
-                                    project,
-                                )?;
+                                upsert_file_edit_from_call(conn, &call, file_path, &name)?;
                             }
                         } else {
                             for file in &patched {
                                 let edit_id = format!("{tool_use_id}#{}", file.path);
-                                upsert_file_edit_from_call(
-                                    conn,
-                                    "cursor",
-                                    session_id,
-                                    &message_id,
-                                    &edit_id,
-                                    &file.path,
-                                    &name,
-                                    ts_ms,
-                                    None,
-                                    project,
-                                )?;
+                                let edit = ToolCallRef {
+                                    tool_use_id: &edit_id,
+                                    ..call
+                                };
+                                upsert_file_edit_from_call(conn, &edit, &file.path, &name)?;
                                 // Line counts come from this file's own slice
                                 // of the patch, through the same counter the
                                 // Claude edits use.
                                 update_file_edit_from_tool_result(
                                     conn,
-                                    "cursor",
-                                    session_id,
-                                    &message_id,
-                                    &edit_id,
+                                    &edit,
                                     &json!({ "structuredPatch": file.patch }),
-                                    ts_ms,
-                                    None,
-                                    project,
                                 )?;
                             }
                         }
@@ -13857,24 +13800,24 @@ pub(crate) fn ingest_cursor_transcript(
                         .with_ordering(call_index, event_index);
                     insert_session_event(
                         conn,
-                        "cursor",
-                        session_id,
-                        project,
-                        project,
-                        None,
-                        &message_id,
-                        None,
-                        ts_ms,
-                        "tool_result",
-                        "tool_result",
-                        materialize_tool_result_text(content).as_deref(),
-                        model,
-                        token_json.as_deref(),
-                        // Cursor records no request identity on this path.
-                        RequestIdentity::none(),
-                        &event_uid,
-                        Some(&facts),
-                        RawMessageFacts::default(),
+                        &EventRow {
+                            source: "cursor",
+                            session_id,
+                            project,
+                            cwd: project,
+                            message_id: &message_id,
+                            ts_ms,
+                            role: "tool_result",
+                            kind: "tool_result",
+                            text: materialize_tool_result_text(content).as_deref(),
+                            model,
+                            token_json: token_json.as_deref(),
+                            // Cursor records no request identity on this path.
+                            identity: RequestIdentity::none(),
+                            event_uid: &event_uid,
+                            tool_result_facts: Some(&facts),
+                            ..EventRow::default()
+                        },
                     )?;
                     if !tool_use_id.is_empty() {
                         if let Some(is_error) = block.get("is_error").and_then(Value::as_bool) {
@@ -13889,14 +13832,16 @@ pub(crate) fn ingest_cursor_transcript(
                         if let Some(result) = find_tool_use_result(block) {
                             update_file_edit_from_tool_result(
                                 conn,
-                                "cursor",
-                                session_id,
-                                &message_id,
-                                &tool_use_id,
+                                &ToolCallRef {
+                                    source: "cursor",
+                                    session_id,
+                                    message_id: &message_id,
+                                    tool_use_id: &tool_use_id,
+                                    ts_ms,
+                                    git_branch: None,
+                                    cwd: project,
+                                },
                                 result,
-                                ts_ms,
-                                None,
-                                project,
                             )?;
                         }
                     }
@@ -14811,23 +14756,20 @@ pub(crate) fn ingest_muse_session(
                 }
                 insert_session_event(
                     conn,
-                    SOURCE,
-                    sid,
-                    project,
-                    project,
-                    None,
-                    &record_uid,
-                    None,
-                    ts,
-                    "user",
-                    "text",
-                    Some(text),
-                    None,
-                    None,
-                    RequestIdentity::none(),
-                    &record_uid,
-                    None,
-                    facts,
+                    &EventRow {
+                        source: SOURCE,
+                        session_id: sid,
+                        project,
+                        cwd: project,
+                        message_id: &record_uid,
+                        ts_ms: ts,
+                        role: "user",
+                        kind: "text",
+                        text: Some(text),
+                        event_uid: &record_uid,
+                        raw_facts: facts,
+                        ..EventRow::default()
+                    },
                 )?;
                 outcome.events += 1;
                 if role == MuseRole::Session {
@@ -14869,25 +14811,24 @@ pub(crate) fn ingest_muse_session(
                     let message_id = message_id.as_deref().unwrap_or(&record_uid);
                     insert_session_event(
                         conn,
-                        SOURCE,
-                        sid,
-                        project,
-                        project,
-                        None,
-                        message_id,
-                        None,
-                        ts,
-                        "assistant",
-                        "thinking",
-                        Some(text),
-                        row_model,
-                        token_json.as_deref(),
-                        RequestIdentity::none(),
-                        &record_uid,
-                        None,
-                        RawMessageFacts {
-                            stop_reason: step.as_ref().and_then(|step| step.finish_reason),
-                            ..facts
+                        &EventRow {
+                            source: SOURCE,
+                            session_id: sid,
+                            project,
+                            cwd: project,
+                            message_id,
+                            ts_ms: ts,
+                            role: "assistant",
+                            kind: "thinking",
+                            text: Some(text),
+                            model: row_model,
+                            token_json: token_json.as_deref(),
+                            event_uid: &record_uid,
+                            raw_facts: RawMessageFacts {
+                                stop_reason: step.as_ref().and_then(|step| step.finish_reason),
+                                ..facts
+                            },
+                            ..EventRow::default()
                         },
                     )?;
                     outcome.events += 1;
@@ -14928,29 +14869,29 @@ pub(crate) fn ingest_muse_session(
                 let message_id = message_id.as_deref().unwrap_or(&record_uid);
                 insert_session_event(
                     conn,
-                    SOURCE,
-                    sid,
-                    project,
-                    project,
-                    None,
-                    message_id,
-                    None,
-                    ts,
-                    "assistant",
-                    "text",
-                    Some(text),
-                    row_model,
-                    token_json.as_deref(),
-                    RequestIdentity {
-                        request_id: response_id.as_deref(),
-                        provider_message_id: Some(message_id),
-                    },
-                    &record_uid,
-                    None,
-                    RawMessageFacts {
-                        request_id: response_id.as_deref(),
-                        stop_reason: finish_reason,
-                        ..facts
+                    &EventRow {
+                        source: SOURCE,
+                        session_id: sid,
+                        project,
+                        cwd: project,
+                        message_id,
+                        ts_ms: ts,
+                        role: "assistant",
+                        kind: "text",
+                        text: Some(text),
+                        model: row_model,
+                        token_json: token_json.as_deref(),
+                        identity: RequestIdentity {
+                            request_id: response_id.as_deref(),
+                            provider_message_id: Some(message_id),
+                        },
+                        event_uid: &record_uid,
+                        raw_facts: RawMessageFacts {
+                            request_id: response_id.as_deref(),
+                            stop_reason: finish_reason,
+                            ..facts
+                        },
+                        ..EventRow::default()
                     },
                 )?;
                 outcome.events += 1;
@@ -14977,47 +14918,52 @@ pub(crate) fn ingest_muse_session(
                     let uid = format!("tool:{}", call.call_id);
                     insert_session_event(
                         conn,
-                        SOURCE,
-                        sid,
-                        project,
-                        project,
-                        None,
-                        message_id,
-                        None,
-                        ts,
-                        "assistant",
-                        "tool_use",
-                        Some(&format_tool_event_text(
-                            &call.name,
-                            target.as_deref(),
-                            &call.arguments,
-                        )),
-                        row_model,
-                        token_json.as_deref(),
-                        RequestIdentity {
-                            request_id: response_id.as_deref(),
-                            provider_message_id: Some(message_id),
-                        },
-                        &uid,
-                        None,
-                        RawMessageFacts {
-                            request_id: response_id.as_deref(),
-                            stop_reason: finish_reason,
-                            ..facts
+                        &EventRow {
+                            source: SOURCE,
+                            session_id: sid,
+                            project,
+                            cwd: project,
+                            message_id,
+                            ts_ms: ts,
+                            role: "assistant",
+                            kind: "tool_use",
+                            text: Some(&format_tool_event_text(
+                                &call.name,
+                                target.as_deref(),
+                                &call.arguments,
+                            )),
+                            model: row_model,
+                            token_json: token_json.as_deref(),
+                            identity: RequestIdentity {
+                                request_id: response_id.as_deref(),
+                                provider_message_id: Some(message_id),
+                            },
+                            event_uid: &uid,
+                            raw_facts: RawMessageFacts {
+                                request_id: response_id.as_deref(),
+                                stop_reason: finish_reason,
+                                ..facts
+                            },
+                            ..EventRow::default()
                         },
                     )?;
                     outcome.events += 1;
+                    let call_ref = ToolCallRef {
+                        source: SOURCE,
+                        session_id: sid,
+                        message_id,
+                        tool_use_id: &call.call_id,
+                        ts_ms: ts,
+                        git_branch: None,
+                        cwd: project,
+                    };
                     insert_tool_call(
                         conn,
-                        SOURCE,
-                        sid,
-                        message_id,
-                        &call.call_id,
+                        &call_ref,
                         &call.name,
                         target.as_deref(),
                         &serde_json::to_string(&call.arguments).unwrap_or_default(),
                         None,
-                        ts,
                     )?;
                     outcome.tool_calls += 1;
                     if muse::is_subagent_tool(&call.name) {
@@ -15025,18 +14971,7 @@ pub(crate) fn ingest_muse_session(
                     }
                     if muse::is_file_edit_tool(&call.name) {
                         if let Some(path) = target.as_deref() {
-                            upsert_file_edit_from_call(
-                                conn,
-                                SOURCE,
-                                sid,
-                                message_id,
-                                &call.call_id,
-                                path,
-                                &call.name,
-                                ts,
-                                None,
-                                project,
-                            )?;
+                            upsert_file_edit_from_call(conn, &call_ref, path, &call.name)?;
                             outcome.file_edits += 1;
                         }
                     }
@@ -15062,23 +14997,21 @@ pub(crate) fn ingest_muse_session(
                     let uid = format!("result:{}", result.call_id);
                     insert_session_event(
                         conn,
-                        SOURCE,
-                        sid,
-                        project,
-                        project,
-                        None,
-                        &uid,
-                        None,
-                        ts,
-                        "tool_result",
-                        "tool_result",
-                        text,
-                        None,
-                        None,
-                        RequestIdentity::none(),
-                        &uid,
-                        Some(&result_facts),
-                        facts,
+                        &EventRow {
+                            source: SOURCE,
+                            session_id: sid,
+                            project,
+                            cwd: project,
+                            message_id: &uid,
+                            ts_ms: ts,
+                            role: "tool_result",
+                            kind: "tool_result",
+                            text,
+                            event_uid: &uid,
+                            tool_result_facts: Some(&result_facts),
+                            raw_facts: facts,
+                            ..EventRow::default()
+                        },
                     )?;
                     outcome.events += 1;
                     match result_facts.result_status.as_deref() {
@@ -15201,14 +15134,16 @@ pub(crate) fn ingest_muse_session(
     let last_ts = transcript.last_ts().unwrap_or(first_ts);
     upsert_session(
         conn,
-        sid,
-        SOURCE,
-        project,
-        None,
-        first_ts,
-        last_ts,
-        last_assistant_text.as_deref(),
-        Some(raw_path),
+        &SessionCatalogRow {
+            session_id: sid,
+            source: SOURCE,
+            cwd: project,
+            git_branch: None,
+            first_ts,
+            last_ts,
+            last_assistant_text: last_assistant_text.as_deref(),
+            raw_path: Some(raw_path),
+        },
     )?;
     // `upsert_session` merges, which suits an append-only log read in pieces.
     // This read is the whole transcript, so the fields it owns are assigned
@@ -15876,31 +15811,28 @@ fn materialize_grok_unified_usage(
             token_json.insert("event_id".into(), json!(event_id));
         }
         let token_json = Value::Object(token_json).to_string();
-        insert_session_event_with_provenance(
+        insert_session_event(
             conn,
-            SOURCE,
-            session_id,
-            cwd.as_deref(),
-            cwd.as_deref(),
-            branch.as_deref(),
-            &uid,
-            None,
-            row.ts_ms.unwrap_or(fallback_ts),
-            "assistant",
-            "text",
-            None,
-            row.model.as_deref(),
-            Some(&token_json),
-            None,
-            None,
-            RequestIdentity::none(),
-            &uid,
-            None,
-            RawMessageFacts {
-                request_span: Some(&uid),
-                ..RawMessageFacts::default()
+            &EventRow {
+                source: SOURCE,
+                session_id,
+                project: cwd.as_deref(),
+                cwd: cwd.as_deref(),
+                git_branch: branch.as_deref(),
+                message_id: &uid,
+                ts_ms: row.ts_ms.unwrap_or(fallback_ts),
+                role: "assistant",
+                kind: "text",
+                model: row.model.as_deref(),
+                token_json: Some(&token_json),
+                event_uid: &uid,
+                raw_facts: RawMessageFacts {
+                    request_span: Some(&uid),
+                    ..RawMessageFacts::default()
+                },
+                raw_kind: Some("unified_log_usage"),
+                ..EventRow::default()
             },
-            Some("unified_log_usage"),
         )?;
         if let Some(model) = &row.model {
             if !models.iter().any(|seen| seen == model) {
@@ -16190,23 +16122,20 @@ fn ingest_grok_session(
                 let uid = grok_event_uid(group.and_then(|group| group.event_key.as_deref()), idx);
                 insert_session_event(
                     conn,
-                    SOURCE,
-                    sid,
-                    project,
-                    project,
-                    branch,
-                    &uid,
-                    None,
-                    ts,
-                    "user",
-                    "text",
-                    Some(text),
-                    None,
-                    None,
-                    RequestIdentity::none(),
-                    &uid,
-                    None,
-                    RawMessageFacts::default(),
+                    &EventRow {
+                        source: SOURCE,
+                        session_id: sid,
+                        project,
+                        cwd: project,
+                        git_branch: branch,
+                        message_id: &uid,
+                        ts_ms: ts,
+                        role: "user",
+                        kind: "text",
+                        text: Some(text),
+                        event_uid: &uid,
+                        ..EventRow::default()
+                    },
                 )?;
                 outcome.events += 1;
                 outcome.prompts += insert_history(
@@ -16266,25 +16195,23 @@ fn ingest_grok_session(
                 let uid = grok_event_uid(group.and_then(|group| group.event_key.as_deref()), idx);
                 insert_session_event(
                     conn,
-                    SOURCE,
-                    sid,
-                    project,
-                    project,
-                    branch,
-                    &uid,
-                    None,
-                    ts,
-                    "assistant",
-                    "thinking",
-                    Some(summary),
-                    None,
-                    None,
-                    RequestIdentity::none(),
-                    &uid,
-                    None,
-                    RawMessageFacts {
-                        request_span: grok_turn_span(turn).as_deref(),
-                        ..RawMessageFacts::default()
+                    &EventRow {
+                        source: SOURCE,
+                        session_id: sid,
+                        project,
+                        cwd: project,
+                        git_branch: branch,
+                        message_id: &uid,
+                        ts_ms: ts,
+                        role: "assistant",
+                        kind: "thinking",
+                        text: Some(summary),
+                        event_uid: &uid,
+                        raw_facts: RawMessageFacts {
+                            request_span: grok_turn_span(turn).as_deref(),
+                            ..RawMessageFacts::default()
+                        },
+                        ..EventRow::default()
                     },
                 )?;
                 outcome.events += 1;
@@ -16312,25 +16239,24 @@ fn ingest_grok_session(
                         grok_event_uid(group.and_then(|group| group.event_key.as_deref()), idx);
                     insert_session_event(
                         conn,
-                        SOURCE,
-                        sid,
-                        project,
-                        project,
-                        branch,
-                        &uid,
-                        None,
-                        ts,
-                        "assistant",
-                        "text",
-                        Some(text),
-                        model.as_deref(),
-                        None,
-                        RequestIdentity::none(),
-                        &uid,
-                        None,
-                        RawMessageFacts {
-                            request_span: grok_turn_span(turn).as_deref(),
-                            ..RawMessageFacts::default()
+                        &EventRow {
+                            source: SOURCE,
+                            session_id: sid,
+                            project,
+                            cwd: project,
+                            git_branch: branch,
+                            message_id: &uid,
+                            ts_ms: ts,
+                            role: "assistant",
+                            kind: "text",
+                            text: Some(text),
+                            model: model.as_deref(),
+                            event_uid: &uid,
+                            raw_facts: RawMessageFacts {
+                                request_span: grok_turn_span(turn).as_deref(),
+                                ..RawMessageFacts::default()
+                            },
+                            ..EventRow::default()
                         },
                     )?;
                     outcome.events += 1;
@@ -16358,29 +16284,28 @@ fn ingest_grok_session(
                     let uid = format!("tool:{tool_use_id}");
                     insert_session_event(
                         conn,
-                        SOURCE,
-                        sid,
-                        project,
-                        project,
-                        branch,
-                        &uid,
-                        None,
-                        ts,
-                        "assistant",
-                        "tool_use",
-                        Some(&format_tool_event_text(
-                            &call.name,
-                            target.as_deref(),
-                            &call.arguments,
-                        )),
-                        model.as_deref(),
-                        None,
-                        RequestIdentity::none(),
-                        &uid,
-                        None,
-                        RawMessageFacts {
-                            request_span: grok_turn_span(call_turn).as_deref(),
-                            ..RawMessageFacts::default()
+                        &EventRow {
+                            source: SOURCE,
+                            session_id: sid,
+                            project,
+                            cwd: project,
+                            git_branch: branch,
+                            message_id: &uid,
+                            ts_ms: ts,
+                            role: "assistant",
+                            kind: "tool_use",
+                            text: Some(&format_tool_event_text(
+                                &call.name,
+                                target.as_deref(),
+                                &call.arguments,
+                            )),
+                            model: model.as_deref(),
+                            event_uid: &uid,
+                            raw_facts: RawMessageFacts {
+                                request_span: grok_turn_span(call_turn).as_deref(),
+                                ..RawMessageFacts::default()
+                            },
+                            ..EventRow::default()
                         },
                     )?;
                     outcome.events += 1;
@@ -16390,17 +16315,22 @@ fn ingest_grok_session(
                     if let Some(call_turn) = call_turn {
                         turn_tool_tail.insert(call_turn, uid.clone());
                     }
+                    let call_ref = ToolCallRef {
+                        source: SOURCE,
+                        session_id: sid,
+                        message_id: &uid,
+                        tool_use_id: &tool_use_id,
+                        ts_ms: ts,
+                        git_branch: branch,
+                        cwd: project,
+                    };
                     insert_tool_call(
                         conn,
-                        SOURCE,
-                        sid,
-                        &uid,
-                        &tool_use_id,
+                        &call_ref,
                         &call.name,
                         target.as_deref(),
                         &serde_json::to_string(&call.arguments).unwrap_or_default(),
                         None,
-                        ts,
                     )?;
                     outcome.tool_calls += 1;
                     if grok::is_subagent_tool(&call.name) {
@@ -16408,18 +16338,7 @@ fn ingest_grok_session(
                     }
                     if grok::is_file_edit_tool(&call.name) {
                         if let Some(path) = target.as_deref() {
-                            upsert_file_edit_from_call(
-                                conn,
-                                SOURCE,
-                                sid,
-                                &uid,
-                                &tool_use_id,
-                                path,
-                                &call.name,
-                                ts,
-                                branch,
-                                project,
-                            )?;
+                            upsert_file_edit_from_call(conn, &call_ref, path, &call.name)?;
                             outcome.file_edits += 1;
                         }
                     }
@@ -16473,23 +16392,21 @@ fn ingest_grok_session(
                 .with_ordering(call_index, event_index);
                 insert_session_event(
                     conn,
-                    SOURCE,
-                    sid,
-                    project,
-                    project,
-                    branch,
-                    &uid,
-                    None,
-                    ts,
-                    "tool_result",
-                    "tool_result",
-                    text.as_deref(),
-                    None,
-                    None,
-                    RequestIdentity::none(),
-                    &uid,
-                    Some(&facts),
-                    RawMessageFacts::default(),
+                    &EventRow {
+                        source: SOURCE,
+                        session_id: sid,
+                        project,
+                        cwd: project,
+                        git_branch: branch,
+                        message_id: &uid,
+                        ts_ms: ts,
+                        role: "tool_result",
+                        kind: "tool_result",
+                        text: text.as_deref(),
+                        event_uid: &uid,
+                        tool_result_facts: Some(&facts),
+                        ..EventRow::default()
+                    },
                 )?;
                 outcome.events += 1;
                 if failed || is_error.is_some() {
@@ -16566,14 +16483,16 @@ fn ingest_grok_session(
 
     upsert_session(
         conn,
-        sid,
-        SOURCE,
-        project,
-        branch,
-        session.first_ts,
-        session.last_ts,
-        session.last_assistant_text.as_deref(),
-        Some(raw_path),
+        &SessionCatalogRow {
+            session_id: sid,
+            source: SOURCE,
+            cwd: project,
+            git_branch: branch,
+            first_ts: session.first_ts,
+            last_ts: session.last_ts,
+            last_assistant_text: session.last_assistant_text.as_deref(),
+            raw_path: Some(raw_path),
+        },
     )?;
     // `upsert_session` merges: it takes MIN/MAX of the activity bounds and
     // keeps the old `last_assistant_text` when the new read has none. That is
@@ -23258,49 +23177,47 @@ mod tests {
 
         super::insert_session_event(
             &conn,
-            "claude",
-            "event-session",
-            None,
-            None,
-            None,
-            "message-1",
-            None,
-            1,
-            "user",
-            "text",
-            Some("hello"),
-            None,
-            None,
-            RequestIdentity::none(),
-            "event-1",
-            None,
-            super::RawMessageFacts::default(),
+            &super::EventRow {
+                source: "claude",
+                session_id: "event-session",
+                message_id: "message-1",
+                ts_ms: 1,
+                role: "user",
+                kind: "text",
+                text: Some("hello"),
+                event_uid: "event-1",
+                ..super::EventRow::default()
+            },
         )
         .unwrap();
         super::insert_tool_call(
             &conn,
-            "claude",
-            "tool-session",
-            "message-2",
-            "tool-1",
+            &super::ToolCallRef {
+                source: "claude",
+                session_id: "tool-session",
+                message_id: "message-2",
+                tool_use_id: "tool-1",
+                ts_ms: 2,
+                ..Default::default()
+            },
             "Read",
             Some("README.md"),
             "{}",
             None,
-            2,
         )
         .unwrap();
         super::upsert_file_edit_from_call(
             &conn,
-            "claude",
-            "edit-session",
-            "message-3",
-            "tool-2",
+            &super::ToolCallRef {
+                source: "claude",
+                session_id: "edit-session",
+                message_id: "message-3",
+                tool_use_id: "tool-2",
+                ts_ms: 3,
+                ..Default::default()
+            },
             "src/lib.rs",
             "Edit",
-            3,
-            None,
-            None,
         )
         .unwrap();
 
@@ -25608,14 +25525,16 @@ mod tests {
         // What the prompt-only parser left: both endpoints at the file mtime.
         super::upsert_session(
             &conn,
-            "s-window",
-            "cursor",
-            Some("/home/dev/demo"),
-            None,
-            7_000_000_000_000,
-            7_000_000_000_000,
-            None,
-            None,
+            &SessionCatalogRow {
+                session_id: "s-window",
+                source: "cursor",
+                cwd: Some("/home/dev/demo"),
+                git_branch: None,
+                first_ts: 7_000_000_000_000,
+                last_ts: 7_000_000_000_000,
+                last_assistant_text: None,
+                raw_path: None,
+            },
         )
         .unwrap();
 
@@ -27502,108 +27421,118 @@ mod tests {
         // Unique full-record match, model and token spend included: healed.
         legacy_event(
             &conn,
-            "parent",
-            "side:0",
-            "delegated work",
-            ts("2026-09-18T10:00:00Z"),
-            0,
-            "assistant",
-            "text",
-            Some("opus"),
-            Some(&token_json),
+            LegacyEvent {
+                session_id: "parent",
+                message_id: "side:0",
+                text: "delegated work",
+                ts_ms: ts("2026-09-18T10:00:00Z"),
+                block: 0,
+                role: "assistant",
+                kind: "text",
+                model: Some("opus"),
+                token_json: Some(&token_json),
+            },
         );
         // Same text, timestamp, role and kind, different model: a changed
         // record whose predecessor stays retained.
         legacy_event(
             &conn,
-            "parent",
-            "side:12",
-            "delegated work",
-            ts("2026-09-18T10:00:00Z"),
-            0,
-            "assistant",
-            "text",
-            Some("opus-old"),
-            Some(&token_json),
+            LegacyEvent {
+                session_id: "parent",
+                message_id: "side:12",
+                text: "delegated work",
+                ts_ms: ts("2026-09-18T10:00:00Z"),
+                block: 0,
+                role: "assistant",
+                kind: "text",
+                model: Some("opus-old"),
+                token_json: Some(&token_json),
+            },
         );
         // Same text and timestamp, different role: a changed record whose
         // predecessor stays retained.
         legacy_event(
             &conn,
-            "parent",
-            "side:7",
-            "delegated work",
-            ts("2026-09-18T10:00:00Z"),
-            0,
-            "user",
-            "text",
-            None,
-            None,
+            LegacyEvent {
+                session_id: "parent",
+                message_id: "side:7",
+                text: "delegated work",
+                ts_ms: ts("2026-09-18T10:00:00Z"),
+                block: 0,
+                role: "user",
+                kind: "text",
+                ..LegacyEvent::default()
+            },
         );
         // Same text and role, different timestamp: not the same record.
         legacy_event(
             &conn,
-            "parent",
-            "side:4",
-            "delegated work",
-            1,
-            0,
-            "assistant",
-            "text",
-            None,
-            None,
+            LegacyEvent {
+                session_id: "parent",
+                message_id: "side:4",
+                text: "delegated work",
+                ts_ms: 1,
+                block: 0,
+                role: "assistant",
+                kind: "text",
+                ..LegacyEvent::default()
+            },
         );
         // Twice-stored duplicate: ambiguous, both preserved.
         legacy_event(
             &conn,
-            "parent",
-            "side:5",
-            "same words",
-            ts("2026-09-18T10:00:02Z"),
-            0,
-            "user",
-            "text",
-            None,
-            None,
+            LegacyEvent {
+                session_id: "parent",
+                message_id: "side:5",
+                text: "same words",
+                ts_ms: ts("2026-09-18T10:00:02Z"),
+                block: 0,
+                role: "user",
+                kind: "text",
+                ..LegacyEvent::default()
+            },
         );
         legacy_event(
             &conn,
-            "parent",
-            "side:6",
-            "same words",
-            ts("2026-09-18T10:00:02Z"),
-            0,
-            "user",
-            "text",
-            None,
-            None,
+            LegacyEvent {
+                session_id: "parent",
+                message_id: "side:6",
+                text: "same words",
+                ts_ms: ts("2026-09-18T10:00:02Z"),
+                block: 0,
+                role: "user",
+                kind: "text",
+                ..LegacyEvent::default()
+            },
         );
         // One shared block with a changed sibling: the record is a new
         // identity whose predecessor stays retained, so both stay.
         let partial_ts = ts("2026-09-18T10:00:03Z");
         legacy_event(
             &conn,
-            "parent",
-            "side:8",
-            "analysis",
-            partial_ts,
-            0,
-            "assistant",
-            "text",
-            None,
-            None,
+            LegacyEvent {
+                session_id: "parent",
+                message_id: "side:8",
+                text: "analysis",
+                ts_ms: partial_ts,
+                block: 0,
+                role: "assistant",
+                kind: "text",
+                ..LegacyEvent::default()
+            },
         );
         legacy_event(
             &conn,
-            "parent",
-            "side:8",
-            "old answer",
-            partial_ts,
-            1,
-            "assistant",
-            "text",
-            None,
-            None,
+            LegacyEvent {
+                session_id: "parent",
+                message_id: "side:8",
+                text: "old answer",
+                ts_ms: partial_ts,
+                block: 1,
+                role: "assistant",
+                kind: "text",
+                ..LegacyEvent::default()
+            },
         );
         // The tool use text is shared with another message, so the event
         // match stays ambiguous and the event is preserved — but the tool
@@ -27611,33 +27540,45 @@ mod tests {
         let tool_ts = ts("2026-09-18T10:00:01Z");
         legacy_event(
             &conn,
-            "parent",
-            "side:1",
-            "Read /work/app/notes.txt",
-            tool_ts,
-            0,
-            "assistant",
-            "tool_use",
-            None,
-            None,
+            LegacyEvent {
+                session_id: "parent",
+                message_id: "side:1",
+                text: "Read /work/app/notes.txt",
+                ts_ms: tool_ts,
+                block: 0,
+                role: "assistant",
+                kind: "tool_use",
+                ..LegacyEvent::default()
+            },
         );
         legacy_event(
             &conn,
-            "parent",
-            "side:9",
-            "Read /work/app/notes.txt",
-            tool_ts,
-            0,
-            "assistant",
-            "tool_use",
-            None,
-            None,
+            LegacyEvent {
+                session_id: "parent",
+                message_id: "side:9",
+                text: "Read /work/app/notes.txt",
+                ts_ms: tool_ts,
+                block: 0,
+                role: "assistant",
+                kind: "tool_use",
+                ..LegacyEvent::default()
+            },
         );
         // An empty tool result writes a null-text event; the null is part
         // of the record key, so the unchanged record still heals exactly.
         let null_ts = ts("2026-09-18T10:00:04Z");
         legacy_event(
-            &conn, "parent", "side:10", "memo", null_ts, 0, "user", "text", None, None,
+            &conn,
+            LegacyEvent {
+                session_id: "parent",
+                message_id: "side:10",
+                text: "memo",
+                ts_ms: null_ts,
+                block: 0,
+                role: "user",
+                kind: "text",
+                ..LegacyEvent::default()
+            },
         );
         conn.execute(
             "INSERT INTO session_events \
@@ -27755,18 +27696,33 @@ mod tests {
         assert_eq!(events, 1);
     }
 
-    fn legacy_event(
-        conn: &Connection,
-        session_id: &str,
-        message_id: &str,
-        text: &str,
+    /// A pre-upgrade positional `session_events` row, as an older parser
+    /// wrote it: `event_uid` is `{message_id}:{block}`.
+    #[derive(Default)]
+    struct LegacyEvent<'a> {
+        session_id: &'a str,
+        message_id: &'a str,
+        text: &'a str,
         ts_ms: i64,
         block: i64,
-        role: &str,
-        kind: &str,
-        model: Option<&str>,
-        token_json: Option<&str>,
-    ) {
+        role: &'a str,
+        kind: &'a str,
+        model: Option<&'a str>,
+        token_json: Option<&'a str>,
+    }
+
+    fn legacy_event(conn: &Connection, event: LegacyEvent<'_>) {
+        let LegacyEvent {
+            session_id,
+            message_id,
+            text,
+            ts_ms,
+            block,
+            role,
+            kind,
+            model,
+            token_json,
+        } = event;
         conn.execute(
             "INSERT INTO session_events \
              (source, session_id, message_id, ts_ms, role, kind, text, event_uid, model, token_json) \
@@ -28072,14 +28028,16 @@ mod tests {
                     if catalogued {
                         upsert_session(
                             &conn,
-                            &meta.session_id,
-                            "claude",
-                            meta.cwd.as_deref(),
-                            None,
-                            meta.first_ts,
-                            meta.last_ts,
-                            None,
-                            Some(&locator),
+                            &SessionCatalogRow {
+                                session_id: &meta.session_id,
+                                source: "claude",
+                                cwd: meta.cwd.as_deref(),
+                                git_branch: None,
+                                first_ts: meta.first_ts,
+                                last_ts: meta.last_ts,
+                                last_assistant_text: None,
+                                raw_path: Some(&locator),
+                            },
                         )
                         .unwrap();
                     }
@@ -30235,14 +30193,16 @@ mod tests {
         // generation; what is missing here is topology, not the facts.
         super::upsert_session(
             &conn,
-            "claude-root",
-            "claude",
-            Some("/work/app"),
-            None,
-            1,
-            2,
-            None,
-            Some(&parent.to_string_lossy()),
+            &SessionCatalogRow {
+                session_id: "claude-root",
+                source: "claude",
+                cwd: Some("/work/app"),
+                git_branch: None,
+                first_ts: 1,
+                last_ts: 2,
+                last_assistant_text: None,
+                raw_path: Some(&parent.to_string_lossy()),
+            },
         )
         .unwrap();
         conn.execute(
@@ -33179,22 +33139,22 @@ mod tests {
         let meta = codex_meta(&path);
         // Simulate a pre-upgrade event-message row, already delivered under its
         // original ID. Reparse must keep that identity rather than add its twin.
-        insert_codex_event(
+        insert_session_event(
             &conn,
-            &meta.session_id,
-            Some("/tmp/project"),
-            None,
-            parse_iso_ms("2026-09-20T10:00:05Z").unwrap(),
-            "assistant",
-            "text",
-            "Reverse mirror.",
-            "7:agent_message",
-            "7:agent_message",
-            None,
-            None,
-            None,
-            None,
-            None,
+            &EventRow {
+                source: "codex",
+                session_id: &meta.session_id,
+                project: Some("/tmp/project"),
+                cwd: Some("/tmp/project"),
+                git_branch: None,
+                message_id: "7:agent_message",
+                ts_ms: parse_iso_ms("2026-09-20T10:00:05Z").unwrap(),
+                role: "assistant",
+                kind: "text",
+                text: Some("Reverse mirror."),
+                event_uid: "7:agent_message",
+                ..EventRow::default()
+            },
         )
         .unwrap();
         for _ in 0..2 {
@@ -33527,36 +33487,35 @@ mod tests {
         .unwrap();
         super::insert_session_event(
             &conn,
-            "codex",
-            "sess-repair",
-            Some("/tmp/proj"),
-            Some("/tmp/proj"),
-            None,
-            "3:agent_message",
-            None,
-            1_788_176_403_000,
-            "assistant",
-            "text",
-            Some("Done."),
-            None,
-            None,
-            RequestIdentity::none(),
-            "3:agent_message",
-            None,
-            super::RawMessageFacts::default(),
+            &super::EventRow {
+                source: "codex",
+                session_id: "sess-repair",
+                project: Some("/tmp/proj"),
+                cwd: Some("/tmp/proj"),
+                message_id: "3:agent_message",
+                ts_ms: 1_788_176_403_000,
+                role: "assistant",
+                kind: "text",
+                text: Some("Done."),
+                event_uid: "3:agent_message",
+                ..super::EventRow::default()
+            },
         )
         .unwrap();
         super::insert_tool_call(
             &conn,
-            "codex",
-            "sess-repair",
-            "fc_1",
-            "call_1",
+            &super::ToolCallRef {
+                source: "codex",
+                session_id: "sess-repair",
+                message_id: "fc_1",
+                tool_use_id: "call_1",
+                ts_ms: 1_788_176_402_000,
+                ..Default::default()
+            },
             "exec_command",
             Some("git status"),
             r#"{"cmd":"git status"}"#,
             None,
-            1_788_176_402_000,
         )
         .unwrap();
 
@@ -36484,31 +36443,8 @@ mod tests {
         );
     }
 
-    /// OpenCode records the stop reason on a `step-finish` part rather than on
-    /// the message, and writes it as its own wire string.
-    #[test]
-    fn opencode_step_finish_reason_is_read_verbatim() {
-        assert_eq!(
-            super::opencode_step_finish_stop_reason(
-                &json!({"type": "step-finish", "reason": "tool-calls"})
-            ),
-            Some("tool-calls")
-        );
-        assert_eq!(
-            super::opencode_step_finish_stop_reason(&json!({"type": "step-finish"})),
-            None
-        );
-        // Another part type never contributes a stop reason, whatever it
-        // happens to carry under that key.
-        assert_eq!(
-            super::opencode_step_finish_stop_reason(
-                &json!({"type": "text", "reason": "not-a-stop-reason"})
-            ),
-            None
-        );
-    }
-
-    /// The end-to-end half of the OpenCode stop-reason contract.
+    /// The end-to-end half of the OpenCode stop-reason contract; the parser's
+    /// `last_step_finish_reason` tests are the unit half.
     #[test]
     fn opencode_assistant_events_carry_step_finish_stop_reason() {
         let dir = tempfile::tempdir().unwrap();

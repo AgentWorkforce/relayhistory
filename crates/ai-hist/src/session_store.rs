@@ -604,6 +604,36 @@ pub struct StoreOptions {
     pub read_only: bool,
 }
 
+impl StoreOptions {
+    /// Open exactly this database; see [`StoreOptions::db_path`].
+    #[must_use]
+    pub fn db_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.db_path = Some(path.into());
+        self
+    }
+
+    /// Scan this provider home; see [`StoreOptions::home`].
+    #[must_use]
+    pub fn home(mut self, home: impl Into<PathBuf>) -> Self {
+        self.home = Some(home.into());
+        self
+    }
+
+    /// Read providers from exactly these roots; see [`StoreOptions::roots`].
+    #[must_use]
+    pub fn roots(mut self, roots: ProviderRoots) -> Self {
+        self.roots = Some(roots);
+        self
+    }
+
+    /// Never write; see [`StoreOptions::read_only`].
+    #[must_use]
+    pub fn read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+}
+
 /// A session the store can name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -1618,6 +1648,29 @@ pub struct DiscoveryOptions {
     pub stop: Option<StopToken>,
 }
 
+impl DiscoveryOptions {
+    /// Read only these sources; see [`DiscoveryOptions::sources`].
+    #[must_use]
+    pub fn sources(mut self, sources: impl IntoIterator<Item = Source>) -> Self {
+        self.sources = Some(sources.into_iter().collect());
+        self
+    }
+
+    /// Read at most this many rows; see [`DiscoveryOptions::limit`].
+    #[must_use]
+    pub fn limit(mut self, limit: usize) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    /// Stop when this token is stopped; see [`DiscoveryOptions::stop`].
+    #[must_use]
+    pub fn stop(mut self, stop: StopToken) -> Self {
+        self.stop = Some(stop);
+        self
+    }
+}
+
 /// Result of [`SessionStore::discover`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -1653,6 +1706,36 @@ pub struct SyncOptions {
     /// per session in the legacy JSON tree. Unchanged files count as processed.
     #[serde(skip)]
     pub progress: Option<ProgressObserver>,
+}
+
+impl SyncOptions {
+    /// Walk every provider; see [`SyncOptions::force`].
+    #[must_use]
+    pub fn force(mut self, force: bool) -> Self {
+        self.force = force;
+        self
+    }
+
+    /// Wait this long for the lock; see [`SyncOptions::lock_timeout_ms`].
+    #[must_use]
+    pub fn lock_timeout_ms(mut self, lock_timeout_ms: u64) -> Self {
+        self.lock_timeout_ms = lock_timeout_ms;
+        self
+    }
+
+    /// Stop when this token is stopped; see [`SyncOptions::stop`].
+    #[must_use]
+    pub fn stop(mut self, stop: StopToken) -> Self {
+        self.stop = Some(stop);
+        self
+    }
+
+    /// Report file progress here; see [`SyncOptions::progress`].
+    #[must_use]
+    pub fn progress(mut self, progress: ProgressObserver) -> Self {
+        self.progress = Some(progress);
+        self
+    }
 }
 
 /// Result of [`SessionStore::sync`].
@@ -1825,6 +1908,23 @@ impl Default for HydrateOptions {
             include_related: true,
             stop: None,
         }
+    }
+}
+
+impl HydrateOptions {
+    /// Also hydrate related transcripts; see
+    /// [`HydrateOptions::include_related`].
+    #[must_use]
+    pub fn include_related(mut self, include_related: bool) -> Self {
+        self.include_related = include_related;
+        self
+    }
+
+    /// Stop when this token is stopped; see [`HydrateOptions::stop`].
+    #[must_use]
+    pub fn stop(mut self, stop: StopToken) -> Self {
+        self.stop = Some(stop);
+        self
     }
 }
 

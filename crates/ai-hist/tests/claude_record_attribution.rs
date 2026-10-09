@@ -17,14 +17,13 @@ fn stage(home: &Path, name: &str) {
     fs::copy(from, project.join(name)).unwrap();
 }
 
-#[allow(clippy::field_reassign_with_default)]
 fn synced(home: &Path) -> SessionStore {
-    let mut options = StoreOptions::default();
-    options.db_path = Some(home.join("ai-history.db"));
-    options.roots = Some(ProviderRoots::from_home(
-        home.to_path_buf(),
-        home.join(".local/share/opencode/opencode.db"),
-    ));
+    let options = StoreOptions::default()
+        .db_path(home.join("ai-history.db"))
+        .roots(ProviderRoots::from_home(
+            home.to_path_buf(),
+            home.join(".local/share/opencode/opencode.db"),
+        ));
     let store = SessionStore::open(options).expect("open");
     store.sync(Default::default()).expect("sync");
     store

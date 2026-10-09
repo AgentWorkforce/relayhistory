@@ -1089,16 +1089,7 @@ pub fn run() -> Result<()> {
                 no_note,
                 json,
                 quiet,
-            } => link_git_commit(
-                &conn,
-                &db_path,
-                &repo,
-                &commit,
-                &match_method,
-                !no_note,
-                json,
-                quiet,
-            ),
+            } => link_git_commit(&conn, &repo, &commit, &match_method, !no_note, json, quiet),
         },
         Command::Learn { action } => match action {
             LearnAction::Distill {
@@ -3358,7 +3349,6 @@ fn uninstall_git_hook(hook_path: &Path) -> Result<()> {
 
 fn link_git_commit(
     conn: &Connection,
-    _db_path: &Path,
     repo: &Path,
     commit: &str,
     match_method: &str,
@@ -4352,17 +4342,7 @@ mod tests {
         )
         .unwrap();
 
-        link_git_commit(
-            &conn,
-            tmp.path(),
-            &repo,
-            commit,
-            "manual",
-            false,
-            false,
-            true,
-        )
-        .unwrap();
+        link_git_commit(&conn, &repo, commit, "manual", false, false, true).unwrap();
 
         let (session_id, commit_sha, match_method, confidence, evidence): (
             String,

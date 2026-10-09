@@ -33,15 +33,14 @@ fn stage(home: &Path) {
     .unwrap();
 }
 
-#[allow(clippy::field_reassign_with_default)]
 fn open(home: &Path, read_only: bool) -> SessionStore {
-    let mut options = StoreOptions::default();
-    options.db_path = Some(home.join("ai-history.db"));
-    options.roots = Some(ProviderRoots::from_home(
-        home.to_path_buf(),
-        home.join(".local/share/opencode/opencode.db"),
-    ));
-    options.read_only = read_only;
+    let options = StoreOptions::default()
+        .db_path(home.join("ai-history.db"))
+        .roots(ProviderRoots::from_home(
+            home.to_path_buf(),
+            home.join(".local/share/opencode/opencode.db"),
+        ))
+        .read_only(read_only);
     SessionStore::open(options).expect("open")
 }
 
@@ -531,7 +530,6 @@ fn forgetting_a_child_of_a_kept_parent_rehydrates_through_the_parent() {
 /// A session whose transcript the provider has deleted cannot be hydrated
 /// back, so it is skipped unless the caller opts in.
 #[test]
-#[allow(clippy::field_reassign_with_default)]
 fn a_session_whose_transcript_is_gone_is_skipped_unless_opted_in() {
     let (dir, store, claude, codex) = hydrated();
     fs::remove_file(
@@ -552,8 +550,7 @@ fn a_session_whose_transcript_is_gone_is_skipped_unless_opted_in() {
     assert_eq!(evidence(&store, &claude), before);
     assert_eq!(state_of(&store, &claude), DiscoveryState::Full);
 
-    let mut anyway = ForgetOptions::default();
-    anyway.include_unrecoverable = true;
+    let anyway = ForgetOptions::default().include_unrecoverable(true);
     let report = store
         .forget_evidence(ForgetScope::Sessions(vec![claude.clone()]), anyway)
         .unwrap();
