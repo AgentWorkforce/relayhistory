@@ -21,7 +21,6 @@ permissions:
 
 jobs:
   verify:
-    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.head_ref == 'trunk' && github.event.pull_request.head.repo.full_name == github.repository && github.base_ref == 'main')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -102,7 +101,6 @@ jobs:
   # fails on any `rusqlite` type in the listing: an embedder never holds a
   # raw connection. See docs/sourcing-sdk.md.
   public-api:
-    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.head_ref == 'trunk' && github.event.pull_request.head.repo.full_name == github.repository && github.base_ref == 'main')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -133,7 +131,6 @@ jobs:
   # published-crate-consumer workflow builds the same example against the
   # crate crates.io actually serves.
   rust-consumer:
-    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.head_ref == 'trunk' && github.event.pull_request.head.repo.full_name == github.repository && github.base_ref == 'main')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -188,7 +185,6 @@ jobs:
   # tell a regression here from breakage in burn. Making the job a required
   # check is a branch-protection setting.
   burn-contract-drift:
-    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.head_ref == 'trunk' && github.event.pull_request.head.repo.full_name == github.repository && github.base_ref == 'main')
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -235,7 +231,6 @@ jobs:
         run: node scripts/burn-guardrails.mjs run-parity --burn-dir burn
 
   msrv:
-    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.head_ref == 'trunk' && github.event.pull_request.head.repo.full_name == github.repository && github.base_ref == 'main')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -244,7 +239,6 @@ jobs:
         run: cargo check -p ai-hist --all-features --locked
 
   node-22-sdk:
-    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.head_ref == 'trunk' && github.event.pull_request.head.repo.full_name == github.repository && github.base_ref == 'main')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -264,7 +258,6 @@ jobs:
         run: npm ci && npm test
 
   optional-history-plugins:
-    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.head_ref == 'trunk' && github.event.pull_request.head.repo.full_name == github.repository && github.base_ref == 'main')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -313,7 +306,6 @@ jobs:
           node scripts/smoke-history-packages.mjs --helpers helper-packs
 
   windows-helper-cancellation:
-    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.head_ref == 'trunk' && github.event.pull_request.head.repo.full_name == github.repository && github.base_ref == 'main')
     runs-on: windows-latest
     defaults:
       run:
