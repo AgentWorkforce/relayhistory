@@ -2129,6 +2129,17 @@ settles across every copy, so an early release never double-counts.
 A record with **no** `stop_reason` key at all is treated as finished: older
 record shapes omit the field.
 
+A record whose every block is a `thinking` block with no text — the signed,
+empty block Claude streams first in a response — stores no event of its own,
+so it is held for the record after it whatever its `stop_reason` says. A later
+record of its message that stores rows takes the response, and the opening
+record is its `thinking_signature` marker alone. Anything else following it,
+or the file going quiet after it, means it **stands alone**: it is its
+response's only record, so it stores its thinking event (empty text, the
+record's usage) and the response is a request like any other. Every reader —
+incremental, whole-file, hook bytes — makes the same decision, so a from-zero
+read stores what the incremental passes stored.
+
 A held message the file stops writing — a session killed mid-response — is
 released by the first pass after the file has been still for the two-minute
 grace window (`QUIESCENT_GRACE_MS`). Holding is bounded at 8 MiB, and past

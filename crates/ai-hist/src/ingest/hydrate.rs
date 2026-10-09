@@ -12292,6 +12292,86 @@ mod tests {
         );
     }
 
+    /// A store an earlier parser built has a sidecar response whose only
+    /// record is a signed, empty thinking block as its marker alone. An
+    /// embedder that only hydrates gets it back: the store migration clears
+    /// the stamp of the hydration that covers the sidecar, which re-reads that
+    /// sidecar from zero, and the hydration after it is unchanged.
+    #[test]
+    fn hydration_restores_the_request_of_a_standalone_record_after_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = |uuid: &str, kind: &str, message: &str| {
+            format!(
+                "{{\"sessionId\":\"session-1\",\"agentId\":\"abc\",\"isSidechain\":true,\"uuid\":\"{uuid}\",\"cwd\":\"/work/app\",\"type\":\"{kind}\",\"requestId\":\"req_{uuid}\",\"message\":{message},\"timestamp\":\"2026-08-31T10:00:03Z\"}}\n"
+            )
+        };
+        let records = [
+            record("side-u1", "user", r#"{"role":"user","content":"delegated"}"#),
+            record(
+                "side-a1",
+                "assistant",
+                r#"{"id":"msg_1","role":"assistant","model":"claude-opus-5","stop_reason":null,"content":[{"type":"thinking","thinking":"","signature":"sig"}],"usage":{"input_tokens":2,"cache_creation_input_tokens":353736,"output_tokens":8}}"#,
+            ),
+            record("side-u2", "user", r#"{"role":"user","content":"go on"}"#),
+            record(
+                "side-a2",
+                "assistant",
+                r#"{"id":"msg_2","role":"assistant","model":"claude-opus-5","stop_reason":"end_turn","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":3,"output_tokens":4}}"#,
+            ),
+        ]
+        .concat();
+        let transcript =
+            claude_parent_with_subagent(dir.path(), &records, Some(CLAUDE_AGENT_META), "agent-abc");
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", "session-1", Some(&transcript));
+        drop(conn);
+        let requests = |conn: &Connection| -> Vec<(String, i64)> {
+            conn.prepare(
+                "SELECT request_key, json_extract(token_json, '$.output_tokens') \
+                 FROM session_requests WHERE source = 'claude' AND session_id = 'abc' \
+                 ORDER BY request_key",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        };
+        let hydrate = || {
+            hydrate_session_at_with_home(&db, &options("claude", "session-1"), dir.path())
+                .unwrap()
+                .status
+        };
+        assert_eq!(hydrate(), "hydrated");
+        let conn = open_db(&db).unwrap();
+        let healthy = requests(&conn);
+        assert_eq!(
+            healthy,
+            vec![
+                ("request-id:req_side-a1".to_string(), 8),
+                ("request-id:req_side-a2".to_string(), 4),
+            ]
+        );
+        assert_eq!(hydrate(), "unchanged");
+
+        // What the earlier parser left: the marker without its event, and the
+        // migration not yet run.
+        conn.execute_batch(
+            "DELETE FROM session_events WHERE event_uid = 'side-a1:0';
+             DELETE FROM schema_migrations WHERE name = 'claude_standalone_records_v1';",
+        )
+        .unwrap();
+        assert_eq!(requests(&conn).len(), 1);
+        drop(conn);
+        open_db(&db).unwrap();
+
+        assert_eq!(hydrate(), "hydrated");
+        let conn = open_db(&db).unwrap();
+        assert_eq!(requests(&conn), healthy);
+        assert_eq!(hydrate(), "unchanged");
+    }
+
     #[test]
     fn claude_subagent_with_agent_id_is_a_linked_child() {
         let dir = tempfile::tempdir().unwrap();

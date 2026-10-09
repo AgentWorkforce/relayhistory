@@ -85,7 +85,7 @@ pub(crate) fn forget_unread_cursor_unless_held(conn: &Connection, path: &Path) -
 /// signal to wait for.
 ///
 /// A record with no `message.id` cannot be grouped and is never held.
-fn claude_message_progress(obj: &Map<String, Value>) -> Option<(String, bool)> {
+pub(crate) fn claude_message_progress(obj: &Map<String, Value>) -> Option<(String, bool)> {
     let message = obj.get("message").and_then(Value::as_object)?;
     let role = message
         .get("role")
@@ -111,22 +111,27 @@ fn claude_message_progress(obj: &Map<String, Value>) -> Option<(String, bool)> {
 /// streaming, so at most one is held at a time, and a pass that ends with one
 /// commits before its first byte so the next pass reads it again.
 ///
+/// A record that stores no event of its own (see
+/// [`claude_record_stores_no_event`]) is held the same way whatever its
+/// `stop_reason`, because whether it stands alone is up to the record after
+/// it; the hold ends at the first record of its message that stores rows.
+///
 /// Claude can write another record between two blocks of one message (a tool
 /// result for a parallel tool call), so a message released by a following
 /// record may gain a further block later. That block is indexed when it
 /// arrives under its own record identity, and the request's usage settles
 /// across every copy, so the early release neither drops nor double-counts
 /// anything.
+///
+/// Nothing is indexed while a message is held -- any record that does not
+/// continue it releases it first -- so the cursor state at the end of a pass
+/// that still holds one is the state before it (see [`commit_point`]).
 struct HeldMessage {
     message_id: String,
     offset: u64,
     line_index: usize,
     lines: Vec<String>,
     bytes: usize,
-    /// Tool-result ordering as it stood before this message was held: the
-    /// state that belongs with the committed offset when the pass backs up to
-    /// it.
-    tool_results: crate::ingest::tool_result_facts::ToolResultIndexer,
 }
 
 /// Read a Claude transcript from its cursor and index what is complete.
@@ -333,6 +338,7 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
                                 &mut claude.tool_results,
                                 &mut claude.cache_reads,
                                 &mut claude.slash_commands,
+                                false,
                             )
                         })?;
                     }
@@ -376,25 +382,20 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
         }
     }
 
-    // Commit before the message still in progress, so the next pass reads it
-    // again from its first byte and can see what follows it when that
-    // arrives. With nothing in progress the commit is the end of the last
-    // complete line.
-    let (commit_offset, commit_line_index, commit_tool_results) = match held.as_ref() {
-        Some(entry) => (entry.offset, entry.line_index, entry.tool_results.clone()),
-        // With an unterminated record indexed, commit past it so a file
-        // nobody has touched compares equal to its cursor and is skipped
-        // outright; `resume_from` is what brings the reader back to it if
-        // the file ever grows.
-        None => match unterminated {
-            Some((start, _)) => (
-                start + reader.tail_bytes(),
-                line_index,
-                claude.tool_results.clone(),
-            ),
-            None => (reader.position(), line_index, claude.tool_results.clone()),
-        },
-    };
+    // A file nobody has written to since the last pass has nothing more to
+    // say about a record held only for what follows it.
+    if !defer_unfinished {
+        release_any(
+            conn,
+            path,
+            attributed_session_id,
+            file_session_id.as_deref(),
+            &mut held,
+            &mut claude,
+        )?;
+    }
+    let (commit_offset, commit_line_index) =
+        commit_point(held.as_ref(), unterminated, &reader, line_index);
     let in_progress: Vec<String> = held.map(|entry| entry.message_id).into_iter().collect();
     pass.in_progress = in_progress.clone();
 
@@ -409,9 +410,6 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
     claude.resume_from = resume_from;
     claude.resume_line_index = resume_line_index;
     claude.resume_tool_results = resume_from.and(unterminated_tool_results);
-    // The ordering that belongs with the committed offset, not with wherever
-    // the pass happened to stop.
-    claude.tool_results = commit_tool_results;
     // A pass whose file was rewritten under it records nothing at all — not
     // the position, not the parser state. Its rows came from bytes that are no
     // longer there, and the next pass reads the same region again and upserts
@@ -433,6 +431,29 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
         .saturating_add(reread_bytes)
         .saturating_add(pass.validation_bytes);
     Ok(pass)
+}
+
+/// Where a pass's database work is committed through, and the line index
+/// that goes with it.
+///
+/// Before the message still in progress, so the next pass reads it again from
+/// its first byte and can see what follows it when that arrives; nothing is
+/// indexed while a message is held, so the cursor state at the end of the pass
+/// is the state that belongs with that offset. With an unterminated record
+/// indexed, past it, so a file nobody has touched compares equal to its cursor
+/// and is skipped outright (`resume_from` brings the reader back to it if the
+/// file ever grows). Otherwise the end of the last complete line.
+fn commit_point(
+    held: Option<&HeldMessage>,
+    unterminated: Option<(u64, usize)>,
+    reader: &TranscriptReader,
+    line_index: usize,
+) -> (u64, usize) {
+    match (held, unterminated) {
+        (Some(entry), _) => (entry.offset, entry.line_index),
+        (None, Some((start, _))) => (start + reader.tail_bytes(), line_index),
+        (None, None) => (reader.position(), line_index),
+    }
 }
 
 /// One parsed record and where it sits in the file.
@@ -460,6 +481,7 @@ fn place_claude_record(
     at: Placement<'_>,
 ) -> Result<bool> {
     let progress = claude_message_progress(at.obj);
+    let stores_no_event = progress.is_some() && claude_record_stores_no_event(at.obj);
     // Any record that is not another block of the held message follows it,
     // and a message something follows is finished.
     let continues_held = matches!(
@@ -485,20 +507,19 @@ fn place_claude_record(
                 entry.bytes += at.line.len();
                 entry.lines.push(at.line.to_string());
             }
-            if complete {
+            // A finished block that stores rows settles the message; one that
+            // stores no event waits on the record after it.
+            if complete && !stores_no_event {
                 release(held, claude)?;
             }
         }
-        Some((message_id, false)) if at.hold => {
+        Some((message_id, complete)) if (at.hold && !complete) || stores_no_event => {
             *held = Some(HeldMessage {
                 message_id,
                 offset: at.offset,
                 line_index: at.index,
                 lines: vec![at.line.to_string()],
                 bytes: at.line.len(),
-                // Held, not indexed, so the current state is the state before
-                // this message.
-                tool_results: claude.tool_results.clone(),
             });
         }
         _ => ingest_claude_record(
@@ -511,6 +532,7 @@ fn place_claude_record(
             &mut claude.tool_results,
             &mut claude.cache_reads,
             &mut claude.slash_commands,
+            false,
         )?,
     }
     let overflowed = held
@@ -545,6 +567,9 @@ fn release_any(
 }
 
 /// Index a held message's records in file order.
+///
+/// A record that stores no event stands alone when no record after it in the
+/// held run stores rows: nothing more of its message followed it.
 fn release_held(
     conn: &Connection,
     path: &Path,
@@ -553,14 +578,25 @@ fn release_held(
     entry: HeldMessage,
     claude: &mut ClaudeCursorState,
 ) -> Result<()> {
-    for text in entry.lines {
-        let record = text.trim_end_matches(['\n', '\r']);
-        let Ok(value) = serde_json::from_str::<Value>(record) else {
-            continue;
-        };
-        let Some(obj) = value.as_object() else {
-            continue;
-        };
+    let records: Vec<(&str, Map<String, Value>)> = entry
+        .lines
+        .iter()
+        .filter_map(|text| {
+            let record = text.trim_end_matches(['\n', '\r']);
+            match serde_json::from_str::<Value>(record) {
+                Ok(Value::Object(obj)) => Some((record, obj)),
+                _ => None,
+            }
+        })
+        .collect();
+    let mut stands_alone = vec![false; records.len()];
+    let mut rows_follow = false;
+    for (alone, (_, obj)) in stands_alone.iter_mut().zip(&records).rev() {
+        let stores_no_event = claude_record_stores_no_event(obj);
+        *alone = stores_no_event && !rows_follow;
+        rows_follow |= !stores_no_event;
+    }
+    for ((record, obj), stands_alone) in records.iter().zip(stands_alone) {
         ingest_claude_record(
             conn,
             path,
@@ -571,6 +607,7 @@ fn release_held(
             &mut claude.tool_results,
             &mut claude.cache_reads,
             &mut claude.slash_commands,
+            stands_alone,
         )?;
     }
     Ok(())
