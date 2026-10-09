@@ -860,6 +860,8 @@ fn normalize_inner(
             // The control vocabulary covers Claude and Codex wrappers; Devin
             // marks its synthetic user turns with `is_user_input` instead.
             control_kind: None,
+            // Devin's usage is stored once per message; `token_json` is it.
+            record_token_json: None,
         };
 
         match role {

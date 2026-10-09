@@ -10,6 +10,11 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Text-bearing OpenCode `reasoning` parts are thinking blocks and an encrypted-only one is an `encrypted_reasoning` marker; synthetic user text (harness-written context such as an `@file` read) is captured as a user text block with `control_kind = "synthetic"`, never as a prompt.
 
+### Changed
+
+- `Message::raw_usage` returns the usage blob of the message's own record, so each streamed copy of one Claude response keeps its own snapshot (and a copy that carried none has none); `Message::usage` and `SessionEvidence::requests` still read the request's settled usage. The first `sync` after upgrading fills it through a one-time raw-facts re-read of Claude and Codex transcripts.
+- Session events carry `recordTokenJson` natively and `recordTokenUsage` in the TypeScript SDK; the session evidence contract is version 4.
+
 ### Fixed
 
 - A Claude transcript made only of `isSidechain` rows (inline Task traffic from older Claude Code) is now catalogued as its own session, with its sidechain turns' usage in `SessionEvidence::requests`; only an `agent-*.jsonl` file is read as a subagent sidecar, and the first `sync` after upgrading catalogs transcripts an earlier build dropped.
@@ -21,6 +26,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Rust API
 
 - Added `ControlKind::Synthetic` (`"synthetic"`); `SESSION_EVIDENCE_CONTRACT_VERSION` is 4 in Rust and TypeScript, so an SDK without the value rejects an addon that can return it.
+- Added `SessionEvent::record_token_json`; code constructing `SessionEvent` with a struct literal must set it. `SESSION_EVIDENCE_CONTRACT_VERSION` is 4.
 
 ## [0.36.0] - 2026-10-07
 

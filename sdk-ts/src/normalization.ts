@@ -274,6 +274,12 @@ export function sessionEvent(value: UnknownRecord): SessionEvent {
     text: nullableString(value.text),
     model: nullableString(value.model),
     tokenUsage: tokenUsage(value.tokenJson),
+    // The record's own usage: the separately kept blob where settlement
+    // replaced it (`"null"` for a copy that carried none), else `tokenJson`.
+    recordTokenUsage:
+      value.recordTokenJson === undefined || value.recordTokenJson === null
+        ? tokenUsage(value.tokenJson)
+        : tokenUsage(value.recordTokenJson),
     provider: nullableString(value.provider),
     eventUid: String(value.eventUid),
     toolUseId: nullableString(value.toolUseId),

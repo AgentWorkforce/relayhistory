@@ -1608,6 +1608,7 @@ mod tests {
             request_span: None,
             control_kind: None,
             raw_kind: None,
+            record_token_json: None,
         }
     }
 

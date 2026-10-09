@@ -554,6 +554,7 @@ pub ai_hist::SessionEvent::project_key: core::option::Option<alloc::string::Stri
 pub ai_hist::SessionEvent::provider: core::option::Option<alloc::string::String>
 pub ai_hist::SessionEvent::provider_message_id: core::option::Option<alloc::string::String>
 pub ai_hist::SessionEvent::raw_kind: core::option::Option<alloc::string::String>
+pub ai_hist::SessionEvent::record_token_json: core::option::Option<alloc::string::String>
 pub ai_hist::SessionEvent::request_id: core::option::Option<alloc::string::String>
 pub ai_hist::SessionEvent::request_span: core::option::Option<alloc::string::String>
 pub ai_hist::SessionEvent::result_status: core::option::Option<alloc::string::String>

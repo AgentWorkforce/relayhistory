@@ -736,6 +736,14 @@ A null is "the provider did not record it", which is not the same as `false`
 or as an empty string: a Claude record with no `isSidechain` key stores null,
 while `"isSidechain": false` stores `0`.
 
+Usage is kept the same way. Claude writes one streamed response as several
+records, each carrying the usage snapshot current when it was written;
+`token_json` holds the request's settled blob on every one of its rows, and
+`record_token_json` keeps a record's own `message.usage` only where settlement
+replaced it (JSON `null` for a copy that carried none), so the bytes are spent
+only on the copies that differ. `Message::raw_usage` returns the record's own
+blob: `record_token_json` where it is set, else `token_json`.
+
 Because of that, none of the six can answer "was this row indexed before the
 facts existed?" -- a real record legitimately has no `request_id`, no
 `stop_reason` and no `turn_id`, and Codex records none of the other three.
