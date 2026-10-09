@@ -31,12 +31,12 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - A Claude transcript made only of `isSidechain` rows (inline Task traffic from older Claude Code) is catalogued as its own session, with its sidechain turns' usage in `SessionEvidence::requests`; only an `agent-*.jsonl` file is read as a subagent sidecar.
-- Claude sidechain user rows — a subagent's delegated prompts and the tool results it received — are `is_sidechain` evidence in messages, tool results and user turns, so a delegated thread's parent chain is whole; they never become prompts or `history`.
+- Claude sidechain user rows — a subagent's delegated prompts and the tool results it received — are `is_sidechain` evidence in messages and tool results, so a delegated thread's parent chain is whole; they never become prompts, user turns or `history`, and a subagent's usage is charged to no prompt.
 - A Claude record's signed `thinking` block with empty text stores no event row; its `thinking_signature` marker carries the record's `request_id` and `provider_message_id`, so the record that opens a streamed response is placed in its request, and the marker's `ts_ms` is when the request started.
 - Claude `continuation` and `fork` edges from `continuedFromSessionId` / `forkSessionId` carry the timestamp of the record that named them in `spawned_at_ms`, not the transcript's first record.
 - A Claude subagent spawned from inside another subagent is delegated by that subagent rather than by the root session; a delegation's `child_model` names the model the subagent's own records used when its `agent-*.meta.json` names none; a spawn tool result carries the child's `agent_id` from the record's `toolUseResult.agentId`.
 - Every OpenCode assistant message is a `Message` and a request in `SessionStore::session`, with its `tokens` verbatim as `raw_usage`, model, provider and stop reason, including messages made only of `step-start` / `step-finish` / `reasoning` parts, in both the `opencode.db` and legacy `storage/` layouts.
-- An OpenCode message's stop reason is its final `step-finish` reason, else the message's own `finish`; a reasonless final step does not report an earlier step's reason.
+- An OpenCode message's stop reason is its final `step-finish` reason, else the message's own `finish`; a final step with no reason, or an empty one, does not report an earlier step's reason.
 - Hydrating a session with related sessions after a parser upgrade re-reads its Codex child rollouts and Claude subagent sidecars from the start instead of resuming from cursors the older parser committed.
 - Existing stores gain all of the above on the first `sync` after upgrading, through one-time passes that re-read the Codex rollouts once and only the Claude transcripts each change affects; an embedder that only hydrates re-parses each session once.
 

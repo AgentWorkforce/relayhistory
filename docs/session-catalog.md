@@ -662,11 +662,12 @@ anything else `unknown`. Only `task_complete` can call a result a success.
 
 Claude sidechain (`isSidechain`) rows are delegated traffic and every one is
 captured, its event rows with `is_sidechain = 1`: the subagent's output, the
-delegating agent's prompts to it, and the tool results it received. Its `tool_result` blocks are
-tool results and blocks of a user turn like any other, so a delegated thread's
-parent chain and its tool calls' results are whole. Its user text is the
-delegating agent's rather than a human's, so it never becomes `history`, a
-prompt, `first_prompt` or a control row.
+delegating agent's prompts to it, and the tool results it received. Its
+`tool_result` blocks are tool results like any other, so a delegated thread's
+parent chain and its tool calls' results are whole. Its user rows are the
+delegating agent's rather than a human's, so they never become `history`, a
+prompt, `first_prompt`, a control row or a user turn, and a subagent's usage
+is charged to no prompt.
 
 Cursor, Grok and OpenCode measure through the same
 `ToolResultFacts::from_payload` helper, so the columns mean the same thing for
