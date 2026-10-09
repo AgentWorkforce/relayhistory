@@ -4,7 +4,11 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Patch]
+
+### Changed
+
+- `SessionStore::session` with `include_text: false`, and the user-turn pages, measure stored text from SQLite's record header instead of reading each body, so a text-free read of a session with large tool results no longer loads them.
 
 ## [0.36.0] - 2026-10-07
 
