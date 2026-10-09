@@ -828,10 +828,16 @@ How each adapter works:
   branch, `version`, models and the first human prompt; tail for the last
   timestamp and the final branch. Meta rows, slash-command wrappers, bash
   wrappers and sidechain (subagent) turns are skipped when picking
-  `first_prompt`. A subagent *sidecar* — a separate file whose records all
-  carry the parent's `sessionId` — is not a session of its own: it is detected
-  in the head read and skipped, so a session is emitted once per run and its
-  row keeps pointing at its own transcript. A transcript whose complete records
+  `first_prompt`. A subagent *sidecar* — an `agent-*.jsonl` file (flat beside
+  the parent, or under `<session>/subagents/`) whose records all carry the
+  parent's `sessionId` as `isSidechain` rows — is not a session of its own: it
+  is detected in the head read and skipped, so a session is emitted once per
+  run and its row keeps pointing at its own transcript. The layout decides the
+  file's role, never an identity. A primary `<sessionId>.jsonl` made only of
+  `isSidechain` rows — inline Task traffic from Claude Code versions that wrote
+  it there — is that session's transcript: catalogued under the records'
+  `sessionId`, with its sidechain assistant turns, `is_sidechain` and usage
+  kept as evidence of it. A transcript whose complete records
   parse as nothing is reported as a diagnostic rather than published under its
   file name; an empty one is simply not a session yet. The subagent workflow
   journal, `<session>/subagents/**/journal.jsonl`, is excluded by name before

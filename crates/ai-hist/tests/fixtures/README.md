@@ -109,7 +109,7 @@ source without deciding which one fails the test.
 | `claude/missing-output-tokens` | burn | `claude/missing-output-tokens.jsonl` | usage carries `input_tokens` only — `output_tokens` is absent, which is not the same as zero |
 | `claude/user-turn-blocks` | burn | `claude/user-turn-blocks.jsonl` | user records carrying tool_result blocks of very different sizes, one of them errored |
 | `claude/compact-boundary` | burn | `claude/compact-boundary.jsonl` | a `system` record with `subtype: compact_boundary` splits the transcript |
-| `claude/sidechain-turn` | burn | `claude/sidechain-turn.jsonl` | every record is `isSidechain: true` — a subagent sidecar, not a session of its own |
+| `claude/sidechain-turn` | burn | `claude/sidechain-turn.jsonl` | every record is `isSidechain: true` in a primary `<session>.jsonl` — inline Task traffic, still its session's transcript |
 | `claude/sidechain-leading-then-main` | burn | `claude/sidechain-leading-then-main.jsonl` | sidechain records precede the first main-chain record in the same file |
 | `claude/nested-subagent` | burn | `claude/nested-subagent.jsonl` | a subagent spawns a subagent, in one file, joined by `agentId` |
 | `claude/system-subagent-notification` | burn | `claude/system-subagent-notification.jsonl` | a `system`/`subagent_completed` record reports a child session id the transcript never contains |

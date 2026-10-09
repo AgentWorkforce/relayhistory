@@ -2668,6 +2668,12 @@ fn ingest_claude(
             "Claude transcript identity does not match the catalog row",
         ));
     }
+    // The selected transcript is the session's own, so it is no delegation's
+    // evidence; see `retract_claude_delegation_evidence`. One indexed probe
+    // when nothing cites it, which is every transcript the current build read.
+    if crate::ingest::claude_delegation_cites(conn, path)? {
+        crate::ingest::retract_claude_delegation_evidence(conn, path)?;
+    }
     upsert_session(
         conn,
         &meta.session_id,
@@ -3027,7 +3033,7 @@ fn claude_sidecars(conn: &Connection, directory: &Path) -> Result<ClaudeSidecarW
     let mut sidecars = Vec::new();
     let mut bytes_read = 0u64;
     let mut superseded = false;
-    for candidate in collect_matching_files(directory, "agent-", "jsonl")? {
+    for candidate in collect_matching_files(directory, super::CLAUDE_SIDECAR_PREFIX, "jsonl")? {
         super::check_capture_cancelled()?;
         let locator = candidate.to_string_lossy().to_string();
         let key = CursorKey::Locator {

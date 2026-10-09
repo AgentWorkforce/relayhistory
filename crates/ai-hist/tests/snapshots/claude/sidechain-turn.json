@@ -6,11 +6,18 @@
   "file_edits": [],
   "fixture": "claude/sidechain-turn",
   "history": [],
-  "hydration": [],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "44444444-4444-4444-4444-444444444444",
+      "source": "claude",
+      "status": "hydrated"
+    }
+  ],
   "layout": "ClaudeTranscript",
   "notes": [],
   "origin": "burn",
-  "quirk": "every record is `isSidechain: true` — a subagent sidecar, not a session of its own",
+  "quirk": "every record is `isSidechain: true` in a primary `<session>.jsonl` — inline Task traffic, still its session's transcript",
   "session_events": [
     {
       "agent_id": null,
@@ -44,27 +51,28 @@
     }
   ],
   "session_markers": [],
-  "session_relationships": [
+  "session_relationships": [],
+  "sessions": [
     {
-      "child_agent_name": null,
-      "child_agent_type": null,
-      "child_has_events": 0,
-      "child_model": null,
-      "child_session_id": null,
-      "evidence_kind": "claude_sidechain_records",
-      "evidence_locator": "<home>/.claude/projects/corpus/sidechain-turn.jsonl",
-      "evidence_ref": null,
-      "identity_status": "unlinked",
-      "origin_session_id": null,
-      "parent_session_id": "44444444-4444-4444-4444-444444444444",
-      "relationship": "delegated",
-      "relationship_uid": "evidence:claude_sidechain_records:<home>/.claude/projects/corpus/sidechain-turn.jsonl",
+      "agent_version": null,
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776643200000,
+      "first_prompt": null,
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776643201000,
+      "last_assistant_text": null,
+      "models_json": "[\"claude-haiku-4-5\"]",
+      "originator": null,
+      "raw_path": "<home>/.claude/projects/corpus/sidechain-turn.jsonl",
+      "repo_url": null,
+      "session_id": "44444444-4444-4444-4444-444444444444",
       "source": "claude",
-      "spawn_depth": null,
-      "spawned_at_ms": 1776643200000
+      "source_stamp": "<n>:747",
+      "workspace_roots_json": null
     }
   ],
-  "sessions": [],
   "source": "claude",
   "tool_calls": []
 }
