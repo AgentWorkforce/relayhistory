@@ -8,7 +8,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- Claude subagent requests and usage are in `SessionEvidence::requests` on the sync or hydration that reads the sidecar: a message is finished once any later record follows it, though Claude Code writes `stop_reason: null` on nearly every sidecar record, so only a transcript's trailing message is held, and `sync` no longer skips a sweep on an unchanged source fingerprint while one is. The first sync after upgrading releases what an earlier build held back.
+- Claude subagent requests and usage reach `SessionEvidence::requests` on the sync or hydration that reads the sidecar, rather than only once the sidecar had sat still for two minutes and a later sweep ran, which `sync` skipped while no other source changed. The first sync after upgrading backfills the messages an earlier build held back.
 
 ## [0.37.0] - 2026-10-09
 

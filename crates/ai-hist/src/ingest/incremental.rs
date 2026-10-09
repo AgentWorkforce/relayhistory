@@ -45,6 +45,22 @@ pub(crate) fn sweep_left_records_held(state: &Map<String, Value>) -> bool {
     state.get(CLAUDE_HOLDING_RECORDS_KEY) == Some(&Value::Bool(true))
 }
 
+/// Forget `path`'s record cursor, returning whether it was holding a trailing
+/// message: a transcript the sweep could not read still owes that message a
+/// sweep, so the caller keeps [`CLAUDE_HOLDING_RECORDS_KEY`] set for it.
+pub(crate) fn forget_cursor_noting_held(conn: &Connection, path: &Path) -> Result<bool> {
+    let locator = path.to_string_lossy();
+    let key = CursorKey::Locator {
+        source: "claude",
+        locator: &locator,
+    };
+    let held = load_cursor(conn, &key)?
+        .claude
+        .is_some_and(|claude| !claude.in_progress.is_empty());
+    forget_locator_cursor(conn, "claude", path)?;
+    Ok(held)
+}
+
 /// Whether this record belongs to an assistant message, and whether the record
 /// itself says that message is finished.
 ///
@@ -229,6 +245,15 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
             // past.
             pass.oversized_records += 1;
             if terminated {
+                // Skipped, but it follows the held message all the same.
+                release_any(
+                    conn,
+                    path,
+                    attributed_session_id,
+                    file_session_id.as_deref(),
+                    &mut held,
+                    &mut claude,
+                )?;
                 line_index += 1;
                 continue;
             }
@@ -257,13 +282,20 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
         // A malformed record that *did* end in a newline is committed bytes,
         // so it keeps consuming its index.
         line_index += 1;
-        let Some(value) = parsed else {
-            continue;
-        };
-        let Some(obj) = value.as_object() else {
+        let Some(obj) = parsed.as_ref().and_then(Value::as_object) else {
             if kind == ReadRecord::Unterminated {
                 break;
             }
+            // Malformed or not an object, but a complete record that follows
+            // the held message.
+            release_any(
+                conn,
+                path,
+                attributed_session_id,
+                file_session_id.as_deref(),
+                &mut held,
+                &mut claude,
+            )?;
             continue;
         };
         pass.records += 1;
@@ -426,17 +458,15 @@ fn place_claude_record(
         (&*held, &progress),
         (Some(entry), Some((id, _))) if entry.message_id == *id
     );
-    let release = |held: &mut Option<HeldMessage>, claude: &mut ClaudeCursorState| match held.take()
-    {
-        Some(entry) => release_held(
+    let release = |held: &mut Option<HeldMessage>, claude: &mut ClaudeCursorState| {
+        release_any(
             conn,
             path,
             attributed_session_id,
             file_session_id,
-            entry,
+            held,
             claude,
-        ),
-        None => Ok(()),
+        )
     };
     if !continues_held {
         release(held, claude)?;
@@ -482,6 +512,28 @@ fn place_claude_record(
         release(held, claude)?;
     }
     Ok(overflowed)
+}
+
+/// Release the held message, if there is one.
+fn release_any(
+    conn: &Connection,
+    path: &Path,
+    attributed_session_id: Option<&str>,
+    file_session_id: Option<&str>,
+    held: &mut Option<HeldMessage>,
+    claude: &mut ClaudeCursorState,
+) -> Result<()> {
+    match held.take() {
+        Some(entry) => release_held(
+            conn,
+            path,
+            attributed_session_id,
+            file_session_id,
+            entry,
+            claude,
+        ),
+        None => Ok(()),
+    }
 }
 
 /// Index a held message's records in file order.

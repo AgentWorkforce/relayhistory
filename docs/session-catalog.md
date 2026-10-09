@@ -2112,10 +2112,12 @@ filled-in `stop_reason`, **or when any later record follows it** — another
 message, a tool result, a system row. A `stop_reason` of `null` alone is no
 signal: Claude Code's subagent sidecars write `null` on nearly every record of
 every message, finished or not. So only the transcript's trailing message can
-still be streaming. Its records are **held and not indexed**, the committed
-offset backs up to its first byte, and the next pass reads it again and
-releases it once a record follows it or its own record says it is done. The
-held message is reported as `HYDRATION_IN_PROGRESS_MESSAGES`, and while any
+still be streaming, and only its records at the end of the file — the ones no
+other record has followed yet — are **held and not indexed**. The committed
+offset backs up to the first of them, and the next pass reads them again and
+releases them once any complete record follows them (even one that is
+malformed or oversized) or their own record says the message is done. The held
+message is reported as `HYDRATION_IN_PROGRESS_MESSAGES`, and while any
 transcript holds one, `sync` does not skip a sweep on an unchanged source
 fingerprint.
 
@@ -2128,8 +2130,9 @@ A record with **no** `stop_reason` key at all is treated as finished: older
 record shapes omit the field.
 
 A held message the file stops writing — a session killed mid-response — is
-released once the file has been still for the grace window. Holding is bounded
-at 8 MiB, and past that the message is indexed as it stands, reported as
+released by the first pass after the file has been still for the two-minute
+grace window (`QUIESCENT_GRACE_MS`). Holding is bounded at 8 MiB, and past
+that the message is indexed as it stands, reported as
 `HYDRATION_IN_PROGRESS_OVERFLOW`; the blocks that arrive later land as further
 rows under their own record identity rather than as corrections.
 

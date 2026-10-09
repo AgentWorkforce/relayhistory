@@ -161,8 +161,9 @@ pub(crate) struct ClaudeCursorState {
     /// rewrites a transcript's prefix and every position after it shifts.
     #[serde(default)]
     pub next_line_index: usize,
-    /// The `message.id` of the trailing assistant message, when the last pass
-    /// ended holding it. `offset` already backs up to its first byte; this
+    /// The `message.id` of the trailing assistant message when the last pass
+    /// ended holding it: empty, or exactly one id, since only a transcript's
+    /// trailing message is held. `offset` already backs up to its first byte; this
     /// says a further pass is owed even though the file has not moved, and
     /// names the message in `HYDRATION_IN_PROGRESS_MESSAGES`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

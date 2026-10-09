@@ -8071,7 +8071,7 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
         if !transcript_is_readable(&path) {
             walked_every_known_root &= !known_before;
             if known_before {
-                transcript_cursor::forget_locator_cursor(conn, "claude", &path)?;
+                holding_records |= incremental::forget_cursor_noting_held(conn, &path)?;
             }
             sync_note!(
                 "  [claude-sessions] could not open {} (skipped)",
@@ -34813,6 +34813,43 @@ mod tests {
         assert_eq!(child_requests(&conn), child_requests(&fresh));
     }
 
+    /// Any complete record follows the held message, including one the reader
+    /// skips: a malformed line, a non-object, an oversized record.
+    #[test]
+    fn a_skipped_record_after_a_held_message_releases_it() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, tail) in [
+            ("malformed", "{not json\n".to_string()),
+            ("array", "[1,2]\n".to_string()),
+            (
+                "oversized",
+                format!(
+                    "{{\"pad\":\"{}\"}}\n",
+                    "x".repeat(transcript_cursor::MAX_RECORD_BYTES as usize)
+                ),
+            ),
+        ] {
+            let sidecar = dir.path().join(format!("agent-{name}.jsonl"));
+            fs::write(
+                &sidecar,
+                [
+                    sidecar_record("user", "c1", r#"{"role":"user","content":"delegated"}"#),
+                    sidecar_tool_use("a1", "msg_1", "toolu_1", 5),
+                    tail,
+                ]
+                .concat(),
+            )
+            .unwrap();
+            let conn = Connection::open_in_memory().unwrap();
+            init_db(&conn).unwrap();
+            let pass =
+                incremental::ingest_claude_transcript_at_locator(&conn, &sidecar, Some("child"))
+                    .unwrap();
+            assert!(pass.in_progress.is_empty(), "{name}");
+            assert_eq!(child_assistant_rows(&conn), 1, "{name}");
+        }
+    }
+
     /// A record whose `stop_reason` is filled in is finished on its own, so a
     /// main transcript's trailing message is indexed on the pass that reads it.
     #[test]
@@ -34924,6 +34961,28 @@ mod tests {
         assert!(claude_holding_records(dir.path()));
         let conn = open_db(&db).unwrap();
         assert_eq!(child_assistant_rows(&conn), 0);
+
+        // A sweep that cannot open the held transcript still owes it a sweep.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o000)).unwrap();
+            if fs::File::open(&sidecar).is_err() {
+                assert!(
+                    super::sync_exclusive_with_roots(&db, &roots, false)
+                        .unwrap()
+                        .swept
+                );
+                assert!(claude_holding_records(dir.path()));
+            }
+            fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(
+                super::sync_exclusive_with_roots(&db, &roots, false)
+                    .unwrap()
+                    .swept
+            );
+            assert!(claude_holding_records(dir.path()));
+        }
 
         // The writer has been gone past the grace window: released.
         let key = transcript_cursor::CursorKey::Locator {
