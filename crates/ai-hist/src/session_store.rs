@@ -3001,9 +3001,11 @@ pub struct Marker {
     pub text: Option<String>,
     pub payload: Option<Value>,
     /// For a `usage_snapshot` (Codex `token_count`), the provider's `info`
-    /// object, typed: no JSON is parsed into a [`Value`] to read it. `None`
-    /// for every other kind, and for the `info: null` snapshot Codex writes
-    /// before a turn has spent anything.
+    /// object, typed: no JSON is parsed into a [`Value`] to read it. Its
+    /// counters and `model_context_window` are kept whole and unaltered; only
+    /// its other strings and containers carry the marker bounds. `None` for
+    /// every other kind, and for the `info: null` snapshot Codex writes before
+    /// a turn has spent anything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_snapshot: Option<Box<UsageSnapshot>>,
     #[serde(

@@ -2575,7 +2575,7 @@ pub(crate) fn ingest_selected_claude(ctx: SelectedIngest<'_>) -> Result<Selected
 
 pub(crate) fn ingest_selected_codex(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
     let path = ctx.file();
-    ingest_codex(ctx.conn, ctx.options, path, ctx.cursor, ctx.reparse)
+    ingest_codex(ctx.conn, ctx.options, path, ctx.cursor, ctx.parser_upgrade)
         .map(|outcome| (outcome, Vec::new(), None))
 }
 
@@ -3125,7 +3125,7 @@ fn claude_subagent_recorded_model(conn: &Connection, agent_id: &str) -> Result<O
         .prepare_cached(
             "SELECT model FROM session_events \
              WHERE source = 'claude' AND session_id = ?1 AND role = 'assistant' \
-               AND model IS NOT NULL AND model <> '' AND model <> '<synthetic>' \
+               AND model IS NOT NULL AND model <> '' AND lower(trim(model)) <> '<synthetic>' \
              ORDER BY ts_ms, id LIMIT 1",
         )?
         .query_row([agent_id], |row| row.get(0))
@@ -3320,7 +3320,7 @@ fn ingest_codex(
     options: &HydrateSessionOptions,
     path: &Path,
     cursor: &mut TranscriptCursorState,
-    reparse: bool,
+    parser_upgrade: bool,
 ) -> Result<IngestOutcome> {
     let (meta, meta_bytes) = read_codex_session_meta_counted(path)?;
     let meta = meta.ok_or_else(|| {
@@ -3361,7 +3361,7 @@ fn ingest_codex(
         // Each child's own continuity is captured with it (a spawned
         // subagent's `thread_spawn` parent is a fork edge that lives only in
         // the child's `session_meta`), so reconcile once they are all banked.
-        indexed.absorb_outcome(ingest_codex_children(conn, options, path, reparse)?);
+        indexed.absorb_outcome(ingest_codex_children(conn, options, path, parser_upgrade)?);
         crate::continuity::reconcile(conn, "codex")?;
     }
     Ok(indexed)
@@ -3461,7 +3461,7 @@ fn ingest_codex_children(
     conn: &Connection,
     options: &HydrateSessionOptions,
     root_path: &Path,
-    reparse: bool,
+    parser_upgrade: bool,
 ) -> Result<IngestOutcome> {
     // Enumeration happens twice per hydration — once to stamp the source,
     // once here — and each pass reads every candidate's head. Counting both
@@ -3488,8 +3488,9 @@ fn ingest_codex_children(
         };
         // A parser upgrade re-reads the child from byte zero like the root:
         // a cursor the older parser committed would skip the records the new
-        // one stores.
-        let mut child_cursor = if reparse {
+        // one stores. A first hydration has no older checkpoint, and resumes
+        // the cursors the current parser's sweep committed.
+        let mut child_cursor = if parser_upgrade {
             TranscriptCursorState::default()
         } else {
             load_cursor(conn, &key)?
@@ -10003,12 +10004,30 @@ mod tests {
             .expect("a sidecar cursor")
             .records_parser = 0;
         store_cursor(&conn, &key, &cursor).unwrap();
+        // The sidecar grows and a sweep reads only its tail: the position it
+        // resumed from is still the older generation's, and says so.
+        let mut sidecar_file = fs::OpenOptions::new().append(true).open(&sidecar).unwrap();
+        std::io::Write::write_all(
+            &mut sidecar_file,
+            b"{\"sessionId\":\"session-sidecar\",\"agentId\":\"child-1\",\"isSidechain\":true,\"uuid\":\"s2\",\"cwd\":\"/work/app\",\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"second\"},\"timestamp\":\"2026-08-31T10:00:02Z\"}\n",
+        )
+        .unwrap();
+        drop(sidecar_file);
+        super::incremental::ingest_claude_transcript_at_locator_batched(
+            &conn,
+            &sidecar,
+            Some("child-1"),
+            &mut || Ok(()),
+        )
+        .unwrap();
+        let resumed = load_cursor(&conn, &key).unwrap();
+        assert_eq!(resumed.claude.unwrap().records_parser, 0);
         drop(conn);
 
         let mut root_only = options("claude", session_id);
         root_only.include_related = false;
         hydrate_session_at_with_home(&db, &root_only, dir.path()).unwrap();
-        assert!(session_event_snapshot(&db, "child-1").is_empty());
+        assert_eq!(session_event_snapshot(&db, "child-1").len(), 1);
 
         hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
         assert_eq!(
@@ -10016,7 +10035,7 @@ mod tests {
                 .iter()
                 .map(|row| row.0.clone())
                 .collect::<Vec<_>>(),
-            vec!["s1:0".to_string()],
+            vec!["s1:0".to_string(), "s2:0".to_string()],
             "the sidecar was re-read from byte zero, not resumed from its cursor"
         );
     }

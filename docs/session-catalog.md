@@ -108,10 +108,10 @@ delegation tree, so the edge's parent is the session whose tool call has the
 `toolUseId` the `agent-<agentId>.meta.json` names: a subagent spawned from
 inside another subagent hangs under that subagent (`spawnDepth` 2 under
 depth 1). The root is the parent when the call is in the root's own
-transcript, and also when the meta names no `toolUseId` or no stored call
-matches it yet; a sidecar whose meta disappeared keeps the parent its edge
-already names, and an edge recorded before its spawning subagent's calls were
-stored moves under that subagent when they are.
+transcript, and also when no stored call matches the meta's `toolUseId` yet.
+A sidecar whose meta names no `toolUseId` (or disappeared) keeps the parent
+its edge already names, else the root; an edge recorded before its spawning
+subagent's calls were stored moves under that subagent when they are.
 Claude Code's meta files name no model, so `child_model` is the model the
 sidecar's first assistant record names when the meta has none. A catalog-less
 child's evidence is read by its own id through `SessionStore::session`, which

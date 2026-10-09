@@ -145,8 +145,13 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
         // because *this* walk restarted left the global sync re-deriving a
         // transcript's identity from byte zero on every append: it stored the
         // scan, then this reloaded the same row and wrote a default over it.
+        //
+        // A walk from byte zero is this parser's own, so it names this
+        // generation; a resumed walk keeps the generation that committed the
+        // position it resumes from.
         ClaudeCursorState {
             scan: saved_claude.scan.clone(),
+            records_parser: super::hydrate::HYDRATION_PARSER_VERSION,
             ..Default::default()
         }
     } else {
@@ -525,10 +530,6 @@ pub(crate) fn ingest_claude_transcript_at_locator_batched(
         &mut cursor,
         between_records,
     )?;
-    cursor
-        .claude
-        .get_or_insert_with(Default::default)
-        .records_parser = super::hydrate::HYDRATION_PARSER_VERSION;
     store_cursor(conn, &key, &cursor)?;
     Ok(pass)
 }
