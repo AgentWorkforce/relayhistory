@@ -191,66 +191,19 @@ pub(crate) fn split_patch_files(patch: &str) -> Vec<PatchFile> {
     // Inside a hunk, every line is content until the next file header or the
     // envelope terminator, so header detection has to stand down.
     let mut in_hunk = false;
-    let mut index = 0;
-    while index < lines.len() {
-        let raw = lines[index];
-        let mut header: Option<String> = None;
-        // Matched against the *raw* line, not the trimmed one. A unified-diff
-        // context line is its content prefixed with a space, so
-        // ` *** Update File: example.md` is a quotation of a marker inside a
-        // hunk, not a marker. Trimming first turned that into a header,
-        // opening a phantom file and carrying the rest of the patch away from
-        // the file it belongs to. Only the extracted path is trimmed.
-        for marker in ["*** Update File: ", "*** Add File: ", "*** Delete File: "] {
-            if let Some(rest) = raw.strip_prefix(marker) {
-                let rest = rest.trim();
-                if !rest.is_empty() {
-                    header = Some(rest.to_string());
-                }
-                break;
+    for (index, &raw) in lines.iter().enumerate() {
+        let header = envelope_header(raw).or_else(|| {
+            if envelope {
+                None
+            } else {
+                unified_diff_header(&lines, index, in_hunk)
             }
-        }
-        // A `--- ` line opens a file only when a `+++ ` line follows it. That
-        // alone is not enough inside a hunk, where it is content: a deleted
-        // `-- old` renders as `--- old` and an added `++ new` as `+++ new`, so
-        // reading those as headers opens a phantom file and splits the real
-        // file's patch in half. The next file's header also arrives while the
-        // previous hunk is still open, though, so "not in a hunk" cannot be
-        // the whole rule either. What separates them is what comes next: a
-        // header pair is followed by `@@`, hunk content is not.
-        // Matched against the raw line, same as the envelope markers: a
-        // unified-diff context line is its content prefixed with a space, so
-        // ` --- a/quoted.rs` is a nested diff being quoted, not a header.
-        // Trimming made the following ` +++` / ` @@` look like a real pair
-        // and opened a phantom file.
-        if !envelope && header.is_none() && raw.starts_with("--- ") {
-            let opens_a_hunk = lines
-                .get(index + 2)
-                .is_some_and(|after| after.starts_with("@@"));
-            if let Some(next) = lines
-                .get(index + 1)
-                .copied()
-                .filter(|_| !in_hunk || opens_a_hunk)
-            {
-                if let Some(rest) = next.strip_prefix("+++ ") {
-                    header = Some(unified_diff_path(rest).unwrap_or_else(|| {
-                        unified_diff_path(raw.strip_prefix("--- ").unwrap_or_default())
-                            .unwrap_or_default()
-                    }));
-                }
-            }
-        }
+        });
         if let Some(path) = header {
-            if let Some((path, body)) = current.take() {
-                files.push(PatchFile {
-                    path,
-                    patch: body.join("\n"),
-                });
-            }
+            close_patch_file(&mut files, &mut current);
             in_hunk = false;
             if !path.is_empty() {
                 current = Some((path, vec![raw]));
-                index += 1;
                 continue;
             }
         }
@@ -260,14 +213,8 @@ pub(crate) fn split_patch_files(patch: &str) -> Vec<PatchFile> {
         // edit smaller than the one that was made. `trim_end` only tolerates
         // a stray `\r` from a CRLF transcript; it does not admit indentation.
         if raw.trim_end() == "*** End Patch" {
-            if let Some((path, body)) = current.take() {
-                files.push(PatchFile {
-                    path,
-                    patch: body.join("\n"),
-                });
-            }
+            close_patch_file(&mut files, &mut current);
             in_hunk = false;
-            index += 1;
             continue;
         }
         // `@@` opens a hunk; everything after it is content until the next
@@ -278,15 +225,62 @@ pub(crate) fn split_patch_files(patch: &str) -> Vec<PatchFile> {
         if let Some((_, body)) = current.as_mut() {
             body.push(raw);
         }
-        index += 1;
     }
+    close_patch_file(&mut files, &mut current);
+    files
+}
+
+/// The path an envelope `*** Update/Add/Delete File:` marker names.
+fn envelope_header(raw: &str) -> Option<String> {
+    // Matched against the *raw* line, not the trimmed one. A unified-diff
+    // context line is its content prefixed with a space, so
+    // ` *** Update File: example.md` is a quotation of a marker inside a
+    // hunk, not a marker. Trimming first turned that into a header,
+    // opening a phantom file and carrying the rest of the patch away from
+    // the file it belongs to. Only the extracted path is trimmed.
+    ["*** Update File: ", "*** Add File: ", "*** Delete File: "]
+        .iter()
+        .find_map(|marker| raw.strip_prefix(marker))
+        .map(str::trim)
+        .filter(|rest| !rest.is_empty())
+        .map(str::to_string)
+}
+
+/// The path a unified-diff `--- ` / `+++ ` header pair starting at `index`
+/// names; empty when both sides name nothing (`/dev/null`).
+fn unified_diff_header(lines: &[&str], index: usize, in_hunk: bool) -> Option<String> {
+    // A `--- ` line opens a file only when a `+++ ` line follows it. That
+    // alone is not enough inside a hunk, where it is content: a deleted
+    // `-- old` renders as `--- old` and an added `++ new` as `+++ new`, so
+    // reading those as headers opens a phantom file and splits the real
+    // file's patch in half. The next file's header also arrives while the
+    // previous hunk is still open, though, so "not in a hunk" cannot be
+    // the whole rule either. What separates them is what comes next: a
+    // header pair is followed by `@@`, hunk content is not.
+    // Matched against the raw line, same as the envelope markers: a
+    // unified-diff context line is its content prefixed with a space, so
+    // ` --- a/quoted.rs` is a nested diff being quoted, not a header.
+    // Trimming made the following ` +++` / ` @@` look like a real pair
+    // and opened a phantom file.
+    let old = lines[index].strip_prefix("--- ")?;
+    let opens_a_hunk = lines
+        .get(index + 2)
+        .is_some_and(|after| after.starts_with("@@"));
+    if in_hunk && !opens_a_hunk {
+        return None;
+    }
+    let new = lines.get(index + 1)?.strip_prefix("+++ ")?;
+    Some(unified_diff_path(new).unwrap_or_else(|| unified_diff_path(old).unwrap_or_default()))
+}
+
+/// Close the file being collected, if any, onto `files`.
+fn close_patch_file(files: &mut Vec<PatchFile>, current: &mut Option<(String, Vec<&str>)>) {
     if let Some((path, body)) = current.take() {
         files.push(PatchFile {
             path,
             patch: body.join("\n"),
         });
     }
-    files
 }
 
 /// `b/src/main.rs` and `a/src/main.rs` both name `src/main.rs`; `/dev/null`

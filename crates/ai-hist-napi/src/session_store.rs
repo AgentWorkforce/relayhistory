@@ -274,154 +274,11 @@ pub(crate) fn dispatch(op: &str, args_json: &str) -> napi::Result<String> {
     let source_name = validate_identity(std::mem::take(&mut args.source), "source")?;
     let source = parse_source(&source_name)?;
     match op {
-        OP_CAPABILITIES => {
-            let evidence_kinds = declared_evidence_kinds(source.as_str());
-            let missing = missing_evidence_kinds(source.as_str());
-            serialize(&SourceCapabilities {
-                hydration_contract_version: SESSION_HYDRATION_CONTRACT_VERSION,
-                relationship_contract_version: SESSION_RELATIONSHIP_CONTRACT_VERSION,
-                source: source_name,
-                evidence_kinds: evidence_kinds
-                    .iter()
-                    .map(|kind| kind.as_str().to_string())
-                    .collect(),
-                full_coverage: missing.is_empty(),
-                missing_evidence_kinds: missing
-                    .iter()
-                    .map(|kind| kind.as_str().to_string())
-                    .collect(),
-                relationships: relationship_capabilities(source.as_str()).into(),
-            })
-        }
-        OP_MARKERS => {
-            let session_id = required_session_id(&mut args)?;
-            let limit = validate_limit(args.limit, DEFAULT_EVENT_LIMIT, 1_000)?;
-            let after = evidence_cursor(args.after);
-            let path = db_path(args.db_path);
-            let page = if path.exists() {
-                with_store(path, |store| {
-                    session_markers_page(
-                        &read_conn(store)?,
-                        source.as_str(),
-                        &session_id,
-                        limit,
-                        after.as_ref(),
-                    )
-                    .map_err(query)
-                })?
-            } else {
-                ai_hist::SessionMarkerPage {
-                    markers: Vec::new(),
-                    next_cursor: None,
-                }
-            };
-            serialize(&SessionMarkersPage {
-                contract_version: SESSION_EVIDENCE_CONTRACT_VERSION,
-                source: source_name,
-                session_id,
-                markers: page
-                    .markers
-                    .into_iter()
-                    .map(NativeSessionMarker::from)
-                    .collect(),
-                next_cursor: page.next_cursor.map(crate::evidence_cursor),
-            })
-        }
-        OP_REQUESTS => {
-            let session_id = required_session_id(&mut args)?;
-            let limit = validate_limit(args.limit, DEFAULT_EVENT_LIMIT, 1_000)?;
-            let after = args
-                .after
-                .map(|cursor| cursor.dated(op))
-                .transpose()?
-                .map(|(ts_ms, id)| SessionRequestCursor { ts_ms, id });
-            let path = db_path(args.db_path);
-            let page = if path.exists() {
-                with_store(path, |store| {
-                    session_requests_page(
-                        &read_conn(store)?,
-                        source.as_str(),
-                        &session_id,
-                        limit,
-                        after.as_ref(),
-                    )
-                    .map_err(query)
-                })?
-            } else {
-                ai_hist::SessionRequestPage {
-                    requests: Vec::new(),
-                    next_cursor: None,
-                }
-            };
-            serialize(&SessionRequestsPage {
-                contract_version: SESSION_USAGE_CONTRACT_VERSION,
-                source: source_name,
-                session_id,
-                requests: page
-                    .requests
-                    .into_iter()
-                    .map(NativeSessionRequest::from)
-                    .collect(),
-                next_cursor: page.next_cursor.map(|cursor| RequestCursor {
-                    ts_ms: cursor.ts_ms,
-                    id: cursor.id,
-                }),
-            })
-        }
-        OP_USAGE_SUMMARY => {
-            let session_id = required_session_id(&mut args)?;
-            let path = db_path(args.db_path);
-            let summary = if path.exists() {
-                with_store(path, |store| {
-                    session_usage_summary(&read_conn(store)?, source.as_str(), &session_id)
-                        .map_err(query)
-                })?
-            } else {
-                None
-            };
-            serialize(&session_usage(source_name, session_id, summary))
-        }
-        OP_USER_TURNS => {
-            let session_id = required_session_id(&mut args)?;
-            let limit = validate_limit(args.limit, DEFAULT_EVENT_LIMIT, 1_000)?;
-            let after = args
-                .after
-                .map(|cursor| cursor.dated(op))
-                .transpose()?
-                .map(|(ts_ms, id)| SessionEventCursor { ts_ms, id });
-            let path = db_path(args.db_path);
-            let page = if path.exists() {
-                with_store(path, |store| {
-                    session_user_turns_page(
-                        &read_conn(store)?,
-                        source.as_str(),
-                        &session_id,
-                        limit,
-                        after.as_ref(),
-                    )
-                    .map_err(query)
-                })?
-            } else {
-                ai_hist::SessionUserTurnPage {
-                    user_turns: Vec::new(),
-                    next_cursor: None,
-                }
-            };
-            serialize(&SessionUserTurnsPage {
-                contract_version: SESSION_EVIDENCE_CONTRACT_VERSION,
-                source: source_name,
-                session_id,
-                user_turns: page
-                    .user_turns
-                    .into_iter()
-                    .map(NativeSessionUserTurn::from)
-                    .collect(),
-                next_cursor: page.next_cursor.map(|cursor| EventCursor {
-                    ts_ms: cursor.ts_ms,
-                    id: cursor.id,
-                }),
-            })
-        }
+        OP_CAPABILITIES => capabilities(&source, source_name),
+        OP_MARKERS => markers(args, &source, source_name),
+        OP_REQUESTS => requests(args, &source, source_name),
+        OP_USAGE_SUMMARY => usage_summary(args, &source, source_name),
+        OP_USER_TURNS => user_turns(args, &source, source_name),
         other => Err(native_error(
             "INVALID_ARGUMENT",
             format!(
@@ -430,6 +287,156 @@ pub(crate) fn dispatch(op: &str, args_json: &str) -> napi::Result<String> {
             ),
         )),
     }
+}
+
+/// Run `read` against the database at `path`, or answer `None` when there is
+/// no database there — a missing database is an empty answer, and a read
+/// never creates it.
+fn read_existing<T>(
+    path: PathBuf,
+    read: impl Fn(&SessionStore) -> Result<T, ai_hist::Error>,
+) -> napi::Result<Option<T>> {
+    if path.exists() {
+        with_store(path, read).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+fn capabilities(source: &Source, source_name: String) -> napi::Result<String> {
+    let evidence_kinds = declared_evidence_kinds(source.as_str());
+    let missing = missing_evidence_kinds(source.as_str());
+    serialize(&SourceCapabilities {
+        hydration_contract_version: SESSION_HYDRATION_CONTRACT_VERSION,
+        relationship_contract_version: SESSION_RELATIONSHIP_CONTRACT_VERSION,
+        source: source_name,
+        evidence_kinds: evidence_kinds
+            .iter()
+            .map(|kind| kind.as_str().to_string())
+            .collect(),
+        full_coverage: missing.is_empty(),
+        missing_evidence_kinds: missing
+            .iter()
+            .map(|kind| kind.as_str().to_string())
+            .collect(),
+        relationships: relationship_capabilities(source.as_str()).into(),
+    })
+}
+
+fn markers(mut args: CallArgs, source: &Source, source_name: String) -> napi::Result<String> {
+    let session_id = required_session_id(&mut args)?;
+    let limit = validate_limit(args.limit, DEFAULT_EVENT_LIMIT, 1_000)?;
+    let after = evidence_cursor(args.after);
+    let page = read_existing(db_path(args.db_path), |store| {
+        session_markers_page(
+            &read_conn(store)?,
+            source.as_str(),
+            &session_id,
+            limit,
+            after.as_ref(),
+        )
+        .map_err(query)
+    })?
+    .unwrap_or_else(|| ai_hist::SessionMarkerPage {
+        markers: Vec::new(),
+        next_cursor: None,
+    });
+    serialize(&SessionMarkersPage {
+        contract_version: SESSION_EVIDENCE_CONTRACT_VERSION,
+        source: source_name,
+        session_id,
+        markers: page
+            .markers
+            .into_iter()
+            .map(NativeSessionMarker::from)
+            .collect(),
+        next_cursor: page.next_cursor.map(crate::evidence_cursor),
+    })
+}
+
+fn requests(mut args: CallArgs, source: &Source, source_name: String) -> napi::Result<String> {
+    let session_id = required_session_id(&mut args)?;
+    let limit = validate_limit(args.limit, DEFAULT_EVENT_LIMIT, 1_000)?;
+    let after = args
+        .after
+        .map(|cursor| cursor.dated(OP_REQUESTS))
+        .transpose()?
+        .map(|(ts_ms, id)| SessionRequestCursor { ts_ms, id });
+    let page = read_existing(db_path(args.db_path), |store| {
+        session_requests_page(
+            &read_conn(store)?,
+            source.as_str(),
+            &session_id,
+            limit,
+            after.as_ref(),
+        )
+        .map_err(query)
+    })?
+    .unwrap_or_else(|| ai_hist::SessionRequestPage {
+        requests: Vec::new(),
+        next_cursor: None,
+    });
+    serialize(&SessionRequestsPage {
+        contract_version: SESSION_USAGE_CONTRACT_VERSION,
+        source: source_name,
+        session_id,
+        requests: page
+            .requests
+            .into_iter()
+            .map(NativeSessionRequest::from)
+            .collect(),
+        next_cursor: page.next_cursor.map(|cursor| RequestCursor {
+            ts_ms: cursor.ts_ms,
+            id: cursor.id,
+        }),
+    })
+}
+
+fn usage_summary(mut args: CallArgs, source: &Source, source_name: String) -> napi::Result<String> {
+    let session_id = required_session_id(&mut args)?;
+    let summary = read_existing(db_path(args.db_path), |store| {
+        session_usage_summary(&read_conn(store)?, source.as_str(), &session_id).map_err(query)
+    })?
+    .flatten();
+    serialize(&session_usage(source_name, session_id, summary))
+}
+
+fn user_turns(mut args: CallArgs, source: &Source, source_name: String) -> napi::Result<String> {
+    let session_id = required_session_id(&mut args)?;
+    let limit = validate_limit(args.limit, DEFAULT_EVENT_LIMIT, 1_000)?;
+    let after = args
+        .after
+        .map(|cursor| cursor.dated(OP_USER_TURNS))
+        .transpose()?
+        .map(|(ts_ms, id)| SessionEventCursor { ts_ms, id });
+    let page = read_existing(db_path(args.db_path), |store| {
+        session_user_turns_page(
+            &read_conn(store)?,
+            source.as_str(),
+            &session_id,
+            limit,
+            after.as_ref(),
+        )
+        .map_err(query)
+    })?
+    .unwrap_or_else(|| ai_hist::SessionUserTurnPage {
+        user_turns: Vec::new(),
+        next_cursor: None,
+    });
+    serialize(&SessionUserTurnsPage {
+        contract_version: SESSION_EVIDENCE_CONTRACT_VERSION,
+        source: source_name,
+        session_id,
+        user_turns: page
+            .user_turns
+            .into_iter()
+            .map(NativeSessionUserTurn::from)
+            .collect(),
+        next_cursor: page.next_cursor.map(|cursor| EventCursor {
+            ts_ms: cursor.ts_ms,
+            id: cursor.id,
+        }),
+    })
 }
 
 /// One JSON request against the `SessionStore` facade.

@@ -149,31 +149,12 @@ pub(crate) fn ingest_transcript_at_with_roots(
     expected_session: Option<&str>,
     include_related: bool,
 ) -> Result<TranscriptIngest> {
-    match fs::metadata(transcript) {
-        Ok(metadata) if metadata.is_file() => {}
-        // A path that resolves to something other than a regular file is the
-        // same non-event as a missing one: there is nothing to read, and a
-        // hook must not fail the tool call that produced it.
-        Ok(_) => {
-            return Ok(TranscriptIngest::short(
-                source,
-                transcript,
-                TranscriptStatus::Missing,
-            ))
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(TranscriptIngest::short(
-                source,
-                transcript,
-                TranscriptStatus::Missing,
-            ))
-        }
-        // Anything else — a permission error, an I/O failure — is a real
-        // condition the caller should be able to see, even if it chooses to
-        // swallow it.
-        Err(error) => {
-            return Err(error).with_context(|| format!("reading {}", transcript.display()))
-        }
+    if !transcript_is_present(transcript)? {
+        return Ok(TranscriptIngest::short(
+            source,
+            transcript,
+            TranscriptStatus::Missing,
+        ));
     }
     let providers = shallow_providers();
     let provider = providers
@@ -182,66 +163,25 @@ pub(crate) fn ingest_transcript_at_with_roots(
         .find(|provider| provider.source() == source)
         .with_context(|| format!("INVALID_ARGUMENT: no local adapter for source '{source}'"))?;
 
-    // The payload comes from another process. Claude binds validation to the
-    // already-opened handle before reading it, closing the path-replacement
-    // window between a canonical-path check and a later open. Providers that
-    // do not use the snapshot path keep the ordinary pre-read validation.
-    let claude_snapshot = if source == "claude" {
-        Some(ClaudeTranscriptSnapshot::open_checked(
-            transcript,
-            |opened| {
-                validate_provider_path(source, transcript, roots)?;
-                validate_opened_file_identity(transcript, opened)
-            },
-        )?)
-    } else {
-        validate_provider_path(source, transcript, roots)?;
-        None
-    };
+    let claude_snapshot = open_validated_transcript(source, transcript, roots)?;
     let claude_sidecar = claude_snapshot
         .as_ref()
         .is_some_and(ClaudeTranscriptSnapshot::is_subagent);
-    let candidate = if let Some(snapshot) = claude_snapshot.as_ref() {
-        Candidate {
-            source: provider.source(),
-            locator: transcript.to_string_lossy().into_owned(),
-            // The complete immutable snapshot has already established this
-            // identity. Supplying it on the candidate prevents discovery from
-            // accepting a same-stamp row previously cached for this locator
-            // under Claude's filename fallback.
-            session_id: (!claude_sidecar).then(|| snapshot.session_id()).flatten(),
-            recency_hint_ms: snapshot.modified_ms,
-            stamp: snapshot.stamp.clone(),
+    let candidate = match claude_snapshot.as_ref() {
+        Some(snapshot) => {
+            snapshot_candidate(provider.source(), transcript, snapshot, claude_sidecar)
         }
-    } else {
-        candidate_for(provider.source(), transcript)?
+        None => candidate_for(provider.source(), transcript)?,
     };
-    let mut preloaded = if claude_sidecar {
+    let preloaded = match claude_snapshot.as_ref() {
         // Feed the full-snapshot classification through discovery rather than
         // returning early: discovery records this exact stamp as a known
         // non-session, so the next sweep cannot resurrect the sidecar through
         // a bounded filename fallback.
-        Some(None)
-    } else {
-        claude_snapshot
-            .as_ref()
-            .map(|snapshot| {
-                crate::discover::claude_shallow_session_from_bytes(
-                    &candidate,
-                    snapshot.text.as_bytes(),
-                )
-            })
-            .transpose()?
+        _ if claude_sidecar => Some(None),
+        Some(snapshot) => Some(snapshot_shallow_session(&candidate, snapshot)?),
+        None => None,
     };
-    if let (Some(Some(session)), Some(snapshot)) = (&mut preloaded, claude_snapshot.as_ref()) {
-        if let Some(session_id) = snapshot.session_id() {
-            // Shallow discovery intentionally examines bounded head/tail
-            // bytes. A hook has already captured and validated the complete
-            // snapshot, so keep its authoritative identity if an unusually
-            // sparse transcript records it only in the middle.
-            session.session_id = session_id;
-        }
-    }
     let single = SingleCandidate {
         inner: provider,
         candidate,
@@ -361,6 +301,87 @@ pub(crate) fn ingest_transcript_at_with_roots(
         status,
         hydration: Some(hydration),
     })
+}
+
+/// Whether the hook's transcript is a regular file there is something to
+/// read in.
+fn transcript_is_present(transcript: &Path) -> Result<bool> {
+    match fs::metadata(transcript) {
+        Ok(metadata) => Ok(metadata.is_file()),
+        // A path that resolves to something other than a regular file is the
+        // same non-event as a missing one: there is nothing to read, and a
+        // hook must not fail the tool call that produced it.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        // Anything else — a permission error, an I/O failure — is a real
+        // condition the caller should be able to see, even if it chooses to
+        // swallow it.
+        Err(error) => Err(error).with_context(|| format!("reading {}", transcript.display())),
+    }
+}
+
+/// Validate the hook's transcript path, returning the complete snapshot for
+/// Claude.
+///
+/// The payload comes from another process. Claude binds validation to the
+/// already-opened handle before reading it, closing the path-replacement
+/// window between a canonical-path check and a later open. Providers that
+/// do not use the snapshot path keep the ordinary pre-read validation.
+fn open_validated_transcript(
+    source: &str,
+    transcript: &Path,
+    roots: &crate::ProviderRoots,
+) -> Result<Option<ClaudeTranscriptSnapshot>> {
+    if source != "claude" {
+        validate_provider_path(source, transcript, roots)?;
+        return Ok(None);
+    }
+    Ok(Some(ClaudeTranscriptSnapshot::open_checked(
+        transcript,
+        |opened| {
+            validate_provider_path(source, transcript, roots)?;
+            validate_opened_file_identity(transcript, opened)
+        },
+    )?))
+}
+
+/// The discovery candidate a complete Claude snapshot stands for.
+fn snapshot_candidate(
+    source: &'static str,
+    transcript: &Path,
+    snapshot: &ClaudeTranscriptSnapshot,
+    sidecar: bool,
+) -> Candidate {
+    Candidate {
+        source,
+        locator: transcript.to_string_lossy().into_owned(),
+        // The complete immutable snapshot has already established this
+        // identity. Supplying it on the candidate prevents discovery from
+        // accepting a same-stamp row previously cached for this locator
+        // under Claude's filename fallback.
+        session_id: (!sidecar).then(|| snapshot.session_id()).flatten(),
+        recency_hint_ms: snapshot.modified_ms,
+        stamp: snapshot.stamp.clone(),
+    }
+}
+
+/// The shallow session read from a complete Claude snapshot, carrying the
+/// snapshot's own identity.
+fn snapshot_shallow_session(
+    candidate: &Candidate,
+    snapshot: &ClaudeTranscriptSnapshot,
+) -> Result<Option<ShallowSession>> {
+    let mut session =
+        crate::discover::claude_shallow_session_from_bytes(candidate, snapshot.text.as_bytes())?;
+    if let Some(session) = &mut session {
+        if let Some(session_id) = snapshot.session_id() {
+            // Shallow discovery intentionally examines bounded head/tail
+            // bytes. A hook has already captured and validated the complete
+            // snapshot, so keep its authoritative identity if an unusually
+            // sparse transcript records it only in the middle.
+            session.session_id = session_id;
+        }
+    }
+    Ok(session)
 }
 
 /// Remove the shallow filename fallback once a full Claude snapshot proves a
