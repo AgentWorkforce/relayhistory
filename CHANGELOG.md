@@ -4,13 +4,23 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased - Patch]
+## [Unreleased - Minor]
+
+### Added
+
+- Text-bearing OpenCode `reasoning` parts are thinking blocks and an encrypted-only one is an `encrypted_reasoning` marker; synthetic user text (harness-written context such as an `@file` read) is captured as a user text block with `control_kind = "synthetic"`, never as a prompt.
 
 ### Fixed
 
 - A Claude transcript made only of `isSidechain` rows (inline Task traffic from older Claude Code) is now catalogued as its own session, with its sidechain turns' usage in `SessionEvidence::requests`; only an `agent-*.jsonl` file is read as a subagent sidecar, and the first `sync` after upgrading catalogs transcripts an earlier build dropped.
+- Every OpenCode assistant message is a `Message` and a request in `SessionStore::session`, with its `tokens` verbatim as `raw_usage`, model, provider and stop reason, including messages made only of `step-start` / `step-finish` / `reasoning` parts; their usage was previously missing from the store in both the `opencode.db` and legacy `storage/` layouts.
+- An OpenCode message's stop reason is its final `step-finish` reason, else the message's own `finish`; a reasonless final step no longer reports an earlier step's reason.
 - `sync` no longer rewrites the full-text index entry of a row it re-reads unchanged: a sweep that re-reads the OpenCode store, or re-parses a transcript, re-indexes only rows whose text, role or project changed, so walking syncs write less and stop fragmenting the full-text index searches read. Fragmentation an existing store already has stays until FTS5's own merges or `ai-hist compact` (which runs `optimize`) consolidate it.
 - Writing a marker reuses its prepared statement instead of compiling it, and the change-feed triggers it fires, once per marker: cold sync and hydration of marker-heavy transcripts are ~10% faster.
+
+### Rust API
+
+- Added `ControlKind::Synthetic` (`"synthetic"`); `SESSION_EVIDENCE_CONTRACT_VERSION` is 4 in Rust and TypeScript, so an SDK without the value rejects an addon that can return it.
 
 ## [0.36.0] - 2026-10-07
 

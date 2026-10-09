@@ -116,7 +116,13 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 3;
 ///
 /// Version 15 recovers Codex desktop assistant response items from unchanged
 /// captures that previous parsers skipped.
-const HYDRATION_PARSER_VERSION: i64 = 15;
+///
+/// Version 16 makes every OpenCode assistant message evidence: one with only
+/// `step-start` / `step-finish` / `reasoning` parts gains its message and
+/// request, reasoning text becomes thinking, and synthetic user text becomes a
+/// `synthetic` control row. Plain `sync` re-normalizes every OpenCode session
+/// already; this re-parses a session an embedder only hydrates.
+const HYDRATION_PARSER_VERSION: i64 = 16;
 
 #[derive(Debug, Clone)]
 pub struct HydrateSessionOptions {

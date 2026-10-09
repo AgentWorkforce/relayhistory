@@ -64,6 +64,7 @@ pub ai_hist::ControlKind::ResumeMarker
 pub ai_hist::ControlKind::SlashCommandCaveat
 pub ai_hist::ControlKind::SlashCommandInvocation
 pub ai_hist::ControlKind::SlashCommandOutput
+pub ai_hist::ControlKind::Synthetic
 pub ai_hist::ControlKind::SystemReminder
 pub ai_hist::ControlKind::TaskNotification
 impl ai_hist::ControlKind

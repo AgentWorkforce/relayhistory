@@ -100,6 +100,7 @@ harness writes into the user role that is not a human prompt keeps
 | `codex_context_wrapper`    | codex  | `<environment_context>`, `<permissions instructions>`, `# AGENTS.md`, …                    |
 | `meta`                     | claude | `isMeta: true` and nothing above applies                                                   |
 | `resume_marker`            | claude | a bare `/resume <id>` or `/continue <id>`                                                  |
+| `synthetic`                | opencode | a user `text` part flagged `synthetic: true` (harness-written context, e.g. an `@file` read) |
 
 A `control_kind` is only ever set on a `role = "user"`, `kind = "text"` row,
 and only to one of the spellings above; the source-evidence validation a
