@@ -14,6 +14,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - Hydrating a session with related sessions after a parser upgrade re-reads its Codex child rollouts and Claude subagent sidecars from the start instead of resuming from cursors the older parser committed.
+- Writing a marker reuses its prepared statement instead of compiling it, and the change-feed triggers it fires, once per marker: hydrating an 8 MB Codex rollout is ~20% faster.
 
 ## [0.36.0] - 2026-10-07
 
