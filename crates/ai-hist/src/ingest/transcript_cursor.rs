@@ -184,6 +184,12 @@ pub(crate) struct ClaudeCursorState {
     /// as long as the transcript keeps an unterminated tail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_tool_results: Option<super::tool_result_facts::ToolResultIndexer>,
+    /// The hydration parser generation whose record walk committed this
+    /// position; 0 for one an earlier build committed. A position another
+    /// generation committed skips records the current parser stores, so
+    /// hydration restarts such a sidecar's record walk from byte zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub records_parser: i64,
     /// The metadata walk's position and fold over the same file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan: Option<ClaudeScanState>,
@@ -2345,4 +2351,8 @@ mod tests {
         assert!(stored.settled.is_none());
         assert_eq!(stored.file.unwrap().unchanged_since_ms, 12_345);
     }
+}
+
+fn is_zero(value: &i64) -> bool {
+    *value == 0
 }

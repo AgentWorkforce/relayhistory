@@ -136,7 +136,7 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 3;
 ///   child's model comes from its own records when its `agent-*.meta.json`
 ///   names none, and a spawn result carries the record's
 ///   `toolUseResult.agentId` (sync's `claude_delegation_capture_v1`).
-const HYDRATION_PARSER_VERSION: i64 = 16;
+pub(crate) const HYDRATION_PARSER_VERSION: i64 = 16;
 
 #[derive(Debug, Clone)]
 pub struct HydrateSessionOptions {
@@ -2812,36 +2812,48 @@ fn ingest_claude(
     // does not drag the parent transcript through a re-parse. A parser
     // upgrade re-reads each sidecar from byte zero like the parent: a cursor
     // the older parser committed would skip the records the new one stores.
+    // The sidecar's own cursor says which generation committed it, so a
+    // sidecar a root-only hydration left unread after the upgrade restarts
+    // too, on whichever later pass reaches it.
     for evidence in subagents {
         super::check_capture_cancelled()?;
-        if parser_upgrade {
-            restart_claude_sidecar_record_walk(conn, &evidence.path)?;
-        }
+        restart_stale_claude_sidecar_record_walk(conn, &evidence.path, parser_upgrade)?;
         outcome.absorb_outcome(ingest_claude_subagent(conn, &options.session_id, evidence)?);
     }
     Ok(outcome)
 }
 
-/// Send a sidecar's next record walk back to byte zero. The metadata walk's
-/// position stays: it is generation-independent, and the snapshot this
-/// hydration took has already advanced it.
-fn restart_claude_sidecar_record_walk(conn: &Connection, path: &Path) -> Result<()> {
+/// Send a sidecar's next record walk back to byte zero when another parser
+/// generation committed its position (or `parser_upgrade` says the parent's
+/// did). The metadata walk's position stays: it is generation-independent,
+/// and the snapshot this hydration took has already advanced it. Every other
+/// part of the stored document is kept as it was.
+fn restart_stale_claude_sidecar_record_walk(
+    conn: &Connection,
+    path: &Path,
+    parser_upgrade: bool,
+) -> Result<()> {
     let locator = path.to_string_lossy();
     let key = CursorKey::Locator {
         source: "claude",
         locator: &locator,
     };
-    let stored = load_cursor(conn, &key)?;
-    let restarted = TranscriptCursorState {
-        claude: stored.claude.map(
+    let mut cursor = load_cursor(conn, &key)?;
+    let committed_by = cursor.claude.as_ref().map(|claude| claude.records_parser);
+    let stale = committed_by.is_some_and(|generation| generation != HYDRATION_PARSER_VERSION);
+    if !parser_upgrade && !stale {
+        return Ok(());
+    }
+    cursor.file = None;
+    cursor.settled = None;
+    cursor.claude =
+        cursor.claude.map(
             |claude| crate::ingest::transcript_cursor::ClaudeCursorState {
                 scan: claude.scan,
                 ..Default::default()
             },
-        ),
-        ..Default::default()
-    };
-    store_cursor(conn, &key, &restarted)
+        );
+    store_cursor(conn, &key, &cursor)
 }
 
 /// Index one Claude subagent transcript and record what established it.
@@ -9922,6 +9934,81 @@ mod tests {
             .unwrap();
         }
         drop(conn);
+
+        hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        assert_eq!(
+            session_event_snapshot(&db, "child-1")
+                .iter()
+                .map(|row| row.0.clone())
+                .collect::<Vec<_>>(),
+            vec!["s1:0".to_string()],
+            "the sidecar was re-read from byte zero, not resumed from its cursor"
+        );
+    }
+
+    /// A root-only hydration after an upgrade stamps the session's checkpoint
+    /// with the current parser without visiting its sidecars. The sidecar's
+    /// own cursor still names the generation that committed it, so the later
+    /// hydration that reaches the sidecar re-reads it from byte zero.
+    #[test]
+    fn a_sidecar_a_root_only_hydration_skipped_is_re_read_after_an_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "session-sidecar";
+        let transcript = seed_claude_transcript(
+            dir.path(),
+            session_id,
+            b"{\"sessionId\":\"session-sidecar\",\"uuid\":\"u1\",\"cwd\":\"/work/app\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"parent prompt\"},\"timestamp\":\"2026-08-31T10:00:00Z\"}\n",
+        );
+        let sidecar = transcript.parent().unwrap().join("agent-child.jsonl");
+        fs::write(
+            &sidecar,
+            "{\"sessionId\":\"session-sidecar\",\"agentId\":\"child-1\",\"isSidechain\":true,\"uuid\":\"s1\",\"cwd\":\"/work/app\",\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"first\"},\"timestamp\":\"2026-08-31T10:00:01Z\"}\n",
+        )
+        .unwrap();
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", session_id, Some(&transcript));
+        drop(conn);
+        hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        assert_eq!(session_event_snapshot(&db, "child-1").len(), 1);
+
+        // Stand in for the older generation: its parser stored none of the
+        // child's rows, its checkpoints name its own version, and its sidecar
+        // cursor carries no generation.
+        let conn = open_db(&db).unwrap();
+        conn.execute(
+            "DELETE FROM session_events WHERE source = 'claude' AND session_id = 'child-1'",
+            [],
+        )
+        .unwrap();
+        for table in [
+            "session_hydration_checkpoints",
+            "observation_hydration_checkpoints",
+        ] {
+            conn.execute(
+                &format!("UPDATE {table} SET parser_version = ? WHERE source = 'claude'"),
+                params![HYDRATION_PARSER_VERSION - 1],
+            )
+            .unwrap();
+        }
+        let locator = sidecar.to_string_lossy().to_string();
+        let key = CursorKey::Locator {
+            source: "claude",
+            locator: &locator,
+        };
+        let mut cursor = load_cursor(&conn, &key).unwrap();
+        cursor
+            .claude
+            .as_mut()
+            .expect("a sidecar cursor")
+            .records_parser = 0;
+        store_cursor(&conn, &key, &cursor).unwrap();
+        drop(conn);
+
+        let mut root_only = options("claude", session_id);
+        root_only.include_related = false;
+        hydrate_session_at_with_home(&db, &root_only, dir.path()).unwrap();
+        assert!(session_event_snapshot(&db, "child-1").is_empty());
 
         hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
         assert_eq!(

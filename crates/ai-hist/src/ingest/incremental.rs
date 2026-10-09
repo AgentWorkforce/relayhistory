@@ -525,6 +525,10 @@ pub(crate) fn ingest_claude_transcript_at_locator_batched(
         &mut cursor,
         between_records,
     )?;
+    cursor
+        .claude
+        .get_or_insert_with(Default::default)
+        .records_parser = super::hydrate::HYDRATION_PARSER_VERSION;
     store_cursor(conn, &key, &cursor)?;
     Ok(pass)
 }
