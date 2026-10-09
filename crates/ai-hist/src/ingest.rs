@@ -866,12 +866,16 @@ struct SessionHoldings {
 
 impl SessionHoldings {
     fn covers(&self, stored: &Self) -> bool {
+        self.covers_evidence(stored) && self.catalog >= stored.catalog
+    }
+
+    /// [`Self::covers`] for everything but the catalog row.
+    fn covers_evidence(&self, stored: &Self) -> bool {
         self.events >= stored.events
             && self.tool_calls >= stored.tool_calls
             && self.file_edits >= stored.file_edits
             && self.history >= stored.history
             && self.markers >= stored.markers
-            && self.catalog >= stored.catalog
     }
 }
 
@@ -1281,11 +1285,6 @@ fn sessions_written_since(
     // and reading every one of its rows to name sessions would cost what the
     // full count does.
     let rows_limit = i64::try_from(DESTINATION_RECOUNT_ROW_LIMIT + 1).unwrap_or(i64::MAX);
-    let note = |touched: &mut HashSet<(String, String)>, read: &mut usize, session| {
-        *read += 1;
-        touched.insert(session);
-        *read <= DESTINATION_RECOUNT_ROW_LIMIT && touched.len() <= DESTINATION_RECOUNT_LIMIT
-    };
     // A replayable prompt deleted or changed in place sends the end of the
     // sweep back to a full count; a new one is recounted like any row (see
     // `PromptBaseline`). Prompts of other sources are not counted.
@@ -1298,39 +1297,12 @@ fn sessions_written_since(
     if prompt_removed {
         return Ok(None);
     }
-    {
-        let mut statement = conn.prepare_cached(
-            "SELECT id, source, session_id FROM history WHERE revision > ?1 \
-             AND +source IN (SELECT value FROM json_each(?2)) LIMIT ?3",
-        )?;
-        let mut rows = statement.query(params![revision, history_sources.clone(), rows_limit])?;
-        let mut read = 0usize;
-        let mut appended = false;
-        while let Some(row) = rows.next()? {
-            // Every row counts toward the limit, sessionless ones too: past
-            // it the scan stops and cannot vouch for what it did not read.
-            read += 1;
-            if read > DESTINATION_RECOUNT_ROW_LIMIT {
-                return Ok(None);
-            }
-            let id: i64 = row.get(0)?;
-            if id <= prompts.max_id {
-                return Ok(None);
-            }
-            appended = true;
-            let Some(session_id) = row.get::<_, Option<String>>(2)? else {
-                continue;
-            };
-            touched.insert((row.get(1)?, session_id));
-            if touched.len() > DESTINATION_RECOUNT_LIMIT {
-                return Ok(None);
-            }
-        }
-        // A new prompt may be an old one deleted and inserted again under
-        // another session, which leaves no tombstone behind.
-        if appended && !prompts.intact(conn)? {
-            return Ok(None);
-        }
+    let window = RevisionWindow {
+        revision,
+        rows_limit,
+    };
+    if !window.note_prompts(conn, &history_sources, prompts, &mut touched)? {
+        return Ok(None);
     }
     for (table, kind) in SESSION_KEYED_HOLDINGS {
         // Markers are counted for the replayable sources only, and a busy
@@ -1344,17 +1316,88 @@ fn sessions_written_since(
             &rows_written_since_sql(table),
             &rows_removed_since_sql(kind),
         ] {
-            let mut statement = conn.prepare_cached(sql)?;
-            let mut rows = statement.query(params![revision, counted.clone(), rows_limit])?;
-            let mut read = 0usize;
-            while let Some(row) = rows.next()? {
-                if !note(&mut touched, &mut read, (row.get(0)?, row.get(1)?)) {
-                    return Ok(None);
-                }
+            if !window.note_sessions(conn, sql, counted, &mut touched)? {
+                return Ok(None);
             }
         }
     }
     Ok(Some(touched))
+}
+
+/// The rows [`sessions_written_since`] reads: those stamped above `revision`,
+/// at most `rows_limit` of them per query.
+struct RevisionWindow {
+    revision: i64,
+    rows_limit: i64,
+}
+
+impl RevisionWindow {
+    /// Notes the session of every replayable prompt appended in the window;
+    /// `false` when the window cannot be told exactly or names too much.
+    fn note_prompts(
+        &self,
+        conn: &Connection,
+        history_sources: &rusqlite::types::Value,
+        prompts: &PromptBaseline,
+        touched: &mut HashSet<(String, String)>,
+    ) -> Result<bool> {
+        let mut statement = conn.prepare_cached(
+            "SELECT id, source, session_id FROM history WHERE revision > ?1 \
+             AND +source IN (SELECT value FROM json_each(?2)) LIMIT ?3",
+        )?;
+        let mut rows = statement.query(params![
+            self.revision,
+            history_sources.clone(),
+            self.rows_limit
+        ])?;
+        let mut read = 0usize;
+        let mut appended = false;
+        while let Some(row) = rows.next()? {
+            // Every row counts toward the limit, sessionless ones too: past
+            // it the scan stops and cannot vouch for what it did not read.
+            read += 1;
+            if read > DESTINATION_RECOUNT_ROW_LIMIT {
+                return Ok(false);
+            }
+            let id: i64 = row.get(0)?;
+            if id <= prompts.max_id {
+                return Ok(false);
+            }
+            appended = true;
+            let Some(session_id) = row.get::<_, Option<String>>(2)? else {
+                continue;
+            };
+            touched.insert((row.get(1)?, session_id));
+            if touched.len() > DESTINATION_RECOUNT_LIMIT {
+                return Ok(false);
+            }
+        }
+        // A new prompt may be an old one deleted and inserted again under
+        // another session, which leaves no tombstone behind.
+        Ok(!appended || prompts.intact(conn)?)
+    }
+
+    /// Notes every `(source, session_id)` row `sql` reads in the window;
+    /// `false` once it reads past the row or session limit.
+    fn note_sessions(
+        &self,
+        conn: &Connection,
+        sql: &str,
+        counted: &rusqlite::types::Value,
+        touched: &mut HashSet<(String, String)>,
+    ) -> Result<bool> {
+        let mut statement = conn.prepare_cached(sql)?;
+        let mut rows = statement.query(params![self.revision, counted.clone(), self.rows_limit])?;
+        let mut read = 0usize;
+        while let Some(row) = rows.next()? {
+            read += 1;
+            touched.insert((row.get(0)?, row.get(1)?));
+            if read > DESTINATION_RECOUNT_ROW_LIMIT || touched.len() > DESTINATION_RECOUNT_LIMIT {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
 }
 
 /// The `(source, session_id)` of every row of `table` stamped above `?1`.
@@ -1625,20 +1668,7 @@ fn destination_shortfall_in(
     // session whose catalog row and events are both gone has no row left to be
     // found by. Catalog, event, history and marker groups collect the names
     // while counting holdings, avoiding another walk of those same tables.
-    let mut muse_children = HashSet::new();
-    // A Muse subagent has no catalog row of its own, so once every event of
-    // it is gone neither table above can name it; the edge its parent's log
-    // recorded still does, and naming it is what sends the parent back to
-    // re-read the tree.
-    let mut statement = conn.prepare(
-        "SELECT source, child_session_id FROM session_relationships \
-         WHERE source = 'muse' AND evidence_kind = 'muse_subagent_log' \
-           AND child_session_id IS NOT NULL",
-    )?;
-    let mut rows = statement.query([])?;
-    while let Some(row) = rows.next()? {
-        muse_children.insert((row.get::<_, String>(0)?, row.get::<_, String>(1)?));
-    }
+    let muse_children = muse_subagent_children(conn)?;
     let named: HashSet<(String, String)> = match &current.named {
         Some(named) => named.union(&muse_children).cloned().collect(),
         // Read from the stored marker: every session it did not recount still
@@ -1666,30 +1696,52 @@ fn destination_shortfall_in(
         // the ordinary catalog guard.
         let expected_subagent_deregistration = before.catalog > 0
             && current.catalog == 0
-            && match source.as_str() {
-                "codex" => {
-                    codex_delegation_recorded(conn, &session_id)?
-                        && !codex_session_has_remote_presence(conn, &session_id)?
-                }
-                // A Muse subagent is deregistered the same way once its log
-                // is linked to its parent.
-                "muse" => {
-                    muse_delegation_recorded(conn, &session_id)?
-                        && !session_has_remote_presence(conn, "muse", &session_id)?
-                }
-                _ => false,
-            };
-        let covered = current.events >= before.events
-            && current.tool_calls >= before.tool_calls
-            && current.file_edits >= before.file_edits
-            && current.history >= before.history
-            && current.markers >= before.markers
+            && subagent_deregistered(conn, &source, &session_id)?;
+        let covered = current.covers_evidence(before)
             && (current.catalog >= before.catalog || expected_subagent_deregistration);
         if !covered {
             repairs.sessions.insert((source, session_id));
         }
     }
     Ok(repairs)
+}
+
+/// Every Muse subagent a parent's log recorded.
+///
+/// A Muse subagent has no catalog row of its own, so once every event of it is
+/// gone neither the catalog nor the event groups can name it; the edge its
+/// parent's log recorded still does, and naming it is what sends the parent
+/// back to re-read the tree.
+fn muse_subagent_children(conn: &Connection) -> Result<HashSet<(String, String)>> {
+    let mut muse_children = HashSet::new();
+    let mut statement = conn.prepare(
+        "SELECT source, child_session_id FROM session_relationships \
+         WHERE source = 'muse' AND evidence_kind = 'muse_subagent_log' \
+           AND child_session_id IS NOT NULL",
+    )?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        muse_children.insert((row.get::<_, String>(0)?, row.get::<_, String>(1)?));
+    }
+    Ok(muse_children)
+}
+
+/// Whether a local-only subagent's catalog row was removed because its
+/// parent's evidence proves the delegation.
+fn subagent_deregistered(conn: &Connection, source: &str, session_id: &str) -> Result<bool> {
+    Ok(match source {
+        "codex" => {
+            codex_delegation_recorded(conn, session_id)?
+                && !codex_session_has_remote_presence(conn, session_id)?
+        }
+        // A Muse subagent is deregistered the same way once its log
+        // is linked to its parent.
+        "muse" => {
+            muse_delegation_recorded(conn, session_id)?
+                && !session_has_remote_presence(conn, "muse", session_id)?
+        }
+        _ => false,
+    })
 }
 
 /// The sources a sweep reads that discovery never enumerates.
@@ -3565,46 +3617,68 @@ fn fold_sync_state(
         if key == FORGOTTEN_PATHS_KEY {
             continue;
         }
-        // A stamp map is merged entry by entry in place: the same result as
-        // `merge_object_values`, without copying thousands of untouched
-        // stamps to change one.
-        let per_entry = match (merged.get(key), value) {
-            (Some(existing @ Value::Object(_)), Value::Object(_)) => {
-                key == CURSOR_SYNC_STATE_KEY
-                    || (!is_file_cursor(existing) && !is_file_cursor(value))
-            }
-            _ => false,
-        };
-        if let (true, Some(Value::Object(stamps)), Value::Object(theirs)) =
-            (per_entry, merged.get_mut(key), value)
-        {
-            for (entry, stamp) in theirs {
-                let next = match stamps.get(entry) {
-                    Some(saved) => merge_sync_value(saved, stamp),
-                    None => stamp.clone(),
-                };
-                if stamps.get(entry) != Some(&next) {
-                    stamps.insert(entry.clone(), next);
-                    changed = true;
-                }
-            }
-            continue;
-        }
-        let next = match merged.get(key) {
-            Some(existing) if key == CURSOR_SYNC_STATE_KEY => {
-                merge_file_cursor_map(existing, value)
-            }
-            Some(existing) => merge_sync_value(existing, value),
-            None => value.clone(),
-        };
-        if merged.get(key) == Some(&next) {
-            continue;
-        }
-        merged.insert(key.clone(), next);
+        changed |= fold_sync_key(merged, key, value);
+    }
+    changed |= sweep_retired_sync_keys(merged, ours);
+    changed |= forget_dropped_stamps(merged, ours);
+    // An instruction, not state: it must not survive into the file, and an
+    // older build that wrote one is cleaned up here.
+    if merged.remove(FORGOTTEN_PATHS_KEY).is_some() {
         changed = true;
     }
-    // Sweep after the fold, so a run concurrent with this one cannot resurrect a
-    // retired key, and only once this run actually carries the successor.
+    changed
+}
+
+/// Folds one delta key into `merged`; `true` when that changed it.
+fn fold_sync_key(merged: &mut Map<String, Value>, key: &str, value: &Value) -> bool {
+    // A stamp map is merged entry by entry in place: the same result as
+    // `merge_object_values`, without copying thousands of untouched
+    // stamps to change one.
+    let per_entry = match (merged.get(key), value) {
+        (Some(existing @ Value::Object(_)), Value::Object(_)) => {
+            key == CURSOR_SYNC_STATE_KEY || (!is_file_cursor(existing) && !is_file_cursor(value))
+        }
+        _ => false,
+    };
+    if let (true, Some(Value::Object(stamps)), Value::Object(theirs)) =
+        (per_entry, merged.get_mut(key), value)
+    {
+        return fold_stamp_entries(stamps, theirs);
+    }
+    let next = match merged.get(key) {
+        Some(existing) if key == CURSOR_SYNC_STATE_KEY => merge_file_cursor_map(existing, value),
+        Some(existing) => merge_sync_value(existing, value),
+        None => value.clone(),
+    };
+    if merged.get(key) == Some(&next) {
+        return false;
+    }
+    merged.insert(key.to_owned(), next);
+    true
+}
+
+/// Overlays `theirs` onto a stamp map entry by entry; `true` when any changed.
+fn fold_stamp_entries(stamps: &mut Map<String, Value>, theirs: &Map<String, Value>) -> bool {
+    let mut changed = false;
+    for (entry, stamp) in theirs {
+        let next = match stamps.get(entry) {
+            Some(saved) => merge_sync_value(saved, stamp),
+            None => stamp.clone(),
+        };
+        if stamps.get(entry) != Some(&next) {
+            stamps.insert(entry.clone(), next);
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Removes every retired key whose successor this run carries.
+///
+/// Swept after the fold, so a run concurrent with this one cannot resurrect a
+/// retired key, and only once this run actually carries the successor.
+fn sweep_retired_sync_keys(merged: &mut Map<String, Value>, ours: &Map<String, Value>) -> bool {
+    let mut changed = false;
     for (retired, superseded_by) in RETIRED_SYNC_STATE_KEYS {
         if !ours.contains_key(*superseded_by) {
             continue;
@@ -3613,29 +3687,32 @@ fn fold_sync_state(
             changed = true;
         }
     }
-    // The same idea one level down: entries this run deliberately dropped from
-    // a stamp map. The fold above cannot express a removal -- it only overlays
-    // the keys this run carries -- so they are applied here instead. A run
-    // concurrent with this one may have just re-stamped one of these paths
-    // because it could see the file; dropping its stamp costs that file one
-    // re-read and never loses a row, which is the safe direction.
-    if let Some(forgotten) = ours.get(FORGOTTEN_PATHS_KEY).and_then(Value::as_object) {
-        for (stamp_map_key, paths) in forgotten {
-            let Some(stamps) = merged.get_mut(stamp_map_key).and_then(Value::as_object_mut) else {
-                continue;
-            };
-            for path in paths.as_array().into_iter().flatten() {
-                let Some(path) = path.as_str() else { continue };
-                if stamps.remove(path).is_some() {
-                    changed = true;
-                }
+    changed
+}
+
+/// Removes the stamp-map entries this run deliberately dropped.
+///
+/// The same idea as [`sweep_retired_sync_keys`] one level down. The fold cannot
+/// express a removal -- it only overlays the keys this run carries -- so they
+/// are applied here instead. A run concurrent with this one may have just
+/// re-stamped one of these paths because it could see the file; dropping its
+/// stamp costs that file one re-read and never loses a row, which is the safe
+/// direction.
+fn forget_dropped_stamps(merged: &mut Map<String, Value>, ours: &Map<String, Value>) -> bool {
+    let Some(forgotten) = ours.get(FORGOTTEN_PATHS_KEY).and_then(Value::as_object) else {
+        return false;
+    };
+    let mut changed = false;
+    for (stamp_map_key, paths) in forgotten {
+        let Some(stamps) = merged.get_mut(stamp_map_key).and_then(Value::as_object_mut) else {
+            continue;
+        };
+        for path in paths.as_array().into_iter().flatten() {
+            let Some(path) = path.as_str() else { continue };
+            if stamps.remove(path).is_some() {
+                changed = true;
             }
         }
-    }
-    // An instruction, not state: it must not survive into the file, and an
-    // older build that wrote one is cleaned up here.
-    if merged.remove(FORGOTTEN_PATHS_KEY).is_some() {
-        changed = true;
     }
     changed
 }
@@ -4639,26 +4716,10 @@ fn sync_codex_sources(
     let mut consumed = offset;
     if offset < size {
         sync_note!("  [codex] syncing {} new bytes...", size - offset);
-        let mut line = String::new();
-        while let Some(position) = source.next_line(&mut line)? {
-            consumed = position;
-            if line.trim().is_empty() {
-                continue;
-            }
-            match parse_codex_line(&line) {
-                Ok(Some(mut entry)) => {
-                    if let Some(session_id) = entry.session_id.as_deref() {
-                        if entry.project.is_none() {
-                            entry.project = cwds.get(session_id).cloned();
-                        }
-                        touched.insert(session_id.to_string());
-                    }
-                    inserted += insert_history(conn, &entry)?;
-                }
-                Ok(None) => {}
-                Err(_) => errors += 1,
-            }
-        }
+        let read = ingest_codex_history_lines(conn, &mut source, &cwds, touched)?;
+        consumed = read.consumed;
+        inserted += read.inserted;
+        errors = read.errors;
     }
     // This also upgrades legacy numeric cursors at EOF. The actual committed
     // position may include complete lines appended after the initial stat.
@@ -4686,6 +4747,50 @@ fn sync_codex_sources(
         sync_note!("  [codex] {}", parts.join(", "));
     }
     Ok(inserted)
+}
+
+/// What one pass over the new lines of Codex's `history.jsonl` did.
+struct CodexHistoryRead {
+    /// The position after the last line read.
+    consumed: u64,
+    inserted: usize,
+    errors: usize,
+}
+
+/// Inserts every prompt in the unread tail of Codex's `history.jsonl`, naming
+/// a prompt's project from its session's rollout when the log does not.
+fn ingest_codex_history_lines(
+    conn: &Connection,
+    source: &mut CompleteJsonlReader,
+    cwds: &HashMap<String, String>,
+    touched: &mut HashSet<String>,
+) -> Result<CodexHistoryRead> {
+    let mut read = CodexHistoryRead {
+        consumed: source.position,
+        inserted: 0,
+        errors: 0,
+    };
+    let mut line = String::new();
+    while let Some(position) = source.next_line(&mut line)? {
+        read.consumed = position;
+        if line.trim().is_empty() {
+            continue;
+        }
+        match parse_codex_line(&line) {
+            Ok(Some(mut entry)) => {
+                if let Some(session_id) = entry.session_id.as_deref() {
+                    if entry.project.is_none() {
+                        entry.project = cwds.get(session_id).cloned();
+                    }
+                    touched.insert(session_id.to_string());
+                }
+                read.inserted += insert_history(conn, &entry)?;
+            }
+            Ok(None) => {}
+            Err(_) => read.errors += 1,
+        }
+    }
+    Ok(read)
 }
 
 /// One pass over every Codex rollout file: session metadata (cwd/branch maps
@@ -8855,29 +8960,7 @@ impl ClaudeMetaFold {
                 object,
             );
         }
-        if value
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .is_some_and(|id| !id.is_empty())
-        {
-            self.identified_records += 1;
-            if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
-                self.sidechain_records += 1;
-            }
-            // A transcript carries one conversation. Two different ids in one
-            // file means the file is not what it claims, and indexing it would
-            // attribute one session's records to another. Recorded rather than
-            // raised here, because a fold has no way to fail: the scan turns
-            // it into the error.
-            if let Some(record_session_id) = value.get("sessionId").and_then(Value::as_str) {
-                match self.session_id.as_deref() {
-                    Some(expected) if expected != record_session_id => {
-                        self.conflicting_session_ids = true;
-                    }
-                    _ => {}
-                }
-            }
-        }
+        self.observe_identity(value);
         if self.agent_id.is_none() {
             self.agent_id = value
                 .get("agentId")
@@ -8930,19 +9013,50 @@ impl ClaudeMetaFold {
                 .is_some_and(is_claude_synthetic_placeholder_model)
         {
             if let Some(content) = value.pointer("/message/content") {
-                if let Some(text) = content.as_str() {
-                    self.last_assistant_text = Some(text.chars().take(4096).collect());
-                } else if let Some(items) = content.as_array() {
-                    let parts = items
-                        .iter()
-                        .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
-                        .filter_map(|item| item.get("text").and_then(Value::as_str))
-                        .collect::<Vec<_>>();
-                    if !parts.is_empty() {
-                        self.last_assistant_text =
-                            Some(parts.join("\n").chars().take(4096).collect());
-                    }
-                }
+                self.observe_assistant_content(content);
+            }
+        }
+    }
+
+    /// Counts a record that names its session, and notes a second session id.
+    fn observe_identity(&mut self, value: &Value) {
+        let Some(record_session_id) = value
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
+            return;
+        };
+        self.identified_records += 1;
+        if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            self.sidechain_records += 1;
+        }
+        // A transcript carries one conversation. Two different ids in one
+        // file means the file is not what it claims, and indexing it would
+        // attribute one session's records to another. Recorded rather than
+        // raised here, because a fold has no way to fail: the scan turns
+        // it into the error.
+        if self
+            .session_id
+            .as_deref()
+            .is_some_and(|expected| expected != record_session_id)
+        {
+            self.conflicting_session_ids = true;
+        }
+    }
+
+    /// Keeps the text of a main-chain assistant message as the excerpt.
+    fn observe_assistant_content(&mut self, content: &Value) {
+        if let Some(text) = content.as_str() {
+            self.last_assistant_text = Some(text.chars().take(4096).collect());
+        } else if let Some(items) = content.as_array() {
+            let parts = items
+                .iter()
+                .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>();
+            if !parts.is_empty() {
+                self.last_assistant_text = Some(parts.join("\n").chars().take(4096).collect());
             }
         }
     }
@@ -9612,37 +9726,8 @@ fn heal_legacy_positional_rows(
     if legacy_ids.is_empty() || (facts.events.is_empty() && facts.tool_use_ids.is_empty()) {
         return Ok(());
     }
-    let placeholders = legacy_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let sql = format!(
-        "SELECT message_id, text, ts_ms, role, kind, model, token_json FROM session_events \
-         WHERE source = 'claude' AND session_id = ? AND message_id IN ({placeholders})"
-    );
-    let mut statement = conn.prepare(&sql)?;
-    let mut rows = statement.query(rusqlite::params_from_iter(
-        [session_id.to_string()]
-            .into_iter()
-            .chain(legacy_ids.iter().cloned()),
-    ))?;
-    // Group legacy events by message: a legacy message heals only on an
-    // exact full-record match. Matching one shared block would erase the
-    // message's changed siblings, which the content-hash model treats as a
-    // distinct retained predecessor.
-    type MessageContentKey = Vec<LegacyEventKey>;
-    let mut by_message: HashMap<String, MessageContentKey> = HashMap::new();
-    while let Some(row) = rows.next()? {
-        let message_id: String = row.get(0)?;
-        by_message.entry(message_id).or_default().push((
-            row.get(1)?,
-            row.get(2)?,
-            row.get(3)?,
-            row.get(4)?,
-            row.get(5)?,
-            row.get(6)?,
-        ));
-    }
-    drop(rows);
-    drop(statement);
-    let mut record_key: MessageContentKey = facts
+    let by_message = legacy_events_by_message(conn, session_id, legacy_ids)?;
+    let mut record_key: LegacyMessageKey = facts
         .events
         .iter()
         .map(|event| {
@@ -9657,22 +9742,7 @@ fn heal_legacy_positional_rows(
         })
         .collect();
     record_key.sort();
-    let mut heal_messages: HashSet<String> = HashSet::new();
-    if !record_key.is_empty() {
-        let mut full_matches = Vec::new();
-        for (message_id, mut key) in by_message {
-            key.sort();
-            if key == record_key {
-                full_matches.push(message_id);
-            }
-        }
-        // Unique or preserved: two legacy messages carrying the same record
-        // stay put rather than risk healing the wrong one.
-        if full_matches.len() == 1 {
-            heal_messages.insert(full_matches.pop().unwrap());
-        }
-    }
-    for message_id in &heal_messages {
+    if let Some(message_id) = sole_full_match(by_message, &record_key) {
         crate::store::retire_evidence_share(
             conn,
             "session_events",
@@ -9687,28 +9757,101 @@ fn heal_legacy_positional_rows(
     // predecessor, so they stay unless the full-record match above heals
     // their message.
     if !facts.tool_use_ids.is_empty() {
-        let id_placeholders = facts
-            .tool_use_ids
-            .iter()
-            .map(|_| "?")
-            .collect::<Vec<_>>()
-            .join(",");
-        let msg_placeholders = legacy_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        for table in ["tool_calls", "file_edits"] {
-            let sql = format!(
-                "DELETE FROM {table} WHERE source = 'claude' AND session_id = ? \
-                 AND message_id IN ({msg_placeholders}) AND tool_use_id IN ({id_placeholders})"
-            );
-            conn.execute(
-                &sql,
-                rusqlite::params_from_iter(
-                    [session_id.to_string()]
-                        .into_iter()
-                        .chain(legacy_ids.iter().cloned())
-                        .chain(facts.tool_use_ids.iter().cloned()),
-                ),
-            )?;
+        delete_legacy_tool_rows(conn, session_id, legacy_ids, &facts.tool_use_ids)?;
+    }
+    Ok(())
+}
+
+/// Every event of one legacy message, as matched against a record.
+type LegacyMessageKey = Vec<LegacyEventKey>;
+
+/// The legacy events of `legacy_ids`, grouped by message: a legacy message
+/// heals only on an exact full-record match. Matching one shared block would
+/// erase the message's changed siblings, which the content-hash model treats
+/// as a distinct retained predecessor.
+fn legacy_events_by_message(
+    conn: &Connection,
+    session_id: &str,
+    legacy_ids: &[String],
+) -> Result<HashMap<String, LegacyMessageKey>> {
+    let placeholders = legacy_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT message_id, text, ts_ms, role, kind, model, token_json FROM session_events \
+         WHERE source = 'claude' AND session_id = ? AND message_id IN ({placeholders})"
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let mut rows = statement.query(rusqlite::params_from_iter(
+        [session_id.to_string()]
+            .into_iter()
+            .chain(legacy_ids.iter().cloned()),
+    ))?;
+    let mut by_message: HashMap<String, LegacyMessageKey> = HashMap::new();
+    while let Some(row) = rows.next()? {
+        let message_id: String = row.get(0)?;
+        by_message.entry(message_id).or_default().push((
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+            row.get(6)?,
+        ));
+    }
+    Ok(by_message)
+}
+
+/// The one legacy message whose events are exactly `record_key` (sorted).
+///
+/// Unique or preserved: two legacy messages carrying the same record stay put
+/// rather than risk healing the wrong one.
+fn sole_full_match(
+    by_message: HashMap<String, LegacyMessageKey>,
+    record_key: &LegacyMessageKey,
+) -> Option<String> {
+    if record_key.is_empty() {
+        return None;
+    }
+    let mut full_matches = Vec::new();
+    for (message_id, mut key) in by_message {
+        key.sort();
+        if key == *record_key {
+            full_matches.push(message_id);
         }
+    }
+    if full_matches.len() == 1 {
+        return full_matches.pop();
+    }
+    None
+}
+
+/// Deletes the call and edit rows of the legacy messages that `tool_use_ids`
+/// name.
+fn delete_legacy_tool_rows(
+    conn: &Connection,
+    session_id: &str,
+    legacy_ids: &[String],
+    tool_use_ids: &[String],
+) -> Result<()> {
+    let id_placeholders = tool_use_ids
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
+    let msg_placeholders = legacy_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    for table in ["tool_calls", "file_edits"] {
+        let sql = format!(
+            "DELETE FROM {table} WHERE source = 'claude' AND session_id = ? \
+             AND message_id IN ({msg_placeholders}) AND tool_use_id IN ({id_placeholders})"
+        );
+        conn.execute(
+            &sql,
+            rusqlite::params_from_iter(
+                [session_id.to_string()]
+                    .into_iter()
+                    .chain(legacy_ids.iter().cloned())
+                    .chain(tool_use_ids.iter().cloned()),
+            ),
+        )?;
     }
     Ok(())
 }
@@ -13972,54 +14115,26 @@ fn sync_muse_with_coverage(
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    let mut inserted = 0;
-    let mut scanned = 0;
-    let mut sessions = 0;
-    let mut errors = 0;
-    let mut accounted = 0;
+    let mut walk = StampedSessionWalk::default();
     for transcript in capture_files("muse", collect_muse_transcripts(root)?) {
         check_capture_cancelled()?;
         let key = transcript.to_string_lossy().to_string();
         let stamp = match muse_session_stamp(&transcript) {
             Ok(stamp) => stamp,
             Err(error) => {
-                if error.is::<CaptureCancelled>() {
-                    return Err(error);
-                }
-                scanned += 1;
-                errors += 1;
-                coverage.note_unread();
-                sync_note!(
-                    "  [muse] unreadable session {}: {error:#}",
-                    transcript.display()
-                );
+                walk.scanned += 1;
+                walk.note_unreadable(coverage, "muse", &transcript, error)?;
                 continue;
             }
         };
         let recorded = muse_state.get(&key);
-        if recorded.and_then(grok_state_stamp) == Some(stamp.as_str()) {
-            // The stamp says unchanged; the database has to agree before
-            // that is taken as "already indexed". Every Muse ingestion writes
-            // at least its catalog row, and one that wrote events is checked
-            // against those.
-            let still_there = match (
-                recorded.and_then(grok_state_session),
-                recorded.and_then(grok_state_had_evidence),
-            ) {
-                (None, _) => true,
-                // The destination marker says rows were lost under this
-                // unchanged stamp — in the session or in a subagent it links.
-                // Existence cannot see a partial loss; re-reading repairs it.
-                (Some(id), _) if muse_tree_needs_repair(conn, repairs, id)? => false,
-                (Some(id), Some(false)) => muse_catalog_row_exists(conn, id)?,
-                (Some(id), _) => muse_evidence_exists(conn, id)?,
-            };
-            if still_there {
-                accounted += 1;
-                continue;
-            }
+        if recorded.and_then(grok_state_stamp) == Some(stamp.as_str())
+            && muse_recorded_still_indexed(conn, repairs, recorded)?
+        {
+            walk.accounted += 1;
+            continue;
         }
-        scanned += 1;
+        walk.scanned += 1;
         // Everything is read before anything is written. A transcript or a
         // subagent log that cannot be read is this session's failure alone:
         // it keeps no stamp, so the next run retries it, and the pass goes on.
@@ -14029,26 +14144,13 @@ fn sync_muse_with_coverage(
         match read_muse_tree(&transcript) {
             Ok(Some((parsed, children))) => {
                 let session_id = parsed.metadata.session_id.clone();
-                let tx = conn.unchecked_transaction()?;
-                let written = muse_history_rows(&tx, &session_id).and_then(|before| {
-                    let outcome =
-                        ingest_muse_session_tree(&tx, &parsed, &transcript, Some(&children))?;
-                    let after = muse_history_rows(&tx, &session_id)?;
-                    Ok((outcome, after.saturating_sub(before)))
-                });
-                let (outcome, added) = match written {
-                    Ok(written) => written,
-                    Err(error) => {
-                        drop(tx);
-                        return Err(error);
-                    }
-                };
+                let (outcome, added) =
+                    index_muse_tree(conn, &parsed, &transcript, &children, &session_id)?;
                 // A re-read replaces the session's prompts wholesale, so what
                 // it added is the difference, not what it wrote.
-                inserted += added;
-                tx.commit()?;
-                sessions += 1;
-                accounted += 1;
+                walk.inserted += added;
+                walk.sessions += 1;
+                walk.accounted += 1;
                 muse_state.insert(
                     key,
                     json!({
@@ -14061,38 +14163,130 @@ fn sync_muse_with_coverage(
                 );
             }
             Ok(None) => {
-                accounted += 1;
+                walk.accounted += 1;
                 muse_state.insert(key, json!({ "stamp": stamp }));
             }
-            Err(error) => {
-                if error.is::<CaptureCancelled>() {
-                    return Err(error);
-                }
-                errors += 1;
-                coverage.note_unread();
-                sync_note!(
-                    "  [muse] unreadable session {}: {error:#}",
-                    transcript.display()
-                );
-            }
+            Err(error) => walk.note_unreadable(coverage, "muse", &transcript, error)?,
         }
     }
     state.insert(MUSE_SYNC_STATE_KEY.to_string(), Value::Object(muse_state));
-    if scanned > 0 {
-        let suffix = if errors > 0 {
-            format!(" ({errors} errors)")
-        } else {
-            String::new()
-        };
-        sync_note!("  [muse] +{inserted} rows from {sessions} sessions{suffix}");
+    walk.finish("muse", "Muse Code session(s)", "transcripts")
+}
+
+/// Whether a Muse session whose stamp says unchanged is still indexed.
+///
+/// The stamp says unchanged; the database has to agree before that is taken as
+/// "already indexed". Every Muse ingestion writes at least its catalog row,
+/// and one that wrote events is checked against those.
+fn muse_recorded_still_indexed(
+    conn: &Connection,
+    repairs: &SweepRepairs,
+    recorded: Option<&Value>,
+) -> Result<bool> {
+    let Some(id) = recorded.and_then(grok_state_session) else {
+        return Ok(true);
+    };
+    // The destination marker says rows were lost under this unchanged stamp
+    // — in the session or in a subagent it links. Existence cannot see a
+    // partial loss; re-reading repairs it.
+    if muse_tree_needs_repair(conn, repairs, id)? {
+        return Ok(false);
     }
-    if errors > 0 && accounted == 0 {
-        anyhow::bail!(
-            "{errors} Muse Code session(s) could not be read and none were indexed; \
-             the unreadable transcripts are named above"
+    match recorded.and_then(grok_state_had_evidence) {
+        Some(false) => muse_catalog_row_exists(conn, id),
+        _ => muse_evidence_exists(conn, id),
+    }
+}
+
+/// Writes one Muse session tree in its own transaction, returning what it
+/// wrote and how many prompts it added.
+fn index_muse_tree(
+    conn: &Connection,
+    parsed: &muse::MuseTranscript,
+    transcript: &Path,
+    children: &[MuseChildLog],
+    session_id: &str,
+) -> Result<(MuseIngestOutcome, usize)> {
+    // A failed write drops `tx`, which rolls the whole tree back.
+    let tx = conn.unchecked_transaction()?;
+    let before = muse_history_rows(&tx, session_id)?;
+    let outcome = ingest_muse_session_tree(&tx, parsed, transcript, Some(children))?;
+    let after = muse_history_rows(&tx, session_id)?;
+    tx.commit()?;
+    Ok((outcome, after.saturating_sub(before)))
+}
+
+/// The tally of one walk over a source's stamped session files.
+#[derive(Default)]
+struct StampedSessionWalk {
+    /// Prompts the walk added.
+    inserted: usize,
+    /// Sessions the walk had to read, unreadable ones included.
+    scanned: usize,
+    /// Sessions the walk indexed.
+    sessions: usize,
+    errors: usize,
+    /// Sessions this run could **account for**: indexed now, or confirmed
+    /// unchanged against a stamp it read successfully. Not the same as
+    /// `sessions`, which counts only what was indexed — a store that is fully
+    /// synced indexes nothing on every later run, and using that count to
+    /// decide whether the source failed would fail it forever over one
+    /// unreadable sibling.
+    accounted: usize,
+}
+
+impl StampedSessionWalk {
+    /// Records a session that could not be read; a cancellation ends the walk.
+    ///
+    /// Its stamp is deliberately not recorded so the next sweep retries it.
+    /// The source fingerprint stays stale too, or the next tick would skip
+    /// before reaching it.
+    fn note_unreadable(
+        &mut self,
+        coverage: &mut SweepCoverage,
+        source: &str,
+        path: &Path,
+        error: anyhow::Error,
+    ) -> Result<()> {
+        if error.is::<CaptureCancelled>() {
+            return Err(error);
+        }
+        self.errors += 1;
+        coverage.note_unread();
+        sync_note!(
+            "  [{source}] unreadable session {}: {error:#}",
+            path.display()
         );
+        Ok(())
     }
-    Ok(inserted)
+
+    /// Reports the walk, returning the prompts it added.
+    ///
+    /// A store where nothing could be read is a failed source, not an empty
+    /// one: the caller records it and the run says so. A store where something
+    /// failed and something else was accounted for stays a success, so the
+    /// sessions that did read keep their saved stamps -- otherwise one
+    /// unreadable session would send every future run back over the whole
+    /// store, and a fully synced store would fail this source on every run
+    /// from then on.
+    fn finish(&self, source: &str, sessions_noun: &str, files_noun: &str) -> Result<usize> {
+        let (inserted, sessions, errors) = (self.inserted, self.sessions, self.errors);
+        if self.scanned > 0 {
+            let suffix = if errors > 0 {
+                format!(" ({errors} errors)")
+            } else {
+                String::new()
+            };
+            sync_note!("  [{source}] +{inserted} rows from {sessions} sessions{suffix}");
+        }
+        if errors > 0 && self.accounted == 0 {
+            anyhow::bail!(
+                "{errors} {sessions_noun} could not be read and none were indexed; \
+                 the unreadable {files_noun} are named above"
+            );
+        }
+        Ok(inserted)
+    }
 }
 
 /// Whether the destination marker names this session, or any subagent its
@@ -15244,17 +15438,7 @@ fn sync_grok_with_coverage(
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    let mut inserted = 0;
-    let mut scanned = 0;
-    let mut sessions = 0;
-    let mut errors = 0;
-    // Sessions this run could **account for**: indexed now, or confirmed
-    // unchanged against a stamp it read successfully. Not the same as
-    // `sessions`, which counts only what was indexed — a store that is fully
-    // synced indexes nothing on every later run, and using that count to
-    // decide whether the source failed would fail it forever over one
-    // unreadable sibling.
-    let mut accounted = 0;
+    let mut walk = StampedSessionWalk::default();
     // The enumeration is the one the source fingerprint already made this
     // sweep; the stamps below are read fresh and reused by discovery (#317).
     for chat in capture_files(
@@ -15271,71 +15455,19 @@ fn sync_grok_with_coverage(
         let stamp = match crate::discover::sweep_inventory::restamp_grok(&chat) {
             Ok((stamp, _)) => stamp,
             Err(error) => {
-                if error.is::<CaptureCancelled>() {
-                    return Err(error);
-                }
-                scanned += 1;
-                errors += 1;
-                coverage.note_unread();
-                sync_note!("  [grok] unreadable session {}: {error:#}", chat.display());
+                walk.scanned += 1;
+                walk.note_unreadable(coverage, "grok", &chat, error)?;
                 continue;
             }
         };
         let recorded = grok_state.get(&key);
-        let recorded_stamp = recorded.and_then(grok_state_stamp).map(str::to_string);
-        let recorded_session = recorded.and_then(grok_state_session).map(str::to_string);
-        let recorded_evidence = recorded.and_then(grok_state_had_evidence);
-        if recorded_stamp.as_deref() == Some(stamp.as_str()) {
-            // The stamp says the file has not changed. That is only half the
-            // question: `.sync-state.json` lives beside the database, so a
-            // deleted or rebuilt `history.db` keeps this file, and a stamp
-            // read on its own would answer "already indexed" for a session
-            // whose rows are gone -- until some file in the directory changes,
-            // which for a finished session is never. The Codex and Claude
-            // walks check the database for the same reason.
-            //
-            // The other half of that is knowing what "its rows" means for
-            // *this* session. Not every Grok session produces `session_events`
-            // -- one made only of `system` lines, synthetic turns or encrypted
-            // reasoning is stored entirely as markers, and one with an empty
-            // transcript and a `subagents/` entry only a relationship -- so
-            // asking only about events would find nothing and re-read such a
-            // session on every run, forever. The answer is not to guess from
-            // the tables but to record what the indexing run actually
-            // produced, and then to ask about that.
-            match (recorded_session.as_deref(), recorded_evidence) {
-                // Written by an older build that saved the stamp alone, so
-                // there is no session id to look the evidence up by. Trust
-                // the stamp, as that build did.
-                (None, _) => {
-                    accounted += 1;
-                    continue;
-                }
-                // The run that indexed it wrote no evidence rows at all. It
-                // still wrote a catalog row -- every ingestion does -- so
-                // that is what there is to check, and it is enough: a session
-                // with no evidence *is* its catalog row. Skipping without
-                // asking anything is what let an empty session disappear for
-                // good when the database was rebuilt.
-                (Some(id), Some(false)) if grok_catalog_row_exists(conn, id)? => {
-                    accounted += 1;
-                    continue;
-                }
-                (Some(id), Some(true) | None)
-                    if grok_indexed_evidence_remains(
-                        conn,
-                        id,
-                        recorded.and_then(grok_state_transcript_events),
-                    )? =>
-                {
-                    accounted += 1;
-                    continue;
-                }
-                // Unchanged, and what it did write is missing: re-index it.
-                _ => {}
-            }
+        if recorded.and_then(grok_state_stamp) == Some(stamp.as_str())
+            && grok_recorded_still_indexed(conn, recorded)?
+        {
+            walk.accounted += 1;
+            continue;
         }
-        scanned += 1;
+        walk.scanned += 1;
         match scan_grok_session_file(&chat) {
             Ok(Some(session)) => {
                 let raw_path = chat.to_string_lossy().to_string();
@@ -15345,7 +15477,7 @@ fn sync_grok_with_coverage(
                 // between the two halves of that.
                 let tx = conn.unchecked_transaction()?;
                 let outcome = ingest_grok_session(&tx, &session, &raw_path)?;
-                inserted += outcome.prompts;
+                walk.inserted += outcome.prompts;
                 tx.commit()?;
                 // Whether this session has any evidence to go looking for on
                 // a later run. A session stored entirely as markers has no
@@ -15356,8 +15488,8 @@ fn sync_grok_with_coverage(
                 // session never filled and re-reads it for ever.
                 let had_evidence =
                     outcome.events > 0 || outcome.markers > 0 || outcome.relationships > 0;
-                sessions += 1;
-                accounted += 1;
+                walk.sessions += 1;
+                walk.accounted += 1;
                 // The session id travels with the stamp so the next run can
                 // ask the database whether this evidence is still there, and
                 // `evidence` says whether there was any to ask about.
@@ -15377,45 +15509,52 @@ fn sync_grok_with_coverage(
             Ok(None) => {
                 // Read fine, and there was no session in it -- so there is no
                 // session id to check any future run against either.
-                accounted += 1;
+                walk.accounted += 1;
                 grok_state.insert(key, json!({ "stamp": stamp }));
             }
-            Err(error) => {
-                if error.is::<CaptureCancelled>() {
-                    return Err(error);
-                }
-                errors += 1;
-                // The stamp is deliberately not recorded so the next sweep
-                // retries this directory. Keep the source fingerprint stale
-                // too, or the next tick would skip before reaching it.
-                coverage.note_unread();
-                sync_note!("  [grok] unreadable session {}: {error:#}", chat.display());
-            }
+            Err(error) => walk.note_unreadable(coverage, "grok", &chat, error)?,
         }
     }
     state.insert(GROK_SYNC_STATE_KEY.to_string(), Value::Object(grok_state));
-    if scanned > 0 {
-        let suffix = if errors > 0 {
-            format!(" ({errors} errors)")
-        } else {
-            String::new()
-        };
-        sync_note!("  [grok] +{inserted} rows from {sessions} sessions{suffix}");
+    walk.finish("grok", "Grok session(s)", "directories")
+}
+
+/// Whether a Grok session whose stamp says unchanged is still indexed.
+///
+/// The stamp says the file has not changed. That is only half the question:
+/// `.sync-state.json` lives beside the database, so a deleted or rebuilt
+/// `history.db` keeps this file, and a stamp read on its own would answer
+/// "already indexed" for a session whose rows are gone -- until some file in
+/// the directory changes, which for a finished session is never. The Codex and
+/// Claude walks check the database for the same reason.
+///
+/// The other half of that is knowing what "its rows" means for *this* session.
+/// Not every Grok session produces `session_events` -- one made only of
+/// `system` lines, synthetic turns or encrypted reasoning is stored entirely as
+/// markers, and one with an empty transcript and a `subagents/` entry only a
+/// relationship -- so asking only about events would find nothing and re-read
+/// such a session on every run, forever. The answer is not to guess from the
+/// tables but to record what the indexing run actually produced, and then to
+/// ask about that. Unchanged, and what it did write is missing: re-index it.
+fn grok_recorded_still_indexed(conn: &Connection, recorded: Option<&Value>) -> Result<bool> {
+    match (
+        recorded.and_then(grok_state_session),
+        recorded.and_then(grok_state_had_evidence),
+    ) {
+        // Written by an older build that saved the stamp alone, so there is no
+        // session id to look the evidence up by. Trust the stamp, as that
+        // build did.
+        (None, _) => Ok(true),
+        // The run that indexed it wrote no evidence rows at all. It still
+        // wrote a catalog row -- every ingestion does -- so that is what there
+        // is to check, and it is enough: a session with no evidence *is* its
+        // catalog row. Skipping without asking anything is what let an empty
+        // session disappear for good when the database was rebuilt.
+        (Some(id), Some(false)) => grok_catalog_row_exists(conn, id),
+        (Some(id), Some(true) | None) => {
+            grok_indexed_evidence_remains(conn, id, recorded.and_then(grok_state_transcript_events))
+        }
     }
-    // A store where nothing could be read is a failed source, not an empty
-    // one: the caller records it and the run says so. A store where something
-    // failed and something else was accounted for stays a success, so the
-    // sessions that did read keep their saved stamps -- otherwise one
-    // unreadable directory would send every future run back over the whole
-    // store, and a fully synced store would fail this source on every run
-    // from then on.
-    if errors > 0 && accounted == 0 {
-        anyhow::bail!(
-            "{errors} Grok session(s) could not be read and none were indexed; \
-             the unreadable directories are named above"
-        );
-    }
-    Ok(inserted)
 }
 
 /// Where Grok writes its process-wide per-inference log, under the Grok home
@@ -15485,13 +15624,8 @@ pub(crate) fn sync_grok_unified_log_in(
 ) -> Result<GrokUnifiedPass> {
     let mut pass = GrokUnifiedPass::default();
     let path = grok_unified_log_path(grok_home);
-    match path.metadata() {
-        Ok(metadata) if metadata.is_file() => {}
-        Ok(_) => return Ok(pass),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(pass),
-        Err(error) => {
-            return Err(error).with_context(|| format!("stat Grok unified log {}", path.display()))
-        }
+    if !grok_unified_log_exists(&path)? {
+        return Ok(pass);
     }
     let locator = path.to_string_lossy().to_string();
     let key = transcript_cursor::CursorKey::Locator {
@@ -15538,22 +15672,7 @@ pub(crate) fn sync_grok_unified_log_in(
         match grok::parse_unified_row(&value, &pid_models) {
             grok::GrokUnifiedRow::Usage(usage) => {
                 pass.usage_rows += 1;
-                pass.new_rows += conn.execute(
-                    "INSERT OR IGNORE INTO grok_unified_usage \
-                     (row_key, session_id, ts_ms, pid, model, event_id, usage_json, locator, line_offset) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    params![
-                        grok::unified_row_key(&value),
-                        usage.session_id,
-                        usage.ts_ms,
-                        usage.pid,
-                        usage.model,
-                        usage.event_id,
-                        usage.usage.to_string(),
-                        locator,
-                        offset as i64,
-                    ],
-                )?;
+                pass.new_rows += insert_grok_unified_usage(conn, &value, &usage, &locator, offset)?;
                 touched.insert(usage.session_id);
             }
             grok::GrokUnifiedRow::ModelChange { pid, model } => {
@@ -15579,23 +15698,9 @@ pub(crate) fn sync_grok_unified_log_in(
         transcript_cursor::CommitOutcome::Superseded => {}
     }
     for session_id in touched {
-        if !grok_catalog_row_exists(conn, &session_id)? {
-            // Retained, not dropped: the rows wait in `grok_unified_usage`
-            // until the session is indexed, and that ingestion attaches them.
-            continue;
+        if materialize_unified_usage_into(conn, &session_id)? {
+            pass.sessions_materialized += 1;
         }
-        if materialize_grok_unified_usage(conn, &session_id, None)?.inserted == 0 {
-            continue;
-        }
-        // A cached hydration replays the diagnostics it stored, and those
-        // were written before this usage existed. Clearing them makes the
-        // next unchanged read rebuild the usage caveat from the stored rows.
-        conn.execute(
-            "UPDATE session_hydration_checkpoints SET source_diagnostics_json = NULL \
-             WHERE source = 'grok' AND session_id = ?",
-            params![session_id],
-        )?;
-        pass.sessions_materialized += 1;
     }
     let orphans: i64 = conn.query_row(
         "SELECT COUNT(*) FROM grok_unified_usage u WHERE NOT EXISTS \
@@ -15605,6 +15710,66 @@ pub(crate) fn sync_grok_unified_log_in(
     )?;
     pass.orphan_rows = orphans as usize;
     Ok(pass)
+}
+
+/// Copies one unified-log usage row into `grok_unified_usage`; the rows it
+/// added (none when the row was already there).
+fn insert_grok_unified_usage(
+    conn: &Connection,
+    value: &Value,
+    usage: &grok::GrokUnifiedUsage,
+    locator: &str,
+    offset: u64,
+) -> Result<usize> {
+    Ok(conn.execute(
+        "INSERT OR IGNORE INTO grok_unified_usage \
+         (row_key, session_id, ts_ms, pid, model, event_id, usage_json, locator, line_offset) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        params![
+            grok::unified_row_key(value),
+            usage.session_id,
+            usage.ts_ms,
+            usage.pid,
+            usage.model,
+            usage.event_id,
+            usage.usage.to_string(),
+            locator,
+            offset as i64,
+        ],
+    )?)
+}
+
+/// Attaches a session's waiting unified-log usage to it once it is indexed;
+/// `true` when that added any.
+fn materialize_unified_usage_into(conn: &Connection, session_id: &str) -> Result<bool> {
+    if !grok_catalog_row_exists(conn, session_id)? {
+        // Retained, not dropped: the rows wait in `grok_unified_usage`
+        // until the session is indexed, and that ingestion attaches them.
+        return Ok(false);
+    }
+    if materialize_grok_unified_usage(conn, session_id, None)?.inserted == 0 {
+        return Ok(false);
+    }
+    // A cached hydration replays the diagnostics it stored, and those
+    // were written before this usage existed. Clearing them makes the
+    // next unchanged read rebuild the usage caveat from the stored rows.
+    conn.execute(
+        "UPDATE session_hydration_checkpoints SET source_diagnostics_json = NULL \
+         WHERE source = 'grok' AND session_id = ?",
+        params![session_id],
+    )?;
+    Ok(true)
+}
+
+/// Whether Grok's unified log is a file to read; a missing one is not an error.
+fn grok_unified_log_exists(path: &Path) -> Result<bool> {
+    match path.metadata() {
+        Ok(metadata) => Ok(metadata.is_file()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => {
+            Err(error).with_context(|| format!("stat Grok unified log {}", path.display()))
+        }
+    }
 }
 
 /// How many `logs/unified.jsonl` usage rows are stored for one session.
@@ -15724,6 +15889,25 @@ struct GrokUnifiedStored {
     usage_json: String,
 }
 
+impl GrokUnifiedStored {
+    /// The `token_json` of the usage event this row becomes.
+    fn token_json(&self) -> String {
+        let mut token_json = serde_json::Map::new();
+        token_json.insert(
+            "usage".into(),
+            serde_json::from_str(&self.usage_json).unwrap_or(Value::Null),
+        );
+        token_json.insert("source".into(), json!("logs/unified.jsonl"));
+        if let Some(pid) = self.pid {
+            token_json.insert("pid".into(), json!(pid));
+        }
+        if let Some(event_id) = &self.event_id {
+            token_json.insert("event_id".into(), json!(event_id));
+        }
+        Value::Object(token_json).to_string()
+    }
+}
+
 /// Attach one session's stored `logs/unified.jsonl` rows as usage events, and
 /// settle which of its turns they cover.
 ///
@@ -15768,27 +15952,7 @@ fn materialize_grok_unified_usage(
     if total == 0 {
         return Ok(GrokUnifiedCoverage::default());
     }
-    // Rows whose local event is not stored yet. A row already attached is
-    // left exactly as it is.
-    let rows = conn
-        .prepare(
-            "SELECT row_key, ts_ms, pid, model, event_id, usage_json FROM grok_unified_usage u \
-             WHERE session_id = ?1 AND NOT EXISTS (SELECT 1 FROM session_events e \
-               WHERE e.source = 'grok' AND e.session_id = ?1 \
-               AND e.event_uid = 'unified:' || u.row_key AND e.location IN ('local', 'both')) \
-             ORDER BY ts_ms IS NULL, ts_ms, locator, line_offset, row_key",
-        )?
-        .query_map(params![session_id], |row| {
-            Ok(GrokUnifiedStored {
-                row_key: row.get(0)?,
-                ts_ms: row.get(1)?,
-                pid: row.get(2)?,
-                model: row.get(3)?,
-                event_id: row.get(4)?,
-                usage_json: row.get(5)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let rows = grok_unified_rows_unattached(conn, session_id)?;
     let fallback_ts = fallback_ts.or(first_activity).unwrap_or(0);
     let mut models: Vec<String> = models_json
         .as_deref()
@@ -15798,19 +15962,7 @@ fn materialize_grok_unified_usage(
     for row in &rows {
         check_capture_cancelled()?;
         let uid = format!("unified:{}", row.row_key);
-        let mut token_json = serde_json::Map::new();
-        token_json.insert(
-            "usage".into(),
-            serde_json::from_str(&row.usage_json).unwrap_or(Value::Null),
-        );
-        token_json.insert("source".into(), json!("logs/unified.jsonl"));
-        if let Some(pid) = row.pid {
-            token_json.insert("pid".into(), json!(pid));
-        }
-        if let Some(event_id) = &row.event_id {
-            token_json.insert("event_id".into(), json!(event_id));
-        }
-        let token_json = Value::Object(token_json).to_string();
+        let token_json = row.token_json();
         insert_session_event(
             conn,
             &EventRow {
@@ -15835,11 +15987,56 @@ fn materialize_grok_unified_usage(
             },
         )?;
         if let Some(model) = &row.model {
-            if !models.iter().any(|seen| seen == model) {
-                models.push(model.clone());
-            }
+            note_model(&mut models, model);
         }
     }
+    settle_grok_unified_session(conn, session_id, &models, models_before)?;
+    let class = grok_turn_coverage(conn, session_id)?;
+    Ok(GrokUnifiedCoverage {
+        rows: total,
+        inserted: rows.len(),
+        covered_turns: class.covered_turns,
+        turn_usage_turns: class.turn_usage_turns,
+        proxy_only_turns: class.proxy_only_turns,
+    })
+}
+
+/// A session's stored unified-log rows whose local event is not stored yet.
+/// A row already attached is left exactly as it is.
+fn grok_unified_rows_unattached(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<GrokUnifiedStored>> {
+    Ok(conn
+        .prepare(
+            "SELECT row_key, ts_ms, pid, model, event_id, usage_json FROM grok_unified_usage u \
+             WHERE session_id = ?1 AND NOT EXISTS (SELECT 1 FROM session_events e \
+               WHERE e.source = 'grok' AND e.session_id = ?1 \
+               AND e.event_uid = 'unified:' || u.row_key AND e.location IN ('local', 'both')) \
+             ORDER BY ts_ms IS NULL, ts_ms, locator, line_offset, row_key",
+        )?
+        .query_map(params![session_id], |row| {
+            Ok(GrokUnifiedStored {
+                row_key: row.get(0)?,
+                ts_ms: row.get(1)?,
+                pid: row.get(2)?,
+                model: row.get(3)?,
+                event_id: row.get(4)?,
+                usage_json: row.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Settles a session once its unified-log usage events are written: demotes
+/// the turn breakdowns the log reaches into, records any model it newly names
+/// and extends its last activity.
+fn settle_grok_unified_session(
+    conn: &Connection,
+    session_id: &str,
+    models: &[String],
+    models_before: usize,
+) -> Result<()> {
     // Per turn: demote a turn's breakdown only when the log reaches into it.
     // A turn with no recorded window cannot be placed, so a timed row never
     // covers it; only a timeless row (which covers every turn) does. Otherwise
@@ -15861,7 +16058,7 @@ fn materialize_grok_unified_usage(
     if models.len() != models_before {
         conn.execute(
             "UPDATE sessions SET models_json = ? WHERE source = 'grok' AND session_id = ?",
-            params![serde_json::to_string(&models)?, session_id],
+            params![serde_json::to_string(models)?, session_id],
         )?;
     }
     // An inference logged after the session's last recorded activity is
@@ -15874,14 +16071,7 @@ fn materialize_grok_unified_usage(
              > COALESCE(last_activity_ms, 0)",
         params![session_id],
     )?;
-    let class = grok_turn_coverage(conn, session_id)?;
-    Ok(GrokUnifiedCoverage {
-        rows: total,
-        inserted: rows.len(),
-        covered_turns: class.covered_turns,
-        turn_usage_turns: class.turn_usage_turns,
-        proxy_only_turns: class.proxy_only_turns,
-    })
+    Ok(())
 }
 
 /// Coverage of one session from the rows already stored: the turn token
@@ -17103,6 +17293,95 @@ struct GrokSession {
     subagents: Vec<GrokSubagentEvidence>,
 }
 
+/// Adds `model` to `models` unless it is already named.
+fn note_model(models: &mut Vec<String>, model: &str) {
+    if !models.iter().any(|seen| seen == model) {
+        models.push(model.to_owned());
+    }
+}
+
+/// Reads a session's `updates.jsonl`, and whether it was there at all.
+fn read_grok_updates(updates_path: &Path) -> Result<(grok::GrokUpdates, bool)> {
+    match fs::read_to_string(updates_path) {
+        Ok(contents) => Ok((grok::parse_updates(&contents, updates_path)?, true)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Ok((grok::GrokUpdates::default(), false))
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("read Grok updates {}", updates_path.display()))
+        }
+    }
+}
+
+/// What a session's `chat_history.jsonl` says, record by record.
+#[derive(Default)]
+struct GrokChatRead {
+    lines: Vec<grok::GrokChatLine>,
+    synthetic_reasons: HashMap<usize, String>,
+    last_assistant_text: Option<String>,
+    models: Vec<String>,
+}
+
+/// Parses every record of a session's chat history.
+fn read_grok_chat(chat: &Path) -> Result<GrokChatRead> {
+    let mut read = GrokChatRead::default();
+    let contents = fs::read_to_string(chat)
+        .with_context(|| format!("read Grok chat history {}", chat.display()))?;
+    for (number, row) in jsonl::rows(&contents).enumerate() {
+        check_capture_cancelled()?;
+        // A complete row that does not parse fails the read. The ingestion
+        // this feeds replaces the session's evidence, so dropping the row
+        // would commit a transcript that is missing a turn Grok did write --
+        // and save the stamp that stops the next run from looking again.
+        let Some(value) = jsonl::parse_row(row, chat, number + 1)? else {
+            continue;
+        };
+        if let Some(reason) = value.get("synthetic_reason").and_then(Value::as_str) {
+            read.synthetic_reasons
+                .insert(read.lines.len(), reason.to_string());
+        }
+        let parsed = grok::parse_chat_record(&value);
+        if let grok::GrokRecord::Assistant { text, model, .. } = &parsed.record {
+            if let Some(text) = text {
+                read.last_assistant_text = Some(text.chars().take(4096).collect::<String>());
+            }
+            if let Some(model) = model {
+                note_model(&mut read.models, model);
+            }
+        }
+        read.lines.push(parsed);
+    }
+    Ok(read)
+}
+
+/// The evidence files beside a session's chat history.
+#[derive(Default)]
+struct GrokSidecars {
+    signals: Option<grok::GrokSignals>,
+    prompt_context: Option<GrokPromptContext>,
+    compactions: Vec<GrokCompaction>,
+    subagents: Vec<GrokSubagentEvidence>,
+}
+
+/// Reads the evidence files in a Grok session directory.
+fn read_grok_sidecars(dir: &Path) -> Result<GrokSidecars> {
+    // A `signals.json` that exists but does not parse is still a fact about
+    // the session, so the marker is written from its existence and the counters
+    // are simply absent. Collapsing that into "no signals" would delete the
+    // marker a previous read wrote and record nothing in its place.
+    let signals = match read_json_file(&dir.join("signals.json"))? {
+        GrokSidecar::Absent => None,
+        GrokSidecar::Unparsed => Some(grok::GrokSignals::default()),
+        GrokSidecar::Read(value) => Some(grok::parse_signals(&value)),
+    };
+    Ok(GrokSidecars {
+        signals,
+        prompt_context: read_grok_prompt_context(&dir.join("prompt_context.json"))?,
+        compactions: read_grok_compactions(&dir.join("compaction_checkpoints"))?,
+        subagents: read_grok_subagents(&dir.join("subagents"))?,
+    })
+}
+
 fn scan_grok_session_file(chat: &Path) -> Result<Option<GrokSession>> {
     let summary = read_grok_summary(&chat.with_file_name("summary.json"))?;
     let fallback_session = chat
@@ -17162,55 +17441,19 @@ fn scan_grok_session_file(chat: &Path) -> Result<Option<GrokSession>> {
     // computed from metadata that is still perfectly readable — checkpoint
     // that loss as the session's settled state until some file changes again.
     let updates_path = chat.with_file_name("updates.jsonl");
-    let (updates, updates_present) = match fs::read_to_string(&updates_path) {
-        Ok(contents) => (grok::parse_updates(&contents, &updates_path)?, true),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            (grok::GrokUpdates::default(), false)
-        }
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("read Grok updates {}", updates_path.display()))
-        }
-    };
+    let (updates, updates_present) = read_grok_updates(&updates_path)?;
 
-    let mut lines = Vec::new();
-    let mut synthetic_reasons = HashMap::new();
-    let mut last_assistant_text = None;
-    let mut models: Vec<String> = Vec::new();
-    let contents = fs::read_to_string(chat)
-        .with_context(|| format!("read Grok chat history {}", chat.display()))?;
-    for (number, row) in jsonl::rows(&contents).enumerate() {
-        check_capture_cancelled()?;
-        // A complete row that does not parse fails the read. The ingestion
-        // this feeds replaces the session's evidence, so dropping the row
-        // would commit a transcript that is missing a turn Grok did write --
-        // and save the stamp that stops the next run from looking again.
-        let Some(value) = jsonl::parse_row(row, chat, number + 1)? else {
-            continue;
-        };
-        if let Some(reason) = value.get("synthetic_reason").and_then(Value::as_str) {
-            synthetic_reasons.insert(lines.len(), reason.to_string());
-        }
-        let parsed = grok::parse_chat_record(&value);
-        if let grok::GrokRecord::Assistant { text, model, .. } = &parsed.record {
-            if let Some(text) = text {
-                last_assistant_text = Some(text.chars().take(4096).collect::<String>());
-            }
-            if let Some(model) = model {
-                if !models.iter().any(|seen| seen == model) {
-                    models.push(model.clone());
-                }
-            }
-        }
-        lines.push(parsed);
-    }
+    let GrokChatRead {
+        lines,
+        synthetic_reasons,
+        last_assistant_text,
+        mut models,
+    } = read_grok_chat(chat)?;
     // The models `updates.jsonl` names per turn (`_meta.modelId`, or a
     // single-key `modelUsage`) are models the session ran on too, including
     // any turn whose transcript record carried no `model_id`.
     for model in updates.turns.iter().filter_map(|turn| turn.model.as_ref()) {
-        if !models.iter().any(|seen| seen == model) {
-            models.push(model.clone());
-        }
+        note_model(&mut models, model);
     }
     if models.is_empty() {
         if let Some(model) = summary
@@ -17223,28 +17466,14 @@ fn scan_grok_session_file(chat: &Path) -> Result<Option<GrokSession>> {
     }
 
     let directory = chat.parent().map(Path::to_path_buf);
-    // A `signals.json` that exists but does not parse is still a fact about
-    // the session, so the marker is written from its existence and the counters
-    // are simply absent. Collapsing that into "no signals" would delete the
-    // marker a previous read wrote and record nothing in its place.
-    let signals = match directory.as_deref() {
-        Some(dir) => match read_json_file(&dir.join("signals.json"))? {
-            GrokSidecar::Absent => None,
-            GrokSidecar::Unparsed => Some(grok::GrokSignals::default()),
-            GrokSidecar::Read(value) => Some(grok::parse_signals(&value)),
-        },
-        None => None,
-    };
-    let prompt_context = match directory.as_deref() {
-        Some(dir) => read_grok_prompt_context(&dir.join("prompt_context.json"))?,
-        None => None,
-    };
-    let (compactions, subagents) = match directory.as_deref() {
-        Some(dir) => (
-            read_grok_compactions(&dir.join("compaction_checkpoints"))?,
-            read_grok_subagents(&dir.join("subagents"))?,
-        ),
-        None => (Vec::new(), Vec::new()),
+    let GrokSidecars {
+        signals,
+        prompt_context,
+        compactions,
+        subagents,
+    } = match directory.as_deref() {
+        Some(dir) => read_grok_sidecars(dir)?,
+        None => GrokSidecars::default(),
     };
 
     // Real recorded times first, in this order: the update stream, then any
@@ -17905,19 +18134,12 @@ fn trajectory_search_text(map: &Map<String, Value>) -> String {
         push_text(&mut parts, task.get("title"));
         push_text(&mut parts, task.get("description"));
     }
-    if let Some(decisions) = map.get("decisions").and_then(Value::as_array) {
-        for decision in decisions {
-            if let Some(decision) = decision.as_object() {
-                for key in ["question", "chosen", "reasoning"] {
-                    push_text(&mut parts, decision.get(key));
-                }
-                if let Some(items) = decision.get("alternatives").and_then(Value::as_array) {
-                    for item in items {
-                        push_text(&mut parts, Some(item));
-                    }
-                }
-            }
+    let decisions = map.get("decisions").and_then(Value::as_array);
+    for decision in decisions.into_iter().flatten().filter_map(Value::as_object) {
+        for key in ["question", "chosen", "reasoning"] {
+            push_text(&mut parts, decision.get(key));
         }
+        push_text_items(&mut parts, decision.get("alternatives"));
     }
     if let Some(retro) = map.get("retrospective").and_then(Value::as_object) {
         for key in ["summary", "approach"] {
@@ -17926,34 +18148,35 @@ fn trajectory_search_text(map: &Map<String, Value>) -> String {
         if let Some(confidence) = retro.get("confidence") {
             parts.push(confidence.to_string());
         }
-        if let Some(items) = retro.get("learnings").and_then(Value::as_array) {
-            for item in items {
-                push_text(&mut parts, Some(item));
-            }
-        }
+        push_text_items(&mut parts, retro.get("learnings"));
     }
     if map.get("type").and_then(Value::as_str) == Some("compacted") {
-        push_text(&mut parts, map.get("narrative"));
-        for key in ["keyFindings", "keyLearnings", "openQuestions"] {
-            if let Some(items) = map.get(key).and_then(Value::as_array) {
-                for item in items {
-                    push_text(&mut parts, Some(item));
-                }
-            }
-        }
-        for key in ["lessons", "conventions"] {
-            if let Some(items) = map.get(key).and_then(Value::as_array) {
-                for item in items {
-                    if let Some(item) = item.as_object() {
-                        for value in item.values() {
-                            push_text(&mut parts, Some(value));
-                        }
-                    }
-                }
+        push_compacted_text(&mut parts, map);
+    }
+    parts.join("\n")
+}
+
+/// [`trajectory_search_text`] for what a compacted trajectory adds.
+fn push_compacted_text(parts: &mut Vec<String>, map: &Map<String, Value>) {
+    push_text(parts, map.get("narrative"));
+    for key in ["keyFindings", "keyLearnings", "openQuestions"] {
+        push_text_items(parts, map.get(key));
+    }
+    for key in ["lessons", "conventions"] {
+        let items = map.get(key).and_then(Value::as_array);
+        for item in items.into_iter().flatten().filter_map(Value::as_object) {
+            for value in item.values() {
+                push_text(parts, Some(value));
             }
         }
     }
-    parts.join("\n")
+}
+
+/// [`push_text`] for every item of an array value.
+fn push_text_items(parts: &mut Vec<String>, items: Option<&Value>) {
+    for item in items.and_then(Value::as_array).into_iter().flatten() {
+        push_text(parts, Some(item));
+    }
 }
 
 fn push_text(parts: &mut Vec<String>, value: Option<&Value>) {
