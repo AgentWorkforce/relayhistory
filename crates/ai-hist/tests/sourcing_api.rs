@@ -755,7 +755,10 @@ fn a_primary_transcript_of_only_sidechain_rows_is_a_session_with_its_usage() {
     assert_eq!(evidence.session.first_prompt, None);
     assert!(evidence.relationships.is_empty());
     let [prompt, message] = evidence.messages.as_slice() else {
-        panic!("the sidechain prompt and its answer: {:?}", evidence.messages);
+        panic!(
+            "the sidechain prompt and its answer: {:?}",
+            evidence.messages
+        );
     };
     assert_eq!(prompt.role, Role::User);
     assert_eq!(prompt.is_sidechain, Some(true));
