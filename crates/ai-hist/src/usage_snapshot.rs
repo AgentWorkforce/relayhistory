@@ -518,6 +518,21 @@ mod tests {
         assert_eq!(round_trip(json!("text")), "[null,null,null,null,\"text\"]");
     }
 
+    /// A stored form no encoder writes, with a key both in a slot and in
+    /// `rest` / `other`: the precedence the TS SDK reader mirrors.
+    #[test]
+    fn a_key_in_a_slot_and_in_rest_reads_one_way() {
+        let Some(Decoded::Snapshot(snapshot)) = decode(
+            r#"[[1,null,null,null,null,null,{"input_tokens":2}],null,9,{"model_context_window":8,"total_token_usage":0}]"#,
+        ) else {
+            panic!("compact form");
+        };
+        assert_eq!(
+            snapshot.to_value(),
+            json!({"total_token_usage": {"input_tokens": 2}, "model_context_window": 8})
+        );
+    }
+
     #[test]
     fn an_object_payload_is_not_the_compact_form() {
         assert_eq!(decode("{\"total_token_usage\":{}}"), None);

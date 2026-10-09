@@ -403,13 +403,14 @@ function storedTokenUsage(slots: JsonValue): { [key: string]: JsonValue } | unde
   if (!Array.isArray(slots) || slots.length > 7) return undefined;
   const rest = slots[6];
   if (rest !== undefined && !isJsonObject(rest)) return undefined;
-  // Spread defines every key as an own property, `__proto__` included.
-  const usage: { [key: string]: JsonValue } = rest ? { ...rest } : {};
+  const usage: { [key: string]: JsonValue } = {};
   USAGE_COUNTERS.forEach((name, index) => {
     const counter = slots[index];
     if (counter !== undefined && counter !== null) usage[name] = counter;
   });
-  return usage;
+  // `rest` last, as the Rust reader applies it. Spread defines every key as
+  // an own property, `__proto__` included.
+  return rest ? { ...usage, ...rest } : usage;
 }
 
 /**
@@ -428,10 +429,14 @@ export function usageSnapshotInfo(stored: JsonValue | null): JsonValue | null {
   const lastUsage = last === null ? null : storedTokenUsage(last);
   if (totalUsage === undefined || lastUsage === undefined) return stored;
   if (info !== null) return info;
-  const object: { [key: string]: JsonValue } = other ? { ...other } : {};
+  // The Rust reader's precedence: `other` over the window slot, the usage
+  // slots over `other`.
+  const object: { [key: string]: JsonValue } = {
+    ...(window !== null ? { model_context_window: window } : {}),
+    ...(other ?? {}),
+  };
   if (totalUsage) object.total_token_usage = totalUsage;
   if (lastUsage) object.last_token_usage = lastUsage;
-  if (window !== null) object.model_context_window = window;
   return object;
 }
 
