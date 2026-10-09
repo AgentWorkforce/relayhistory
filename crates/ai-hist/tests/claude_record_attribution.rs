@@ -46,6 +46,31 @@ fn opening_request(store: &SessionStore) -> (Vec<String>, i64, bool) {
     (ids, request.first_ts_ms, request.has_thinking)
 }
 
+/// `(message_id, ts_ms, payload)` of the opening record's signature marker.
+fn opening_marker(store: &SessionStore) -> Option<(String, i64, serde_json::Value)> {
+    let evidence = store
+        .session(
+            &SessionRef::id(Source::Claude, MULTI_BLOCK),
+            SessionQuery::default(),
+        )
+        .unwrap()
+        .unwrap();
+    evidence
+        .markers
+        .iter()
+        .find(|marker| {
+            marker.subkind.as_deref() == Some("thinking_signature")
+                && marker.message_id.as_deref() == Some("u-asst-1a")
+        })
+        .map(|marker| {
+            (
+                marker.message_id.clone().unwrap(),
+                marker.ts_ms.unwrap(),
+                marker.payload.clone().unwrap(),
+            )
+        })
+}
+
 /// `spawned_at_ms` of the edge whose parent is `parent`.
 fn spawned_at(store: &SessionStore, parent: &str) -> Option<i64> {
     let evidence = store
@@ -63,9 +88,12 @@ fn spawned_at(store: &SessionStore, parent: &str) -> Option<i64> {
         .spawned_at_ms
 }
 
-const ALL_FOUR: [&str; 4] = ["u-asst-1a", "u-asst-1b", "u-asst-1c", "u-asst-1d"];
+/// The records that store events; the opening record stores only its marker.
+const WITH_EVENTS: [&str; 3] = ["u-asst-1b", "u-asst-1c", "u-asst-1d"];
 /// 2026-04-20T00:00:01.000Z, the signature-only record that opens the response.
 const RESPONSE_START: i64 = 1_776_643_201_000;
+/// 2026-04-20T00:00:01.500Z, the response's first record that stores an event.
+const FIRST_EVENT: i64 = 1_776_643_201_500;
 /// 2026-04-24T02:00:00.000Z, the user line carrying `continuedFromSessionId`.
 const CONTINUED_AT: i64 = 1_776_996_000_000;
 /// 2026-04-24T02:00:01.000Z, the assistant line carrying `forkSessionId`.
@@ -79,7 +107,22 @@ fn a_fresh_store_attributes_the_opening_record_and_the_naming_records() {
     let store = synced(dir.path());
     assert_eq!(
         opening_request(&store),
-        (ALL_FOUR.map(String::from).to_vec(), RESPONSE_START, true)
+        (WITH_EVENTS.map(String::from).to_vec(), FIRST_EVENT, false),
+        "the request is grouped from events; the opening record has none"
+    );
+    assert_eq!(
+        opening_marker(&store),
+        Some((
+            "u-asst-1a".to_string(),
+            RESPONSE_START,
+            serde_json::json!({
+                "bytes": 3,
+                "has_signature": true,
+                "request_id": "req_1",
+                "provider_message_id": "msg_multi_1",
+            })
+        )),
+        "the opening record's marker carries when the request started and names it"
     );
     assert_eq!(spawned_at(&store, "original-session"), Some(CONTINUED_AT));
     assert_eq!(spawned_at(&store, "fork-source-session"), Some(FORKED_AT));

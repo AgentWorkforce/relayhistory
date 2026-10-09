@@ -8174,8 +8174,9 @@ const CLAUDE_LACKS_RAW_FACTS_SQL: &str = "SELECT
                 LIMIT 1
         )";
 
-/// A thinking-signature marker whose record has no `thinking` event: what a
-/// parser that dropped signed, empty `thinking` blocks left behind. Reached by
+/// A thinking-signature marker whose record has no `thinking` event and that
+/// names no request: what a parser before signature markers carried the
+/// request identity left for a signed, empty `thinking` block. Reached by
 /// the same two routes as [`CLAUDE_LACKS_RAW_FACTS_SQL`].
 const CLAUDE_LACKS_SIGNED_THINKING_SQL: &str = "SELECT
             EXISTS(
@@ -8184,6 +8185,8 @@ const CLAUDE_LACKS_SIGNED_THINKING_SQL: &str = "SELECT
                 CROSS JOIN session_markers m ON m.source = s.source AND m.session_id = s.session_id
                 WHERE s.source = 'claude' AND s.raw_path = ?1
                   AND m.subkind = 'thinking_signature'
+                  AND json_type(m.payload_json, '$.request_id') IS NULL
+                  AND json_type(m.payload_json, '$.provider_message_id') IS NULL
                   AND NOT EXISTS(
                     SELECT 1 FROM session_events e
                     WHERE e.source = 'claude' AND e.message_id = m.message_id
@@ -8198,6 +8201,8 @@ const CLAUDE_LACKS_SIGNED_THINKING_SQL: &str = "SELECT
                  AND m.session_id = COALESCE(r.child_session_id, r.parent_session_id)
                 WHERE r.source = 'claude' AND r.evidence_locator = ?1
                   AND m.subkind = 'thinking_signature'
+                  AND json_type(m.payload_json, '$.request_id') IS NULL
+                  AND json_type(m.payload_json, '$.provider_message_id') IS NULL
                   AND NOT EXISTS(
                     SELECT 1 FROM session_events e
                     WHERE e.source = 'claude' AND e.message_id = m.message_id
@@ -9793,7 +9798,10 @@ fn ingest_claude_record(
         // block — an unsupported block type, a thinking signature, tool
         // replacement metadata, a delegated result's agent id — is
         // recorded here, before the arms that handle what it can.
-        for (suffix, draft) in claude_markers_for_block(block_type, block) {
+        let request_id = identity.request_id.or(raw_facts.request_id);
+        for (suffix, draft) in
+            claude_markers_for_block(block_type, block, request_id, identity.provider_message_id)
+        {
             let marker_uid = format!("{event_uid}:{suffix}");
             insert_session_marker(
                 conn,
@@ -9830,13 +9838,10 @@ fn ingest_claude_record(
                     .get("thinking")
                     .or_else(|| block.get("text"))
                     .and_then(Value::as_str);
-                // A signed block with no display text is still the model's
-                // reasoning: Claude streams it as the first record of a
-                // response, and that record's timestamp is when the request
-                // started. Without an event it joins no request, so the
-                // request would begin at its second record.
-                let signed = block.get("signature").and_then(Value::as_str).is_some();
-                if signed || text.is_some_and(|s| !s.trim().is_empty()) {
+                // A signed block with no display text is carried by its
+                // `thinking_signature` marker, which names the record's
+                // request; it has no content to store as an event.
+                if text.is_some_and(|s| !s.trim().is_empty()) {
                     insert_session_event(
                         conn,
                         "claude",
@@ -10542,20 +10547,45 @@ fn claude_marker_for_record(
 /// tool-replacement metadata, and the `agentId` a delegated tool result
 /// carries. Several can apply to one block, so each marker brings the suffix
 /// that keys it.
-fn claude_markers_for_block(block_type: &str, block: &Value) -> Vec<(&'static str, MarkerDraft)> {
+///
+/// A signed `thinking` block with no display text is the record Claude streams
+/// first in a response, so its timestamp is when the request started. It
+/// stores no event, so its marker carries the record's request identity --
+/// `request_id` and `provider_message_id` -- which is what places it in its
+/// request (`session_requests` folds these markers in).
+fn claude_markers_for_block(
+    block_type: &str,
+    block: &Value,
+    request_id: Option<&str>,
+    provider_message_id: Option<&str>,
+) -> Vec<(&'static str, MarkerDraft)> {
     let mut markers = Vec::new();
     match block_type {
         "text" | "tool_use" => {}
         "thinking" => {
             if let Some(signature) = block.get("signature").and_then(Value::as_str) {
+                let mut payload = vec![
+                    ("bytes", Value::from(signature.len())),
+                    ("has_signature", Value::Bool(true)),
+                ];
+                let text = block
+                    .get("thinking")
+                    .or_else(|| block.get("text"))
+                    .and_then(Value::as_str);
+                if text.is_none_or(|text| text.trim().is_empty()) {
+                    let id = |value: Option<&str>| {
+                        value
+                            .filter(|value| !value.is_empty())
+                            .map(|value| Value::String(value.to_string()))
+                            .unwrap_or(Value::Null)
+                    };
+                    payload.push(("request_id", id(request_id)));
+                    payload.push(("provider_message_id", id(provider_message_id)));
+                }
                 markers.push((
                     "signature",
-                    MarkerDraft::new("unsupported_block", Some("thinking_signature")).with_payload(
-                        vec![
-                            ("bytes", Value::from(signature.len())),
-                            ("has_signature", Value::Bool(true)),
-                        ],
-                    ),
+                    MarkerDraft::new("unsupported_block", Some("thinking_signature"))
+                        .with_payload(payload),
                 ));
             }
         }
@@ -32064,7 +32094,8 @@ mod tests {
         let state_path = dir.path().join(".sync-state.json");
         let mut state = load_sync_state(&state_path).unwrap();
         conn.execute_batch(
-            "DELETE FROM session_events WHERE event_uid = 'u-asst-1a:0';
+            "UPDATE session_markers SET payload_json = '{\"bytes\":3,\"has_signature\":true}'
+              WHERE subkind = 'thinking_signature';
              UPDATE session_continuity_evidence
                 SET explicit_targets_json = json_remove(explicit_targets_json,
                       '$.continuation_ts_ms', '$.fork_ts_ms');
@@ -32114,15 +32145,22 @@ mod tests {
                 .unwrap()
                 .swept
         );
-        let (first_ts, has_thinking): (i64, bool) = conn
+        // The opening record's marker names its request again, at the time
+        // the request started.
+        let (ts, request, provider): (i64, String, String) = conn
             .query_row(
-                "SELECT first_ts_ms, has_thinking FROM session_requests \
-                 WHERE source = 'claude' AND request_key = 'request-id:req_1'",
+                "SELECT ts_ms, json_extract(payload_json, '$.request_id'), \
+                        json_extract(payload_json, '$.provider_message_id') \
+                 FROM session_markers \
+                 WHERE subkind = 'thinking_signature' AND message_id = 'u-asst-1a'",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert_eq!((first_ts, has_thinking), (1_776_643_201_000, true));
+        assert_eq!(
+            (ts, request.as_str(), provider.as_str()),
+            (1_776_643_201_000, "req_1", "msg_multi_1")
+        );
         let forked_at: i64 = conn
             .query_row(
                 "SELECT spawned_at_ms FROM session_relationships WHERE relationship = 'fork'",

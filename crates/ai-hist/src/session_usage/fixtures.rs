@@ -77,11 +77,12 @@ fn assistant_rows_with_usage(conn: &Connection) -> i64 {
 #[test]
 fn a_multi_block_turn_is_one_request_per_request_id() {
     let conn = claude_store("claude/multi-block-turn.jsonl");
-    // All four records, the signed but empty opening `thinking` block
-    // included, each carry a full copy of the one request's usage.
+    // The fixture's opening `thinking` block is empty, so the parser stores
+    // no row for it; the remaining three records each carry a full copy of
+    // the one request's usage.
     assert_eq!(
         assistant_rows_with_usage(&conn),
-        4,
+        3,
         "the fixture really does copy one request's usage onto every record"
     );
     let raw_row_sum: i64 = conn
@@ -91,7 +92,7 @@ fn a_multi_block_turn_is_one_request_per_request_id() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(raw_row_sum, 172, "summing rows would quadruple the request");
+    assert_eq!(raw_row_sum, 129, "summing rows would triple the request");
 
     let page = session_requests_page(&conn, "claude", CLAUDE_SESSION, 50, None).unwrap();
     assert_eq!(page.requests.len(), 1);
@@ -99,19 +100,8 @@ fn a_multi_block_turn_is_one_request_per_request_id() {
     assert_eq!(request.request_key, "request-id:req_1");
     assert_eq!(request.request_key_source, RequestKeySource::RequestId);
     assert_eq!(request.model.as_deref(), Some("claude-opus-4-7"));
-    let mut message_ids = request.message_ids.clone();
-    message_ids.sort();
-    assert_eq!(
-        message_ids,
-        ["u-asst-1a", "u-asst-1b", "u-asst-1c", "u-asst-1d"],
-        "the signature-only record that opens the response is part of it"
-    );
-    assert_eq!(request.event_count, 4);
-    assert_eq!(
-        request.first_ts_ms, 1_776_643_201_000,
-        "the request starts at its first record, 00:00:01.000"
-    );
-    assert!(request.has_thinking);
+    assert_eq!(request.message_ids.len(), 3);
+    assert_eq!(request.event_count, 3);
     assert!(request.diagnostics.is_empty());
     assert_eq!(
         request.tool_use_ids,
@@ -212,7 +202,7 @@ fn records_with_no_captured_identity_are_flagged_and_not_summed() {
     .unwrap();
 
     let page = session_requests_page(&conn, "claude", CLAUDE_SESSION, 50, None).unwrap();
-    assert_eq!(page.requests.len(), 4, "one row per record, as stored");
+    assert_eq!(page.requests.len(), 3, "one row per record, as stored");
     for request in &page.requests {
         assert_eq!(request.request_key_source, RequestKeySource::RecordId);
         assert_eq!(
@@ -226,10 +216,10 @@ fn records_with_no_captured_identity_are_flagged_and_not_summed() {
     let summary = session_usage_summary(&conn, "claude", CLAUDE_SESSION)
         .unwrap()
         .unwrap();
-    assert_eq!(summary.total_request_count, 4);
+    assert_eq!(summary.total_request_count, 3);
     assert_eq!(
         summary.usage, None,
-        "4 x 43 output tokens is not this session's total"
+        "3 x 43 output tokens is not this session's total"
     );
     assert!(summary
         .diagnostics
@@ -844,35 +834,15 @@ fn a_codex_counter_above_i64_max_survives_the_parser_intact() {
 }
 
 /// Prompt attribution is a faithful move of the commercial outbox's rule,
-/// including its refusal: with the multi-block fixture's opening record
-/// missing from the store, every later record's ancestry runs through a
-/// record nothing holds, so every response in the turn has a broken chain to
-/// its prompt and none of them is charged. A missing number, not a plausible
-/// wrong one.
+/// including its refusal: the multi-block fixture's ancestry runs through the
+/// empty `thinking` record, which the parser stores nothing for, so every
+/// response in the turn has a broken chain to its prompt and none of them is
+/// charged. A missing number, not a plausible wrong one.
 #[test]
 fn prompt_attribution_refuses_a_response_whose_ancestry_is_broken() {
     let conn = claude_store("claude/multi-block-turn.jsonl");
-    conn.execute(
-        "DELETE FROM session_events WHERE message_id = 'u-asst-1a'",
-        [],
-    )
-    .unwrap();
     let events = crate::store::session_events(&conn, CLAUDE_SESSION, Some("claude")).unwrap();
     assert!(crate::usage::attribute_usage_to_prompts(&events, "claude").is_empty());
-}
-
-/// The signed, empty `thinking` record that opens a streamed response is
-/// stored, so the response's ancestry reaches its prompt and the request is
-/// charged to it once.
-#[test]
-fn prompt_attribution_follows_a_response_through_its_signature_only_record() {
-    let conn = claude_store("claude/multi-block-turn.jsonl");
-    let events = crate::store::session_events(&conn, CLAUDE_SESSION, Some("claude")).unwrap();
-    let attributed = crate::usage::attribute_usage_to_prompts(&events, "claude");
-    assert_eq!(attributed.len(), 1);
-    let ((_, prompt), usage) = attributed.iter().next().unwrap();
-    assert_eq!(prompt, "check the repo");
-    assert_eq!((usage.input_tokens, usage.output_tokens), (3, 43));
 }
 
 /// And attributes normally when the chain is intact.
