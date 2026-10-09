@@ -123,6 +123,28 @@ jobs:
       - name: Public API matches the checked-in snapshot
         run: node scripts/check-public-api.mjs
 
+  # Code-quality ratchet (AgentWorkforce/rust-oleum). rust-oleum.toml
+  # grandfathers today's complexity and file-size violations at their current
+  # ceilings; a new violation, or growth past a ceiling, fails. A refactor
+  # that brings an entry down regenerates the baseline with
+  # `rust-oleum --write-baseline`. Separate from `verify`, which deletes
+  # plugins/, one of the scanned source roots.
+  code-quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        id: rust-oleum-cache
+        with:
+          path: ~/.cargo/bin/rust-oleum
+          key: rust-oleum-${{ runner.os }}-0.1.2
+      - name: Install rust-oleum
+        if: steps.rust-oleum-cache.outputs.cache-hit != 'true'
+        run: cargo install rust-oleum --version 0.1.2 --locked
+      - name: Quality ratchet
+        run: rust-oleum --github-summary "$GITHUB_STEP_SUMMARY"
+
   # Nothing in the workspace proves that a crate outside it can consume
   # ai-hist. examples/rust-consumer is that crate: not a workspace member, its
   # own lockfile, a crates.io dependency on the default features. Here the
