@@ -4,7 +4,12 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Patch]
+
+### Fixed
+
+- `sync` no longer rewrites the full-text index entry of a row it re-reads unchanged: a sweep that re-reads the OpenCode store, or re-parses a transcript, re-indexes only rows whose text, role or project changed, so walking syncs write less and stop fragmenting the full-text index searches read. Fragmentation an existing store already has stays until FTS5's own merges or `ai-hist compact` (which runs `optimize`) consolidate it.
+- Writing a marker reuses its prepared statement instead of compiling it, and the change-feed triggers it fires, once per marker: cold sync and hydration of marker-heavy transcripts are ~10% faster.
 
 ## [0.36.0] - 2026-10-07
 
