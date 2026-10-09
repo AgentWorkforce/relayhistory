@@ -45,10 +45,16 @@ pub(crate) fn sweep_left_records_held(state: &Map<String, Value>) -> bool {
     state.get(CLAUDE_HOLDING_RECORDS_KEY) == Some(&Value::Bool(true))
 }
 
-/// Forget `path`'s record cursor, returning whether it was holding a trailing
-/// message: a transcript the sweep could not read still owes that message a
-/// sweep, so the caller keeps [`CLAUDE_HOLDING_RECORDS_KEY`] set for it.
-pub(crate) fn forget_cursor_noting_held(conn: &Connection, path: &Path) -> Result<bool> {
+/// Forget the record cursor of a transcript the sweep could not open, unless
+/// it is holding a trailing message; returns whether it is.
+///
+/// A holding cursor is kept because it is the only record that the message is
+/// owed a pass: its offset stops short of the file's end, so the unchanged
+/// skip never passes over it, and the caller keeps
+/// [`CLAUDE_HOLDING_RECORDS_KEY`] set so the sweep keeps running until the file
+/// can be read again. Any other cursor is dropped, so the next read starts from
+/// zero rather than trusting a position over bytes it could not see.
+pub(crate) fn forget_unread_cursor_unless_held(conn: &Connection, path: &Path) -> Result<bool> {
     let locator = path.to_string_lossy();
     let key = CursorKey::Locator {
         source: "claude",
@@ -57,7 +63,9 @@ pub(crate) fn forget_cursor_noting_held(conn: &Connection, path: &Path) -> Resul
     let held = load_cursor(conn, &key)?
         .claude
         .is_some_and(|claude| !claude.in_progress.is_empty());
-    forget_locator_cursor(conn, "claude", path)?;
+    if !held {
+        forget_locator_cursor(conn, "claude", path)?;
+    }
     Ok(held)
 }
 

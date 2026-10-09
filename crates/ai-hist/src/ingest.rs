@@ -8067,11 +8067,12 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
         // walk absorbs it, withholds the generation if this file was one it
         // would otherwise have skipped, and drops the cursor so the next walk
         // reads it again rather than skipping it on a position that no longer
-        // describes anything readable.
+        // describes anything readable -- unless the cursor holds a message,
+        // which keeps the sweep coming back to it.
         if !transcript_is_readable(&path) {
             walked_every_known_root &= !known_before;
             if known_before {
-                holding_records |= incremental::forget_cursor_noting_held(conn, &path)?;
+                holding_records |= incremental::forget_unread_cursor_unless_held(conn, &path)?;
             }
             sync_note!(
                 "  [claude-sessions] could not open {} (skipped)",
@@ -34967,7 +34968,12 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt as _;
             fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o000)).unwrap();
-            if fs::File::open(&sidecar).is_err() {
+            assert!(
+                fs::File::open(&sidecar).is_err(),
+                "mode 000 must make the sidecar unreadable; run this test as a non-root user"
+            );
+            // Twice: the second unread sweep must still see what the first kept.
+            for _ in 0..2 {
                 assert!(
                     super::sync_exclusive_with_roots(&db, &roots, false)
                         .unwrap()
