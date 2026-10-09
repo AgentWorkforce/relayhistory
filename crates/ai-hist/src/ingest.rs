@@ -770,8 +770,12 @@ fn destination_head(conn: &Connection) -> Result<String> {
 /// generations belong in the stamp. OpenCode keeps no per-file sync state --
 /// every sweep re-normalizes every session -- so its entry is a generation name
 /// alone, [`OPENCODE_NORMALIZER_GENERATION`].
+///
+/// Claude transcripts are skipped on their byte cursors rather than a stamp
+/// map, so their entry names the one-time Claude pass that is pending,
+/// `CLAUDE_RECORD_ATTRIBUTION_KEY` at its generation.
 const SWEEP_PARSER_GENERATIONS: &[&str] = &[
-    "claude_sessions_v3",
+    "claude_record_attribution_1",
     "codex_rollouts_v7",
     GROK_SYNC_STATE_KEY,
     OPENCODE_NORMALIZER_GENERATION,
@@ -3195,6 +3199,16 @@ fn record_fidelity_backfill(state: &mut Map<String, Value>, key: &str) {
 /// `the_raw_facts_version_and_generation_are_bumped_together` is the guard.
 const RAW_MESSAGE_FACTS_GENERATION: i64 = 4;
 const CLAUDE_RAW_MESSAGE_FACTS_KEY: &str = "claude_raw_message_facts";
+
+/// One-time pass over indexed Claude transcripts for what earlier parsers
+/// left out: the event of a signed, empty `thinking` block (its signature
+/// marker is stored, the event is not) and the timestamps of the records
+/// naming explicit continuity targets. Only transcripts the probes select are
+/// re-read or re-captured, and the probes run only while the pass is pending
+/// and only for transcripts already indexed, so a fresh store and every later
+/// sync pay nothing.
+const CLAUDE_RECORD_ATTRIBUTION_GENERATION: i64 = 1;
+const CLAUDE_RECORD_ATTRIBUTION_KEY: &str = "claude_record_attribution";
 const CODEX_RAW_MESSAGE_FACTS_KEY: &str = "codex_raw_message_facts";
 
 /// One-time re-read of every Codex fork rollout, so the fork replay gate
@@ -7602,6 +7616,11 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
         .and_then(Value::as_i64)
         .unwrap_or(0)
         < CLAUDE_SIDECAR_LAYOUT_GENERATION;
+    let backfill_attribution = state
+        .get(CLAUDE_RECORD_ATTRIBUTION_KEY)
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        < CLAUDE_RECORD_ATTRIBUTION_GENERATION;
     // The first read failure, returned once everything else has been indexed.
     // Continuing past it indexes the rest of the tree, but the run did omit a
     // transcript it discovered, and a caller told the sync completed would
@@ -7663,7 +7682,10 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
         // transcript does not own cannot pin the file off the fast path.
         let backfill = (backfill_fidelity
             && claude_transcript_lacks_tool_result_fidelity(conn, &path)?)
-            || (backfill_raw_facts && claude_transcript_lacks_raw_facts(conn, &path)?);
+            || (backfill_raw_facts && claude_transcript_lacks_raw_facts(conn, &path)?)
+            || (backfill_attribution
+                && indexed
+                && claude_transcript_lacks_signed_thinking(conn, &path)?);
         // Present but short: the destination marker says this transcript's
         // session lost rows. A cursor cannot answer that — it describes bytes,
         // not evidence — and the transcript's bytes will never move again to
@@ -7686,7 +7708,11 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
             // Gated on `transcript_events` because a subagent sidecar reaches
             // this skip through its delegation evidence instead, and a sidecar
             // is not a session: it has no row to owe and must not be re-read.
-            if transcript_events && claude_transcript_lacks_continuity_evidence(conn, &path)? {
+            if transcript_events
+                && (claude_transcript_lacks_continuity_evidence(conn, &path)?
+                    || (backfill_attribution
+                        && crate::continuity::claude_evidence_lacks_naming_times(conn, &path)?))
+            {
                 crate::continuity::capture_claude_transcript(conn, &path)?;
             }
             continue;
@@ -7876,6 +7902,12 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
     }
     crate::continuity::reconcile(conn, "claude")?;
     record_raw_facts_backfill(state, CLAUDE_RAW_MESSAGE_FACTS_KEY, walked_every_known_root);
+    if walked_every_known_root {
+        state.insert(
+            CLAUDE_RECORD_ATTRIBUTION_KEY.to_string(),
+            json!(CLAUDE_RECORD_ATTRIBUTION_GENERATION),
+        );
+    }
     if repairs.repairs_all() && !walked_every_known_root {
         coverage.note_unread();
     }
@@ -8261,6 +8293,53 @@ const CLAUDE_LACKS_RAW_FACTS_SQL: &str = "SELECT
                   AND COALESCE(e.raw_facts_version, 0) < ?2
                 LIMIT 1
         )";
+
+/// A thinking-signature marker whose record has no `thinking` event and that
+/// names no request: what a parser before signature markers carried the
+/// request identity left for a signed, empty `thinking` block. Reached by
+/// the same two routes as [`CLAUDE_LACKS_RAW_FACTS_SQL`].
+const CLAUDE_LACKS_SIGNED_THINKING_SQL: &str = "SELECT
+            EXISTS(
+                SELECT 1
+                FROM sessions s
+                CROSS JOIN session_markers m ON m.source = s.source AND m.session_id = s.session_id
+                WHERE s.source = 'claude' AND s.raw_path = ?1
+                  AND m.subkind = 'thinking_signature'
+                  AND json_type(m.payload_json, '$.request_id') IS NULL
+                  AND json_type(m.payload_json, '$.provider_message_id') IS NULL
+                  AND NOT EXISTS(
+                    SELECT 1 FROM session_events e
+                    WHERE e.source = 'claude' AND e.message_id = m.message_id
+                      AND e.kind = 'thinking')
+                LIMIT 1
+            )
+            OR EXISTS(
+                SELECT 1
+                FROM session_relationships r
+                CROSS JOIN session_markers m
+                  ON m.source = 'claude'
+                 AND m.session_id = COALESCE(r.child_session_id, r.parent_session_id)
+                WHERE r.source = 'claude' AND r.evidence_locator = ?1
+                  AND m.subkind = 'thinking_signature'
+                  AND json_type(m.payload_json, '$.request_id') IS NULL
+                  AND json_type(m.payload_json, '$.provider_message_id') IS NULL
+                  AND NOT EXISTS(
+                    SELECT 1 FROM session_events e
+                    WHERE e.source = 'claude' AND e.message_id = m.message_id
+                      AND e.kind = 'thinking')
+                LIMIT 1
+        )";
+
+fn claude_transcript_lacks_signed_thinking(conn: &Connection, path: &Path) -> Result<bool> {
+    let raw_path = path.to_string_lossy();
+    let lacking: i64 = cached_query_row(
+        conn,
+        CLAUDE_LACKS_SIGNED_THINKING_SQL,
+        [raw_path.as_ref()],
+        |row| row.get(0),
+    )?;
+    Ok(lacking != 0)
+}
 
 /// The raw-facts question for a Claude transcript.
 ///
@@ -9884,7 +9963,10 @@ fn ingest_claude_record(
         // block — an unsupported block type, a thinking signature, tool
         // replacement metadata, a delegated result's agent id — is
         // recorded here, before the arms that handle what it can.
-        for (suffix, draft) in claude_markers_for_block(block_type, block) {
+        let request_id = identity.request_id.or(raw_facts.request_id);
+        for (suffix, draft) in
+            claude_markers_for_block(block_type, block, request_id, identity.provider_message_id)
+        {
             let marker_uid = format!("{event_uid}:{suffix}");
             insert_session_marker(
                 conn,
@@ -9921,6 +10003,9 @@ fn ingest_claude_record(
                     .get("thinking")
                     .or_else(|| block.get("text"))
                     .and_then(Value::as_str);
+                // A signed block with no display text is carried by its
+                // `thinking_signature` marker, which names the record's
+                // request; it has no content to store as an event.
                 if text.is_some_and(|s| !s.trim().is_empty()) {
                     insert_session_event(
                         conn,
@@ -10627,20 +10712,45 @@ fn claude_marker_for_record(
 /// tool-replacement metadata, and the `agentId` a delegated tool result
 /// carries. Several can apply to one block, so each marker brings the suffix
 /// that keys it.
-fn claude_markers_for_block(block_type: &str, block: &Value) -> Vec<(&'static str, MarkerDraft)> {
+///
+/// A signed `thinking` block with no display text is the record Claude streams
+/// first in a response, so its timestamp is when the request started. It
+/// stores no event, so its marker carries the record's request identity --
+/// `request_id` and `provider_message_id` -- which is what places it in its
+/// request (`session_requests` folds these markers in).
+fn claude_markers_for_block(
+    block_type: &str,
+    block: &Value,
+    request_id: Option<&str>,
+    provider_message_id: Option<&str>,
+) -> Vec<(&'static str, MarkerDraft)> {
     let mut markers = Vec::new();
     match block_type {
         "text" | "tool_use" => {}
         "thinking" => {
             if let Some(signature) = block.get("signature").and_then(Value::as_str) {
+                let mut payload = vec![
+                    ("bytes", Value::from(signature.len())),
+                    ("has_signature", Value::Bool(true)),
+                ];
+                let text = block
+                    .get("thinking")
+                    .or_else(|| block.get("text"))
+                    .and_then(Value::as_str);
+                if text.is_none_or(|text| text.trim().is_empty()) {
+                    let id = |value: Option<&str>| {
+                        value
+                            .filter(|value| !value.is_empty())
+                            .map(|value| Value::String(value.to_string()))
+                            .unwrap_or(Value::Null)
+                    };
+                    payload.push(("request_id", id(request_id)));
+                    payload.push(("provider_message_id", id(provider_message_id)));
+                }
                 markers.push((
                     "signature",
-                    MarkerDraft::new("unsupported_block", Some("thinking_signature")).with_payload(
-                        vec![
-                            ("bytes", Value::from(signature.len())),
-                            ("has_signature", Value::Bool(true)),
-                        ],
-                    ),
+                    MarkerDraft::new("unsupported_block", Some("thinking_signature"))
+                        .with_payload(payload),
                 ));
             }
         }
@@ -32375,6 +32485,119 @@ mod tests {
                     None,
                 ),
             ]
+        );
+    }
+
+    /// A store the previous parser indexed has no event for the signed, empty
+    /// `thinking` record that opens a streamed response, continuity evidence
+    /// without naming timestamps, a fork edge dated by the transcript's first
+    /// record, cursors at end of file, no attribution pass recorded and a
+    /// fingerprint that vouches for all of it. One plain sync repairs every
+    /// part, then the fast path resumes.
+    #[test]
+    fn unchanged_claude_transcripts_gain_opening_records_and_naming_times_after_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join(".claude/projects/-tmp-project");
+        fs::create_dir_all(&project).unwrap();
+        for name in [
+            "multi-block-turn.jsonl",
+            "explicit-line-relationships.jsonl",
+        ] {
+            fs::copy(
+                corpus_fixture(&format!("claude/{name}")),
+                project.join(name),
+            )
+            .unwrap();
+        }
+        let db = dir.path().join("history.db");
+        let roots = crate::ProviderRoots::from_home(
+            dir.path().to_path_buf(),
+            dir.path().join("opencode.db"),
+        );
+        super::sync_exclusive_with_roots(&db, &roots, false).unwrap();
+        let conn = open_db(&db).unwrap();
+        let state_path = dir.path().join(".sync-state.json");
+        let mut state = load_sync_state(&state_path).unwrap();
+        conn.execute_batch(
+            "UPDATE session_markers SET payload_json = '{\"bytes\":3,\"has_signature\":true}'
+              WHERE subkind = 'thinking_signature';
+             UPDATE session_continuity_evidence
+                SET explicit_targets_json = json_remove(explicit_targets_json,
+                      '$.continuation_ts_ms', '$.fork_ts_ms');
+             UPDATE session_relationships SET spawned_at_ms = 1776996000000
+              WHERE relationship = 'fork';",
+        )
+        .unwrap();
+        state.remove(super::CLAUDE_RECORD_ATTRIBUTION_KEY);
+        // The previous build's fingerprint and a destination proof taken over
+        // what it stored, so nothing but the generation can force the sweep.
+        let source_part = state[super::SOURCE_FINGERPRINT_KEY]
+            .as_str()
+            .unwrap()
+            .split_once('/')
+            .unwrap()
+            .1
+            .to_string();
+        let old_generations = [
+            "claude_sessions_v3",
+            "codex_rollouts_v7",
+            super::GROK_SYNC_STATE_KEY,
+        ]
+        .join("|");
+        let old_generation = format!(
+            "g{:016x}",
+            crate::discover::fingerprint_hash(
+                "sweep-generation",
+                &crate::discover::SHALLOW_SCANNER_VERSION.to_string(),
+                &old_generations,
+            )
+        );
+        let old_fingerprint = format!("{old_generation}/{source_part}");
+        state.insert(super::SOURCE_FINGERPRINT_KEY.into(), json!(old_fingerprint));
+        state.insert(
+            super::DESTINATION_GENERATION_KEY.into(),
+            json!(super::destination_generation(&conn).unwrap()),
+        );
+        state.insert(
+            super::DESTINATION_HEAD_KEY.into(),
+            json!(super::destination_head(&conn).unwrap()),
+        );
+        assert!(super::sources_unchanged(&conn, &state, &old_fingerprint));
+        fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+
+        assert!(
+            super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept
+        );
+        // The opening record's marker names its request again, at the time
+        // the request started.
+        let (ts, request, provider): (i64, String, String) = conn
+            .query_row(
+                "SELECT ts_ms, json_extract(payload_json, '$.request_id'), \
+                        json_extract(payload_json, '$.provider_message_id') \
+                 FROM session_markers \
+                 WHERE subkind = 'thinking_signature' AND message_id = 'u-asst-1a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (ts, request.as_str(), provider.as_str()),
+            (1_776_643_201_000, "req_1", "msg_multi_1")
+        );
+        let forked_at: i64 = conn
+            .query_row(
+                "SELECT spawned_at_ms FROM session_relationships WHERE relationship = 'fork'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(forked_at, 1_776_996_001_000);
+        assert!(
+            !super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept
         );
     }
 

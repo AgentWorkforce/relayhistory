@@ -154,7 +154,7 @@
       "marker_uid": "u-asst-1a:0:signature",
       "message_id": "u-asst-1a",
       "parent_id": "u-user-1",
-      "payload_json": "{\"bytes\":3,\"has_signature\":true}",
+      "payload_json": "{\"bytes\":3,\"has_signature\":true,\"provider_message_id\":\"msg_multi_1\",\"request_id\":\"req_1\"}",
       "session_id": "22222222-2222-2222-2222-222222222222",
       "source": "claude",
       "subkind": "thinking_signature",

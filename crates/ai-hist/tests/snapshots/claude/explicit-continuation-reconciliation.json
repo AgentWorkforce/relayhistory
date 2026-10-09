@@ -180,7 +180,7 @@
       "relationship_uid": "fork:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
       "source": "claude",
       "spawn_depth": null,
-      "spawned_at_ms": 1776996000000
+      "spawned_at_ms": 1776996001000
     },
     {
       "child_agent_name": null,

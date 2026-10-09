@@ -77,6 +77,14 @@ pub struct ContinuityEvidence {
     /// and the edge records whichever one the rollout actually carried.
     #[serde(default)]
     pub explicit_fork_refs: BTreeMap<String, String>,
+    /// When the record that first named each continuation target was
+    /// written. The edge is dated by it, not by the transcript's first record:
+    /// the field can sit on any line of the file.
+    #[serde(default)]
+    pub explicit_continuation_ts_ms: BTreeMap<String, i64>,
+    /// When the record that first named each fork target was written.
+    #[serde(default)]
+    pub explicit_fork_ts_ms: BTreeMap<String, i64>,
     /// An explicit `sourceSessionId`, which names the origin directly.
     pub explicit_source_session_id: Option<String>,
     pub source_version: Option<String>,
@@ -114,6 +122,8 @@ impl ContinuityEvidence {
             // banked by a scanner that did not read Codex's own fork fields,
             // and `codex_evidence_is_current` re-reads it once.
             "fork_refs": self.explicit_fork_refs,
+            "continuation_ts_ms": self.explicit_continuation_ts_ms,
+            "fork_ts_ms": self.explicit_fork_ts_ms,
             "source": self.explicit_source_session_id,
         })
         .to_string()
@@ -303,9 +313,15 @@ pub(crate) fn fold_claude_record(
     if let Some(target) =
         string_field(object, &["continuedFromSessionId", "continued_from_session_id"])
     {
+        if !evidence.explicit_continuation_targets.contains(&target) {
+            note_named_at(&mut evidence.explicit_continuation_ts_ms, &target, object);
+        }
         push_unique(&mut evidence.explicit_continuation_targets, target);
     }
     if let Some(target) = string_field(object, &["forkSessionId", "fork_session_id"]) {
+        if !evidence.explicit_fork_targets.contains(&target) {
+            note_named_at(&mut evidence.explicit_fork_ts_ms, &target, object);
+        }
         push_unique(&mut evidence.explicit_fork_targets, target);
     }
     if evidence.explicit_source_session_id.is_none() {
@@ -468,6 +484,23 @@ pub(crate) fn codex_evidence_is_current(conn: &Connection, locator: &str) -> Res
             [locator],
             |row| row.get::<_, bool>(0),
         )
+        .optional()?
+        .unwrap_or(false))
+}
+
+/// Whether a Claude transcript's banked evidence names an explicit target but
+/// was banked before the naming records' timestamps were recorded.
+pub(crate) fn claude_evidence_lacks_naming_times(conn: &Connection, path: &Path) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT json_type(explicit_targets_json, '$.continuation_ts_ms') IS NULL \
+                AND (json_array_length(explicit_targets_json, '$.continuation') > 0 \
+                     OR json_array_length(explicit_targets_json, '$.fork') > 0) \
+             FROM session_continuity_evidence \
+             WHERE source = 'claude' AND locator = ? AND json_valid(explicit_targets_json) \
+             LIMIT 1",
+        )?
+        .query_row([path.to_string_lossy().as_ref()], |row| row.get::<_, bool>(0))
         .optional()?
         .unwrap_or(false))
 }
@@ -881,6 +914,7 @@ fn resolve_explicit(
             Some(evidence.session_id.as_str()),
             REF_CONTINUED_FROM,
             evidence.explicit_source_session_id.as_deref(),
+            named_at(&evidence.explicit_continuation_ts_ms, target, evidence),
         )?);
     }
     for target in &evidence.explicit_fork_targets {
@@ -903,6 +937,7 @@ fn resolve_explicit(
             Some(evidence.session_id.as_str()),
             evidence_ref,
             Some(origin),
+            named_at(&evidence.explicit_fork_ts_ms, target, evidence),
         )?);
     }
     Ok(())
@@ -946,6 +981,7 @@ fn resolve_explicit_source(
         Some(evidence.session_id.as_str()),
         REF_SOURCE_SESSION,
         Some(origin),
+        evidence.first_ts_ms,
     )?);
     Ok(())
 }
@@ -986,6 +1022,7 @@ fn resolve_resume(
             .as_deref()
             .filter(|id| !id.is_empty() && *id != evidence.session_id)
             .or(Some(target)),
+        evidence.first_ts_ms,
     )?);
     Ok(())
 }
@@ -1037,6 +1074,7 @@ fn resolve_cross_file_parent(
         Some(evidence.session_id.as_str()),
         parent_uuid,
         evidence.explicit_source_session_id.as_deref(),
+        evidence.first_ts_ms,
     )?);
     Ok(())
 }
@@ -1108,6 +1146,7 @@ fn resolve_fork_group(
             child,
             REF_SHARED_SESSION_ID,
             Some(origin.as_str()),
+            member.first_ts_ms,
         )?;
         // Only this locator's own row is part of its keep-set; a sibling's row
         // is retracted by the sibling's own pass, never by this one.
@@ -1157,6 +1196,7 @@ fn write_edge(
     child_session_id: Option<&str>,
     evidence_ref: &str,
     origin_session_id: Option<&str>,
+    spawned_at_ms: Option<i64>,
 ) -> Result<(String, String)> {
     // Unlinked branches of one origin must not collapse into a single row, so
     // their uid carries the transcript that distinguishes them.
@@ -1179,7 +1219,7 @@ fn write_edge(
             evidence_locator: Some(&evidence.locator),
             evidence_ref: Some(evidence_ref),
             child_has_events,
-            spawned_at_ms: evidence.first_ts_ms,
+            spawned_at_ms,
             origin_session_id,
             relationship_uid: Some(&uid),
             ..ObservedRelationship::default()
@@ -1251,6 +1291,8 @@ fn map_evidence(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContinuityEvidence>
                     .collect()
             })
             .unwrap_or_default(),
+        explicit_continuation_ts_ms: ts_map(&targets, "continuation_ts_ms"),
+        explicit_fork_ts_ms: ts_map(&targets, "fork_ts_ms"),
         explicit_source_session_id: targets
             .get("source")
             .and_then(Value::as_str)
@@ -1484,6 +1526,45 @@ fn string_field(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Optio
         .map(str::trim)
         .find(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+fn ts_map(value: &Value, key: &str) -> BTreeMap<String, i64> {
+    value
+        .get(key)
+        .and_then(Value::as_object)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|(target, ts)| Some((target.clone(), ts.as_i64()?)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Remember when the record that first names `target` was written. Called
+/// only for that first record: one without a timestamp leaves the target
+/// undated rather than dated by a later record.
+fn note_named_at(
+    named: &mut BTreeMap<String, i64>,
+    target: &str,
+    object: &serde_json::Map<String, Value>,
+) {
+    if let Some(ts) = record_ts_ms(object) {
+        named.insert(target.to_string(), ts);
+    }
+}
+
+/// When the record naming an explicit target was written.
+///
+/// A Codex rollout names its targets only on the `session_meta` line that
+/// opens it, so its first record is the naming record. A Claude naming record
+/// without a timestamp leaves only the transcript's first record to date by.
+fn named_at(
+    named: &BTreeMap<String, i64>,
+    target: &str,
+    evidence: &ContinuityEvidence,
+) -> Option<i64> {
+    named.get(target).copied().or(evidence.first_ts_ms)
 }
 
 fn string_array(value: &Value, key: &str) -> Vec<String> {
@@ -1725,6 +1806,44 @@ mod tests {
                 format!("fork:{CROSS}"),
                 REF_FORK_SESSION.to_string(),
             )]
+        );
+    }
+
+    /// Each explicit edge is dated by the record that named it. The fixture's
+    /// `continuedFromSessionId` is on its first line (02:00:00) and its
+    /// `forkSessionId` on the assistant line after it (02:00:01).
+    #[test]
+    fn explicit_fields_are_dated_by_the_record_that_names_them() {
+        let (_dir, conn) = database();
+        ingest(&conn, "explicit-line-relationships.jsonl");
+        let spawned_at = |parent: &str| {
+            session_children(&conn, "claude", parent, &RelationshipKinds::continuity())
+                .unwrap()
+                .remove(0)
+                .spawned_at_ms
+        };
+        assert_eq!(spawned_at("original-session"), Some(1_776_996_000_000));
+        assert_eq!(spawned_at("fork-source-session"), Some(1_776_996_001_000));
+    }
+
+    #[test]
+    fn a_target_whose_naming_record_is_undated_falls_back_to_the_first_record() {
+        let mut evidence = ContinuityEvidence {
+            first_ts_ms: Some(1_000),
+            ..ContinuityEvidence::default()
+        };
+        let mut first_user_seen = false;
+        for record in [
+            json!({"sessionId": "s", "forkSessionId": "base"}),
+            json!({"sessionId": "s", "forkSessionId": "base",
+                   "timestamp": "2026-04-24T02:00:01.000Z"}),
+        ] {
+            fold_claude_record(&mut evidence, &mut first_user_seen, record.as_object().unwrap());
+        }
+        assert!(evidence.explicit_fork_ts_ms.is_empty());
+        assert_eq!(
+            named_at(&evidence.explicit_fork_ts_ms, "base", &evidence),
+            Some(1_000)
         );
     }
 

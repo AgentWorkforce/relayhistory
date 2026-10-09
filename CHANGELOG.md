@@ -22,6 +22,10 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - An OpenCode message's stop reason is its final `step-finish` reason, else the message's own `finish`; a reasonless final step no longer reports an earlier step's reason.
 - `sync` no longer rewrites the full-text index entry of a row it re-reads unchanged: a sweep that re-reads the OpenCode store, or re-parses a transcript, re-indexes only rows whose text, role or project changed, so walking syncs write less and stop fragmenting the full-text index searches read. Fragmentation an existing store already has stays until FTS5's own merges or `ai-hist compact` (which runs `optimize`) consolidate it.
 - Writing a marker reuses its prepared statement instead of compiling it, and the change-feed triggers it fires, once per marker: cold sync and hydration of marker-heavy transcripts are ~10% faster.
+- Claude: the `thinking_signature` marker of a signed `thinking` block with empty text carries the record's `request_id` and `provider_message_id` in its payload, so the record that opens a streamed response — which stores no event — can be placed in its request, and the marker's `ts_ms` is when the request started.
+- Claude: `continuation` and `fork` edges from `continuedFromSessionId` / `forkSessionId` carry the timestamp of the record that named them in `spawned_at_ms`, not the transcript's first record.
+- Existing stores gain both on the next `sync`, which re-reads only the Claude transcripts whose signature markers do not yet name their request and re-captures continuity only for transcripts naming an explicit target.
+- Re-reading a Claude subagent transcript is linear in its own records again: retiring a sidechain record's rows under the parent session is an indexed lookup instead of a scan of the parent's events, tool calls, edits and markers. On a store with a 50 MB session and ~1,100 sidecar subagents the one-time re-read above takes about as long as a cold sync instead of ~19x it.
 
 ### Rust API
 
