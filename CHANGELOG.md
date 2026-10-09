@@ -8,11 +8,11 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Breaking Changes
 
-- Change-feed rows (`StoredRow`) and `ai-hist export` payloads no longer carry `session_events.raw_facts_version` or `sessions.source_stamp`, the store's own parser and discovery generation bookkeeping; the feed does not stamp a row when only they change.
+- Change-feed rows (`StoredRow`) and `ai-hist export` payloads no longer carry `session_events.raw_facts_version`, the store's own parser-generation bookkeeping; the feed does not stamp an event when only it changes.
 
 ### Fixed
 
-- Upgrading no longer re-delivers a store's history through the change feed. An appended column restamps only rows holding a value in it (a column a row was delivered without is NULL); a dropped, renamed or retyped column still restamps every row of its kind. A parser or discovery generation bump re-delivers only rows whose evidence changed.
+- An appended exported column restamps only rows holding a value in it, and a raw-facts parser-generation bump restamps only events whose evidence changed, so neither re-delivers a store's session events. A row holding NULL in an appended column keeps its revision; a consumer reads a column a row was delivered without as NULL. A dropped, renamed or retyped column still restamps every row of its kind.
 
 ## [0.37.0] - 2026-10-09
 

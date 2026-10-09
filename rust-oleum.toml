@@ -23,7 +23,7 @@ rust_roots = ["crates/ai-hist-cli/src", "crates/ai-hist-napi/src", "crates/ai-hi
 [baseline]
 
 [baseline.file_loc]
-"crates/ai-hist/src/change_feed.rs" = 1606
+"crates/ai-hist/src/change_feed.rs" = 1516
 "crates/ai-hist/src/continuity.rs" = 1124
 "crates/ai-hist/src/discover.rs" = 3902
 "crates/ai-hist/src/forget.rs" = 644

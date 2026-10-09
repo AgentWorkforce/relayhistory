@@ -389,10 +389,7 @@ fn sqlite_value(value: ValueRef<'_>) -> Value {
 
 /// Columns that are the database's own bookkeeping, which the feed never
 /// carries.
-const LOCAL_COLUMNS: &[(&str, &str)] = &[
-    ("session_events", "raw_facts_version"),
-    ("sessions", "source_stamp"),
-];
+const LOCAL_COLUMNS: &[(&str, &str)] = &[("session_events", "raw_facts_version")];
 
 /// Every row of one table as the feed carries it: every column but `revision`
 /// and the [`LOCAL_COLUMNS`].

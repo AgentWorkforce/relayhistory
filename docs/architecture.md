@@ -548,9 +548,10 @@ Three rules a consumer must hold:
   existing kind restamps only rows of that kind above the old head: otherwise
   an unchanged row would keep its revision while acquiring different semantic
   JSON. A migration that only appends columns restamps only the rows holding a
-  value in one of them; every other row exports what it did before plus
-  `null` for each new column, and a column a row was delivered without is
-  NULL, so upgrading never re-delivers a store's history. The epoch and named
+  value in one of them, so upgrading never re-delivers a store's history. Every
+  other row keeps its revision: re-read at that revision it also carries each
+  new column as `null`, and a consumer reads a column a row was delivered
+  without as NULL. The epoch and named
   cursors remain stable, and unrelated kinds are not
 replayed. A newly fed kind is stamped above the old head and records its
 fingerprint without resetting established consumers. Retiring a fed kind is
