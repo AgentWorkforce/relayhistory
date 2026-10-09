@@ -120,6 +120,14 @@ API` changelog entry in the same PR). The plugin crates are not workspace member
 `cargo test --workspace` does not reach them — run them directly when you touch
 `plugins/`.
 
+The `code-quality` job runs [rust-oleum](https://github.com/AgentWorkforce/rust-oleum)
+against `rust-oleum.toml`: per-function cyclomatic/cognitive complexity,
+Halstead difficulty and lines per file. Existing violations are grandfathered
+at their current ceiling in `[baseline]`; a new violation, or growing past a
+ceiling, fails. Run `rust-oleum` locally before pushing. When a refactor brings
+an entry down, lower or delete its baseline line (`rust-oleum --write-baseline`
+prints the regenerated section) — never raise one.
+
 For a change under `crates/ai-hist/`, the `burn-contract-drift` job checks out
 `AgentWorkforce/burn` (main, or the commit in the `BURN_REF` repository
 variable), rewrites burn's `ai-hist` requirement to a path dependency on this
