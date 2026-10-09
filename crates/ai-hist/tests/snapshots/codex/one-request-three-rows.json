@@ -180,7 +180,7 @@
       "marker_uid": "7:marker",
       "message_id": null,
       "parent_id": null,
-      "payload_json": "{\"total_token_usage\":{\"cached_input_tokens\":0,\"input_tokens\":500,\"output_tokens\":120,\"reasoning_output_tokens\":40,\"total_tokens\":620}}",
+      "payload_json": "[[500,0,null,120,40,620]]",
       "session_id": "sess_codex_three_rows",
       "source": "codex",
       "subkind": "token_count",

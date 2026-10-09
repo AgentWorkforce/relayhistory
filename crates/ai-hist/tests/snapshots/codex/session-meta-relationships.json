@@ -51,7 +51,7 @@
       "marker_uid": "4:marker",
       "message_id": null,
       "parent_id": null,
-      "payload_json": "{\"total_token_usage\":{\"cached_input_tokens\":20,\"input_tokens\":100,\"output_tokens\":10,\"reasoning_output_tokens\":2}}",
+      "payload_json": "[[100,20,null,10,2]]",
       "session_id": "sess_meta_child",
       "source": "codex",
       "subkind": "token_count",

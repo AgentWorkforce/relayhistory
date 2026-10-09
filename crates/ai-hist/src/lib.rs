@@ -44,6 +44,7 @@ mod session_identities;
 mod session_store;
 mod session_usage;
 mod usage;
+mod usage_snapshot;
 
 #[cfg(all(feature = "git-hooks", feature = "unstable-internal"))]
 pub mod git_helpers;
@@ -104,6 +105,7 @@ pub use usage::{
     attribute_usage_to_prompts, normalize_usage, normalize_usage_str, source_accounting,
     NormalizedUsage, PromptKey, UsageAccounting, UsageCoverage, UsageError, NORMALIZABLE_SOURCES,
 };
+pub use usage_snapshot::{TokenUsage, UsageSnapshot};
 pub use watch::{TickTrigger, WatchDriver};
 
 #[cfg(not(feature = "unstable-internal"))]

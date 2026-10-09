@@ -5911,11 +5911,13 @@ fn bounded_marker_json(document: &Value) -> Result<String> {
 
 /// Store one Codex `token_count` as a `usage_snapshot` marker.
 ///
-/// The payload is the provider's `info` as written (`total_token_usage`,
-/// `last_token_usage`, `model_context_window`), bounded whole like any
-/// provider document in `payload_json`; the bound never alters a number, so
-/// counters are never truncated. The `info: null` snapshot Codex emits before
-/// a turn has spent anything stores no payload.
+/// The payload is the provider's `info` (`total_token_usage`,
+/// `last_token_usage`, `model_context_window`, anything else it writes),
+/// bounded whole like any provider document in `payload_json` and stored in
+/// the compact form [`crate::usage_snapshot`] describes; neither the bound
+/// nor the encoding alters a number, so counters are never truncated. The
+/// `info: null` snapshot Codex emits before a turn has spent anything stores
+/// no payload.
 ///
 /// It is a cumulative snapshot, not a per-request delta: per-request usage
 /// stays on the assistant events' `token_json`, and nothing reads these
@@ -5934,9 +5936,13 @@ fn record_codex_usage_snapshot(
     // `info: null` carries no counters and stores no payload, like every
     // other marker with nothing to say: a stored `"null"` would read back as
     // `Some(Null)` here and `None` after a serde round trip.
-    let payload_json = (!info.is_null())
-        .then(|| bounded_marker_json(info))
-        .transpose()?;
+    let payload_json = match info {
+        Value::Null => None,
+        info if marker_payload_is_bounded(info) => Some(crate::usage_snapshot::encode(info)?),
+        info => Some(crate::usage_snapshot::encode(&bound_marker_value(
+            info.clone(),
+        ))?),
+    };
     insert_session_marker(
         conn,
         "codex",

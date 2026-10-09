@@ -388,8 +388,50 @@ export function sessionFileEdit(value: UnknownRecord): SessionFileEdit {
   };
 }
 
+/** Counter order of a stored Codex token usage array. */
+const USAGE_COUNTERS = [
+  'input_tokens', 'cached_input_tokens', 'cache_write_input_tokens',
+  'output_tokens', 'reasoning_output_tokens', 'total_tokens',
+] as const;
+
+function isJsonObject(value: JsonValue | undefined): value is { [key: string]: JsonValue } {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function storedTokenUsage(slots: JsonValue | undefined): { [key: string]: JsonValue } | null {
+  if (!Array.isArray(slots)) return null;
+  const usage: { [key: string]: JsonValue } = {};
+  USAGE_COUNTERS.forEach((name, index) => {
+    const counter = slots[index];
+    if (counter !== undefined && counter !== null) usage[name] = counter;
+  });
+  if (isJsonObject(slots[6])) Object.assign(usage, slots[6]);
+  return usage;
+}
+
+/**
+ * A Codex `usage_snapshot` stores its `info` object compactly, as
+ * `[total, last, window, other, info]` (see the crate's `usage_snapshot`
+ * module); this is the object it was stored from. A payload already an
+ * object is returned as is.
+ */
+export function usageSnapshotInfo(stored: JsonValue | null): JsonValue | null {
+  if (!Array.isArray(stored)) return stored;
+  const [total, last, window, other, info] = stored;
+  if (info !== undefined && info !== null) return info;
+  const object: { [key: string]: JsonValue } = isJsonObject(other) ? { ...other } : {};
+  const totalUsage = storedTokenUsage(total);
+  if (totalUsage) object.total_token_usage = totalUsage;
+  const lastUsage = storedTokenUsage(last);
+  if (lastUsage) object.last_token_usage = lastUsage;
+  if (window !== undefined && window !== null) object.model_context_window = window;
+  return object;
+}
+
 export function sessionMarker(value: UnknownRecord): SessionMarker {
   const payloadJson = nullableString(value.payloadJson);
+  const kind = String(value.kind);
+  const payload = parseStoredJson(payloadJson);
   return {
     id: Number(value.id),
     source: String(value.source) as Source,
@@ -399,10 +441,10 @@ export function sessionMarker(value: UnknownRecord): SessionMarker {
     messageId: nullableString(value.messageId),
     parentId: nullableString(value.parentId),
     turnId: nullableString(value.turnId),
-    kind: String(value.kind),
+    kind,
     subkind: nullableString(value.subkind),
     text: nullableString(value.text),
-    payload: parseStoredJson(payloadJson),
+    payload: kind === 'usage_snapshot' ? usageSnapshotInfo(payload) : payload,
     payloadJson,
   };
 }

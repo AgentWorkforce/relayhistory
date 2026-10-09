@@ -4,8 +4,8 @@
 //! A turn whose rollout reports usage through `event_msg/token_count` without
 //! an assistant message still billed those tokens. Each populated snapshot is
 //! a `usage_snapshot` marker on [`SessionEvidence::markers`]: the provider's
-//! `info` as written (`null` included), stamped with the Codex `turn_id` it
-//! fell inside, in read order.
+//! `info`, typed in [`Marker::usage_snapshot`] (none for `info: null`),
+//! stamped with the Codex `turn_id` it fell inside, in read order.
 //! Snapshots are cumulative and never differenced here, so every one of them
 //! stays readable for a consumer that does its own accounting.
 
@@ -69,12 +69,15 @@ fn snapshots(evidence: &SessionEvidence) -> Vec<(Option<&str>, Value)> {
         .into_iter()
         .map(|marker| {
             assert_eq!(marker.subkind.as_deref(), Some("token_count"));
-            // `info: null` stores no payload.
-            let raw: Value = marker
-                .raw_payload()
-                .map(|raw| serde_json::from_str(raw).expect("raw payload is JSON"))
-                .unwrap_or(Value::Null);
-            (marker.turn_id.as_deref(), raw)
+            // The counters are typed; nothing is left to parse.
+            assert_eq!(marker.payload, None);
+            assert_eq!(marker.raw_payload(), None);
+            // `info: null` has no snapshot.
+            let info = marker
+                .usage_snapshot
+                .as_ref()
+                .map_or(Value::Null, |snapshot| snapshot.to_value());
+            (marker.turn_id.as_deref(), info)
         })
         .collect()
 }
@@ -248,6 +251,26 @@ fn counters_are_never_altered_by_the_marker_bound() {
     .collect::<String>();
     let (_dir, evidence) = synced(&rollout, "sess_counters");
     assert_eq!(snapshots(&evidence), vec![(Some("turn_c"), info)]);
+    let total = usage_snapshots(&evidence)[0]
+        .usage_snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.total_token_usage.as_ref())
+        .expect("typed total");
+    assert_eq!(
+        total.input_tokens.as_ref().and_then(Value::as_u64),
+        Some(u64::MAX)
+    );
+    assert_eq!(
+        total.output_tokens.as_ref().and_then(Value::as_f64),
+        Some(1.5)
+    );
+    assert_eq!(
+        total
+            .reasoning_output_tokens
+            .as_ref()
+            .and_then(Value::as_i64),
+        Some(-3)
+    );
 }
 
 /// State markers survive a serde round trip unchanged, `info: null` included:
@@ -260,7 +283,40 @@ fn state_markers_round_trip_through_serde() {
     let null_snapshot = usage_snapshots(&evidence)[0];
     assert_eq!(null_snapshot.raw_payload(), None);
     assert_eq!(null_snapshot.payload, None);
+    assert_eq!(null_snapshot.usage_snapshot, None);
+    assert!(usage_snapshots(&evidence)[1].usage_snapshot.is_some());
     let encoded = serde_json::to_string(&evidence.markers).unwrap();
     let decoded: Vec<Marker> = serde_json::from_str(&encoded).unwrap();
     assert_eq!(decoded, evidence.markers);
+}
+
+/// A payload stored as the `info` object itself -- by a development build
+/// before the compact form -- reads back typed all the same.
+#[test]
+fn an_info_object_payload_reads_back_typed() {
+    let rollout = fixture("simple-turn.jsonl");
+    let (dir, evidence) = synced(&rollout, "sess_simple_1");
+    let expected = snapshots(&evidence);
+    let conn = rusqlite::Connection::open(dir.path().join("ai-history.db")).unwrap();
+    let rewritten = conn
+        .execute(
+            "UPDATE session_markers SET payload_json = ?1 \
+             WHERE kind = 'usage_snapshot' AND payload_json IS NOT NULL",
+            [serde_json::to_string(&line_info(&rollout, 4)).unwrap()],
+        )
+        .unwrap();
+    assert_eq!(rewritten, 1);
+    drop(conn);
+    let mut options = StoreOptions::default();
+    options.db_path = Some(dir.path().join("ai-history.db"));
+    options.read_only = true;
+    let reread = SessionStore::open(options)
+        .unwrap()
+        .session(
+            &SessionRef::id(Source::Codex, "sess_simple_1"),
+            SessionQuery::default(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshots(&reread), expected);
 }

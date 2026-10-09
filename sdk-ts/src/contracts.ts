@@ -678,7 +678,11 @@ export interface SessionMarker {
   subkind: string | null;
   /** The provider's own readable text for this marker, when it wrote one. */
   text: string | null;
-  /** Parsed bounded payload projection, or null when absent or unparseable. */
+  /**
+   * Parsed bounded payload projection, or null when absent or unparseable.
+   * For a Codex `usage_snapshot`, the provider's `info` object, expanded from
+   * the compact form `payloadJson` stores.
+   */
   payload: JsonValue | null;
   /** The stored payload string exactly as indexed, parseable or not. */
   payloadJson: string | null;

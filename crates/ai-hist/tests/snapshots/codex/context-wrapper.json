@@ -163,7 +163,7 @@
       "marker_uid": "8:marker",
       "message_id": null,
       "parent_id": null,
-      "payload_json": "{\"last_token_usage\":{\"cached_input_tokens\":200,\"input_tokens\":800,\"output_tokens\":60,\"reasoning_output_tokens\":10,\"total_tokens\":860},\"total_token_usage\":{\"cached_input_tokens\":200,\"input_tokens\":800,\"output_tokens\":60,\"reasoning_output_tokens\":10,\"total_tokens\":860}}",
+      "payload_json": "[[800,200,null,60,10,860],[800,200,null,60,10,860]]",
       "session_id": "sess_context_wrapper_1",
       "source": "codex",
       "subkind": "token_count",
