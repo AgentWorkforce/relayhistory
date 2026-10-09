@@ -1208,7 +1208,8 @@ fn is_failed_tool(state: Option<&Map<String, Value>>) -> bool {
 
 /// The reason on the message's *last* `step-finish` part. A turn can take
 /// several steps; only the last one says why the turn ended, so a final step
-/// that names no reason yields none rather than an earlier step's.
+/// that names no reason -- or an empty one -- yields none rather than an
+/// earlier step's.
 fn last_step_finish_reason(parts: &[OpencodePart]) -> Option<String> {
     parts
         .iter()
@@ -1216,6 +1217,7 @@ fn last_step_finish_reason(parts: &[OpencodePart]) -> Option<String> {
         .find(|part| part.kind == "step-finish")?
         .get("reason")
         .and_then(Value::as_str)
+        .filter(|reason| !reason.is_empty())
         .map(str::to_string)
 }
 
@@ -1403,7 +1405,8 @@ fn normalize_session(
             .tokens
             .as_ref()
             .and_then(|tokens| serde_json::to_string(tokens).ok());
-        let stop_reason = last_step_finish_reason(parts).or_else(|| message.finish.clone());
+        let stop_reason = last_step_finish_reason(parts)
+            .or_else(|| message.finish.clone().filter(|finish| !finish.is_empty()));
         let message_project = message.path_cwd.clone().or_else(|| project.clone());
 
         if message.role == "user" {
@@ -1991,6 +1994,11 @@ mod tests {
         let parts = vec![
             part(r#"{"id":"p1","type":"step-finish","reason":"tool-calls"}"#),
             part(r#"{"id":"p2","type":"step-finish"}"#),
+        ];
+        assert_eq!(last_step_finish_reason(&parts), None);
+        let parts = vec![
+            part(r#"{"id":"p1","type":"step-finish","reason":"tool-calls"}"#),
+            part(r#"{"id":"p2","type":"step-finish","reason":""}"#),
         ];
         assert_eq!(last_step_finish_reason(&parts), None);
     }
