@@ -14,7 +14,10 @@ import { test } from "node:test";
  */
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const read = (file) => readFileSync(path.join(ROOT, ".github/workflows", file), "utf8");
-const LABEL_FILTER = "(github.event.action != 'labeled' || github.event.label.name == 'ci:run')";
+/** The complete trunk-PR + ci:run gate. Asserted exactly: a substring check would
+ * still pass if a job appended an `|| ...` bypass. */
+const TRUNK_CI_GATE =
+  "(github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.head_ref == 'trunk' && github.event.pull_request.head.repo.full_name == github.repository && github.base_ref == 'main' && (github.event.action != 'labeled' || github.event.label.name == 'ci:run'))";
 
 /** Every `if:` of a top-level job (2-space indented key under `jobs:`). */
 function jobGates(source) {
@@ -47,8 +50,7 @@ for (const file of ["ci.yml"]) {
     const gates = jobGates(source);
     assert.ok(Object.keys(gates).length > 0);
     for (const [job, gate] of Object.entries(gates)) {
-      assert.ok(gate?.includes("github.head_ref == 'trunk'"), `${file} ${job}: trunk PR gate`);
-      assert.ok(gate?.includes(LABEL_FILTER), `${file} ${job}: must skip label events other than ci:run`);
+      assert.equal(gate, TRUNK_CI_GATE, `${file} ${job}: exact trunk PR + ci:run gate`);
     }
   });
 }
