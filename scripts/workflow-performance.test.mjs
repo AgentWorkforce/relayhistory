@@ -19,8 +19,15 @@ function jobBlock(workflow, name, nextName) {
 
 test("CI cancels stale runs and release markers do not launch the full suite", () => {
   assert.match(ci, /paths-ignore:\n\s+- '\.release\/dispatch-patch-\*'/);
-  assert.match(ci, /group: ci-\$\{\{ github\.event\.pull_request\.number \|\| github\.ref \}\}/);
-  assert.match(ci, /cancel-in-progress: true/);
+  // PR runs collapse per PR (a newer `ci:run` cancels the superseded trunk head);
+  // push runs key off the sha so back-to-back merges never cancel each other.
+  assert.ok(
+    ci.includes(
+      "group: ci-${{ github.event_name != 'pull_request' && format('push-{0}', github.sha) || ((github.event.action == 'labeled' && github.event.label.name != 'ci:run') && format('ignored-{0}', github.run_id) || format('pr-{0}', github.event.pull_request.number)) }}\n",
+    ),
+    "the complete concurrency group: push by sha, ignored labels throwaway, PRs per number",
+  );
+  assert.match(ci, /cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' \}\}/);
 });
 
 test("critical CI Rust jobs restore explicit caches", () => {
