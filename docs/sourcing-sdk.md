@@ -347,7 +347,9 @@ It returns the whole reachable work, never a truncated part of it.
 Continuity (a fork, resume or continuation) is not followed: those are
 conversations of their own. An embedder sharing a session's work shares these
 with it. `delegated_by(&SessionIdentity)` is the other direction: the sessions
-that delegated work to one, empty for a session of its own.
+that delegated work to one, empty for a session of its own. Each descendant's
+evidence is read with `session()` by its id; see
+[delegated children](#delegated-children).
 
 A delegated child is part of its parent's work, not a session to offer apart
 from it. Setting `CatalogQuery { exclude_delegated: true, .. }` or calling
@@ -398,6 +400,41 @@ summary together; `History` the prompts; the other kinds their own table. What
 is read is `coverage ∩ kinds`, reported back as `loaded`, so a kind the source
 cannot produce is never fetched and never listed. `CommitLink` is not carried
 by `session()`.
+
+#### Delegated children
+
+A Claude subagent sidecar or a Codex child thread is kept out of the catalog —
+it is part of its parent's work — but its evidence is stored under its own id,
+and `session(&SessionRef::id(source, child_id), ..)` reads it like any
+session: messages with `raw_usage()`, requests and the usage rollup, tool
+calls and results, markers. Its `session` is `DiscoveryState::Delegated`,
+described from the child's own rows — `cwd`, `git_branch`, `agent_version`,
+`models`, the activity window and `project_key` its events recorded, and
+`raw_path` the transcript its delegation edge names; `first_prompt`,
+`last_assistant_text` and `source_stamp` are `None` and `locations` is empty,
+because a child has no catalog row or presence of its own. Its
+`relationships` carry the `RelationshipSide::Child` edge whose
+`parent_session_id` is the session that spawned it — for a nested Claude
+subagent, the subagent whose tool use started it — and the `Parent` edges of
+anything it spawned in turn. An id no session delegated to, or one nothing is
+stored under, is `None`, and a child is named by id, never by path.
+
+Every child of a session, for a consumer accounting for its delegated spend:
+
+```rust
+let root = SessionIdentity::new("claude", session_id);
+for child in store.delegated_descendants(&[root])? {
+    let Some(source) = child.source() else { continue };
+    let Some(evidence) = store.session(&SessionRef::id(source, &child.session_id), SessionQuery::default())? else {
+        continue; // named by an edge, nothing stored under it
+    };
+    // evidence.messages[..].raw_usage(), evidence.requests, evidence.tool_calls …
+}
+```
+
+Each read is one session's evidence, so a child's usage is never folded into
+its parent's rollup and nothing is counted twice; `sessions()` and
+`session_identities` with `exclude_delegated` still list only the root.
 
 A `Block` carries `control: Option<ControlKind>`: why a block in the user role
 is not a human prompt — a slash-command caveat, invocation or output, a task

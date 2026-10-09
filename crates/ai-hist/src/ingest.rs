@@ -772,10 +772,12 @@ fn destination_head(conn: &Connection) -> Result<String> {
 /// alone, [`OPENCODE_NORMALIZER_GENERATION`].
 ///
 /// Claude transcripts are skipped on their byte cursors rather than a stamp
-/// map, so their entry names the one-time Claude pass that is pending,
-/// `CLAUDE_RECORD_ATTRIBUTION_KEY` at its generation.
+/// map, so their entries name the one-time Claude passes that are pending:
+/// `CLAUDE_RECORD_ATTRIBUTION_KEY` at its generation and
+/// [`CLAUDE_DELEGATION_CAPTURE_KEY`].
 const SWEEP_PARSER_GENERATIONS: &[&str] = &[
     "claude_record_attribution_1",
+    CLAUDE_DELEGATION_CAPTURE_KEY,
     "codex_rollouts_v7",
     GROK_SYNC_STATE_KEY,
     OPENCODE_NORMALIZER_GENERATION,
@@ -3219,6 +3221,22 @@ const CODEX_RAW_MESSAGE_FACTS_KEY: &str = "codex_raw_message_facts";
 /// backfills.
 const CODEX_FORK_REPLAY_GENERATION: i64 = 1;
 const CODEX_FORK_REPLAY_KEY: &str = "codex_fork_replay_gate";
+
+/// One-time re-read of the Claude transcripts whose delegation evidence an
+/// earlier parser recorded thinner than the provider wrote it: a spawn result
+/// without the record's `toolUseResult.agentId`, and a sidecar edge without
+/// its child's model or hung on a parent that does not hold the tool use that
+/// started it. Finished transcripts never change again, so without the pass an
+/// upgraded install that only syncs keeps the old edges for good. The name is
+/// in [`SWEEP_PARSER_GENERATIONS`], so the sweep fingerprint an earlier build
+/// stored cannot skip the pass; it is recorded only after a walk that reached
+/// every known root, like the other backfills.
+const CLAUDE_DELEGATION_CAPTURE_KEY: &str = "claude_delegation_capture_v1";
+
+/// Whether the Claude delegation backfill pass is still owed.
+fn delegation_backfill_pending(state: &Map<String, Value>) -> bool {
+    !state.contains_key(CLAUDE_DELEGATION_CAPTURE_KEY)
+}
 
 /// Whether this provider still owes a one-time raw-facts backfill pass.
 fn raw_facts_backfill_pending(state: &Map<String, Value>, key: &str) -> bool {
@@ -7621,6 +7639,7 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
         .and_then(Value::as_i64)
         .unwrap_or(0)
         < CLAUDE_RECORD_ATTRIBUTION_GENERATION;
+    let backfill_delegation = delegation_backfill_pending(state);
     // The first read failure, returned once everything else has been indexed.
     // Continuing past it indexes the rest of the tree, but the run did omit a
     // transcript it discovered, and a caller told the sync completed would
@@ -7685,7 +7704,10 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
             || (backfill_raw_facts && claude_transcript_lacks_raw_facts(conn, &path)?)
             || (backfill_attribution
                 && indexed
-                && claude_transcript_lacks_signed_thinking(conn, &path)?);
+                && claude_transcript_lacks_signed_thinking(conn, &path)?)
+            || (backfill_delegation
+                && indexed
+                && claude_transcript_lacks_delegation_capture(conn, &path)?);
         // Present but short: the destination marker says this transcript's
         // session lost rows. A cursor cannot answer that — it describes bytes,
         // not evidence — and the transcript's bytes will never move again to
@@ -7899,6 +7921,7 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
             CLAUDE_SIDECAR_LAYOUT_KEY.to_string(),
             json!(CLAUDE_SIDECAR_LAYOUT_GENERATION),
         );
+        state.insert(CLAUDE_DELEGATION_CAPTURE_KEY.to_string(), json!(1));
     }
     crate::continuity::reconcile(conn, "claude")?;
     record_raw_facts_backfill(state, CLAUDE_RAW_MESSAGE_FACTS_KEY, walked_every_known_root);
@@ -8357,6 +8380,49 @@ fn claude_transcript_lacks_raw_facts(conn: &Connection, path: &Path) -> Result<b
         conn,
         CLAUDE_LACKS_RAW_FACTS_SQL,
         params![raw_path.as_ref(), RAW_MESSAGE_FACTS_VERSION],
+        |row| row.get(0),
+    )?;
+    Ok(lacking != 0)
+}
+
+/// [`claude_transcript_lacks_delegation_capture`]'s probe: a session
+/// transcript holding an Agent/Task result with no `agent_id`, or a sidecar
+/// whose edge has no child model or hangs on a parent whose transcript does
+/// not hold the tool use that started it.
+/// `CROSS JOIN` pins the join order for the reason
+/// [`CLAUDE_TRANSCRIPT_EVENTS_SQL`] gives.
+const CLAUDE_LACKS_DELEGATION_CAPTURE_SQL: &str = "SELECT
+            EXISTS(
+                SELECT 1
+                FROM sessions s
+                CROSS JOIN session_events e ON e.source = s.source AND e.session_id = s.session_id
+                CROSS JOIN tool_calls t ON t.source = e.source AND t.session_id = e.session_id
+                  AND t.tool_use_id = e.tool_use_id
+                WHERE s.source = 'claude' AND s.raw_path = ?1
+                  AND e.kind = 'tool_result' AND e.agent_id IS NULL
+                  AND t.name IN ('Agent', 'Task')
+                LIMIT 1
+            )
+            OR EXISTS(
+                SELECT 1
+                FROM session_relationships r
+                WHERE r.source = 'claude' AND r.evidence_locator = ?1
+                  AND r.relationship = 'delegated' AND r.child_session_id IS NOT NULL
+                  AND (r.child_model IS NULL
+                    OR (r.evidence_ref IS NOT NULL AND NOT EXISTS(
+                          SELECT 1 FROM tool_calls t
+                          WHERE t.source = 'claude' AND t.session_id = r.parent_session_id
+                            AND t.tool_use_id = r.evidence_ref)))
+                LIMIT 1
+            )";
+
+/// Whether the delegation backfill pass has to re-read this transcript.
+fn claude_transcript_lacks_delegation_capture(conn: &Connection, path: &Path) -> Result<bool> {
+    let raw_path = path.to_string_lossy();
+    let lacking: i64 = cached_query_row(
+        conn,
+        CLAUDE_LACKS_DELEGATION_CAPTURE_SQL,
+        [raw_path.as_ref()],
         |row| row.get(0),
     )?;
     Ok(lacking != 0)
@@ -9921,6 +9987,18 @@ fn ingest_claude_record(
             &mut first_text_event_uid,
         )?;
     }
+    // Claude Code writes a tool's structured result beside the message, as
+    // the record's `toolUseResult`, one result per record. It describes the
+    // record's tool_result block only when there is exactly one to describe.
+    let record_tool_use_result = obj.get("toolUseResult").filter(|_| {
+        content
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+            .count()
+            == 1
+    });
     for (block_index, block) in content.as_array().into_iter().flatten().enumerate() {
         let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
         let event_uid = format!("{message_uuid}:{block_index}");
@@ -10068,8 +10146,15 @@ fn ingest_claude_record(
                 // actually returned, which a post-processed string can no
                 // longer answer.
                 let (call_index, event_index) = indexer.next(tool_use_id);
-                let facts = tool_result_facts::claude_tool_result_facts(block)
+                let mut facts = tool_result_facts::claude_tool_result_facts(block)
                     .with_ordering(call_index, event_index);
+                // The delegated child an Agent/Task result reports on.
+                facts.agent_id = find_tool_use_result(block)
+                    .or(record_tool_use_result)
+                    .and_then(|result| result.get("agentId"))
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string);
                 let text = materialize_tool_result_text(content);
                 insert_session_event_with_provenance(
                     conn,

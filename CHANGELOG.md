@@ -8,8 +8,6 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- Text-bearing OpenCode `reasoning` parts are thinking blocks and an encrypted-only one is an `encrypted_reasoning` marker; synthetic user text (harness-written context such as an `@file` read) is captured as a user text block with `control_kind = "synthetic"`, never as a prompt.
-
 ### Changed
 
 - `Message::raw_usage` returns the usage blob of the message's own record, so each streamed copy of one Claude response keeps its own snapshot (and a copy that carried none has none); `Message::usage` and `SessionEvidence::requests` still read the request's settled usage. The first `sync` after upgrading fills it through a one-time raw-facts re-read of Claude and Codex transcripts.
@@ -27,11 +25,16 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Existing stores gain both on the next `sync`, which re-reads only the Claude transcripts whose signature markers do not yet name their request and re-captures continuity only for transcripts naming an explicit target.
 - Re-reading a Claude subagent transcript is linear in its own records again: retiring a sidechain record's rows under the parent session is an indexed lookup instead of a scan of the parent's events, tool calls, edits and markers. On a store with a 50 MB session and ~1,100 sidecar subagents the one-time re-read above takes about as long as a cold sync instead of ~19x it.
 - Claude sidechain user rows — a subagent's delegated prompts and the tool results it received — are captured as `is_sidechain` evidence in messages, tool results and user turns, so a delegated thread's parent chain is whole; they still never become prompts or `history`.
+- A Claude subagent spawned from inside another subagent is recorded as delegated by that subagent rather than by the root session.
+- A Claude delegation's `child_model` names the model the subagent's own records used when its `agent-*.meta.json` names none, as Claude Code's never do.
+- A Claude spawn tool result carries the child's `agent_id` from the record's `toolUseResult.agentId`.
+- An existing store heals those three on its next `sync` or hydration: Claude transcripts holding them re-parse once, with every file unchanged.
 
 ### Rust API
 
 - Added `ControlKind::Synthetic` (`"synthetic"`); `SESSION_EVIDENCE_CONTRACT_VERSION` is 4 in Rust and TypeScript, so an SDK without the value rejects an addon that can return it.
 - Added `SessionEvent::record_token_json`; code constructing `SessionEvent` with a struct literal must set it. `SESSION_EVIDENCE_CONTRACT_VERSION` is 4.
+- Added `DiscoveryState::Delegated`, the `discovery_state` of a delegated child that `SessionStore::session` read without a catalog row.
 
 ## [0.36.0] - 2026-10-07
 

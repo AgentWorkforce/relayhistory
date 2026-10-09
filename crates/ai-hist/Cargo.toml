@@ -64,6 +64,10 @@ required-features = ["unstable-internal"]
 libc = "0.2"
 
 [[test]]
+name = "delegated_capture_upgrade"
+required-features = ["unstable-internal"]
+
+[[test]]
 name = "live_capture"
 required-features = ["unstable-internal"]
 

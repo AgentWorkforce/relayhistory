@@ -129,6 +129,11 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 3;
 /// - Claude: each record keeps its own usage beside the settled request
 ///   blob, and sidechain user rows are `is_sidechain` evidence (sync's
 ///   raw-facts generation 4).
+/// - Claude delegation as the provider wrote it: a nested sidecar hangs under
+///   the subagent whose tool use spawned it rather than the root session, a
+///   child's model comes from its own records when its `agent-*.meta.json`
+///   names none, and a spawn result carries the record's
+///   `toolUseResult.agentId` (sync's `claude_delegation_capture_v1`).
 const HYDRATION_PARSER_VERSION: i64 = 16;
 
 #[derive(Debug, Clone)]
@@ -2860,16 +2865,43 @@ pub(crate) fn ingest_claude_subagent_batched(
                 between_records,
             )?);
             cleanup_subagent_registration(conn, "claude", agent_id)?;
+            // `spawnDepth` 1 is the meta saying the root spawned it, which is
+            // nearly every subagent: no lookup.
+            let spawner = if evidence.spawn_depth == Some(1) {
+                parent_session_id.to_string()
+            } else {
+                claude_subagent_spawner(
+                    conn,
+                    parent_session_id,
+                    agent_id,
+                    evidence.tool_use_id.as_deref(),
+                    &locator,
+                )?
+            };
+            // A sidecar names the session at the root of its delegation tree;
+            // the tool use that started it says which session in that tree
+            // spawned it. An edge an earlier read hung elsewhere is retired.
+            conn.prepare_cached(
+                "DELETE FROM session_relationships \
+                 WHERE source = 'claude' AND relationship = 'delegated' \
+                   AND child_session_id = ?1 AND evidence_locator = ?2 \
+                   AND parent_session_id <> ?3",
+            )?
+            .execute(params![agent_id, locator, spawner])?;
+            let child_model = match evidence.model.clone() {
+                Some(model) => Some(model),
+                None => claude_subagent_recorded_model(conn, agent_id)?,
+            };
             record_relationship(
                 conn,
                 &ObservedRelationship {
                     source: "claude",
-                    parent_session_id,
+                    parent_session_id: &spawner,
                     child_session_id: Some(agent_id),
                     relationship: "delegated",
                     child_agent_type: evidence.agent_type.as_deref(),
                     child_agent_name: evidence.description.as_deref(),
-                    child_model: evidence.model.as_deref(),
+                    child_model: child_model.as_deref(),
                     spawn_depth: evidence.spawn_depth,
                     evidence_kind: "claude_subagent_meta",
                     evidence_locator: Some(&locator),
@@ -2879,6 +2911,7 @@ pub(crate) fn ingest_claude_subagent_batched(
                     ..ObservedRelationship::default()
                 },
             )?;
+            adopt_claude_subagents_spawned_by(conn, parent_session_id, agent_id)?;
         }
         None => {
             outcome.absorb(incremental::ingest_claude_transcript_at_locator_batched(
@@ -2909,6 +2942,125 @@ pub(crate) fn ingest_claude_subagent_batched(
         }
     }
     Ok(outcome)
+}
+
+/// The session whose transcript holds `tool_use_id`, the tool use that
+/// started `agent_id`: `root` or a subagent already recorded in its
+/// delegation tree, and `root` when the call is not (yet) stored. A sidecar
+/// that names no tool use — its meta file is gone, or never existed — is no
+/// evidence about who spawned it, so the parent the edge from this same
+/// sidecar already names stands.
+fn claude_subagent_spawner(
+    conn: &Connection,
+    root: &str,
+    agent_id: &str,
+    tool_use_id: Option<&str>,
+    locator: &str,
+) -> Result<String> {
+    let Some(tool_use_id) = tool_use_id else {
+        let recorded: Option<String> = conn
+            .prepare_cached(
+                "SELECT parent_session_id FROM session_relationships \
+                 WHERE source = 'claude' AND relationship = 'delegated' \
+                   AND child_session_id = ?1 AND evidence_locator = ?2 \
+                 ORDER BY parent_session_id = ?3, parent_session_id LIMIT 1",
+            )?
+            .query_row(params![agent_id, locator, root], |row| row.get(0))
+            .optional()?;
+        return Ok(recorded.unwrap_or_else(|| root.to_string()));
+    };
+    // Almost every subagent is spawned from the root's own transcript, so
+    // the root is asked first: one seek on the `(source, session_id,
+    // tool_use_id)` key. Only a nested subagent walks the tree.
+    let in_root: bool = conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM tool_calls \
+             WHERE source = 'claude' AND session_id = ?1 AND tool_use_id = ?2)",
+        )?
+        .query_row(params![root, tool_use_id], |row| row.get(0))?;
+    if in_root {
+        return Ok(root.to_string());
+    }
+    // `CROSS JOIN` and the unary `+` keep each step a seek by parent and each
+    // probe a seek on the tool-call key; left to choose, the planner reads
+    // the child index's whole `claude` range and every Claude tool call.
+    let spawner: Option<String> = conn
+        .prepare_cached(
+            "WITH RECURSIVE tree(id) AS ( \
+               SELECT ?1 \
+               UNION \
+               SELECT r.child_session_id FROM tree CROSS JOIN session_relationships r \
+                 ON r.source = 'claude' AND r.parent_session_id = tree.id \
+               WHERE r.relationship = 'delegated' AND +r.child_session_id IS NOT NULL \
+                 AND +r.child_session_id <> ?2 \
+             ) \
+             SELECT t.session_id FROM tree CROSS JOIN tool_calls t \
+               ON t.source = 'claude' AND t.session_id = tree.id AND t.tool_use_id = ?3 \
+             ORDER BY t.session_id LIMIT 1",
+        )?
+        .query_row(params![root, agent_id, tool_use_id], |row| row.get(0))
+        .optional()?;
+    Ok(spawner.unwrap_or_else(|| root.to_string()))
+}
+
+/// Re-hang under `agent_id` the subagents a read recorded under `root`
+/// before `agent_id`'s own tool calls, which started them, were stored: the
+/// sync walk meets a session's sidecars in whatever order the directory
+/// lists them.
+fn adopt_claude_subagents_spawned_by(conn: &Connection, root: &str, agent_id: &str) -> Result<()> {
+    // Only a subagent that spawned subagents of its own has anything to
+    // adopt, and Claude Code spawns them through its Agent (formerly Task)
+    // tool; asking first keeps the scan of the root's edges below off the
+    // path of every leaf subagent.
+    let spawns: bool = conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM tool_calls \
+             WHERE source = 'claude' AND session_id = ?1 AND name IN ('Agent', 'Task'))",
+        )?
+        .query_row([agent_id], |row| row.get(0))?;
+    if root == agent_id || !spawns {
+        return Ok(());
+    }
+    // `+child_session_id` keeps the lookup on the parent index.
+    const SPAWNED: &str = "source = 'claude' AND relationship = 'delegated' \
+         AND parent_session_id = ?1 AND +child_session_id IS NOT NULL \
+         AND +child_session_id <> ?2 \
+         AND evidence_ref IN (SELECT tool_use_id FROM tool_calls \
+                              WHERE source = 'claude' AND session_id = ?2)";
+    conn.execute(
+        &format!(
+            "INSERT OR IGNORE INTO session_relationships (source, parent_session_id, \
+               relationship_uid, child_session_id, relationship, identity_status, \
+               child_agent_type, child_agent_name, child_model, spawn_depth, evidence_kind, \
+               evidence_locator, evidence_ref, child_has_events, spawned_at_ms, created_ms, \
+               updated_ms, origin_session_id) \
+             SELECT source, ?2, relationship_uid, child_session_id, relationship, \
+               identity_status, child_agent_type, child_agent_name, child_model, spawn_depth, \
+               evidence_kind, evidence_locator, evidence_ref, child_has_events, spawned_at_ms, \
+               created_ms, ?3, origin_session_id \
+             FROM session_relationships WHERE {SPAWNED}"
+        ),
+        params![root, agent_id, crate::relationship_capture::now_ms()],
+    )?;
+    conn.execute(
+        &format!("DELETE FROM session_relationships WHERE {SPAWNED}"),
+        params![root, agent_id],
+    )?;
+    Ok(())
+}
+
+/// The model a subagent's own assistant records name first. Claude Code's
+/// `agent-*.meta.json` carries no model, so the records are where it is.
+fn claude_subagent_recorded_model(conn: &Connection, agent_id: &str) -> Result<Option<String>> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT model FROM session_events \
+             WHERE source = 'claude' AND session_id = ?1 AND role = 'assistant' \
+               AND model IS NOT NULL AND model <> '' AND model <> '<synthetic>' \
+             ORDER BY ts_ms, id LIMIT 1",
+        )?
+        .query_row([agent_id], |row| row.get(0))
+        .optional()?)
 }
 
 /// Forget everything a metadata sidecar said about a child, because the

@@ -129,6 +129,7 @@ source without deciding which one fails the test.
 | `claude/system-reminder` | relayhistory | `claude/system-reminder.jsonl` | `<system-reminder>` blocks injected into user content, as a block of their own, inline in a string prompt, and alone on an `isMeta` record |
 | `claude/hook-and-passthrough` | relayhistory | `claude/hook-and-passthrough.jsonl` | a `<user-prompt-submit-hook>` row flagged `isMeta`, a `<bash-input>` / `<bash-stdout>` pass-through pair, and a bare `isMeta` bookkeeping row between two prompts |
 | `claude/sidecar-subagent` | relayhistory | `claude/sidecar-subagent` | a subagent transcript in `<sessionId>/subagents/agent-<id>.jsonl` with its `agent-<id>.meta.json` sidecar, carrying the PARENT's sessionId |
+| `claude/nested-sidecars` | burn | `claude/nested-sidecars` | two `subagents/` sidecars whose meta files name no model: `a1` spawned from the main transcript, `a2` spawned by a tool use inside `a1` (`spawnDepth` 2); the spawn results carry `toolUseResult.agentId` on the record |
 
 ### `codex`
 
