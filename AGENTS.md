@@ -132,7 +132,7 @@ the base branch to confirm, and a maintainer can pin `BURN_REF` to a
 known-good burn commit until it is fixed. Until burn depends on `ai-hist`
 (burn #557) the job passes with a notice.
 
-<!-- prpm:snippet:start @agent-relay/merge-train-snippet@1.0.1 -->
+<!-- prpm:snippet:start @agent-relay/merge-train-snippet@1.0.2 -->
 ## Merging: `trunk` + the `mergeable` label
 
 CI suites do **not** run automatically on feature branches. They run only on
@@ -149,13 +149,17 @@ agent batches ready PRs into `trunk`, gets that one PR green, and merges it.
 2. No CI runs on your PR, so verify locally before calling it ready: run the
    typecheck, tests and lint this repo uses, and list the exact commands and
    results in the PR body.
+3. If the repo has numbered migrations, re-derive the migration floor (the
+   highest number on `trunk`) right before pushing. Renumber a migration? Push
+   the renumbered branch immediately; an unpushed reservation is invisible to
+   every check.
 
 **When the PR is ready**
-3. Add the label **`mergeable`** once all of these are true:
+4. Add the label **`mergeable`** once all of these are true:
    - The change is complete and the local checks above pass.
    - Review feedback (human and bot) is addressed or answered.
    - It is not a draft and does not depend on an unmerged PR.
-4. Remove `mergeable` if the PR stops being ready (new work, a failing check, a
+5. Remove `mergeable` if the PR stops being ready (new work, a failing check, a
    blocking question). The label is read live from GitHub on every sweep.
 
 **What you must not do**
@@ -163,6 +167,13 @@ agent batches ready PRs into `trunk`, gets that one PR green, and merges it.
   directly.
 - Do not re-enable CI for feature branches or edit the `trunk` gates in
   `.github/workflows/`.
+- Never add `mergeable` to a PR you did not author without a human
+  maintainer's explicit approval.
+- Never add `mergeable` to an external contributor's PR (anyone outside the
+  org without write access, including fork PRs). Only a maintainer labels
+  those, after reviewing the exact head: the merge train merges an external PR
+  only with a maintainer's APPROVED review on its head and `mergeable` added by
+  a maintainer after the last push.
 
 **The merge agent** sweeps open `mergeable` PRs with base `trunk` about every
 10 minutes. It reads each PR's linked sessions (the `Agent Relay sessions`
@@ -170,7 +181,4 @@ block in the PR body, then the session summary) for context, merges them into
 `trunk`, opens or updates the `trunk` → `main` PR, fixes CI there, merges when
 green, and posts a summary. If your PR conflicts with `trunk`, it may ask you
 to rebase on `trunk`; do so and keep the label.
-
-> Interim: the sweep worker is not deployed yet. Until it is, a human or a
-> designated agent performs the merge-agent steps manually. Labelling is unchanged.
-<!-- prpm:snippet:end @agent-relay/merge-train-snippet@1.0.1 -->
+<!-- prpm:snippet:end @agent-relay/merge-train-snippet@1.0.2 -->
