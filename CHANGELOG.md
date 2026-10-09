@@ -4,7 +4,11 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Patch]
+
+### Fixed
+
+- Claude subagent requests and usage are in `SessionEvidence::requests` on the sync or hydration that reads the sidecar: a message is finished once any later record follows it, though Claude Code writes `stop_reason: null` on nearly every sidecar record, so only a transcript's trailing message is held, and `sync` no longer skips a sweep on an unchanged source fingerprint while one is. The first sync after upgrading releases what an earlier build held back.
 
 ## [0.37.0] - 2026-10-09
 

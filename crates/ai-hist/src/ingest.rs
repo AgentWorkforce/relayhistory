@@ -726,6 +726,15 @@ impl<W: io::Write> SyncSourceReport<W> {
 /// the sync state file that already holds every per-source cursor.
 const SOURCE_FINGERPRINT_KEY: &str = "source_fingerprint";
 
+/// One-time sweep for stores an earlier parser built, which held back every
+/// Claude message whose records carried `stop_reason: null` — nearly every
+/// message of a subagent sidecar. Those transcripts' cursors still stand
+/// before the first held record, so this sweep resumes each one there and the
+/// current rule releases them; transcripts with nothing held are skipped on
+/// their cursors as usual. The name is in [`SWEEP_PARSER_GENERATIONS`], so the
+/// source fingerprint an earlier build stored cannot skip that sweep.
+const CLAUDE_TRAILING_HOLD_GENERATION: &str = "claude_trailing_hold_v1";
+
 /// Where the destination's own generation is remembered, beside the source
 /// fingerprint it qualifies.
 const DESTINATION_GENERATION_KEY: &str = "destination_generation";
@@ -773,11 +782,12 @@ fn destination_head(conn: &Connection) -> Result<String> {
 ///
 /// Claude transcripts are skipped on their byte cursors rather than a stamp
 /// map, so their entries name the one-time Claude passes that are pending:
-/// `CLAUDE_RECORD_ATTRIBUTION_KEY` at its generation and
-/// [`CLAUDE_DELEGATION_CAPTURE_KEY`].
+/// `CLAUDE_RECORD_ATTRIBUTION_KEY` at its generation,
+/// [`CLAUDE_DELEGATION_CAPTURE_KEY`] and [`CLAUDE_TRAILING_HOLD_GENERATION`].
 const SWEEP_PARSER_GENERATIONS: &[&str] = &[
     "claude_record_attribution_1",
     CLAUDE_DELEGATION_CAPTURE_KEY,
+    CLAUDE_TRAILING_HOLD_GENERATION,
     "codex_rollouts_v7",
     CODEX_STATE_MARKER_KEY,
     GROK_SYNC_STATE_KEY,
@@ -1957,7 +1967,7 @@ fn sources_unchanged(conn: &Connection, state: &Map<String, Value>, current: &st
     let Some(stored) = state.get(SOURCE_FINGERPRINT_KEY).and_then(Value::as_str) else {
         return false;
     };
-    if stored.is_empty() || stored != current {
+    if stored.is_empty() || stored != current || incremental::sweep_left_records_held(state) {
         return false;
     }
     // The sources are where the last sweep left them. That alone does not
@@ -7906,6 +7916,7 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
         {
             coverage.note_unread();
         }
+        state.insert(incremental::CLAUDE_HOLDING_RECORDS_KEY.into(), false.into());
         return Ok(());
     }
     // The `claude_sessions*` path -> stamp maps are retired. They recorded only
@@ -7982,6 +7993,10 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
     }
     let mut scanned = 0;
     let mut upserted = 0;
+    // A held transcript's cursor stands before its held message, short of the
+    // file's end, so the unchanged skip below never passes over one: every
+    // transcript holding records is re-read, and counted, on every sweep.
+    let mut holding_records = false;
     for path in capture_files("claude", transcripts) {
         check_capture_cancelled()?;
         let transcript_events = claude_transcript_events_exist(conn, &path)?;
@@ -8019,7 +8034,7 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
             && !backfill
             && !needs_repair
             && !misread_as_sidecar
-            && claude_transcript_unchanged(conn, &path)?
+            && incremental::claude_transcript_unchanged(conn, &path)?
         {
             // A transcript registered as a session and indexed before
             // continuity existed still owes its evidence. Reading it here
@@ -8144,12 +8159,13 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
                 // The sync walk reports its reads through its own counters, not
                 // through a hydration result, so the byte count is dropped here.
                 let (evidence, _) = hydrate::claude_subagent_evidence(path.clone(), &meta);
-                hydrate::ingest_claude_subagent_batched(
+                let outcome = hydrate::ingest_claude_subagent_batched(
                     conn,
                     &meta.session_id,
                     &evidence,
                     &mut || write.record(),
                 )?;
+                holding_records |= !outcome.in_progress.is_empty();
                 write.commit()?;
                 continue;
             }
@@ -8185,12 +8201,13 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
             if !scan_superseded {
                 set_claude_first_prompt(conn, &meta)?;
             }
-            incremental::ingest_claude_transcript_at_locator_batched(
+            let pass = incremental::ingest_claude_transcript_at_locator_batched(
                 conn,
                 &path,
                 None,
                 &mut || write.record(),
             )?;
+            holding_records |= !pass.in_progress.is_empty();
             if scan_superseded {
                 transcript_cursor::forget_locator_cursor(conn, "claude", &path)?;
             }
@@ -8216,11 +8233,15 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
         write.commit()?;
     }
 
+    state.insert(
+        incremental::CLAUDE_HOLDING_RECORDS_KEY.into(),
+        holding_records.into(),
+    );
     if walked_every_known_root {
         record_fidelity_backfill(state, CLAUDE_FIDELITY_GENERATION_KEY);
         state.insert(
-            CLAUDE_SIDECAR_LAYOUT_KEY.to_string(),
-            json!(CLAUDE_SIDECAR_LAYOUT_GENERATION),
+            CLAUDE_SIDECAR_LAYOUT_KEY.into(),
+            CLAUDE_SIDECAR_LAYOUT_GENERATION.into(),
         );
         state.insert(CLAUDE_DELEGATION_CAPTURE_KEY.to_string(), json!(1));
     }
@@ -8228,8 +8249,8 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
     record_raw_facts_backfill(state, CLAUDE_RAW_MESSAGE_FACTS_KEY, walked_every_known_root);
     if walked_every_known_root {
         state.insert(
-            CLAUDE_RECORD_ATTRIBUTION_KEY.to_string(),
-            json!(CLAUDE_RECORD_ATTRIBUTION_GENERATION),
+            CLAUDE_RECORD_ATTRIBUTION_KEY.into(),
+            CLAUDE_RECORD_ATTRIBUTION_GENERATION.into(),
         );
     }
     if repairs.repairs_all() && !walked_every_known_root {
@@ -8244,33 +8265,6 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
         Some(error) => Err(error),
         None => Ok(()),
     }
-}
-
-/// What a Claude transcript is skipped on when nothing about it changed.
-///
-/// A subagent sidecar's `agent-<agentId>.meta.json` is the only place the
-/// child's type, name, model and spawn depth are recorded, so metadata that
-/// changes beside an untouched transcript is still new evidence and has to
-/// reach `session_relationships`. It carries its own whole-file cursor, so it
-/// is checked here rather than folded into the transcript's stamp.
-fn claude_transcript_unchanged(conn: &Connection, path: &Path) -> Result<bool> {
-    if !transcript_cursor::transcript_unchanged(conn, "claude", path)? {
-        return Ok(false);
-    }
-    let metadata = hydrate::claude_subagent_meta_path(path);
-    // A sidecar that was indexed and has since been deleted is a change, and
-    // it is the one change no amount of looking at the file will reveal. Its
-    // cursor is the record that it was once there; without this the transcript
-    // takes the fast path forever and the relationship keeps describing a
-    // child from a file nobody can read any more.
-    let indexed_metadata =
-        transcript_cursor::locator_cursor_exists(conn, CLAUDE_SUBAGENT_META_SOURCE, &metadata)?;
-    if (metadata.is_file() || indexed_metadata)
-        && !transcript_cursor::transcript_unchanged(conn, CLAUDE_SUBAGENT_META_SOURCE, &metadata)?
-    {
-        return Ok(false);
-    }
-    Ok(true)
 }
 
 /// The cursor namespace for `agent-*.meta.json` sidecars. Not a catalog
@@ -28092,7 +28086,10 @@ mod tests {
                         if agent_id.is_some() { (0, 2) } else { (1, 0) },
                         "{case}"
                     );
-                    assert!(claude_transcript_unchanged(&conn, &path).unwrap(), "{case}");
+                    assert!(
+                        incremental::claude_transcript_unchanged(&conn, &path).unwrap(),
+                        "{case}"
+                    );
 
                     if heal_by_hydration {
                         hydrate::hydrate_session_at_with_home(
@@ -30184,7 +30181,7 @@ mod tests {
             &metadata
         )
         .unwrap());
-        assert!(claude_transcript_unchanged(&conn, &named).unwrap());
+        assert!(incremental::claude_transcript_unchanged(&conn, &named).unwrap());
     }
 
     #[test]
@@ -34617,6 +34614,440 @@ mod tests {
         assert!(!claude_sidecar_evidence_exists(&conn, &sidecar).unwrap());
         sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
         assert_eq!(child_rows(&conn), (1, 1));
+    }
+
+    /// One record of a Claude Code subagent sidecar: every assistant record
+    /// carries `stop_reason: null`, finished or not, as Claude Code 2.1.28x
+    /// writes them.
+    fn sidecar_record(kind: &str, uuid: &str, body: &str) -> String {
+        format!(
+            r#"{{"type":"{kind}","uuid":"{uuid}","sessionId":"root-1","agentId":"child","isSidechain":true,"cwd":"/work/app","requestId":"req_{uuid}","timestamp":"2026-10-01T10:00:00Z","message":{body}}}"#
+        ) + "\n"
+    }
+
+    fn sidecar_assistant(uuid: &str, message_id: &str, block: &str, output: i64) -> String {
+        sidecar_record(
+            "assistant",
+            uuid,
+            &format!(
+                r#"{{"id":"{message_id}","role":"assistant","model":"claude-opus-5","stop_reason":null,"content":[{block}],"usage":{{"input_tokens":10,"cache_read_input_tokens":100,"output_tokens":{output}}}}}"#
+            ),
+        )
+        .replace(&format!("req_{uuid}"), &format!("req_{message_id}"))
+    }
+
+    fn sidecar_tool_use(uuid: &str, message_id: &str, tool: &str, output: i64) -> String {
+        sidecar_assistant(
+            uuid,
+            message_id,
+            &format!(
+                r#"{{"type":"tool_use","id":"{tool}","name":"Bash","input":{{"command":"ls"}}}}"#
+            ),
+            output,
+        )
+    }
+
+    fn sidecar_tool_result(uuid: &str, tool: &str) -> String {
+        sidecar_record(
+            "user",
+            uuid,
+            &format!(
+                r#"{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"{tool}","content":"ok"}}]}}"#
+            ),
+        )
+    }
+
+    /// `(request_key, output_tokens)` for each of the child's requests.
+    fn child_requests(conn: &Connection) -> Vec<(String, i64)> {
+        conn.prepare(
+            "SELECT request_key, json_extract(token_json, '$.output_tokens') \
+             FROM session_requests WHERE source = 'claude' AND session_id = 'child' \
+             ORDER BY request_key",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    fn child_assistant_rows(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM session_events \
+             WHERE source = 'claude' AND session_id = 'child' AND role = 'assistant'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// A finished sidecar whose every assistant record says `stop_reason:
+    /// null` — two blocks of one message, then a tool result, and so on to the
+    /// end — has every message indexed: the record after a message finishes
+    /// it, whatever its own `stop_reason` says.
+    #[test]
+    fn a_sidecar_whose_stop_reasons_are_all_null_indexes_every_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = dir.path().join("agent-child.jsonl");
+        let text = [
+            sidecar_record("user", "c1", r#"{"role":"user","content":"delegated"}"#),
+            sidecar_assistant(
+                "a1a",
+                "msg_1",
+                r#"{"type":"thinking","thinking":"plan","signature":"s"}"#,
+                1,
+            ),
+            sidecar_tool_use("a1b", "msg_1", "toolu_1", 5),
+            sidecar_tool_result("r1", "toolu_1"),
+            sidecar_tool_use("a2", "msg_2", "toolu_2", 7),
+            sidecar_tool_result("r2", "toolu_2"),
+            sidecar_tool_use("a3", "msg_3", "toolu_3", 9),
+            sidecar_tool_result("r3", "toolu_3"),
+        ]
+        .concat();
+        fs::write(&sidecar, &text).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let pass = incremental::ingest_claude_transcript_at_locator(&conn, &sidecar, Some("child"))
+            .unwrap();
+        assert!(pass.in_progress.is_empty(), "{:?}", pass.in_progress);
+        assert_eq!(child_assistant_rows(&conn), 4);
+        assert_eq!(
+            child_requests(&conn),
+            vec![
+                ("request-id:req_msg_1".to_string(), 5),
+                ("request-id:req_msg_2".to_string(), 7),
+                ("request-id:req_msg_3".to_string(), 9),
+            ]
+        );
+        let cursor = transcript_cursor::load_cursor(
+            &conn,
+            &transcript_cursor::CursorKey::Locator {
+                source: "claude",
+                locator: &sidecar.to_string_lossy(),
+            },
+        )
+        .unwrap();
+        assert_eq!(cursor.file.unwrap().offset, text.len() as u64);
+    }
+
+    /// Only the trailing message can still be streaming. It is held while it
+    /// is the file's last, through any number of further blocks of its own;
+    /// the record that follows it releases it; a block Claude writes after an
+    /// interleaved tool result lands as one more row of the same request. The
+    /// stored rows and usage are exactly a from-zero read's, so nothing is
+    /// counted twice.
+    #[test]
+    fn a_streaming_tail_is_held_until_a_record_follows_it_and_counted_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = dir.path().join("agent-child.jsonl");
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let append = |text: &str| {
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&sidecar)
+                .unwrap();
+            file.write_all(text.as_bytes()).unwrap();
+        };
+        let pass = || {
+            incremental::ingest_claude_transcript_at_locator(&conn, &sidecar, Some("child"))
+                .unwrap()
+        };
+
+        let prompt = sidecar_record("user", "c1", r#"{"role":"user","content":"delegated"}"#);
+        append(&prompt);
+        append(&sidecar_assistant(
+            "a1a",
+            "msg_1",
+            r#"{"type":"thinking","thinking":"plan","signature":"s"}"#,
+            1,
+        ));
+        assert_eq!(pass().in_progress, vec!["msg_1".to_string()]);
+        assert_eq!(child_assistant_rows(&conn), 0);
+
+        // Another block of the same message: still the tail, still held.
+        append(&sidecar_tool_use("a1b", "msg_1", "toolu_1", 5));
+        assert_eq!(pass().in_progress, vec!["msg_1".to_string()]);
+        assert_eq!(child_assistant_rows(&conn), 0);
+
+        // The tool result follows it, so it is finished.
+        append(&sidecar_tool_result("r1", "toolu_1"));
+        assert!(pass().in_progress.is_empty());
+        assert_eq!(child_assistant_rows(&conn), 2);
+        assert_eq!(
+            child_requests(&conn),
+            vec![("request-id:req_msg_1".to_string(), 5)]
+        );
+
+        // A parallel tool call's block arrives after that result: one more
+        // row of the same request, whose usage settles on the latest copy.
+        append(&sidecar_tool_use("a1c", "msg_1", "toolu_1b", 6));
+        assert_eq!(pass().in_progress, vec!["msg_1".to_string()]);
+        append(&sidecar_tool_result("r1b", "toolu_1b"));
+        assert!(pass().in_progress.is_empty());
+        assert_eq!(child_assistant_rows(&conn), 3);
+        assert_eq!(
+            child_requests(&conn),
+            vec![("request-id:req_msg_1".to_string(), 6)]
+        );
+        // Nothing new: nothing changes.
+        assert!(pass().in_progress.is_empty());
+
+        let rows = |conn: &Connection| -> Vec<(String, Option<String>)> {
+            conn.prepare(
+                "SELECT event_uid, token_json FROM session_events \
+                 WHERE session_id = 'child' ORDER BY event_uid",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        };
+        let fresh = Connection::open_in_memory().unwrap();
+        init_db(&fresh).unwrap();
+        incremental::ingest_claude_transcript_at_locator(&fresh, &sidecar, Some("child")).unwrap();
+        assert_eq!(rows(&conn), rows(&fresh));
+        assert_eq!(child_requests(&conn), child_requests(&fresh));
+    }
+
+    /// A record whose `stop_reason` is filled in is finished on its own, so a
+    /// main transcript's trailing message is indexed on the pass that reads it.
+    #[test]
+    fn a_trailing_message_with_a_stop_reason_is_indexed_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess-main.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","uuid":"u1","sessionId":"sess-main","cwd":"/tmp/project","timestamp":"2026-10-01T10:00:00Z","message":{"role":"user","content":"hi"}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"sess-main","cwd":"/tmp/project","requestId":"req_1","timestamp":"2026-10-01T10:00:01Z","message":{"id":"msg_1","role":"assistant","model":"claude-opus-5","stop_reason":"end_turn","content":[{"type":"text","text":"Done."}],"usage":{"input_tokens":10,"output_tokens":3}}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let pass = incremental::ingest_claude_transcript_at_locator(&conn, &path, None).unwrap();
+        assert!(pass.in_progress.is_empty());
+        let requests: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_requests WHERE session_id = 'sess-main'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(requests, 1);
+    }
+
+    /// The sweep generation this build stores, computed with `generations`
+    /// in place of [`SWEEP_PARSER_GENERATIONS`].
+    fn sweep_generation_with(generations: &[&str]) -> String {
+        let current = sweep_generation();
+        let parts = SWEEP_PARSER_GENERATIONS.join("|");
+        let older = generations.join("|");
+        // Same encoding as `sweep_generation`, over the older list.
+        let tail = format!(
+            "|tool_result_fidelity={TOOL_RESULT_FIDELITY_GENERATION}\
+             |raw_message_facts={RAW_MESSAGE_FACTS_GENERATION}\
+             |codex_fork_replay={CODEX_FORK_REPLAY_GENERATION}\
+             |codex_metadata_backfill={CODEX_METADATA_BACKFILL_GENERATION}"
+        );
+        let hash = |list: &str| {
+            format!(
+                "g{:016x}",
+                crate::discover::fingerprint_hash(
+                    "sweep-generation",
+                    &crate::discover::SHALLOW_SCANNER_VERSION.to_string(),
+                    &format!("{list}{tail}"),
+                )
+            )
+        };
+        assert_eq!(
+            hash(&parts),
+            current,
+            "the encoding above is sweep_generation's"
+        );
+        hash(&older)
+    }
+
+    fn claude_holding_records(dir: &Path) -> bool {
+        load_sync_state(&dir.join(".sync-state.json")).unwrap()
+            [incremental::CLAUDE_HOLDING_RECORDS_KEY]
+            .as_bool()
+            .unwrap()
+    }
+
+    /// A transcript that stops mid-message keeps its stat, so the source
+    /// fingerprint would call the tree unchanged and skip the sweep that
+    /// releases the message once its writer has gone quiet. A sweep that left
+    /// records held therefore never licenses the next one to skip.
+    #[test]
+    fn a_held_trailing_message_keeps_the_sweep_running_until_it_is_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join(".claude/projects/-work-app");
+        let subagents = project.join("root-1/subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        fs::write(
+            project.join("root-1.jsonl"),
+            r#"{"type":"user","uuid":"u1","sessionId":"root-1","cwd":"/work/app","timestamp":"2026-10-01T09:59:00Z","message":{"role":"user","content":"start"}}"#.to_string() + "\n",
+        )
+        .unwrap();
+        let sidecar = subagents.join("agent-child.jsonl");
+        fs::write(
+            &sidecar,
+            [
+                sidecar_record("user", "c1", r#"{"role":"user","content":"delegated"}"#),
+                sidecar_tool_use("a1", "msg_1", "toolu_1", 5),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let db = dir.path().join("history.db");
+        let roots = crate::ProviderRoots::from_home(
+            dir.path().to_path_buf(),
+            dir.path().join("opencode.db"),
+        );
+        assert!(
+            super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept
+        );
+        assert!(claude_holding_records(dir.path()));
+        // Inside the grace window: swept again, still held.
+        assert!(
+            super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept
+        );
+        assert!(claude_holding_records(dir.path()));
+        let conn = open_db(&db).unwrap();
+        assert_eq!(child_assistant_rows(&conn), 0);
+
+        // The writer has been gone past the grace window: released.
+        let key = transcript_cursor::CursorKey::Locator {
+            source: "claude",
+            locator: &sidecar.to_string_lossy(),
+        };
+        let mut cursor = transcript_cursor::load_cursor(&conn, &key).unwrap();
+        cursor.file.as_mut().unwrap().unchanged_since_ms -=
+            transcript_cursor::QUIESCENT_GRACE_MS + 1;
+        transcript_cursor::store_cursor(&conn, &key, &cursor).unwrap();
+        assert!(
+            super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept
+        );
+        assert!(!claude_holding_records(dir.path()));
+        assert_eq!(child_assistant_rows(&conn), 1);
+        assert!(
+            !super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept
+        );
+    }
+
+    /// A store an earlier parser built held back every sidecar message whose
+    /// records said `stop_reason: null`: no assistant rows, the cursor
+    /// standing before the first held record, and a fingerprint vouching for
+    /// it. One plain sync releases every message, re-reading only the held
+    /// region, and the next sync takes the fast path.
+    #[test]
+    fn an_upgraded_store_releases_messages_an_earlier_parser_held_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join(".claude/projects/-work-app");
+        let subagents = project.join("root-1/subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        fs::write(
+            project.join("root-1.jsonl"),
+            r#"{"type":"user","uuid":"u1","sessionId":"root-1","cwd":"/work/app","timestamp":"2026-10-01T09:59:00Z","message":{"role":"user","content":"start"}}"#.to_string() + "\n",
+        )
+        .unwrap();
+        let sidecar = subagents.join("agent-child.jsonl");
+        let head = sidecar_record("user", "c1", r#"{"role":"user","content":"delegated"}"#);
+        let held = [
+            sidecar_tool_use("a1", "msg_1", "toolu_1", 5),
+            sidecar_tool_result("r1", "toolu_1"),
+            sidecar_tool_use("a2", "msg_2", "toolu_2", 7),
+            sidecar_tool_result("r2", "toolu_2"),
+        ]
+        .concat();
+        let db = dir.path().join("history.db");
+        let roots = crate::ProviderRoots::from_home(
+            dir.path().to_path_buf(),
+            dir.path().join("opencode.db"),
+        );
+        // What the earlier parser left: its walk held from the first assistant
+        // record on and committed before it, so the cursor is the one a walk
+        // over the head commits, over a file that then held everything.
+        fs::write(&sidecar, &head).unwrap();
+        super::sync_exclusive_with_roots(&db, &roots, false).unwrap();
+        let conn = open_db(&db).unwrap();
+        let key = transcript_cursor::CursorKey::Locator {
+            source: "claude",
+            locator: &sidecar.to_string_lossy(),
+        };
+        let mut cursor = transcript_cursor::load_cursor(&conn, &key).unwrap();
+        fs::write(&sidecar, head.clone() + &held).unwrap();
+        let metadata = fs::metadata(&sidecar).unwrap();
+        let file = cursor.file.as_mut().unwrap();
+        assert_eq!(file.offset, head.len() as u64);
+        file.size = metadata.len();
+        file.mtime_ns = super::metadata_mtime_ns(&metadata);
+        cursor.claude.as_mut().unwrap().in_progress =
+            vec!["msg_1".to_string(), "msg_2".to_string()];
+        transcript_cursor::store_cursor(&conn, &key, &cursor).unwrap();
+        assert_eq!(child_assistant_rows(&conn), 0);
+
+        let state_path = dir.path().join(".sync-state.json");
+        let mut state = load_sync_state(&state_path).unwrap();
+        let source_part = state[SOURCE_FINGERPRINT_KEY]
+            .as_str()
+            .unwrap()
+            .split_once('/')
+            .unwrap()
+            .1
+            .to_string();
+        let older: Vec<&str> = SWEEP_PARSER_GENERATIONS
+            .iter()
+            .copied()
+            .filter(|generation| *generation != CLAUDE_TRAILING_HOLD_GENERATION)
+            .collect();
+        let old_fingerprint = format!("{}/{source_part}", sweep_generation_with(&older));
+        state.insert(SOURCE_FINGERPRINT_KEY.into(), json!(old_fingerprint));
+        state.remove(incremental::CLAUDE_HOLDING_RECORDS_KEY);
+        state.insert(
+            DESTINATION_GENERATION_KEY.into(),
+            json!(destination_generation(&conn).unwrap()),
+        );
+        state.insert(
+            DESTINATION_HEAD_KEY.into(),
+            json!(destination_head(&conn).unwrap()),
+        );
+        assert!(sources_unchanged(&conn, &state, &old_fingerprint));
+        fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+
+        assert!(
+            super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept
+        );
+        assert_eq!(child_assistant_rows(&conn), 2);
+        assert_eq!(
+            child_requests(&conn),
+            vec![
+                ("request-id:req_msg_1".to_string(), 5),
+                ("request-id:req_msg_2".to_string(), 7),
+            ]
+        );
+        assert!(!claude_holding_records(dir.path()));
+        assert!(
+            !super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept
+        );
+        assert_eq!(child_assistant_rows(&conn), 2);
     }
 
     #[test]
