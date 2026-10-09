@@ -10904,7 +10904,8 @@ fn codex_marker_for_payload(
         };
     }
     match payload_type {
-        // The root thread's turn a delegated thread's turn works for: a
+        // The turn of the root thread that the delegated thread is working
+        // for: a
         // `turn_context` that repeats everything else is not stored, so the
         // turn keeps its root here.
         "task_started" => {

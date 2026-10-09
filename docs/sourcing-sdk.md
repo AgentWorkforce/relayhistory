@@ -738,27 +738,40 @@ A Codex `turn_context` marker is stored only where the configuration changes:
 Codex restates its whole configuration on every turn, and a record that repeats
 the previous one apart from the fields naming its turn stores nothing. **The
 configuration of a turn is the latest `turn_context` marker at or before that
-turn's start in rollout order**, a turn's start being its own `turn_context`
-record (Codex writes it just after the turn's `task_started`): the marker
-carrying the turn's `turn_id` when there is one, else the latest earlier one.
+turn's start in rollout order** — the marker carrying the turn's `turn_id` when
+there is one, else the latest earlier one. Rollout order is the record's line:
+every Codex `marker_uid` and `event_uid` is `<line>:<suffix>`, `<line>` the
+record's zero-based line in the rollout. `markers` is read in timestamp order,
+which agrees with it whenever the rollout's timestamps do.
+
 Every stored marker is the record whole. Its `turn_id` is the turn it took
-effect at; `root_turn_id` — the root thread's turn a delegated thread's turn
-works for — is the turn's own on its `task_started` marker's payload when Codex
-wrote it there, and is then left out of the comparison; every other field —
-`model`, `effort`, `cwd`, `current_date`, the approval and sandbox policy, and
-`root_turn_id` where `task_started` does not carry it — is the configuration of
-each turn up to the next marker. A session's first `turn_context` is always
-stored, and so is a fork child's first own one: the replayed parent history is
-the parent's, so a child's markers alone configure its turns.
+effect at. `root_turn_id` — the turn of the root thread that the delegated
+thread is working for — is left out of the comparison when the turn's own
+`task_started` wrote the same value, and that `task_started` marker carries it
+as `payload.root_turn_id`; older Codex writes it on `turn_context` alone, and
+there it is compared like any other field. Every other field — `model`,
+`effort`, `cwd`, `current_date`, the approval and sandbox policy — is the
+configuration of each turn up to the next marker.
+
+A session's first `turn_context` is always stored. In a fork, the parent history
+the child replays is one `fork_replay_boundary` marker and writes no
+`turn_context` markers under the child; the comparison starts at the child's
+first own `turn_context`, which is always stored, so a child's own markers
+configure every child turn.
 
 ```rust
-// turn id -> the turn_context payload it ran under, walking `markers` in read order.
+// turn id -> the turn_context payload it ran under, in rollout order.
+let line = |uid: &str| uid.split_once(':').and_then(|(n, _)| n.parse::<u64>().ok());
+let mut markers: Vec<&Marker> = evidence.markers.iter().collect();
+markers.sort_by_key(|m| line(&m.marker_uid));
 let mut current: Option<&serde_json::Value> = None;
 let mut configs: HashMap<&str, Option<&serde_json::Value>> = HashMap::new();
-for marker in &evidence.markers {
-    let Some(turn) = marker.turn_id.as_deref() else { continue };
+for marker in markers {
     if marker.kind == "turn_context" {
         current = marker.payload.as_ref();
+    }
+    let Some(turn) = marker.turn_id.as_deref() else { continue };
+    if marker.kind == "turn_context" {
         configs.insert(turn, current);
     } else {
         configs.entry(turn).or_insert(current);

@@ -504,7 +504,7 @@ it holds for every kind.
 | `compaction_boundary` | ✓ `type:"system"`, `subtype:"compact_boundary"` | ✓ top-level `compacted`, `context_compacted` | ✓ | – | ✓ node `metadata.summarized_from` | `compact_boundary`, `compacted` |
 | `summary` | ✓ `type:"summary"` | – | – | – | – | `summary` |
 | `subagent_notification` | ✓ system rows with `parent_tool_use_id`; tool results carrying `toolUseResult.agentId` | ✓ `subagent_*` | – | – | – | `subagent_completed`, `tool_use_result_agent_id`, `subagent_message_complete` |
-| `task_started` | – | ✓ `payload_json` carries `root_turn_id` when Codex wrote one: the root thread's turn a delegated thread's turn works for | – | – | – | `task_started` |
+| `task_started` | – | ✓ `payload_json` carries `root_turn_id` when Codex wrote one: the turn of the root thread that the delegated thread is working for | – | – | – | `task_started` |
 | `task_complete` | – | ✓ | – | – | – | `task_complete` |
 | `turn_diff` | – | ✓ | – | – | – | `turn_diff` |
 | `stream_error` | – | ✓ | – | – | – | `stream_error` |

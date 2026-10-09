@@ -2794,8 +2794,11 @@ impl FileEdit {
 ///
 /// A Codex `turn_context` marker is stored only where the configuration
 /// changes: the configuration of a turn is the latest `turn_context` marker
-/// at or before that turn's start in rollout order -- the marker carrying the
-/// turn's `turn_id` when there is one, else the latest earlier one. Its
+/// at or before that turn's start in rollout order (the `<line>` of
+/// `<line>:<suffix>` in `marker_uid`) -- the marker carrying the turn's
+/// `turn_id` when there is one, else the latest earlier one. A fork child's
+/// replayed parent history writes none; its chain starts at its first own
+/// `turn_context`, which is always stored. Its
 /// `turn_id` is the turn it took effect at, and every other payload field is
 /// the configuration of each turn up to the next marker -- except
 /// `root_turn_id` where the turn's `task_started` marker carries its own,
