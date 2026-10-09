@@ -26,6 +26,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Claude: `continuation` and `fork` edges from `continuedFromSessionId` / `forkSessionId` carry the timestamp of the record that named them in `spawned_at_ms`, not the transcript's first record.
 - Existing stores gain both on the next `sync`, which re-reads only the Claude transcripts whose signature markers do not yet name their request and re-captures continuity only for transcripts naming an explicit target.
 - Re-reading a Claude subagent transcript is linear in its own records again: retiring a sidechain record's rows under the parent session is an indexed lookup instead of a scan of the parent's events, tool calls, edits and markers. On a store with a 50 MB session and ~1,100 sidecar subagents the one-time re-read above takes about as long as a cold sync instead of ~19x it.
+- Claude sidechain user rows — a subagent's delegated prompts and the tool results it received — are captured as `is_sidechain` evidence in messages, tool results and user turns, so a delegated thread's parent chain is whole; they still never become prompts or `history`.
 
 ### Rust API
 

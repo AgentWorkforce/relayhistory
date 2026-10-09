@@ -219,9 +219,10 @@ fn delegation_topology_survives_the_whole_acquisition_path() {
         ]
     );
 
-    // The child's own output is addressable under the child, and under the
-    // child only: hydration healed the parent-attributed row the earlier
-    // parser version (and the sync path) wrote.
+    // The child's own rows -- its delegated prompt and its output -- are
+    // addressable under the child, and under the child only: hydration healed
+    // the parent-attributed rows the earlier parser version (and the sync
+    // path) wrote.
     let placement: (i64, i64) = conn
         .query_row(
             "SELECT \
@@ -231,7 +232,7 @@ fn delegation_topology_survives_the_whole_acquisition_path() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(placement, (1, 0));
+    assert_eq!(placement, (2, 0));
     drop(conn);
 
     // A later full sync walks the same provider files again. It must not undo
@@ -250,7 +251,7 @@ fn delegation_topology_survives_the_whole_acquisition_path() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .unwrap();
-    assert_eq!(after, (1, 0, 2, 4));
+    assert_eq!(after, (2, 0, 2, 4));
     let raw_path: String = conn
         .query_row(
             "SELECT raw_path FROM sessions WHERE source='claude' AND session_id='claude-root'",

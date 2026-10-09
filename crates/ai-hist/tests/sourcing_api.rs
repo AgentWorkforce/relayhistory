@@ -740,8 +740,9 @@ fn synced_claude_transcript(name: &str, body: &str) -> (tempfile::TempDir, Sessi
 /// Claude Code versions that wrote Task traffic inline put it in the primary
 /// transcript as `isSidechain` rows, so a transcript can consist of nothing
 /// else. Its billable turn is that session's evidence: the session is listed,
-/// the message keeps `is_sidechain` and its provider usage verbatim, and the
-/// request carries the usage.
+/// both messages keep `is_sidechain`, the assistant message keeps its provider
+/// usage verbatim, the request carries the usage, and the sidechain prompt is
+/// never the session's first prompt.
 #[test]
 fn a_primary_transcript_of_only_sidechain_rows_is_a_session_with_its_usage() {
     let body = fs::read_to_string(fixtures_root().join("claude/sidechain-turn.jsonl")).unwrap();
@@ -753,9 +754,11 @@ fn a_primary_transcript_of_only_sidechain_rows_is_a_session_with_its_usage() {
     );
     assert_eq!(evidence.session.first_prompt, None);
     assert!(evidence.relationships.is_empty());
-    let [message] = evidence.messages.as_slice() else {
-        panic!("one assistant message: {:?}", evidence.messages);
+    let [prompt, message] = evidence.messages.as_slice() else {
+        panic!("the sidechain prompt and its answer: {:?}", evidence.messages);
     };
+    assert_eq!(prompt.role, Role::User);
+    assert_eq!(prompt.is_sidechain, Some(true));
     assert_eq!(message.role, Role::Assistant);
     assert_eq!(message.is_sidechain, Some(true));
     assert_eq!(message.model.as_deref(), Some("claude-haiku-4-5"));

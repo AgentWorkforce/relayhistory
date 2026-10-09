@@ -9512,19 +9512,13 @@ fn ingest_claude_record(
         }
     };
     let session_id = attributed_session_id.unwrap_or(record_session_id);
-    // Subagent sidecar transcripts share the parent's sessionId with
-    // isSidechain rows. The subagent's assistant output is real session
-    // activity (text and token spend), but its user-role rows are the
-    // parent agent's own prompts and tool results — ingesting those
-    // manufactures fake human turns.
+    // A sidechain row is delegated traffic: the subagent's output, and the
+    // parent agent's prompts and tool results to it. Every one is stored --
+    // its event rows with `is_sidechain` set -- so the delegated thread's
+    // parent chain and tool results are whole; its user-role rows are the delegating agent's, not a
+    // human's, so they never become `history`, a prompt or a control row.
     let is_sidechain = obj.get("isSidechain").and_then(Value::as_bool);
     let sidechain = is_sidechain.unwrap_or(false);
-    let skipped_sidechain = sidechain
-        && obj
-            .get("message")
-            .and_then(|m| m.get("role"))
-            .and_then(Value::as_str)
-            != Some("assistant");
     let uuid = obj.get("uuid").and_then(Value::as_str);
     let message = obj.get("message").and_then(Value::as_object);
     // Records without provider identity fall back to a content hash, never
@@ -9626,10 +9620,10 @@ fn ingest_claude_record(
         }
     }
     // Heal what an earlier parser version wrote for this record: it
-    // attributed every sidechain row to the parent, and stored the rows
-    // this guard now skips. Re-reading the file removes the stale rows
-    // under the identity they were written with, so a re-parse moves them
-    // onto the child instead of duplicating them across both.
+    // attributed every sidechain row to the parent. Re-reading the file
+    // removes the stale rows under the identity they were written with, so a
+    // re-parse moves them onto the child instead of duplicating them across
+    // both.
     // Pre-upgrade positional leftovers match by full stored record,
     // unique or preserved: the live index cannot identify them after a
     // rewrite.
@@ -9729,15 +9723,8 @@ fn ingest_claude_record(
     // message body, are dropped further down, and a marker written after
     // that point would never be reached for exactly the records this table
     // exists to keep.
-    //
-    // A skipped sidechain record is deliberately excluded. Its rows are
-    // deleted rather than stored, so a marker would be the one trace left
-    // of a record the parser has decided not to keep.
-    let record_draft = if skipped_sidechain {
-        None
-    } else {
-        claude_marker_for_record(obj, last_assistant_cache_read.get(session_id).copied())
-    };
+    let record_draft =
+        claude_marker_for_record(obj, last_assistant_cache_read.get(session_id).copied());
     if let Some(draft) = &record_draft {
         record_rows += 1;
         let marker_uid = format!("{message_uuid}:marker");
@@ -9761,17 +9748,10 @@ fn ingest_claude_record(
     // Claude reports a finished subagent as a `type: "system"` line with
     // no message body, so the block walk below never sees it. It is the
     // only record that ties a delegated child back to the Agent call that
-    // spawned it, which makes it a tool result in everything but shape.
-    //
-    // This runs before the sidechain guard, and has to. A system line
-    // carries no `message`, so `skipped_sidechain` is true for every one
-    // of them that is marked `isSidechain` -- and a nested Agent call
-    // writes its completion line inside the child's sidecar, where every
-    // record is a sidechain. Skipping those would drop the only record of
-    // the nested spawn while keeping the rows for the spawns that happen
-    // to sit on the parent transcript. The guard below still owns every
-    // other sidechain row; a system line that names no child falls
-    // through to it.
+    // spawned it, which makes it a tool result in everything but shape. A
+    // nested Agent call writes its completion line inside the child's
+    // sidecar, where every record is a sidechain, and it is read the same
+    // way there.
     let system_record = obj.get("type").and_then(Value::as_str) == Some("system");
     if system_record {
         if let Some(tool_facts) = tool_result_facts::claude_subagent_notification_facts(obj) {
@@ -9813,22 +9793,6 @@ fn ingest_claude_record(
             )?;
             return Ok(());
         }
-    }
-    if skipped_sidechain {
-        delete_claude_record_rows(conn, session_id, message_uuid)?;
-        if id_less {
-            heal_legacy_positional_record(
-                conn,
-                session_id,
-                stem,
-                ts_ms,
-                message,
-                message_role,
-                model,
-                token_json.as_deref(),
-            )?;
-        }
-        return Ok(());
     }
     // A system line that names no delegated child has nothing else this
     // parser stores -- it carries no `message` body to walk -- and is
@@ -9875,7 +9839,8 @@ fn ingest_claude_record(
     // the record is a prompt or one of the harness's own rows; the envelope
     // (`origin.kind`, `attachment.commandMode`, `isMeta`) is read in the same
     // call. Model output is never control, and a sidechain user row is the
-    // parent agent's, which the guard above already settled. The one answer
+    // delegating agent's rather than a human's, so it is never classified as
+    // either. The one answer
     // is what `history`, the event rows and the triad walk all act on, so a
     // row cannot be kept out of `history` and still read back as a prompt.
     let user_record = message_role == "user" && !sidechain;
@@ -27539,9 +27504,9 @@ mod tests {
             super::parse_iso_ms("2026-08-31T11:00:02Z")
         );
 
-        // The child's output is addressable under the child, its delegated
-        // instruction is nobody's human prompt, and a delegated thread never
-        // becomes a session of its own.
+        // The child's output and its delegated instruction are addressable
+        // under the child, the instruction is nobody's human prompt, and a
+        // delegated thread never becomes a session of its own.
         let counts: (i64, i64, i64, i64) = conn
             .query_row(
                 "SELECT \
@@ -27553,7 +27518,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
-        assert_eq!(counts, (1, 0, 0, 0));
+        assert_eq!(counts, (2, 0, 0, 0));
     }
 
     #[test]
@@ -27724,7 +27689,9 @@ mod tests {
                     assert_eq!(before.1, 1, "{case}");
                     assert_eq!(
                         (before.2, before.3),
-                        if agent_id.is_some() { (0, 1) } else { (1, 0) },
+                        // The child holds the sidechain prompt and the
+                        // subagent's output.
+                        if agent_id.is_some() { (0, 2) } else { (1, 0) },
                         "{case}"
                     );
                     assert!(claude_transcript_unchanged(&conn, &path).unwrap(), "{case}");
@@ -27779,7 +27746,8 @@ mod tests {
         let (evidence, _) = hydrate::claude_subagent_evidence(path.clone(), &meta);
         hydrate::ingest_claude_subagent(&conn, &meta.session_id, &evidence).unwrap();
         transcript_cursor::forget_locator(&conn, "claude", &path.to_string_lossy()).unwrap();
-        assert_eq!(sidechain_only_placement(&conn, &path), (0, 1, 0, 1));
+        // The child holds the sidechain prompt and the subagent's output.
+        assert_eq!(sidechain_only_placement(&conn, &path), (0, 1, 0, 2));
         let mut state = Map::new();
         state.insert(
             CLAUDE_SIDECAR_LAYOUT_KEY.to_string(),
@@ -27845,7 +27813,8 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(child_events, 1);
+        // The delegated prompt and the child's output, once each.
+        assert_eq!(child_events, 2);
     }
 
     /// Reproduce what a release without the per-message raw facts left behind:
@@ -31942,9 +31911,8 @@ mod tests {
         );
         assert_eq!(rows[0].tool_use_id.as_deref(), Some("toolu_nested"));
 
-        // Every other sidechain record is still skipped: the guard below the
-        // notification handler is unchanged, and a sidechain user row is the
-        // parent's own prompt rather than a human turn of the child's.
+        // A sidechain user row is the delegating agent's prompt: stored as
+        // flagged evidence, never as a human prompt.
         let sidechain_user = dir.path().join("sidecar-user.jsonl");
         fs::write(
             &sidechain_user,
@@ -31959,14 +31927,21 @@ mod tests {
         )
         .unwrap();
         ingest_claude_transcript(&conn, &sidechain_user).unwrap();
-        let events: i64 = conn
+        let (events, history): (i64, i64) = conn
             .query_row(
-                "SELECT COUNT(*) FROM session_events WHERE source = 'claude' AND session_id = ?",
+                "SELECT \
+                   (SELECT COUNT(*) FROM session_events WHERE source = 'claude' \
+                      AND session_id = ?1 AND is_sidechain = 1 AND control_kind IS NULL), \
+                   (SELECT COUNT(*) FROM history WHERE source = 'claude' AND session_id = ?1)",
                 params!["sidecar-user-session"],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(events, 0, "a sidechain user row is not the child's turn");
+        assert_eq!(
+            (events, history),
+            (1, 0),
+            "a sidechain user row is evidence, not a human prompt"
+        );
     }
 
     #[test]
@@ -34095,8 +34070,128 @@ mod tests {
         assert_eq!(before, after);
     }
 
+    /// An install synced before sidechain user rows were captured holds the
+    /// subagent's output and not the delegated prompt or tool result its
+    /// parent chain names. The transcript is unchanged on disk, so the
+    /// raw-facts generation is what re-reads it and stores them.
     #[test]
-    fn sidechain_rows_keep_assistant_output_but_drop_fake_user_turns() {
+    fn plain_claude_sync_backfills_sidechain_user_rows_an_earlier_parser_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("sess-inline.jsonl"),
+            concat!(
+                r#"{"type":"user","uuid":"u1","sessionId":"sess-inline","cwd":"/tmp/project","isSidechain":false,"timestamp":"2026-04-20T00:00:00.000Z","message":{"role":"user","content":"explore"}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"sess-inline","cwd":"/tmp/project","isSidechain":false,"timestamp":"2026-04-20T00:00:01.000Z","message":{"id":"m1","role":"assistant","model":"claude-opus-5","content":[{"type":"tool_use","id":"toolu_task","name":"Task","input":{"prompt":"Research"}}]}}"#, "\n",
+                r#"{"type":"user","uuid":"s1","parentUuid":"a1","sessionId":"sess-inline","cwd":"/tmp/project","isSidechain":true,"timestamp":"2026-04-20T00:00:02.000Z","message":{"role":"user","content":"Research"}}"#, "\n",
+                r#"{"type":"assistant","uuid":"s2","parentUuid":"s1","sessionId":"sess-inline","cwd":"/tmp/project","isSidechain":true,"timestamp":"2026-04-20T00:00:03.000Z","message":{"id":"m2","role":"assistant","model":"claude-haiku-4-5","content":[{"type":"tool_use","id":"toolu_read","name":"Read","input":{"file_path":"/tmp/project/a.rs"}}],"usage":{"input_tokens":5,"output_tokens":2}}}"#, "\n",
+                r#"{"type":"user","uuid":"s3","parentUuid":"s2","sessionId":"sess-inline","cwd":"/tmp/project","isSidechain":true,"timestamp":"2026-04-20T00:00:04.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_read","content":"fn main() {}"}]}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let sidechain_rows = |conn: &Connection| -> Vec<(String, String, String)> {
+            conn.prepare(
+                "SELECT message_id, kind, COALESCE(parent_id, '') FROM session_events \
+                 WHERE source = 'claude' AND is_sidechain = 1 ORDER BY ts_ms, id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        };
+        let expected = vec![
+            ("s1".to_string(), "text".to_string(), "a1".to_string()),
+            ("s2".to_string(), "tool_use".to_string(), "s1".to_string()),
+            (
+                "s3".to_string(),
+                "tool_result".to_string(),
+                "s2".to_string(),
+            ),
+        ];
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(sidechain_rows(&conn), expected);
+        let history: Vec<String> = conn
+            .prepare("SELECT prompt FROM history WHERE source = 'claude'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(history, vec!["explore".to_string()]);
+
+        // What an earlier parser left: no sidechain user rows, and rows
+        // stamped with the generation before this one.
+        conn.execute(
+            "DELETE FROM session_events WHERE source = 'claude' AND message_id IN ('s1', 's3')",
+            [],
+        )
+        .unwrap();
+        blank_raw_message_facts(&conn, "claude");
+        blank_raw_message_facts_state(&mut state);
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(sidechain_rows(&conn), expected);
+    }
+
+    /// A named sidecar whose only record is the delegated prompt -- a child
+    /// interrupted before it replied -- left an earlier parser a delegation
+    /// row and no child events. That is not delegation evidence the fast path
+    /// accepts (`claude_sidecar_evidence_exists` asks for the child's rows),
+    /// so the next sync re-reads the sidecar and stores the prompt.
+    #[test]
+    fn plain_claude_sync_rereads_a_sidecar_an_earlier_parser_left_without_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("app");
+        let subagents = project.join("root-1/subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        fs::write(
+            project.join("root-1.jsonl"),
+            concat!(
+                r#"{"type":"user","uuid":"u1","sessionId":"root-1","cwd":"/work/app","timestamp":"2026-08-31T11:00:00Z","message":{"role":"user","content":"start"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let sidecar = subagents.join("agent-child.jsonl");
+        fs::write(
+            &sidecar,
+            concat!(
+                r#"{"type":"user","uuid":"c1","sessionId":"root-1","agentId":"child","isSidechain":true,"cwd":"/work/app","timestamp":"2026-08-31T11:00:01Z","message":{"role":"user","content":"delegated instruction"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let child_rows = |conn: &Connection| -> (i64, i64) {
+            conn.query_row(
+                "SELECT \
+                   (SELECT COUNT(*) FROM session_events WHERE source = 'claude' \
+                      AND session_id = 'child' AND is_sidechain = 1), \
+                   (SELECT COUNT(*) FROM session_relationships WHERE source = 'claude' \
+                      AND child_session_id = 'child')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(child_rows(&conn), (1, 1));
+
+        conn.execute(
+            "DELETE FROM session_events WHERE source = 'claude' AND session_id = 'child'",
+            [],
+        )
+        .unwrap();
+        assert!(!claude_sidecar_evidence_exists(&conn, &sidecar).unwrap());
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(child_rows(&conn), (1, 1));
+    }
+
+    #[test]
+    fn sidechain_rows_are_flagged_evidence_and_never_human_prompts() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agent-sub.jsonl");
         fs::write(
@@ -34110,17 +34205,28 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         ingest_claude_transcript(&conn, &path).unwrap();
-        let rows: Vec<(String, String)> = conn
-            .prepare("SELECT role, text FROM session_events ORDER BY id")
+        let rows: Vec<(String, String, Option<i64>)> = conn
+            .prepare("SELECT role, text, is_sidechain FROM session_events ORDER BY id")
             .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(
             rows,
-            vec![("assistant".into(), "Here is the report.".into())]
+            vec![
+                (
+                    "user".into(),
+                    "Research the repo thoroughly.".into(),
+                    Some(1)
+                ),
+                ("assistant".into(), "Here is the report.".into(), Some(1)),
+            ]
         );
+        let history: i64 = conn
+            .query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(history, 0, "a delegated prompt is not a human prompt");
     }
 
     /// Group N. A replacement that lands *while the scan is reading* must not

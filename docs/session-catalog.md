@@ -646,6 +646,14 @@ turn can still receive the `exec_command_end` that fails one of its calls after
 the bytes a sync read, so a partial read records the failures it saw and leaves
 anything else `unknown`. Only `task_complete` can call a result a success.
 
+Claude sidechain (`isSidechain`) rows are delegated traffic and every one is
+captured, its event rows with `is_sidechain = 1`: the subagent's output, the
+delegating agent's prompts to it, and the tool results it received. Its `tool_result` blocks are
+tool results and blocks of a user turn like any other, so a delegated thread's
+parent chain and its tool calls' results are whole. Its user text is the
+delegating agent's rather than a human's, so it never becomes `history`, a
+prompt, `first_prompt` or a control row.
+
 Cursor, Grok and OpenCode measure through the same
 `ToolResultFacts::from_payload` helper, so the columns mean the same thing for
 them. `event_source` says where the result was recorded, and that decides
