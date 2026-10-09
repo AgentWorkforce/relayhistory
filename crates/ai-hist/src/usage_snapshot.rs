@@ -34,7 +34,7 @@ use serde_json::{Map, Value};
 use std::fmt;
 
 /// The counter names Codex writes in a token usage object, in stored order.
-const COUNTERS: [&str; 6] = [
+pub(crate) const COUNTERS: [&str; 6] = [
     "input_tokens",
     "cached_input_tokens",
     "cache_write_input_tokens",

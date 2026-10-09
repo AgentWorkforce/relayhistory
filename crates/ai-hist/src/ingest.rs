@@ -6039,8 +6039,8 @@ impl Serialize for ConfigurationFields<'_> {
 ///
 /// The payload is the provider's `info` (`total_token_usage`,
 /// `last_token_usage`, `model_context_window`, any other key it writes),
-/// bounded whole like any provider document in `payload_json` -- strings at
-/// 128 characters, containers at 32 entries -- and stored in the compact form
+/// bounded by [`bound_usage_info`] -- strings at 128 characters, containers at
+/// 32 entries, with every counter kept -- and stored in the compact form
 /// [`crate::usage_snapshot`] describes; neither the bound nor the encoding
 /// alters a number, so counters are never truncated. The
 /// `info: null` snapshot Codex emits before a turn has spent anything stores
@@ -6052,6 +6052,51 @@ impl Serialize for ConfigurationFields<'_> {
 /// What it adds is the counter itself, for every snapshot the provider wrote,
 /// including those of a turn that produced no assistant event to carry a
 /// delta.
+/// [`bound_marker_value`] for a Codex `token_count` `info`, keeping what it
+/// measures whole: `total_token_usage` and `last_token_usage` keep every
+/// counter, and `model_context_window` is kept, however many other keys sort
+/// ahead of them. Only the remaining keys are cut at the entry limit.
+fn bound_usage_info(info: Value) -> Value {
+    const MEASURED: [&str; 3] = [
+        "total_token_usage",
+        "last_token_usage",
+        "model_context_window",
+    ];
+    fn keep_whole(fields: &mut Map<String, Value>, keys: &[&str]) -> Map<String, Value> {
+        keys.iter()
+            .filter_map(|key| Some((key.to_string(), fields.remove(*key)?)))
+            .collect()
+    }
+    fn merge(kept: Map<String, Value>, rest: Map<String, Value>) -> Value {
+        let mut merged = match bound_marker_value(Value::Object(rest)) {
+            Value::Object(rest) => rest,
+            _ => Map::new(),
+        };
+        merged.extend(kept);
+        Value::Object(merged)
+    }
+    let Value::Object(mut fields) = info else {
+        return bound_marker_value(info);
+    };
+    let kept = keep_whole(&mut fields, &MEASURED)
+        .into_iter()
+        .map(|(key, value)| {
+            let value = match value {
+                Value::Object(mut usage) if key != "model_context_window" => {
+                    let counters = keep_whole(&mut usage, &crate::usage_snapshot::COUNTERS)
+                        .into_iter()
+                        .map(|(name, counter)| (name, bound_marker_value(counter)))
+                        .collect();
+                    merge(counters, usage)
+                }
+                value => bound_marker_value(value),
+            };
+            (key, value)
+        })
+        .collect();
+    merge(kept, fields)
+}
+
 fn record_codex_usage_snapshot(
     conn: &Connection,
     session_id: &str,
@@ -6066,7 +6111,7 @@ fn record_codex_usage_snapshot(
     let payload_json = match info {
         Value::Null => None,
         info if marker_payload_is_bounded(info) => Some(crate::usage_snapshot::encode(info)?),
-        info => Some(crate::usage_snapshot::encode(&bound_marker_value(
+        info => Some(crate::usage_snapshot::encode(&bound_usage_info(
             info.clone(),
         ))?),
     };
@@ -7375,7 +7420,7 @@ impl ForkReplaySpan {
                 .and_then(CodexTokenTotals::from_usage)
             {
                 self.inherited = Some(totals);
-                self.inherited_snapshot = info.cloned().map(bound_marker_value);
+                self.inherited_snapshot = info.cloned().map(bound_usage_info);
             }
         }
     }
@@ -7445,7 +7490,7 @@ fn record_codex_fork_replay(
         "closed_by": closed_by.map(|(_, basis)| basis),
         "inherited_total_tokens": span.inherited.map(|totals| totals.total),
         // The replayed `token_count` `info` that total came from, as written,
-        // bounded per the marker contract (counters are never truncated).
+        // bounded by `bound_usage_info` (counters are never truncated).
         "inherited_snapshot": span.inherited_snapshot,
         // `pending` until the child's first readable snapshot, then
         // `applied` or `dropped` with `inherited_baseline_basis` (see
@@ -37759,6 +37804,45 @@ mod codex_fork_replay_tests {
         assert_eq!(closed["inherited_snapshot"], usage(1000)["info"]);
         // 1600 cumulative, 1000 of it inherited from the parent.
         assert_eq!(token_totals(&conn, CHILD), vec![600]);
+    }
+
+    /// Keys that sort ahead of the measured ones cannot push a counter out
+    /// of the bounded `info`, at the top level or inside a usage object.
+    #[test]
+    fn the_usage_info_bound_keeps_every_counter() {
+        let mut usage = Map::new();
+        let mut info = Map::new();
+        for index in 0..40 {
+            usage.insert(format!("a{index:02}"), json!(index));
+            info.insert(format!("a{index:02}"), json!(index));
+        }
+        for (position, counter) in crate::usage_snapshot::COUNTERS.iter().enumerate() {
+            usage.insert(counter.to_string(), json!(u64::MAX - position as u64));
+        }
+        info.insert("total_token_usage".into(), Value::Object(usage.clone()));
+        info.insert("last_token_usage".into(), Value::Object(usage));
+        info.insert("model_context_window".into(), json!(258_400));
+
+        let bounded = bound_usage_info(Value::Object(info));
+
+        for key in ["total_token_usage", "last_token_usage"] {
+            for (position, counter) in crate::usage_snapshot::COUNTERS.iter().enumerate() {
+                assert_eq!(
+                    bounded[key][counter],
+                    json!(u64::MAX - position as u64),
+                    "{key}.{counter}"
+                );
+            }
+            assert_eq!(
+                bounded[key].as_object().unwrap().len(),
+                MARKER_PAYLOAD_ARRAY_LIMIT + crate::usage_snapshot::COUNTERS.len()
+            );
+        }
+        assert_eq!(bounded["model_context_window"], json!(258_400));
+        assert_eq!(
+            bounded.as_object().unwrap().len(),
+            MARKER_PAYLOAD_ARRAY_LIMIT + 3
+        );
     }
 
     /// Rows an earlier parser indexed under the child for replayed lines are
