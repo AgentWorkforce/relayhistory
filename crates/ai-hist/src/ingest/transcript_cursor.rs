@@ -173,10 +173,11 @@ pub(crate) struct ClaudeCursorState {
     /// rewrites a transcript's prefix and every position after it shifts.
     #[serde(default)]
     pub next_line_index: usize,
-    /// `message.id`s whose assistant message had not finished when the last
-    /// pass ended. `offset` already backs up to the first byte of the earliest
-    /// of them, so this is carried for reporting and for the
-    /// `HYDRATION_IN_PROGRESS_MESSAGES` diagnostic rather than for correctness.
+    /// The `message.id` of the trailing assistant message when the last pass
+    /// ended holding it: empty, or exactly one id, since only a transcript's
+    /// trailing message is held. `offset` already backs up to its first byte; this
+    /// says a further pass is owed even though the file has not moved, and
+    /// names the message in `HYDRATION_IN_PROGRESS_MESSAGES`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub in_progress: Vec<String>,
     /// Where a trailing record that had no newline began.
@@ -1674,8 +1675,8 @@ pub(crate) struct IncrementalPass {
     pub validation_bytes: u64,
     /// Complete JSON records handed to the per-record indexer.
     pub records: i64,
-    /// Messages still unfinished when the pass ended. Their rows were not
-    /// written and the committed offset backs up to before the earliest.
+    /// The trailing message, when nothing after it said it was finished. Its
+    /// rows were not written and the committed offset backs up to before it.
     pub in_progress: Vec<String>,
     /// The cursor was discarded and the file re-read from zero.
     pub rotated: bool,

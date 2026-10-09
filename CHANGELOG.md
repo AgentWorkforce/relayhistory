@@ -6,6 +6,10 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased - Minor]
 
+### Fixed
+
+- Claude subagent requests and usage reach `SessionEvidence::requests` on the sync or hydration that reads the sidecar, rather than only once the sidecar had sat still for two minutes and a later sweep ran, which `sync` skipped while no other source changed. The first sync after upgrading backfills the messages an earlier build held back.
+
 ### Rust API
 
 - `StoreOptions`, `DiscoveryOptions`, `SyncOptions`, `HydrateOptions` and `ForgetOptions` have a chainable setter per field, e.g. `StoreOptions::default().db_path(path).read_only(true)`.

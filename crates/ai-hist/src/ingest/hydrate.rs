@@ -3879,8 +3879,8 @@ fn outcome_diagnostics(indexed: &IngestOutcome, source_bytes: i64) -> Vec<Hydrat
     if indexed.deferral_overflowed {
         diagnostics.push(HydrationDiagnostic {
             code: "HYDRATION_IN_PROGRESS_OVERFLOW".to_string(),
-            message: "a transcript held more unfinished messages than the deferral ceiling \
-                      allows; the oldest were indexed as they stood so the reader could \
+            message: "a transcript's trailing message passed the holding ceiling before \
+                      a record followed it; it was indexed as it stood so the reader could \
                       keep making progress"
                 .to_string(),
             duration_ms: None,
@@ -11838,6 +11838,61 @@ mod tests {
         spawn_depth: Option<i64>,
         evidence_ref: Option<String>,
         has_events: bool,
+    }
+
+    /// Hydration releases a sidecar's messages the way the sweep does: every
+    /// assistant record says `stop_reason: null`, and each message is
+    /// finished by the record after it, so the child's requests are all there
+    /// on the first pass and nothing is reported as still being written.
+    #[test]
+    fn hydration_indexes_a_sidecar_whose_stop_reasons_are_all_null() {
+        let dir = tempfile::tempdir().unwrap();
+        let assistant = |uuid: &str, message: &str, tool: &str, output: i64| {
+            format!(
+                "{{\"sessionId\":\"session-1\",\"agentId\":\"abc\",\"isSidechain\":true,\"uuid\":\"{uuid}\",\"cwd\":\"/work/app\",\"type\":\"assistant\",\"requestId\":\"req_{message}\",\"message\":{{\"id\":\"{message}\",\"role\":\"assistant\",\"model\":\"claude-opus-5\",\"stop_reason\":null,\"content\":[{{\"type\":\"tool_use\",\"id\":\"{tool}\",\"name\":\"Bash\",\"input\":{{}}}}],\"usage\":{{\"input_tokens\":10,\"output_tokens\":{output}}}}},\"timestamp\":\"2026-08-31T10:00:03Z\"}}\n"
+            )
+        };
+        let result = |uuid: &str, tool: &str| {
+            format!(
+                "{{\"sessionId\":\"session-1\",\"agentId\":\"abc\",\"isSidechain\":true,\"uuid\":\"{uuid}\",\"cwd\":\"/work/app\",\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"{tool}\",\"content\":\"ok\"}}]}},\"timestamp\":\"2026-08-31T10:00:04Z\"}}\n"
+            )
+        };
+        let records = [
+            assistant("side-a1", "msg_1", "toolu_a", 3),
+            result("side-r1", "toolu_a"),
+            assistant("side-a2", "msg_2", "toolu_b", 4),
+            result("side-r2", "toolu_b"),
+        ]
+        .concat();
+        let transcript =
+            claude_parent_with_subagent(dir.path(), &records, Some(CLAUDE_AGENT_META), "agent-abc");
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", "session-1", Some(&transcript));
+        drop(conn);
+
+        let hydrated =
+            hydrate_session_at_with_home(&db, &options("claude", "session-1"), dir.path()).unwrap();
+        assert!(diagnostic(&hydrated, "HYDRATION_IN_PROGRESS_MESSAGES").is_none());
+        let conn = open_db(&db).unwrap();
+        let requests: Vec<(String, i64)> = conn
+            .prepare(
+                "SELECT request_key, json_extract(token_json, '$.output_tokens') \
+                 FROM session_requests WHERE source = 'claude' AND session_id = 'abc' \
+                 ORDER BY request_key",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            requests,
+            vec![
+                ("request-id:req_msg_1".to_string(), 3),
+                ("request-id:req_msg_2".to_string(), 4),
+            ]
+        );
     }
 
     #[test]

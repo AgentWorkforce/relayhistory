@@ -13,44 +13,78 @@
 use super::transcript_cursor::*;
 use super::*;
 
-/// How many bytes of deferred records one pass will hold before it gives up on
-/// deferral for the oldest of them.
+/// How many bytes of one held message a pass will keep before it indexes the
+/// message as it stands.
 ///
-/// Deferral exists so a half-written message is not indexed as if it were
-/// finished, not to make the reader hold a transcript in memory. A well-formed
-/// transcript has at most one message open at its tail, so this ceiling is
-/// only reached by a malformed or adversarial file — one whose assistant
-/// messages never carry a `stop_reason`. When it is reached the oldest held
-/// message is indexed as it stands and the pass continues, which keeps memory
-/// bounded *and* keeps the reader making forward progress. Indexing an
-/// unfinished message early is recoverable: its rows carry their own record
-/// identity, so the blocks that arrive later land as further rows rather than
-/// as corrections to these.
+/// Holding exists so a half-written message is not indexed as if it were
+/// finished, not to make the reader hold a transcript in memory. Only the
+/// file's trailing message can be held (see [`HeldMessage`]), so this ceiling
+/// is only reached by one message whose blocks pass 8 MiB without a record
+/// following them. When it is reached the message is indexed as it stands and
+/// the pass continues, which keeps memory bounded *and* keeps the reader making
+/// forward progress. Indexing an unfinished message early is recoverable: its
+/// rows carry their own record identity and its usage settles across copies,
+/// so the blocks that arrive later land as further rows rather than as
+/// corrections to these.
 const CLAUDE_DEFERRED_BYTES_CAP: usize = 8 * 1024 * 1024;
 
-/// The same ceiling expressed in messages, for a file of many tiny unfinished
-/// ones.
-const CLAUDE_DEFERRED_MESSAGE_CAP: usize = 512;
+/// Whether the last sweep left any Claude transcript holding a trailing
+/// message back (see [`HeldMessage`]).
+///
+/// A held message is released by the record that follows it or, once its
+/// writer stops, by the quiet-file rule — and both need a sweep to read the
+/// file again. The source fingerprint cannot see either: a transcript that
+/// stopped mid-message is byte-for-byte unchanged. So a sweep that left
+/// records held does not license the next one to skip. A boolean, always
+/// written and never removed: the sync-state merge only folds keys forward,
+/// and it would read a number as a legacy offset and keep the larger.
+pub(crate) const CLAUDE_HOLDING_RECORDS_KEY: &str = "claude_holding_records";
 
-/// Whether this record belongs to an assistant message, and whether that
-/// message is finished.
+/// Whether the last sweep recorded [`CLAUDE_HOLDING_RECORDS_KEY`] as true.
+pub(crate) fn sweep_left_records_held(state: &Map<String, Value>) -> bool {
+    state.get(CLAUDE_HOLDING_RECORDS_KEY) == Some(&Value::Bool(true))
+}
+
+/// Forget the record cursor of a transcript the sweep could not open, unless
+/// it is holding a trailing message; returns whether it is.
+///
+/// A holding cursor is kept because it is the only record that the message is
+/// owed a pass: its offset stops short of the file's end, so the unchanged
+/// skip never passes over it, and the caller keeps
+/// [`CLAUDE_HOLDING_RECORDS_KEY`] set so the sweep keeps running until the file
+/// can be read again. Any other cursor is dropped, so the next read starts from
+/// zero rather than trusting a position over bytes it could not see.
+pub(crate) fn forget_unread_cursor_unless_held(conn: &Connection, path: &Path) -> Result<bool> {
+    let locator = path.to_string_lossy();
+    let key = CursorKey::Locator {
+        source: "claude",
+        locator: &locator,
+    };
+    let held = load_cursor(conn, &key)?
+        .claude
+        .is_some_and(|claude| !claude.in_progress.is_empty());
+    if !held {
+        forget_locator_cursor(conn, "claude", path)?;
+    }
+    Ok(held)
+}
+
+/// Whether this record belongs to an assistant message, and whether the record
+/// itself says that message is finished.
 ///
 /// Claude writes one assistant message as several JSONL records over time, one
 /// per content block, and `message.id` is the identity that ties them
-/// together. The provider signals "still streaming" by writing the key
-/// `stop_reason` with the value `null`, and completion by filling it in.
+/// together. A filled-in `stop_reason` says the message is finished. A
+/// `stop_reason` of `null` says nothing on its own: Claude Code's subagent
+/// sidecars write `null` on nearly every record of every message, finished or
+/// not, so the record that settles the question is the next one in the file
+/// (see [`HeldMessage`]).
 ///
-/// **An absent `stop_reason` is treated as finished, not as streaming.** burn
-/// parses the field into an `Option` and cannot tell the two apart, but here
-/// the difference decides whether a record is ever written: deferring a record
-/// whose shape has no completion signal would hold it back on this pass, and
-/// on every pass after it, and the message would never be indexed at all. That
-/// is exactly the failure this repository keeps finding — a well-formed
-/// success returned over work that never happened — so the ambiguous case is
-/// resolved towards indexing. Claude sidechain records and the older record
-/// shapes in this repository's own corpus omit the field entirely.
+/// **An absent `stop_reason` is treated as finished.** Older record shapes in
+/// this repository's own corpus omit the field entirely, and they carry no
+/// signal to wait for.
 ///
-/// A record with no `message.id` cannot be grouped and is never deferred.
+/// A record with no `message.id` cannot be grouped and is never held.
 fn claude_message_progress(obj: &Map<String, Value>) -> Option<(String, bool)> {
     let message = obj.get("message").and_then(Value::as_object)?;
     let role = message
@@ -68,29 +102,30 @@ fn claude_message_progress(obj: &Map<String, Value>) -> Option<(String, bool)> {
     Some((id.to_string(), !streaming))
 }
 
-/// Records of one unfinished message, and the position that precedes them.
-struct DeferredMessage {
+/// The records of the transcript's trailing assistant message, held because
+/// nothing after them says the message is finished.
+///
+/// A message is finished once its record says so (`stop_reason` filled in)
+/// **or once any later record follows it** — a different message, a tool
+/// result, a system row. Only the message at the end of the file can still be
+/// streaming, so at most one is held at a time, and a pass that ends with one
+/// commits before its first byte so the next pass reads it again.
+///
+/// Claude can write another record between two blocks of one message (a tool
+/// result for a parallel tool call), so a message released by a following
+/// record may gain a further block later. That block is indexed when it
+/// arrives under its own record identity, and the request's usage settles
+/// across every copy, so the early release neither drops nor double-counts
+/// anything.
+struct HeldMessage {
+    message_id: String,
     offset: u64,
     line_index: usize,
-    lines: Vec<(usize, String)>,
+    lines: Vec<String>,
     bytes: usize,
-    /// Tool-result ordering as it stood before this message was held.
-    ///
-    /// The commit backs up to the earliest held message, so this is the state
-    /// that belongs with the committed offset. Storing the end-of-pass state
-    /// instead let every re-read of the held region claim fresh indexes.
-    ///
-    /// Known limit, in the one place it can bite: two messages can interleave,
-    /// and flushing the earlier one indexes its records wherever they fall —
-    /// including after the later one's offset, which is where the commit backs
-    /// up to. Those records are re-read on the next pass and renumbered, while
-    /// the same message's records *before* that offset keep the numbers they
-    /// already have, so one message's `event_index` values can stop being
-    /// monotonic. Rows are not duplicated — the conflict key is `event_uid` —
-    /// and the ordering converges once the file stops changing. Fixing it
-    /// properly means committing no further than the earliest record of any
-    /// message this pass flushed, which costs a re-read of every interleaved
-    /// span on every pass.
+    /// Tool-result ordering as it stood before this message was held: the
+    /// state that belongs with the committed offset when the pass backs up to
+    /// it.
     tool_results: crate::ingest::tool_result_facts::ToolResultIndexer,
 }
 
@@ -192,11 +227,7 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
     // would hold it back forever.
     let defer_unfinished = !reader.quiesced();
 
-    let mut deferred: HashMap<String, DeferredMessage> = HashMap::new();
-    // First-held order, which is file order, so the head is always the
-    // earliest unfinished message and therefore the commit point.
-    let mut deferred_order: Vec<String> = Vec::new();
-    let mut deferred_bytes = 0usize;
+    let mut held: Option<HeldMessage> = None;
 
     // Tool-result ordering as it stood before the unterminated trailing
     // record, if there is one.
@@ -222,6 +253,15 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
             // past.
             pass.oversized_records += 1;
             if terminated {
+                // Skipped, but it follows the held message all the same.
+                release_any(
+                    conn,
+                    path,
+                    attributed_session_id,
+                    file_session_id.as_deref(),
+                    &mut held,
+                    &mut claude,
+                )?;
                 line_index += 1;
                 continue;
             }
@@ -250,13 +290,20 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
         // A malformed record that *did* end in a newline is committed bytes,
         // so it keeps consuming its index.
         line_index += 1;
-        let Some(value) = parsed else {
-            continue;
-        };
-        let Some(obj) = value.as_object() else {
+        let Some(obj) = parsed.as_ref().and_then(Value::as_object) else {
             if kind == ReadRecord::Unterminated {
                 break;
             }
+            // Malformed or not an object, but a complete record that follows
+            // the held message.
+            release_any(
+                conn,
+                path,
+                attributed_session_id,
+                file_session_id.as_deref(),
+                &mut held,
+                &mut claude,
+            )?;
             continue;
         };
         pass.records += 1;
@@ -269,7 +316,6 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
                 Some(id) => {
                     file_session_id = Some(id.to_string());
                     if let Some(from) = sessionless_from.take() {
-                        let mut file = claude.file_parse(path, None, file_session_id.as_deref());
                         reread_bytes += reader.replay(from, line_start, |held| {
                             let Ok(value) = serde_json::from_str::<Value>(held) else {
                                 return Ok(());
@@ -277,7 +323,12 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
                             let Some(held_obj) = value.as_object() else {
                                 return Ok(());
                             };
-                            ingest_claude_record(conn, &mut file, held, held_obj)
+                            ingest_claude_record(
+                                conn,
+                                &mut claude.file_parse(path, None, file_session_id.as_deref()),
+                                held,
+                                held_obj,
+                            )
                         })?;
                     }
                 }
@@ -299,106 +350,51 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
         if kind == ReadRecord::Unterminated {
             unterminated = Some((line_start, index));
         }
-        match claude_message_progress(obj) {
-            Some((message_id, complete)) => {
-                if let Some(entry) = deferred.get_mut(&message_id) {
-                    entry.bytes += line.len();
-                    deferred_bytes += line.len();
-                    entry.lines.push((index, line.clone()));
-                    if complete {
-                        flush_deferred(
-                            conn,
-                            &mut claude.file_parse(
-                                path,
-                                attributed_session_id,
-                                file_session_id.as_deref(),
-                            ),
-                            &message_id,
-                            &mut deferred,
-                            &mut deferred_order,
-                            &mut deferred_bytes,
-                        )?;
-                    }
-                } else if complete || !defer_unfinished {
-                    ingest_claude_record(
-                        conn,
-                        &mut claude.file_parse(
-                            path,
-                            attributed_session_id,
-                            file_session_id.as_deref(),
-                        ),
-                        record,
-                        obj,
-                    )?;
-                } else {
-                    deferred_bytes += line.len();
-                    deferred.insert(
-                        message_id.clone(),
-                        DeferredMessage {
-                            offset: line_start,
-                            line_index: index,
-                            // Held, not indexed, so the current state is the
-                            // state before this message.
-                            tool_results: claude.tool_results.clone(),
-                            lines: vec![(index, line.clone())],
-                            bytes: line.len(),
-                        },
-                    );
-                    deferred_order.push(message_id);
-                }
-            }
-            None => ingest_claude_record(
-                conn,
-                &mut claude.file_parse(path, attributed_session_id, file_session_id.as_deref()),
+        pass.deferral_overflowed |= place_claude_record(
+            conn,
+            path,
+            attributed_session_id,
+            file_session_id.as_deref(),
+            &mut held,
+            &mut claude,
+            Placement {
+                hold: defer_unfinished,
+                offset: line_start,
+                index,
+                line: &line,
                 record,
                 obj,
-            )?,
-        }
+            },
+        )?;
         if kind == ReadRecord::Unterminated {
             break;
         }
-        while deferred_bytes > CLAUDE_DEFERRED_BYTES_CAP
-            || deferred.len() > CLAUDE_DEFERRED_MESSAGE_CAP
-        {
-            let Some(oldest) = deferred_order.first().cloned() else {
-                break;
-            };
-            pass.deferral_overflowed = true;
-            flush_deferred(
-                conn,
-                &mut claude.file_parse(path, attributed_session_id, file_session_id.as_deref()),
-                &oldest,
-                &mut deferred,
-                &mut deferred_order,
-                &mut deferred_bytes,
-            )?;
-        }
     }
 
-    // Commit before the earliest message still in progress, so the next pass
-    // reads it again from its first byte and can see the completion when it
+    // Commit before the message still in progress, so the next pass reads it
+    // again from its first byte and can see what follows it when that
     // arrives. With nothing in progress the commit is the end of the last
     // complete line.
-    let (commit_offset, commit_line_index, commit_tool_results) =
-        match deferred_order.first().and_then(|id| deferred.get(id)) {
-            Some(entry) => (entry.offset, entry.line_index, entry.tool_results.clone()),
-            // With an unterminated record indexed, commit past it so a file
-            // nobody has touched compares equal to its cursor and is skipped
-            // outright; `resume_from` is what brings the reader back to it if
-            // the file ever grows.
-            None => match unterminated {
-                Some((start, _)) => (
-                    start + reader.tail_bytes(),
-                    line_index,
-                    claude.tool_results.clone(),
-                ),
-                None => (reader.position(), line_index, claude.tool_results.clone()),
-            },
-        };
-    pass.in_progress = deferred_order.clone();
+    let (commit_offset, commit_line_index, commit_tool_results) = match held.as_ref() {
+        Some(entry) => (entry.offset, entry.line_index, entry.tool_results.clone()),
+        // With an unterminated record indexed, commit past it so a file
+        // nobody has touched compares equal to its cursor and is skipped
+        // outright; `resume_from` is what brings the reader back to it if
+        // the file ever grows.
+        None => match unterminated {
+            Some((start, _)) => (
+                start + reader.tail_bytes(),
+                line_index,
+                claude.tool_results.clone(),
+            ),
+            None => (reader.position(), line_index, claude.tool_results.clone()),
+        },
+    };
+    let in_progress: Vec<String> = held.map(|entry| entry.message_id).into_iter().collect();
+    pass.in_progress = in_progress.clone();
 
     claude.next_line_index = commit_line_index;
-    claude.in_progress = deferred_order;
+    claude.in_progress = in_progress;
     // Only meaningful when the pass committed past the record; a pass that
     // backed up for a held message will re-read it anyway.
     let (resume_from, resume_line_index) = match unterminated {
@@ -454,21 +450,120 @@ impl ClaudeCursorState {
     }
 }
 
-/// Index one deferred message's records in file order and forget it.
-fn flush_deferred(
+/// One parsed record and where it sits in the file.
+struct Placement<'a> {
+    /// Whether an unfinished message may be held at all: false once the file
+    /// has gone quiet, when nothing more is coming to finish it.
+    hold: bool,
+    offset: u64,
+    index: usize,
+    line: &'a str,
+    record: &'a str,
+    obj: &'a Map<String, Value>,
+}
+
+/// Send one record onto the held message, into a new hold, or straight to the
+/// indexer, releasing first whatever message it follows. Returns whether the
+/// held message passed [`CLAUDE_DEFERRED_BYTES_CAP`] and was released early.
+fn place_claude_record(
     conn: &Connection,
-    file: &mut ClaudeFileParse<'_>,
-    message_id: &str,
-    deferred: &mut HashMap<String, DeferredMessage>,
-    deferred_order: &mut Vec<String>,
-    deferred_bytes: &mut usize,
-) -> Result<()> {
-    let Some(entry) = deferred.remove(message_id) else {
-        return Ok(());
+    path: &Path,
+    attributed_session_id: Option<&str>,
+    file_session_id: Option<&str>,
+    held: &mut Option<HeldMessage>,
+    claude: &mut ClaudeCursorState,
+    at: Placement<'_>,
+) -> Result<bool> {
+    let progress = claude_message_progress(at.obj);
+    // Any record that is not another block of the held message follows it,
+    // and a message something follows is finished.
+    let continues_held = matches!(
+        (&*held, &progress),
+        (Some(entry), Some((id, _))) if entry.message_id == *id
+    );
+    let release = |held: &mut Option<HeldMessage>, claude: &mut ClaudeCursorState| {
+        release_any(
+            conn,
+            path,
+            attributed_session_id,
+            file_session_id,
+            held,
+            claude,
+        )
     };
-    deferred_order.retain(|id| id != message_id);
-    *deferred_bytes = deferred_bytes.saturating_sub(entry.bytes);
-    for (_, text) in entry.lines {
+    if !continues_held {
+        release(held, claude)?;
+    }
+    match progress {
+        Some((_, complete)) if continues_held => {
+            if let Some(entry) = held.as_mut() {
+                entry.bytes += at.line.len();
+                entry.lines.push(at.line.to_string());
+            }
+            if complete {
+                release(held, claude)?;
+            }
+        }
+        Some((message_id, false)) if at.hold => {
+            *held = Some(HeldMessage {
+                message_id,
+                offset: at.offset,
+                line_index: at.index,
+                lines: vec![at.line.to_string()],
+                bytes: at.line.len(),
+                // Held, not indexed, so the current state is the state before
+                // this message.
+                tool_results: claude.tool_results.clone(),
+            });
+        }
+        _ => ingest_claude_record(
+            conn,
+            &mut claude.file_parse(path, attributed_session_id, file_session_id),
+            at.record,
+            at.obj,
+        )?,
+    }
+    let overflowed = held
+        .as_ref()
+        .is_some_and(|entry| entry.bytes > CLAUDE_DEFERRED_BYTES_CAP);
+    if overflowed {
+        release(held, claude)?;
+    }
+    Ok(overflowed)
+}
+
+/// Release the held message, if there is one.
+fn release_any(
+    conn: &Connection,
+    path: &Path,
+    attributed_session_id: Option<&str>,
+    file_session_id: Option<&str>,
+    held: &mut Option<HeldMessage>,
+    claude: &mut ClaudeCursorState,
+) -> Result<()> {
+    match held.take() {
+        Some(entry) => release_held(
+            conn,
+            path,
+            attributed_session_id,
+            file_session_id,
+            entry,
+            claude,
+        ),
+        None => Ok(()),
+    }
+}
+
+/// Index a held message's records in file order.
+fn release_held(
+    conn: &Connection,
+    path: &Path,
+    attributed_session_id: Option<&str>,
+    file_session_id: Option<&str>,
+    entry: HeldMessage,
+    claude: &mut ClaudeCursorState,
+) -> Result<()> {
+    for text in entry.lines {
         let record = text.trim_end_matches(['\n', '\r']);
         let Ok(value) = serde_json::from_str::<Value>(record) else {
             continue;
@@ -476,9 +571,48 @@ fn flush_deferred(
         let Some(obj) = value.as_object() else {
             continue;
         };
-        ingest_claude_record(conn, file, record, obj)?;
+        ingest_claude_record(
+            conn,
+            &mut claude.file_parse(path, attributed_session_id, file_session_id),
+            record,
+            obj,
+        )?;
     }
     Ok(())
+}
+
+/// What a Claude transcript is skipped on when nothing about it changed.
+///
+/// A subagent sidecar's `agent-<agentId>.meta.json` is the only place the
+/// child's type, name, model and spawn depth are recorded, so metadata that
+/// changes beside an untouched transcript is still new evidence and has to
+/// reach `session_relationships`. It carries its own whole-file cursor, so it
+/// is checked here rather than folded into the transcript's stamp.
+pub(crate) fn claude_transcript_unchanged(conn: &Connection, path: &Path) -> Result<bool> {
+    if !transcript_cursor::transcript_unchanged(conn, "claude", path)? {
+        return Ok(false);
+    }
+    let metadata = super::hydrate::claude_subagent_meta_path(path);
+    // A sidecar that was indexed and has since been deleted is a change, and
+    // it is the one change no amount of looking at the file will reveal. Its
+    // cursor is the record that it was once there; without this the transcript
+    // takes the fast path forever and the relationship keeps describing a
+    // child from a file nobody can read any more.
+    let indexed_metadata = transcript_cursor::locator_cursor_exists(
+        conn,
+        super::CLAUDE_SUBAGENT_META_SOURCE,
+        &metadata,
+    )?;
+    if (metadata.is_file() || indexed_metadata)
+        && !transcript_cursor::transcript_unchanged(
+            conn,
+            super::CLAUDE_SUBAGENT_META_SOURCE,
+            &metadata,
+        )?
+    {
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 /// Read a Claude transcript through a locator-keyed cursor, loading and
