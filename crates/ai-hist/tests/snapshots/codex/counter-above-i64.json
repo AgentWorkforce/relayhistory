@@ -90,6 +90,19 @@
   ],
   "session_markers": [
     {
+      "kind": "turn_context",
+      "marker_uid": "1:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"cwd\":\"/tmp/project\",\"model\":\"gpt-5.4\",\"turn_id\":\"t1\"}",
+      "session_id": "sess_codex_huge",
+      "source": "codex",
+      "subkind": "turn_context",
+      "text": null,
+      "ts_ms": 1776661200100,
+      "turn_id": "t1"
+    },
+    {
       "kind": "task_started",
       "marker_uid": "2:marker",
       "message_id": null,
@@ -100,6 +113,19 @@
       "subkind": "task_started",
       "text": null,
       "ts_ms": 1776661200200,
+      "turn_id": "t1"
+    },
+    {
+      "kind": "usage_snapshot",
+      "marker_uid": "5:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "[[9223372036854775808,0,null,5,0,9223372036854775813]]",
+      "session_id": "sess_codex_huge",
+      "source": "codex",
+      "subkind": "token_count",
+      "text": null,
+      "ts_ms": 1776661201000,
       "turn_id": "t1"
     },
     {

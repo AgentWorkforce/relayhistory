@@ -12,6 +12,7 @@ import {
   sessionMarkers, sync,
   type SessionMarker,
 } from './index.js';
+import { sessionMarker } from './normalization.js';
 
 const SESSION = 'markers-1';
 
@@ -170,4 +171,38 @@ test('source capabilities answer from the provider tables, before any database e
     getSourceCapabilities('trajectory' as never),
     (error: unknown) => error instanceof InvalidArgumentError,
   );
+});
+
+test('a Codex usage snapshot payload is the info object it was stored from', () => {
+  const row = (payloadJson: string | null) => sessionMarker({
+    id: 1, source: 'codex', sessionId: 's', markerUid: '4:marker', tsMs: 1, messageId: null,
+    parentId: null, turnId: 't', kind: 'usage_snapshot', subkind: 'token_count', text: null, payloadJson,
+  });
+  const marker = row('[[1000,400,null,120,30,1120,{"output_tokens_extra":2}],[10,null,null,1],258400,{"rate":1}]');
+  assert.equal(marker.payloadJson, '[[1000,400,null,120,30,1120,{"output_tokens_extra":2}],[10,null,null,1],258400,{"rate":1}]');
+  assert.deepEqual(marker.payload, {
+    total_token_usage: {
+      input_tokens: 1000, cached_input_tokens: 400, output_tokens: 120,
+      reasoning_output_tokens: 30, total_tokens: 1120, output_tokens_extra: 2,
+    },
+    last_token_usage: { input_tokens: 10, output_tokens: 1 },
+    model_context_window: 258400,
+    rate: 1,
+  });
+  assert.deepEqual(row('[null,null,null,null,[1,2]]').payload, [1, 2]);
+  assert.deepEqual(row('{"total_token_usage":{"input_tokens":1}}').payload, { total_token_usage: { input_tokens: 1 } });
+  assert.equal(row(null).payload, null);
+  // Not the stored form: kept as stored, as the Rust reader keeps it.
+  assert.deepEqual(row('[1,2,3]').payload, [1, 2, 3]);
+  assert.deepEqual(row('[[1],null,null,7]').payload, [[1], null, null, 7]);
+  // A key both in a slot and in `rest` / `other` reads as the Rust reader
+  // reads it.
+  assert.deepEqual(row('[[1,null,null,null,null,null,{"input_tokens":2}],null,9,{"model_context_window":8,"total_token_usage":0}]').payload, {
+    total_token_usage: { input_tokens: 2 }, model_context_window: 8,
+  });
+  // Every key is data, `__proto__` included.
+  const proto = row('[[1,null,null,null,null,null,{"__proto__":{"x":1}}],null,null,{"__proto__":2}]').payload as Record<string, unknown>;
+  assert.equal(Object.getPrototypeOf(proto), Object.prototype);
+  assert.deepEqual(Object.keys(proto).sort(), ['__proto__', 'total_token_usage']);
+  assert.deepEqual(Object.keys(proto.total_token_usage as object).sort(), ['__proto__', 'input_tokens']);
 });

@@ -6,6 +6,12 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased - Minor]
 
+### Added
+
+- Codex sessions keep every `token_count` snapshot outside a fork's replayed parent history as a `usage_snapshot` marker, bounded per the marker contract (counters are never truncated) and typed as `Marker::usage_snapshot`, on `SessionEvidence::markers`, with its `turn_id` and in read order, including turns that wrote no assistant message; a fork's `fork_replay_boundary` marker carries the inherited snapshot as `inherited_snapshot`. Existing stores re-read their Codex rollouts once on the next sync or hydration to capture them.
+- Codex sessions keep each `turn_context` record outside a fork's replayed parent history that changes the session's configuration as a `turn_context` marker (every field but `turn_id` counts, and so does `root_turn_id` unless the turn's own `task_started` marker carries it), as written, bounded per the marker contract, with the `turn_id` it took effect at; a turn's configuration — model, effort, cwd, approval/sandbox policy — is the latest `turn_context` marker at or before its start in rollout order, readable even when it wrote no assistant message.
+- Codex `task_started` markers carry the turn's `root_turn_id` in their payload when Codex writes it.
+
 ### Changed
 
 - `Message::raw_usage` returns the usage blob of the message's own record, so each streamed copy of one Claude response keeps its own snapshot (and a copy that carried none has none); `Message::usage` and `SessionEvidence::requests` still read the request's settled usage. The first `sync` after upgrading fills it through a one-time raw-facts re-read of Claude and Codex transcripts.
@@ -28,12 +34,15 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A Claude delegation's `child_model` names the model the subagent's own records used when its `agent-*.meta.json` names none, as Claude Code's never do.
 - A Claude spawn tool result carries the child's `agent_id` from the record's `toolUseResult.agentId`.
 - An existing store heals those three on its next `sync` or hydration: Claude transcripts holding them re-parse once, with every file unchanged.
+- Hydrating a session with related sessions after a parser upgrade re-reads its Codex child rollouts and Claude subagent sidecars from the start instead of resuming from cursors the older parser committed.
+- Writing a marker reuses its prepared statement instead of compiling it, and the change-feed triggers it fires, once per marker: hydrating an 8 MB Codex rollout is ~20% faster.
 
 ### Rust API
 
 - Added `ControlKind::Synthetic` (`"synthetic"`); `SESSION_EVIDENCE_CONTRACT_VERSION` is 4 in Rust and TypeScript, so an SDK without the value rejects an addon that can return it.
 - Added `SessionEvent::record_token_json`; code constructing `SessionEvent` with a struct literal must set it. `SESSION_EVIDENCE_CONTRACT_VERSION` is 4.
 - Added `DiscoveryState::Delegated`, the `discovery_state` of a delegated child that `SessionStore::session` read without a catalog row.
+- Added `Marker::usage_snapshot: Option<Box<UsageSnapshot>>` and the `UsageSnapshot` / `TokenUsage` types (`to_value()` gives the provider's object); a `usage_snapshot` marker carries its counters there, with no `payload` or `raw_payload()`.
 
 ## [0.36.0] - 2026-10-07
 

@@ -105,8 +105,15 @@ not dropped. A log row with no time cannot be placed, so it covers every turn.
 
 ### Codex
 
-`token_count` events carry cumulative `total_token_usage` snapshots. The parser
-differences consecutive strictly-advancing snapshots into per-request deltas and
+`token_count` events carry cumulative `total_token_usage` snapshots. Every one
+outside a fork's replayed parent history is stored in read order as a
+`usage_snapshot` marker carrying the provider's `info` object, bounded per the marker contract (counters are never truncated) and typed on `Marker::usage_snapshot`, and the Codex `turn_id` it fell inside — including a
+turn that wrote no assistant message, whose delta has no event to attach to,
+and the `info: null` snapshot Codex writes before a turn has spent anything. A
+snapshot is cumulative evidence for a consumer doing its own accounting; it is
+never read into `session_requests` or the session summary.
+
+The parser differences consecutive strictly-advancing snapshots into per-request deltas and
 attaches each to the nearest assistant event, so summing a session's deltas
 reproduces its final cumulative total. A snapshot that repeats or goes backwards
 is not a delta: the prior baseline is kept, so the next advancing snapshot

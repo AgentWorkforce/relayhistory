@@ -157,6 +157,32 @@
   ],
   "session_markers": [
     {
+      "kind": "turn_context",
+      "marker_uid": "1:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"cwd\":\"/tmp/project\",\"model\":\"gpt-5.4\",\"turn_id\":\"t1\"}",
+      "session_id": "sess_codex_reinstall",
+      "source": "codex",
+      "subkind": "turn_context",
+      "text": null,
+      "ts_ms": 1776682800100,
+      "turn_id": "t1"
+    },
+    {
+      "kind": "usage_snapshot",
+      "marker_uid": "2:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "[[-1,0,null,9000,0,8999]]",
+      "session_id": "sess_codex_reinstall",
+      "source": "codex",
+      "subkind": "token_count",
+      "text": null,
+      "ts_ms": 1776682800150,
+      "turn_id": "t1"
+    },
+    {
       "kind": "task_started",
       "marker_uid": "3:marker",
       "message_id": null,
@@ -167,6 +193,45 @@
       "subkind": "task_started",
       "text": null,
       "ts_ms": 1776682800200,
+      "turn_id": "t1"
+    },
+    {
+      "kind": "usage_snapshot",
+      "marker_uid": "6:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "[[900,0,null,55.5,0,955]]",
+      "session_id": "sess_codex_reinstall",
+      "source": "codex",
+      "subkind": "token_count",
+      "text": null,
+      "ts_ms": 1776682801000,
+      "turn_id": "t1"
+    },
+    {
+      "kind": "usage_snapshot",
+      "marker_uid": "7:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "[[1000,0,null,300,0,1300]]",
+      "session_id": "sess_codex_reinstall",
+      "source": "codex",
+      "subkind": "token_count",
+      "text": null,
+      "ts_ms": 1776682801500,
+      "turn_id": "t1"
+    },
+    {
+      "kind": "usage_snapshot",
+      "marker_uid": "10:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "[[1400,0,null,440,0,1840]]",
+      "session_id": "sess_codex_reinstall",
+      "source": "codex",
+      "subkind": "token_count",
+      "text": null,
+      "ts_ms": 1776682803000,
       "turn_id": "t1"
     },
     {

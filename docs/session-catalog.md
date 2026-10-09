@@ -517,14 +517,16 @@ it holds for every kind.
 | `compaction_boundary` | ✓ `type:"system"`, `subtype:"compact_boundary"` | ✓ top-level `compacted`, `context_compacted` | ✓ | – | ✓ node `metadata.summarized_from` | `compact_boundary`, `compacted` |
 | `summary` | ✓ `type:"summary"` | – | – | – | – | `summary` |
 | `subagent_notification` | ✓ system rows with `parent_tool_use_id`; tool results carrying `toolUseResult.agentId` | ✓ `subagent_*` | – | – | – | `subagent_completed`, `tool_use_result_agent_id`, `subagent_message_complete` |
-| `task_started` | – | ✓ | – | – | – | `task_started` |
+| `task_started` | – | ✓ `payload_json` carries `root_turn_id` when Codex wrote one: the turn of the root thread that the delegated thread is working for | – | – | – | `task_started` |
 | `task_complete` | – | ✓ | – | – | – | `task_complete` |
 | `turn_diff` | – | ✓ | – | – | – | `turn_diff` |
 | `stream_error` | – | ✓ | – | – | – | `stream_error` |
 | `tool_begin` | – | ✓ any `*_begin` | – | – | – | `exec_command_begin`, `patch_apply_begin`, `mcp_tool_call_begin` |
 | `review_mode` | – | ✓ | – | – | – | `entered_review_mode`, `exited_review_mode` |
-| `fork_replay_boundary` | – | ✓ one per replayed span in a forked rollout: `parent_id` is the fork parent, `turn_id` the child turn that closed it, `payload_json` carries `first_line`, `last_line`, `replayed_lines`, `closed_by` (`turn_id`, `task_started.started_at`, `undecided`, or null while the span is still open), `inherited_total_tokens`, and `inherited_baseline` (`pending`, `applied`, `dropped`) with `inherited_baseline_basis` (`last_token_usage`, `regression`, `no_evidence`) | – | – | – | `session_meta` |
+| `fork_replay_boundary` | – | ✓ one per replayed span in a forked rollout: `parent_id` is the fork parent, `turn_id` the child turn that closed it, `payload_json` carries `first_line`, `last_line`, `replayed_lines`, `closed_by` (`turn_id`, `task_started.started_at`, `undecided`, or null while the span is still open), `inherited_total_tokens` with `inherited_snapshot` (the replayed `token_count` `info` it was read from, as written, bounded per the marker contract (counters are never truncated)), and `inherited_baseline` (`pending`, `applied`, `dropped`) with `inherited_baseline_basis` (`last_token_usage`, `regression`, `no_evidence`) | – | – | – | `session_meta` |
 | `unsupported_block` | ✓ any content block with no event `kind`, plus thinking signatures | – | – | – | ✓ a human `user` node whose `content` holds no readable text; its JSON type in `payload_json`, never the payload | `image`, `document`, `redacted_thinking`, `server_tool_use`, `thinking_signature`, `user_content` |
+| `usage_snapshot` | – | ✓ every `event_msg/token_count` outside a fork's replayed parent history (the `fork_replay_boundary` marker stands for that span, and keeps its last snapshot as `inherited_snapshot`), in read order: `payload_json` is the provider's `info`, bounded per the marker contract (counters are never truncated), stored positionally as `[total, last, window, other]` — each usage object as `[input, cached_input, cache_write_input, output, reasoning_output, total, rest]` with `null` for an absent counter, every other key kept in `rest` / `other`, trailing `null`s left out (no payload for an `info: null` snapshot); read back typed as `Marker::usage_snapshot`, `turn_id` the turn it fell inside. A cumulative snapshot, never added into `session_requests` | – | – | – | `token_count` |
+| `turn_context` | – | ✓ each `turn_context` outside a fork's replayed parent history (the `fork_replay_boundary` marker stands for that span) whose payload differs from the session's previous one in any field but `turn_id` (and `root_turn_id` when the turn's `task_started` wrote the same one, which that marker keeps) — the session's first is always stored, a fork child's first own one included: `payload_json` is the record's payload as written, bounded per the marker contract (`turn_id`, `root_turn_id`, `model`, `effort`, `cwd`, `current_date`, approval and sandbox policy, …; strings at 128 characters, containers at 32 entries — in practice only instruction text is long enough to reach the bound), `turn_id` the turn it took effect at. The configuration of a turn is the latest `turn_context` marker at or before that turn's start in rollout order — the turn's model even when it wrote no assistant message | – | – | – | `turn_context` |
 | `encrypted_reasoning` | – | ✓ `response_item/reasoning` | ✓ an opaque reasoning trace with no summary | ✓ `reasoning_committed` with only `encrypted_content` | – | `reasoning` |
 | `tool_replacement` | ✓ `_meta.replaces` / `_meta.collapsedCalls` | – | – | – | – | `tool_result` |
 | `system` | – | – | ✓ a system preamble, in `text` | – | ✓ a `role:"system"` node, in `text` | – |
@@ -580,8 +582,7 @@ rule.
 
 Codex keeps one explicit exception list, for lines that are state updates
 rather than records and whose information is stored elsewhere: `session_meta`
-and `turn_context` populate the catalog, `token_count` is folded into the
-adjacent assistant event's `token_json`, `thread_settings_applied` carries the
+populates the catalog, `thread_settings_applied` carries the
 model forward, a `*_delta` is a fragment of an event recorded whole, and an
 assistant `message` is the mirrored twin of the `agent_message` that stores the
 text.

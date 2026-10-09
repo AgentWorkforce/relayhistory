@@ -438,6 +438,7 @@ pub ai_hist::Marker::subkind: core::option::Option<alloc::string::String>
 pub ai_hist::Marker::text: core::option::Option<alloc::string::String>
 pub ai_hist::Marker::ts_ms: core::option::Option<i64>
 pub ai_hist::Marker::turn_id: core::option::Option<alloc::string::String>
+pub ai_hist::Marker::usage_snapshot: core::option::Option<alloc::boxed::Box<ai_hist::UsageSnapshot>>
 impl ai_hist::Marker
 pub fn ai_hist::Marker::raw_payload(&self) -> core::option::Option<&str>
 #[non_exhaustive] pub struct ai_hist::Message
@@ -807,6 +808,20 @@ pub ai_hist::TickReport::forced: bool
 pub ai_hist::TickReport::skipped_unchanged: bool
 pub ai_hist::TickReport::swept: bool
 pub ai_hist::TickReport::trigger: ai_hist::TickTrigger
+#[non_exhaustive] pub struct ai_hist::TokenUsage
+pub ai_hist::TokenUsage::cache_write_input_tokens: core::option::Option<serde_json::value::Value>
+pub ai_hist::TokenUsage::cached_input_tokens: core::option::Option<serde_json::value::Value>
+pub ai_hist::TokenUsage::input_tokens: core::option::Option<serde_json::value::Value>
+pub ai_hist::TokenUsage::other: serde_json::map::Map<alloc::string::String, serde_json::value::Value>
+pub ai_hist::TokenUsage::output_tokens: core::option::Option<serde_json::value::Value>
+pub ai_hist::TokenUsage::reasoning_output_tokens: core::option::Option<serde_json::value::Value>
+pub ai_hist::TokenUsage::total_tokens: core::option::Option<serde_json::value::Value>
+impl ai_hist::TokenUsage
+pub fn ai_hist::TokenUsage::to_value(&self) -> serde_json::value::Value
+impl serde_core::ser::Serialize for ai_hist::TokenUsage
+pub fn ai_hist::TokenUsage::serialize<S: serde_core::ser::Serializer>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error>
+impl<'de> serde_core::de::Deserialize<'de> for ai_hist::TokenUsage
+pub fn ai_hist::TokenUsage::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
 #[non_exhaustive] pub struct ai_hist::ToolCall
 pub ai_hist::ToolCall::args: core::option::Option<serde_json::value::Value>
 pub ai_hist::ToolCall::is_error: core::option::Option<bool>
@@ -843,6 +858,17 @@ pub ai_hist::UsageCoverage::has_output_tokens: bool
 pub ai_hist::UsageCoverage::has_reasoning_tokens: bool
 impl ai_hist::UsageCoverage
 pub fn ai_hist::UsageCoverage::is_complete(&self) -> bool
+#[non_exhaustive] pub struct ai_hist::UsageSnapshot
+pub ai_hist::UsageSnapshot::last_token_usage: core::option::Option<ai_hist::TokenUsage>
+pub ai_hist::UsageSnapshot::model_context_window: core::option::Option<serde_json::value::Value>
+pub ai_hist::UsageSnapshot::other: serde_json::map::Map<alloc::string::String, serde_json::value::Value>
+pub ai_hist::UsageSnapshot::total_token_usage: core::option::Option<ai_hist::TokenUsage>
+impl ai_hist::UsageSnapshot
+pub fn ai_hist::UsageSnapshot::to_value(&self) -> serde_json::value::Value
+impl serde_core::ser::Serialize for ai_hist::UsageSnapshot
+pub fn ai_hist::UsageSnapshot::serialize<S: serde_core::ser::Serializer>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error>
+impl<'de> serde_core::de::Deserialize<'de> for ai_hist::UsageSnapshot
+pub fn ai_hist::UsageSnapshot::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
 pub struct ai_hist::WatchHandle
 impl ai_hist::WatchHandle
 pub fn ai_hist::WatchHandle::driver(&self) -> core::option::Option<ai_hist::WatchDriver>

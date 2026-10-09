@@ -302,6 +302,13 @@ pub(crate) struct CodexCursorState {
     /// would stamp the rest of the turn with nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
+    /// The configuration digest of the last `turn_context` marker stored for
+    /// the session. A `turn_context` is stored only when it changes the
+    /// configuration, and a pass that resumes mid-session cannot see the
+    /// marker it would compare against; without this it would store the
+    /// first record it reads whether or not anything changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_context_digest: Option<String>,
     /// The adjacent-mirror deduper's one-record memory, as
     /// `(is_response_item, text)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -312,6 +319,13 @@ pub(crate) struct CodexCursorState {
     /// re-reading the whole replay until it does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inherited_baseline_marker: Option<String>,
+    /// The state-marker generation of the parser that indexed the rows behind
+    /// this position. A cursor from an older one sits past records whose
+    /// `usage_snapshot` and `turn_context` markers it never wrote, so it is
+    /// not resumed from — whether sync or a related-session hydration loads
+    /// it.
+    #[serde(default)]
+    pub state_markers: i64,
 }
 
 /// A stat under which a cursor's positions were proven by their digests.

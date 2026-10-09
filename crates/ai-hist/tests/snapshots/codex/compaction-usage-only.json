@@ -1,0 +1,165 @@
+{
+  "corpus_files": [
+    "codex/compaction-usage-only.jsonl"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "codex/compaction-usage-only",
+  "history": [],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "sess_codex_compact_usage_only",
+      "source": "codex",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "CodexRollout",
+  "notes": [],
+  "origin": "burn",
+  "quirk": "burn's `compaction.jsonl` with its session id renamed so it does not collide with this corpus's `compaction.jsonl`, which adds message records: two turns either side of a `compacted` record whose only usage evidence is their cumulative `token_count`s, with no assistant message",
+  "session_events": [],
+  "session_markers": [
+    {
+      "kind": "turn_context",
+      "marker_uid": "1:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"cwd\":\"/tmp/project\",\"model\":\"gpt-5.4\",\"turn_id\":\"turn_compact_1\"}",
+      "session_id": "sess_codex_compact_usage_only",
+      "source": "codex",
+      "subkind": "turn_context",
+      "text": null,
+      "ts_ms": 1776654000100,
+      "turn_id": "turn_compact_1"
+    },
+    {
+      "kind": "task_started",
+      "marker_uid": "2:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_codex_compact_usage_only",
+      "source": "codex",
+      "subkind": "task_started",
+      "text": null,
+      "ts_ms": 1776654000200,
+      "turn_id": "turn_compact_1"
+    },
+    {
+      "kind": "usage_snapshot",
+      "marker_uid": "3:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "[[3000,1000,null,200,50,3200]]",
+      "session_id": "sess_codex_compact_usage_only",
+      "source": "codex",
+      "subkind": "token_count",
+      "text": null,
+      "ts_ms": 1776654001000,
+      "turn_id": "turn_compact_1"
+    },
+    {
+      "kind": "task_complete",
+      "marker_uid": "4:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_codex_compact_usage_only",
+      "source": "codex",
+      "subkind": "task_complete",
+      "text": null,
+      "ts_ms": 1776654002000,
+      "turn_id": "turn_compact_1"
+    },
+    {
+      "kind": "compaction_boundary",
+      "marker_uid": "5:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"replacement_items\":2}",
+      "session_id": "sess_codex_compact_usage_only",
+      "source": "codex",
+      "subkind": "compacted",
+      "text": null,
+      "ts_ms": 1776654003000,
+      "turn_id": null
+    },
+    {
+      "kind": "compaction_boundary",
+      "marker_uid": "6:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_codex_compact_usage_only",
+      "source": "codex",
+      "subkind": "context_compacted",
+      "text": null,
+      "ts_ms": 1776654003100,
+      "turn_id": null
+    },
+    {
+      "kind": "task_started",
+      "marker_uid": "8:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_codex_compact_usage_only",
+      "source": "codex",
+      "subkind": "task_started",
+      "text": null,
+      "ts_ms": 1776654004100,
+      "turn_id": "turn_compact_2"
+    },
+    {
+      "kind": "usage_snapshot",
+      "marker_uid": "9:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "[[6500,1500,null,450,90,6950]]",
+      "session_id": "sess_codex_compact_usage_only",
+      "source": "codex",
+      "subkind": "token_count",
+      "text": null,
+      "ts_ms": 1776654005000,
+      "turn_id": "turn_compact_2"
+    },
+    {
+      "kind": "task_complete",
+      "marker_uid": "10:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_codex_compact_usage_only",
+      "source": "codex",
+      "subkind": "task_complete",
+      "text": null,
+      "ts_ms": 1776654006000,
+      "turn_id": "turn_compact_2"
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": null,
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776654000000,
+      "first_prompt": null,
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776654006000,
+      "last_assistant_text": null,
+      "models_json": "[\"gpt-5.4\"]",
+      "originator": null,
+      "raw_path": "<home>/.codex/sessions/2026/04/20/rollout-2026-04-20T00-00-00-compaction-usage-only.jsonl",
+      "repo_url": null,
+      "session_id": "sess_codex_compact_usage_only",
+      "source": "codex",
+      "source_stamp": "<n>:1761",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "codex",
+  "tool_calls": []
+}

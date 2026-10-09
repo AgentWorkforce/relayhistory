@@ -394,8 +394,62 @@ export function sessionFileEdit(value: UnknownRecord): SessionFileEdit {
   };
 }
 
+/** Counter order of a stored Codex token usage array. */
+const USAGE_COUNTERS = [
+  'input_tokens', 'cached_input_tokens', 'cache_write_input_tokens',
+  'output_tokens', 'reasoning_output_tokens', 'total_tokens',
+] as const;
+
+function isJsonObject(value: JsonValue | undefined): value is { [key: string]: JsonValue } {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** A stored token usage array, or `undefined` when `slots` is not one. */
+function storedTokenUsage(slots: JsonValue): { [key: string]: JsonValue } | undefined {
+  if (!Array.isArray(slots) || slots.length > 7) return undefined;
+  const rest = slots[6];
+  if (rest !== undefined && !isJsonObject(rest)) return undefined;
+  const usage: { [key: string]: JsonValue } = {};
+  USAGE_COUNTERS.forEach((name, index) => {
+    const counter = slots[index];
+    if (counter !== undefined && counter !== null) usage[name] = counter;
+  });
+  // `rest` last, as the Rust reader applies it. Spread defines every key as
+  // an own property, `__proto__` included.
+  return rest ? { ...usage, ...rest } : usage;
+}
+
+/**
+ * A Codex `usage_snapshot` stores its `info` object -- bounded like every
+ * marker payload (strings at 128 characters, containers at 32 entries,
+ * numbers never altered) -- compactly, as `[total, last, window, other]`
+ * (see the crate's `usage_snapshot` module); this is the object it was
+ * stored from. A payload that is not that form is returned as stored, as the
+ * Rust reader does.
+ */
+export function usageSnapshotInfo(stored: JsonValue | null): JsonValue | null {
+  if (!Array.isArray(stored) || stored.length > 5) return stored;
+  const [total = null, last = null, window = null, other = null, info = null] = stored;
+  if (other !== null && !isJsonObject(other)) return stored;
+  const totalUsage = total === null ? null : storedTokenUsage(total);
+  const lastUsage = last === null ? null : storedTokenUsage(last);
+  if (totalUsage === undefined || lastUsage === undefined) return stored;
+  if (info !== null) return info;
+  // The Rust reader's precedence: `other` over the window slot, the usage
+  // slots over `other`.
+  const object: { [key: string]: JsonValue } = {
+    ...(window !== null ? { model_context_window: window } : {}),
+    ...(other ?? {}),
+  };
+  if (totalUsage) object.total_token_usage = totalUsage;
+  if (lastUsage) object.last_token_usage = lastUsage;
+  return object;
+}
+
 export function sessionMarker(value: UnknownRecord): SessionMarker {
   const payloadJson = nullableString(value.payloadJson);
+  const kind = String(value.kind);
+  const payload = parseStoredJson(payloadJson);
   return {
     id: Number(value.id),
     source: String(value.source) as Source,
@@ -405,10 +459,10 @@ export function sessionMarker(value: UnknownRecord): SessionMarker {
     messageId: nullableString(value.messageId),
     parentId: nullableString(value.parentId),
     turnId: nullableString(value.turnId),
-    kind: String(value.kind),
+    kind,
     subkind: nullableString(value.subkind),
     text: nullableString(value.text),
-    payload: parseStoredJson(payloadJson),
+    payload: kind === 'usage_snapshot' ? usageSnapshotInfo(payload) : payload,
     payloadJson,
   };
 }

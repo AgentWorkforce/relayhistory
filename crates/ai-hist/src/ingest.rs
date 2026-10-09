@@ -779,6 +779,7 @@ const SWEEP_PARSER_GENERATIONS: &[&str] = &[
     "claude_record_attribution_1",
     CLAUDE_DELEGATION_CAPTURE_KEY,
     "codex_rollouts_v7",
+    CODEX_STATE_MARKER_KEY,
     GROK_SYNC_STATE_KEY,
     OPENCODE_NORMALIZER_GENERATION,
 ];
@@ -3238,6 +3239,38 @@ fn delegation_backfill_pending(state: &Map<String, Value>) -> bool {
     !state.contains_key(CLAUDE_DELEGATION_CAPTURE_KEY)
 }
 
+/// One-time re-read of every Codex rollout indexed before its state records
+/// were stored: `token_count` as `usage_snapshot` markers and `turn_context`
+/// as `turn_context` markers. A finished rollout's stamp never changes, so
+/// without this its counters and turn settings would stay unread for the life
+/// of the install. Each rollout's stamp record says which generation last read
+/// it, so a rollout is re-read once however long the pass stays open; the pass
+/// itself is recorded only after a walk that reached every known root, like
+/// the other backfills.
+///
+/// The key is in [`SWEEP_PARSER_GENERATIONS`], so the first sync after the
+/// upgrade cannot honour the source fingerprint the previous build stored and
+/// skip the sweep this backfill runs in. Raising the generation means renaming
+/// the key, for the same reason.
+const CODEX_STATE_MARKER_GENERATION: i64 = 1;
+const CODEX_STATE_MARKER_KEY: &str = "codex_state_markers_v1";
+
+/// Whether the rollout behind a stamp-map record was last read by a parser
+/// older than the state-marker generation.
+///
+/// Recorded on the rollout's own stamp record, not inferred from the markers
+/// a session holds: a rollout with no `token_count` legitimately has no
+/// `usage_snapshot`, a marker observed only remotely says nothing about the
+/// local file, and either would make a marker probe re-read the rollout on
+/// every sync for as long as the backfill stays open.
+fn rollout_owes_state_markers(record: Option<&Map<String, Value>>) -> bool {
+    record
+        .and_then(|r| r.get("state_markers"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        < CODEX_STATE_MARKER_GENERATION
+}
+
 /// Whether this provider still owes a one-time raw-facts backfill pass.
 fn raw_facts_backfill_pending(state: &Map<String, Value>, key: &str) -> bool {
     state.get(key).and_then(Value::as_i64).unwrap_or(0) < RAW_MESSAGE_FACTS_GENERATION
@@ -4820,6 +4853,11 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
         .and_then(Value::as_i64)
         .unwrap_or(0)
         < CODEX_FORK_REPLAY_GENERATION;
+    let backfill_state_markers = state
+        .get(CODEX_STATE_MARKER_KEY)
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        < CODEX_STATE_MARKER_GENERATION;
     // A root the stamp map has entries for but whose rollouts this run cannot
     // see is an archive we could not read, not an archive that is gone.
     // Walking it vacuously and then recording the generation would retire the
@@ -4949,6 +4987,9 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                     Some(_)
                         if backfill_fork_replay
                             && crate::continuity::codex_evidence_names_fork(conn, &key)? => {}
+                    // Indexed before its state records were stored: re-read
+                    // once so its counters and turn settings are captured.
+                    Some(_) if backfill_state_markers && rollout_owes_state_markers(record) => {}
                     Some(id)
                         if codex_session_evidence_exists(conn, id)?
                             && !(backfill_fidelity
@@ -5122,7 +5163,12 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
             write.commit()?;
             seen.insert(
                 key,
-                json!({ "stamp": stamp, "session": meta.session_id, "subagent": meta.is_subagent }),
+                json!({
+                    "stamp": stamp,
+                    "session": meta.session_id,
+                    "subagent": meta.is_subagent,
+                    "state_markers": CODEX_STATE_MARKER_GENERATION,
+                }),
             );
         }
     }
@@ -5160,6 +5206,10 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
         state.insert(
             CODEX_FORK_REPLAY_KEY.to_string(),
             json!(CODEX_FORK_REPLAY_GENERATION),
+        );
+        state.insert(
+            CODEX_STATE_MARKER_KEY.to_string(),
+            json!(CODEX_STATE_MARKER_GENERATION),
         );
     }
     if repairs.repairs_all() && !walked_every_known_root {
@@ -5907,6 +5957,138 @@ fn surviving_refusals(
     refused
 }
 
+/// One `turn_context` payload, bounded per the marker contract, and the digest
+/// of the configuration it carries.
+///
+/// The digest covers every field but the ones that name the turn rather than
+/// configure it, in the order the provider wrote them, so two records with the
+/// same digest describe the same configuration:
+///
+/// - `turn_id`, always: it is new on every turn, the marker keeps it in its
+///   own `turn_id` column as the turn the configuration took effect at, and
+///   the turn's `task_started` marker names it too.
+/// - `root_turn_id` -- the root thread's turn a delegated thread is working
+///   for, which moves with the root's turns -- only when the turn's own
+///   `task_started` wrote the same value, because that marker keeps it. Older
+///   Codex builds write it on `turn_context` alone, and there it is part of
+///   the configuration, or a turn inheriting an earlier marker would read
+///   another turn's root.
+///
+/// It is persisted on the Codex cursor, so its form is fixed: SHA-256 of the
+/// bounded payload's compact JSON without those fields, lowercase hex.
+struct CodexTurnContext<'a> {
+    payload: std::borrow::Cow<'a, Value>,
+    digest: String,
+}
+
+impl<'a> CodexTurnContext<'a> {
+    /// `started` is the `(turn_id, root_turn_id)` of the last `task_started`
+    /// that wrote both. A payload is almost always within the bound already,
+    /// so it is checked in place and copied only when something actually has
+    /// to be cut.
+    fn read(payload: &'a Value, started: Option<&(String, String)>) -> Result<Self> {
+        let field = |key: &str| payload.get(key).and_then(Value::as_str);
+        let root_is_the_turns = started.is_some_and(|(turn, root)| {
+            field("turn_id") == Some(turn.as_str()) && field("root_turn_id") == Some(root.as_str())
+        });
+        let identity: &[&str] = if root_is_the_turns {
+            &["turn_id", "root_turn_id"]
+        } else {
+            &["turn_id"]
+        };
+        let payload = if marker_payload_is_bounded(payload) {
+            std::borrow::Cow::Borrowed(payload)
+        } else {
+            std::borrow::Cow::Owned(bound_marker_value(payload.clone()))
+        };
+        let mut hasher = Sha256::new();
+        serde_json::to_writer(
+            &mut hasher,
+            &ConfigurationFields(payload.as_ref(), identity),
+        )?;
+        Ok(Self {
+            payload,
+            digest: format!("{:x}", hasher.finalize()),
+        })
+    }
+}
+
+/// A `turn_context` payload without its identity fields, serialized as is.
+struct ConfigurationFields<'a>(&'a Value, &'a [&'a str]);
+
+impl Serialize for ConfigurationFields<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let Value::Object(map) = self.0 else {
+            return self.0.serialize(serializer);
+        };
+        let mut out = serializer.serialize_map(None)?;
+        for (key, value) in map {
+            if !self.1.contains(&key.as_str()) {
+                out.serialize_entry(key, value)?;
+            }
+        }
+        out.end()
+    }
+}
+
+/// Store one Codex `token_count` as a `usage_snapshot` marker.
+///
+/// The payload is the provider's `info` (`total_token_usage`,
+/// `last_token_usage`, `model_context_window`, any other key it writes),
+/// bounded whole like any provider document in `payload_json` -- strings at
+/// 128 characters, containers at 32 entries -- and stored in the compact form
+/// [`crate::usage_snapshot`] describes; neither the bound nor the encoding
+/// alters a number, so counters are never truncated. The
+/// `info: null` snapshot Codex emits before a turn has spent anything stores
+/// no payload.
+///
+/// It is a cumulative snapshot, not a per-request delta: per-request usage
+/// stays on the assistant events' `token_json`, and nothing reads these
+/// markers into `session_requests`, so a turn's spend is never counted twice.
+/// What it adds is the counter itself, for every snapshot the provider wrote,
+/// including those of a turn that produced no assistant event to carry a
+/// delta.
+fn record_codex_usage_snapshot(
+    conn: &Connection,
+    session_id: &str,
+    index: usize,
+    ts_ms: i64,
+    turn_id: Option<&str>,
+    info: &Value,
+) -> Result<()> {
+    // `info: null` carries no counters and stores no payload, like every
+    // other marker with nothing to say: a stored `"null"` would read back as
+    // `Some(Null)` here and `None` after a serde round trip.
+    let payload_json = match info {
+        Value::Null => None,
+        info if marker_payload_is_bounded(info) => Some(crate::usage_snapshot::encode(info)?),
+        info => Some(crate::usage_snapshot::encode(&bound_marker_value(
+            info.clone(),
+        ))?),
+    };
+    insert_session_marker(
+        conn,
+        "codex",
+        session_id,
+        &NewSessionMarker {
+            marker_uid: &format!("{index}:marker"),
+            ts_ms: (ts_ms != 0).then_some(ts_ms),
+            message_id: None,
+            parent_id: None,
+            turn_id,
+            kind: "usage_snapshot",
+            subkind: Some("token_count"),
+            text: None,
+            payload_json: payload_json.as_deref(),
+        },
+    )?;
+    Ok(())
+}
+
 /// Attach measured usage to the assistant event that earned it, or hold it
 /// until one appears.
 fn attach_codex_usage(
@@ -6068,6 +6250,15 @@ fn ingest_codex_rollout_incremental(
     let cwd = Some(meta.cwd.as_str());
     let branch = meta.git_branch.as_deref();
     let mut outcome = CodexIngestOutcome::default();
+    // A position an older parser committed sits past records whose state
+    // markers it never wrote: read the rollout again from byte zero.
+    if cursor
+        .codex
+        .as_ref()
+        .is_some_and(|codex| codex.state_markers < CODEX_STATE_MARKER_GENERATION)
+    {
+        *cursor = transcript_cursor::TranscriptCursorState::default();
+    }
     // Codex keeps its existing rule for a trailing line with no newline: it
     // is the half-written tail of a live rollout and the next pass re-reads
     // it. Unlike Claude, no Codex writer leaves its last line unterminated.
@@ -6144,6 +6335,15 @@ fn ingest_codex_rollout_incremental(
     // boundaries recoverable downstream — and carrying it *across passes* is
     // why it is part of the resume state rather than a plain local.
     let mut turn_id: Option<String> = resume.turn_id.clone();
+    // The configuration of the last `turn_context` stored for this session
+    // (see `CodexTurnContext`). Carried across passes, so a resumed pass
+    // stores a record only if it changes what the stored markers say.
+    let mut turn_context_digest: Option<String> = resume.turn_context_digest.clone();
+    // `(turn_id, root_turn_id)` of the last `task_started` that wrote both,
+    // whose marker keeps the root (see `CodexTurnContext`). Needs no resume
+    // state: a pass commits only at `task_complete`, before the next turn's
+    // `task_started`.
+    let mut started_turn: Option<(String, String)> = None;
     let mut saw_model_output = resume.saw_model_output;
     // Mirrors are adjacent physical records. Keep the index too so malformed
     // or oversized lines cannot make two separate equal replies look adjacent.
@@ -6292,6 +6492,11 @@ fn ingest_codex_rollout_incremental(
         // Lifecycle, compaction, streaming-failure and begin-side tool lines
         // are not messages, so none of the arms below can hold them. Classify
         // every line once, here, and keep whatever the event model drops.
+        if line_type == "event_msg" && payload_type == "task_started" {
+            started_turn = payload_str("turn_id")
+                .zip(payload_str("root_turn_id"))
+                .map(|(turn, root)| (turn.to_string(), root.to_string()));
+        }
         if let Some(draft) = codex_marker_for_event(line_type, payload_type, payload) {
             let marker_uid = format!("{index}:marker");
             insert_session_marker(
@@ -6465,6 +6670,39 @@ fn ingest_codex_rollout_incremental(
         previous_assistant = None;
         match line_type {
             "turn_context" => {
+                // The turn's settings as the provider wrote them: the model
+                // is otherwise only stamped onto the turn's messages, and a
+                // turn that wrote none would have no model at all.
+                //
+                // Stored only when they change. Codex restates its whole
+                // configuration on every turn, and a turn whose record
+                // repeats the previous one apart from its turn id is
+                // configured by the marker already stored: a turn's
+                // configuration is the latest `turn_context` marker at or
+                // before its start.
+                let context = CodexTurnContext::read(&value["payload"], started_turn.as_ref())?;
+                if turn_context_digest.as_deref() == Some(context.digest.as_str()) {
+                    // Accounted for by the marker it repeats.
+                    unwritten_line = None;
+                } else {
+                    insert_session_marker(
+                        conn,
+                        "codex",
+                        session_id,
+                        &NewSessionMarker {
+                            marker_uid: &format!("{index}:marker"),
+                            ts_ms: (ts_ms != 0).then_some(ts_ms),
+                            message_id: None,
+                            parent_id: None,
+                            turn_id: payload_str("turn_id"),
+                            kind: "turn_context",
+                            subkind: Some("turn_context"),
+                            text: None,
+                            payload_json: Some(&serde_json::to_string(context.payload.as_ref())?),
+                        },
+                    )?;
+                    turn_context_digest = Some(context.digest);
+                }
                 if let Some(m) = payload_str("model") {
                     model = Some(m.to_string());
                 }
@@ -6503,10 +6741,20 @@ fn ingest_codex_rollout_incremental(
                     }
                 }
                 "token_count" => {
-                    let Some(usage) = payload
-                        .get("info")
-                        .and_then(|info| info.get("total_token_usage"))
-                    else {
+                    // The provider's counters, kept as written whatever the
+                    // differencing below makes of them: a turn with no
+                    // assistant event has nowhere to attach a delta, and its
+                    // snapshot is still the only record of what it billed.
+                    let info = payload.get("info").unwrap_or(&Value::Null);
+                    record_codex_usage_snapshot(
+                        conn,
+                        session_id,
+                        index,
+                        ts_ms,
+                        turn_id.as_deref(),
+                        info,
+                    )?;
+                    let Some(usage) = info.get("total_token_usage") else {
                         continue;
                     };
                     // The provider reported a call here, so the rows written
@@ -6700,9 +6948,11 @@ fn ingest_codex_rollout_incremental(
                                 untokened_assistant_uid: untokened_assistant_uid.clone(),
                                 tool_results: indexer.clone(),
                                 turn_id: turn_id.clone(),
+                                turn_context_digest: turn_context_digest.clone(),
                                 saw_model_output,
                                 previous_human_message: human_messages.remembered(),
                                 inherited_baseline_marker: inherited_baseline_marker.clone(),
+                                state_markers: CODEX_STATE_MARKER_GENERATION,
                             },
                         );
                     }
@@ -7075,6 +7325,9 @@ struct ForkReplaySpan {
     prompts: Vec<(i64, String)>,
     /// The last readable cumulative snapshot inside the replay.
     inherited: Option<CodexTokenTotals>,
+    /// The provider's `info` object that `inherited` was read from, as
+    /// written.
+    inherited_snapshot: Option<Value>,
 }
 
 impl ForkReplaySpan {
@@ -7086,6 +7339,7 @@ impl ForkReplaySpan {
             call_ids: Vec::new(),
             prompts: Vec::new(),
             inherited: None,
+            inherited_snapshot: None,
         }
     }
 
@@ -7115,12 +7369,13 @@ impl ForkReplaySpan {
             self.prompts.push((ts_ms, message.text));
         }
         if payload.get("type").and_then(Value::as_str) == Some("token_count") {
-            if let Some(totals) = payload
-                .get("info")
+            let info = payload.get("info");
+            if let Some(totals) = info
                 .and_then(|info| info.get("total_token_usage"))
                 .and_then(CodexTokenTotals::from_usage)
             {
                 self.inherited = Some(totals);
+                self.inherited_snapshot = info.cloned().map(bound_marker_value);
             }
         }
     }
@@ -7189,6 +7444,9 @@ fn record_codex_fork_replay(
         "closed_by_turn_id": closed_by.and_then(|(turn, _)| turn),
         "closed_by": closed_by.map(|(_, basis)| basis),
         "inherited_total_tokens": span.inherited.map(|totals| totals.total),
+        // The replayed `token_count` `info` that total came from, as written,
+        // bounded per the marker contract (counters are never truncated).
+        "inherited_snapshot": span.inherited_snapshot,
         // `pending` until the child's first readable snapshot, then
         // `applied` or `dropped` with `inherited_baseline_basis` (see
         // `inherited_baseline_verdict`); null when nothing was inherited or
@@ -7310,8 +7568,7 @@ fn flush_unwritten_codex_line(
 /// Codex lines that legitimately write no row of their own.
 ///
 /// These are state updates, not records, and their information is stored
-/// elsewhere: `session_meta` and `turn_context` populate the session catalog,
-/// `token_count` is folded into the adjacent assistant event's `token_json`,
+/// elsewhere: `session_meta` populates the session catalog,
 /// `thread_settings_applied` only carries the model forward, a `*_delta` is a
 /// fragment of an event recorded whole, while assistant messages are stored above (including desktop-only replies).
 ///
@@ -7331,10 +7588,9 @@ fn codex_line_is_state_only(
     _payload: &Map<String, Value>,
 ) -> bool {
     match line_type {
-        "session_meta" | "turn_context" => true,
+        "session_meta" => true,
         "event_msg" => {
-            matches!(payload_type, "token_count" | "thread_settings_applied")
-                || payload_type.ends_with("_delta")
+            payload_type == "thread_settings_applied" || payload_type.ends_with("_delta")
         }
         "response_item" => payload_type.ends_with("_delta"),
         _ => false,
@@ -10981,7 +11237,16 @@ fn codex_marker_for_payload(
         };
     }
     match payload_type {
-        "task_started" => MarkerDraft::new("task_started", Some("task_started")),
+        // The turn of the root thread that the delegated thread is working
+        // for: a
+        // `turn_context` that repeats everything else is not stored, so the
+        // turn keeps its root here.
+        "task_started" => {
+            MarkerDraft::new("task_started", Some("task_started")).with_payload(vec![(
+                "root_turn_id",
+                payload.get("root_turn_id").cloned().unwrap_or(Value::Null),
+            )])
+        }
         "task_complete" => {
             MarkerDraft::new("task_complete", Some("task_complete")).with_payload(vec![(
                 "duration_ms",
@@ -30769,13 +31034,20 @@ mod tests {
                 .iter()
                 .map(|(kind, subkind, _)| (kind.as_str(), subkind.as_str()))
                 .collect::<Vec<_>>(),
-            vec![("unknown", "message"), ("unknown", "user_message")],
+            vec![
+                ("turn_context", "turn_context"),
+                ("unknown", "message"),
+                ("unknown", "user_message")
+            ],
             "every user line nothing stored must leave a row: {markers:?}"
         );
         // No marker payload carries the image or the wrapper text, only the
         // fact that the line was there.
         assert!(
-            markers.iter().all(|(_, _, payload)| payload.is_empty()),
+            markers
+                .iter()
+                .filter(|(kind, _, _)| kind != "turn_context")
+                .all(|(_, _, payload)| payload.is_empty()),
             "the marker records that the line existed, not its contents"
         );
     }
@@ -30824,9 +31096,11 @@ mod tests {
             vec!["fix the importer".to_string(), "done".to_string()],
             "one row per turn, not one per representation"
         );
+        // The turn's own `turn_context` is its marker; the mirrored twin adds
+        // none.
         let markers = markers_of(&conn, "codex", "sess-mirror");
         assert!(
-            markers.is_empty(),
+            markers.iter().all(|(kind, _, _)| kind == "turn_context"),
             "a mirrored twin wrote through its partner, so it earns its silence: {markers:?}"
         );
     }
@@ -30903,11 +31177,10 @@ mod tests {
         }
         // Session metadata is a state update, not a record: it populates the
         // catalog rather than the ledger, and must stay silent or every
-        // rollout gains two markers it does not need.
+        // rollout gains markers it does not need. A `turn_context` is the
+        // turn's settings and is stored as its own `turn_context` marker.
         assert!(
-            !subkinds
-                .iter()
-                .any(|s| s == "session_meta" || s == "turn_context"),
+            !subkinds.iter().any(|s| s == "session_meta"),
             "state-only lines must not produce markers: {subkinds:?}"
         );
     }
@@ -31643,6 +31916,7 @@ mod tests {
             "subagent_notification",
             "compaction_boundary",
             "task_complete",
+            "turn_context",
         ] {
             assert!(
                 kinds.iter().any(|kind| kind == expected),
@@ -31651,9 +31925,9 @@ mod tests {
         }
         assert_eq!(
             kinds.len(),
-            10,
+            11,
             "a streaming delta is a fragment of an event that is already \
-             recorded whole, and turn_context is modeled: {markers:?}"
+             recorded whole: {markers:?}"
         );
 
         let unknown = markers
@@ -31694,7 +31968,7 @@ mod tests {
 
         // Idempotent under a re-parse: uids are derived from file position.
         super::ingest_codex_rollout(&conn, &path, &codex_meta(&path)).unwrap();
-        assert_eq!(marker_kinds(&conn, "codex", "sess-markers").len(), 10);
+        assert_eq!(marker_kinds(&conn, "codex", "sess-markers").len(), 11);
     }
 
     /// The tool-result row answering one call, whatever its position. A
@@ -33455,6 +33729,12 @@ mod tests {
             "codex_session_branches".into(),
             json!({"sess-unchanged-sub": "main"}),
         );
+        // An install that has already run the usage-snapshot backfill, so the
+        // stamp-unchanged fast path is what this exercises.
+        state.insert(
+            super::CODEX_STATE_MARKER_KEY.into(),
+            json!(super::CODEX_STATE_MARKER_GENERATION),
+        );
 
         let (cwds, branches, inserted) = super::sync_codex_rollouts_with_repairs(
             &conn,
@@ -33501,6 +33781,10 @@ mod tests {
                     "subagent": true
                 }
             }),
+        );
+        state.insert(
+            CODEX_STATE_MARKER_KEY.into(),
+            json!(CODEX_STATE_MARKER_GENERATION),
         );
         state
     }
@@ -37459,6 +37743,8 @@ mod codex_fork_replay_tests {
         let closed = replay_marker(&conn, CHILD).expect("closed replay marker");
         assert_eq!(closed["closed_by_turn_id"], CHILD_TURN);
         assert_eq!(closed["inherited_total_tokens"], 1000);
+        // The replayed snapshot itself, as the parent's rollout wrote it.
+        assert_eq!(closed["inherited_snapshot"], usage(1000)["info"]);
         // 1600 cumulative, 1000 of it inherited from the parent.
         assert_eq!(token_totals(&conn, CHILD), vec![600]);
     }
@@ -37618,6 +37904,434 @@ mod codex_fork_replay_tests {
         );
     }
 
+    /// Local `usage_snapshot` and `turn_context` markers for `PARENT`.
+    fn state_marker_uids(conn: &Connection) -> Vec<String> {
+        conn.prepare(
+            "SELECT marker_uid FROM session_markers WHERE source = 'codex' \
+             AND session_id = ? AND kind IN ('usage_snapshot', 'turn_context') \
+             AND location IN ('local', 'both') ORDER BY marker_uid",
+        )
+        .unwrap()
+        .query_map([PARENT], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    fn forget_state_markers(conn: &Connection) {
+        conn.execute(
+            "DELETE FROM session_markers WHERE kind IN ('usage_snapshot', 'turn_context')",
+            [],
+        )
+        .unwrap();
+    }
+
+    /// The sync state an older build left: no state-marker pass recorded,
+    /// and no rollout stamped with the generation that read it.
+    fn as_older_build(state: &mut Map<String, Value>) {
+        state.remove(CODEX_STATE_MARKER_KEY);
+        if let Some(seen) = state
+            .get_mut("codex_rollouts_v7")
+            .and_then(Value::as_object_mut)
+        {
+            for record in seen.values_mut().filter_map(Value::as_object_mut) {
+                record.remove("state_markers");
+            }
+        }
+    }
+
+    /// A one-turn rollout whose turn closed, so sync commits a cursor at its
+    /// end.
+    fn closed_turn_rollout(path: &std::path::Path, with_usage: bool) {
+        let mut lines = vec![
+            line(
+                "2026-04-20T00:00:00.000Z",
+                "session_meta",
+                json!({"id": PARENT, "cwd": "/tmp/project"}),
+            ),
+            line(
+                "2026-04-20T00:00:00.100Z",
+                "turn_context",
+                json!({"turn_id": PARENT_TURN, "cwd": "/tmp/project", "model": "gpt-5.4"}),
+            ),
+        ];
+        if with_usage {
+            lines.push(line("2026-04-20T00:00:02.000Z", "event_msg", usage(1000)));
+        }
+        lines.push(line(
+            "2026-04-20T00:00:03.000Z",
+            "event_msg",
+            json!({"type": "task_complete", "turn_id": PARENT_TURN}),
+        ));
+        fs::write(path, lines.concat()).unwrap();
+    }
+
+    /// A rollout an older build indexed has an unchanged stamp, so only the
+    /// one-time backfill re-reads it for its state markers. Once recorded,
+    /// the backfill is spent.
+    #[test]
+    fn an_unchanged_rollout_is_re_read_once_for_its_state_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        closed_turn_rollout(&day.join("rollout-plain.jsonl"), true);
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+        assert_eq!(state_marker_uids(&conn), vec!["1:marker", "2:marker"]);
+        assert_eq!(
+            state.get(CODEX_STATE_MARKER_KEY),
+            Some(&json!(CODEX_STATE_MARKER_GENERATION))
+        );
+
+        // With the backfill spent, an unchanged rollout is not re-read.
+        forget_state_markers(&conn);
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+        assert!(state_marker_uids(&conn).is_empty());
+
+        // An install that predates the markers owes the backfill.
+        as_older_build(&mut state);
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+        assert_eq!(state_marker_uids(&conn), vec!["1:marker", "2:marker"]);
+        assert_eq!(
+            state.get(CODEX_STATE_MARKER_KEY),
+            Some(&json!(CODEX_STATE_MARKER_GENERATION))
+        );
+    }
+
+    /// A rollout that grew since the last sync would normally resume from its
+    /// cursor. A cursor an older parser committed names no state-marker
+    /// generation, so the rollout is read from byte zero, or the records
+    /// before the cursor would never gain their markers.
+    #[test]
+    fn the_state_marker_backfill_reads_a_grown_rollout_from_the_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-grown.jsonl");
+        closed_turn_rollout(&rollout, true);
+        let append = |at: &str, message: &str| {
+            let mut file = fs::OpenOptions::new().append(true).open(&rollout).unwrap();
+            std::io::Write::write_all(
+                &mut file,
+                line(
+                    at,
+                    "event_msg",
+                    json!({"type": "user_message", "message": message}),
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        };
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+        // A grown rollout resumes, and that pass leaves a cursor committed at
+        // the closed turn.
+        append("2026-04-20T00:00:04.000Z", "again");
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+
+        forget_state_markers(&conn);
+        as_older_build(&mut state);
+        conn.execute(
+            "UPDATE transcript_cursors \
+             SET parser_state_json = json_remove(parser_state_json, '$.codex.state_markers') \
+             WHERE source = 'codex'",
+            [],
+        )
+        .unwrap();
+        append("2026-04-20T00:00:05.000Z", "and again");
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+        assert_eq!(state_marker_uids(&conn), vec!["1:marker", "2:marker"]);
+    }
+
+    /// Markers observed only remotely say nothing about the local rollout,
+    /// which an older build still owes a read.
+    #[test]
+    fn remote_state_markers_do_not_spend_a_local_rollouts_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        closed_turn_rollout(&day.join("rollout-remote.jsonl"), true);
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+
+        forget_state_markers(&conn);
+        conn.execute(
+            "INSERT INTO session_markers (source, session_id, marker_uid, kind, subkind, location) \
+             VALUES ('codex', ?1, 'remote:1', 'usage_snapshot', 'token_count', 'remote'), \
+                    ('codex', ?1, 'remote:2', 'turn_context', 'turn_context', 'remote')",
+            [PARENT],
+        )
+        .unwrap();
+        as_older_build(&mut state);
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+        assert_eq!(state_marker_uids(&conn), vec!["1:marker", "2:marker"]);
+    }
+
+    /// The backfill is spent per rollout. A rollout with no `token_count`
+    /// holds only a `turn_context` marker after its re-read, and while the
+    /// pass stays open (an unreadable root holds it back) it is not re-read
+    /// again on every sync.
+    #[test]
+    fn a_rollout_is_re_read_once_while_the_backfill_stays_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        closed_turn_rollout(&day.join("rollout-no-usage.jsonl"), false);
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+
+        as_older_build(&mut state);
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+        assert_eq!(state_marker_uids(&conn), vec!["1:marker"]);
+
+        // The pass is still open, but this rollout has been read by this
+        // generation: dropping its markers shows it is not read again.
+        state.remove(CODEX_STATE_MARKER_KEY);
+        forget_state_markers(&conn);
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+        assert!(state_marker_uids(&conn).is_empty());
+    }
+
+    /// A store synced by the previous build has a source fingerprint that
+    /// matches this build's sources; only the generation half of it can force
+    /// the sweep the state-marker backfill runs in.
+    #[test]
+    fn the_state_marker_backfill_moves_the_sweep_generation() {
+        assert!(SWEEP_PARSER_GENERATIONS.contains(&CODEX_STATE_MARKER_KEY));
+    }
+
+    /// `(marker_uid, turn_id, model)` of every local `turn_context` marker of
+    /// `session`, in rollout order.
+    fn turn_contexts(conn: &Connection, session: &str) -> Vec<(String, String, String)> {
+        conn.prepare(
+            "SELECT marker_uid, turn_id, json_extract(payload_json, '$.model') \
+             FROM session_markers WHERE source = 'codex' AND session_id = ? \
+             AND kind = 'turn_context' AND location IN ('local', 'both') \
+             ORDER BY CAST(marker_uid AS INTEGER)",
+        )
+        .unwrap()
+        .query_map([session], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    /// One closed turn of `PARENT` configured with `model`: four lines.
+    fn configured_turn(turn: &str, model: &str, minute: u32) -> String {
+        let at = |second: u32| format!("2026-04-20T00:{minute:02}:{second:02}.000Z");
+        [
+            line(
+                &at(0),
+                "event_msg",
+                json!({"type": "task_started", "turn_id": turn}),
+            ),
+            line(
+                &at(1),
+                "turn_context",
+                json!({"turn_id": turn, "cwd": "/tmp/project", "model": model}),
+            ),
+            line(
+                &at(2),
+                "event_msg",
+                json!({"type": "user_message", "message": format!("prompt {turn}")}),
+            ),
+            line(
+                &at(3),
+                "event_msg",
+                json!({"type": "task_complete", "turn_id": turn}),
+            ),
+        ]
+        .concat()
+    }
+
+    fn parent_meta_line() -> String {
+        line(
+            "2026-04-20T00:00:00.000Z",
+            "session_meta",
+            json!({"id": PARENT, "cwd": "/tmp/project"}),
+        )
+    }
+
+    fn append_to(path: &std::path::Path, text: &str) {
+        let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+        std::io::Write::write_all(&mut file, text.as_bytes()).unwrap();
+    }
+
+    /// The configuration digest the committed Codex cursor carries.
+    fn cursor_digest(conn: &Connection) -> Option<String> {
+        conn.query_row(
+            "SELECT json_extract(parser_state_json, '$.codex.turn_context_digest') \
+             FROM transcript_cursors WHERE source = 'codex'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// A sync that resumes mid-session compares against the configuration
+    /// the committed cursor carries, not against nothing: an appended turn
+    /// that repeats it stores no marker, and one that changes it does.
+    #[test]
+    fn a_resumed_pass_stores_a_turn_context_only_when_it_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-resume.jsonl");
+        fs::write(
+            &rollout,
+            parent_meta_line() + &configured_turn("t1", "gpt-5.4", 1),
+        )
+        .unwrap();
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        let codex = dir.path().join(".codex");
+        sync_codex(&conn, &mut state, &codex).unwrap();
+        // The first sync re-reads under the one-time repairs; the next one
+        // to see the rollout grow commits a cursor at its last closed turn.
+        append_to(&rollout, &configured_turn("t2", "gpt-5.4", 2));
+        sync_codex(&conn, &mut state, &codex).unwrap();
+        assert_eq!(
+            turn_contexts(&conn, PARENT),
+            vec![("2:marker".into(), "t1".into(), "gpt-5.4".into())],
+            "t2 repeats t1's configuration"
+        );
+        let digest = cursor_digest(&conn).expect("the cursor carries the digest");
+
+        // Dropped so the next pass shows it resumed: a read from byte zero
+        // would store t1's marker again.
+        let t1 = turn_contexts(&conn, PARENT);
+        conn.execute(
+            "DELETE FROM session_markers WHERE kind = 'turn_context'",
+            [],
+        )
+        .unwrap();
+        append_to(&rollout, &configured_turn("t3", "gpt-5.4", 3));
+        sync_codex(&conn, &mut state, &codex).unwrap();
+        assert!(
+            turn_contexts(&conn, PARENT).is_empty(),
+            "the resumed pass stores nothing for a repeat"
+        );
+        assert_eq!(cursor_digest(&conn).as_deref(), Some(digest.as_str()));
+
+        append_to(&rollout, &configured_turn("t4", "gpt-5.5", 4));
+        sync_codex(&conn, &mut state, &codex).unwrap();
+        assert_eq!(
+            turn_contexts(&conn, PARENT),
+            vec![("14:marker".into(), "t4".into(), "gpt-5.5".into())]
+        );
+        assert_ne!(cursor_digest(&conn), Some(digest));
+
+        // A full re-read from byte zero makes the same decisions.
+        conn.execute("DELETE FROM session_markers", []).unwrap();
+        let meta = read_codex_session_meta(&rollout).unwrap().unwrap();
+        ingest_codex_rollout(&conn, &rollout, &meta).unwrap();
+        let mut expected = t1;
+        expected.push(("14:marker".into(), "t4".into(), "gpt-5.5".into()));
+        assert_eq!(turn_contexts(&conn, PARENT), expected);
+    }
+
+    /// A repeated `turn_context` writes no row, and the line is accounted
+    /// for by the marker it repeats: it does not fall back to an `unknown`
+    /// marker.
+    #[test]
+    fn a_repeated_turn_context_leaves_no_unknown_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-repeat.jsonl");
+        fs::write(
+            &rollout,
+            parent_meta_line()
+                + &configured_turn("t1", "gpt-5.4", 1)
+                + &configured_turn("t2", "gpt-5.4", 2),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let meta = read_codex_session_meta(&rollout).unwrap().unwrap();
+        ingest_codex_rollout(&conn, &rollout, &meta).unwrap();
+        assert_eq!(turn_contexts(&conn, PARENT).len(), 1);
+        let unknown: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_markers WHERE kind = 'unknown'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unknown, 0);
+    }
+
+    /// A fork child's configuration chain starts at its own first
+    /// `turn_context`. The replayed parent records are the parent's, not the
+    /// child's, so the child's first own record is stored even when it
+    /// repeats the configuration it inherited -- the child's markers alone
+    /// configure every child turn -- and its later repeats are not.
+    #[test]
+    fn a_fork_childs_first_turn_context_is_stored_even_when_it_repeats_the_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-child.jsonl");
+        let second = "019da830-d1e8-7000-8000-0000000000c2";
+        let changed = "019da830-d1e8-7000-8000-0000000000c3";
+        fs::write(
+            &rollout,
+            forked_prefix(human_fork_meta(), PARENT_TURN)
+                + &child_turn(CHILD_TURN, 1100)
+                + &child_turn(second, 1200)
+                + &child_turn(changed, 1300).replace("gpt-5.4", "gpt-5.5"),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let meta = read_codex_session_meta(&rollout).unwrap().unwrap();
+        ingest_codex_rollout(&conn, &rollout, &meta).unwrap();
+        let contexts = turn_contexts(&conn, CHILD);
+        assert_eq!(
+            contexts
+                .iter()
+                .map(|(_, turn, model)| (turn.as_str(), model.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(CHILD_TURN, "gpt-5.4"), (changed, "gpt-5.5")],
+            "the replayed parent context is not the child's, and the repeat is inherited"
+        );
+        assert!(replay_marker(&conn, CHILD).is_some());
+    }
+
+    /// The one-time state-marker backfill over a rollout an older build
+    /// indexed stores the same changed-only markers a fresh read does.
+    #[test]
+    fn the_state_marker_backfill_stores_only_changed_turn_contexts() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(
+            day.join("rollout-backfill.jsonl"),
+            parent_meta_line()
+                + &configured_turn("t1", "gpt-5.4", 1)
+                + &configured_turn("t2", "gpt-5.4", 2)
+                + &configured_turn("t3", "gpt-5.5", 3)
+                + &configured_turn("t4", "gpt-5.5", 4),
+        )
+        .unwrap();
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        let codex = dir.path().join(".codex");
+        sync_codex(&conn, &mut state, &codex).unwrap();
+        let fresh = turn_contexts(&conn, PARENT);
+        assert_eq!(
+            fresh
+                .iter()
+                .map(|(_, turn, _)| turn.as_str())
+                .collect::<Vec<_>>(),
+            vec!["t1", "t3"]
+        );
+
+        forget_state_markers(&conn);
+        as_older_build(&mut state);
+        sync_codex(&conn, &mut state, &codex).unwrap();
+        assert_eq!(turn_contexts(&conn, PARENT), fresh);
+    }
     /// A child turn whose snapshot carries `last_token_usage`, as codex-rs
     /// writes it.
     fn child_turn_with_last(turn: &str, total: u64, last: u64) -> String {

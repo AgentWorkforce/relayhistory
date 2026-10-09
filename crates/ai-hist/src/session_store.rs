@@ -55,11 +55,12 @@ use crate::source_evidence::EvidenceKind;
 use crate::store::{
     default_db_path, open_db, open_db_readonly, prompt_hash, schema_is_event_read_current,
     schema_is_evidence_read_current, schema_is_relationship_read_current,
-    schema_is_usage_read_current, session_events_sized, session_file_edits, session_markers_sized,
-    session_prompts_sized, session_tool_calls, session_user_turns_all, PromptRow, SessionEvent,
-    SessionFileEdit, SessionMarker, SessionScope, SessionToolCall, SessionUserTurn,
+    schema_is_usage_read_current, session_events_sized, session_file_edits, session_prompts_sized,
+    session_tool_calls, session_user_turns_all, PromptRow, SessionEvent, SessionFileEdit,
+    SessionScope, SessionToolCall, SessionUserTurn,
 };
 use crate::usage::{normalize_usage_str, source_accounting, NormalizedUsage, UsageAccounting};
+use crate::usage_snapshot::{self, UsageSnapshot};
 use crate::watch::{TickOutcome, TickTrigger, WatchDriver, WatchLoop};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -1289,11 +1290,8 @@ impl SessionStore {
                 .collect();
         }
         if wants(EvidenceKind::SessionMarker) {
-            evidence.markers = session_markers_sized(&tx, name, &session_id, include_text)
-                .map_err(Error::query)?
-                .into_iter()
-                .map(Marker::from_row)
-                .collect();
+            evidence.markers =
+                session_markers(&tx, name, &session_id, include_text).map_err(Error::query)?;
         }
         if wants(EvidenceKind::Relationship) {
             let graph = relationship_graph::session_relationships(&tx, name, &session_id)
@@ -2974,6 +2972,20 @@ impl FileEdit {
 /// `lifecycle`, `unknown`, …); `subkind` is the provider-native type
 /// verbatim. `payload` is a bounded projection — every string at 128
 /// characters, every container at 32 entries — never the bytes of an image.
+/// A Codex `usage_snapshot` carries its counters typed in `usage_snapshot`
+/// instead, and has no `payload`.
+///
+/// A Codex `turn_context` marker is stored only where the configuration
+/// changes: the configuration of a turn is the latest `turn_context` marker
+/// at or before that turn's start in rollout order (the `<line>` of
+/// `<line>:<suffix>` in `marker_uid`) -- the marker carrying the turn's
+/// `turn_id` when there is one, else the latest earlier one. A fork child's
+/// replayed parent history writes none; its chain starts at its first own
+/// `turn_context`, which is always stored. Its
+/// `turn_id` is the turn it took effect at, and every other payload field is
+/// the configuration of each turn up to the next marker -- except
+/// `root_turn_id` where the turn's `task_started` marker carries its own,
+/// which is then that turn's root.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Marker {
@@ -2988,6 +3000,12 @@ pub struct Marker {
     /// (grok). `None` when the query asked for no text.
     pub text: Option<String>,
     pub payload: Option<Value>,
+    /// For a `usage_snapshot` (Codex `token_count`), the provider's `info`
+    /// object, typed: no JSON is parsed into a [`Value`] to read it. `None`
+    /// for every other kind, and for the `info: null` snapshot Codex writes
+    /// before a turn has spent anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_snapshot: Option<Box<UsageSnapshot>>,
     #[serde(
         rename = "raw_payload",
         default,
@@ -2997,28 +3015,66 @@ pub struct Marker {
 }
 
 impl Marker {
-    /// The stored `payload_json`, verbatim.
+    /// The stored `payload_json`, verbatim. `None` for a `usage_snapshot`,
+    /// whose stored payload is read into [`Marker::usage_snapshot`].
     pub fn raw_payload(&self) -> Option<&str> {
         self.payload_json.as_deref()
     }
 
-    fn from_row(row: SessionMarker) -> Self {
-        Self {
-            marker_uid: row.marker_uid,
-            ts_ms: row.ts_ms,
-            message_id: row.message_id,
-            parent_id: row.parent_id,
-            turn_id: row.turn_id,
-            kind: row.kind,
-            subkind: row.subkind,
-            text: row.text,
-            payload: row
-                .payload_json
-                .as_deref()
-                .and_then(|raw| serde_json::from_str(raw).ok()),
-            payload_json: row.payload_json,
-        }
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        let kind: String = row.get(5)?;
+        // Borrowed from the row: a snapshot's stored payload is decoded in
+        // place and never copied.
+        let raw = row.get_ref(8)?.as_str_or_null()?;
+        let (payload, usage_snapshot, payload_json) = match raw {
+            Some(raw) if kind == "usage_snapshot" => match usage_snapshot::decode(raw) {
+                Some(usage_snapshot::Decoded::Snapshot(snapshot)) => (None, Some(snapshot), None),
+                Some(usage_snapshot::Decoded::Other(info)) => (Some(info), None, Some(raw.into())),
+                // A payload stored as the `info` object itself.
+                None => {
+                    let info: Option<Value> = serde_json::from_str(raw).ok();
+                    match info.as_ref().and_then(UsageSnapshot::from_info) {
+                        Some(snapshot) => (None, Some(Box::new(snapshot)), None),
+                        None => (info, None, Some(raw.into())),
+                    }
+                }
+            },
+            Some(raw) => (serde_json::from_str(raw).ok(), None, Some(raw.into())),
+            None => (None, None, None),
+        };
+        Ok(Self {
+            marker_uid: row.get(0)?,
+            ts_ms: row.get(1)?,
+            message_id: row.get(2)?,
+            parent_id: row.get(3)?,
+            turn_id: row.get(4)?,
+            kind,
+            subkind: row.get(6)?,
+            text: row.get(7)?,
+            payload,
+            usage_snapshot,
+            payload_json,
+        })
     }
+}
+
+/// Every marker of a session, oldest first, on the caller's snapshot, without
+/// moving the `text` column when `include_text` is false.
+fn session_markers(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+    include_text: bool,
+) -> anyhow::Result<Vec<Marker>> {
+    let sql = format!(
+        "SELECT marker_uid, ts_ms, message_id, parent_id, turn_id, kind, subkind, {}, \
+         payload_json FROM session_markers WHERE source = ? AND session_id = ? \
+         ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC",
+        if include_text { "text" } else { "NULL" }
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt.query_map(rusqlite::params![source, session_id], Marker::from_row)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// Which end of a [`Relationship`] the queried session sits on.

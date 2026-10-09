@@ -117,10 +117,12 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 3;
 /// Version 15 recovers Codex desktop assistant response items from unchanged
 /// captures that previous parsers skipped.
 ///
-/// Version 16 is one release's parser changes, and a checkpoint at 15
-/// re-parses once so an embedder that only hydrates gets what sync's one-time
-/// backfills capture:
+/// Version 16: a checkpoint at 15 re-parses once, so an embedder that only
+/// hydrates gets what sync's one-time backfills capture:
 ///
+/// - Codex: every `token_count` is a `usage_snapshot` marker, and each
+///   `turn_context` that changes the configuration is a `turn_context` marker
+///   (sync's `codex_state_markers_v1`).
 /// - OpenCode: every assistant message is evidence — one with only
 ///   `step-start` / `step-finish` / `reasoning` parts gains its message and
 ///   request, reasoning text becomes thinking, and synthetic user text becomes
@@ -555,13 +557,20 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
         // generation before it: the same bytes now mean something else. Starting
         // from an empty cursor is what makes the first sync after an upgrade a
         // single full re-parse per transcript, after which cursors take over.
-        let mut cursor = if previous
+        let reparse = previous
             .as_ref()
-            .is_some_and(|(_, parser_version, _)| *parser_version == HYDRATION_PARSER_VERSION)
-        {
-            load_cursor(&tx, &cursor_key)?
-        } else {
+            .is_none_or(|(_, parser_version, _)| *parser_version != HYDRATION_PARSER_VERSION);
+        // Narrower than `reparse`: a checkpoint exists and an older parser
+        // wrote it. A first hydration over a store the sweep built meets
+        // related cursors the current parser committed, and has nothing to
+        // re-read there.
+        let parser_upgrade = previous
+            .as_ref()
+            .is_some_and(|(_, parser_version, _)| *parser_version != HYDRATION_PARSER_VERSION);
+        let mut cursor = if reparse {
             TranscriptCursorState::default()
+        } else {
+            load_cursor(&tx, &cursor_key)?
         };
         let (indexed, source_diagnostics, cursor_consumed_through) = ingest_selected(
             &tx,
@@ -572,6 +581,8 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
             snapshot.claude_transcript.as_ref(),
             snapshot.devin_session.as_ref(),
             &mut cursor,
+            reparse,
+            parser_upgrade,
             records_parsed,
             snapshot.opencode_layout,
         )?;
@@ -2465,6 +2476,13 @@ pub(crate) struct SelectedIngest<'a> {
     pub(crate) claude_snapshot: Option<&'a ClaudeTranscriptSnapshot>,
     pub(crate) devin_session: Option<&'a crate::ingest::devin::DevinSession>,
     pub(crate) cursor: &'a mut TranscriptCursorState,
+    /// The checkpoint was written by another parser generation, so every
+    /// stored position — the root's and its related transcripts' — is read
+    /// again from byte zero.
+    pub(crate) reparse: bool,
+    /// A checkpoint exists and another parser generation wrote it, so
+    /// Claude subagent sidecars are read again from byte zero too.
+    pub(crate) parser_upgrade: bool,
     pub(crate) records: i64,
     pub(crate) opencode_layout: Option<OpencodeIngestLayout>,
 }
@@ -2514,6 +2532,8 @@ fn ingest_selected(
     claude_snapshot: Option<&ClaudeTranscriptSnapshot>,
     devin_session: Option<&crate::ingest::devin::DevinSession>,
     cursor: &mut TranscriptCursorState,
+    reparse: bool,
+    parser_upgrade: bool,
     records: i64,
     opencode_layout: Option<OpencodeIngestLayout>,
 ) -> Result<SelectedIngestResult> {
@@ -2532,6 +2552,8 @@ fn ingest_selected(
         claude_snapshot,
         devin_session,
         cursor,
+        reparse,
+        parser_upgrade,
         records,
         opencode_layout,
     })
@@ -2546,13 +2568,15 @@ pub(crate) fn ingest_selected_claude(ctx: SelectedIngest<'_>) -> Result<Selected
         ctx.claude_subagents,
         ctx.claude_snapshot,
         ctx.cursor,
+        ctx.parser_upgrade,
     )
     .map(|outcome| (outcome, Vec::new(), None))
 }
 
 pub(crate) fn ingest_selected_codex(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
     let path = ctx.file();
-    ingest_codex(ctx.conn, ctx.options, path, ctx.cursor).map(|outcome| (outcome, Vec::new(), None))
+    ingest_codex(ctx.conn, ctx.options, path, ctx.cursor, ctx.reparse)
+        .map(|outcome| (outcome, Vec::new(), None))
 }
 
 pub(crate) fn ingest_selected_cursor(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
@@ -2648,6 +2672,7 @@ fn ingest_claude(
     subagents: &[ClaudeSubagentEvidence],
     snapshot: Option<&ClaudeTranscriptSnapshot>,
     cursor: &mut TranscriptCursorState,
+    parser_upgrade: bool,
 ) -> Result<IngestOutcome> {
     // Resumed from the same cursor document the record walk uses, so a
     // hydration of a transcript that grew by a kilobyte reads a kilobyte in
@@ -2784,12 +2809,39 @@ fn ingest_claude(
     // The snapshot already walked and parsed these sidecars to stamp them, so
     // this pass indexes that evidence instead of finding it a second time.
     // Each sidecar carries its own locator-keyed cursor, so one that grows
-    // does not drag the parent transcript through a re-parse.
+    // does not drag the parent transcript through a re-parse. A parser
+    // upgrade re-reads each sidecar from byte zero like the parent: a cursor
+    // the older parser committed would skip the records the new one stores.
     for evidence in subagents {
         super::check_capture_cancelled()?;
+        if parser_upgrade {
+            restart_claude_sidecar_record_walk(conn, &evidence.path)?;
+        }
         outcome.absorb_outcome(ingest_claude_subagent(conn, &options.session_id, evidence)?);
     }
     Ok(outcome)
+}
+
+/// Send a sidecar's next record walk back to byte zero. The metadata walk's
+/// position stays: it is generation-independent, and the snapshot this
+/// hydration took has already advanced it.
+fn restart_claude_sidecar_record_walk(conn: &Connection, path: &Path) -> Result<()> {
+    let locator = path.to_string_lossy();
+    let key = CursorKey::Locator {
+        source: "claude",
+        locator: &locator,
+    };
+    let stored = load_cursor(conn, &key)?;
+    let restarted = TranscriptCursorState {
+        claude: stored.claude.map(
+            |claude| crate::ingest::transcript_cursor::ClaudeCursorState {
+                scan: claude.scan,
+                ..Default::default()
+            },
+        ),
+        ..Default::default()
+    };
+    store_cursor(conn, &key, &restarted)
 }
 
 /// Index one Claude subagent transcript and record what established it.
@@ -3251,6 +3303,7 @@ fn ingest_codex(
     options: &HydrateSessionOptions,
     path: &Path,
     cursor: &mut TranscriptCursorState,
+    reparse: bool,
 ) -> Result<IngestOutcome> {
     let (meta, meta_bytes) = read_codex_session_meta_counted(path)?;
     let meta = meta.ok_or_else(|| {
@@ -3291,7 +3344,7 @@ fn ingest_codex(
         // Each child's own continuity is captured with it (a spawned
         // subagent's `thread_spawn` parent is a fork edge that lives only in
         // the child's `session_meta`), so reconcile once they are all banked.
-        indexed.absorb_outcome(ingest_codex_children(conn, options, path)?);
+        indexed.absorb_outcome(ingest_codex_children(conn, options, path, reparse)?);
         crate::continuity::reconcile(conn, "codex")?;
     }
     Ok(indexed)
@@ -3391,6 +3444,7 @@ fn ingest_codex_children(
     conn: &Connection,
     options: &HydrateSessionOptions,
     root_path: &Path,
+    reparse: bool,
 ) -> Result<IngestOutcome> {
     // Enumeration happens twice per hydration — once to stamp the source,
     // once here — and each pass reads every candidate's head. Counting both
@@ -3415,7 +3469,14 @@ fn ingest_codex_children(
             source: "codex",
             locator: &locator,
         };
-        let mut child_cursor = load_cursor(conn, &key)?;
+        // A parser upgrade re-reads the child from byte zero like the root:
+        // a cursor the older parser committed would skip the records the new
+        // one stores.
+        let mut child_cursor = if reparse {
+            TranscriptCursorState::default()
+        } else {
+            load_cursor(conn, &key)?
+        };
         let (_, pass) =
             ingest_codex_rollout_incremental(conn, &candidate, &meta, &mut child_cursor)?;
         store_cursor(conn, &key, &child_cursor)?;
@@ -4882,6 +4943,7 @@ mod tests {
                     &[],
                     None,
                     &mut cursor,
+                    false,
                 )
             },
         )
@@ -5056,6 +5118,8 @@ mod tests {
             snapshot.claude_transcript.as_ref(),
             snapshot.devin_session.as_ref(),
             &mut cursor,
+            false,
+            false,
             records,
             snapshot.opencode_layout,
         )
@@ -9693,6 +9757,175 @@ mod tests {
         assert_ne!(
             after.status, "unchanged",
             "a same-size, same-mtime rewrite of a child must not be served from its cursor"
+        );
+    }
+
+    /// A parser upgrade re-reads a Codex child from byte zero, like the root.
+    /// The child's locator cursor was committed by the older parser at the
+    /// end of the file, so resuming from it would read nothing and the
+    /// records the new parser stores would never reach the child.
+    #[test]
+    fn a_parser_upgrade_re_reads_codex_children_from_the_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/08/31");
+        fs::create_dir_all(&day).unwrap();
+        let root = day.join("rollout-root.jsonl");
+        fs::write(
+            &root,
+            concat!(
+                "{\"timestamp\":\"2026-08-31T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"root\",\"cwd\":\"/work/app\"}}\n",
+                "{\"timestamp\":\"2026-08-31T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"root prompt\"}}\n",
+                "{\"timestamp\":\"2026-08-31T10:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"t1\"}}\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            day.join("rollout-child.jsonl"),
+            concat!(
+                "{\"timestamp\":\"2026-08-31T10:00:03Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"child\",\"session_id\":\"root\",\"parent_thread_id\":\"root\",\"cwd\":\"/work/app\",\"thread_source\":\"subagent\",\"source\":{\"subagent\":{\"other\":\"guardian\"}}}}\n",
+                "{\"timestamp\":\"2026-08-31T10:00:04Z\",\"type\":\"turn_context\",\"payload\":{\"turn_id\":\"t2\",\"cwd\":\"/work/app\",\"model\":\"gpt-5.4\"}}\n",
+                "{\"timestamp\":\"2026-08-31T10:00:05Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":10,\"total_tokens\":10}}}}\n",
+                "{\"timestamp\":\"2026-08-31T10:00:06Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"t2\"}}\n",
+            ),
+        )
+        .unwrap();
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "codex", "root", Some(&root));
+        drop(conn);
+        hydrate_session_at_with_home(&db, &options("codex", "root"), dir.path()).unwrap();
+
+        let child_markers = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM session_markers WHERE source = 'codex' \
+                 AND session_id = 'child' AND kind IN ('usage_snapshot', 'turn_context')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let conn = open_db(&db).unwrap();
+        assert_eq!(child_markers(&conn), 2);
+        // Stand in for the older generation: its parser stored neither marker
+        // and its checkpoint names its own version.
+        conn.execute(
+            "DELETE FROM session_markers WHERE kind IN ('usage_snapshot', 'turn_context')",
+            [],
+        )
+        .unwrap();
+        for table in [
+            "session_hydration_checkpoints",
+            "observation_hydration_checkpoints",
+        ] {
+            conn.execute(
+                &format!("UPDATE {table} SET parser_version = ? WHERE source = 'codex'"),
+                params![HYDRATION_PARSER_VERSION - 1],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        hydrate_session_at_with_home(&db, &options("codex", "root"), dir.path()).unwrap();
+        let conn = open_db(&db).unwrap();
+        assert_eq!(
+            child_markers(&conn),
+            2,
+            "the child was re-read from byte zero, not resumed from its cursor"
+        );
+
+        // An older build also left the child's own cursor, and the root may
+        // be upgraded by a hydration that never opens its children. The
+        // child's cursor names the generation that wrote it, so a later
+        // related hydration still reads the child from byte zero.
+        conn.execute(
+            "DELETE FROM session_markers WHERE kind IN ('usage_snapshot', 'turn_context')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE transcript_cursors \
+             SET parser_state_json = json_remove(parser_state_json, '$.codex.state_markers') \
+             WHERE source = 'codex'",
+            [],
+        )
+        .unwrap();
+        for table in [
+            "session_hydration_checkpoints",
+            "observation_hydration_checkpoints",
+        ] {
+            conn.execute(
+                &format!("UPDATE {table} SET parser_version = ? WHERE source = 'codex'"),
+                params![HYDRATION_PARSER_VERSION - 1],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        let mut root_only = options("codex", "root");
+        root_only.include_related = false;
+        hydrate_session_at_with_home(&db, &root_only, dir.path()).unwrap();
+        hydrate_session_at_with_home(&db, &options("codex", "root"), dir.path()).unwrap();
+        let conn = open_db(&db).unwrap();
+        assert_eq!(
+            child_markers(&conn),
+            2,
+            "a child cursor from an older generation is not resumed from"
+        );
+    }
+
+    /// A parser upgrade re-reads a Claude subagent sidecar from byte zero,
+    /// like its parent. The sidecar's locator cursor was committed by the
+    /// older parser at the end of the file, so resuming from it would read
+    /// nothing and the records the new parser stores would never reach the
+    /// child.
+    #[test]
+    fn a_parser_upgrade_re_reads_claude_sidecars_from_the_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "session-sidecar";
+        let transcript = seed_claude_transcript(
+            dir.path(),
+            session_id,
+            b"{\"sessionId\":\"session-sidecar\",\"uuid\":\"u1\",\"cwd\":\"/work/app\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"parent prompt\"},\"timestamp\":\"2026-08-31T10:00:00Z\"}\n",
+        );
+        fs::write(
+            transcript.parent().unwrap().join("agent-child.jsonl"),
+            "{\"sessionId\":\"session-sidecar\",\"agentId\":\"child-1\",\"isSidechain\":true,\"uuid\":\"s1\",\"cwd\":\"/work/app\",\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"first\"},\"timestamp\":\"2026-08-31T10:00:01Z\"}\n",
+        )
+        .unwrap();
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", session_id, Some(&transcript));
+        drop(conn);
+        hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        assert_eq!(session_event_snapshot(&db, "child-1").len(), 1);
+
+        // Stand in for the older generation: its parser stored none of the
+        // child's rows and its checkpoint names its own version.
+        let conn = open_db(&db).unwrap();
+        conn.execute(
+            "DELETE FROM session_events WHERE source = 'claude' AND session_id = 'child-1'",
+            [],
+        )
+        .unwrap();
+        for table in [
+            "session_hydration_checkpoints",
+            "observation_hydration_checkpoints",
+        ] {
+            conn.execute(
+                &format!("UPDATE {table} SET parser_version = ? WHERE source = 'claude'"),
+                params![HYDRATION_PARSER_VERSION - 1],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        assert_eq!(
+            session_event_snapshot(&db, "child-1")
+                .iter()
+                .map(|row| row.0.clone())
+                .collect::<Vec<_>>(),
+            vec!["s1:0".to_string()],
+            "the sidecar was re-read from byte zero, not resumed from its cursor"
         );
     }
 
