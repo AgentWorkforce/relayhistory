@@ -17,7 +17,7 @@ const read = (file) => readFileSync(path.join(ROOT, ".github/workflows", file), 
 /** The complete trunk-PR + ci:run gate. Asserted exactly: a substring check would
  * still pass if a job appended an `|| ...` bypass. */
 const TRUNK_CI_GATE =
-  "(github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.head_ref == 'trunk' && github.event.pull_request.head.repo.full_name == github.repository && github.base_ref == 'main' && (github.event.action != 'labeled' || github.event.label.name == 'ci:run'))";
+  "(github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.head_ref == 'trunk' && github.event.pull_request.head.repo.full_name == github.repository && github.base_ref == 'main' && github.event.action == 'labeled' && github.event.label.name == 'ci:run')";
 
 /** Every `if:` of a top-level job (2-space indented key under `jobs:`). */
 function jobGates(source) {
@@ -38,14 +38,14 @@ function jobGates(source) {
 }
 
 for (const file of ["ci.yml"]) {
-  test(`${file} runs the trunk PR only on opened/reopened/ci:run, never on synchronize`, () => {
+  test(`${file} runs the trunk PR only when the ci:run label is added, never on opened/reopened/synchronize`, () => {
     const source = read(file);
     const pullRequest = source.slice(source.indexOf("\n  pull_request:\n"));
     const types = /\n    types: \[([^\]]*)\]/.exec(pullRequest);
     assert.ok(types, `${file}: pull_request must declare types`);
     assert.deepEqual(
       types[1].split(",").map((t) => t.trim()),
-      ["opened", "reopened", "labeled"],
+      ["labeled"],
     );
     const gates = jobGates(source);
     assert.ok(Object.keys(gates).length > 0);
