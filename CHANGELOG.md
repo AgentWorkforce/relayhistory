@@ -9,6 +9,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - `sync` no longer rewrites the full-text index entry of a row it re-reads unchanged: a sweep that re-reads the OpenCode store, or re-parses a transcript, re-indexes only rows whose text, role or project changed, so walking syncs write less and search stays as fast as on a freshly indexed store.
+- Writing a marker reuses its prepared statement instead of compiling it, and the change-feed triggers it fires, once per marker: cold sync and hydration of marker-heavy transcripts are ~10% faster.
 
 ## [0.36.0] - 2026-10-07
 

@@ -3480,7 +3480,9 @@ pub fn insert_session_marker(
     marker: &NewSessionMarker<'_>,
 ) -> Result<usize> {
     crate::mark_session_presence(conn, source, session_id, SessionLocation::Local)?;
-    let changed = conn.execute(
+    // Cached: a sweep writes markers once per record, and preparing this
+    // statement compiles the change-feed and location triggers it fires.
+    let changed = conn.prepare_cached(
         "INSERT INTO session_markers \
          (source, session_id, marker_uid, ts_ms, message_id, parent_id, turn_id, kind, subkind, text, payload_json) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
@@ -3490,7 +3492,8 @@ pub fn insert_session_marker(
          text=excluded.text, payload_json=excluded.payload_json, \
          location=CASE WHEN session_markers.location = excluded.location \
            THEN session_markers.location ELSE 'both' END",
-        params![
+    )?
+    .execute(params![
             source,
             session_id,
             marker.marker_uid,
@@ -3502,8 +3505,7 @@ pub fn insert_session_marker(
             marker.subkind,
             marker.text,
             marker.payload_json,
-        ],
-    )?;
+        ])?;
     Ok(changed)
 }
 
